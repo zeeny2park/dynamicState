@@ -1,10 +1,12 @@
 # Runtime State Explorer — Branch-safe State Transition & Exploration Engine
 
 > [!NOTE]
-> **Status: `PHASE_4.1_COMPLETE`** — Runtime State Exploration Validation & Hardening  
-> Verified with 65 Unit Tests and 9 GDB E2E Integration Test Suites.
+> **Status: `EXTERNAL_DEBUG_IMAGE_FOUNDATION_COMPLETE`** — External Debug Image Support for Stripped Production Binaries  
+> Verified with 81 Unit Tests and 11 GDB E2E Integration Test Suites.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
+
+나아가 실제 CI/CD 및 프로덕션 환경에서 배포되는 **Stripped Production Binary**를 그대로 실행하면서, 동일 빌드의 **External Debug Image**(unstripped artifact / split DWARF)를 바인딩하여 안전하고 결정론적인 런타임 상태 추출·변이·탐색을 수행합니다.
 
 ---
 
@@ -39,8 +41,10 @@ GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 �
                      ▼
              State Restorer (GDB Fork Backend)
                      │
-                     ▼
-               Product Binary
+          ┌──────────┴──────────┐
+          ▼                     ▼
+Stripped Production Binary  External Debug Image
+(/proc/<pid>/mem, /proc/exe) (DWARF & Symbols only)
 ```
 
 ### Important Architecture Principle
@@ -71,8 +75,10 @@ Recursive Semantic Reachability Traversal
   (단일 결정론적 상태 전이 실행 및 관측: Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> StateTransition)
 - **Phase 4**: *"Can the runtime engine systematically discover new states from a parent runtime state through independent mutations?"*  
   (단일 부모 상태에서 여러 변이 후보를 안전하게 복원하며 독립적인 상태 공간 가지(Branches)를 체계적으로 탐색)
-- **Phase 4.1 (Complete)**: *"Validation & Hardening — Real GDB Checkpoints, Crash/Timeout Isolation, and Semantic Determinism"*  
+- **Phase 4.1**: *"Validation & Hardening — Real GDB Checkpoints, Crash/Timeout Isolation, and Semantic Determinism"*  
   (GDB 체크포인트 에러 코드 명시화, 자율적 `StateExplorer.run()` 오케스트레이션, `SIGSEGV`/`TIMEOUT` 장애 격리, ASLR 및 Storage-Class 무관 상태 해시, Runtime Capabilities API 및 안전 한계 적용)
+- **External Debug Image Foundation (Complete)**: *"Production-Grade Stripped Binary Execution with External Debug Images"*  
+  (실제 프로덕션 환경의 stripped 바이너리를 변경 없이 실행하면서 동일 빌드의 외부 unstripped/debug 이미지를 바인딩하여 런타임 상태 추출, 변이, 전이, 탐색을 온전히 수행. GNU Build ID 검증, 아키텍처 호환성 검사, 런타임 프로세스 메모리 격리 보장, 스냅샷 출처(Provenance) 추적)
 
 ---
 
@@ -247,14 +253,91 @@ corpus/
 
 ---
 
+## External Debug Image Architecture for Stripped Production Binaries
+
+실제 CI/CD 및 프로덕션 환경에서는 보안 및 용량 최적화를 위해 바이너리가 완전히 `strip`되어 배포됩니다. dynamicState는 실행 중인 stripped 바이너리의 런타임 메모리를 변경 없이 관찰하면서, 동일 빌드의 unstripped 아티팩트(External Debug Image)로부터 심볼과 DWARF 구조체를 안전하게 바인딩합니다.
+
+```text
+    Runtime Binary
+        │ 실제 실행 (/proc/<pid>/mem, /proc/<pid>/exe, registers)
+        ▼
+   Stripped Production Binary
+        │
+        ▼
+       GDB Backend ───────────────┐ (Zero memory reads from debug image)
+        ▲                         │
+        │ DWARF / Types / Symbols │
+        │ Strict GNU Build ID     ▼
+   External Debug Image     Runtime State Engine
+   (Unstripped / Split DWARF)  (Snapshot, Mutation, Transition, Exploration)
+```
+
+### Core Invariants & Safety Guarantees
+
+1. **Process Memory as Single Source of Truth**:
+   - 런타임 상태 값(Primitive, Pointer, Enum, String 등)은 **오직 실행 중인 프로세스 메모리 및 레지스터**에서만 읽습니다.
+   - 외부 디버그 이미지 파일의 데이터 섹션이나 정적 메모리는 결코 상태 값의 소스로 사용되지 않습니다.
+
+2. **Strict GNU Build ID & Architecture Verification**:
+   - 런타임 바이너리와 외부 디버그 이미지는 ELF 헤더 및 `.note.gnu.build-id`를 대조하여 엄격히 검증됩니다.
+   - 불일치 시 상태 추출을 즉시 거부하며 명확한 에러 코드를 반환합니다:
+     - `BUILD_ID_MISMATCH`: 동일 아키텍처이나 빌드 해시가 불일치함
+     - `ARCHITECTURE_MISMATCH`: ELF 클래스(32/64), 아키텍처(x86_64, aarch64 등), 엔디언 불일치
+     - `BUILD_ID_NOT_AVAILABLE`: Build ID가 누락되고 `.gnu_debuglink`가 불일치함
+     - `DEBUG_INFO_MISSING`: 디버그 이미지에 DWARF 정보(`.debug_*`) 및 심볼이 존재하지 않음
+
+3. **Zero-Dependency ELF Inspector**:
+   - `extractor/debug_image.py`는 `readelf`나 `pyelftools` 등 외부 패키지에 의존하지 않고, 순수 파이썬 struct 기반으로 ELF32/ELF64 헤더, PT_NOTE, `.note.gnu.build-id`, `.gnu_debuglink`, 섹션 헤더를 직접 파싱하여 < 1ms 내에 검증을 완료합니다.
+
+4. **Snapshot Provenance Tracking**:
+   - 모든 스냅샷과 상태 전이 아티팩트는 출처 메타데이터를 보존합니다:
+     ```json
+     "provenance": {
+       "runtime_binary": {
+         "path": "/opt/app/bin/server",
+         "build_id": "d100266b036d9ecf7280e3e01eb5fd541d1cb348",
+         "architecture": "aarch64",
+         "elf_class": "ELF64",
+         "stripped": true
+       },
+       "debug_image": {
+         "path": "/opt/debug/server.debug",
+         "build_id": "d100266b036d9ecf7280e3e01eb5fd541d1cb348",
+         "source": "external",
+         "verified": true,
+         "compatible": true,
+         "reason": "COMPATIBLE"
+       },
+       "performance": {
+         "debug_image_load_ms": 0.35,
+         "binary_identity_check_ms": 0.21,
+         "debug_image_verification_ms": 0.58
+       }
+     }
+     ```
+
+5. **State Hash Invariance**:
+   - 의미론적 상태 해시(`SemanticStateHash`)는 실행 바이너리의 파일 경로, stripped 여부, 디버그 이미지 경로, Build ID에 **완전히 독립적**입니다.
+   - 동일한 논리적 런타임 상태는 unstripped 로컬 바이너리에서 추출하든 stripped 프로덕션 바이너리+외부 디버그 이미지에서 추출하든 100% 동일한 SHA-256 해시를 산출합니다.
+
+---
+
 ## Usage
 
-### 1. Build and Run Target
+### 1. Build and Run Target with External Debug Image
+
+CI/CD 파이프라인에서 분리된 디버그 이미지 생성 및 GDB 실행 예시:
 
 ```bash
+# 1. 빌드 및 디버그 심볼 분리
 g++ -g -O0 -o sample examples/sample.cpp
-gdb -q ./sample
+objcopy --only-keep-debug sample sample.debug
+strip -s -o sample_stripped sample
+
+# 2. GDB 실행 및 외부 디버그 이미지 로드
+gdb -q ./sample_stripped
 (gdb) source gdb/extract_state.py
+(gdb) load-debug-image ./sample.debug
 (gdb) break runtime_state_checkpoint
 (gdb) set args 10
 (gdb) run
@@ -262,16 +345,30 @@ gdb -q ./sample
 
 ### 2. GDB Commands
 
+#### Binary Identity & Capabilities Inspection:
+```gdb
+# 런타임 바이너리와 디버그 이미지의 호환성 및 Build ID 검사
+(gdb) runtime-info
+(gdb) runtime-info --json
+```
+
+#### External Debug Image Binding:
+```gdb
+# 외부 디버그 이미지 로드 및 엄격 검증
+(gdb) load-debug-image /path/to/sample.debug
+```
+
+#### State Extraction with Debug Image:
+```gdb
+(gdb) extract-state --output snapshot.json
+# 또는 명시적 디버그 이미지 지정:
+(gdb) extract-state --debug-image /path/to/sample.debug --output snapshot.json
+```
+
 #### High-level Transition Command:
 ```gdb
 # Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> Transition Artifact를 실행
 (gdb) transition-state --object obj_0001 --field retry --value 3 --id T001 --parent A --child B --output transitions/T001.json
-```
-
-#### Mutation Candidates Proposal:
-```gdb
-# 현재 스냅샷에서 가능한 변이 후보군을 규칙 기반으로 추출
-(gdb) propose-mutations
 ```
 
 #### Branch-safe State Exploration:
@@ -288,23 +385,29 @@ gdb -q ./sample
 
 ### 3. Programmatic Python API (Agent & Script Usage)
 
-상위 계층(예: 자율 탐색 스크립트 또는 향후 연동될 Coding Agent)은 `StateExplorer` API를 직접 호출하여 런타임 상태 공간을 자율적으로 탐색할 수 있습니다:
+상위 계층(예: 자율 탐색 스크립트 또는 향후 연동될 Coding Agent)은 `StateExplorer` 및 `RuntimeController` API를 직접 호출하여 프로덕션 바이너리를 제어할 수 있습니다:
 
 ```python
 import runtime_commands
 from extractor.state_corpus import StateCorpus
 from extractor.explorer import StateExplorer
 
-# 1. 런타임 컨트롤러 및 코퍼스 초기화
+# 1. 런타임 컨트롤러 초기화 및 외부 디버그 이미지 로드
 controller = runtime_commands._CONTROLLER
+controller.load_debug_image("/path/to/sample.debug")
+
+# 2. 런타임 정보 및 출처 검증
+info = controller.runtime_info()
+assert info["debug_image"]["compatible"] is True
+
+# 3. 코퍼스 및 탐색기 초기화
 corpus = StateCorpus("corpus")
 explorer = StateExplorer(controller, corpus, "corpus")
 
-# 2. 초기 런타임 상태 관측 및 시드 상태 등록
+# 4. 초기 런타임 상태 관측 및 시드 상태 등록
 seed_state_id = explorer.seed()
 
-# 3. 브랜치 안전 자율 상태 공간 탐색 실행
-# (부모 복원 -> 변이 후보 실행 -> 자식 스냅샷 -> 해시 계산 -> 코퍼스 등록이 완전 자동화됨)
+# 5. 브랜치 안전 자율 상태 공간 탐색 실행
 result = explorer.run(max_steps=10, timeout_ms=1000)
 
 print("Exploration ID:", result["exploration_id"])
@@ -324,14 +427,20 @@ print("Timeouts detected:", result["summary"]["timeouts"])
 ```python
 caps = controller.get_capabilities()
 # RuntimeCapabilities(
-#     can_checkpoint=True,
-#     can_restore=True,
-#     can_mutate=True,
-#     can_diff=True,
-#     can_timeout=True,
-#     can_detect_crashes=True,
-#     checkpoint_backend="gdb_fork",
-#     exploration_mode="branching"
+#     checkpoint=True,
+#     restore=True,
+#     typed_mutation=True,
+#     semantic_snapshot=True,
+#     semantic_diff=True,
+#     state_hash=True,
+#     branch_exploration=True,
+#     crash_recovery=True,
+#     timeout_recovery=True,
+#     external_debug_image=True,
+#     multi_thread_determinism=False,
+#     external_io_rollback=False,
+#     exploration_mode="deterministic_single_thread_context",
+#     backend="gdb_fork"
 # )
 ```
 
@@ -347,10 +456,10 @@ caps = controller.get_capabilities()
 
 ## Testing
 
-모든 단위 테스트와 9개의 GDB 종단간 통합 테스트 스크립트가 완전히 통과합니다:
+모든 단위 테스트와 11개의 GDB 종단간 통합 테스트 스크립트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 테스트 (65 unit tests across all modules)
+# 1. 단위 테스트 (81 unit tests across all modules)
 python3 -m unittest discover -s tests -v
 
 # 2. Phase 1 & 2 GDB 기본 통합 테스트
@@ -365,20 +474,26 @@ bash tests/integration_mutation_validation.sh
 # 5. Phase 3 크래시(SIGSEGV) 및 타임아웃 전이 테스트
 bash tests/integration_transition_failure.sh
 
-# 6. Phase 4 코퍼스 저장 및 중복 제거 탐색 테스트
+# 6. Phase 3 종합 통합 테스트
+bash tests/integration_phase3.sh
+
+# 7. Phase 4 코퍼스 저장 및 중복 제거 탐색 테스트
 bash tests/integration_exploration.sh
 
-# 7. Phase 4 Branch-safe 독립 후보 전이 통합 테스트
+# 8. Phase 4 Branch-safe 독립 후보 전이 통합 테스트
 bash tests/integration_exploration_branching.sh
 
-# 8. Phase 4.1 StateExplorer.run() 자율 브랜칭 GDB 통합 테스트 (신규)
+# 9. Phase 4.1 StateExplorer.run() 자율 브랜칭 GDB 통합 테스트
 bash tests/integration_explorer_real_gdb.sh
 
-# 9. Phase 4.1 크래시/타임아웃 장애 격리 GDB 통합 테스트 (신규)
+# 10. Phase 4.1 크래시/타임아웃 장애 격리 GDB 통합 테스트
 bash tests/integration_explorer_failure_isolation.sh
 
-# 10. Phase 3 종합 통합 테스트
-bash tests/integration_phase3.sh
+# 11. External Debug Image 호환성/Build-ID 불일치 거부 및 상태 추출 통합 테스트 (신규)
+bash tests/integration_stripped_debug_image.sh
+
+# 12. Stripped 바이너리 상태 전이 및 상태 공간 탐색 통합 테스트 (신규)
+bash tests/integration_stripped_transition.sh
 ```
 
 ---

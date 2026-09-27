@@ -16,15 +16,18 @@ class RuntimeSnapshot:
     persistent: Any
     metadata: Optional[Dict[str, Any]] = None
     transition: Optional[Dict[str, Any]] = None
+    provenance: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_runtime_state(cls, state, snapshot_id: str, metadata: Optional[Dict[str, Any]] = None,
-                           transition: Optional[Dict[str, Any]] = None) -> "RuntimeSnapshot":
+                           transition: Optional[Dict[str, Any]] = None,
+                           provenance: Optional[Dict[str, Any]] = None) -> "RuntimeSnapshot":
+        prov = provenance or getattr(state, "provenance", None)
         return cls(snapshot_id=snapshot_id, schema_version="0.3",
                    created_at=datetime.now(timezone.utc).isoformat(),
                    process=state.process, execution=state.execution,
                    persistent=state.persistent, metadata=metadata,
-                   transition=transition)
+                   transition=transition, provenance=prov)
 
     def to_dict(self) -> Dict[str, Any]:
         data = {
@@ -39,6 +42,8 @@ class RuntimeSnapshot:
             data["metadata"] = self.metadata
         if self.transition is not None:
             data["transition"] = self.transition
+        if self.provenance is not None:
+            data["provenance"] = self.provenance
         return data
 
     def write_json(self, output: str) -> None:

@@ -20,10 +20,18 @@ def _options(arg):
             result.setdefault("_", []).append(token)
             index += 1
             continue
+        opt = token[2:]
+        if "=" in opt:
+            k, v = opt.split("=", 1)
+            result[k.replace("-", "_")] = v
+            index += 1
+            continue
+        key = opt.replace("-", "_")
         index += 1
-        if index == len(tokens):
-            raise gdb.GdbError("{} requires a value".format(token))
-        result[token[2:].replace("-", "_")] = tokens[index]
+        if index == len(tokens) or tokens[index].startswith("--"):
+            result[key] = "true"
+            continue
+        result[key] = tokens[index]
         index += 1
     return result
 
@@ -38,7 +46,8 @@ class SnapshotStateCommand(gdb.Command):
         try:
             state = _CONTROLLER.snapshot(identifier, opts.get("output"),
                                          int(opts["max_depth"]) if "max_depth" in opts else None,
-                                         opts.get("globals", "true") != "false")
+                                         opts.get("globals", "true") != "false",
+                                         debug_image=opts.get("debug_image"))
             print(json.dumps(state.to_dict()["snapshot"], ensure_ascii=False))
         except Exception as exc:
             raise gdb.GdbError("snapshot-state failed: {}".format(exc))
@@ -164,7 +173,8 @@ class TransitionStateCommand(gdb.Command):
                 child_snapshot_id=child_id,
                 snapshots_dir=snapshots_dir,
                 parent_output=parent_output,
-                child_output=child_output
+                child_output=child_output,
+                debug_image=opts.get("debug_image")
             )
             print(json.dumps(transition.to_dict(), ensure_ascii=False))
         except Exception as exc:
@@ -182,7 +192,12 @@ class ExploreStateCommand(gdb.Command):
         timeout_ms = int(opts.get("timeout_ms", 1000))
         corpus_dir = opts.get("corpus_dir", "corpus")
         try:
-            result = _CONTROLLER.explore(max_steps=steps, timeout_ms=timeout_ms, corpus_dir=corpus_dir)
+            result = _CONTROLLER.explore(
+                max_steps=steps,
+                timeout_ms=timeout_ms,
+                corpus_dir=corpus_dir,
+                debug_image=opts.get("debug_image")
+            )
             print(json.dumps(result, indent=2, ensure_ascii=False))
         except Exception as exc:
             raise gdb.GdbError("explore-state failed: {}".format(exc))
@@ -235,6 +250,63 @@ class ProposeMutationsCommand(gdb.Command):
         print(json.dumps([c.to_dict() for c in cands], indent=2, ensure_ascii=False))
 
 
+class RuntimeInfoCommand(gdb.Command):
+    """Display runtime binary identity, external debug image, and capabilities."""
+    def __init__(self):
+        super(RuntimeInfoCommand, self).__init__("runtime-info", gdb.COMMAND_DATA)
+
+    def invoke(self, arg, from_tty):
+        opts = _options(arg)
+        if "debug_image" in opts:
+            try:
+                _CONTROLLER.load_debug_image(opts["debug_image"])
+            except Exception as exc:
+                raise gdb.GdbError("load-debug-image failed: {}".format(exc))
+
+        info = _CONTROLLER.runtime_info()
+        if opts.get("json", "false").lower() == "true":
+            print(json.dumps(info, indent=2, ensure_ascii=False))
+            return
+
+        rb = info.get("runtime_binary") or {}
+        di = info.get("debug_image") or {}
+
+        lines = [
+            "Runtime Binary:",
+            "  path: {}".format(rb.get("path") or "<unknown>"),
+            "  build_id: {}".format(rb.get("build_id") or "<none>"),
+            "  architecture: {}".format(rb.get("architecture") or "<unknown>"),
+            "  stripped: {}".format(rb.get("stripped", False)),
+            "",
+            "Debug Image:",
+            "  path: {}".format(di.get("path") or "<none>"),
+            "  build_id: {}".format(di.get("build_id") or "<none>"),
+            "  architecture: {}".format(di.get("architecture") or "<unknown>"),
+            "  source: {}".format(di.get("source") or "none"),
+            "  compatible: {}".format(di.get("compatible", False))
+        ]
+        print("\n".join(lines))
+
+
+class LoadDebugImageCommand(gdb.Command):
+    """Load and verify an external debug image for the current inferior."""
+    def __init__(self):
+        super(LoadDebugImageCommand, self).__init__("load-debug-image", gdb.COMMAND_FILES)
+
+    def invoke(self, arg, from_tty):
+        opts = _options(arg)
+        pos = opts.get("_", [])
+        path = opts.get("path") or (pos[0] if pos else None)
+        if not path:
+            raise gdb.GdbError("load-debug-image requires path to debug image")
+        try:
+            compat = _CONTROLLER.load_debug_image(path)
+            reason = compat.reason if compat else "COMPATIBLE"
+            print("Loaded external debug image: {} ({})".format(path, reason))
+        except Exception as exc:
+            raise gdb.GdbError("load-debug-image failed: {}".format(exc))
+
+
 SnapshotStateCommand()
 MutateStateCommand()
 ContinueStateCommand()
@@ -244,3 +316,6 @@ ExploreStateCommand()
 CorpusListCommand()
 CorpusShowCommand()
 ProposeMutationsCommand()
+RuntimeInfoCommand()
+LoadDebugImageCommand()
+

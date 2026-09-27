@@ -31,7 +31,8 @@ class ExtractStateCommand(gdb.Command):
         try:
             start = time.monotonic()
             state = snapshot(gdb, max_depth=options["max_depth"],
-                             include_globals=options["include_globals"])
+                             include_globals=options["include_globals"],
+                             debug_image=options.get("debug_image"))
             observed_ms = (time.monotonic() - start) * 1000
             serialization_start = time.monotonic()
             payload = to_json(state)
@@ -51,7 +52,7 @@ class ExtractStateCommand(gdb.Command):
     @staticmethod
     def _parse_options(arg):
         tokens = shlex.split(arg)
-        result = {"max_depth": None, "include_globals": True, "output": None}
+        result = {"max_depth": None, "include_globals": True, "output": None, "debug_image": None}
         index = 0
         while index < len(tokens):
             token = tokens[index]
@@ -59,7 +60,7 @@ class ExtractStateCommand(gdb.Command):
                 result["include_globals"] = True
             elif token == "--no-globals":
                 result["include_globals"] = False
-            elif token in ("--max-depth", "--output"):
+            elif token in ("--max-depth", "--output", "--debug-image"):
                 index += 1
                 if index == len(tokens):
                     raise ValueError("{} requires a value".format(token))
@@ -71,8 +72,10 @@ class ExtractStateCommand(gdb.Command):
                     if value < 1:
                         raise ValueError("--max-depth must be a positive integer")
                     result["max_depth"] = value
-                else:
+                elif token == "--output":
                     result["output"] = tokens[index]
+                elif token == "--debug-image":
+                    result["debug_image"] = tokens[index]
             else:
                 raise ValueError("unknown option: {}".format(token))
             index += 1

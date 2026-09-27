@@ -100,6 +100,11 @@ class RuntimeState:
     execution: ExecutionState
     objects: List[ObjectState]
     persistent: Optional[PersistentState] = None
+    provenance: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if self.provenance is None:
+            d.pop("provenance", None)
+        return d
+

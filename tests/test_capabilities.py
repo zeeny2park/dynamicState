@@ -17,6 +17,7 @@ class CapabilitiesTests(unittest.TestCase):
         self.assertTrue(d["branch_exploration"])
         self.assertTrue(d["crash_recovery"])
         self.assertTrue(d["timeout_recovery"])
+        self.assertTrue(d["external_debug_image"])
         self.assertFalse(d["multi_thread_determinism"])
         self.assertFalse(d["external_io_rollback"])
         self.assertEqual(d["exploration_mode"], "deterministic_single_thread_context")

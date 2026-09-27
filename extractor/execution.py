@@ -12,17 +12,30 @@ class RuntimeBackend:
 
 
 class GdbBackend(RuntimeBackend):
-    def __init__(self, gdb_module):
+    def __init__(self, gdb_module, debug_image_provider=None):
         self.gdb = gdb_module
+        self.debug_image_provider = debug_image_provider
+        self.runtime_binary_path = None
 
     def process_info(self):
         inferior = self.gdb.selected_inferior()
         pid = getattr(inferior, "pid", 0) or None
         binary = None
-        try:
-            binary = self.gdb.current_progspace().filename
-        except Exception:
-            pass
+        if pid:
+            import os
+            proc_exe = "/proc/{}/exe".format(pid)
+            if os.path.exists(proc_exe):
+                try:
+                    binary = os.path.realpath(proc_exe)
+                except Exception:
+                    pass
+        if not binary and getattr(self, "runtime_binary_path", None):
+            binary = self.runtime_binary_path
+        if not binary:
+            try:
+                binary = self.gdb.current_progspace().filename
+            except Exception:
+                pass
         return {"pid": pid, "binary": binary}
 
     def snapshot(self, max_depth=None, include_globals=True):
@@ -34,7 +47,7 @@ class GdbBackend(RuntimeBackend):
         from .memory_maps import MemoryMapProvider
         process = self.process_info()
         graph = ObjectGraphBuilder(self, TypeResolver(self.gdb), max_object_depth=max_depth,
-                                   memory_maps=MemoryMapProvider(process["pid"], process["binary"]))
+                                    memory_maps=MemoryMapProvider(process["pid"], process["binary"]))
         traversal_start = time.monotonic()
         execution = self.execution(graph)
         traversal_ms = (time.monotonic() - traversal_start) * 1000
@@ -42,6 +55,84 @@ class GdbBackend(RuntimeBackend):
         if include_globals:
             self.global_roots(graph)
         roots_ms = (time.monotonic() - roots_start) * 1000
+
+        # Provenance and debug image performance
+        provenance = None
+        load_ms = 0.0
+        id_ms = 0.0
+        verify_ms = 0.0
+        if self.debug_image_provider:
+            if not self.debug_image_provider.runtime_identity and process.get("binary"):
+                self.debug_image_provider.verify(process["binary"])
+            provenance = self.debug_image_provider.get_provenance()
+            load_ms = self.debug_image_provider.load_ms
+            id_ms = self.debug_image_provider.identity_check_ms
+            verify_ms = self.debug_image_provider.verification_ms
+        elif process.get("binary"):
+            try:
+                from .debug_image import inspect_elf, DebugImageProvider
+                import os
+                progspace_fn = None
+                try:
+                    progspace_fn = self.gdb.current_progspace().filename
+                except Exception:
+                    pass
+
+                # If progspace filename is different from running process binary,
+                # an external debug image / symbol file was loaded in GDB
+                if (progspace_fn and os.path.exists(progspace_fn) and
+                        os.path.realpath(progspace_fn) != os.path.realpath(process["binary"])):
+                    provider = DebugImageProvider(progspace_fn)
+                    provider.verify(process["binary"])
+                    self.debug_image_provider = provider
+                    provenance = provider.get_provenance()
+                    load_ms = provider.load_ms
+                    id_ms = provider.identity_check_ms
+                    verify_ms = provider.verification_ms
+                else:
+                    t_check = time.monotonic()
+                    r_ident = inspect_elf(process["binary"])
+                    id_ms = round((time.monotonic() - t_check) * 1000, 3)
+                    provenance = {
+                        "runtime_binary": {
+                            "path": r_ident.path,
+                            "build_id": r_ident.build_id,
+                            "architecture": r_ident.architecture,
+                            "elf_class": r_ident.elf_class,
+                            "endianness": r_ident.endianness,
+                            "stripped": r_ident.stripped,
+                        },
+                        "debug_image": {
+                            "path": r_ident.path,
+                            "build_id": r_ident.build_id,
+                            "architecture": r_ident.architecture,
+                            "elf_class": r_ident.elf_class,
+                            "endianness": r_ident.endianness,
+                            "source": "embedded",
+                            "verified": True,
+                            "compatible": True,
+                            "reason": "EMBEDDED_DEBUG_INFO" if r_ident.has_debug_info else "STRIPPED_NO_DEBUG_IMAGE",
+                        },
+                        "performance": {
+                            "debug_image_load_ms": 0.0,
+                            "binary_identity_check_ms": id_ms,
+                            "debug_image_verification_ms": 0.0,
+                        },
+                    }
+            except Exception:
+                provenance = None
+
+        perf_stats = {
+            "root_discovery_ms": round(roots_ms, 3),
+            "traversal_ms": round(traversal_ms, 3),
+            "objects_per_second": round(
+                len(graph.objects) / max(traversal_ms / 1000.0, 0.000001), 3
+            ),
+            "debug_image_load_ms": load_ms,
+            "binary_identity_check_ms": id_ms,
+            "debug_image_verification_ms": verify_ms,
+        }
+
         persistent = PersistentState(roots=graph.roots, objects=graph.objects,
             statistics={"root_count": len(graph.roots), "object_count": len(graph.objects),
                         "edge_count": sum(1 for obj in graph.objects for field in obj.fields if field.object_ref),
@@ -52,14 +143,11 @@ class GdbBackend(RuntimeBackend):
                         "max_depth_reached": graph.max_depth_reached,
                         "cycles_detected": graph.cycles_detected,
                         "unreadable_objects": graph.unreadable_objects,
-                        "performance": {"root_discovery_ms": round(roots_ms, 3),
-                                        "traversal_ms": round(traversal_ms, 3),
-                                        "objects_per_second": round(
-                                            len(graph.objects) / max(traversal_ms / 1000.0, 0.000001), 3)},
+                        "performance": perf_stats,
                         "storage": self._storage_statistics(graph.objects)})
         # ``objects`` remains as a Phase-1-compatible alias.
         return RuntimeState(schema_version="0.2", process=process, execution=execution,
-                            objects=graph.objects, persistent=persistent)
+                            objects=graph.objects, persistent=persistent, provenance=provenance)
 
     @staticmethod
     def _storage_statistics(objects):

@@ -1,7 +1,8 @@
 """Deterministic runtime API; GDB-specific mutation remains in this adapter."""
 
-import math
 import json
+import math
+import os
 import re
 import threading
 import time
@@ -39,6 +40,7 @@ class RuntimeCapabilities:
     branch_exploration: bool = True
     crash_recovery: bool = True
     timeout_recovery: bool = True
+    external_debug_image: bool = True
     multi_thread_determinism: bool = False
     external_io_rollback: bool = False
     exploration_mode: str = "deterministic_single_thread_context"
@@ -118,11 +120,21 @@ class RuntimeController:
     def explore(self, max_steps=10, timeout_ms=1000, corpus_dir="corpus"):
         raise NotImplementedError
 
+    def load_debug_image(self, path: str):
+        pass
+
+    def runtime_info(self) -> Dict[str, Any]:
+        return {}
+
+    def attach(self, pid: int, debug_image: Optional[str] = None):
+        pass
+
 
 class GdbRuntimeController(RuntimeController):
-    def __init__(self, gdb_module):
+    def __init__(self, gdb_module, debug_image_provider=None):
         self.gdb = gdb_module
-        self.backend = GdbBackend(gdb_module)
+        self.debug_image_provider = debug_image_provider
+        self.backend = GdbBackend(gdb_module, debug_image_provider=debug_image_provider)
         self.types = TypeResolver(gdb_module)
         from .state_restorer import GdbCheckpointRestorer
         self.restorer = GdbCheckpointRestorer(gdb_module)
@@ -132,6 +144,117 @@ class GdbRuntimeController(RuntimeController):
         self._latest: Optional[RuntimeSnapshot] = None
         self._last_mutation: Optional[MutationResult] = None
         self._last_execution: Optional[ExecutionResult] = None
+
+    def load_debug_image(self, path: str):
+        from .debug_image import DebugImageProvider
+        provider = DebugImageProvider(path)
+        pinfo = self.backend.process_info()
+        runtime_bin = pinfo.get("binary")
+        if runtime_bin:
+            compat = provider.verify(runtime_bin)
+            if not compat.compatible:
+                raise RuntimeError("DEBUG_IMAGE_INCOMPATIBLE: {}".format(compat.reason))
+        else:
+            if not provider.debug_identity:
+                raise RuntimeError("DEBUG_IMAGE_INVALID: failed to load debug image")
+
+        if runtime_bin:
+            self.backend.runtime_binary_path = runtime_bin
+
+        # Register build-id in shadow debug directory so GDB locates separate debug file natively
+        if provider.debug_identity and provider.debug_identity.build_id:
+            bid = provider.debug_identity.build_id
+            shadow_dir = "/tmp/.dynamicstate_debug"
+            link_dir = os.path.join(shadow_dir, ".build-id", bid[:2])
+            os.makedirs(link_dir, exist_ok=True)
+            link_file = os.path.join(link_dir, bid[2:] + ".debug")
+            if os.path.exists(link_file) or os.path.islink(link_file):
+                try:
+                    os.unlink(link_file)
+                except Exception:
+                    pass
+            try:
+                os.symlink(os.path.abspath(path), link_file)
+            except Exception:
+                pass
+            try:
+                cur = self.gdb.parameter("debug-file-directory") or ""
+                if shadow_dir not in cur:
+                    new_val = "{}:{}".format(shadow_dir, cur) if cur else shadow_dir
+                    self.gdb.execute("set debug-file-directory {}".format(new_val))
+            except Exception:
+                pass
+
+        try:
+            self.gdb.execute("set confirm off")
+            if not self._is_stopped() and runtime_bin:
+                self.gdb.execute("file {}".format(runtime_bin))
+            else:
+                self.gdb.execute("symbol-file {}".format(path))
+        except Exception as exc:
+            raise RuntimeError("GDB_SYMBOL_FILE_FAILED: {}".format(exc))
+
+        self.debug_image_provider = provider
+        self.backend.debug_image_provider = provider
+        return provider.compatibility or (provider.verify(runtime_bin) if runtime_bin else None)
+
+    def runtime_info(self) -> Dict[str, Any]:
+        pinfo = self.backend.process_info()
+        r_bin = pinfo.get("binary")
+        r_ident = None
+        if r_bin:
+            try:
+                from .debug_image import inspect_elf
+                r_ident = inspect_elf(r_bin).to_dict()
+            except Exception:
+                r_ident = {"path": r_bin}
+
+        debug_ident = None
+        if self.debug_image_provider and self.debug_image_provider.debug_identity:
+            debug_ident = self.debug_image_provider.debug_identity.to_dict()
+            debug_ident["source"] = "external"
+            debug_ident["verified"] = bool(self.debug_image_provider.compatibility and self.debug_image_provider.compatibility.compatible)
+            debug_ident["compatible"] = bool(self.debug_image_provider.compatibility and self.debug_image_provider.compatibility.compatible)
+            debug_ident["reason"] = self.debug_image_provider.compatibility.reason if self.debug_image_provider.compatibility else None
+        else:
+            progspace_fn = None
+            try:
+                progspace_fn = self.gdb.current_progspace().filename
+            except Exception:
+                pass
+            if r_bin and progspace_fn and os.path.exists(progspace_fn) and os.path.realpath(progspace_fn) != os.path.realpath(r_bin):
+                from .debug_image import DebugImageProvider
+                provider = DebugImageProvider(progspace_fn)
+                provider.verify(r_bin)
+                self.debug_image_provider = provider
+                self.backend.debug_image_provider = provider
+                debug_ident = provider.debug_identity.to_dict()
+                debug_ident["source"] = "external"
+                debug_ident["verified"] = bool(provider.compatibility and provider.compatibility.compatible)
+                debug_ident["compatible"] = bool(provider.compatibility and provider.compatibility.compatible)
+                debug_ident["reason"] = provider.compatibility.reason if provider.compatibility else None
+            elif r_ident:
+                debug_ident = dict(r_ident)
+                debug_ident["source"] = "embedded"
+                debug_ident["verified"] = True
+                debug_ident["compatible"] = True
+                debug_ident["reason"] = "EMBEDDED_DEBUG_INFO" if r_ident.get("has_debug_info") else "STRIPPED_NO_DEBUG_IMAGE"
+
+        return {
+            "process": pinfo,
+            "runtime_binary": r_ident,
+            "debug_image": debug_ident,
+            "capabilities": self.get_capabilities()
+        }
+
+    def attach(self, pid: int, debug_image: Optional[str] = None):
+        try:
+            self.gdb.execute("attach {}".format(pid))
+        except Exception as exc:
+            raise RuntimeError("ATTACH_FAILED: {}".format(exc))
+
+        if debug_image:
+            self.load_debug_image(debug_image)
 
     def get_capabilities(self) -> Dict[str, Any]:
         thread_count = 1
@@ -150,6 +273,7 @@ class GdbRuntimeController(RuntimeController):
             branch_exploration=True,
             crash_recovery=True,
             timeout_recovery=True,
+            external_debug_image=True,
             multi_thread_determinism=False,
             external_io_rollback=False,
             exploration_mode="deterministic_single_thread_context" if thread_count <= 1 else "multi_thread_experimental",
@@ -221,11 +345,15 @@ class GdbRuntimeController(RuntimeController):
         from .explorer import StateExplorer
         return StateExplorer(self).propose_mutations(snapshot)
 
-    def explore(self, max_steps=10, timeout_ms=1000, corpus_dir="corpus"):
+    def explore(self, max_steps=10, timeout_ms=1000, corpus_dir="corpus", debug_image=None):
+        if debug_image:
+            self.load_debug_image(debug_image)
         from .explorer import StateExplorer
         return StateExplorer(self, corpus_dir=corpus_dir).run(max_steps=max_steps, timeout_ms=timeout_ms)
 
-    def snapshot(self, snapshot_id=None, output=None, max_depth=None, include_globals=True):
+    def snapshot(self, snapshot_id=None, output=None, max_depth=None, include_globals=True, debug_image=None):
+        if debug_image:
+            self.load_debug_image(debug_image)
         if not self._is_stopped():
             raise RuntimeError("PROCESS_NOT_STOPPED")
         self._counter += 1
@@ -368,7 +496,10 @@ class GdbRuntimeController(RuntimeController):
     def execute_transition(self, object_id=None, field_path=None, value=None, path=None,
                            timeout_ms=1000, transition_id=None, output=None,
                            parent_snapshot_id=None, child_snapshot_id=None,
-                           snapshots_dir=None, parent_output=None, child_output=None):
+                           snapshots_dir=None, parent_output=None, child_output=None,
+                           debug_image=None):
+        if debug_image:
+            self.load_debug_image(debug_image)
         import os
         from .snapshot import StateTransition
         t_total_start = time.monotonic()
