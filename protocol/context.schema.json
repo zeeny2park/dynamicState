@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentStateContext",
+  "description": "Compact semantic context summarizing the current runtime state for agent reasoning.",
+  "type": "object",
+  "required": ["snapshot_id", "execution", "objects", "statistics"],
+  "properties": {
+    "snapshot_id": {
+      "type": "string",
+      "description": "Current snapshot identifier (e.g. S001)"
+    },
+    "state_id": {
+      "type": ["string", "null"],
+      "description": "Corpus state identifier if indexed (e.g. state_000001)"
+    },
+    "state_hash": {
+      "type": ["string", "null"],
+      "description": "Deterministic SHA-256 semantic state hash"
+    },
+    "execution": {
+      "type": "object",
+      "required": ["thread_id", "function"],
+      "properties": {
+        "thread_id": { "type": ["integer", "string"] },
+        "function": { "type": ["string", "null"] },
+        "frame_level": { "type": "integer" },
+        "location": { "type": ["string", "null"] },
+        "pc": { "type": ["string", "null"] }
+      }
+    },
+    "objects": {
+      "type": "array",
+      "description": "Summary list of top semantic objects reachable from execution roots",
+      "items": {
+        "type": "object",
+        "required": ["object_id", "type"],
+        "properties": {
+          "object_id": { "type": "string" },
+          "type": { "type": "string" },
+          "storage": { "type": ["string", "null"] },
+          "fields": {
+            "type": "object",
+            "description": "Key-value map of primitive and symbolic field values"
+          }
+        }
+      }
+    },
+    "statistics": {
+      "type": "object",
+      "required": ["object_count"],
+      "properties": {
+        "object_count": { "type": "integer" },
+        "root_count": { "type": "integer" },
+        "edge_count": { "type": "integer" }
+      }
+    },
+    "provenance": {
+      "type": ["object", "null"],
+      "description": "Binary and debug image provenance metadata"
+    }
+  },
+  "additionalProperties": false
+}

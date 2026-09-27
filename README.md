@@ -1,50 +1,45 @@
-# Runtime State Explorer — Branch-safe State Transition & Exploration Engine
+# Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `EXTERNAL_DEBUG_IMAGE_FOUNDATION_COMPLETE`** — External Debug Image Support for Stripped Production Binaries  
-> Verified with 81 Unit Tests and 11 GDB E2E Integration Test Suites.
+> **Status: `PHASE_5_AGENT_RUNTIME_FOUNDATION_COMPLETE`** — Agent Runtime Protocol + Reference Implementation  
+> Verified with 110 Unit Tests and 12 GDB E2E Integration Test Suites.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
-나아가 실제 CI/CD 및 프로덕션 환경에서 배포되는 **Stripped Production Binary**를 그대로 실행하면서, 동일 빌드의 **External Debug Image**(unstripped artifact / split DWARF)를 바인딩하여 안전하고 결정론적인 런타임 상태 추출·변이·탐색을 수행합니다.
+나아가 실제 CI/CD 및 프로덕션 환경의 **Stripped Production Binary**와 **External Debug Image** 환경 위에서, 자율 코딩 에이전트(Autonomous Coding Agent)가 GDB 명령어나 원시 메모리 주소를 직접 다루지 않고 오직 고수준 의미론적 개념(Object, Field, State, MutationCandidate, Transition, Exploration, Evidence, Invariant)만을 사용하여 런타임 상태를 관찰하고 탐색할 수 있는 **Agent Runtime Protocol (ARP)** 과 참조 구현체 `AgentRuntime`을 제공합니다.
 
 ---
 
 ## Architecture & Exploration Pipeline
 
 ```text
-               Coding Agent (Future Phase)
-                     │
-                     ▼
-             Runtime State API
-                     │
-                     ▼
-              State Explorer
-                     │
-          ┌──────────┼──────────┐
-          ▼          ▼          ▼
-      Checkpoint  Mutation  Transition
-          │          │          │
-          └──────────┼──────────┘
-                     ▼
-                State Diff
-                     │
-                     ▼
-              Interestingness
-                     │
-                     ▼
-                State Corpus
-                     │
-                     ▼
-              Next Exploration
-                     │
-                     ▼
-             State Restorer (GDB Fork Backend)
-                     │
-          ┌──────────┴──────────┐
-          ▼                     ▼
-Stripped Production Binary  External Debug Image
-(/proc/<pid>/mem, /proc/exe) (DWARF & Symbols only)
+               Coding Agent
+                    │
+                    │ Agent Runtime Protocol (JSON Actions & Results)
+                    ▼
+               AgentRuntime
+                    │
+                    ├── Compact Context (AgentStateContext)
+                    ├── Object & Field Inspection (AgentObject, AgentField)
+                    ├── Candidate Ranker (Deterministic Priority Scoring)
+                    ├── Transition Analyzer (Semantic Facts & Fact-based Evidence)
+                    ├── Invariant Candidate Detector (Structural / Numeric Hypotheses)
+                    └── Agent Safety Boundaries (Capability Enforcement & Input Validation)
+                    │
+                    ▼
+            RuntimeController
+                    │
+                    ├── State Snapshot & Object Graph
+                    ├── Typed Mutation & State Restorer (GDB Fork Backend)
+                    ├── State Explorer & State Corpus (Persistent State DAG)
+                    └── External Debug Image Provider (GNU Build-ID Verification)
+                            │
+                            ▼
+                          GDB
+                            │
+                            ▼
+                    Stripped Production Binary
+                    (/proc/<pid>/mem, /proc/exe)
 ```
 
 ### Important Architecture Principle
@@ -77,8 +72,10 @@ Recursive Semantic Reachability Traversal
   (단일 부모 상태에서 여러 변이 후보를 안전하게 복원하며 독립적인 상태 공간 가지(Branches)를 체계적으로 탐색)
 - **Phase 4.1**: *"Validation & Hardening — Real GDB Checkpoints, Crash/Timeout Isolation, and Semantic Determinism"*  
   (GDB 체크포인트 에러 코드 명시화, 자율적 `StateExplorer.run()` 오케스트레이션, `SIGSEGV`/`TIMEOUT` 장애 격리, ASLR 및 Storage-Class 무관 상태 해시, Runtime Capabilities API 및 안전 한계 적용)
-- **External Debug Image Foundation (Complete)**: *"Production-Grade Stripped Binary Execution with External Debug Images"*  
+- **External Debug Image Foundation**: *"Production-Grade Stripped Binary Execution with External Debug Images"*  
   (실제 프로덕션 환경의 stripped 바이너리를 변경 없이 실행하면서 동일 빌드의 외부 unstripped/debug 이미지를 바인딩하여 런타임 상태 추출, 변이, 전이, 탐색을 온전히 수행. GNU Build ID 검증, 아키텍처 호환성 검사, 런타임 프로세스 메모리 격리 보장, 스냅샷 출처(Provenance) 추적)
+- **Phase 5 (Complete)**: *"Agent Runtime Protocol (ARP) & Reference Implementation"*  
+  (자율 코딩 에이전트 전용 의미론적 런타임 인터페이스 구축: GDB 명령어 및 메모리 주소를 철저히 은닉하고, JSON 스키마 기반 Agent Runtime Protocol, 결정론적 후보 랭커(Candidate Ranker), 전이 분석기(Transition Analyzer), 사실 기반 증거 모델(Evidence Model), 구조적 불변식 후보 탐지기(Invariant Detector), 엄격한 안전 경계(Safety Boundary) 및 참조 구현체 `AgentRuntime` 제공)
 
 ---
 
@@ -454,12 +451,146 @@ caps = controller.get_capabilities()
 
 ---
 
+## Phase 5: Agent Runtime Protocol (ARP) & Reference Implementation
+
+Phase 5는 dynamicState를 사람이 직접 GDB API를 다루는 저수준 디버깅 도구에서, 자율 코딩 에이전트(Autonomous Coding Agent)가 프로그래밍 방식으로 런타임 상태 공간을 안전하게 관찰하고 탐색할 수 있는 **Agent-Native Runtime Engine**으로 진화시킵니다.
+
+### 1. Core Principles & Safety Boundaries
+
+1. **Strictly NO LLM / Deterministic Core**: 런타임 엔진, 변이 후보 생성기, 우선순위 랭커, 전이 분석기는 100% 결정론적인 알고리즘과 휴리스틱 규칙으로 구동되며, LLM 추론이나 프롬프트 엔지니어링에 의존하지 않습니다.
+2. **Future MCP 1:1 Mapping**: 향후 Model Context Protocol (MCP) 도구 인터페이스로 1:1 직결될 수 있도록 JSON Schema 기반의 전송 계층 독립적 프로토콜로 설계되었습니다.
+3. **Strict Abstraction & Safety Boundary**:
+   - 에이전트는 GDB command, shell command, raw memory address(`0x7fff...`), DWARF 심볼 테이블을 직접 호출하거나 전달할 수 없습니다.
+   - 모든 변이는 런타임 엔진이 검증하고 제안한 `MutationCandidate` 식별자를 통해서만 인가되며, 임의 메모리 쓰기나 체크포인트 우회는 엄격히 거부됩니다(`CAPABILITY_UNSUPPORTED`, `INVALID_CANDIDATE`).
+4. **Stripped Production Binary + External Debug Image**: 실제 프로덕션 환경의 stripped 바이너리와 external debug image 조합에서도 출처(Provenance)를 온전히 추적하며 완벽하게 동작합니다.
+
+### 2. Semantic Concept Distinction
+
+시스템은 에이전트가 혼동하기 쉬운 핵심 개념들을 엄격히 분리하여 모델링합니다:
+
+| 개념 | 클래스 | 정의 및 역할 |
+| :--- | :--- | :--- |
+| **Semantic Snapshot** | `RuntimeSnapshot` | 특정 실행 중단 시점의 DWARF 기반 의미론적 관측 데이터 (정적 그래프 데이터) |
+| **Runtime Checkpoint** | `RuntimeCheckpoint` | 부모 상태로 즉각 롤백할 수 있는 OS/GDB 레벨의 실제 실행 가능 프로세스 포크 핸들 |
+| **Semantic State** | `AgentStateContext` | 코퍼스에 저장된 정규화된 고유 상태 (`state_000001`, SHA-256 해시 기반 중복 제거) |
+| **State Transition** | `AgentTransition` | 부모 상태에서 변이 적용 및 실행 후 자식 상태로 전이된 결과 및 변경 내역 |
+| **Observed Evidence** | `AgentEvidence` | 전이 결과로부터 관측된 객관적 사실 (가정이나 주관적 버그 판단 배제) |
+| **Invariant Candidate** | `AgentInvariantCandidate` | 관측된 상태로부터 제안된 가설 단계의 구조적/수치적 불변식 (`status="unconfirmed_candidate"`) |
+
+### 3. Protocol Schemas (`protocol/`)
+
+- [`protocol/actions.schema.json`](file:///home/ubuntu/workspace/ut/protocol/actions.schema.json): 16가지 에이전트 액션 정의 (`OBSERVE`, `SNAPSHOT`, `LIST_OBJECTS`, `INSPECT_OBJECT`, `INSPECT_FIELD`, `LIST_MUTATION_CANDIDATES`, `CHECKPOINT`, `RESTORE`, `EXECUTE_TRANSITION`, `INSPECT_TRANSITION`, `INSPECT_STATE`, `LIST_STATES`, `GET_CAPABILITIES`, `EXPLORE`, `STATE_HASH`, `DETECT_INVARIANTS`)
+- [`protocol/results.schema.json`](file:///home/ubuntu/workspace/ut/protocol/results.schema.json): 표준화된 응답 봉투(`AgentActionResult`) 및 17개 표준 에러 코드 (`INVALID_OBJECT`, `INVALID_FIELD`, `INVALID_CANDIDATE`, `MUTATION_REJECTED`, `RUNTIME_NOT_STOPPED`, `CAPABILITY_UNSUPPORTED` 등)
+- [`protocol/context.schema.json`](file:///home/ubuntu/workspace/ut/protocol/context.schema.json): 컨텍스트 윈도우가 제한된 에이전트를 위한 압축 요약 컨텍스트 (`AgentStateContext`)
+- [`protocol/mutations.schema.json`](file:///home/ubuntu/workspace/ut/protocol/mutations.schema.json): 우선순위 점수와 랭킹 사유가 부여된 변이 후보 모델 (`AgentMutationCandidate`)
+
+### 4. Deterministic Candidate Ranker (`extractor/candidate_ranker.py`)
+
+단일 상태에서 수십 개의 변이 후보가 생성될 때, 에이전트가 탐색 가치가 높은 후보를 먼저 선택할 수 있도록 결정론적 우선순위 점수(Priority Score)를 계산합니다:
+
+- **Enum 전이 (+4.0점)**: 상태 머신 분기 전이 가능성이 가장 높음 (`SessionState::CONNECTED` -> `ERROR`, `DISCONNECTED`)
+- **수치 경계값 (+3.0점)**: 0, 1, 최대값-1, 최대값, 임계값 경계
+- **분기 민감 필드명 (+2.5점)**: 이름에 `state`, `status`, `flag`, `mode`, `type`, `error`, `retry`가 포함된 필드
+- **최근 변경된 필드 (+2.0점)**: 직전 전이에서 변경된 객체의 필드
+- **불변식 관련 필드 (+1.5점)**: `length`, `capacity`, `size`, `count`, `limit` 등
+- **실행 컨텍스트 도달 객체 (+1.0점)**: 현재 중단점 스택 프레임에서 직접 참조되는 객체
+- **포인터 널 전이 (+2.0점)**: 유효 포인터를 nullptr로 전이하여 방어 로직 검증
+
+각 후보는 `ranking_reasons` 배열을 통해 왜 해당 점수가 부여되었는지 투명하게 설명됩니다.
+
+### 5. Transition Analyzer & Invariant Candidate Detector
+
+- **TransitionAnalyzer (`extractor/transition_analyzer.py`)**:
+  - `branch_changed`: 실행 함수 변경, 크래시, 타임아웃, 상태/플래그 필드 변경, 객체 생성/소멸 여부를 종합하여 실제 코드 분기 변화 발생 여부를 불리언으로 판정
+  - `facts`: `field_changed`, `reference_changed`, `object_created`, `object_removed`, `crash`, `timeout` 등의 객관적 사실 딕셔너리 추출
+  - `evidence`: "Field Session.retry changed from 2 to 3"과 같은 관측된 사실만을 기록하는 구조화된 증거 목록 생성 (주관적 버그 단정 배제)
+- **InvariantDetector (`extractor/invariant_detector.py`)**:
+  - 관측된 객체 그래프로부터 구조적 경계 불변식(`Buffer.length <= Buffer.capacity`), 비음수 범위(`Session.retry >= 0`), 유효 포인터 불변식(`Session.buffer != nullptr`)을 가설 후보로 자동 제안
+
+### 6. Simulated Agent Python Workflow
+
+```python
+from extractor.agent_runtime import AgentRuntime
+
+# 1. AgentRuntime 초기화 (Stripped binary + External debug image 바인딩)
+agent = AgentRuntime(controller, corpus_dir="corpus")
+
+# 2. 고수준 의미론적 런타임 상태 관측 (GDB 명령어 은닉)
+res = agent.observe()
+ctx = res.data
+print(f"Current Function: {ctx.execution.function}, Snapshot: {ctx.snapshot_id}")
+
+# 3. 객체 탐색 및 상세 필드 조사
+res_objs = agent.list_objects()
+session_id = next(o.object_id for o in res_objs.data if o.type == "Session")
+field_retry = agent.inspect_field(session_id, "retry").data
+
+# 4. 결정론적으로 랭킹된 변이 후보 확인 및 선택
+candidates = agent.list_mutation_candidates().data
+top_candidate = candidates[0]  # 최고 우선순위 점수 후보
+print(f"Selected Candidate: {top_candidate.candidate_id} (Score: {top_candidate.priority_score})")
+print(f"Reasons: {top_candidate.ranking_reasons}")
+
+# 5. 상태 전이 실행 (자동 부모 체크포인트 복원 및 격리)
+res_trans = agent.execute_transition(top_candidate.candidate_id, timeout_ms=1000)
+trans = res_trans.data
+print(f"Branch Changed: {trans.facts['branch_changed']}")
+print(f"Observed Evidence Count: {len(trans.evidence)}")
+
+# 6. 구조적 불변식 후보 탐지
+invariants = agent.detect_invariant_candidates().data
+for inv in invariants:
+    print(f"Invariant Candidate: {inv.expression} (Confidence: {inv.confidence})")
+
+# 7. 자율 상태 공간 탐색 루프 실행
+exp_res = agent.explore(max_steps=5, timeout_ms=1000).data
+print(f"Exploration complete: {exp_res.steps} steps executed, {exp_res.new_states} new states")
+```
+
+---
+
+## Runtime Capabilities & Safety Limits
+
+### 1. Capabilities API (`extractor/runtime_controller.py`)
+
+상위 에이전트 및 컨트롤러 계층이 현재 백엔드의 지원 기능을 프로그래밍 방식으로 질의할 수 있습니다:
+
+```python
+caps = controller.get_capabilities()
+# RuntimeCapabilities(
+#     checkpoint=True,
+#     restore=True,
+#     typed_mutation=True,
+#     semantic_snapshot=True,
+#     semantic_diff=True,
+#     state_hash=True,
+#     branch_exploration=True,
+#     crash_recovery=True,
+#     timeout_recovery=True,
+#     external_debug_image=True,
+#     multi_thread_determinism=False,
+#     external_io_rollback=False,
+#     exploration_mode="deterministic_single_thread_context",
+#     backend="gdb_fork"
+# )
+```
+
+### 2. Exploration Safety Limits
+
+- **`max_steps`** (기본값: 10): 단일 탐색 세션 동안 실행할 최대 변이 스텝 수
+- **`max_candidates`** (기본값: 50): 단일 상태에서 생성할 수 있는 최대 변이 후보 수
+- **`max_corpus_states`** (기본값: 100): 코퍼스에 저장 가능한 최대 고유 상태 수
+- **`max_checkpoints`** (기본값: 10): 동시에 유지 가능한 최대 런타임 체크포인트 수
+- **`timeout_ms`** (기본값: 1000ms): 자식 브랜치 실행 지속 시간 상한 (무한 루프 방지)
+
+---
+
 ## Testing
 
-모든 단위 테스트와 11개의 GDB 종단간 통합 테스트 스크립트가 완전히 통과합니다:
+모든 단위 테스트와 12개의 GDB 종단간 통합 테스트 스크립트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 테스트 (81 unit tests across all modules)
+# 1. 단위 테스트 (110 unit tests across all modules)
 python3 -m unittest discover -s tests -v
 
 # 2. Phase 1 & 2 GDB 기본 통합 테스트
@@ -489,11 +620,14 @@ bash tests/integration_explorer_real_gdb.sh
 # 10. Phase 4.1 크래시/타임아웃 장애 격리 GDB 통합 테스트
 bash tests/integration_explorer_failure_isolation.sh
 
-# 11. External Debug Image 호환성/Build-ID 불일치 거부 및 상태 추출 통합 테스트 (신규)
+# 11. External Debug Image 호환성/Build-ID 불일치 거부 및 상태 추출 통합 테스트
 bash tests/integration_stripped_debug_image.sh
 
-# 12. Stripped 바이너리 상태 전이 및 상태 공간 탐색 통합 테스트 (신규)
+# 12. Stripped 바이너리 상태 전이 및 상태 공간 탐색 통합 테스트
 bash tests/integration_stripped_transition.sh
+
+# 13. Phase 5 Agent Runtime Protocol 종단간 시뮬레이션 통합 테스트 (신규)
+bash tests/integration_agent_runtime.sh
 ```
 
 ---

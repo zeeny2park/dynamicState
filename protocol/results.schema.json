@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentActionResult",
+  "description": "Standardized response schema for all Agent Runtime Protocol actions.",
+  "type": "object",
+  "required": ["success", "action"],
+  "properties": {
+    "success": {
+      "type": "boolean",
+      "description": "Whether the requested action succeeded"
+    },
+    "action": {
+      "type": "string",
+      "description": "The action name corresponding to the request"
+    },
+    "data": {
+      "description": "Structured semantic payload returned on success, or null on failure"
+    },
+    "error": {
+      "type": ["object", "null"],
+      "description": "Standardized structured error details when success is false",
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "INVALID_OBJECT",
+            "INVALID_FIELD",
+            "INVALID_CANDIDATE",
+            "SNAPSHOT_NOT_FOUND",
+            "STATE_NOT_FOUND",
+            "TRANSITION_NOT_FOUND",
+            "CHECKPOINT_NOT_FOUND",
+            "MUTATION_REJECTED",
+            "TYPE_CONVERSION_ERROR",
+            "RANGE_ERROR",
+            "UNSUPPORTED_TYPE",
+            "TIMEOUT",
+            "CRASHED",
+            "CAPABILITY_UNSUPPORTED",
+            "SAFETY_LIMIT_REACHED",
+            "RUNTIME_NOT_STOPPED",
+            "DEBUG_IMAGE_MISMATCH",
+            "RUNTIME_ERROR"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": ["object", "null"],
+          "additionalProperties": true
+        }
+      },
+      "required": ["code", "message"]
+    },
+    "performance": {
+      "type": ["object", "null"],
+      "description": "Diagnostic performance latencies in milliseconds",
+      "additionalProperties": {
+        "type": "number"
+      }
+    }
+  },
+  "additionalProperties": false
+}

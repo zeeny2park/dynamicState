@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentMutationCandidate",
+  "description": "Validated mutation candidate proposed by the runtime engine and ranked for agent exploration.",
+  "type": "object",
+  "required": [
+    "candidate_id",
+    "snapshot_id",
+    "object_id",
+    "field",
+    "type",
+    "current_value",
+    "proposed_value",
+    "reason"
+  ],
+  "properties": {
+    "candidate_id": {
+      "type": "string",
+      "description": "Unique candidate identifier (e.g. M001)"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "description": "Snapshot on which this candidate was discovered"
+    },
+    "object_id": {
+      "type": "string",
+      "description": "Target semantic object identifier (e.g. obj_0001)"
+    },
+    "field": {
+      "type": "string",
+      "description": "Target field name (e.g. retry)"
+    },
+    "type": {
+      "type": "string",
+      "description": "DWARF data type of the field (e.g. uint32_t)"
+    },
+    "current_value": {
+      "description": "Observed runtime value before mutation"
+    },
+    "proposed_value": {
+      "description": "Valid candidate value to be assigned"
+    },
+    "reason": {
+      "type": "string",
+      "description": "Heuristic category (e.g. ZERO_BOUNDARY, BOUNDARY_PLUS_ONE, ENUM_MEMBER)"
+    },
+    "priority_score": {
+      "type": "number",
+      "default": 0.0,
+      "description": "Deterministic ranking priority score"
+    },
+    "ranking_reasons": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Explainable ranking signals assigned by CandidateRanker"
+    }
+  },
+  "additionalProperties": false
+}
