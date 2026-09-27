@@ -23,7 +23,10 @@
         "GET_CAPABILITIES",
         "EXPLORE",
         "STATE_HASH",
-        "DETECT_INVARIANTS"
+        "DETECT_INVARIANTS",
+        "MEMORY_SNAPSHOT",
+        "ANALYZE_MEMORY_SNAPSHOT",
+        "GET_MEMORY_SNAPSHOT"
       ]
     },
     "snapshot_id": {
@@ -83,6 +86,32 @@
       "type": "string",
       "default": "corpus",
       "description": "Corpus storage directory"
+    },
+    "pid": {
+      "type": ["integer", "null"],
+      "description": "Target process PID for memory capture"
+    },
+    "policy": {
+      "type": ["string", "null"],
+      "enum": ["STACK", "HEAP", "GLOBAL", "EXECUTABLE", "SHARED_LIBRARY", "ALL_READABLE", "SELECTED", null],
+      "description": "Memory region selection policy"
+    },
+    "max_bytes": {
+      "type": ["integer", "null"],
+      "description": "Maximum memory capture bytes cap"
+    },
+    "memory_snapshot_id": {
+      "type": ["string", "null"],
+      "description": "Identifier for raw memory snapshot"
+    },
+    "debug_image": {
+      "type": ["string", "null"],
+      "description": "Path to external debug image"
+    },
+    "mode": {
+      "type": ["string", "null"],
+      "enum": ["CONSISTENT", "LOW_IMPACT", null],
+      "description": "Observation mode"
     }
   },
   "additionalProperties": false

@@ -252,6 +252,10 @@ class DebugImageProvider:
         self.load_ms = round((time.monotonic() - t0) * 1000, 3)
         return identity
 
+    @property
+    def path(self) -> Optional[str]:
+        return self.debug_image_path
+
     def register_module_debug_image(self, module_name_or_path: str, debug_image_path: str) -> None:
         """Register debug image mapping for a shared library module."""
         self.module_debug_images[module_name_or_path] = os.path.abspath(debug_image_path)

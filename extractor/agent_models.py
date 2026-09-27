@@ -103,6 +103,12 @@ class AgentAction(_SubscriptableModel):
     max_steps: int = 10
     max_states: int = 20
     corpus_dir: str = "corpus"
+    pid: Optional[int] = None
+    policy: Optional[str] = None
+    max_bytes: Optional[int] = None
+    memory_snapshot_id: Optional[str] = None
+    debug_image: Optional[str] = None
+    mode: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -122,7 +128,13 @@ class AgentAction(_SubscriptableModel):
             timeout_ms=int(data.get("timeout_ms", 1000)),
             max_steps=int(data.get("max_steps", 10)),
             max_states=int(data.get("max_states", 20)),
-            corpus_dir=data.get("corpus_dir", "corpus")
+            corpus_dir=data.get("corpus_dir", "corpus"),
+            pid=data.get("pid"),
+            policy=data.get("policy"),
+            max_bytes=data.get("max_bytes"),
+            memory_snapshot_id=data.get("memory_snapshot_id"),
+            debug_image=data.get("debug_image"),
+            mode=data.get("mode")
         )
 
 

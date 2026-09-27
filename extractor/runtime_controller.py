@@ -45,6 +45,27 @@ class RuntimeCapabilities:
     external_io_rollback: bool = False
     exploration_mode: str = "deterministic_single_thread_context"
     backend: str = "generic"
+    observation: Optional[Dict[str, bool]] = None
+    memory_snapshot: Optional[Dict[str, bool]] = None
+
+    def __post_init__(self):
+        import platform
+        has_vm_readv = (platform.system() == "Linux")
+        if self.observation is None:
+            self.observation = {
+                "gdb_consistent": True,
+                "low_impact_memory_snapshot": has_vm_readv,
+                "offline_semantic_analysis": True,
+            }
+        if self.memory_snapshot is None:
+            self.memory_snapshot = {
+                "process_vm_readv": has_vm_readv,
+                "partial_read": True,
+                "stack": True,
+                "heap": True,
+                "global": True,
+                "all_readable": True,
+            }
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -1,19 +1,21 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `PHASE_5_AGENT_RUNTIME_FOUNDATION_COMPLETE`** — Agent Runtime Protocol + Reference Implementation  
-> Verified with 110 Unit Tests and 12 GDB E2E Integration Test Suites.
+> **Status: `PHASE_5_1_LOW_IMPACT_SNAPSHOT_COMPLETE`** — Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis  
+> Verified with 130 Unit Tests and 13 GDB/process_vm_readv Integration Test Suites.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
 나아가 실제 CI/CD 및 프로덕션 환경의 **Stripped Production Binary**와 **External Debug Image** 환경 위에서, 자율 코딩 에이전트(Autonomous Coding Agent)가 GDB 명령어나 원시 메모리 주소를 직접 다루지 않고 오직 고수준 의미론적 개념(Object, Field, State, MutationCandidate, Transition, Exploration, Evidence, Invariant)만을 사용하여 런타임 상태를 관찰하고 탐색할 수 있는 **Agent Runtime Protocol (ARP)** 과 참조 구현체 `AgentRuntime`을 제공합니다.
+
+또한, 고성능·통신·프로덕션 환경에서 장시간 stop-the-world 중단 없이 실행 중인 프로세스의 원시 메모리를 비침습적으로 캡처하고(`process_vm_readv`), 사후 오프라인에서 외부 디버그 이미지의 DWARF 메타데이터와 결합하여 의미론적 런타임 스냅샷을 재구성하는 **Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis (Phase 5.1)** 를 지원합니다.
 
 ---
 
 ## Architecture & Exploration Pipeline
 
 ```text
-               Coding Agent
+               Coding Agent / CLI Tool
                     │
                     │ Agent Runtime Protocol (JSON Actions & Results)
                     ▼
@@ -24,23 +26,32 @@ GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 �
                     ├── Candidate Ranker (Deterministic Priority Scoring)
                     ├── Transition Analyzer (Semantic Facts & Fact-based Evidence)
                     ├── Invariant Candidate Detector (Structural / Numeric Hypotheses)
+                    ├── Offline Memory Analyzer (DWARF-guided Heap/Stack Graph Reconstruction)
                     └── Agent Safety Boundaries (Capability Enforcement & Input Validation)
                     │
-                    ▼
-            RuntimeController
-                    │
-                    ├── State Snapshot & Object Graph
-                    ├── Typed Mutation & State Restorer (GDB Fork Backend)
-                    ├── State Explorer & State Corpus (Persistent State DAG)
-                    └── External Debug Image Provider (GNU Build-ID Verification)
-                            │
-                            ▼
-                          GDB
-                            │
-                            ▼
-                    Stripped Production Binary
-                    (/proc/<pid>/mem, /proc/exe)
+       ┌────────────┴──────────────────────────┐
+       ▼ [CONSISTENT Mode]                     ▼ [LOW_IMPACT Mode]
+RuntimeController                       MemoryCapture (Linux process_vm_readv)
+       │                                       │
+       ├── State Snapshot & Object Graph       ├── Non-intrusive Zero-Stop Capture
+       ├── Typed Mutation & State Restorer     ├── Partial Consistency Tracking (NON_ATOMIC)
+       ├── State Explorer & State Corpus       └── RawMemorySnapshot Artifact Directory
+       └── External Debug Image Provider               │
+               │                                       ▼
+               ▼                             OfflineMemoryAnalyzer
+             GDB                                       │ (DWARF context + memory blobs)
+               │                                       ▼
+               ▼                               RuntimeSnapshot (Semantic Graph)
+       Stripped Production Binary
+       (/proc/<pid>/mem, /proc/exe)
 ```
+
+### Observation Modes
+
+| 모드 | 관측 방식 | 프로세스 중단 | 변이/전이/탐색 | 정합성 수준 | 주요 활용 환경 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`CONSISTENT`** | GDB Breakpoint / ptrace | 중단 (Stop-the-world) | **지원** (Typed Mutation, Continue, Rollback) | `STOPPED` / `ATOMIC` | 개발, CI/CD, 상태 공간 탐색, 버그 재현 |
+| **`LOW_IMPACT`** | Linux `process_vm_readv()` | **중단 없음** (Zero-Stop) | **엄격히 불가** (`CAPABILITY_UNSUPPORTED`) | `NON_ATOMIC` (경고 메타데이터 기록) | 통신, 실시간 제어, 프로덕션 모니터링 |
 
 ### Important Architecture Principle
 
@@ -74,8 +85,10 @@ Recursive Semantic Reachability Traversal
   (GDB 체크포인트 에러 코드 명시화, 자율적 `StateExplorer.run()` 오케스트레이션, `SIGSEGV`/`TIMEOUT` 장애 격리, ASLR 및 Storage-Class 무관 상태 해시, Runtime Capabilities API 및 안전 한계 적용)
 - **External Debug Image Foundation**: *"Production-Grade Stripped Binary Execution with External Debug Images"*  
   (실제 프로덕션 환경의 stripped 바이너리를 변경 없이 실행하면서 동일 빌드의 외부 unstripped/debug 이미지를 바인딩하여 런타임 상태 추출, 변이, 전이, 탐색을 온전히 수행. GNU Build ID 검증, 아키텍처 호환성 검사, 런타임 프로세스 메모리 격리 보장, 스냅샷 출처(Provenance) 추적)
-- **Phase 5 (Complete)**: *"Agent Runtime Protocol (ARP) & Reference Implementation"*  
+- **Phase 5**: *"Agent Runtime Protocol (ARP) & Reference Implementation"*  
   (자율 코딩 에이전트 전용 의미론적 런타임 인터페이스 구축: GDB 명령어 및 메모리 주소를 철저히 은닉하고, JSON 스키마 기반 Agent Runtime Protocol, 결정론적 후보 랭커(Candidate Ranker), 전이 분석기(Transition Analyzer), 사실 기반 증거 모델(Evidence Model), 구조적 불변식 후보 탐지기(Invariant Detector), 엄격한 안전 경계(Safety Boundary) 및 참조 구현체 `AgentRuntime` 제공)
+- **Phase 5.1 (Complete)**: *"Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis"*  
+  (프로덕션/실시간 애플리케이션을 위한 무중단 원시 메모리 캡처 및 사후 DWARF 오프라인 의미 분석: Linux `process_vm_readv()` 기반 고속 복사, `RawMemorySnapshot` 디스크 영속 아티팩트, 부분 일관성(`NON_ATOMIC`) 모델, `OfflineMemoryAnalyzer` 의미론적 객체 그래프 복원, CLI 도구(`capture-memory`, `analyze-memory`), LOW_IMPACT 모드 엄격한 관측 전용 경계 보장)
 
 ---
 
@@ -549,6 +562,111 @@ print(f"Exploration complete: {exp_res.steps} steps executed, {exp_res.new_state
 
 ---
 
+## Phase 5.1: Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis
+
+통신 장비, 실시간 스트리밍, 대규모 트래픽을 처리하는 프로덕션 환경에서는 GDB 중단점 설정이나 프로세스 일시 정지(Stop-the-world) 자체가 서비스 지연이나 타이밍 변화를 유발할 수 있습니다. Phase 5.1은 프로세스를 장시간 중단하지 않고 필요한 가상 메모리 영역만을 고속 복사한 뒤, 오프라인에서 DWARF 디버그 정보와 결합하여 의미론적 상태 객체 그래프를 복원하는 완전 분리형 파이프라인을 제공합니다.
+
+### 1. Zero-Stop Architecture & Separation of Concerns
+
+```text
+[Online / Live Process]
+Running Linux Process (PID)
+      │
+      │ process_vm_readv() (10~20ms, non-intrusive)
+      ▼
+RawMemorySnapshot Directory Artifact
+      │ (metadata.json, manifest.json, maps.json, memory/*.bin)
+═════════════════════════════════════════════════════════════════
+[Offline / Isolated Environment]
+RawMemorySnapshot + External Debug Image (DWARF)
+      │
+      ▼
+OfflineMemoryAnalyzer (No inferior process, bounds-checked)
+      │
+      ▼
+RuntimeSnapshot (Semantic Object Graph & State Hash)
+```
+
+### 2. On-Disk Artifact Structure (`RawMemorySnapshot`)
+
+메모리 캡처 결과물은 자립형(Self-contained) 디렉터리 구조로 디스크에 저장됩니다:
+
+```text
+mem_snap_001/
+├── metadata.json       # PID, 타임스탬프, 바이너리 경로, 일관성 메타데이터, 캡처 시간(us)
+├── manifest.json       # 캡처된 영역 목록 (start_addr, end_addr, size, checksum, blob path)
+├── maps.json           # 전체 /proc/<pid>/maps 스냅샷
+└── memory/
+    ├── region_0x0000000000400000.bin
+    ├── region_0x00007fffa0000000.bin
+    └── ...
+```
+
+### 3. Partial Consistency Tracking (`SnapshotConsistency`)
+
+실행 중인 프로세스의 메모리를 프로세스 중단 없이 복사하므로 스냅샷은 본질적으로 **Non-Atomic**입니다:
+
+- **`NON_ATOMIC`**: 프로세스가 실행 중인 상태에서 `process_vm_readv()`로 복사됨. 영역 간 동시성 레이스가 존재할 수 있음.
+- **`warnings` 메타데이터**: `"Memory captured while process was executing; potential torn reads between regions"`.
+- 의미론적 스냅샷(`RuntimeSnapshot`) 및 출처(`provenance`)에도 `capture_mode: "LOW_IMPACT"`, `consistency: "NON_ATOMIC"`이 명시되어 분석자가 일관성 한계를 명확히 인식할 수 있습니다.
+
+### 4. Region Selection Policies (`SnapshotPolicy`)
+
+필요한 메모리 영역만을 선택하여 캡처 시간과 디스크 사용량을 최소화합니다:
+
+- **`STACK`**: 스레드 스택 영역만 캡처
+- **`HEAP`**: 힙 메모리 영역만 캡처
+- **`GLOBAL`**: 데이터 및 BSS 세그먼트만 캡처
+- **`ALL_READABLE`**: 읽기 가능한 모든 가상 메모리 영역 (기본값)
+- **`SELECTED`**: 명시적으로 지정한 메모리 주소 범위
+
+안전 상한(`max_bytes`, 기본 32MB) 및 개별 영역 크기 제한(`max_region_bytes`)을 적용하여 OOM 및 디스크 고갈을 방지합니다.
+
+### 5. Offline Semantic Analysis (`OfflineMemoryAnalyzer`)
+
+오프라인 분석기는 실행 중인 프로세스나 GDB inferior 없이 순수 정적 데이터와 DWARF 디버그 이미지로부터 객체 그래프를 복원합니다:
+
+1. **ASLR Load Slide 보정**: `maps.json`의 실행 파일 로드 주소와 ELF 헤더 기본 주소 간의 차이를 계산하여 전역 심볼의 실제 런타임 주소를 매핑합니다.
+2. **Bounds-Checked 메모리 리더**: `SnapshotMemoryReader`를 통해 캡처되지 않은 영역이나 범위를 벗어난 주소 참조 시 안전하게 `None` 또는 fallback을 반환합니다.
+3. **DWARF 기반 도달성 탐색**: 전역 루트 심볼로부터 시작하여 포인터를 역참조하며 힙/스택 객체를 재귀적으로 탐색합니다.
+4. **순환 참조 방지 및 깊이 제한**: 방문 주소 추적으로 순환 참조(`Session.parent -> Session`)를 안전하게 감지하고 최대 탐색 깊이(`MAX_OBJECT_DEPTH=8`)를 강제합니다.
+
+### 6. Strict Safety Boundaries in `LOW_IMPACT` Mode
+
+- **관측 전용 (Read-Only)**: `LOW_IMPACT` 관측 모드에서는 변이(`Typed Mutation`), 재개(`Continue`), 상태 전이(`Execute Transition`), 체크포인트 복원(`Restore`)이 **원천 차단**됩니다.
+- 에이전트가 변이를 시도하면 즉시 `CAPABILITY_UNSUPPORTED` 에러 코드가 반환됩니다.
+- 임의 주소 메모리 쓰기, 임의 shell/ptrace 명령 실행을 차단합니다.
+
+### 7. CLI Usage
+
+런타임 CLI 도구 `dynamic-state`를 통해 명령줄에서 직접 메모리 캡처 및 오프라인 분석을 수행할 수 있습니다:
+
+```bash
+# 1. 실행 중인 프로세스의 메모리 무중단 캡처
+bin/dynamic-state capture-memory \
+    --pid 12345 \
+    --policy ALL_READABLE \
+    --max-bytes 33554432 \
+    --output ./snapshots/mem_snap_001 \
+    --snapshot-id M0001
+
+# 2. 캡처된 원시 메모리와 외부 디버그 이미지를 결합하여 의미론적 스냅샷 분석
+bin/dynamic-state analyze-memory \
+    --snapshot ./snapshots/mem_snap_001 \
+    --debug-image ./artifacts/app.debug \
+    --output ./snapshots/semantic_snap_001.json
+```
+
+### 8. Agent Runtime Protocol Actions
+
+에이전트 프로토콜에 신규 액션 3종이 추가되었습니다:
+
+- **`MEMORY_SNAPSHOT`**: 지정된 PID와 정책으로 비침습적 원시 메모리 스냅샷 생성
+- **`ANALYZE_MEMORY_SNAPSHOT`**: 캡처된 원시 메모리 아티팩트와 외부 디버그 이미지를 오프라인 분석하여 `AgentStateContext` 반환
+- **`GET_MEMORY_SNAPSHOT`**: 캡처된 원시 메모리 스냅샷 메타데이터 및 매니페스트 조회
+
+---
+
 ## Runtime Capabilities & Safety Limits
 
 ### 1. Capabilities API (`extractor/runtime_controller.py`)
@@ -568,6 +686,8 @@ caps = controller.get_capabilities()
 #     crash_recovery=True,
 #     timeout_recovery=True,
 #     external_debug_image=True,
+#     observation={"consistent_gdb": True, "low_impact_memory_snapshot": True},
+#     memory_snapshot={"process_vm_readv": True, "offline_analyzer": True},
 #     multi_thread_determinism=False,
 #     external_io_rollback=False,
 #     exploration_mode="deterministic_single_thread_context",
@@ -587,10 +707,10 @@ caps = controller.get_capabilities()
 
 ## Testing
 
-모든 단위 테스트와 12개의 GDB 종단간 통합 테스트 스크립트가 완전히 통과합니다:
+모든 단위 테스트와 13개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 테스트 (110 unit tests across all modules)
+# 1. 단위 테스트 (130 unit tests across all modules)
 python3 -m unittest discover -s tests -v
 
 # 2. Phase 1 & 2 GDB 기본 통합 테스트
@@ -626,8 +746,11 @@ bash tests/integration_stripped_debug_image.sh
 # 12. Stripped 바이너리 상태 전이 및 상태 공간 탐색 통합 테스트
 bash tests/integration_stripped_transition.sh
 
-# 13. Phase 5 Agent Runtime Protocol 종단간 시뮬레이션 통합 테스트 (신규)
+# 13. Phase 5 Agent Runtime Protocol 종단간 시뮬레이션 통합 테스트
 bash tests/integration_agent_runtime.sh
+
+# 14. Phase 5.1 Low-Impact Memory Snapshot + Offline Analysis E2E 통합 테스트 (신규)
+bash tests/integration_low_impact_snapshot.sh
 ```
 
 ---

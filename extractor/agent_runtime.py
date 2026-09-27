@@ -53,6 +53,13 @@ class AgentRuntime:
         self._cached_transitions: Dict[str, StateTransition] = {}
         self._recent_changed_fields: Set[str] = set()
 
+        # Phase 5.1 Low-Impact Memory Snapshot support
+        self.memory_snapshots: Dict[str, Any] = {}
+        self.raw_snapshots_dir: str = os.path.join(self.corpus_dir, "memory_snapshots")
+        self.observation_mode: str = "CONSISTENT"
+        self._memory_capturer: Any = None
+        self._offline_analyzer: Any = None
+
     # -------------------------------------------------------------------------
     # Protocol Action Dispatcher
     # -------------------------------------------------------------------------
@@ -78,9 +85,16 @@ class AgentRuntime:
             action = action_request
 
         act = action.action.upper()
+
         try:
             if act == "OBSERVE":
-                return self.observe()
+                return self.observe(
+                    mode=action.mode or "CONSISTENT",
+                    pid=action.pid,
+                    policy=action.policy or "ALL_READABLE",
+                    max_bytes=action.max_bytes,
+                    debug_image=action.debug_image
+                )
             elif act == "SNAPSHOT":
                 return self.snapshot(snapshot_id=action.snapshot_id)
             elif act == "LIST_OBJECTS":
@@ -125,6 +139,33 @@ class AgentRuntime:
                 return self.state_hash(snapshot_id=action.snapshot_id)
             elif act == "DETECT_INVARIANTS":
                 return self.detect_invariant_candidates(snapshot_id=action.snapshot_id)
+            elif act == "MEMORY_SNAPSHOT":
+                pid = action.pid
+                if pid is None and self.controller:
+                    try:
+                        pinfo = self.controller.process_info() if hasattr(self.controller, "process_info") else {}
+                        pid = pinfo.get("pid")
+                    except Exception:
+                        pass
+                if not pid:
+                    return self._error("INVALID_FIELD", "pid is required for MEMORY_SNAPSHOT", act, t0)
+                return self.capture_memory_snapshot(
+                    pid=pid,
+                    policy=action.policy or "ALL_READABLE",
+                    max_bytes=action.max_bytes,
+                    timeout_ms=action.timeout_ms,
+                    snapshot_id=action.memory_snapshot_id or action.snapshot_id
+                )
+            elif act == "ANALYZE_MEMORY_SNAPSHOT":
+                target = action.memory_snapshot_id or action.snapshot_id
+                if not target:
+                    return self._error("SNAPSHOT_NOT_FOUND", "memory_snapshot_id or snapshot_id is required", act, t0)
+                return self.analyze_memory_snapshot(target, debug_image=action.debug_image)
+            elif act == "GET_MEMORY_SNAPSHOT":
+                target = action.memory_snapshot_id or action.snapshot_id
+                if not target:
+                    return self._error("SNAPSHOT_NOT_FOUND", "memory_snapshot_id or snapshot_id is required", act, t0)
+                return self.get_memory_snapshot(target)
             else:
                 return self._error("CAPABILITY_UNSUPPORTED", f"Action '{act}' is not supported by ARP", act, t0)
         except Exception as exc:
@@ -134,9 +175,33 @@ class AgentRuntime:
     # Observation & Snapshot Operations
     # -------------------------------------------------------------------------
 
-    def observe(self) -> AgentActionResult:
-        """Return a compact semantic summary of the current runtime state."""
+    def observe(self, mode: str = "CONSISTENT", pid: Optional[int] = None,
+                policy: str = "ALL_READABLE", max_bytes: Optional[int] = None,
+                debug_image: Optional[str] = None) -> AgentActionResult:
+        """Return a compact semantic summary of the current runtime state.
+
+        Supports CONSISTENT (GDB-based stop-the-world) and LOW_IMPACT (process_vm_readv without stopping).
+        """
         t0 = time.monotonic()
+        if mode.upper() == "LOW_IMPACT":
+            self.observation_mode = "LOW_IMPACT"
+            target_pid = pid
+            if target_pid is None and self.controller and hasattr(self.controller, "process_info"):
+                pinfo = self.controller.process_info() if callable(self.controller.process_info) else self.controller.process_info
+                if isinstance(pinfo, dict):
+                    target_pid = pinfo.get("pid")
+            if not target_pid:
+                return self._error("INVALID_FIELD", "pid is required for LOW_IMPACT observation", "OBSERVE", t0)
+
+            cap_res = self.capture_memory_snapshot(target_pid, policy=policy, max_bytes=max_bytes)
+            if not cap_res.success:
+                return cap_res
+
+            ms_id = cap_res.data["snapshot_id"]
+            ana_res = self.analyze_memory_snapshot(ms_id, debug_image=debug_image)
+            return ana_res
+
+        self.observation_mode = "CONSISTENT"
         if not self.controller:
             return self._error("RUNTIME_ERROR", "No active runtime controller attached", "OBSERVE", t0)
 
@@ -397,6 +462,9 @@ class AgentRuntime:
         mutations must map to a valid MutationCandidate targeting a verified semantic field.
         """
         t0 = time.monotonic()
+        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
+            return self._error("CAPABILITY_UNSUPPORTED", "Mutation and transitions are not supported in LOW_IMPACT observation mode", "EXECUTE_TRANSITION", t0)
+
         if not self.controller:
             return self._error("RUNTIME_ERROR", "No active runtime controller attached", "EXECUTE_TRANSITION", t0)
 
@@ -632,6 +700,19 @@ class AgentRuntime:
                 "crash_recovery": caps.get("crash_recovery", True),
                 "timeout_recovery": caps.get("timeout_recovery", True),
             },
+            "observation": caps.get("observation", {
+                "gdb_consistent": True,
+                "low_impact_memory_snapshot": True,
+                "offline_semantic_analysis": True,
+            }),
+            "memory_snapshot": caps.get("memory_snapshot", {
+                "process_vm_readv": True,
+                "partial_read": True,
+                "stack": True,
+                "heap": True,
+                "global": True,
+                "all_readable": True,
+            }),
             "debug": {
                 "external_debug_image": caps.get("external_debug_image", True),
                 "build_id_verification": True,
@@ -656,6 +737,155 @@ class AgentRuntime:
             data=res,
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
         )
+
+    # -------------------------------------------------------------------------
+    # Low-Impact Memory Snapshot Operations (Phase 5.1)
+    # -------------------------------------------------------------------------
+
+    def capture_memory_snapshot(
+        self,
+        pid: int,
+        policy: str = "ALL_READABLE",
+        max_bytes: Optional[int] = None,
+        timeout_ms: int = 2000,
+        output_dir: Optional[str] = None,
+        snapshot_id: Optional[str] = None
+    ) -> AgentActionResult:
+        """Capture memory regions from target process without halting it via process_vm_readv."""
+        t0 = time.monotonic()
+        from .memory_capture import MemoryCapture
+        if self._memory_capturer is None:
+            self._memory_capturer = MemoryCapture()
+
+        if not self._memory_capturer.is_supported:
+            return self._error("CAPABILITY_UNSUPPORTED", "process_vm_readv is not supported on this platform", "MEMORY_SNAPSHOT", t0)
+
+        sid = snapshot_id or "M{:04d}".format(int(time.time() * 1000) % 10000)
+        target_dir = output_dir or os.path.join(self.raw_snapshots_dir, sid)
+
+        try:
+            kwargs: Dict[str, Any] = {
+                "pid": pid,
+                "policy": policy,
+                "output_dir": target_dir,
+                "timeout_ms": timeout_ms,
+                "snapshot_id": sid,
+            }
+            if max_bytes is not None:
+                kwargs["max_bytes"] = max_bytes
+
+            raw_snap = self._memory_capturer.capture(**kwargs)
+            self.memory_snapshots[sid] = raw_snap
+            elapsed = round((time.monotonic() - t0) * 1000, 3)
+
+            return AgentActionResult(
+                success=True,
+                action="MEMORY_SNAPSHOT",
+                data=raw_snap.to_metadata(),
+                performance={"total_ms": elapsed, "capture_duration_us": raw_snap.duration_us}
+            )
+        except ProcessLookupError as exc:
+            return self._error("MEMORY_CAPTURE_FAILED", f"Target process not found: {exc}", "MEMORY_SNAPSHOT", t0)
+        except PermissionError as exc:
+            return self._error("MEMORY_CAPTURE_FAILED", f"Permission denied capturing process: {exc}", "MEMORY_SNAPSHOT", t0)
+        except Exception as exc:
+            return self._error("MEMORY_CAPTURE_FAILED", str(exc), "MEMORY_SNAPSHOT", t0)
+
+    def analyze_memory_snapshot(
+        self,
+        memory_snapshot_id: str,
+        debug_image: Optional[str] = None,
+        output: Optional[str] = None
+    ) -> AgentActionResult:
+        """Perform offline semantic reconstruction on captured memory without inferior connection."""
+        t0 = time.monotonic()
+        from .offline_analyzer import OfflineMemoryAnalyzer
+        if self._offline_analyzer is None:
+            self._offline_analyzer = OfflineMemoryAnalyzer()
+
+        # 1. Resolve raw memory snapshot
+        raw_snap = self._resolve_raw_memory_snapshot(memory_snapshot_id)
+        if raw_snap is None:
+            return self._error("SNAPSHOT_NOT_FOUND", f"Memory snapshot '{memory_snapshot_id}' not found", "ANALYZE_MEMORY_SNAPSHOT", t0)
+
+        # 2. Resolve external debug image
+        dimg_path = debug_image
+        if not dimg_path and self.controller and hasattr(self.controller, "debug_image_path"):
+            dimg_path = self.controller.debug_image_path
+        if not dimg_path:
+            return self._error("INVALID_FIELD", "debug_image path is required for offline analysis", "ANALYZE_MEMORY_SNAPSHOT", t0)
+
+        try:
+            semantic_snap = self._offline_analyzer.analyze(raw_snap, dimg_path)
+            if output:
+                os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+                semantic_snap.write_json(output)
+
+            if self.controller and hasattr(self.controller, "snapshots"):
+                self.controller.snapshots[semantic_snap.snapshot_id] = semantic_snap
+
+            context = self._build_context(semantic_snap)
+            elapsed = round((time.monotonic() - t0) * 1000, 3)
+
+            return AgentActionResult(
+                success=True,
+                action="ANALYZE_MEMORY_SNAPSHOT",
+                data=context,
+                performance={"total_ms": elapsed, "agent_context_generation_ms": elapsed}
+            )
+        except Exception as exc:
+            return self._error("RUNTIME_ERROR", f"Offline analysis failed: {exc}", "ANALYZE_MEMORY_SNAPSHOT", t0)
+
+    def get_memory_snapshot(self, memory_snapshot_id: str) -> AgentActionResult:
+        """Inspect a raw memory snapshot manifest and metadata."""
+        t0 = time.monotonic()
+        raw_snap = self._resolve_raw_memory_snapshot(memory_snapshot_id)
+        if raw_snap is None:
+            return self._error("SNAPSHOT_NOT_FOUND", f"Memory snapshot '{memory_snapshot_id}' not found", "GET_MEMORY_SNAPSHOT", t0)
+
+        return AgentActionResult(
+            success=True,
+            action="GET_MEMORY_SNAPSHOT",
+            data=raw_snap.to_dict(),
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+        )
+
+    def _resolve_raw_memory_snapshot(self, target: str) -> Optional[Any]:
+        """Resolve a RawMemorySnapshot by ID or path."""
+        from .memory_snapshot import RawMemorySnapshot
+        if target in self.memory_snapshots:
+            return self.memory_snapshots[target]
+        if os.path.exists(target):
+            try:
+                snap = RawMemorySnapshot.load(target)
+                self.memory_snapshots[snap.snapshot_id] = snap
+                return snap
+            except Exception:
+                pass
+        potential_dir = os.path.join(self.raw_snapshots_dir, target)
+        if os.path.exists(potential_dir):
+            try:
+                snap = RawMemorySnapshot.load(potential_dir)
+                self.memory_snapshots[target] = snap
+                return snap
+            except Exception:
+                pass
+        for root_dir in [self.raw_snapshots_dir, self.corpus_dir]:
+            if root_dir and os.path.exists(root_dir):
+                try:
+                    for entry in os.listdir(root_dir):
+                        sub = os.path.join(root_dir, entry)
+                        if os.path.isdir(sub) and os.path.exists(os.path.join(sub, "metadata.json")):
+                            try:
+                                s = RawMemorySnapshot.load(sub)
+                                self.memory_snapshots[s.snapshot_id] = s
+                                if s.snapshot_id == target:
+                                    return s
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+        return None
 
     # -------------------------------------------------------------------------
     # Helper & Context Building Methods
