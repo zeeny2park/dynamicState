@@ -32,6 +32,10 @@ class ObjectState:
     error: Optional[str] = None
     thread_id: Optional[int] = None
     frame_level: Optional[int] = None
+    identity: Dict[str, Any] = field(default_factory=lambda: {
+        "strategy": "address_type",
+        "scope": "snapshot"
+    })
 
 
 @dataclass

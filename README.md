@@ -65,32 +65,80 @@ Recursive Semantic Reachability Traversal
 - **RuntimeSnapshot (schema 0.3)**: Execution context + Persistent Object Graph + Snapshot Metadata + Transition record 원자적 캡처
 - **Typed Mutation**: DWARF-aware typed memory write (signed/unsigned integers `uint8_t`~`uint64_t`, `bool`, `float`/`double`, `enum`, `null pointer`)
 - **Execution Continue**: `continue-state` (breakpoint stop, signal, exit code, timeout interrupt 감지)
-- **Semantic Diff Engine**: Pure Python, order-independent semantic diff (value changes, object created/removed, reference changes, execution frame changes, availability changes)
-- **State Transition Model**: `StateTransition` (parent_snapshot, child_snapshot, mutation, execution, diff) 데이터 구조 확립
+- **Semantic Diff Engine**: Pure Python, order-independent semantic diff with `ObjectMatcher` abstraction (value changes, object created/removed, reference changes, execution frame changes, availability changes)
+- **State Transition Engine**: `StateTransition` 1급 결과물 생성 및 JSON artifact 영속화 (`transitions/T001.json`)
+
+---
+
+## State Transition & Object Identity
+
+### State Transition Workflow
+
+```text
+    Snapshot A
+        │
+        │ Typed Mutation
+        ▼
+    Product Execution
+        │
+        ▼
+    Snapshot B
+        │
+        ▼
+    Semantic Diff
+        │
+        ▼
+    StateTransition (Artifact: transitions/T001.json)
+```
+
+### Object Identity
+
+```text
+(address, canonical_type) is used as snapshot-scoped observation identity.
+It is NOT a guaranteed cross-snapshot lifetime identity.
+```
+
+- **Observation Identity vs Lifetime Identity**: 스냅샷 A의 `(0x2000, Session)`과 스냅샷 B의 `(0x2000, Session)`은 동일 관측 주소와 정규화된 DWARF 타입을 공유하지만, 프로세스 실행 중 재할당(deallocation & reallocation) 여부까지 보장하는 process-lifetime identity는 아닙니다.
+- **Pluggable ObjectMatcher**: `ObjectMatcher` 인터페이스를 통해 현재 기본 매처인 `AddressTypeObjectMatcher`가 적용되며, 향후 Phase 4에서 `AllocationAwareObjectMatcher`, `RootPathObjectMatcher` 등으로 손쉽게 확장할 수 있습니다.
+- **Identity Metadata**: 각 객체 및 diff change 레코드에 `identity: {"strategy": "address_type", "scope": "snapshot", "confidence": "observation"}` 메타데이터가 명시됩니다.
+
+### Transition Artifact Directory
+
+```text
+    snapshots/
+        S001.json
+        S002.json
+
+    transitions/
+        T001.json
+```
 
 ---
 
 ## Example Workflow
 
 ```text
-    Snapshot A
-        Session
-          retry = 2
-          state = CONNECTED
-            ↓
-        mutate retry = 3
-            ↓
-        continue
-            ↓
-    Snapshot B
-        Session
-          retry = 3
-          state = ERROR
-            ↓
-        Semantic Diff
-        retry: 2 → 3
-        state: CONNECTED → ERROR
-        flagged: 0 → 1
+    Session.retry = 2
+    Session.state = CONNECTED
+    Session.flagged = false
+
+          ↓
+
+    mutate retry = 3
+
+          ↓
+
+    continue
+
+          ↓
+
+    Session.retry = 3
+    Session.state = ERROR
+    Session.flagged = true
+
+          ↓
+
+    StateTransition (T001)
 ```
 
 ---
@@ -109,6 +157,13 @@ gdb -q ./sample
 
 ### 2. Phase 3 GDB Commands
 
+#### High-level Transition Command:
+```gdb
+# Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> Transition Artifact를 한 번에 실행
+(gdb) transition-state --object obj_0001 --field retry --value 3 --id T001 --parent A --child B --output transitions/T001.json --snapshots-dir snapshots
+```
+
+#### Individual Step Commands:
 ```gdb
 # 1. Snapshot A 생성
 (gdb) snapshot-state A --output snapshots/A.json
@@ -162,21 +217,30 @@ python3 -m extractor.state_diff --before snapshots/A.json --after snapshots/B.js
 ## Testing
 
 ```bash
-# Unit Tests (MemoryMaps, ObjectGraph, Serializer, Snapshot, TypeResolver, StateDiff, Mutation)
+# 1. Unit Tests (MemoryMaps, ObjectGraph, Serializer, Snapshot, TypeResolver, StateDiff, Mutation)
 python3 -m unittest discover -s tests -v
 
-# Phase 1 & 2 GDB Integration Test
+# 2. Phase 1 & 2 GDB Integration Test
 bash tests/integration_gdb.sh
 
-# Phase 3 GDB Integration Test (Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> Transition)
+# 3. State Transition Integration Test (End-to-End State Transition Workflow)
+bash tests/integration_state_transition.sh
+
+# 4. Mutation Validation Integration Test (10 Mutation Type & Error Validation Scenarios)
+bash tests/integration_mutation_validation.sh
+
+# 5. Phase 3 종합 Integration Test
 bash tests/integration_phase3.sh
 ```
 
 ---
 
-## Phase 4 Candidates
+## Phase 4 Boundary & Candidates
 
-- Autonomous LLM Coding Agent integration
+Phase 3의 책임은 **결정론적 Runtime State Transition Engine** 구축이며, autonomous exploration은 Phase 4에서 진행합니다.
+
+### Phase 4 Candidates
+- Autonomous LLM Coding Agent integration (`observe`, `mutate`, `continue`, `diff`, `execute_transition`)
 - Coverage-guided mutation strategy
 - State corpus management and loop exploration
 - Richer STL container and smart pointer traversals

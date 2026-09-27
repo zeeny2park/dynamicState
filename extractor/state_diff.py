@@ -2,7 +2,7 @@
 
 from dataclasses import asdict, dataclass, field
 import time
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 @dataclass
@@ -15,7 +15,34 @@ class StateDiff:
         return asdict(self)
 
 
+class ObjectMatcher:
+    """Base interface for cross-snapshot object identity matching."""
+
+    def identity_key(self, obj: Dict[str, Any]) -> Any:
+        raise NotImplementedError
+
+    def match(self, before_object: Dict[str, Any], after_object: Dict[str, Any]) -> bool:
+        raise NotImplementedError
+
+
+class AddressTypeObjectMatcher(ObjectMatcher):
+    """Observation identity based on (address, canonical_type).
+
+    address + canonical_type is used as snapshot-scoped observation identity.
+    It is not a guaranteed allocation/lifetime identity across snapshots.
+    """
+
+    def identity_key(self, obj: Dict[str, Any]) -> Tuple[str, str]:
+        return (str(obj.get("address")), str(obj.get("type")))
+
+    def match(self, before_object: Dict[str, Any], after_object: Dict[str, Any]) -> bool:
+        return self.identity_key(before_object) == self.identity_key(after_object)
+
+
 class StateDiffEngine:
+    def __init__(self, matcher: Optional[ObjectMatcher] = None):
+        self.matcher = matcher or AddressTypeObjectMatcher()
+
     def diff(self, before: Any, after: Any) -> StateDiff:
         start = time.monotonic()
         a, b = self._data(before), self._data(after)
@@ -23,18 +50,25 @@ class StateDiffEngine:
         fields_compared = 0
         objects_a = self._object_map(a)
         objects_b = self._object_map(b)
+        identity_meta = {
+            "strategy": "address_type",
+            "scope": "snapshot",
+            "confidence": "observation"
+        }
         for key in sorted(objects_b.keys() - objects_a.keys()):
             obj = objects_b[key]
             changes.append({"kind": "object_created", "object_id": obj.get("object_id"),
                             "type": obj.get("type"), "address": obj.get("address"),
+                            "identity": identity_meta,
                             "identity_confidence": "low"})
         for key in sorted(objects_a.keys() - objects_b.keys()):
             obj = objects_a[key]
             changes.append({"kind": "object_removed", "object_id": obj.get("object_id"),
                             "type": obj.get("type"), "address": obj.get("address"),
+                            "identity": identity_meta,
                             "identity_confidence": "low"})
         for key in sorted(objects_a.keys() & objects_b.keys()):
-            added, compared = self._diff_object(objects_a[key], objects_b[key], objects_a, objects_b)
+            added, compared = self._diff_object(objects_a[key], objects_b[key], objects_a, objects_b, identity_meta)
             changes.extend(added)
             fields_compared += compared
         changes.extend(self._execution_changes(a, b))
@@ -54,13 +88,12 @@ class StateDiffEngine:
     def _data(snapshot: Any) -> Dict[str, Any]:
         return snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
 
-    @staticmethod
-    def _object_map(snapshot: Dict[str, Any]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    def _object_map(self, snapshot: Dict[str, Any]) -> Dict[Any, Dict[str, Any]]:
         persistent = snapshot.get("persistent") or {}
         # Address+type is an observation identity, never a lifetime guarantee.
-        return {(str(o.get("address")), str(o.get("type"))): o for o in persistent.get("objects", [])}
+        return {self.matcher.identity_key(o): o for o in persistent.get("objects", [])}
 
-    def _diff_object(self, before, after, objects_a, objects_b):
+    def _diff_object(self, before, after, objects_a, objects_b, identity_meta):
         changes, compared = [], 0
         fields_a = {f.get("name"): f for f in before.get("fields", [])}
         fields_b = {f.get("name"): f for f in after.get("fields", [])}
@@ -73,27 +106,29 @@ class StateDiffEngine:
             if left.get("availability") != right.get("availability"):
                 changes.append({"kind": "availability_change", "object_id": after.get("object_id"),
                                 "path": path, "before": left.get("availability") or "available",
-                                "after": right.get("availability") or "available"})
+                                "after": right.get("availability") or "available",
+                                "identity": identity_meta})
                 continue
             left_ref = self._reference_key(left, objects_a)
             right_ref = self._reference_key(right, objects_b)
             if left_ref != right_ref:
                 changes.append({"kind": "reference_change", "object_id": after.get("object_id"),
                                 "type": after.get("type"), "field": name, "path": path,
-                                "before": left.get("object_ref"), "after": right.get("object_ref")})
+                                "before": left.get("object_ref"), "after": right.get("object_ref"),
+                                "identity": identity_meta})
             elif left.get("value") != right.get("value"):
                 changes.append({"kind": "value_change", "object_id": after.get("object_id"),
                                 "type": after.get("type"), "field": name, "path": path,
-                                "before": left.get("value"), "after": right.get("value")})
+                                "before": left.get("value"), "after": right.get("value"),
+                                "identity": identity_meta})
         return changes, compared
 
-    @staticmethod
-    def _reference_key(field, objects):
+    def _reference_key(self, field, objects):
         ref = field.get("object_ref")
         if ref is None:
             return None
         target = next((obj for obj in objects.values() if obj.get("object_id") == ref), None)
-        return (target.get("address"), target.get("type")) if target else ref
+        return self.matcher.identity_key(target) if target else ref
 
     @staticmethod
     def _execution_changes(before, after):

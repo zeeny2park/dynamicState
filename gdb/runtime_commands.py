@@ -112,7 +112,67 @@ class DiffStateCommand(gdb.Command):
         print(json.dumps(result, ensure_ascii=False))
 
 
+class TransitionStateCommand(gdb.Command):
+    """Execute high-level state transition: snapshot -> mutate -> continue -> snapshot -> diff."""
+    def __init__(self):
+        super(TransitionStateCommand, self).__init__("transition-state", gdb.COMMAND_RUNNING)
+
+    def invoke(self, arg, from_tty):
+        opts = _options(arg)
+        obj = opts.get("object")
+        field = opts.get("field")
+        val = opts.get("value")
+        path = opts.get("path")
+        pos = opts.get("_", [])
+        if not path and not obj and not field:
+            if len(pos) == 2:
+                path = pos[0]
+                val = pos[1]
+            elif len(pos) >= 3:
+                obj = pos[0]
+                field = pos[1]
+                val = pos[2]
+        elif obj and field and val is None and pos:
+            val = pos[0]
+        elif path and val is None and pos:
+            val = pos[0]
+
+        timeout_str = opts.get("timeout_ms", "1000")
+        try:
+            timeout_ms = int(timeout_str)
+        except ValueError:
+            timeout_ms = 1000
+
+        output = opts.get("output") or opts.get("transition_output")
+        transition_id = opts.get("id") or opts.get("transition_id")
+        parent_id = opts.get("parent") or opts.get("parent_snapshot")
+        child_id = opts.get("child") or opts.get("child_snapshot")
+        snapshots_dir = opts.get("snapshots_dir")
+        parent_output = opts.get("parent_output")
+        child_output = opts.get("child_output")
+
+        try:
+            transition = _CONTROLLER.execute_transition(
+                object_id=obj,
+                field_path=field,
+                value=val,
+                path=path,
+                timeout_ms=timeout_ms,
+                transition_id=transition_id,
+                output=output,
+                parent_snapshot_id=parent_id,
+                child_snapshot_id=child_id,
+                snapshots_dir=snapshots_dir,
+                parent_output=parent_output,
+                child_output=child_output
+            )
+            print(json.dumps(transition.to_dict(), ensure_ascii=False))
+        except Exception as exc:
+            raise gdb.GdbError("transition-state failed: {}".format(exc))
+
+
 SnapshotStateCommand()
 MutateStateCommand()
 ContinueStateCommand()
 DiffStateCommand()
+TransitionStateCommand()

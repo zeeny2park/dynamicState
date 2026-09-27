@@ -181,6 +181,9 @@ class GdbBackend(RuntimeBackend):
     def primitive_value(self, value, kind):
         if kind == "primitive":
             try:
+                code = getattr(value.type.strip_typedefs(), "code", None)
+                if code == getattr(self.gdb, "TYPE_CODE_FLT", None):
+                    return float(value)
                 return int(value)
             except Exception:
                 try:

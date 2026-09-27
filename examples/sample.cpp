@@ -16,6 +16,7 @@ struct Session {
     Session* parent;
     bool flagged;
     uint8_t priority;
+    double ratio;
 };
 
 Session* global_session = nullptr;
@@ -52,7 +53,7 @@ void process_packet(Session* session) {
 int main() {
     char* data = new char[64]{};
     Buffer* buffer = new Buffer{64, 256, data};
-    Session* session = new Session{SessionState::CONNECTED, 2, 10, buffer, nullptr, false, 7};
+    Session* session = new Session{SessionState::CONNECTED, 2, 10, buffer, nullptr, false, 7, 1.0};
     session->parent = session;  // Deliberate circular reference for traversal validation.
     global_session = session;
     file_session = session;

@@ -231,6 +231,33 @@ class MutationTests(unittest.TestCase):
         self.assertFalse(res.success)
         self.assertEqual(res.error["code"], "AMBIGUOUS_OBJECT")
 
+    # Test 9: Phase 4 API compatibility (get_object, get_field, observe)
+    def test_9_phase4_api_compatibility(self):
+        obj = self.controller.get_object("obj_0001")
+        self.assertIsNotNone(obj)
+        self.assertEqual(obj.object_id, "obj_0001")
+
+        field = self.controller.get_field("obj_0001", "retry")
+        self.assertIsNotNone(field)
+        self.assertEqual(field.name, "retry")
+
+        self.assertIsNone(self.controller.get_object("nonexistent"))
+        self.assertIsNone(self.controller.get_field("obj_0001", "nonexistent"))
+
+    # Test 10: execute_transition with failed mutation records NOT_RUN execution
+    def test_10_execute_transition_mutation_failure(self):
+        trans = self.controller.execute_transition(
+            object_id="obj_0001",
+            field_path="nonexistent",
+            value=123,
+            transition_id="T_FAIL"
+        )
+        self.assertEqual(trans.transition_id, "T_FAIL")
+        self.assertFalse(trans.mutation.success)
+        self.assertEqual(trans.execution.status, "NOT_RUN")
+        self.assertIsNone(trans.child_snapshot)
+        self.assertIsNone(trans.diff)
+
 
 if __name__ == "__main__":
     unittest.main()

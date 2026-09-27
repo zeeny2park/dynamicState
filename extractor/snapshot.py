@@ -52,20 +52,56 @@ def load_snapshot(path: str) -> Dict[str, Any]:
         return json.load(handle)
 
 
+def load_transition(path: str) -> Dict[str, Any]:
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 @dataclass
 class StateTransition:
-    """A deterministic Phase-3 transition record for a future state corpus."""
+    """A deterministic Phase-3 transition record for state transitions and Phase 4 state corpus."""
     transition_id: str
     parent_snapshot: str
-    child_snapshot: str
-    mutation: Dict[str, Any]
-    execution: Dict[str, Any]
-    diff: Dict[str, Any]
+    child_snapshot: Optional[str] = None
+    mutation: Optional[Any] = None
+    execution: Optional[Any] = None
+    diff: Optional[Any] = None
+    performance: Optional[Dict[str, float]] = None
+    schema_version: str = "0.3"
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        mut_dict = self.mutation.to_dict() if hasattr(self.mutation, "to_dict") else self.mutation
+        exec_dict = self.execution.to_dict() if hasattr(self.execution, "to_dict") else self.execution
+        diff_dict = self.diff.to_dict() if hasattr(self.diff, "to_dict") else self.diff
+
+        trans = {
+            "transition_id": self.transition_id,
+            "parent_snapshot": self.parent_snapshot,
+            "child_snapshot": self.child_snapshot,
+            "mutation": mut_dict,
+            "execution": exec_dict,
+            "diff": diff_dict,
+        }
+        if self.performance is not None:
+            trans["performance"] = self.performance
+
+        return {
+            "schema_version": self.schema_version,
+            "transition": trans,
+            "transition_id": self.transition_id,
+            "parent_snapshot": self.parent_snapshot,
+            "child_snapshot": self.child_snapshot,
+            "mutation": mut_dict,
+            "execution": exec_dict,
+            "diff": diff_dict,
+            "performance": self.performance,
+        }
 
     def write_json(self, output: str) -> None:
+        import os
+        parent_dir = os.path.dirname(os.path.abspath(output))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         with open(output, "w", encoding="utf-8") as handle:
             json.dump(self.to_dict(), handle, indent=2, ensure_ascii=False)
             handle.write("\n")

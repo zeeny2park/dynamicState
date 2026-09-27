@@ -29,13 +29,29 @@ class ExecutionResult:
 
 
 class RuntimeController:
+    def observe(self):
+        raise NotImplementedError
+
     def snapshot(self, snapshot_id=None, output=None):
+        raise NotImplementedError
+
+    def get_object(self, object_id):
+        raise NotImplementedError
+
+    def get_field(self, object_id, field):
         raise NotImplementedError
 
     def mutate(self, object_id, field_path, value):
         raise NotImplementedError
 
     def continue_execution(self, timeout_ms=1000):
+        raise NotImplementedError
+
+    def diff(self, before, after):
+        raise NotImplementedError
+
+    def execute_transition(self, object_id=None, field_path=None, value=None, path=None,
+                           timeout_ms=1000, transition_id=None, output=None):
         raise NotImplementedError
 
 
@@ -46,9 +62,26 @@ class GdbRuntimeController(RuntimeController):
         self.types = TypeResolver(gdb_module)
         self.snapshots: Dict[str, RuntimeSnapshot] = {}
         self._counter = 0
+        self._transition_counter = 0
         self._latest: Optional[RuntimeSnapshot] = None
         self._last_mutation: Optional[MutationResult] = None
         self._last_execution: Optional[ExecutionResult] = None
+
+    def observe(self):
+        if self._is_stopped():
+            return self.snapshot()
+        return self._latest
+
+    def get_object(self, object_id):
+        if not self._latest:
+            return None
+        return next((o for o in self._latest.persistent.objects if o.object_id == object_id), None)
+
+    def get_field(self, object_id, field):
+        obj = self.get_object(object_id)
+        if not obj:
+            return None
+        return next((f for f in obj.fields if f.name == field), None)
 
     def snapshot(self, snapshot_id=None, output=None, max_depth=None, include_globals=True):
         if not self._is_stopped():
@@ -168,23 +201,158 @@ class GdbRuntimeController(RuntimeController):
         elif "exited" in info or "not being run" in info:
             res = ExecutionResult("EXITED", reason=info.strip(), performance={"total_ms": elapsed})
         elif "signal" in info:
-            res = ExecutionResult("SIGNAL", reason=info.strip(), performance={"total_ms": elapsed})
+            crash_sig = None
+            for sig in ("sigsegv", "sigbus", "sigfpe", "sigill", "sigabrt", "sigtrap"):
+                if sig in info:
+                    crash_sig = sig.upper()
+                    break
+            if crash_sig:
+                res = ExecutionResult("CRASHED", signal=crash_sig, reason=info.strip(), performance={"total_ms": elapsed})
+            else:
+                res = ExecutionResult("SIGNAL", reason=info.strip(), performance={"total_ms": elapsed})
         else:
-            res = ExecutionResult("STOPPED", reason="breakpoint_or_stop", performance={"total_ms": elapsed})
+            reason = "breakpoint" if "breakpoint" in info else "breakpoint_or_stop"
+            res = ExecutionResult("STOPPED", reason=reason, performance={"total_ms": elapsed})
         self._last_execution = res
         return res
 
     def diff(self, before, after):
         return StateDiffEngine().diff(before, after)
 
-    def build_transition(self, transition_id, parent, child, mutation, execution):
+    def execute_transition(self, object_id=None, field_path=None, value=None, path=None,
+                           timeout_ms=1000, transition_id=None, output=None,
+                           parent_snapshot_id=None, child_snapshot_id=None,
+                           snapshots_dir=None, parent_output=None, child_output=None):
+        import os
+        from .snapshot import StateTransition
+        t_total_start = time.monotonic()
+        self._transition_counter += 1
+        tid = transition_id or "T{:03d}".format(self._transition_counter)
+
+        if not self._is_stopped():
+            exec_res = ExecutionResult("PROCESS_NOT_STOPPED", error={"code": "PROCESS_NOT_STOPPED"})
+            return StateTransition(
+                transition_id=tid,
+                parent_snapshot="<none>",
+                child_snapshot=None,
+                mutation=None,
+                execution=exec_res,
+                diff=None,
+                performance={"total_ms": round((time.monotonic() - t_total_start) * 1000, 3)}
+            )
+
+        # 1. Snapshot A (Parent)
+        t_snap_a = time.monotonic()
+        if parent_snapshot_id and parent_snapshot_id in self.snapshots:
+            parent_snapshot = self.snapshots[parent_snapshot_id]
+        elif self._latest and (parent_snapshot_id is None or self._latest.snapshot_id == parent_snapshot_id):
+            parent_snapshot = self._latest
+        else:
+            parent_snapshot = self.snapshot(snapshot_id=parent_snapshot_id)
+        snap_before_ms = round((time.monotonic() - t_snap_a) * 1000, 3)
+
+        if snapshots_dir:
+            os.makedirs(snapshots_dir, exist_ok=True)
+            parent_output = parent_output or os.path.join(snapshots_dir, "{}.json".format(parent_snapshot.snapshot_id))
+        if parent_output:
+            parent_snapshot.write_json(parent_output)
+
+        # 2. Mutation
+        t_mut = time.monotonic()
+        mutation_res = self.mutate(
+            object_id=object_id,
+            field_path=field_path,
+            value=value,
+            path=path
+        )
+        mutation_ms = round((time.monotonic() - t_mut) * 1000, 3)
+
+        if not mutation_res.success:
+            exec_res = ExecutionResult("NOT_RUN", reason="mutation failed")
+            perf = {
+                "snapshot_before_ms": snap_before_ms,
+                "mutation_ms": mutation_ms,
+                "continue_ms": 0.0,
+                "snapshot_after_ms": 0.0,
+                "diff_ms": 0.0,
+                "total_ms": round((time.monotonic() - t_total_start) * 1000, 3)
+            }
+            trans = StateTransition(
+                transition_id=tid,
+                parent_snapshot=parent_snapshot.snapshot_id,
+                child_snapshot=None,
+                mutation=mutation_res,
+                execution=exec_res,
+                diff=None,
+                performance=perf
+            )
+            if output:
+                trans.write_json(output)
+            return trans
+
+        # 3. Continue execution
+        t_cont = time.monotonic()
+        execution_res = self.continue_execution(timeout_ms=timeout_ms)
+        continue_ms = round((time.monotonic() - t_cont) * 1000, 3)
+
+        # 4. Snapshot B (Child) & Semantic Diff (only when stopped)
+        child_snapshot = None
+        diff_res = None
+        snap_after_ms = 0.0
+        diff_ms = 0.0
+
+        if execution_res.status == "STOPPED":
+            t_snap_b = time.monotonic()
+            child_snapshot = self.snapshot(snapshot_id=child_snapshot_id)
+            snap_after_ms = round((time.monotonic() - t_snap_b) * 1000, 3)
+
+            if snapshots_dir:
+                child_output = child_output or os.path.join(snapshots_dir, "{}.json".format(child_snapshot.snapshot_id))
+            if child_output:
+                child_snapshot.write_json(child_output)
+
+            t_diff = time.monotonic()
+            diff_res = self.diff(parent_snapshot, child_snapshot)
+            diff_ms = round((time.monotonic() - t_diff) * 1000, 3)
+
+        perf = {
+            "snapshot_before_ms": snap_before_ms,
+            "mutation_ms": mutation_ms,
+            "continue_ms": continue_ms,
+            "snapshot_after_ms": snap_after_ms,
+            "diff_ms": diff_ms,
+            "total_ms": round((time.monotonic() - t_total_start) * 1000, 3)
+        }
+
+        trans = StateTransition(
+            transition_id=tid,
+            parent_snapshot=parent_snapshot.snapshot_id,
+            child_snapshot=child_snapshot.snapshot_id if child_snapshot else None,
+            mutation=mutation_res,
+            execution=execution_res,
+            diff=diff_res,
+            performance=perf
+        )
+        if output:
+            trans.write_json(output)
+        return trans
+
+    def build_transition(self, transition_id, parent, child, mutation, execution, performance=None):
         from .snapshot import StateTransition
         parent_id = parent.snapshot_id if hasattr(parent, "snapshot_id") else (parent.get("snapshot", {}).get("snapshot_id") or str(parent))
-        child_id = child.snapshot_id if hasattr(child, "snapshot_id") else (child.get("snapshot", {}).get("snapshot_id") or str(child))
+        child_id = (child.snapshot_id if hasattr(child, "snapshot_id") else (child.get("snapshot", {}).get("snapshot_id") or str(child))) if child else None
         mut_dict = mutation.to_dict() if hasattr(mutation, "to_dict") else mutation
         exec_dict = execution.to_dict() if hasattr(execution, "to_dict") else execution
-        diff_dict = self.diff(parent, child).to_dict()
-        return StateTransition(transition_id, parent_id, child_id, mut_dict, exec_dict, diff_dict)
+        diff_dict = self.diff(parent, child).to_dict() if (parent and child) else None
+        return StateTransition(
+            transition_id=transition_id,
+            parent_snapshot=parent_id,
+            child_snapshot=child_id,
+            mutation=mut_dict,
+            execution=exec_dict,
+            diff=diff_dict,
+            performance=performance
+        )
 
     def _is_stopped(self):
         try:
