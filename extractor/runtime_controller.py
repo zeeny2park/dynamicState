@@ -28,6 +28,26 @@ class ExecutionResult:
         return asdict(self)
 
 
+@dataclass
+class RuntimeCapabilities:
+    checkpoint: bool = True
+    restore: bool = True
+    typed_mutation: bool = True
+    semantic_snapshot: bool = True
+    semantic_diff: bool = True
+    state_hash: bool = True
+    branch_exploration: bool = True
+    crash_recovery: bool = True
+    timeout_recovery: bool = True
+    multi_thread_determinism: bool = False
+    external_io_rollback: bool = False
+    exploration_mode: str = "deterministic_single_thread_context"
+    backend: str = "generic"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class RuntimeController:
     def observe(self):
         raise NotImplementedError
@@ -80,6 +100,18 @@ class RuntimeController:
             timeout_ms=timeout_ms
         )
 
+    def get_capabilities(self) -> Dict[str, Any]:
+        return RuntimeCapabilities().to_dict()
+
+    def get_type_info(self, type_name: str) -> Optional[Any]:
+        return None
+
+    def get_enum_members(self, type_name: str):
+        return []
+
+    def get_integer_range(self, type_name: str):
+        return None
+
     def propose_mutations(self, snapshot=None):
         raise NotImplementedError
 
@@ -100,6 +132,52 @@ class GdbRuntimeController(RuntimeController):
         self._latest: Optional[RuntimeSnapshot] = None
         self._last_mutation: Optional[MutationResult] = None
         self._last_execution: Optional[ExecutionResult] = None
+
+    def get_capabilities(self) -> Dict[str, Any]:
+        thread_count = 1
+        try:
+            inf = self.gdb.selected_inferior()
+            thread_count = len(inf.threads())
+        except Exception:
+            pass
+        return RuntimeCapabilities(
+            checkpoint=True,
+            restore=True,
+            typed_mutation=True,
+            semantic_snapshot=True,
+            semantic_diff=True,
+            state_hash=True,
+            branch_exploration=True,
+            crash_recovery=True,
+            timeout_recovery=True,
+            multi_thread_determinism=False,
+            external_io_rollback=False,
+            exploration_mode="deterministic_single_thread_context" if thread_count <= 1 else "multi_thread_experimental",
+            backend="gdb_fork"
+        ).to_dict()
+
+    def get_type_info(self, type_name: str) -> Optional[Any]:
+        if not type_name:
+            return None
+        cleaned = type_name.replace("enum class ", "").replace("enum ", "").replace("struct ", "").replace("class ", "").strip()
+        for prefix in ["", "struct ", "class ", "enum "]:
+            try:
+                return self.gdb.lookup_type(prefix + cleaned).strip_typedefs()
+            except Exception:
+                pass
+        return None
+
+    def get_enum_members(self, type_name: str):
+        gdb_type = self.get_type_info(type_name)
+        if gdb_type is not None:
+            return self.types.enum_members(gdb_type)
+        return []
+
+    def get_integer_range(self, type_name: str):
+        gdb_type = self.get_type_info(type_name)
+        if gdb_type is not None and self.types.kind(gdb_type) == "primitive":
+            return self.types.integer_range(gdb_type)
+        return None
 
     def checkpoint(self, checkpoint_id=None):
         return self.restorer.checkpoint(checkpoint_id=checkpoint_id)
@@ -249,7 +327,11 @@ class GdbRuntimeController(RuntimeController):
             timer.daemon = True
             timer.start()
         try:
-            self.gdb.execute("continue")
+            try:
+                # signal 0 continues execution without delivering any pending signals from prior stops
+                self.gdb.execute("signal 0")
+            except Exception:
+                self.gdb.execute("continue")
         except Exception as exc:
             text = str(exc)
             if "exited" in text.lower():

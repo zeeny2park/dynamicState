@@ -12,6 +12,8 @@ sample
 # Temporary build / debug artifacts
 .phase*
 state.json
+tmp_*
+corpus/
 
 # Snapshot outputs (preserve directory with .gitkeep)
 snapshots/*.json

@@ -7,6 +7,9 @@ or environment-dependent details:
 - Thread IDs and process PIDs
 - Timestamps and performance metrics
 - Host filesystem paths in memory maps
+- Physical storage classification (heap/stack/global): excluded to guarantee
+  pure semantic state equivalence regardless of whether an object was allocated
+  on the stack or heap across runs or restarts.
 """
 
 from collections import deque
@@ -72,13 +75,12 @@ def _canonicalize_object_graph(data: Dict[str, Any]) -> Tuple[Tuple[Any, ...], .
     for idx, oid in enumerate(visited_order):
         canonical_id_map[oid] = "C_{}".format(idx)
 
-    # 2. Build canonical object descriptors
+    # 2. Build canonical object descriptors (excluding physical memory storage layout)
     canonical_objects: List[Tuple[Any, ...]] = []
     for oid in visited_order:
         obj = obj_by_id[oid]
         cid = canonical_id_map[oid]
         obj_type = str(obj.get("type", ""))
-        storage = str(obj.get("storage", "unknown"))
 
         fields_repr: List[Tuple[str, Any, Any]] = []
         for f in sorted(obj.get("fields", []), key=lambda x: str(x.get("name", ""))):
@@ -105,7 +107,7 @@ def _canonicalize_object_graph(data: Dict[str, Any]) -> Tuple[Tuple[Any, ...], .
 
             fields_repr.append((fname, semantic_val, avail))
 
-        canonical_objects.append((cid, obj_type, storage, tuple(fields_repr)))
+        canonical_objects.append((cid, obj_type, tuple(fields_repr)))
 
     return tuple(canonical_objects)
 
@@ -114,7 +116,7 @@ def compute_state_hash(snapshot: Any) -> str:
     """Compute an address-independent deterministic 16-hex semantic state hash.
 
     Excludes raw memory addresses, thread IDs, process PIDs, timestamps,
-    and memory map file paths.
+    physical storage classifications, and memory map file paths.
     """
     data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
     canonical: List[Any] = []
