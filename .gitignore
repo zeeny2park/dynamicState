@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C/C++ compiled binaries and objects
+*.o
+*.obj
+*.so
+sample
+
+# Temporary build / debug artifacts
+.phase*
+state.json
+
+# Snapshot outputs (preserve directory with .gitkeep)
+snapshots/*.json
+!snapshots/.gitkeep

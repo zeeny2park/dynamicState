@@ -1,0 +1,2 @@
+# Runtime dependencies are supplied by GDB's embedded Python.
+# Unit tests use Python's standard-library unittest; no pip dependency is required.
