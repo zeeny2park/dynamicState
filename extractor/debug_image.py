@@ -22,6 +22,9 @@ class BinaryIdentity:
     debuglink: Optional[Dict[str, Any]] = None  # {"filename": str, "crc": Optional[int]}
     stripped: bool = False
     has_debug_info: bool = False
+    elf_type: Optional[str] = None              # "ET_EXEC", "ET_DYN", etc.
+    entry_point: Optional[int] = None
+    pt_loads: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -175,8 +178,17 @@ def inspect_elf(path: str) -> BinaryIdentity:
                         crc = struct.unpack(endian + "I", dl_bytes[padded_pos : padded_pos + 4])[0]
                     debuglink = {"filename": dl_filename, "crc": crc}
 
-        # If build_id was not in section headers, try PT_NOTE in program headers
-        if not build_id and e_phoff > 0 and e_phnum > 0 and e_phentsize > 0:
+        elf_type_map = {
+            1: "ET_REL",
+            2: "ET_EXEC",
+            3: "ET_DYN",
+            4: "ET_CORE",
+        }
+        elf_type_name = elf_type_map.get(e_type, "ET_0x{:04x}".format(e_type))
+
+        # Program headers: read PT_LOAD segments and PT_NOTE (if needed)
+        pt_loads = []
+        if e_phoff > 0 and e_phnum > 0 and e_phentsize > 0:
             f.seek(e_phoff)
             ph_data = f.read(e_phentsize * e_phnum)
             for i in range(e_phnum):
@@ -184,7 +196,26 @@ def inspect_elf(path: str) -> BinaryIdentity:
                 if len(chunk) < e_phentsize:
                     break
                 p_type = struct.unpack(endian + "I", chunk[:4])[0]
-                if p_type == 4:  # PT_NOTE
+                if p_type == 1:  # PT_LOAD
+                    if is_64:
+                        p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = struct.unpack(
+                            endian + "IQQQQQQ", chunk[4:56]
+                        )
+                    else:
+                        p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align = struct.unpack(
+                            endian + "IIIIIII", chunk[4:32]
+                        )
+                    pt_loads.append({
+                        "p_type": 1,
+                        "p_offset": p_offset,
+                        "p_vaddr": p_vaddr,
+                        "p_paddr": p_paddr,
+                        "p_filesz": p_filesz,
+                        "p_memsz": p_memsz,
+                        "p_flags": p_flags,
+                        "p_align": p_align,
+                    })
+                elif p_type == 4 and not build_id:  # PT_NOTE
                     if is_64:
                         p_flags, p_offset, p_vaddr, p_paddr, p_filesz = struct.unpack(endian + "IQQQQ", chunk[4:40])
                     else:
@@ -205,8 +236,6 @@ def inspect_elf(path: str) -> BinaryIdentity:
                             build_id = desc_bytes.hex()
                             break
                         n_offset += padded_namesz + padded_descsz
-                    if build_id:
-                        break
 
         has_debug_info = any(s.startswith(".debug_") or s == ".gdb_index" for s in sec_names)
         is_stripped = (".symtab" not in sec_names) and not has_debug_info
@@ -219,7 +248,10 @@ def inspect_elf(path: str) -> BinaryIdentity:
             build_id=build_id,
             debuglink=debuglink,
             stripped=is_stripped,
-            has_debug_info=has_debug_info
+            has_debug_info=has_debug_info,
+            elf_type=elf_type_name,
+            entry_point=e_entry,
+            pt_loads=pt_loads,
         )
 
 

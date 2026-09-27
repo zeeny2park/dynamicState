@@ -26,7 +26,9 @@
         "DETECT_INVARIANTS",
         "MEMORY_SNAPSHOT",
         "ANALYZE_MEMORY_SNAPSHOT",
-        "GET_MEMORY_SNAPSHOT"
+        "GET_MEMORY_SNAPSHOT",
+        "GET_MODULES",
+        "GET_SNAPSHOT_PROVENANCE"
       ]
     },
     "snapshot_id": {

@@ -42,6 +42,8 @@
             "DEBUG_IMAGE_MISMATCH",
             "MEMORY_CAPTURE_FAILED",
             "MEMORY_REGION_UNREADABLE",
+            "LOAD_BIAS_RESOLUTION_FAILED",
+            "PROCESS_EXITED",
             "RUNTIME_ERROR"
           ]
         },

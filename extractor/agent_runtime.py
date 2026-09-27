@@ -166,6 +166,9 @@ class AgentRuntime:
                 if not target:
                     return self._error("SNAPSHOT_NOT_FOUND", "memory_snapshot_id or snapshot_id is required", act, t0)
                 return self.get_memory_snapshot(target)
+            elif act in ("GET_MODULES", "LIST_MODULES"):
+                target = action.memory_snapshot_id or action.snapshot_id
+                return self.get_modules(target)
             else:
                 return self._error("CAPABILITY_UNSUPPORTED", f"Action '{act}' is not supported by ARP", act, t0)
         except Exception as exc:
@@ -700,11 +703,26 @@ class AgentRuntime:
                 "crash_recovery": caps.get("crash_recovery", True),
                 "timeout_recovery": caps.get("timeout_recovery", True),
             },
+            "observation_modes": ["CONSISTENT", "LOW_IMPACT"],
             "observation": caps.get("observation", {
                 "gdb_consistent": True,
                 "low_impact_memory_snapshot": True,
                 "offline_semantic_analysis": True,
             }),
+            "low_impact": {
+                "memory_capture": True,
+                "offline_analysis": True,
+                "module_discovery": True,
+                "build_id_verification": True,
+                "debuglink": True,
+                "mutation": False,
+                "execution_context": False,
+                "consistency": "NON_ATOMIC",
+                "backend": "process_vm_readv",
+                "process_stop": False,
+                "ptrace": False,
+                "sigstop": False,
+            },
             "memory_snapshot": caps.get("memory_snapshot", {
                 "process_vm_readv": True,
                 "partial_read": True,
@@ -785,7 +803,7 @@ class AgentRuntime:
                 performance={"total_ms": elapsed, "capture_duration_us": raw_snap.duration_us}
             )
         except ProcessLookupError as exc:
-            return self._error("MEMORY_CAPTURE_FAILED", f"Target process not found: {exc}", "MEMORY_SNAPSHOT", t0)
+            return self._error("PROCESS_EXITED", f"Target process not found: {exc}", "MEMORY_SNAPSHOT", t0)
         except PermissionError as exc:
             return self._error("MEMORY_CAPTURE_FAILED", f"Permission denied capturing process: {exc}", "MEMORY_SNAPSHOT", t0)
         except Exception as exc:
@@ -850,6 +868,60 @@ class AgentRuntime:
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
         )
 
+    def get_modules(self, snapshot_id: Optional[str] = None) -> AgentActionResult:
+        """Query discovered runtime modules for a snapshot or active inferior."""
+        t0 = time.monotonic()
+        # 1. If snapshot_id is given, check memory_snapshots or resolved snapshot
+        if snapshot_id:
+            raw_snap = self._resolve_raw_memory_snapshot(snapshot_id)
+            if raw_snap and raw_snap.modules:
+                return AgentActionResult(
+                    success=True,
+                    action="GET_MODULES",
+                    data={"modules": raw_snap.modules},
+                    performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+                )
+            snap, err = self._resolve_snapshot(snapshot_id)
+            if snap:
+                s_dict = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+                prov = s_dict.get("provenance") or {}
+                if "modules" in prov:
+                    return AgentActionResult(
+                        success=True,
+                        action="GET_MODULES",
+                        data={"modules": prov["modules"]},
+                        performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+                    )
+
+        # 2. If controller is active, discover from controller maps
+        if self.controller and hasattr(self.controller, "maps"):
+            from .modules import discover_modules
+            pid = 0
+            if hasattr(self.controller, "process_info"):
+                pinfo = self.controller.process_info() if callable(self.controller.process_info) else self.controller.process_info
+                pid = pinfo.get("pid", 0) if isinstance(pinfo, dict) else 0
+            maps = self.controller.maps.get_regions() if hasattr(self.controller.maps, "get_regions") else []
+            mods = discover_modules(pid, maps, getattr(self.controller, "binary", None))
+            return AgentActionResult(
+                success=True,
+                action="GET_MODULES",
+                data={"modules": [m.to_dict() for m in mods]},
+                performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+            )
+
+        # 3. Default to inspecting cached memory snapshots
+        if self.memory_snapshots:
+            latest = list(self.memory_snapshots.values())[-1]
+            if latest.modules:
+                return AgentActionResult(
+                    success=True,
+                    action="GET_MODULES",
+                    data={"modules": latest.modules},
+                    performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+                )
+
+        return self._error("SNAPSHOT_NOT_FOUND", f"No modules found for '{snapshot_id}'", "GET_MODULES", t0)
+
     def _resolve_raw_memory_snapshot(self, target: str) -> Optional[Any]:
         """Resolve a RawMemorySnapshot by ID or path."""
         from .memory_snapshot import RawMemorySnapshot
@@ -900,23 +972,34 @@ class AgentRuntime:
 
         # 1. Execution summary
         exec_data = s_data.get("execution") or s_inner.get("execution") or {}
-        threads = exec_data.get("threads") or []
-        top_frame: Dict[str, Any] = {}
-        top_thread_id = 1
-        if threads:
-            top_thread = threads[0]
-            top_thread_id = top_thread.get("thread_id", 1)
-            frames = top_thread.get("frames") or []
-            if frames:
-                top_frame = frames[0]
+        if exec_data.get("availability") == "UNAVAILABLE":
+            exec_summary = {
+                "thread_id": None,
+                "function": "<unavailable>",
+                "frame_level": None,
+                "location": None,
+                "pc": None,
+                "availability": "UNAVAILABLE",
+                "reason": exec_data.get("reason", "LOW_IMPACT_MEMORY_SNAPSHOT"),
+            }
+        else:
+            threads = exec_data.get("threads") or []
+            top_frame: Dict[str, Any] = {}
+            top_thread_id = 1
+            if threads:
+                top_thread = threads[0]
+                top_thread_id = top_thread.get("thread_id", 1)
+                frames = top_thread.get("frames") or []
+                if frames:
+                    top_frame = frames[0]
 
-        exec_summary = {
-            "thread_id": top_thread_id,
-            "function": top_frame.get("function", "<unknown>"),
-            "frame_level": top_frame.get("level", 0),
-            "location": top_frame.get("location"),
-            "pc": top_frame.get("pc"),
-        }
+            exec_summary = {
+                "thread_id": top_thread_id,
+                "function": top_frame.get("function", "<unknown>"),
+                "frame_level": top_frame.get("level", 0),
+                "location": top_frame.get("location"),
+                "pc": top_frame.get("pc"),
+            }
 
         # 2. Objects summary
         objects_data = self._get_objects_from_snapshot(s_data)

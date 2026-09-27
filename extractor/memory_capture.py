@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .memory_maps import MemoryMapProvider, MemoryRegion
 from .memory_snapshot import CapturedRegion, RawMemorySnapshot
+from .modules import discover_modules
 from .snapshot_consistency import NON_ATOMIC, SnapshotConsistency
 from .snapshot_regions import (
     DEFAULT_MAX_REGION_BYTES,
@@ -104,9 +105,11 @@ class MemoryCapture:
         mem_dir = os.path.join(target_dir, "memory")
         os.makedirs(mem_dir, exist_ok=True)
 
-        # 4. Read memory maps
+        # 4. Read memory maps and discover modules
         map_provider = MemoryMapProvider(pid, binary=binary_path)
         all_regions = map_provider.get_regions()
+        modules = discover_modules(pid, all_regions, main_binary=binary_path)
+
         selected_regions = filter_regions(
             all_regions,
             policy=policy,
@@ -122,6 +125,7 @@ class MemoryCapture:
         bytes_captured = 0
         partial_reads = 0
         failed_reads = 0
+        process_exited = False
 
         fn_vm_readv = self._libc.process_vm_readv
         deadline_ns = t_start_ns + (timeout_ms * 1_000_000)
@@ -151,7 +155,26 @@ class MemoryCapture:
 
             if nread < 0:
                 err = ctypes.get_errno()
-                err_str = "EFAULT" if err == 14 else ("ESRCH" if err == 3 else ("EPERM" if err == 1 else f"ERRNO_{err}"))
+                if err == 3:  # ESRCH: Target process terminated during capture
+                    process_exited = True
+                    failed_reads += 1
+                    captured_regions.append(CapturedRegion(
+                        region_id=reg_id,
+                        start=region.start,
+                        end=region.end,
+                        size=req_size,
+                        permissions=region.permissions,
+                        category=region.category,
+                        pathname=region.pathname,
+                        requested=req_size,
+                        captured=0,
+                        status="FAILED",
+                        filename=None,
+                        error="ESRCH_PROCESS_EXITED"
+                    ))
+                    break
+
+                err_str = "EFAULT" if err == 14 else ("EPERM" if err == 1 else f"ERRNO_{err}")
                 failed_reads += 1
                 captured_regions.append(CapturedRegion(
                     region_id=reg_id,
@@ -217,7 +240,9 @@ class MemoryCapture:
         duration_us = (t_end_ns - t_start_ns) / 1000.0
 
         # Determine overall status
-        if not captured_regions or (failed_reads == len(captured_regions)):
+        if process_exited:
+            overall_status = "PROCESS_EXITED"
+        elif not captured_regions or (failed_reads == len(captured_regions)):
             overall_status = "FAILED"
         elif partial_reads > 0 or failed_reads > 0:
             overall_status = "PARTIAL"
@@ -261,6 +286,14 @@ class MemoryCapture:
                 partial_reads=partial_reads,
                 failed_reads=failed_reads,
             ).to_dict(),
+            capture={
+                "backend": "process_vm_readv",
+                "process_stop": False,
+                "ptrace": False,
+                "sigstop": False,
+                "sigcont": False
+            },
+            modules=[m.to_dict() for m in modules],
             output_dir=os.path.abspath(target_dir),
             regions=captured_regions,
             maps=[r.to_dict() for r in all_regions],

@@ -68,6 +68,8 @@ class ThreadState:
 @dataclass
 class ExecutionState:
     threads: List[ThreadState] = field(default_factory=list)
+    availability: Optional[str] = None          # "AVAILABLE" or "UNAVAILABLE"
+    reason: Optional[str] = None                # e.g. "LOW_IMPACT_MEMORY_SNAPSHOT"
 
 
 @dataclass

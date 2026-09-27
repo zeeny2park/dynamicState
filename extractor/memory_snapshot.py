@@ -98,6 +98,14 @@ class RawMemorySnapshot:
     capture_start_ns: int = 0
     capture_end_ns: int = 0
     consistency: Dict[str, Any] = field(default_factory=lambda: {"level": NON_ATOMIC})
+    capture: Dict[str, Any] = field(default_factory=lambda: {
+        "backend": "process_vm_readv",
+        "process_stop": False,
+        "ptrace": False,
+        "sigstop": False,
+        "sigcont": False
+    })
+    modules: List[Dict[str, Any]] = field(default_factory=list)
     output_dir: str = ""
     regions: List[CapturedRegion] = field(default_factory=list)
     maps: List[Dict[str, Any]] = field(default_factory=list)
@@ -114,6 +122,7 @@ class RawMemorySnapshot:
             "endianness": self.endianness,
             "page_size": self.page_size,
             "status": self.status,
+            "capture": self.capture,
             "regions": self.regions_captured,
             "regions_requested": self.regions_requested,
             "bytes_requested": self.bytes_requested,
@@ -121,9 +130,11 @@ class RawMemorySnapshot:
             "partial_reads": self.partial_reads,
             "failed_reads": self.failed_reads,
             "duration_us": round(self.duration_us, 3),
+            "duration_ms": round(self.duration_us / 1000.0, 3),
             "capture_start_ns": self.capture_start_ns,
             "capture_end_ns": self.capture_end_ns,
             "consistency": self.consistency,
+            "modules": [m.to_dict() if hasattr(m, "to_dict") else m for m in self.modules],
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -156,6 +167,12 @@ class RawMemorySnapshot:
         with open(maps_path, "w", encoding="utf-8") as f:
             json.dump(self.maps, f, indent=2)
 
+        # 4. modules.json
+        modules_path = os.path.join(self.output_dir, "modules.json")
+        mods_data = [m.to_dict() if hasattr(m, "to_dict") else m for m in self.modules]
+        with open(modules_path, "w", encoding="utf-8") as f:
+            json.dump(mods_data, f, indent=2)
+
         return self.output_dir
 
     @classmethod
@@ -165,6 +182,7 @@ class RawMemorySnapshot:
         meta_path = os.path.join(dir_path, "metadata.json")
         manifest_path = os.path.join(dir_path, "manifest.json")
         maps_path = os.path.join(dir_path, "maps.json")
+        modules_path = os.path.join(dir_path, "modules.json")
 
         if not os.path.exists(meta_path):
             raise FileNotFoundError(f"Missing metadata.json in {dir_path}")
@@ -182,6 +200,13 @@ class RawMemorySnapshot:
         if os.path.exists(maps_path):
             with open(maps_path, "r", encoding="utf-8") as f:
                 maps = json.load(f)
+
+        modules = []
+        if os.path.exists(modules_path):
+            with open(modules_path, "r", encoding="utf-8") as f:
+                modules = json.load(f)
+        elif "modules" in meta:
+            modules = meta["modules"]
 
         return cls(
             snapshot_id=meta["snapshot_id"],
@@ -204,6 +229,14 @@ class RawMemorySnapshot:
             capture_start_ns=meta.get("capture_start_ns", 0),
             capture_end_ns=meta.get("capture_end_ns", 0),
             consistency=meta.get("consistency", {"level": NON_ATOMIC}),
+            capture=meta.get("capture", {
+                "backend": "process_vm_readv",
+                "process_stop": False,
+                "ptrace": False,
+                "sigstop": False,
+                "sigcont": False
+            }),
+            modules=modules,
             output_dir=dir_path,
             regions=regions,
             maps=maps,

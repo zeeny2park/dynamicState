@@ -16,8 +16,11 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from .debug_image import DebugImageProvider, inspect_elf
+from .debug_artifacts import DebugArtifactProvider
+from .debug_image import BinaryIdentity, CompatibilityResult, DebugImageProvider, inspect_elf
+from .debug_info import DebugInfoProvider, GdbDebugInfoProvider
 from .memory_snapshot import CapturedRegion, RawMemorySnapshot
+from .modules import ModuleAddressResolver, RuntimeModule, discover_modules
 from .runtime_state import (
     ExecutionState,
     FieldState,
@@ -31,26 +34,61 @@ from .snapshot import RuntimeSnapshot
 
 
 class SnapshotMemoryReader:
-    """Reads memory bytes from raw memory snapshot artifacts."""
+    """Module-aware memory reader from raw memory snapshot artifacts."""
 
-    def __init__(self, raw_snapshot: RawMemorySnapshot):
+    def __init__(
+        self,
+        raw_snapshot: RawMemorySnapshot,
+        modules: Optional[List[RuntimeModule]] = None,
+    ):
         self.snapshot = raw_snapshot
-        self._regions: List[Tuple[int, int, str, str]] = []
+        self._regions: List[Tuple[int, int, str, str, CapturedRegion]] = []
         self._cache: Dict[str, bytes] = {}
 
         for r in raw_snapshot.regions:
             if r.captured > 0 and r.filename:
                 full_path = os.path.join(raw_snapshot.output_dir, r.filename)
-                self._regions.append((r.start, r.start + r.captured, full_path, r.category))
+                self._regions.append((r.start, r.start + r.captured, full_path, r.category, r))
 
         # Sort by ascending start address for binary search / quick lookup
         self._regions.sort(key=lambda x: x[0])
 
-    def find_region(self, address: int) -> Optional[Tuple[int, int, str, str]]:
-        for start, end, fpath, cat in self._regions:
+        if modules is not None:
+            self.modules = list(modules)
+        elif raw_snapshot.modules:
+            self.modules = [
+                RuntimeModule.from_dict(m) if isinstance(m, dict) else m
+                for m in raw_snapshot.modules
+            ]
+        else:
+            self.modules = discover_modules(
+                raw_snapshot.pid, raw_snapshot.maps, raw_snapshot.binary
+            )
+
+    def find_region(self, address: int) -> Optional[Tuple[int, int, str, str, CapturedRegion]]:
+        for start, end, fpath, cat, reg in self._regions:
             if start <= address < end:
-                return (start, end, fpath, cat)
+                return (start, end, fpath, cat, reg)
         return None
+
+    def region_for_address(self, address: int) -> Optional[CapturedRegion]:
+        r = self.find_region(address)
+        return r[4] if r else None
+
+    def module_for_address(self, address: int) -> Optional[RuntimeModule]:
+        for mod in self.modules:
+            if mod.runtime_base <= address < mod.runtime_end:
+                return mod
+        return None
+
+    def runtime_to_elf(self, address: int) -> Optional[Tuple[RuntimeModule, int]]:
+        mod = self.module_for_address(address)
+        if not mod:
+            return None
+        return (mod, address - mod.load_bias)
+
+    def elf_to_runtime(self, module: RuntimeModule, elf_address: int) -> int:
+        return elf_address + module.load_bias
 
     def is_readable(self, address: int, size: int = 1) -> bool:
         r = self.find_region(address)
@@ -64,7 +102,7 @@ class SnapshotMemoryReader:
         r = self.find_region(address)
         if not r:
             return None
-        start, end, fpath, _ = r
+        start, end, fpath, _, _ = r
         if (address + size) > end:
             # Span exceeds captured boundary
             return None
@@ -263,8 +301,11 @@ class OfflineMemoryAnalyzer:
     def analyze(
         self,
         memory_snapshot: Union[RawMemorySnapshot, str],
-        debug_image: Union[DebugImageProvider, str],
+        debug_image: Optional[Union[DebugImageProvider, DebugArtifactProvider, str]] = None,
         optional_symbol_context: Optional[Dict[str, Any]] = None,
+        debug_artifact_provider: Optional[DebugArtifactProvider] = None,
+        debug_info_provider: Optional[DebugInfoProvider] = None,
+        search_paths: Optional[List[str]] = None,
     ) -> RuntimeSnapshot:
         """Perform offline semantic reconstruction of the captured process state."""
         t_start = time.monotonic()
@@ -275,47 +316,80 @@ class OfflineMemoryAnalyzer:
         else:
             raw_snap = memory_snapshot
 
-        # 2. Verify debug image compatibility
-        if isinstance(debug_image, str):
-            provider = DebugImageProvider(debug_image)
+        # 2. Resolve runtime modules
+        if raw_snap.modules:
+            modules = [
+                RuntimeModule.from_dict(m) if isinstance(m, dict) else m
+                for m in raw_snap.modules
+            ]
         else:
-            provider = debug_image
+            modules = discover_modules(raw_snap.pid, raw_snap.maps, raw_snap.binary)
 
-        runtime_bin = raw_snap.binary
-        if runtime_bin and os.path.exists(runtime_bin):
-            compat = provider.verify(runtime_bin)
+        main_module = next((m for m in modules if m.is_main_executable), modules[0] if modules else None)
+
+        # 3. Resolve and verify debug artifact
+        if debug_artifact_provider:
+            artifact_provider = debug_artifact_provider
+        elif isinstance(debug_image, DebugArtifactProvider):
+            artifact_provider = debug_image
+        else:
+            artifact_provider = DebugArtifactProvider(search_paths=search_paths)
+
+        if isinstance(debug_image, str):
+            if main_module:
+                artifact_provider.register(main_module.module_id, debug_image)
+            artifact_provider.register("main", debug_image)
+        elif isinstance(debug_image, DebugImageProvider) and debug_image.path:
+            if main_module:
+                artifact_provider.register(main_module.module_id, debug_image.path)
+            artifact_provider.register("main", debug_image.path)
+
+        dbg_path = None
+        if main_module:
+            dbg_path = artifact_provider.find_debug_artifact(main_module)
+        if not dbg_path and isinstance(debug_image, str):
+            dbg_path = os.path.abspath(debug_image)
+        elif not dbg_path and hasattr(debug_image, "path") and debug_image.path:
+            dbg_path = debug_image.path
+
+        if not dbg_path:
+            dbg_path = getattr(debug_image, "path", None) or "unknown_debug_image"
+
+        if not optional_symbol_context and (not dbg_path or not os.path.exists(dbg_path)):
+            raise FileNotFoundError(
+                f"Debug artifact not found for main executable: {main_module.path if main_module else 'unknown'}"
+            )
+
+        if main_module and dbg_path and os.path.exists(dbg_path):
+            compat = artifact_provider.verify(main_module, dbg_path)
             if not compat.compatible:
-                raise ValueError(f"DEBUG_IMAGE_INCOMPATIBLE: {compat.reason}")
+                raise ValueError(f"DEBUG_IMAGE_MISMATCH: {compat.reason}")
+        elif hasattr(debug_image, "verify") and callable(debug_image.verify):
+            compat = debug_image.verify(raw_snap.binary)
+            if hasattr(compat, "compatible") and not compat.compatible:
+                raise ValueError(f"DEBUG_IMAGE_MISMATCH: {compat.reason}")
 
-        # 3. Obtain symbol & struct definitions from debug image
+        # 4. Extract symbols & types via DebugInfoProvider
         if optional_symbol_context:
             symbol_context = optional_symbol_context
+        elif debug_info_provider:
+            debug_info_provider.load(main_module, dbg_path)
+            symbol_context = {
+                "symbols": debug_info_provider.get_symbols(),
+                "types": debug_info_provider.get_types(),
+            }
         else:
-            symbol_context = extract_dwarf_context(provider.path)
+            info_provider = GdbDebugInfoProvider(dbg_path)
+            symbol_context = {
+                "symbols": info_provider.get_symbols(),
+                "types": info_provider.get_types(),
+            }
 
         symbols = symbol_context.get("symbols", [])
         types_map = symbol_context.get("types", {})
 
-        # 4. Determine runtime load slide (ASLR) from maps
-        load_slide = 0
-        bin_maps = [
-            m for m in raw_snap.maps
-            if m.get("pathname") and runtime_bin and (
-                m.get("pathname") == runtime_bin or
-                os.path.realpath(m.get("pathname")) == os.path.realpath(runtime_bin)
-            )
-        ]
-        if bin_maps:
-            min_addr = min(m.get("start_addr", int(m.get("start", "0"), 16)) for m in bin_maps)
-            try:
-                elf_info = inspect_elf(provider.path)
-                if elf_info.elf_class in ("ELF64", "ELF32"):
-                    load_slide = min_addr
-            except Exception:
-                load_slide = min_addr
-
-        # 5. Initialize SnapshotMemoryReader and Object Graph builders
-        reader = SnapshotMemoryReader(raw_snap)
+        # 5. Initialize module-aware SnapshotMemoryReader and Object Graph builders
+        reader = SnapshotMemoryReader(raw_snap, modules=modules)
         roots: List[RootState] = []
         objects: List[ObjectState] = []
         by_identity: Dict[Tuple[str, str], ObjectState] = {}
@@ -490,7 +564,11 @@ class OfflineMemoryAnalyzer:
             if s_elf_addr is None:
                 continue
 
-            runtime_sym_addr = load_slide + s_elf_addr
+            if main_module:
+                runtime_sym_addr = ModuleAddressResolver.resolve_runtime_address(main_module, s_elf_addr)
+            else:
+                runtime_sym_addr = s_elf_addr
+
             tinfo = resolve_type_info(s_type)
             clean_type = tinfo["clean"]
             is_ptr = tinfo["is_ptr"]
@@ -545,14 +623,11 @@ class OfflineMemoryAnalyzer:
         )
 
         # 8. Execution State for LOW_IMPACT mode
-        # Stacks and exact registers are unavailable offline without a live debugger
+        # In LOW_IMPACT capture, process execution context (threads/frames/PC) is not captured
         execution = ExecutionState(
-            threads=[
-                ThreadState(
-                    thread_id=1,
-                    frames=[]
-                )
-            ]
+            threads=[],
+            availability="UNAVAILABLE",
+            reason="LOW_IMPACT_MEMORY_SNAPSHOT"
         )
 
         # 9. Provenance metadata
@@ -564,12 +639,13 @@ class OfflineMemoryAnalyzer:
                 "stripped": True,
             },
             "debug_image": {
-                "path": provider.path,
+                "path": dbg_path,
                 "compatible": True,
                 "source": "external",
                 "verified": True,
                 "reason": "COMPATIBLE",
             },
+            "modules": [m.to_dict() if hasattr(m, "to_dict") else m for m in modules],
             "capture_mode": "LOW_IMPACT",
             "consistency": raw_snap.consistency,
         }
@@ -584,6 +660,7 @@ class OfflineMemoryAnalyzer:
             "regions_captured": raw_snap.regions_captured,
             "objects_discovered": len(objects),
             "roots_discovered": len(roots),
+            "module_count": len(modules),
         }
 
         snap_id = f"S_{raw_snap.snapshot_id}"

@@ -1,14 +1,14 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `PHASE_5_1_LOW_IMPACT_SNAPSHOT_COMPLETE`** — Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis  
-> Verified with 130 Unit Tests and 13 GDB/process_vm_readv Integration Test Suites.
+> **Status: `PHASE_5_2_PRODUCTION_OBSERVATION_HARDENING_COMPLETE`** — Production-grade Low-Impact Observation Hardening  
+> Verified with 150 Unit Tests and 14 GDB/process_vm_readv Integration Test Suites.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
 나아가 실제 CI/CD 및 프로덕션 환경의 **Stripped Production Binary**와 **External Debug Image** 환경 위에서, 자율 코딩 에이전트(Autonomous Coding Agent)가 GDB 명령어나 원시 메모리 주소를 직접 다루지 않고 오직 고수준 의미론적 개념(Object, Field, State, MutationCandidate, Transition, Exploration, Evidence, Invariant)만을 사용하여 런타임 상태를 관찰하고 탐색할 수 있는 **Agent Runtime Protocol (ARP)** 과 참조 구현체 `AgentRuntime`을 제공합니다.
 
-또한, 고성능·통신·프로덕션 환경에서 장시간 stop-the-world 중단 없이 실행 중인 프로세스의 원시 메모리를 비침습적으로 캡처하고(`process_vm_readv`), 사후 오프라인에서 외부 디버그 이미지의 DWARF 메타데이터와 결합하여 의미론적 런타임 스냅샷을 재구성하는 **Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis (Phase 5.1)** 를 지원합니다.
+또한, 고성능·통신·프로덕션 환경에서 프로세스 중단 없이 실행 중인 프로세스의 원시 메모리를 비침습적으로 캡처하고(`process_vm_readv`), ELF `PT_LOAD` 세그먼트 기반의 정확한 `load_bias` 계산, `RuntimeModule` 모델 및 `.gnu_debuglink`/Build ID 디버그 아티팩트 검증, 오프라인 DWARF 의미론적 객체 그래프 복원을 수행하는 **Production-grade Low-Impact Observation Hardening (Phase 5.2)** 을 지원합니다.
 
 ---
 
@@ -87,8 +87,10 @@ Recursive Semantic Reachability Traversal
   (실제 프로덕션 환경의 stripped 바이너리를 변경 없이 실행하면서 동일 빌드의 외부 unstripped/debug 이미지를 바인딩하여 런타임 상태 추출, 변이, 전이, 탐색을 온전히 수행. GNU Build ID 검증, 아키텍처 호환성 검사, 런타임 프로세스 메모리 격리 보장, 스냅샷 출처(Provenance) 추적)
 - **Phase 5**: *"Agent Runtime Protocol (ARP) & Reference Implementation"*  
   (자율 코딩 에이전트 전용 의미론적 런타임 인터페이스 구축: GDB 명령어 및 메모리 주소를 철저히 은닉하고, JSON 스키마 기반 Agent Runtime Protocol, 결정론적 후보 랭커(Candidate Ranker), 전이 분석기(Transition Analyzer), 사실 기반 증거 모델(Evidence Model), 구조적 불변식 후보 탐지기(Invariant Detector), 엄격한 안전 경계(Safety Boundary) 및 참조 구현체 `AgentRuntime` 제공)
-- **Phase 5.1 (Complete)**: *"Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis"*  
+- **Phase 5.1**: *"Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis"*  
   (프로덕션/실시간 애플리케이션을 위한 무중단 원시 메모리 캡처 및 사후 DWARF 오프라인 의미 분석: Linux `process_vm_readv()` 기반 고속 복사, `RawMemorySnapshot` 디스크 영속 아티팩트, 부분 일관성(`NON_ATOMIC`) 모델, `OfflineMemoryAnalyzer` 의미론적 객체 그래프 복원, CLI 도구(`capture-memory`, `analyze-memory`), LOW_IMPACT 모드 엄격한 관측 전용 경계 보장)
+- **Phase 5.2 (Complete)**: *"Production-grade Low-Impact Observation Hardening"*  
+  (ELF `PT_LOAD` 세그먼트 기반의 정확한 `load_bias` 계산, `RuntimeModule` 모델 및 `/proc/<pid>/maps` 모듈 검색, Build ID / `.gnu_debuglink` CRC 디버그 아티팩트 provenance 검증, `DebugArtifactProvider` 및 `DebugInfoProvider` 추상화, `ObservationBackend` 명시적 모델(`GDBObservationBackend` vs `LowImpactObservationBackend`), 오프라인 스냅샷 내 가짜 스레드/프레임 제거 및 실행 상태 `availability="UNAVAILABLE"` 명시화, 프로세스 종료(`ESRCH`) graceful handling, CLI 서브커맨드 `list-modules` 및 `runtime-info` 지원)
 
 ---
 
@@ -664,6 +666,72 @@ bin/dynamic-state analyze-memory \
 - **`MEMORY_SNAPSHOT`**: 지정된 PID와 정책으로 비침습적 원시 메모리 스냅샷 생성
 - **`ANALYZE_MEMORY_SNAPSHOT`**: 캡처된 원시 메모리 아티팩트와 외부 디버그 이미지를 오프라인 분석하여 `AgentStateContext` 반환
 - **`GET_MEMORY_SNAPSHOT`**: 캡처된 원시 메모리 스냅샷 메타데이터 및 매니페스트 조회
+- **`GET_MODULES`**: 런타임 모듈 목록 및 베이스/로드 바이어스 메타데이터 조회
+
+---
+
+## Phase 5.2: Production-grade Low-Impact Observation Hardening
+
+Phase 5.2에서는 실행 중인 Linux 프로세스를 중단하지 않고 관찰하는 `LOW_IMPACT` observation 기능을 실제 프로덕션 및 CI/CD 환경에 적합한 엔터프라이즈 수준으로 강화(Hardening)하였습니다.
+
+### 1. Accurate ELF `load_bias` Calculation via `PT_LOAD`
+단순 메모리 매핑 최저 주소가 아닌 ELF 프로그램 헤더의 `PT_LOAD` 세그먼트를 파싱하여 정확한 `load_bias`를 계산합니다:
+$$\text{load\_bias} = \text{runtime\_mapping\_start} - \text{PT\_LOAD.p\_vaddr}$$
+- **Non-PIE (`ET_EXEC`)**: runtime mapping 주소가 ELF 가상 주소와 일치하므로 `load_bias = 0`.
+- **PIE (`ET_DYN`) with/without ASLR**: ELF 가상 주소 0x0 기준 런타임 베이스와의 델타 반영 (`load_bias = runtime_base`).
+- **Shared Libraries (`ET_DYN`)**: 런타임에 동적으로 로드된 공유 라이브러리의 오프셋 0 세그먼트 기준 load bias 자동 산출.
+
+### 2. `RuntimeModule` Model & Module Address Resolution
+`/proc/<pid>/maps`를 파싱하여 메인 바이너리 및 동적 공유 라이브러리를 포괄하는 `RuntimeModule` 객체를 구성하고 스냅샷 아티팩트(`modules.json`)로 보존합니다:
+- `module_for_address(runtime_addr)`: 런타임 가상 주소가 속한 모듈 검색
+- `runtime_to_elf(runtime_addr)`: 런타임 가상 주소를 ELF 심볼 가상 주소로 변환
+- `elf_to_runtime(module, elf_addr)`: ELF 정적 주소를 프로세스 런타임 주소로 변환
+
+### 3. Capture-time Build ID Provenance & `.gnu_debuglink` CRC Verification
+- 캡처 시점에 `/proc/<pid>/exe` 및 맵핑 파일의 ELF 헤더에서 GNU Build ID를 추출하여 메타데이터에 보존 (`build_id_status: VERIFIED | NOT_AVAILABLE`).
+- 외부 디버그 심볼 탐색 시 `.gnu_debuglink` 섹션 파싱 및 CRC32 검증을 지원합니다.
+- `DebugArtifactProvider`의 명확한 우선순위:
+  1. 명시적으로 등록된 디버그 이미지 (`--debug-image`)
+  2. Build ID 경로 (`.build-id/xx/yyyy.debug`)
+  3. `.gnu_debuglink` (동일 디렉터리, `.debug/`, `/usr/lib/debug/` 및 CRC 검증)
+  4. 런타임 바이너리 자체 (unstripped인 경우)
+- Build ID 불일치 시 `DEBUG_IMAGE_MISMATCH` 오류로 즉각 거부합니다.
+
+### 4. `DebugInfoProvider` Abstraction & Zero Live Inferior Intervention
+디버그 정보 추출 계층을 오프라인 분석기와 완전히 분리하는 `DebugInfoProvider` 추상 인터페이스를 도입했습니다:
+- **`GdbDebugInfoProvider`**: 라이브 프로세스 부착/중단 없이 GDB를 배치 모드(`-batch`)로 디스크의 디버그 이미지만 분석하여 DWARF 전역 심볼 및 구조체/열거형 레이아웃을 일괄 추출합니다.
+- **`NativeDwarfDebugInfoProvider`**: 향후 네이티브 DWARF 파서 확장을 위한 인터페이스 스텁.
+
+### 5. Architectural Separation of Observation Backends
+- **`GDBObservationBackend` (`CONSISTENT`)**: ptrace/GDB 부착, 프로세스 중단, 정확한 콜스택/레지스터 관측, `typed_mutation` 및 `state_restorer` 브랜칭 탐색 지원.
+- **`LowImpactObservationBackend` (`LOW_IMPACT`)**: `process_vm_readv` 기반 제로-스톱 메모리 복사, 비원자적(`NON_ATOMIC`) 정합성, 엄격한 읽기 전용(변이 및 실행 제어 거부).
+
+### 6. Honest Execution Context Contract
+LOW_IMPACT 모드에서는 ptrace 없이 레지스터/콜스택을 캡처할 수 없으므로, 가짜 스레드나 더미 프레임을 절대 생성하지 않습니다:
+```json
+"execution": {
+  "availability": "UNAVAILABLE",
+  "reason": "LOW_IMPACT_MEMORY_SNAPSHOT",
+  "threads": []
+}
+```
+
+### 7. Process Exit & Race Resilience
+캡처 도중 대상 프로세스가 종료(`ESRCH`)되는 레이스 컨디션을 감지하여 비정상 크래시 없이 부분 캡처된 아티팩트를 보존하고 `status: "PROCESS_EXITED"`로 안전하게 마킹합니다.
+
+### 8. CLI Toolchain Extensions
+```bash
+# 1. 지원 런타임 백엔드 및 안전 계약 확인
+dynamic-state runtime-info
+
+# 2. 캡처된 스냅샷 또는 라이브 프로세스의 런타임 모듈 목록 조회
+dynamic-state list-modules --snapshot ./snapshots/mem_snap_001
+dynamic-state list-modules --pid 12345
+
+# 3. 비침습적 메모리 캡처 및 오프라인 분석
+dynamic-state capture-memory --pid 12345 --output ./snapshots/mem_snap_001
+dynamic-state analyze-memory --snapshot ./snapshots/mem_snap_001 --debug-image ./artifacts/app.debug --output ./snapshots/semantic.json
+```
 
 ---
 
@@ -707,10 +775,10 @@ caps = controller.get_capabilities()
 
 ## Testing
 
-모든 단위 테스트와 13개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트가 완전히 통과합니다:
+모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 테스트 (130 unit tests across all modules)
+# 1. 단위 테스트 (150 unit tests across all modules)
 python3 -m unittest discover -s tests -v
 
 # 2. Phase 1 & 2 GDB 기본 통합 테스트
@@ -749,8 +817,11 @@ bash tests/integration_stripped_transition.sh
 # 13. Phase 5 Agent Runtime Protocol 종단간 시뮬레이션 통합 테스트
 bash tests/integration_agent_runtime.sh
 
-# 14. Phase 5.1 Low-Impact Memory Snapshot + Offline Analysis E2E 통합 테스트 (신규)
+# 14. Phase 5.1 Low-Impact Memory Snapshot + Offline Analysis E2E 통합 테스트
 bash tests/integration_low_impact_snapshot.sh
+
+# 15. Phase 5.2 Production-Grade Low-Impact Observation Hardening 통합 테스트 (신규)
+bash tests/integration_phase5_2_hardening.sh
 ```
 
 ---

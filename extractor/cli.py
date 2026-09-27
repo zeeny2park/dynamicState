@@ -31,7 +31,7 @@ def main():
                             help="Maximum total bytes to capture (default: 32MB)")
     cap_parser.add_argument("--timeout-ms", type=int, default=2000,
                             help="Capture timeout in milliseconds (default: 2000ms)")
-    cap_parser.add_argument("--output", type=str, required=True,
+    cap_parser.add_argument("--output", "--output-dir", dest="output", type=str, required=True,
                             help="Directory path to save raw memory snapshot")
     cap_parser.add_argument("--snapshot-id", type=str, default=None,
                             help="Optional snapshot identifier")
@@ -43,7 +43,14 @@ def main():
     ana_parser.add_argument("--debug-image", type=str, required=True,
                             help="Path to external debug image / unstripped ELF binary")
     ana_parser.add_argument("--output", type=str, default=None,
-                            help="Output JSON path to save semantic snapshot")
+                            help="Optional output path to save semantic snapshot JSON")
+    # 3. list-modules
+    mod_parser = subparsers.add_parser("list-modules", help="Discover and list runtime modules for a process or snapshot")
+    mod_parser.add_argument("--pid", type=int, default=None, help="Target process PID")
+    mod_parser.add_argument("--snapshot", type=str, default=None, help="Path to raw memory snapshot directory")
+
+    # 4. runtime-info
+    subparsers.add_parser("runtime-info", help="Display platform observation capabilities and backend support")
 
     args = parser.parse_args()
 
@@ -85,6 +92,46 @@ def main():
         except Exception as e:
             print(f"ERROR: Offline analysis failed: {e}", file=sys.stderr)
             sys.exit(1)
+
+    elif args.command == "list-modules":
+        from .memory_maps import MemoryMapProvider
+        from .memory_snapshot import RawMemorySnapshot
+        from .modules import discover_modules
+
+        try:
+            if args.snapshot:
+                snap = RawMemorySnapshot.load(args.snapshot)
+                print(json.dumps(snap.modules, indent=2))
+            elif args.pid:
+                provider = MemoryMapProvider(args.pid)
+                regs = provider.get_regions()
+                mods = discover_modules(args.pid, regs)
+                print(json.dumps([m.to_dict() for m in mods], indent=2))
+            else:
+                print("ERROR: Either --pid or --snapshot must be specified.", file=sys.stderr)
+                sys.exit(1)
+            sys.exit(0)
+        except Exception as e:
+            print(f"ERROR: Failed listing modules: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "runtime-info":
+        capturer = MemoryCapture()
+        info = {
+            "platform": sys.platform,
+            "architecture": os.uname().machine if hasattr(os, "uname") else "unknown",
+            "observation_modes": ["CONSISTENT", "LOW_IMPACT"],
+            "process_vm_readv_supported": capturer.is_supported,
+            "low_impact_safety": {
+                "process_stop": False,
+                "ptrace": False,
+                "sigstop": False,
+                "sigcont": False,
+                "mutation": False,
+            }
+        }
+        print(json.dumps(info, indent=2))
+        sys.exit(0)
 
 
 if __name__ == "__main__":
