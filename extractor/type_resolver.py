@@ -51,3 +51,29 @@ class TypeResolver:
             return gdb_type.target()
         except Exception:
             return None
+
+    def enum_members(self, gdb_type):
+        """Return symbolic member names for an enum type."""
+        try:
+            resolved = self.strip_typedefs(gdb_type)
+            if self.kind(resolved) == "enum":
+                members = []
+                for f in resolved.fields():
+                    mname = getattr(f, "name", str(f))
+                    if "::" in mname:
+                        mname = mname.rsplit("::", 1)[1]
+                    members.append(mname)
+                return members
+        except Exception:
+            pass
+        return []
+
+    def integer_range(self, gdb_type):
+        """Return (min_val, max_val) for an integer type based on width and signedness."""
+        resolved = self.strip_typedefs(gdb_type)
+        display = self.display_name(resolved)
+        bits = int(getattr(resolved, "sizeof", 4)) * 8
+        signed = not ("unsigned" in display or display.startswith("uint"))
+        if signed:
+            return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+        return 0, (1 << bits) - 1

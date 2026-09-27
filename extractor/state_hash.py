@@ -1,0 +1,137 @@
+"""Address-independent deterministic semantic state hashing for Phase 4.
+
+The semantic state hash captures the execution call stack structure and the
+reachable semantic object graph while strictly excluding transient, process-local,
+or environment-dependent details:
+- Raw heap, stack, or global memory addresses (ASLR-independent)
+- Thread IDs and process PIDs
+- Timestamps and performance metrics
+- Host filesystem paths in memory maps
+"""
+
+from collections import deque
+import hashlib
+from typing import Any, Dict, List, Set, Tuple
+
+
+def _canonicalize_object_graph(data: Dict[str, Any]) -> Tuple[Tuple[Any, ...], ...]:
+    """Build an address-independent canonical representation of the object graph.
+
+    Assigns topological canonical IDs (C_0, C_1, ...) to objects in deterministic
+    traversal order starting from sorted semantic roots.
+    Pointer references are represented by relative canonical target IDs ('self',
+    'ref:C_1', 'null'), preventing recursion loops on cyclic graphs.
+    """
+    persistent = data.get("persistent") or {}
+    raw_objects = persistent.get("objects", [])
+    raw_roots = persistent.get("roots", [])
+
+    obj_by_id: Dict[str, Dict[str, Any]] = {
+        obj.get("object_id"): obj for obj in raw_objects if obj.get("object_id")
+    }
+
+    # 1. Determine canonical ordering of objects from roots
+    canonical_id_map: Dict[str, str] = {}
+    visited_order: List[str] = []
+    visited_set: Set[str] = set()
+
+    # Sort roots deterministically by (source, name, type)
+    sorted_roots = sorted(
+        raw_roots,
+        key=lambda r: (str(r.get("source", "")), str(r.get("name", "")), str(r.get("type", "")))
+    )
+
+    queue: deque = deque()
+    for root in sorted_roots:
+        target_ref = root.get("object_ref")
+        if target_ref and target_ref in obj_by_id and target_ref not in visited_set:
+            visited_set.add(target_ref)
+            visited_order.append(target_ref)
+            queue.append(target_ref)
+
+    # Breadth-first traversal of object graph
+    while queue:
+        curr_id = queue.popleft()
+        curr_obj = obj_by_id.get(curr_id, {})
+        for f in sorted(curr_obj.get("fields", []), key=lambda x: str(x.get("name", ""))):
+            ref = f.get("object_ref")
+            if ref and ref in obj_by_id and ref not in visited_set:
+                visited_set.add(ref)
+                visited_order.append(ref)
+                queue.append(ref)
+
+    # Any unreferenced objects (if present) appended in deterministic type/content order
+    remaining = [oid for oid in obj_by_id if oid not in visited_set]
+    remaining.sort(key=lambda oid: (
+        str(obj_by_id[oid].get("type", "")),
+        str([(f.get("name"), str(f.get("value"))) for f in obj_by_id[oid].get("fields", [])])
+    ))
+    for oid in remaining:
+        visited_order.append(oid)
+
+    for idx, oid in enumerate(visited_order):
+        canonical_id_map[oid] = "C_{}".format(idx)
+
+    # 2. Build canonical object descriptors
+    canonical_objects: List[Tuple[Any, ...]] = []
+    for oid in visited_order:
+        obj = obj_by_id[oid]
+        cid = canonical_id_map[oid]
+        obj_type = str(obj.get("type", ""))
+        storage = str(obj.get("storage", "unknown"))
+
+        fields_repr: List[Tuple[str, Any, Any]] = []
+        for f in sorted(obj.get("fields", []), key=lambda x: str(x.get("name", ""))):
+            fname = str(f.get("name", ""))
+            ftype = str(f.get("type", ""))
+            avail = f.get("availability")
+            obj_ref = f.get("object_ref")
+            val = f.get("value")
+
+            if obj_ref:
+                if obj_ref == oid:
+                    semantic_val = "self"
+                elif obj_ref in canonical_id_map:
+                    semantic_val = "ref:{}".format(canonical_id_map[obj_ref])
+                else:
+                    semantic_val = "ref:unknown"
+            elif ftype.endswith("*") or "pointer" in ftype.lower():
+                if val in ("0x0", "null", "nullptr", None, 0):
+                    semantic_val = "null"
+                else:
+                    semantic_val = "non_null_pointer"
+            else:
+                semantic_val = val
+
+            fields_repr.append((fname, semantic_val, avail))
+
+        canonical_objects.append((cid, obj_type, storage, tuple(fields_repr)))
+
+    return tuple(canonical_objects)
+
+
+def compute_state_hash(snapshot: Any) -> str:
+    """Compute an address-independent deterministic 16-hex semantic state hash.
+
+    Excludes raw memory addresses, thread IDs, process PIDs, timestamps,
+    and memory map file paths.
+    """
+    data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
+    canonical: List[Any] = []
+
+    # 1. Execution context: thread call stack semantic functions (no thread_id / no PC)
+    threads = (data.get("execution") or {}).get("threads", [])
+    threads_canonical = []
+    for thread in threads:
+        frames = thread.get("frames", [])
+        func_sequence = tuple(str(frame.get("function")) for frame in frames)
+        threads_canonical.append((len(frames), func_sequence))
+    threads_canonical.sort()
+    canonical.append(("execution", tuple(threads_canonical)))
+
+    # 2. Persistent Object Graph canonicalization
+    canonical_graph = _canonicalize_object_graph(data)
+    canonical.append(("objects", canonical_graph))
+
+    canonical_bytes = repr(canonical).encode("utf-8")
+    return hashlib.sha256(canonical_bytes).hexdigest()[:16]

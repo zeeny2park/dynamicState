@@ -54,6 +54,32 @@ class RuntimeController:
                            timeout_ms=1000, transition_id=None, output=None):
         raise NotImplementedError
 
+    def checkpoint(self, checkpoint_id=None):
+        if not hasattr(self, "_default_restorer"):
+            from .state_restorer import MockStateRestorer
+            self._default_restorer = MockStateRestorer()
+        return self._default_restorer.checkpoint(checkpoint_id=checkpoint_id)
+
+    def restore(self, checkpoint):
+        if hasattr(self, "_default_restorer"):
+            self._default_restorer.restore(checkpoint)
+
+    def release_checkpoint(self, checkpoint):
+        if hasattr(self, "_default_restorer"):
+            self._default_restorer.release(checkpoint)
+
+    def execute_transition_from_checkpoint(self, checkpoint, candidate, timeout_ms=1000):
+        self.restore(checkpoint)
+        cand_obj = candidate.object_id if hasattr(candidate, "object_id") else candidate.get("object_id")
+        cand_field = candidate.field_path if hasattr(candidate, "field_path") else candidate.get("field_path")
+        cand_val = candidate.proposed_value if hasattr(candidate, "proposed_value") else candidate.get("proposed_value")
+        return self.execute_transition(
+            object_id=cand_obj,
+            field_path=cand_field,
+            value=cand_val,
+            timeout_ms=timeout_ms
+        )
+
     def propose_mutations(self, snapshot=None):
         raise NotImplementedError
 
@@ -66,12 +92,36 @@ class GdbRuntimeController(RuntimeController):
         self.gdb = gdb_module
         self.backend = GdbBackend(gdb_module)
         self.types = TypeResolver(gdb_module)
+        from .state_restorer import GdbCheckpointRestorer
+        self.restorer = GdbCheckpointRestorer(gdb_module)
         self.snapshots: Dict[str, RuntimeSnapshot] = {}
         self._counter = 0
         self._transition_counter = 0
         self._latest: Optional[RuntimeSnapshot] = None
         self._last_mutation: Optional[MutationResult] = None
         self._last_execution: Optional[ExecutionResult] = None
+
+    def checkpoint(self, checkpoint_id=None):
+        return self.restorer.checkpoint(checkpoint_id=checkpoint_id)
+
+    def restore(self, checkpoint):
+        self.restorer.restore(checkpoint)
+        self._latest = None
+
+    def release_checkpoint(self, checkpoint):
+        self.restorer.release(checkpoint)
+
+    def execute_transition_from_checkpoint(self, checkpoint, candidate, timeout_ms=1000):
+        self.restore(checkpoint)
+        cand_obj = candidate.object_id if hasattr(candidate, "object_id") else candidate.get("object_id")
+        cand_field = candidate.field_path if hasattr(candidate, "field_path") else candidate.get("field_path")
+        cand_val = candidate.proposed_value if hasattr(candidate, "proposed_value") else candidate.get("proposed_value")
+        return self.execute_transition(
+            object_id=cand_obj,
+            field_path=cand_field,
+            value=cand_val,
+            timeout_ms=timeout_ms
+        )
 
     def observe(self):
         if self._is_stopped():

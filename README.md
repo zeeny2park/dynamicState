@@ -1,10 +1,10 @@
-# Runtime State Explorer — State Transition & Exploration Engine
+# Runtime State Explorer — Branch-safe State Transition & Exploration Engine
 
-GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 체계적인 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
+GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
 ---
 
-## Architecture
+## Architecture & Exploration Pipeline
 
 ```text
                Coding Agent (Future Phase)
@@ -17,7 +17,7 @@ GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 �
                      │
           ┌──────────┼──────────┐
           ▼          ▼          ▼
-      Snapshot    Mutation   Transition
+      Checkpoint  Mutation  Transition
           │          │          │
           └──────────┼──────────┘
                      ▼
@@ -33,7 +33,7 @@ GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 �
               Next Exploration
                      │
                      ▼
-                GDB Backend
+             State Restorer (GDB Fork Backend)
                      │
                      ▼
                Product Binary
@@ -61,336 +61,248 @@ Recursive Semantic Reachability Traversal
 
 ---
 
-## Current Capability
+## Phase Distinction
 
-### Phase 1: Execution Context
-- Thread, Frame, Arguments, Locals 추출
-- DWARF type resolution 및 scalar value serialization
-- call stack frame depth 및 symbol 정보 수집
-
-### Phase 2: Persistent Object Graph
-- Global / Frame root 탐색
-- Pointer → `object_ref` semantic edge traversal
-- Object identity `(address, canonical_type)` 기반 cycle detection 및 deduplication
-- max-depth 제한 및 unreadable memory 방어
-- storage classification (`heap`, `stack`, `global`, `unknown`)
-
-### Phase 3: Deterministic State Transition Engine
-- **RuntimeSnapshot (schema 0.3)**: Execution context + Persistent Object Graph + Snapshot Metadata + Transition reference 원자적 캡처
-- **Typed Mutation**: DWARF-aware typed memory write (signed/unsigned integers `uint8_t`~`uint64_t`, `bool`, `float`/`double`, `enum`, `null pointer`)
-- **Execution Continue**: `continue-state` (breakpoint stop, signal, exit code, timeout interrupt 감지)
-- **Semantic Diff Engine**: Pure Python, order-independent semantic diff with `ObjectMatcher` abstraction (value changes, object created/removed, reference changes, execution frame changes, availability changes)
-- **State Transition Engine**: `StateTransition` 1급 결과물 생성 및 JSON artifact 영속화 (`transitions/T001.json`)
-
-### Phase 4: Runtime State Exploration & State Corpus Foundation
-- **State Corpus (`extractor/state_corpus.py`)**: 흥미로운 runtime state 및 transition 아티팩트를 보존하고 관리하는 영속 저장소 (`corpus/states/`, `corpus/transitions/`, `corpus/index.json`)
-- **Deterministic Semantic State Hash**: 타임스탬프, PID, 성능 지표 등 비의미론적 데이터를 배제하고 실행 컨텍스트와 도달 가능한 객체 그래프의 정규형을 기반으로 중복 상태를 감지하는 16-char SHA-256 해시
-- **Interesting State Evaluation**: `NEW_STATE`, `NEW_OBJECT`, `OBJECT_REMOVED`, `REFERENCE_CHANGED`, `VALUE_CHANGE`, `CRASH`, `TIMEOUT`, `EXECUTION_CHANGE` 기준에 따른 자동 흥미도 판정
-- **Exploration Engine (`extractor/explorer.py`)**: 시드 스냅샷으로부터 규칙 기반 변이 후보(`MutationCandidate`)를 생성하고, 안전하게 전이를 실행하여 흥미로운 상태를 코퍼스에 축적하는 체계적 탐색 루프
-- **Failure Transitions**: 실제 타깃 프로세스에서의 결정론적 `CRASH` (`SIGSEGV`) 및 `TIMEOUT` 전이 아티팩트 지원
+- **Phase 3**: *"Can I execute and observe one deterministic state transition?"*  
+  (단일 결정론적 상태 전이 실행 및 관측: Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> StateTransition)
+- **Phase 4**: *"Can the runtime engine systematically discover new states from a parent runtime state through independent mutations?"*  
+  (단일 부모 상태에서 여러 변이 후보를 안전하게 복원하며 독립적인 상태 공간 가지(Branches)를 체계적으로 탐색)
 
 ---
 
-## State Transition & Object Identity
+## Branch-safe Exploration & Checkpoint Architecture
 
-### State Transition Workflow
+### 1. The Core Invariant
 
+Mutation Candidate A, B, C는 **반드시 동일한 Parent State에서 독립적으로 실행**되어야 합니다.
+
+#### ❌ 잘못된 구조 (Linear Transition Chain):
 ```text
-    Snapshot A (Parent)
-        │
-        │ Typed Mutation
-        ▼
-    Product Execution (Continue with Timeout)
-        │
-        ▼
-    Snapshot B (Child)
-        │
-        ▼
-    Semantic Diff (DiffEngine with ObjectMatcher)
-        │
-        ▼
-    StateTransition (Artifact: transitions/T001.json)
+S001
+  │
+  ├─ M1 → S002
+  │         │
+  │         └─ M2 → S003
+  │                    │
+  │                    └─ M3 → S004
 ```
+이는 단순한 선형 전이 체인이며, M1의 결과나 부작용(또는 Crash)이 M2, M3에 누적되어 독립적인 상태 공간 탐색이 불가능합니다.
 
-### Transition Artifact Schema
-
-```json
-{
-  "transition_id": "T001",
-  "parent_snapshot": "A",
-  "child_snapshot": "B",
-  "mutation": {
-    "status": "SUCCESS",
-    "target_object": "obj_0001",
-    "field": "retry",
-    "old_value": 2,
-    "new_value": 3
-  },
-  "execution": {
-    "status": "COMPLETED",
-    "stop_reason": "breakpoint",
-    "signal": null,
-    "exit_code": null,
-    "duration_ms": 12
-  },
-  "diff": {
-    "summary": { "changed_fields": 2, "total_changes": 2 },
-    "changes": [
-      {
-        "change_type": "value_changed",
-        "object_id": "obj_0001",
-        "field_name": "retry",
-        "old_value": 2,
-        "new_value": 3
-      },
-      {
-        "change_type": "value_changed",
-        "object_id": "obj_0001",
-        "field_name": "state",
-        "old_value": "CONNECTED",
-        "new_value": "ERROR"
-      }
-    ]
-  }
-}
-```
-
-### Failure Transitions (Crash & Timeout)
-
-전이 도중 타깃 프로세스가 크래시되거나 타임아웃이 발생한 경우에도 유효한 `StateTransition` 아티팩트가 생성됩니다:
-
-- **Crash Transition (`SIGSEGV` 등)**:
-  ```json
-  {
-    "transition_id": "T_CRASH",
-    "parent_snapshot": "S_PRE_CRASH",
-    "child_snapshot": null,
-    "execution": {
-      "status": "CRASHED",
-      "signal": "SIGSEGV"
-    },
-    "diff": null
-  }
-  ```
-- **Timeout Transition**:
-  ```json
-  {
-    "transition_id": "T_TIMEOUT",
-    "parent_snapshot": "S_PRE_TIMEOUT",
-    "child_snapshot": null,
-    "execution": {
-      "status": "TIMEOUT",
-      "duration_ms": 200
-    },
-    "diff": null
-  }
-  ```
-
-### Object Identity: Observation vs Lifetime Identity
-
+#### ✅ 올바른 구조 (Branch-safe Independent Exploration):
 ```text
-(address, canonical_type) is used as snapshot-scoped observation identity.
-It is NOT a guaranteed cross-snapshot lifetime identity.
+                    S001 (Parent State)
+                  /        |        \
+                 /         |         \
+               M1          M2         M3
+               │           │          │
+            restore     restore    restore
+               │           │          │
+              S002        S003       S004
 ```
 
-- **Observation Identity**: 스냅샷 A의 `(0x2000, Session)`과 스냅샷 B의 `(0x2000, Session)`은 동일 관측 주소와 정규화된 DWARF 타입을 공유하지만, 프로세스 실행 중 메모리 해제 후 재할당(deallocation & reallocation) 여부까지 보장하는 process-lifetime identity는 아닙니다.
-- **Pluggable ObjectMatcher**: `ObjectMatcher` 인터페이스를 통해 현재 기본 매처인 `AddressTypeObjectMatcher`가 적용되며, 메타데이터(`matcher.metadata()`)를 동적으로 제공합니다. 향후 `AllocationAwareObjectMatcher`, `FingerprintObjectMatcher` 등으로 손쉽게 확장할 수 있습니다.
-- **Identity Metadata**:
-  ```json
-  {
-    "strategy": "address_type",
-    "scope": "snapshot",
-    "confidence": "observation"
-  }
-  ```
+각 변이 후보 실행 직전에 반드시 부모 런타임 체크포인트를 복원(`restore`)하여, 후보 A가 크래시(`SIGSEGV`)나 타임아웃(`TIMEOUT`)을 유발하더라도 다음 후보 B, C는 깨끗한 부모 상태에서 독립적으로 실행됩니다.
+
+### 2. Semantic Snapshot vs Runtime Checkpoint
+
+시스템은 의미론적 스냅샷과 런타임 체크포인트를 명확히 분리합니다:
+
+| 개념 | 식별자 예시 | 역할 및 성격 |
+| :--- | :--- | :--- |
+| **Semantic Snapshot** | `S001`, `S002` | 특정 시점 프로세스의 관측된 실행 컨텍스트와 객체 그래프를 담은 읽기 전용 JSON 아티팩트 |
+| **Runtime Checkpoint**| `C001`, `C002` | 프로세스 메모리와 레지스터를 해당 시점으로 정확히 되돌릴 수 있는 실행 런타임 복원 상태 |
+| **State ID** | `state_000001` | 의미론적 상태 해시(`state_hash`)를 기준으로 코퍼스에 등록된 고유 정규 상태 |
+| **Transition ID** | `T001`, `T002` | 부모 상태에서 자식 상태로의 전이 결과(변이 + 실행 + 디프) 아티팩트 |
+
+> [!IMPORTANT]
+> JSON 스냅샷 자체를 프로세스 메모리 복원 수단으로 사용하지 않습니다. 런타임 복원은 전용 `StateRestorer` 인터페이스를 통해 안전하게 수행됩니다.
+
+### 3. Restore Backend (`extractor/state_restorer.py`)
+
+GDB 환경에서 OS Copy-on-Write `fork()` 기반의 체크포인트 엔진(`GdbCheckpointRestorer`)을 구현했습니다:
+- **Master Checkpoint**: 부모 상태 지점에서 GDB `checkpoint`로 생성되어 변경 없이 보존되는 기준 프로세스
+- **Worker Clone**: 각 후보 변이 실행 직전에 Master로부터 순간적으로 포크되는 일회용 복제 프로세스
+- 후보 실행 도중 `SIGSEGV` 크래시나 무한 루프(`TIMEOUT`)가 발생하더라도 Master Checkpoint는 무결하게 보존되며, 다음 후보 실행 시 새로운 Worker Clone으로 안전하게 복귀합니다.
 
 ---
 
-## State Corpus & Exploration Loop
+## Deterministic Semantic State Hash (`extractor/state_hash.py`)
 
-### State ID vs Snapshot ID
+동일한 의미론적 상태는 프로세스 재시작이나 ASLR로 인해 메모리 주소가 달라져도 **동일한 16자리 SHA-256 해시**를 산출합니다.
 
-- **Snapshot ID (`A`, `B`, `S001`)**: 특정 실행 시점에 캡처된 원시 관측 스냅샷 파일 식별자
-- **State ID (`state_000001`, `state_000002`)**: 의미론적 상태 해시(`state_hash`)를 기준으로 코퍼스에 등록된 고유 정규 상태 식별자
-- **Transition ID (`trans_000001`, `T001`)**: 상태 간의 전이 결과(변이 + 실행 + 디프) 식별자
+### 배제되는 비의미론적(Non-semantic) 데이터
+- 원시 힙, 스택, 전역 메모리 주소 (ASLR 독립성 보장)
+- OS 스레드 ID (`thread_id`) 및 프로세스 PID
+- 타임스탬프 및 성능 지표 (`*_ms`)
+- `/proc/maps` 호스트 파일시스템 경로
 
-### Deterministic State Hash
+### 정규화(Canonicalization) 원칙
+1. **호출 스택**: 스레드 ID나 PC 대신 호출 스택의 함수명 시퀀스 정규화
+2. **객체 그래프 위상 정렬**: 정렬된 루트(Root)들로부터의 도달 순서에 따라 위상 정규 ID(`C_0`, `C_1`, ...) 부여
+3. **포인터 참조 정규화**: 메모리 주소 대신 상대적 정규 ID(`ref:C_1`), 자기 참조(`self`), 널 포인터(`null`)로 변환하여 **순환 참조(Cycle) 시의 무한 재귀를 원천 차단**
 
-`compute_state_hash(snapshot)`는 16자리 SHA-256 헥스 문자열을 생성합니다:
-1. 최상위 호출 스택 프레임의 함수명 및 프레임 수
-2. 도달 가능한 모든 객체의 정규화 타입 및 정렬된 주소
-3. 각 객체의 정렬된 필드명, 스칼라 값, 객체 참조 관계
+---
 
-타임스탬프, PID, 스레드 ID, `/proc/maps` 경로 등 비의미론적(non-semantic) 데이터는 해시 계산에서 철저히 배제되어 완벽한 상태 중복 제거(deduplication)를 보장합니다.
+## Mutation Candidate Generation (`extractor/explorer.py`)
 
-### State Corpus Directory Structure
+DWARF 타입 정보를 활용하여 정밀한 변이 후보군을 규칙 기반으로 생성합니다:
+
+1. **정수형 (Type-width-aware boundaries)**:
+   - `uint8_t`: `0` ~ `255` (`MAX = 255`)
+   - `uint16_t`: `0` ~ `65535` (`MAX = 65535`)
+   - `uint32_t`: `0` ~ `4294967295` (`MAX = 4294967295`)
+   - `uint64_t`: `0` ~ `18446744073709551615`
+   - 부호 있는 정수(`int8_t`~`int64_t`): 실제 비트 폭에 따른 `MIN` / `MAX`
+   - 후보 생성 규칙: `val - 1`, `val + 1`, `0`, `1`, `MAX`, `MIN` (범위 내 값만 생성, 언더플로우 및 중복 제거)
+2. **열거형 (Enum)**:
+   - DWARF 메타데이터를 파싱하여 심볼릭 멤버 목록 추출
+   - 현재 값 이외의 대체 심볼릭 멤버 후보 생성 (예: `CONNECTED` -> `DISCONNECTED`, `ERROR`)
+3. **포인터 (Pointer)**:
+   - 임의 주소 쓰기를 금지하고 안전한 `null` / `nullptr` 변이만 허용
+4. **부울 (Boolean)**:
+   - `true` <-> `false` 토글
+5. **부동소수점 (Floating Point)**:
+   - 유한수(finite) 경계값: `0.0`, `1.0`, `-1.0`, `val - 1.0`, `val + 1.0`
+
+---
+
+## State Corpus & Exploration Artifacts
+
+### Directory Structure
 
 ```text
 corpus/
 ├── index.json
 ├── states/
-│   ├── state_000001.json
-│   └── state_000002.json
-└── transitions/
-    ├── trans_000001.json
-    └── trans_000002.json
+│   ├── state_000001/
+│   │   ├── snapshot.json
+│   │   └── metadata.json
+│   └── state_000002/
+├── transitions/
+│   ├── T001.json
+│   └── T002.json
+└── explorations/
+    └── E000001.json
 ```
 
-- `index.json`: 등록된 상태 해시 목록, 상태별 참조 카운트, 메타데이터 인덱스
-- `states/`: 각 정규 상태의 전체 스냅샷 JSON
-- `transitions/`: 각 전이의 전체 StateTransition JSON
+### Exploration Artifact Schema (`corpus/explorations/E000001.json`)
 
-### Interestingness Evaluation
-
-상태 전이 후 다음 기준 중 하나 이상을 만족하면 해당 상태를 **흥미로운 상태(Interesting State)**로 평가하여 코퍼스에 저장합니다:
-- `NEW_STATE`: 이전에 관측되지 않은 새로운 `state_hash` 발견
-- `NEW_OBJECT`: 힙 등에 새로운 객체 동적 할당 관측
-- `OBJECT_REMOVED`: 기존 객체의 메모리 해제 관측
-- `REFERENCE_CHANGED`: 포인터 참조 관계 변경 관측
-- `VALUE_CHANGE`: 구조체 내부 스칼라 필드값 변경 관측
-- `EXECUTION_CHANGE`: 실행 함수나 호출 스택 변경 관측
-- `CRASH`: 프로세스 비정상 종료 (SIGSEGV 등) 유발
-- `TIMEOUT`: 실행 시간 초과 유발
+```json
+{
+  "exploration_id": "E000001",
+  "seed_state_id": "state_000001",
+  "seed_snapshot_id": "S001",
+  "parent_checkpoint_id": "C001",
+  "steps": 3,
+  "summary": {
+    "candidates": 6,
+    "executed": 3,
+    "new_states": 2,
+    "duplicate_states": 1,
+    "crashes": 0,
+    "timeouts": 0
+  },
+  "performance": {
+    "checkpoint_creation_ms": 5.21,
+    "candidate_generation_ms": 1.15,
+    "total_time_ms": 48.32,
+    "avg_step_ms": 16.1,
+    "step_metrics": [
+      {
+        "candidate_id": "M0001",
+        "transition_id": "T001",
+        "restore_ms": 4.12,
+        "step_ms": 15.3,
+        "status": "STOPPED",
+        "child_state_id": "state_000002",
+        "interesting": true,
+        "reasons": ["VALUE_CHANGE", "NEW_STATE"]
+      }
+    ]
+  },
+  "states": ["state_000001", "state_000002"],
+  "transitions": ["T001", "T002", "T003"],
+  "new_states": ["state_000002"],
+  "crashes": [],
+  "timeouts": []
+}
+```
 
 ---
 
 ## Usage
 
-### 1. Build and Run Sample
+### 1. Build and Run Target
 
 ```bash
-# 디버그 심볼 포함 빌드
 g++ -g -O0 -o sample examples/sample.cpp
-
-# GDB 실행 및 브레이크포인트 설정
 gdb -q ./sample
 (gdb) source gdb/extract_state.py
 (gdb) break runtime_state_checkpoint
+(gdb) set args 10
 (gdb) run
 ```
 
-### 2. Phase 3 GDB Commands: State Transitions
+### 2. GDB Commands
 
 #### High-level Transition Command:
 ```gdb
-# Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> Transition Artifact를 원자적으로 실행
-(gdb) transition-state --object obj_0001 --field retry --value 3 --id T001 --parent A --child B --output transitions/T001.json --snapshots-dir snapshots
+# Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> Transition Artifact를 실행
+(gdb) transition-state --object obj_0001 --field retry --value 3 --id T001 --parent A --child B --output transitions/T001.json
 ```
-
-#### Individual Step Commands:
-```gdb
-# 1. Snapshot A 생성
-(gdb) snapshot-state A --output snapshots/A.json
-
-# 2. Typed Mutation (object_id 또는 semantic path 지원)
-(gdb) mutate-state --object obj_0001 --field retry --value 3
-# 또는 축약형:
-(gdb) mutate-state obj_0001 retry 3
-(gdb) mutate-state Session.retry 3
-
-# 3. Execution Continue (timeout_ms 지정)
-(gdb) continue-state --timeout-ms 1000
-
-# 4. Snapshot B 생성
-(gdb) snapshot-state B --output snapshots/B.json
-
-# 5. Semantic Diff 계산
-(gdb) diff-state A B --output snapshots/diff.json
-# 또는 파일 경로 직접 지정:
-(gdb) diff-state --before snapshots/A.json --after snapshots/B.json
-```
-
-### 3. Phase 4 GDB Commands: Exploration & State Corpus
 
 #### Mutation Candidates Proposal:
 ```gdb
-# 현재 스냅샷(또는 지정 스냅샷)에서 가능한 변이 후보군을 규칙 기반으로 추출
+# 현재 스냅샷에서 가능한 변이 후보군을 규칙 기반으로 추출
 (gdb) propose-mutations
-(gdb) propose-mutations A
 ```
 
-#### Autonomous State Exploration:
+#### Branch-safe State Exploration:
 ```gdb
-# 최대 N 스텝 탐색 루프 실행 (시드 등록 -> 변이 제안 -> 전이 실행 -> 흥미도 평가 -> 코퍼스 저장)
+# 부모 체크포인트를 안전하게 유지하며 최대 N 스텝 독립 변이 탐색 실행
 (gdb) explore-state --steps 5 --timeout-ms 1000 --corpus-dir corpus
 ```
 
 #### Corpus Inspection:
 ```gdb
-# 코퍼스에 저장된 모든 상태 목록 및 통계 확인
 (gdb) corpus-list --corpus-dir corpus
-
-# 특정 상태의 세부 스냅샷 정보 조회
 (gdb) corpus-show state_000001 --corpus-dir corpus
 ```
-
-### 4. Standalone CLI Diff (Outside GDB)
-
-GDB 없이 독립된 CLI 환경에서 두 스냅샷 간의 의미론적 차이를 분석할 수 있습니다:
-
-```bash
-python3 -m extractor.state_diff --before snapshots/A.json --after snapshots/B.json --output snapshots/diff.json
-```
-
----
-
-## Supported Types & Mutations
-
-### Supported Mutation Types
-- **Integers**: `int8_t`, `int16_t`, `int32_t`, `int64_t`, `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t` (엄격한 range validation 적용)
-- **Boolean**: `bool` (`true`/`false`, `1`/`0`)
-- **Enum**: Qualified name (예: `SessionState::ERROR`), unqualified name (예: `ERROR`), 또는 underlying integer
-- **Floating Point**: `float`, `double` (finite number 검증)
-- **Pointer**: `null` / `nullptr` / `0` 으로의 초기화 지원 (임의 raw memory address mutation은 안전을 위해 차단)
-
-### Error Codes
-- `PROCESS_NOT_STOPPED`: Inferior가 running 상태일 때 mutation/snapshot 시도
-- `OBJECT_NOT_FOUND`: 최신 snapshot에 해당 object가 없을 때
-- `FIELD_NOT_FOUND`: DWARF metadata에 해당 field가 없을 때
-- `AMBIGUOUS_OBJECT`: semantic path (예: `Session.retry`) 매칭 객체가 2개 이상일 때
-- `TYPE_CONVERSION_ERROR`: 타입 변환 실패 (예: 문자열 "hello"를 int에 대입)
-- `RANGE_ERROR`: 타입 범위를 벗어난 값 대입 (예: `uint8_t`에 999 또는 음수 대입)
-- `UNSUPPORTED_TYPE`: struct/class 전체 write 또는 nested field mutation 시도
 
 ---
 
 ## Testing
 
-단위 테스트와 통합 테스트 스위트가 완비되어 있습니다.
-
 ```bash
-# 1. Unit Tests (43 unit tests across all modules)
+# 1. 단위 테스트 (53 unit tests across all modules)
 python3 -m unittest discover -s tests -v
 
-# 2. Phase 1 & 2 GDB Integration Test
+# 2. Phase 1 & 2 GDB 기본 통합 테스트
 bash tests/integration_gdb.sh
 
-# 3. State Transition Integration Test (End-to-End State Transition Workflow)
+# 3. 상태 전이 E2E 통합 테스트
 bash tests/integration_state_transition.sh
 
-# 4. Mutation Validation Integration Test (10 Mutation Type & Error Validation Scenarios)
+# 4. 타입 변이 및 유효성 검증 테스트
 bash tests/integration_mutation_validation.sh
 
-# 5. Transition Failure Integration Test (Real Crash [SIGSEGV] and Timeout Transitions)
+# 5. 크래시(SIGSEGV) 및 타임아웃 전이 테스트
 bash tests/integration_transition_failure.sh
 
-# 6. Exploration Integration Test (Seed -> Propose -> Transitions -> Corpus -> Deduplication)
+# 6. 코퍼스 저장 및 중복 제거 탐색 테스트
 bash tests/integration_exploration.sh
 
-# 7. Phase 3 종합 Integration Test
+# 7. Branch-safe 독립 후보 전이 통합 테스트 (신규)
+bash tests/integration_exploration_branching.sh
+
+# 8. Phase 3 종합 통합 테스트
 bash tests/integration_phase3.sh
 ```
 
 ---
 
-## Boundaries & Limitations (Not Yet Implemented)
+## Boundaries & Known Limitations
 
-본 시스템은 런타임 탐색 기반을 구축하는 단계이며, 다음 기능은 의도적으로 제외되어 있으며 향후 Phase 대상입니다:
-- Autonomous LLM Coding Agent 의사결정 루프 (상위 에이전트 계층 연동)
-- Edge / Branch Code Coverage 수집 및 피드백 루프
-- Automatic Invariant Inference (불변식 자동 추론)
-- Coverage-guided mutation prioritization
-- Allocation-aware object lifetime identity (malloc/free hook)
-- Frida / DynamoRIO 동적 바이너리 계측 백엔드
-- 분산 타깃 탐색 및 임의 메모리 바이트 쓰기
-- 자동 process restart loop (Safety 원칙에 따라 금지)
+- **Multi-thread Nondeterminism**: 다중 스레드 레이스 컨디션에 따른 비결정론적 스케줄링은 현재 싱글 스레드/중단점 컨텍스트에 초점이 맞춰져 있습니다.
+- **External I/O & Socket State**: 프로세스 외부 커널 소켓 연결이나 원격 RPC 상태는 OS fork만으로 완전 롤백되지 않습니다.
+- **Optimized Binaries (-O2/-O3)**: 컴파일러 인라인화 및 레지스터 할당으로 DWARF 위치 표현식이 `<optimized out>`인 필드는 변이가 제한됩니다.
+- **Automated Restart Loop**: 무제한 프로세스 재생성 루프는 안전성 원칙에 따라 방지되며, 최대 탐색 스텝(`max_steps`)과 타임아웃 제한이 적용됩니다.

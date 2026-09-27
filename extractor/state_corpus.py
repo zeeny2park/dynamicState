@@ -2,48 +2,11 @@
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-
-def compute_state_hash(snapshot: Any) -> str:
-    """Compute a deterministic semantic state hash.
-
-    Excludes transient data (timestamps, performance metrics, PID, memory paths)
-    and hashes only semantic execution context and reachable object graph state.
-    """
-    data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
-    canonical = []
-
-    # 1. Execution context: thread frames
-    threads = (data.get("execution") or {}).get("threads", [])
-    for thread in sorted(threads, key=lambda t: t.get("thread_id", 0)):
-        frames = thread.get("frames", [])
-        top_func = frames[0].get("function") if frames else None
-        canonical.append(("thread", thread.get("thread_id"), top_func, len(frames)))
-
-    # 2. Persistent Objects: sorted by (address, type)
-    objects = (data.get("persistent") or {}).get("objects", [])
-    for obj in sorted(objects, key=lambda o: (str(o.get("address")), str(o.get("type")))):
-        fields_repr = []
-        for f in sorted(obj.get("fields", []), key=lambda x: str(x.get("name"))):
-            fields_repr.append((
-                str(f.get("name")),
-                str(f.get("value")),
-                str(f.get("object_ref")),
-                str(f.get("availability"))
-            ))
-        canonical.append((
-            "object",
-            str(obj.get("type")),
-            str(obj.get("address")),
-            tuple(fields_repr)
-        ))
-
-    canonical_bytes = repr(canonical).encode("utf-8")
-    return hashlib.sha256(canonical_bytes).hexdigest()[:16]
+from .state_hash import compute_state_hash
 
 
 class StateInterestingness:
@@ -89,17 +52,19 @@ class StateInterestingness:
 
 
 class StateCorpus:
-    """Manages persistent interesting runtime states and deduplication."""
+    """Manages persistent interesting runtime states, transitions, and explorations."""
 
     def __init__(self, corpus_dir: str = "corpus"):
         self.corpus_dir = os.path.abspath(corpus_dir)
         self.states_dir = os.path.join(self.corpus_dir, "states")
         self.transitions_dir = os.path.join(self.corpus_dir, "transitions")
+        self.explorations_dir = os.path.join(self.corpus_dir, "explorations")
         self.index_file = os.path.join(self.corpus_dir, "index.json")
 
         self.states: Dict[str, Dict[str, Any]] = {}
         self.hash_to_state: Dict[str, str] = {}
         self.transitions: List[str] = []
+        self.explorations: List[str] = []
         self._counter = 0
 
         self._ensure_dirs()
@@ -108,6 +73,7 @@ class StateCorpus:
     def _ensure_dirs(self) -> None:
         os.makedirs(self.states_dir, exist_ok=True)
         os.makedirs(self.transitions_dir, exist_ok=True)
+        os.makedirs(self.explorations_dir, exist_ok=True)
 
     def add(self, snapshot: Any, metadata: Optional[Dict[str, Any]] = None) -> Tuple[str, bool]:
         """Add a snapshot to corpus.
@@ -130,15 +96,22 @@ class StateCorpus:
         self._counter += 1
         state_id = "state_{:06d}".format(self._counter)
 
+        meta = metadata or {}
         state_meta = {
             "state_id": state_id,
             "state_hash": s_hash,
-            "created_at": datetime.now(timezone.utc).isoformat(),
             "snapshot_id": snapshot_id,
+            "parent_state_id": meta.get("parent_state_id"),
+            "parent_snapshot_id": meta.get("parent_snapshot_id"),
+            "transition_id": meta.get("transition_id"),
+            "interesting": meta.get("interesting", True),
+            "interesting_reasons": meta.get("interesting_reasons", ["SEED"] if not meta else []),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "observations": [snapshot_id],
         }
-        if metadata:
-            state_meta["metadata"] = metadata
+        custom_meta = {k: v for k, v in meta.items() if k not in state_meta}
+        if custom_meta:
+            state_meta["metadata"] = custom_meta
 
         # Write state directory and artifacts
         state_path = os.path.join(self.states_dir, state_id)
@@ -172,6 +145,20 @@ class StateCorpus:
         self.save()
         return tid
 
+    def add_exploration(self, artifact: Dict[str, Any]) -> str:
+        """Add an exploration summary artifact to corpus explorations directory."""
+        eid = artifact.get("exploration_id", "E_UNKNOWN")
+        e_path = os.path.join(self.explorations_dir, "{}.json".format(eid))
+
+        with open(e_path, "w", encoding="utf-8") as f:
+            json.dump(artifact, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+
+        if eid not in self.explorations:
+            self.explorations.append(eid)
+        self.save()
+        return eid
+
     def get(self, state_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve snapshot data for state_id."""
         s_path = os.path.join(self.states_dir, state_id, "snapshot.json")
@@ -199,7 +186,8 @@ class StateCorpus:
             "counter": self._counter,
             "states": self.states,
             "hash_to_state": self.hash_to_state,
-            "transitions": self.transitions
+            "transitions": self.transitions,
+            "explorations": self.explorations
         }
         with open(self.index_file, "w", encoding="utf-8") as f:
             json.dump(index_data, f, indent=2, ensure_ascii=False)
@@ -216,5 +204,6 @@ class StateCorpus:
             self.states = index_data.get("states", {})
             self.hash_to_state = index_data.get("hash_to_state", {})
             self.transitions = index_data.get("transitions", [])
+            self.explorations = index_data.get("explorations", [])
         except Exception:
             pass
