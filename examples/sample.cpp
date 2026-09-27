@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdlib>
 
 struct Buffer {
     uint32_t length;
@@ -40,17 +41,30 @@ void process_packet(Session* session) {
     uint32_t local_retry = session->retry;
     uint32_t observed_capacity = session->buffer->capacity;
     runtime_state_checkpoint();  // Snapshot A / mutation stop.
-    if (session->retry >= 3) {
+    if (session->priority == 139) {
+        *(volatile int*)0 = 42;
+    }
+    if (session->priority == 255) {
+        while (session->priority == 255) {
+            asm volatile("" ::: "memory");
+        }
+    }
+    if (session->retry == 0) {
+        session->state = SessionState::DISCONNECTED;
+        session->flagged = false;
+    } else if (session->retry >= 3) {
         session->state = SessionState::ERROR;
         session->flagged = true;
     } else {
+        session->state = SessionState::CONNECTED;
         session->packet_count += local_retry + observed_capacity + local_buffer.length;
     }
     if (local_session == nullptr) return;
     runtime_state_checkpoint();  // Snapshot B stop.
 }
 
-int main() {
+int main(int argc, char** argv) {
+    int max_packets = (argc > 1) ? std::atoi(argv[1]) : 1;
     char* data = new char[64]{};
     Buffer* buffer = new Buffer{64, 256, data};
     Session* session = new Session{SessionState::CONNECTED, 2, 10, buffer, nullptr, false, 7, 1.0};
@@ -59,6 +73,8 @@ int main() {
     file_session = session;
     Manager::instance = session;
     g_manager.current = session;
-    process_packet(session);
+    for (int i = 0; i < max_packets; ++i) {
+        process_packet(session);
+    }
     return session->packet_count == 0;
 }

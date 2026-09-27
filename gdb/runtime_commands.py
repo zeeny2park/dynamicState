@@ -171,8 +171,76 @@ class TransitionStateCommand(gdb.Command):
             raise gdb.GdbError("transition-state failed: {}".format(exc))
 
 
+class ExploreStateCommand(gdb.Command):
+    """Run systematic state exploration loop."""
+    def __init__(self):
+        super(ExploreStateCommand, self).__init__("explore-state", gdb.COMMAND_RUNNING)
+
+    def invoke(self, arg, from_tty):
+        opts = _options(arg)
+        steps = int(opts.get("steps", 10))
+        timeout_ms = int(opts.get("timeout_ms", 1000))
+        corpus_dir = opts.get("corpus_dir", "corpus")
+        try:
+            result = _CONTROLLER.explore(max_steps=steps, timeout_ms=timeout_ms, corpus_dir=corpus_dir)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        except Exception as exc:
+            raise gdb.GdbError("explore-state failed: {}".format(exc))
+
+
+class CorpusListCommand(gdb.Command):
+    """List states in runtime state corpus."""
+    def __init__(self):
+        super(CorpusListCommand, self).__init__("corpus-list", gdb.COMMAND_DATA)
+
+    def invoke(self, arg, from_tty):
+        from extractor.state_corpus import StateCorpus
+        opts = _options(arg)
+        corpus_dir = opts.get("corpus_dir", "corpus")
+        corpus = StateCorpus(corpus_dir)
+        print(json.dumps(corpus.list(), indent=2, ensure_ascii=False))
+
+
+class CorpusShowCommand(gdb.Command):
+    """Show details of a state in runtime state corpus."""
+    def __init__(self):
+        super(CorpusShowCommand, self).__init__("corpus-show", gdb.COMMAND_DATA)
+
+    def invoke(self, arg, from_tty):
+        from extractor.state_corpus import StateCorpus
+        opts = _options(arg)
+        pos = opts.get("_", [])
+        if not pos:
+            raise gdb.GdbError("corpus-show requires state_id (e.g. state_000001)")
+        state_id = pos[0]
+        corpus_dir = opts.get("corpus_dir", "corpus")
+        corpus = StateCorpus(corpus_dir)
+        state_data = corpus.get(state_id)
+        if state_data is None:
+            raise gdb.GdbError("state not found in corpus: {}".format(state_id))
+        print(json.dumps(state_data, indent=2, ensure_ascii=False))
+
+
+class ProposeMutationsCommand(gdb.Command):
+    """Propose mutation candidates for a snapshot."""
+    def __init__(self):
+        super(ProposeMutationsCommand, self).__init__("propose-mutations", gdb.COMMAND_DATA)
+
+    def invoke(self, arg, from_tty):
+        opts = _options(arg)
+        pos = opts.get("_", [])
+        snap_id = pos[0] if pos else None
+        snap = _CONTROLLER.snapshots.get(snap_id) if snap_id else None
+        cands = _CONTROLLER.propose_mutations(snap)
+        print(json.dumps([c.to_dict() for c in cands], indent=2, ensure_ascii=False))
+
+
 SnapshotStateCommand()
 MutateStateCommand()
 ContinueStateCommand()
 DiffStateCommand()
 TransitionStateCommand()
+ExploreStateCommand()
+CorpusListCommand()
+CorpusShowCommand()
+ProposeMutationsCommand()

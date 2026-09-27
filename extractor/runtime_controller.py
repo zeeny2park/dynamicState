@@ -54,6 +54,12 @@ class RuntimeController:
                            timeout_ms=1000, transition_id=None, output=None):
         raise NotImplementedError
 
+    def propose_mutations(self, snapshot=None):
+        raise NotImplementedError
+
+    def explore(self, max_steps=10, timeout_ms=1000, corpus_dir="corpus"):
+        raise NotImplementedError
+
 
 class GdbRuntimeController(RuntimeController):
     def __init__(self, gdb_module):
@@ -83,6 +89,14 @@ class GdbRuntimeController(RuntimeController):
             return None
         return next((f for f in obj.fields if f.name == field), None)
 
+    def propose_mutations(self, snapshot=None):
+        from .explorer import StateExplorer
+        return StateExplorer(self).propose_mutations(snapshot)
+
+    def explore(self, max_steps=10, timeout_ms=1000, corpus_dir="corpus"):
+        from .explorer import StateExplorer
+        return StateExplorer(self, corpus_dir=corpus_dir).run(max_steps=max_steps, timeout_ms=timeout_ms)
+
     def snapshot(self, snapshot_id=None, output=None, max_depth=None, include_globals=True):
         if not self._is_stopped():
             raise RuntimeError("PROCESS_NOT_STOPPED")
@@ -94,11 +108,11 @@ class GdbRuntimeController(RuntimeController):
         state = self.backend.snapshot(max_depth=max_depth, include_globals=include_globals)
         transition = None
         if self._latest and self._last_mutation:
+            tid = "T{:03d}".format(self._transition_counter) if self._transition_counter else "T001"
             transition = {
+                "origin_transition_id": tid,
                 "parent_snapshot": self._latest.snapshot_id,
                 "child_snapshot": identifier,
-                "mutation": self._last_mutation.to_dict() if hasattr(self._last_mutation, "to_dict") else self._last_mutation,
-                "execution": self._last_execution.to_dict() if (self._last_execution and hasattr(self._last_execution, "to_dict")) else {"status": "STOPPED"},
             }
         result = RuntimeSnapshot.from_runtime_state(state, identifier, transition=transition)
         performance = result.persistent.statistics.setdefault("performance", {})

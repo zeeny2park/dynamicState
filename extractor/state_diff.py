@@ -24,6 +24,13 @@ class ObjectMatcher:
     def match(self, before_object: Dict[str, Any], after_object: Dict[str, Any]) -> bool:
         raise NotImplementedError
 
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "strategy": "unknown",
+            "scope": "snapshot",
+            "confidence": "observation"
+        }
+
 
 class AddressTypeObjectMatcher(ObjectMatcher):
     """Observation identity based on (address, canonical_type).
@@ -38,6 +45,13 @@ class AddressTypeObjectMatcher(ObjectMatcher):
     def match(self, before_object: Dict[str, Any], after_object: Dict[str, Any]) -> bool:
         return self.identity_key(before_object) == self.identity_key(after_object)
 
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "strategy": "address_type",
+            "scope": "snapshot",
+            "confidence": "observation"
+        }
+
 
 class StateDiffEngine:
     def __init__(self, matcher: Optional[ObjectMatcher] = None):
@@ -50,11 +64,7 @@ class StateDiffEngine:
         fields_compared = 0
         objects_a = self._object_map(a)
         objects_b = self._object_map(b)
-        identity_meta = {
-            "strategy": "address_type",
-            "scope": "snapshot",
-            "confidence": "observation"
-        }
+        identity_meta = self.matcher.metadata()
         for key in sorted(objects_b.keys() - objects_a.keys()):
             obj = objects_b[key]
             changes.append({"kind": "object_created", "object_id": obj.get("object_id"),

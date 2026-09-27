@@ -61,12 +61,19 @@ Recursive Semantic Reachability Traversal
 - max-depth 제한 및 unreadable memory 방어
 - storage classification (`heap`, `stack`, `global`, `unknown`)
 
-### Phase 3: Runtime Snapshot + Typed Mutation + State Transition + Semantic Diff
+### Phase 3: Deterministic State Transition Engine
 - **RuntimeSnapshot (schema 0.3)**: Execution context + Persistent Object Graph + Snapshot Metadata + Transition record 원자적 캡처
 - **Typed Mutation**: DWARF-aware typed memory write (signed/unsigned integers `uint8_t`~`uint64_t`, `bool`, `float`/`double`, `enum`, `null pointer`)
 - **Execution Continue**: `continue-state` (breakpoint stop, signal, exit code, timeout interrupt 감지)
 - **Semantic Diff Engine**: Pure Python, order-independent semantic diff with `ObjectMatcher` abstraction (value changes, object created/removed, reference changes, execution frame changes, availability changes)
 - **State Transition Engine**: `StateTransition` 1급 결과물 생성 및 JSON artifact 영속화 (`transitions/T001.json`)
+
+### Phase 4: Runtime State Exploration & State Corpus Foundation
+- **State Corpus (`extractor/state_corpus.py`)**: 흥미로운 runtime state 및 transition 아티팩트를 보존하고 관리하는 영속 저장소 (`corpus/states/`, `corpus/transitions/`, `corpus/index.json`)
+- **Deterministic Semantic State Hash**: 타임스탬프, PID, 성능 지표 등 비의미론적 데이터를 배제하고 실행 컨텍스트와 도달 가능한 객체 그래프의 정규형을 기반으로 중복 상태를 감지하는 16-char 해시
+- **Interesting State Evaluation**: `NEW_STATE`, `NEW_OBJECT`, `OBJECT_REMOVED`, `REFERENCE_CHANGED`, `VALUE_CHANGE`, `CRASH`, `TIMEOUT`, `EXECUTION_CHANGE` 기준에 따른 자동 흥미도 판정
+- **Exploration Engine (`extractor/explorer.py`)**: 시드 스냅샷으로부터 규칙 기반 변이 후보(`MutationCandidate`)를 생성하고, 안전하게 전이를 실행하여 흥미로운 상태를 코퍼스에 축적하는 체계적 탐색 루프
+- **Failure Transitions**: 실제 타깃 프로세스에서의 결정론적 `CRASH` (`SIGSEGV`) 및 `TIMEOUT` 전이 아티팩트 지원
 
 ---
 
@@ -214,10 +221,51 @@ python3 -m extractor.state_diff --before snapshots/A.json --after snapshots/B.js
 
 ---
 
+## Phase 4: State Exploration Architecture
+
+```text
+                Coding Agent (Future Phase)
+                     │
+                     ▼
+             Runtime State API
+                     │
+                     ▼
+              State Explorer
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+      Snapshot    Mutation   Transition
+          │          │          │
+          └──────────┼──────────┘
+                     ▼
+                State Diff
+                     │
+                     ▼
+              Interestingness
+                     │
+                     ▼
+                State Corpus
+                     │
+                     ▼
+              Next Exploration
+```
+
+### State Corpus & State Hash
+
+- **State ID vs Snapshot ID**: `Snapshot ID`는 개별 실행 지점의 관측 아티팩트(`S001`, `S002`)이며, `State ID`는 코퍼스에 저장된 정규 상태(`state_000001`)를 나타냅니다.
+- **Deterministic State Hash**: 실행 스레드의 최상위 프레임 함수명, 도달 가능한 객체의 정규화 타입 및 주소, 정렬된 스칼라 필드값과 객체 참조를 직렬화하여 16자리 SHA-256 해시를 생성합니다. 타임스탬프, PID, 파일 경로, 성능 지표 등 비의미론적 데이터는 해시에서 엄격히 제외되어 중복 상태를 정확하게 식별하고 deduplication을 수행합니다.
+
+### Phase Distinction
+
+- **Phase 3**: *"Can I execute and observe one deterministic state transition?"* (단일 결정론적 상태 전이 실행 및 관측)
+- **Phase 4**: *"Can the runtime engine systematically discover new states without a human specifying every test case?"* (사람이 모든 테스트 케이스를 명시하지 않아도 런타임 엔진이 체계적으로 새로운 상태 공간을 발견하는 기반 구축)
+
+---
+
 ## Testing
 
 ```bash
-# 1. Unit Tests (MemoryMaps, ObjectGraph, Serializer, Snapshot, TypeResolver, StateDiff, Mutation)
+# 1. Unit Tests (43 unit tests across all modules)
 python3 -m unittest discover -s tests -v
 
 # 2. Phase 1 & 2 GDB Integration Test
@@ -229,19 +277,26 @@ bash tests/integration_state_transition.sh
 # 4. Mutation Validation Integration Test (10 Mutation Type & Error Validation Scenarios)
 bash tests/integration_mutation_validation.sh
 
-# 5. Phase 3 종합 Integration Test
+# 5. Transition Failure Integration Test (Real Crash [SIGSEGV] and Timeout Transitions)
+bash tests/integration_transition_failure.sh
+
+# 6. Exploration Integration Test (Seed -> Propose -> Transitions -> Corpus -> Deduplication)
+bash tests/integration_exploration.sh
+
+# 7. Phase 3 종합 Integration Test
 bash tests/integration_phase3.sh
 ```
 
 ---
 
-## Phase 4 Boundary & Candidates
+## Boundaries & Limitations (Not Yet Implemented)
 
-Phase 3의 책임은 **결정론적 Runtime State Transition Engine** 구축이며, autonomous exploration은 Phase 4에서 진행합니다.
-
-### Phase 4 Candidates
-- Autonomous LLM Coding Agent integration (`observe`, `mutate`, `continue`, `diff`, `execute_transition`)
-- Coverage-guided mutation strategy
-- State corpus management and loop exploration
-- Richer STL container and smart pointer traversals
-- Portable TLS discovery
+본 Phase는 런타임 탐색 기반을 구축하는 단계이며, 다음 기능은 의도적으로 제외되어 있으며 향후 Phase 대상입니다:
+- Autonomous LLM Coding Agent 의사결정 루프
+- Edge / Branch Code Coverage 수집 및 피드백
+- Automatic Invariant Inference (불변식 자동 추론)
+- Coverage-guided mutation prioritization
+- Allocation-aware object lifetime identity (malloc/free hook)
+- Frida / DynamoRIO 동적 바이너리 계측 백엔드
+- 분산 타깃 탐색 및 임의 바이트 쓰기
+- 자동 process restart loop (Safety 원칙에 따라 금지)
