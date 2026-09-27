@@ -1,5 +1,9 @@
 # Runtime State Explorer — Branch-safe State Transition & Exploration Engine
 
+> [!NOTE]
+> **Status: `PHASE_4.1_COMPLETE`** — Runtime State Exploration Validation & Hardening  
+> Verified with 65 Unit Tests and 9 GDB E2E Integration Test Suites.
+
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
 ---
@@ -280,6 +284,33 @@ gdb -q ./sample
 ```gdb
 (gdb) corpus-list --corpus-dir corpus
 (gdb) corpus-show state_000001 --corpus-dir corpus
+```
+
+### 3. Programmatic Python API (Agent & Script Usage)
+
+상위 계층(예: 자율 탐색 스크립트 또는 향후 연동될 Coding Agent)은 `StateExplorer` API를 직접 호출하여 런타임 상태 공간을 자율적으로 탐색할 수 있습니다:
+
+```python
+import runtime_commands
+from extractor.state_corpus import StateCorpus
+from extractor.explorer import StateExplorer
+
+# 1. 런타임 컨트롤러 및 코퍼스 초기화
+controller = runtime_commands._CONTROLLER
+corpus = StateCorpus("corpus")
+explorer = StateExplorer(controller, corpus, "corpus")
+
+# 2. 초기 런타임 상태 관측 및 시드 상태 등록
+seed_state_id = explorer.seed()
+
+# 3. 브랜치 안전 자율 상태 공간 탐색 실행
+# (부모 복원 -> 변이 후보 실행 -> 자식 스냅샷 -> 해시 계산 -> 코퍼스 등록이 완전 자동화됨)
+result = explorer.run(max_steps=10, timeout_ms=1000)
+
+print("Exploration ID:", result["exploration_id"])
+print("New states found:", result["summary"]["new_states"])
+print("Crashes detected:", result["summary"]["crashes"])
+print("Timeouts detected:", result["summary"]["timeouts"])
 ```
 
 ---
