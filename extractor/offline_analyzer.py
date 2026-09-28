@@ -67,7 +67,7 @@ class SnapshotMemoryReader:
 
         # Determine target endianness authoritatively
         # Precedence: 1. RuntimeModule.endianness, 2. raw_snapshot.endianness, 3. None (UNKNOWN)
-        main_mod = next((m for m in self.modules if m.is_main_executable), self.modules[0] if self.modules else None)
+        main_mod = next((m for m in self.modules if m.is_main_executable), None)
         raw_endian = None
         if main_mod and main_mod.endianness and main_mod.endianness.lower() in ("little", "big"):
             raw_endian = main_mod.endianness.lower()
@@ -372,7 +372,7 @@ class OfflineMemoryAnalyzer:
         else:
             modules = discover_modules(raw_snap.pid, raw_snap.maps, raw_snap.binary)
 
-        main_module = next((m for m in modules if m.is_main_executable), modules[0] if modules else None)
+        main_module = next((m for m in modules if m.is_main_executable), None)
 
         # 3. Resolve and verify debug artifact
         if debug_artifact_provider:

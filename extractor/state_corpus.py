@@ -167,6 +167,18 @@ class StateCorpus:
         with open(s_path, encoding="utf-8") as f:
             return json.load(f)
 
+    def get_transition(self, transition_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve transition artifact for transition_id."""
+        t_path = os.path.join(self.transitions_dir, "{}.json".format(transition_id))
+        if not os.path.isfile(t_path):
+            return None
+        with open(t_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def list_transitions(self) -> List[str]:
+        """Return list of all transition IDs in corpus."""
+        return list(self.transitions)
+
     def get_metadata(self, state_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve metadata for state_id."""
         return self.states.get(state_id)

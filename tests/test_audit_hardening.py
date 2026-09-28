@@ -863,6 +863,42 @@ CORRUPT_LINE_WITHOUT_HYPHEN_OR_VALID_HEX
                             self.assertFalse(snap.consistency.get("mapping_race_detected", False))
                             self.assertEqual(snap.status, "COMPLETE")
 
+    def test_audit_no_fallback_to_first_module_when_main_missing(self):
+        """AUDIT-F5: Verify no silent fallback to modules[0] when is_main_executable is not set."""
+        mod_shlib = RuntimeModule(
+            module_id="mod_lib",
+            path="/usr/lib/libfoo.so",
+            runtime_base=0x7fff0000,
+            runtime_end=0x7fff2000,
+            load_bias=0x7fff0000,
+            build_id="LIBFOO_BUILD",
+            architecture="x86_64",
+            endianness="big",  # shlib has big endianness
+            elf_class="ELF64",
+            is_main_executable=False,  # NOT main executable!
+            load_bias_status="RESOLVED",
+        )
+        raw_snap = RawMemorySnapshot(
+            snapshot_id="SNAP_NO_MAIN_MOD",
+            pid=8888,
+            binary="/app/target",
+            timestamp_ns=1000,
+            output_dir=self.tmp_dir,
+            regions=[],
+            maps=[],
+            modules=[mod_shlib.to_dict()],
+            endianness="UNKNOWN",
+        )
+        # SnapshotMemoryReader must NOT use mod_shlib's endianness as target endianness
+        reader = SnapshotMemoryReader(raw_snap)
+        self.assertIsNone(reader.endianness)
+        self.assertIsNone(reader.ptr_size)
+
+        # OfflineMemoryAnalyzer.analyze must not treat mod_shlib as main_module
+        analyzer = OfflineMemoryAnalyzer()
+        with self.assertRaises(FileNotFoundError):
+            analyzer.analyze(raw_snap)
+
 
 if __name__ == "__main__":
     unittest.main()

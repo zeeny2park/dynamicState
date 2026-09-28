@@ -1,8 +1,8 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `PHASE_5_2_PRODUCTION_OBSERVATION_HARDENING_COMPLETE`** — Production-grade Low-Impact Observation Hardening  
-> Verified with 150 Unit Tests and 14 GDB/process_vm_readv Integration Test Suites.
+> **Status: `DYNAMICSTATE_WEB_UI_MVP_PASS`** — Runtime State Explorer Web UI MVP Complete  
+> Verified with 195 Unit Tests, Web API Security Suite, and 24-step End-to-End Acceptance Scenario.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
@@ -91,6 +91,8 @@ Recursive Semantic Reachability Traversal
   (프로덕션/실시간 애플리케이션을 위한 무중단 원시 메모리 캡처 및 사후 DWARF 오프라인 의미 분석: Linux `process_vm_readv()` 기반 고속 복사, `RawMemorySnapshot` 디스크 영속 아티팩트, 부분 일관성(`NON_ATOMIC`) 모델, `OfflineMemoryAnalyzer` 의미론적 객체 그래프 복원, CLI 도구(`capture-memory`, `analyze-memory`), LOW_IMPACT 모드 엄격한 관측 전용 경계 보장)
 - **Phase 5.2 (Complete)**: *"Production-grade Low-Impact Observation Hardening"*  
   (ELF `PT_LOAD` 세그먼트 기반의 정확한 `load_bias` 계산, `RuntimeModule` 모델 및 `/proc/<pid>/maps` 모듈 검색, Build ID / `.gnu_debuglink` CRC 디버그 아티팩트 provenance 검증, `DebugArtifactProvider` 및 `DebugInfoProvider` 추상화, `ObservationBackend` 명시적 모델(`GDBObservationBackend` vs `LowImpactObservationBackend`), 오프라인 스냅샷 내 가짜 스레드/프레임 제거 및 실행 상태 `availability="UNAVAILABLE"` 명시화, 프로세스 종료(`ESRCH`) graceful handling, CLI 서브커맨드 `list-modules` 및 `runtime-info` 지원)
+- **Web UI MVP (Complete)**: *"Runtime State Explorer for Human Validation"*  
+  (인간 엔지니어가 런타임 상태, DWARF 객체 그래프, 결정론적 변이 후보, 상태 전이 및 상태 해시, 상태 전이 그래프(SVG), 스냅샷 diff, 자율 탐색 진행 상황을 시각적으로 검증할 수 있는 경량 단일 페이지 웹 UI. 외부 pip 의존성 없는 Python 표준 라이브러리 기반 HTTP 서버, AgentRuntime 1:1 래핑 Web API 어댑터, 임의 GDB/Shell/메모리 쓰기 차단 안전 경계, LOW_IMPACT 관측 전용 표시 및 변이 차단, UNKNOWN 메타데이터 정직성 보장)
 
 ---
 
@@ -773,13 +775,120 @@ caps = controller.get_capabilities()
 
 ---
 
-## Testing
+## Web UI MVP — Runtime State Explorer
 
-모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트가 완전히 통과합니다:
+dynamicState의 런타임 상태 및 상태 공간 탐색 결과를 인간 엔지니어가 직관적으로 검증하고 상호작용할 수 있는 웹 기반 탐색기(Runtime State Explorer)를 제공합니다.
+
+> [!IMPORTANT]
+> **Visualization & Interaction Layer Contract**:
+> - Web UI는 `AgentRuntime`의 시각화 및 상호작용 레이어일 뿐이며, 제2의 런타임 구현체가 아닙니다.
+> - 파일 시스템에 영속화된 JSON 아티팩트(`corpus/`, `snapshots/`)가 시스템의 유일한 Canonical State입니다.
+> - 별도의 DB(PostgreSQL, SQLite, Redis 등)를 도입하지 않고 순수 표준 라이브러리(`http.server.ThreadingHTTPServer`)로 동작합니다.
+> - 외부 pip 패키지 설치 없이 즉시 실행됩니다 (`Zero External Dependencies`).
+
+### Architecture
+
+```text
+       Web UI (Browser)
+             │
+             │ HTTP / JSON REST API
+             ▼
+     WebApiAdapter (extractor/web/server.py)
+             │
+             │ Strict Semantic ARP Dispatch
+             ▼
+        AgentRuntime
+             │
+             ├── Snapshot & State Corpus (corpus/)
+             ├── Object Graph Inspection
+             ├── Candidate Ranking
+             ├── Typed Mutation & State Restorer (Checkpoint/Restore)
+             ├── Transition Analyzer & State Diff Engine
+             ├── Autonomous StateExplorer Loop
+             └── Platform Provenance & Capabilities
+                     │
+             ┌───────┴────────┐
+             ▼                ▼
+     RuntimeController   MemoryCapture (LOW_IMPACT)
+             │                │
+            GDB          process_vm_readv
+```
+
+### Supported Views
+
+1. **Runtime & Provenance Overview**: 실행 상태(`STOPPED`/`RUNNING`), 관측 모드(`CONSISTENT`/`LOW_IMPACT`), PID, 실행 파일 및 디버그 이미지 검증 상태, 아키텍처/엔디안/ELF 클래스, 로드된 모듈 목록(Base/End/Load Bias/Build ID) 및 탐색 안전 한계.
+2. **State Graph & Explorer**: 전체 상태 코퍼스 목록, 단축 상태 해시(Monospace), 계층형 SVG 상태 전이 그래프(상태 노드, 변이 필드/값 방향성 화살표, STOPPED/CRASHED/TIMEOUT 색상 구분).
+3. **Object Graph & Inspector**: 실행 루트로부터 도달 가능한 의미론적 객체 트리/그래프, 대규모 객체 탐색 시 브라우저 프리징 방지를 위한 Truncation Guard(100개 초과 시 알림), 필드별 타입·값·포인터 참조 링크·가변성(`mutable`/`read_only`) 확인.
+4. **Typed Mutation & Transition Execution**: 랭킹된 변이 후보군(현재값 → 제안값, 생성 사유) 조회, `[Execute]` 버튼을 통한 안전한 전이 실행, 실행 결과(자식 상태 ID, 상태 해시, 의미론적 변경 필드) 실시간 확인.
+5. **Semantic State Diff**: 임의의 두 스냅샷(부모-자식) 간 값 변경, 참조 변경, 객체 생성/삭제 요약 및 필드별 변경 전후 상세 테이블.
+6. **Autonomous Explore**: `max_steps`, `timeout_ms`, `max_states` 파라미터를 설정하여 `StateExplorer` 자율 루프 실행 및 실시간 결과 메트릭(스텝수, 신규 상태수, 전이수, 크래시수, 타임아웃수) 확인.
+7. **Raw JSON Artifact Viewer**: 모든 화면에서 `[View JSON]` 모달을 통해 표준 JSON 스키마 아티팩트 직접 열람 및 클립보드 복사.
+
+### Startup & CLI
 
 ```bash
-# 1. 단위 테스트 (182 unit tests across all modules)
+# 1. Python 모듈로 실행 (기본 127.0.0.1:8000)
+python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
+
+# 2. 전용 CLI 스크립트로 실행
+./bin/dynamic-state-ui --host 127.0.0.1 --port 8000 --corpus corpus
+```
+
+서버 시작 시 다음과 같이 바인딩 주소가 출력됩니다:
+```text
+========================================
+ dynamicState Web UI
+ http://127.0.0.1:8000
+ Mode: CONSISTENT
+ Corpus: /path/to/corpus
+ Press Ctrl+C to terminate.
+========================================
+```
+
+### Web API Endpoints
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/api/health` | 서버 상태, ARP 버전, 현재 관측 모드 반환 |
+| `GET` | `/api/capabilities` | 런타임 기능 및 안전 한계(limits) 반환 |
+| `GET` | `/api/runtime` | 런타임 상태, PID, 아키텍처/엔디안/ELF, 모듈 통계 반환 |
+| `GET` | `/api/modules` | 로드된 런타임 모듈 목록 (`?snapshot_id=`) |
+| `GET` | `/api/provenance` | 스냅샷의 빌드 및 디버그 아티팩트 provenance |
+| `GET` | `/api/states` | 코퍼스에 저장된 모든 상태 요약 목록 |
+| `GET` | `/api/states/{state_id}` | 특정 상태의 상세 의미론적 컨텍스트 |
+| `GET` | `/api/states/{state_id}/objects` | 특정 상태의 도달 가능한 객체 목록 |
+| `GET` | `/api/objects/{object_id}` | 특정 객체의 상세 정보 및 필드 목록 |
+| `GET` | `/api/objects/{object_id}/fields` | 객체 내 필드 정보 (`?field=`) |
+| `GET` | `/api/transitions` | 기록된 모든 상태 전이 목록 |
+| `GET` | `/api/transitions/{transition_id}` | 상태 전이 상세 사실(Facts) 및 증거(Evidence) |
+| `GET` | `/api/snapshots/{id}/diff/{other_id}` | 두 스냅샷 간 의미론적 Diff 계산 |
+| `GET` | `/api/mutation-candidates` | 변이 후보 목록 (`?object_id=&field=`) |
+| `GET` | `/api/state-graph` | 시각화용 노드 및 엣지 그래프 데이터 |
+| `POST` | `/api/observe` | 프로세스 의미론적 상태 관측 (`mode`, `pid`, `debug_image`) |
+| `POST` | `/api/snapshot` | 새 런타임 스냅샷 캡처 |
+| `POST` | `/api/mutation` | 유효 변이 후보 실행 및 자식 상태 생성 |
+| `POST` | `/api/checkpoint` | 프로세스 브랜치 체크포인트 생성 |
+| `POST` | `/api/restore` | 프로세스 체크포인트 복원 |
+| `POST` | `/api/explore` | 자율 상태 탐색 루프 실행 |
+
+### Safety Boundaries & Metadata Honesty
+
+- **임의 명령 및 메모리 쓰기 차단**: `/api/gdb-command`, `/api/write-memory`, `/api/eval-expression`, `/api/arbitrary-command` 등 GDB/Shell 우회 엔드포인트는 존재하지 않으며 호출 시 즉시 403 Forbidden으로 차단됩니다.
+- **LOW_IMPACT 모드 엄격 제한**: `LOW_IMPACT` 관측 시 UI 상단에 경고 배너가 표시되며, 변이 후보 조회 및 변이 실행, 체크포인트 요청은 `CAPABILITY_UNSUPPORTED` 에러와 함께 비활성화됩니다.
+- **메타데이터 정직성(Metadata Honesty)**: 타깃 아키텍처, 엔디안, ELF 클래스가 검증되지 않은 경우 임의로 "little"이나 64비트로 추측하지 않고 `UNKNOWN`으로 정직하게 표시합니다.
+
+---
+
+## Testing
+
+모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
+
+```bash
+# 1. 단위 테스트 (195 unit tests across all modules, including Web API suite)
 python3 -m unittest discover -s tests -v
+
+# 2. Web UI MVP End-to-End 수락 시나리오 (24개 스텝 전수 검증)
+bash tests/manual_acceptance_web_ui.sh
 
 # 2. Phase 1 & 2 GDB 기본 통합 테스트
 bash tests/integration_gdb.sh
