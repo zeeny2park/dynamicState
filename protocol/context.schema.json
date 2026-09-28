@@ -19,13 +19,15 @@
     },
     "execution": {
       "type": "object",
-      "required": ["thread_id", "function"],
+      "required": ["function"],
       "properties": {
-        "thread_id": { "type": ["integer", "string"] },
+        "thread_id": { "type": ["integer", "string", "null"] },
         "function": { "type": ["string", "null"] },
-        "frame_level": { "type": "integer" },
+        "frame_level": { "type": ["integer", "null"] },
         "location": { "type": ["string", "null"] },
-        "pc": { "type": ["string", "null"] }
+        "pc": { "type": ["string", "null"] },
+        "availability": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] }
       }
     },
     "objects": {

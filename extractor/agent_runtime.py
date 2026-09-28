@@ -375,6 +375,8 @@ class AgentRuntime:
     def list_mutation_candidates(self, snapshot_id: Optional[str] = None) -> AgentActionResult:
         """Discover and rank type-safe mutation candidates for a snapshot."""
         t0 = time.monotonic()
+        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
+            return self._error("CAPABILITY_UNSUPPORTED", "Mutation candidates are not supported in LOW_IMPACT observation mode", "LIST_MUTATION_CANDIDATES", t0)
         snap, err = self._resolve_snapshot(snapshot_id)
         if err:
             return self._error(err[0], err[1], "LIST_MUTATION_CANDIDATES", t0)

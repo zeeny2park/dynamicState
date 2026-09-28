@@ -95,7 +95,10 @@ for s_name in sym_names:
         if not sym:
             sym = gdb.lookup_static_symbol(s_name)
         if sym:
-            addr = int(gdb.parse_and_eval('&' + s_name))
+            try:
+                addr = int(sym.value().address)
+            except Exception:
+                addr = int(gdb.parse_and_eval('&' + s_name))
             discovered_symbols.append({{
                 'name': s_name,
                 'type': str(sym.type),
@@ -156,7 +159,7 @@ print('__DWARF_JSON_START__')
 print(json.dumps({{'symbols': discovered_symbols, 'types': types_out}}))
 print('__DWARF_JSON_END__')
 """
-        cmd = ["gdb", "-q", "-nx", "-batch", "-ex", f"file {abs_path}", "-ex", f"python\n{py_script}"]
+        cmd = ["gdb", "-q", "-nx", "-batch", abs_path, "-ex", f"python\n{py_script}"]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             raise RuntimeError(f"GDB offline symbol extraction failed: {proc.stderr}")

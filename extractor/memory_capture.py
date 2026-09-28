@@ -60,6 +60,26 @@ class MemoryCapture:
     def is_supported(self) -> bool:
         return self._has_process_vm_readv
 
+    @staticmethod
+    def get_process_identity(pid: int) -> Optional[Tuple[int, int, int]]:
+        """Returns (pid, starttime, proc_dir_inode) or None if process is not running."""
+        try:
+            proc_dir = f"/proc/{pid}"
+            st = os.stat(proc_dir)
+            inode = st.st_ino
+            with open(os.path.join(proc_dir, "stat"), "r") as f:
+                stat_content = f.read().strip()
+            rparen = stat_content.rfind(")")
+            if rparen == -1:
+                return None
+            parts = stat_content[rparen + 1:].strip().split()
+            if len(parts) < 20:
+                return None
+            starttime = int(parts[19])
+            return (pid, starttime, inode)
+        except Exception:
+            return None
+
     def capture(
         self,
         pid: int,
@@ -90,6 +110,10 @@ class MemoryCapture:
         except PermissionError:
             raise PermissionError(f"Permission denied inspecting PID {pid} (EPERM)")
 
+        proc_identity = self.get_process_identity(pid)
+        if proc_identity is None:
+            raise ProcessLookupError(f"Process with PID {pid} is not running (ESRCH)")
+
         # 2. Binary path detection
         binary_path = ""
         exe_link = os.path.join(proc_dir, "exe")
@@ -110,6 +134,10 @@ class MemoryCapture:
         all_regions = map_provider.get_regions()
         modules = discover_modules(pid, all_regions, main_binary=binary_path)
 
+        # Verify process has not exited or had PID reused during map discovery
+        curr_identity = self.get_process_identity(pid)
+        process_exited = (curr_identity != proc_identity)
+
         selected_regions = filter_regions(
             all_regions,
             policy=policy,
@@ -125,12 +153,29 @@ class MemoryCapture:
         bytes_captured = 0
         partial_reads = 0
         failed_reads = 0
-        process_exited = False
 
         fn_vm_readv = self._libc.process_vm_readv
         deadline_ns = t_start_ns + (timeout_ms * 1_000_000)
 
         for idx, region in enumerate(selected_regions, start=1):
+            if process_exited:
+                failed_reads += 1
+                captured_regions.append(CapturedRegion(
+                    region_id="R{:06d}".format(idx),
+                    start=region.start,
+                    end=region.end,
+                    size=region.size,
+                    permissions=region.permissions,
+                    category=region.category,
+                    pathname=region.pathname,
+                    requested=region.size,
+                    captured=0,
+                    status="FAILED",
+                    filename=None,
+                    error="ESRCH_PROCESS_EXITED"
+                ))
+                break
+
             if time.monotonic_ns() > deadline_ns:
                 # Timeout limit reached
                 break
@@ -155,7 +200,19 @@ class MemoryCapture:
 
             if nread < 0:
                 err = ctypes.get_errno()
-                if err == 3:  # ESRCH: Target process terminated during capture
+                if err == 4:  # EINTR: interrupted system call, retry once
+                    nread = fn_vm_readv(
+                        pid,
+                        ctypes.byref(l_iov),
+                        1,
+                        ctypes.byref(r_iov),
+                        1,
+                        0
+                    )
+                    if nread < 0:
+                        err = ctypes.get_errno()
+
+                if err == 3 or self.get_process_identity(pid) != proc_identity:  # ESRCH: Target process terminated
                     process_exited = True
                     failed_reads += 1
                     captured_regions.append(CapturedRegion(
@@ -238,6 +295,10 @@ class MemoryCapture:
 
         t_end_ns = time.monotonic_ns()
         duration_us = (t_end_ns - t_start_ns) / 1000.0
+
+        # Post-loop verification: ensure PID was not recycled during the capture loop
+        if not process_exited and self.get_process_identity(pid) != proc_identity:
+            process_exited = True
 
         # Determine overall status
         if process_exited:

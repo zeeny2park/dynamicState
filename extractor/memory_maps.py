@@ -86,42 +86,45 @@ class MemoryMapProvider:
         try:
             with open(maps_path, encoding="utf-8") as maps:
                 for line in maps:
-                    parts = line.rstrip("\n").split(None, 5)
-                    if len(parts) < 5:
-                        continue
-                    start_text, end_text = parts[0].split("-", 1)
-                    start = int(start_text, 16)
-                    end = int(end_text, 16)
-                    perms = parts[1]
                     try:
-                        offset = int(parts[2], 16)
-                    except (ValueError, TypeError):
-                        offset = 0
-                    device = parts[3]
-                    try:
-                        inode = int(parts[4])
-                    except (ValueError, TypeError):
-                        inode = 0
-                    pathname = parts[5] if len(parts) == 6 else ""
-                    category = self._kind(perms, pathname)
+                        parts = line.rstrip("\n").split(None, 5)
+                        if len(parts) < 5:
+                            continue
+                        start_text, end_text = parts[0].split("-", 1)
+                        start = int(start_text, 16)
+                        end = int(end_text, 16)
+                        perms = parts[1]
+                        try:
+                            offset = int(parts[2], 16)
+                        except (ValueError, TypeError):
+                            offset = 0
+                        device = parts[3]
+                        try:
+                            inode = int(parts[4])
+                        except (ValueError, TypeError):
+                            inode = 0
+                        pathname = parts[5] if len(parts) == 6 else ""
+                        category = self._kind(perms, pathname)
 
-                    regions.append(MemoryRegion(
-                        start=start,
-                        end=end,
-                        permissions=perms,
-                        path=pathname,
-                        kind=category,
-                        size=end - start,
-                        offset=offset,
-                        device=device,
-                        inode=inode,
-                        pathname=pathname,
-                        readable=("r" in perms),
-                        writable=("w" in perms),
-                        executable=("x" in perms),
-                        category=category
-                    ))
-        except (OSError, ValueError):
+                        regions.append(MemoryRegion(
+                            start=start,
+                            end=end,
+                            permissions=perms,
+                            path=pathname,
+                            kind=category,
+                            size=end - start,
+                            offset=offset,
+                            device=device,
+                            inode=inode,
+                            pathname=pathname,
+                            readable=("r" in perms),
+                            writable=("w" in perms),
+                            executable=("x" in perms),
+                            category=category
+                        ))
+                    except (ValueError, IndexError):
+                        continue
+        except OSError:
             pass
         self._regions = regions
         return regions

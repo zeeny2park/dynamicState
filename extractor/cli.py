@@ -91,6 +91,8 @@ def main():
                 snapshot_id=args.snapshot_id
             )
             print(json.dumps(raw_snap.to_metadata(), indent=2))
+            if raw_snap.status in ("FAILED", "PROCESS_EXITED"):
+                sys.exit(1)
             sys.exit(0)
         except Exception as e:
             print(f"ERROR: Memory capture failed: {e}", file=sys.stderr)
@@ -177,6 +179,9 @@ def main():
                     max_bytes=args.max_bytes,
                     timeout_ms=args.timeout_ms
                 )
+                if raw_snap.status in ("FAILED", "PROCESS_EXITED"):
+                    print(f"ERROR: Extraction failed: memory capture returned status '{raw_snap.status}'", file=sys.stderr)
+                    sys.exit(1)
                 analyzer = OfflineMemoryAnalyzer()
                 semantic_snap = analyzer.analyze(
                     memory_snapshot=raw_snap,

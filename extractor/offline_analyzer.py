@@ -121,7 +121,10 @@ class SnapshotMemoryReader:
 
         data = self._cache[fpath]
         offset = address - start
-        return data[offset:offset + size]
+        res = data[offset:offset + size]
+        if len(res) < size:
+            return None
+        return res
 
     def read_int(self, address: int, size: int = 4, signed: bool = False, endian: str = "little") -> Optional[int]:
         raw = self.read(address, size)
@@ -558,14 +561,19 @@ class OfflineMemoryAnalyzer:
             finally:
                 active_identities.discard(identity)
 
-            # Compute object-level availability based on field readability
+            # Compute object-level availability based on field readability and struct size readability
             unavail_count = sum(1 for f in obj.fields if f.availability in ("unavailable", "unknown") or f.error is not None)
-            if not obj.fields or unavail_count == 0:
-                obj.availability = "COMPLETE"
-            elif unavail_count == len(obj.fields):
+            struct_size = type_def.get("sizeof", 0) if type_def else 0
+            is_full_struct_readable = reader.is_readable(address_num, struct_size) if struct_size > 0 else reader.is_readable(address_num, 1)
+
+            if not obj.fields:
+                obj.availability = "COMPLETE" if is_full_struct_readable else "UNAVAILABLE"
+            elif unavail_count == len(obj.fields) or not reader.is_readable(address_num, 1):
                 obj.availability = "UNAVAILABLE"
-            else:
+            elif unavail_count > 0 or not is_full_struct_readable:
                 obj.availability = "PARTIAL"
+            else:
+                obj.availability = "COMPLETE"
 
             return obj_id
 
@@ -651,6 +659,8 @@ class OfflineMemoryAnalyzer:
                 "architecture": raw_snap.architecture,
                 "endianness": raw_snap.endianness,
                 "stripped": True,
+                "build_id": main_module.build_id if main_module else None,
+                "build_id_status": main_module.build_id_status if main_module else "NOT_AVAILABLE",
             },
             "debug_image": {
                 "path": dbg_path,

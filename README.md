@@ -778,7 +778,7 @@ caps = controller.get_capabilities()
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 테스트 (150 unit tests across all modules)
+# 1. 단위 테스트 (171 unit tests across all modules)
 python3 -m unittest discover -s tests -v
 
 # 2. Phase 1 & 2 GDB 기본 통합 테스트

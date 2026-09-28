@@ -8,6 +8,7 @@ import unittest
 
 from extractor.debug_image import DebugImageProvider
 from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+from extractor.modules import RuntimeModule
 from extractor.offline_analyzer import OfflineMemoryAnalyzer
 from extractor.snapshot import RuntimeSnapshot
 from extractor.state_hash import compute_state_hash
@@ -89,6 +90,20 @@ class OfflineMemoryAnalyzerTests(unittest.TestCase):
             filename="memory/region_heap.bin"
         )
 
+        mod_main = RuntimeModule(
+            module_id="main",
+            path="/tmp/sample",
+            runtime_base=0x20000,
+            runtime_end=0x21000,
+            load_bias=0x20000,
+            build_id="TEST_BUILD_ID",
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            is_main_executable=True,
+            load_bias_status="RESOLVED",
+        )
+
         self.raw_snap = RawMemorySnapshot(
             snapshot_id="M_OFFLINE_TEST",
             pid=9876,
@@ -99,7 +114,8 @@ class OfflineMemoryAnalyzerTests(unittest.TestCase):
             maps=[
                 {"start_addr": 0x20000, "end_addr": 0x21000, "category": "global", "pathname": "/tmp/sample"},
                 {"start_addr": 0x5000, "end_addr": 0x7000, "category": "heap", "pathname": "[heap]"},
-            ]
+            ],
+            modules=[mod_main.to_dict()]
         )
 
         # Synthetic DWARF symbol & type context

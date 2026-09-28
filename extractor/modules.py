@@ -24,19 +24,23 @@ class RuntimeModule:
     path: str
     runtime_base: int
     runtime_end: int
-    load_bias: int
+    load_bias: Optional[int]
     build_id: Optional[str]
     architecture: str
     endianness: str
     elf_class: str
     is_main_executable: bool = False
     build_id_status: str = "NOT_AVAILABLE"      # "VERIFIED", "NOT_AVAILABLE", "MISMATCH", "UNREADABLE"
+    load_bias_status: str = "RESOLVED"          # "RESOLVED", "UNRESOLVED"
     debuglink: Optional[Dict[str, Any]] = None  # {"filename": str, "crc": Optional[int]}
     elf_type: Optional[str] = None              # "ET_EXEC", "ET_DYN", etc.
     entry_point: Optional[int] = None
     pt_loads: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
+        load_bias_str = None
+        if self.load_bias is not None:
+            load_bias_str = "0x{:x}".format(self.load_bias) if self.load_bias >= 0 else "-0x{:x}".format(abs(self.load_bias))
         return {
             "module_id": self.module_id,
             "name": os.path.basename(self.path) if self.path else self.module_id,
@@ -45,8 +49,9 @@ class RuntimeModule:
             "runtime_end": "0x{:x}".format(self.runtime_end),
             "runtime_base_addr": self.runtime_base,
             "runtime_end_addr": self.runtime_end,
-            "load_bias": "0x{:x}".format(self.load_bias) if self.load_bias >= 0 else "-0x{:x}".format(abs(self.load_bias)),
+            "load_bias": load_bias_str,
             "load_bias_val": self.load_bias,
+            "load_bias_status": self.load_bias_status,
             "build_id": self.build_id,
             "build_id_status": self.build_id_status,
             "architecture": self.architecture,
@@ -65,16 +70,22 @@ class RuntimeModule:
 
     def contains_elf_address(self, elf_addr: int) -> bool:
         """Check if an ELF virtual address falls within this module's mapped range."""
+        if self.load_bias_status != "RESOLVED" or self.load_bias is None:
+            return False
         runtime_addr = elf_addr + self.load_bias
         return self.contains_runtime_address(runtime_addr)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RuntimeModule":
-        def parse_hex_or_int(val: Any) -> int:
+        def parse_hex_or_int(val: Any) -> Optional[int]:
+            if val is None:
+                return None
             if isinstance(val, int):
                 return val
             if isinstance(val, str):
                 s = val.strip()
+                if not s:
+                    return None
                 if s.startswith("-"):
                     return -int(s[1:], 16 if s[1:].startswith("0x") else 10)
                 return int(s, 16 if s.startswith("0x") else 10)
@@ -82,15 +93,19 @@ class RuntimeModule:
 
         r_base = data.get("runtime_base_addr")
         if r_base is None:
-            r_base = parse_hex_or_int(data.get("runtime_base", 0))
+            r_base = parse_hex_or_int(data.get("runtime_base", 0)) or 0
 
         r_end = data.get("runtime_end_addr")
         if r_end is None:
-            r_end = parse_hex_or_int(data.get("runtime_end", 0))
+            r_end = parse_hex_or_int(data.get("runtime_end", 0)) or 0
 
         l_bias = data.get("load_bias_val")
-        if l_bias is None:
-            l_bias = parse_hex_or_int(data.get("load_bias", 0))
+        if l_bias is None and "load_bias" in data and data["load_bias"] is not None:
+            l_bias = parse_hex_or_int(data.get("load_bias"))
+
+        load_bias_status = data.get("load_bias_status")
+        if not load_bias_status:
+            load_bias_status = "RESOLVED" if l_bias is not None else "UNRESOLVED"
 
         ep_val = data.get("entry_point")
         entry_point = parse_hex_or_int(ep_val) if ep_val is not None else None
@@ -107,6 +122,7 @@ class RuntimeModule:
             elf_class=data.get("elf_class", "ELF64"),
             is_main_executable=data.get("is_main_executable", False),
             build_id_status=data.get("build_id_status", "NOT_AVAILABLE"),
+            load_bias_status=load_bias_status,
             debuglink=data.get("debuglink"),
             elf_type=data.get("elf_type"),
             entry_point=entry_point,
@@ -191,11 +207,19 @@ class ModuleAddressResolver:
     @staticmethod
     def resolve_runtime_address(module: RuntimeModule, elf_address: int) -> int:
         """Translate static ELF / DWARF symbol address to runtime memory address."""
+        if module.load_bias_status != "RESOLVED" or module.load_bias is None:
+            raise LoadBiasResolutionError(
+                f"Cannot resolve runtime address: module '{module.module_id}' has UNRESOLVED load bias."
+            )
         return elf_address + module.load_bias
 
     @staticmethod
     def resolve_elf_address(module: RuntimeModule, runtime_address: int) -> int:
         """Translate runtime memory address to static ELF / DWARF symbol address."""
+        if module.load_bias_status != "RESOLVED" or module.load_bias is None:
+            raise LoadBiasResolutionError(
+                f"Cannot resolve ELF address: module '{module.module_id}' has UNRESOLVED load bias."
+            )
         return runtime_address - module.load_bias
 
     @staticmethod
@@ -297,7 +321,8 @@ def discover_modules(
         # Attempt to inspect ELF on filesystem or via /proc/<pid>/exe
         elf_info: Optional[BinaryIdentity] = None
         build_id_status = "NOT_AVAILABLE"
-        load_bias = 0
+        load_bias: Optional[int] = None
+        load_bias_status = "UNRESOLVED"
 
         inspect_path = None
         if os.path.exists(clean_p):
@@ -317,13 +342,16 @@ def discover_modules(
 
                 # Calculate accurate load bias using PT_LOAD
                 load_bias = ModuleAddressResolver.calculate_load_bias(maps, elf_info)
+                load_bias_status = "RESOLVED"
             except Exception:
                 build_id_status = "UNREADABLE"
-                # Fallback load bias if PT_LOAD fails
-                load_bias = r_base
+                # Mark load bias as unresolved instead of silent fallback
+                load_bias = None
+                load_bias_status = "UNRESOLVED"
         else:
             build_id_status = "UNREADABLE"
-            load_bias = r_base
+            load_bias = None
+            load_bias_status = "UNRESOLVED"
 
         modules.append(RuntimeModule(
             module_id=mod_id,
@@ -337,6 +365,7 @@ def discover_modules(
             elf_class=elf_info.elf_class if elf_info else "ELF64",
             is_main_executable=is_main,
             build_id_status=build_id_status,
+            load_bias_status=load_bias_status,
             debuglink=elf_info.debuglink if elf_info else None,
             elf_type=elf_info.elf_type if elf_info else None,
             entry_point=elf_info.entry_point if elf_info else None,
