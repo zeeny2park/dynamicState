@@ -154,7 +154,11 @@ class GdbCheckpointRestorer(StateRestorer):
             else:
                 raise RuntimeError("CHECKPOINT_CREATE_FAILED: no new checkpoint ID created by GDB")
         else:
-            new_gdb_id = list(diff)[0]
+            non_zero_diff = [gid for gid in diff if gid != "0"]
+            if non_zero_diff:
+                new_gdb_id = sorted(non_zero_diff, key=lambda x: [int(p) for p in x.split(".")])[-1]
+            else:
+                new_gdb_id = list(diff)[0]
 
         cp_record = {
             "checkpoint_id": cid,
@@ -210,7 +214,13 @@ class GdbCheckpointRestorer(StateRestorer):
 
         after = set(self._list_gdb_checkpoints().keys())
         diff = after - before
-        worker_id = list(diff)[0] if diff else master_id
+        non_zero_worker_diff = [gid for gid in diff if gid != "0"]
+        if non_zero_worker_diff:
+            worker_id = sorted(non_zero_worker_diff, key=lambda x: [int(p) for p in x.split(".")])[-1]
+        elif diff:
+            worker_id = list(diff)[0]
+        else:
+            worker_id = master_id
 
         # 3. Switch to worker clone for candidate execution
         try:

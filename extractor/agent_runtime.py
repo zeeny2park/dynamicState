@@ -529,7 +529,7 @@ class AgentRuntime:
         child_state = None
         if hasattr(trans, "parent_snapshot") and trans.parent_snapshot in self.controller.snapshots:
             p_snap = self.controller.snapshots[trans.parent_snapshot]
-            parent_state = self.corpus.hash_to_state.get(compute_state_hash(p_snap))
+            parent_state, _ = self.corpus.add(p_snap)
 
         if hasattr(trans, "child_snapshot") and trans.child_snapshot and trans.child_snapshot in self.controller.snapshots:
             c_snap = self.controller.snapshots[trans.child_snapshot]
@@ -863,7 +863,13 @@ class AgentRuntime:
                 performance={"total_ms": elapsed, "agent_context_generation_ms": elapsed}
             )
         except Exception as exc:
-            return self._error("RUNTIME_ERROR", f"Offline analysis failed: {exc}", "ANALYZE_MEMORY_SNAPSHOT", t0)
+            err_msg = str(exc)
+            err_code = "RUNTIME_ERROR"
+            if "DEBUG_IMAGE_MISMATCH" in err_msg or "BUILD_ID_MISMATCH" in err_msg:
+                err_code = "DEBUG_IMAGE_MISMATCH"
+            elif "INVALID_DEBUG_IMAGE" in err_msg:
+                err_code = "INVALID_DEBUG_IMAGE"
+            return self._error(err_code, f"Offline analysis failed: {err_msg}", "ANALYZE_MEMORY_SNAPSHOT", t0)
 
     def get_memory_snapshot(self, memory_snapshot_id: str) -> AgentActionResult:
         """Inspect a raw memory snapshot manifest and metadata."""

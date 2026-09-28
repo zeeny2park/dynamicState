@@ -88,8 +88,33 @@ class WebApiAdapter:
 
             binary_path = getattr(ctrl, "binary", None)
             debug_image = getattr(ctrl, "debug_image_path", None)
-            if debug_image:
+            if hasattr(ctrl, "debug_image_provider") and ctrl.debug_image_provider:
+                debug_image = getattr(ctrl.debug_image_provider, "path", None) or debug_image
+                if getattr(ctrl.debug_image_provider, "compatibility", None) and ctrl.debug_image_provider.compatibility.compatible:
+                    debug_image_status = "COMPATIBLE"
+                else:
+                    debug_image_status = getattr(ctrl, "debug_image_status", "VERIFIED")
+            elif debug_image:
                 debug_image_status = getattr(ctrl, "debug_image_status", "VERIFIED")
+
+            if hasattr(ctrl, "runtime_info") and callable(ctrl.runtime_info):
+                try:
+                    cinfo = ctrl.runtime_info()
+                    rb = cinfo.get("runtime_binary") or {}
+                    di = cinfo.get("debug_image") or {}
+                    if not binary_path and rb.get("path"):
+                        binary_path = rb.get("path")
+                    if not debug_image and di.get("path"):
+                        debug_image = di.get("path")
+                        debug_image_status = "COMPATIBLE" if di.get("compatible") else "LOADED"
+                    if target_arch == "UNKNOWN" and rb.get("architecture"):
+                        target_arch = rb.get("architecture")
+                    if target_endian == "UNKNOWN" and rb.get("endianness"):
+                        target_endian = rb.get("endianness")
+                    if target_elf == "UNKNOWN" and rb.get("elf_class"):
+                        target_elf = rb.get("elf_class")
+                except Exception:
+                    pass
 
         # Discover target metadata from discovered modules or snapshots without silent guessing
         modules = []
@@ -255,7 +280,8 @@ class WebApiAdapter:
                     "parent_snapshot": trans_inner.get("parent_snapshot"),
                     "child_snapshot": trans_inner.get("child_snapshot"),
                     "mutation_field": mut.get("field") or mut.get("field_path"),
-                    "mutation_value": mut.get("value"),
+                    "mutation_value": mut.get("after") if mut.get("after") is not None else mut.get("value"),
+                    "mutation_before": mut.get("before") if mut.get("before") is not None else mut.get("old_value"),
                     "status": exec_info.get("status", "STOPPED"),
                 })
         return {"success": True, "data": transitions}
@@ -384,8 +410,12 @@ class WebApiAdapter:
                 "from": from_state or p_snap or "UNKNOWN",
                 "to": to_state or c_snap or "UNKNOWN",
                 "field": mut.get("field") or mut.get("field_path", "unknown"),
-                "old_value": mut.get("old_value"),
-                "new_value": mut.get("value") if mut.get("value") is not None else mut.get("proposed_value"),
+                "old_value": mut.get("old_value") if mut.get("old_value") is not None else mut.get("before"),
+                "new_value": mut.get("new_value") if mut.get("new_value") is not None else (
+                    mut.get("after") if mut.get("after") is not None else (
+                        mut.get("value") if mut.get("value") is not None else mut.get("proposed_value")
+                    )
+                ),
                 "status": exec_status,
                 "signal": exec_info.get("signal"),
             })
@@ -769,9 +799,8 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             super().log_message(format, *args)
 
 
-class DynamicStateWebServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """Multi-threaded HTTP Server for dynamicState Web UI."""
-    daemon_threads = True
+class DynamicStateWebServer(http.server.HTTPServer):
+    """HTTP Server for dynamicState Web UI."""
 
     def __init__(self, server_address: Tuple[str, int], runtime: AgentRuntime, static_dir: str):
         super().__init__(server_address, DynamicStateRequestHandler)

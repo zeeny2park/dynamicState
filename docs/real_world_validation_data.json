@@ -1,0 +1,923 @@
+{
+  "metadata": {
+    "build_id": "afd7c5d4e752e20b99ecbc06e1400d4d319660e7",
+    "elf_class": "ELF64",
+    "endianness": "little",
+    "architecture": "aarch64",
+    "app_bin": "/tmp/dynstate_val_build_0_veltqz/sample_prod",
+    "app_stripped": "/tmp/dynstate_val_build_0_veltqz/sample_prod_stripped",
+    "app_dbg": "/tmp/dynstate_val_build_0_veltqz/sample_prod.debug",
+    "mismatch_dbg": "/tmp/dynstate_val_build_0_veltqz/mismatch.debug",
+    "lib_so": "/tmp/dynstate_val_build_0_veltqz/libhelper.so"
+  },
+  "low_impact": {
+    "status": "PASS",
+    "bytes_captured": 13967360,
+    "regions_count": 28,
+    "exec_availability": "UNAVAILABLE",
+    "mutation_rejected": "CAPABILITY_UNSUPPORTED",
+    "checkpoint_rejected": "CAPABILITY_UNSUPPORTED",
+    "mismatch_rejected": "DEBUG_IMAGE_MISMATCH"
+  },
+  "consistent": {
+    "runtime_info": {
+      "status": "STOPPED",
+      "mode": "CONSISTENT",
+      "pid": null,
+      "architecture": "aarch64",
+      "endianness": "little",
+      "elf_class": "ELF64",
+      "executable": "/tmp/dynstate_val_build_0_veltqz/sample_prod_stripped",
+      "debug_image": "/tmp/dynstate_val_build_0_veltqz/sample_prod.debug",
+      "debug_image_status": "COMPATIBLE",
+      "build_id": null,
+      "module_count": 0,
+      "state_count": 3,
+      "transition_count": 3,
+      "current_checkpoint": null,
+      "safety_limits": {
+        "max_steps": 50,
+        "max_timeout_ms": 5000,
+        "max_candidates": 50,
+        "max_corpus_states": 100
+      },
+      "capabilities": {
+        "runtime": {
+          "snapshot": true,
+          "mutation": true,
+          "transition": true,
+          "checkpoint": true,
+          "restore": true,
+          "exploration": true,
+          "state_hash": true,
+          "crash_recovery": true,
+          "timeout_recovery": true
+        },
+        "observation_modes": [
+          "CONSISTENT",
+          "LOW_IMPACT"
+        ],
+        "observation": {
+          "gdb_consistent": true,
+          "low_impact_memory_snapshot": true,
+          "offline_semantic_analysis": true
+        },
+        "low_impact": {
+          "memory_capture": true,
+          "offline_analysis": true,
+          "module_discovery": true,
+          "build_id_verification": true,
+          "debuglink": true,
+          "mutation": false,
+          "execution_context": false,
+          "consistency": "NON_ATOMIC",
+          "backend": "process_vm_readv",
+          "process_stop": false,
+          "ptrace": false,
+          "sigstop": false
+        },
+        "memory_snapshot": {
+          "process_vm_readv": true,
+          "partial_read": true,
+          "stack": true,
+          "heap": true,
+          "global": true,
+          "all_readable": true
+        },
+        "debug": {
+          "external_debug_image": true,
+          "build_id_verification": true
+        },
+        "mutation": {
+          "integer": true,
+          "boolean": true,
+          "enum": true,
+          "float": true,
+          "pointer_null": true
+        },
+        "limits": {
+          "max_steps": 50,
+          "max_timeout_ms": 5000,
+          "max_candidates": 50,
+          "max_corpus_states": 100
+        }
+      }
+    },
+    "observe": {
+      "snapshot_id": "S001",
+      "execution": {
+        "thread_id": 1,
+        "function": "runtime_state_checkpoint",
+        "frame_level": 0,
+        "location": null,
+        "pc": "0xaaaaaaaa1984"
+      },
+      "objects": [
+        {
+          "object_id": "obj_0001",
+          "type": "Session",
+          "storage": "heap",
+          "fields": {
+            "state": "SessionState::CONNECTED",
+            "retry": 2,
+            "packet_count": 10,
+            "buffer": "0xaaaaaaad3300",
+            "parent": "0xaaaaaaad3320",
+            "flagged": 0,
+            "priority": 7,
+            "ratio": 1.0
+          }
+        },
+        {
+          "object_id": "obj_0002",
+          "type": "Buffer",
+          "storage": "heap",
+          "fields": {
+            "length": 64,
+            "capacity": 256,
+            "data": "0xaaaaaaad32b0"
+          }
+        },
+        {
+          "object_id": "obj_0003",
+          "type": "Buffer",
+          "storage": "stack",
+          "fields": {
+            "length": 1,
+            "capacity": 2,
+            "data": "0x0"
+          }
+        },
+        {
+          "object_id": "obj_0004",
+          "type": "std::thread",
+          "storage": "stack",
+          "fields": {
+            "_M_id": "obj_0005"
+          }
+        },
+        {
+          "object_id": "obj_0005",
+          "type": "std::thread::id",
+          "storage": "stack",
+          "fields": {
+            "_M_thread": 0
+          }
+        },
+        {
+          "object_id": "obj_0006",
+          "type": "std::atomic<unsigned long>",
+          "storage": "global",
+          "fields": {
+            "is_always_lock_free": 1
+          }
+        },
+        {
+          "object_id": "obj_0007",
+          "type": "Manager",
+          "storage": "global",
+          "fields": {
+            "current": "0xaaaaaaad3320",
+            "instance": "0xaaaaaaad3320"
+          }
+        },
+        {
+          "object_id": "obj_0008",
+          "type": "std::atomic<bool>",
+          "storage": "global",
+          "fields": {
+            "_M_base": "obj_0009",
+            "is_always_lock_free": 1
+          }
+        },
+        {
+          "object_id": "obj_0009",
+          "type": "std::__atomic_base<bool>",
+          "storage": "global",
+          "fields": {
+            "_S_alignment": 1,
+            "_M_i": 1
+          }
+        }
+      ],
+      "statistics": {
+        "object_count": 9,
+        "root_count": 12,
+        "edge_count": 6
+      },
+      "state_id": "state_000001",
+      "state_hash": "4c61e1ee15c6c5f6",
+      "provenance": {
+        "runtime_binary": {
+          "path": "/tmp/dynstate_val_build_0_veltqz/sample_prod_stripped",
+          "build_id": "afd7c5d4e752e20b99ecbc06e1400d4d319660e7",
+          "architecture": "aarch64",
+          "elf_class": "ELF64",
+          "endianness": "little",
+          "stripped": true
+        },
+        "debug_image": {
+          "path": "/tmp/dynstate_val_build_0_veltqz/sample_prod.debug",
+          "build_id": "afd7c5d4e752e20b99ecbc06e1400d4d319660e7",
+          "architecture": "aarch64",
+          "elf_class": "ELF64",
+          "endianness": "little",
+          "source": "external",
+          "verified": true,
+          "compatible": true,
+          "reason": "COMPATIBLE"
+        },
+        "performance": {
+          "debug_image_load_ms": 0.205,
+          "binary_identity_check_ms": 0.182,
+          "debug_image_verification_ms": 0.187
+        }
+      }
+    },
+    "objects_summary": [
+      {
+        "object_id": "obj_0001",
+        "type": "Session",
+        "storage": "heap",
+        "fields": [
+          {
+            "name": "state",
+            "type": "SessionState",
+            "value": "SessionState::CONNECTED",
+            "object_ref": null
+          },
+          {
+            "name": "retry",
+            "type": "uint32_t",
+            "value": 2,
+            "object_ref": null
+          },
+          {
+            "name": "packet_count",
+            "type": "uint32_t",
+            "value": 10,
+            "object_ref": null
+          },
+          {
+            "name": "buffer",
+            "type": "Buffer*",
+            "value": "0xaaaaaaad3300",
+            "object_ref": "obj_0002"
+          },
+          {
+            "name": "parent",
+            "type": "Session*",
+            "value": "0xaaaaaaad3320",
+            "object_ref": "obj_0001"
+          },
+          {
+            "name": "flagged",
+            "type": "bool",
+            "value": 0,
+            "object_ref": null
+          },
+          {
+            "name": "priority",
+            "type": "uint8_t",
+            "value": 7,
+            "object_ref": null
+          },
+          {
+            "name": "ratio",
+            "type": "double",
+            "value": 1.0,
+            "object_ref": null
+          }
+        ],
+        "identity_hint": "Session:obj_0001"
+      },
+      {
+        "object_id": "obj_0002",
+        "type": "Buffer",
+        "storage": "heap",
+        "fields": [
+          {
+            "name": "length",
+            "type": "uint32_t",
+            "value": 64,
+            "object_ref": null
+          },
+          {
+            "name": "capacity",
+            "type": "uint32_t",
+            "value": 256,
+            "object_ref": null
+          },
+          {
+            "name": "data",
+            "type": "char*",
+            "value": "0xaaaaaaad32b0",
+            "object_ref": null
+          }
+        ],
+        "identity_hint": "Buffer:obj_0002"
+      },
+      {
+        "object_id": "obj_0003",
+        "type": "Buffer",
+        "storage": "stack",
+        "fields": [
+          {
+            "name": "length",
+            "type": "uint32_t",
+            "value": 1,
+            "object_ref": null
+          },
+          {
+            "name": "capacity",
+            "type": "uint32_t",
+            "value": 2,
+            "object_ref": null
+          },
+          {
+            "name": "data",
+            "type": "char*",
+            "value": "0x0",
+            "object_ref": null
+          }
+        ],
+        "identity_hint": "Buffer:obj_0003"
+      },
+      {
+        "object_id": "obj_0004",
+        "type": "std::thread",
+        "storage": "stack",
+        "fields": [
+          {
+            "name": "_M_id",
+            "type": "std::thread::id",
+            "value": null,
+            "object_ref": "obj_0005"
+          }
+        ],
+        "identity_hint": "std::thread:obj_0004"
+      },
+      {
+        "object_id": "obj_0005",
+        "type": "std::thread::id",
+        "storage": "stack",
+        "fields": [
+          {
+            "name": "_M_thread",
+            "type": "std::thread::native_handle_type",
+            "value": 0,
+            "object_ref": null
+          }
+        ],
+        "identity_hint": "std::thread::id:obj_0005"
+      },
+      {
+        "object_id": "obj_0006",
+        "type": "std::atomic<unsigned long>",
+        "storage": "global",
+        "fields": [
+          {
+            "name": "is_always_lock_free",
+            "type": "const bool",
+            "value": 1,
+            "object_ref": null
+          }
+        ],
+        "identity_hint": "std::atomic<unsigned long>:obj_0006"
+      },
+      {
+        "object_id": "obj_0007",
+        "type": "Manager",
+        "storage": "global",
+        "fields": [
+          {
+            "name": "current",
+            "type": "Session*",
+            "value": "0xaaaaaaad3320",
+            "object_ref": "obj_0001"
+          },
+          {
+            "name": "instance",
+            "type": "Session*",
+            "value": "0xaaaaaaad3320",
+            "object_ref": "obj_0001"
+          }
+        ],
+        "identity_hint": "Manager:obj_0007"
+      },
+      {
+        "object_id": "obj_0008",
+        "type": "std::atomic<bool>",
+        "storage": "global",
+        "fields": [
+          {
+            "name": "_M_base",
+            "type": "std::__atomic_base<bool>",
+            "value": null,
+            "object_ref": "obj_0009"
+          },
+          {
+            "name": "is_always_lock_free",
+            "type": "const bool",
+            "value": 1,
+            "object_ref": null
+          }
+        ],
+        "identity_hint": "std::atomic<bool>:obj_0008"
+      },
+      {
+        "object_id": "obj_0009",
+        "type": "std::__atomic_base<bool>",
+        "storage": "global",
+        "fields": [
+          {
+            "name": "_S_alignment",
+            "type": "const int",
+            "value": 1,
+            "object_ref": null
+          },
+          {
+            "name": "_M_i",
+            "type": "std::__atomic_base<bool>::__int_type",
+            "value": 1,
+            "object_ref": null
+          }
+        ],
+        "identity_hint": "std::__atomic_base<bool>:obj_0009"
+      }
+    ],
+    "session_object": {
+      "object_id": "obj_0001",
+      "type": "Session",
+      "storage": "heap",
+      "fields": [
+        {
+          "name": "state",
+          "type": "SessionState",
+          "value": "SessionState::CONNECTED"
+        },
+        {
+          "name": "retry",
+          "type": "uint32_t",
+          "value": 2
+        },
+        {
+          "name": "packet_count",
+          "type": "uint32_t",
+          "value": 10
+        },
+        {
+          "name": "buffer",
+          "type": "Buffer*",
+          "value": "0xaaaaaaad3300",
+          "object_ref": "obj_0002"
+        },
+        {
+          "name": "parent",
+          "type": "Session*",
+          "value": "0xaaaaaaad3320",
+          "object_ref": "obj_0001"
+        },
+        {
+          "name": "flagged",
+          "type": "bool",
+          "value": 0
+        },
+        {
+          "name": "priority",
+          "type": "uint8_t",
+          "value": 7
+        },
+        {
+          "name": "ratio",
+          "type": "double",
+          "value": 1.0
+        }
+      ],
+      "identity_hint": "Session:obj_0001"
+    },
+    "buffer_object": {
+      "object_id": "obj_0002",
+      "type": "Buffer",
+      "storage": "heap",
+      "fields": [
+        {
+          "name": "length",
+          "type": "uint32_t",
+          "value": 64
+        },
+        {
+          "name": "capacity",
+          "type": "uint32_t",
+          "value": 256
+        },
+        {
+          "name": "data",
+          "type": "char*",
+          "value": "0xaaaaaaad32b0"
+        }
+      ],
+      "identity_hint": "Buffer:obj_0002"
+    },
+    "retry_field": {
+      "object_id": "obj_0001",
+      "field": "retry",
+      "type": "uint32_t",
+      "value": 2,
+      "mutability": "mutable",
+      "object_ref": null
+    },
+    "candidates": [
+      {
+        "candidate_id": "M0003",
+        "snapshot_id": "S001",
+        "object_id": "obj_0001",
+        "field": "retry",
+        "type": "uint32_t",
+        "current_value": 2,
+        "proposed_value": 1,
+        "reason": "BOUNDARY_MINUS_ONE",
+        "priority_score": 7.5,
+        "ranking_reasons": [
+          "BRANCH_SENSITIVE",
+          "EXECUTION_REACHABLE",
+          "NUMERIC_BOUNDARY"
+        ]
+      },
+      {
+        "candidate_id": "M0004",
+        "snapshot_id": "S001",
+        "object_id": "obj_0001",
+        "field": "retry",
+        "type": "uint32_t",
+        "current_value": 2,
+        "proposed_value": 3,
+        "reason": "BOUNDARY_PLUS_ONE",
+        "priority_score": 7.5,
+        "ranking_reasons": [
+          "BRANCH_SENSITIVE",
+          "EXECUTION_REACHABLE",
+          "NUMERIC_BOUNDARY"
+        ]
+      },
+      {
+        "candidate_id": "M0005",
+        "snapshot_id": "S001",
+        "object_id": "obj_0001",
+        "field": "retry",
+        "type": "uint32_t",
+        "current_value": 2,
+        "proposed_value": 0,
+        "reason": "ZERO_BOUNDARY",
+        "priority_score": 7.5,
+        "ranking_reasons": [
+          "BRANCH_SENSITIVE",
+          "EXECUTION_REACHABLE",
+          "NUMERIC_BOUNDARY"
+        ]
+      },
+      {
+        "candidate_id": "M0006",
+        "snapshot_id": "S001",
+        "object_id": "obj_0001",
+        "field": "retry",
+        "type": "uint32_t",
+        "current_value": 2,
+        "proposed_value": 4294967295,
+        "reason": "MAX_BOUNDARY",
+        "priority_score": 7.5,
+        "ranking_reasons": [
+          "BRANCH_SENSITIVE",
+          "EXECUTION_REACHABLE",
+          "NUMERIC_BOUNDARY"
+        ]
+      }
+    ],
+    "branch_1": {
+      "transition_id": "T001",
+      "child_state_id": "state_000002",
+      "state_hash": "56d6d71bd1593342",
+      "facts": {
+        "branch_changed": true,
+        "execution_function_changed": false,
+        "execution_location_changed": false,
+        "field_changed": [
+          "Session.flagged",
+          "Session.packet_count",
+          "Session.retry",
+          "Session.state"
+        ],
+        "reference_changed": [],
+        "object_created": [],
+        "object_removed": [],
+        "crash": false,
+        "crash_signal": null,
+        "timeout": false,
+        "summary": {
+          "value_changes": 4,
+          "reference_changes": 0,
+          "objects_created": 0,
+          "objects_removed": 0,
+          "execution_changes": 0
+        }
+      },
+      "evidence": [
+        {
+          "evidence_id": "EV_0001",
+          "source": "mutation",
+          "transition_id": "T001",
+          "observation": "Applied mutation to field 'retry': 2 -> 3",
+          "facts": {
+            "field": "retry",
+            "before": 2,
+            "after": 3
+          },
+          "snapshot_before": "S001",
+          "snapshot_after": "S002"
+        },
+        {
+          "evidence_id": "EV_0002",
+          "source": "diff",
+          "transition_id": "T001",
+          "observation": "Session.flagged changed from 0 to 1",
+          "facts": {
+            "path": "Session.flagged",
+            "before": 0,
+            "after": 1
+          },
+          "snapshot_before": "S001",
+          "snapshot_after": "S002"
+        },
+        {
+          "evidence_id": "EV_0003",
+          "source": "diff",
+          "transition_id": "T001",
+          "observation": "Session.packet_count changed from 10 to 30",
+          "facts": {
+            "path": "Session.packet_count",
+            "before": 10,
+            "after": 30
+          },
+          "snapshot_before": "S001",
+          "snapshot_after": "S002"
+        },
+        {
+          "evidence_id": "EV_0004",
+          "source": "diff",
+          "transition_id": "T001",
+          "observation": "Session.retry changed from 2 to 3",
+          "facts": {
+            "path": "Session.retry",
+            "before": 2,
+            "after": 3
+          },
+          "snapshot_before": "S001",
+          "snapshot_after": "S002"
+        },
+        {
+          "evidence_id": "EV_0005",
+          "source": "diff",
+          "transition_id": "T001",
+          "observation": "Session.state changed from SessionState::CONNECTED to SessionState::ERROR",
+          "facts": {
+            "path": "Session.state",
+            "before": "SessionState::CONNECTED",
+            "after": "SessionState::ERROR"
+          },
+          "snapshot_before": "S001",
+          "snapshot_after": "S002"
+        }
+      ]
+    },
+    "branch_2": {
+      "transition_id": "T002",
+      "child_state_id": "state_000003",
+      "state_hash": "9944af0d94c034dc",
+      "facts": {
+        "branch_changed": true,
+        "execution_function_changed": false,
+        "execution_location_changed": false,
+        "field_changed": [
+          "Session.packet_count",
+          "Session.retry",
+          "Session.state"
+        ],
+        "reference_changed": [],
+        "object_created": [],
+        "object_removed": [],
+        "crash": false,
+        "crash_signal": null,
+        "timeout": false,
+        "summary": {
+          "value_changes": 3,
+          "reference_changes": 0,
+          "objects_created": 0,
+          "objects_removed": 0,
+          "execution_changes": 0
+        }
+      },
+      "evidence": [
+        {
+          "evidence_id": "EV_0006",
+          "source": "mutation",
+          "transition_id": "T002",
+          "observation": "Applied mutation to field 'retry': 2 -> 0",
+          "facts": {
+            "field": "retry",
+            "before": 2,
+            "after": 0
+          },
+          "snapshot_before": "S003",
+          "snapshot_after": "S004"
+        },
+        {
+          "evidence_id": "EV_0007",
+          "source": "diff",
+          "transition_id": "T002",
+          "observation": "Session.packet_count changed from 10 to 30",
+          "facts": {
+            "path": "Session.packet_count",
+            "before": 10,
+            "after": 30
+          },
+          "snapshot_before": "S003",
+          "snapshot_after": "S004"
+        },
+        {
+          "evidence_id": "EV_0008",
+          "source": "diff",
+          "transition_id": "T002",
+          "observation": "Session.retry changed from 2 to 0",
+          "facts": {
+            "path": "Session.retry",
+            "before": 2,
+            "after": 0
+          },
+          "snapshot_before": "S003",
+          "snapshot_after": "S004"
+        },
+        {
+          "evidence_id": "EV_0009",
+          "source": "diff",
+          "transition_id": "T002",
+          "observation": "Session.state changed from SessionState::CONNECTED to SessionState::DISCONNECTED",
+          "facts": {
+            "path": "Session.state",
+            "before": "SessionState::CONNECTED",
+            "after": "SessionState::DISCONNECTED"
+          },
+          "snapshot_before": "S003",
+          "snapshot_after": "S004"
+        }
+      ]
+    },
+    "state_hashes": {
+      "seed": "4c61e1ee15c6c5f6",
+      "branch_1_error": "56d6d71bd1593342",
+      "branch_2_disconnected": "9944af0d94c034dc"
+    },
+    "failure_case": {
+      "transition_id": "T_VAL_CRASH",
+      "parent_snapshot": "S001",
+      "child_snapshot": null,
+      "parent_state": null,
+      "child_state": null,
+      "mutation": {
+        "success": true,
+        "object_id": "obj_0001",
+        "field": "priority",
+        "type": null,
+        "before": 7,
+        "after": 139,
+        "address": null,
+        "error": null,
+        "performance": {}
+      },
+      "execution": {
+        "status": "CRASHED",
+        "reason": "Address not mapped to object",
+        "signal": "SIGSEGV",
+        "exit_code": null,
+        "error": null,
+        "performance": null
+      },
+      "facts": {
+        "branch_changed": true,
+        "execution_function_changed": false,
+        "execution_location_changed": false,
+        "field_changed": [],
+        "reference_changed": [],
+        "object_created": [],
+        "object_removed": [],
+        "crash": true,
+        "crash_signal": "SIGSEGV",
+        "timeout": false,
+        "summary": {
+          "value_changes": 0,
+          "reference_changes": 0,
+          "objects_created": 0,
+          "objects_removed": 0,
+          "execution_changes": 0
+        }
+      },
+      "evidence": [
+        {
+          "evidence_id": "EV_0010",
+          "source": "mutation",
+          "transition_id": "T_VAL_CRASH",
+          "observation": "Applied mutation to field 'priority': 7 -> 139",
+          "facts": {
+            "field": "priority",
+            "before": 7,
+            "after": 139
+          },
+          "snapshot_before": "S001"
+        },
+        {
+          "evidence_id": "EV_0011",
+          "source": "execution",
+          "transition_id": "T_VAL_CRASH",
+          "observation": "Process crashed with signal SIGSEGV (Address not mapped to object)",
+          "facts": {
+            "status": "CRASHED",
+            "signal": "SIGSEGV",
+            "reason": "Address not mapped to object"
+          },
+          "snapshot_before": "S001"
+        }
+      ],
+      "performance": {
+        "transition_analysis_ms": 0.028
+      }
+    },
+    "state_graph": {
+      "nodes": [
+        {
+          "id": "state_000001",
+          "state_hash": "4c61e1ee15c6c5f6",
+          "short_hash": "4c61e1ee",
+          "parent_state_id": null,
+          "transition_id": null,
+          "created_at": "2026-09-28T10:38:40.433510+00:00",
+          "is_seed": true,
+          "object_count": 9,
+          "status": "STOPPED"
+        },
+        {
+          "id": "state_000002",
+          "state_hash": "56d6d71bd1593342",
+          "short_hash": "56d6d71b",
+          "parent_state_id": null,
+          "transition_id": null,
+          "created_at": "2026-09-28T10:38:40.510125+00:00",
+          "is_seed": true,
+          "object_count": 9,
+          "status": "STOPPED"
+        },
+        {
+          "id": "state_000003",
+          "state_hash": "9944af0d94c034dc",
+          "short_hash": "9944af0d",
+          "parent_state_id": null,
+          "transition_id": null,
+          "created_at": "2026-09-28T10:38:40.637558+00:00",
+          "is_seed": true,
+          "object_count": 9,
+          "status": "STOPPED"
+        }
+      ],
+      "edges": [
+        {
+          "id": "T001",
+          "from": "state_000001",
+          "to": "state_000002",
+          "field": "retry",
+          "old_value": 2,
+          "new_value": 3,
+          "status": "STOPPED",
+          "signal": null
+        },
+        {
+          "id": "T002",
+          "from": "state_000001",
+          "to": "state_000003",
+          "field": "retry",
+          "old_value": 2,
+          "new_value": 0,
+          "status": "STOPPED",
+          "signal": null
+        },
+        {
+          "id": "T_VAL_CRASH",
+          "from": "state_000001",
+          "to": "UNKNOWN",
+          "field": "priority",
+          "old_value": 7,
+          "new_value": 139,
+          "status": "CRASHED",
+          "signal": "SIGSEGV"
+        }
+      ]
+    }
+  }
+}
