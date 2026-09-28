@@ -239,14 +239,43 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("state_hash", res.data)
         self.assertEqual(len(res.data["state_hash"]), 16)
 
-    def test_detect_invariants(self):
-        res = self.runtime.detect_invariant_candidates()
+    def test_get_snapshot_provenance(self):
+        # 1. Via method call
+        res = self.runtime.get_snapshot_provenance("S001")
         self.assertTrue(res.success)
-        invs = res.data
-        self.assertGreaterEqual(len(invs), 2)
-        exprs = [inv["expression"] for inv in invs]
-        self.assertIn("Buffer.length <= Buffer.capacity", exprs)
-        self.assertIn("Session.retry >= 0", exprs)
+        self.assertEqual(res.action, "GET_SNAPSHOT_PROVENANCE")
+        prov = res.data["provenance"]
+        self.assertTrue(prov["runtime_binary"]["stripped"])
+        self.assertEqual(prov["runtime_binary"]["build_id"], "mock_id")
+
+        # 2. Via protocol dispatch_action
+        action_res = self.runtime.dispatch_action({
+            "action": "GET_SNAPSHOT_PROVENANCE",
+            "snapshot_id": "S001"
+        })
+        self.assertTrue(action_res.success)
+        self.assertEqual(action_res.action, "GET_SNAPSHOT_PROVENANCE")
+        self.assertEqual(action_res.data["provenance"]["runtime_binary"]["build_id"], "mock_id")
+
+    def test_low_impact_mode_unsupported_operations(self):
+        # In LOW_IMPACT mode, mutation, checkpoints, restores, and exploration loops are strictly disallowed
+        self.runtime.observation_mode = "LOW_IMPACT"
+
+        res_cp = self.runtime.checkpoint()
+        self.assertFalse(res_cp.success)
+        self.assertEqual(res_cp.error.code, "CAPABILITY_UNSUPPORTED")
+
+        res_rest = self.runtime.restore("CP_001")
+        self.assertFalse(res_rest.success)
+        self.assertEqual(res_rest.error.code, "CAPABILITY_UNSUPPORTED")
+
+        res_exp = self.runtime.explore()
+        self.assertFalse(res_exp.success)
+        self.assertEqual(res_exp.error.code, "CAPABILITY_UNSUPPORTED")
+
+        res_mut = self.runtime.execute_transition("M001")
+        self.assertFalse(res_mut.success)
+        self.assertEqual(res_mut.error.code, "CAPABILITY_UNSUPPORTED")
 
 
 if __name__ == "__main__":

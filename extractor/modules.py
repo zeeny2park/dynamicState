@@ -129,15 +129,19 @@ class ModuleAddressResolver:
         - PIE (ET_DYN) with/without ASLR: Returns delta between runtime base and ELF virtual address.
         - Shared Library (ET_DYN): Returns delta between runtime base and ELF virtual address.
         """
+        if elf_info.elf_type == "ET_EXEC":
+            return 0
+
         if not elf_info.pt_loads:
             raise LoadBiasResolutionError(
                 f"No PT_LOAD segments found in ELF for '{elf_info.path}'. Cannot calculate load bias."
             )
 
         # Standard ELF loader convention: find PT_LOAD segment with lowest virtual address / offset 0
-        first_pt_load = elf_info.pt_loads[0]
-        for pt in elf_info.pt_loads:
-            if pt.get("p_offset") == 0:
+        sorted_pt_loads = sorted(elf_info.pt_loads, key=lambda pt: pt.get("p_vaddr", 0))
+        first_pt_load = sorted_pt_loads[0]
+        for pt in sorted_pt_loads:
+            if pt.get("p_offset", 0) == 0:
                 first_pt_load = pt
                 break
 
@@ -150,13 +154,23 @@ class ModuleAddressResolver:
                 return m.start
             return m.get("start_addr", int(m.get("start", "0"), 16) if isinstance(m.get("start"), str) else m.get("start", 0))
 
+        def get_map_end(m: Any) -> int:
+            if isinstance(m, MemoryRegion):
+                return m.end
+            return m.get("end_addr", int(m.get("end", "0"), 16) if isinstance(m.get("end"), str) else m.get("end", 0))
+
         def get_map_offset(m: Any) -> int:
             if isinstance(m, MemoryRegion):
                 return m.offset
-            return m.get("offset", 0)
+            raw = m.get("offset", 0)
+            if isinstance(raw, str):
+                return int(raw, 16 if raw.startswith("0x") else 10)
+            return int(raw or 0)
 
         for m in sorted(runtime_mappings, key=get_map_start):
-            if get_map_offset(m) == target_offset:
+            m_off = get_map_offset(m)
+            m_len = get_map_end(m) - get_map_start(m)
+            if m_off <= target_offset < m_off + m_len:
                 matching_map = m
                 break
 
@@ -168,7 +182,8 @@ class ModuleAddressResolver:
                     f"No runtime mappings found for module '{elf_info.path}'."
                 )
 
-        runtime_vaddr = get_map_start(matching_map)
+        map_offset = get_map_offset(matching_map)
+        runtime_vaddr = get_map_start(matching_map) + (target_offset - map_offset)
         elf_vaddr = first_pt_load.get("p_vaddr", 0)
         load_bias = runtime_vaddr - elf_vaddr
         return load_bias
@@ -203,16 +218,21 @@ def discover_modules(
     # 1. Resolve canonical main binary path
     real_main = None
     if main_binary:
-        real_main = os.path.realpath(main_binary) if os.path.exists(main_binary) else main_binary
+        clean_mb = main_binary[:-10].strip() if main_binary.endswith(" (deleted)") else main_binary
+        real_main = os.path.realpath(clean_mb) if os.path.exists(clean_mb) else clean_mb
     elif pid > 0:
         exe_link = f"/proc/{pid}/exe"
-        if os.path.exists(exe_link):
+        if os.path.islink(exe_link) or os.path.exists(exe_link):
             try:
-                real_main = os.path.realpath(exe_link)
+                target = os.readlink(exe_link)
+                if target.endswith(" (deleted)"):
+                    target = target[:-10].strip()
+                real_main = os.path.realpath(target) if os.path.exists(target) else target
             except Exception:
                 pass
 
-    # 2. Group mappings by real file pathname
+    # 2. Group mappings by real/canonical file pathname
+    canonical_paths: Dict[str, str] = {}
     file_mappings: Dict[str, List[Any]] = {}
 
     def get_path(r: Any) -> str:
@@ -234,24 +254,30 @@ def discover_modules(
         p = get_path(r)
         if not p or p.startswith("[") or p == "(deleted)":
             continue
-        # Only consider regular files
-        file_mappings.setdefault(p, []).append(r)
+        is_deleted = p.endswith(" (deleted)")
+        clean_p = p[:-10].strip() if is_deleted else p
+        if not clean_p or clean_p.startswith("["):
+            continue
+        canon_p = os.path.realpath(clean_p) if os.path.exists(clean_p) else clean_p
+        file_mappings.setdefault(canon_p, []).append(r)
+        if canon_p not in canonical_paths:
+            canonical_paths[canon_p] = clean_p
 
     modules: List[RuntimeModule] = []
     mod_idx = 1
 
-    for p, maps in file_mappings.items():
+    for canon_p, maps in file_mappings.items():
         if not maps:
             continue
 
-        real_p = os.path.realpath(p) if os.path.exists(p) else p
+        clean_p = canonical_paths.get(canon_p, canon_p)
         is_main = (
-            (real_main is not None and (real_p == real_main or p == real_main)) or
-            (main_binary is not None and (p == main_binary or real_p == main_binary))
+            (real_main is not None and (canon_p == real_main or clean_p == real_main or (real_main.endswith(" (deleted)") and canon_p == real_main[:-10].strip()))) or
+            (main_binary is not None and (canon_p == main_binary or clean_p == main_binary))
         )
 
         # Check if file has executable mapping or shared library extension
-        is_shlib = p.endswith(".so") or ".so." in p
+        is_shlib = clean_p.endswith(".so") or ".so." in clean_p
         has_exec = any(
             (r.executable if isinstance(r, MemoryRegion) else "x" in r.get("permissions", ""))
             for r in maps
@@ -268,14 +294,22 @@ def discover_modules(
         if not is_main:
             mod_idx += 1
 
-        # Attempt to inspect ELF on filesystem
+        # Attempt to inspect ELF on filesystem or via /proc/<pid>/exe
         elf_info: Optional[BinaryIdentity] = None
         build_id_status = "NOT_AVAILABLE"
         load_bias = 0
 
-        if os.path.exists(p):
+        inspect_path = None
+        if os.path.exists(clean_p):
+            inspect_path = clean_p
+        elif is_main and pid > 0:
+            exe_link = f"/proc/{pid}/exe"
+            if os.path.islink(exe_link) or os.path.exists(exe_link):
+                inspect_path = exe_link
+
+        if inspect_path:
             try:
-                elf_info = inspect_elf(p)
+                elf_info = inspect_elf(inspect_path)
                 if elf_info.build_id:
                     build_id_status = "VERIFIED"
                 else:
@@ -293,7 +327,7 @@ def discover_modules(
 
         modules.append(RuntimeModule(
             module_id=mod_id,
-            path=p,
+            path=clean_p,
             runtime_base=r_base,
             runtime_end=r_end,
             load_bias=load_bias,

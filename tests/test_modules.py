@@ -134,6 +134,41 @@ class TestModuleAddressResolver(unittest.TestCase):
         load_bias = ModuleAddressResolver.calculate_load_bias(mappings, elf_info)
         self.assertEqual(load_bias, 0x7ffff7f00000)
 
+    def test_calculate_load_bias_et_exec_always_zero(self):
+        elf_info = BinaryIdentity(
+            path="/bin/static_bin",
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            elf_type="ET_EXEC",
+            pt_loads=[
+                {"p_offset": 0, "p_vaddr": 0x400000, "p_filesz": 0x1000, "p_memsz": 0x1000, "p_flags": 5, "p_align": 0x1000}
+            ],
+        )
+        mappings = [{"start_addr": 0x400000, "end_addr": 0x401000, "offset": 0}]
+        self.assertEqual(ModuleAddressResolver.calculate_load_bias(mappings, elf_info), 0)
+
+    def test_calculate_load_bias_inner_page_offset_and_unsorted_pt_loads(self):
+        # Unsorted pt_loads
+        elf_info = BinaryIdentity(
+            path="/bin/pie_app",
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            elf_type="ET_DYN",
+            pt_loads=[
+                {"p_offset": 0x2000, "p_vaddr": 0x2000, "p_filesz": 0x1000, "p_memsz": 0x1000, "p_flags": 6, "p_align": 0x1000},
+                {"p_offset": 0x0, "p_vaddr": 0x0, "p_filesz": 0x2000, "p_memsz": 0x2000, "p_flags": 5, "p_align": 0x1000},
+            ],
+        )
+        # Mapping starting at 0x555555554000 with offset "0x0" (string format test)
+        mappings = [
+            {"start": "0x555555554000", "end": "0x555555556000", "offset": "0x0"},
+            {"start": "0x555555556000", "end": "0x555555557000", "offset": "0x2000"},
+        ]
+        bias = ModuleAddressResolver.calculate_load_bias(mappings, elf_info)
+        self.assertEqual(bias, 0x555555554000)
+
     def test_calculate_load_bias_missing_pt_loads_raises(self):
         elf_info = BinaryIdentity(
             path="/bin/broken",
@@ -146,7 +181,7 @@ class TestModuleAddressResolver(unittest.TestCase):
         with self.assertRaises(LoadBiasResolutionError):
             ModuleAddressResolver.calculate_load_bias(mappings, elf_info)
 
-    def test_resolve_address_bidirectional(self):
+    def test_resolve_address_bidirectional_roundtrip(self):
         mod = RuntimeModule(
             module_id="main",
             path="/bin/app",
@@ -159,12 +194,21 @@ class TestModuleAddressResolver(unittest.TestCase):
             elf_class="ELF64",
         )
 
-        elf_addr = 0x1234
-        runtime_addr = ModuleAddressResolver.resolve_runtime_address(mod, elf_addr)
-        self.assertEqual(runtime_addr, 0x555555554000 + 0x1234)
+        # 1. elf -> runtime -> elf
+        test_elf_addrs = [0x0, 0x1234, 0x5678, 0xbfff]
+        for elf_addr in test_elf_addrs:
+            rt_addr = ModuleAddressResolver.resolve_runtime_address(mod, elf_addr)
+            self.assertEqual(rt_addr, mod.load_bias + elf_addr)
+            roundtrip_elf = ModuleAddressResolver.resolve_elf_address(mod, rt_addr)
+            self.assertEqual(roundtrip_elf, elf_addr)
 
-        reversed_elf_addr = ModuleAddressResolver.resolve_elf_address(mod, runtime_addr)
-        self.assertEqual(reversed_elf_addr, elf_addr)
+        # 2. runtime -> elf -> runtime
+        test_rt_addrs = [0x555555554000, 0x555555555000, 0x55555555ffff]
+        for rt_addr in test_rt_addrs:
+            elf_a = ModuleAddressResolver.resolve_elf_address(mod, rt_addr)
+            self.assertEqual(elf_a, rt_addr - mod.load_bias)
+            roundtrip_rt = ModuleAddressResolver.resolve_runtime_address(mod, elf_a)
+            self.assertEqual(roundtrip_rt, rt_addr)
 
 
 class TestDiscoverModules(unittest.TestCase):
@@ -194,6 +238,38 @@ class TestDiscoverModules(unittest.TestCase):
         self.assertEqual(shlib_mod.path, "/usr/lib/libutils.so.1")
         self.assertEqual(shlib_mod.runtime_base, 0x7f0000)
         self.assertEqual(shlib_mod.runtime_end, 0x7f5000)
+
+    def test_discover_modules_deleted_binary_handling(self):
+        regions = [
+            {"start_addr": 0x55550000, "end_addr": 0x55554000, "permissions": "r-xp", "pathname": "/tmp/my_app (deleted)", "offset": 0},
+            {"start_addr": 0x55554000, "end_addr": 0x55556000, "permissions": "rw-p", "pathname": "/tmp/my_app (deleted)", "offset": 0x4000},
+        ]
+        modules = discover_modules(pid=9999, regions=regions, main_binary="/tmp/my_app")
+        self.assertEqual(len(modules), 1)
+        self.assertEqual(modules[0].module_id, "main")
+        self.assertEqual(modules[0].path, "/tmp/my_app")
+        self.assertEqual(modules[0].runtime_base, 0x55550000)
+        self.assertEqual(modules[0].runtime_end, 0x55556000)
+
+    def test_discover_modules_symlink_deduplication(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            real_lib = os.path.join(td, "libreal.so")
+            sym_lib = os.path.join(td, "libsym.so")
+            with open(real_lib, "wb") as f:
+                f.write(b"\x7fELFfake")
+            os.symlink(real_lib, sym_lib)
+
+            regions = [
+                {"start_addr": 0x7f1000, "end_addr": 0x7f2000, "permissions": "r-xp", "pathname": real_lib, "offset": 0},
+                {"start_addr": 0x7f2000, "end_addr": 0x7f3000, "permissions": "rw-p", "pathname": sym_lib, "offset": 0x1000},
+            ]
+            modules = discover_modules(pid=9998, regions=regions)
+            # Both mappings point to the same canonical file, so exactly 1 module should be created
+            self.assertEqual(len(modules), 1)
+            self.assertEqual(modules[0].runtime_base, 0x7f1000)
+            self.assertEqual(modules[0].runtime_end, 0x7f3000)
 
     def test_discover_modules_live_python_process(self):
         # Test against current running python executable

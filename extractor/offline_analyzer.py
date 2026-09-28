@@ -107,6 +107,11 @@ class SnapshotMemoryReader:
             # Span exceeds captured boundary
             return None
 
+        # Guard against reads exceeding module boundaries
+        mod = self.module_for_address(address)
+        if mod and (address + size) > mod.runtime_end:
+            return None
+
         # Load region file (cache into memory)
         if fpath not in self._cache:
             if not os.path.exists(fpath):
@@ -438,8 +443,8 @@ class OfflineMemoryAnalyzer:
                 type=type_name,
                 address=addr_hex,
                 storage=storage,
-                thread_id=1,
-                frame_level=0,
+                thread_id=None,
+                frame_level=None,
                 fields=[]
             )
 
@@ -552,6 +557,15 @@ class OfflineMemoryAnalyzer:
                         ))
             finally:
                 active_identities.discard(identity)
+
+            # Compute object-level availability based on field readability
+            unavail_count = sum(1 for f in obj.fields if f.availability in ("unavailable", "unknown") or f.error is not None)
+            if not obj.fields or unavail_count == 0:
+                obj.availability = "COMPLETE"
+            elif unavail_count == len(obj.fields):
+                obj.availability = "UNAVAILABLE"
+            else:
+                obj.availability = "PARTIAL"
 
             return obj_id
 

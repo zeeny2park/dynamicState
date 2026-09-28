@@ -195,6 +195,37 @@ class TestDebugArtifacts(unittest.TestCase):
         self.assertFalse(compat.compatible)
         self.assertEqual(compat.reason, "DEBUG_IMAGE_STRIPPED")
 
+    def test_verify_debug_image_missing_build_id(self):
+        provider = DebugArtifactProvider()
+        fake_dbg = os.path.join(self.tmp_dir, "nobuildid.debug")
+        with open(fake_dbg, "wb") as f:
+            f.write(b"data")
+
+        provider._ident_cache[os.path.abspath(fake_dbg)] = BinaryIdentity(
+            path=fake_dbg,
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            build_id=None,  # Missing Build ID
+            has_debug_info=True,
+        )
+
+        mod = RuntimeModule(
+            module_id="main",
+            path="/bin/app",
+            runtime_base=0x1000,
+            runtime_end=0x2000,
+            load_bias=0,
+            build_id="good111111111111",
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+        )
+
+        compat = provider.verify(mod, fake_dbg)
+        self.assertFalse(compat.compatible)
+        self.assertEqual(compat.reason, "DEBUG_IMAGE_MISMATCH")
+
     def test_native_dwarf_debug_info_provider_stub(self):
         provider = NativeDwarfDebugInfoProvider()
         mod = RuntimeModule(

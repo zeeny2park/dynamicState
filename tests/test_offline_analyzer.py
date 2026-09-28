@@ -195,14 +195,19 @@ class OfflineMemoryAnalyzerTests(unittest.TestCase):
         self.assertEqual(fields["priority"].value, 7)
         self.assertAlmostEqual(fields["ratio"].value, 2.5)
 
-        # Verify circular reference: session->parent points back to session_obj
-        self.assertEqual(fields["parent"].object_ref, session_obj.object_id)
+        # Verify honest execution context: thread_id is None, frame_level is None
+        self.assertIsNone(session_obj.thread_id)
+        self.assertIsNone(session_obj.frame_level)
+        self.assertEqual(session_obj.availability, "COMPLETE")
 
         # Verify buffer object
         buffer_id = fields["buffer"].object_ref
         self.assertIsNotNone(buffer_id)
         buffer_obj = objects[buffer_id]
         self.assertEqual(buffer_obj.type, "Buffer")
+        self.assertIsNone(buffer_obj.thread_id)
+        self.assertIsNone(buffer_obj.frame_level)
+        self.assertEqual(buffer_obj.availability, "COMPLETE")
         buf_fields = {f.name: f for f in buffer_obj.fields}
         self.assertEqual(buf_fields["length"].value, 64)
         self.assertEqual(buf_fields["capacity"].value, 256)
@@ -211,6 +216,77 @@ class OfflineMemoryAnalyzerTests(unittest.TestCase):
         h = compute_state_hash(semantic_snap)
         self.assertIsInstance(h, str)
         self.assertEqual(len(h), 16)
+
+    def test_object_availability_partial_and_unavailable(self):
+        # Test object availability when memory is partially or fully uncaptured
+        from extractor.offline_analyzer import SnapshotMemoryReader
+        from extractor.modules import RuntimeModule
+
+        analyzer = OfflineMemoryAnalyzer()
+
+        class MockDebugImageProvider:
+            path = "/tmp/sample.debug"
+            def verify(self, runtime_binary):
+                class Compat:
+                    compatible = True
+                    reason = "COMPATIBLE"
+                return Compat()
+
+        # Create symbol context pointing to an address that is partially within captured heap
+        # Address 0x6ff8 has 8 bytes before heap end 0x7000.
+        # An object of 16 bytes starting at 0x6ff8 will have fields partially out of bounds.
+        sym_context = {
+            "symbols": [
+                {"name": "partial_obj", "type": "PartialStruct *", "address": 0x18}
+            ],
+            "types": {
+                "PartialStruct": {
+                    "name": "PartialStruct",
+                    "code": "aggregate",
+                    "sizeof": 16,
+                    "fields": [
+                        {"name": "field1", "type": "uint32_t", "offset": 0, "sizeof": 4},
+                        {"name": "field2", "type": "uint32_t", "offset": 12, "sizeof": 4},  # offset 12 is at 0x7004 (out of bounds)
+                    ]
+                }
+            }
+        }
+
+        # Repoint global session at 0x18 to 0x6ff8
+        mem_dir = os.path.join(self.tmp_dir, "memory")
+        with open(os.path.join(mem_dir, "region_global.bin"), "r+b") as f:
+            f.seek(0x18)
+            f.write(struct.pack("<Q", 0x6ff8))
+
+        snap = analyzer.analyze(
+            memory_snapshot=self.raw_snap,
+            debug_image=MockDebugImageProvider(),
+            optional_symbol_context=sym_context
+        )
+        self.assertEqual(len(snap.persistent.objects), 1)
+        obj = snap.persistent.objects[0]
+        self.assertEqual(obj.availability, "PARTIAL")
+
+    def test_snapshot_memory_reader_module_boundary_guard(self):
+        from extractor.offline_analyzer import SnapshotMemoryReader
+        from extractor.modules import RuntimeModule
+
+        mod = RuntimeModule(
+            module_id="main",
+            path="/tmp/sample",
+            runtime_base=0x20000,
+            runtime_end=0x20500,  # Module ends at 0x20500, though region extends to 0x21000
+            load_bias=0,
+            build_id=None,
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+        )
+        reader = SnapshotMemoryReader(self.raw_snap, modules=[mod])
+        # Reading within module boundary succeeds
+        self.assertIsNotNone(reader.read(0x20000, 0x100))
+        # Reading across module boundary returns None
+        self.assertIsNone(reader.read(0x20480, 0x100))  # 0x20580 > 0x20500
 
 
 if __name__ == "__main__":

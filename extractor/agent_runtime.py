@@ -169,6 +169,9 @@ class AgentRuntime:
             elif act in ("GET_MODULES", "LIST_MODULES"):
                 target = action.memory_snapshot_id or action.snapshot_id
                 return self.get_modules(target)
+            elif act == "GET_SNAPSHOT_PROVENANCE":
+                target = action.snapshot_id or action.memory_snapshot_id
+                return self.get_snapshot_provenance(target)
             else:
                 return self._error("CAPABILITY_UNSUPPORTED", f"Action '{act}' is not supported by ARP", act, t0)
         except Exception as exc:
@@ -411,6 +414,8 @@ class AgentRuntime:
     def checkpoint(self, checkpoint_id: Optional[str] = None) -> AgentActionResult:
         """Capture a branch-safe process checkpoint (GDB fork backend)."""
         t0 = time.monotonic()
+        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
+            return self._error("CAPABILITY_UNSUPPORTED", "Checkpoint is not supported in LOW_IMPACT observation mode", "CHECKPOINT", t0)
         if not self.controller or not hasattr(self.controller, "checkpoint"):
             return self._error("CAPABILITY_UNSUPPORTED", "Checkpoint is not supported by runtime backend", "CHECKPOINT", t0)
 
@@ -430,6 +435,8 @@ class AgentRuntime:
     def restore(self, checkpoint_id: str) -> AgentActionResult:
         """Restore process state to an exact parent checkpoint."""
         t0 = time.monotonic()
+        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
+            return self._error("CAPABILITY_UNSUPPORTED", "Restore is not supported in LOW_IMPACT observation mode", "RESTORE", t0)
         if not self.controller or not hasattr(self.controller, "restore"):
             return self._error("CAPABILITY_UNSUPPORTED", "Restore is not supported by runtime backend", "RESTORE", t0)
 
@@ -647,6 +654,8 @@ class AgentRuntime:
                 max_states: int = 20) -> AgentActionResult:
         """Run the autonomous branch-safe state exploration loop."""
         t0 = time.monotonic()
+        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
+            return self._error("CAPABILITY_UNSUPPORTED", "Exploration loop is not supported in LOW_IMPACT observation mode", "EXPLORE", t0)
         if not self.controller:
             return self._error("RUNTIME_ERROR", "No active runtime controller attached", "EXPLORE", t0)
 
@@ -921,6 +930,61 @@ class AgentRuntime:
                 )
 
         return self._error("SNAPSHOT_NOT_FOUND", f"No modules found for '{snapshot_id}'", "GET_MODULES", t0)
+
+    def get_snapshot_provenance(self, snapshot_id: Optional[str] = None) -> AgentActionResult:
+        """Retrieve provenance information for a snapshot (raw or semantic)."""
+        t0 = time.monotonic()
+        # 1. Check raw memory snapshot first if snapshot_id provided
+        if snapshot_id:
+            raw_snap = self._resolve_raw_memory_snapshot(snapshot_id)
+            if raw_snap:
+                prov = getattr(raw_snap, "provenance", None)
+                if prov is not None:
+                    return AgentActionResult(
+                        success=True,
+                        action="GET_SNAPSHOT_PROVENANCE",
+                        data={"provenance": prov},
+                        performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+                    )
+            # Check semantic snapshot
+            snap, err = self._resolve_snapshot(snapshot_id)
+            if snap:
+                s_dict = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+                s_inner = s_dict.get("state", {})
+                prov = s_dict.get("provenance") or s_inner.get("provenance")
+                return AgentActionResult(
+                    success=True,
+                    action="GET_SNAPSHOT_PROVENANCE",
+                    data={"provenance": prov or {}},
+                    performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+                )
+            return self._error("SNAPSHOT_NOT_FOUND", f"Snapshot '{snapshot_id}' not found", "GET_SNAPSHOT_PROVENANCE", t0)
+
+        # 2. If no snapshot_id, check latest snapshot or controller
+        snap, err = self._resolve_snapshot(None)
+        if snap:
+            s_dict = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+            s_inner = s_dict.get("state", {})
+            prov = s_dict.get("provenance") or s_inner.get("provenance")
+            return AgentActionResult(
+                success=True,
+                action="GET_SNAPSHOT_PROVENANCE",
+                data={"provenance": prov or {}},
+                performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+            )
+
+        if self.memory_snapshots:
+            latest = list(self.memory_snapshots.values())[-1]
+            prov = getattr(latest, "provenance", None)
+            if prov is not None:
+                return AgentActionResult(
+                    success=True,
+                    action="GET_SNAPSHOT_PROVENANCE",
+                    data={"provenance": prov},
+                    performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+                )
+
+        return self._error("SNAPSHOT_NOT_FOUND", "No snapshot available to retrieve provenance", "GET_SNAPSHOT_PROVENANCE", t0)
 
     def _resolve_raw_memory_snapshot(self, target: str) -> Optional[Any]:
         """Resolve a RawMemorySnapshot by ID or path."""

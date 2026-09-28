@@ -8,7 +8,9 @@ Commands:
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 
 from .memory_capture import MemoryCapture
 from .offline_analyzer import OfflineMemoryAnalyzer
@@ -51,6 +53,25 @@ def main():
 
     # 4. runtime-info
     subparsers.add_parser("runtime-info", help="Display platform observation capabilities and backend support")
+
+    # 5. extract-state
+    ext_parser = subparsers.add_parser("extract-state", help="Extract semantic runtime state (LOW_IMPACT or CONSISTENT)")
+    ext_parser.add_argument("--mode", type=str, default="LOW_IMPACT", choices=["LOW_IMPACT", "CONSISTENT"],
+                            help="Observation mode (default: LOW_IMPACT)")
+    ext_parser.add_argument("--pid", type=int, default=None, help="Target process PID")
+    ext_parser.add_argument("--debug-image", type=str, default=None,
+                            help="Path to external debug image / unstripped ELF binary")
+    ext_parser.add_argument("--binary", type=str, default=None,
+                            help="Path to executable binary (for CONSISTENT mode)")
+    ext_parser.add_argument("--policy", type=str, default="ALL_READABLE",
+                            choices=["STACK", "HEAP", "GLOBAL", "EXECUTABLE", "SHARED_LIBRARY", "ALL_READABLE", "SELECTED"],
+                            help="Region selection policy (default: ALL_READABLE)")
+    ext_parser.add_argument("--max-bytes", type=int, default=32 * 1024 * 1024,
+                            help="Maximum total bytes to capture (default: 32MB)")
+    ext_parser.add_argument("--timeout-ms", type=int, default=2000,
+                            help="Capture timeout in milliseconds (default: 2000ms)")
+    ext_parser.add_argument("--output", type=str, default=None,
+                            help="Optional output path to save semantic snapshot JSON")
 
     args = parser.parse_args()
 
@@ -132,6 +153,67 @@ def main():
         }
         print(json.dumps(info, indent=2))
         sys.exit(0)
+
+    elif args.command == "extract-state":
+        if args.mode == "LOW_IMPACT":
+            if not args.pid:
+                print("ERROR: --pid is required for LOW_IMPACT observation mode.", file=sys.stderr)
+                sys.exit(1)
+            if not args.debug_image:
+                print("ERROR: --debug-image is required for LOW_IMPACT offline analysis.", file=sys.stderr)
+                sys.exit(1)
+
+            capturer = MemoryCapture()
+            if not capturer.is_supported:
+                print("ERROR: process_vm_readv is not supported on this platform.", file=sys.stderr)
+                sys.exit(1)
+
+            tmp_dir = tempfile.mkdtemp(prefix="dynstate_low_impact_")
+            try:
+                raw_snap = capturer.capture(
+                    pid=args.pid,
+                    policy=args.policy,
+                    output_dir=tmp_dir,
+                    max_bytes=args.max_bytes,
+                    timeout_ms=args.timeout_ms
+                )
+                analyzer = OfflineMemoryAnalyzer()
+                semantic_snap = analyzer.analyze(
+                    memory_snapshot=raw_snap,
+                    debug_image=args.debug_image
+                )
+                if args.output:
+                    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+                    semantic_snap.write_json(args.output)
+                    print(f"Semantic snapshot saved to {args.output}")
+                else:
+                    print(json.dumps(semantic_snap.to_dict(), indent=2))
+                sys.exit(0)
+            except Exception as e:
+                print(f"ERROR: Extraction failed: {e}", file=sys.stderr)
+                sys.exit(1)
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        elif args.mode == "CONSISTENT":
+            from .runtime_controller import RuntimeController
+            target_bin = args.binary or args.debug_image
+            if not target_bin:
+                print("ERROR: --binary or --debug-image is required for CONSISTENT mode.", file=sys.stderr)
+                sys.exit(1)
+            try:
+                ctrl = RuntimeController(binary=target_bin, pid=args.pid, debug_image=args.debug_image)
+                snap = ctrl.observe()
+                if args.output:
+                    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+                    snap.write_json(args.output)
+                    print(f"Semantic snapshot saved to {args.output}")
+                else:
+                    print(json.dumps(snap.to_dict(), indent=2))
+                sys.exit(0)
+            except Exception as e:
+                print(f"ERROR: Consistent extraction failed: {e}", file=sys.stderr)
+                sys.exit(1)
 
 
 if __name__ == "__main__":

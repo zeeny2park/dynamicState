@@ -157,9 +157,9 @@ class DebugArtifactProvider:
                     verification_ms=round((time.monotonic() - t0) * 1000, 3)
                 )
 
-        # 3. Build ID compatibility (if present in both)
-        if module.build_id and dbg_ident.build_id:
-            if module.build_id.lower() != dbg_ident.build_id.lower():
+        # 3. Build ID compatibility
+        if module.build_id:
+            if not dbg_ident.build_id or module.build_id.lower() != dbg_ident.build_id.lower():
                 return CompatibilityResult(
                     compatible=False,
                     reason="DEBUG_IMAGE_MISMATCH",
