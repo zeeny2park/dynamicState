@@ -290,6 +290,336 @@ CORRUPT_LINE_WITHOUT_HYPHEN_OR_VALID_HEX
                 self.assertEqual(regions[0].start, 0x00400000)
                 self.assertEqual(regions[1].start, 0x00600000)
 
+    def test_audit_big_endian_decoding(self):
+        """AUDIT-B: Authoritative big-endian target memory decoding (int16/32/64, float, double, ptr, enum)."""
+        analyzer = OfflineMemoryAnalyzer()
+
+        mem_dir = os.path.join(self.tmp_dir, "be_memory")
+        os.makedirs(mem_dir, exist_ok=True)
+
+        # Build big-endian memory buffer (> format)
+        be_buf = bytearray(128)
+        # offset 0: uint16 = 0x1234 (bytes: 12 34)
+        struct.pack_into(">H", be_buf, 0, 0x1234)
+        # offset 4: uint32 = 0x12345678 (bytes: 12 34 56 78)
+        struct.pack_into(">I", be_buf, 4, 0x12345678)
+        # offset 8: uint64 = 0x0102030405060708 (bytes: 01 02 03 04 05 06 07 08)
+        struct.pack_into(">Q", be_buf, 8, 0x0102030405060708)
+        # offset 16: float = 12.5
+        struct.pack_into(">f", be_buf, 16, 12.5)
+        # offset 24: double = 123.456
+        struct.pack_into(">d", be_buf, 24, 123.456)
+        # offset 32: enum (SessionState = 2 -> "DISCONNECTED")
+        struct.pack_into(">I", be_buf, 32, 2)
+        # offset 40: pointer = 0x8000
+        struct.pack_into(">Q", be_buf, 40, 0x8000)
+
+        with open(os.path.join(mem_dir, "be_reg.bin"), "wb") as f:
+            f.write(be_buf)
+
+        cap_reg = CapturedRegion(
+            region_id="R000001",
+            start=0x5000,
+            end=0x5080,
+            size=128,
+            permissions="rw-p",
+            category="global",
+            pathname="/app/be_target",
+            requested=128,
+            captured=128,
+            status="COMPLETE",
+            filename="be_memory/be_reg.bin",
+        )
+
+        mod_be = RuntimeModule(
+            module_id="main",
+            path="/app/be_target",
+            runtime_base=0x5000,
+            runtime_end=0x5080,
+            load_bias=0x5000,
+            build_id="BE_BUILD_ID",
+            architecture="mips64",
+            endianness="big",  # Big-endian target
+            elf_class="ELF64",
+            is_main_executable=True,
+            load_bias_status="RESOLVED",
+        )
+
+        raw_snap = RawMemorySnapshot(
+            snapshot_id="SNAP_BE_AUDIT",
+            pid=2222,
+            binary="/app/be_target",
+            timestamp_ns=2000,
+            output_dir=self.tmp_dir,
+            regions=[cap_reg],
+            maps=[{"start_addr": 0x5000, "end_addr": 0x5080, "category": "global", "pathname": "/app/be_target"}],
+            modules=[mod_be.to_dict()],
+            endianness="big",
+        )
+
+        # Verify SnapshotMemoryReader recognizes big-endian
+        reader = SnapshotMemoryReader(raw_snap)
+        self.assertEqual(reader.endianness, "big")
+        self.assertEqual(reader.read_int(0x5000, 2, signed=False), 0x1234)
+        self.assertEqual(reader.read_int(0x5004, 4, signed=False), 0x12345678)
+        self.assertEqual(reader.read_int(0x5008, 8, signed=False), 0x0102030405060708)
+        self.assertAlmostEqual(reader.read_float(0x5010), 12.5, places=3)
+        self.assertAlmostEqual(reader.read_double(0x5018), 123.456, places=3)
+        self.assertEqual(reader.read_ptr(0x5028), 0x8000)
+
+        # Verify full offline semantic analysis with big-endian struct
+        sym_context = {
+            "symbols": [
+                {"name": "be_obj", "type": "BigEndianStruct", "address": 0x0}
+            ],
+            "types": {
+                "BigEndianStruct": {
+                    "name": "BigEndianStruct",
+                    "code": "aggregate",
+                    "sizeof": 48,
+                    "fields": [
+                        {"name": "u16_val", "type": "uint16_t", "offset": 0, "sizeof": 2},
+                        {"name": "u32_val", "type": "uint32_t", "offset": 4, "sizeof": 4},
+                        {"name": "u64_val", "type": "uint64_t", "offset": 8, "sizeof": 8},
+                        {"name": "f_val", "type": "float", "offset": 16, "sizeof": 4},
+                        {"name": "d_val", "type": "double", "offset": 24, "sizeof": 8},
+                        {"name": "state", "type": "StateEnum", "offset": 32, "sizeof": 4},
+                    ]
+                },
+                "StateEnum": {
+                    "name": "StateEnum",
+                    "code": "enum",
+                    "sizeof": 4,
+                    "fields": ["IDLE", "CONNECTING", "DISCONNECTED"]
+                }
+            }
+        }
+
+        class MockDbg:
+            path = "/app/be_target"
+            def verify(self, b):
+                class C:
+                    compatible = True
+                return C()
+
+        snap = analyzer.analyze(
+            memory_snapshot=raw_snap,
+            debug_image=MockDbg(),
+            optional_symbol_context=sym_context,
+        )
+
+        self.assertEqual(len(snap.persistent.objects), 1)
+        obj = snap.persistent.objects[0]
+        fields = {f.name: f.value for f in obj.fields}
+        self.assertEqual(fields["u16_val"], 0x1234)
+        self.assertEqual(fields["u32_val"], 0x12345678)
+        self.assertEqual(fields["u64_val"], 0x0102030405060708)
+        self.assertAlmostEqual(fields["f_val"], 12.5, places=3)
+        self.assertAlmostEqual(fields["d_val"], 123.456, places=3)
+        self.assertEqual(fields["state"], "DISCONNECTED")
+
+    def test_audit_elf32_pointer_width(self):
+        """AUDIT-C: Verify ELF32 pointer width is 4 bytes and ELF64 is 8 bytes."""
+        mod32 = RuntimeModule(
+            module_id="main",
+            path="/app/target32",
+            runtime_base=0x1000,
+            runtime_end=0x2000,
+            load_bias=0x1000,
+            build_id="BUILD32",
+            architecture="x86",
+            endianness="little",
+            elf_class="ELF32",
+            is_main_executable=True,
+            load_bias_status="RESOLVED",
+        )
+
+        raw_snap32 = RawMemorySnapshot(
+            snapshot_id="SNAP_ELF32",
+            pid=3333,
+            binary="/app/target32",
+            timestamp_ns=3000,
+            output_dir=self.tmp_dir,
+            regions=[],
+            maps=[],
+            modules=[mod32.to_dict()],
+        )
+
+        reader32 = SnapshotMemoryReader(raw_snap32)
+        self.assertEqual(reader32.ptr_size, 4)
+
+        mod64 = RuntimeModule(
+            module_id="main",
+            path="/app/target64",
+            runtime_base=0x1000,
+            runtime_end=0x2000,
+            load_bias=0x1000,
+            build_id="BUILD64",
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            is_main_executable=True,
+            load_bias_status="RESOLVED",
+        )
+
+        raw_snap64 = RawMemorySnapshot(
+            snapshot_id="SNAP_ELF64",
+            pid=4444,
+            binary="/app/target64",
+            timestamp_ns=4000,
+            output_dir=self.tmp_dir,
+            regions=[],
+            maps=[],
+            modules=[mod64.to_dict()],
+        )
+
+        reader64 = SnapshotMemoryReader(raw_snap64)
+        self.assertEqual(reader64.ptr_size, 8)
+
+    def test_audit_strict_build_id_rejection_when_debug_has_no_build_id(self):
+        """AUDIT-D: Reject debug image if runtime binary has Build ID but debug image does not."""
+        dbg_provider = DebugImageProvider()
+        dbg_provider.debug_image_path = "/tmp/debug_no_bid"
+
+        # Mock debug identity without build ID
+        from extractor.debug_image import BinaryIdentity
+        dbg_provider.debug_identity = BinaryIdentity(
+            path="/tmp/debug_no_bid",
+            elf_class="ELF64",
+            architecture="x86_64",
+            endianness="little",
+            build_id=None,  # No Build ID in debug image
+            has_debug_info=True,
+        )
+
+        # Mock runtime binary identity with Build ID
+        with mock.patch("extractor.debug_image.inspect_elf") as mock_inspect:
+            mock_inspect.return_value = BinaryIdentity(
+                path="/tmp/runtime_bin",
+                elf_class="ELF64",
+                architecture="x86_64",
+                endianness="little",
+                build_id="KNOWN_BUILD_ID_AAA",  # Runtime binary has Build ID
+                has_debug_info=False,
+            )
+
+            res = dbg_provider.verify("/tmp/runtime_bin")
+            self.assertFalse(res.compatible)
+            self.assertEqual(res.reason, "BUILD_ID_MISMATCH")
+
+    def test_audit_gnu_debuglink_crc_verification_and_ambiguity(self):
+        """AUDIT-E: Test .gnu_debuglink CRC matching, CRC mismatch rejection, and ambiguous candidates."""
+        provider = DebugArtifactProvider(search_paths=[self.tmp_dir])
+
+        # Create two debug files: one with matching CRC and one with mismatching content
+        dbg_correct = os.path.join(self.tmp_dir, "libfoo.debug")
+        with open(dbg_correct, "wb") as f:
+            f.write(b"CORRECT_DEBUG_DATA")
+
+        from extractor.debug_artifacts import compute_gnu_debuglink_crc
+        correct_crc = compute_gnu_debuglink_crc(dbg_correct)
+
+        mod_matching = RuntimeModule(
+            module_id="mod_foo",
+            path=os.path.join(self.tmp_dir, "libfoo.so"),
+            runtime_base=0x1000,
+            runtime_end=0x2000,
+            load_bias=0x1000,
+            build_id=None,
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            debuglink={"filename": "libfoo.debug", "crc": correct_crc},
+        )
+
+        # Case 1: CRC matches -> artifact discovered
+        found = provider.find_debug_artifact(mod_matching)
+        self.assertEqual(found, dbg_correct)
+
+        # Case 2: CRC mismatch -> artifact rejected
+        mod_mismatch = RuntimeModule(
+            module_id="mod_foo",
+            path=os.path.join(self.tmp_dir, "libfoo.so"),
+            runtime_base=0x1000,
+            runtime_end=0x2000,
+            load_bias=0x1000,
+            build_id=None,
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            debuglink={"filename": "libfoo.debug", "crc": 0xDEADBEEF},
+        )
+        found_mismatch = provider.find_debug_artifact(mod_mismatch)
+        self.assertIsNone(found_mismatch)
+
+    def test_audit_shared_library_address_translation_boundaries(self):
+        """AUDIT-A: Module boundary checks and address translation for shared libraries."""
+        mod_exe = RuntimeModule(
+            module_id="main",
+            path="/bin/app",
+            runtime_base=0x400000,
+            runtime_end=0x405000,
+            load_bias=0x400000,
+            build_id="EXE_ID",
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            is_main_executable=True,
+            load_bias_status="RESOLVED",
+        )
+        mod_lib = RuntimeModule(
+            module_id="mod_0001",
+            path="/lib/libhelper.so",
+            runtime_base=0x7fff1000,
+            runtime_end=0x7fff5000,
+            load_bias=0x7fff1000,
+            build_id="LIB_ID",
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            is_main_executable=False,
+            load_bias_status="RESOLVED",
+        )
+        mod_unresolved = RuntimeModule(
+            module_id="mod_0002",
+            path="/lib/libunresolved.so",
+            runtime_base=0x7fff6000,
+            runtime_end=0x7fff8000,
+            load_bias=None,
+            build_id="UNRES_ID",
+            architecture="x86_64",
+            endianness="little",
+            elf_class="ELF64",
+            is_main_executable=False,
+            load_bias_status="UNRESOLVED",
+        )
+
+        modules = [mod_exe, mod_lib, mod_unresolved]
+        raw_snap = RawMemorySnapshot(
+            snapshot_id="SNAP_BOUNDS",
+            pid=5555,
+            binary="/bin/app",
+            timestamp_ns=5000,
+            output_dir=self.tmp_dir,
+            regions=[],
+            maps=[],
+            modules=[m.to_dict() for m in modules],
+        )
+        reader = SnapshotMemoryReader(raw_snap)
+
+        # 1. module_for_address
+        self.assertEqual(reader.module_for_address(0x401000).module_id, "main")
+        self.assertEqual(reader.module_for_address(0x7fff2000).module_id, "mod_0001")
+        self.assertIsNone(reader.module_for_address(0x1000))
+
+        # 2. runtime_to_elf translation within bounds
+        m, elf_addr = reader.runtime_to_elf(0x7fff2500)
+        self.assertEqual(m.module_id, "mod_0001")
+        self.assertEqual(elf_addr, 0x1500)
+
+        # 3. Unresolved module returns None on runtime_to_elf
+        self.assertIsNone(reader.runtime_to_elf(0x7fff7000))
+
 
 if __name__ == "__main__":
     unittest.main()

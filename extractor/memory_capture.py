@@ -319,6 +319,28 @@ class MemoryCapture:
         else:
             arch_norm = arch
 
+        # Determine authoritative endianness from main module
+        main_mod = next((m for m in modules if m.is_main_executable), modules[0] if modules else None)
+        target_endian = (main_mod.endianness if main_mod and main_mod.endianness else "little") or "little"
+
+        # Detect if process modified mappings during capture
+        maps_after = MemoryMapProvider(pid, binary=binary_path).get_regions()
+        mapping_race_detected = (len(maps_after) != len(all_regions))
+        if not mapping_race_detected:
+            if any(r1.start != r2.start or r1.end != r2.end for r1, r2 in zip(all_regions, maps_after)):
+                mapping_race_detected = True
+
+        consistency_dict = SnapshotConsistency(
+            level=NON_ATOMIC,
+            capture_start_ns=t_start_ns,
+            capture_end_ns=t_end_ns,
+            duration_us=duration_us,
+            partial_reads=partial_reads,
+            failed_reads=failed_reads,
+        ).to_dict()
+        if mapping_race_detected:
+            consistency_dict["mapping_race_detected"] = True
+
         raw_snapshot = RawMemorySnapshot(
             snapshot_id=sid,
             pid=pid,
@@ -327,7 +349,7 @@ class MemoryCapture:
             capture_mode="LOW_IMPACT",
             backend="process_vm_readv",
             architecture=arch_norm,
-            endianness="little",
+            endianness=target_endian,
             page_size=self.page_size,
             status=overall_status,
             regions_requested=len(selected_regions),
@@ -339,14 +361,7 @@ class MemoryCapture:
             duration_us=duration_us,
             capture_start_ns=t_start_ns,
             capture_end_ns=t_end_ns,
-            consistency=SnapshotConsistency(
-                level=NON_ATOMIC,
-                capture_start_ns=t_start_ns,
-                capture_end_ns=t_end_ns,
-                duration_us=duration_us,
-                partial_reads=partial_reads,
-                failed_reads=failed_reads,
-            ).to_dict(),
+            consistency=consistency_dict,
             capture={
                 "backend": "process_vm_readv",
                 "process_stop": False,

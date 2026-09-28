@@ -87,14 +87,24 @@ class DebugArtifactProvider:
                 candidate_paths.append(os.path.join(sp, dl_filename))
 
             expected_crc = module.debuglink.get("crc")
+            matching_candidates = []
             for cand in candidate_paths:
                 if os.path.exists(cand):
                     if expected_crc is not None:
                         actual_crc = compute_gnu_debuglink_crc(cand)
                         if actual_crc == expected_crc:
-                            return cand
+                            if cand not in matching_candidates:
+                                matching_candidates.append(cand)
                     else:
-                        return cand
+                        # If CRC is not provided in debuglink, only accept directly adjacent candidates
+                        if (cand.startswith(bin_dir) or cand.startswith(os.path.join(bin_dir, ".debug"))) and cand not in matching_candidates:
+                            matching_candidates.append(cand)
+
+            if len(matching_candidates) == 1:
+                return matching_candidates[0]
+            elif len(matching_candidates) > 1:
+                # Ambiguous candidate artifacts: reject arbitrary selection
+                return None
 
         # 4. Runtime binary itself (if it contains DWARF/debug info)
         if module.path and os.path.exists(module.path):

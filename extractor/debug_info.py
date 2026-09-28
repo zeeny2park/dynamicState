@@ -160,7 +160,7 @@ print(json.dumps({{'symbols': discovered_symbols, 'types': types_out}}))
 print('__DWARF_JSON_END__')
 """
         cmd = ["gdb", "-q", "-nx", "-batch", abs_path, "-ex", f"python\n{py_script}"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
         if proc.returncode != 0:
             raise RuntimeError(f"GDB offline symbol extraction failed: {proc.stderr}")
 

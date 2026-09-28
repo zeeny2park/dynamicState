@@ -352,8 +352,8 @@ class DebugImageProvider:
             return res
 
         # 2. Build ID comparison (Strongest authority)
-        if runtime_id.build_id and debug_id.build_id:
-            if runtime_id.build_id != debug_id.build_id:
+        if runtime_id.build_id:
+            if not debug_id.build_id or runtime_id.build_id != debug_id.build_id:
                 res = CompatibilityResult(
                     compatible=False,
                     reason="BUILD_ID_MISMATCH",

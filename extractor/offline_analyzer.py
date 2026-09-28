@@ -65,6 +65,20 @@ class SnapshotMemoryReader:
                 raw_snapshot.pid, raw_snapshot.maps, raw_snapshot.binary
             )
 
+        # Determine target endianness and pointer width authoritatively
+        main_mod = next((m for m in self.modules if m.is_main_executable), self.modules[0] if self.modules else None)
+        raw_endian = (main_mod.endianness if main_mod and main_mod.endianness else getattr(raw_snapshot, "endianness", "little")) or "little"
+        self.endianness: str = raw_endian.lower()
+        if self.endianness not in ("little", "big"):
+            raise ValueError(f"Unsupported target endianness: '{self.endianness}'")
+
+        if main_mod and main_mod.elf_class:
+            self.ptr_size: int = 4 if main_mod.elf_class == "ELF32" else 8
+        elif getattr(raw_snapshot, "architecture", "") in ("x86", "i386", "arm", "armv7l", "mips"):
+            self.ptr_size = 4
+        else:
+            self.ptr_size = 8
+
     def find_region(self, address: int) -> Optional[Tuple[int, int, str, str, CapturedRegion]]:
         for start, end, fpath, cat, reg in self._regions:
             if start <= address < end:
@@ -83,12 +97,12 @@ class SnapshotMemoryReader:
 
     def runtime_to_elf(self, address: int) -> Optional[Tuple[RuntimeModule, int]]:
         mod = self.module_for_address(address)
-        if not mod:
+        if not mod or mod.load_bias_status != "RESOLVED" or mod.load_bias is None:
             return None
-        return (mod, address - mod.load_bias)
+        return (mod, ModuleAddressResolver.resolve_elf_address(mod, address))
 
     def elf_to_runtime(self, module: RuntimeModule, elf_address: int) -> int:
-        return elf_address + module.load_bias
+        return ModuleAddressResolver.resolve_runtime_address(module, elf_address)
 
     def is_readable(self, address: int, size: int = 1) -> bool:
         r = self.find_region(address)
@@ -126,30 +140,43 @@ class SnapshotMemoryReader:
             return None
         return res
 
-    def read_int(self, address: int, size: int = 4, signed: bool = False, endian: str = "little") -> Optional[int]:
+    def read_int(self, address: int, size: int = 4, signed: bool = False, endian: Optional[str] = None) -> Optional[int]:
+        byte_order = endian or self.endianness
+        if byte_order not in ("little", "big"):
+            raise ValueError(f"Unsupported endianness: '{byte_order}'")
         raw = self.read(address, size)
         if raw is None or len(raw) < size:
             return None
-        return int.from_bytes(raw, byteorder=endian, signed=signed)
+        return int.from_bytes(raw, byteorder=byte_order, signed=signed)
 
-    def read_ptr(self, address: int, ptr_size: int = 8, endian: str = "little") -> Optional[int]:
-        raw = self.read(address, ptr_size)
-        if raw is None or len(raw) < ptr_size:
+    def read_ptr(self, address: int, ptr_size: Optional[int] = None, endian: Optional[str] = None) -> Optional[int]:
+        p_size = ptr_size or self.ptr_size
+        byte_order = endian or self.endianness
+        if byte_order not in ("little", "big"):
+            raise ValueError(f"Unsupported endianness: '{byte_order}'")
+        raw = self.read(address, p_size)
+        if raw is None or len(raw) < p_size:
             return None
-        return int.from_bytes(raw, byteorder=endian, signed=False)
+        return int.from_bytes(raw, byteorder=byte_order, signed=False)
 
-    def read_float(self, address: int, endian: str = "little") -> Optional[float]:
+    def read_float(self, address: int, endian: Optional[str] = None) -> Optional[float]:
+        byte_order = endian or self.endianness
+        if byte_order not in ("little", "big"):
+            raise ValueError(f"Unsupported endianness: '{byte_order}'")
         raw = self.read(address, 4)
         if raw is None or len(raw) < 4:
             return None
-        fmt = "<f" if endian == "little" else ">f"
+        fmt = "<f" if byte_order == "little" else ">f"
         return struct.unpack(fmt, raw)[0]
 
-    def read_double(self, address: int, endian: str = "little") -> Optional[float]:
+    def read_double(self, address: int, endian: Optional[str] = None) -> Optional[float]:
+        byte_order = endian or self.endianness
+        if byte_order not in ("little", "big"):
+            raise ValueError(f"Unsupported endianness: '{byte_order}'")
         raw = self.read(address, 8)
         if raw is None or len(raw) < 8:
             return None
-        fmt = "<d" if endian == "little" else ">d"
+        fmt = "<d" if byte_order == "little" else ">d"
         return struct.unpack(fmt, raw)[0]
 
     def read_bool(self, address: int) -> Optional[bool]:
@@ -187,8 +214,8 @@ def extract_dwarf_context(debug_image_path: str, known_symbols: Optional[List[st
     # Discover global variable symbols from ELF symbols if known_symbols not fully specified
     sym_list = list(known_symbols or [])
     try:
-        cmd_nm = ["nm", "-g", "-C", "--defined-only", debug_image_path]
-        proc_nm = subprocess.run(cmd_nm, capture_output=True, text=True, check=False)
+        cmd_nm = ["nm", "-g", "-C", "--defined-only", "--", debug_image_path]
+        proc_nm = subprocess.run(cmd_nm, capture_output=True, text=True, check=False, timeout=10)
         if proc_nm.returncode == 0:
             for line in proc_nm.stdout.splitlines():
                 parts = line.strip().split()
@@ -499,7 +526,7 @@ class OfflineMemoryAnalyzer:
                                 address=ptr_hex,
                                 object_ref=target_ref
                             ))
-                    elif clean_type in ("bool", "int", "uint32_t", "uint64_t", "int32_t", "int64_t", "uint8_t", "int8_t", "double", "float") or (f_tinfo["definition"] and f_tinfo["definition"].get("code") == "enum"):
+                    elif clean_type in ("bool", "int", "short", "uint16_t", "int16_t", "unsigned short", "uint32_t", "uint64_t", "int32_t", "int64_t", "uint8_t", "int8_t", "double", "float") or (f_tinfo["definition"] and f_tinfo["definition"].get("code") == "enum"):
                         # Primitive or Enum
                         if clean_type == "bool":
                             val = reader.read_bool(f_addr)
@@ -511,6 +538,10 @@ class OfflineMemoryAnalyzer:
                             val = reader.read_int(f_addr, 1, signed=False)
                         elif clean_type == "int8_t":
                             val = reader.read_int(f_addr, 1, signed=True)
+                        elif clean_type in ("uint16_t", "unsigned short"):
+                            val = reader.read_int(f_addr, 2, signed=False)
+                        elif clean_type in ("int16_t", "short"):
+                            val = reader.read_int(f_addr, 2, signed=True)
                         elif clean_type in ("uint32_t", "int"):
                             val = reader.read_int(f_addr, 4, signed=("uint" not in clean_type))
                         elif clean_type in ("uint64_t", "int64_t"):
