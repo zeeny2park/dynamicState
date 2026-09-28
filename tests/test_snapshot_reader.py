@@ -57,7 +57,9 @@ class SnapshotMemoryReaderTests(unittest.TestCase):
             binary="/bin/test",
             timestamp_ns=1000000,
             output_dir=self.tmp_dir,
-            regions=[self.region1]
+            regions=[self.region1],
+            endianness="little",
+            elf_class="ELF64",
         )
         self.reader = SnapshotMemoryReader(self.raw_snap)
 

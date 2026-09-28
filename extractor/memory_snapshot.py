@@ -84,8 +84,9 @@ class RawMemorySnapshot:
     timestamp_ns: int
     capture_mode: str = "LOW_IMPACT"
     backend: str = "process_vm_readv"
-    architecture: str = "x86_64"
-    endianness: str = "little"
+    architecture: str = "unknown"
+    endianness: str = "UNKNOWN"
+    elf_class: Optional[str] = None
     page_size: int = 4096
     status: str = "COMPLETE"            # "COMPLETE", "PARTIAL", "FAILED"
     regions_requested: int = 0
@@ -120,6 +121,7 @@ class RawMemorySnapshot:
             "backend": self.backend,
             "architecture": self.architecture,
             "endianness": self.endianness,
+            "elf_class": self.elf_class,
             "page_size": self.page_size,
             "status": self.status,
             "capture": self.capture,
@@ -215,8 +217,9 @@ class RawMemorySnapshot:
             timestamp_ns=meta.get("timestamp_ns", 0),
             capture_mode=meta.get("capture_mode", "LOW_IMPACT"),
             backend=meta.get("backend", "process_vm_readv"),
-            architecture=meta.get("architecture", "x86_64"),
-            endianness=meta.get("endianness", "little"),
+            architecture=meta.get("architecture", "unknown"),
+            endianness=meta.get("endianness", "UNKNOWN"),
+            elf_class=meta.get("elf_class"),
             page_size=meta.get("page_size", 4096),
             status=meta.get("status", "COMPLETE"),
             regions_requested=meta.get("regions_requested", len(regions)),

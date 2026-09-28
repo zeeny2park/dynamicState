@@ -11,7 +11,7 @@ import platform
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .memory_maps import MemoryMapProvider, MemoryRegion
+from .memory_maps import MemoryMapProvider, MemoryRegion, get_region_fingerprint
 from .memory_snapshot import CapturedRegion, RawMemorySnapshot
 from .modules import discover_modules
 from .snapshot_consistency import NON_ATOMIC, SnapshotConsistency
@@ -300,12 +300,18 @@ class MemoryCapture:
         if not process_exited and self.get_process_identity(pid) != proc_identity:
             process_exited = True
 
+        # Detect if process modified mappings during capture
+        maps_after = MemoryMapProvider(pid, binary=binary_path).get_regions()
+        fps_before = [get_region_fingerprint(r) for r in all_regions]
+        fps_after = [get_region_fingerprint(r) for r in maps_after]
+        mapping_race_detected = (fps_before != fps_after)
+
         # Determine overall status
         if process_exited:
             overall_status = "PROCESS_EXITED"
         elif not captured_regions or (failed_reads == len(captured_regions)):
             overall_status = "FAILED"
-        elif partial_reads > 0 or failed_reads > 0:
+        elif partial_reads > 0 or failed_reads > 0 or mapping_race_detected:
             overall_status = "PARTIAL"
         else:
             overall_status = "COMPLETE"
@@ -319,16 +325,13 @@ class MemoryCapture:
         else:
             arch_norm = arch
 
-        # Determine authoritative endianness from main module
-        main_mod = next((m for m in modules if m.is_main_executable), modules[0] if modules else None)
-        target_endian = (main_mod.endianness if main_mod and main_mod.endianness else "little") or "little"
-
-        # Detect if process modified mappings during capture
-        maps_after = MemoryMapProvider(pid, binary=binary_path).get_regions()
-        mapping_race_detected = (len(maps_after) != len(all_regions))
-        if not mapping_race_detected:
-            if any(r1.start != r2.start or r1.end != r2.end for r1, r2 in zip(all_regions, maps_after)):
-                mapping_race_detected = True
+        # Determine authoritative target endianness and elf_class from main module
+        main_mod = next((m for m in modules if m.is_main_executable), None)
+        if main_mod and main_mod.endianness in ("little", "big"):
+            target_endian = main_mod.endianness
+        else:
+            target_endian = "UNKNOWN"
+        target_elf_class = main_mod.elf_class if main_mod and main_mod.elf_class in ("ELF32", "ELF64") else None
 
         consistency_dict = SnapshotConsistency(
             level=NON_ATOMIC,
@@ -350,6 +353,7 @@ class MemoryCapture:
             backend="process_vm_readv",
             architecture=arch_norm,
             endianness=target_endian,
+            elf_class=target_elf_class,
             page_size=self.page_size,
             status=overall_status,
             regions_requested=len(selected_regions),

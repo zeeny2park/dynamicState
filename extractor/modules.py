@@ -26,9 +26,9 @@ class RuntimeModule:
     runtime_end: int
     load_bias: Optional[int]
     build_id: Optional[str]
-    architecture: str
-    endianness: str
-    elf_class: str
+    architecture: Optional[str] = None
+    endianness: Optional[str] = None
+    elf_class: Optional[str] = None
     is_main_executable: bool = False
     build_id_status: str = "NOT_AVAILABLE"      # "VERIFIED", "NOT_AVAILABLE", "MISMATCH", "UNREADABLE"
     load_bias_status: str = "RESOLVED"          # "RESOLVED", "UNRESOLVED"
@@ -117,9 +117,9 @@ class RuntimeModule:
             runtime_end=r_end,
             load_bias=l_bias,
             build_id=data.get("build_id"),
-            architecture=data.get("architecture", "x86_64"),
-            endianness=data.get("endianness", "little"),
-            elf_class=data.get("elf_class", "ELF64"),
+            architecture=data.get("architecture", "unknown"),
+            endianness=data.get("endianness"),
+            elf_class=data.get("elf_class"),
             is_main_executable=data.get("is_main_executable", False),
             build_id_status=data.get("build_id_status", "NOT_AVAILABLE"),
             load_bias_status=load_bias_status,
@@ -361,8 +361,8 @@ def discover_modules(
             load_bias=load_bias,
             build_id=elf_info.build_id if elf_info else None,
             architecture=elf_info.architecture if elf_info else "unknown",
-            endianness=elf_info.endianness if elf_info else "little",
-            elf_class=elf_info.elf_class if elf_info else "ELF64",
+            endianness=elf_info.endianness if elf_info else None,
+            elf_class=elf_info.elf_class if elf_info else None,
             is_main_executable=is_main,
             build_id_status=build_id_status,
             load_bias_status=load_bias_status,

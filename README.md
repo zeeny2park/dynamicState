@@ -778,7 +778,7 @@ caps = controller.get_capabilities()
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 테스트 (176 unit tests across all modules)
+# 1. 단위 테스트 (182 unit tests across all modules)
 python3 -m unittest discover -s tests -v
 
 # 2. Phase 1 & 2 GDB 기본 통합 테스트
@@ -830,8 +830,8 @@ bash tests/integration_phase5_2_hardening.sh
 
 - **LOW_IMPACT Observation Contract**: Zero-stop (`process_stop=False`, `ptrace=False`), read-only memory capture via `process_vm_readv`. Execution context (`thread_id`, `pc`, `frames`) is explicitly reported as `UNAVAILABLE`. Mutation, checkpoint/restore, continue, and exploration are strictly rejected with `CAPABILITY_UNSUPPORTED`.
 - **Shared Library Semantic Scope**: `discover_modules` discovers all loaded dynamic libraries, calculates their load biases, checks their Build IDs, and enforces address boundary guards. Semantic root and type reconstruction currently targets the main executable module; shared library global roots require registered debug artifacts and are not cross-interpreted using the main executable's DWARF.
-- **Target Endianness & Pointer Width**: Authoritative target endianness (little-endian or big-endian) and pointer width (4 bytes for ELF32, 8 bytes for ELF64) are determined strictly from runtime module ELF headers, independent of host architecture.
-- **Non-Atomic Snapshots**: LOW_IMPACT capture is non-atomic (`consistency.level = NON_ATOMIC`). Mapping modifications during capture are detected and flagged in snapshot consistency metadata.
+- **Target Endianness & Pointer Width**: Target endianness is obtained strictly from target ELF/module metadata. Unknown endianness is never assumed to be little-endian (results in explicit `TARGET_ENDIANNESS_UNAVAILABLE` error or `None`). Pointer width is obtained strictly from the ELF class (4 bytes for ELF32, 8 bytes for ELF64); unknown ELF class does not default to 64-bit (`ptr_size = None`).
+- **Mapping Race Detection & Non-Atomic Snapshots**: LOW_IMPACT capture is strictly non-atomic (`consistency.level = NON_ATOMIC`). Mapping changes (address range, permissions, offset, device/inode, or pathname) occurring during capture are detected via pre- and post-capture fingerprinting and flagged with `consistency.mapping_race_detected = True` and snapshot `status: "PARTIAL"`.
 - **Multi-thread Nondeterminism**: 다중 스레드 레이스 컨디션에 따른 비결정론적 스케줄링은 현재 싱글 스레드/중단점 컨텍스트에 초점이 맞춰져 있습니다.
 - **External I/O & Socket State**: 프로세스 외부 커널 소켓 연결이나 원격 RPC 상태는 OS fork만으로 완전 롤백되지 않습니다.
 - **Optimized Binaries (-O2/-O3)**: 컴파일러 인라인화 및 레지스터 할당으로 DWARF 위치 표현식이 `<optimized out>`인 필드는 변이가 제한됩니다.

@@ -65,19 +65,29 @@ class SnapshotMemoryReader:
                 raw_snapshot.pid, raw_snapshot.maps, raw_snapshot.binary
             )
 
-        # Determine target endianness and pointer width authoritatively
+        # Determine target endianness authoritatively
+        # Precedence: 1. RuntimeModule.endianness, 2. raw_snapshot.endianness, 3. None (UNKNOWN)
         main_mod = next((m for m in self.modules if m.is_main_executable), self.modules[0] if self.modules else None)
-        raw_endian = (main_mod.endianness if main_mod and main_mod.endianness else getattr(raw_snapshot, "endianness", "little")) or "little"
-        self.endianness: str = raw_endian.lower()
-        if self.endianness not in ("little", "big"):
-            raise ValueError(f"Unsupported target endianness: '{self.endianness}'")
+        raw_endian = None
+        if main_mod and main_mod.endianness and main_mod.endianness.lower() in ("little", "big"):
+            raw_endian = main_mod.endianness.lower()
+        elif getattr(raw_snapshot, "endianness", None) and str(raw_snapshot.endianness).lower() in ("little", "big"):
+            raw_endian = str(raw_snapshot.endianness).lower()
 
-        if main_mod and main_mod.elf_class:
-            self.ptr_size: int = 4 if main_mod.elf_class == "ELF32" else 8
-        elif getattr(raw_snapshot, "architecture", "") in ("x86", "i386", "arm", "armv7l", "mips"):
-            self.ptr_size = 4
-        else:
+        self.endianness: Optional[str] = raw_endian
+
+        # Determine pointer width authoritatively from ELF class
+        # Precedence: 1. RuntimeModule.elf_class, 2. raw_snapshot.elf_class, 3. None (UNKNOWN)
+        if main_mod and main_mod.elf_class == "ELF32":
+            self.ptr_size: Optional[int] = 4
+        elif main_mod and main_mod.elf_class == "ELF64":
             self.ptr_size = 8
+        elif getattr(raw_snapshot, "elf_class", None) == "ELF32":
+            self.ptr_size = 4
+        elif getattr(raw_snapshot, "elf_class", None) == "ELF64":
+            self.ptr_size = 8
+        else:
+            self.ptr_size = None
 
     def find_region(self, address: int) -> Optional[Tuple[int, int, str, str, CapturedRegion]]:
         for start, end, fpath, cat, reg in self._regions:
@@ -142,18 +152,20 @@ class SnapshotMemoryReader:
 
     def read_int(self, address: int, size: int = 4, signed: bool = False, endian: Optional[str] = None) -> Optional[int]:
         byte_order = endian or self.endianness
-        if byte_order not in ("little", "big"):
-            raise ValueError(f"Unsupported endianness: '{byte_order}'")
+        if not byte_order or byte_order not in ("little", "big"):
+            raise ValueError(f"TARGET_ENDIANNESS_UNAVAILABLE: '{byte_order}'")
         raw = self.read(address, size)
         if raw is None or len(raw) < size:
             return None
         return int.from_bytes(raw, byteorder=byte_order, signed=signed)
 
     def read_ptr(self, address: int, ptr_size: Optional[int] = None, endian: Optional[str] = None) -> Optional[int]:
-        p_size = ptr_size or self.ptr_size
+        p_size = ptr_size if ptr_size is not None else self.ptr_size
+        if p_size is None or p_size not in (4, 8):
+            return None
         byte_order = endian or self.endianness
-        if byte_order not in ("little", "big"):
-            raise ValueError(f"Unsupported endianness: '{byte_order}'")
+        if not byte_order or byte_order not in ("little", "big"):
+            raise ValueError(f"TARGET_ENDIANNESS_UNAVAILABLE: '{byte_order}'")
         raw = self.read(address, p_size)
         if raw is None or len(raw) < p_size:
             return None
@@ -161,8 +173,8 @@ class SnapshotMemoryReader:
 
     def read_float(self, address: int, endian: Optional[str] = None) -> Optional[float]:
         byte_order = endian or self.endianness
-        if byte_order not in ("little", "big"):
-            raise ValueError(f"Unsupported endianness: '{byte_order}'")
+        if not byte_order or byte_order not in ("little", "big"):
+            raise ValueError(f"TARGET_ENDIANNESS_UNAVAILABLE: '{byte_order}'")
         raw = self.read(address, 4)
         if raw is None or len(raw) < 4:
             return None
@@ -171,8 +183,8 @@ class SnapshotMemoryReader:
 
     def read_double(self, address: int, endian: Optional[str] = None) -> Optional[float]:
         byte_order = endian or self.endianness
-        if byte_order not in ("little", "big"):
-            raise ValueError(f"Unsupported endianness: '{byte_order}'")
+        if not byte_order or byte_order not in ("little", "big"):
+            raise ValueError(f"TARGET_ENDIANNESS_UNAVAILABLE: '{byte_order}'")
         raw = self.read(address, 8)
         if raw is None or len(raw) < 8:
             return None
@@ -494,100 +506,109 @@ class OfflineMemoryAnalyzer:
                     is_ptr = f_tinfo["is_ptr"]
                     base_type = f_tinfo["base"]
 
-                    if is_ptr:
-                        ptr_val = reader.read_ptr(f_addr)
-                        if ptr_val is None:
-                            obj.fields.append(FieldState(
-                                name=f_name,
-                                type=clean_type,
-                                offset=f_offset,
-                                availability="unavailable",
-                                error="Memory not captured"
-                            ))
-                        elif ptr_val == 0:
-                            obj.fields.append(FieldState(
-                                name=f_name,
-                                type=clean_type,
-                                offset=f_offset,
-                                value="0x0",
-                                address="0x0",
-                                object_ref=None
-                            ))
-                        else:
-                            ptr_hex = "0x{:x}".format(ptr_val)
-                            target_ref = None
-                            if depth + 1 <= self.MAX_OBJECT_DEPTH:
-                                target_ref = build_object(ptr_val, base_type, depth + 1)
-                            obj.fields.append(FieldState(
-                                name=f_name,
-                                type=clean_type,
-                                offset=f_offset,
-                                value=ptr_hex,
-                                address=ptr_hex,
-                                object_ref=target_ref
-                            ))
-                    elif clean_type in ("bool", "int", "short", "uint16_t", "int16_t", "unsigned short", "uint32_t", "uint64_t", "int32_t", "int64_t", "uint8_t", "int8_t", "double", "float") or (f_tinfo["definition"] and f_tinfo["definition"].get("code") == "enum"):
-                        # Primitive or Enum
-                        if clean_type == "bool":
-                            val = reader.read_bool(f_addr)
-                        elif clean_type == "double":
-                            val = reader.read_double(f_addr)
-                        elif clean_type == "float":
-                            val = reader.read_float(f_addr)
-                        elif clean_type == "uint8_t":
-                            val = reader.read_int(f_addr, 1, signed=False)
-                        elif clean_type == "int8_t":
-                            val = reader.read_int(f_addr, 1, signed=True)
-                        elif clean_type in ("uint16_t", "unsigned short"):
-                            val = reader.read_int(f_addr, 2, signed=False)
-                        elif clean_type in ("int16_t", "short"):
-                            val = reader.read_int(f_addr, 2, signed=True)
-                        elif clean_type in ("uint32_t", "int"):
-                            val = reader.read_int(f_addr, 4, signed=("uint" not in clean_type))
-                        elif clean_type in ("uint64_t", "int64_t"):
-                            val = reader.read_int(f_addr, 8, signed=("uint" not in clean_type))
-                        elif f_tinfo["definition"] and f_tinfo["definition"].get("code") == "enum":
-                            raw_enum = reader.read_int(f_addr, 4, signed=False)
-                            enum_members = f_tinfo["definition"].get("fields", [])
-                            if raw_enum is not None and 0 <= raw_enum < len(enum_members):
-                                val = enum_members[raw_enum]
+                    try:
+                        if is_ptr:
+                            ptr_val = reader.read_ptr(f_addr)
+                            if ptr_val is None:
+                                obj.fields.append(FieldState(
+                                    name=f_name,
+                                    type=clean_type,
+                                    offset=f_offset,
+                                    availability="unavailable",
+                                    error="Memory not captured or pointer width unavailable"
+                                ))
+                            elif ptr_val == 0:
+                                obj.fields.append(FieldState(
+                                    name=f_name,
+                                    type=clean_type,
+                                    offset=f_offset,
+                                    value="0x0",
+                                    address="0x0",
+                                    object_ref=None
+                                ))
                             else:
-                                val = raw_enum
-                        else:
-                            val = reader.read_int(f_addr, 4, signed=False)
+                                ptr_hex = "0x{:x}".format(ptr_val)
+                                target_ref = None
+                                if depth + 1 <= self.MAX_OBJECT_DEPTH:
+                                    target_ref = build_object(ptr_val, base_type, depth + 1)
+                                obj.fields.append(FieldState(
+                                    name=f_name,
+                                    type=clean_type,
+                                    offset=f_offset,
+                                    value=ptr_hex,
+                                    address=ptr_hex,
+                                    object_ref=target_ref
+                                ))
+                        elif clean_type in ("bool", "int", "short", "uint16_t", "int16_t", "unsigned short", "uint32_t", "uint64_t", "int32_t", "int64_t", "uint8_t", "int8_t", "double", "float") or (f_tinfo["definition"] and f_tinfo["definition"].get("code") == "enum"):
+                            # Primitive or Enum
+                            if clean_type == "bool":
+                                val = reader.read_bool(f_addr)
+                            elif clean_type == "double":
+                                val = reader.read_double(f_addr)
+                            elif clean_type == "float":
+                                val = reader.read_float(f_addr)
+                            elif clean_type == "uint8_t":
+                                val = reader.read_int(f_addr, 1, signed=False)
+                            elif clean_type == "int8_t":
+                                val = reader.read_int(f_addr, 1, signed=True)
+                            elif clean_type in ("uint16_t", "unsigned short"):
+                                val = reader.read_int(f_addr, 2, signed=False)
+                            elif clean_type in ("int16_t", "short"):
+                                val = reader.read_int(f_addr, 2, signed=True)
+                            elif clean_type in ("uint32_t", "int"):
+                                val = reader.read_int(f_addr, 4, signed=("uint" not in clean_type))
+                            elif clean_type in ("uint64_t", "int64_t"):
+                                val = reader.read_int(f_addr, 8, signed=("uint" not in clean_type))
+                            elif f_tinfo["definition"] and f_tinfo["definition"].get("code") == "enum":
+                                raw_enum = reader.read_int(f_addr, 4, signed=False)
+                                enum_members = f_tinfo["definition"].get("fields", [])
+                                if raw_enum is not None and 0 <= raw_enum < len(enum_members):
+                                    val = enum_members[raw_enum]
+                                else:
+                                    val = raw_enum
+                            else:
+                                val = reader.read_int(f_addr, 4, signed=False)
 
-                        if val is None:
+                            if val is None:
+                                obj.fields.append(FieldState(
+                                    name=f_name,
+                                    type=clean_type,
+                                    offset=f_offset,
+                                    availability="unavailable",
+                                    error="Memory not captured"
+                                ))
+                            else:
+                                obj.fields.append(FieldState(
+                                    name=f_name,
+                                    type=clean_type,
+                                    offset=f_offset,
+                                    value=val
+                                ))
+                        elif f_tinfo["definition"] and f_tinfo["definition"].get("code") == "aggregate":
+                            # Embedded aggregate struct
+                            child_ref = build_object(f_addr, base_type, depth + 1)
                             obj.fields.append(FieldState(
                                 name=f_name,
                                 type=clean_type,
                                 offset=f_offset,
-                                availability="unavailable",
-                                error="Memory not captured"
+                                value="0x{:x}".format(f_addr),
+                                object_ref=child_ref
                             ))
                         else:
                             obj.fields.append(FieldState(
                                 name=f_name,
                                 type=clean_type,
                                 offset=f_offset,
-                                value=val
+                                value=None,
+                                availability="unknown"
                             ))
-                    elif f_tinfo["definition"] and f_tinfo["definition"].get("code") == "aggregate":
-                        # Embedded aggregate struct
-                        child_ref = build_object(f_addr, base_type, depth + 1)
+                    except ValueError as e:
                         obj.fields.append(FieldState(
                             name=f_name,
                             type=clean_type,
                             offset=f_offset,
-                            value="0x{:x}".format(f_addr),
-                            object_ref=child_ref
-                        ))
-                    else:
-                        obj.fields.append(FieldState(
-                            name=f_name,
-                            type=clean_type,
-                            offset=f_offset,
-                            value=None,
-                            availability="unknown"
+                            availability="unavailable",
+                            error=str(e)
                         ))
             finally:
                 active_identities.discard(identity)

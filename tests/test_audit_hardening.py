@@ -620,6 +620,249 @@ CORRUPT_LINE_WITHOUT_HYPHEN_OR_VALID_HEX
         # 3. Unresolved module returns None on runtime_to_elf
         self.assertIsNone(reader.runtime_to_elf(0x7fff7000))
 
+    def test_audit_missing_endianness_no_silent_fallback(self):
+        """AUDIT-F1: Verify missing target endianness does NOT silently default to little-endian."""
+        mod = RuntimeModule(
+            module_id="main",
+            path="/app/target_unknown_endian",
+            runtime_base=0x1000,
+            runtime_end=0x2000,
+            load_bias=0x1000,
+            build_id="BUILD_UNKNOWN_ENDIAN",
+            architecture="x86_64",
+            endianness=None,  # Endianness is unavailable
+            elf_class="ELF64",
+            is_main_executable=True,
+            load_bias_status="RESOLVED",
+        )
+        raw_snap = RawMemorySnapshot(
+            snapshot_id="SNAP_NO_ENDIAN",
+            pid=7771,
+            binary="/app/target_unknown_endian",
+            timestamp_ns=1000,
+            output_dir=self.tmp_dir,
+            regions=[],
+            maps=[],
+            modules=[mod.to_dict()],
+            endianness="UNKNOWN",
+        )
+        reader = SnapshotMemoryReader(raw_snap)
+        # SnapshotMemoryReader must NOT assume little-endian
+        self.assertIsNone(reader.endianness)
+        self.assertNotEqual(reader.endianness, "little")
+
+        # Explicit error raised at semantic decoding boundary
+        with self.assertRaises(ValueError) as ctx:
+            reader.read_int(0x1000, 4)
+        self.assertIn("TARGET_ENDIANNESS_UNAVAILABLE", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            reader.read_ptr(0x1000)
+        self.assertIn("TARGET_ENDIANNESS_UNAVAILABLE", str(ctx.exception))
+
+    def test_audit_missing_elf_class_no_silent_pointer_fallback(self):
+        """AUDIT-F2: Verify missing elf_class does NOT silently default to 8-byte pointer width."""
+        mod = RuntimeModule(
+            module_id="main",
+            path="/app/target_no_class",
+            runtime_base=0x1000,
+            runtime_end=0x2000,
+            load_bias=0x1000,
+            build_id="BUILD_NO_CLASS",
+            architecture="x86_64",
+            endianness="little",
+            elf_class=None,  # ELF class is unavailable
+            is_main_executable=True,
+            load_bias_status="RESOLVED",
+        )
+        raw_snap = RawMemorySnapshot(
+            snapshot_id="SNAP_NO_CLASS",
+            pid=7772,
+            binary="/app/target_no_class",
+            timestamp_ns=2000,
+            output_dir=self.tmp_dir,
+            regions=[],
+            maps=[],
+            modules=[mod.to_dict()],
+            endianness="little",
+            elf_class=None,
+        )
+        reader = SnapshotMemoryReader(raw_snap)
+        # Pointer width must be unavailable, NOT defaulted to 8
+        self.assertIsNone(reader.ptr_size)
+        self.assertNotEqual(reader.ptr_size, 8)
+
+        # read_ptr must NOT decode arbitrary 8 bytes, but return None (unavailable)
+        self.assertIsNone(reader.read_ptr(0x1000))
+
+    def test_audit_mapping_race_path_change(self):
+        """AUDIT-F3a: Mapping race detected when pathname changes between capture start and end."""
+        from extractor.memory_maps import MemoryRegion, get_region_fingerprint
+        r_before = MemoryRegion(
+            start=0x1000,
+            end=0x2000,
+            permissions="rw-p",
+            pathname="/lib/libA.so",
+            offset=0,
+            device="08:01",
+            inode=12345,
+        )
+        r_after = MemoryRegion(
+            start=0x1000,
+            end=0x2000,
+            permissions="rw-p",
+            pathname="/lib/libB.so",
+            offset=0,
+            device="08:01",
+            inode=12345,
+        )
+        self.assertNotEqual(get_region_fingerprint(r_before), get_region_fingerprint(r_after))
+
+        capturer = MemoryCapture()
+        capturer._libc = mock.MagicMock()
+        capturer._libc.process_vm_readv.return_value = 0x1000
+
+        with mock.patch("extractor.memory_capture.MemoryMapProvider") as mock_mmp_cls:
+            mock_provider_before = mock.MagicMock()
+            mock_provider_before.get_regions.return_value = [r_before]
+            mock_provider_after = mock.MagicMock()
+            mock_provider_after.get_regions.return_value = [r_after]
+            mock_mmp_cls.side_effect = [mock_provider_before, mock_provider_after]
+
+            with mock.patch.object(capturer, "get_process_identity", return_value=(os.getpid(), 123456)):
+                with mock.patch("os.path.exists", return_value=True):
+                    with mock.patch("os.kill"):
+                        with mock.patch("extractor.memory_capture.discover_modules", return_value=[]):
+                            snap = capturer.capture(pid=os.getpid(), output_dir=self.tmp_dir)
+                            self.assertTrue(snap.consistency.get("mapping_race_detected", False))
+                            self.assertEqual(snap.status, "PARTIAL")
+
+    def test_audit_mapping_race_inode_change(self):
+        """AUDIT-F3b: Mapping race detected when inode changes (file replaced under same pathname)."""
+        from extractor.memory_maps import MemoryRegion, get_region_fingerprint
+        r_before = MemoryRegion(
+            start=0x1000,
+            end=0x2000,
+            permissions="rw-p",
+            pathname="/lib/libA.so",
+            offset=0,
+            device="08:01",
+            inode=10001,
+        )
+        r_after = MemoryRegion(
+            start=0x1000,
+            end=0x2000,
+            permissions="rw-p",
+            pathname="/lib/libA.so",
+            offset=0,
+            device="08:01",
+            inode=10002,  # Replaced file with different inode
+        )
+        self.assertNotEqual(get_region_fingerprint(r_before), get_region_fingerprint(r_after))
+
+        capturer = MemoryCapture()
+        capturer._libc = mock.MagicMock()
+        capturer._libc.process_vm_readv.return_value = 0x1000
+
+        with mock.patch("extractor.memory_capture.MemoryMapProvider") as mock_mmp_cls:
+            mock_provider_before = mock.MagicMock()
+            mock_provider_before.get_regions.return_value = [r_before]
+            mock_provider_after = mock.MagicMock()
+            mock_provider_after.get_regions.return_value = [r_after]
+            mock_mmp_cls.side_effect = [mock_provider_before, mock_provider_after]
+
+            with mock.patch.object(capturer, "get_process_identity", return_value=(os.getpid(), 123456)):
+                with mock.patch("os.path.exists", return_value=True):
+                    with mock.patch("os.kill"):
+                        with mock.patch("extractor.memory_capture.discover_modules", return_value=[]):
+                            snap = capturer.capture(pid=os.getpid(), output_dir=self.tmp_dir)
+                            self.assertTrue(snap.consistency.get("mapping_race_detected", False))
+                            self.assertEqual(snap.status, "PARTIAL")
+
+    def test_audit_mapping_race_permission_change(self):
+        """AUDIT-F3c: Mapping race detected when permissions change (e.g. r--p -> rw-p)."""
+        from extractor.memory_maps import MemoryRegion, get_region_fingerprint
+        r_before = MemoryRegion(
+            start=0x1000,
+            end=0x2000,
+            permissions="r--p",
+            pathname="/lib/libA.so",
+            offset=0,
+            device="08:01",
+            inode=12345,
+        )
+        r_after = MemoryRegion(
+            start=0x1000,
+            end=0x2000,
+            permissions="rw-p",  # Changed from r--p
+            pathname="/lib/libA.so",
+            offset=0,
+            device="08:01",
+            inode=12345,
+        )
+        self.assertNotEqual(get_region_fingerprint(r_before), get_region_fingerprint(r_after))
+
+        capturer = MemoryCapture()
+        capturer._libc = mock.MagicMock()
+        capturer._libc.process_vm_readv.return_value = 0x1000
+
+        with mock.patch("extractor.memory_capture.MemoryMapProvider") as mock_mmp_cls:
+            mock_provider_before = mock.MagicMock()
+            mock_provider_before.get_regions.return_value = [r_before]
+            mock_provider_after = mock.MagicMock()
+            mock_provider_after.get_regions.return_value = [r_after]
+            mock_mmp_cls.side_effect = [mock_provider_before, mock_provider_after]
+
+            with mock.patch.object(capturer, "get_process_identity", return_value=(os.getpid(), 123456)):
+                with mock.patch("os.path.exists", return_value=True):
+                    with mock.patch("os.kill"):
+                        with mock.patch("extractor.memory_capture.discover_modules", return_value=[]):
+                            snap = capturer.capture(pid=os.getpid(), output_dir=self.tmp_dir)
+                            self.assertTrue(snap.consistency.get("mapping_race_detected", False))
+                            self.assertEqual(snap.status, "PARTIAL")
+
+    def test_audit_stable_mapping_no_race(self):
+        """AUDIT-F3d: Identical mapping fingerprints produce mapping_race_detected = False."""
+        from extractor.memory_maps import MemoryRegion, get_region_fingerprint
+        r1 = MemoryRegion(
+            start=0x1000,
+            end=0x2000,
+            permissions="rw-p",
+            pathname="/lib/libA.so",
+            offset=0,
+            device="08:01",
+            inode=12345,
+        )
+        r2 = MemoryRegion(
+            start=0x1000,
+            end=0x2000,
+            permissions="rw-p",
+            pathname="/lib/libA.so",
+            offset=0,
+            device="08:01",
+            inode=12345,
+        )
+        self.assertEqual(get_region_fingerprint(r1), get_region_fingerprint(r2))
+
+        capturer = MemoryCapture()
+        capturer._libc = mock.MagicMock()
+        capturer._libc.process_vm_readv.return_value = 0x1000
+
+        with mock.patch("extractor.memory_capture.MemoryMapProvider") as mock_mmp_cls:
+            mock_provider_before = mock.MagicMock()
+            mock_provider_before.get_regions.return_value = [r1]
+            mock_provider_after = mock.MagicMock()
+            mock_provider_after.get_regions.return_value = [r2]
+            mock_mmp_cls.side_effect = [mock_provider_before, mock_provider_after]
+
+            with mock.patch.object(capturer, "get_process_identity", return_value=(os.getpid(), 123456)):
+                with mock.patch("os.path.exists", return_value=True):
+                    with mock.patch("os.kill"):
+                        with mock.patch("extractor.memory_capture.discover_modules", return_value=[]):
+                            snap = capturer.capture(pid=os.getpid(), output_dir=self.tmp_dir)
+                            self.assertFalse(snap.consistency.get("mapping_race_detected", False))
+                            self.assertEqual(snap.status, "COMPLETE")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,18 @@ class MemoryRegion:
         if "x" in self.permissions and not self.executable:
             object.__setattr__(self, "executable", True)
 
+    def fingerprint(self) -> Tuple[int, int, str, int, str, int, str]:
+        """Returns deterministic mapping identity tuple (start, end, permissions, offset, device, inode, pathname)."""
+        return (
+            self.start,
+            self.end,
+            self.permissions,
+            self.offset,
+            self.device,
+            self.inode,
+            self.pathname,
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "start": "0x{:x}".format(self.start),
@@ -64,6 +76,35 @@ class MemoryRegion:
             "category": self.category,
             "kind": self.kind,
         }
+
+
+def get_region_fingerprint(r: Any) -> Tuple[int, int, str, int, str, int, str]:
+    """Extract deterministic mapping fingerprint from MemoryRegion or dict."""
+    if isinstance(r, MemoryRegion):
+        return r.fingerprint()
+    if isinstance(r, dict):
+        start_raw = r.get("start_addr", r.get("start", 0))
+        end_raw = r.get("end_addr", r.get("end", 0))
+        start_val = int(start_raw, 16) if isinstance(start_raw, str) else int(start_raw)
+        end_val = int(end_raw, 16) if isinstance(end_raw, str) else int(end_raw)
+        return (
+            start_val,
+            end_val,
+            str(r.get("permissions", "")),
+            int(r.get("offset", 0)),
+            str(r.get("device", "")),
+            int(r.get("inode", 0)),
+            str(r.get("pathname", r.get("path", ""))),
+        )
+    return (
+        getattr(r, "start", 0),
+        getattr(r, "end", 0),
+        getattr(r, "permissions", ""),
+        getattr(r, "offset", 0),
+        getattr(r, "device", ""),
+        getattr(r, "inode", 0),
+        getattr(r, "pathname", getattr(r, "path", "")),
+    )
 
 
 class MemoryMapProvider:
