@@ -270,7 +270,7 @@ class AgentRuntime:
                 fields_summary.append({
                     "name": f.get("name"),
                     "type": f.get("type"),
-                    "value": f.get("value"),
+                    "value": self._sanitize_field_value(f),
                     "object_ref": f.get("object_ref")
                 })
             result.append(AgentObject(
@@ -305,7 +305,7 @@ class AgentRuntime:
             field_dict = {
                 "name": f.get("name"),
                 "type": f.get("type"),
-                "value": f.get("value"),
+                "value": self._sanitize_field_value(f),
             }
             if f.get("object_ref"):
                 field_dict["object_ref"] = f.get("object_ref")
@@ -356,7 +356,7 @@ class AgentRuntime:
             object_id=object_id,
             field=field_path,
             type=ftype,
-            value=field_item.get("value"),
+            value=self._sanitize_field_value(field_item),
             mutability=mutability,
             object_ref=field_item.get("object_ref")
         )
@@ -491,10 +491,19 @@ class AgentRuntime:
             if cand_id and cand_id in self._cached_candidates:
                 cand_obj = self._cached_candidates[cand_id]
             else:
-                try:
-                    cand_obj = AgentMutationCandidate.from_dict(candidate)
-                except Exception as exc:
-                    return self._error("INVALID_CANDIDATE", f"Malformed candidate dict: {exc}", "EXECUTE_TRANSITION", t0)
+                # Check if matching candidate exists in cache by (object_id, field, proposed_value)
+                obj_id = candidate.get("object_id")
+                f_name = candidate.get("field") or candidate.get("field_path")
+                p_val = candidate.get("proposed_value") if "proposed_value" in candidate else candidate.get("value")
+                matched = next((c for c in self._cached_candidates.values()
+                                if c.object_id == obj_id and c.field == f_name and c.proposed_value == p_val), None)
+                if matched:
+                    cand_obj = matched
+                else:
+                    try:
+                        cand_obj = AgentMutationCandidate.from_dict(candidate)
+                    except Exception as exc:
+                        return self._error("INVALID_CANDIDATE", f"Malformed candidate dict: {exc}", "EXECUTE_TRANSITION", t0)
         elif isinstance(candidate, AgentMutationCandidate):
             cand_obj = candidate
         else:
@@ -1070,7 +1079,7 @@ class AgentRuntime:
                 "function": top_frame.get("function", "<unknown>"),
                 "frame_level": top_frame.get("level", 0),
                 "location": top_frame.get("location"),
-                "pc": top_frame.get("pc"),
+                "pc": None,  # Sanitized: do not leak raw instruction memory address; location/function are semantic
             }
 
         # 2. Objects summary
@@ -1079,11 +1088,7 @@ class AgentRuntime:
         for obj in objects_data[:10]:  # Top 10 objects for compact context
             field_dict = {}
             for f in obj.get("fields", []):
-                val = f.get("value")
-                if val is not None:
-                    field_dict[f.get("name")] = val
-                elif f.get("object_ref"):
-                    field_dict[f.get("name")] = f.get("object_ref")
+                field_dict[f.get("name")] = self._sanitize_field_value(f)
             object_summaries.append({
                 "object_id": obj.get("object_id"),
                 "type": obj.get("type"),
@@ -1142,6 +1147,24 @@ class AgentRuntime:
         s_inner = s_data.get("snapshot", s_data)
         persistent = s_data.get("persistent") or s_inner.get("persistent") or {}
         return persistent.get("objects") or s_data.get("objects") or []
+
+    @staticmethod
+    def _sanitize_field_value(field_dict: Dict[str, Any]) -> Any:
+        """Return a clean semantic representation for a field value, eliminating raw memory addresses."""
+        obj_ref = field_dict.get("object_ref")
+        if obj_ref:
+            return obj_ref
+        ftype = str(field_dict.get("type", ""))
+        val = field_dict.get("value")
+        if ftype.endswith("*") or "pointer" in ftype.lower():
+            if val in ("0x0", "0x00000000", "0x0000000000000000", "null", "nullptr", None, 0):
+                return "<null>"
+            return "<pointer>"
+        if isinstance(val, str) and (val.startswith("0x") or val.startswith("0X")):
+            if val.lower() in ("0x0", "0x00000000", "0x0000000000000000"):
+                return "<null>"
+            return "<pointer>"
+        return val
 
     @staticmethod
     def _error(code: str, message: str, action: str, t_start: float) -> AgentActionResult:

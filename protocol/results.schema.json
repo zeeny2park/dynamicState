@@ -40,6 +40,8 @@
             "SAFETY_LIMIT_REACHED",
             "RUNTIME_NOT_STOPPED",
             "DEBUG_IMAGE_MISMATCH",
+            "BUILD_ID_MISMATCH",
+            "INVALID_DEBUG_IMAGE",
             "MEMORY_CAPTURE_FAILED",
             "MEMORY_REGION_UNREADABLE",
             "LOAD_BIAS_RESOLUTION_FAILED",

@@ -1,14 +1,14 @@
 {
   "metadata": {
-    "build_id": "afd7c5d4e752e20b99ecbc06e1400d4d319660e7",
+    "build_id": "34f164e256dcf4cbc82de1e72cb4d9fad3b9cd35",
     "elf_class": "ELF64",
     "endianness": "little",
     "architecture": "aarch64",
-    "app_bin": "/tmp/dynstate_val_build_0_veltqz/sample_prod",
-    "app_stripped": "/tmp/dynstate_val_build_0_veltqz/sample_prod_stripped",
-    "app_dbg": "/tmp/dynstate_val_build_0_veltqz/sample_prod.debug",
-    "mismatch_dbg": "/tmp/dynstate_val_build_0_veltqz/mismatch.debug",
-    "lib_so": "/tmp/dynstate_val_build_0_veltqz/libhelper.so"
+    "app_bin": "/tmp/dynstate_val_build_l1tab7j_/sample_prod",
+    "app_stripped": "/tmp/dynstate_val_build_l1tab7j_/sample_prod_stripped",
+    "app_dbg": "/tmp/dynstate_val_build_l1tab7j_/sample_prod.debug",
+    "mismatch_dbg": "/tmp/dynstate_val_build_l1tab7j_/mismatch.debug",
+    "lib_so": "/tmp/dynstate_val_build_l1tab7j_/libhelper.so"
   },
   "low_impact": {
     "status": "PASS",
@@ -27,8 +27,8 @@
       "architecture": "aarch64",
       "endianness": "little",
       "elf_class": "ELF64",
-      "executable": "/tmp/dynstate_val_build_0_veltqz/sample_prod_stripped",
-      "debug_image": "/tmp/dynstate_val_build_0_veltqz/sample_prod.debug",
+      "executable": "/tmp/dynstate_val_build_l1tab7j_/sample_prod_stripped",
+      "debug_image": "/tmp/dynstate_val_build_l1tab7j_/sample_prod.debug",
       "debug_image_status": "COMPATIBLE",
       "build_id": null,
       "module_count": 0,
@@ -110,7 +110,7 @@
         "function": "runtime_state_checkpoint",
         "frame_level": 0,
         "location": null,
-        "pc": "0xaaaaaaaa1984"
+        "pc": null
       },
       "objects": [
         {
@@ -121,8 +121,8 @@
             "state": "SessionState::CONNECTED",
             "retry": 2,
             "packet_count": 10,
-            "buffer": "0xaaaaaaad3300",
-            "parent": "0xaaaaaaad3320",
+            "buffer": "obj_0002",
+            "parent": "obj_0001",
             "flagged": 0,
             "priority": 7,
             "ratio": 1.0
@@ -135,7 +135,7 @@
           "fields": {
             "length": 64,
             "capacity": 256,
-            "data": "0xaaaaaaad32b0"
+            "data": "<pointer>"
           }
         },
         {
@@ -145,7 +145,7 @@
           "fields": {
             "length": 1,
             "capacity": 2,
-            "data": "0x0"
+            "data": "<null>"
           }
         },
         {
@@ -177,8 +177,8 @@
           "type": "Manager",
           "storage": "global",
           "fields": {
-            "current": "0xaaaaaaad3320",
-            "instance": "0xaaaaaaad3320"
+            "current": "obj_0001",
+            "instance": "obj_0001"
           }
         },
         {
@@ -209,16 +209,16 @@
       "state_hash": "4c61e1ee15c6c5f6",
       "provenance": {
         "runtime_binary": {
-          "path": "/tmp/dynstate_val_build_0_veltqz/sample_prod_stripped",
-          "build_id": "afd7c5d4e752e20b99ecbc06e1400d4d319660e7",
+          "path": "/tmp/dynstate_val_build_l1tab7j_/sample_prod_stripped",
+          "build_id": "34f164e256dcf4cbc82de1e72cb4d9fad3b9cd35",
           "architecture": "aarch64",
           "elf_class": "ELF64",
           "endianness": "little",
           "stripped": true
         },
         "debug_image": {
-          "path": "/tmp/dynstate_val_build_0_veltqz/sample_prod.debug",
-          "build_id": "afd7c5d4e752e20b99ecbc06e1400d4d319660e7",
+          "path": "/tmp/dynstate_val_build_l1tab7j_/sample_prod.debug",
+          "build_id": "34f164e256dcf4cbc82de1e72cb4d9fad3b9cd35",
           "architecture": "aarch64",
           "elf_class": "ELF64",
           "endianness": "little",
@@ -228,9 +228,9 @@
           "reason": "COMPATIBLE"
         },
         "performance": {
-          "debug_image_load_ms": 0.205,
-          "binary_identity_check_ms": 0.182,
-          "debug_image_verification_ms": 0.187
+          "debug_image_load_ms": 0.2,
+          "binary_identity_check_ms": 0.122,
+          "debug_image_verification_ms": 0.126
         }
       }
     },
@@ -261,13 +261,13 @@
           {
             "name": "buffer",
             "type": "Buffer*",
-            "value": "0xaaaaaaad3300",
+            "value": "obj_0002",
             "object_ref": "obj_0002"
           },
           {
             "name": "parent",
             "type": "Session*",
-            "value": "0xaaaaaaad3320",
+            "value": "obj_0001",
             "object_ref": "obj_0001"
           },
           {
@@ -311,7 +311,7 @@
           {
             "name": "data",
             "type": "char*",
-            "value": "0xaaaaaaad32b0",
+            "value": "<pointer>",
             "object_ref": null
           }
         ],
@@ -337,7 +337,7 @@
           {
             "name": "data",
             "type": "char*",
-            "value": "0x0",
+            "value": "<null>",
             "object_ref": null
           }
         ],
@@ -351,7 +351,7 @@
           {
             "name": "_M_id",
             "type": "std::thread::id",
-            "value": null,
+            "value": "obj_0005",
             "object_ref": "obj_0005"
           }
         ],
@@ -393,13 +393,13 @@
           {
             "name": "current",
             "type": "Session*",
-            "value": "0xaaaaaaad3320",
+            "value": "obj_0001",
             "object_ref": "obj_0001"
           },
           {
             "name": "instance",
             "type": "Session*",
-            "value": "0xaaaaaaad3320",
+            "value": "obj_0001",
             "object_ref": "obj_0001"
           }
         ],
@@ -413,7 +413,7 @@
           {
             "name": "_M_base",
             "type": "std::__atomic_base<bool>",
-            "value": null,
+            "value": "obj_0009",
             "object_ref": "obj_0009"
           },
           {
@@ -469,13 +469,13 @@
         {
           "name": "buffer",
           "type": "Buffer*",
-          "value": "0xaaaaaaad3300",
+          "value": "obj_0002",
           "object_ref": "obj_0002"
         },
         {
           "name": "parent",
           "type": "Session*",
-          "value": "0xaaaaaaad3320",
+          "value": "obj_0001",
           "object_ref": "obj_0001"
         },
         {
@@ -514,7 +514,7 @@
         {
           "name": "data",
           "type": "char*",
-          "value": "0xaaaaaaad32b0"
+          "value": "<pointer>"
         }
       ],
       "identity_hint": "Buffer:obj_0002"

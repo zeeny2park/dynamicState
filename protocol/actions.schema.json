@@ -28,6 +28,7 @@
         "ANALYZE_MEMORY_SNAPSHOT",
         "GET_MEMORY_SNAPSHOT",
         "GET_MODULES",
+        "LIST_MODULES",
         "GET_SNAPSHOT_PROVENANCE"
       ]
     },
