@@ -111,67 +111,86 @@ sequenceDiagram
 
 ---
 
-### Pattern 2: Zero-Python Direct Process Memory Capture
+### Pattern 2: Native C99 Process Memory Collector (`target/collector/`)
 
-This pattern provides **LOW_IMPACT** observation without stopping the process, without installing GDB on the target, and with **zero Python dependencies** on the target board.
+This is the **recommended production approach** for resource-constrained Linux targets (ARM, MIPS, RISC-V, x86). It provides high-speed, safe **LOW_IMPACT** observation without stopping the process, without installing GDB, and with **zero Python or web dependencies** on the target board.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant TargetApp as Running Target Process (PID 890)
-    participant CaptureScript as target_capture.sh (POSIX sh + dd)
+    participant Collector as dynamicstate-collector (Native C99)
     participant Host as Host Workstation (dynamicState)
 
-    Note over TargetApp: Running multi-threaded mission-critical application
-    CaptureScript->>TargetApp: Read /proc/890/maps (zero pause)
-    CaptureScript->>TargetApp: Read readable memory via /proc/890/mem with dd
-    CaptureScript->>CaptureScript: Package raw_snapshot/ bundle
-    Note over TargetApp: Process never stopped; zero downtime
-    CaptureScript->>Host: Transfer bundle (scp / rsync / SD card / NFS)
-    Host->>Host: Offline DWARF semantic reconstruction with sensor_node.debug
-    Host->>Host: Produce Semantic Snapshot S_M_001
+    Note over TargetApp: Running mission-critical C/C++ application
+    Collector->>TargetApp: Read /proc/890/maps (parse categories)
+    Collector->>TargetApp: Read memory via process_vm_readv / pread
+    Collector->>Collector: Package metadata.json, manifest.json, maps.json, memory/
+    Note over TargetApp: Process never stopped; zero downtime; zero python
+    Collector->>Host: Transfer raw snapshot bundle (scp / tftp / NFS)
+    Host->>Host: RawMemorySnapshot.load() & Offline DWARF reconstruction
+    Host->>Host: Produce Semantic Snapshot S_M_001 & Memory Breakdown
 ```
 
 #### Step-by-Step Instructions
 
-1. **On Target Board**:
-   Run the lightweight POSIX capture script [`scripts/target_capture.sh`](file:///home/ubuntu/workspace/ut/scripts/target_capture.sh):
+1. **Build the Collector for Target Architecture**:
+   Cross-compile on host or build natively:
    ```bash
-   chmod +x scripts/target_capture.sh
-   ./scripts/target_capture.sh 890 /tmp/snapshot_890
+   # Cross-compile for ARM:
+   cd target/collector
+   CC=arm-linux-gnueabihf-gcc make
+   ```
+
+2. **On Target Board**:
+   Run the lightweight binary [`target/collector/dynamicstate-collector`](file:///home/ubuntu/workspace/ut/target/collector):
+   ```bash
+   ./dynamicstate-collector -p 890 -o /tmp/snapshot_890
    ```
    Output bundle generated:
    ```
    /tmp/snapshot_890/
-   ├── metadata.json       # PID, capture timestamp, page size, kernel info
-   ├── maps.txt            # Snapshot of /proc/$PID/maps
-   └── chunks/             # Memory segments (heap, bss, data, stack)
-       ├── chunk_0000.bin
-       ├── chunk_0001.bin
+   ├── metadata.json       # PID, capture timestamp, page size, kernel/arch info
+   ├── manifest.json       # Precise region boundaries, permissions, status
+   ├── maps.json           # Categorized memory maps (heap, stack, global, etc.)
+   ├── maps.txt            # Raw /proc/$PID/maps copy for provenance
+   └── memory/             # Binary memory segment dumps
+       ├── region_000001.bin
+       ├── region_000002.bin
        └── ...
    ```
 
-2. **Transfer to Host Workstation**:
+3. **Transfer to Host Workstation**:
    ```bash
    scp -r root@192.168.1.100:/tmp/snapshot_890 /home/developer/snapshots/
    ```
 
-3. **On Host Workstation**:
-   Reconstruct the full semantic object graph offline using the unstripped debug image:
-   ```bash
-   python3 -m extractor.low_impact \
-     --raw-snapshot /home/developer/snapshots/snapshot_890 \
-     --debug-image /build/sensor_node.debug \
-     --output /home/developer/corpus/state_890.json
+4. **On Host Workstation**:
+   Load and explore the raw snapshot:
+   ```python
+   from extractor.memory_snapshot import RawMemorySnapshot
+   from extractor.memory_snapshot_summary import build_memory_snapshot_summary
+
+   snapshot = RawMemorySnapshot.load("/home/developer/snapshots/snapshot_890")
+   summary = build_memory_snapshot_summary({"snapshot_id": snapshot.snapshot_id}, raw_memory_snapshot=snapshot)
+   print(f"Captured {summary.captured_bytes} bytes across {len(summary.regions)} regions.")
    ```
-   Or launch the Web UI to visually explore the offline memory snapshot:
+
+---
+
+### Pattern 3: Shell Prototype Script (`scripts/target_capture.sh`)
+
+> **Note**: This is a lightweight POSIX shell prototype useful for rapid triage where cross-compilation toolchains are not immediately available. For production environments, prefer the native C99 collector (Pattern 2).
+
+1. **On Target Board**:
+   Run [`scripts/target_capture.sh`](file:///home/ubuntu/workspace/ut/scripts/target_capture.sh):
    ```bash
-   python3 -m extractor server \
-     --host 127.0.0.1 \
-     --port 8080 \
-     --snapshot /home/developer/corpus/state_890.json \
-     --debug-image /build/sensor_node.debug
+   chmod +x scripts/target_capture.sh
+   ./scripts/target_capture.sh 890 /tmp/snapshot_890
    ```
+
+2. **Transfer to Host Workstation**:
+   Transfer the `/tmp/snapshot_890` directory to the host for analysis.
 
 ---
 

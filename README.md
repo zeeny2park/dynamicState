@@ -1,8 +1,8 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `DYNAMICSTATE_WEB_UI_MVP_PASS`** — Runtime State Explorer Web UI MVP Complete  
-> Verified with 195 Unit Tests, Web API Security Suite, and 24-step End-to-End Acceptance Scenario.
+> **Status: `DYNAMICSTATE_HUMAN_CENTRIC_EXPLORER_AND_EMBEDDED_HARDENING_COMPLETE`** — Memory Snapshot Explorer & Embedded Hardening Complete  
+> Verified with 215 Unit/Integration Tests, Subprocess Lifecycle Integration Suite, Real GDB 9.2 Containerized Integration Suite, Native C99 Target Collector Suite, Web API Security Suite, and 24-step End-to-End Acceptance Scenario.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
@@ -945,4 +945,52 @@ bash tests/integration_phase5_2_hardening.sh
 - **External I/O & Socket State**: 프로세스 외부 커널 소켓 연결이나 원격 RPC 상태는 OS fork만으로 완전 롤백되지 않습니다.
 - **Optimized Binaries (-O2/-O3)**: 컴파일러 인라인화 및 레지스터 할당으로 DWARF 위치 표현식이 `<optimized out>`인 필드는 변이가 제한됩니다.
 - **Automated Restart Loop**: 무제한 프로세스 재생성 루프는 안전성 원칙에 따라 방지되며, 최대 탐색 스텝(`max_steps`)과 타임아웃 제한이 적용됩니다.
+
+---
+
+## Human-Centric Memory Snapshot Explorer & Web UI
+
+The Web UI is structured into **6 clear tabs** with the primary focus on understanding runtime memory:
+
+1. **🧠 Memory Snapshot (Default First Screen)**:
+   - **Capture Status**: Status (`COMPLETE`/`PARTIAL`), Total Captured Size (MB), Capture Duration (ms), Consistency Level, Architecture, Pointer Width, Endianness.
+   - **Memory Breakdown**: Visual proportional stacked bar and category cards (Heap, Stack, Global Data, Executable Code, Shared Libraries, Other Mappings).
+   - **Discovered Semantic Runtime Objects**: Discovered count, storage breakdown, and an expandable ASCII/box semantic hierarchy preview with direct "Inspect →" actions.
+   - **Snapshot Quality & Provenance**: Completeness %, mapping race detection, partial/failed read counts, external debug image verification, and GNU Build ID matching.
+2. **📦 Runtime Objects**: Complete list of semantic objects, storage badges, field values, and progressive disclosure inspectors.
+3. **🕸️ Object Graph**: Interactive SVG object graph with zoom/pan and visual cycle indicators.
+4. **📜 History / State Diff**: Checkpoint timeline and semantic diffs showing exact field-level state transitions.
+5. **⚡ Advanced Exploration**: Mutation candidate inspection, hypothesis execution, continue, rollback, and autonomous exploration loop.
+6. **🛠️ System / Provenance**: ELF metadata, Build ID matching, loaded modules table, and GDB compatibility report.
+
+---
+
+## Embedded Deployment Architecture
+
+dynamicState strictly separates developer host workstations from resource-constrained target boards:
+- **Target Boards Require ZERO Python and ZERO Web Server**.
+- **Pattern 1: Remote GDB**: `gdbserver` on target, dynamicState + GDB on host. Full `CONSISTENT` mutation and exploration support.
+- **Pattern 2: Native C99 Collector (`target/collector/`)**: Zero-dependency POSIX C99 binary capturing `/proc/<pid>/maps` and `/proc/<pid>/mem` via `process_vm_readv` or `pread`. Generates standard snapshot bundles for offline analysis.
+- **Pattern 3: Shell Prototype (`scripts/target_capture.sh`)**: Quick triage script using BusyBox POSIX shell tools.
+
+See [`docs/EMBEDDED_DEPLOYMENT_ARCHITECTURE.md`](file:///home/ubuntu/workspace/ut/docs/EMBEDDED_DEPLOYMENT_ARCHITECTURE.md) and [`docs/GDB_COMPATIBILITY.md`](file:///home/ubuntu/workspace/ut/docs/GDB_COMPATIBILITY.md) for complete details.
+
+---
+
+## Technical Verification & Claims Matrix
+
+To prevent overclaiming, every capability in dynamicState is categorized under strict verification levels:
+
+| Component / Feature | Implementation Status | Test Scope | Verification Level | Real Target Evidence |
+| :--- | :--- | :--- | :--- | :--- |
+| **Memory Snapshot Explorer (Web UI)** | Complete | 13 API tests, 2 lifecycle tests, 24 acceptance steps | **REAL TARGET VALIDATED** | Verified via browser & automated acceptance harness |
+| **Subprocess Server Lifecycle** | Complete | Real `subprocess.Popen` with SIGINT/SIGTERM | **INTEGRATION TESTED** | Clean exit (code 0), immediate port re-bind |
+| **GDB Version Fallback Elimination** | Complete | 6 unit tests with explicit `status="UNKNOWN"` | **UNIT TESTED** | Unknown GDB returns `status="UNKNOWN"`, `major=None` |
+| **GDB 9.2 Frame & Snapshot Traversal** | Complete | Docker Ubuntu 20.04 with genuine GDB 9.2 | **REAL GDB 9.2 VERIFIED** | Executed in container (`dynamicstate-gdb92:latest`) |
+| **Native C99 Target Collector** | Complete | 3 unit/integration tests with GCC/Make | **REAL TARGET VALIDATED** | Captures live process, reloaded by `RawMemorySnapshot.load` |
+| **Agent Semantic Protocol Leakage Guard** | Complete | 7 contract tests with recursive leakage scanner | **INTEGRATION TESTED** | Zero pointers (`0x...`), PIDs, PCs, or GDB commands leak |
+| **LOW_IMPACT process_vm_readv Capture** | Complete | Process memory capture & mapping race detection | **REAL TARGET VALIDATED** | Tested on live Linux processes on AArch64 host |
+| **Offline DWARF Semantic Reconstruction** | Complete | Unstripped debug image + raw snapshot bundles | **INTEGRATION TESTED** | Reconstructs semantic graph without live process |
+| **Branch-Safe State Exploration** | Complete | Checkpoint-restore, crash isolation (SIGSEGV) | **INTEGRATION TESTED** | Verified multi-branch exploration |
+
 

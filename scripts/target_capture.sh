@@ -1,6 +1,8 @@
 #!/bin/sh
-# dynamicState — Embedded Linux Target Memory Capture Script
-# Zero-Python Dependency: Runs using standard POSIX/BusyBox shell tools (sh, dd, awk, grep)
+# dynamicState — Embedded Linux Target Memory Capture Script (Shell Prototype)
+# NOTE: This script is a shell-based PROTOTYPE using BusyBox/POSIX tools.
+# For production embedded deployments, use the native C99 collector in target/collector/
+# which has zero shell/toolchain dependencies and provides higher fidelity.
 #
 # Usage on Embedded Target:
 #   sh target_capture.sh <PID> [OUTPUT_DIR] [MAX_MB]

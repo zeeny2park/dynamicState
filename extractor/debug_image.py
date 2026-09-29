@@ -240,11 +240,14 @@ def inspect_elf(path: str) -> BinaryIdentity:
         has_debug_info = any(s.startswith(".debug_") or s == ".gdb_index" for s in sec_names)
         is_stripped = (".symtab" not in sec_names) and not has_debug_info
 
+        elf_class_str = "ELF64" if ei_class == 2 else ("ELF32" if ei_class == 1 else "UNKNOWN")
+        endian_str = "little" if ei_data == 1 else ("big" if ei_data == 2 else "UNKNOWN")
+
         return BinaryIdentity(
             path=os.path.abspath(path),
-            elf_class="ELF64" if is_64 else "ELF32",
+            elf_class=elf_class_str,
             architecture=arch_name,
-            endianness="little" if ei_data == 1 else "big",
+            endianness=endian_str,
             build_id=build_id,
             debuglink=debuglink,
             stripped=is_stripped,

@@ -442,6 +442,78 @@ class AgentSemanticContractTests(unittest.TestCase):
         self.assertIn(res.error.code, ("DEBUG_IMAGE_MISMATCH", "INVALID_DEBUG_IMAGE", "RUNTIME_ERROR"))
         self.assertNotIn("Traceback", res.error.message)
 
+    # -------------------------------------------------------------------------
+    # Test G: Zero Leakage of Low-Level Artifacts (Addresses, PIDs, PCs, GDB)
+    # -------------------------------------------------------------------------
+    def test_g_zero_leakage_semantic_isolation(self):
+        """Test G: Strict negative assertion guaranteeing no raw pointers, PIDs, PCs, or GDB internals leak to agent."""
+        import re
+        from dataclasses import asdict, is_dataclass
+
+        HEX_PTR_RE = re.compile(r"^0x[0-9a-fA-F]{6,}$")
+        FORBIDDEN_TERMS = ("gdb.", "set var", "DW_TAG", "DW_AT", "ptrace(")
+
+        def check_no_leakage(val, context_label):
+            if val is None or isinstance(val, (int, float, bool)):
+                return
+            if isinstance(val, str):
+                self.assertFalse(
+                    bool(HEX_PTR_RE.match(val)),
+                    f"Forbidden raw pointer address leaked in {context_label}: '{val}'"
+                )
+                for term in FORBIDDEN_TERMS:
+                    self.assertNotIn(
+                        term, val,
+                        f"Forbidden debugger/DWARF internal leaked in {context_label}: '{val}'"
+                    )
+            elif isinstance(val, dict):
+                for k, v in val.items():
+                    self.assertNotEqual(k, "pid", f"Process PID key must not leak in {context_label}")
+                    if k == "pc":
+                        self.assertIsNone(v, f"PC address must be sanitized to None in {context_label}: {v}")
+                    else:
+                        check_no_leakage(v, f"{context_label}.{k}")
+            elif isinstance(val, list):
+                for idx, item in enumerate(val):
+                    check_no_leakage(item, f"{context_label}[{idx}]")
+            elif is_dataclass(val):
+                check_no_leakage(asdict(val), context_label)
+            elif hasattr(val, "to_dict") and callable(getattr(val, "to_dict")):
+                check_no_leakage(val.to_dict(), context_label)
+            elif hasattr(val, "__dict__"):
+                check_no_leakage(val.__dict__, context_label)
+
+        # 1. OBSERVE
+        res_obs = self.runtime.observe()
+        self.assertTrue(res_obs.success)
+        check_no_leakage(res_obs.data, "OBSERVE.data")
+
+        # 2. LIST_OBJECTS
+        res_list = self.runtime.list_objects()
+        self.assertTrue(res_list.success)
+        check_no_leakage(res_list.data, "LIST_OBJECTS.data")
+
+        # 3. INSPECT_OBJECT
+        res_insp = self.runtime.inspect_object("obj_0001")
+        self.assertTrue(res_insp.success)
+        check_no_leakage(res_insp.data, "INSPECT_OBJECT.data")
+
+        # 4. INSPECT_FIELD
+        res_fld = self.runtime.inspect_field("obj_0001", "retry")
+        self.assertTrue(res_fld.success)
+        check_no_leakage(res_fld.data, "INSPECT_FIELD.data")
+
+        # 5. LIST_MUTATION_CANDIDATES
+        res_cands = self.runtime.list_mutation_candidates()
+        self.assertTrue(res_cands.success)
+        check_no_leakage(res_cands.data, "LIST_MUTATION_CANDIDATES.data")
+
+        # 6. EXECUTE_TRANSITION
+        res_trans = self.runtime.execute_transition("M001")
+        self.assertTrue(res_trans.success)
+        check_no_leakage(res_trans.data, "EXECUTE_TRANSITION.data")
+
 
 if __name__ == "__main__":
     unittest.main()
+

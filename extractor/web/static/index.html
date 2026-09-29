@@ -36,12 +36,14 @@
     </div>
   </header>
 
-  <!-- Main Navigation Tabs -->
+  <!-- Main Navigation Tabs (6 Clean Functional Views) -->
   <nav class="app-nav">
-    <button class="nav-tab active" data-tab="tab-memory">🧠 Runtime Memory Explorer</button>
-    <button class="nav-tab" data-tab="tab-topology">🕸️ Object Topology & Graph</button>
-    <button class="nav-tab" data-tab="tab-exploration">⚡ Advanced Exploration</button>
-    <button class="nav-tab" data-tab="tab-provenance">📦 System & Provenance</button>
+    <button class="nav-tab active" data-tab="tab-memory-snapshot">1. 🧠 Memory Snapshot</button>
+    <button class="nav-tab" data-tab="tab-runtime-objects">2. 📦 Runtime Objects</button>
+    <button class="nav-tab" data-tab="tab-object-graph">3. 🕸️ Object Graph</button>
+    <button class="nav-tab" data-tab="tab-history-diff">4. 📜 History / State Diff</button>
+    <button class="nav-tab" data-tab="tab-advanced-explore">5. ⚡ Advanced Exploration</button>
+    <button class="nav-tab" data-tab="tab-system-provenance">6. 🛠️ System / Provenance</button>
   </nav>
 
   <!-- Banner for low-impact observation mode -->
@@ -59,56 +61,255 @@
   <main class="app-main">
 
     <!-- ===================================================================== -->
-    <!-- TAB 1: Human-Centric Runtime Memory Explorer (Default Screen)        -->
+    <!-- TAB 1: 🧠 Memory Snapshot (Primary Default Screen)                    -->
     <!-- ===================================================================== -->
-    <section id="tab-memory" class="tab-pane active">
-      <!-- Top Hero Runtime Summary -->
-      <div class="hero-summary-card card">
+    <section id="tab-memory-snapshot" class="tab-pane active">
+      <!-- Snapshot Selector & Target Header -->
+      <div class="card snap-header-card">
         <div class="hero-top-row">
           <div class="hero-identity">
             <div class="hero-badge-row">
-              <span class="badge badge-info" id="hero-mode">CONSISTENT</span>
-              <span class="badge badge-success" id="hero-status">STOPPED</span>
-              <span class="badge badge-neutral" id="hero-completeness">COMPLETE</span>
+              <span class="badge badge-info" id="ms-badge-mode">CONSISTENT</span>
+              <span class="badge badge-success" id="ms-badge-status">COMPLETE</span>
+              <span class="badge badge-neutral" id="ms-badge-consistency">CONSISTENT</span>
             </div>
-            <h2 class="hero-title" id="hero-target-title">Target: Not Connected</h2>
-            <div class="hero-subtitle" id="hero-target-subtitle">No active execution inferior</div>
+            <h2 class="hero-title" id="ms-target-title">Target: Not Connected</h2>
+            <div class="hero-subtitle mono" id="ms-target-subtitle">No active execution inferior</div>
           </div>
           
           <div class="hero-state-selector">
-            <label for="select-memory-state">Active State Snapshot:</label>
+            <label for="select-snapshot-id">Active Snapshot / State:</label>
             <div class="state-select-group">
-              <select id="select-memory-state" class="input-select">
-                <option value="">(Select a State)</option>
+              <select id="select-snapshot-id" class="input-select">
+                <option value="">(Select Snapshot / State)</option>
               </select>
-              <button class="btn btn-outline btn-sm btn-view-json" data-entity="state" title="View Current State JSON">JSON</button>
+              <button class="btn btn-outline btn-sm btn-view-json" data-entity="memory-summary" title="View Memory Summary JSON">Summary JSON</button>
             </div>
-          </div>
-        </div>
-
-        <div class="hero-metrics-row">
-          <div class="hero-metric-box">
-            <div class="metric-val" id="hero-obj-count">0</div>
-            <div class="metric-label">Semantic Objects</div>
-          </div>
-          <div class="hero-metric-box">
-            <div class="metric-val" id="hero-ptr-count">0</div>
-            <div class="metric-label">Pointer References</div>
-          </div>
-          <div class="hero-metric-box">
-            <div class="metric-val" id="hero-mod-count">0</div>
-            <div class="metric-label">Loaded Modules</div>
-          </div>
-          <div class="hero-metric-box hero-metric-provenance">
-            <div class="metric-label">Debug Image Provenance</div>
-            <div class="metric-text mono" id="hero-debug-info">N/A</div>
           </div>
         </div>
       </div>
 
-      <!-- Main Explorer: Master-Detail Layout -->
-      <div class="split-view" style="margin-top: 16px;">
-        <!-- Left Column: Semantic Object Directory -->
+      <!-- 1. Capture Status Card Grid -->
+      <div class="section-title-row" style="margin-top: 20px;">
+        <h3>Capture Status</h3>
+        <span class="subtext">Execution capture parameters and memory consistency guarantees</span>
+      </div>
+
+      <div class="overview-grid status-grid">
+        <div class="card status-card">
+          <div class="metric-label">Capture Status</div>
+          <div class="metric-val text-accent" id="stat-status">COMPLETE</div>
+          <div class="card-caption" id="stat-status-sub">No errors or partial reads</div>
+        </div>
+        <div class="card status-card">
+          <div class="metric-label">Captured Memory</div>
+          <div class="metric-val" id="stat-captured-mb">0.00 MB</div>
+          <div class="card-caption" id="stat-captured-bytes">0 bytes across regions</div>
+        </div>
+        <div class="card status-card">
+          <div class="metric-label">Capture Duration</div>
+          <div class="metric-val" id="stat-duration">N/A</div>
+          <div class="card-caption" id="stat-consistency">Consistency: CONSISTENT</div>
+        </div>
+        <div class="card status-card">
+          <div class="metric-label">Memory Regions</div>
+          <div class="metric-val" id="stat-region-count">0</div>
+          <div class="card-caption">Mapped memory segments</div>
+        </div>
+        <div class="card status-card">
+          <div class="metric-label">Target Architecture</div>
+          <div class="metric-val mono" id="stat-arch">UNKNOWN</div>
+          <div class="card-caption" id="stat-pointer-endian">Pointer: UNKNOWN · Endian: UNKNOWN</div>
+        </div>
+      </div>
+
+      <!-- 2. Memory Breakdown (Visual Proportional Bar & Table) -->
+      <div class="section-title-row" style="margin-top: 24px;">
+        <h3>Memory Breakdown</h3>
+        <span class="subtext">Distribution of captured process memory segments by semantic role</span>
+      </div>
+
+      <div class="card memory-breakdown-card">
+        <!-- Visual Proportional Bar -->
+        <div class="breakdown-bar-container">
+          <div class="memory-breakdown-bar" id="breakdown-bar">
+            <div class="breakdown-segment seg-heap" style="width: 0%;" title="Heap: 0 MB"></div>
+            <div class="breakdown-segment seg-stack" style="width: 0%;" title="Stack: 0 MB"></div>
+            <div class="breakdown-segment seg-global" style="width: 0%;" title="Global: 0 MB"></div>
+            <div class="breakdown-segment seg-exec" style="width: 0%;" title="Executable: 0 MB"></div>
+            <div class="breakdown-segment seg-shlib" style="width: 0%;" title="Shared Libs: 0 MB"></div>
+            <div class="breakdown-segment seg-other" style="width: 0%;" title="Other: 0 MB"></div>
+          </div>
+        </div>
+
+        <!-- Breakdown Grid -->
+        <div class="breakdown-grid" style="margin-top: 16px;">
+          <div class="breakdown-item">
+            <div class="breakdown-header"><span class="legend-dot dot-heap"></span> Heap</div>
+            <div class="breakdown-val mono" id="bd-heap-val">0.00 MB</div>
+            <div class="breakdown-pct" id="bd-heap-pct">0%</div>
+          </div>
+          <div class="breakdown-item">
+            <div class="breakdown-header"><span class="legend-dot dot-stack"></span> Stack</div>
+            <div class="breakdown-val mono" id="bd-stack-val">0.00 MB</div>
+            <div class="breakdown-pct" id="bd-stack-pct">0%</div>
+          </div>
+          <div class="breakdown-item">
+            <div class="breakdown-header"><span class="legend-dot dot-global"></span> Global / BSS</div>
+            <div class="breakdown-val mono" id="bd-global-val">0.00 MB</div>
+            <div class="breakdown-pct" id="bd-global-pct">0%</div>
+          </div>
+          <div class="breakdown-item">
+            <div class="breakdown-header"><span class="legend-dot dot-exec"></span> Executable Code</div>
+            <div class="breakdown-val mono" id="bd-exec-val">0.00 MB</div>
+            <div class="breakdown-pct" id="bd-exec-pct">0%</div>
+          </div>
+          <div class="breakdown-item">
+            <div class="breakdown-header"><span class="legend-dot dot-shlib"></span> Shared Libraries</div>
+            <div class="breakdown-val mono" id="bd-shlib-val">0.00 MB</div>
+            <div class="breakdown-pct" id="bd-shlib-pct">0%</div>
+          </div>
+          <div class="breakdown-item">
+            <div class="breakdown-header"><span class="legend-dot dot-other"></span> Other Mappings</div>
+            <div class="breakdown-val mono" id="bd-other-val">0.00 MB</div>
+            <div class="breakdown-pct" id="bd-other-pct">0%</div>
+          </div>
+          <div class="breakdown-item breakdown-total">
+            <div class="breakdown-header"><strong>Total Captured</strong></div>
+            <div class="breakdown-val mono text-accent" id="bd-total-val" style="font-size: 1.25rem;">0.00 MB</div>
+            <div class="breakdown-pct text-muted">100% of snapshot</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. Semantic Runtime Objects Summary & Hierarchy Tree -->
+      <div class="section-title-row" style="margin-top: 24px;">
+        <h3>Semantic Runtime Objects</h3>
+        <span class="subtext">Typed C/C++ objects discovered from memory mappings and DWARF structures</span>
+      </div>
+
+      <div class="card semantic-overview-card">
+        <div class="metric-row" style="margin-bottom: 16px;">
+          <div class="metric-box">
+            <div class="metric-val text-accent" id="sem-total-objs">0</div>
+            <div class="metric-label">Total Objects</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-val" id="sem-heap-objs">0</div>
+            <div class="metric-label">Heap Objects</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-val" id="sem-global-objs">0</div>
+            <div class="metric-label">Global Objects</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-val" id="sem-stack-objs">0</div>
+            <div class="metric-label">Stack Objects</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-val" id="sem-refs-count">0</div>
+            <div class="metric-label">Pointer References</div>
+          </div>
+        </div>
+
+        <div class="card-subtitle" style="margin-bottom: 8px;">Discovered Object Hierarchy & State Preview:</div>
+        <div class="semantic-tree-container" id="semantic-tree-preview">
+          <div class="text-muted text-center p-3">No semantic objects loaded for this snapshot</div>
+        </div>
+        
+        <div style="margin-top: 12px; text-align: right;">
+          <button class="btn btn-primary btn-sm" id="btn-goto-objects">Inspect All Objects in Detail →</button>
+        </div>
+      </div>
+
+      <!-- 4. Snapshot Quality & Provenance -->
+      <div class="section-title-row" style="margin-top: 24px;">
+        <h3>Snapshot Quality & Provenance</h3>
+        <span class="subtext">Completeness score, memory mapping race verification, and debug image integrity</span>
+      </div>
+
+      <div class="overview-grid quality-grid">
+        <div class="card">
+          <div class="metric-label">Completeness</div>
+          <div class="metric-val text-success" id="qual-completeness">100%</div>
+          <div class="card-caption" id="qual-completeness-text">Complete memory acquisition</div>
+        </div>
+        <div class="card">
+          <div class="metric-label">Mapping Race</div>
+          <div class="metric-val text-success" id="qual-mapping-race">CLEAN</div>
+          <div class="card-caption">Pre/post mapping identity verified</div>
+        </div>
+        <div class="card">
+          <div class="metric-label">Partial / Failed Reads</div>
+          <div class="metric-val" id="qual-partials">0 / 0</div>
+          <div class="card-caption">Zero region read errors</div>
+        </div>
+        <div class="card">
+          <div class="metric-label">Unavailable Fields</div>
+          <div class="metric-val" id="qual-unavail-fields">0</div>
+          <div class="card-caption">Zero truncated struct members</div>
+        </div>
+        <div class="card">
+          <div class="metric-label">Debug Image</div>
+          <div class="metric-val text-accent" id="qual-debug-status">VERIFIED</div>
+          <div class="card-caption mono break-all" id="qual-debug-path">Unstripped ELF symbols</div>
+        </div>
+        <div class="card">
+          <div class="metric-label">Build ID</div>
+          <div class="metric-val mono" id="qual-build-id">MATCHED</div>
+          <div class="card-caption" id="qual-module-count">1 runtime modules verified</div>
+        </div>
+      </div>
+
+      <!-- 5. Memory to State Pipeline Flow Lineage -->
+      <div class="card pipeline-flow-card" style="margin-top: 24px;">
+        <div class="pipeline-title">Semantic Observation Pipeline Lineage:</div>
+        <div class="pipeline-flow">
+          <div class="pipeline-step">
+            <div class="step-num">1</div>
+            <div class="step-name">Raw Memory</div>
+            <div class="step-desc">/proc/$PID/mem + maps</div>
+          </div>
+          <div class="pipeline-arrow">➔</div>
+          <div class="pipeline-step">
+            <div class="step-num">2</div>
+            <div class="step-name">Runtime Modules</div>
+            <div class="step-desc">ELF Load Bias & Build ID</div>
+          </div>
+          <div class="pipeline-arrow">➔</div>
+          <div class="pipeline-step">
+            <div class="step-num">3</div>
+            <div class="step-name">Typed Memory</div>
+            <div class="step-desc">DWARF Types & Struct Layout</div>
+          </div>
+          <div class="pipeline-arrow">➔</div>
+          <div class="pipeline-step">
+            <div class="step-num">4</div>
+            <div class="step-name">Semantic Objects</div>
+            <div class="step-desc">Persistent Object Graph</div>
+          </div>
+          <div class="pipeline-arrow">➔</div>
+          <div class="pipeline-step">
+            <div class="step-num">5</div>
+            <div class="step-name">Object Graph</div>
+            <div class="step-desc">Pointer Reference Topology</div>
+          </div>
+          <div class="pipeline-arrow">➔</div>
+          <div class="pipeline-step">
+            <div class="step-num">6</div>
+            <div class="step-name">Runtime State</div>
+            <div class="step-desc">Invariant State Hash</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 2: 📦 Runtime Objects (Master-Detail Inspector)                   -->
+    <!-- ===================================================================== -->
+    <section id="tab-runtime-objects" class="tab-pane">
+      <div class="split-view">
+        <!-- Left: Object Directory -->
         <div class="split-sidebar">
           <div class="sidebar-header">
             <h3>Object Directory</h3>
@@ -130,13 +331,13 @@
             <small id="txt-mem-truncated-count">Displaying first 100 objects</small>
           </div>
 
-          <!-- Object Tree / List -->
+          <!-- Object List -->
           <div class="list-container" id="list-memory-objects">
             <div class="text-muted text-center p-3">Select a state to inspect objects</div>
           </div>
         </div>
 
-        <!-- Right Column: Human-Centric Object Inspector -->
+        <!-- Right: Human-Centric Object Inspector -->
         <div class="split-main">
           <div class="card" id="card-human-inspector">
             <div class="card-header-row">
@@ -202,9 +403,9 @@
     </section>
 
     <!-- ===================================================================== -->
-    <!-- TAB 2: Semantic Object Topology & Reference Graph                     -->
+    <!-- TAB 3: 🕸️ Object Graph (Interactive SVG Topology)                     -->
     <!-- ===================================================================== -->
-    <section id="tab-topology" class="tab-pane">
+    <section id="tab-object-graph" class="tab-pane">
       <div class="pane-header">
         <div class="header-left">
           <h2>Semantic Object Topology & References</h2>
@@ -223,7 +424,7 @@
           <span class="legend-item"><span class="legend-dot dot-heap"></span> Heap Allocated</span>
           <span class="legend-item"><span class="legend-dot dot-stack"></span> Stack Frame</span>
         </div>
-        <div class="topology-hint text-muted">Click any node to inspect its fields in the Runtime Memory Explorer</div>
+        <div class="topology-hint text-muted">Click any node to inspect its fields in the Runtime Objects tab</div>
       </div>
 
       <!-- Interactive SVG Topology Graph Container -->
@@ -233,21 +434,17 @@
     </section>
 
     <!-- ===================================================================== -->
-    <!-- TAB 3: Advanced Exploration (DAG, Mutations, Diff, Autonomous Loop)  -->
+    <!-- TAB 4: 📜 History / State Diff                                         -->
     <!-- ===================================================================== -->
-    <section id="tab-exploration" class="tab-pane">
-      <!-- Sub-Navigation Bar for Advanced Features -->
+    <section id="tab-history-diff" class="tab-pane">
       <div class="advanced-subnav">
-        <button class="subnav-pill active" data-subtab="subtab-dag">1. State Transition DAG</button>
-        <button class="subnav-pill" data-subtab="subtab-mutations">2. Mutation Proposals</button>
-        <button class="subnav-pill" data-subtab="subtab-diff">3. Semantic State Diff</button>
-        <button class="subnav-pill" data-subtab="subtab-explore">4. Autonomous Exploration Loop</button>
+        <button class="subnav-pill active" data-subtab="subtab-dag">State Transition DAG (History)</button>
+        <button class="subnav-pill" data-subtab="subtab-diff">Semantic State Diff</button>
       </div>
 
-      <!-- Subtab 1: State DAG & History -->
-      <div id="subtab-dag" class="subtab-content active">
+      <!-- Subtab 1: State DAG -->
+      <div id="subtab-dag" class="subtab-content active" style="margin-top: 16px;">
         <div class="split-view">
-          <!-- Left: States List -->
           <div class="split-sidebar">
             <div class="sidebar-header">
               <h3>Discovered States</h3>
@@ -261,7 +458,6 @@
             </div>
           </div>
 
-          <!-- Right: State Graph & State Details -->
           <div class="split-main">
             <div class="panel-header">
               <div class="panel-title-group">
@@ -274,12 +470,10 @@
               </div>
             </div>
 
-            <!-- SVG Visual State Graph -->
             <div class="graph-canvas-container" id="graph-container">
               <svg id="state-graph-svg" width="100%" height="360"></svg>
             </div>
 
-            <!-- Selected State Detail Card -->
             <div class="state-detail-panel card" id="card-state-detail" style="display: none; margin-top: 16px;">
               <div class="card-header-row">
                 <div class="card-title-group">
@@ -295,7 +489,7 @@
                 <div><strong>Observations:</strong> <span id="detail-observations" class="mono">1</span></div>
               </div>
               <div class="state-actions-row">
-                <button class="btn btn-primary btn-sm" id="btn-inspect-state-objects">Inspect in Memory Explorer</button>
+                <button class="btn btn-primary btn-sm" id="btn-inspect-state-objects">Inspect in Runtime Objects</button>
                 <button class="btn btn-secondary btn-sm" id="btn-state-diff-parent">Diff with Parent</button>
                 <button class="btn btn-secondary btn-sm" id="btn-state-mutate">Propose Mutations</button>
               </div>
@@ -304,8 +498,83 @@
         </div>
       </div>
 
-      <!-- Subtab 2: Mutation Proposals & Execution -->
-      <div id="subtab-mutations" class="subtab-content">
+      <!-- Subtab 2: Semantic State Diff -->
+      <div id="subtab-diff" class="subtab-content" style="margin-top: 16px;">
+        <div class="pane-header">
+          <div>
+            <h3>Semantic State Diff</h3>
+            <span class="subtext">Compare field modifications, pointer rewrites, and object lifecycle between two snapshots</span>
+          </div>
+          <div class="diff-selectors-row">
+            <div class="select-item">
+              <label>Snapshot A (Parent):</label>
+              <input type="text" id="input-diff-a" class="input-text" placeholder="State ID or Snapshot ID">
+            </div>
+            <div class="select-item">
+              <label>Snapshot B (Child):</label>
+              <input type="text" id="input-diff-b" class="input-text" placeholder="State ID or Snapshot ID">
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-run-diff">Compute Diff</button>
+          </div>
+        </div>
+
+        <div class="diff-content" id="diff-results" style="display: none; margin-top: 16px;">
+          <div class="metric-row" style="margin-bottom: 20px;">
+            <div class="metric-box">
+              <div class="metric-val" id="diff-val-changes">0</div>
+              <div class="metric-label">Values Changed</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-val" id="diff-ref-changes">0</div>
+              <div class="metric-label">References Changed</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-val" id="diff-obj-created">0</div>
+              <div class="metric-label">Objects Created</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-val" id="diff-obj-removed">0</div>
+              <div class="metric-label">Objects Removed</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header-row">
+              <h4>Field Value Modifications</h4>
+              <button class="btn btn-outline btn-sm btn-view-json" data-entity="diff">Diff JSON</button>
+            </div>
+            <div class="table-container">
+              <table class="data-table" id="table-diff-changes">
+                <thead>
+                  <tr>
+                    <th>Object</th>
+                    <th>Field</th>
+                    <th>Before Value</th>
+                    <th>After Value</th>
+                    <th>Category</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td colspan="5" class="text-muted text-center">No field changes</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 5: ⚡ Advanced Exploration (Mutations & Autonomous Loop)          -->
+    <!-- ===================================================================== -->
+    <section id="tab-advanced-explore" class="tab-pane">
+      <div class="advanced-subnav">
+        <button class="subnav-pill active" data-subtab="subtab-mutations">Mutation Proposals & Execution</button>
+        <button class="subnav-pill" data-subtab="subtab-explore">Autonomous Exploration Loop</button>
+      </div>
+
+      <!-- Subtab 1: Mutation Proposals -->
+      <div id="subtab-mutations" class="subtab-content active" style="margin-top: 16px;">
         <div class="candidates-layout">
           <div class="candidates-browser card">
             <div class="card-header-row">
@@ -380,73 +649,8 @@
         </div>
       </div>
 
-      <!-- Subtab 3: Semantic State Diff -->
-      <div id="subtab-diff" class="subtab-content">
-        <div class="pane-header">
-          <div>
-            <h3>Semantic State Diff</h3>
-            <span class="subtext">Compare field modifications, pointer rewrites, and object lifecycle between two snapshots</span>
-          </div>
-          <div class="diff-selectors-row">
-            <div class="select-item">
-              <label>Snapshot A (Parent):</label>
-              <input type="text" id="input-diff-a" class="input-text" placeholder="State ID or Snapshot ID">
-            </div>
-            <div class="select-item">
-              <label>Snapshot B (Child):</label>
-              <input type="text" id="input-diff-b" class="input-text" placeholder="State ID or Snapshot ID">
-            </div>
-            <button class="btn btn-primary btn-sm" id="btn-run-diff">Compute Diff</button>
-          </div>
-        </div>
-
-        <div class="diff-content" id="diff-results" style="display: none; margin-top: 16px;">
-          <div class="metric-row" style="margin-bottom: 20px;">
-            <div class="metric-box">
-              <div class="metric-val" id="diff-val-changes">0</div>
-              <div class="metric-label">Values Changed</div>
-            </div>
-            <div class="metric-box">
-              <div class="metric-val" id="diff-ref-changes">0</div>
-              <div class="metric-label">References Changed</div>
-            </div>
-            <div class="metric-box">
-              <div class="metric-val" id="diff-obj-created">0</div>
-              <div class="metric-label">Objects Created</div>
-            </div>
-            <div class="metric-box">
-              <div class="metric-val" id="diff-obj-removed">0</div>
-              <div class="metric-label">Objects Removed</div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header-row">
-              <h4>Field Value Modifications</h4>
-              <button class="btn btn-outline btn-sm btn-view-json" data-entity="diff">Diff JSON</button>
-            </div>
-            <div class="table-container">
-              <table class="data-table" id="table-diff-changes">
-                <thead>
-                  <tr>
-                    <th>Object</th>
-                    <th>Field</th>
-                    <th>Before Value</th>
-                    <th>After Value</th>
-                    <th>Category</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr><td colspan="5" class="text-muted text-center">No field changes</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Subtab 4: Autonomous Exploration Loop -->
-      <div id="subtab-explore" class="subtab-content">
+      <!-- Subtab 2: Autonomous Loop -->
+      <div id="subtab-explore" class="subtab-content" style="margin-top: 16px;">
         <div class="explore-layout">
           <div class="card explore-config-card">
             <h4>Autonomous State Space Exploration</h4>
@@ -504,9 +708,9 @@
     </section>
 
     <!-- ===================================================================== -->
-    <!-- TAB 4: System & Provenance (Discovered Modules & Environment)         -->
+    <!-- TAB 6: 🛠️ System / Provenance                                          -->
     <!-- ===================================================================== -->
-    <section id="tab-provenance" class="tab-pane">
+    <section id="tab-system-provenance" class="tab-pane">
       <div class="pane-header">
         <div>
           <h2>Target Architecture & Provenance</h2>

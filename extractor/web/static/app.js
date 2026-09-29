@@ -1,5 +1,5 @@
 /**
- * dynamicState — Human-Centric Runtime Memory Explorer Frontend
+ * dynamicState — Memory Snapshot & Runtime State Explorer Frontend
  * Single-Page Application communicating via AgentRuntime REST API.
  */
 
@@ -11,20 +11,21 @@
     runtime: null,
     states: [],
     selectedStateId: null,
+    memorySummary: null,
     objects: [],
     selectedObjectId: null,
     storageFilter: 'all',
     searchQuery: '',
     candidates: [],
     stateGraphData: { nodes: [], edges: [] },
-    activeTab: 'tab-memory',
+    activeTab: 'tab-memory-snapshot',
     activeSubtab: 'subtab-dag',
     jsonViewerCache: {},
   };
 
   // DOM Elements Cache
   const el = {
-    // Header & Badges
+    // Header & Global Status Bar
     txtRuntimeStatus: document.getElementById('txt-runtime-status'),
     pillRuntimeStatus: document.getElementById('pill-runtime-status'),
     badgeObsMode: document.getElementById('badge-obs-mode'),
@@ -37,23 +38,62 @@
     lowImpactBanner: document.getElementById('low-impact-banner'),
     toastContainer: document.getElementById('toast-container'),
 
-    // Main Nav Tabs
+    // Main Nav Tabs (6 Tabs)
     navTabs: document.querySelectorAll('.nav-tab'),
     tabPanes: document.querySelectorAll('.tab-pane'),
 
-    // Tab 1: Memory Explorer Hero Summary
-    heroMode: document.getElementById('hero-mode'),
-    heroStatus: document.getElementById('hero-status'),
-    heroCompleteness: document.getElementById('hero-completeness'),
-    heroTargetTitle: document.getElementById('hero-target-title'),
-    heroTargetSubtitle: document.getElementById('hero-target-subtitle'),
-    selectMemoryState: document.getElementById('select-memory-state'),
-    heroObjCount: document.getElementById('hero-obj-count'),
-    heroPtrCount: document.getElementById('hero-ptr-count'),
-    heroModCount: document.getElementById('hero-mod-count'),
-    heroDebugInfo: document.getElementById('hero-debug-info'),
+    // Tab 1: Memory Snapshot Explorer
+    msBadgeMode: document.getElementById('ms-badge-mode'),
+    msBadgeStatus: document.getElementById('ms-badge-status'),
+    msBadgeConsistency: document.getElementById('ms-badge-consistency'),
+    msTargetTitle: document.getElementById('ms-target-title'),
+    msTargetSubtitle: document.getElementById('ms-target-subtitle'),
+    selectSnapshotId: document.getElementById('select-snapshot-id'),
 
-    // Tab 1: Directory & Inspector
+    statStatus: document.getElementById('stat-status'),
+    statStatusSub: document.getElementById('stat-status-sub'),
+    statCapturedMb: document.getElementById('stat-captured-mb'),
+    statCapturedBytes: document.getElementById('stat-captured-bytes'),
+    statDuration: document.getElementById('stat-duration'),
+    statConsistency: document.getElementById('stat-consistency'),
+    statRegionCount: document.getElementById('stat-region-count'),
+    statArch: document.getElementById('stat-arch'),
+    statPointerEndian: document.getElementById('stat-pointer-endian'),
+
+    breakdownBar: document.getElementById('breakdown-bar'),
+    bdHeapVal: document.getElementById('bd-heap-val'),
+    bdHeapPct: document.getElementById('bd-heap-pct'),
+    bdStackVal: document.getElementById('bd-stack-val'),
+    bdStackPct: document.getElementById('bd-stack-pct'),
+    bdGlobalVal: document.getElementById('bd-global-val'),
+    bdGlobalPct: document.getElementById('bd-global-pct'),
+    bdExecVal: document.getElementById('bd-exec-val'),
+    bdExecPct: document.getElementById('bd-exec-pct'),
+    bdShlibVal: document.getElementById('bd-shlib-val'),
+    bdShlibPct: document.getElementById('bd-shlib-pct'),
+    bdOtherVal: document.getElementById('bd-other-val'),
+    bdOtherPct: document.getElementById('bd-other-pct'),
+    bdTotalVal: document.getElementById('bd-total-val'),
+
+    semTotalObjs: document.getElementById('sem-total-objs'),
+    semHeapObjs: document.getElementById('sem-heap-objs'),
+    semGlobalObjs: document.getElementById('sem-global-objs'),
+    semStackObjs: document.getElementById('sem-stack-objs'),
+    semRefsCount: document.getElementById('sem-refs-count'),
+    semanticTreePreview: document.getElementById('semantic-tree-preview'),
+    btnGotoObjects: document.getElementById('btn-goto-objects'),
+
+    qualCompleteness: document.getElementById('qual-completeness'),
+    qualCompletenessText: document.getElementById('qual-completeness-text'),
+    qualMappingRace: document.getElementById('qual-mapping-race'),
+    qualPartials: document.getElementById('qual-partials'),
+    qualUnavailFields: document.getElementById('qual-unavail-fields'),
+    qualDebugStatus: document.getElementById('qual-debug-status'),
+    qualDebugPath: document.getElementById('qual-debug-path'),
+    qualBuildId: document.getElementById('qual-build-id'),
+    qualModuleCount: document.getElementById('qual-module-count'),
+
+    // Tab 2: Runtime Objects Directory & Inspector
     inputSearchObjects: document.getElementById('input-search-objects'),
     storageFilterPills: document.querySelectorAll('.storage-filter-pills .filter-pill'),
     badgeMemObjectsCount: document.getElementById('badge-mem-objects-count'),
@@ -74,15 +114,14 @@
     memTechType: document.getElementById('mem-tech-type'),
     memTechId: document.getElementById('mem-tech-id'),
 
-    // Tab 2: Topology
+    // Tab 3: Topology SVG Graph
     svgTopologyGraph: document.getElementById('topology-graph-svg'),
     btnResetTopology: document.getElementById('btn-reset-topology'),
 
-    // Tab 3: Advanced Exploration Subnav
+    // Tab 4: History / State Diff
     subnavPills: document.querySelectorAll('.subnav-pill'),
     subtabContents: document.querySelectorAll('.subtab-content'),
 
-    // Tab 3: State DAG
     badgeStatesCount: document.getElementById('badge-states-count'),
     inputSearchStates: document.getElementById('input-search-states'),
     listStates: document.getElementById('list-states'),
@@ -100,7 +139,17 @@
     btnStateDiffParent: document.getElementById('btn-state-diff-parent'),
     btnStateMutate: document.getElementById('btn-state-mutate'),
 
-    // Tab 3: Mutation Proposals
+    inputDiffA: document.getElementById('input-diff-a'),
+    inputDiffB: document.getElementById('input-diff-b'),
+    btnRunDiff: document.getElementById('btn-run-diff'),
+    diffResults: document.getElementById('diff-results'),
+    diffValChanges: document.getElementById('diff-val-changes'),
+    diffRefChanges: document.getElementById('diff-ref-changes'),
+    diffObjCreated: document.getElementById('diff-obj-created'),
+    diffObjRemoved: document.getElementById('diff-obj-removed'),
+    tableDiffChanges: document.querySelector('#table-diff-changes tbody'),
+
+    // Tab 5: Advanced Exploration (Mutations & Autonomous Loop)
     inputFilterCandField: document.getElementById('input-filter-cand-field'),
     tableCandidates: document.querySelector('#table-candidates tbody'),
     cardExecutionResult: document.getElementById('card-execution-result'),
@@ -112,18 +161,6 @@
     listExecChangedFields: document.getElementById('list-exec-changed-fields'),
     btnViewTransJson: document.getElementById('btn-view-trans-json'),
 
-    // Tab 3: State Diff
-    inputDiffA: document.getElementById('input-diff-a'),
-    inputDiffB: document.getElementById('input-diff-b'),
-    btnRunDiff: document.getElementById('btn-run-diff'),
-    diffResults: document.getElementById('diff-results'),
-    diffValChanges: document.getElementById('diff-val-changes'),
-    diffRefChanges: document.getElementById('diff-ref-changes'),
-    diffObjCreated: document.getElementById('diff-obj-created'),
-    diffObjRemoved: document.getElementById('diff-obj-removed'),
-    tableDiffChanges: document.querySelector('#table-diff-changes tbody'),
-
-    // Tab 3: Autonomous Explore
     formExplore: document.getElementById('form-explore'),
     expMaxSteps: document.getElementById('exp-max-steps'),
     expTimeout: document.getElementById('exp-timeout'),
@@ -136,7 +173,7 @@
     expResCrashes: document.getElementById('exp-res-crashes'),
     expResTimeouts: document.getElementById('exp-res-timeouts'),
 
-    // Tab 4: Provenance & System
+    // Tab 6: System & Provenance
     ovStatus: document.getElementById('ov-status'),
     ovPid: document.getElementById('ov-pid'),
     ovMode: document.getElementById('ov-mode'),
@@ -172,14 +209,13 @@
   };
 
   // --------------------------------------------------------------------------
-  // API Transport Helpers
+  // API Helpers
   // --------------------------------------------------------------------------
 
   async function apiGet(endpoint) {
     try {
       const res = await fetch(endpoint);
-      const data = await res.json();
-      return data;
+      return await res.json();
     } catch (err) {
       console.error(`API GET ${endpoint} error:`, err);
       return { success: false, error: { code: 'NETWORK_ERROR', message: String(err) } };
@@ -193,8 +229,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      const data = await res.json();
-      return data;
+      return await res.json();
     } catch (err) {
       console.error(`API POST ${endpoint} error:`, err);
       return { success: false, error: { code: 'NETWORK_ERROR', message: String(err) } };
@@ -222,6 +257,15 @@
       .replace(/"/g, '&quot;');
   }
 
+  function formatBytes(bytes) {
+    if (!bytes || bytes <= 0) return '0.00 MB';
+    const mb = bytes / (1024 * 1024);
+    if (mb < 0.01) {
+      return (bytes / 1024).toFixed(1) + ' KB';
+    }
+    return mb.toFixed(2) + ' MB';
+  }
+
   function getBaseName(path) {
     if (!path) return 'N/A';
     const parts = path.split('/');
@@ -229,7 +273,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // Tab & Subtab Navigation
+  // Navigation & Subtab Switching
   // --------------------------------------------------------------------------
 
   function initTabs() {
@@ -243,7 +287,7 @@
     el.subnavPills.forEach((pill) => {
       pill.addEventListener('click', () => {
         const targetSubtab = pill.getAttribute('data-subtab');
-        switchSubtab(targetSubtab);
+        switchSubtab(targetSubtab, pill);
       });
     });
   }
@@ -257,21 +301,22 @@
       p.classList.toggle('active', p.id === tabId);
     });
 
-    if (tabId === 'tab-topology') {
+    if (tabId === 'tab-object-graph') {
       renderObjectTopology();
-    } else if (tabId === 'tab-exploration') {
-      if (state.activeSubtab === 'subtab-dag') {
-        renderStateGraph();
-      }
+    } else if (tabId === 'tab-runtime-objects') {
+      renderMemoryObjectsList();
+    } else if (tabId === 'tab-history-diff') {
+      renderStateGraph();
     }
   }
 
-  function switchSubtab(subtabId) {
+  function switchSubtab(subtabId, triggerPill) {
     state.activeSubtab = subtabId;
-    el.subnavPills.forEach((p) => {
+    const parentContainer = triggerPill.closest('.tab-pane') || document;
+    parentContainer.querySelectorAll('.subnav-pill').forEach((p) => {
       p.classList.toggle('active', p.getAttribute('data-subtab') === subtabId);
     });
-    el.subtabContents.forEach((c) => {
+    parentContainer.querySelectorAll('.subtab-content').forEach((c) => {
       c.classList.toggle('active', c.id === subtabId);
     });
 
@@ -283,7 +328,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // Runtime Overview & Hero Summary
+  // Runtime Overview & State Loading
   // --------------------------------------------------------------------------
 
   async function loadRuntimeOverview() {
@@ -322,28 +367,7 @@
     el.tagEndian.textContent = `Endian: ${data.endianness || 'UNKNOWN'}`;
     el.tagElf.textContent = `ELF: ${data.elf_class || 'UNKNOWN'}`;
 
-    // Tab 1 Hero Runtime Summary
-    el.heroMode.textContent = mode;
-    el.heroMode.className = 'badge ' + (mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info');
-    el.heroStatus.textContent = status;
-    el.heroStatus.className = 'badge ' + (status === 'STOPPED' ? 'badge-success' : status === 'RUNNING' ? 'badge-info' : 'badge-neutral');
-    el.heroCompleteness.textContent = mode === 'LOW_IMPACT' ? 'OFFLINE SNAPSHOT' : 'COMPLETE DWARF';
-
-    const binName = getBaseName(data.executable);
-    el.heroTargetTitle.textContent = data.pid ? `${binName} (PID ${data.pid})` : binName;
-    el.heroTargetSubtitle.textContent = data.executable || 'No executable path reported';
-    el.heroModCount.textContent = data.module_count || 0;
-
-    let debugSummary = 'None';
-    if (data.debug_image) {
-      const dbgName = getBaseName(data.debug_image);
-      const dbgStatus = data.debug_image_status || 'UNVERIFIED';
-      const bId = data.build_id ? `[${data.build_id.substring(0, 8)}...]` : '';
-      debugSummary = `${dbgName} · ${dbgStatus} ${bId}`;
-    }
-    el.heroDebugInfo.textContent = debugSummary;
-
-    // Tab 4: System Overview & Provenance Cards
+    // Tab 6: System Overview Cards
     el.ovStatus.textContent = status;
     el.ovPid.textContent = data.pid || 'None';
     el.ovMode.innerHTML = `<span class="badge ${mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info'}">${mode}</span>`;
@@ -361,7 +385,6 @@
     el.ovStatesCount.textContent = data.state_count || 0;
     el.ovTransCount.textContent = data.transition_count || 0;
 
-    // Safety limits
     const limits = data.safety_limits || {};
     el.ovLimits.innerHTML = `
       <span class="tag">Max steps: ${limits.max_steps || 50}</span>
@@ -414,10 +437,6 @@
     el.tableModules.innerHTML = rowsHtml;
   }
 
-  // --------------------------------------------------------------------------
-  // States & Corpus DAG Management
-  // --------------------------------------------------------------------------
-
   async function loadStatesAndGraph() {
     const [statesRes, graphRes] = await Promise.all([
       apiGet('/api/states'),
@@ -430,7 +449,6 @@
       renderStatesList(state.states);
       updateStateSelectors(state.states);
 
-      // Auto-select latest or first state if none selected
       if (!state.selectedStateId && state.states.length > 0) {
         selectState(state.states[0].state_id);
       }
@@ -444,17 +462,17 @@
   }
 
   function updateStateSelectors(statesList) {
-    const options = ['<option value="">(Select a State)</option>'];
+    const options = ['<option value="">(Select Snapshot / State)</option>'];
     statesList.forEach((s) => {
       const shortHash = (s.state_hash || '').substring(0, 8);
       const isSeed = !s.metadata || !s.metadata.parent_state_id;
       const tag = isSeed ? '[Seed]' : '';
       options.push(`<option value="${s.state_id}">${s.state_id} ${tag} (${shortHash})</option>`);
     });
-    el.selectMemoryState.innerHTML = options.join('');
+    el.selectSnapshotId.innerHTML = options.join('');
 
     if (state.selectedStateId) {
-      el.selectMemoryState.value = state.selectedStateId;
+      el.selectSnapshotId.value = state.selectedStateId;
     }
   }
 
@@ -494,23 +512,23 @@
     if (!stateId) return;
     state.selectedStateId = stateId;
 
-    // Synchronize selector dropdowns
-    if (el.selectMemoryState.value !== stateId) {
-      el.selectMemoryState.value = stateId;
+    if (el.selectSnapshotId.value !== stateId) {
+      el.selectSnapshotId.value = stateId;
     }
 
-    // Update list selection highlight
     el.listStates.querySelectorAll('.state-list-item').forEach((item) => {
       item.classList.toggle('selected', item.getAttribute('data-state-id') === stateId);
     });
 
-    // Update DAG graph highlight
     renderStateGraph();
 
-    // Load objects for this state into Memory Explorer & Topology
+    // 1. Load Memory Snapshot Summary (Primary Tab 1)
+    await loadMemorySummary(stateId);
+
+    // 2. Load objects for Tab 2 & Tab 3
     await loadObjectsForState(stateId);
 
-    // Fetch state details for Tab 3 DAG panel
+    // 3. Load state details for Tab 4
     const res = await apiGet(`/api/states/${stateId}`);
     if (res.success) {
       const s = res.data;
@@ -537,7 +555,183 @@
   }
 
   // --------------------------------------------------------------------------
-  // Tab 1: Human-Centric Runtime Memory Explorer & Inspector
+  // Tab 1: Memory Snapshot Summary Renderer
+  // --------------------------------------------------------------------------
+
+  async function loadMemorySummary(stateId) {
+    const res = await apiGet(`/api/states/${stateId}/memory-summary`);
+    if (!res.success) {
+      showToast(res.error ? res.error.message : 'Failed to fetch memory summary', 'warning');
+      return;
+    }
+
+    const summary = res.data;
+    state.memorySummary = summary;
+    state.jsonViewerCache['memory-summary'] = summary;
+
+    renderMemorySummary(summary);
+  }
+
+  function renderMemorySummary(summary) {
+    const mode = summary.capture_mode || 'CONSISTENT';
+    const status = summary.status || 'COMPLETE';
+    const q = summary.quality || {};
+    const bd = summary.breakdown || {};
+    const objs = summary.objects || {};
+
+    // Header identity
+    el.msBadgeMode.textContent = mode;
+    el.msBadgeMode.className = 'badge ' + (mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info');
+
+    el.msBadgeStatus.textContent = status;
+    el.msBadgeStatus.className = 'badge ' + (status === 'COMPLETE' ? 'badge-success' : 'badge-warning');
+
+    el.msBadgeConsistency.textContent = mode === 'LOW_IMPACT' ? 'NON_ATOMIC (READV)' : 'CONSISTENT (STOPPED)';
+
+    const binName = state.runtime ? getBaseName(state.runtime.executable) : 'Target';
+    el.msTargetTitle.textContent = state.runtime && state.runtime.pid ? `${binName} (PID ${state.runtime.pid})` : binName;
+    el.msTargetSubtitle.textContent = state.runtime ? state.runtime.executable || 'No executable path' : '';
+
+    // 1. Capture Status Cards
+    el.statStatus.textContent = status;
+    el.statStatus.className = 'metric-val ' + (status === 'COMPLETE' ? 'text-success' : 'text-warning');
+    el.statStatusSub.textContent = q.mapping_race_detected ? '⚠️ Mapping race detected' : (q.partial_read_count > 0 ? `${q.partial_read_count} partial reads` : 'Complete readv capture');
+
+    el.statCapturedMb.textContent = formatBytes(summary.captured_bytes);
+    el.statCapturedBytes.textContent = `${(summary.captured_bytes || 0).toLocaleString()} bytes`;
+
+    el.statDuration.textContent = summary.duration_ms !== null && summary.duration_ms !== undefined ? `${summary.duration_ms} ms` : 'N/A (Stopped)';
+    el.statConsistency.textContent = `Consistency: ${mode === 'LOW_IMPACT' ? 'NON_ATOMIC' : 'CONSISTENT'}`;
+
+    el.statRegionCount.textContent = summary.region_count || 0;
+    el.statArch.textContent = q.architecture || 'UNKNOWN';
+    el.statPointerEndian.textContent = `Pointer: ${q.pointer_width || 'UNKNOWN'} · Endian: ${q.endianness || 'UNKNOWN'}`;
+
+    // 2. Memory Breakdown (Proportional Bar & Cards)
+    const totalBytes = bd.total_captured_bytes || 1;
+    const calcPct = (bytes) => ((bytes / totalBytes) * 100).toFixed(1);
+
+    const heapPct = calcPct(bd.heap_bytes || 0);
+    const stackPct = calcPct(bd.stack_bytes || 0);
+    const globalPct = calcPct(bd.global_bytes || 0);
+    const execPct = calcPct(bd.executable_bytes || 0);
+    const shlibPct = calcPct(bd.shared_library_bytes || 0);
+    const otherPct = calcPct(bd.other_bytes || 0);
+
+    // Update stacked bar segments
+    el.breakdownBar.innerHTML = `
+      <div class="breakdown-segment seg-heap" style="width: ${heapPct}%;" title="Heap: ${formatBytes(bd.heap_bytes)} (${heapPct}%)"></div>
+      <div class="breakdown-segment seg-stack" style="width: ${stackPct}%;" title="Stack: ${formatBytes(bd.stack_bytes)} (${stackPct}%)"></div>
+      <div class="breakdown-segment seg-global" style="width: ${globalPct}%;" title="Global: ${formatBytes(bd.global_bytes)} (${globalPct}%)"></div>
+      <div class="breakdown-segment seg-exec" style="width: ${execPct}%;" title="Executable: ${formatBytes(bd.executable_bytes)} (${execPct}%)"></div>
+      <div class="breakdown-segment seg-shlib" style="width: ${shlibPct}%;" title="Shared Libs: ${formatBytes(bd.shared_library_bytes)} (${shlibPct}%)"></div>
+      <div class="breakdown-segment seg-other" style="width: ${otherPct}%;" title="Other: ${formatBytes(bd.other_bytes)} (${otherPct}%)"></div>
+    `;
+
+    // Update breakdown values
+    el.bdHeapVal.textContent = formatBytes(bd.heap_bytes);
+    el.bdHeapPct.textContent = `${heapPct}%`;
+
+    el.bdStackVal.textContent = formatBytes(bd.stack_bytes);
+    el.bdStackPct.textContent = `${stackPct}%`;
+
+    el.bdGlobalVal.textContent = formatBytes(bd.global_bytes);
+    el.bdGlobalPct.textContent = `${globalPct}%`;
+
+    el.bdExecVal.textContent = formatBytes(bd.executable_bytes);
+    el.bdExecPct.textContent = `${execPct}%`;
+
+    el.bdShlibVal.textContent = formatBytes(bd.shared_library_bytes);
+    el.bdShlibPct.textContent = `${shlibPct}%`;
+
+    el.bdOtherVal.textContent = formatBytes(bd.other_bytes);
+    el.bdOtherPct.textContent = `${otherPct}%`;
+
+    el.bdTotalVal.textContent = formatBytes(bd.total_captured_bytes);
+
+    // 3. Semantic Runtime Objects Preview & Tree
+    el.semTotalObjs.textContent = objs.total_objects || 0;
+    el.semHeapObjs.textContent = objs.heap_objects || 0;
+    el.semGlobalObjs.textContent = objs.global_objects || 0;
+    el.semStackObjs.textContent = objs.stack_objects || 0;
+    el.semRefsCount.textContent = objs.total_references || 0;
+
+    renderSemanticTreePreview(objs.hierarchy_preview || []);
+
+    // 4. Snapshot Quality & Provenance
+    el.qualCompleteness.textContent = `${q.completeness_pct || 100}%`;
+    el.qualCompleteness.className = 'metric-val ' + (q.completeness === 'COMPLETE' ? 'text-success' : 'text-warning');
+    el.qualCompletenessText.textContent = q.completeness === 'COMPLETE' ? 'Complete memory acquisition' : 'Partial memory acquisition';
+
+    el.qualMappingRace.textContent = q.mapping_race_detected ? 'DETECTED' : 'CLEAN';
+    el.qualMappingRace.className = 'metric-val ' + (q.mapping_race_detected ? 'text-danger' : 'text-success');
+
+    el.qualPartials.textContent = `${q.partial_read_count || 0} / ${q.failed_read_count || 0}`;
+    el.qualUnavailFields.textContent = objs.unavailable_fields || 0;
+
+    el.qualDebugStatus.textContent = q.debug_image_status || 'UNKNOWN';
+    el.qualDebugStatus.className = 'metric-val ' + (q.debug_image_status === 'VERIFIED' ? 'text-success' : 'text-accent');
+    el.qualDebugPath.textContent = state.runtime ? state.runtime.debug_image || 'No external debug image' : 'N/A';
+
+    el.qualBuildId.textContent = q.build_id ? `[${q.build_id.substring(0, 8)}...]` : (q.build_id_status || 'UNAVAILABLE');
+    el.qualModuleCount.textContent = `${q.module_count || 1} runtime modules verified`;
+  }
+
+  function renderSemanticTreePreview(hierarchyPreview) {
+    if (!hierarchyPreview || hierarchyPreview.length === 0) {
+      el.semanticTreePreview.innerHTML = '<div class="text-muted text-center p-3">No semantic objects discovered in this snapshot</div>';
+      return;
+    }
+
+    let treeHtml = `<div class="tree-root-label">Application</div>`;
+
+    hierarchyPreview.forEach((node, index) => {
+      const isLast = index === hierarchyPreview.length - 1;
+      const branchSymbol = isLast ? '└─' : '├─';
+      const childPrefix = isLast ? '&nbsp;&nbsp;&nbsp;' : '│&nbsp;&nbsp;';
+      const storage = (node.storage || 'UNKNOWN').toLowerCase();
+      const storageClass = storage === 'heap' ? 'badge-storage-heap' : storage === 'global' ? 'badge-storage-global' : 'badge-storage-stack';
+
+      treeHtml += `
+        <div class="tree-node-row">
+          <span class="tree-branch-line">${branchSymbol}</span>
+          <span class="tree-obj-name">${escapeHtml(node.object_id)}</span>
+          <span class="tree-obj-type">(${escapeHtml(node.type)})</span>
+          <span class="badge ${storageClass}" style="font-size: 0.65rem; padding: 1px 4px;">${storage.toUpperCase()}</span>
+          <button class="tree-btn-inspect" data-inspect-id="${node.object_id}">Inspect →</button>
+        </div>
+      `;
+
+      // Render key fields preview
+      (node.key_fields || []).forEach((f, fIdx) => {
+        const isFieldLast = fIdx === (node.key_fields.length - 1);
+        const fBranch = isFieldLast ? '└─' : '├─';
+        const valStr = f.ref ? `──► ${escapeHtml(f.ref)}` : escapeHtml(String(f.value));
+
+        treeHtml += `
+          <div class="tree-field-row">
+            <span class="tree-branch-line">${childPrefix}${fBranch}</span>
+            <span class="tree-field-name">${escapeHtml(f.name)}</span> =
+            <span class="tree-field-val">${valStr}</span>
+          </div>
+        `;
+      });
+    });
+
+    el.semanticTreePreview.innerHTML = treeHtml;
+
+    // Attach inspect buttons
+    el.semanticTreePreview.querySelectorAll('.tree-btn-inspect').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const oid = btn.getAttribute('data-inspect-id');
+        selectObject(oid);
+        switchTab('tab-runtime-objects');
+      });
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Tab 2: Runtime Objects Directory & Human-Centric Inspector
   // --------------------------------------------------------------------------
 
   async function loadObjectsForState(stateId) {
@@ -552,24 +746,9 @@
     state.objects = objects;
     state.jsonViewerCache['objects'] = objects;
 
-    // Metrics in hero banner
-    el.heroObjCount.textContent = objects.length;
-    let ptrCount = 0;
-    objects.forEach((o) => {
-      const fields = o.fields || [];
-      fields.forEach((f) => {
-        if (f.object_ref) ptrCount++;
-      });
-    });
-    el.heroPtrCount.textContent = ptrCount;
-
-    // Render object directory list
     renderMemoryObjectsList();
-
-    // Render Topology graph
     renderObjectTopology();
 
-    // Preserve or auto-select object
     if (state.selectedObjectId && objects.some((o) => o.object_id === state.selectedObjectId)) {
       selectObject(state.selectedObjectId);
     } else if (objects.length > 0) {
@@ -583,11 +762,9 @@
     const filter = state.storageFilter || 'all';
 
     const filtered = objects.filter((o) => {
-      // Storage filter
       const st = (o.storage || 'unknown').toLowerCase();
       if (filter !== 'all' && st !== filter) return false;
 
-      // Text query
       if (!query) return true;
       const matchesId = (o.object_id || '').toLowerCase().includes(query);
       const matchesType = (o.type || '').toLowerCase().includes(query);
@@ -638,7 +815,6 @@
   function selectObject(objectId) {
     state.selectedObjectId = objectId;
 
-    // Highlight item in object directory
     el.listMemoryObjects.querySelectorAll('.mem-obj-item').forEach((item) => {
       item.classList.toggle('selected', item.getAttribute('data-object-id') === objectId);
     });
@@ -647,7 +823,6 @@
     if (!obj) return;
     state.jsonViewerCache[`object_${objectId}`] = obj;
 
-    // Header info
     const storage = (obj.storage || 'UNKNOWN').toUpperCase();
     const storageClass = storage === 'HEAP' ? 'badge-storage-heap' : storage === 'GLOBAL' ? 'badge-storage-global' : 'badge-storage-stack';
     const addrHex = obj.address ? '0x' + Number(obj.address).toString(16) : 'N/A';
@@ -664,7 +839,7 @@
     el.memTechType.textContent = obj.type || 'Unknown';
     el.memTechId.textContent = obj.object_id;
 
-    // Render Semantic Fields Table
+    // Fields Table
     const fields = obj.fields || [];
     if (fields.length === 0) {
       el.tableSemanticFields.innerHTML = `<tr><td colspan="6" class="text-muted text-center">No fields defined for this object</td></tr>`;
@@ -677,7 +852,6 @@
       const isMutable = isFieldMutable(f.type);
       const valHtml = formatSemanticValue(f.value, f.type, f.object_ref);
 
-      // Referenced target object name & type lookup
       let refChipHtml = '<span class="text-muted">null</span>';
       if (isRef) {
         const targetObj = state.objects.find((target) => target.object_id === f.object_ref);
@@ -704,7 +878,6 @@
     });
     el.tableSemanticFields.innerHTML = fieldsHtml;
 
-    // Attach click events on pointer chips to jump directly to referenced object
     el.tableSemanticFields.querySelectorAll('.pointer-chip').forEach((btn) => {
       btn.addEventListener('click', (e) => {
         e.preventDefault();
@@ -713,13 +886,13 @@
       });
     });
 
-    // Attach click events to jump into mutation proposing
     el.tableSemanticFields.querySelectorAll('.btn-inspect-cand').forEach((btn) => {
       btn.addEventListener('click', () => {
         const oid = btn.getAttribute('data-object-id');
         const fld = btn.getAttribute('data-field-name');
-        switchTab('tab-exploration');
-        switchSubtab('subtab-mutations');
+        switchTab('tab-advanced-explore');
+        const pill = document.querySelector('[data-subtab="subtab-mutations"]');
+        if (pill) switchSubtab('subtab-mutations', pill);
         loadCandidates(oid, fld);
       });
     });
@@ -729,7 +902,6 @@
     if (!objectId) return;
     selectObject(objectId);
 
-    // Scroll object into view in the left list
     const listItem = el.listMemoryObjects.querySelector(`[data-object-id="${objectId}"]`);
     if (listItem) {
       listItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -739,29 +911,24 @@
   function formatSemanticValue(val, typeStr, objectRef) {
     if (val === null || val === undefined) return '<span class="text-muted">None</span>';
 
-    // Booleans
     if (typeof val === 'boolean' || val === 'true' || val === 'false') {
       const boolVal = val === true || val === 'true';
       return `<span class="val-badge-bool-${boolVal}">${boolVal ? 'TRUE' : 'FALSE'}</span>`;
     }
 
-    // Unavailable / Unknown markers
     if (val === 'UNAVAILABLE' || val === 'UNKNOWN') {
       return `<span class="val-badge-unavailable">⚠️ ${val}</span>`;
     }
 
-    // Enums (contains :: or all uppercase with underscores)
     const strVal = String(val);
     if (strVal.includes('::') || (strVal.length > 2 && /^[A-Z][A-Z0-9_]+$/.test(strVal))) {
       return `<span class="val-badge-enum">${escapeHtml(strVal)}</span>`;
     }
 
-    // Pointer reference value
     if (objectRef) {
       return `<span class="mono text-accent">${escapeHtml(strVal)}</span>`;
     }
 
-    // Regular scalar / string value
     return `<span class="mono">${escapeHtml(strVal)}</span>`;
   }
 
@@ -773,7 +940,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // Tab 2: Semantic Object Topology & Reference Graph
+  // Tab 3: Object Topology & Graph (Interactive SVG)
   // --------------------------------------------------------------------------
 
   function renderObjectTopology() {
@@ -785,7 +952,6 @@
       return;
     }
 
-    // Build graph adjacency
     const incomingEdges = {};
     const outgoingEdges = {};
     objects.forEach((o) => {
@@ -805,7 +971,6 @@
       });
     });
 
-    // Roots: global, stack, or objects with 0 incoming references
     const levels = {};
     objects.forEach((o) => {
       const st = (o.storage || '').toLowerCase();
@@ -814,7 +979,6 @@
       }
     });
 
-    // BFS to assign hierarchy levels
     const queue = Object.keys(levels);
     while (queue.length > 0) {
       const curr = queue.shift();
@@ -827,12 +991,10 @@
       });
     }
 
-    // Default remaining disconnected nodes to level 0
     objects.forEach((o) => {
       if (levels[o.object_id] === undefined) levels[o.object_id] = 0;
     });
 
-    // Group nodes by level
     const levelGroups = {};
     objects.forEach((o) => {
       const lvl = levels[o.object_id] || 0;
@@ -872,7 +1034,6 @@
       </defs>
     `;
 
-    // Render Edges
     objects.forEach((src) => {
       const fromPos = coords[src.object_id];
       if (!fromPos) return;
@@ -898,7 +1059,6 @@
       });
     });
 
-    // Render Nodes
     objects.forEach((obj) => {
       const pos = coords[obj.object_id];
       if (!pos) return;
@@ -919,18 +1079,17 @@
 
     svg.innerHTML = svgHtml;
 
-    // Attach click events to nodes
     svg.querySelectorAll('.topo-node').forEach((nodeEl) => {
       nodeEl.addEventListener('click', () => {
         const oid = nodeEl.getAttribute('data-object-id');
         selectObject(oid);
-        switchTab('tab-memory');
+        switchTab('tab-runtime-objects');
       });
     });
   }
 
   // --------------------------------------------------------------------------
-  // Tab 3: Advanced Exploration — State DAG
+  // Tab 4: History / State Diff
   // --------------------------------------------------------------------------
 
   function renderStateGraph() {
@@ -1004,7 +1163,6 @@
       </defs>
     `;
 
-    // Render Edges
     edges.forEach((e) => {
       const from = coords[e.from];
       const to = coords[e.to];
@@ -1033,7 +1191,6 @@
       `;
     });
 
-    // Render Nodes
     nodes.forEach((n) => {
       const pos = coords[n.id];
       if (!pos) return;
@@ -1070,8 +1227,53 @@
     });
   }
 
+  async function computeDiff(snapA, snapB) {
+    if (!snapA || !snapB) {
+      showToast('Both Snapshot A and Snapshot B are required', 'error');
+      return;
+    }
+
+    showToast(`Computing diff between ${snapA} and ${snapB}...`, 'info');
+    const res = await apiGet(`/api/snapshots/${encodeURIComponent(snapA)}/diff/${encodeURIComponent(snapB)}`);
+
+    if (!res.success) {
+      showToast(res.error ? res.error.message : 'Diff computation failed', 'error');
+      return;
+    }
+
+    const diff = res.data;
+    state.jsonViewerCache['diff'] = diff;
+    el.diffResults.style.display = 'block';
+
+    const summary = diff.summary || {};
+    el.diffValChanges.textContent = summary.value_changes || 0;
+    el.diffRefChanges.textContent = summary.reference_changes || 0;
+    el.diffObjCreated.textContent = summary.objects_created || 0;
+    el.diffObjRemoved.textContent = summary.objects_removed || 0;
+
+    const changes = diff.changes || [];
+    if (changes.length === 0) {
+      el.tableDiffChanges.innerHTML = `<tr><td colspan="5" class="text-muted text-center">No field changes between snapshots</td></tr>`;
+      return;
+    }
+
+    let html = '';
+    changes.forEach((c) => {
+      html += `
+        <tr>
+          <td class="mono">${escapeHtml(c.object_id || '')}</td>
+          <td><strong>${escapeHtml(c.field || '')}</strong></td>
+          <td class="mono text-muted">${escapeHtml(String(c.before))}</td>
+          <td class="mono text-accent"><strong>${escapeHtml(String(c.after))}</strong></td>
+          <td><span class="tag">${escapeHtml(c.category || 'value')}</span></td>
+        </tr>
+      `;
+    });
+    el.tableDiffChanges.innerHTML = html;
+  }
+
   // --------------------------------------------------------------------------
-  // Tab 3: Mutation Candidates & Execution
+  // Tab 5: Advanced Exploration (Mutations & Autonomous Loop)
   // --------------------------------------------------------------------------
 
   async function loadCandidates(filterObjId = null, filterField = null) {
@@ -1166,62 +1368,8 @@
       el.listExecChangedFields.innerHTML = changed.map((f) => `<li class="mono">${escapeHtml(f)}</li>`).join('');
     }
 
-    // Refresh states and graph
     await loadStatesAndGraph();
   }
-
-  // --------------------------------------------------------------------------
-  // Tab 3: Semantic State Diff
-  // --------------------------------------------------------------------------
-
-  async function computeDiff(snapA, snapB) {
-    if (!snapA || !snapB) {
-      showToast('Both Snapshot A and Snapshot B are required', 'error');
-      return;
-    }
-
-    showToast(`Computing diff between ${snapA} and ${snapB}...`, 'info');
-    const res = await apiGet(`/api/snapshots/${encodeURIComponent(snapA)}/diff/${encodeURIComponent(snapB)}`);
-
-    if (!res.success) {
-      showToast(res.error ? res.error.message : 'Diff computation failed', 'error');
-      return;
-    }
-
-    const diff = res.data;
-    state.jsonViewerCache['diff'] = diff;
-    el.diffResults.style.display = 'block';
-
-    const summary = diff.summary || {};
-    el.diffValChanges.textContent = summary.value_changes || 0;
-    el.diffRefChanges.textContent = summary.reference_changes || 0;
-    el.diffObjCreated.textContent = summary.objects_created || 0;
-    el.diffObjRemoved.textContent = summary.objects_removed || 0;
-
-    const changes = diff.changes || [];
-    if (changes.length === 0) {
-      el.tableDiffChanges.innerHTML = `<tr><td colspan="5" class="text-muted text-center">No field changes between snapshots</td></tr>`;
-      return;
-    }
-
-    let html = '';
-    changes.forEach((c) => {
-      html += `
-        <tr>
-          <td class="mono">${escapeHtml(c.object_id || '')}</td>
-          <td><strong>${escapeHtml(c.field || '')}</strong></td>
-          <td class="mono text-muted">${escapeHtml(String(c.before))}</td>
-          <td class="mono text-accent"><strong>${escapeHtml(String(c.after))}</strong></td>
-          <td><span class="tag">${escapeHtml(c.category || 'value')}</span></td>
-        </tr>
-      `;
-    });
-    el.tableDiffChanges.innerHTML = html;
-  }
-
-  // --------------------------------------------------------------------------
-  // Tab 3: Autonomous Exploration Loop
-  // --------------------------------------------------------------------------
 
   async function runAutonomousExplore(maxSteps, timeoutMs, maxStates) {
     showToast('Starting autonomous state exploration loop...', 'info');
@@ -1256,7 +1404,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // JSON Viewer Modal
+  // Modals & Event Bindings
   // --------------------------------------------------------------------------
 
   function openJsonModal(title, jsonData) {
@@ -1308,10 +1456,6 @@
     });
   }
 
-  // --------------------------------------------------------------------------
-  // Observation Dialog Modal
-  // --------------------------------------------------------------------------
-
   function initObserveDialog() {
     el.btnObserveDialog.addEventListener('click', () => {
       el.modalObserve.style.display = 'flex';
@@ -1353,10 +1497,6 @@
     });
   }
 
-  // --------------------------------------------------------------------------
-  // Event Bindings
-  // --------------------------------------------------------------------------
-
   function bindEvents() {
     el.btnRefresh.addEventListener('click', async () => {
       showToast('Refreshing runtime state...', 'info');
@@ -1364,9 +1504,13 @@
       await loadStatesAndGraph();
     });
 
-    el.selectMemoryState.addEventListener('change', (e) => {
+    el.selectSnapshotId.addEventListener('change', (e) => {
       const sid = e.target.value;
       if (sid) selectState(sid);
+    });
+
+    el.btnGotoObjects.addEventListener('click', () => {
+      switchTab('tab-runtime-objects');
     });
 
     el.inputSearchObjects.addEventListener('input', (e) => {
@@ -1384,7 +1528,7 @@
     });
 
     el.btnJumpTopology.addEventListener('click', () => {
-      switchTab('tab-topology');
+      switchTab('tab-object-graph');
     });
 
     el.btnResetTopology.addEventListener('click', () => {
@@ -1405,19 +1549,22 @@
 
     el.btnInspectStateObjects.addEventListener('click', () => {
       if (state.selectedStateId) {
-        switchTab('tab-memory');
+        switchTab('tab-runtime-objects');
       }
     });
 
     el.btnStateDiffParent.addEventListener('click', () => {
       if (state.selectedStateId) {
-        switchSubtab('subtab-diff');
+        const diffPill = document.querySelector('[data-subtab="subtab-diff"]');
+        if (diffPill) switchSubtab('subtab-diff', diffPill);
         computeDiff(el.inputDiffA.value, el.inputDiffB.value);
       }
     });
 
     el.btnStateMutate.addEventListener('click', () => {
-      switchSubtab('subtab-mutations');
+      switchTab('tab-advanced-explore');
+      const mutPill = document.querySelector('[data-subtab="subtab-mutations"]');
+      if (mutPill) switchSubtab('subtab-mutations', mutPill);
       loadCandidates();
     });
 

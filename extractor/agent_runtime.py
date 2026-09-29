@@ -1003,6 +1003,53 @@ class AgentRuntime:
 
         return self._error("SNAPSHOT_NOT_FOUND", "No snapshot available to retrieve provenance", "GET_SNAPSHOT_PROVENANCE", t0)
 
+    def get_memory_summary(self, snapshot_id: Optional[str] = None) -> AgentActionResult:
+        """Return UI-friendly MemorySnapshotSummary for a snapshot."""
+        t0 = time.monotonic()
+        from .memory_snapshot_summary import build_memory_snapshot_summary
+
+        raw_snap = None
+        snap = None
+
+        if snapshot_id:
+            raw_snap = self._resolve_raw_memory_snapshot(snapshot_id)
+            if raw_snap is None:
+                snap, err = self._resolve_snapshot(snapshot_id)
+        else:
+            snap, err = self._resolve_snapshot(None)
+            if snap is None and self.memory_snapshots:
+                raw_snap = list(self.memory_snapshots.values())[-1]
+
+        if snap is None and raw_snap is None:
+            return self._error("SNAPSHOT_NOT_FOUND", f"Snapshot '{snapshot_id}' not found", "GET_MEMORY_SUMMARY", t0)
+
+        modules_res = self.get_modules(snapshot_id)
+        modules_list = modules_res.data.get("modules", []) if modules_res.success and isinstance(modules_res.data, dict) else []
+
+        debug_img_info = {
+            "status": getattr(self.controller, "debug_image_status", None) if self.controller else None,
+            "path": getattr(self.controller, "debug_image_path", None) if self.controller else None,
+        }
+
+        snap_dict = snap.to_dict() if hasattr(snap, "to_dict") else (dict(snap) if snap is not None else {})
+        if not snap_dict and raw_snap is not None:
+            snap_dict = raw_snap.to_dict()
+
+        summary = build_memory_snapshot_summary(
+            snap_dict,
+            raw_memory_snapshot=raw_snap,
+            runtime_modules=modules_list,
+            debug_image_info=debug_img_info,
+        )
+
+        elapsed = round((time.monotonic() - t0) * 1000, 3)
+        return AgentActionResult(
+            success=True,
+            action="GET_MEMORY_SUMMARY",
+            data=summary.to_dict(),
+            performance={"total_ms": elapsed}
+        )
+
     def _resolve_raw_memory_snapshot(self, target: str) -> Optional[Any]:
         """Resolve a RawMemorySnapshot by ID or path."""
         from .memory_snapshot import RawMemorySnapshot

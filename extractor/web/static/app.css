@@ -1317,3 +1317,285 @@ details[open] .accordion-icon {
 .subtab-content.active {
   display: block;
 }
+
+/* ========================================================================== */
+/* Memory Snapshot Explorer Styles (Tab 1 Primary View)                       */
+/* ========================================================================== */
+
+.snap-header-card {
+  padding: 16px 20px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+
+/* Status Grid */
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.status-card {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.card-caption {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* Memory Breakdown Proportional Bar */
+.memory-breakdown-card {
+  padding: 20px;
+}
+
+.breakdown-bar-container {
+  width: 100%;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 4px;
+  overflow: hidden;
+}
+
+.memory-breakdown-bar {
+  display: flex;
+  height: 24px;
+  border-radius: 6px;
+  overflow: hidden;
+  background-color: #1e293b;
+}
+
+.breakdown-segment {
+  height: 100%;
+  transition: width 0.3s ease;
+  min-width: 2px;
+}
+
+.seg-heap {
+  background-color: #38bdf8; /* Cyan */
+}
+
+.seg-stack {
+  background-color: #34d399; /* Emerald */
+}
+
+.seg-global {
+  background-color: #c084fc; /* Purple */
+}
+
+.seg-exec {
+  background-color: #fbbf24; /* Amber */
+}
+
+.seg-shlib {
+  background-color: #818cf8; /* Indigo */
+}
+
+.seg-other {
+  background-color: #64748b; /* Slate */
+}
+
+.dot-exec {
+  background-color: #fbbf24;
+}
+
+.dot-shlib {
+  background-color: #818cf8;
+}
+
+.dot-other {
+  background-color: #64748b;
+}
+
+/* Breakdown Grid */
+.breakdown-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.breakdown-item {
+  background-color: var(--bg-main);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.breakdown-header {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.breakdown-val {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.breakdown-pct {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.breakdown-total {
+  border-color: var(--accent);
+  background-color: rgba(56, 189, 248, 0.06);
+}
+
+/* Semantic Object Hierarchy Tree */
+.semantic-overview-card {
+  padding: 20px;
+}
+
+.semantic-tree-container {
+  background-color: var(--bg-main);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 14px;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  max-height: 380px;
+  overflow-y: auto;
+  line-height: 1.6;
+}
+
+.tree-root-label {
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.tree-node-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.tree-branch-line {
+  color: #475569;
+  user-select: none;
+}
+
+.tree-obj-name {
+  color: #f1f5f9;
+  font-weight: 600;
+}
+
+.tree-obj-type {
+  color: #94a3b8;
+  font-size: 0.8rem;
+}
+
+.tree-field-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0 1px 24px;
+  font-size: 0.8rem;
+  color: #cbd5e1;
+}
+
+.tree-field-name {
+  color: #94a3b8;
+}
+
+.tree-field-val {
+  color: #38bdf8;
+}
+
+.tree-btn-inspect {
+  margin-left: auto;
+  font-size: 0.7rem;
+  padding: 1px 6px;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.tree-btn-inspect:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Quality Grid */
+.quality-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+/* Pipeline Flow Card */
+.pipeline-flow-card {
+  padding: 18px 20px;
+  background-color: var(--bg-card);
+}
+
+.pipeline-title {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+
+.pipeline-flow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pipeline-step {
+  background-color: var(--bg-main);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 12px;
+  text-align: center;
+  flex: 1;
+  min-width: 120px;
+}
+
+.step-num {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  border-radius: 50%;
+  background-color: var(--accent);
+  color: #0b0f19;
+  font-size: 0.7rem;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.step-name {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-main);
+}
+
+.step-desc {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.pipeline-arrow {
+  color: var(--text-dim);
+  font-size: 1rem;
+}

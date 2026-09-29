@@ -419,6 +419,23 @@ class TestWebApi(unittest.TestCase):
         self.assertEqual(res.get("steps"), 5)
         self.assertEqual(res.get("new_states"), 3)
 
+    def test_13_memory_summary_endpoint(self):
+        status, data = self._get("/api/memory-summary")
+        self.assertEqual(status, 200)
+        self.assertTrue(data.get("success"))
+        summary = data.get("data", {})
+        self.assertIn("breakdown", summary)
+        self.assertIn("objects", summary)
+        self.assertIn("quality", summary)
+        self.assertIn("status", summary)
+        self.assertEqual(summary.get("objects", {}).get("total_objects"), 2)
+
+        # Test state-specific memory summary
+        status, s_data = self._get("/api/states/state_000001/memory-summary")
+        self.assertEqual(status, 200)
+        self.assertTrue(s_data.get("success"))
+        self.assertEqual(s_data.get("data", {}).get("objects", {}).get("total_objects"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

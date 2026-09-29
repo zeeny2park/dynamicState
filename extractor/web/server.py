@@ -138,6 +138,10 @@ class WebApiAdapter:
         caps_res = self.runtime.capabilities()
         caps = caps_res.data if caps_res.success else {}
 
+        # Pre-compute memory summary if snapshot or states available
+        mem_summary_res = self.runtime.get_memory_summary()
+        mem_summary = _to_json_serializable(mem_summary_res.data) if mem_summary_res.success else None
+
         return {
             "success": True,
             "data": {
@@ -157,7 +161,36 @@ class WebApiAdapter:
                 "current_checkpoint": list(self.runtime._cached_checkpoints.keys())[-1] if self.runtime._cached_checkpoints else None,
                 "safety_limits": caps.get("limits", {}),
                 "capabilities": caps,
+                "memory_summary": mem_summary,
             }
+        }
+
+    def get_memory_summary(self, snapshot_id: Optional[str] = None) -> Dict[str, Any]:
+        res = self.runtime.get_memory_summary(snapshot_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {
+            "success": False,
+            "error": {"code": res.error.code if res.error else "SNAPSHOT_NOT_FOUND",
+                      "message": res.error.message if res.error else "Memory summary not found"}
+        }
+
+    def get_state_memory_summary(self, state_id: str) -> Dict[str, Any]:
+        state_meta = self.runtime.corpus.get_metadata(state_id)
+        snap_id = state_meta.get("snapshot_id") if state_meta else None
+        res = self.runtime.get_memory_summary(snap_id or state_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        # Fallback if state in corpus
+        snap_data = self.runtime.corpus.get(state_id)
+        if snap_data:
+            from extractor.memory_snapshot_summary import build_memory_snapshot_summary
+            summary = build_memory_snapshot_summary(snap_data)
+            return {"success": True, "data": _to_json_serializable(summary.to_dict())}
+        return {
+            "success": False,
+            "error": {"code": res.error.code if res.error else "STATE_NOT_FOUND",
+                      "message": res.error.message if res.error else f"State '{state_id}' memory summary not found"}
         }
 
     def get_modules(self, snapshot_id: Optional[str] = None) -> Dict[str, Any]:
@@ -600,6 +633,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_runtime_info())
                 return
 
+            # GET /api/memory-summary
+            if path == "/api/memory-summary":
+                self._send_json(adapter.get_memory_summary(snapshot_id=q_param("snapshot_id")))
+                return
+
             # GET /api/modules
             if path == "/api/modules":
                 self._send_json(adapter.get_modules(snapshot_id=q_param("snapshot_id")))
@@ -613,6 +651,13 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             # GET /api/states
             if path == "/api/states":
                 self._send_json(adapter.list_states())
+                return
+
+            # GET /api/states/{state_id}/memory-summary
+            m_state_mem = re.match(r"^/api/states/([^/]+)/memory-summary$", path)
+            if m_state_mem:
+                state_id = m_state_mem.group(1)
+                self._send_json(adapter.get_state_memory_summary(state_id))
                 return
 
             # GET /api/states/{state_id}/objects

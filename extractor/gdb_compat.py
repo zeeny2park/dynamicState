@@ -7,19 +7,47 @@ Ensures backward compatibility with GDB 9.2+ and forward compatibility with mode
 - Version detection and capability interrogation
 """
 
+from dataclasses import dataclass
 import re
-from typing import Any, Optional, Tuple
+from typing import Any, Iterator, Optional, Tuple
 
 
-def get_gdb_version(gdb_module: Any) -> Tuple[int, int, str]:
-    """Parse GDB version into (major, minor, raw_string). Defaults to (9, 2, '9.2') if unknown."""
+@dataclass(frozen=True)
+class GdbVersion:
+    major: Optional[int]
+    minor: Optional[int]
+    raw: str
+    status: str  # "RESOLVED" or "UNKNOWN"
+
+    def is_known(self) -> bool:
+        return self.status == "RESOLVED" and self.major is not None
+
+    def supports_frame_level(self) -> bool:
+        """Frame.level() was introduced in GDB 11.0. If unknown, assume unsupported (conservative)."""
+        return bool(self.is_known() and self.major is not None and self.major >= 11)
+
+    def __iter__(self) -> Iterator[Any]:
+        """Support tuple unpacking (major, minor, raw) for backward compatibility."""
+        return iter((self.major, self.minor, self.raw))
+
+    def __getitem__(self, index: int) -> Any:
+        return (self.major, self.minor, self.raw)[index]
+
+
+def get_gdb_version(gdb_module: Any) -> GdbVersion:
+    """Parse GDB version into GdbVersion object with explicit UNKNOWN status.
+
+    NEVER silently falls back to arbitrary versions like 9.2 when GDB or version is unknown.
+    """
     if not gdb_module or not hasattr(gdb_module, "VERSION"):
-        return (9, 2, "9.2")
-    raw = str(getattr(gdb_module, "VERSION", "9.2"))
+        return GdbVersion(major=None, minor=None, raw="UNKNOWN", status="UNKNOWN")
+    raw = str(getattr(gdb_module, "VERSION", "")).strip()
+    if not raw:
+        return GdbVersion(major=None, minor=None, raw="UNKNOWN", status="UNKNOWN")
     m = re.search(r"(\d+)\.(\d+)", raw)
     if m:
-        return (int(m.group(1)), int(m.group(2)), raw)
-    return (9, 2, raw)
+        return GdbVersion(major=int(m.group(1)), minor=int(m.group(2)), raw=raw, status="RESOLVED")
+    return GdbVersion(major=None, minor=None, raw=raw, status="UNKNOWN")
 
 
 def get_frame_level(frame: Any, fallback_level: int = 0) -> int:
