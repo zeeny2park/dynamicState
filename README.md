@@ -175,13 +175,38 @@ if (linux_fork_multiple_threads ())
    - OS 포크 불가 및 재시작 불가 환경으로, capability에서 `supported=False`, scope=`NONE` 보고
    - 탐색 시 예외 크래시 대신 `status="UNAVAILABLE"`과 함께 안전한 대안 액션(`OBSERVE`, `SNAPSHOT`, `LIST_OBJECTS`, `INSPECT_OBJECT`, `LIST_MUTATION_CANDIDATES`)을 안내
 
-#### 3) Capability-Aware StateExplorer & Web UI
+#### 3) Multithread Restart Determinism Verification Invariant
+부모 상태(Parent State)에서 분기한 여러 변이 브랜치가 독립적으로 실행된 후 복원되었을 때, 상태 해시의 완벽한 재현성을 검증합니다:
+```text
+Parent State (hash = H_P)
+    ├── Branch A (Mutate -> Continue -> Child A, hash = H_A)
+    ├── restore() -> Process Restart -> R1 (hash = H_R1)
+    ├── Branch B (Mutate -> Continue -> Child B, hash = H_B)
+    └── restore() -> Process Restart -> R2 (hash = H_R2)
+
+Invariant:
+    H_P == H_R1 == H_R2
+    H_A != H_P, H_B != H_P, H_A != H_B
+```
+
+- **Pre-Exploration Determinism Verification (`verify_restart_determinism`)**:
+  자율 탐색 루프 실행 전, 사전 dry-run 재시작을 통해 부모 상태 해시와 복원 후 상태 해시의 일치 여부를 검증합니다. 외부 I/O, 시간, 난수 등으로 인해 상태가 일치하지 않는 경우 임의로 추정하지 않고 `NON_DETERMINISTIC` / `RESTART_REPRODUCTION_FAILED`로 분류하고 필드 단위 불일치 디프를 제공합니다.
+- **Internal Synchronization & Scheduler Metadata Filtering**:
+  Glibc condition variable (`__pthread_cond_s`, `pthread_cond_t`), mutex (`pthread_mutex_t`), 정리 버퍼 (`_condvar_cleanup_buffer`)의 내부 futex 대기 카운터 (`wseq`, `__futex`, `__g1_orig_size`, `__g_refs`, `__wrefs`) 및 스케줄러 래퍼 프레임을 상태 해시 계산에서 정제하여, 커널 스레드 스케줄링 순서에 의한 거짓 불일치(false positive)를 방지합니다.
+- **Thread-Local Storage (TLS) Determinism**:
+  모든 워커 스레드의 `thread_local` 변수(`t_thread_id`, `t_worker_state`, `t_worker_counter`)가 재시작 후에도 일관되게 복원되는지 검증합니다 (`verify_tls_determinism`).
+- **Web UI & Agent Capability Expose**:
+  Web UI 탐색 화면 및 REST API(`/api/runtime/verify_determinism`)에서 Checkpoint Backend, Checkpoint Semantics, Thread Scope, Determinism Status, Branch Isolation 상태를 실시간 가시화하고 "Verify Restart Determinism" 버튼을 통해 대화형 검증을 수행할 수 있습니다.
+
+#### 4) Capability-Aware StateExplorer & Web UI
 - `StateExplorer.run()`은 체크포인트 시도 전 `controller.get_capabilities()`의 `branch_isolation` 상태를 확인하여 격리가 불가능한 환경에서 비정상 종료 없이 즉시 대안을 보고합니다.
 - Web UI의 "Autonomous Exploration" 탭은 타깃의 스레드 수와 브랜치 격리 백엔드를 감지하여, 격리가 불가능한 경우 시각적 경고 배너와 권장 대안 버튼을 제공하고 파괴적인 비격리 실행을 사전에 방지합니다.
 
 - **Explicit Structured Error Codes**:
   - `MULTITHREAD_CHECKPOINT_UNSUPPORTED`: 멀티스레드 환경에서 fork checkpoint 시도 차단
   - `MULTITHREAD_BRANCH_ISOLATION_UNSUPPORTED`: 브랜치 격리 미지원으로 인한 탐색 불가
+  - `RESTART_DETERMINISM_FAILED`: 재시작 결정론 검증 실패
+  - `NON_DETERMINISTIC_RUNTIME_STATE`: 외부 비결정론적 상태로 인한 안전 탐색 중단
   - `CHECKPOINT_CREATE_FAILED`: GDB 체크포인트 포크 실패
   - `CHECKPOINT_NOT_FOUND`: 요청한 체크포인트 ID가 등록되지 않음
   - `CHECKPOINT_RESTORE_FAILED`: Master 체크포인트 재시작 또는 Worker 복제 실패

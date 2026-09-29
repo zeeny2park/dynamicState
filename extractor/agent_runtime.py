@@ -137,6 +137,8 @@ class AgentRuntime:
                                     max_states=action.max_states)
             elif act == "STATE_HASH":
                 return self.state_hash(snapshot_id=action.snapshot_id)
+            elif act == "VERIFY_RESTART_DETERMINISM":
+                return self.verify_restart_determinism(checkpoint_id=action.checkpoint_id)
             elif act == "DETECT_INVARIANTS":
                 return self.detect_invariant_candidates(snapshot_id=action.snapshot_id)
             elif act == "MEMORY_SNAPSHOT":
@@ -461,6 +463,26 @@ class AgentRuntime:
             )
         except Exception as exc:
             return self._error("RUNTIME_ERROR", f"Restore failed: {exc}", "RESTORE", t0)
+
+    def verify_restart_determinism(self, checkpoint_id: Optional[str] = None) -> AgentActionResult:
+        """Verify deterministic reproducibility of state across inferior restarts."""
+        t0 = time.monotonic()
+        if not self.controller:
+            return self._error("RUNTIME_ERROR", "No active runtime controller attached", "VERIFY_RESTART_DETERMINISM", t0)
+        cp = None
+        if checkpoint_id:
+            cp = self._cached_checkpoints.get(checkpoint_id)
+        try:
+            res = self.controller.verify_restart_determinism(checkpoint=cp)
+            success = res.get("deterministic", False)
+            return AgentActionResult(
+                success=success,
+                action="VERIFY_RESTART_DETERMINISM",
+                data=res,
+                performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+            )
+        except Exception as exc:
+            return self._error("RUNTIME_ERROR", f"Determinism verification failed: {exc}", "VERIFY_RESTART_DETERMINISM", t0)
 
     # -------------------------------------------------------------------------
     # State Transition Execution & Inspection

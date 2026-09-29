@@ -436,6 +436,21 @@ class TestWebApi(unittest.TestCase):
         self.assertTrue(s_data.get("success"))
         self.assertEqual(s_data.get("data", {}).get("objects", {}).get("total_objects"), 2)
 
+    def test_14_verify_restart_determinism_endpoint(self):
+        # GET
+        status, data = self._get("/api/runtime/verify_determinism")
+        self.assertEqual(status, 200)
+        self.assertTrue(data.get("success"))
+        self.assertTrue(data.get("data", {}).get("deterministic"))
+        self.assertEqual(data.get("data", {}).get("status"), "VERIFIED")
+
+        # POST
+        status, p_data = self._post("/api/runtime/verify_determinism", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(p_data.get("success"))
+        self.assertTrue(p_data.get("data", {}).get("deterministic"))
+
 
 if __name__ == "__main__":
     unittest.main()
+

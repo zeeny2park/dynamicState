@@ -111,7 +111,56 @@ docker run --rm -v $(pwd):/workspace -w /workspace dynamicstate-gdb92:latest pyt
 ```
 Expected output:
 ```
-Ran 9 tests in ...
+Ran 18 tests in ...
 OK
 ```
+
+---
+
+## 6. Multithread Restart Determinism & Branch Isolation Architecture
+
+### 6.1. The Principle of Restart-Based Checkpoint/Restore
+In multithreaded Linux processes, GDB native `checkpoint` (which issues `fork()`) only duplicates the calling thread and deadlocks any mutex held by background threads. dynamicState resolves this through `RestartBasedRestorer`:
+```text
+Parent State (at predefined observation breakpoint)
+      │
+      ├── Branch A (Mutate -> Continue -> Child State A)
+      │
+      ├── restore() -> Process Restart -> Breakpoint Re-hit
+      │                 ├── Inferior stopped validation
+      │                 ├── Breakpoint location validation
+      │                 └── Thread count validation
+      │
+      ├── Branch B (Mutate -> Continue -> Child State B)
+      │
+      └── restore() -> Process Restart -> Breakpoint Re-hit
+                        │
+                        ▼
+            Parent State Reproducibility:
+            hash(Parent) == hash(R1) == hash(R2)
+            hash(A) != hash(Parent), hash(B) != hash(Parent), hash(A) != hash(B)
+```
+
+### 6.2. Pre-Exploration Determinism Verification
+Before running autonomous exploration loops across sibling mutation branches, dynamicState verifies that process restarts produce identical semantic states:
+- Parent snapshot is captured: `h_parent = compute_state_hash(snap_parent)`.
+- A dry-run restart is performed: `restorer.restore(cp)`.
+- Restored snapshot is captured: `h_restored = compute_state_hash(snap_restored)`.
+- If `h_parent == h_restored`, status is marked `VERIFIED`.
+- If hashes differ due to unmanaged external I/O, timestamps, or entropy, the runtime never fakes determinism; it marks the state `NON_DETERMINISTIC` with reason `RESTART_REPRODUCTION_FAILED` and provides field-level mismatch diffs. Under `safe` determinism policy, exploration safely halts with `NON_DETERMINISTIC_RUNTIME_STATE`.
+
+### 6.3. Internal OS Synchronization Structure & Futex Filtering
+Glibc condition variables (`pthread_cond_t`), mutexes (`pthread_mutex_t`), and cancellation buffers (`_condvar_cleanup_buffer`) maintain internal futex wait sequences (`wseq`, `__wseq`, `__g1_orig_size`, `__g_refs`, `__wrefs`). In multithreaded programs, OS kernel scheduler thread arrival order naturally causes these internal counters to increment or permute between executions, even when the user application state is 100% deterministic.
+dynamicState filters internal synchronization types (`pthread_cond`, `pthread_mutex`, `condition_variable`, `std::mutex`) and internal scheduler metadata fields (`wseq`, `__futex`, `__g1_orig_size`, `__g_refs`, etc.) from semantic state hashing and diffing, ensuring state hashes reflect strictly user application semantics.
+
+### 6.4. Attached vs. Launched Process Limitations
+- **Launched Inferior (`run`)**: Full restart capability (`RESTART`). The target was launched under GDB control with known arguments and environment. Restoring to the parent observation breakpoint is fully supported.
+- **Attached Inferior (`attach <pid>`)**: Cannot be re-executed via `run` (doing so would launch a separate binary rather than returning to the attached process context). Checkpoint restore is marked `NONE`, branch isolation is marked `UNAVAILABLE`, and the runtime provides safe alternative actions (`OBSERVE`, `SNAPSHOT`, `LIST_OBJECTS`, `INSPECT_OBJECT`, `LIST_MUTATION_CANDIDATES`).
+
+### 6.5. Thread-Local Storage (TLS) Determinism
+Each thread's `thread_local` variables (`t_thread_id`, `t_worker_state`, `t_worker_counter`) are inspected across all live threads (`verify_tls_determinism`). The restorer ensures that per-thread TLS states match exactly between parent and restored inferior runs.
+
+### 6.6. Web UI & Agent API Visualization
+- **Web UI Exploration Panel**: Displays real-time Checkpoint Backend (`GDB_CHECKPOINT` / `RESTART` / `NONE`), Checkpoint Semantics (`MEMORY_CHECKPOINT` / `RESTART_TO_OBSERVATION_POINT`), Thread Scope (`SINGLE_THREAD` / `MULTITHREAD`), Determinism Status (`VERIFIED` / `UNKNOWN` / `FAILED` / `NON_DETERMINISTIC`), and Branch Isolation (`SUPPORTED` / `CONDITIONAL` / `UNAVAILABLE`).
+- **Interactive Verification**: Includes an interactive **"Verify Restart Determinism"** button (`/api/runtime/verify_determinism`) allowing human engineers and agents to test state reproducibility on demand before launching long-running state explorations.
 

@@ -26,8 +26,43 @@ def _canonicalize_object_graph(data: Dict[str, Any]) -> Tuple[Tuple[Any, ...], .
     'ref:C_1', 'null'), preventing recursion loops on cyclic graphs.
     """
     persistent = data.get("persistent") or {}
-    raw_objects = persistent.get("objects", [])
-    raw_roots = persistent.get("roots", [])
+    INTERNAL_SYNC_SUBSTRINGS = (
+        "_condvar_cleanup_buffer",
+        "_pthread_cleanup_buffer",
+        "pthread_cond",
+        "pthread_mutex",
+        "pthread_rwlock",
+        "pthread_barrier",
+        "__pthread_cond_s",
+        "__pthread_mutex_s",
+        "condition_variable",
+        "std::mutex",
+        "std::__mutex_base",
+        "thread::id",
+    )
+    SCHEDULER_METADATA_FIELDS = {
+        "wseq", "__wseq", "__futex", "__owner", "__cur_writer",
+        "__lock", "__arg", "__canceltype", "__routine",
+        "__g1_orig_size", "__g1_start", "__g_refs", "__g_signals",
+        "__g_size", "__wrefs", "__align", "__data", "__size",
+        "__id", "_M_thread", "_M_id", "__native_handle"
+    }
+
+    raw_objects = []
+    for obj in (persistent.get("objects", []) or []):
+        t = str(obj.get("type", ""))
+        if any(sub in t for sub in INTERNAL_SYNC_SUBSTRINGS):
+            continue
+        fnames = {f.get("name") for f in obj.get("fields", [])}
+        if fnames and fnames.issubset(SCHEDULER_METADATA_FIELDS):
+            continue
+        raw_objects.append(obj)
+
+    raw_roots = [
+        root for root in (persistent.get("roots", []) or [])
+        if not any(sub in str(root.get("type", "")) for sub in INTERNAL_SYNC_SUBSTRINGS)
+        and not any(str(root.get("function", "")).startswith(p) for p in ("__pthread", "___pthread", "__GI___", "clone"))
+    ]
 
     obj_by_id: Dict[str, Dict[str, Any]] = {
         obj.get("object_id"): obj for obj in raw_objects if obj.get("object_id")
@@ -57,6 +92,9 @@ def _canonicalize_object_graph(data: Dict[str, Any]) -> Tuple[Tuple[Any, ...], .
         curr_id = queue.popleft()
         curr_obj = obj_by_id.get(curr_id, {})
         for f in sorted(curr_obj.get("fields", []), key=lambda x: str(x.get("name", ""))):
+            fname = str(f.get("name", ""))
+            if fname in SCHEDULER_METADATA_FIELDS:
+                continue
             ref = f.get("object_ref")
             if ref and ref in obj_by_id and ref not in visited_set:
                 visited_set.add(ref)
@@ -67,7 +105,7 @@ def _canonicalize_object_graph(data: Dict[str, Any]) -> Tuple[Tuple[Any, ...], .
     remaining = [oid for oid in obj_by_id if oid not in visited_set]
     remaining.sort(key=lambda oid: (
         str(obj_by_id[oid].get("type", "")),
-        str([(f.get("name"), str(f.get("value"))) for f in obj_by_id[oid].get("fields", [])])
+        str([(f.get("name"), str(f.get("value"))) for f in obj_by_id[oid].get("fields", []) if str(f.get("name", "")) not in SCHEDULER_METADATA_FIELDS])
     ))
     for oid in remaining:
         visited_order.append(oid)
@@ -85,6 +123,8 @@ def _canonicalize_object_graph(data: Dict[str, Any]) -> Tuple[Tuple[Any, ...], .
         fields_repr: List[Tuple[str, Any, Any]] = []
         for f in sorted(obj.get("fields", []), key=lambda x: str(x.get("name", ""))):
             fname = str(f.get("name", ""))
+            if fname in SCHEDULER_METADATA_FIELDS:
+                continue
             ftype = str(f.get("type", ""))
             avail = f.get("availability")
             obj_ref = f.get("object_ref")
@@ -102,6 +142,11 @@ def _canonicalize_object_graph(data: Dict[str, Any]) -> Tuple[Tuple[Any, ...], .
                     semantic_val = "null"
                 else:
                     semantic_val = "non_null_pointer"
+            elif isinstance(val, str) and (val.startswith("@0x") or (val.startswith("0x") and len(val) >= 6)):
+                if val in ("0x0", "@0x0"):
+                    semantic_val = "null"
+                else:
+                    semantic_val = "non_null_pointer"
             else:
                 semantic_val = val
 
@@ -116,7 +161,8 @@ def compute_state_hash(snapshot: Any) -> str:
     """Compute an address-independent deterministic 16-hex semantic state hash.
 
     Excludes raw memory addresses, thread IDs, process PIDs, timestamps,
-    physical storage classifications, and memory map file paths.
+    physical storage classifications, memory map file paths, and internal OS
+    thread scheduling metadata.
     """
     data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
     canonical: List[Any] = []
@@ -124,10 +170,17 @@ def compute_state_hash(snapshot: Any) -> str:
     # 1. Execution context: thread call stack semantic functions (no thread_id / no PC)
     threads = (data.get("execution") or {}).get("threads", [])
     threads_canonical = []
+    internal_prefixes = (
+        "__pthread", "___pthread", "__GI_", "__GI___", "clone",
+        "__futex", "futex", "__syscall", "syscall", "start_thread", "thread_start"
+    )
     for thread in threads:
         frames = thread.get("frames", [])
-        func_sequence = tuple(str(frame.get("function")) for frame in frames)
-        threads_canonical.append((len(frames), func_sequence))
+        filtered_funcs = tuple(
+            str(frame.get("function")) for frame in frames
+            if frame.get("function") and not any(str(frame.get("function") or "").startswith(p) for p in internal_prefixes)
+        )
+        threads_canonical.append((len(filtered_funcs), filtered_funcs))
     threads_canonical.sort()
     canonical.append(("execution", tuple(threads_canonical)))
 

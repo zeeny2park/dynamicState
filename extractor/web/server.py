@@ -555,6 +555,19 @@ class WebApiAdapter:
             "data": _to_json_serializable(res.data) if res.data else None
         }
 
+    def verify_restart_determinism(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        cid = params.get("checkpoint_id")
+        res = self.runtime.verify_restart_determinism(checkpoint_id=cid)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {
+            "success": False,
+            "error": {"code": res.error.code if res.error else "RUNTIME_ERROR",
+                      "message": res.error.message if res.error else "Determinism verification failed"},
+            "data": _to_json_serializable(res.data) if res.data else None
+        }
+
+
 
 class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
     """HTTP Request Handler providing strict REST API endpoints and static file hosting."""
@@ -737,6 +750,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_state_graph())
                 return
 
+            # GET /api/verify-determinism
+            if path in ("/api/verify-determinism", "/api/runtime/verify_determinism"):
+                self._send_json(adapter.verify_restart_determinism({}))
+                return
+
             # Unrecognized API endpoint
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
                             status=404)
@@ -776,9 +794,13 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if path == "/api/explore":
                 self._send_json(adapter.explore(body))
                 return
+            if path in ("/api/verify-determinism", "/api/runtime/verify_determinism"):
+                self._send_json(adapter.verify_restart_determinism(body))
+                return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
                             status=404)
+
         except Exception as exc:
             self._send_json({"success": False, "error": {"code": "RUNTIME_ERROR", "message": str(exc)}},
                             status=500)

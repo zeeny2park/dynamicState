@@ -126,13 +126,47 @@ class RuntimeController:
             timeout_ms=timeout_ms
         )
 
+    def verify_restart_determinism(self, checkpoint=None) -> Dict[str, Any]:
+        if hasattr(self, "restorer") and hasattr(self.restorer, "verify_restart_determinism"):
+            cp = checkpoint or self.checkpoint()
+            return self.restorer.verify_restart_determinism(cp, controller=self)
+        if hasattr(self, "_default_restorer"):
+            cp = checkpoint or self.checkpoint()
+            return self._default_restorer.verify_restart_determinism(cp, controller=self)
+        return {
+            "deterministic": True,
+            "status": "VERIFIED",
+            "parent_state_hash": None,
+            "restored_state_hash": None,
+            "mismatches": [],
+        }
+
     def get_capabilities(self) -> Dict[str, Any]:
         return RuntimeCapabilities(
             checkpoint=True,
             restore=True,
             threads=1,
-            checkpoint_restore={"supported": True, "backend": "MOCK", "scope": "MULTITHREAD", "threads": 1, "reason": None},
-            branch_isolation={"status": "SUPPORTED", "scope": "MULTITHREAD", "restore_backend": "MOCK", "threads": 1, "reason": None, "safe_alternatives": []}
+            checkpoint_restore={
+                "supported": True,
+                "backend": "MOCK",
+                "scope": "MULTITHREAD",
+                "semantics": "MEMORY_CHECKPOINT",
+                "determinism_required": False,
+                "determinism_status": "VERIFIED",
+                "threads": 1,
+                "reason": None
+            },
+            branch_isolation={
+                "status": "SUPPORTED",
+                "scope": "MULTITHREAD",
+                "restore_backend": "MOCK",
+                "semantics": "MEMORY_CHECKPOINT",
+                "determinism_required": False,
+                "determinism_status": "VERIFIED",
+                "threads": 1,
+                "reason": None,
+                "safe_alternatives": []
+            }
         ).to_dict()
 
     def get_type_info(self, type_name: str) -> Optional[Any]:
@@ -308,6 +342,9 @@ class GdbRuntimeController(RuntimeController):
             "supported": True,
             "backend": "gdb_fork",
             "scope": "SINGLE_THREAD_ONLY" if thread_count <= 1 else "NONE",
+            "semantics": "MEMORY_CHECKPOINT" if thread_count <= 1 else "OBSERVATION_ONLY",
+            "determinism_required": False,
+            "determinism_status": "VERIFIED" if thread_count <= 1 else "UNKNOWN",
             "threads": thread_count,
             "reason": None if thread_count <= 1 else "MULTITHREAD_CHECKPOINT_UNSUPPORTED",
         }
@@ -315,13 +352,22 @@ class GdbRuntimeController(RuntimeController):
         can_checkpoint = restorer_cap.get("supported", False)
         backend_name = restorer_cap.get("backend", "gdb_fork")
         scope = restorer_cap.get("scope", "SINGLE_THREAD_ONLY")
+        semantics = restorer_cap.get("semantics", "MEMORY_CHECKPOINT" if backend_name in ("gdb_fork", "GDB_CHECKPOINT") else "RESTART_TO_OBSERVATION_POINT")
+        det_req = restorer_cap.get("determinism_required", backend_name == "RESTART")
+        det_status = restorer_cap.get("determinism_status", "VERIFIED" if backend_name in ("gdb_fork", "GDB_CHECKPOINT") else "UNKNOWN")
 
         branch_status = "SUPPORTED" if can_checkpoint else "UNAVAILABLE"
+        if can_checkpoint and det_status in ("FAILED", "NON_DETERMINISTIC"):
+            branch_status = "CONDITIONAL"
+
         branch_reason = restorer_cap.get("reason")
         branch_isolation_dict = {
             "status": branch_status,
             "scope": scope,
             "restore_backend": backend_name,
+            "semantics": semantics,
+            "determinism_required": det_req,
+            "determinism_status": det_status,
             "threads": thread_count,
             "reason": branch_reason,
             "safe_alternatives": [
@@ -348,7 +394,7 @@ class GdbRuntimeController(RuntimeController):
             crash_recovery=can_checkpoint,
             timeout_recovery=can_checkpoint,
             external_debug_image=True,
-            multi_thread_determinism=(thread_count <= 1),
+            multi_thread_determinism=(thread_count <= 1 or det_status == "VERIFIED"),
             external_io_rollback=False,
             exploration_mode=exploration_mode,
             backend=backend_name.lower(),
@@ -356,6 +402,10 @@ class GdbRuntimeController(RuntimeController):
             checkpoint_restore=restorer_cap,
             branch_isolation=branch_isolation_dict
         ).to_dict()
+
+    def verify_restart_determinism(self, checkpoint=None) -> Dict[str, Any]:
+        cp = checkpoint or self.checkpoint()
+        return self.restorer.verify_restart_determinism(cp, controller=self)
 
     def get_type_info(self, type_name: str) -> Optional[Any]:
         if not type_name:

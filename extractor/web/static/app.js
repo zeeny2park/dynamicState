@@ -178,12 +178,26 @@
     exploreIsolationAlternatives: document.getElementById('explore-isolation-alternatives'),
     exploreAlternativesList: document.getElementById('explore-alternatives-list'),
 
+    // Tab 5 Checkpoint & Determinism Card
+    expCpBackend: document.getElementById('exp-cp-backend'),
+    expCpSemantics: document.getElementById('exp-cp-semantics'),
+    expCpScope: document.getElementById('exp-cp-scope'),
+    expCpDeterminism: document.getElementById('exp-cp-determinism'),
+    expCpBranchIsolation: document.getElementById('exp-cp-branch-isolation'),
+    btnVerifyDeterminism: document.getElementById('btn-verify-determinism'),
+    boxDeterminismResult: document.getElementById('box-determinism-result'),
+    detResultTitle: document.getElementById('det-result-title'),
+    detResultDetails: document.getElementById('det-result-details'),
+
     // Tab 6: System & Provenance
     ovStatus: document.getElementById('ov-status'),
     ovPid: document.getElementById('ov-pid'),
     ovThreads: document.getElementById('ov-threads'),
     ovMode: document.getElementById('ov-mode'),
     ovRestoreBackend: document.getElementById('ov-restore-backend'),
+    ovCheckpointSemantics: document.getElementById('ov-checkpoint-semantics'),
+    ovThreadScope: document.getElementById('ov-thread-scope'),
+    ovDeterminismStatus: document.getElementById('ov-determinism-status'),
     ovBranchIsolation: document.getElementById('ov-branch-isolation'),
     ovBinary: document.getElementById('ov-binary'),
     ovDebugImage: document.getElementById('ov-debug-image'),
@@ -410,14 +424,47 @@
     el.tagEndian.textContent = `Endian: ${data.endianness || 'UNKNOWN'}`;
     el.tagElf.textContent = `ELF: ${data.elf_class || 'UNKNOWN'}`;
 
+    // Tab 5: Checkpoint & Determinism Card
+    const cpRestore = data.checkpoint_restore || {};
+    const backendName = cpRestore.backend || branchIso.restore_backend || (threadCount > 1 ? 'RESTART' : 'GDB_CHECKPOINT');
+    const semantics = cpRestore.semantics || branchIso.semantics || (backendName === 'RESTART' ? 'RESTART_TO_OBSERVATION_POINT' : 'MEMORY_CHECKPOINT');
+    const scope = cpRestore.scope || branchIso.scope || (threadCount > 1 ? 'MULTITHREAD' : 'SINGLE_THREAD');
+    const detStatus = cpRestore.determinism_status || branchIso.determinism_status || 'UNKNOWN';
+    const branchStatus = branchIso.status || (isIsoSupported ? 'SUPPORTED' : 'UNAVAILABLE');
+
+    if (el.expCpBackend) el.expCpBackend.textContent = backendName;
+    if (el.expCpSemantics) el.expCpSemantics.textContent = semantics;
+    if (el.expCpScope) el.expCpScope.textContent = scope;
+    if (el.expCpDeterminism) {
+      let detClass = 'badge-neutral';
+      if (detStatus === 'VERIFIED') detClass = 'badge-success';
+      else if (detStatus === 'FAILED' || detStatus === 'NON_DETERMINISTIC') detClass = 'badge-danger';
+      el.expCpDeterminism.innerHTML = `<span class="badge ${detClass}">${detStatus}</span>`;
+    }
+    if (el.expCpBranchIsolation) {
+      let isoClass = 'badge-neutral';
+      if (branchStatus === 'SUPPORTED') isoClass = 'badge-success';
+      else if (branchStatus === 'CONDITIONAL') isoClass = 'badge-warning';
+      else if (branchStatus === 'UNAVAILABLE') isoClass = 'badge-danger';
+      el.expCpBranchIsolation.innerHTML = `<span class="badge ${isoClass}">${branchStatus}</span>`;
+    }
+
     // Tab 6: System Overview Cards
     el.ovStatus.textContent = status;
     el.ovPid.textContent = data.pid || 'None';
     if (el.ovThreads) el.ovThreads.textContent = threadCount;
     el.ovMode.innerHTML = `<span class="badge ${mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info'}">${mode}</span>`;
-    if (el.ovRestoreBackend) el.ovRestoreBackend.textContent = branchIso.restore_backend || 'GDB_CHECKPOINT';
+    if (el.ovRestoreBackend) el.ovRestoreBackend.textContent = backendName;
+    if (el.ovCheckpointSemantics) el.ovCheckpointSemantics.textContent = semantics;
+    if (el.ovThreadScope) el.ovThreadScope.textContent = scope;
+    if (el.ovDeterminismStatus) {
+      let detClass = 'badge-neutral';
+      if (detStatus === 'VERIFIED') detClass = 'badge-success';
+      else if (detStatus === 'FAILED' || detStatus === 'NON_DETERMINISTIC') detClass = 'badge-danger';
+      el.ovDeterminismStatus.innerHTML = `<span class="badge ${detClass}">${detStatus}</span>`;
+    }
     if (el.ovBranchIsolation) {
-      el.ovBranchIsolation.innerHTML = `<span class="badge ${isIsoSupported ? 'badge-success' : 'badge-warning'}">${branchIso.status || (isIsoSupported ? 'SUPPORTED' : 'UNAVAILABLE')}</span>`;
+      el.ovBranchIsolation.innerHTML = `<span class="badge ${isIsoSupported ? 'badge-success' : 'badge-warning'}">${branchStatus}</span>`;
     }
     el.ovBinary.textContent = data.executable || 'None';
     el.ovDebugImage.textContent = data.debug_image || 'None';
@@ -1662,6 +1709,48 @@
       const b = el.inputDiffB.value.trim();
       computeDiff(a, b);
     });
+
+    if (el.btnVerifyDeterminism) {
+      el.btnVerifyDeterminism.addEventListener('click', async () => {
+        showToast('Verifying restart determinism across process restarts...', 'info');
+        el.btnVerifyDeterminism.disabled = true;
+        const res = await apiPost('/api/runtime/verify_determinism', {});
+        el.btnVerifyDeterminism.disabled = false;
+
+        if (el.boxDeterminismResult) {
+          el.boxDeterminismResult.style.display = 'block';
+          if (res.success && res.data && res.data.deterministic) {
+            showToast('Restart determinism VERIFIED: parent state matches restored state!', 'success');
+            el.boxDeterminismResult.className = 'alert-banner alert-success';
+            if (el.detResultTitle) el.detResultTitle.textContent = '✓ Restart Determinism Verified';
+            const d = res.data;
+            const pH = d.parent_state_hash ? d.parent_state_hash.substring(0, 16) + '...' : 'N/A';
+            const rH = d.restored_state_hash ? d.restored_state_hash.substring(0, 16) + '...' : 'N/A';
+            if (el.detResultDetails) {
+              el.detResultDetails.innerHTML = `Status: <strong>${d.status}</strong><br>Parent Hash: ${pH}<br>Restored Hash: ${rH}`;
+            }
+          } else {
+            const d = res.data || {};
+            const statusVal = d.status || (res.error ? res.error.code : 'FAILED');
+            const isNonDet = statusVal === 'NON_DETERMINISTIC';
+            showToast(`Determinism Verification: ${statusVal}`, isNonDet ? 'warning' : 'error');
+            el.boxDeterminismResult.className = `alert-banner ${isNonDet ? 'alert-warning' : 'alert-danger'}`;
+            if (el.detResultTitle) el.detResultTitle.textContent = isNonDet ? '⚠️ Non-Deterministic State Detected' : '❌ Restart Determinism Failed';
+            const errCode = (res.error && res.error.code) || d.reason_code || statusVal;
+            const errMsg = (res.error && res.error.message) || d.message || 'Mismatches detected between parent and restored state';
+            const mismatches = d.mismatches || [];
+            let detailsHtml = `Status: <strong>${statusVal}</strong> (${errCode})<br>${escapeHtml(errMsg)}`;
+            if (mismatches.length > 0) {
+              detailsHtml += '<br>Mismatches: ' + mismatches.map(m => escapeHtml(m.field || m.object_id || JSON.stringify(m))).join(', ');
+            }
+            if (el.detResultDetails) {
+              el.detResultDetails.innerHTML = detailsHtml;
+            }
+          }
+        }
+        await loadRuntimeOverview();
+      });
+    }
 
     el.formExplore.addEventListener('submit', (e) => {
       e.preventDefault();

@@ -684,3 +684,47 @@ Notice that during the entire session:
 - Zero GDB commands were typed.
 - Zero PIDs or inferior IDs were needed.
 - Complete branch safety and state verification were maintained.
+
+---
+
+## 9. Multithread Restart Determinism in the Agent API
+
+### 9.1. Determinism Semantic Contract
+When target programs run multiple threads, GDB fork-based checkpoints cannot be used. The runtime automatically switches to `RestartBasedRestorer` (`RESTART` backend). To guarantee that the Agent is exploring real causal transitions rather than scheduler nondeterminism, `AgentRuntime` exposes:
+
+1. **`VERIFY_RESTART_DETERMINISM` Action**:
+```json
+{
+  "action": "VERIFY_RESTART_DETERMINISM",
+  "data": {
+    "deterministic": true,
+    "status": "VERIFIED",
+    "parent_state_hash": "ecb44815d2a564bc",
+    "restored_state_hash": "ecb44815d2a564bc",
+    "threads": 4,
+    "mismatches": [],
+    "tls": {
+      "t_thread_id": { "threads_matched": 4, "status": "VERIFIED" }
+    }
+  }
+}
+```
+
+2. **Exploration Policies**:
+- `safe` (default): Aborts exploration immediately if determinism verification fails (`RESTART_DETERMINISM_FAILED` or `NON_DETERMINISTIC_RUNTIME_STATE`), protecting the Agent from hallucinated state transitions.
+- `permissive`: Emits warnings and logs non-deterministic provenance but allows partial exploration to continue.
+
+3. **Transition Provenance**:
+All transitions recorded under multithreaded restart attach full provenance:
+```json
+{
+  "provenance": {
+    "restore_backend": "RESTART",
+    "branch_isolation": "SUPPORTED",
+    "determinism": "VERIFIED",
+    "observation_point": "observation_checkpoint",
+    "thread_count": 4
+  }
+}
+```
+

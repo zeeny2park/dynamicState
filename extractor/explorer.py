@@ -71,12 +71,14 @@ class StateExplorer:
 
     def __init__(self, controller: RuntimeController, corpus: Optional[StateCorpus] = None,
                  corpus_dir: str = "corpus", max_candidates: int = MAX_CANDIDATES,
-                 max_corpus_states: int = MAX_CORPUS_STATES):
+                 max_corpus_states: int = MAX_CORPUS_STATES,
+                 determinism_policy: str = "safe"):
         self.controller = controller
         self.corpus = corpus or StateCorpus(corpus_dir)
         self.corpus_dir = corpus_dir
         self.max_candidates = max_candidates
         self.max_corpus_states = max_corpus_states
+        self.determinism_policy = determinism_policy
         self._candidate_counter = 0
         self._exploration_counter = 0
         self.seed_snapshot: Optional[RuntimeSnapshot] = None
@@ -355,7 +357,62 @@ class StateExplorer:
             }
         checkpoint_ms = round((time.monotonic() - t_cp_start) * 1000, 3)
 
-        # 2. Determine candidates
+        # 2. Check restart determinism if using RESTART backend
+        det_res = None
+        if hasattr(parent_checkpoint, "backend") and parent_checkpoint.backend.upper() == "RESTART":
+            if hasattr(self.controller, "verify_restart_determinism"):
+                det_res = self.controller.verify_restart_determinism(parent_checkpoint)
+            elif hasattr(parent_checkpoint, "determinism") and isinstance(parent_checkpoint.determinism, dict):
+                det_res = parent_checkpoint.determinism
+            else:
+                det_res = {"status": "UNKNOWN", "deterministic": False}
+
+            det_status = det_res.get("status", "UNKNOWN")
+            if det_status in ("FAILED", "NON_DETERMINISTIC") or not det_res.get("deterministic", False):
+                reason_code = "RESTART_DETERMINISM_FAILED" if det_status == "FAILED" else "NON_DETERMINISTIC_RUNTIME_STATE"
+                msg = f"Restart determinism verification failed: {det_res.get('reason', 'Parent state could not be deterministically reproduced across restarts')}"
+                return {
+                    "status": "UNAVAILABLE",
+                    "reason_code": reason_code,
+                    "message": msg,
+                    "threads": caps.get("threads", 1),
+                    "restore_backend": "RESTART",
+                    "determinism_verification": det_res,
+                    "safe_alternatives": branch_iso.get("safe_alternatives") or [
+                        "OBSERVE",
+                        "SNAPSHOT",
+                        "LIST_OBJECTS",
+                        "INSPECT_OBJECT",
+                        "LIST_MUTATION_CANDIDATES"
+                    ]
+                }
+            elif det_status == "UNKNOWN":
+                if self.determinism_policy == "safe":
+                    return {
+                        "status": "UNAVAILABLE",
+                        "reason_code": "RESTART_DETERMINISM_UNVERIFIED",
+                        "message": "Restart state reproducibility has not been verified (safe policy active). Exploration aborted to prevent corrupted corpus.",
+                        "threads": caps.get("threads", 1),
+                        "restore_backend": "RESTART",
+                        "determinism_verification": det_res,
+                        "safe_alternatives": branch_iso.get("safe_alternatives") or [
+                            "OBSERVE",
+                            "SNAPSHOT",
+                            "LIST_OBJECTS",
+                            "INSPECT_OBJECT",
+                            "LIST_MUTATION_CANDIDATES"
+                        ]
+                    }
+
+        provenance = {
+            "restore_backend": getattr(parent_checkpoint, "backend", "GENERIC").upper(),
+            "branch_isolation": getattr(parent_checkpoint, "restore_semantics", "MEMORY_CHECKPOINT"),
+            "determinism": det_res.get("status") if det_res else ("VERIFIED" if getattr(parent_checkpoint, "backend", "").upper() in ("GDB_CHECKPOINT", "MOCK") else "UNKNOWN"),
+            "observation_point": (getattr(parent_checkpoint, "observation_point", None) or {}).get("function") or "observation_checkpoint",
+            "thread_count": caps.get("threads", 1)
+        }
+
+        # 3. Determine candidates
         t_cand_start = time.monotonic()
         if candidates is not None:
             available_candidates = list(candidates)
@@ -439,6 +496,7 @@ class StateExplorer:
                             "candidate_id": cand.candidate_id,
                             "interesting": is_interesting,
                             "interesting_reasons": eval_reasons,
+                            "provenance": provenance,
                         })
                         child_state_id = sid
                         if is_new:
@@ -494,6 +552,8 @@ class StateExplorer:
             "seed_state_id": self.seed_state_id,
             "seed_snapshot_id": parent_snap_id,
             "parent_checkpoint_id": parent_checkpoint.checkpoint_id,
+            "provenance": provenance,
+            "determinism_verification": det_res or {"status": "VERIFIED", "deterministic": True},
             "candidate_count": len(available_candidates),
             "executed_count": executed_count,
             "new_state_count": new_states_count,

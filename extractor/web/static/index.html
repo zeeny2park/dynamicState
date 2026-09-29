@@ -668,6 +668,27 @@
               </div>
             </div>
 
+            <!-- Checkpoint & Determinism Verification Card -->
+            <div class="card" style="margin-top: 14px; margin-bottom: 14px; background: rgba(255, 255, 255, 0.03);">
+              <div class="card-header-row" style="margin-bottom: 8px;">
+                <h5 style="margin: 0;">Checkpoint & Branch Isolation Capabilities</h5>
+                <button type="button" class="btn btn-secondary btn-sm" id="btn-verify-determinism">
+                  <span>🔄</span> Verify Restart Determinism
+                </button>
+              </div>
+              <table class="key-value-table">
+                <tr><td>Checkpoint Backend</td><td id="exp-cp-backend" class="mono">NONE</td></tr>
+                <tr><td>Checkpoint Semantics</td><td id="exp-cp-semantics" class="mono">OBSERVATION_ONLY</td></tr>
+                <tr><td>Thread Scope</td><td id="exp-cp-scope" class="mono">SINGLE_THREAD</td></tr>
+                <tr><td>Determinism</td><td id="exp-cp-determinism"><span class="badge badge-neutral">UNKNOWN</span></td></tr>
+                <tr><td>Branch Isolation</td><td id="exp-cp-branch-isolation"><span class="badge badge-neutral">UNAVAILABLE</span></td></tr>
+              </table>
+              <div id="box-determinism-result" style="display: none; margin-top: 10px; padding: 10px; border-radius: 6px; font-size: 13px;" class="alert-banner">
+                <div style="font-weight: 600;" id="det-result-title">Determinism Verification Result</div>
+                <div id="det-result-details" style="margin-top: 4px;" class="mono"></div>
+              </div>
+            </div>
+
             <form id="form-explore" style="margin-top: 16px;">
               <div class="form-group">
                 <label for="exp-max-steps">Max Exploration Steps (Safety Limit: 50):</label>
@@ -740,6 +761,9 @@
             <tr><td>Threads</td><td id="ov-threads" class="mono">1</td></tr>
             <tr><td>Observation Mode</td><td id="ov-mode"><span class="badge badge-info">CONSISTENT</span></td></tr>
             <tr><td>Restore Backend</td><td id="ov-restore-backend" class="mono">GDB_CHECKPOINT</td></tr>
+            <tr><td>Checkpoint Semantics</td><td id="ov-checkpoint-semantics" class="mono">MEMORY_CHECKPOINT</td></tr>
+            <tr><td>Thread Scope</td><td id="ov-thread-scope" class="mono">SINGLE_THREAD</td></tr>
+            <tr><td>Determinism Status</td><td id="ov-determinism-status"><span class="badge badge-neutral">UNKNOWN</span></td></tr>
             <tr><td>Branch Isolation</td><td id="ov-branch-isolation"><span class="badge badge-success">SUPPORTED</span></td></tr>
             <tr><td>Executable</td><td id="ov-binary" class="mono break-all">None</td></tr>
             <tr><td>Debug Image</td><td id="ov-debug-image" class="mono break-all">None</td></tr>
