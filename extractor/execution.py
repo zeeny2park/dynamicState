@@ -2,6 +2,7 @@
 
 import time
 
+from .gdb_compat import get_frame_level
 from .runtime_state import ExecutionState, FrameState, ThreadState
 
 
@@ -167,8 +168,10 @@ class GdbBackend(RuntimeBackend):
         thread.switch()
         frames = []
         frame = self.gdb.newest_frame()
+        current_level = 0
         while frame is not None:
-            state = FrameState(level=frame.level(), function=frame.name(),
+            f_level = get_frame_level(frame, fallback_level=current_level)
+            state = FrameState(level=f_level, function=frame.name(),
                                pc=self.format_address(frame.pc()))
             for symbol in self._symbols(frame):
                 name = getattr(symbol, "print_name", None) or getattr(symbol, "name", None)
@@ -176,7 +179,7 @@ class GdbBackend(RuntimeBackend):
                     continue
                 try:
                     value = frame.read_var(symbol)
-                    context = {"thread_id": self.thread_id(thread), "frame_level": frame.level()}
+                    context = {"thread_id": self.thread_id(thread), "frame_level": f_level}
                     variable = graph.variable(name, value, storage="stack", context=context)
                 except Exception as exc:
                     variable = graph.variable_unavailable(name, symbol, exc) if hasattr(graph, "variable_unavailable") else None
@@ -190,9 +193,10 @@ class GdbBackend(RuntimeBackend):
                     state.locals[name] = variable
                 if variable.object_ref:
                     graph.add_root(name, "frame", variable, thread_id=self.thread_id(thread),
-                                   frame_level=frame.level(), function=frame.name())
+                                   frame_level=f_level, function=frame.name())
             frames.append(state)
             frame = frame.older()
+            current_level += 1
         return frames
 
     def execution(self, graph):

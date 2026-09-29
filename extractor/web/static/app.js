@@ -1,25 +1,28 @@
 /**
- * dynamicState — Runtime State Explorer Frontend (Single-Page App)
- * Communicates strictly via thin Web API mapping to AgentRuntime.
+ * dynamicState — Human-Centric Runtime Memory Explorer Frontend
+ * Single-Page Application communicating via AgentRuntime REST API.
  */
 
 (function () {
   'use strict';
 
-  // Global App State
+  // Global Application State
   const state = {
     runtime: null,
     states: [],
     selectedStateId: null,
     objects: [],
     selectedObjectId: null,
+    storageFilter: 'all',
+    searchQuery: '',
     candidates: [],
     stateGraphData: { nodes: [], edges: [] },
-    activeTab: 'tab-overview',
+    activeTab: 'tab-memory',
+    activeSubtab: 'subtab-dag',
     jsonViewerCache: {},
   };
 
-  // DOM Elements
+  // DOM Elements Cache
   const el = {
     // Header & Badges
     txtRuntimeStatus: document.getElementById('txt-runtime-status'),
@@ -34,11 +37,106 @@
     lowImpactBanner: document.getElementById('low-impact-banner'),
     toastContainer: document.getElementById('toast-container'),
 
-    // Nav Tabs
+    // Main Nav Tabs
     navTabs: document.querySelectorAll('.nav-tab'),
     tabPanes: document.querySelectorAll('.tab-pane'),
 
-    // Tab 1: Overview
+    // Tab 1: Memory Explorer Hero Summary
+    heroMode: document.getElementById('hero-mode'),
+    heroStatus: document.getElementById('hero-status'),
+    heroCompleteness: document.getElementById('hero-completeness'),
+    heroTargetTitle: document.getElementById('hero-target-title'),
+    heroTargetSubtitle: document.getElementById('hero-target-subtitle'),
+    selectMemoryState: document.getElementById('select-memory-state'),
+    heroObjCount: document.getElementById('hero-obj-count'),
+    heroPtrCount: document.getElementById('hero-ptr-count'),
+    heroModCount: document.getElementById('hero-mod-count'),
+    heroDebugInfo: document.getElementById('hero-debug-info'),
+
+    // Tab 1: Directory & Inspector
+    inputSearchObjects: document.getElementById('input-search-objects'),
+    storageFilterPills: document.querySelectorAll('.storage-filter-pills .filter-pill'),
+    badgeMemObjectsCount: document.getElementById('badge-mem-objects-count'),
+    memGraphTruncatedWarning: document.getElementById('mem-graph-truncated-warning'),
+    txtMemTruncatedCount: document.getElementById('txt-mem-truncated-count'),
+    listMemoryObjects: document.getElementById('list-memory-objects'),
+
+    memObjTitle: document.getElementById('mem-obj-title'),
+    memObjSubtitle: document.getElementById('mem-obj-subtitle'),
+    memObjTypeBadge: document.getElementById('mem-obj-type-badge'),
+    memObjStorageBadge: document.getElementById('mem-obj-storage-badge'),
+    btnJumpTopology: document.getElementById('btn-jump-topology'),
+    btnViewObjJson: document.getElementById('btn-view-obj-json'),
+    tableSemanticFields: document.querySelector('#table-semantic-fields tbody'),
+
+    memTechAddr: document.getElementById('mem-tech-addr'),
+    memTechStorage: document.getElementById('mem-tech-storage'),
+    memTechType: document.getElementById('mem-tech-type'),
+    memTechId: document.getElementById('mem-tech-id'),
+
+    // Tab 2: Topology
+    svgTopologyGraph: document.getElementById('topology-graph-svg'),
+    btnResetTopology: document.getElementById('btn-reset-topology'),
+
+    // Tab 3: Advanced Exploration Subnav
+    subnavPills: document.querySelectorAll('.subnav-pill'),
+    subtabContents: document.querySelectorAll('.subtab-content'),
+
+    // Tab 3: State DAG
+    badgeStatesCount: document.getElementById('badge-states-count'),
+    inputSearchStates: document.getElementById('input-search-states'),
+    listStates: document.getElementById('list-states'),
+    svgStateGraph: document.getElementById('state-graph-svg'),
+    btnResetGraph: document.getElementById('btn-reset-graph'),
+    cardStateDetail: document.getElementById('card-state-detail'),
+    detailStateId: document.getElementById('detail-state-id'),
+    detailStateBadge: document.getElementById('detail-state-badge'),
+    detailStateHash: document.getElementById('detail-state-hash'),
+    detailParentState: document.getElementById('detail-parent-state'),
+    detailCreatedAt: document.getElementById('detail-created-at'),
+    detailObservations: document.getElementById('detail-observations'),
+    btnViewStateJson: document.getElementById('btn-view-state-json'),
+    btnInspectStateObjects: document.getElementById('btn-inspect-state-objects'),
+    btnStateDiffParent: document.getElementById('btn-state-diff-parent'),
+    btnStateMutate: document.getElementById('btn-state-mutate'),
+
+    // Tab 3: Mutation Proposals
+    inputFilterCandField: document.getElementById('input-filter-cand-field'),
+    tableCandidates: document.querySelector('#table-candidates tbody'),
+    cardExecutionResult: document.getElementById('card-execution-result'),
+    execTransId: document.getElementById('exec-trans-id'),
+    execStatusBadge: document.getElementById('exec-status-badge'),
+    execStatusText: document.getElementById('exec-status-text'),
+    execChildState: document.getElementById('exec-child-state'),
+    execChildHash: document.getElementById('exec-child-hash'),
+    listExecChangedFields: document.getElementById('list-exec-changed-fields'),
+    btnViewTransJson: document.getElementById('btn-view-trans-json'),
+
+    // Tab 3: State Diff
+    inputDiffA: document.getElementById('input-diff-a'),
+    inputDiffB: document.getElementById('input-diff-b'),
+    btnRunDiff: document.getElementById('btn-run-diff'),
+    diffResults: document.getElementById('diff-results'),
+    diffValChanges: document.getElementById('diff-val-changes'),
+    diffRefChanges: document.getElementById('diff-ref-changes'),
+    diffObjCreated: document.getElementById('diff-obj-created'),
+    diffObjRemoved: document.getElementById('diff-obj-removed'),
+    tableDiffChanges: document.querySelector('#table-diff-changes tbody'),
+
+    // Tab 3: Autonomous Explore
+    formExplore: document.getElementById('form-explore'),
+    expMaxSteps: document.getElementById('exp-max-steps'),
+    expTimeout: document.getElementById('exp-timeout'),
+    expMaxStates: document.getElementById('exp-max-states'),
+    btnStartExplore: document.getElementById('btn-start-explore'),
+    cardExploreResults: document.getElementById('card-explore-results'),
+    expResSteps: document.getElementById('exp-res-steps'),
+    expResStates: document.getElementById('exp-res-states'),
+    expResTransitions: document.getElementById('exp-res-transitions'),
+    expResCrashes: document.getElementById('exp-res-crashes'),
+    expResTimeouts: document.getElementById('exp-res-timeouts'),
+
+    // Tab 4: Provenance & System
     ovStatus: document.getElementById('ov-status'),
     ovPid: document.getElementById('ov-pid'),
     ovMode: document.getElementById('ov-mode'),
@@ -57,73 +155,6 @@
     ovLimits: document.getElementById('ov-limits'),
     tableModules: document.querySelector('#table-modules tbody'),
 
-    // Tab 2: State Graph & Explorer
-    badgeStatesCount: document.getElementById('badge-states-count'),
-    inputSearchStates: document.getElementById('input-search-states'),
-    listStates: document.getElementById('list-states'),
-    svgStateGraph: document.getElementById('state-graph-svg'),
-    btnResetGraph: document.getElementById('btn-reset-graph'),
-    cardStateDetail: document.getElementById('card-state-detail'),
-    detailStateId: document.getElementById('detail-state-id'),
-    detailStateBadge: document.getElementById('detail-state-badge'),
-    detailStateHash: document.getElementById('detail-state-hash'),
-    detailParentState: document.getElementById('detail-parent-state'),
-    detailCreatedAt: document.getElementById('detail-created-at'),
-    detailObservations: document.getElementById('detail-observations'),
-    btnViewStateJson: document.getElementById('btn-view-state-json'),
-    btnInspectStateObjects: document.getElementById('btn-inspect-state-objects'),
-    btnStateDiffParent: document.getElementById('btn-state-diff-parent'),
-    btnStateMutate: document.getElementById('btn-state-mutate'),
-
-    // Tab 3: Object Graph
-    selectObjectState: document.getElementById('select-object-state'),
-    badgeObjectsCount: document.getElementById('badge-objects-count'),
-    listObjects: document.getElementById('list-objects'),
-    graphTruncatedWarning: document.getElementById('graph-truncated-warning'),
-    txtTruncatedCount: document.getElementById('txt-truncated-count'),
-    objDetailId: document.getElementById('obj-detail-id'),
-    objDetailType: document.getElementById('obj-detail-type'),
-    objDetailStorage: document.getElementById('obj-detail-storage'),
-    objDetailAddr: document.getElementById('obj-detail-addr'),
-    tableFields: document.querySelector('#table-fields tbody'),
-    btnViewObjJson: document.getElementById('btn-view-obj-json'),
-
-    // Tab 4: Mutations
-    inputFilterCandField: document.getElementById('input-filter-cand-field'),
-    tableCandidates: document.querySelector('#table-candidates tbody'),
-    cardExecutionResult: document.getElementById('card-execution-result'),
-    execTransId: document.getElementById('exec-trans-id'),
-    execStatusBadge: document.getElementById('exec-status-badge'),
-    execStatusText: document.getElementById('exec-status-text'),
-    execChildState: document.getElementById('exec-child-state'),
-    execChildHash: document.getElementById('exec-child-hash'),
-    listExecChangedFields: document.getElementById('list-exec-changed-fields'),
-    btnViewTransJson: document.getElementById('btn-view-trans-json'),
-
-    // Tab 5: State Diff
-    inputDiffA: document.getElementById('input-diff-a'),
-    inputDiffB: document.getElementById('input-diff-b'),
-    btnRunDiff: document.getElementById('btn-run-diff'),
-    diffResults: document.getElementById('diff-results'),
-    diffValChanges: document.getElementById('diff-val-changes'),
-    diffRefChanges: document.getElementById('diff-ref-changes'),
-    diffObjCreated: document.getElementById('diff-obj-created'),
-    diffObjRemoved: document.getElementById('diff-obj-removed'),
-    tableDiffChanges: document.querySelector('#table-diff-changes tbody'),
-
-    // Tab 6: Explore
-    formExplore: document.getElementById('form-explore'),
-    expMaxSteps: document.getElementById('exp-max-steps'),
-    expTimeout: document.getElementById('exp-timeout'),
-    expMaxStates: document.getElementById('exp-max-states'),
-    btnStartExplore: document.getElementById('btn-start-explore'),
-    cardExploreResults: document.getElementById('card-explore-results'),
-    expResSteps: document.getElementById('exp-res-steps'),
-    expResStates: document.getElementById('exp-res-states'),
-    expResTransitions: document.getElementById('exp-res-transitions'),
-    expResCrashes: document.getElementById('exp-res-crashes'),
-    expResTimeouts: document.getElementById('exp-res-timeouts'),
-
     // Modals
     modalObserve: document.getElementById('modal-observe'),
     btnCloseObserveModal: document.getElementById('btn-close-observe-modal'),
@@ -141,7 +172,7 @@
   };
 
   // --------------------------------------------------------------------------
-  // API Helper
+  // API Transport Helpers
   // --------------------------------------------------------------------------
 
   async function apiGet(endpoint) {
@@ -173,11 +204,12 @@
   function showToast(message, type = 'info') {
     const t = document.createElement('div');
     t.className = `toast ${type}`;
-    t.innerHTML = `<span>${type === 'success' ? '✓' : type === 'error' ? '⚠️' : 'ℹ'}</span> <span>${escapeHtml(message)}</span>`;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '⚠️' : 'ℹ';
+    t.innerHTML = `<span>${icon}</span> <span>${escapeHtml(message)}</span>`;
     el.toastContainer.appendChild(t);
     setTimeout(() => {
       t.style.opacity = '0';
-      setTimeout(() => t.remove(), 200);
+      setTimeout(() => t.remove(), 250);
     }, 3500);
   }
 
@@ -190,8 +222,14 @@
       .replace(/"/g, '&quot;');
   }
 
+  function getBaseName(path) {
+    if (!path) return 'N/A';
+    const parts = path.split('/');
+    return parts[parts.length - 1] || path;
+  }
+
   // --------------------------------------------------------------------------
-  // Tab Navigation
+  // Tab & Subtab Navigation
   // --------------------------------------------------------------------------
 
   function initTabs() {
@@ -199,6 +237,13 @@
       tab.addEventListener('click', () => {
         const targetTab = tab.getAttribute('data-tab');
         switchTab(targetTab);
+      });
+    });
+
+    el.subnavPills.forEach((pill) => {
+      pill.addEventListener('click', () => {
+        const targetSubtab = pill.getAttribute('data-subtab');
+        switchSubtab(targetSubtab);
       });
     });
   }
@@ -212,15 +257,33 @@
       p.classList.toggle('active', p.id === tabId);
     });
 
-    if (tabId === 'tab-state-graph') {
+    if (tabId === 'tab-topology') {
+      renderObjectTopology();
+    } else if (tabId === 'tab-exploration') {
+      if (state.activeSubtab === 'subtab-dag') {
+        renderStateGraph();
+      }
+    }
+  }
+
+  function switchSubtab(subtabId) {
+    state.activeSubtab = subtabId;
+    el.subnavPills.forEach((p) => {
+      p.classList.toggle('active', p.getAttribute('data-subtab') === subtabId);
+    });
+    el.subtabContents.forEach((c) => {
+      c.classList.toggle('active', c.id === subtabId);
+    });
+
+    if (subtabId === 'subtab-dag') {
       renderStateGraph();
-    } else if (tabId === 'tab-object-graph' && state.selectedStateId) {
-      loadObjectsForState(state.selectedStateId);
+    } else if (subtabId === 'subtab-mutations') {
+      loadCandidates();
     }
   }
 
   // --------------------------------------------------------------------------
-  // TAB 1: Runtime Overview & Modules
+  // Runtime Overview & Hero Summary
   // --------------------------------------------------------------------------
 
   async function loadRuntimeOverview() {
@@ -259,7 +322,28 @@
     el.tagEndian.textContent = `Endian: ${data.endianness || 'UNKNOWN'}`;
     el.tagElf.textContent = `ELF: ${data.elf_class || 'UNKNOWN'}`;
 
-    // Overview cards
+    // Tab 1 Hero Runtime Summary
+    el.heroMode.textContent = mode;
+    el.heroMode.className = 'badge ' + (mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info');
+    el.heroStatus.textContent = status;
+    el.heroStatus.className = 'badge ' + (status === 'STOPPED' ? 'badge-success' : status === 'RUNNING' ? 'badge-info' : 'badge-neutral');
+    el.heroCompleteness.textContent = mode === 'LOW_IMPACT' ? 'OFFLINE SNAPSHOT' : 'COMPLETE DWARF';
+
+    const binName = getBaseName(data.executable);
+    el.heroTargetTitle.textContent = data.pid ? `${binName} (PID ${data.pid})` : binName;
+    el.heroTargetSubtitle.textContent = data.executable || 'No executable path reported';
+    el.heroModCount.textContent = data.module_count || 0;
+
+    let debugSummary = 'None';
+    if (data.debug_image) {
+      const dbgName = getBaseName(data.debug_image);
+      const dbgStatus = data.debug_image_status || 'UNVERIFIED';
+      const bId = data.build_id ? `[${data.build_id.substring(0, 8)}...]` : '';
+      debugSummary = `${dbgName} · ${dbgStatus} ${bId}`;
+    }
+    el.heroDebugInfo.textContent = debugSummary;
+
+    // Tab 4: System Overview & Provenance Cards
     el.ovStatus.textContent = status;
     el.ovPid.textContent = data.pid || 'None';
     el.ovMode.innerHTML = `<span class="badge ${mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info'}">${mode}</span>`;
@@ -283,7 +367,7 @@
       <span class="tag">Max steps: ${limits.max_steps || 50}</span>
       <span class="tag">Timeout: ${limits.max_timeout_ms || 5000}ms</span>
       <span class="tag">Max candidates: ${limits.max_candidates || 50}</span>
-      <span class="tag">Max states: ${limits.max_corpus_states || 100}</span>
+      <span class="tag">Max corpus states: ${limits.max_corpus_states || 100}</span>
     `;
 
     // Load modules table
@@ -331,7 +415,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // TAB 2: State Graph & Explorer
+  // States & Corpus DAG Management
   // --------------------------------------------------------------------------
 
   async function loadStatesAndGraph() {
@@ -345,12 +429,32 @@
       el.badgeStatesCount.textContent = state.states.length;
       renderStatesList(state.states);
       updateStateSelectors(state.states);
+
+      // Auto-select latest or first state if none selected
+      if (!state.selectedStateId && state.states.length > 0) {
+        selectState(state.states[0].state_id);
+      }
     }
 
     if (graphRes.success) {
       state.stateGraphData = graphRes.data || { nodes: [], edges: [] };
       state.jsonViewerCache['state-graph'] = state.stateGraphData;
       renderStateGraph();
+    }
+  }
+
+  function updateStateSelectors(statesList) {
+    const options = ['<option value="">(Select a State)</option>'];
+    statesList.forEach((s) => {
+      const shortHash = (s.state_hash || '').substring(0, 8);
+      const isSeed = !s.metadata || !s.metadata.parent_state_id;
+      const tag = isSeed ? '[Seed]' : '';
+      options.push(`<option value="${s.state_id}">${s.state_id} ${tag} (${shortHash})</option>`);
+    });
+    el.selectMemoryState.innerHTML = options.join('');
+
+    if (state.selectedStateId) {
+      el.selectMemoryState.value = state.selectedStateId;
     }
   }
 
@@ -378,7 +482,6 @@
     });
     el.listStates.innerHTML = html;
 
-    // Attach click handlers
     el.listStates.querySelectorAll('.state-list-item').forEach((item) => {
       item.addEventListener('click', () => {
         const sid = item.getAttribute('data-state-id');
@@ -387,30 +490,31 @@
     });
   }
 
-  function updateStateSelectors(statesList) {
-    const options = ['<option value="">(Select a State)</option>'];
-    statesList.forEach((s) => {
-      const shortHash = (s.state_hash || '').substring(0, 8);
-      options.push(`<option value="${s.state_id}">${s.state_id} (${shortHash})</option>`);
-    });
-    el.selectObjectState.innerHTML = options.join('');
-  }
-
   async function selectState(stateId) {
+    if (!stateId) return;
     state.selectedStateId = stateId;
+
+    // Synchronize selector dropdowns
+    if (el.selectMemoryState.value !== stateId) {
+      el.selectMemoryState.value = stateId;
+    }
 
     // Update list selection highlight
     el.listStates.querySelectorAll('.state-list-item').forEach((item) => {
       item.classList.toggle('selected', item.getAttribute('data-state-id') === stateId);
     });
 
-    // Update graph selection highlight
+    // Update DAG graph highlight
     renderStateGraph();
 
-    // Fetch state details
+    // Load objects for this state into Memory Explorer & Topology
+    await loadObjectsForState(stateId);
+
+    // Fetch state details for Tab 3 DAG panel
     const res = await apiGet(`/api/states/${stateId}`);
     if (res.success) {
       const s = res.data;
+      state.jsonViewerCache['state'] = s;
       state.jsonViewerCache[`state_${stateId}`] = s;
 
       el.cardStateDetail.style.display = 'block';
@@ -422,7 +526,6 @@
       el.detailCreatedAt.textContent = s.timestamp || 'N/A';
       el.detailObservations.textContent = (s.observations && s.observations.length) || 1;
 
-      // Enable diff with parent if parent exists
       if (s.parent_state) {
         el.btnStateDiffParent.disabled = false;
         el.inputDiffA.value = s.parent_state;
@@ -433,7 +536,403 @@
     }
   }
 
-  // Hierarchical SVG State Graph Renderer
+  // --------------------------------------------------------------------------
+  // Tab 1: Human-Centric Runtime Memory Explorer & Inspector
+  // --------------------------------------------------------------------------
+
+  async function loadObjectsForState(stateId) {
+    if (!stateId) return;
+    const res = await apiGet(`/api/states/${stateId}/objects`);
+    if (!res.success) {
+      el.listMemoryObjects.innerHTML = `<div class="text-muted text-center p-3">${escapeHtml(res.error.message)}</div>`;
+      return;
+    }
+
+    const objects = res.data || [];
+    state.objects = objects;
+    state.jsonViewerCache['objects'] = objects;
+
+    // Metrics in hero banner
+    el.heroObjCount.textContent = objects.length;
+    let ptrCount = 0;
+    objects.forEach((o) => {
+      const fields = o.fields || [];
+      fields.forEach((f) => {
+        if (f.object_ref) ptrCount++;
+      });
+    });
+    el.heroPtrCount.textContent = ptrCount;
+
+    // Render object directory list
+    renderMemoryObjectsList();
+
+    // Render Topology graph
+    renderObjectTopology();
+
+    // Preserve or auto-select object
+    if (state.selectedObjectId && objects.some((o) => o.object_id === state.selectedObjectId)) {
+      selectObject(state.selectedObjectId);
+    } else if (objects.length > 0) {
+      selectObject(objects[0].object_id);
+    }
+  }
+
+  function renderMemoryObjectsList() {
+    const objects = state.objects || [];
+    const query = (state.searchQuery || '').toLowerCase().trim();
+    const filter = state.storageFilter || 'all';
+
+    const filtered = objects.filter((o) => {
+      // Storage filter
+      const st = (o.storage || 'unknown').toLowerCase();
+      if (filter !== 'all' && st !== filter) return false;
+
+      // Text query
+      if (!query) return true;
+      const matchesId = (o.object_id || '').toLowerCase().includes(query);
+      const matchesType = (o.type || '').toLowerCase().includes(query);
+      const matchesField = (o.fields || []).some((f) => {
+        return (f.name || '').toLowerCase().includes(query) || String(f.value || '').toLowerCase().includes(query);
+      });
+      return matchesId || matchesType || matchesField;
+    });
+
+    el.badgeMemObjectsCount.textContent = `${filtered.length} / ${objects.length}`;
+
+    if (filtered.length === 0) {
+      el.listMemoryObjects.innerHTML = `<div class="text-muted text-center p-3">No matching objects found</div>`;
+      return;
+    }
+
+    let html = '';
+    filtered.forEach((o) => {
+      const isSelected = o.object_id === state.selectedObjectId;
+      const storage = (o.storage || 'unknown').toLowerCase();
+      const storageClass = storage === 'heap' ? 'badge-storage-heap' : storage === 'global' ? 'badge-storage-global' : 'badge-storage-stack';
+      const fieldCount = (o.fields && o.fields.length) || 0;
+      const pointerCount = (o.fields || []).filter((f) => f.object_ref).length;
+
+      html += `
+        <div class="mem-obj-item ${isSelected ? 'selected' : ''}" data-object-id="${o.object_id}">
+          <div class="mem-obj-top">
+            <span class="mem-obj-title-text">${escapeHtml(o.object_id)}</span>
+            <span class="badge ${storageClass}">${storage.toUpperCase()}</span>
+          </div>
+          <div class="mem-obj-meta-row">
+            <span class="mem-obj-type">${escapeHtml(o.type || 'Unknown')}</span>
+            <span class="text-muted">${fieldCount} flds${pointerCount > 0 ? ` · ${pointerCount} 🔗` : ''}</span>
+          </div>
+        </div>
+      `;
+    });
+    el.listMemoryObjects.innerHTML = html;
+
+    el.listMemoryObjects.querySelectorAll('.mem-obj-item').forEach((item) => {
+      item.addEventListener('click', () => {
+        const oid = item.getAttribute('data-object-id');
+        selectObject(oid);
+      });
+    });
+  }
+
+  function selectObject(objectId) {
+    state.selectedObjectId = objectId;
+
+    // Highlight item in object directory
+    el.listMemoryObjects.querySelectorAll('.mem-obj-item').forEach((item) => {
+      item.classList.toggle('selected', item.getAttribute('data-object-id') === objectId);
+    });
+
+    const obj = state.objects.find((o) => o.object_id === objectId);
+    if (!obj) return;
+    state.jsonViewerCache[`object_${objectId}`] = obj;
+
+    // Header info
+    const storage = (obj.storage || 'UNKNOWN').toUpperCase();
+    const storageClass = storage === 'HEAP' ? 'badge-storage-heap' : storage === 'GLOBAL' ? 'badge-storage-global' : 'badge-storage-stack';
+    const addrHex = obj.address ? '0x' + Number(obj.address).toString(16) : 'N/A';
+
+    el.memObjTitle.textContent = `${obj.object_id} — ${obj.type || 'Unknown'}`;
+    el.memObjSubtitle.textContent = `${storage} memory object located at ${addrHex}`;
+    el.memObjTypeBadge.textContent = obj.type || 'Unknown';
+    el.memObjStorageBadge.textContent = storage;
+    el.memObjStorageBadge.className = 'badge ' + storageClass;
+
+    // Collapsible technical details
+    el.memTechAddr.textContent = addrHex;
+    el.memTechStorage.textContent = storage;
+    el.memTechType.textContent = obj.type || 'Unknown';
+    el.memTechId.textContent = obj.object_id;
+
+    // Render Semantic Fields Table
+    const fields = obj.fields || [];
+    if (fields.length === 0) {
+      el.tableSemanticFields.innerHTML = `<tr><td colspan="6" class="text-muted text-center">No fields defined for this object</td></tr>`;
+      return;
+    }
+
+    let fieldsHtml = '';
+    fields.forEach((f) => {
+      const isRef = Boolean(f.object_ref);
+      const isMutable = isFieldMutable(f.type);
+      const valHtml = formatSemanticValue(f.value, f.type, f.object_ref);
+
+      // Referenced target object name & type lookup
+      let refChipHtml = '<span class="text-muted">null</span>';
+      if (isRef) {
+        const targetObj = state.objects.find((target) => target.object_id === f.object_ref);
+        const targetType = targetObj ? targetObj.type : 'Object';
+        refChipHtml = `
+          <button class="pointer-chip" data-ref-id="${f.object_ref}" title="Jump to referenced object">
+            <span>🔗</span> ${escapeHtml(f.object_ref)} (${escapeHtml(targetType)})
+          </button>
+        `;
+      }
+
+      fieldsHtml += `
+        <tr>
+          <td><strong>${escapeHtml(f.name)}</strong></td>
+          <td class="mono">${escapeHtml(f.type || '')}</td>
+          <td>${valHtml}</td>
+          <td>${refChipHtml}</td>
+          <td><span class="badge ${isMutable ? 'badge-success' : 'badge-neutral'}">${isMutable ? 'mutable' : 'read_only'}</span></td>
+          <td>
+            ${isMutable ? `<button class="btn btn-secondary btn-sm btn-inspect-cand" data-object-id="${objectId}" data-field-name="${f.name}">Mutate</button>` : '<span class="text-muted">—</span>'}
+          </td>
+        </tr>
+      `;
+    });
+    el.tableSemanticFields.innerHTML = fieldsHtml;
+
+    // Attach click events on pointer chips to jump directly to referenced object
+    el.tableSemanticFields.querySelectorAll('.pointer-chip').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const refId = btn.getAttribute('data-ref-id');
+        jumpToObject(refId);
+      });
+    });
+
+    // Attach click events to jump into mutation proposing
+    el.tableSemanticFields.querySelectorAll('.btn-inspect-cand').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const oid = btn.getAttribute('data-object-id');
+        const fld = btn.getAttribute('data-field-name');
+        switchTab('tab-exploration');
+        switchSubtab('subtab-mutations');
+        loadCandidates(oid, fld);
+      });
+    });
+  }
+
+  function jumpToObject(objectId) {
+    if (!objectId) return;
+    selectObject(objectId);
+
+    // Scroll object into view in the left list
+    const listItem = el.listMemoryObjects.querySelector(`[data-object-id="${objectId}"]`);
+    if (listItem) {
+      listItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+
+  function formatSemanticValue(val, typeStr, objectRef) {
+    if (val === null || val === undefined) return '<span class="text-muted">None</span>';
+
+    // Booleans
+    if (typeof val === 'boolean' || val === 'true' || val === 'false') {
+      const boolVal = val === true || val === 'true';
+      return `<span class="val-badge-bool-${boolVal}">${boolVal ? 'TRUE' : 'FALSE'}</span>`;
+    }
+
+    // Unavailable / Unknown markers
+    if (val === 'UNAVAILABLE' || val === 'UNKNOWN') {
+      return `<span class="val-badge-unavailable">⚠️ ${val}</span>`;
+    }
+
+    // Enums (contains :: or all uppercase with underscores)
+    const strVal = String(val);
+    if (strVal.includes('::') || (strVal.length > 2 && /^[A-Z][A-Z0-9_]+$/.test(strVal))) {
+      return `<span class="val-badge-enum">${escapeHtml(strVal)}</span>`;
+    }
+
+    // Pointer reference value
+    if (objectRef) {
+      return `<span class="mono text-accent">${escapeHtml(strVal)}</span>`;
+    }
+
+    // Regular scalar / string value
+    return `<span class="mono">${escapeHtml(strVal)}</span>`;
+  }
+
+  function isFieldMutable(typeStr) {
+    if (!typeStr) return false;
+    const lower = typeStr.toLowerCase();
+    if (lower.includes('const')) return false;
+    return ['int', 'bool', 'enum', 'float', 'double', 'char', '*'].some((t) => lower.includes(t));
+  }
+
+  // --------------------------------------------------------------------------
+  // Tab 2: Semantic Object Topology & Reference Graph
+  // --------------------------------------------------------------------------
+
+  function renderObjectTopology() {
+    const svg = el.svgTopologyGraph;
+    const objects = state.objects || [];
+
+    if (!svg || objects.length === 0) {
+      if (svg) svg.innerHTML = '<text x="50%" y="50%" fill="#6b7280" text-anchor="middle">No objects in current snapshot</text>';
+      return;
+    }
+
+    // Build graph adjacency
+    const incomingEdges = {};
+    const outgoingEdges = {};
+    objects.forEach((o) => {
+      incomingEdges[o.object_id] = 0;
+      outgoingEdges[o.object_id] = [];
+    });
+
+    objects.forEach((src) => {
+      (src.fields || []).forEach((f) => {
+        if (f.object_ref && incomingEdges[f.object_ref] !== undefined) {
+          incomingEdges[f.object_ref]++;
+          outgoingEdges[src.object_id].push({
+            to: f.object_ref,
+            field: f.name,
+          });
+        }
+      });
+    });
+
+    // Roots: global, stack, or objects with 0 incoming references
+    const levels = {};
+    objects.forEach((o) => {
+      const st = (o.storage || '').toLowerCase();
+      if (st === 'global' || st === 'stack' || incomingEdges[o.object_id] === 0) {
+        levels[o.object_id] = 0;
+      }
+    });
+
+    // BFS to assign hierarchy levels
+    const queue = Object.keys(levels);
+    while (queue.length > 0) {
+      const curr = queue.shift();
+      const currLevel = levels[curr];
+      (outgoingEdges[curr] || []).forEach((edge) => {
+        if (levels[edge.to] === undefined) {
+          levels[edge.to] = currLevel + 1;
+          queue.push(edge.to);
+        }
+      });
+    }
+
+    // Default remaining disconnected nodes to level 0
+    objects.forEach((o) => {
+      if (levels[o.object_id] === undefined) levels[o.object_id] = 0;
+    });
+
+    // Group nodes by level
+    const levelGroups = {};
+    objects.forEach((o) => {
+      const lvl = levels[o.object_id] || 0;
+      if (!levelGroups[lvl]) levelGroups[lvl] = [];
+      levelGroups[lvl].push(o);
+    });
+
+    const nodeWidth = 140;
+    const nodeHeight = 54;
+    const colSpacing = 200;
+    const rowSpacing = 90;
+
+    const coords = {};
+    let maxSvgWidth = 600;
+    let maxSvgHeight = 400;
+
+    Object.keys(levelGroups).forEach((lvlStr) => {
+      const lvl = parseInt(lvlStr, 10);
+      const group = levelGroups[lvl];
+      const x = 50 + lvl * colSpacing;
+      group.forEach((obj, idx) => {
+        const y = 50 + idx * rowSpacing;
+        coords[obj.object_id] = { x, y };
+        if (x + nodeWidth + 60 > maxSvgWidth) maxSvgWidth = x + nodeWidth + 60;
+        if (y + nodeHeight + 60 > maxSvgHeight) maxSvgHeight = y + nodeHeight + 60;
+      });
+    });
+
+    svg.setAttribute('width', maxSvgWidth);
+    svg.setAttribute('height', maxSvgHeight);
+
+    let svgHtml = `
+      <defs>
+        <marker id="topo-arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdf8" />
+        </marker>
+      </defs>
+    `;
+
+    // Render Edges
+    objects.forEach((src) => {
+      const fromPos = coords[src.object_id];
+      if (!fromPos) return;
+
+      (outgoingEdges[src.object_id] || []).forEach((edge) => {
+        const toPos = coords[edge.to];
+        if (!toPos) return;
+
+        const x1 = fromPos.x + nodeWidth;
+        const y1 = fromPos.y + nodeHeight / 2;
+        const x2 = toPos.x;
+        const y2 = toPos.y + nodeHeight / 2;
+
+        const midX = (x1 + x2) / 2;
+        const d = `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`;
+
+        svgHtml += `
+          <g class="topo-edge">
+            <path d="${d}" marker-end="url(#topo-arrow)" />
+            <text x="${midX}" y="${(y1 + y2) / 2 - 4}">${escapeHtml(edge.field)}</text>
+          </g>
+        `;
+      });
+    });
+
+    // Render Nodes
+    objects.forEach((obj) => {
+      const pos = coords[obj.object_id];
+      if (!pos) return;
+
+      const isSelected = obj.object_id === state.selectedObjectId;
+      const storage = (obj.storage || 'unknown').toLowerCase();
+      const barColor = storage === 'heap' ? '#38bdf8' : storage === 'global' ? '#c084fc' : '#34d399';
+
+      svgHtml += `
+        <g class="topo-node ${isSelected ? 'selected' : ''}" data-object-id="${obj.object_id}" transform="translate(${pos.x}, ${pos.y})">
+          <rect class="topo-box" width="${nodeWidth}" height="${nodeHeight}" />
+          <rect class="topo-header-bar" width="${nodeWidth}" height="4" fill="${barColor}" />
+          <text class="topo-node-title" x="10" y="24">${escapeHtml(obj.object_id)}</text>
+          <text class="topo-node-sub" x="10" y="42">${escapeHtml((obj.type || '').substring(0, 18))}</text>
+        </g>
+      `;
+    });
+
+    svg.innerHTML = svgHtml;
+
+    // Attach click events to nodes
+    svg.querySelectorAll('.topo-node').forEach((nodeEl) => {
+      nodeEl.addEventListener('click', () => {
+        const oid = nodeEl.getAttribute('data-object-id');
+        selectObject(oid);
+        switchTab('tab-memory');
+      });
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Tab 3: Advanced Exploration — State DAG
+  // --------------------------------------------------------------------------
+
   function renderStateGraph() {
     const svg = el.svgStateGraph;
     const data = state.stateGraphData;
@@ -445,13 +944,12 @@
     const nodes = data.nodes;
     const edges = data.edges;
 
-    // Compute layout levels using simple BFS from seed nodes
-    const levels = {};
     const parents = {};
     edges.forEach((e) => {
       parents[e.to] = e.from;
     });
 
+    const levels = {};
     nodes.forEach((n) => {
       let depth = 0;
       let curr = n.id;
@@ -464,7 +962,6 @@
       levels[n.id] = depth;
     });
 
-    // Group nodes by level
     const levelGroups = {};
     nodes.forEach((n) => {
       const d = levels[n.id] || 0;
@@ -484,19 +981,18 @@
     Object.keys(levelGroups).forEach((lvlStr) => {
       const lvl = parseInt(lvlStr, 10);
       const group = levelGroups[lvl];
-      const y = 50 + lvl * levelSpacing;
+      const y = 40 + lvl * levelSpacing;
       group.forEach((n, idx) => {
-        const x = 60 + idx * (nodeWidth + siblingSpacing);
+        const x = 50 + idx * (nodeWidth + siblingSpacing);
         coords[n.id] = { x, y };
-        if (x + nodeWidth + 60 > maxSvgWidth) maxSvgWidth = x + nodeWidth + 60;
-        if (y + nodeHeight + 60 > maxSvgHeight) maxSvgHeight = y + nodeHeight + 60;
+        if (x + nodeWidth + 50 > maxSvgWidth) maxSvgWidth = x + nodeWidth + 50;
+        if (y + nodeHeight + 50 > maxSvgHeight) maxSvgHeight = y + nodeHeight + 50;
       });
     });
 
     svg.setAttribute('width', maxSvgWidth);
     svg.setAttribute('height', maxSvgHeight);
 
-    // Build SVG Content
     let svgHtml = `
       <defs>
         <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -523,7 +1019,6 @@
       const marker = isCrash ? 'url(#arrow-crash)' : 'url(#arrow)';
       const edgeClass = isCrash ? 'graph-edge crashed' : e.status === 'TIMEOUT' ? 'graph-edge timeout' : 'graph-edge';
 
-      // Curved Bezier path
       const midY = (y1 + y2) / 2;
       const d = `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
 
@@ -567,7 +1062,6 @@
 
     svg.innerHTML = svgHtml;
 
-    // Attach click events on nodes
     svg.querySelectorAll('.graph-node').forEach((nodeEl) => {
       nodeEl.addEventListener('click', () => {
         const nid = nodeEl.getAttribute('data-node-id');
@@ -577,146 +1071,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // TAB 3: Object Graph & Inspector
-  // --------------------------------------------------------------------------
-
-  async function loadObjectsForState(stateId) {
-    if (!stateId) return;
-    const res = await apiGet(`/api/states/${stateId}/objects`);
-    if (!res.success) {
-      el.listObjects.innerHTML = `<div class="text-muted text-center p-3">${escapeHtml(res.error.message)}</div>`;
-      return;
-    }
-
-    const objects = res.data || [];
-    state.objects = objects;
-    state.jsonViewerCache['objects'] = objects;
-    el.badgeObjectsCount.textContent = objects.length;
-
-    // Truncation guard: if > 100 objects, limit display and show banner
-    const maxDisplay = 100;
-    const displayObjects = objects.slice(0, maxDisplay);
-    if (objects.length > maxDisplay) {
-      el.graphTruncatedWarning.style.display = 'block';
-      el.txtTruncatedCount.textContent = `Graph truncated: ${objects.length - maxDisplay} additional objects`;
-    } else {
-      el.graphTruncatedWarning.style.display = 'none';
-    }
-
-    renderObjectsList(displayObjects);
-
-    // Auto-select first object if available
-    if (displayObjects.length > 0) {
-      selectObject(displayObjects[0].object_id);
-    }
-  }
-
-  function renderObjectsList(objs) {
-    if (!objs || objs.length === 0) {
-      el.listObjects.innerHTML = `<div class="text-muted text-center p-3">No semantic objects in this state</div>`;
-      return;
-    }
-
-    let html = '';
-    objs.forEach((o) => {
-      const isSelected = o.object_id === state.selectedObjectId;
-      html += `
-        <div class="object-list-item ${isSelected ? 'selected' : ''}" data-object-id="${o.object_id}">
-          <div class="state-item-header">
-            <span class="mono" style="font-weight: 600;">${escapeHtml(o.object_id)}</span>
-            <span class="badge badge-info">${escapeHtml(o.type || 'Unknown')}</span>
-          </div>
-          <div class="state-item-hash">storage: ${o.storage || 'UNKNOWN'}</div>
-        </div>
-      `;
-    });
-    el.listObjects.innerHTML = html;
-
-    el.listObjects.querySelectorAll('.object-list-item').forEach((item) => {
-      item.addEventListener('click', () => {
-        const oid = item.getAttribute('data-object-id');
-        selectObject(oid);
-      });
-    });
-  }
-
-  async function selectObject(objectId) {
-    state.selectedObjectId = objectId;
-    el.listObjects.querySelectorAll('.object-list-item').forEach((item) => {
-      item.classList.toggle('selected', item.getAttribute('data-object-id') === objectId);
-    });
-
-    const obj = state.objects.find((o) => o.object_id === objectId);
-    if (!obj) return;
-    state.jsonViewerCache[`object_${objectId}`] = obj;
-
-    el.objDetailId.textContent = objectId;
-    el.objDetailType.textContent = obj.type || 'Unknown';
-    el.objDetailStorage.textContent = obj.storage || 'UNKNOWN';
-    el.objDetailAddr.textContent = obj.address ? '0x' + Number(obj.address).toString(16) : 'N/A';
-
-    // Render Fields Table
-    const fields = obj.fields || [];
-    if (fields.length === 0) {
-      el.tableFields.innerHTML = `<tr><td colspan="6" class="text-muted text-center">No fields defined</td></tr>`;
-      return;
-    }
-
-    let fieldsHtml = '';
-    fields.forEach((f) => {
-      const isRef = Boolean(f.object_ref);
-      const isMutable = isFieldMutable(f.type);
-      const valStr = formatFieldValue(f.value);
-
-      fieldsHtml += `
-        <tr>
-          <td><strong>${escapeHtml(f.name)}</strong></td>
-          <td class="mono">${escapeHtml(f.type || '')}</td>
-          <td class="mono ${valStr === 'UNAVAILABLE' ? 'text-warning' : ''}">${escapeHtml(valStr)}</td>
-          <td>${isRef ? `<a href="#" class="ref-link" data-ref-id="${f.object_ref}">${escapeHtml(f.object_ref)}</a>` : '<span class="text-muted">None</span>'}</td>
-          <td><span class="badge ${isMutable ? 'badge-success' : 'badge-neutral'}">${isMutable ? 'mutable' : 'read_only'}</span></td>
-          <td>
-            ${isMutable ? `<button class="btn btn-primary btn-sm btn-inspect-cand" data-object-id="${objectId}" data-field-name="${f.name}">Candidates</button>` : ''}
-          </td>
-        </tr>
-      `;
-    });
-    el.tableFields.innerHTML = fieldsHtml;
-
-    // Attach field action handlers
-    el.tableFields.querySelectorAll('.ref-link').forEach((link) => {
-      link.addEventListener('click', (e) => {
-        e.preventDefault();
-        const refId = link.getAttribute('data-ref-id');
-        selectObject(refId);
-      });
-    });
-
-    el.tableFields.querySelectorAll('.btn-inspect-cand').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const oid = btn.getAttribute('data-object-id');
-        const fld = btn.getAttribute('data-field-name');
-        switchTab('tab-mutations');
-        loadCandidates(oid, fld);
-      });
-    });
-  }
-
-  function isFieldMutable(typeStr) {
-    if (!typeStr) return false;
-    const lower = typeStr.toLowerCase();
-    if (lower.includes('const')) return false;
-    return ['int', 'bool', 'enum', 'float', 'double', '*'].some((t) => lower.includes(t));
-  }
-
-  function formatFieldValue(val) {
-    if (val === null || val === undefined) return 'None';
-    if (typeof val === 'object') return JSON.stringify(val);
-    return String(val);
-  }
-
-  // --------------------------------------------------------------------------
-  // TAB 4: Mutations & Transitions
+  // Tab 3: Mutation Candidates & Execution
   // --------------------------------------------------------------------------
 
   async function loadCandidates(filterObjId = null, filterField = null) {
@@ -756,8 +1111,8 @@
           <td class="mono">${escapeHtml(c.candidate_id)}</td>
           <td class="mono">${escapeHtml(c.object_id)}</td>
           <td><strong>${escapeHtml(c.field)}</strong></td>
-          <td class="mono">${escapeHtml(formatFieldValue(c.current_value))}</td>
-          <td class="mono text-accent"><strong>${escapeHtml(formatFieldValue(c.proposed_value))}</strong></td>
+          <td class="mono">${escapeHtml(String(c.current_value))}</td>
+          <td class="mono text-accent"><strong>${escapeHtml(String(c.proposed_value))}</strong></td>
           <td class="mono">${escapeHtml(c.type || '')}</td>
           <td><span class="tag">${escapeHtml(c.reason || 'candidate')}</span></td>
           <td><span class="badge ${c.supported ? 'badge-success' : 'badge-neutral'}">${c.supported ? 'YES' : 'NO'}</span></td>
@@ -771,7 +1126,6 @@
     });
     el.tableCandidates.innerHTML = html;
 
-    // Attach Execute Click Handlers
     el.tableCandidates.querySelectorAll('.btn-exec-mutation').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const candId = btn.getAttribute('data-candidate-id');
@@ -793,7 +1147,6 @@
     state.jsonViewerCache['last_transition'] = trans;
     showToast('Transition executed successfully!', 'success');
 
-    // Display Transition Card
     el.cardExecutionResult.style.display = 'block';
     el.execTransId.textContent = trans.transition_id || 'Transition Complete';
 
@@ -805,7 +1158,6 @@
     el.execChildState.textContent = trans.child_state || 'None';
     el.execChildHash.textContent = trans.state_hash || 'N/A';
 
-    // List changed fields
     const facts = trans.facts || {};
     const changed = facts.field_changed || [];
     if (changed.length === 0) {
@@ -819,7 +1171,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // TAB 5: State Diff
+  // Tab 3: Semantic State Diff
   // --------------------------------------------------------------------------
 
   async function computeDiff(snapA, snapB) {
@@ -858,8 +1210,8 @@
         <tr>
           <td class="mono">${escapeHtml(c.object_id || '')}</td>
           <td><strong>${escapeHtml(c.field || '')}</strong></td>
-          <td class="mono text-muted">${escapeHtml(formatFieldValue(c.before))}</td>
-          <td class="mono text-accent"><strong>${escapeHtml(formatFieldValue(c.after))}</strong></td>
+          <td class="mono text-muted">${escapeHtml(String(c.before))}</td>
+          <td class="mono text-accent"><strong>${escapeHtml(String(c.after))}</strong></td>
           <td><span class="tag">${escapeHtml(c.category || 'value')}</span></td>
         </tr>
       `;
@@ -868,7 +1220,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // TAB 6: Autonomous Explore
+  // Tab 3: Autonomous Exploration Loop
   // --------------------------------------------------------------------------
 
   async function runAutonomousExplore(maxSteps, timeoutMs, maxStates) {
@@ -899,7 +1251,6 @@
     el.expResCrashes.textContent = exp.crashes || 0;
     el.expResTimeouts.textContent = exp.timeouts || 0;
 
-    // Refresh states and graph
     await loadRuntimeOverview();
     await loadStatesAndGraph();
   }
@@ -958,7 +1309,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // Observe Dialog Modal
+  // Observation Dialog Modal
   // --------------------------------------------------------------------------
 
   function initObserveDialog() {
@@ -1013,6 +1364,37 @@
       await loadStatesAndGraph();
     });
 
+    el.selectMemoryState.addEventListener('change', (e) => {
+      const sid = e.target.value;
+      if (sid) selectState(sid);
+    });
+
+    el.inputSearchObjects.addEventListener('input', (e) => {
+      state.searchQuery = e.target.value;
+      renderMemoryObjectsList();
+    });
+
+    el.storageFilterPills.forEach((pill) => {
+      pill.addEventListener('click', () => {
+        el.storageFilterPills.forEach((p) => p.classList.remove('active'));
+        pill.classList.add('active');
+        state.storageFilter = pill.getAttribute('data-storage');
+        renderMemoryObjectsList();
+      });
+    });
+
+    el.btnJumpTopology.addEventListener('click', () => {
+      switchTab('tab-topology');
+    });
+
+    el.btnResetTopology.addEventListener('click', () => {
+      renderObjectTopology();
+    });
+
+    el.btnResetGraph.addEventListener('click', () => {
+      renderStateGraph();
+    });
+
     el.inputSearchStates.addEventListener('input', (e) => {
       const q = e.target.value.toLowerCase();
       const filtered = state.states.filter((s) => {
@@ -1021,35 +1403,22 @@
       renderStatesList(filtered);
     });
 
-    el.btnResetGraph.addEventListener('click', () => {
-      renderStateGraph();
-    });
-
     el.btnInspectStateObjects.addEventListener('click', () => {
       if (state.selectedStateId) {
-        el.selectObjectState.value = state.selectedStateId;
-        switchTab('tab-object-graph');
-        loadObjectsForState(state.selectedStateId);
+        switchTab('tab-memory');
       }
     });
 
     el.btnStateDiffParent.addEventListener('click', () => {
       if (state.selectedStateId) {
-        switchTab('tab-diff');
+        switchSubtab('subtab-diff');
         computeDiff(el.inputDiffA.value, el.inputDiffB.value);
       }
     });
 
     el.btnStateMutate.addEventListener('click', () => {
-      switchTab('tab-mutations');
+      switchSubtab('subtab-mutations');
       loadCandidates();
-    });
-
-    el.selectObjectState.addEventListener('change', (e) => {
-      const sid = e.target.value;
-      if (sid) {
-        loadObjectsForState(sid);
-      }
     });
 
     el.inputFilterCandField.addEventListener('input', (e) => {
@@ -1085,10 +1454,8 @@
     initObserveDialog();
     bindEvents();
 
-    // Initial data fetch
     await loadRuntimeOverview();
     await loadStatesAndGraph();
-    loadCandidates();
   }
 
   window.addEventListener('DOMContentLoaded', init);

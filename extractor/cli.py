@@ -73,6 +73,17 @@ def main():
     ext_parser.add_argument("--output", type=str, default=None,
                             help="Optional output path to save semantic snapshot JSON")
 
+    # 6. server
+    srv_parser = subparsers.add_parser("server", help="Launch dynamicState Web UI server (host/workstation only)")
+    srv_parser.add_argument("--host", type=str, default="127.0.0.1", help="HTTP host to bind (default: 127.0.0.1)")
+    srv_parser.add_argument("--port", type=int, default=8000, help="HTTP port to bind (default: 8000)")
+    srv_parser.add_argument("--corpus", type=str, default="corpus", help="Path to State Corpus directory (default: corpus)")
+    srv_parser.add_argument("--mode", type=str, default="CONSISTENT", choices=["CONSISTENT", "LOW_IMPACT"], help="Observation mode (default: CONSISTENT)")
+    srv_parser.add_argument("--snapshot", type=str, default=None, help="Optional snapshot file to load into corpus")
+    srv_parser.add_argument("--binary", type=str, default=None, help="Optional target binary path")
+    srv_parser.add_argument("--debug-image", type=str, default=None, help="Optional external debug image path")
+    srv_parser.add_argument("--pid", type=int, default=None, help="Optional process PID")
+
     args = parser.parse_args()
 
     if args.command == "capture-memory":
@@ -219,6 +230,40 @@ def main():
             except Exception as e:
                 print(f"ERROR: Consistent extraction failed: {e}", file=sys.stderr)
                 sys.exit(1)
+
+    elif args.command == "server":
+        from .agent_runtime import AgentRuntime
+        from .web.server import run_server, run_server_loop
+        corpus_dir = os.path.abspath(args.corpus)
+        os.makedirs(corpus_dir, exist_ok=True)
+        runtime = AgentRuntime(corpus_dir=corpus_dir)
+        runtime.observation_mode = args.mode
+
+        if args.snapshot:
+            if os.path.exists(args.snapshot):
+                try:
+                    with open(args.snapshot) as f:
+                        s_data = json.load(f)
+                    runtime.corpus.add(s_data)
+                except Exception as exc:
+                    print(f"WARNING: Could not preload snapshot {args.snapshot}: {exc}", file=sys.stderr)
+
+        server = run_server(runtime=runtime, host=args.host, port=args.port)
+        url = f"http://{args.host}:{args.port}"
+        print("========================================")
+        print(" dynamicState Web UI")
+        print(f" {url}")
+        print(f" Mode: {runtime.observation_mode}")
+        print(f" Corpus: {corpus_dir}")
+        print(" Press Ctrl+C to terminate.")
+        print("========================================")
+        sys.stdout.flush()
+
+        try:
+            run_server_loop(server)
+        finally:
+            print("\nShutting down dynamicState Web UI...")
+            sys.exit(0)
 
 
 if __name__ == "__main__":

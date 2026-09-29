@@ -10,7 +10,7 @@ import signal
 import sys
 
 from extractor.agent_runtime import AgentRuntime
-from extractor.web.server import run_server
+from extractor.web.server import run_server, run_server_loop
 
 
 def main():
@@ -54,20 +54,10 @@ def main():
     print("========================================")
     sys.stdout.flush()
 
-    def handle_sigint(sig, frame):
-        print("\nShutting down dynamicState Web UI...")
-        server.shutdown()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_sigint)
-    signal.signal(signal.SIGTERM, handle_sigint)
-
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        run_server_loop(server)
     finally:
-        server.server_close()
+        print("\nShutting down dynamicState Web UI...")
 
 
 if __name__ == "__main__":

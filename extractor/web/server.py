@@ -811,9 +811,44 @@ class DynamicStateWebServer(http.server.HTTPServer):
 
 def run_server(runtime: AgentRuntime, host: str = "127.0.0.1", port: int = 8000,
                static_dir: Optional[str] = None) -> DynamicStateWebServer:
-    """Instantiate and start the HTTP server."""
+    """Instantiate and configure the HTTP server."""
     if static_dir is None:
         static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
     server = DynamicStateWebServer((host, port), runtime, static_dir)
     return server
+
+
+def run_server_loop(server: DynamicStateWebServer) -> None:
+    """Run server loop with safe signal handling and clean Ctrl+C shutdown with zero deadlock."""
+    import signal
+
+    stop_requested = threading.Event()
+
+    def _serve():
+        try:
+            server.serve_forever(poll_interval=0.2)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+
+    def handle_signal(sig, frame):
+        stop_requested.set()
+
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    except (ValueError, AttributeError):
+        pass
+
+    try:
+        while not stop_requested.is_set():
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        stop_requested.set()
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=2.0)
