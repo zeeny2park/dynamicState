@@ -512,6 +512,19 @@ class AgentRuntime:
             cand_id = candidate.get("candidate_id")
             if cand_id and cand_id in self._cached_candidates:
                 cand_obj = self._cached_candidates[cand_id]
+                if "proposed_value" in candidate or "value" in candidate:
+                    new_val = candidate.get("proposed_value") if "proposed_value" in candidate else candidate.get("value")
+                    if new_val != cand_obj.proposed_value:
+                        cand_obj = AgentMutationCandidate(
+                            candidate_id=cand_obj.candidate_id,
+                            snapshot_id=cand_obj.snapshot_id,
+                            object_id=cand_obj.object_id,
+                            field=cand_obj.field,
+                            type=cand_obj.type,
+                            current_value=cand_obj.current_value,
+                            proposed_value=new_val,
+                            reason=candidate.get("reason", cand_obj.reason)
+                        )
             else:
                 # Check if matching candidate exists in cache by (object_id, field, proposed_value)
                 obj_id = candidate.get("object_id")

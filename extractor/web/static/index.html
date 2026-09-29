@@ -24,9 +24,18 @@
       <div class="meta-tag" id="tag-arch">Arch: UNKNOWN</div>
       <div class="meta-tag" id="tag-endian">Endian: UNKNOWN</div>
       <div class="meta-tag" id="tag-elf">ELF: UNKNOWN</div>
+      <div class="meta-tag meta-obs-point" id="tag-header-obs-point" title="Active observation point (deterministic breakpoint for state capture/mutation)">
+        <span>📍</span> <span id="txt-header-obs-point">Point: N/A</span>
+      </div>
     </div>
 
     <div class="header-actions">
+      <!-- Human-Centric Basic vs Advanced Mode Toggle -->
+      <div class="mode-toggle-group" id="group-mode-toggle" title="Switch between clean human-friendly Basic view and technical Advanced view">
+        <button type="button" class="btn btn-sm btn-mode active" id="btn-mode-basic">👤 Basic</button>
+        <button type="button" class="btn btn-sm btn-mode" id="btn-mode-advanced">⚙️ Advanced</button>
+      </div>
+
       <button class="btn btn-secondary btn-sm" id="btn-refresh" title="Refresh runtime data">
         <span class="icon">⟳</span> Refresh
       </button>
@@ -72,9 +81,15 @@
               <span class="badge badge-info" id="ms-badge-mode">CONSISTENT</span>
               <span class="badge badge-success" id="ms-badge-status">COMPLETE</span>
               <span class="badge badge-neutral" id="ms-badge-consistency">CONSISTENT</span>
+              <span class="badge badge-accent" id="ms-badge-backend" title="Restore backend used for sibling branch isolation">Backend: RESTART</span>
+              <span class="badge badge-success" id="ms-badge-isolation" title="Branch isolation guarantee">Isolation: SUPPORTED</span>
             </div>
             <h2 class="hero-title" id="ms-target-title">Target: Not Connected</h2>
             <div class="hero-subtitle mono" id="ms-target-subtitle">No active execution inferior</div>
+            <div class="hero-obs-point-row" style="margin-top: 6px; display: flex; align-items: center; gap: 8px;">
+              <span class="badge badge-info" style="font-size: 0.75rem;">📍 Observation Point</span>
+              <span class="mono" id="ms-txt-obs-point" style="color: var(--accent); font-weight: 600;">N/A</span>
+            </div>
           </div>
           
           <div class="hero-state-selector">
@@ -86,6 +101,36 @@
               <button class="btn btn-outline btn-sm btn-view-json" data-entity="memory-summary" title="View Memory Summary JSON">Summary JSON</button>
             </div>
           </div>
+        </div>
+      </div>
+
+      <!-- Active Threads & Execution Context -->
+      <div class="section-title-row" style="margin-top: 20px;">
+        <div style="display: flex; align-items: baseline; gap: 10px;">
+          <h3>Active Threads & Observation Context</h3>
+          <span class="badge badge-neutral" id="badge-threads-count">1 Thread</span>
+        </div>
+        <span class="subtext">Live thread execution state, source code locations, and active observation points</span>
+      </div>
+
+      <div class="card thread-explorer-card" id="card-thread-explorer">
+        <div class="table-container">
+          <table class="data-table" id="table-threads">
+            <thead>
+              <tr>
+                <th>Thread</th>
+                <th>Role / Label</th>
+                <th>State</th>
+                <th>Current Function</th>
+                <th>Source Location</th>
+                <th>Frames</th>
+                <th>Observation Context</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-threads">
+              <tr><td colspan="7" class="text-muted text-center">Loading thread details...</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -618,32 +663,82 @@
           <div class="execution-result-card card" id="card-execution-result" style="display: none; margin-top: 16px;">
             <div class="card-header-row">
               <div class="card-title-group">
-                <h4 id="exec-trans-id">Transition T001</h4>
+                <h4 id="exec-trans-id">Transition Complete</h4>
                 <span class="badge badge-success" id="exec-status-badge">STOPPED</span>
               </div>
               <button class="btn btn-outline btn-sm" id="btn-view-trans-json">Transition JSON</button>
             </div>
 
-            <div class="overview-grid" style="margin-top: 12px;">
-              <div class="metric-box">
-                <div class="metric-label">Execution Status</div>
-                <div class="metric-val" id="exec-status-text" style="font-size: 1.2rem;">STOPPED</div>
+            <!-- Parent State -> Mutation -> Child State Flow -->
+            <div class="state-transition-flow" id="trans-flow-container" style="margin-top: 16px;">
+              <div class="flow-card flow-parent-card">
+                <div class="flow-badge">PARENT STATE</div>
+                <div class="flow-title mono" id="flow-parent-id">state_000001</div>
+                <div class="flow-hash mono text-muted" id="flow-parent-hash">56d6d7...</div>
+                <div class="flow-val mono" id="flow-parent-val">Before: N/A</div>
               </div>
-              <div class="metric-box">
-                <div class="metric-label">Child State</div>
-                <div class="metric-val mono" id="exec-child-state" style="font-size: 1.1rem;">state_000002</div>
+              <div class="flow-arrow-card">
+                <div class="flow-arrow-icon">➔</div>
+                <div class="flow-arrow-label mono" id="flow-mutation-label">mutation</div>
+                <div class="flow-arrow-meta text-muted" id="flow-arrow-meta">Timeout: 1000ms</div>
               </div>
-              <div class="metric-box">
-                <div class="metric-label">Child State Hash</div>
-                <div class="metric-val mono" id="exec-child-hash" style="font-size: 0.85rem;">e3b0c44...</div>
+              <div class="flow-card flow-child-card">
+                <div class="flow-badge">CHILD STATE</div>
+                <div class="flow-title mono text-accent" id="flow-child-id">state_000002</div>
+                <div class="flow-hash mono text-muted" id="flow-child-hash">a1b2c3...</div>
+                <div class="flow-val mono text-accent" id="flow-child-val">After: N/A</div>
               </div>
             </div>
 
-            <div class="changed-fields-box" style="margin-top: 16px;">
-              <h5>Changed Fields (Semantic Diff)</h5>
-              <ul id="list-exec-changed-fields" class="field-changes-list">
-                <li>No changes observed</li>
-              </ul>
+            <!-- Execution Status Grid -->
+            <div class="overview-grid" style="margin-top: 16px;">
+              <div class="metric-box">
+                <div class="metric-label">Execution Status</div>
+                <div class="metric-val" id="exec-status-text" style="font-size: 1.15rem;">STOPPED</div>
+              </div>
+              <div class="metric-box">
+                <div class="metric-label">Restore Backend</div>
+                <div class="metric-val mono" id="exec-restore-backend" style="font-size: 1.05rem;">RESTART</div>
+              </div>
+              <div class="metric-box">
+                <div class="metric-label">Step Duration</div>
+                <div class="metric-val mono" id="exec-step-duration" style="font-size: 1.05rem;">N/A</div>
+              </div>
+              <div class="metric-box">
+                <div class="metric-label">State Hash</div>
+                <div class="metric-val mono" id="exec-child-hash-box" style="font-size: 0.85rem;">e3b0c44...</div>
+              </div>
+            </div>
+
+            <!-- Verified Execution Timeline (Zero fake progress) -->
+            <div class="timeline-section" style="margin-top: 18px;">
+              <div class="section-title-row" style="margin-bottom: 8px;">
+                <h5>Verified Execution Timeline</h5>
+                <span class="subtext">Actual completed stages reported by runtime backend</span>
+              </div>
+              <div class="execution-timeline" id="exec-timeline-list">
+                <!-- Dynamically rendered verified steps -->
+              </div>
+            </div>
+
+            <!-- Changed Fields (Semantic Diff) -->
+            <div class="changed-fields-box" style="margin-top: 18px;">
+              <h5>Changed Fields & Semantic State Diff</h5>
+              <div class="table-container" style="margin-top: 8px;">
+                <table class="data-table" id="table-exec-diff">
+                  <thead>
+                    <tr>
+                      <th>Target Object / Field</th>
+                      <th>Before Value</th>
+                      <th>After Value</th>
+                      <th>Category</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tbody-exec-diff">
+                    <tr><td colspan="4" class="text-muted text-center">No field modifications detected</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
@@ -876,6 +971,85 @@
           <button type="submit" class="btn btn-primary" id="btn-submit-observe">Capture & Observe</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Mutation Preview & Safety Verification Modal -->
+  <div id="modal-mutation-preview" class="modal-backdrop" style="display: none;">
+    <div class="modal-card modal-medium">
+      <div class="modal-header">
+        <h3>⚡ Mutation Preview & Verification</h3>
+        <button class="btn-close" id="btn-close-mutation-modal">×</button>
+      </div>
+      <div class="modal-body">
+        <!-- Target Overview Card -->
+        <div class="card preview-target-card" style="margin-bottom: 16px; background: rgba(56, 189, 248, 0.05); border: 1px solid rgba(56, 189, 248, 0.2);">
+          <div class="preview-target-header" style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;">
+            <span class="badge badge-info" id="prev-target-storage">HEAP</span>
+            <span class="badge badge-success" id="prev-target-mutability">MUTABLE</span>
+            <span class="badge badge-neutral mono" id="prev-target-raw-id" style="display: none;">obj_0001</span>
+          </div>
+          <div class="preview-target-title mono text-accent" id="prev-target-semantic" style="font-size: 1.15rem; font-weight: 700;">Session.retry</div>
+          <div class="preview-target-sub text-muted" id="prev-target-type" style="margin-top: 2px;">Type: uint32_t</div>
+        </div>
+
+        <form id="form-mutation-preview">
+          <!-- Current vs Proposed Value Grid -->
+          <div class="preview-values-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;">
+            <div class="form-group" style="margin-bottom: 0;">
+              <label>Current Value:</label>
+              <div class="static-val-box mono" id="prev-current-value" style="padding: 9px 12px; background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 6px; min-height: 38px; display: flex; align-items: center;">2</div>
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <label for="prev-proposed-value">Proposed New Value:</label>
+              <div id="prev-input-container">
+                <input type="text" id="prev-proposed-value" class="input-text mono" required style="width: 100%;">
+              </div>
+            </div>
+          </div>
+
+          <!-- Execution Environment & Restore Safety -->
+          <div class="card preview-safety-card" style="background: rgba(255, 255, 255, 0.02); padding: 12px 16px;">
+            <div class="card-subtitle" style="margin-bottom: 10px; font-weight: 600; color: var(--accent);">Execution & Isolation Context</div>
+            <table class="key-value-table">
+              <tr>
+                <td>Observation Point:</td>
+                <td class="mono text-accent" id="prev-obs-point">worker_loop() @ sample_multithread.cpp:73</td>
+              </tr>
+              <tr>
+                <td>Restore Backend:</td>
+                <td class="mono" id="prev-restore-backend">RESTART (RestartBasedRestorer)</td>
+              </tr>
+              <tr>
+                <td>Branch Isolation:</td>
+                <td><span class="badge badge-success" id="prev-branch-isolation">SUPPORTED</span></td>
+              </tr>
+              <tr>
+                <td>Execution Timeout:</td>
+                <td>
+                  <select id="prev-timeout-select" class="input-select" style="width: auto; padding: 4px 10px;">
+                    <option value="100">100 ms (Fast)</option>
+                    <option value="500">500 ms</option>
+                    <option value="1000" selected>1000 ms (Standard)</option>
+                    <option value="2000">2000 ms</option>
+                    <option value="5000">5000 ms (Max safety)</option>
+                  </select>
+                </td>
+              </tr>
+            </table>
+            <div class="card-caption" style="margin-top: 8px; color: var(--text-muted); font-size: 0.8rem;">
+              ℹ️ Branch isolation ensures the parent state is restored after this mutation run, preventing side-effects on subsequent branch explorations.
+            </div>
+          </div>
+
+          <div class="modal-actions" style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
+            <button type="button" class="btn btn-secondary" id="btn-cancel-mutation">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-submit-mutation">
+              <span>🚀</span> Run Mutation
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   </div>
 

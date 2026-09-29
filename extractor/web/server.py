@@ -38,6 +38,29 @@ def _to_json_serializable(val: Any) -> Any:
     return str(val)
 
 
+def _clean_type_name(t: Any) -> str:
+    """Strip struct/class/enum keywords from C/C++ type names for clean human presentation."""
+    if not t:
+        return "Unknown"
+    s = str(t).strip()
+    for prefix in ("struct ", "class ", "enum "):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+    return s.strip()
+
+
+def _is_field_mutable(ftype: Any) -> str:
+    """Classify mutability from type string consistently."""
+    if not ftype:
+        return "unsupported"
+    fl = str(ftype).lower()
+    if "const" in fl:
+        return "read_only"
+    if any(t in fl for t in ("int", "bool", "enum", "float", "double", "char", "*")):
+        return "mutable"
+    return "unsupported"
+
+
 class WebApiAdapter:
     """Thin adapter mapping REST endpoints to AgentRuntime methods."""
 
@@ -142,6 +165,104 @@ class WebApiAdapter:
         mem_summary_res = self.runtime.get_memory_summary()
         mem_summary = _to_json_serializable(mem_summary_res.data) if mem_summary_res.success else None
 
+        # Observation point resolution
+        observation_point = None
+        if self.runtime._cached_checkpoints:
+            last_cp = list(self.runtime._cached_checkpoints.values())[-1]
+            if getattr(last_cp, "observation_point", None):
+                observation_point = last_cp.observation_point
+
+        if not observation_point and ctrl:
+            bp_spec = getattr(ctrl, "breakpoint_spec", None)
+            if hasattr(ctrl, "restorer"):
+                if getattr(ctrl.restorer, "breakpoint_spec", None):
+                    bp_spec = ctrl.restorer.breakpoint_spec
+                elif hasattr(ctrl.restorer, "_restart_restorer") and getattr(ctrl.restorer._restart_restorer, "breakpoint_spec", None):
+                    bp_spec = ctrl.restorer._restart_restorer.breakpoint_spec
+            if bp_spec:
+                observation_point = {
+                    "kind": "BREAKPOINT",
+                    "spec": bp_spec,
+                    "function": bp_spec,
+                    "location": bp_spec,
+                }
+
+        # Threads detail resolution from latest snapshot
+        threads_detail = []
+        snap, _ = self.runtime._resolve_snapshot(None)
+        if snap:
+            s_data = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+            exec_data = s_data.get("execution") or {}
+            threads_list = exec_data.get("threads") or []
+            for th in threads_list:
+                th_dict = th if isinstance(th, dict) else (th.to_dict() if hasattr(th, "to_dict") else asdict(th))
+                tid = th_dict.get("thread_id", 1)
+                frames = th_dict.get("frames") or []
+                top_f = frames[0] if frames else {}
+                top_f_dict = top_f if isinstance(top_f, dict) else (top_f.to_dict() if hasattr(top_f, "to_dict") else asdict(top_f))
+                t_name = th_dict.get("name")
+                if not t_name:
+                    t_name = "Main Thread" if tid == 1 else f"Worker #{tid}"
+                threads_detail.append({
+                    "thread_id": tid,
+                    "name": t_name,
+                    "state": th_dict.get("state", "STOPPED"),
+                    "function": top_f_dict.get("function") or "<unknown>",
+                    "location": top_f_dict.get("location") or (f"{top_f_dict.get('function')}()" if top_f_dict.get("function") else "<unknown>"),
+                    "frame_depth": len(frames),
+                })
+            if not observation_point and threads_detail and threads_detail[0]["function"] != "<unknown>":
+                observation_point = {
+                    "kind": "FRAME",
+                    "spec": threads_detail[0]["function"],
+                    "function": threads_detail[0]["function"],
+                    "location": threads_detail[0]["location"],
+                }
+
+        # Fallback to inferior thread inspection if live GDB inferior
+        if not threads_detail and ctrl and hasattr(ctrl, "gdb") and hasattr(ctrl.gdb, "selected_inferior"):
+            try:
+                inf = ctrl.gdb.selected_inferior()
+                for t in inf.threads():
+                    tid = getattr(t, "global_num", None) or getattr(t, "num", 1)
+                    t_name = getattr(t, "name", None) or ("Main Thread" if tid == 1 else f"Worker #{tid}")
+                    t_state = "STOPPED"
+                    try:
+                        if hasattr(t, "is_stopped"):
+                            t_state = "STOPPED" if t.is_stopped() else "RUNNING"
+                    except Exception:
+                        pass
+                    threads_detail.append({
+                        "thread_id": tid,
+                        "name": t_name,
+                        "state": t_state,
+                        "function": "<unknown>",
+                        "location": "<unknown>",
+                        "frame_depth": 1,
+                    })
+            except Exception:
+                pass
+
+        if not threads_detail:
+            thread_cnt = caps.get("threads", 1)
+            for i in range(1, thread_cnt + 1):
+                threads_detail.append({
+                    "thread_id": i,
+                    "name": "Main Thread" if i == 1 else f"Worker #{i}",
+                    "state": status if status != "DISCONNECTED" else "UNKNOWN",
+                    "function": "<unknown>",
+                    "location": "<unknown>",
+                    "frame_depth": 1,
+                })
+
+        if not observation_point:
+            observation_point = {
+                "kind": "BREAKPOINT",
+                "spec": "observation_checkpoint",
+                "function": "observation_checkpoint",
+                "location": "observation_checkpoint",
+            }
+
         return {
             "success": True,
             "data": {
@@ -159,6 +280,8 @@ class WebApiAdapter:
                 "state_count": len(self.runtime.corpus.states),
                 "transition_count": len(self.runtime.corpus.transitions),
                 "threads": caps.get("threads", 1),
+                "threads_detail": threads_detail,
+                "observation_point": observation_point,
                 "checkpoint_restore": caps.get("checkpoint_restore", {}),
                 "branch_isolation": caps.get("branch_isolation", {}),
                 "current_checkpoint": list(self.runtime._cached_checkpoints.keys())[-1] if self.runtime._cached_checkpoints else None,
@@ -244,40 +367,146 @@ class WebApiAdapter:
                 "error": {"code": "STATE_NOT_FOUND", "message": f"State '{state_id}' not found in corpus"}
             }
         snap_id = state_meta.get("snapshot_id")
-        res = self.runtime.list_objects(snapshot_id=snap_id)
-        if res.success:
-            return {"success": True, "data": _to_json_serializable(res.data)}
+        snap, _ = self.runtime._resolve_snapshot(snap_id or state_id)
+        if snap is None:
+            snap = self.runtime.corpus.get(state_id)
 
-        # Fallback: inspect raw persistent objects in stored snapshot.json
-        snap_data = self.runtime.corpus.get(state_id)
-        if snap_data:
-            objs = snap_data.get("persistent", {}).get("objects", [])
-            summary = []
-            for obj in objs:
-                summary.append({
-                    "object_id": obj.get("object_id", ""),
-                    "type": obj.get("type", "Unknown"),
-                    "storage": obj.get("storage"),
-                    "fields": obj.get("fields", []),
-                    "identity_hint": f"{obj.get('type')}:{obj.get('object_id')}"
+        if snap is None:
+            res = self.runtime.list_objects(snapshot_id=snap_id)
+            if res.success:
+                return {"success": True, "data": _to_json_serializable(res.data)}
+            return {
+                "success": False,
+                "error": {"code": res.error.code if res.error else "SNAPSHOT_NOT_FOUND",
+                          "message": res.error.message if res.error else "Failed to list state objects"}
+            }
+
+        snap_dict = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+        s_inner = snap_dict.get("snapshot", snap_dict)
+        persistent = snap_dict.get("persistent") or s_inner.get("persistent") or {}
+        roots = persistent.get("roots", [])
+        objects = persistent.get("objects", [])
+
+        # Build root mapping (object_ref -> root)
+        root_map: Dict[str, Dict[str, Any]] = {}
+        for idx, r in enumerate(roots):
+            r_dict = r if isinstance(r, dict) else (r.to_dict() if hasattr(r, "to_dict") else asdict(r))
+            oref = r_dict.get("object_ref")
+            if oref:
+                root_map[oref] = r_dict
+            elif idx < len(objects):
+                fallback_oid = objects[idx].get("object_id") if isinstance(objects[idx], dict) else getattr(objects[idx], "object_id", None)
+                if fallback_oid and fallback_oid not in root_map:
+                    root_map[fallback_oid] = r_dict
+
+        # Build parent reference map (object_ref -> parent_path)
+        parent_ref_map: Dict[str, str] = {}
+        for o in objects:
+            o_dict = o if isinstance(o, dict) else (o.to_dict() if hasattr(o, "to_dict") else asdict(o))
+            oid = o_dict.get("object_id")
+            p_name = root_map.get(oid, {}).get("name") or _clean_type_name(o_dict.get("type", ""))
+            for f in o_dict.get("fields", []):
+                f_dict = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
+                ref = f_dict.get("object_ref")
+                if ref and ref not in parent_ref_map:
+                    parent_ref_map[ref] = f"{p_name}.{f_dict.get('name')}"
+
+        enriched_objects = []
+        for o in objects:
+            o_dict = o if isinstance(o, dict) else (o.to_dict() if hasattr(o, "to_dict") else asdict(o))
+            oid = o_dict.get("object_id", "")
+            raw_type = o_dict.get("type", "Unknown")
+            cleaned_type = _clean_type_name(raw_type)
+
+            semantic_name = None
+            if oid in root_map:
+                semantic_name = root_map[oid].get("name")
+            elif oid in parent_ref_map:
+                semantic_name = parent_ref_map[oid]
+            else:
+                semantic_name = cleaned_type
+
+            enriched_fields = []
+            for f in o_dict.get("fields", []):
+                f_dict = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
+                enriched_fields.append({
+                    "name": f_dict.get("name"),
+                    "type": f_dict.get("type"),
+                    "value": self.runtime._sanitize_field_value(f_dict),
+                    "object_ref": f_dict.get("object_ref"),
+                    "mutability": _is_field_mutable(f_dict.get("type", "")),
+                    "address": f_dict.get("address"),
                 })
-            return {"success": True, "data": summary}
 
-        return {
-            "success": False,
-            "error": {"code": res.error.code if res.error else "SNAPSHOT_NOT_FOUND",
-                      "message": res.error.message if res.error else "Failed to list state objects"}
-        }
+            enriched_objects.append({
+                "object_id": oid,
+                "type": raw_type,
+                "cleaned_type": cleaned_type,
+                "semantic_name": semantic_name or oid,
+                "root_name": root_map.get(oid, {}).get("name"),
+                "root_source": root_map.get(oid, {}).get("source"),
+                "storage": o_dict.get("storage", "unknown"),
+                "address": o_dict.get("address"),
+                "thread_id": o_dict.get("thread_id"),
+                "frame_level": o_dict.get("frame_level"),
+                "fields": enriched_fields,
+                "identity_hint": f"{raw_type}:{oid}",
+            })
+
+        return {"success": True, "data": enriched_objects}
 
     def inspect_object(self, object_id: str, snapshot_id: Optional[str] = None) -> Dict[str, Any]:
         res = self.runtime.inspect_object(object_id, snapshot_id=snapshot_id)
-        if res.success:
-            return {"success": True, "data": _to_json_serializable(res.data)}
-        return {
-            "success": False,
-            "error": {"code": res.error.code if res.error else "INVALID_OBJECT",
-                      "message": res.error.message if res.error else f"Object '{object_id}' not found"}
-        }
+        if not res.success:
+            return {
+                "success": False,
+                "error": {"code": res.error.code if res.error else "INVALID_OBJECT",
+                          "message": res.error.message if res.error else f"Object '{object_id}' not found"}
+            }
+        data = _to_json_serializable(res.data)
+        if isinstance(data, dict):
+            raw_type = data.get("type", "Unknown")
+            cleaned_type = _clean_type_name(raw_type)
+            data["cleaned_type"] = cleaned_type
+
+            snap, _ = self.runtime._resolve_snapshot(snapshot_id)
+            if snap:
+                snap_dict = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+                s_inner = snap_dict.get("snapshot", snap_dict)
+                persistent = snap_dict.get("persistent") or s_inner.get("persistent") or {}
+                roots = persistent.get("roots", [])
+                raw_objs = persistent.get("objects", [])
+                root_item = next((r for r in roots if (r.get("object_ref") if isinstance(r, dict) else getattr(r, "object_ref", None)) == object_id), None)
+                if not root_item and roots and raw_objs:
+                    for idx, r in enumerate(roots):
+                        if idx < len(raw_objs):
+                            f_oid = raw_objs[idx].get("object_id") if isinstance(raw_objs[idx], dict) else getattr(raw_objs[idx], "object_id", None)
+                            if f_oid == object_id:
+                                root_item = r
+                                break
+
+                if root_item:
+                    r_name = root_item.get("name") if isinstance(root_item, dict) else getattr(root_item, "name", None)
+                    data["root_name"] = r_name
+                    data["semantic_name"] = r_name
+                else:
+                    data["semantic_name"] = cleaned_type
+
+                raw_obj = next((o for o in raw_objs if (o.get("object_id") if isinstance(o, dict) else getattr(o, "object_id", None)) == object_id), None)
+                if raw_obj:
+                    o_dict = raw_obj if isinstance(raw_obj, dict) else (raw_obj.to_dict() if hasattr(raw_obj, "to_dict") else asdict(raw_obj))
+                    data["address"] = o_dict.get("address")
+                    data["thread_id"] = o_dict.get("thread_id")
+                    data["frame_level"] = o_dict.get("frame_level")
+            else:
+                data["semantic_name"] = cleaned_type
+
+            # Enrich fields with mutability
+            for f in data.get("fields", []):
+                if isinstance(f, dict) and "mutability" not in f:
+                    f["mutability"] = _is_field_mutable(f.get("type", ""))
+
+        return {"success": True, "data": data}
 
     def inspect_fields(self, object_id: str, field_path: Optional[str] = None,
                        snapshot_id: Optional[str] = None) -> Dict[str, Any]:
@@ -375,6 +604,41 @@ class WebApiAdapter:
             candidates = [c for c in candidates if c.get("object_id") == object_id]
         if field_name:
             candidates = [c for c in candidates if c.get("field") == field_name]
+
+        # Enrich candidates with semantic names
+        if candidates:
+            snap, _ = self.runtime._resolve_snapshot(snapshot_id)
+            if snap:
+                snap_dict = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+                s_inner = snap_dict.get("snapshot", snap_dict)
+                persistent = snap_dict.get("persistent") or s_inner.get("persistent") or {}
+                roots = persistent.get("roots", [])
+                raw_objs = persistent.get("objects", [])
+                root_names = {}
+                for idx, r in enumerate(roots):
+                    r_dict = r if isinstance(r, dict) else (r.to_dict() if hasattr(r, "to_dict") else asdict(r))
+                    oref = r_dict.get("object_ref")
+                    rname = r_dict.get("name")
+                    if oref and rname:
+                        root_names[oref] = rname
+                    elif idx < len(raw_objs):
+                        f_oid = raw_objs[idx].get("object_id") if isinstance(raw_objs[idx], dict) else getattr(raw_objs[idx], "object_id", None)
+                        if f_oid and rname and f_oid not in root_names:
+                            root_names[f_oid] = rname
+
+                obj_types = {}
+                for o in raw_objs:
+                    o_dict = o if isinstance(o, dict) else (o.to_dict() if hasattr(o, "to_dict") else asdict(o))
+                    oid = o_dict.get("object_id")
+                    otyp = o_dict.get("type")
+                    if oid and otyp:
+                        obj_types[oid] = _clean_type_name(otyp)
+
+                for c in candidates:
+                    oid = c.get("object_id")
+                    sem_name = root_names.get(oid) or obj_types.get(oid) or oid
+                    c["semantic_name"] = sem_name
+                    c["semantic_target"] = f"{sem_name}.{c.get('field')}"
 
         return {"success": True, "data": candidates}
 
@@ -498,16 +762,39 @@ class WebApiAdapter:
 
     def execute_transition(self, params: Dict[str, Any]) -> Dict[str, Any]:
         # Strict validation: candidate_id or validated candidate dict
-        cand = params.get("candidate_id") or params.get("candidate")
+        cand = params.get("candidate") or params.get("candidate_id")
         if not cand:
             return {
                 "success": False,
                 "error": {"code": "INVALID_CANDIDATE", "message": "candidate_id or candidate payload is required"}
             }
+        if isinstance(cand, str) and ("proposed_value" in params or "value" in params):
+            cand = {
+                "candidate_id": cand,
+                "proposed_value": params.get("proposed_value") if "proposed_value" in params else params.get("value")
+            }
         timeout_ms = int(params.get("timeout_ms", 1000))
         res = self.runtime.execute_transition(candidate=cand, timeout_ms=timeout_ms)
         if res.success:
-            return {"success": True, "data": _to_json_serializable(res.data)}
+            data = _to_json_serializable(res.data)
+            if isinstance(data, dict):
+                p_state = data.get("parent_state")
+                c_state = data.get("child_state")
+                if p_state:
+                    p_meta = self.runtime.corpus.get_metadata(p_state) or {}
+                    data["parent_state_hash"] = p_meta.get("state_hash")
+                if c_state:
+                    c_meta = self.runtime.corpus.get_metadata(c_state) or {}
+                    data["child_state_hash"] = c_meta.get("state_hash")
+                    if not data.get("state_hash"):
+                        data["state_hash"] = c_meta.get("state_hash")
+
+                caps_res = self.runtime.capabilities()
+                caps_data = caps_res.data if caps_res.success else {}
+                cp_res = caps_data.get("checkpoint_restore", {})
+                data["restore_backend"] = cp_res.get("backend", "RESTART" if caps_data.get("threads", 1) > 1 else "GDB_CHECKPOINT")
+                data["timeout_ms"] = timeout_ms
+            return {"success": True, "data": data}
         return {
             "success": False,
             "error": {"code": res.error.code if res.error else "MUTATION_REJECTED",

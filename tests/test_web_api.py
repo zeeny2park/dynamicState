@@ -450,6 +450,92 @@ class TestWebApi(unittest.TestCase):
         self.assertTrue(p_data.get("success"))
         self.assertTrue(p_data.get("data", {}).get("deterministic"))
 
+    def test_15_enriched_human_centric_metadata(self):
+        # 1. Runtime info threads_detail & observation_point
+        status, data = self._get("/api/runtime")
+        self.assertEqual(status, 200)
+        info = data.get("data", {})
+        self.assertIn("threads_detail", info)
+        self.assertIn("observation_point", info)
+        td = info["threads_detail"]
+        self.assertGreaterEqual(len(td), 1)
+        self.assertEqual(td[0]["thread_id"], 1)
+        self.assertIn("name", td[0])
+        self.assertEqual(td[0]["function"], "handle_request")
+        self.assertEqual(td[0]["location"], "main.cpp:20")
+        obs = info["observation_point"]
+        self.assertIn("spec", obs)
+        self.assertIn("location", obs)
+
+        # 2. Objects enriched with semantic names & cleaned types
+        status, o_data = self._get("/api/states/state_000001/objects")
+        self.assertEqual(status, 200)
+        objs = o_data.get("data", [])
+        obj1 = next(o for o in objs if o["object_id"] == "obj_0001")
+        self.assertEqual(obj1.get("semantic_name"), "server_inst")
+        self.assertEqual(obj1.get("cleaned_type"), "ServerConfig")
+        self.assertEqual(obj1.get("root_name"), "server_inst")
+        self.assertTrue(any(f.get("mutability") == "mutable" for f in obj1.get("fields", [])))
+
+        # 3. Candidates enriched with semantic targets
+        status, c_data = self._get("/api/mutation-candidates")
+        self.assertEqual(status, 200)
+        cands = c_data.get("data", [])
+        c1 = next(c for c in cands if c["object_id"] == "obj_0001" and c["field"] == "retry")
+        self.assertEqual(c1.get("semantic_name"), "server_inst")
+        self.assertEqual(c1.get("semantic_target"), "server_inst.retry")
+
+        # 4. Mutation enriched with restore_backend, timeout, and hashes
+        status, m_data = self._post("/api/mutation", {"candidate_id": "M001", "timeout_ms": 500})
+        self.assertEqual(status, 200)
+        trans = m_data.get("data", {})
+        self.assertEqual(trans.get("timeout_ms"), 500)
+        self.assertIn("restore_backend", trans)
+        self.assertIn("child_state_hash", trans)
+
+        # 5. Mutation with candidate payload dict
+        status, m_custom = self._post("/api/mutation", {
+            "candidate": {
+                "candidate_id": "M001",
+                "proposed_value": 9
+            },
+            "timeout_ms": 250
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(m_custom.get("data", {}).get("timeout_ms"), 250)
+
+    def test_16_static_assets_and_html_elements(self):
+        # 1. Root index.html
+        req_root = urllib.request.Request(self.base_url + "/")
+        with urllib.request.urlopen(req_root) as resp:
+            self.assertEqual(resp.status, 200)
+            html_str = resp.read().decode("utf-8")
+            self.assertIn("btn-mode-basic", html_str)
+            self.assertIn("btn-mode-advanced", html_str)
+            self.assertIn("modal-mutation-preview", html_str)
+            self.assertIn("card-thread-explorer", html_str)
+            self.assertIn("trans-flow-container", html_str)
+            self.assertIn("exec-timeline-list", html_str)
+            self.assertIn("table-exec-diff", html_str)
+
+        # 2. Static CSS
+        req_css = urllib.request.Request(self.base_url + "/static/app.css")
+        with urllib.request.urlopen(req_css) as resp:
+            self.assertEqual(resp.status, 200)
+            css_text = resp.read().decode("utf-8")
+            self.assertIn(".mode-toggle-group", css_text)
+            self.assertIn(".execution-timeline", css_text)
+            self.assertIn(".flow-card", css_text)
+
+        # 3. Static JS
+        req_js = urllib.request.Request(self.base_url + "/static/app.js")
+        with urllib.request.urlopen(req_js) as resp:
+            self.assertEqual(resp.status, 200)
+            js_text = resp.read().decode("utf-8")
+            self.assertIn("initModeToggle", js_text)
+            self.assertIn("openMutationPreview", js_text)
+            self.assertIn("renderThreads", js_text)
+
 
 if __name__ == "__main__":
     unittest.main()
