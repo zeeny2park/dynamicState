@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gdb \
     python3 \
     gcc \
+    g++ \
     make \
     libc6-dev \
     && rm -rf /var/lib/apt/lists/*

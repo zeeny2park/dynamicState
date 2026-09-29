@@ -8,6 +8,7 @@ __pycache__/
 *.obj
 *.so
 sample
+examples/sample_multithread
 target/collector/dynamicstate-collector
 
 # Temporary build / debug artifacts

@@ -100,6 +100,9 @@ int main() {
             snap = RawMemorySnapshot.load(out_snap_dir)
             self.assertEqual(snap.pid, proc.pid)
             self.assertEqual(snap.status, "COMPLETE")
+            self.assertFalse(snap.mapping_race_detected)
+            self.assertFalse(snap.process_exited)
+            self.assertGreater(snap.process_starttime, 0)
             self.assertGreater(snap.regions_captured, 0)
             self.assertGreater(snap.bytes_captured, 0)
             self.assertIn(snap.architecture, ("aarch64", "x86_64", "arm", "arm64"))
@@ -116,6 +119,17 @@ int main() {
         finally:
             proc.terminate()
             proc.wait()
+
+    def test_04_exited_process_detected(self):
+        out_snap_dir = os.path.join(self.tmp_dir, "snap_dead")
+        # Run against non-existent PID (e.g. 999999)
+        res = subprocess.run(
+            [self.collector_bin, "-p", "999999", "-o", out_snap_dir],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Error:", res.stderr)
 
 
 if __name__ == "__main__":

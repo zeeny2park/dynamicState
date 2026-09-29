@@ -296,3 +296,21 @@ python3 -m extractor server --host 127.0.0.1 --port 8080 --corpus /path/to/corpu
 # 4. Run full test suite including GDB compatibility:
 python3 -m unittest discover tests
 ```
+
+---
+
+## 6. Target-Side Native Collector Hardening & Multithread Branch Isolation
+
+### 6.1. Race Condition Detection in Target-Side Memory Collection
+When capturing memory on live, non-stopped targets without `ptrace`, dynamicState hardens against memory-layout changes:
+1. **Mapping Race Detection (`mapping_race_detected`)**:
+   - Compares memory layout before and after capture (`collector_compare_maps`).
+   - If dynamic `mmap`, `munmap`, or `mprotect` changes permissions, offsets, or ranges during reading, `mapping_race_detected = true` and snapshot status becomes `PARTIAL`.
+2. **Process Lifetime & PID Recycling Check (`process_starttime`)**:
+   - Parses field 22 from `/proc/<pid>/stat` before and after capture.
+   - If the target process exits or is recycled into another process with the same PID, `process_exited = true` and capture aborts cleanly.
+
+### 6.2. Multithread Branch Isolation in Embedded Deployment
+- **Launched Target Programs**: Remote GDB sessions that launch the target with an entry/observation breakpoint support `RESTART` backend, ensuring clean branch isolation across multithreaded mutations.
+- **Attached Target Programs**: Processes attached via `attach <pid>` or `gdbserver --attach` report `branch_isolation.status = "UNAVAILABLE"`, preventing dangerous non-isolated mutations while enabling safe observation (`OBSERVE`, `SNAPSHOT`, `INSPECT_OBJECT`).
+

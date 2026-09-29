@@ -41,6 +41,8 @@ class SemanticObjectOverview:
     total_references: int = 0
     unavailable_fields: int = 0
     hierarchy_preview: List[Dict[str, Any]] = field(default_factory=list)
+    footprint_bytes: Optional[int] = None
+    footprint_status: str = "NOT_AVAILABLE"  # "ESTIMATED", "NOT_AVAILABLE"
 
 
 @dataclass
@@ -71,6 +73,7 @@ class MemorySnapshotSummary:
     objects: SemanticObjectOverview
     quality: SnapshotQuality
     regions: List[Dict[str, Any]] = field(default_factory=list)
+    captured_memory_status: str = "AVAILABLE"  # "AVAILABLE", "NOT_AVAILABLE"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -170,29 +173,23 @@ def build_memory_snapshot_summary(
             "permissions": perms,
         })
 
-    # If CONSISTENT mode with no raw /proc/mem dump, estimate from objects
     persistent = snapshot_data.get("persistent") or {}
     objects_list = persistent.get("objects") or []
-
-    if breakdown.total_captured_bytes == 0 and objects_list:
-        for obj in objects_list:
-            st = (obj.get("storage") or "unknown").lower()
-            obj_size = 32  # baseline struct estimate
-            for f in obj.get("fields", []):
-                obj_size += 8
-            if st == "heap":
-                breakdown.heap_bytes += obj_size
-            elif st == "stack":
-                breakdown.stack_bytes += obj_size
-            elif st == "global":
-                breakdown.global_bytes += obj_size
-            else:
-                breakdown.other_bytes += obj_size
-            breakdown.total_captured_bytes += obj_size
 
     # 2. Semantic Runtime Objects Analysis
     obj_overview = SemanticObjectOverview()
     obj_overview.total_objects = len(objects_list)
+
+    if objects_list:
+        # Separate semantic object footprint from physical captured memory
+        est_footprint = 0
+        for obj in objects_list:
+            est_footprint += 32 + (len(obj.get("fields") or []) * 8)
+        obj_overview.footprint_bytes = est_footprint
+        obj_overview.footprint_status = "ESTIMATED"
+    else:
+        obj_overview.footprint_bytes = None
+        obj_overview.footprint_status = "NOT_AVAILABLE"
 
     for obj in objects_list:
         st = (obj.get("storage") or "unknown").lower()
@@ -259,10 +256,13 @@ def build_memory_snapshot_summary(
     rt_bin = provenance.get("runtime_binary") or {}
     dbg_img = provenance.get("debug_image") or (debug_image_info or {})
 
+    # Strictly search for the authoritative main executable module; NEVER guess modules[0]
+    main_mod = next((m for m in (runtime_modules or []) if m.get("is_main_executable")), None)
+
     arch_raw = (
         snapshot_data.get("architecture")
         or rt_bin.get("architecture")
-        or (runtime_modules[0].get("architecture") if runtime_modules else None)
+        or (main_mod.get("architecture") if main_mod else None)
         or ""
     ).lower()
 
@@ -283,7 +283,7 @@ def build_memory_snapshot_summary(
     elf_class = (
         snapshot_data.get("elf_class")
         or rt_bin.get("elf_class")
-        or (runtime_modules[0].get("elf_class") if runtime_modules else None)
+        or (main_mod.get("elf_class") if main_mod else None)
         or ""
     )
     if elf_class == "ELF64":
@@ -297,7 +297,7 @@ def build_memory_snapshot_summary(
     endian_raw = (
         snapshot_data.get("endianness")
         or rt_bin.get("endianness")
-        or (runtime_modules[0].get("endianness") if runtime_modules else None)
+        or (main_mod.get("endianness") if main_mod else None)
         or ""
     ).lower()
     if endian_raw == "little":
@@ -308,7 +308,7 @@ def build_memory_snapshot_summary(
         quality.endianness = "UNKNOWN"
 
     # Debug image & build ID status
-    build_id = rt_bin.get("build_id") or (runtime_modules[0].get("build_id") if runtime_modules else None)
+    build_id = rt_bin.get("build_id") or (main_mod.get("build_id") if main_mod else None)
     quality.build_id = build_id
     if build_id:
         quality.build_id_status = "MATCHED"
@@ -327,6 +327,7 @@ def build_memory_snapshot_summary(
     quality.module_count = len(runtime_modules) if runtime_modules else (1 if main_binary_path else 0)
 
     overall_status = "COMPLETE" if quality.completeness == "COMPLETE" else "PARTIAL"
+    captured_status = "AVAILABLE" if breakdown.total_captured_bytes > 0 else "NOT_AVAILABLE"
 
     return MemorySnapshotSummary(
         snapshot_id=snap_id,
@@ -339,4 +340,5 @@ def build_memory_snapshot_summary(
         objects=obj_overview,
         quality=quality,
         regions=region_items,
+        captured_memory_status=captured_status,
     )

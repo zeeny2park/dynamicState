@@ -67,6 +67,61 @@ int collector_get_exe_path(pid_t pid, char *buf, size_t buf_size) {
     return -1;
 }
 
+int collector_get_process_starttime(pid_t pid, uint64_t *starttime_out) {
+    if (pid <= 0 || !starttime_out) return -1;
+    char stat_path[128];
+    snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", (int)pid);
+    FILE *fp = fopen(stat_path, "r");
+    if (!fp) {
+        return -1;
+    }
+    char line[4096];
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+
+    char *paren = strrchr(line, ')');
+    if (!paren) return -1;
+
+    char *p = paren + 1;
+    while (*p == ' ' || *p == '\t') p++;
+
+    for (int field = 3; field < 22; field++) {
+        char *space = strchr(p, ' ');
+        if (!space) return -1;
+        p = space + 1;
+        while (*p == ' ' || *p == '\t') p++;
+    }
+
+    char *endptr = NULL;
+    uint64_t st = strtoull(p, &endptr, 10);
+    if (endptr == p) return -1;
+
+    *starttime_out = st;
+    return 0;
+}
+
+int collector_compare_maps(const parsed_region_t *before, int count_before, const parsed_region_t *after, int count_after) {
+    if (!before || !after) return -1;
+    if (count_before != count_after) {
+        return 1;
+    }
+    for (int i = 0; i < count_before; i++) {
+        if (before[i].start != after[i].start ||
+            before[i].end != after[i].end ||
+            before[i].offset != after[i].offset ||
+            before[i].inode != after[i].inode ||
+            strcmp(before[i].perms, after[i].perms) != 0 ||
+            strcmp(before[i].device, after[i].device) != 0 ||
+            strcmp(before[i].pathname, after[i].pathname) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void collector_classify_region(parsed_region_t *r, const char *exe_path) {
     if (!r) return;
     if (strstr(r->pathname, "[heap]")) {
@@ -294,6 +349,15 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     memset(&stats, 0, sizeof(stats));
     stats.page_size = sysconf(_SC_PAGESIZE);
 
+    uint64_t starttime_before = 0;
+    if (collector_get_process_starttime(cfg->pid, &starttime_before) < 0) {
+        stats.process_exited = 1;
+        snprintf(stats.status, sizeof(stats.status), "PROCESS_EXITED");
+        if (stats_out) *stats_out = stats;
+        return -1;
+    }
+    stats.process_starttime = starttime_before;
+
     /* Architecture detection */
     struct utsname uts;
     if (uname(&uts) == 0) {
@@ -479,6 +543,32 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         snprintf(stats.status, sizeof(stats.status), "COMPLETE");
     }
 
+    /* Check process starttime after capture to detect PID recycling / exit */
+    uint64_t starttime_after = 0;
+    if (collector_get_process_starttime(cfg->pid, &starttime_after) < 0 || starttime_after != starttime_before) {
+        stats.process_exited = 1;
+        snprintf(stats.status, sizeof(stats.status), "PROCESS_EXITED");
+    }
+
+    /* Check maps after capture to detect concurrent mmap/munmap/mprotect race */
+    parsed_region_t *regions_after = NULL;
+    int region_count_after = 0;
+    if (collector_parse_maps(cfg->pid, exe_path, &regions_after, &region_count_after) == 0) {
+        int cmp = collector_compare_maps(regions, region_count, regions_after, region_count_after);
+        if (cmp != 0) {
+            stats.mapping_race_detected = 1;
+            if (strcmp(stats.status, "PROCESS_EXITED") != 0) {
+                snprintf(stats.status, sizeof(stats.status), "PARTIAL");
+            }
+        }
+        free(regions_after);
+    } else {
+        stats.mapping_race_detected = 1;
+        if (strcmp(stats.status, "PROCESS_EXITED") != 0) {
+            snprintf(stats.status, sizeof(stats.status), "PARTIAL");
+        }
+    }
+
     /* Write maps.json */
     char maps_json_path[2048];
     snprintf(maps_json_path, sizeof(maps_json_path), "%s/maps.json", out_dir);
@@ -533,6 +623,9 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         fprintf(f_meta, "  \"elf_class\": \"%s\",\n", stats.elf_class);
         fprintf(f_meta, "  \"page_size\": %ld,\n", stats.page_size);
         fprintf(f_meta, "  \"status\": \"%s\",\n", stats.status);
+        fprintf(f_meta, "  \"mapping_race_detected\": %s,\n", stats.mapping_race_detected ? "true" : "false");
+        fprintf(f_meta, "  \"process_exited\": %s,\n", stats.process_exited ? "true" : "false");
+        fprintf(f_meta, "  \"process_starttime\": %llu,\n", (unsigned long long)stats.process_starttime);
         fprintf(f_meta, "  \"capture\": {\n");
         fprintf(f_meta, "    \"backend\": \"%s\",\n", stats.backend_used);
         fprintf(f_meta, "    \"process_stop\": false,\n");

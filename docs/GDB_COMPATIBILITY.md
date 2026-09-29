@@ -82,3 +82,36 @@ _run_native_gdb92_verification (__main__.RealGdb92IntegrationTests)
 Execute the real GDB 9.2 test scenario natively. ... REAL_GDB_9_2_VERIFICATION_PASS
 ok
 ```
+
+---
+
+## 5. Multithread Checkpoint & Branch Isolation across GDB Versions
+
+### 5.1. Ground Truth of GDB's Built-in Checkpoint Command
+GDB's built-in `checkpoint` command relies on the OS `fork()` primitive.
+In GDB source code (`gdb/linux-fork.c`):
+```c
+if (linux_fork_multiple_threads ())
+  error (_("checkpoint: can't checkpoint multiple threads."));
+```
+Because Linux `fork()` duplicates only the calling thread, attempting to fork a multithreaded process drops all background threads, leaving mutexes held by those threads permanently deadlocked in the clone. This restriction exists identically across **GDB 9.2**, **GDB 12**, and **GDB 15**.
+
+### 5.2. Verification Matrix for Multithread Branch Isolation
+
+| Target Type | Restore Backend | GDB 9.2 (Docker) | GDB 15.1 (Host) | Branch Isolation Guarantee |
+| :--- | :--- | :--- | :--- | :--- |
+| **Single-Thread Process** | `GDB_CHECKPOINT` | Verified | Verified | Copy-on-Write fork clone per mutation branch |
+| **Multithread Process (Launched)** | `RESTART` | Verified | Verified | Deterministic restart to observation breakpoint; all threads/TLS/mutexes clean |
+| **Multithread Process (Attached)** | `NONE` | Verified | Verified | Explicitly `UNAVAILABLE`; reports safe alternatives to avoid non-isolated mutations |
+
+### 5.3. Reproducing Multithread Verification in GDB 9.2 Container
+
+```bash
+docker run --rm -v $(pwd):/workspace -w /workspace dynamicstate-gdb92:latest python3 -m unittest tests/test_multithread_exploration.py
+```
+Expected output:
+```
+Ran 9 tests in ...
+OK
+```
+

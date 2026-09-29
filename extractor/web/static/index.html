@@ -656,6 +656,18 @@
             <h4>Autonomous State Space Exploration</h4>
             <p class="text-muted">Executes branch-safe iterative state exploration using checkpoint-restore isolation.</p>
 
+            <div id="explore-isolation-banner" class="alert-banner" style="display: none; margin-top: 14px; margin-bottom: 14px;">
+              <div class="alert-header">
+                <span id="explore-isolation-icon">⚠️</span>
+                <strong id="explore-isolation-title">Branch Isolation Status</strong>
+              </div>
+              <p id="explore-isolation-msg" style="margin: 6px 0 10px 0; font-size: 13px;"></p>
+              <div id="explore-isolation-alternatives" style="display: none;">
+                <span style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-muted);">Recommended Safe Alternatives:</span>
+                <div class="badge-list" id="explore-alternatives-list" style="margin-top: 6px; display: flex; gap: 8px; flex-wrap: wrap;"></div>
+              </div>
+            </div>
+
             <form id="form-explore" style="margin-top: 16px;">
               <div class="form-group">
                 <label for="exp-max-steps">Max Exploration Steps (Safety Limit: 50):</label>
@@ -725,7 +737,10 @@
           <table class="key-value-table">
             <tr><td>Status</td><td id="ov-status" class="mono">DISCONNECTED</td></tr>
             <tr><td>PID</td><td id="ov-pid" class="mono">None</td></tr>
+            <tr><td>Threads</td><td id="ov-threads" class="mono">1</td></tr>
             <tr><td>Observation Mode</td><td id="ov-mode"><span class="badge badge-info">CONSISTENT</span></td></tr>
+            <tr><td>Restore Backend</td><td id="ov-restore-backend" class="mono">GDB_CHECKPOINT</td></tr>
+            <tr><td>Branch Isolation</td><td id="ov-branch-isolation"><span class="badge badge-success">SUPPORTED</span></td></tr>
             <tr><td>Executable</td><td id="ov-binary" class="mono break-all">None</td></tr>
             <tr><td>Debug Image</td><td id="ov-debug-image" class="mono break-all">None</td></tr>
             <tr><td>Debug Artifact Status</td><td id="ov-debug-status"><span class="badge">NOT_AVAILABLE</span></td></tr>

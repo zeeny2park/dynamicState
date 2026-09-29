@@ -158,6 +158,9 @@ class WebApiAdapter:
                 "module_count": len(modules),
                 "state_count": len(self.runtime.corpus.states),
                 "transition_count": len(self.runtime.corpus.transitions),
+                "threads": caps.get("threads", 1),
+                "checkpoint_restore": caps.get("checkpoint_restore", {}),
+                "branch_isolation": caps.get("branch_isolation", {}),
                 "current_checkpoint": list(self.runtime._cached_checkpoints.keys())[-1] if self.runtime._cached_checkpoints else None,
                 "safety_limits": caps.get("limits", {}),
                 "capabilities": caps,
@@ -548,7 +551,8 @@ class WebApiAdapter:
         return {
             "success": False,
             "error": {"code": res.error.code if res.error else "RUNTIME_ERROR",
-                      "message": res.error.message if res.error else "Exploration failed"}
+                      "message": res.error.message if res.error else "Exploration failed"},
+            "data": _to_json_serializable(res.data) if res.data else None
         }
 
 

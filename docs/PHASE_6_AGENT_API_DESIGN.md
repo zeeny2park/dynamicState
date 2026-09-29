@@ -228,12 +228,28 @@ A verified factual finding extracted from a transition without subjective specul
 An explicit categorization of execution issues: `MUTATION_REJECTED`, `APPLICATION_CRASH`, `EXECUTION_TIMEOUT`, `DEBUG_IMAGE_MISMATCH`, or `CAPABILITY_UNSUPPORTED`.
 
 ### 9. Capability
-An explicit declaration of what operations are supported by the active observation mode.
+An explicit declaration of what operations are supported by the active observation mode and target inferior execution model.
 ```json
 {
   "observation_mode": "CONSISTENT",
   "mutation_supported": true,
   "checkpoint_supported": true,
+  "threads": 4,
+  "checkpoint_restore": {
+    "supported": true,
+    "backend": "RESTART",
+    "scope": "MULTITHREAD",
+    "threads": 4,
+    "reason": null
+  },
+  "branch_isolation": {
+    "status": "SUPPORTED",
+    "scope": "MULTITHREAD",
+    "restore_backend": "RESTART",
+    "threads": 4,
+    "reason": null,
+    "safe_alternatives": []
+  },
   "atomic_observation": true
 }
 ```

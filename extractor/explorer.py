@@ -300,6 +300,27 @@ class StateExplorer:
         Enforces the core Phase 4 invariant: every candidate mutation executes
         independently from the exact same parent runtime checkpoint.
         """
+        # Check if branch isolation / checkpoint is supported before attempting
+        caps = self.controller.get_capabilities() if hasattr(self.controller, "get_capabilities") else {}
+        branch_iso = caps.get("branch_isolation") or {}
+        if branch_iso.get("status") == "UNAVAILABLE" or caps.get("checkpoint") is False:
+            threads = caps.get("threads", 1)
+            reason_code = "MULTITHREAD_BRANCH_ISOLATION_UNSUPPORTED" if threads > 1 else "BRANCH_ISOLATION_UNSUPPORTED"
+            return {
+                "status": "UNAVAILABLE",
+                "reason_code": reason_code,
+                "message": branch_iso.get("reason") or "Autonomous exploration requires branch isolation to evaluate mutations independently from a pristine parent state. Branch isolation is unavailable for this inferior.",
+                "threads": threads,
+                "restore_backend": branch_iso.get("restore_backend", "NONE"),
+                "safe_alternatives": branch_iso.get("safe_alternatives") or [
+                    "OBSERVE",
+                    "SNAPSHOT",
+                    "LIST_OBJECTS",
+                    "INSPECT_OBJECT",
+                    "LIST_MUTATION_CANDIDATES"
+                ]
+            }
+
         t_start = time.monotonic()
         self._exploration_counter += 1
         eid = "E{:06d}".format(self._exploration_counter)
@@ -313,7 +334,25 @@ class StateExplorer:
 
         # 1. Capture pristine Parent Runtime Checkpoint
         t_cp_start = time.monotonic()
-        parent_checkpoint = self.controller.checkpoint()
+        try:
+            parent_checkpoint = self.controller.checkpoint()
+        except Exception as exc:
+            threads = caps.get("threads", 1)
+            reason_code = "MULTITHREAD_BRANCH_ISOLATION_UNSUPPORTED" if ("MULTITHREAD" in str(exc) or threads > 1) else "CHECKPOINT_FAILED"
+            return {
+                "status": "UNAVAILABLE",
+                "reason_code": reason_code,
+                "message": str(exc),
+                "threads": threads,
+                "restore_backend": branch_iso.get("restore_backend", "NONE"),
+                "safe_alternatives": [
+                    "OBSERVE",
+                    "SNAPSHOT",
+                    "LIST_OBJECTS",
+                    "INSPECT_OBJECT",
+                    "LIST_MUTATION_CANDIDATES"
+                ]
+            }
         checkpoint_ms = round((time.monotonic() - t_cp_start) * 1000, 3)
 
         # 2. Determine candidates

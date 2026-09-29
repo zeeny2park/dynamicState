@@ -1,0 +1,45 @@
+name: GDB 9.2 Compatibility
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  gdb92-docker:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build GDB 9.2 Docker Image
+        run: |
+          docker build -t dynamicstate-gdb92:latest -f docker/gdb92/Dockerfile .
+
+      - name: Run GDB 9.2 Integration Tests
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace dynamicstate-gdb92:latest python3 tests/integration_gdb92.py --direct
+
+      - name: Run GDB 9.2 Multithread Branch Isolation Tests
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace dynamicstate-gdb92:latest bash -c "
+            g++ -g -O0 -pthread examples/sample_multithread.cpp -o /tmp/sample_mt &&
+            gdb -batch -ex 'file /tmp/sample_mt' -ex 'break observation_checkpoint' -ex 'run' -ex \"python
+          import sys
+          sys.path.insert(0, '/workspace')
+          import gdb
+          from extractor.state_restorer import RestartBasedRestorer, GdbCheckpointRestorer
+          inf = gdb.selected_inferior()
+          assert len(inf.threads()) == 4
+          restorer = RestartBasedRestorer(gdb, breakpoint_spec='observation_checkpoint')
+          cp = restorer.checkpoint('PARENT')
+          gdb.execute('set var g_state.counter = 50')
+          gdb.execute('continue')
+          s1 = gdb.parse_and_eval('g_state')
+          assert int(s1['counter']) == 50
+          restorer.restore(cp)
+          sr1 = gdb.parse_and_eval('g_state')
+          assert int(sr1['counter']) == 10
+          print('GDB_9_2_CI_PASS')
+          \""

@@ -106,6 +106,9 @@ class RawMemorySnapshot:
         "sigstop": False,
         "sigcont": False
     })
+    mapping_race_detected: bool = False
+    process_exited: bool = False
+    process_starttime: int = 0
     modules: List[Dict[str, Any]] = field(default_factory=list)
     output_dir: str = ""
     regions: List[CapturedRegion] = field(default_factory=list)
@@ -124,6 +127,9 @@ class RawMemorySnapshot:
             "elf_class": self.elf_class,
             "page_size": self.page_size,
             "status": self.status,
+            "mapping_race_detected": self.mapping_race_detected,
+            "process_exited": self.process_exited,
+            "process_starttime": self.process_starttime,
             "capture": self.capture,
             "regions": self.regions_captured,
             "regions_requested": self.regions_requested,
@@ -222,6 +228,9 @@ class RawMemorySnapshot:
             elf_class=meta.get("elf_class"),
             page_size=meta.get("page_size", 4096),
             status=meta.get("status", "COMPLETE"),
+            mapping_race_detected=meta.get("mapping_race_detected", False),
+            process_exited=meta.get("process_exited", False),
+            process_starttime=meta.get("process_starttime", 0),
             regions_requested=meta.get("regions_requested", len(regions)),
             regions_captured=meta.get("regions", len(regions)),
             bytes_requested=meta.get("bytes_requested", 0),

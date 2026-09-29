@@ -47,6 +47,9 @@ class RuntimeCapabilities:
     backend: str = "generic"
     observation: Optional[Dict[str, bool]] = None
     memory_snapshot: Optional[Dict[str, bool]] = None
+    checkpoint_restore: Optional[Dict[str, Any]] = None
+    branch_isolation: Optional[Dict[str, Any]] = None
+    threads: int = 1
 
     def __post_init__(self):
         import platform
@@ -124,7 +127,13 @@ class RuntimeController:
         )
 
     def get_capabilities(self) -> Dict[str, Any]:
-        return RuntimeCapabilities().to_dict()
+        return RuntimeCapabilities(
+            checkpoint=True,
+            restore=True,
+            threads=1,
+            checkpoint_restore={"supported": True, "backend": "MOCK", "scope": "MULTITHREAD", "threads": 1, "reason": None},
+            branch_isolation={"status": "SUPPORTED", "scope": "MULTITHREAD", "restore_backend": "MOCK", "threads": 1, "reason": None, "safe_alternatives": []}
+        ).to_dict()
 
     def get_type_info(self, type_name: str) -> Optional[Any]:
         return None
@@ -139,7 +148,8 @@ class RuntimeController:
         raise NotImplementedError
 
     def explore(self, max_steps=10, timeout_ms=1000, corpus_dir="corpus"):
-        raise NotImplementedError
+        from .explorer import StateExplorer
+        return StateExplorer(self, corpus_dir=corpus_dir).run(max_steps=max_steps, timeout_ms=timeout_ms)
 
     def load_debug_image(self, path: str):
         pass
@@ -152,13 +162,19 @@ class RuntimeController:
 
 
 class GdbRuntimeController(RuntimeController):
-    def __init__(self, gdb_module, debug_image_provider=None):
+    def __init__(self, gdb_module, debug_image_provider=None, restorer=None, breakpoint_spec=None):
         self.gdb = gdb_module
         self.debug_image_provider = debug_image_provider
         self.backend = GdbBackend(gdb_module, debug_image_provider=debug_image_provider)
         self.types = TypeResolver(gdb_module)
-        from .state_restorer import GdbCheckpointRestorer
-        self.restorer = GdbCheckpointRestorer(gdb_module)
+        self.is_attached = False
+        self.attached_pid = None
+        self.breakpoint_spec = breakpoint_spec
+        if restorer is not None:
+            self.restorer = restorer
+        else:
+            from .state_restorer import AdaptiveGdbRestorer
+            self.restorer = AdaptiveGdbRestorer(self, breakpoint_spec=breakpoint_spec)
         self.snapshots: Dict[str, RuntimeSnapshot] = {}
         self._counter = 0
         self._transition_counter = 0
@@ -271,6 +287,8 @@ class GdbRuntimeController(RuntimeController):
     def attach(self, pid: int, debug_image: Optional[str] = None):
         try:
             self.gdb.execute("attach {}".format(pid))
+            self.is_attached = True
+            self.attached_pid = pid
         except Exception as exc:
             raise RuntimeError("ATTACH_FAILED: {}".format(exc))
 
@@ -280,25 +298,63 @@ class GdbRuntimeController(RuntimeController):
     def get_capabilities(self) -> Dict[str, Any]:
         thread_count = 1
         try:
-            inf = self.gdb.selected_inferior()
-            thread_count = len(inf.threads())
+            if hasattr(self.gdb, "selected_inferior"):
+                inf = self.gdb.selected_inferior()
+                thread_count = len(inf.threads())
         except Exception:
             pass
+
+        restorer_cap = self.restorer.get_capability(thread_count) if hasattr(self.restorer, "get_capability") else {
+            "supported": True,
+            "backend": "gdb_fork",
+            "scope": "SINGLE_THREAD_ONLY" if thread_count <= 1 else "NONE",
+            "threads": thread_count,
+            "reason": None if thread_count <= 1 else "MULTITHREAD_CHECKPOINT_UNSUPPORTED",
+        }
+
+        can_checkpoint = restorer_cap.get("supported", False)
+        backend_name = restorer_cap.get("backend", "gdb_fork")
+        scope = restorer_cap.get("scope", "SINGLE_THREAD_ONLY")
+
+        branch_status = "SUPPORTED" if can_checkpoint else "UNAVAILABLE"
+        branch_reason = restorer_cap.get("reason")
+        branch_isolation_dict = {
+            "status": branch_status,
+            "scope": scope,
+            "restore_backend": backend_name,
+            "threads": thread_count,
+            "reason": branch_reason,
+            "safe_alternatives": [
+                "OBSERVE",
+                "SNAPSHOT",
+                "LIST_OBJECTS",
+                "INSPECT_OBJECT",
+                "LIST_MUTATION_CANDIDATES"
+            ] if not can_checkpoint else []
+        }
+
+        exploration_mode = "deterministic_single_thread_context" if thread_count <= 1 else (
+            "multi_thread_restart_isolated" if can_checkpoint else "multi_thread_no_isolation"
+        )
+
         return RuntimeCapabilities(
-            checkpoint=True,
-            restore=True,
+            checkpoint=can_checkpoint,
+            restore=can_checkpoint,
             typed_mutation=True,
             semantic_snapshot=True,
             semantic_diff=True,
             state_hash=True,
-            branch_exploration=True,
-            crash_recovery=True,
-            timeout_recovery=True,
+            branch_exploration=can_checkpoint,
+            crash_recovery=can_checkpoint,
+            timeout_recovery=can_checkpoint,
             external_debug_image=True,
-            multi_thread_determinism=False,
+            multi_thread_determinism=(thread_count <= 1),
             external_io_rollback=False,
-            exploration_mode="deterministic_single_thread_context" if thread_count <= 1 else "multi_thread_experimental",
-            backend="gdb_fork"
+            exploration_mode=exploration_mode,
+            backend=backend_name.lower(),
+            threads=thread_count,
+            checkpoint_restore=restorer_cap,
+            branch_isolation=branch_isolation_dict
         ).to_dict()
 
     def get_type_info(self, type_name: str) -> Optional[Any]:

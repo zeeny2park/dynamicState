@@ -172,11 +172,19 @@
     expResTransitions: document.getElementById('exp-res-transitions'),
     expResCrashes: document.getElementById('exp-res-crashes'),
     expResTimeouts: document.getElementById('exp-res-timeouts'),
+    exploreIsolationBanner: document.getElementById('explore-isolation-banner'),
+    exploreIsolationTitle: document.getElementById('explore-isolation-title'),
+    exploreIsolationMsg: document.getElementById('explore-isolation-msg'),
+    exploreIsolationAlternatives: document.getElementById('explore-isolation-alternatives'),
+    exploreAlternativesList: document.getElementById('explore-alternatives-list'),
 
     // Tab 6: System & Provenance
     ovStatus: document.getElementById('ov-status'),
     ovPid: document.getElementById('ov-pid'),
+    ovThreads: document.getElementById('ov-threads'),
     ovMode: document.getElementById('ov-mode'),
+    ovRestoreBackend: document.getElementById('ov-restore-backend'),
+    ovBranchIsolation: document.getElementById('ov-branch-isolation'),
     ovBinary: document.getElementById('ov-binary'),
     ovDebugImage: document.getElementById('ov-debug-image'),
     ovDebugStatus: document.getElementById('ov-debug-status'),
@@ -351,15 +359,50 @@
     el.badgeObsMode.textContent = mode;
     el.badgeObsMode.className = 'mode-badge' + (mode === 'LOW_IMPACT' ? ' low-impact' : '');
 
-    // Show/hide low-impact banner
+    // Show/hide low-impact banner & branch isolation banner
+    const branchIso = data.branch_isolation || {};
+    const threadCount = data.threads || 1;
+    const isIsoSupported = branchIso.status === 'SUPPORTED';
+
     if (mode === 'LOW_IMPACT') {
       el.lowImpactBanner.style.display = 'flex';
+      if (el.exploreIsolationBanner) el.exploreIsolationBanner.style.display = 'none';
       el.btnStartExplore.disabled = true;
       el.btnStartExplore.title = 'Exploration unsupported in LOW_IMPACT mode';
     } else {
       el.lowImpactBanner.style.display = 'none';
-      el.btnStartExplore.disabled = false;
-      el.btnStartExplore.title = '';
+
+      if (el.exploreIsolationBanner) {
+        el.exploreIsolationBanner.style.display = 'block';
+        if (!isIsoSupported) {
+          el.exploreIsolationBanner.className = 'alert-banner alert-warning';
+          if (el.exploreIsolationTitle) el.exploreIsolationTitle.textContent = `Branch Isolation Unavailable (${threadCount} Active Threads)`;
+          if (el.exploreIsolationMsg) {
+            el.exploreIsolationMsg.textContent = branchIso.reason || 
+              `Target process has ${threadCount} threads. Branch isolation is unavailable, preventing independent mutation evaluation from the parent state.`;
+          }
+          if (el.exploreIsolationAlternatives && el.exploreAlternativesList) {
+            el.exploreIsolationAlternatives.style.display = 'block';
+            const alts = branchIso.safe_alternatives || ['OBSERVE', 'SNAPSHOT', 'LIST_OBJECTS', 'INSPECT_OBJECT', 'LIST_MUTATION_CANDIDATES'];
+            el.exploreAlternativesList.innerHTML = alts.map(a => `<span class="badge badge-info" style="cursor: pointer;" onclick="handleAlternativeAction('${a}')">${a}</span>`).join(' ');
+          }
+          el.btnStartExplore.disabled = true;
+          el.btnStartExplore.title = 'Autonomous exploration disabled: Branch isolation unavailable for multithreaded inferior';
+        } else {
+          el.exploreIsolationBanner.className = 'alert-banner alert-success';
+          const backendName = branchIso.restore_backend || 'RESTART';
+          if (el.exploreIsolationTitle) el.exploreIsolationTitle.textContent = `Branch Isolation Active (${backendName} Backend, ${threadCount} Thread${threadCount > 1 ? 's' : ''})`;
+          if (el.exploreIsolationMsg) {
+            el.exploreIsolationMsg.textContent = `Independent sibling mutation execution is fully verified and supported via ${backendName} restore.`;
+          }
+          if (el.exploreIsolationAlternatives) el.exploreIsolationAlternatives.style.display = 'none';
+          el.btnStartExplore.disabled = false;
+          el.btnStartExplore.title = '';
+        }
+      } else {
+        el.btnStartExplore.disabled = false;
+        el.btnStartExplore.title = '';
+      }
     }
 
     el.tagPid.textContent = data.pid ? `PID: ${data.pid}` : 'PID: N/A';
@@ -370,7 +413,12 @@
     // Tab 6: System Overview Cards
     el.ovStatus.textContent = status;
     el.ovPid.textContent = data.pid || 'None';
+    if (el.ovThreads) el.ovThreads.textContent = threadCount;
     el.ovMode.innerHTML = `<span class="badge ${mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info'}">${mode}</span>`;
+    if (el.ovRestoreBackend) el.ovRestoreBackend.textContent = branchIso.restore_backend || 'GDB_CHECKPOINT';
+    if (el.ovBranchIsolation) {
+      el.ovBranchIsolation.innerHTML = `<span class="badge ${isIsoSupported ? 'badge-success' : 'badge-warning'}">${branchIso.status || (isIsoSupported ? 'SUPPORTED' : 'UNAVAILABLE')}</span>`;
+    }
     el.ovBinary.textContent = data.executable || 'None';
     el.ovDebugImage.textContent = data.debug_image || 'None';
     el.ovDebugStatus.innerHTML = `<span class="badge ${data.debug_image_status === 'VERIFIED' ? 'badge-success' : 'badge-neutral'}">${data.debug_image_status || 'NOT_AVAILABLE'}</span>`;
@@ -1384,7 +1432,24 @@
     el.btnStartExplore.disabled = false;
 
     if (!res.success) {
-      showToast(res.error ? res.error.message : 'Exploration loop failed', 'error');
+      const errData = res.data;
+      if (errData && errData.status === 'UNAVAILABLE') {
+        showToast(`Exploration Unavailable: ${res.error ? res.error.message : 'Branch isolation unsupported'}`, 'warning');
+        if (el.exploreIsolationBanner) {
+          el.exploreIsolationBanner.style.display = 'block';
+          el.exploreIsolationBanner.className = 'alert-banner alert-warning';
+          if (el.exploreIsolationTitle) el.exploreIsolationTitle.textContent = `Branch Isolation Unavailable (${errData.threads || 1} Threads)`;
+          if (el.exploreIsolationMsg) el.exploreIsolationMsg.textContent = errData.message || res.error.message;
+          if (el.exploreIsolationAlternatives && el.exploreAlternativesList) {
+            el.exploreIsolationAlternatives.style.display = 'block';
+            const alts = errData.safe_alternatives || ['OBSERVE', 'SNAPSHOT', 'LIST_OBJECTS', 'INSPECT_OBJECT', 'LIST_MUTATION_CANDIDATES'];
+            el.exploreAlternativesList.innerHTML = alts.map(a => `<span class="badge badge-info" style="cursor: pointer;" onclick="handleAlternativeAction('${a}')">${a}</span>`).join(' ');
+          }
+          el.btnStartExplore.disabled = true;
+        }
+      } else {
+        showToast(res.error ? res.error.message : 'Exploration loop failed', 'error');
+      }
       return;
     }
 
@@ -1402,6 +1467,22 @@
     await loadRuntimeOverview();
     await loadStatesAndGraph();
   }
+
+  window.handleAlternativeAction = function(action) {
+    if (action === 'SNAPSHOT' || action === 'OBSERVE') {
+      const tabBtn = document.querySelector('.tab-btn[data-tab="tab-viewer"]');
+      if (tabBtn) tabBtn.click();
+      if (el.btnObserve) el.btnObserve.click();
+    } else if (action === 'LIST_OBJECTS' || action === 'INSPECT_OBJECT') {
+      const tabBtn = document.querySelector('.tab-btn[data-tab="tab-objects"]');
+      if (tabBtn) tabBtn.click();
+    } else if (action === 'LIST_MUTATION_CANDIDATES') {
+      const tabBtn = document.querySelector('.tab-btn[data-tab="tab-advanced"]');
+      if (tabBtn) tabBtn.click();
+      const subBtn = document.querySelector('.subnav-pill[data-subtab="subtab-candidates"]');
+      if (subBtn) subBtn.click();
+    }
+  };
 
   // --------------------------------------------------------------------------
   // Modals & Event Bindings

@@ -57,17 +57,22 @@ typedef struct {
     int64_t capture_start_ns;
     int64_t capture_end_ns;
     double duration_us;
-    char status[32];          /* "COMPLETE", "PARTIAL", "FAILED" */
+    char status[32];          /* "COMPLETE", "PARTIAL", "FAILED", "PROCESS_EXITED" */
     char backend_used[32];    /* "process_vm_readv", "pread" */
     char arch[65];
     char endianness[16];
     char elf_class[16];
     long page_size;
+    int mapping_race_detected;
+    int process_exited;
+    uint64_t process_starttime;
 } collector_stats_t;
 
 void collector_init_config(collector_config_t *cfg);
 int collector_get_exe_path(pid_t pid, char *buf, size_t buf_size);
+int collector_get_process_starttime(pid_t pid, uint64_t *starttime_out);
 int collector_parse_maps(pid_t pid, const char *exe_path, parsed_region_t **regions_out, int *count_out);
+int collector_compare_maps(const parsed_region_t *before, int count_before, const parsed_region_t *after, int count_after);
 void collector_classify_region(parsed_region_t *r, const char *exe_path);
 int collector_filter_regions(parsed_region_t *regions, int count, const collector_config_t *cfg, int *selected_count_out);
 int collector_read_region(pid_t pid, int mem_fd, int backend, uint64_t start, size_t size, void *buf, size_t *bytes_read);

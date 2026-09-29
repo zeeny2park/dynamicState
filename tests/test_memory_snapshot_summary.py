@@ -108,6 +108,67 @@ class TestMemorySnapshotSummary(unittest.TestCase):
         self.assertEqual(summary.quality.build_id_status, "UNAVAILABLE")
         self.assertEqual(summary.status, "COMPLETE")
         self.assertEqual(summary.breakdown.total_captured_bytes, 0)
+        self.assertEqual(summary.captured_memory_status, "NOT_AVAILABLE")
+
+    def test_no_runtime_modules_zero_fallback(self):
+        """Never guess runtime_modules[0] as main executable; require is_main_executable == True."""
+        snapshot = {
+            "snapshot_id": "S_MODULES_TEST",
+            "persistent": {"objects": []},
+        }
+        # Non-main shared libraries
+        modules = [
+            {
+                "name": "libhelper.so",
+                "is_main_executable": False,
+                "architecture": "x86_64",
+                "elf_class": "ELF64",
+                "endianness": "little",
+                "build_id": "fake_helper_build_id"
+            },
+            {
+                "name": "libc.so.6",
+                "is_main_executable": False,
+                "architecture": "x86_64",
+                "elf_class": "ELF64",
+                "endianness": "little",
+                "build_id": "fake_libc_build_id"
+            }
+        ]
+        summary = build_memory_snapshot_summary(snapshot, runtime_modules=modules)
+        # Without is_main_executable == True, must NOT adopt libhelper.so properties
+        self.assertEqual(summary.quality.architecture, "UNKNOWN")
+        self.assertEqual(summary.quality.pointer_width, "UNKNOWN")
+        self.assertEqual(summary.quality.endianness, "UNKNOWN")
+        self.assertEqual(summary.quality.build_id_status, "UNAVAILABLE")
+        self.assertIsNone(summary.quality.build_id)
+
+    def test_separation_of_captured_memory_and_object_footprint(self):
+        """Do not synthesize captured memory from object counts; keep captured memory and footprint distinct."""
+        snapshot = {
+            "snapshot_id": "S_OBJ_TEST",
+            "persistent": {
+                "objects": [
+                    {
+                        "object_id": "obj_01",
+                        "type": "Config",
+                        "storage": "heap",
+                        "fields": [{"name": "f1", "value": 1}, {"name": "f2", "value": 2}]
+                    }
+                ]
+            }
+        }
+        summary = build_memory_snapshot_summary(snapshot)
+        # Captured physical memory must be 0 and NOT_AVAILABLE
+        self.assertEqual(summary.breakdown.total_captured_bytes, 0)
+        self.assertEqual(summary.breakdown.heap_bytes, 0)
+        self.assertEqual(summary.captured_bytes, 0)
+        self.assertEqual(summary.captured_memory_status, "NOT_AVAILABLE")
+
+        # Object footprint is separate
+        self.assertEqual(summary.objects.total_objects, 1)
+        self.assertEqual(summary.objects.footprint_status, "ESTIMATED")
+        self.assertGreater(summary.objects.footprint_bytes, 0)
 
 
 if __name__ == "__main__":

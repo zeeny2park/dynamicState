@@ -680,6 +680,16 @@ class AgentRuntime:
                 timeout_ms=timeout_ms,
                 corpus_dir=self.corpus_dir
             )
+            if isinstance(result, dict) and result.get("status") == "UNAVAILABLE":
+                reason_code = result.get("reason_code", "BRANCH_ISOLATION_UNSUPPORTED")
+                msg = result.get("message", "Branch isolation is unavailable for this target")
+                return AgentActionResult(
+                    success=False,
+                    action="EXPLORE",
+                    error=AgentActionError(code=reason_code, message=msg),
+                    data=result,
+                    performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+                )
             summary = result.get("summary", {})
             agent_result = AgentExplorationResult(
                 exploration_id=result.get("exploration_id", "E001"),
@@ -723,6 +733,9 @@ class AgentRuntime:
                 "crash_recovery": caps.get("crash_recovery", True),
                 "timeout_recovery": caps.get("timeout_recovery", True),
             },
+            "threads": caps.get("threads", 1),
+            "checkpoint_restore": caps.get("checkpoint_restore", {}),
+            "branch_isolation": caps.get("branch_isolation", {}),
             "observation_modes": ["CONSISTENT", "LOW_IMPACT"],
             "observation": caps.get("observation", {
                 "gdb_consistent": True,

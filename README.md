@@ -1,8 +1,8 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `DYNAMICSTATE_HUMAN_CENTRIC_EXPLORER_AND_EMBEDDED_HARDENING_COMPLETE`** — Memory Snapshot Explorer & Embedded Hardening Complete  
-> Verified with 215 Unit/Integration Tests, Subprocess Lifecycle Integration Suite, Real GDB 9.2 Containerized Integration Suite, Native C99 Target Collector Suite, Web API Security Suite, and 24-step End-to-End Acceptance Scenario.
+> **Status: `DYNAMICSTATE_MULTITHREAD_BRANCH_ISOLATION_AND_EXPLORATION_HARDENING_COMPLETE`** — Multithread Checkpoint/Restore & Exploration Hardening Complete  
+> Verified with 229 Unit/Integration Tests, Multithread Branch Isolation Suite, Real GDB 9.2 Containerized Multithread Suite, Subprocess Lifecycle Integration Suite, Native C99 Target Collector Suite (with mapping race & process starttime validation), Web API Security Suite, and 24-step End-to-End Acceptance Scenario.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
@@ -142,21 +142,52 @@ S001
 > [!IMPORTANT]
 > JSON 스냅샷 자체를 프로세스 메모리 복원 수단으로 사용하지 않습니다. 런타임 복원은 전용 `StateRestorer` 인터페이스를 통해 안전하게 수행됩니다.
 
-### 3. Restore Backend & GDB Checkpoint Hardening (`extractor/state_restorer.py`)
+### 3. Restore Backend & Multithread Branch Isolation Hardening (`extractor/state_restorer.py`)
 
-GDB 환경에서 OS Copy-on-Write `fork()` 기반의 체크포인트 엔진(`GdbCheckpointRestorer`)을 구현 및 강화했습니다:
-- **Master Checkpoint**: 부모 상태 지점에서 GDB `checkpoint`로 생성되어 변경 없이 보존되는 기준 프로세스
-- **Worker Clone**: 각 후보 변이 실행 직전에 Master로부터 순간적으로 포크되는 일회용 복제 프로세스
-- **Crash & Timeout Isolation**: 후보 실행 도중 `SIGSEGV` 크래시나 무한 루프(`TIMEOUT`)가 발생하더라도 Master Checkpoint는 무결하게 보존됩니다.
-- **Signal Leakage Prevention**: GDB `signal 0` 재개를 통해 이전 후보에서 발생한 `SIGSEGV`나 인터럽트 신호가 새로 복제된 Worker에 누출되어 즉시 비정상 종료되는 현상을 원천 차단했습니다.
+dynamicState의 핵심 안전성은 **부모 상태 격리(Parent State Isolation)** 에 있습니다.
+```text
+                    Parent State
+                  /      |      \
+        Mutation A   Mutation B   Mutation C
+            ↓            ↓            ↓
+         Child A      Child B      Child C
+```
+각 변이 후보는 이전 후보의 결과나 부작용에 오염되지 않고 항상 깨끗한 동일 부모 상태로부터 독립적으로 실행되어야 합니다.
+
+#### 1) 멀티스레드 GDB Checkpoint의 근본적 제약 (Ground Truth)
+GDB 내장 `checkpoint` 명령은 리눅스 `fork()` 시스템 콜을 사용합니다. GDB 소스 코드(`linux-fork.c`):
+```c
+if (linux_fork_multiple_threads ())
+  error (_("checkpoint: can't checkpoint multiple threads."));
+```
+리눅스 `fork()`는 호출한 단일 스레드만 복제하므로, 멀티스레드 프로세스를 포크하면 다른 모든 워커 스레드가 증발하고 다른 스레드가 획득했던 뮤텍스는 영원히 잠금 상태로 남아 데드락이 발생합니다. 따라서 raw GDB `checkpoint`는 멀티스레드 프로세스에 사용될 수 없습니다.
+
+#### 2) 세 가지 복원 백엔드 (Restore Backends)
+1. **`GDB_CHECKPOINT` (Single-Thread Only)**:
+   - 단일 스레드 프로세스에서 OS Copy-on-Write `fork()` 기반의 고속 스냅샷 제공
+   - 스레드 수가 2개 이상이면 capability에서 `supported=False`, scope=`SINGLE_THREAD_ONLY`로 보고하며, `checkpoint()` 호출 시 `MULTITHREAD_CHECKPOINT_UNSUPPORTED` 예외 발생
+2. **`RESTART` (Multithread Capable)**:
+   - dynamicState가 바이너리로부터 실행(launch)한 멀티스레드 타깃 프로세스에 대해 결정론적 재시작(`run` to observation breakpoint) 기반의 진정한 브랜치 격리 제공
+   - 각 변이 가지 실행 전 관측 중단점까지 프로그램을 재시작하여 모든 스레드, 스택, TLS(Thread-Local Storage), 힙, 동기화 프리미티브를 부모 상태로 완벽히 복원
+   - `SIGSEGV` 크래시 및 타임아웃 발생 후에도 깨끗한 부모 상태 복원 보장 (GDB 15.1 및 GDB 9.2 실측 검증 완료)
+3. **`NONE` (Attached Multithread Targets)**:
+   - 이미 실행 중인 프로세스에 `attach <pid>`로 연결된 멀티스레드 타깃
+   - OS 포크 불가 및 재시작 불가 환경으로, capability에서 `supported=False`, scope=`NONE` 보고
+   - 탐색 시 예외 크래시 대신 `status="UNAVAILABLE"`과 함께 안전한 대안 액션(`OBSERVE`, `SNAPSHOT`, `LIST_OBJECTS`, `INSPECT_OBJECT`, `LIST_MUTATION_CANDIDATES`)을 안내
+
+#### 3) Capability-Aware StateExplorer & Web UI
+- `StateExplorer.run()`은 체크포인트 시도 전 `controller.get_capabilities()`의 `branch_isolation` 상태를 확인하여 격리가 불가능한 환경에서 비정상 종료 없이 즉시 대안을 보고합니다.
+- Web UI의 "Autonomous Exploration" 탭은 타깃의 스레드 수와 브랜치 격리 백엔드를 감지하여, 격리가 불가능한 경우 시각적 경고 배너와 권장 대안 버튼을 제공하고 파괴적인 비격리 실행을 사전에 방지합니다.
+
 - **Explicit Structured Error Codes**:
+  - `MULTITHREAD_CHECKPOINT_UNSUPPORTED`: 멀티스레드 환경에서 fork checkpoint 시도 차단
+  - `MULTITHREAD_BRANCH_ISOLATION_UNSUPPORTED`: 브랜치 격리 미지원으로 인한 탐색 불가
   - `CHECKPOINT_CREATE_FAILED`: GDB 체크포인트 포크 실패
   - `CHECKPOINT_NOT_FOUND`: 요청한 체크포인트 ID가 등록되지 않음
   - `CHECKPOINT_RESTORE_FAILED`: Master 체크포인트 재시작 또는 Worker 복제 실패
   - `CHECKPOINT_RELEASE_FAILED`: 체크포인트 프로세스 해제 실패
   - `CHECKPOINT_STATE_INVALID`: Inferior가 실행 중이거나 디스크립터가 유효하지 않음
   - `CHECKPOINT_LIMIT_REACHED`: 최대 체크포인트 제한(`max_checkpoints`) 초과
-- **Safe Release Cycle**: GDB가 현재 활성 체크포인트 삭제를 거부하는 제약을 처리하기 위해, 삭제 전 Master 또는 루트 프로세스로 컨텍스트를 안전하게 전환 후 Worker와 Master를 순차 해제합니다.
 
 ---
 

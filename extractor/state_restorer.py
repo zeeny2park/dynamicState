@@ -25,11 +25,46 @@ class RuntimeCheckpoint:
 class StateRestorer:
     """Abstract interface for capturing and restoring runtime execution state."""
 
+    def get_capability(self, thread_count: int = 1) -> Dict[str, Any]:
+        return {
+            "supported": True,
+            "backend": "GENERIC",
+            "scope": "MULTITHREAD",
+            "threads": thread_count,
+            "reason": None,
+        }
+
     def checkpoint(self, checkpoint_id: Optional[str] = None) -> RuntimeCheckpoint:
         raise NotImplementedError
 
     def restore(self, checkpoint: RuntimeCheckpoint) -> None:
         raise NotImplementedError
+
+    def release(self, checkpoint: RuntimeCheckpoint) -> None:
+        pass
+
+
+class NullRestorer(StateRestorer):
+    """Null restorer used when inferior cannot support branch isolation."""
+
+    def __init__(self, reason: Optional[str] = None, backend: str = "NONE"):
+        self.reason = reason or "Branch isolation is unavailable for this target."
+        self.backend_name = backend
+
+    def get_capability(self, thread_count: int = 1) -> Dict[str, Any]:
+        return {
+            "supported": False,
+            "backend": self.backend_name,
+            "scope": "NONE",
+            "threads": thread_count,
+            "reason": self.reason,
+        }
+
+    def checkpoint(self, checkpoint_id: Optional[str] = None) -> RuntimeCheckpoint:
+        raise RuntimeError(f"CHECKPOINT_UNSUPPORTED: {self.reason}")
+
+    def restore(self, checkpoint: RuntimeCheckpoint) -> None:
+        raise RuntimeError(f"RESTORE_UNSUPPORTED: {self.reason}")
 
     def release(self, checkpoint: RuntimeCheckpoint) -> None:
         pass
@@ -48,6 +83,15 @@ class MockStateRestorer(StateRestorer):
         self._store: Dict[str, Any] = {}
         self.checkpoints: Dict[str, RuntimeCheckpoint] = {}
         self.restore_count = 0
+
+    def get_capability(self, thread_count: int = 1) -> Dict[str, Any]:
+        return {
+            "supported": True,
+            "backend": "MOCK",
+            "scope": "MULTITHREAD",
+            "threads": thread_count,
+            "reason": None,
+        }
 
     def checkpoint(self, checkpoint_id: Optional[str] = None) -> RuntimeCheckpoint:
         if len(self.checkpoints) >= self.max_checkpoints:
@@ -118,10 +162,41 @@ class GdbCheckpointRestorer(StateRestorer):
                 result[cp_id] = {"current": is_cur, "desc": m.group(3), "line": line_str}
         return result
 
+    def get_capability(self, thread_count: int = 1) -> Dict[str, Any]:
+        if thread_count > 1:
+            return {
+                "supported": False,
+                "backend": "GDB_CHECKPOINT",
+                "scope": "SINGLE_THREAD_ONLY",
+                "threads": thread_count,
+                "reason": f"GDB fork checkpoint cannot checkpoint multiple threads ({thread_count} active threads).",
+            }
+        return {
+            "supported": True,
+            "backend": "GDB_CHECKPOINT",
+            "scope": "SINGLE_THREAD_ONLY",
+            "threads": thread_count,
+            "reason": None,
+        }
+
     def checkpoint(self, checkpoint_id: Optional[str] = None) -> RuntimeCheckpoint:
         """Create a new GDB fork checkpoint."""
         if len(self._checkpoints) >= self.max_checkpoints:
             raise RuntimeError("CHECKPOINT_LIMIT_REACHED: maximum checkpoint limit ({}) exceeded".format(self.max_checkpoints))
+
+        # Thread count validation
+        thread_count = 1
+        try:
+            if hasattr(self.gdb, "selected_inferior"):
+                inf = self.gdb.selected_inferior()
+                thread_count = len(inf.threads())
+        except Exception:
+            pass
+        if thread_count > 1:
+            raise RuntimeError(
+                f"MULTITHREAD_CHECKPOINT_UNSUPPORTED: GDB fork checkpoint cannot checkpoint multiple threads "
+                f"({thread_count} active threads). Forking a multithreaded process drops other threads and deadlocks."
+            )
 
         # Inferior state validation
         try:
@@ -269,4 +344,169 @@ class GdbCheckpointRestorer(StateRestorer):
                     self.gdb.execute("delete checkpoint {}".format(master_id))
                 except Exception:
                     pass
+
+
+class RestartBasedRestorer(StateRestorer):
+    """Deterministic restart-based state restorer for multithreaded targets.
+
+    Provides true branch isolation for multithreaded programs launched by GDB.
+    When restoring, re-runs the program from entry to the observation breakpoint,
+    cleanly resetting all threads, stacks, TLS, and synchronization primitives.
+    """
+
+    def __init__(self, gdb_module, breakpoint_spec: Optional[str] = None):
+        self.gdb = gdb_module
+        self.breakpoint_spec = breakpoint_spec
+        self._counter = 0
+        self._checkpoints: Dict[str, Dict[str, Any]] = {}
+
+    def get_capability(self, thread_count: int = 1) -> Dict[str, Any]:
+        return {
+            "supported": True,
+            "backend": "RESTART",
+            "scope": "MULTITHREAD",
+            "threads": thread_count,
+            "reason": None,
+        }
+
+    def _ensure_breakpoint(self, spec: str):
+        try:
+            self.gdb.execute("set confirm off")
+            self.gdb.execute(f"break {spec}")
+        except Exception:
+            pass
+
+    def _resolve_breakpoint_spec(self) -> str:
+        if self.breakpoint_spec:
+            return self.breakpoint_spec
+        try:
+            frame = self.gdb.selected_frame()
+            name = frame.name()
+            if name:
+                self.breakpoint_spec = name
+                return name
+            sal = frame.find_sal()
+            if sal and sal.symtab and sal.line:
+                self.breakpoint_spec = f"{sal.symtab.filename}:{sal.line}"
+                return self.breakpoint_spec
+            pc = frame.pc()
+            self.breakpoint_spec = f"*{hex(pc)}"
+            return self.breakpoint_spec
+        except Exception:
+            pass
+        return "observation_checkpoint"
+
+    def checkpoint(self, checkpoint_id: Optional[str] = None) -> RuntimeCheckpoint:
+        bp_spec = self._resolve_breakpoint_spec()
+        self._ensure_breakpoint(bp_spec)
+        self._counter += 1
+        cid = checkpoint_id or f"C{self._counter:03d}"
+        self._checkpoints[cid] = {
+            "checkpoint_id": cid,
+            "breakpoint": bp_spec,
+            "created_at": time.time(),
+        }
+        return RuntimeCheckpoint(
+            checkpoint_id=cid,
+            backend="restart",
+            metadata={"breakpoint": bp_spec}
+        )
+
+    def restore(self, checkpoint: RuntimeCheckpoint) -> None:
+        if checkpoint is None or not hasattr(checkpoint, "checkpoint_id"):
+            raise RuntimeError("CHECKPOINT_STATE_INVALID: checkpoint descriptor is required")
+        cid = checkpoint.checkpoint_id
+        if cid not in self._checkpoints:
+            raise RuntimeError(f"CHECKPOINT_NOT_FOUND: checkpoint '{cid}' not found")
+        bp_spec = self._checkpoints[cid].get("breakpoint") or self._resolve_breakpoint_spec()
+        self._ensure_breakpoint(bp_spec)
+        try:
+            self.gdb.execute("set confirm off")
+            self.gdb.execute("run")
+        except Exception as exc:
+            raise RuntimeError(f"CHECKPOINT_RESTORE_FAILED: restart failed: {exc}")
+
+    def release(self, checkpoint: RuntimeCheckpoint) -> None:
+        if checkpoint is None or not hasattr(checkpoint, "checkpoint_id"):
+            return
+        self._checkpoints.pop(checkpoint.checkpoint_id, None)
+
+
+class AdaptiveGdbRestorer(StateRestorer):
+    """Adaptive restorer that routes between GdbCheckpointRestorer, RestartBasedRestorer, and NullRestorer."""
+
+    def __init__(self, controller, breakpoint_spec: Optional[str] = None):
+        self.controller = controller
+        self.gdb = getattr(controller, "gdb", controller)
+        self.breakpoint_spec = breakpoint_spec
+        self._fork_restorer = GdbCheckpointRestorer(self.gdb)
+        self._restart_restorer = RestartBasedRestorer(self.gdb, breakpoint_spec=breakpoint_spec)
+
+    def _get_active_restorer(self, thread_count: int) -> StateRestorer:
+        is_attached = getattr(self.controller, "is_attached", False)
+        if is_attached:
+            if thread_count > 1:
+                return NullRestorer(
+                    reason="Attached multithreaded target: GDB cannot fork multiple threads and restart is unavailable."
+                )
+            return self._fork_restorer
+        else:
+            if thread_count > 1:
+                return self._restart_restorer
+            return self._fork_restorer
+
+    def get_capability(self, thread_count: int = 1) -> Dict[str, Any]:
+        restorer = self._get_active_restorer(thread_count)
+        return restorer.get_capability(thread_count)
+
+    def checkpoint(self, checkpoint_id: Optional[str] = None) -> RuntimeCheckpoint:
+        thread_count = 1
+        try:
+            if hasattr(self.gdb, "selected_inferior"):
+                inf = self.gdb.selected_inferior()
+                thread_count = len(inf.threads())
+        except Exception:
+            pass
+        restorer = self._get_active_restorer(thread_count)
+        return restorer.checkpoint(checkpoint_id=checkpoint_id)
+
+    def restore(self, checkpoint: RuntimeCheckpoint) -> None:
+        if checkpoint is None or not hasattr(checkpoint, "backend"):
+            raise RuntimeError("CHECKPOINT_STATE_INVALID: valid checkpoint descriptor required")
+        if checkpoint.backend == "restart":
+            self._restart_restorer.restore(checkpoint)
+        elif checkpoint.backend in ("gdb_fork", "GDB_CHECKPOINT"):
+            self._fork_restorer.restore(checkpoint)
+        else:
+            thread_count = 1
+            try:
+                if hasattr(self.gdb, "selected_inferior"):
+                    inf = self.gdb.selected_inferior()
+                    thread_count = len(inf.threads())
+            except Exception:
+                pass
+            restorer = self._get_active_restorer(thread_count)
+            restorer.restore(checkpoint)
+
+    def release(self, checkpoint: RuntimeCheckpoint) -> None:
+        if checkpoint is None or not hasattr(checkpoint, "backend"):
+            return
+        if checkpoint.backend == "restart":
+            self._restart_restorer.release(checkpoint)
+        else:
+            self._fork_restorer.release(checkpoint)
+
+
+def create_restorer(controller_or_gdb, mode: str = "auto", breakpoint_spec: Optional[str] = None) -> StateRestorer:
+    if mode == "mock":
+        return MockStateRestorer()
+    gdb_mod = getattr(controller_or_gdb, "gdb", controller_or_gdb)
+    if mode == "restart":
+        return RestartBasedRestorer(gdb_mod, breakpoint_spec=breakpoint_spec)
+    if mode == "gdb_checkpoint":
+        return GdbCheckpointRestorer(gdb_mod)
+    if mode == "null":
+        return NullRestorer()
+    return AdaptiveGdbRestorer(controller_or_gdb, breakpoint_spec=breakpoint_spec)
+
 
