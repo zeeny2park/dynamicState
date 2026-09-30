@@ -518,8 +518,8 @@ class RestartBasedRestorer(StateRestorer):
         return {
             "kind": "BREAKPOINT",
             "spec": bp_spec,
-            "function": func_name or bp_spec,
-            "location": location or func_name or bp_spec,
+            "function": func_name,
+            "location": location,
             "pc": pc_hex,
             "expected_thread_count": thread_count,
         }

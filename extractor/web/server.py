@@ -4,6 +4,7 @@ Strictly wraps AgentRuntime without duplicating semantics, executing arbitrary s
 or making silent target architecture assumptions.
 """
 
+from collections import deque
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import http.server
@@ -61,6 +62,71 @@ def _is_field_mutable(ftype: Any) -> str:
     return "unsupported"
 
 
+def _build_semantic_paths(roots: List[Any], objects: List[Any]) -> Tuple[Dict[str, List[str]], Dict[str, Dict[str, Any]]]:
+    """Build hierarchical semantic paths for all objects reachable from roots.
+    
+    Returns:
+      (obj_paths: Dict[str, List[str]], root_info: Dict[str, Dict[str, Any]])
+    cycle-safe BFS graph traversal.
+    """
+    obj_paths: Dict[str, List[str]] = {}
+    obj_lookup: Dict[str, Dict[str, Any]] = {}
+    for o in objects:
+        o_dict = o if isinstance(o, dict) else (o.to_dict() if hasattr(o, "to_dict") else asdict(o))
+        oid = o_dict.get("object_id")
+        if oid:
+            obj_lookup[oid] = o_dict
+            obj_paths[oid] = []
+
+    # Map roots
+    root_info: Dict[str, Dict[str, Any]] = {}
+    for idx, r in enumerate(roots):
+        r_dict = r if isinstance(r, dict) else (r.to_dict() if hasattr(r, "to_dict") else asdict(r))
+        oref = r_dict.get("object_ref")
+        rname = r_dict.get("name") or f"Root_{idx+1}"
+        if oref and oref in obj_lookup:
+            root_info[oref] = r_dict
+            if rname not in obj_paths[oref]:
+                obj_paths[oref].append(rname)
+        elif idx < len(objects):
+            target_oid = objects[idx].get("object_id") if isinstance(objects[idx], dict) else getattr(objects[idx], "object_id", None)
+            if target_oid and target_oid in obj_lookup and target_oid not in root_info:
+                root_info[target_oid] = r_dict
+                if rname not in obj_paths[target_oid]:
+                    obj_paths[target_oid].append(rname)
+
+    # Queue of (current_oid, current_path, visited_oids_on_branch)
+    queue: deque = deque()
+    for oid, paths in obj_paths.items():
+        for p in paths:
+            queue.append((oid, p, {oid}))
+
+    # BFS expand references
+    while queue:
+        curr_oid, curr_path, branch_visited = queue.popleft()
+        curr_obj = obj_lookup.get(curr_oid)
+        if not curr_obj:
+            continue
+
+        for f in curr_obj.get("fields", []):
+            f_dict = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
+            ref_oid = f_dict.get("object_ref")
+            fname = f_dict.get("name")
+            if ref_oid and fname and ref_oid in obj_lookup:
+                child_path = f"{curr_path}.{fname}"
+                if ref_oid not in obj_paths:
+                    obj_paths[ref_oid] = []
+                if child_path not in obj_paths[ref_oid]:
+                    obj_paths[ref_oid].append(child_path)
+                # Cycle prevention: only traverse deeper if ref_oid was not already visited along this branch
+                if ref_oid not in branch_visited and len(branch_visited) < 32:
+                    new_visited = set(branch_visited)
+                    new_visited.add(ref_oid)
+                    queue.append((ref_oid, child_path, new_visited))
+
+    return obj_paths, root_info
+
+
 class WebApiAdapter:
     """Thin adapter mapping REST endpoints to AgentRuntime methods."""
 
@@ -79,7 +145,24 @@ class WebApiAdapter:
     def get_capabilities(self) -> Dict[str, Any]:
         res = self.runtime.capabilities()
         if res.success:
-            return {"success": True, "data": _to_json_serializable(res.data)}
+            data = _to_json_serializable(res.data)
+            if isinstance(data, dict):
+                limits = data.get("limits") or {}
+                mutation = data.get("mutation") or {}
+                default_timeout = (
+                    mutation.get("default_timeout_ms")
+                    or limits.get("default_timeout_ms")
+                    or data.get("default_timeout_ms")
+                    or 1000
+                )
+                if isinstance(mutation, dict):
+                    mutation["default_timeout_ms"] = default_timeout
+                    data["mutation"] = mutation
+                if isinstance(limits, dict):
+                    limits["default_timeout_ms"] = default_timeout
+                    data["limits"] = limits
+                data["default_timeout_ms"] = default_timeout
+            return {"success": True, "data": data}
         return {
             "success": False,
             "error": {"code": res.error.code if res.error else "RUNTIME_ERROR",
@@ -165,14 +248,19 @@ class WebApiAdapter:
         mem_summary_res = self.runtime.get_memory_summary()
         mem_summary = _to_json_serializable(mem_summary_res.data) if mem_summary_res.success else None
 
-        # Observation point resolution (Strictly honest: never fabricate placeholders)
+        # Observation point resolution (Strictly honest: never fabricate placeholders or duplicate spec)
         observation_point = None
         if self.runtime._cached_checkpoints:
             last_cp = list(self.runtime._cached_checkpoints.values())[-1]
             if getattr(last_cp, "observation_point", None):
                 op = last_cp.observation_point
                 if isinstance(op, dict) and op.get("spec") not in (None, "", "observation_checkpoint"):
-                    observation_point = op
+                    observation_point = {
+                        "kind": op.get("kind", "BREAKPOINT"),
+                        "spec": op.get("spec"),
+                        "function": op.get("function"),
+                        "location": op.get("location"),
+                    }
 
         if not observation_point and ctrl:
             bp_spec = getattr(ctrl, "breakpoint_spec", None)
@@ -182,14 +270,15 @@ class WebApiAdapter:
                 elif hasattr(ctrl.restorer, "_restart_restorer") and getattr(ctrl.restorer._restart_restorer, "breakpoint_spec", None):
                     bp_spec = ctrl.restorer._restart_restorer.breakpoint_spec
             if bp_spec and bp_spec != "observation_checkpoint":
+                # Honest: Never duplicate spec into function or location
                 observation_point = {
                     "kind": "BREAKPOINT",
                     "spec": bp_spec,
-                    "function": bp_spec,
-                    "location": bp_spec,
+                    "function": None,
+                    "location": None,
                 }
 
-        # Threads detail resolution from latest snapshot (Honest: never fabricate thread names)
+        # Threads detail resolution from latest snapshot (Honest: never fabricate thread names or locations)
         threads_detail = []
         snap, _ = self.runtime._resolve_snapshot(None)
         if snap:
@@ -210,7 +299,7 @@ class WebApiAdapter:
                     "name": t_name if t_name else None,
                     "state": th_dict.get("state", "STOPPED"),
                     "function": top_fn if top_fn and top_fn != "<unknown>" else None,
-                    "location": top_loc if top_loc and top_loc != "<unknown>" else (f"{top_fn}()" if top_fn and top_fn != "<unknown>" else None),
+                    "location": top_loc if top_loc and top_loc != "<unknown>" else None,
                     "frame_depth": len(frames),
                 })
             if not observation_point and threads_detail and threads_detail[0].get("function"):
@@ -221,7 +310,7 @@ class WebApiAdapter:
                         "kind": "FRAME",
                         "spec": fn,
                         "function": fn,
-                        "location": loc or f"{fn}()",
+                        "location": loc,
                     }
 
         # Fallback to inferior thread inspection if live GDB inferior
@@ -260,15 +349,37 @@ class WebApiAdapter:
                     "frame_depth": 1,
                 })
 
-        # Capability vs Verification distinctions
+        # Capability vs Verification distinctions (Strictly honest: never infer verification without provenance)
         branch_iso = caps.get("branch_isolation", {})
         cp_restore = caps.get("checkpoint_restore", {})
         det_status = cp_restore.get("determinism_status") or branch_iso.get("determinism_status") or "UNKNOWN"
-        is_det_verified = (det_status == "VERIFIED")
+        is_det_verified = bool(det_status == "VERIFIED" or cp_restore.get("verified") or branch_iso.get("determinism_verified"))
         branch_iso_cap = branch_iso.get("status", "UNAVAILABLE")
-        branch_iso_verified = is_det_verified or (branch_iso_cap == "SUPPORTED" and caps.get("threads", 1) == 1)
+        # STRICT: branch isolation verification requires explicit verification execution provenance
+        branch_iso_verified = bool(branch_iso.get("verified", False))
+        branch_iso_source = branch_iso.get("verification_source", None)
+
+        branch_iso_dict = dict(branch_iso)
+        branch_iso_dict["capability"] = branch_iso_cap
+        branch_iso_dict["verified"] = branch_iso_verified
+        branch_iso_dict["verification_source"] = branch_iso_source
+        if "status" not in branch_iso_dict:
+            branch_iso_dict["status"] = branch_iso_cap
+
+        det_cap = "SUPPORTED" if (branch_iso_cap in ("SUPPORTED", "CONDITIONAL") or caps.get("checkpoint")) else "UNAVAILABLE"
+        det_dict = {
+            "capability": det_cap,
+            "verified": is_det_verified,
+            "status": det_status,
+        }
+
         limits = caps.get("limits", {})
-        default_timeout = limits.get("default_timeout_ms", 1000)
+        default_timeout = (
+            caps.get("mutation", {}).get("default_timeout_ms")
+            or limits.get("default_timeout_ms")
+            or caps.get("default_timeout_ms")
+            or 1000
+        )
 
         return {
             "success": True,
@@ -290,10 +401,12 @@ class WebApiAdapter:
                 "threads_detail": threads_detail,
                 "observation_point": observation_point,
                 "checkpoint_restore": cp_restore,
-                "branch_isolation": branch_iso,
+                "branch_isolation": branch_iso_dict,
                 "branch_isolation_capability": branch_iso_cap,
                 "branch_isolation_verified": branch_iso_verified,
-                "determinism_capability": "SUPPORTED" if branch_iso_cap == "SUPPORTED" else "UNAVAILABLE",
+                "branch_isolation_source": branch_iso_source,
+                "determinism": det_dict,
+                "determinism_capability": det_cap,
                 "determinism_verified": is_det_verified,
                 "determinism_status": det_status,
                 "default_timeout_ms": default_timeout,
@@ -400,29 +513,8 @@ class WebApiAdapter:
         roots = persistent.get("roots", [])
         objects = persistent.get("objects", [])
 
-        # Build root mapping (object_ref -> root)
-        root_map: Dict[str, Dict[str, Any]] = {}
-        for idx, r in enumerate(roots):
-            r_dict = r if isinstance(r, dict) else (r.to_dict() if hasattr(r, "to_dict") else asdict(r))
-            oref = r_dict.get("object_ref")
-            if oref:
-                root_map[oref] = r_dict
-            elif idx < len(objects):
-                fallback_oid = objects[idx].get("object_id") if isinstance(objects[idx], dict) else getattr(objects[idx], "object_id", None)
-                if fallback_oid and fallback_oid not in root_map:
-                    root_map[fallback_oid] = r_dict
-
-        # Build parent reference map (object_ref -> parent_path)
-        parent_ref_map: Dict[str, str] = {}
-        for o in objects:
-            o_dict = o if isinstance(o, dict) else (o.to_dict() if hasattr(o, "to_dict") else asdict(o))
-            oid = o_dict.get("object_id")
-            p_name = root_map.get(oid, {}).get("name") or _clean_type_name(o_dict.get("type", ""))
-            for f in o_dict.get("fields", []):
-                f_dict = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
-                ref = f_dict.get("object_ref")
-                if ref and ref not in parent_ref_map:
-                    parent_ref_map[ref] = f"{p_name}.{f_dict.get('name')}"
+        # Build hierarchical semantic paths from roots
+        obj_paths, root_map = _build_semantic_paths(roots, objects)
 
         # Compute outgoing and incoming counts
         outgoing_counts: Dict[str, int] = {}
@@ -446,36 +538,46 @@ class WebApiAdapter:
             raw_type = o_dict.get("type", "Unknown")
             cleaned_type = _clean_type_name(raw_type)
 
-            semantic_name = None
-            if oid in root_map:
-                semantic_name = root_map[oid].get("name")
-            elif oid in parent_ref_map:
-                semantic_name = parent_ref_map[oid]
-            else:
-                semantic_name = cleaned_type
+            paths = obj_paths.get(oid, [])
+            primary_path = paths[0] if paths else None
+            additional_paths = paths[1:] if len(paths) > 1 else []
+            semantic_path = primary_path or root_map.get(oid, {}).get("name") or cleaned_type
+            semantic_name = semantic_path
 
             enriched_fields = []
             for f in o_dict.get("fields", []):
                 f_dict = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
+                fname = f_dict.get("name")
+                fpath = f"{semantic_path}.{fname}" if fname else semantic_path
                 enriched_fields.append({
-                    "name": f_dict.get("name"),
+                    "name": fname,
                     "type": f_dict.get("type"),
                     "cleaned_type": _clean_type_name(f_dict.get("type", "")),
                     "value": self.runtime._sanitize_field_value(f_dict),
                     "object_ref": f_dict.get("object_ref"),
                     "mutability": _is_field_mutable(f_dict.get("type", "")),
                     "address": f_dict.get("address"),
+                    "semantic_path": fpath,
                 })
+
+            addr = o_dict.get("address")
+            identity_str = f"{cleaned_type}@{addr}" if addr else f"{cleaned_type}:{oid}"
 
             enriched_objects.append({
                 "object_id": oid,
                 "type": raw_type,
                 "cleaned_type": cleaned_type,
+                "canonical_type": cleaned_type,
                 "semantic_name": semantic_name or oid,
+                "semantic_path": semantic_path,
+                "primary_path": primary_path,
+                "paths": paths,
+                "additional_paths": additional_paths,
+                "identity": identity_str,
                 "root_name": root_map.get(oid, {}).get("name"),
                 "root_source": root_map.get(oid, {}).get("source") or ("Root Variable" if oid in root_map else None),
                 "storage": o_dict.get("storage", "unknown"),
-                "address": o_dict.get("address"),
+                "address": addr,
                 "thread_id": o_dict.get("thread_id"),
                 "frame_level": o_dict.get("frame_level"),
                 "fields": enriched_fields,
@@ -483,7 +585,7 @@ class WebApiAdapter:
                 "outgoing_count": outgoing_counts.get(oid, 0),
                 "incoming_count": incoming_counts.get(oid, 0),
                 "reference_count": outgoing_counts.get(oid, 0) + incoming_counts.get(oid, 0),
-                "identity_hint": f"{raw_type}:{oid}",
+                "identity_hint": identity_str,
             })
 
         return {"success": True, "data": enriched_objects}
@@ -501,6 +603,7 @@ class WebApiAdapter:
             raw_type = data.get("type", "Unknown")
             cleaned_type = _clean_type_name(raw_type)
             data["cleaned_type"] = cleaned_type
+            data["canonical_type"] = cleaned_type
 
             snap, _ = self.runtime._resolve_snapshot(snapshot_id)
             if snap:
@@ -509,7 +612,13 @@ class WebApiAdapter:
                 persistent = snap_dict.get("persistent") or s_inner.get("persistent") or {}
                 roots = persistent.get("roots", [])
                 raw_objs = persistent.get("objects", [])
-                root_item = next((r for r in roots if (r.get("object_ref") if isinstance(r, dict) else getattr(r, "object_ref", None)) == object_id), None)
+
+                obj_paths, root_map = _build_semantic_paths(roots, raw_objs)
+                paths = obj_paths.get(object_id, [])
+                primary_path = paths[0] if paths else None
+                additional_paths = paths[1:] if len(paths) > 1 else []
+
+                root_item = root_map.get(object_id)
                 if not root_item and roots and raw_objs:
                     for idx, r in enumerate(roots):
                         if idx < len(raw_objs):
@@ -518,21 +627,30 @@ class WebApiAdapter:
                                 root_item = r
                                 break
 
+                semantic_path = primary_path or (root_item.get("name") if root_item else cleaned_type)
+                data["semantic_name"] = semantic_path
+                data["semantic_path"] = semantic_path
+                data["primary_path"] = primary_path
+                data["paths"] = paths
+                data["additional_paths"] = additional_paths
+
                 if root_item:
                     r_name = root_item.get("name") if isinstance(root_item, dict) else getattr(root_item, "name", None)
                     data["root_name"] = r_name
-                    data["semantic_name"] = r_name
                     data["root_source"] = root_item.get("source") if isinstance(root_item, dict) else getattr(root_item, "source", "Root Variable")
-                else:
-                    data["semantic_name"] = cleaned_type
 
                 raw_obj = next((o for o in raw_objs if (o.get("object_id") if isinstance(o, dict) else getattr(o, "object_id", None)) == object_id), None)
                 if raw_obj:
                     o_dict = raw_obj if isinstance(raw_obj, dict) else (raw_obj.to_dict() if hasattr(raw_obj, "to_dict") else asdict(raw_obj))
-                    data["address"] = o_dict.get("address")
+                    addr = o_dict.get("address")
+                    data["address"] = addr
+                    data["identity"] = f"{cleaned_type}@{addr}" if addr else f"{cleaned_type}:{object_id}"
                     data["thread_id"] = o_dict.get("thread_id")
                     data["frame_level"] = o_dict.get("frame_level")
                     data["storage"] = o_dict.get("storage", "unknown")
+                else:
+                    addr = data.get("address")
+                    data["identity"] = f"{cleaned_type}@{addr}" if addr else f"{cleaned_type}:{object_id}"
 
                 # Compute Outgoing and Incoming references
                 outgoing_refs = []
@@ -570,10 +688,19 @@ class WebApiAdapter:
                 data["reference_count"] = len(outgoing_refs) + len(incoming_refs)
             else:
                 data["semantic_name"] = cleaned_type
+                data["semantic_path"] = cleaned_type
+                data["primary_path"] = cleaned_type
+                data["paths"] = [cleaned_type]
+                data["additional_paths"] = []
+                addr = data.get("address")
+                data["identity"] = f"{cleaned_type}@{addr}" if addr else f"{cleaned_type}:{object_id}"
 
-            # Enrich fields with mutability and cleaned_type
+            # Enrich fields with mutability, cleaned_type, and semantic_path
+            sem_base = data.get("semantic_path") or data.get("semantic_name") or cleaned_type
             for f in data.get("fields", []):
                 if isinstance(f, dict):
+                    fname = f.get("name")
+                    f["semantic_path"] = f"{sem_base}.{fname}" if fname else sem_base
                     if "mutability" not in f:
                         f["mutability"] = _is_field_mutable(f.get("type", ""))
                     if "cleaned_type" not in f:
@@ -687,17 +814,7 @@ class WebApiAdapter:
                 persistent = snap_dict.get("persistent") or s_inner.get("persistent") or {}
                 roots = persistent.get("roots", [])
                 raw_objs = persistent.get("objects", [])
-                root_names = {}
-                for idx, r in enumerate(roots):
-                    r_dict = r if isinstance(r, dict) else (r.to_dict() if hasattr(r, "to_dict") else asdict(r))
-                    oref = r_dict.get("object_ref")
-                    rname = r_dict.get("name")
-                    if oref and rname:
-                        root_names[oref] = rname
-                    elif idx < len(raw_objs):
-                        f_oid = raw_objs[idx].get("object_id") if isinstance(raw_objs[idx], dict) else getattr(raw_objs[idx], "object_id", None)
-                        if f_oid and rname and f_oid not in root_names:
-                            root_names[f_oid] = rname
+                obj_paths, root_map = _build_semantic_paths(roots, raw_objs)
 
                 obj_types = {}
                 for o in raw_objs:
@@ -709,9 +826,12 @@ class WebApiAdapter:
 
                 for c in candidates:
                     oid = c.get("object_id")
-                    sem_name = root_names.get(oid) or obj_types.get(oid) or oid
-                    c["semantic_name"] = sem_name
-                    c["semantic_target"] = f"{sem_name}.{c.get('field')}"
+                    paths = obj_paths.get(oid, [])
+                    sem_path = paths[0] if paths else (root_map.get(oid, {}).get("name") or obj_types.get(oid) or oid)
+                    c["semantic_name"] = sem_path
+                    c["primary_path"] = sem_path
+                    c["paths"] = paths
+                    c["semantic_target"] = f"{sem_path}.{c.get('field')}"
 
         return {"success": True, "data": candidates}
 
@@ -846,7 +966,15 @@ class WebApiAdapter:
                 "candidate_id": cand,
                 "proposed_value": params.get("proposed_value") if "proposed_value" in params else params.get("value")
             }
-        timeout_ms = int(params.get("timeout_ms", 1000))
+        caps_res = self.runtime.capabilities()
+        caps_data = caps_res.data if caps_res.success else {}
+        backend_default_timeout = (
+            caps_data.get("mutation", {}).get("default_timeout_ms")
+            or caps_data.get("limits", {}).get("default_timeout_ms")
+            or caps_data.get("default_timeout_ms")
+            or 1000
+        )
+        timeout_ms = int(params.get("timeout_ms", backend_default_timeout))
         res = self.runtime.execute_transition(candidate=cand, timeout_ms=timeout_ms)
         if res.success:
             data = _to_json_serializable(res.data)
@@ -862,18 +990,38 @@ class WebApiAdapter:
                     if not data.get("state_hash"):
                         data["state_hash"] = c_meta.get("state_hash")
 
-                caps_res = self.runtime.capabilities()
-                caps_data = caps_res.data if caps_res.success else {}
                 cp_res = caps_data.get("checkpoint_restore", {})
                 branch_iso = caps_data.get("branch_isolation", {})
                 det_status = cp_res.get("determinism_status") or branch_iso.get("determinism_status") or "UNKNOWN"
+                branch_iso_cap = branch_iso.get("status", "UNAVAILABLE")
+                branch_iso_verified = bool(branch_iso.get("verified", False))
+                branch_iso_source = branch_iso.get("verification_source", None)
+                is_det_verified = bool(det_status == "VERIFIED" or cp_res.get("verified") or branch_iso.get("determinism_verified"))
+
+                branch_iso_dict = dict(branch_iso)
+                branch_iso_dict["capability"] = branch_iso_cap
+                branch_iso_dict["verified"] = branch_iso_verified
+                branch_iso_dict["verification_source"] = branch_iso_source
+                if "status" not in branch_iso_dict:
+                    branch_iso_dict["status"] = branch_iso_cap
+
+                det_cap = "SUPPORTED" if (branch_iso_cap in ("SUPPORTED", "CONDITIONAL") or caps_data.get("checkpoint")) else "UNAVAILABLE"
+                det_dict = {
+                    "capability": det_cap,
+                    "verified": is_det_verified,
+                    "status": det_status,
+                }
 
                 data["restore_backend"] = cp_res.get("backend", "RESTART" if caps_data.get("threads", 1) > 1 else "GDB_CHECKPOINT")
                 data["timeout_ms"] = timeout_ms
-                data["branch_isolation_capability"] = branch_iso.get("status", "UNAVAILABLE")
-                data["branch_isolation_verified"] = (det_status == "VERIFIED") or (data["branch_isolation_capability"] == "SUPPORTED" and caps_data.get("threads", 1) == 1)
+                data["branch_isolation"] = branch_iso_dict
+                data["branch_isolation_capability"] = branch_iso_cap
+                data["branch_isolation_verified"] = branch_iso_verified
+                data["branch_isolation_source"] = branch_iso_source
+                data["determinism"] = det_dict
+                data["determinism_capability"] = det_cap
                 data["determinism_status"] = det_status
-                data["determinism_verified"] = (det_status == "VERIFIED")
+                data["determinism_verified"] = is_det_verified
             return {"success": True, "data": data}
         return {
             "success": False,
@@ -1044,6 +1192,14 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_state_memory_summary(state_id))
                 return
 
+            # GET /api/states/{state_id}/objects/{object_id}
+            m_state_obj = re.match(r"^/api/states/([^/]+)/objects/([^/]+)$", path)
+            if m_state_obj:
+                state_id = m_state_obj.group(1)
+                object_id = m_state_obj.group(2)
+                self._send_json(adapter.inspect_object(object_id, snapshot_id=state_id))
+                return
+
             # GET /api/states/{state_id}/objects
             m_state_objs = re.match(r"^/api/states/([^/]+)/objects$", path)
             if m_state_objs:
@@ -1103,8 +1259,8 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_snapshot(snapshot_id))
                 return
 
-            # GET /api/mutation-candidates
-            if path == "/api/mutation-candidates":
+            # GET /api/mutation-candidates or /api/mutation/candidates
+            if path in ("/api/mutation-candidates", "/api/mutation/candidates"):
                 self._send_json(adapter.list_mutation_candidates(
                     snapshot_id=q_param("snapshot_id"),
                     object_id=q_param("object_id"),

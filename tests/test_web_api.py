@@ -663,6 +663,275 @@ class TestWebApi(unittest.TestCase):
             self.assertIn("renderReferenceTable", js)
             self.assertIn("switchCenterView", js)
 
+    def test_22_test_a_capability_vs_verification_separation(self):
+        """Test A: Verify SUPPORTED capability does not automatically mean VERIFIED even for single-thread."""
+        status, data = self._get("/api/runtime")
+        self.assertEqual(status, 200)
+        rt = data.get("data", {})
+
+        # Capability is SUPPORTED
+        self.assertEqual(rt.get("branch_isolation_capability"), "SUPPORTED")
+        self.assertEqual(rt.get("branch_isolation", {}).get("capability"), "SUPPORTED")
+
+        # Verification must be FALSE because no verification was run!
+        self.assertFalse(rt.get("branch_isolation_verified"))
+        self.assertFalse(rt.get("branch_isolation", {}).get("verified"))
+
+        # Determinism capability vs verification
+        self.assertEqual(rt.get("determinism_capability"), "SUPPORTED")
+        self.assertFalse(rt.get("determinism_verified"))
+        self.assertFalse(rt.get("determinism", {}).get("verified"))
+
+    def test_23_test_b_actual_verification_provenance(self):
+        """Test B: When actual verification is performed/present in provenance, verified must be True."""
+        old_caps = self.controller.get_capabilities()
+        try:
+            def mock_verified_caps():
+                c = dict(old_caps)
+                c["branch_isolation"] = dict(c.get("branch_isolation", {}))
+                c["branch_isolation"]["verified"] = True
+                c["branch_isolation"]["verification_source"] = "TEST_RESTORE_VERIFICATION"
+                c["checkpoint_restore"] = dict(c.get("checkpoint_restore", {}))
+                c["checkpoint_restore"]["determinism_status"] = "VERIFIED"
+                c["checkpoint_restore"]["verified"] = True
+                return c
+
+            self.controller.get_capabilities = mock_verified_caps
+
+            status, data = self._get("/api/runtime")
+            self.assertEqual(status, 200)
+            rt = data.get("data", {})
+            self.assertTrue(rt.get("branch_isolation_verified"))
+            self.assertTrue(rt.get("branch_isolation", {}).get("verified"))
+            self.assertEqual(rt.get("branch_isolation", {}).get("verification_source"), "TEST_RESTORE_VERIFICATION")
+            self.assertTrue(rt.get("determinism_verified"))
+            self.assertTrue(rt.get("determinism", {}).get("verified"))
+        finally:
+            self.controller.get_capabilities = lambda: old_caps
+
+    def test_24_test_c_determinism_and_branch_isolation_independence(self):
+        """Test C: Determinism verified=True must NOT cause branch isolation verified=True, and vice versa."""
+        old_caps = self.controller.get_capabilities()
+        try:
+            # Case 1: Determinism is VERIFIED, but Branch isolation is NOT verified
+            def mock_det_only_caps():
+                c = dict(old_caps)
+                c["branch_isolation"] = dict(c.get("branch_isolation", {}))
+                c["branch_isolation"]["status"] = "SUPPORTED"
+                c["branch_isolation"]["verified"] = False
+                c["checkpoint_restore"] = dict(c.get("checkpoint_restore", {}))
+                c["checkpoint_restore"]["determinism_status"] = "VERIFIED"
+                return c
+
+            self.controller.get_capabilities = mock_det_only_caps
+            status, data = self._get("/api/runtime")
+            self.assertEqual(status, 200)
+            rt = data.get("data", {})
+            self.assertTrue(rt.get("determinism_verified"))
+            self.assertFalse(rt.get("branch_isolation_verified"), "Determinism VERIFIED must NOT infer branch isolation VERIFIED")
+            self.assertFalse(rt.get("branch_isolation", {}).get("verified"))
+
+            # Case 2: Branch isolation is verified, but Determinism is NOT verified
+            def mock_branch_only_caps():
+                c = dict(old_caps)
+                c["branch_isolation"] = dict(c.get("branch_isolation", {}))
+                c["branch_isolation"]["status"] = "SUPPORTED"
+                c["branch_isolation"]["verified"] = True
+                c["branch_isolation"]["verification_source"] = "ISOLATION_CHECK"
+                c["checkpoint_restore"] = dict(c.get("checkpoint_restore", {}))
+                c["checkpoint_restore"]["determinism_status"] = "NOT_VERIFIED"
+                return c
+
+            self.controller.get_capabilities = mock_branch_only_caps
+            status, data = self._get("/api/runtime")
+            self.assertEqual(status, 200)
+            rt = data.get("data", {})
+            self.assertTrue(rt.get("branch_isolation_verified"))
+            self.assertFalse(rt.get("determinism_verified"), "Branch isolation VERIFIED must NOT infer determinism VERIFIED")
+        finally:
+            self.controller.get_capabilities = lambda: old_caps
+
+    def test_25_test_d_observation_point_honesty_no_spec_duplication(self):
+        """Test D: Observation point spec must NOT be duplicated into function or location when frame info is absent."""
+        self.controller.breakpoint_spec = "worker_loop"
+        self.controller._cached_checkpoints = {}
+        snap_copy = json.loads(json.dumps(self.controller._sample_snap))
+        snap_copy["execution"]["threads"][0]["frames"] = []
+        old_latest = self.controller._latest
+        self.controller._latest = snap_copy
+
+        try:
+            status, data = self._get("/api/runtime")
+            self.assertEqual(status, 200)
+            rt = data.get("data", {})
+            obs = rt.get("observation_point")
+            self.assertIsNotNone(obs)
+            self.assertEqual(obs.get("spec"), "worker_loop")
+            self.assertIsNone(obs.get("function"), "spec must NOT be copied to function")
+            self.assertIsNone(obs.get("location"), "spec must NOT be copied to location")
+        finally:
+            self.controller.breakpoint_spec = None
+            self.controller._latest = old_latest
+
+    def test_26_test_e_thread_metadata_honesty_no_name_fabrication(self):
+        """Test E: Threads with no name or location must remain None / unavailable without fake generation."""
+        snap_copy = json.loads(json.dumps(self.controller._sample_snap))
+        snap_copy["execution"]["threads"] = [
+            {
+                "thread_id": 2,
+                "frames": [
+                    {"level": 0, "function": "worker_func", "location": None}
+                ]
+            }
+        ]
+        old_latest = self.controller._latest
+        self.controller._latest = snap_copy
+
+        try:
+            status, data = self._get("/api/runtime")
+            self.assertEqual(status, 200)
+            rt = data.get("data", {})
+            threads = rt.get("threads_detail", [])
+            self.assertEqual(len(threads), 1)
+            t = threads[0]
+            self.assertEqual(t.get("thread_id"), 2)
+            self.assertIsNone(t.get("name"), "Thread name must be None if not provided by OS/debugger (no fake 'Worker #2')")
+            self.assertIsNone(t.get("location"), "Location must be None if not provided by debug info (no fake 'worker_func()')")
+            self.assertEqual(t.get("function"), "worker_func")
+        finally:
+            self.controller._latest = old_latest
+
+    def test_27_test_f_timeout_source_of_truth_consistency(self):
+        """Test F: Timeout source of truth is backend default and is consistent across capabilities, runtime, and execution."""
+        # 1. Capabilities endpoint
+        status, caps_data = self._get("/api/capabilities")
+        self.assertEqual(status, 200)
+        c_data = caps_data.get("data", {})
+        backend_default = c_data.get("default_timeout_ms") or c_data.get("mutation", {}).get("default_timeout_ms")
+        self.assertEqual(backend_default, 1000)
+
+        # 2. Runtime endpoint
+        status, rt_data = self._get("/api/runtime")
+        self.assertEqual(status, 200)
+        rt_default = rt_data.get("data", {}).get("default_timeout_ms")
+        self.assertEqual(rt_default, backend_default)
+
+        # 3. Execute transition with default (no timeout specified in payload)
+        payload = {"candidate_id": "M001", "proposed_value": 5}
+        status, trans_data = self._post("/api/mutation", payload)
+        self.assertEqual(status, 200)
+        t_res = trans_data.get("data", {})
+        self.assertEqual(t_res.get("timeout_ms"), backend_default)
+
+        # 4. Execute transition with explicit user override (e.g. 5000ms)
+        payload_override = {"candidate_id": "M001", "proposed_value": 7, "timeout_ms": 5000}
+        status, trans_override = self._post("/api/mutation", payload_override)
+        self.assertEqual(status, 200)
+        t_res_override = trans_override.get("data", {})
+        self.assertEqual(t_res_override.get("timeout_ms"), 5000)
+
+    def test_28_test_g_hierarchical_semantic_path_generation(self):
+        """Test G: Hierarchical semantic path Session -> worker -> state -> counter generates Session.worker.state.counter."""
+        session_snap = {
+            "schema_version": "0.3",
+            "snapshot_id": "S_SESSION",
+            "process": {"pid": 1111, "binary": "/app/session_srv"},
+            "execution": {"threads": [{"thread_id": 1, "frames": []}]},
+            "persistent": {
+                "roots": [{"name": "Session", "kind": "global", "object_ref": "obj_session"}],
+                "objects": [
+                    {
+                        "object_id": "obj_session",
+                        "type": "SessionController",
+                        "storage": "global",
+                        "fields": [
+                            {"name": "worker", "type": "WorkerThread*", "value": "0x1000", "object_ref": "obj_worker"}
+                        ]
+                    },
+                    {
+                        "object_id": "obj_worker",
+                        "type": "WorkerThread",
+                        "storage": "heap",
+                        "fields": [
+                            {"name": "state", "type": "WorkerState*", "value": "0x2000", "object_ref": "obj_state"}
+                        ]
+                    },
+                    {
+                        "object_id": "obj_state",
+                        "type": "WorkerState",
+                        "storage": "heap",
+                        "fields": [
+                            {"name": "counter", "type": "int", "value": 10},
+                            {"name": "active", "type": "bool", "value": True}
+                        ]
+                    }
+                ],
+                "statistics": {"object_count": 3, "root_count": 1, "edge_count": 2}
+            }
+        }
+        self.controller.snapshots["S_SESSION"] = session_snap
+        sid, _ = self.runtime.corpus.add(session_snap, metadata={"interesting_reasons": ["SEED"]})
+
+        # 1. Check list_state_objects
+        status, data = self._get(f"/api/states/{sid}/objects")
+        self.assertEqual(status, 200)
+        objects = data.get("data", [])
+        self.assertEqual(len(objects), 3)
+
+        obj_state = next((o for o in objects if o["object_id"] == "obj_state"), None)
+        self.assertIsNotNone(obj_state)
+        self.assertEqual(obj_state.get("primary_path"), "Session.worker.state")
+        self.assertEqual(obj_state.get("semantic_path"), "Session.worker.state")
+        self.assertEqual(obj_state.get("semantic_name"), "Session.worker.state")
+
+        # Check fields of obj_state
+        fields = obj_state.get("fields", [])
+        counter_field = next((f for f in fields if f["name"] == "counter"), None)
+        self.assertIsNotNone(counter_field)
+        self.assertEqual(counter_field.get("semantic_path"), "Session.worker.state.counter")
+
+        # 2. Check inspect_object endpoint
+        istatus, idata = self._get(f"/api/states/{sid}/objects/obj_state")
+        self.assertEqual(istatus, 200)
+        iobj = idata.get("data", {})
+        self.assertEqual(iobj.get("primary_path"), "Session.worker.state")
+        self.assertEqual(iobj.get("semantic_path"), "Session.worker.state")
+
+        # 3. Check mutation candidates endpoint
+        old_propose = self.controller.propose_mutations
+        self.controller.propose_mutations = lambda snapshot=None: [
+            MutationCandidate("M_CNT", "S_SESSION", "obj_state", "counter", 10, 20, "int", "INCREMENT")
+        ]
+        try:
+            cstatus, cdata = self._get("/api/mutation/candidates?snapshot_id=S_SESSION")
+            self.assertEqual(cstatus, 200)
+            cands = cdata.get("data", [])
+            cnt_cand = next((c for c in cands if c.get("candidate_id") == "M_CNT"), None)
+            self.assertIsNotNone(cnt_cand)
+            self.assertEqual(cnt_cand.get("semantic_target"), "Session.worker.state.counter")
+            self.assertEqual(cnt_cand.get("semantic_name"), "Session.worker.state")
+        finally:
+            self.controller.propose_mutations = old_propose
+
+    def test_29_frontend_regression_checks(self):
+        """Test Frontend checks: SUPPORTED is not shown as Verified, honest unavailable observation, and timeout source of truth."""
+        req_js = urllib.request.Request(self.base_url + "/static/app.js")
+        with urllib.request.urlopen(req_js) as resp:
+            js = resp.read().decode("utf-8")
+            # 1. SUPPORTED without verification displays Supported (Not verified)
+            self.assertIn("Supported (Not verified)", js)
+            self.assertIn("SUPPORTED (NOT VERIFIED)", js)
+            # 2. Verified only displayed when verified is true
+            self.assertIn("Supported (Verified)", js)
+            self.assertIn("SUPPORTED (VERIFIED)", js)
+            # 3. Unavailable observation metadata rendered as Unavailable
+            self.assertIn("'Unavailable'", js)
+            # 4. Semantic path / primary path priority
+            self.assertIn("primary_path", js)
+            self.assertIn("additional_paths", js)
+            # 5. Provenance timeline steps
+            self.assertIn("semanticStatus", js)
+
 
 if __name__ == "__main__":
     unittest.main()

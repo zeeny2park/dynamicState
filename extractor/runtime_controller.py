@@ -152,7 +152,7 @@ class RuntimeController:
                 "scope": "MULTITHREAD",
                 "semantics": "MEMORY_CHECKPOINT",
                 "determinism_required": False,
-                "determinism_status": "VERIFIED",
+                "determinism_status": "NOT_VERIFIED",
                 "threads": 1,
                 "reason": None
             },
@@ -162,7 +162,7 @@ class RuntimeController:
                 "restore_backend": "MOCK",
                 "semantics": "MEMORY_CHECKPOINT",
                 "determinism_required": False,
-                "determinism_status": "VERIFIED",
+                "determinism_status": "NOT_VERIFIED",
                 "threads": 1,
                 "reason": None,
                 "safe_alternatives": []
@@ -344,7 +344,7 @@ class GdbRuntimeController(RuntimeController):
             "scope": "SINGLE_THREAD_ONLY" if thread_count <= 1 else "NONE",
             "semantics": "MEMORY_CHECKPOINT" if thread_count <= 1 else "OBSERVATION_ONLY",
             "determinism_required": False,
-            "determinism_status": "VERIFIED" if thread_count <= 1 else "UNKNOWN",
+            "determinism_status": "NOT_VERIFIED" if thread_count <= 1 else "UNKNOWN",
             "threads": thread_count,
             "reason": None if thread_count <= 1 else "MULTITHREAD_CHECKPOINT_UNSUPPORTED",
         }
@@ -354,7 +354,7 @@ class GdbRuntimeController(RuntimeController):
         scope = restorer_cap.get("scope", "SINGLE_THREAD_ONLY")
         semantics = restorer_cap.get("semantics", "MEMORY_CHECKPOINT" if backend_name in ("gdb_fork", "GDB_CHECKPOINT") else "RESTART_TO_OBSERVATION_POINT")
         det_req = restorer_cap.get("determinism_required", backend_name == "RESTART")
-        det_status = restorer_cap.get("determinism_status", "VERIFIED" if backend_name in ("gdb_fork", "GDB_CHECKPOINT") else "UNKNOWN")
+        det_status = restorer_cap.get("determinism_status", "NOT_VERIFIED" if backend_name in ("gdb_fork", "GDB_CHECKPOINT") else "UNKNOWN")
 
         branch_status = "SUPPORTED" if can_checkpoint else "UNAVAILABLE"
         if can_checkpoint and det_status in ("FAILED", "NON_DETERMINISTIC"):

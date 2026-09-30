@@ -561,16 +561,18 @@
                          t.state === 'RUNNING' ? '<span class="badge badge-info">RUNNING</span>' :
                          `<span class="badge badge-neutral">${escapeHtml(t.state || 'UNKNOWN')}</span>`;
 
-      // Honest thread display: NEVER fabricate thread names
+      // Honest thread display: NEVER fabricate thread names or locations
       const threadDisplayName = t.name ? escapeHtml(t.name) : '<span class="text-muted">Name unavailable</span>';
+      const funcDisplay = t.function ? `<code class="mono">${escapeHtml(t.function)}</code>` : '<span class="text-muted">Unavailable</span>';
+      const locDisplay = t.location ? `<span class="mono">${escapeHtml(t.location)}</span>` : '<span class="text-muted">Unavailable</span>';
 
       rowsHtml += `
         <tr class="${isObsThread ? 'row-obs-thread' : ''}">
           <td class="mono font-semibold">#${escapeHtml(String(t.thread_id))}</td>
           <td>${threadDisplayName}</td>
           <td>${stateBadge}</td>
-          <td><code class="mono">${escapeHtml(t.function || 'unknown')}</code></td>
-          <td class="mono text-muted">${escapeHtml(t.location || 'N/A')}</td>
+          <td>${funcDisplay}</td>
+          <td class="mono text-muted">${locDisplay}</td>
           <td class="mono">${t.frame_depth !== undefined ? t.frame_depth : 1}</td>
           <td>
             ${isObsThread ? '<span class="badge badge-obs-active">📍 OBS POINT</span>' : '<span class="text-muted">—</span>'}
@@ -622,11 +624,15 @@
       el.sumStateHash.textContent = sh && sh !== 'N/A' ? sh.substring(0, 8) + '...' : 'N/A';
     }
 
-    // Timeout Source of Truth
-    if (data.default_timeout_ms !== undefined) {
-      state.globalTimeoutMs = data.default_timeout_ms;
-      if (el.selectGlobalTimeout) el.selectGlobalTimeout.value = String(data.default_timeout_ms);
-      if (el.prevTimeoutSelect) el.prevTimeoutSelect.value = String(data.default_timeout_ms);
+    // Timeout Source of Truth (Backend default unless user customized)
+    if (!state.userCustomizedTimeout) {
+      const backendTimeout = (data.mutation && data.mutation.default_timeout_ms)
+        || (data.limits && data.limits.default_timeout_ms)
+        || data.default_timeout_ms
+        || 1000;
+      state.globalTimeoutMs = backendTimeout;
+      if (el.selectGlobalTimeout) el.selectGlobalTimeout.value = String(backendTimeout);
+      if (el.prevTimeoutSelect) el.prevTimeoutSelect.value = String(backendTimeout);
     }
 
     // Show/hide low-impact banner & branch isolation banner
@@ -666,7 +672,7 @@
           const backendName = branchIso.restore_backend || 'RESTART';
           if (el.exploreIsolationTitle) el.exploreIsolationTitle.textContent = `Branch Isolation Active (${backendName} Backend, ${threadCount} Thread${threadCount > 1 ? 's' : ''})`;
           if (el.exploreIsolationMsg) {
-            el.exploreIsolationMsg.textContent = `Independent sibling mutation execution is fully verified and supported via ${backendName} restore.`;
+            el.exploreIsolationMsg.textContent = `Independent sibling mutation execution is supported via ${backendName} restore.`;
           }
           if (el.exploreIsolationAlternatives) el.exploreIsolationAlternatives.style.display = 'none';
           if (el.btnStartExplore) {
@@ -685,10 +691,19 @@
     if (el.tagEndian) el.tagEndian.textContent = `Endian: ${data.endianness || 'UNKNOWN'}`;
     if (el.tagElf) el.tagElf.textContent = `ELF: ${data.elf_class || 'UNKNOWN'}`;
 
-    // Observation Point display - HONEST: NEVER fabricate 'observation_checkpoint'
+    // Observation Point display - HONEST: NEVER fabricate 'observation_checkpoint' or copy spec
     const obsPoint = data.observation_point;
     if (obsPoint && (obsPoint.location || obsPoint.spec || obsPoint.function)) {
-      const obsDisplay = obsPoint.location || obsPoint.spec || (obsPoint.function ? `${obsPoint.function}()` : 'Breakpoint Active');
+      let obsDisplay;
+      if (obsPoint.location) {
+        obsDisplay = obsPoint.function ? `${obsPoint.function} @ ${obsPoint.location}` : obsPoint.location;
+      } else if (obsPoint.function) {
+        obsDisplay = `${obsPoint.function}()`;
+      } else if (obsPoint.spec) {
+        obsDisplay = obsPoint.spec;
+      } else {
+        obsDisplay = 'Available';
+      }
       if (el.tagHeaderObsPoint) el.tagHeaderObsPoint.style.display = 'inline-flex';
       if (el.txtHeaderObsPoint) el.txtHeaderObsPoint.textContent = obsDisplay;
       if (el.msTxtObsPoint) el.msTxtObsPoint.textContent = obsDisplay;
@@ -696,9 +711,9 @@
       if (el.inspMutObsPoint) el.inspMutObsPoint.textContent = obsDisplay;
     } else {
       if (el.tagHeaderObsPoint) el.tagHeaderObsPoint.style.display = 'none';
-      if (el.msTxtObsPoint) el.msTxtObsPoint.textContent = 'Not available';
-      if (el.sumObsPoint) el.sumObsPoint.textContent = 'Not available';
-      if (el.inspMutObsPoint) el.inspMutObsPoint.textContent = 'Not available';
+      if (el.msTxtObsPoint) el.msTxtObsPoint.textContent = 'Unavailable';
+      if (el.sumObsPoint) el.sumObsPoint.textContent = 'Unavailable';
+      if (el.inspMutObsPoint) el.inspMutObsPoint.textContent = 'Unavailable';
     }
 
     // Checkpoint & Determinism: Capability vs Verification
@@ -714,24 +729,23 @@
     }
 
     // Branch isolation: Capability vs Verification
-    const branchIsoCap = data.branch_isolation_capability || (branchIso.status === 'SUPPORTED' ? 'SUPPORTED' : 'UNAVAILABLE');
-    const branchIsoVer = Boolean(data.branch_isolation_verified);
-    const branchStatus = branchIso.status || (isIsoSupported ? 'SUPPORTED' : 'UNAVAILABLE');
+    const branchIsoCap = data.branch_isolation_capability || (branchIso.capability || (branchIso.status === 'SUPPORTED' ? 'SUPPORTED' : 'UNAVAILABLE'));
+    const branchIsoVer = Boolean(data.branch_isolation_verified || branchIso.verified);
 
     if (el.sumIsolationStatus) {
-      let isoBadgeClass = branchIsoCap === 'SUPPORTED' ? (branchIsoVer ? 'badge-success' : 'badge-info') : 'badge-warning';
-      let isoText = branchIsoCap === 'SUPPORTED' ? (branchIsoVer ? 'Supported (Verified)' : 'Supported') : 'Unavailable';
+      let isoBadgeClass = branchIsoVer ? 'badge-success' : (branchIsoCap === 'SUPPORTED' ? 'badge-info' : (branchIsoCap === 'CONDITIONAL' ? 'badge-warning' : 'badge-danger'));
+      let isoText = branchIsoCap === 'SUPPORTED' ? (branchIsoVer ? 'Supported (Verified)' : 'Supported (Not verified)') : (branchIsoCap === 'CONDITIONAL' ? 'Conditional' : 'Unavailable');
       el.sumIsolationStatus.innerHTML = `<span class="badge ${isoBadgeClass}" title="${branchIso.reason || ''}">${escapeHtml(isoText)}</span>`;
     }
 
     // Determinism: Capability vs Verification
-    const detCap = data.determinism_capability || 'SUPPORTED';
-    const detVer = Boolean(data.determinism_verified);
+    const detCap = data.determinism_capability || (data.determinism && data.determinism.capability) || 'SUPPORTED';
+    const detVer = Boolean(data.determinism_verified || (data.determinism && data.determinism.verified));
     const detStatus = cpRestore.determinism_status || branchIso.determinism_status || (detVer ? 'VERIFIED' : 'NOT_VERIFIED');
 
     if (el.sumDeterminismStatus) {
       let detClass = 'badge-neutral';
-      let detText = 'Not verified';
+      let detText = 'Supported (Not verified)';
       if (detStatus === 'VERIFIED' || detVer) {
         detClass = 'badge-success';
         detText = 'Verified';
@@ -741,6 +755,9 @@
       } else if (detCap === 'UNSUPPORTED' || detCap === 'UNAVAILABLE') {
         detClass = 'badge-warning';
         detText = 'Unavailable';
+      } else if (detCap === 'SUPPORTED') {
+        detClass = 'badge-neutral';
+        detText = 'Supported (Not verified)';
       }
       el.sumDeterminismStatus.innerHTML = `<span class="badge ${detClass}">${escapeHtml(detText)}</span>`;
     }
@@ -751,8 +768,10 @@
     // Tab 1 Hero Badges
     if (el.msBadgeBackend) el.msBadgeBackend.textContent = backendName;
     if (el.msBadgeIsolation) {
-      el.msBadgeIsolation.textContent = branchStatus;
-      el.msBadgeIsolation.className = 'badge ' + (branchStatus === 'SUPPORTED' ? 'badge-success' : branchStatus === 'CONDITIONAL' ? 'badge-warning' : 'badge-danger');
+      let badgeText = branchIsoCap === 'SUPPORTED' ? (branchIsoVer ? 'SUPPORTED (VERIFIED)' : 'SUPPORTED (NOT VERIFIED)') : branchIsoCap;
+      let badgeClass = branchIsoVer ? 'badge-success' : (branchIsoCap === 'SUPPORTED' ? 'badge-info' : (branchIsoCap === 'CONDITIONAL' ? 'badge-warning' : 'badge-danger'));
+      el.msBadgeIsolation.textContent = badgeText;
+      el.msBadgeIsolation.className = 'badge ' + badgeClass;
     }
 
     // Render Threads detail table
@@ -1539,8 +1558,9 @@
     const storage = (obj.storage || 'UNKNOWN').toUpperCase();
     const storageClass = storage === 'HEAP' ? 'badge-storage-heap' : storage === 'GLOBAL' ? 'badge-storage-global' : 'badge-storage-stack';
     const addrHex = obj.address ? '0x' + Number(obj.address).toString(16) : 'N/A';
-    const semanticName = obj.semantic_name || obj.object_id;
-    const cleanedType = obj.cleaned_type || (obj.type ? obj.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
+    const semanticName = obj.primary_path || obj.semantic_path || obj.semantic_name || obj.object_id;
+    const additionalPaths = obj.additional_paths || [];
+    const cleanedType = obj.cleaned_type || obj.canonical_type || (obj.type ? obj.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
 
     // 2. Update Center Breadcrumb
     if (el.bcCurrentName) {
@@ -1550,9 +1570,13 @@
     // 3. Populate Inspector Header
     if (el.memObjTitle) el.memObjTitle.textContent = `${semanticName} — ${cleanedType}`;
     if (el.memObjSubtitle) {
-      el.memObjSubtitle.textContent = state.isAdvancedMode
+      let sub = state.isAdvancedMode
         ? `[${obj.object_id}] ${storage} memory object located at ${addrHex}`
         : `${storage} memory object · ${obj.root_source || 'Application Root'}`;
+      if (additionalPaths.length > 0) {
+        sub += ` · Also referenced as: ${additionalPaths.join(', ')}`;
+      }
+      el.memObjSubtitle.textContent = sub;
     }
     if (el.memObjTypeBadge) el.memObjTypeBadge.textContent = cleanedType;
     if (el.memObjStorageBadge) {
@@ -1772,7 +1796,8 @@
 
     state.currentMutableField = { object: obj, field: targetField };
 
-    const semanticLabel = `${obj.semantic_name || obj.object_id}.${targetField.name}`;
+    const targetBase = obj.primary_path || obj.semantic_path || obj.semantic_name || obj.object_id;
+    const semanticLabel = `${targetBase}.${targetField.name}`;
     if (el.inspMutTargetLabel) el.inspMutTargetLabel.textContent = semanticLabel;
     if (el.inspMutCurrentVal) el.inspMutCurrentVal.textContent = String(targetField.value);
     if (el.btnInspRunMutation) el.btnInspRunMutation.disabled = false;
@@ -2333,7 +2358,16 @@
 
     // Execution & Isolation Context
     const obsPoint = state.runtime ? state.runtime.observation_point : null;
-    const obsText = obsPoint ? (obsPoint.location || obsPoint.spec || (obsPoint.function ? `${obsPoint.function}()` : 'Breakpoint Active')) : 'Breakpoint Active';
+    let obsText = 'Unavailable';
+    if (obsPoint) {
+      if (obsPoint.location) {
+        obsText = obsPoint.function ? `${obsPoint.function} @ ${obsPoint.location}` : obsPoint.location;
+      } else if (obsPoint.function) {
+        obsText = `${obsPoint.function}()`;
+      } else if (obsPoint.spec) {
+        obsText = obsPoint.spec;
+      }
+    }
     if (el.prevObsPoint) el.prevObsPoint.textContent = obsText;
 
     const cpRestore = state.runtime ? (state.runtime.checkpoint_restore || {}) : {};
@@ -2342,13 +2376,15 @@
     const backendName = cpRestore.backend || branchIso.restore_backend || (threads > 1 ? 'RESTART' : 'GDB_CHECKPOINT');
     if (el.prevRestoreBackend) el.prevRestoreBackend.textContent = `${backendName} (${backendName === 'RESTART' ? 'RestartBasedRestorer' : 'NativeCheckpointRestorer'})`;
 
-    const isoStatus = branchIso.status || 'SUPPORTED';
+    const isoCap = (state.runtime && state.runtime.branch_isolation_capability) || branchIso.capability || branchIso.status || 'UNAVAILABLE';
+    const isIsoVerified = Boolean(state.runtime && (state.runtime.branch_isolation_verified || branchIso.verified));
     if (el.prevBranchIsolation) {
-      el.prevBranchIsolation.textContent = isoStatus;
-      el.prevBranchIsolation.className = 'badge ' + (isoStatus === 'SUPPORTED' ? 'badge-success' : 'badge-warning');
+      let isoText = isoCap === 'SUPPORTED' ? (isIsoVerified ? 'Supported (Verified)' : 'Supported (Not verified)') : (isoCap === 'CONDITIONAL' ? 'Conditional' : 'Unavailable');
+      el.prevBranchIsolation.textContent = isoText;
+      el.prevBranchIsolation.className = 'badge ' + (isIsoVerified ? 'badge-success' : (isoCap === 'SUPPORTED' ? 'badge-info' : 'badge-warning'));
     }
 
-    if (el.prevTimeoutSelect) el.prevTimeoutSelect.value = "1000";
+    if (el.prevTimeoutSelect) el.prevTimeoutSelect.value = String(state.globalTimeoutMs || 1000);
     if (el.modalMutationPreview) el.modalMutationPreview.style.display = 'flex';
   }
 
@@ -2363,6 +2399,14 @@
     if (el.btnCancelMutation) {
       el.btnCancelMutation.addEventListener('click', () => {
         el.modalMutationPreview.style.display = 'none';
+      });
+    }
+
+    if (el.prevTimeoutSelect) {
+      el.prevTimeoutSelect.addEventListener('change', (e) => {
+        state.globalTimeoutMs = parseInt(e.target.value, 10) || 1000;
+        state.userCustomizedTimeout = true;
+        if (el.selectGlobalTimeout) el.selectGlobalTimeout.value = String(state.globalTimeoutMs);
       });
     }
 
@@ -2385,7 +2429,11 @@
           inputVal = parseFloat(inputVal);
         }
 
-        const timeoutMs = parseInt(el.prevTimeoutSelect.value, 10) || 1000;
+        const timeoutMs = parseInt(el.prevTimeoutSelect.value, 10) || state.globalTimeoutMs || 1000;
+        state.globalTimeoutMs = timeoutMs;
+        state.userCustomizedTimeout = true;
+        if (el.selectGlobalTimeout) el.selectGlobalTimeout.value = String(timeoutMs);
+
         el.modalMutationPreview.style.display = 'none';
 
         await executeTransitionWithParams({
@@ -2452,7 +2500,7 @@
     if (cand) {
       openMutationPreview(cand);
     } else {
-      await executeTransitionWithParams({ candidate_id: candidateId, timeout_ms: 1000 });
+      await executeTransitionWithParams({ candidate_id: candidateId, timeout_ms: state.globalTimeoutMs });
     }
   }
 
@@ -2499,45 +2547,94 @@
     if (el.flowChildHash) el.flowChildHash.textContent = `hash: ${childHashShort}`;
     if (el.flowChildVal) el.flowChildVal.textContent = `${fieldName} = ${newVal}`;
 
-    // 2. Render Verified Execution Timeline (Zero fake progress: actual events)
+    // 2. Render Verified Execution Timeline (Strictly honest provenance)
     if (el.execTimelineList) {
-      const obsPointLoc = (state.runtime && state.runtime.observation_point && state.runtime.observation_point.location) || 'Observation Breakpoint';
+      const obsPointObj = state.runtime ? state.runtime.observation_point : null;
+      let obsPointLoc = 'Unavailable';
+      if (obsPointObj) {
+        if (obsPointObj.location) {
+          obsPointLoc = obsPointObj.function ? `${obsPointObj.function} @ ${obsPointObj.location}` : obsPointObj.location;
+        } else if (obsPointObj.function) {
+          obsPointLoc = `${obsPointObj.function}()`;
+        } else if (obsPointObj.spec) {
+          obsPointLoc = obsPointObj.spec;
+        }
+      }
+
+      const branchIsoObj = trans.branch_isolation || (state.runtime && state.runtime.branch_isolation) || {};
+      const isIsoVerified = Boolean(trans.branch_isolation_verified || branchIsoObj.verified);
+      const isIsoSupported = (trans.branch_isolation_capability || branchIsoObj.capability || branchIsoObj.status) === 'SUPPORTED';
+
+      const detObj = trans.determinism || (state.runtime && state.runtime.determinism) || {};
+      const isDetVerified = Boolean(trans.determinism_verified || detObj.verified);
+      const isDetSupported = (trans.determinism_capability || detObj.capability) === 'SUPPORTED';
+
+      let isoBadge = isIsoVerified ? 'VERIFIED' : (isIsoSupported ? 'SUPPORTED (NOT VERIFIED)' : 'UNAVAILABLE');
+      let isoBadgeClass = isIsoVerified ? 'badge-success' : (isIsoSupported ? 'badge-info' : 'badge-warning');
+
+      let detBadge = isDetVerified ? 'VERIFIED' : (isDetSupported ? 'SUPPORTED (NOT VERIFIED)' : 'UNAVAILABLE');
+      let detBadgeClass = isDetVerified ? 'badge-success' : (isDetSupported ? 'badge-info' : 'badge-warning');
+
+      const isStopped = execStatus === 'STOPPED';
+      const isCrashed = execStatus === 'CRASHED';
+      const isTimeout = execStatus === 'TIMEOUT';
 
       const timelineSteps = [
         {
-          title: 'Observation Point Active',
-          detail: `Target suspended at ${obsPointLoc}`,
-          status: 'success'
+          title: 'Observation Point',
+          semanticStatus: obsPointObj ? 'COMPLETED' : 'UNAVAILABLE',
+          badgeClass: obsPointObj ? 'badge-info' : 'badge-warning',
+          detail: obsPointObj ? `Target suspended at ${obsPointLoc}` : 'Observation point metadata unavailable',
+          iconType: obsPointObj ? 'success' : 'warning'
         },
         {
           title: 'Parent State Captured & Preserved',
+          semanticStatus: 'COMPLETED',
+          badgeClass: 'badge-info',
           detail: `State ${parentId} snapshot registered in corpus`,
-          status: 'success'
+          iconType: 'success'
         },
         {
-          title: 'Branch Isolation Verified',
-          detail: `Isolation backend confirmed: ${restoreBackend}`,
-          status: 'success'
+          title: 'Branch Isolation',
+          semanticStatus: isoBadge,
+          badgeClass: isoBadgeClass,
+          detail: isIsoVerified ? `Isolation verified via ${restoreBackend}` : `Backend: ${restoreBackend} (not verified during this transition)`,
+          iconType: isIsoVerified ? 'success' : 'info'
+        },
+        {
+          title: 'Determinism Provenance',
+          semanticStatus: detBadge,
+          badgeClass: detBadgeClass,
+          detail: isDetVerified ? 'Restart determinism verified' : `Determinism status: ${trans.determinism_status || detObj.status || 'NOT VERIFIED'}`,
+          iconType: isDetVerified ? 'success' : 'info'
         },
         {
           title: 'Mutation Injected into Target',
+          semanticStatus: 'COMPLETED',
+          badgeClass: 'badge-info',
           detail: `Applied ${targetLabel} = ${newVal}`,
-          status: 'success'
+          iconType: 'success'
         },
         {
           title: 'Target Execution Monitored',
+          semanticStatus: isTimeout ? 'TIMEOUT' : 'COMPLETED',
+          badgeClass: isTimeout ? 'badge-warning' : 'badge-info',
           detail: `Inferior resumed with timeout limit ${stepDuration}`,
-          status: 'success'
+          iconType: isTimeout ? 'warning' : 'success'
         },
         {
           title: `Inferior Re-suspended (${execStatus})`,
-          detail: `Execution halted with status ${execStatus}`,
-          status: execStatus === 'CRASHED' ? 'danger' : 'success'
+          semanticStatus: isCrashed ? 'CRASHED' : (isTimeout ? 'TIMEOUT' : 'COMPLETED'),
+          badgeClass: isCrashed ? 'badge-danger' : (isTimeout ? 'badge-warning' : 'badge-info'),
+          detail: isCrashed ? `Inferior crashed with signal ${trans.execution && trans.execution.signal ? trans.execution.signal : 'abnormal'}` : `Execution halted with status ${execStatus}`,
+          iconType: isCrashed ? 'danger' : 'success'
         },
         {
           title: 'Child State Recorded & Semantic Diff Computed',
-          detail: `Child state ${childId} verified (hash: ${childHashShort})`,
-          status: 'success'
+          semanticStatus: childHash !== 'N/A' ? 'COMPLETED' : 'UNAVAILABLE',
+          badgeClass: childHash !== 'N/A' ? 'badge-info' : 'badge-warning',
+          detail: `Child state ${childId} recorded (hash: ${childHashShort})`,
+          iconType: 'success'
         }
       ];
 
@@ -2545,11 +2642,14 @@
       timelineSteps.forEach((s) => {
         timelineHtml += `
           <div class="timeline-step">
-            <div class="step-icon-box ${s.status === 'danger' ? 'danger' : 'success'}">
-              <span>${s.status === 'danger' ? '✕' : '✓'}</span>
+            <div class="step-icon-box ${s.iconType === 'danger' ? 'danger' : (s.iconType === 'warning' ? 'warning' : 'success')}">
+              <span>${s.iconType === 'danger' ? '✕' : (s.iconType === 'warning' ? '!' : '✓')}</span>
             </div>
             <div class="step-content">
-              <div class="step-title font-semibold">${escapeHtml(s.title)}</div>
+              <div class="step-header flex justify-between items-center">
+                <div class="step-title font-semibold">${escapeHtml(s.title)}</div>
+                <span class="badge ${s.badgeClass} text-xs font-mono ml-2">${escapeHtml(s.semanticStatus)}</span>
+              </div>
               <div class="step-detail text-muted">${escapeHtml(s.detail)}</div>
             </div>
           </div>

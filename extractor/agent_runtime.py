@@ -809,13 +809,16 @@ class AgentRuntime:
                 "enum": True,
                 "float": True,
                 "pointer_null": True,
+                "default_timeout_ms": 1000,
             },
             "limits": {
                 "max_steps": 50,
                 "max_timeout_ms": 5000,
+                "default_timeout_ms": 1000,
                 "max_candidates": 50,
                 "max_corpus_states": 100,
-            }
+            },
+            "default_timeout_ms": 1000,
         }
         return AgentActionResult(
             success=True,
