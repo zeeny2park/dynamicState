@@ -112,10 +112,14 @@
     inspValName: document.getElementById('insp-val-name'),
     inspValType: document.getElementById('insp-val-type'),
     inspValStorage: document.getElementById('insp-val-storage'),
+    inspValStatus: document.getElementById('insp-val-status'),
     inspValRoot: document.getElementById('insp-val-root'),
     inspValThread: document.getElementById('insp-val-thread'),
     memTechId: document.getElementById('mem-tech-id'),
     memTechAddr: document.getElementById('mem-tech-addr'),
+    memTechDwarf: document.getElementById('mem-tech-dwarf'),
+    memTechRange: document.getElementById('mem-tech-range'),
+    memTechBuildId: document.getElementById('mem-tech-build-id'),
     memTechStorage: document.getElementById('mem-tech-storage'),
     memTechType: document.getElementById('mem-tech-type'),
 
@@ -1673,11 +1677,29 @@
       el.inspValStorage.textContent = storage;
       el.inspValStorage.className = 'badge ' + storageClass;
     }
+    const semStatus = (obj.semantic_status || (obj.synthetic ? 'SYNTHETIC' : (obj.status === 'PARTIAL' ? 'PARTIAL' : (obj.status === 'UNRESOLVED' ? 'UNRESOLVED' : 'REAL')))).toUpperCase();
+    if (el.inspValStatus) {
+      el.inspValStatus.textContent = semStatus;
+      el.inspValStatus.className = 'badge ' + (
+        semStatus === 'REAL' ? 'badge-storage-global' :
+        semStatus === 'PARTIAL' ? 'badge-storage-heap' :
+        semStatus === 'SYNTHETIC' ? 'badge-storage-stack' : 'badge-storage-stack'
+      );
+    }
     if (el.inspValRoot) el.inspValRoot.textContent = obj.root_source || (storage === 'GLOBAL' ? 'Global Variable' : storage === 'STACK' ? 'Stack Local' : 'Heap Allocated');
     if (el.inspValThread) el.inspValThread.textContent = obj.thread_name || (state.runtime && state.runtime.threads ? `${state.runtime.threads} Thread(s)` : 'N/A');
 
     if (el.memTechId) el.memTechId.textContent = obj.object_id;
     if (el.memTechAddr) el.memTechAddr.textContent = addrHex;
+    if (el.memTechDwarf) el.memTechDwarf.textContent = obj.dwarf_type || obj.type || '—';
+    if (el.memTechRange) {
+      const mr = obj.memory_range || (obj.provenance && obj.provenance.memory_range);
+      el.memTechRange.textContent = Array.isArray(mr) && mr.length >= 2 ? `${mr[0]} - ${mr[1]}` : (addrHex !== 'N/A' ? `${addrHex} (+${obj.size || 0}B)` : '—');
+    }
+    if (el.memTechBuildId) {
+      const bid = obj.build_id || (obj.provenance && obj.provenance.build_id);
+      el.memTechBuildId.textContent = bid || '—';
+    }
     if (el.memTechStorage) el.memTechStorage.textContent = storage;
     if (el.memTechType) el.memTechType.textContent = obj.type || 'Unknown';
 

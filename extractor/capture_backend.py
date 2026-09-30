@@ -134,6 +134,7 @@ def _read_proc_maps(pid: int) -> List[Dict[str, Any]]:
                         "end": end,
                         "size": end - start,
                         "permissions": perms,
+                        "offset": int(offset, 16) if isinstance(offset, str) else offset,
                         "category": cat,
                         "pathname": pathname
                     })
@@ -413,6 +414,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "end": "0x{:x}".format(reg_start + nread),
                     "size": nread,
                     "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
                     "category": reg["category"],
                     "pathname": reg.get("pathname", ""),
                     "captured_bytes": nread,
@@ -426,6 +428,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "end": "0x{:x}".format(reg_start + reg_size),
                     "size": reg_size,
                     "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
                     "category": reg["category"],
                     "pathname": reg.get("pathname", ""),
                     "captured_bytes": 0,
@@ -458,6 +461,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "capture_end": datetime.fromtimestamp(t_resumed / 1e9, tz=timezone.utc).isoformat(),
             "observation_point": observation_point,
             "latency_report": latency_report.to_dict(),
+            "memory_maps": all_maps,
         }
 
         provenance = {
@@ -579,6 +583,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                                 "end": "0x{:x}".format(reg_start + len(chunk)),
                                 "size": len(chunk),
                                 "permissions": reg["permissions"],
+                                "offset": reg.get("offset", 0),
                                 "category": reg["category"],
                                 "pathname": reg.get("pathname", ""),
                                 "captured_bytes": len(chunk),
@@ -638,7 +643,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             captured_ranges=captured_ranges,
             raw_memory={"total_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions)},
             capture_backend=self.name,
-            observation_metadata={"latency_report": latency_report.to_dict()},
+            observation_metadata={"latency_report": latency_report.to_dict(), "memory_maps": all_maps},
             completeness="COMPLETE",
             provenance=provenance,
             _buffers=buffers,

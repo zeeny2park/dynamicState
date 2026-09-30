@@ -44,7 +44,7 @@ def compute_semantic_state_hash(
             fname = f.get("name", "")
             ftype = f.get("type", "")
             fval = str(f.get("value", ""))
-            fref = str(f.get("reference", ""))
+            fref = str(f.get("reference") or f.get("object_ref") or "")
             h.update(f"FLD:{fname}:{ftype}:{fval}:{fref}".encode("utf-8"))
 
     # 3. Threads hash (thread IDs and states)
@@ -275,12 +275,18 @@ class OfflineSemanticEngine:
         raw_snapshot: RawRuntimeSnapshot,
         symbol_context: Optional[Dict[str, Any]] = None,
         debug_image: Optional[str] = None,
+        allow_symbol_mismatch: bool = False,
+        allow_synthetic_fallback: bool = False,
     ) -> SemanticState:
         """Offline semantic state reconstruction from captured memory buffers and DWARF info."""
         roots = []
         objects = []
         references = []
         threads = list(raw_snapshot.thread_metadata)
+        diagnostics = []
+        state_status = "COMPLETE"
+        load_bias = 0
+        debug_artifact_used = None
 
         # 1. If symbol_context is provided (e.g. simulated or loaded from DWARF extraction)
         if symbol_context:
@@ -291,34 +297,37 @@ class OfflineSemanticEngine:
                 threads = copy.deepcopy(symbol_context["threads"])
             objects = raw_objs
         else:
-            # 2. Extract from DWARF / inspect_elf if executable exists
-            exe_path = raw_snapshot.executable or debug_image
-            if exe_path and os.path.exists(exe_path):
+            # 2. Extract from DWARF via DwarfRuntimeResolver
+            debug_path = debug_image or raw_snapshot.executable
+            if debug_path and os.path.exists(debug_path):
+                debug_artifact_used = os.path.abspath(debug_path)
                 try:
-                    from .debug_image import inspect_elf
-                    elf_info = inspect_elf(exe_path)
-                    # Create baseline root if binary identity known
-                    root_name = os.path.basename(exe_path).split(".")[0]
-                    roots.append({
-                        "name": root_name,
-                        "type": "Application",
-                        "object_ref": "obj_root",
-                    })
-                    objects.append({
-                        "object_id": "obj_root",
-                        "type": "Application",
-                        "address": 0x400000,
-                        "storage": "static",
-                        "fields": [
-                            {"name": "pid", "type": "int", "value": raw_snapshot.pid},
-                            {"name": "status", "type": "str", "value": raw_snapshot.completeness},
-                        ]
-                    })
-                except Exception:
-                    pass
+                    from .cpp_decoder import DwarfRuntimeResolver
+                    resolver = DwarfRuntimeResolver(
+                        snapshot=raw_snapshot,
+                        debug_image_path=debug_path,
+                        allow_symbol_mismatch=allow_symbol_mismatch,
+                    )
+                    res = resolver.resolve()
+                    state_status = res.status
+                    load_bias = res.load_bias
+                    diagnostics.extend(res.diagnostics)
 
-        # If no objects discovered yet, create a default process root object
-        if not objects:
+                    if res.status != "SYMBOL_MISMATCH":
+                        roots = res.roots
+                        objects = res.objects
+                        references = res.references
+                except Exception as exc:
+                    state_status = "DECODE_ERROR"
+                    diagnostics.append({
+                        "code": "RESOLVER_EXCEPTION",
+                        "message": str(exc),
+                        "recoverable": False,
+                    })
+
+        # 3. Synthetic fallback ONLY if explicitly requested and no real objects resolved
+        if not objects and allow_synthetic_fallback:
+            state_status = "SYNTHETIC"
             roots.append({
                 "name": "Process",
                 "type": "ProcessContext",
@@ -329,13 +338,17 @@ class OfflineSemanticEngine:
                 "type": "ProcessContext",
                 "address": 0x1000,
                 "storage": "heap",
+                "synthetic": True,
                 "fields": [
                     {"name": "pid", "type": "int", "value": raw_snapshot.pid},
                     {"name": "captured_bytes", "type": "int", "value": raw_snapshot.provenance.get("captured_bytes", 0)},
                 ]
             })
 
-        # 3. Compute hierarchical semantic paths for all objects
+        if not objects and state_status == "COMPLETE":
+            state_status = "UNRESOLVED"
+
+        # 4. Compute hierarchical semantic paths for all objects
         obj_paths, root_map = self._build_semantic_paths(roots, objects)
         sem_path_map: Dict[str, str] = {}
 
@@ -369,15 +382,20 @@ class OfflineSemanticEngine:
                 if fname:
                     f["semantic_path"] = f"{primary_path}.{fname}"
 
-        # 4. Compute deterministic state hash
+        # 5. Compute deterministic state hash
         state_hash = compute_semantic_state_hash(roots, objects, threads)
 
-        # 5. Build full provenance
+        # 6. Build full provenance
         prov = dict(raw_snapshot.provenance)
         prov["state_hash"] = state_hash
         prov["object_count"] = len(objects)
         prov["root_count"] = len(roots)
         prov["reconstructed_offline"] = True
+        prov["status"] = state_status
+        prov["load_bias"] = load_bias
+        prov["debug_image"] = debug_artifact_used
+        prov["diagnostics"] = diagnostics
+        prov["synthetic"] = any(o.get("synthetic", False) for o in objects)
 
         return SemanticState(
             snapshot_id=raw_snapshot.snapshot_id,
@@ -386,8 +404,8 @@ class OfflineSemanticEngine:
             objects=objects,
             semantic_paths=sem_path_map,
             threads=threads,
-            globals=[],
-            static_objects=[],
+            globals=[r for r in roots if r.get("kind") == "global"],
+            static_objects=[r for r in roots if r.get("kind") in ("file_static", "static")],
             references=references,
             provenance=prov,
             branch_info={"branch_type": "ROOT_CAPTURE"}

@@ -660,9 +660,32 @@ class WebApiAdapter:
                     data["thread_id"] = o_dict.get("thread_id")
                     data["frame_level"] = o_dict.get("frame_level")
                     data["storage"] = o_dict.get("storage", "unknown")
+                    prov = o_dict.get("provenance", {})
+                    data["provenance"] = prov
+                    data["status"] = o_dict.get("status", "COMPLETE")
+                    data["synthetic"] = bool(o_dict.get("synthetic", False))
+                    data["dwarf_type"] = prov.get("dwarf_type") or cleaned_type
+                    data["build_id"] = prov.get("build_id") or snap_dict.get("provenance", {}).get("executable_identity", {}).get("build_id")
+                    data["memory_range"] = prov.get("memory_range")
                 else:
                     addr = data.get("address")
                     data["identity"] = f"{cleaned_type}@{addr}" if addr else f"{cleaned_type}:{object_id}"
+                    data["provenance"] = data.get("provenance", {})
+                    data["status"] = data.get("status", "COMPLETE")
+                    data["synthetic"] = bool(data.get("synthetic", False))
+                    data["dwarf_type"] = data.get("provenance", {}).get("dwarf_type") or cleaned_type
+                    data["build_id"] = data.get("provenance", {}).get("build_id")
+                    data["memory_range"] = data.get("provenance", {}).get("memory_range")
+
+                # Semantic state classification: REAL, PARTIAL, SYNTHETIC, UNRESOLVED
+                if data.get("synthetic"):
+                    data["semantic_status"] = "SYNTHETIC"
+                elif data.get("status") == "PARTIAL":
+                    data["semantic_status"] = "PARTIAL"
+                elif data.get("status") == "UNRESOLVED":
+                    data["semantic_status"] = "UNRESOLVED"
+                else:
+                    data["semantic_status"] = "REAL"
 
                 # Compute Outgoing and Incoming references
                 outgoing_refs = []
