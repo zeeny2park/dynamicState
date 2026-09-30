@@ -165,12 +165,14 @@ class WebApiAdapter:
         mem_summary_res = self.runtime.get_memory_summary()
         mem_summary = _to_json_serializable(mem_summary_res.data) if mem_summary_res.success else None
 
-        # Observation point resolution
+        # Observation point resolution (Strictly honest: never fabricate placeholders)
         observation_point = None
         if self.runtime._cached_checkpoints:
             last_cp = list(self.runtime._cached_checkpoints.values())[-1]
             if getattr(last_cp, "observation_point", None):
-                observation_point = last_cp.observation_point
+                op = last_cp.observation_point
+                if isinstance(op, dict) and op.get("spec") not in (None, "", "observation_checkpoint"):
+                    observation_point = op
 
         if not observation_point and ctrl:
             bp_spec = getattr(ctrl, "breakpoint_spec", None)
@@ -179,7 +181,7 @@ class WebApiAdapter:
                     bp_spec = ctrl.restorer.breakpoint_spec
                 elif hasattr(ctrl.restorer, "_restart_restorer") and getattr(ctrl.restorer._restart_restorer, "breakpoint_spec", None):
                     bp_spec = ctrl.restorer._restart_restorer.breakpoint_spec
-            if bp_spec:
+            if bp_spec and bp_spec != "observation_checkpoint":
                 observation_point = {
                     "kind": "BREAKPOINT",
                     "spec": bp_spec,
@@ -187,7 +189,7 @@ class WebApiAdapter:
                     "location": bp_spec,
                 }
 
-        # Threads detail resolution from latest snapshot
+        # Threads detail resolution from latest snapshot (Honest: never fabricate thread names)
         threads_detail = []
         snap, _ = self.runtime._resolve_snapshot(None)
         if snap:
@@ -201,23 +203,26 @@ class WebApiAdapter:
                 top_f = frames[0] if frames else {}
                 top_f_dict = top_f if isinstance(top_f, dict) else (top_f.to_dict() if hasattr(top_f, "to_dict") else asdict(top_f))
                 t_name = th_dict.get("name")
-                if not t_name:
-                    t_name = "Main Thread" if tid == 1 else f"Worker #{tid}"
+                top_fn = top_f_dict.get("function")
+                top_loc = top_f_dict.get("location")
                 threads_detail.append({
                     "thread_id": tid,
-                    "name": t_name,
+                    "name": t_name if t_name else None,
                     "state": th_dict.get("state", "STOPPED"),
-                    "function": top_f_dict.get("function") or "<unknown>",
-                    "location": top_f_dict.get("location") or (f"{top_f_dict.get('function')}()" if top_f_dict.get("function") else "<unknown>"),
+                    "function": top_fn if top_fn and top_fn != "<unknown>" else None,
+                    "location": top_loc if top_loc and top_loc != "<unknown>" else (f"{top_fn}()" if top_fn and top_fn != "<unknown>" else None),
                     "frame_depth": len(frames),
                 })
-            if not observation_point and threads_detail and threads_detail[0]["function"] != "<unknown>":
-                observation_point = {
-                    "kind": "FRAME",
-                    "spec": threads_detail[0]["function"],
-                    "function": threads_detail[0]["function"],
-                    "location": threads_detail[0]["location"],
-                }
+            if not observation_point and threads_detail and threads_detail[0].get("function"):
+                fn = threads_detail[0]["function"]
+                loc = threads_detail[0].get("location")
+                if fn and fn != "<unknown>":
+                    observation_point = {
+                        "kind": "FRAME",
+                        "spec": fn,
+                        "function": fn,
+                        "location": loc or f"{fn}()",
+                    }
 
         # Fallback to inferior thread inspection if live GDB inferior
         if not threads_detail and ctrl and hasattr(ctrl, "gdb") and hasattr(ctrl.gdb, "selected_inferior"):
@@ -225,7 +230,7 @@ class WebApiAdapter:
                 inf = ctrl.gdb.selected_inferior()
                 for t in inf.threads():
                     tid = getattr(t, "global_num", None) or getattr(t, "num", 1)
-                    t_name = getattr(t, "name", None) or ("Main Thread" if tid == 1 else f"Worker #{tid}")
+                    t_name = getattr(t, "name", None) or None
                     t_state = "STOPPED"
                     try:
                         if hasattr(t, "is_stopped"):
@@ -236,8 +241,8 @@ class WebApiAdapter:
                         "thread_id": tid,
                         "name": t_name,
                         "state": t_state,
-                        "function": "<unknown>",
-                        "location": "<unknown>",
+                        "function": None,
+                        "location": None,
                         "frame_depth": 1,
                     })
             except Exception:
@@ -248,20 +253,22 @@ class WebApiAdapter:
             for i in range(1, thread_cnt + 1):
                 threads_detail.append({
                     "thread_id": i,
-                    "name": "Main Thread" if i == 1 else f"Worker #{i}",
+                    "name": None,
                     "state": status if status != "DISCONNECTED" else "UNKNOWN",
-                    "function": "<unknown>",
-                    "location": "<unknown>",
+                    "function": None,
+                    "location": None,
                     "frame_depth": 1,
                 })
 
-        if not observation_point:
-            observation_point = {
-                "kind": "BREAKPOINT",
-                "spec": "observation_checkpoint",
-                "function": "observation_checkpoint",
-                "location": "observation_checkpoint",
-            }
+        # Capability vs Verification distinctions
+        branch_iso = caps.get("branch_isolation", {})
+        cp_restore = caps.get("checkpoint_restore", {})
+        det_status = cp_restore.get("determinism_status") or branch_iso.get("determinism_status") or "UNKNOWN"
+        is_det_verified = (det_status == "VERIFIED")
+        branch_iso_cap = branch_iso.get("status", "UNAVAILABLE")
+        branch_iso_verified = is_det_verified or (branch_iso_cap == "SUPPORTED" and caps.get("threads", 1) == 1)
+        limits = caps.get("limits", {})
+        default_timeout = limits.get("default_timeout_ms", 1000)
 
         return {
             "success": True,
@@ -282,10 +289,16 @@ class WebApiAdapter:
                 "threads": caps.get("threads", 1),
                 "threads_detail": threads_detail,
                 "observation_point": observation_point,
-                "checkpoint_restore": caps.get("checkpoint_restore", {}),
-                "branch_isolation": caps.get("branch_isolation", {}),
+                "checkpoint_restore": cp_restore,
+                "branch_isolation": branch_iso,
+                "branch_isolation_capability": branch_iso_cap,
+                "branch_isolation_verified": branch_iso_verified,
+                "determinism_capability": "SUPPORTED" if branch_iso_cap == "SUPPORTED" else "UNAVAILABLE",
+                "determinism_verified": is_det_verified,
+                "determinism_status": det_status,
+                "default_timeout_ms": default_timeout,
                 "current_checkpoint": list(self.runtime._cached_checkpoints.keys())[-1] if self.runtime._cached_checkpoints else None,
-                "safety_limits": caps.get("limits", {}),
+                "safety_limits": limits,
                 "capabilities": caps,
                 "memory_summary": mem_summary,
             }
@@ -411,6 +424,21 @@ class WebApiAdapter:
                 if ref and ref not in parent_ref_map:
                     parent_ref_map[ref] = f"{p_name}.{f_dict.get('name')}"
 
+        # Compute outgoing and incoming counts
+        outgoing_counts: Dict[str, int] = {}
+        incoming_counts: Dict[str, int] = {}
+        for o in objects:
+            o_dict = o if isinstance(o, dict) else (o.to_dict() if hasattr(o, "to_dict") else asdict(o))
+            oid = o_dict.get("object_id", "")
+            out_c = 0
+            for f in o_dict.get("fields", []):
+                f_dict = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
+                ref = f_dict.get("object_ref")
+                if ref:
+                    out_c += 1
+                    incoming_counts[ref] = incoming_counts.get(ref, 0) + 1
+            outgoing_counts[oid] = out_c
+
         enriched_objects = []
         for o in objects:
             o_dict = o if isinstance(o, dict) else (o.to_dict() if hasattr(o, "to_dict") else asdict(o))
@@ -432,6 +460,7 @@ class WebApiAdapter:
                 enriched_fields.append({
                     "name": f_dict.get("name"),
                     "type": f_dict.get("type"),
+                    "cleaned_type": _clean_type_name(f_dict.get("type", "")),
                     "value": self.runtime._sanitize_field_value(f_dict),
                     "object_ref": f_dict.get("object_ref"),
                     "mutability": _is_field_mutable(f_dict.get("type", "")),
@@ -444,12 +473,16 @@ class WebApiAdapter:
                 "cleaned_type": cleaned_type,
                 "semantic_name": semantic_name or oid,
                 "root_name": root_map.get(oid, {}).get("name"),
-                "root_source": root_map.get(oid, {}).get("source"),
+                "root_source": root_map.get(oid, {}).get("source") or ("Root Variable" if oid in root_map else None),
                 "storage": o_dict.get("storage", "unknown"),
                 "address": o_dict.get("address"),
                 "thread_id": o_dict.get("thread_id"),
                 "frame_level": o_dict.get("frame_level"),
                 "fields": enriched_fields,
+                "field_count": len(enriched_fields),
+                "outgoing_count": outgoing_counts.get(oid, 0),
+                "incoming_count": incoming_counts.get(oid, 0),
+                "reference_count": outgoing_counts.get(oid, 0) + incoming_counts.get(oid, 0),
                 "identity_hint": f"{raw_type}:{oid}",
             })
 
@@ -489,6 +522,7 @@ class WebApiAdapter:
                     r_name = root_item.get("name") if isinstance(root_item, dict) else getattr(root_item, "name", None)
                     data["root_name"] = r_name
                     data["semantic_name"] = r_name
+                    data["root_source"] = root_item.get("source") if isinstance(root_item, dict) else getattr(root_item, "source", "Root Variable")
                 else:
                     data["semantic_name"] = cleaned_type
 
@@ -498,13 +532,52 @@ class WebApiAdapter:
                     data["address"] = o_dict.get("address")
                     data["thread_id"] = o_dict.get("thread_id")
                     data["frame_level"] = o_dict.get("frame_level")
+                    data["storage"] = o_dict.get("storage", "unknown")
+
+                # Compute Outgoing and Incoming references
+                outgoing_refs = []
+                for f in data.get("fields", []):
+                    ref_id = f.get("object_ref")
+                    if ref_id:
+                        target_obj = next((o for o in raw_objs if (o.get("object_id") if isinstance(o, dict) else getattr(o, "object_id", None)) == ref_id), None)
+                        t_dict = target_obj if isinstance(target_obj, dict) else (target_obj.to_dict() if hasattr(target_obj, "to_dict") else (asdict(target_obj) if target_obj else {}))
+                        outgoing_refs.append({
+                            "field": f.get("name"),
+                            "target_object_id": ref_id,
+                            "target_type": _clean_type_name(t_dict.get("type", "Object")),
+                            "target_storage": t_dict.get("storage", "unknown"),
+                        })
+
+                incoming_refs = []
+                for other_obj in raw_objs:
+                    o_d = other_obj if isinstance(other_obj, dict) else (other_obj.to_dict() if hasattr(other_obj, "to_dict") else asdict(other_obj))
+                    if o_d.get("object_id") == object_id:
+                        continue
+                    for f in o_d.get("fields", []):
+                        f_d = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
+                        if f_d.get("object_ref") == object_id:
+                            incoming_refs.append({
+                                "source_object_id": o_d.get("object_id"),
+                                "source_type": _clean_type_name(o_d.get("type", "Object")),
+                                "field": f_d.get("name"),
+                                "source_storage": o_d.get("storage", "unknown"),
+                            })
+
+                data["outgoing_references"] = outgoing_refs
+                data["incoming_references"] = incoming_refs
+                data["outgoing_count"] = len(outgoing_refs)
+                data["incoming_count"] = len(incoming_refs)
+                data["reference_count"] = len(outgoing_refs) + len(incoming_refs)
             else:
                 data["semantic_name"] = cleaned_type
 
-            # Enrich fields with mutability
+            # Enrich fields with mutability and cleaned_type
             for f in data.get("fields", []):
-                if isinstance(f, dict) and "mutability" not in f:
-                    f["mutability"] = _is_field_mutable(f.get("type", ""))
+                if isinstance(f, dict):
+                    if "mutability" not in f:
+                        f["mutability"] = _is_field_mutable(f.get("type", ""))
+                    if "cleaned_type" not in f:
+                        f["cleaned_type"] = _clean_type_name(f.get("type", ""))
 
         return {"success": True, "data": data}
 
@@ -792,8 +865,15 @@ class WebApiAdapter:
                 caps_res = self.runtime.capabilities()
                 caps_data = caps_res.data if caps_res.success else {}
                 cp_res = caps_data.get("checkpoint_restore", {})
+                branch_iso = caps_data.get("branch_isolation", {})
+                det_status = cp_res.get("determinism_status") or branch_iso.get("determinism_status") or "UNKNOWN"
+
                 data["restore_backend"] = cp_res.get("backend", "RESTART" if caps_data.get("threads", 1) > 1 else "GDB_CHECKPOINT")
                 data["timeout_ms"] = timeout_ms
+                data["branch_isolation_capability"] = branch_iso.get("status", "UNAVAILABLE")
+                data["branch_isolation_verified"] = (det_status == "VERIFIED") or (data["branch_isolation_capability"] == "SUPPORTED" and caps_data.get("threads", 1) == 1)
+                data["determinism_status"] = det_status
+                data["determinism_verified"] = (det_status == "VERIFIED")
             return {"success": True, "data": data}
         return {
             "success": False,

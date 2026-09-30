@@ -7,6 +7,7 @@
   'use strict';
 
   // Global Application State
+  // Global Application State
   const state = {
     runtime: null,
     states: [],
@@ -15,14 +16,21 @@
     objects: [],
     selectedObjectId: null,
     storageFilter: 'all',
+    objectFilterGroup: 'all', // 'all', 'roots', 'heap', 'globals', 'stack', 'types'
+    objectSort: 'name-asc', // 'name-asc', 'name-desc', 'type-asc', 'fields-desc', 'refs-desc', 'addr-asc'
     searchQuery: '',
     candidates: [],
     stateGraphData: { nodes: [], edges: [] },
-    activeTab: 'tab-memory-snapshot',
+    activeTab: 'tab-object-explorer',
     activeSubtab: 'subtab-dag',
+    centerView: 'tree', // 'tree', 'table', 'graph'
     jsonViewerCache: {},
     isAdvancedMode: false,
     currentMutationTarget: null,
+    currentMutableField: null,
+    globalTimeoutMs: 1000,
+    expandedTreeNodes: new Set(),
+    treeFilterQuery: '',
   };
 
   // DOM Elements Cache
@@ -44,11 +52,99 @@
     lowImpactBanner: document.getElementById('low-impact-banner'),
     toastContainer: document.getElementById('toast-container'),
 
+    // Runtime Memory & State Summary Bar (Top Overview)
+    sumRuntimeStatus: document.getElementById('sum-runtime-status'),
+    sumThreadCount: document.getElementById('sum-thread-count'),
+    sumObjectCount: document.getElementById('sum-object-count'),
+    sumRootCount: document.getElementById('sum-root-count'),
+    sumStateHash: document.getElementById('sum-state-hash'),
+    sumCheckpointStatus: document.getElementById('sum-checkpoint-status'),
+    sumIsolationStatus: document.getElementById('sum-isolation-status'),
+    sumDeterminismStatus: document.getElementById('sum-determinism-status'),
+    sumObsPoint: document.getElementById('sum-obs-point'),
+    selectGlobalTimeout: document.getElementById('select-global-timeout'),
+    selectSnapshotId: document.getElementById('select-snapshot-id'),
+
     // Main Nav Tabs (6 Tabs)
     navTabs: document.querySelectorAll('.nav-tab'),
     tabPanes: document.querySelectorAll('.tab-pane'),
 
-    // Tab 1: Memory Snapshot Explorer
+    // TAB 1: 3-Pane Object Explorer Workspace
+    // Left Pane
+    badgeMemObjectsCount: document.getElementById('badge-mem-objects-count'),
+    selectObjSort: document.getElementById('select-obj-sort'),
+    inputSearchObjects: document.getElementById('input-search-objects'),
+    btnClearObjSearch: document.getElementById('btn-clear-obj-search'),
+    filterObjGroupPills: document.querySelectorAll('#filter-obj-group .filter-pill'),
+    memGraphTruncatedWarning: document.getElementById('mem-graph-truncated-warning'),
+    txtMemTruncatedCount: document.getElementById('txt-mem-truncated-count'),
+    listMemoryObjects: document.getElementById('list-memory-objects'),
+
+    // Center Pane
+    centerBreadcrumb: document.getElementById('center-breadcrumb'),
+    bcCurrentName: document.getElementById('bc-current-name'),
+    btnViewTree: document.getElementById('btn-view-tree'),
+    btnViewTable: document.getElementById('btn-view-table'),
+    btnViewGraph: document.getElementById('btn-view-graph'),
+    centerViewTabs: document.querySelectorAll('.center-view-tabs .btn-tab-pill'),
+    viewReferenceTree: document.getElementById('view-reference-tree'),
+    viewReferenceTable: document.getElementById('view-reference-table'),
+    viewTopologyGraph: document.getElementById('view-topology-graph'),
+    treeReferenceContainer: document.getElementById('tree-reference-container'),
+    btnExpandAllTree: document.getElementById('btn-expand-all-tree'),
+    btnCollapseAllTree: document.getElementById('btn-collapse-all-tree'),
+    tableObjectsSummary: document.getElementById('table-objects-summary'),
+    tbodyObjectsSummary: document.getElementById('tbody-objects-summary'),
+    svgTopologyGraph: document.getElementById('topology-graph-svg'),
+    btnResetTopology: document.getElementById('btn-reset-topology'),
+
+    // Right Pane (Inspector)
+    memObjTitle: document.getElementById('mem-obj-title'),
+    memObjSubtitle: document.getElementById('mem-obj-subtitle'),
+    memObjTypeBadge: document.getElementById('mem-obj-type-badge'),
+    memObjStorageBadge: document.getElementById('mem-obj-storage-badge'),
+    btnViewObjJson: document.getElementById('btn-view-obj-json'),
+    btnJumpTopology: document.getElementById('btn-jump-topology'),
+
+    inspValName: document.getElementById('insp-val-name'),
+    inspValType: document.getElementById('insp-val-type'),
+    inspValStorage: document.getElementById('insp-val-storage'),
+    inspValRoot: document.getElementById('insp-val-root'),
+    inspValThread: document.getElementById('insp-val-thread'),
+    memTechId: document.getElementById('mem-tech-id'),
+    memTechAddr: document.getElementById('mem-tech-addr'),
+    memTechStorage: document.getElementById('mem-tech-storage'),
+    memTechType: document.getElementById('mem-tech-type'),
+
+    inspFieldsCount: document.getElementById('insp-fields-count'),
+    tableSemanticFields: document.querySelector('#table-semantic-fields tbody'),
+
+    badgeTotalRefsCount: document.getElementById('badge-total-refs-count'),
+    badgeOutgoingCount: document.getElementById('badge-outgoing-count'),
+    badgeIncomingCount: document.getElementById('badge-incoming-count'),
+    inspectorOutgoingRefs: document.getElementById('inspector-outgoing-refs'),
+    inspectorIncomingRefs: document.getElementById('inspector-incoming-refs'),
+
+    cardIntegratedMutation: document.getElementById('card-integrated-mutation'),
+    inspMutBadge: document.getElementById('insp-mut-badge'),
+    inspMutTargetLabel: document.getElementById('insp-mut-target-label'),
+    inspMutCurrentVal: document.getElementById('insp-mut-current-val'),
+    inspMutInputContainer: document.getElementById('insp-mut-input-container'),
+    inspMutNewVal: document.getElementById('insp-mut-new-val'),
+    inspMutBackend: document.getElementById('insp-mut-backend'),
+    inspMutObsPoint: document.getElementById('insp-mut-obs-point'),
+    btnInspRunMutation: document.getElementById('btn-insp-run-mutation'),
+
+    inspStateId: document.getElementById('insp-state-id'),
+    inspParentStateId: document.getElementById('insp-parent-state-id'),
+    inspStateHash: document.getElementById('insp-state-hash'),
+
+    // Thread Explorer (Tab 2)
+    badgeThreadsCount: document.getElementById('badge-threads-count'),
+    tableThreads: document.getElementById('table-threads'),
+    tbodyThreads: document.getElementById('tbody-threads'),
+
+    // Memory Snapshot Explorer (Tab 3)
     msBadgeMode: document.getElementById('ms-badge-mode'),
     msBadgeStatus: document.getElementById('ms-badge-status'),
     msBadgeConsistency: document.getElementById('ms-badge-consistency'),
@@ -57,12 +153,6 @@
     msTxtObsPoint: document.getElementById('ms-txt-obs-point'),
     msTargetTitle: document.getElementById('ms-target-title'),
     msTargetSubtitle: document.getElementById('ms-target-subtitle'),
-    selectSnapshotId: document.getElementById('select-snapshot-id'),
-
-    // Thread Explorer
-    badgeThreadsCount: document.getElementById('badge-threads-count'),
-    tableThreads: document.getElementById('table-threads'),
-    tbodyThreads: document.getElementById('tbody-threads'),
 
     statStatus: document.getElementById('stat-status'),
     statStatusSub: document.getElementById('stat-status-sub'),
@@ -107,30 +197,7 @@
     qualBuildId: document.getElementById('qual-build-id'),
     qualModuleCount: document.getElementById('qual-module-count'),
 
-    // Tab 2: Runtime Objects Directory & Inspector
-    inputSearchObjects: document.getElementById('input-search-objects'),
     storageFilterPills: document.querySelectorAll('.storage-filter-pills .filter-pill'),
-    badgeMemObjectsCount: document.getElementById('badge-mem-objects-count'),
-    memGraphTruncatedWarning: document.getElementById('mem-graph-truncated-warning'),
-    txtMemTruncatedCount: document.getElementById('txt-mem-truncated-count'),
-    listMemoryObjects: document.getElementById('list-memory-objects'),
-
-    memObjTitle: document.getElementById('mem-obj-title'),
-    memObjSubtitle: document.getElementById('mem-obj-subtitle'),
-    memObjTypeBadge: document.getElementById('mem-obj-type-badge'),
-    memObjStorageBadge: document.getElementById('mem-obj-storage-badge'),
-    btnJumpTopology: document.getElementById('btn-jump-topology'),
-    btnViewObjJson: document.getElementById('btn-view-obj-json'),
-    tableSemanticFields: document.querySelector('#table-semantic-fields tbody'),
-
-    memTechAddr: document.getElementById('mem-tech-addr'),
-    memTechStorage: document.getElementById('mem-tech-storage'),
-    memTechType: document.getElementById('mem-tech-type'),
-    memTechId: document.getElementById('mem-tech-id'),
-
-    // Tab 3: Topology SVG Graph
-    svgTopologyGraph: document.getElementById('topology-graph-svg'),
-    btnResetTopology: document.getElementById('btn-reset-topology'),
 
     // Tab 4: History / State Diff
     subnavPills: document.querySelectorAll('.subnav-pill'),
@@ -336,6 +403,25 @@
     return parts[parts.length - 1] || path;
   }
 
+  // Mutability Normalization & Helpers (Source of Truth)
+  function normalizeMutability(val) {
+    if (!val) return 'unsupported';
+    const lower = String(val).toLowerCase().trim();
+    if (lower === 'mutable') return 'mutable';
+    if (lower === 'read_only' || lower === 'readonly' || lower === 'const') return 'read_only';
+    return 'unsupported';
+  }
+
+  function isFieldMutable(typeStr, mutabilityVal) {
+    if (mutabilityVal !== undefined && mutabilityVal !== null) {
+      return normalizeMutability(mutabilityVal) === 'mutable';
+    }
+    if (!typeStr) return false;
+    const lower = typeStr.toLowerCase();
+    if (lower.includes('const')) return false;
+    return ['int', 'bool', 'enum', 'float', 'double', 'char', '*'].some((t) => lower.includes(t));
+  }
+
   // --------------------------------------------------------------------------
   // Navigation & Subtab Switching
   // --------------------------------------------------------------------------
@@ -354,6 +440,30 @@
         switchSubtab(targetSubtab, pill);
       });
     });
+
+    // Center view pills (Reference Tree, Table, SVG Graph)
+    if (el.btnViewTree) el.btnViewTree.addEventListener('click', () => switchCenterView('tree'));
+    if (el.btnViewTable) el.btnViewTable.addEventListener('click', () => switchCenterView('table'));
+    if (el.btnViewGraph) el.btnViewGraph.addEventListener('click', () => switchCenterView('graph'));
+  }
+
+  function switchCenterView(viewMode) {
+    state.centerView = viewMode;
+    if (el.btnViewTree) el.btnViewTree.classList.toggle('active', viewMode === 'tree');
+    if (el.btnViewTable) el.btnViewTable.classList.toggle('active', viewMode === 'table');
+    if (el.btnViewGraph) el.btnViewGraph.classList.toggle('active', viewMode === 'graph');
+
+    if (el.viewReferenceTree) el.viewReferenceTree.style.display = viewMode === 'tree' ? 'flex' : 'none';
+    if (el.viewReferenceTable) el.viewReferenceTable.style.display = viewMode === 'table' ? 'flex' : 'none';
+    if (el.viewTopologyGraph) el.viewTopologyGraph.style.display = viewMode === 'graph' ? 'flex' : 'none';
+
+    if (viewMode === 'tree') {
+      renderReferenceTree();
+    } else if (viewMode === 'table') {
+      renderReferenceTable();
+    } else if (viewMode === 'graph') {
+      renderObjectTopology();
+    }
   }
 
   function switchTab(tabId) {
@@ -365,7 +475,13 @@
       p.classList.toggle('active', p.id === tabId);
     });
 
-    if (tabId === 'tab-object-graph') {
+    if (tabId === 'tab-object-explorer') {
+      renderMemoryObjectsList();
+      if (state.centerView === 'tree') renderReferenceTree();
+      else if (state.centerView === 'table') renderReferenceTable();
+      else if (state.centerView === 'graph') renderObjectTopology();
+      if (state.selectedObjectId) selectObject(state.selectedObjectId);
+    } else if (tabId === 'tab-object-graph') {
       renderObjectTopology();
     } else if (tabId === 'tab-runtime-objects') {
       renderMemoryObjectsList();
@@ -445,10 +561,13 @@
                          t.state === 'RUNNING' ? '<span class="badge badge-info">RUNNING</span>' :
                          `<span class="badge badge-neutral">${escapeHtml(t.state || 'UNKNOWN')}</span>`;
 
+      // Honest thread display: NEVER fabricate thread names
+      const threadDisplayName = t.name ? escapeHtml(t.name) : '<span class="text-muted">Name unavailable</span>';
+
       rowsHtml += `
         <tr class="${isObsThread ? 'row-obs-thread' : ''}">
           <td class="mono font-semibold">#${escapeHtml(String(t.thread_id))}</td>
-          <td><strong>${escapeHtml(t.name || 'Thread')}</strong></td>
+          <td>${threadDisplayName}</td>
           <td>${stateBadge}</td>
           <td><code class="mono">${escapeHtml(t.function || 'unknown')}</code></td>
           <td class="mono text-muted">${escapeHtml(t.location || 'N/A')}</td>
@@ -479,25 +598,50 @@
 
     // Header pills & badges
     const status = data.status || 'DISCONNECTED';
-    el.txtRuntimeStatus.textContent = status;
-    el.pillRuntimeStatus.className = 'status-pill ' + status.toLowerCase();
+    if (el.txtRuntimeStatus) el.txtRuntimeStatus.textContent = status;
+    if (el.pillRuntimeStatus) el.pillRuntimeStatus.className = 'status-pill ' + status.toLowerCase();
 
     const mode = data.mode || 'CONSISTENT';
-    el.badgeObsMode.textContent = mode;
-    el.badgeObsMode.className = 'mode-badge' + (mode === 'LOW_IMPACT' ? ' low-impact' : '');
+    if (el.badgeObsMode) {
+      el.badgeObsMode.textContent = mode;
+      el.badgeObsMode.className = 'mode-badge' + (mode === 'LOW_IMPACT' ? ' low-impact' : '');
+    }
+
+    // Top Summary Bar Updates
+    if (el.sumRuntimeStatus) {
+      el.sumRuntimeStatus.textContent = status;
+      el.sumRuntimeStatus.className = 'summary-val status-badge ' + (status === 'STOPPED' ? 'status-stopped' : status === 'RUNNING' ? 'status-running' : 'status-crashed');
+    }
+
+    const threadCount = data.threads || 1;
+    if (el.sumThreadCount) el.sumThreadCount.textContent = threadCount;
+    if (el.sumObjectCount) el.sumObjectCount.textContent = (data.state_summary && data.state_summary.objects_count) || (state.objects && state.objects.length) || 0;
+    if (el.sumRootCount) el.sumRootCount.textContent = (data.state_summary && data.state_summary.roots_count) || 0;
+    if (el.sumStateHash) {
+      const sh = (data.state_summary && data.state_summary.state_hash) || data.current_state_hash || 'N/A';
+      el.sumStateHash.textContent = sh && sh !== 'N/A' ? sh.substring(0, 8) + '...' : 'N/A';
+    }
+
+    // Timeout Source of Truth
+    if (data.default_timeout_ms !== undefined) {
+      state.globalTimeoutMs = data.default_timeout_ms;
+      if (el.selectGlobalTimeout) el.selectGlobalTimeout.value = String(data.default_timeout_ms);
+      if (el.prevTimeoutSelect) el.prevTimeoutSelect.value = String(data.default_timeout_ms);
+    }
 
     // Show/hide low-impact banner & branch isolation banner
     const branchIso = data.branch_isolation || {};
-    const threadCount = data.threads || 1;
     const isIsoSupported = branchIso.status === 'SUPPORTED';
 
     if (mode === 'LOW_IMPACT') {
-      el.lowImpactBanner.style.display = 'flex';
+      if (el.lowImpactBanner) el.lowImpactBanner.style.display = 'flex';
       if (el.exploreIsolationBanner) el.exploreIsolationBanner.style.display = 'none';
-      el.btnStartExplore.disabled = true;
-      el.btnStartExplore.title = 'Exploration unsupported in LOW_IMPACT mode';
+      if (el.btnStartExplore) {
+        el.btnStartExplore.disabled = true;
+        el.btnStartExplore.title = 'Exploration unsupported in LOW_IMPACT mode';
+      }
     } else {
-      el.lowImpactBanner.style.display = 'none';
+      if (el.lowImpactBanner) el.lowImpactBanner.style.display = 'none';
 
       if (el.exploreIsolationBanner) {
         el.exploreIsolationBanner.style.display = 'block';
@@ -513,8 +657,10 @@
             const alts = branchIso.safe_alternatives || ['OBSERVE', 'SNAPSHOT', 'LIST_OBJECTS', 'INSPECT_OBJECT', 'LIST_MUTATION_CANDIDATES'];
             el.exploreAlternativesList.innerHTML = alts.map(a => `<span class="badge badge-info" style="cursor: pointer;" onclick="handleAlternativeAction('${a}')">${a}</span>`).join(' ');
           }
-          el.btnStartExplore.disabled = true;
-          el.btnStartExplore.title = 'Autonomous exploration disabled: Branch isolation unavailable for multithreaded inferior';
+          if (el.btnStartExplore) {
+            el.btnStartExplore.disabled = true;
+            el.btnStartExplore.title = 'Autonomous exploration disabled: Branch isolation unavailable for multithreaded inferior';
+          }
         } else {
           el.exploreIsolationBanner.className = 'alert-banner alert-success';
           const backendName = branchIso.restore_backend || 'RESTART';
@@ -523,39 +669,84 @@
             el.exploreIsolationMsg.textContent = `Independent sibling mutation execution is fully verified and supported via ${backendName} restore.`;
           }
           if (el.exploreIsolationAlternatives) el.exploreIsolationAlternatives.style.display = 'none';
-          el.btnStartExplore.disabled = false;
-          el.btnStartExplore.title = '';
+          if (el.btnStartExplore) {
+            el.btnStartExplore.disabled = false;
+            el.btnStartExplore.title = '';
+          }
         }
-      } else {
+      } else if (el.btnStartExplore) {
         el.btnStartExplore.disabled = false;
         el.btnStartExplore.title = '';
       }
     }
 
-    el.tagPid.textContent = data.pid ? `PID: ${data.pid}` : 'PID: N/A';
-    el.tagArch.textContent = `Arch: ${data.architecture || 'UNKNOWN'}`;
-    el.tagEndian.textContent = `Endian: ${data.endianness || 'UNKNOWN'}`;
-    el.tagElf.textContent = `ELF: ${data.elf_class || 'UNKNOWN'}`;
+    if (el.tagPid) el.tagPid.textContent = data.pid ? `PID: ${data.pid}` : 'PID: N/A';
+    if (el.tagArch) el.tagArch.textContent = `Arch: ${data.architecture || 'UNKNOWN'}`;
+    if (el.tagEndian) el.tagEndian.textContent = `Endian: ${data.endianness || 'UNKNOWN'}`;
+    if (el.tagElf) el.tagElf.textContent = `ELF: ${data.elf_class || 'UNKNOWN'}`;
 
-    // Observation Point display
+    // Observation Point display - HONEST: NEVER fabricate 'observation_checkpoint'
     const obsPoint = data.observation_point;
     if (obsPoint && (obsPoint.location || obsPoint.spec || obsPoint.function)) {
       const obsDisplay = obsPoint.location || obsPoint.spec || (obsPoint.function ? `${obsPoint.function}()` : 'Breakpoint Active');
       if (el.tagHeaderObsPoint) el.tagHeaderObsPoint.style.display = 'inline-flex';
       if (el.txtHeaderObsPoint) el.txtHeaderObsPoint.textContent = obsDisplay;
       if (el.msTxtObsPoint) el.msTxtObsPoint.textContent = obsDisplay;
+      if (el.sumObsPoint) el.sumObsPoint.textContent = obsDisplay;
+      if (el.inspMutObsPoint) el.inspMutObsPoint.textContent = obsDisplay;
     } else {
       if (el.tagHeaderObsPoint) el.tagHeaderObsPoint.style.display = 'none';
-      if (el.msTxtObsPoint) el.msTxtObsPoint.textContent = 'None';
+      if (el.msTxtObsPoint) el.msTxtObsPoint.textContent = 'Not available';
+      if (el.sumObsPoint) el.sumObsPoint.textContent = 'Not available';
+      if (el.inspMutObsPoint) el.inspMutObsPoint.textContent = 'Not available';
     }
 
-    // Tab 5: Checkpoint & Determinism Card
+    // Checkpoint & Determinism: Capability vs Verification
     const cpRestore = data.checkpoint_restore || {};
     const backendName = cpRestore.backend || branchIso.restore_backend || (threadCount > 1 ? 'RESTART' : 'GDB_CHECKPOINT');
     const semantics = cpRestore.semantics || branchIso.semantics || (backendName === 'RESTART' ? 'RESTART_TO_OBSERVATION_POINT' : 'MEMORY_CHECKPOINT');
     const scope = cpRestore.scope || branchIso.scope || (threadCount > 1 ? 'MULTITHREAD' : 'SINGLE_THREAD');
-    const detStatus = cpRestore.determinism_status || branchIso.determinism_status || 'UNKNOWN';
+
+    // Checkpoint capability
+    const cpCap = data.checkpoint_capability !== undefined ? data.checkpoint_capability : (cpRestore.supported !== undefined ? cpRestore.supported : true);
+    if (el.sumCheckpointStatus) {
+      el.sumCheckpointStatus.innerHTML = `<span class="badge ${cpCap ? 'badge-success' : 'badge-danger'}">${cpCap ? 'Supported' : 'Unavailable'}</span>`;
+    }
+
+    // Branch isolation: Capability vs Verification
+    const branchIsoCap = data.branch_isolation_capability || (branchIso.status === 'SUPPORTED' ? 'SUPPORTED' : 'UNAVAILABLE');
+    const branchIsoVer = Boolean(data.branch_isolation_verified);
     const branchStatus = branchIso.status || (isIsoSupported ? 'SUPPORTED' : 'UNAVAILABLE');
+
+    if (el.sumIsolationStatus) {
+      let isoBadgeClass = branchIsoCap === 'SUPPORTED' ? (branchIsoVer ? 'badge-success' : 'badge-info') : 'badge-warning';
+      let isoText = branchIsoCap === 'SUPPORTED' ? (branchIsoVer ? 'Supported (Verified)' : 'Supported') : 'Unavailable';
+      el.sumIsolationStatus.innerHTML = `<span class="badge ${isoBadgeClass}" title="${branchIso.reason || ''}">${escapeHtml(isoText)}</span>`;
+    }
+
+    // Determinism: Capability vs Verification
+    const detCap = data.determinism_capability || 'SUPPORTED';
+    const detVer = Boolean(data.determinism_verified);
+    const detStatus = cpRestore.determinism_status || branchIso.determinism_status || (detVer ? 'VERIFIED' : 'NOT_VERIFIED');
+
+    if (el.sumDeterminismStatus) {
+      let detClass = 'badge-neutral';
+      let detText = 'Not verified';
+      if (detStatus === 'VERIFIED' || detVer) {
+        detClass = 'badge-success';
+        detText = 'Verified';
+      } else if (detStatus === 'FAILED' || detStatus === 'NON_DETERMINISTIC') {
+        detClass = 'badge-danger';
+        detText = detStatus === 'NON_DETERMINISTIC' ? 'Non-deterministic' : 'Failed';
+      } else if (detCap === 'UNSUPPORTED' || detCap === 'UNAVAILABLE') {
+        detClass = 'badge-warning';
+        detText = 'Unavailable';
+      }
+      el.sumDeterminismStatus.innerHTML = `<span class="badge ${detClass}">${escapeHtml(detText)}</span>`;
+    }
+
+    // Inspector mutation backend card
+    if (el.inspMutBackend) el.inspMutBackend.textContent = backendName;
 
     // Tab 1 Hero Badges
     if (el.msBadgeBackend) el.msBadgeBackend.textContent = backendName;
@@ -585,10 +776,10 @@
     }
 
     // Tab 6: System Overview Cards
-    el.ovStatus.textContent = status;
-    el.ovPid.textContent = data.pid || 'None';
+    if (el.ovStatus) el.ovStatus.textContent = status;
+    if (el.ovPid) el.ovPid.textContent = data.pid || 'None';
     if (el.ovThreads) el.ovThreads.textContent = threadCount;
-    el.ovMode.innerHTML = `<span class="badge ${mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info'}">${mode}</span>`;
+    if (el.ovMode) el.ovMode.innerHTML = `<span class="badge ${mode === 'LOW_IMPACT' ? 'badge-warning' : 'badge-info'}">${mode}</span>`;
     if (el.ovRestoreBackend) el.ovRestoreBackend.textContent = backendName;
     if (el.ovCheckpointSemantics) el.ovCheckpointSemantics.textContent = semantics;
     if (el.ovThreadScope) el.ovThreadScope.textContent = scope;
@@ -601,27 +792,29 @@
     if (el.ovBranchIsolation) {
       el.ovBranchIsolation.innerHTML = `<span class="badge ${isIsoSupported ? 'badge-success' : 'badge-warning'}">${branchStatus}</span>`;
     }
-    el.ovBinary.textContent = data.executable || 'None';
-    el.ovDebugImage.textContent = data.debug_image || 'None';
-    el.ovDebugStatus.innerHTML = `<span class="badge ${data.debug_image_status === 'VERIFIED' ? 'badge-success' : 'badge-neutral'}">${data.debug_image_status || 'NOT_AVAILABLE'}</span>`;
+    if (el.ovBinary) el.ovBinary.textContent = data.executable || 'None';
+    if (el.ovDebugImage) el.ovDebugImage.textContent = data.debug_image || 'None';
+    if (el.ovDebugStatus) el.ovDebugStatus.innerHTML = `<span class="badge ${data.debug_image_status === 'VERIFIED' ? 'badge-success' : 'badge-neutral'}">${data.debug_image_status || 'NOT_AVAILABLE'}</span>`;
 
-    el.ovArch.textContent = data.architecture || 'UNKNOWN';
-    el.ovEndian.textContent = data.endianness || 'UNKNOWN';
-    el.ovElf.textContent = data.elf_class || 'UNKNOWN';
-    el.ovBuildId.textContent = data.build_id || 'None';
-    el.ovModulesCount.textContent = data.module_count || 0;
-    el.ovCheckpoint.textContent = data.current_checkpoint || 'None';
+    if (el.ovArch) el.ovArch.textContent = data.architecture || 'UNKNOWN';
+    if (el.ovEndian) el.ovEndian.textContent = data.endianness || 'UNKNOWN';
+    if (el.ovElf) el.ovElf.textContent = data.elf_class || 'UNKNOWN';
+    if (el.ovBuildId) el.ovBuildId.textContent = data.build_id || 'None';
+    if (el.ovModulesCount) el.ovModulesCount.textContent = data.module_count || 0;
+    if (el.ovCheckpoint) el.ovCheckpoint.textContent = data.current_checkpoint || 'None';
 
-    el.ovStatesCount.textContent = data.state_count || 0;
-    el.ovTransCount.textContent = data.transition_count || 0;
+    if (el.ovStatesCount) el.ovStatesCount.textContent = data.state_count || 0;
+    if (el.ovTransCount) el.ovTransCount.textContent = data.transition_count || 0;
 
     const limits = data.safety_limits || {};
-    el.ovLimits.innerHTML = `
-      <span class="tag">Max steps: ${limits.max_steps || 50}</span>
-      <span class="tag">Timeout: ${limits.max_timeout_ms || 5000}ms</span>
-      <span class="tag">Max candidates: ${limits.max_candidates || 50}</span>
-      <span class="tag">Max corpus states: ${limits.max_corpus_states || 100}</span>
-    `;
+    if (el.ovLimits) {
+      el.ovLimits.innerHTML = `
+        <span class="tag">Max steps: ${limits.max_steps || 50}</span>
+        <span class="tag">Timeout: ${limits.max_timeout_ms || 5000}ms</span>
+        <span class="tag">Max candidates: ${limits.max_candidates || 50}</span>
+        <span class="tag">Max corpus states: ${limits.max_corpus_states || 100}</span>
+      `;
+    }
 
     // Load modules table
     loadModules();
@@ -964,11 +1157,17 @@
   // Tab 2: Runtime Objects Directory & Human-Centric Inspector
   // --------------------------------------------------------------------------
 
+  // --------------------------------------------------------------------------
+  // TAB 1: 3-Pane Object Explorer Workspace (Android Studio / HeapHero Inspired)
+  // --------------------------------------------------------------------------
+
   async function loadObjectsForState(stateId) {
     if (!stateId) return;
     const res = await apiGet(`/api/states/${stateId}/objects`);
     if (!res.success) {
-      el.listMemoryObjects.innerHTML = `<div class="text-muted text-center p-3">${escapeHtml(res.error.message)}</div>`;
+      if (el.listMemoryObjects) {
+        el.listMemoryObjects.innerHTML = `<div class="text-muted text-center p-3">${escapeHtml(res.error.message)}</div>`;
+      }
       return;
     }
 
@@ -976,8 +1175,20 @@
     state.objects = objects;
     state.jsonViewerCache['objects'] = objects;
 
+    // Default expand root nodes in reference tree
+    state.expandedTreeNodes.clear();
+    objects.slice(0, 5).forEach((o) => {
+      state.expandedTreeNodes.add(o.object_id);
+    });
+
     renderMemoryObjectsList();
-    renderObjectTopology();
+    if (state.centerView === 'tree') {
+      renderReferenceTree();
+    } else if (state.centerView === 'table') {
+      renderReferenceTable();
+    } else if (state.centerView === 'graph') {
+      renderObjectTopology();
+    }
 
     if (state.selectedObjectId && objects.some((o) => o.object_id === state.selectedObjectId)) {
       selectObject(state.selectedObjectId);
@@ -987,14 +1198,26 @@
   }
 
   function renderMemoryObjectsList() {
+    if (!el.listMemoryObjects) return;
     const objects = state.objects || [];
     const query = (state.searchQuery || '').toLowerCase().trim();
-    const filter = state.storageFilter || 'all';
+    const groupFilter = state.objectFilterGroup || 'all';
 
-    const filtered = objects.filter((o) => {
+    // 1. Group Filtering
+    let filtered = objects.filter((o) => {
       const st = (o.storage || 'unknown').toLowerCase();
-      if (filter !== 'all' && st !== filter) return false;
+      if (groupFilter === 'roots') {
+        const isRoot = Boolean(o.root_source) || st === 'global' || st === 'stack' || (o.incoming_count === 0);
+        if (!isRoot) return false;
+      } else if (groupFilter === 'heap') {
+        if (st !== 'heap') return false;
+      } else if (groupFilter === 'globals') {
+        if (st !== 'global') return false;
+      } else if (groupFilter === 'stack') {
+        if (st !== 'stack') return false;
+      }
 
+      // Search Query
       if (!query) return true;
       const matchesId = (o.object_id || '').toLowerCase().includes(query);
       const matchesSemantic = (o.semantic_name || '').toLowerCase().includes(query);
@@ -1006,44 +1229,74 @@
       return matchesId || matchesSemantic || matchesType || matchesCleaned || matchesField;
     });
 
-    el.badgeMemObjectsCount.textContent = `${filtered.length} / ${objects.length}`;
+    // 2. Sorting
+    const sortMode = state.objectSort || 'name-asc';
+    filtered.sort((a, b) => {
+      const nameA = a.semantic_name || a.object_id;
+      const nameB = b.semantic_name || b.object_id;
+      if (sortMode === 'name-asc') return nameA.localeCompare(nameB);
+      if (sortMode === 'name-desc') return nameB.localeCompare(nameA);
+      if (sortMode === 'type-asc') {
+        const typeA = a.cleaned_type || a.type || '';
+        const typeB = b.cleaned_type || b.type || '';
+        return typeA.localeCompare(typeB);
+      }
+      if (sortMode === 'fields-desc') {
+        const fA = a.field_count !== undefined ? a.field_count : (a.fields ? a.fields.length : 0);
+        const fB = b.field_count !== undefined ? b.field_count : (b.fields ? b.fields.length : 0);
+        return fB - fA;
+      }
+      if (sortMode === 'refs-desc') {
+        const rA = (a.outgoing_count || 0) + (a.incoming_count || 0);
+        const rB = (b.outgoing_count || 0) + (b.incoming_count || 0);
+        return rB - rA;
+      }
+      if (sortMode === 'addr-asc') {
+        return (Number(a.address) || 0) - (Number(b.address) || 0);
+      }
+      return 0;
+    });
+
+    if (el.badgeMemObjectsCount) {
+      el.badgeMemObjectsCount.textContent = `${filtered.length} / ${objects.length}`;
+    }
 
     if (filtered.length === 0) {
       el.listMemoryObjects.innerHTML = `<div class="text-muted text-center p-3">No matching objects found</div>`;
       return;
     }
 
-    let html = '';
-    filtered.forEach((o) => {
-      const isSelected = o.object_id === state.selectedObjectId;
-      const storage = (o.storage || 'unknown').toLowerCase();
-      const storageClass = storage === 'heap' ? 'badge-storage-heap' : storage === 'global' ? 'badge-storage-global' : 'badge-storage-stack';
-      const fieldCount = (o.fields && o.fields.length) || 0;
-      const pointerCount = (o.fields || []).filter((f) => f.object_ref).length;
+    // 3. Render: By Type (Accordion Grouping) vs Flat Card List
+    if (groupFilter === 'types') {
+      const typeGroups = {};
+      filtered.forEach((o) => {
+        const t = o.cleaned_type || (o.type ? o.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
+        if (!typeGroups[t]) typeGroups[t] = [];
+        typeGroups[t].push(o);
+      });
 
-      const semanticName = o.semantic_name || o.object_id;
-      const cleanedType = o.cleaned_type || (o.type ? o.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
-
-      const advancedIdHtml = state.isAdvancedMode && o.semantic_name && o.semantic_name !== o.object_id
-        ? `<span class="mem-obj-raw-id mono text-muted" style="font-size: 0.75rem; margin-left: 6px;">[${escapeHtml(o.object_id)}]</span>`
-        : '';
-
-      html += `
-        <div class="mem-obj-item ${isSelected ? 'selected' : ''}" data-object-id="${o.object_id}">
-          <div class="mem-obj-top">
-            <span class="mem-obj-title-text font-semibold">${escapeHtml(semanticName)}${advancedIdHtml}</span>
-            <span class="badge ${storageClass}">${storage.toUpperCase()}</span>
+      let html = '';
+      Object.keys(typeGroups).sort().forEach((typeName) => {
+        const groupObjs = typeGroups[typeName];
+        html += `
+          <div class="obj-tree-group">
+            <div class="obj-tree-group-header" data-group-type="${escapeHtml(typeName)}">
+              <span class="obj-tree-group-title">🏷️ ${escapeHtml(typeName)}</span>
+              <span class="obj-tree-group-count">${groupObjs.length} instance${groupObjs.length > 1 ? 's' : ''}</span>
+            </div>
+            <div class="obj-tree-group-body">
+              ${groupObjs.map((o) => renderObjectCardHtml(o)).join('')}
+            </div>
           </div>
-          <div class="mem-obj-meta-row">
-            <span class="mem-obj-type">${escapeHtml(cleanedType)}</span>
-            <span class="text-muted">${fieldCount} flds${pointerCount > 0 ? ` · ${pointerCount} 🔗` : ''}</span>
-          </div>
-        </div>
-      `;
-    });
-    el.listMemoryObjects.innerHTML = html;
+        `;
+      });
+      el.listMemoryObjects.innerHTML = html;
+    } else {
+      el.listMemoryObjects.innerHTML = filtered.map((o) => renderObjectCardHtml(o)).join('');
+    }
 
-    el.listMemoryObjects.querySelectorAll('.mem-obj-item').forEach((item) => {
+    // Attach click listeners to cards
+    el.listMemoryObjects.querySelectorAll('.object-card-item').forEach((item) => {
       item.addEventListener('click', () => {
         const oid = item.getAttribute('data-object-id');
         selectObject(oid);
@@ -1051,12 +1304,233 @@
     });
   }
 
+  function renderObjectCardHtml(o) {
+    const isSelected = o.object_id === state.selectedObjectId;
+    const storage = (o.storage || 'unknown').toLowerCase();
+    const storageClass = storage === 'heap' ? 'badge-storage-heap' : storage === 'global' ? 'badge-storage-global' : 'badge-storage-stack';
+    const fieldCount = o.field_count !== undefined ? o.field_count : ((o.fields && o.fields.length) || 0);
+    const outgoingCount = o.outgoing_count !== undefined ? o.outgoing_count : ((o.fields || []).filter((f) => f.object_ref).length);
+    const incomingCount = o.incoming_count || 0;
+
+    const semanticName = o.semantic_name || o.object_id;
+    const cleanedType = o.cleaned_type || (o.type ? o.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
+
+    const advancedIdHtml = state.isAdvancedMode
+      ? `<span class="mono text-muted text-xs" style="margin-left: 4px;">[${escapeHtml(o.object_id)}]</span>`
+      : '';
+
+    return `
+      <div class="object-card-item ${isSelected ? 'selected' : ''}" data-object-id="${o.object_id}">
+        <div class="obj-card-top">
+          <span class="obj-name-semantic">${escapeHtml(semanticName)}${advancedIdHtml}</span>
+          <span class="badge ${storageClass}" style="font-size: 0.65rem;">${storage.toUpperCase()}</span>
+        </div>
+        <div class="obj-card-meta">
+          <span class="obj-type-tag">${escapeHtml(cleanedType)}</span>
+        </div>
+        <div class="obj-stats-badges">
+          <span class="obj-badge">${fieldCount} flds</span>
+          ${outgoingCount > 0 ? `<span class="obj-badge" title="${outgoingCount} outgoing references">🔗 ${outgoingCount} out</span>` : ''}
+          ${incomingCount > 0 ? `<span class="obj-badge" title="${incomingCount} incoming references">📥 ${incomingCount} in</span>` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  // --------------------------------------------------------------------------
+  // Center Pane: Reference Tree & Hierarchy (Android Studio Heap Dump Tree Style)
+  // --------------------------------------------------------------------------
+
+  function renderReferenceTree() {
+    if (!el.treeReferenceContainer) return;
+    const objects = state.objects || [];
+
+    if (objects.length === 0) {
+      el.treeReferenceContainer.innerHTML = '<div class="text-muted text-center p-3">No objects available in current snapshot</div>';
+      return;
+    }
+
+    // Identify Root Objects: globals, stack locals, root_source, or no incoming refs
+    let rootObjects = objects.filter((o) => {
+      const st = (o.storage || '').toLowerCase();
+      return Boolean(o.root_source) || st === 'global' || st === 'stack' || (o.incoming_count === 0);
+    });
+
+    if (rootObjects.length === 0) {
+      rootObjects = objects;
+    }
+
+    let treeHtml = '';
+    rootObjects.forEach((rootObj) => {
+      treeHtml += renderTreeNodeHtml(rootObj, null, new Set(), 0);
+    });
+
+    el.treeReferenceContainer.innerHTML = treeHtml;
+
+    // Attach tree expand/collapse handlers
+    el.treeReferenceContainer.querySelectorAll('.tree-expander').forEach((exp) => {
+      exp.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const nodeKey = exp.getAttribute('data-node-key');
+        if (state.expandedTreeNodes.has(nodeKey)) {
+          state.expandedTreeNodes.delete(nodeKey);
+        } else {
+          state.expandedTreeNodes.add(nodeKey);
+        }
+        renderReferenceTree();
+      });
+    });
+
+    // Attach node row select handlers
+    el.treeReferenceContainer.querySelectorAll('.tree-node-row').forEach((row) => {
+      row.addEventListener('click', () => {
+        const oid = row.getAttribute('data-object-id');
+        if (oid) selectObject(oid);
+      });
+    });
+  }
+
+  function renderTreeNodeHtml(obj, viaField, visitedPath, depth) {
+    if (!obj) return '';
+    const nodeKey = `${obj.object_id}_${depth}`;
+    const isExpanded = state.expandedTreeNodes.has(nodeKey) || state.expandedTreeNodes.has(obj.object_id);
+    const isSelected = obj.object_id === state.selectedObjectId;
+
+    // Find outgoing reference fields
+    const refFields = (obj.fields || []).filter((f) => Boolean(f.object_ref));
+    const hasChildren = refFields.length > 0 && !visitedPath.has(obj.object_id) && depth < 8;
+
+    const expanderIcon = hasChildren ? (isExpanded ? '▼' : '▶') : ' ';
+    const semanticName = obj.semantic_name || obj.object_id;
+    const cleanedType = obj.cleaned_type || (obj.type ? obj.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
+    const storage = (obj.storage || 'HEAP').toUpperCase();
+
+    const fieldLabelHtml = viaField
+      ? `<span class="tree-node-field">${escapeHtml(viaField)}: </span>`
+      : '';
+
+    const isCycle = visitedPath.has(obj.object_id);
+
+    let html = `
+      <div class="ref-tree-node">
+        <div class="tree-node-row ${isSelected ? 'selected' : ''}" data-object-id="${obj.object_id}">
+          <span class="tree-expander" data-node-key="${nodeKey}">${expanderIcon}</span>
+          <span class="tree-node-icon">${depth === 0 ? '📦' : '🔗'}</span>
+          ${fieldLabelHtml}
+          <span class="tree-node-label">${escapeHtml(semanticName)}</span>
+          <span class="tree-node-type">(${escapeHtml(cleanedType)})</span>
+          ${isCycle ? '<span class="badge badge-warning text-xs">cyclic</span>' : ''}
+          <span class="tree-node-badge">${storage}</span>
+        </div>
+    `;
+
+    if (hasChildren && isExpanded) {
+      const nextVisited = new Set(visitedPath);
+      nextVisited.add(obj.object_id);
+
+      html += `<div class="ref-tree-children">`;
+      refFields.forEach((rf) => {
+        const childObj = state.objects.find((candidate) => candidate.object_id === rf.object_ref);
+        if (childObj) {
+          html += renderTreeNodeHtml(childObj, rf.name, nextVisited, depth + 1);
+        } else {
+          html += `
+            <div class="tree-node-row" style="opacity: 0.7;">
+              <span class="tree-expander"> </span>
+              <span class="tree-node-icon">🔗</span>
+              <span class="tree-node-field">${escapeHtml(rf.name)}: </span>
+              <span class="tree-node-label mono text-muted">${escapeHtml(rf.object_ref)}</span>
+              <span class="text-muted text-xs">(External reference)</span>
+            </div>
+          `;
+        }
+      });
+      html += `</div>`;
+    }
+
+    html += `</div>`;
+    return html;
+  }
+
+  // --------------------------------------------------------------------------
+  // Center Pane: Reference Table View
+  // --------------------------------------------------------------------------
+
+  function renderReferenceTable() {
+    if (!el.tbodyObjectsSummary) return;
+    const objects = state.objects || [];
+
+    if (objects.length === 0) {
+      el.tbodyObjectsSummary.innerHTML = `<tr><td colspan="7" class="text-muted text-center p-3">No objects available in current snapshot</td></tr>`;
+      return;
+    }
+
+    let rowsHtml = '';
+    objects.forEach((o) => {
+      const isSelected = o.object_id === state.selectedObjectId;
+      const storage = (o.storage || 'UNKNOWN').toUpperCase();
+      const storageClass = storage === 'HEAP' ? 'badge-storage-heap' : storage === 'GLOBAL' ? 'badge-storage-global' : 'badge-storage-stack';
+      const fieldCount = o.field_count !== undefined ? o.field_count : ((o.fields && o.fields.length) || 0);
+      const outgoingCount = o.outgoing_count !== undefined ? o.outgoing_count : ((o.fields || []).filter((f) => f.object_ref).length);
+      const incomingCount = o.incoming_count || 0;
+
+      const semanticName = o.semantic_name || o.object_id;
+      const cleanedType = o.cleaned_type || (o.type ? o.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
+
+      rowsHtml += `
+        <tr class="${isSelected ? 'selected' : ''}">
+          <td class="mono font-semibold text-accent">${escapeHtml(semanticName)}</td>
+          <td class="mono">${escapeHtml(cleanedType)}</td>
+          <td><span class="badge ${storageClass}">${storage}</span></td>
+          <td class="mono">${fieldCount}</td>
+          <td class="mono">${outgoingCount > 0 ? `🔗 ${outgoingCount}` : '0'}</td>
+          <td class="mono">${incomingCount > 0 ? `📥 ${incomingCount}` : '0'}</td>
+          <td>
+            <button class="btn btn-sm btn-secondary btn-table-inspect" data-object-id="${o.object_id}">Inspect →</button>
+          </td>
+        </tr>
+      `;
+    });
+
+    el.tbodyObjectsSummary.innerHTML = rowsHtml;
+
+    el.tbodyObjectsSummary.querySelectorAll('.btn-table-inspect').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const oid = btn.getAttribute('data-object-id');
+        selectObject(oid);
+      });
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Right Pane: Object Inspector & Reference Navigation
+  // --------------------------------------------------------------------------
+
   function selectObject(objectId) {
+    if (!objectId) return;
     state.selectedObjectId = objectId;
 
-    el.listMemoryObjects.querySelectorAll('.mem-obj-item').forEach((item) => {
-      item.classList.toggle('selected', item.getAttribute('data-object-id') === objectId);
-    });
+    // 1. Highlight in list & table
+    if (el.listMemoryObjects) {
+      el.listMemoryObjects.querySelectorAll('.object-card-item').forEach((item) => {
+        item.classList.toggle('selected', item.getAttribute('data-object-id') === objectId);
+      });
+    }
+
+    if (el.tbodyObjectsSummary) {
+      el.tbodyObjectsSummary.querySelectorAll('tr').forEach((tr) => {
+        const btn = tr.querySelector('.btn-table-inspect');
+        const isSel = btn && btn.getAttribute('data-object-id') === objectId;
+        tr.classList.toggle('selected', isSel);
+      });
+    }
+
+    // Highlight in Reference Tree
+    if (el.treeReferenceContainer) {
+      el.treeReferenceContainer.querySelectorAll('.tree-node-row').forEach((row) => {
+        row.classList.toggle('selected', row.getAttribute('data-object-id') === objectId);
+      });
+    }
 
     const obj = state.objects.find((o) => o.object_id === objectId);
     if (!obj) return;
@@ -1068,94 +1542,291 @@
     const semanticName = obj.semantic_name || obj.object_id;
     const cleanedType = obj.cleaned_type || (obj.type ? obj.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
 
-    el.memObjTitle.textContent = `${semanticName} — ${cleanedType}`;
-    el.memObjSubtitle.textContent = state.isAdvancedMode
-      ? `[${obj.object_id}] ${storage} memory object located at ${addrHex}`
-      : `${storage} memory object · ${obj.root_source || 'Application Root'}`;
-    el.memObjTypeBadge.textContent = cleanedType;
-    el.memObjStorageBadge.textContent = storage;
-    el.memObjStorageBadge.className = 'badge ' + storageClass;
+    // 2. Update Center Breadcrumb
+    if (el.bcCurrentName) {
+      el.bcCurrentName.textContent = `${semanticName} (${cleanedType})`;
+    }
 
-    // Collapsible technical details
-    el.memTechAddr.textContent = addrHex;
-    el.memTechStorage.textContent = storage;
-    el.memTechType.textContent = obj.type || 'Unknown';
-    el.memTechId.textContent = obj.object_id;
+    // 3. Populate Inspector Header
+    if (el.memObjTitle) el.memObjTitle.textContent = `${semanticName} — ${cleanedType}`;
+    if (el.memObjSubtitle) {
+      el.memObjSubtitle.textContent = state.isAdvancedMode
+        ? `[${obj.object_id}] ${storage} memory object located at ${addrHex}`
+        : `${storage} memory object · ${obj.root_source || 'Application Root'}`;
+    }
+    if (el.memObjTypeBadge) el.memObjTypeBadge.textContent = cleanedType;
+    if (el.memObjStorageBadge) {
+      el.memObjStorageBadge.textContent = storage;
+      el.memObjStorageBadge.className = 'badge ' + storageClass;
+    }
 
-    // Fields Table
+    // 4. Identity & Scope Details
+    if (el.inspValName) el.inspValName.textContent = semanticName;
+    if (el.inspValType) el.inspValType.textContent = cleanedType;
+    if (el.inspValStorage) {
+      el.inspValStorage.textContent = storage;
+      el.inspValStorage.className = 'badge ' + storageClass;
+    }
+    if (el.inspValRoot) el.inspValRoot.textContent = obj.root_source || (storage === 'GLOBAL' ? 'Global Variable' : storage === 'STACK' ? 'Stack Local' : 'Heap Allocated');
+    if (el.inspValThread) el.inspValThread.textContent = obj.thread_name || (state.runtime && state.runtime.threads ? `${state.runtime.threads} Thread(s)` : 'N/A');
+
+    if (el.memTechId) el.memTechId.textContent = obj.object_id;
+    if (el.memTechAddr) el.memTechAddr.textContent = addrHex;
+    if (el.memTechStorage) el.memTechStorage.textContent = storage;
+    if (el.memTechType) el.memTechType.textContent = obj.type || 'Unknown';
+
+    // 5. Fields Table
     const fields = obj.fields || [];
+    if (el.inspFieldsCount) el.inspFieldsCount.textContent = `${fields.length} field${fields.length !== 1 ? 's' : ''}`;
+
     if (fields.length === 0) {
-      el.tableSemanticFields.innerHTML = `<tr><td colspan="6" class="text-muted text-center">No fields defined for this object</td></tr>`;
+      if (el.tableSemanticFields) {
+        el.tableSemanticFields.innerHTML = `<tr><td colspan="6" class="text-muted text-center">No fields defined for this object</td></tr>`;
+      }
+    } else {
+      let fieldsHtml = '';
+      fields.forEach((f) => {
+        const isRef = Boolean(f.object_ref);
+        const mutStatus = normalizeMutability(f.mutability);
+        const isMut = mutStatus === 'mutable' || isFieldMutable(f.type, f.mutability);
+        const valHtml = formatSemanticValue(f.value, f.type, f.object_ref);
+        const cleanedFieldType = f.cleaned_type || (f.type ? f.type.replace(/\b(struct|class|enum)\s+/g, '') : '');
+
+        let refChipHtml = '<span class="text-muted">—</span>';
+        if (isRef) {
+          const targetObj = state.objects.find((target) => target.object_id === f.object_ref);
+          const targetName = targetObj ? (targetObj.semantic_name || targetObj.cleaned_type || targetObj.type) : f.object_ref;
+          refChipHtml = `
+            <button class="ref-chip outgoing-chip" data-ref-id="${f.object_ref}" title="Jump to referenced object">
+              <span class="ref-chip-field">🔗</span> <span class="ref-chip-target">${escapeHtml(targetName)}</span>
+            </button>
+          `;
+        }
+
+        const mutBadgeHtml = isMut
+          ? '<span class="badge badge-success">MUTABLE</span>'
+          : '<span class="badge badge-neutral">READ_ONLY</span>';
+
+        fieldsHtml += `
+          <tr>
+            <td><strong>${escapeHtml(f.name)}</strong></td>
+            <td class="mono text-accent">${escapeHtml(cleanedFieldType)}</td>
+            <td>${valHtml}</td>
+            <td>${refChipHtml}</td>
+            <td>${mutBadgeHtml}</td>
+            <td>
+              ${isMut ? `<button class="field-mutate-btn" data-object-id="${objectId}" data-field-name="${f.name}">⚡ Mutate</button>` : '<span class="text-muted">—</span>'}
+            </td>
+          </tr>
+        `;
+      });
+      if (el.tableSemanticFields) el.tableSemanticFields.innerHTML = fieldsHtml;
+
+      // Pointer chip jump handlers
+      if (el.tableSemanticFields) {
+        el.tableSemanticFields.querySelectorAll('.ref-chip').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            const refId = btn.getAttribute('data-ref-id');
+            jumpToObject(refId);
+          });
+        });
+
+        // Field Mutate inline button handlers
+        el.tableSemanticFields.querySelectorAll('.field-mutate-btn').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const fldName = btn.getAttribute('data-field-name');
+            const targetField = fields.find((f) => f.name === fldName);
+            if (targetField) {
+              populateIntegratedMutation(obj, targetField);
+            }
+          });
+        });
+      }
+    }
+
+    // 6. Reference Relations (HeapHero / Android Studio Incoming & Outgoing)
+    // Outgoing References (this points to other objects)
+    const outgoingRefs = obj.outgoing_references || [];
+    const directOutgoing = outgoingRefs.length > 0 ? outgoingRefs : (fields.filter((f) => f.object_ref).map((f) => ({
+      field: f.name,
+      target_id: f.object_ref,
+      type: f.cleaned_type || f.type
+    })));
+
+    if (el.badgeOutgoingCount) el.badgeOutgoingCount.textContent = `(${directOutgoing.length})`;
+
+    if (el.inspectorOutgoingRefs) {
+      if (directOutgoing.length === 0) {
+        el.inspectorOutgoingRefs.innerHTML = '<span class="text-muted text-xs">No outgoing references</span>';
+      } else {
+        let outHtml = '';
+        directOutgoing.forEach((ref) => {
+          const targetObj = state.objects.find((o) => o.object_id === ref.target_id);
+          const targetName = targetObj ? (targetObj.semantic_name || targetObj.cleaned_type || targetObj.object_id) : ref.target_id;
+          outHtml += `
+            <button class="ref-chip outgoing-chip" data-nav-id="${ref.target_id}" title="Click to inspect ${escapeHtml(targetName)}">
+              <span class="ref-chip-field">${escapeHtml(ref.field)} ➔</span>
+              <span class="ref-chip-target">${escapeHtml(targetName)}</span>
+            </button>
+          `;
+        });
+        el.inspectorOutgoingRefs.innerHTML = outHtml;
+
+        el.inspectorOutgoingRefs.querySelectorAll('.ref-chip').forEach((chip) => {
+          chip.addEventListener('click', () => {
+            const navId = chip.getAttribute('data-nav-id');
+            jumpToObject(navId);
+          });
+        });
+      }
+    }
+
+    // Incoming References (other objects point to this)
+    let incomingRefs = obj.incoming_references || [];
+    if (incomingRefs.length === 0) {
+      // Compute from state objects
+      state.objects.forEach((srcObj) => {
+        (srcObj.fields || []).forEach((f) => {
+          if (f.object_ref === objectId) {
+            incomingRefs.push({
+              source_id: srcObj.object_id,
+              semantic_name: srcObj.semantic_name,
+              field: f.name,
+              type: srcObj.cleaned_type || srcObj.type
+            });
+          }
+        });
+      });
+    }
+
+    if (el.badgeIncomingCount) el.badgeIncomingCount.textContent = `(${incomingRefs.length})`;
+
+    if (el.inspectorIncomingRefs) {
+      if (incomingRefs.length === 0) {
+        el.inspectorIncomingRefs.innerHTML = '<span class="text-muted text-xs">No incoming references (Root / Unreferenced)</span>';
+      } else {
+        let inHtml = '';
+        incomingRefs.forEach((ref) => {
+          const srcObj = state.objects.find((o) => o.object_id === ref.source_id);
+          const srcName = srcObj ? (srcObj.semantic_name || srcObj.cleaned_type || srcObj.object_id) : (ref.semantic_name || ref.source_id);
+          inHtml += `
+            <button class="ref-chip incoming-chip" data-nav-id="${ref.source_id}" title="Referenced by ${escapeHtml(srcName)}.${escapeHtml(ref.field)}">
+              <span class="ref-chip-target">${escapeHtml(srcName)}</span>
+              <span class="ref-chip-field">.${escapeHtml(ref.field)} ➔</span>
+            </button>
+          `;
+        });
+        el.inspectorIncomingRefs.innerHTML = inHtml;
+
+        el.inspectorIncomingRefs.querySelectorAll('.ref-chip').forEach((chip) => {
+          chip.addEventListener('click', () => {
+            const navId = chip.getAttribute('data-nav-id');
+            jumpToObject(navId);
+          });
+        });
+      }
+    }
+
+    if (el.badgeTotalRefsCount) {
+      const totalRefs = directOutgoing.length + incomingRefs.length;
+      el.badgeTotalRefsCount.textContent = `${totalRefs} reference${totalRefs !== 1 ? 's' : ''}`;
+    }
+
+    // 7. Populate Integrated Field Mutation Card
+    const firstMutable = fields.find((f) => {
+      const mutStatus = normalizeMutability(f.mutability);
+      return mutStatus === 'mutable' || isFieldMutable(f.type, f.mutability);
+    });
+    populateIntegratedMutation(obj, firstMutable || null);
+
+    // 8. State Context
+    if (el.inspStateId) el.inspStateId.textContent = state.selectedStateId || 'N/A';
+    if (el.inspParentStateId) {
+      const curState = state.states.find((s) => s.state_id === state.selectedStateId);
+      el.inspParentStateId.textContent = (curState && curState.parent_state) || (curState && curState.metadata && curState.metadata.parent_state_id) || 'None (Seed)';
+    }
+    if (el.inspStateHash) {
+      const curState = state.states.find((s) => s.state_id === state.selectedStateId);
+      el.inspStateHash.textContent = (curState && curState.state_hash) || 'UNKNOWN';
+    }
+  }
+
+  function populateIntegratedMutation(obj, targetField) {
+    if (!el.cardIntegratedMutation) return;
+
+    if (!targetField) {
+      if (el.inspMutTargetLabel) el.inspMutTargetLabel.textContent = 'No mutable fields available';
+      if (el.inspMutCurrentVal) el.inspMutCurrentVal.textContent = '—';
+      if (el.inspMutInputContainer) {
+        el.inspMutInputContainer.innerHTML = '<input type="text" class="input-text input-text-sm mono" disabled placeholder="Read-only object">';
+      }
+      if (el.btnInspRunMutation) el.btnInspRunMutation.disabled = true;
+      if (el.inspMutBadge) {
+        el.inspMutBadge.textContent = 'READ_ONLY';
+        el.inspMutBadge.className = 'badge badge-neutral';
+      }
+      state.currentMutableField = null;
       return;
     }
 
-    let fieldsHtml = '';
-    fields.forEach((f) => {
-      const isRef = Boolean(f.object_ref);
-      const isMutable = f.mutability ? f.mutability === 'MUTABLE' : isFieldMutable(f.type);
-      const valHtml = formatSemanticValue(f.value, f.type, f.object_ref);
-      const cleanedFieldType = f.cleaned_type || (f.type ? f.type.replace(/\b(struct|class|enum)\s+/g, '') : '');
+    state.currentMutableField = { object: obj, field: targetField };
 
-      let refChipHtml = '<span class="text-muted">null</span>';
-      if (isRef) {
-        const targetObj = state.objects.find((target) => target.object_id === f.object_ref);
-        const targetName = targetObj ? (targetObj.semantic_name || targetObj.cleaned_type || targetObj.type) : 'Object';
-        refChipHtml = `
-          <button class="pointer-chip" data-ref-id="${f.object_ref}" title="Jump to referenced object">
-            <span>🔗</span> ${escapeHtml(targetName)} (${escapeHtml(f.object_ref)})
-          </button>
-        `;
-      }
+    const semanticLabel = `${obj.semantic_name || obj.object_id}.${targetField.name}`;
+    if (el.inspMutTargetLabel) el.inspMutTargetLabel.textContent = semanticLabel;
+    if (el.inspMutCurrentVal) el.inspMutCurrentVal.textContent = String(targetField.value);
+    if (el.btnInspRunMutation) el.btnInspRunMutation.disabled = false;
+    if (el.inspMutBadge) {
+      el.inspMutBadge.textContent = 'MUTABLE';
+      el.inspMutBadge.className = 'badge badge-success';
+    }
 
-      fieldsHtml += `
-        <tr>
-          <td><strong>${escapeHtml(f.name)}</strong></td>
-          <td class="mono">${escapeHtml(cleanedFieldType)}</td>
-          <td>${valHtml}</td>
-          <td>${refChipHtml}</td>
-          <td><span class="badge ${isMutable ? 'badge-success' : 'badge-neutral'}">${isMutable ? 'MUTABLE' : 'READ_ONLY'}</span></td>
-          <td>
-            ${isMutable ? `<button class="btn btn-secondary btn-sm btn-inspect-cand" data-object-id="${objectId}" data-field-name="${f.name}">⚡ Mutate...</button>` : '<span class="text-muted">—</span>'}
-          </td>
-        </tr>
+    // Type-Aware Input Box
+    const rawType = (targetField.type || '').toLowerCase();
+    const curVal = targetField.value;
+    let inputHtml = '';
+
+    if (rawType.includes('bool')) {
+      const isCurTrue = curVal === true || curVal === 'true' || curVal === 1 || curVal === '1';
+      inputHtml = `
+        <select id="insp-mut-new-val" class="input-select input-select-sm" style="width: 100%; font-weight: 600;">
+          <option value="true" ${!isCurTrue ? 'selected' : ''}>true</option>
+          <option value="false" ${isCurTrue ? 'selected' : ''}>false</option>
+        </select>
       `;
-    });
-    el.tableSemanticFields.innerHTML = fieldsHtml;
+    } else if (rawType.includes('int') || rawType.includes('short') || rawType.includes('long') || rawType.includes('size_t')) {
+      const nextVal = Number.isInteger(Number(curVal)) ? Number(curVal) + 1 : 1;
+      inputHtml = `
+        <input type="number" id="insp-mut-new-val" class="input-text input-text-sm mono" style="width: 100%; font-weight: 600;" value="${escapeHtml(String(nextVal))}">
+      `;
+    } else if (rawType.includes('float') || rawType.includes('double')) {
+      const nextVal = (Number(curVal) || 0) + 1.0;
+      inputHtml = `
+        <input type="number" step="any" id="insp-mut-new-val" class="input-text input-text-sm mono" style="width: 100%; font-weight: 600;" value="${escapeHtml(String(nextVal))}">
+      `;
+    } else {
+      inputHtml = `
+        <input type="text" id="insp-mut-new-val" class="input-text input-text-sm mono" style="width: 100%; font-weight: 600;" value="${escapeHtml(String(curVal))}">
+      `;
+    }
 
-    el.tableSemanticFields.querySelectorAll('.pointer-chip').forEach((btn) => {
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        const refId = btn.getAttribute('data-ref-id');
-        jumpToObject(refId);
-      });
-    });
+    if (el.inspMutInputContainer) el.inspMutInputContainer.innerHTML = inputHtml;
 
-    el.tableSemanticFields.querySelectorAll('.btn-inspect-cand').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const oid = btn.getAttribute('data-object-id');
-        const fld = btn.getAttribute('data-field-name');
-        const targetObj = state.objects.find((o) => o.object_id === oid);
-        const targetField = (targetObj && targetObj.fields ? targetObj.fields.find((f) => f.name === fld) : null) || {};
+    // Environmental details
+    const branchIso = state.runtime ? (state.runtime.branch_isolation || {}) : {};
+    const backendName = branchIso.restore_backend || 'RESTART';
+    if (el.inspMutBackend) el.inspMutBackend.textContent = backendName;
 
-        openMutationPreview({
-          object_id: oid,
-          semantic_name: targetObj ? targetObj.semantic_name : null,
-          field: fld,
-          current_value: targetField.value,
-          type: targetField.type,
-          cleaned_type: targetField.cleaned_type,
-          storage: targetObj ? targetObj.storage : 'HEAP',
-          mutability: 'MUTABLE',
-        });
-      });
-    });
+    const obsPoint = state.runtime ? state.runtime.observation_point : null;
+    const obsText = obsPoint ? (obsPoint.location || obsPoint.spec || (obsPoint.function ? `${obsPoint.function}()` : 'Breakpoint Active')) : 'Not available';
+    if (el.inspMutObsPoint) el.inspMutObsPoint.textContent = obsText;
   }
 
   function jumpToObject(objectId) {
     if (!objectId) return;
     selectObject(objectId);
 
-    const listItem = el.listMemoryObjects.querySelector(`[data-object-id="${objectId}"]`);
+    const listItem = el.listMemoryObjects ? el.listMemoryObjects.querySelector(`[data-object-id="${objectId}"]`) : null;
     if (listItem) {
       listItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
@@ -1183,13 +1854,6 @@
     }
 
     return `<span class="mono">${escapeHtml(strVal)}</span>`;
-  }
-
-  function isFieldMutable(typeStr) {
-    if (!typeStr) return false;
-    const lower = typeStr.toLowerCase();
-    if (lower.includes('const')) return false;
-    return ['int', 'bool', 'enum', 'float', 'double', 'char', '*'].some((t) => lower.includes(t));
   }
 
   // --------------------------------------------------------------------------
@@ -1739,10 +2403,11 @@
 
   async function executeTransitionWithParams(params) {
     const semanticName = params.semantic_target || `${params.object_id || ''}.${params.field || ''}`;
-    showToast(`Executing mutation on ${semanticName} (${params.timeout_ms}ms)...`, 'info');
+    const effectiveTimeout = params.timeout_ms || state.globalTimeoutMs || 1000;
+    showToast(`Executing mutation on ${semanticName} (${effectiveTimeout}ms)...`, 'info');
 
     const payload = {
-      timeout_ms: params.timeout_ms,
+      timeout_ms: effectiveTimeout,
     };
     if (params.candidate_id) {
       payload.candidate_id = params.candidate_id;
@@ -1768,13 +2433,18 @@
     state.jsonViewerCache['last_transition'] = trans;
     showToast('Mutation executed & state verified successfully!', 'success');
 
-    // Switch to Tab 5 mutations subtab so result is visible
-    switchTab('tab-advanced-explore');
-    const mutPill = document.querySelector('[data-subtab="subtab-mutations"]');
-    if (mutPill) switchSubtab('subtab-mutations', mutPill);
-
+    // Display execution result flow & timeline
     renderExecutionResult(trans, params);
+    if (el.cardExecutionResult) {
+      el.cardExecutionResult.style.display = 'block';
+      el.cardExecutionResult.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    // Refresh states and select child state if produced
     await loadStatesAndGraph();
+    if (trans.child_state) {
+      await selectState(trans.child_state);
+    }
   }
 
   async function executeTransition(candidateId) {
@@ -2095,19 +2765,110 @@
       await loadStatesAndGraph();
     });
 
-    el.selectSnapshotId.addEventListener('change', (e) => {
-      const sid = e.target.value;
-      if (sid) selectState(sid);
+    if (el.selectGlobalTimeout) {
+      el.selectGlobalTimeout.addEventListener('change', (e) => {
+        state.globalTimeoutMs = parseInt(e.target.value, 10) || 1000;
+        if (el.prevTimeoutSelect) el.prevTimeoutSelect.value = String(state.globalTimeoutMs);
+      });
+    }
+
+    if (el.selectSnapshotId) {
+      el.selectSnapshotId.addEventListener('change', (e) => {
+        const sid = e.target.value;
+        if (sid) selectState(sid);
+      });
+    }
+
+    // Object Explorer Sorting
+    if (el.selectObjSort) {
+      el.selectObjSort.addEventListener('change', (e) => {
+        state.objectSort = e.target.value;
+        renderMemoryObjectsList();
+      });
+    }
+
+    // Object Explorer Filter Group Pills
+    el.filterObjGroupPills.forEach((pill) => {
+      pill.addEventListener('click', () => {
+        el.filterObjGroupPills.forEach((p) => p.classList.remove('active'));
+        pill.classList.add('active');
+        state.objectFilterGroup = pill.getAttribute('data-group');
+        renderMemoryObjectsList();
+      });
     });
 
-    el.btnGotoObjects.addEventListener('click', () => {
-      switchTab('tab-runtime-objects');
-    });
+    // Object Explorer Search & Clear
+    if (el.inputSearchObjects) {
+      el.inputSearchObjects.addEventListener('input', (e) => {
+        state.searchQuery = e.target.value;
+        renderMemoryObjectsList();
+      });
+    }
 
-    el.inputSearchObjects.addEventListener('input', (e) => {
-      state.searchQuery = e.target.value;
-      renderMemoryObjectsList();
-    });
+    if (el.btnClearObjSearch) {
+      el.btnClearObjSearch.addEventListener('click', () => {
+        if (el.inputSearchObjects) el.inputSearchObjects.value = '';
+        state.searchQuery = '';
+        renderMemoryObjectsList();
+      });
+    }
+
+    // Reference Tree Toolbar: Expand/Collapse All
+    if (el.btnExpandAllTree) {
+      el.btnExpandAllTree.addEventListener('click', () => {
+        (state.objects || []).forEach((o) => state.expandedTreeNodes.add(o.object_id));
+        renderReferenceTree();
+      });
+    }
+
+    if (el.btnCollapseAllTree) {
+      el.btnCollapseAllTree.addEventListener('click', () => {
+        state.expandedTreeNodes.clear();
+        renderReferenceTree();
+      });
+    }
+
+    // Integrated Field Mutation Trigger
+    if (el.btnInspRunMutation) {
+      el.btnInspRunMutation.addEventListener('click', () => {
+        if (!state.currentMutableField || !state.currentMutableField.object || !state.currentMutableField.field) {
+          showToast('No mutable field selected', 'warning');
+          return;
+        }
+        const obj = state.currentMutableField.object;
+        const field = state.currentMutableField.field;
+        const inputEl = document.getElementById('insp-mut-new-val');
+        if (!inputEl) return;
+
+        let inputVal = inputEl.value;
+        const rawType = (field.type || '').toLowerCase();
+        if (rawType.includes('bool')) {
+          inputVal = inputVal === 'true' || inputVal === '1';
+        } else if (rawType.includes('int') || rawType.includes('short') || rawType.includes('long') || rawType.includes('size_t')) {
+          inputVal = parseInt(inputVal, 10);
+        } else if (rawType.includes('float') || rawType.includes('double')) {
+          inputVal = parseFloat(inputVal);
+        }
+
+        openMutationPreview({
+          object_id: obj.object_id,
+          semantic_name: obj.semantic_name,
+          field: field.name,
+          current_value: field.value,
+          proposed_value: inputVal,
+          type: field.type,
+          cleaned_type: field.cleaned_type,
+          storage: obj.storage,
+          mutability: 'MUTABLE',
+        });
+      });
+    }
+
+    if (el.btnGotoObjects) {
+      el.btnGotoObjects.addEventListener('click', () => {
+        switchTab('tab-object-explorer');
+      });
+    }
 
     el.storageFilterPills.forEach((pill) => {
       pill.addEventListener('click', () => {

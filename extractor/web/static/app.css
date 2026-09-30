@@ -1863,3 +1863,596 @@ body.advanced-mode .basic-only {
   border-radius: 4px;
   font-weight: 700;
 }
+
+/* ========================================================================== */
+/* Top Runtime Memory & State Summary Bar                                     */
+/* ========================================================================== */
+
+.runtime-summary-bar {
+  background-color: var(--bg-card);
+  border-bottom: 1px solid var(--border-color);
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+}
+
+.summary-metric-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 10px;
+  border-right: 1px solid var(--border-color);
+  min-width: 100px;
+}
+
+.summary-control-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 10px;
+  border-right: 1px solid var(--border-color);
+}
+
+.summary-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+
+.summary-val {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-main);
+  white-space: nowrap;
+}
+
+/* ========================================================================== */
+/* 3-Pane Object Explorer Workspace (Android Studio / HeapHero Inspired)      */
+/* ========================================================================== */
+
+.explorer-workspace {
+  display: grid;
+  grid-template-columns: 310px 1fr 380px;
+  gap: 16px;
+  height: calc(100vh - 165px);
+  min-height: 580px;
+  overflow: hidden;
+  margin-top: 12px;
+}
+
+@media (max-width: 1280px) {
+  .explorer-workspace {
+    grid-template-columns: 280px 1fr 340px;
+  }
+}
+
+@media (max-width: 960px) {
+  .explorer-workspace {
+    grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
+  }
+}
+
+.pane-card {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.pane-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: rgba(255, 255, 255, 0.02);
+}
+
+.pane-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pane-title-group h4 {
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.sort-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pane-search-bar {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-sidebar);
+}
+
+.search-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+
+.search-input-wrap .search-icon {
+  position: absolute;
+  left: 8px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+.search-input-wrap .input-text {
+  padding-left: 28px;
+  padding-right: 26px;
+  width: 100%;
+  height: 30px;
+  font-size: 0.82rem;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  color: var(--text-main);
+}
+
+.search-input-wrap .input-text:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.btn-clear-search {
+  position: absolute;
+  right: 6px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: 2px 4px;
+}
+
+.btn-clear-search:hover {
+  color: var(--text-main);
+}
+
+/* Logical Grouping Pills */
+.explorer-filter-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-color);
+  background-color: rgba(0, 0, 0, 0.12);
+}
+
+.filter-pill {
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 9999px;
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.filter-pill:hover {
+  border-color: var(--border-hover);
+  color: var(--text-main);
+}
+
+.filter-pill.active {
+  background-color: rgba(56, 189, 248, 0.15);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.pane-list-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Object Card Item */
+.object-card-item {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background-color: var(--bg-main);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.object-card-item:hover {
+  border-color: var(--accent);
+  background-color: rgba(56, 189, 248, 0.04);
+}
+
+.object-card-item.selected {
+  border-color: var(--accent);
+  background-color: rgba(56, 189, 248, 0.12);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.obj-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+
+.obj-name-semantic {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.obj-type-tag {
+  font-size: 0.72rem;
+  font-family: var(--font-mono);
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.obj-card-meta {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.obj-stats-badges {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.obj-badge {
+  font-size: 0.68rem;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+}
+
+/* Accordion Grouping by Type / Storage */
+.obj-tree-group {
+  margin-bottom: 8px;
+}
+
+.obj-tree-group-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 8px;
+  background-color: var(--bg-input);
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.78rem;
+  margin-bottom: 4px;
+  user-select: none;
+}
+
+.obj-tree-group-header:hover {
+  background-color: var(--border-hover);
+}
+
+.obj-tree-group-title {
+  color: var(--text-main);
+  font-family: var(--font-mono);
+}
+
+.obj-tree-group-count {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+
+.obj-tree-group-body {
+  padding-left: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Center Pane Toolbar & Views */
+.center-breadcrumb {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.center-breadcrumb .bc-current {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.center-view-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.btn-tab-pill {
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-tab-pill:hover {
+  color: var(--text-main);
+  border-color: var(--border-hover);
+}
+
+.btn-tab-pill.active {
+  background: rgba(56, 189, 248, 0.15);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.center-view-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 10px;
+}
+
+/* Reference Tree View (Android Studio Heap Dump Tree style) */
+.ref-tree-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.ref-tree-body {
+  flex: 1;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  padding: 4px;
+  background-color: var(--bg-main);
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+}
+
+.ref-tree-node {
+  margin: 2px 0;
+}
+
+.tree-node-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.1s ease;
+  white-space: nowrap;
+}
+
+.tree-node-row:hover {
+  background-color: var(--bg-input);
+}
+
+.tree-node-row.selected {
+  background-color: rgba(56, 189, 248, 0.15);
+  border: 1px solid rgba(56, 189, 248, 0.4);
+}
+
+.tree-expander {
+  width: 14px;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+.tree-node-icon {
+  font-size: 0.8rem;
+}
+
+.tree-node-label {
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.tree-node-field {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.tree-node-type {
+  color: var(--accent);
+  font-size: 0.72rem;
+}
+
+.tree-node-badge {
+  font-size: 0.65rem;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background-color: var(--bg-input);
+  color: var(--text-dim);
+  margin-left: auto;
+}
+
+.ref-tree-children {
+  margin-left: 18px;
+  border-left: 1px dashed var(--border-color);
+  padding-left: 4px;
+}
+
+/* Right Pane: Object Inspector */
+.inspector-header-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.obj-header-badges {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 2px;
+}
+
+.inspector-scroll-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.inspector-card {
+  background-color: var(--bg-main);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.inspector-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.inspector-card-title {
+  font-weight: 600;
+  font-size: 0.8rem;
+  color: var(--text-main);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+
+/* Reference Chips (HeapHero / Android Studio Incoming & Outgoing) */
+.refs-subgroup-title {
+  font-weight: 600;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.refs-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ref-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 0.74rem;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.ref-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background-color: rgba(56, 189, 248, 0.08);
+}
+
+.outgoing-chip {
+  border-left: 3px solid var(--accent);
+}
+
+.incoming-chip {
+  border-left: 3px solid var(--info);
+}
+
+.ref-chip-field {
+  color: var(--text-muted);
+  font-weight: normal;
+}
+
+.ref-chip-target {
+  color: var(--text-main);
+  font-weight: 600;
+}
+
+/* Integrated Field Mutation Card */
+.inspector-mutation-card {
+  border-left: 3px solid var(--warning);
+}
+
+.mutation-form-compact {
+  margin-top: 6px;
+}
+
+.mut-target-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.field-mutate-btn {
+  padding: 2px 6px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  color: var(--accent);
+  font-weight: 600;
+  transition: all 0.15s ease;
+}
+
+.field-mutate-btn:hover {
+  background-color: rgba(56, 189, 248, 0.15);
+  border-color: var(--accent);
+}
+

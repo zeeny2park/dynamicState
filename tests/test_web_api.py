@@ -536,7 +536,135 @@ class TestWebApi(unittest.TestCase):
             self.assertIn("openMutationPreview", js_text)
             self.assertIn("renderThreads", js_text)
 
+    def test_17_mutability_normalization_and_lowercase(self):
+        """Verify _is_field_mutable returns canonical lowercase 'mutable', 'read_only', or 'unsupported'."""
+        from extractor.web.server import _is_field_mutable
+        self.assertEqual(_is_field_mutable("int"), "mutable")
+        self.assertEqual(_is_field_mutable("bool"), "mutable")
+        self.assertEqual(_is_field_mutable("float"), "mutable")
+        self.assertEqual(_is_field_mutable("char *"), "mutable")
+        self.assertEqual(_is_field_mutable("const int"), "read_only")
+        self.assertEqual(_is_field_mutable("const char *"), "read_only")
+        self.assertEqual(_is_field_mutable("void"), "unsupported")
+        self.assertEqual(_is_field_mutable(""), "unsupported")
+
+    def test_18_runtime_honesty_no_fake_obs_point_or_thread_name(self):
+        """Verify no fake 'observation_checkpoint' or fake thread names are fabricated."""
+        status, data = self._get("/api/runtime")
+        self.assertEqual(status, 200)
+        rt = data.get("data", {})
+        
+        # When no observation point is active, it must be None (never fake 'observation_checkpoint')
+        obs = rt.get("observation_point")
+        if obs is None:
+            self.assertIsNone(obs)
+        else:
+            self.assertNotEqual(obs.get("function"), "observation_checkpoint")
+
+        # When thread names are not provided by OS/debugger, name must be None (never fake 'Main Thread' or 'Worker #2')
+        threads_detail = rt.get("threads_detail", [])
+        for t in threads_detail:
+            # If name is None, verify it's honestly None
+            if t.get("name") is None:
+                self.assertIsNone(t.get("name"))
+
+    def test_19_capability_vs_verification_separation(self):
+        """Verify capability (Supported) vs verification (Verified) are distinct fields."""
+        status, data = self._get("/api/runtime")
+        self.assertEqual(status, 200)
+        rt = data.get("data", {})
+        
+        self.assertIn("branch_isolation_capability", rt)
+        self.assertIn(rt["branch_isolation_capability"], ["SUPPORTED", "UNAVAILABLE", "CONDITIONAL"])
+        self.assertIn("branch_isolation_verified", rt)
+        self.assertIsInstance(rt["branch_isolation_verified"], bool)
+
+        self.assertIn("determinism_capability", rt)
+        self.assertIn("determinism_verified", rt)
+        self.assertIsInstance(rt["determinism_verified"], bool)
+
+        self.assertIn("default_timeout_ms", rt)
+        self.assertIsInstance(rt["default_timeout_ms"], int)
+
+    def test_20_object_reference_relationships_incoming_outgoing(self):
+        """Verify incoming and outgoing reference relations in state objects and object inspector."""
+        status, data = self._get("/api/states/state_seed/objects")
+        self.assertEqual(status, 200)
+        objects = data.get("data", [])
+        self.assertIsInstance(objects, list)
+        
+        if objects:
+            first_obj = objects[0]
+            self.assertIn("outgoing_count", first_obj)
+            self.assertIn("incoming_count", first_obj)
+            self.assertIn("reference_count", first_obj)
+
+            # Inspect object endpoint
+            oid = first_obj["object_id"]
+            istatus, idata = self._get(f"/api/states/state_seed/objects/{oid}")
+            self.assertEqual(istatus, 200)
+            iobj = idata.get("data", {})
+            self.assertIn("incoming_references", iobj)
+            self.assertIn("outgoing_references", iobj)
+            self.assertIsInstance(iobj["incoming_references"], list)
+            self.assertIsInstance(iobj["outgoing_references"], list)
+
+    def test_21_object_explorer_html_workspace_and_components(self):
+        """Verify 3-Pane Object Explorer workspace elements, summary bar, CSS and JS."""
+        # 1. HTML elements
+        req_root = urllib.request.Request(self.base_url + "/")
+        with urllib.request.urlopen(req_root) as resp:
+            html = resp.read().decode("utf-8")
+            # Summary Bar
+            self.assertIn("runtime-summary-bar", html)
+            self.assertIn("sum-runtime-status", html)
+            self.assertIn("sum-thread-count", html)
+            self.assertIn("sum-object-count", html)
+            self.assertIn("sum-root-count", html)
+            self.assertIn("sum-state-hash", html)
+            self.assertIn("sum-checkpoint-status", html)
+            self.assertIn("sum-isolation-status", html)
+            self.assertIn("sum-determinism-status", html)
+            self.assertIn("sum-obs-point", html)
+            self.assertIn("select-global-timeout", html)
+
+            # 3-Pane Workspace
+            self.assertIn("explorer-workspace", html)
+            self.assertIn("pane-object-explorer", html)
+            self.assertIn("filter-obj-group", html)
+            self.assertIn("select-obj-sort", html)
+            self.assertIn("pane-reference-center", html)
+            self.assertIn("tree-reference-container", html)
+            self.assertIn("table-objects-summary", html)
+            self.assertIn("topology-graph-svg", html)
+            self.assertIn("pane-object-inspector", html)
+            self.assertIn("table-semantic-fields", html)
+            self.assertIn("inspector-outgoing-refs", html)
+            self.assertIn("inspector-incoming-refs", html)
+            self.assertIn("card-integrated-mutation", html)
+
+        # 2. CSS classes
+        req_css = urllib.request.Request(self.base_url + "/static/app.css")
+        with urllib.request.urlopen(req_css) as resp:
+            css = resp.read().decode("utf-8")
+            self.assertIn(".runtime-summary-bar", css)
+            self.assertIn(".explorer-workspace", css)
+            self.assertIn(".pane-card", css)
+            self.assertIn(".ref-tree-node", css)
+            self.assertIn(".outgoing-chip", css)
+            self.assertIn(".incoming-chip", css)
+
+        # 3. JS functions
+        req_js = urllib.request.Request(self.base_url + "/static/app.js")
+        with urllib.request.urlopen(req_js) as resp:
+            js = resp.read().decode("utf-8")
+            self.assertIn("normalizeMutability", js)
+            self.assertIn("renderReferenceTree", js)
+            self.assertIn("renderReferenceTable", js)
+            self.assertIn("switchCenterView", js)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

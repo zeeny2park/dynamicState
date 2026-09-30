@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>dynamicState — Runtime State Explorer</title>
+  <title>dynamicState — Runtime State Explorer & Object Workspace</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -11,7 +11,7 @@
   <header class="app-header">
     <div class="header-brand">
       <div class="brand-title">dynamicState</div>
-      <div class="brand-subtitle">Runtime State Explorer</div>
+      <div class="brand-subtitle">Runtime State Explorer & Object Workspace</div>
     </div>
     
     <div class="header-status">
@@ -25,13 +25,13 @@
       <div class="meta-tag" id="tag-endian">Endian: UNKNOWN</div>
       <div class="meta-tag" id="tag-elf">ELF: UNKNOWN</div>
       <div class="meta-tag meta-obs-point" id="tag-header-obs-point" title="Active observation point (deterministic breakpoint for state capture/mutation)">
-        <span>📍</span> <span id="txt-header-obs-point">Point: N/A</span>
+        <span>📍</span> <span id="txt-header-obs-point">Point: Not available</span>
       </div>
     </div>
 
     <div class="header-actions">
       <!-- Human-Centric Basic vs Advanced Mode Toggle -->
-      <div class="mode-toggle-group" id="group-mode-toggle" title="Switch between clean human-friendly Basic view and technical Advanced view">
+      <div class="mode-toggle-group" id="group-mode-toggle" title="Switch between human-friendly Basic view and technical Advanced view">
         <button type="button" class="btn btn-sm btn-mode active" id="btn-mode-basic">👤 Basic</button>
         <button type="button" class="btn btn-sm btn-mode" id="btn-mode-advanced">⚙️ Advanced</button>
       </div>
@@ -45,14 +45,70 @@
     </div>
   </header>
 
-  <!-- Main Navigation Tabs (6 Clean Functional Views) -->
+  <!-- Runtime Memory & State Summary Bar (Top Overview) -->
+  <div class="runtime-summary-bar">
+    <div class="summary-metric-tile">
+      <span class="summary-label">Runtime</span>
+      <span class="summary-val status-badge" id="sum-runtime-status">STOPPED</span>
+    </div>
+    <div class="summary-metric-tile">
+      <span class="summary-label">Active Threads</span>
+      <span class="summary-val" id="sum-thread-count">1</span>
+    </div>
+    <div class="summary-metric-tile">
+      <span class="summary-label">Discovered Objects</span>
+      <span class="summary-val" id="sum-object-count">0</span>
+    </div>
+    <div class="summary-metric-tile">
+      <span class="summary-label">Root Variables</span>
+      <span class="summary-val" id="sum-root-count">0</span>
+    </div>
+    <div class="summary-metric-tile">
+      <span class="summary-label">State Hash</span>
+      <span class="summary-val mono text-accent" id="sum-state-hash">N/A</span>
+    </div>
+    <div class="summary-metric-tile" title="Checkpoint Restore Capability">
+      <span class="summary-label">Checkpoint</span>
+      <span class="summary-val" id="sum-checkpoint-status"><span class="badge badge-success">Supported</span></span>
+    </div>
+    <div class="summary-metric-tile" title="Sibling mutation branch isolation capability & verification">
+      <span class="summary-label">Branch Isolation</span>
+      <span class="summary-val" id="sum-isolation-status"><span class="badge badge-success">Supported</span></span>
+    </div>
+    <div class="summary-metric-tile" title="Restart reproducibility verification status">
+      <span class="summary-label">Determinism</span>
+      <span class="summary-val" id="sum-determinism-status"><span class="badge badge-neutral">Not verified</span></span>
+    </div>
+    <div class="summary-metric-tile summary-obs-tile" title="Observation Point (deterministic breakpoint)">
+      <span class="summary-label">Observation Point</span>
+      <span class="summary-val mono text-accent" id="sum-obs-point">Not available</span>
+    </div>
+    <div class="summary-control-tile" title="Execution Timeout Source of Truth">
+      <label for="select-global-timeout" class="summary-label">Timeout (Source of Truth)</label>
+      <select id="select-global-timeout" class="input-select input-select-sm">
+        <option value="100">100 ms</option>
+        <option value="500">500 ms</option>
+        <option value="1000" selected>1000 ms (1s)</option>
+        <option value="2000">2000 ms (2s)</option>
+        <option value="5000">5000 ms (5s)</option>
+      </select>
+    </div>
+    <div class="summary-control-tile">
+      <label for="select-snapshot-id" class="summary-label">Active State / Snapshot</label>
+      <select id="select-snapshot-id" class="input-select input-select-sm">
+        <option value="">(Select Snapshot / State)</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Main Navigation Tabs (6 Functional Views) -->
   <nav class="app-nav">
-    <button class="nav-tab active" data-tab="tab-memory-snapshot">1. 🧠 Memory Snapshot</button>
-    <button class="nav-tab" data-tab="tab-runtime-objects">2. 📦 Runtime Objects</button>
-    <button class="nav-tab" data-tab="tab-object-graph">3. 🕸️ Object Graph</button>
-    <button class="nav-tab" data-tab="tab-history-diff">4. 📜 History / State Diff</button>
-    <button class="nav-tab" data-tab="tab-advanced-explore">5. ⚡ Advanced Exploration</button>
-    <button class="nav-tab" data-tab="tab-system-provenance">6. 🛠️ System / Provenance</button>
+    <button class="nav-tab active" data-tab="tab-object-explorer">1. 📦 Object Explorer</button>
+    <button class="nav-tab" data-tab="tab-thread-explorer">2. 🧵 Thread Explorer</button>
+    <button class="nav-tab" data-tab="tab-memory-snapshot">3. 🧠 Memory Snapshot</button>
+    <button class="nav-tab" data-tab="tab-history-diff">4. 📜 State DAG & Diff</button>
+    <button class="nav-tab" data-tab="tab-advanced-explore">5. ⚡ Autonomous Loop</button>
+    <button class="nav-tab" data-tab="tab-system-provenance">6. 🛠️ System / Modules</button>
   </nav>
 
   <!-- Banner for low-impact observation mode -->
@@ -66,46 +122,376 @@
   <!-- Global notification toast container -->
   <div id="toast-container" class="toast-container"></div>
 
-  <!-- Tab Content Containers -->
+  <!-- Main Views Container -->
   <main class="app-main">
 
     <!-- ===================================================================== -->
-    <!-- TAB 1: 🧠 Memory Snapshot (Primary Default Screen)                    -->
+    <!-- TAB 1: 📦 Object Explorer (Android Studio / HeapHero 3-Pane Workspace)-->
     <!-- ===================================================================== -->
-    <section id="tab-memory-snapshot" class="tab-pane active">
-      <!-- Snapshot Selector & Target Header -->
-      <div class="card snap-header-card">
-        <div class="hero-top-row">
-          <div class="hero-identity">
-            <div class="hero-badge-row">
-              <span class="badge badge-info" id="ms-badge-mode">CONSISTENT</span>
-              <span class="badge badge-success" id="ms-badge-status">COMPLETE</span>
-              <span class="badge badge-neutral" id="ms-badge-consistency">CONSISTENT</span>
-              <span class="badge badge-accent" id="ms-badge-backend" title="Restore backend used for sibling branch isolation">Backend: RESTART</span>
-              <span class="badge badge-success" id="ms-badge-isolation" title="Branch isolation guarantee">Isolation: SUPPORTED</span>
+    <section id="tab-object-explorer" class="tab-pane active">
+      <div class="explorer-workspace">
+        
+        <!-- PANE 1: Object Explorer (Left) -->
+        <div class="pane-card pane-explorer" id="pane-object-explorer">
+          <div class="pane-header">
+            <div class="pane-title-group">
+              <h4>Object Explorer</h4>
+              <span class="badge badge-neutral" id="badge-mem-objects-count">0</span>
             </div>
-            <h2 class="hero-title" id="ms-target-title">Target: Not Connected</h2>
-            <div class="hero-subtitle mono" id="ms-target-subtitle">No active execution inferior</div>
-            <div class="hero-obs-point-row" style="margin-top: 6px; display: flex; align-items: center; gap: 8px;">
-              <span class="badge badge-info" style="font-size: 0.75rem;">📍 Observation Point</span>
-              <span class="mono" id="ms-txt-obs-point" style="color: var(--accent); font-weight: 600;">N/A</span>
+            <div class="sort-control">
+              <label for="select-obj-sort" class="text-xs text-muted">Sort:</label>
+              <select id="select-obj-sort" class="input-select input-select-sm">
+                <option value="name-asc">Name (A-Z)</option>
+                <option value="name-desc">Name (Z-A)</option>
+                <option value="type-asc">Type (A-Z)</option>
+                <option value="fields-desc">Fields (High-Low)</option>
+                <option value="refs-desc">Refs (High-Low)</option>
+                <option value="addr-asc" class="advanced-only">Address (0x...)</option>
+              </select>
             </div>
           </div>
-          
-          <div class="hero-state-selector">
-            <label for="select-snapshot-id">Active Snapshot / State:</label>
-            <div class="state-select-group">
-              <select id="select-snapshot-id" class="input-select">
-                <option value="">(Select Snapshot / State)</option>
-              </select>
-              <button class="btn btn-outline btn-sm btn-view-json" data-entity="memory-summary" title="View Memory Summary JSON">Summary JSON</button>
+
+          <!-- Live Search & Filter -->
+          <div class="pane-search-bar">
+            <div class="search-input-wrap">
+              <span class="search-icon">🔍</span>
+              <input type="text" id="input-search-objects" class="input-text" placeholder="Filter by name, type, field, thread...">
+              <button type="button" class="btn-clear-search" id="btn-clear-obj-search" title="Clear filter">×</button>
+            </div>
+          </div>
+
+          <!-- Logical Grouping Pills (Roots, Objects, Types based on real backend data) -->
+          <div class="explorer-filter-pills" id="filter-obj-group">
+            <button class="filter-pill active" data-group="all">All</button>
+            <button class="filter-pill" data-group="roots" title="Roots (Globals, Frame Locals, Statics)">Roots</button>
+            <button class="filter-pill" data-group="heap" title="Heap / Persistent allocated objects">Heap</button>
+            <button class="filter-pill" data-group="globals" title="Global memory objects">Globals</button>
+            <button class="filter-pill" data-group="stack" title="Stack / Frame local objects">Stack/Locals</button>
+            <button class="filter-pill" data-group="types" title="Group objects by their C/C++ type">By Type</button>
+          </div>
+
+          <div id="mem-graph-truncated-warning" class="banner banner-info" style="display: none; padding: 4px 8px; margin: 6px 0; font-size: 0.75rem;">
+            <small id="txt-mem-truncated-count">Displaying first 100 objects</small>
+          </div>
+
+          <!-- Object List / Accordion Container -->
+          <div class="pane-list-container" id="list-memory-objects">
+            <div class="text-muted text-center p-3">Select a state to inspect objects</div>
+          </div>
+        </div>
+
+        <!-- PANE 2: Reference Hierarchy & Graph (Center) -->
+        <div class="pane-card pane-center" id="pane-reference-center">
+          <div class="pane-header">
+            <div class="center-breadcrumb mono" id="center-breadcrumb">
+              <span>Roots</span> <span class="bc-sep">/</span> <span class="bc-current" id="bc-current-name">All Objects</span>
+            </div>
+            <div class="center-view-tabs">
+              <button type="button" class="btn-tab-pill active" id="btn-view-tree" data-view="tree">🌲 Reference Tree</button>
+              <button type="button" class="btn-tab-pill" id="btn-view-table" data-view="table">📊 Table</button>
+              <button type="button" class="btn-tab-pill" id="btn-view-graph" data-view="graph">🕸️ Topology Graph</button>
+            </div>
+          </div>
+
+          <!-- View 1: Reference Tree View (Android Studio Heap Dump Tree style) -->
+          <div class="center-view-content active" id="view-reference-tree">
+            <div class="ref-tree-toolbar">
+              <span class="text-xs text-muted">Expandable reference hierarchy from application roots:</span>
+              <div style="display: flex; gap: 6px;">
+                <button class="btn btn-sm btn-secondary" id="btn-expand-all-tree">Expand All</button>
+                <button class="btn btn-sm btn-secondary" id="btn-collapse-all-tree">Collapse All</button>
+              </div>
+            </div>
+            <div class="ref-tree-body" id="tree-reference-container">
+              <!-- Rendered recursively from roots and object_ref -->
+            </div>
+          </div>
+
+          <!-- View 2: Reference Table View -->
+          <div class="center-view-content" id="view-reference-table" style="display: none;">
+            <div class="table-container">
+              <table class="data-table" id="table-objects-summary">
+                <thead>
+                  <tr>
+                    <th>Semantic Name</th>
+                    <th>Type</th>
+                    <th>Scope</th>
+                    <th>Fields</th>
+                    <th>Outgoing Refs</th>
+                    <th>Incoming Refs</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="tbody-objects-summary">
+                  <!-- Populated dynamically -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- View 3: SVG Topology Graph View -->
+          <div class="center-view-content" id="view-topology-graph" style="display: none;">
+            <div class="graph-toolbar" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <button class="btn btn-sm btn-secondary" id="btn-reset-topology">Reset Graph</button>
+              <span class="text-xs text-muted">Click any node to inspect</span>
+            </div>
+            <div class="svg-container" style="flex: 1; border: 1px solid var(--border-color); border-radius: 6px; overflow: hidden; background: var(--bg-main);">
+              <svg id="topology-graph-svg" width="100%" height="450"></svg>
+            </div>
+          </div>
+        </div>
+
+        <!-- PANE 3: Android Studio-Style Object Inspector (Right) -->
+        <div class="pane-card pane-inspector" id="pane-object-inspector">
+          <div class="pane-header">
+            <div class="inspector-header-info">
+              <div class="obj-header-badges">
+                <span class="badge badge-info" id="mem-obj-type-badge">Type</span>
+                <span class="badge" id="mem-obj-storage-badge">HEAP</span>
+              </div>
+              <h4 id="mem-obj-title">Select an Object</h4>
+              <div class="text-muted text-xs" id="mem-obj-subtitle">Select an object from the explorer to inspect</div>
+            </div>
+            <button class="btn btn-outline btn-sm btn-view-obj-json" id="btn-view-obj-json" title="View raw JSON">JSON</button>
+          </div>
+
+          <div class="inspector-scroll-body">
+            <!-- 1. Identity & Scope Card -->
+            <div class="inspector-card">
+              <div class="inspector-card-title">Identity & Scope</div>
+              <table class="key-value-table text-xs">
+                <tr>
+                  <td>Semantic Name:</td>
+                  <td class="mono font-semibold text-accent" id="insp-val-name">—</td>
+                </tr>
+                <tr>
+                  <td>Type:</td>
+                  <td class="mono" id="insp-val-type">—</td>
+                </tr>
+                <tr>
+                  <td>Storage Scope:</td>
+                  <td><span class="badge" id="insp-val-storage">—</span></td>
+                </tr>
+                <tr>
+                  <td>Root Source:</td>
+                  <td id="insp-val-root">—</td>
+                </tr>
+                <tr>
+                  <td>Thread:</td>
+                  <td id="insp-val-thread">—</td>
+                </tr>
+                <tr class="advanced-only">
+                  <td>Object ID:</td>
+                  <td class="mono text-muted" id="mem-tech-id">—</td>
+                </tr>
+                <tr class="advanced-only">
+                  <td>Memory Address:</td>
+                  <td class="mono text-muted" id="mem-tech-addr">—</td>
+                </tr>
+              </table>
+            </div>
+
+            <!-- 2. Semantic Fields Card -->
+            <div class="inspector-card">
+              <div class="inspector-card-header">
+                <div class="inspector-card-title">Semantic Fields</div>
+                <span class="text-xs text-muted" id="insp-fields-count">0 fields</span>
+              </div>
+              <div class="table-container">
+                <table class="data-table text-xs" id="table-semantic-fields">
+                  <thead>
+                    <tr>
+                      <th>Field</th>
+                      <th>Type</th>
+                      <th>Value</th>
+                      <th>Pointer</th>
+                      <th>Mutability</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr><td colspan="6" class="text-muted text-center">No fields available</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- 3. References Card (HeapHero / Android Studio: Incoming & Outgoing) -->
+            <div class="inspector-card">
+              <div class="inspector-card-header">
+                <div class="inspector-card-title">Reference Relations</div>
+                <span class="badge badge-neutral" id="badge-total-refs-count">0 references</span>
+              </div>
+
+              <!-- Outgoing References: this points to other objects -->
+              <div class="refs-subgroup">
+                <div class="refs-subgroup-title">
+                  <span>Outgoing References</span>
+                  <span class="text-xs text-muted" id="badge-outgoing-count">(0)</span>
+                </div>
+                <div class="refs-chip-list" id="inspector-outgoing-refs">
+                  <span class="text-muted text-xs">No outgoing references</span>
+                </div>
+              </div>
+
+              <!-- Incoming References: other objects point to this -->
+              <div class="refs-subgroup" style="margin-top: 10px;">
+                <div class="refs-subgroup-title">
+                  <span>Incoming References (Referenced By)</span>
+                  <span class="text-xs text-muted" id="badge-incoming-count">(0)</span>
+                </div>
+                <div class="refs-chip-list" id="inspector-incoming-refs">
+                  <span class="text-muted text-xs">No incoming references</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 4. Integrated Field Mutation Card -->
+            <div class="inspector-card inspector-mutation-card" id="card-integrated-mutation">
+              <div class="inspector-card-header">
+                <div class="inspector-card-title">⚡ Field Mutation & Safe Evaluation</div>
+                <span class="badge badge-success" id="insp-mut-badge">MUTABLE</span>
+              </div>
+              <div class="mutation-form-compact">
+                <div class="mut-target-row">
+                  <span class="text-xs text-muted">Target Field:</span>
+                  <strong class="mono text-accent" id="insp-mut-target-label">Select a mutable field</strong>
+                </div>
+                <div class="mut-values-row" style="margin-top: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                  <div>
+                    <label class="text-xs text-muted">Current Value:</label>
+                    <div class="static-val-box mono text-xs" id="insp-mut-current-val">—</div>
+                  </div>
+                  <div>
+                    <label class="text-xs text-muted" for="insp-mut-new-val">Proposed Value:</label>
+                    <div id="insp-mut-input-container">
+                      <input type="text" id="insp-mut-new-val" class="input-text input-text-sm mono" placeholder="New value">
+                    </div>
+                  </div>
+                </div>
+                <div class="mut-env-row text-xs text-muted" style="margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border-color);">
+                  <span>Restore: <strong id="insp-mut-backend">RESTART</strong></span> · 
+                  <span>Obs Point: <strong id="insp-mut-obs-point">Not available</strong></span>
+                </div>
+                <div class="mut-action-row" style="margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px;">
+                  <button type="button" class="btn btn-sm btn-primary" id="btn-insp-run-mutation">
+                    <span>🚀</span> Preview & Mutate
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 5. State Context Card -->
+            <div class="inspector-card">
+              <div class="inspector-card-title">State Context</div>
+              <table class="key-value-table text-xs">
+                <tr>
+                  <td>Active State ID:</td>
+                  <td class="mono font-semibold" id="insp-state-id">—</td>
+                </tr>
+                <tr>
+                  <td>Parent State:</td>
+                  <td class="mono" id="insp-parent-state-id">—</td>
+                </tr>
+                <tr>
+                  <td>State Hash:</td>
+                  <td class="mono text-muted" id="insp-state-hash">—</td>
+                </tr>
+              </table>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- Active Threads & Execution Context -->
-      <div class="section-title-row" style="margin-top: 20px;">
+      <!-- BOTTOM DRAWER: State Transition Flow, Verified Timeline & Semantic Diff -->
+      <div class="card execution-result-card" id="card-execution-result" style="display: none; margin-top: 16px;">
+        <div class="card-header-row">
+          <div class="card-title-group">
+            <h4 id="exec-trans-id">Transition Complete</h4>
+            <span class="badge badge-success" id="exec-status-badge">STOPPED</span>
+          </div>
+          <button class="btn btn-outline btn-sm" id="btn-view-trans-json">Transition JSON</button>
+        </div>
+
+        <!-- Parent State -> Mutation -> Child State Flow -->
+        <div class="state-transition-flow" id="trans-flow-container" style="margin-top: 16px;">
+          <div class="flow-card flow-parent-card">
+            <div class="flow-badge">PARENT STATE</div>
+            <div class="flow-title mono" id="flow-parent-id">state_000001</div>
+            <div class="flow-hash mono text-muted" id="flow-parent-hash">56d6d7...</div>
+            <div class="flow-val mono" id="flow-parent-val">Before: N/A</div>
+          </div>
+          <div class="flow-arrow-card">
+            <div class="flow-arrow-icon">➔</div>
+            <div class="flow-arrow-label mono" id="flow-mutation-label">mutation</div>
+            <div class="flow-arrow-meta text-muted" id="flow-arrow-meta">Timeout: 1000ms</div>
+          </div>
+          <div class="flow-card flow-child-card">
+            <div class="flow-badge">CHILD STATE</div>
+            <div class="flow-title mono text-accent" id="flow-child-id">state_000002</div>
+            <div class="flow-hash mono text-muted" id="flow-child-hash">a1b2c3...</div>
+            <div class="flow-val mono text-accent" id="flow-child-val">After: N/A</div>
+          </div>
+        </div>
+
+        <!-- Execution Status Grid -->
+        <div class="overview-grid" style="margin-top: 16px;">
+          <div class="metric-box">
+            <div class="metric-label">Execution Status</div>
+            <div class="metric-val" id="exec-status-text" style="font-size: 1.15rem;">STOPPED</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-label">Restore Backend</div>
+            <div class="metric-val mono" id="exec-restore-backend" style="font-size: 1.05rem;">RESTART</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-label">Step Duration / Timeout</div>
+            <div class="metric-val mono" id="exec-step-duration" style="font-size: 1.05rem;">1000 ms</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-label">State Hash</div>
+            <div class="metric-val mono" id="exec-child-hash-box" style="font-size: 0.85rem;">e3b0c44...</div>
+          </div>
+        </div>
+
+        <!-- Verified Execution Timeline (Zero fake progress) -->
+        <div class="timeline-section" style="margin-top: 18px;">
+          <div class="section-title-row" style="margin-bottom: 8px;">
+            <h5>Verified Execution Timeline</h5>
+            <span class="subtext">Actual completed stages reported by runtime backend</span>
+          </div>
+          <div class="execution-timeline" id="exec-timeline-list">
+            <!-- Dynamically rendered verified steps -->
+          </div>
+        </div>
+
+        <!-- Changed Fields (Semantic Diff) -->
+        <div class="changed-fields-box" style="margin-top: 18px;">
+          <h5>Changed Fields & Semantic State Diff</h5>
+          <div class="table-container" style="margin-top: 8px;">
+            <table class="data-table" id="table-exec-diff">
+              <thead>
+                <tr>
+                  <th>Target Object / Field</th>
+                  <th>Before Value</th>
+                  <th>After Value</th>
+                  <th>Category</th>
+                </tr>
+              </thead>
+              <tbody id="tbody-exec-diff">
+                <tr><td colspan="4" class="text-muted text-center">No field modifications detected</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 2: 🧵 Thread Explorer & Stack Context                             -->
+    <!-- ===================================================================== -->
+    <section id="tab-thread-explorer" class="tab-pane">
+      <div class="section-title-row">
         <div style="display: flex; align-items: baseline; gap: 10px;">
           <h3>Active Threads & Observation Context</h3>
           <span class="badge badge-neutral" id="badge-threads-count">1 Thread</span>
@@ -133,8 +519,34 @@
           </table>
         </div>
       </div>
+    </section>
 
-      <!-- 1. Capture Status Card Grid -->
+    <!-- ===================================================================== -->
+    <!-- TAB 3: 🧠 Memory Snapshot (Breakdown & Readv Quality)                 -->
+    <!-- ===================================================================== -->
+    <section id="tab-memory-snapshot" class="tab-pane">
+      <!-- Snapshot Selector & Target Header -->
+      <div class="card snap-header-card">
+        <div class="hero-top-row">
+          <div class="hero-identity">
+            <div class="hero-badge-row">
+              <span class="badge badge-info" id="ms-badge-mode">CONSISTENT</span>
+              <span class="badge badge-success" id="ms-badge-status">COMPLETE</span>
+              <span class="badge badge-neutral" id="ms-badge-consistency">CONSISTENT</span>
+              <span class="badge badge-accent" id="ms-badge-backend" title="Restore backend used for sibling branch isolation">Backend: RESTART</span>
+              <span class="badge badge-success" id="ms-badge-isolation" title="Branch isolation guarantee">Isolation: SUPPORTED</span>
+            </div>
+            <h2 class="hero-title" id="ms-target-title">Target: Not Connected</h2>
+            <div class="hero-subtitle mono" id="ms-target-subtitle">No active execution inferior</div>
+            <div class="hero-obs-point-row" style="margin-top: 6px; display: flex; align-items: center; gap: 8px;">
+              <span class="badge badge-info" style="font-size: 0.75rem;">📍 Observation Point</span>
+              <span class="mono" id="ms-txt-obs-point" style="color: var(--accent); font-weight: 600;">Not available</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Capture Status Grid -->
       <div class="section-title-row" style="margin-top: 20px;">
         <h3>Capture Status</h3>
         <span class="subtext">Execution capture parameters and memory consistency guarantees</span>
@@ -159,344 +571,138 @@
         <div class="card status-card">
           <div class="metric-label">Memory Regions</div>
           <div class="metric-val" id="stat-region-count">0</div>
-          <div class="card-caption">Mapped memory segments</div>
+          <div class="card-caption" id="stat-arch">Arch: UNKNOWN</div>
         </div>
         <div class="card status-card">
-          <div class="metric-label">Target Architecture</div>
-          <div class="metric-val mono" id="stat-arch">UNKNOWN</div>
-          <div class="card-caption" id="stat-pointer-endian">Pointer: UNKNOWN · Endian: UNKNOWN</div>
+          <div class="metric-label">Architecture / Endian</div>
+          <div class="metric-val mono text-sm" id="stat-pointer-endian">Pointer: N/A · Endian: N/A</div>
+          <div class="card-caption">Target binary characteristics</div>
         </div>
       </div>
 
-      <!-- 2. Memory Breakdown (Visual Proportional Bar & Table) -->
+      <!-- Memory Breakdown -->
       <div class="section-title-row" style="margin-top: 24px;">
-        <h3>Memory Breakdown</h3>
-        <span class="subtext">Distribution of captured process memory segments by semantic role</span>
+        <h3>Memory Region Breakdown</h3>
+        <span class="subtext">Distribution of captured process memory segments</span>
       </div>
 
-      <div class="card memory-breakdown-card">
-        <!-- Visual Proportional Bar -->
+      <div class="card breakdown-card">
         <div class="breakdown-bar-container">
-          <div class="memory-breakdown-bar" id="breakdown-bar">
-            <div class="breakdown-segment seg-heap" style="width: 0%;" title="Heap: 0 MB"></div>
-            <div class="breakdown-segment seg-stack" style="width: 0%;" title="Stack: 0 MB"></div>
-            <div class="breakdown-segment seg-global" style="width: 0%;" title="Global: 0 MB"></div>
-            <div class="breakdown-segment seg-exec" style="width: 0%;" title="Executable: 0 MB"></div>
-            <div class="breakdown-segment seg-shlib" style="width: 0%;" title="Shared Libs: 0 MB"></div>
-            <div class="breakdown-segment seg-other" style="width: 0%;" title="Other: 0 MB"></div>
+          <div class="breakdown-bar" id="breakdown-bar">
+            <!-- Dynamically populated proportional segments -->
           </div>
         </div>
 
-        <!-- Breakdown Grid -->
-        <div class="breakdown-grid" style="margin-top: 16px;">
-          <div class="breakdown-item">
-            <div class="breakdown-header"><span class="legend-dot dot-heap"></span> Heap</div>
-            <div class="breakdown-val mono" id="bd-heap-val">0.00 MB</div>
-            <div class="breakdown-pct" id="bd-heap-pct">0%</div>
+        <div class="breakdown-legend-grid">
+          <div class="legend-item">
+            <span class="legend-color-box seg-heap"></span>
+            <div class="legend-labels">
+              <span class="legend-title">Heap</span>
+              <span class="legend-value mono" id="bd-heap-val">0 MB</span>
+              <span class="legend-pct text-muted" id="bd-heap-pct">0%</span>
+            </div>
           </div>
-          <div class="breakdown-item">
-            <div class="breakdown-header"><span class="legend-dot dot-stack"></span> Stack</div>
-            <div class="breakdown-val mono" id="bd-stack-val">0.00 MB</div>
-            <div class="breakdown-pct" id="bd-stack-pct">0%</div>
+          <div class="legend-item">
+            <span class="legend-color-box seg-stack"></span>
+            <div class="legend-labels">
+              <span class="legend-title">Stack</span>
+              <span class="legend-value mono" id="bd-stack-val">0 MB</span>
+              <span class="legend-pct text-muted" id="bd-stack-pct">0%</span>
+            </div>
           </div>
-          <div class="breakdown-item">
-            <div class="breakdown-header"><span class="legend-dot dot-global"></span> Global / BSS</div>
-            <div class="breakdown-val mono" id="bd-global-val">0.00 MB</div>
-            <div class="breakdown-pct" id="bd-global-pct">0%</div>
+          <div class="legend-item">
+            <span class="legend-color-box seg-global"></span>
+            <div class="legend-labels">
+              <span class="legend-title">Global / BSS / Data</span>
+              <span class="legend-value mono" id="bd-global-val">0 MB</span>
+              <span class="legend-pct text-muted" id="bd-global-pct">0%</span>
+            </div>
           </div>
-          <div class="breakdown-item">
-            <div class="breakdown-header"><span class="legend-dot dot-exec"></span> Executable Code</div>
-            <div class="breakdown-val mono" id="bd-exec-val">0.00 MB</div>
-            <div class="breakdown-pct" id="bd-exec-pct">0%</div>
+          <div class="legend-item">
+            <span class="legend-color-box seg-exec"></span>
+            <div class="legend-labels">
+              <span class="legend-title">Executable (Text)</span>
+              <span class="legend-value mono" id="bd-exec-val">0 MB</span>
+              <span class="legend-pct text-muted" id="bd-exec-pct">0%</span>
+            </div>
           </div>
-          <div class="breakdown-item">
-            <div class="breakdown-header"><span class="legend-dot dot-shlib"></span> Shared Libraries</div>
-            <div class="breakdown-val mono" id="bd-shlib-val">0.00 MB</div>
-            <div class="breakdown-pct" id="bd-shlib-pct">0%</div>
+          <div class="legend-item">
+            <span class="legend-color-box seg-shlib"></span>
+            <div class="legend-labels">
+              <span class="legend-title">Shared Libraries</span>
+              <span class="legend-value mono" id="bd-shlib-val">0 MB</span>
+              <span class="legend-pct text-muted" id="bd-shlib-pct">0%</span>
+            </div>
           </div>
-          <div class="breakdown-item">
-            <div class="breakdown-header"><span class="legend-dot dot-other"></span> Other Mappings</div>
-            <div class="breakdown-val mono" id="bd-other-val">0.00 MB</div>
-            <div class="breakdown-pct" id="bd-other-pct">0%</div>
+          <div class="legend-item">
+            <span class="legend-color-box seg-other"></span>
+            <div class="legend-labels">
+              <span class="legend-title">Other / Mappings</span>
+              <span class="legend-value mono" id="bd-other-val">0 MB</span>
+              <span class="legend-pct text-muted" id="bd-other-pct">0%</span>
+            </div>
           </div>
-          <div class="breakdown-item breakdown-total">
-            <div class="breakdown-header"><strong>Total Captured</strong></div>
-            <div class="breakdown-val mono text-accent" id="bd-total-val" style="font-size: 1.25rem;">0.00 MB</div>
-            <div class="breakdown-pct text-muted">100% of snapshot</div>
-          </div>
+        </div>
+
+        <div class="breakdown-footer">
+          <span>Total Captured: <strong class="mono" id="bd-total-val">0 MB</strong></span>
         </div>
       </div>
 
-      <!-- 3. Semantic Runtime Objects Summary & Hierarchy Tree -->
+      <!-- Snapshot Quality & Integrity -->
       <div class="section-title-row" style="margin-top: 24px;">
-        <h3>Semantic Runtime Objects</h3>
-        <span class="subtext">Typed C/C++ objects discovered from memory mappings and DWARF structures</span>
-      </div>
-
-      <div class="card semantic-overview-card">
-        <div class="metric-row" style="margin-bottom: 16px;">
-          <div class="metric-box">
-            <div class="metric-val text-accent" id="sem-total-objs">0</div>
-            <div class="metric-label">Total Objects</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-val" id="sem-heap-objs">0</div>
-            <div class="metric-label">Heap Objects</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-val" id="sem-global-objs">0</div>
-            <div class="metric-label">Global Objects</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-val" id="sem-stack-objs">0</div>
-            <div class="metric-label">Stack Objects</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-val" id="sem-refs-count">0</div>
-            <div class="metric-label">Pointer References</div>
-          </div>
-        </div>
-
-        <div class="card-subtitle" style="margin-bottom: 8px;">Discovered Object Hierarchy & State Preview:</div>
-        <div class="semantic-tree-container" id="semantic-tree-preview">
-          <div class="text-muted text-center p-3">No semantic objects loaded for this snapshot</div>
-        </div>
-        
-        <div style="margin-top: 12px; text-align: right;">
-          <button class="btn btn-primary btn-sm" id="btn-goto-objects">Inspect All Objects in Detail →</button>
-        </div>
-      </div>
-
-      <!-- 4. Snapshot Quality & Provenance -->
-      <div class="section-title-row" style="margin-top: 24px;">
-        <h3>Snapshot Quality & Provenance</h3>
-        <span class="subtext">Completeness score, memory mapping race verification, and debug image integrity</span>
+        <h3>Acquisition Quality & Provenance</h3>
+        <span class="subtext">Integrity checks, mapping race detection, and external debug info status</span>
       </div>
 
       <div class="overview-grid quality-grid">
-        <div class="card">
-          <div class="metric-label">Completeness</div>
+        <div class="card quality-card">
+          <div class="metric-label">Memory Acquisition Quality</div>
           <div class="metric-val text-success" id="qual-completeness">100%</div>
           <div class="card-caption" id="qual-completeness-text">Complete memory acquisition</div>
         </div>
-        <div class="card">
-          <div class="metric-label">Mapping Race</div>
+        <div class="card quality-card">
+          <div class="metric-label">Mapping Race Condition</div>
           <div class="metric-val text-success" id="qual-mapping-race">CLEAN</div>
-          <div class="card-caption">Pre/post mapping identity verified</div>
+          <div class="card-caption">Checked via /proc/pid/maps re-validation</div>
         </div>
-        <div class="card">
+        <div class="card quality-card">
           <div class="metric-label">Partial / Failed Reads</div>
-          <div class="metric-val" id="qual-partials">0 / 0</div>
-          <div class="card-caption">Zero region read errors</div>
+          <div class="metric-val mono" id="qual-partials">0 / 0</div>
+          <div class="card-caption">Unavailable fields: <span id="qual-unavail-fields">0</span></div>
         </div>
-        <div class="card">
-          <div class="metric-label">Unavailable Fields</div>
-          <div class="metric-val" id="qual-unavail-fields">0</div>
-          <div class="card-caption">Zero truncated struct members</div>
-        </div>
-        <div class="card">
-          <div class="metric-label">Debug Image</div>
+        <div class="card quality-card">
+          <div class="metric-label">Debug Image Status</div>
           <div class="metric-val text-accent" id="qual-debug-status">VERIFIED</div>
-          <div class="card-caption mono break-all" id="qual-debug-path">Unstripped ELF symbols</div>
+          <div class="card-caption mono break-all text-xs" id="qual-debug-path">No external image</div>
         </div>
-        <div class="card">
-          <div class="metric-label">Build ID</div>
-          <div class="metric-val mono" id="qual-build-id">MATCHED</div>
-          <div class="card-caption" id="qual-module-count">1 runtime modules verified</div>
-        </div>
-      </div>
-
-      <!-- 5. Memory to State Pipeline Flow Lineage -->
-      <div class="card pipeline-flow-card" style="margin-top: 24px;">
-        <div class="pipeline-title">Semantic Observation Pipeline Lineage:</div>
-        <div class="pipeline-flow">
-          <div class="pipeline-step">
-            <div class="step-num">1</div>
-            <div class="step-name">Raw Memory</div>
-            <div class="step-desc">/proc/$PID/mem + maps</div>
-          </div>
-          <div class="pipeline-arrow">➔</div>
-          <div class="pipeline-step">
-            <div class="step-num">2</div>
-            <div class="step-name">Runtime Modules</div>
-            <div class="step-desc">ELF Load Bias & Build ID</div>
-          </div>
-          <div class="pipeline-arrow">➔</div>
-          <div class="pipeline-step">
-            <div class="step-num">3</div>
-            <div class="step-name">Typed Memory</div>
-            <div class="step-desc">DWARF Types & Struct Layout</div>
-          </div>
-          <div class="pipeline-arrow">➔</div>
-          <div class="pipeline-step">
-            <div class="step-num">4</div>
-            <div class="step-name">Semantic Objects</div>
-            <div class="step-desc">Persistent Object Graph</div>
-          </div>
-          <div class="pipeline-arrow">➔</div>
-          <div class="pipeline-step">
-            <div class="step-num">5</div>
-            <div class="step-name">Object Graph</div>
-            <div class="step-desc">Pointer Reference Topology</div>
-          </div>
-          <div class="pipeline-arrow">➔</div>
-          <div class="pipeline-step">
-            <div class="step-num">6</div>
-            <div class="step-name">Runtime State</div>
-            <div class="step-desc">Invariant State Hash</div>
-          </div>
+        <div class="card quality-card">
+          <div class="metric-label">Binary Build ID</div>
+          <div class="metric-val mono text-sm" id="qual-build-id">UNAVAILABLE</div>
+          <div class="card-caption text-xs" id="qual-module-count">1 runtime module verified</div>
         </div>
       </div>
     </section>
 
     <!-- ===================================================================== -->
-    <!-- TAB 2: 📦 Runtime Objects (Master-Detail Inspector)                   -->
-    <!-- ===================================================================== -->
-    <section id="tab-runtime-objects" class="tab-pane">
-      <div class="split-view">
-        <!-- Left: Object Directory -->
-        <div class="split-sidebar">
-          <div class="sidebar-header">
-            <h3>Object Directory</h3>
-            <span class="badge badge-neutral" id="badge-mem-objects-count">0</span>
-          </div>
-
-          <!-- Real-time Filter & Search -->
-          <div class="object-filter-bar">
-            <input type="text" id="input-search-objects" class="input-text" placeholder="Filter by name, type, field...">
-            <div class="storage-filter-pills">
-              <button class="filter-pill active" data-storage="all">All</button>
-              <button class="filter-pill" data-storage="heap">Heap</button>
-              <button class="filter-pill" data-storage="global">Global</button>
-              <button class="filter-pill" data-storage="stack">Stack</button>
-            </div>
-          </div>
-
-          <div id="mem-graph-truncated-warning" class="banner banner-info" style="display: none; padding: 6px 12px; margin-bottom: 8px;">
-            <small id="txt-mem-truncated-count">Displaying first 100 objects</small>
-          </div>
-
-          <!-- Object List -->
-          <div class="list-container" id="list-memory-objects">
-            <div class="text-muted text-center p-3">Select a state to inspect objects</div>
-          </div>
-        </div>
-
-        <!-- Right: Human-Centric Object Inspector -->
-        <div class="split-main">
-          <div class="card" id="card-human-inspector">
-            <div class="card-header-row">
-              <div class="card-title-group">
-                <div class="obj-header-badges">
-                  <span class="badge badge-info" id="mem-obj-type-badge">Type</span>
-                  <span class="badge" id="mem-obj-storage-badge">HEAP</span>
-                </div>
-                <h3 id="mem-obj-title">Select an Object</h3>
-                <div class="text-muted text-sm" id="mem-obj-subtitle">Select an object from the directory on the left to inspect its state</div>
-              </div>
-              <div class="card-actions-group">
-                <button class="btn btn-secondary btn-sm" id="btn-jump-topology" title="View object in interactive reference graph">
-                  <span>🕸️</span> View in Topology
-                </button>
-                <button class="btn btn-outline btn-sm" id="btn-view-obj-json">Object JSON</button>
-              </div>
-            </div>
-
-            <!-- Human-Friendly Semantic Fields Table -->
-            <div class="section-title-row" style="margin-top: 16px;">
-              <h4>Semantic Fields & State</h4>
-              <span class="subtext">Interpreted C/C++ typed values with interactive pointer navigation</span>
-            </div>
-
-            <div class="table-container">
-              <table class="data-table" id="table-semantic-fields">
-                <thead>
-                  <tr>
-                    <th>Field Name</th>
-                    <th>Type</th>
-                    <th>Value</th>
-                    <th>Reference Pointer</th>
-                    <th>Mutability</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr><td colspan="6" class="text-muted text-center">No fields available</td></tr>
-                </tbody>
-              </table>
-            </div>
-
-            <!-- Collapsible Technical / DWARF Details Accordion -->
-            <details class="tech-accordion" id="accordion-tech-details">
-              <summary class="tech-summary">
-                <span class="accordion-icon">▶</span>
-                <strong>📐 Technical / DWARF Details</strong>
-                <span class="subtext">(Virtual address, storage class, layout & raw JSON)</span>
-              </summary>
-              <div class="tech-content">
-                <div class="detail-grid">
-                  <div><strong>Virtual Address:</strong> <span id="mem-tech-addr" class="mono text-muted">0x0</span></div>
-                  <div><strong>Storage Class:</strong> <span id="mem-tech-storage" class="mono">UNKNOWN</span></div>
-                  <div><strong>DWARF Type Signature:</strong> <span id="mem-tech-type" class="mono text-accent">Unknown</span></div>
-                  <div><strong>Object ID:</strong> <span id="mem-tech-id" class="mono">obj_0000</span></div>
-                </div>
-              </div>
-            </details>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ===================================================================== -->
-    <!-- TAB 3: 🕸️ Object Graph (Interactive SVG Topology)                     -->
-    <!-- ===================================================================== -->
-    <section id="tab-object-graph" class="tab-pane">
-      <div class="pane-header">
-        <div class="header-left">
-          <h2>Semantic Object Topology & References</h2>
-          <span class="subtext">Directed object reference graph showing heap, global, and stack pointer relationships</span>
-        </div>
-        <div class="panel-actions">
-          <button class="btn btn-outline btn-sm" id="btn-reset-topology">Fit View</button>
-          <button class="btn btn-outline btn-sm btn-view-json" data-entity="objects">Objects JSON</button>
-        </div>
-      </div>
-
-      <!-- Graph Legend & Controls -->
-      <div class="topology-controls-bar">
-        <div class="topology-legend">
-          <span class="legend-item"><span class="legend-dot dot-global"></span> Global / Static Root</span>
-          <span class="legend-item"><span class="legend-dot dot-heap"></span> Heap Allocated</span>
-          <span class="legend-item"><span class="legend-dot dot-stack"></span> Stack Frame</span>
-        </div>
-        <div class="topology-hint text-muted">Click any node to inspect its fields in the Runtime Objects tab</div>
-      </div>
-
-      <!-- Interactive SVG Topology Graph Container -->
-      <div class="graph-canvas-container" id="topology-container" style="min-height: 480px; overflow: auto;">
-        <svg id="topology-graph-svg" width="100%" height="480"></svg>
-      </div>
-    </section>
-
-    <!-- ===================================================================== -->
-    <!-- TAB 4: 📜 History / State Diff                                         -->
+    <!-- TAB 4: 📜 State DAG & Corpus Diff                                     -->
     <!-- ===================================================================== -->
     <section id="tab-history-diff" class="tab-pane">
-      <div class="advanced-subnav">
-        <button class="subnav-pill active" data-subtab="subtab-dag">State Transition DAG (History)</button>
+      <div class="subnav-pill-group">
+        <button class="subnav-pill active" data-subtab="subtab-dag">State Transition Graph</button>
         <button class="subnav-pill" data-subtab="subtab-diff">Semantic State Diff</button>
       </div>
 
-      <!-- Subtab 1: State DAG -->
+      <!-- Subtab 1: State Transition Graph -->
       <div id="subtab-dag" class="subtab-content active" style="margin-top: 16px;">
         <div class="split-view">
           <div class="split-sidebar">
             <div class="sidebar-header">
-              <h3>Discovered States</h3>
+              <h3>Corpus States</h3>
               <span class="badge badge-neutral" id="badge-states-count">0</span>
             </div>
-            <div class="search-box">
-              <input type="text" id="input-search-states" class="input-text" placeholder="Filter states by hash or id...">
+            <div class="filter-box">
+              <input type="text" id="input-search-states" class="input-text" placeholder="Search state ID or hash...">
             </div>
             <div class="list-container" id="list-states">
               <div class="text-muted text-center p-3">No states recorded in corpus</div>
@@ -534,7 +740,7 @@
                 <div><strong>Observations:</strong> <span id="detail-observations" class="mono">1</span></div>
               </div>
               <div class="state-actions-row">
-                <button class="btn btn-primary btn-sm" id="btn-inspect-state-objects">Inspect in Runtime Objects</button>
+                <button class="btn btn-primary btn-sm" id="btn-inspect-state-objects">Inspect in Object Explorer</button>
                 <button class="btn btn-secondary btn-sm" id="btn-state-diff-parent">Diff with Parent</button>
                 <button class="btn btn-secondary btn-sm" id="btn-state-mutate">Propose Mutations</button>
               </div>
@@ -610,7 +816,7 @@
     </section>
 
     <!-- ===================================================================== -->
-    <!-- TAB 5: ⚡ Advanced Exploration (Mutations & Autonomous Loop)          -->
+    <!-- TAB 5: ⚡ Autonomous Loop & Candidate Discovery                      -->
     <!-- ===================================================================== -->
     <section id="tab-advanced-explore" class="tab-pane">
       <div class="advanced-subnav">
@@ -658,89 +864,6 @@
               </table>
             </div>
           </div>
-
-          <!-- Transition Execution Result Box -->
-          <div class="execution-result-card card" id="card-execution-result" style="display: none; margin-top: 16px;">
-            <div class="card-header-row">
-              <div class="card-title-group">
-                <h4 id="exec-trans-id">Transition Complete</h4>
-                <span class="badge badge-success" id="exec-status-badge">STOPPED</span>
-              </div>
-              <button class="btn btn-outline btn-sm" id="btn-view-trans-json">Transition JSON</button>
-            </div>
-
-            <!-- Parent State -> Mutation -> Child State Flow -->
-            <div class="state-transition-flow" id="trans-flow-container" style="margin-top: 16px;">
-              <div class="flow-card flow-parent-card">
-                <div class="flow-badge">PARENT STATE</div>
-                <div class="flow-title mono" id="flow-parent-id">state_000001</div>
-                <div class="flow-hash mono text-muted" id="flow-parent-hash">56d6d7...</div>
-                <div class="flow-val mono" id="flow-parent-val">Before: N/A</div>
-              </div>
-              <div class="flow-arrow-card">
-                <div class="flow-arrow-icon">➔</div>
-                <div class="flow-arrow-label mono" id="flow-mutation-label">mutation</div>
-                <div class="flow-arrow-meta text-muted" id="flow-arrow-meta">Timeout: 1000ms</div>
-              </div>
-              <div class="flow-card flow-child-card">
-                <div class="flow-badge">CHILD STATE</div>
-                <div class="flow-title mono text-accent" id="flow-child-id">state_000002</div>
-                <div class="flow-hash mono text-muted" id="flow-child-hash">a1b2c3...</div>
-                <div class="flow-val mono text-accent" id="flow-child-val">After: N/A</div>
-              </div>
-            </div>
-
-            <!-- Execution Status Grid -->
-            <div class="overview-grid" style="margin-top: 16px;">
-              <div class="metric-box">
-                <div class="metric-label">Execution Status</div>
-                <div class="metric-val" id="exec-status-text" style="font-size: 1.15rem;">STOPPED</div>
-              </div>
-              <div class="metric-box">
-                <div class="metric-label">Restore Backend</div>
-                <div class="metric-val mono" id="exec-restore-backend" style="font-size: 1.05rem;">RESTART</div>
-              </div>
-              <div class="metric-box">
-                <div class="metric-label">Step Duration</div>
-                <div class="metric-val mono" id="exec-step-duration" style="font-size: 1.05rem;">N/A</div>
-              </div>
-              <div class="metric-box">
-                <div class="metric-label">State Hash</div>
-                <div class="metric-val mono" id="exec-child-hash-box" style="font-size: 0.85rem;">e3b0c44...</div>
-              </div>
-            </div>
-
-            <!-- Verified Execution Timeline (Zero fake progress) -->
-            <div class="timeline-section" style="margin-top: 18px;">
-              <div class="section-title-row" style="margin-bottom: 8px;">
-                <h5>Verified Execution Timeline</h5>
-                <span class="subtext">Actual completed stages reported by runtime backend</span>
-              </div>
-              <div class="execution-timeline" id="exec-timeline-list">
-                <!-- Dynamically rendered verified steps -->
-              </div>
-            </div>
-
-            <!-- Changed Fields (Semantic Diff) -->
-            <div class="changed-fields-box" style="margin-top: 18px;">
-              <h5>Changed Fields & Semantic State Diff</h5>
-              <div class="table-container" style="margin-top: 8px;">
-                <table class="data-table" id="table-exec-diff">
-                  <thead>
-                    <tr>
-                      <th>Target Object / Field</th>
-                      <th>Before Value</th>
-                      <th>After Value</th>
-                      <th>Category</th>
-                    </tr>
-                  </thead>
-                  <tbody id="tbody-exec-diff">
-                    <tr><td colspan="4" class="text-muted text-center">No field modifications detected</td></tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
 
@@ -778,144 +901,127 @@
                 <tr><td>Determinism</td><td id="exp-cp-determinism"><span class="badge badge-neutral">UNKNOWN</span></td></tr>
                 <tr><td>Branch Isolation</td><td id="exp-cp-branch-isolation"><span class="badge badge-neutral">UNAVAILABLE</span></td></tr>
               </table>
-              <div id="box-determinism-result" style="display: none; margin-top: 10px; padding: 10px; border-radius: 6px; font-size: 13px;" class="alert-banner">
-                <div style="font-weight: 600;" id="det-result-title">Determinism Verification Result</div>
-                <div id="det-result-details" style="margin-top: 4px;" class="mono"></div>
+              <div class="box-determinism-result alert-banner" id="box-determinism-result" style="display: none; margin-top: 10px;">
+                <div class="alert-header">
+                  <span id="det-result-title">Restart Determinism Verification Result</span>
+                </div>
+                <p id="det-result-details" class="mono text-xs" style="margin-top: 4px;"></p>
               </div>
             </div>
 
-            <form id="form-explore" style="margin-top: 16px;">
+            <form id="form-explore">
               <div class="form-group">
-                <label for="exp-max-steps">Max Exploration Steps (Safety Limit: 50):</label>
-                <input type="number" id="exp-max-steps" class="input-text" value="10" min="1" max="50">
-              </div>
-              <div class="form-group">
-                <label for="exp-timeout">Step Timeout ms (Safety Limit: 5000):</label>
-                <input type="number" id="exp-timeout" class="input-text" value="1000" min="100" max="5000">
+                <label for="exp-max-steps">Max Exploration Steps:</label>
+                <input type="number" id="exp-max-steps" class="input-text" value="10" min="1" max="100">
               </div>
               <div class="form-group">
-                <label for="exp-max-states">Max Discovered States (Corpus Limit: 100):</label>
-                <input type="number" id="exp-max-states" class="input-text" value="20" min="1" max="100">
+                <label for="exp-timeout">Step Timeout (ms):</label>
+                <input type="number" id="exp-timeout" class="input-text" value="1000" min="100" max="10000" step="100">
               </div>
-              <div class="form-actions" style="margin-top: 20px;">
-                <button type="submit" class="btn btn-primary" id="btn-start-explore">
-                  <span>🚀</span> Start Autonomous Exploration
-                </button>
+              <div class="form-group">
+                <label for="exp-max-states">Max Corpus States:</label>
+                <input type="number" id="exp-max-states" class="input-text" value="20" min="1" max="500">
               </div>
+              <button type="submit" class="btn btn-primary" id="btn-start-explore">Start Autonomous Exploration</button>
             </form>
           </div>
 
-          <div class="card explore-result-card" id="card-explore-results" style="display: none;">
-            <h4>Exploration Execution Results</h4>
-            <div class="metric-row" style="margin: 16px 0;">
+          <div class="card explore-results-card" id="card-explore-results" style="display: none;">
+            <h4>Exploration Summary</h4>
+            <div class="metric-row">
               <div class="metric-box">
                 <div class="metric-val" id="exp-res-steps">0</div>
                 <div class="metric-label">Steps Executed</div>
               </div>
               <div class="metric-box">
-                <div class="metric-val text-accent" id="exp-res-states">0</div>
-                <div class="metric-label">New States</div>
+                <div class="metric-val" id="exp-res-states">0</div>
+                <div class="metric-label">New States Found</div>
               </div>
               <div class="metric-box">
                 <div class="metric-val" id="exp-res-transitions">0</div>
                 <div class="metric-label">Transitions</div>
               </div>
               <div class="metric-box">
-                <div class="metric-val text-danger" id="exp-res-crashes">0</div>
-                <div class="metric-label">Crashes</div>
+                <div class="metric-val" id="exp-res-crashes">0</div>
+                <div class="metric-label">Crashes Detected</div>
               </div>
               <div class="metric-box">
-                <div class="metric-val text-warning" id="exp-res-timeouts">0</div>
+                <div class="metric-val" id="exp-res-timeouts">0</div>
                 <div class="metric-label">Timeouts</div>
               </div>
             </div>
-            <button class="btn btn-outline btn-sm btn-view-json" data-entity="explore">View Full Result JSON</button>
           </div>
         </div>
       </div>
     </section>
 
     <!-- ===================================================================== -->
-    <!-- TAB 6: 🛠️ System / Provenance                                          -->
+    <!-- TAB 6: 🛠️ System / Provenance & Modules                              -->
     <!-- ===================================================================== -->
     <section id="tab-system-provenance" class="tab-pane">
-      <div class="pane-header">
-        <div>
-          <h2>Target Architecture & Provenance</h2>
-          <span class="subtext">Low-level execution environment, ELF modules, Build IDs, and safety constraints</span>
-        </div>
-        <button class="btn btn-outline btn-sm btn-view-json" data-entity="runtime">Runtime JSON</button>
-      </div>
-
       <div class="overview-grid">
         <div class="card">
-          <div class="card-title">Target Execution Environment</div>
+          <h4>Target Process Info</h4>
           <table class="key-value-table">
-            <tr><td>Status</td><td id="ov-status" class="mono">DISCONNECTED</td></tr>
-            <tr><td>PID</td><td id="ov-pid" class="mono">None</td></tr>
-            <tr><td>Threads</td><td id="ov-threads" class="mono">1</td></tr>
-            <tr><td>Observation Mode</td><td id="ov-mode"><span class="badge badge-info">CONSISTENT</span></td></tr>
-            <tr><td>Restore Backend</td><td id="ov-restore-backend" class="mono">GDB_CHECKPOINT</td></tr>
-            <tr><td>Checkpoint Semantics</td><td id="ov-checkpoint-semantics" class="mono">MEMORY_CHECKPOINT</td></tr>
-            <tr><td>Thread Scope</td><td id="ov-thread-scope" class="mono">SINGLE_THREAD</td></tr>
-            <tr><td>Determinism Status</td><td id="ov-determinism-status"><span class="badge badge-neutral">UNKNOWN</span></td></tr>
-            <tr><td>Branch Isolation</td><td id="ov-branch-isolation"><span class="badge badge-success">SUPPORTED</span></td></tr>
-            <tr><td>Executable</td><td id="ov-binary" class="mono break-all">None</td></tr>
-            <tr><td>Debug Image</td><td id="ov-debug-image" class="mono break-all">None</td></tr>
-            <tr><td>Debug Artifact Status</td><td id="ov-debug-status"><span class="badge">NOT_AVAILABLE</span></td></tr>
+            <tr><td>Status:</td><td id="ov-status" class="mono">DISCONNECTED</td></tr>
+            <tr><td>PID:</td><td id="ov-pid" class="mono">None</td></tr>
+            <tr><td>Active Threads:</td><td id="ov-threads" class="mono">1</td></tr>
+            <tr><td>Observation Mode:</td><td id="ov-mode">CONSISTENT</td></tr>
+            <tr><td>Restore Backend:</td><td id="ov-restore-backend" class="mono">RESTART</td></tr>
+            <tr><td>Checkpoint Semantics:</td><td id="ov-checkpoint-semantics" class="mono">RESTART_TO_OBSERVATION_POINT</td></tr>
+            <tr><td>Thread Scope:</td><td id="ov-thread-scope" class="mono">MULTITHREAD</td></tr>
+            <tr><td>Determinism Status:</td><td id="ov-determinism-status">UNKNOWN</td></tr>
+            <tr><td>Branch Isolation:</td><td id="ov-branch-isolation">SUPPORTED</td></tr>
+            <tr><td>Executable:</td><td id="ov-binary" class="mono break-all">None</td></tr>
+            <tr><td>Debug Image:</td><td id="ov-debug-image" class="mono break-all">None</td></tr>
+            <tr><td>Debug Status:</td><td id="ov-debug-status">NOT_AVAILABLE</td></tr>
           </table>
         </div>
 
         <div class="card">
-          <div class="card-title">System & Provenance Metadata</div>
+          <h4>Platform & Architecture</h4>
           <table class="key-value-table">
-            <tr><td>Architecture</td><td id="ov-arch" class="mono">UNKNOWN</td></tr>
-            <tr><td>Endianness</td><td id="ov-endian" class="mono">UNKNOWN</td></tr>
-            <tr><td>ELF Class</td><td id="ov-elf" class="mono">UNKNOWN</td></tr>
-            <tr><td>Build ID</td><td id="ov-build-id" class="mono break-all">None</td></tr>
-            <tr><td>Discovered Modules</td><td id="ov-modules-count" class="mono">0</td></tr>
-            <tr><td>Latest Checkpoint</td><td id="ov-checkpoint" class="mono">None</td></tr>
+            <tr><td>Architecture:</td><td id="ov-arch" class="mono">UNKNOWN</td></tr>
+            <tr><td>Endianness:</td><td id="ov-endian" class="mono">UNKNOWN</td></tr>
+            <tr><td>ELF Class:</td><td id="ov-elf" class="mono">UNKNOWN</td></tr>
+            <tr><td>Main Build ID:</td><td id="ov-build-id" class="mono break-all">None</td></tr>
+            <tr><td>Discovered Modules:</td><td id="ov-modules-count" class="mono">0</td></tr>
+            <tr><td>Current Checkpoint:</td><td id="ov-checkpoint" class="mono">None</td></tr>
           </table>
         </div>
 
         <div class="card">
-          <div class="card-title">Safety Limits & Metrics</div>
-          <div class="metric-row">
-            <div class="metric-box">
-              <div class="metric-val" id="ov-states-count">0</div>
-              <div class="metric-label">States</div>
-            </div>
-            <div class="metric-box">
-              <div class="metric-val" id="ov-trans-count">0</div>
-              <div class="metric-label">Transitions</div>
-            </div>
-            <div class="metric-box">
-              <div class="metric-val" id="ov-candidates-count">0</div>
-              <div class="metric-label">Candidates</div>
-            </div>
-          </div>
-          <div class="card-subtitle" style="margin-top: 16px;">Safety Enforcement</div>
-          <div id="ov-limits" class="limits-list">
-            <span class="tag">Max steps: 50</span>
-            <span class="tag">Timeout: 5000ms</span>
-            <span class="tag">Max candidates: 50</span>
+          <h4>Corpus & Safety Statistics</h4>
+          <table class="key-value-table">
+            <tr><td>Corpus States:</td><td id="ov-states-count" class="mono">0</td></tr>
+            <tr><td>Transitions Recorded:</td><td id="ov-trans-count" class="mono">0</td></tr>
+            <tr><td>Mutation Candidates:</td><td id="ov-candidates-count" class="mono">0</td></tr>
+          </table>
+          <div class="safety-limits-group" style="margin-top: 12px;">
+            <div class="text-sm font-semibold">Safety Limits:</div>
+            <div class="limits-pills" id="ov-limits" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px;"></div>
           </div>
         </div>
       </div>
 
-      <div class="section-block" style="margin-top: 24px;">
-        <div class="section-title-row">
-          <h3>Discovered Runtime Modules</h3>
-          <button class="btn btn-outline btn-sm btn-view-json" data-entity="modules">View Modules JSON</button>
+      <!-- Modules Discovery Table -->
+      <div class="card modules-card" style="margin-top: 16px;">
+        <div class="card-header-row">
+          <div>
+            <h4>Discovered Modules & Load Biases</h4>
+            <span class="subtext">Dynamic runtime memory maps and load bias offsets</span>
+          </div>
+          <button class="btn btn-outline btn-sm btn-view-json" data-entity="modules">Modules JSON</button>
         </div>
-        <div class="table-container">
+
+        <div class="table-container" style="margin-top: 12px;">
           <table class="data-table" id="table-modules">
             <thead>
               <tr>
                 <th>Main</th>
-                <th>Module Path</th>
-                <th>Base Address</th>
-                <th>End Address</th>
+                <th>Binary Path</th>
+                <th>Runtime Base</th>
+                <th>Runtime End</th>
                 <th>Load Bias</th>
                 <th>Bias Status</th>
                 <th>Build ID</th>
@@ -925,7 +1031,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr><td colspan="10" class="text-muted text-center">No modules loaded</td></tr>
+              <tr><td colspan="10" class="text-muted text-center">Loading module mappings...</td></tr>
             </tbody>
           </table>
         </div>
@@ -934,43 +1040,58 @@
 
   </main>
 
+  <!-- ======================================================================= -->
+  <!-- MODALS                                                                  -->
+  <!-- ======================================================================= -->
+
   <!-- Observation Dialog Modal -->
   <div id="modal-observe" class="modal-backdrop" style="display: none;">
     <div class="modal-card">
       <div class="modal-header">
-        <h3>Observe Runtime Process</h3>
+        <h3>Initiate Target Observation</h3>
         <button class="btn-close" id="btn-close-observe-modal">×</button>
       </div>
-      <form id="form-observe">
-        <div class="form-group">
-          <label>Observation Mode:</label>
-          <div class="radio-row">
-            <label><input type="radio" name="obs-mode" value="CONSISTENT" checked> CONSISTENT (GDB breakpoint stop)</label>
-            <label><input type="radio" name="obs-mode" value="LOW_IMPACT"> LOW_IMPACT (process_vm_readv non-stop)</label>
+      <div class="modal-body">
+        <form id="form-observe">
+          <div class="form-group">
+            <label>Observation Mode:</label>
+            <div class="radio-group">
+              <label class="radio-label">
+                <input type="radio" name="obs-mode" value="CONSISTENT" checked>
+                <span><strong>CONSISTENT (Default)</strong> — Precise breakpoint snapshot via GDB.</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="obs-mode" value="LOW_IMPACT">
+                <span><strong>LOW_IMPACT</strong> — Zero stop, reads memory live via <code>process_vm_readv</code>.</span>
+              </label>
+            </div>
           </div>
-        </div>
-        <div class="form-group">
-          <label for="obs-pid">Target PID (required for LOW_IMPACT):</label>
-          <input type="number" id="obs-pid" class="input-text" placeholder="e.g. 12345">
-        </div>
-        <div class="form-group">
-          <label for="obs-debug-image">Debug Image Path (unstripped ELF):</label>
-          <input type="text" id="obs-debug-image" class="input-text" placeholder="e.g. /path/to/binary.debug">
-        </div>
-        <div class="form-group">
-          <label for="obs-policy">Memory Region Policy (LOW_IMPACT):</label>
-          <select id="obs-policy" class="input-select">
-            <option value="ALL_READABLE" selected>ALL_READABLE (Stack, Heap, Global, Libs)</option>
-            <option value="GLOBAL">GLOBAL (BSS, Data)</option>
-            <option value="HEAP">HEAP only</option>
-            <option value="STACK">STACK only</option>
-          </select>
-        </div>
-        <div class="modal-actions">
-          <button type="button" class="btn btn-secondary" id="btn-cancel-observe">Cancel</button>
-          <button type="submit" class="btn btn-primary" id="btn-submit-observe">Capture & Observe</button>
-        </div>
-      </form>
+
+          <div class="form-group">
+            <label for="obs-pid">Attach to Existing Target PID (Optional):</label>
+            <input type="number" id="obs-pid" class="input-text" placeholder="e.g. 1234">
+          </div>
+
+          <div class="form-group">
+            <label for="obs-debug-image">Debug Image Path (Optional):</label>
+            <input type="text" id="obs-debug-image" class="input-text" placeholder="/path/to/binary.debug">
+          </div>
+
+          <div class="form-group">
+            <label for="obs-policy">Snapshot Policy:</label>
+            <select id="obs-policy" class="input-select">
+              <option value="HEAP_AND_STACK" selected>Heap + Stack + Globals</option>
+              <option value="HEAP_ONLY">Heap Only</option>
+              <option value="FULL">Full Process Address Space</option>
+            </select>
+          </div>
+
+          <div class="modal-actions">
+            <button type="button" class="btn btn-secondary" id="btn-cancel-observe">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-submit-observe">Capture Observation</button>
+          </div>
+        </form>
+      </div>
     </div>
   </div>
 
@@ -1014,7 +1135,7 @@
             <table class="key-value-table">
               <tr>
                 <td>Observation Point:</td>
-                <td class="mono text-accent" id="prev-obs-point">worker_loop() @ sample_multithread.cpp:73</td>
+                <td class="mono text-accent" id="prev-obs-point">Not available</td>
               </tr>
               <tr>
                 <td>Restore Backend:</td>
@@ -1057,14 +1178,14 @@
   <div id="modal-json" class="modal-backdrop" style="display: none;">
     <div class="modal-card modal-large">
       <div class="modal-header">
-        <h3 id="modal-json-title">Raw JSON Artifact</h3>
-        <div class="modal-header-actions">
-          <button class="btn btn-secondary btn-sm" id="btn-copy-json">Copy JSON</button>
-          <button class="btn-close" id="btn-close-json-modal">×</button>
-        </div>
+        <h3 id="modal-json-title">Entity Raw JSON</h3>
+        <button class="btn-close" id="btn-close-json-modal">×</button>
       </div>
       <div class="modal-body">
-        <pre id="modal-json-content" class="code-pre"></pre>
+        <div class="json-actions-bar">
+          <button class="btn btn-secondary btn-sm" id="btn-copy-json">Copy JSON</button>
+        </div>
+        <pre class="json-content-viewer" id="modal-json-content"></pre>
       </div>
     </div>
   </div>
