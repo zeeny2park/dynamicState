@@ -31,6 +31,9 @@
     globalTimeoutMs: 1000,
     expandedTreeNodes: new Set(),
     treeFilterQuery: '',
+    selectedLabSnapshotId: null,
+    lastCaptureReport: null,
+    stateLabTree: null,
   };
 
   // DOM Elements Cache
@@ -337,6 +340,58 @@
     modalJsonContent: document.getElementById('modal-json-content'),
     btnCloseJsonModal: document.getElementById('btn-close-json-modal'),
     btnCopyJson: document.getElementById('btn-copy-json'),
+
+    // Tab 7: State Laboratory
+    btnFastCapture: document.getElementById('btn-fast-capture'),
+    sumCaptureBackend: document.getElementById('sum-capture-backend'),
+    sumCaptureLatency: document.getElementById('sum-capture-latency'),
+    statelabBackendBadge: document.getElementById('statelab-backend-badge'),
+    btnLabOpenCapture: document.getElementById('btn-lab-open-capture'),
+    btnLabOpenBranch: document.getElementById('btn-lab-open-branch'),
+    btnLabOpenMutate: document.getElementById('btn-lab-open-mutate'),
+    btnRefreshLabTree: document.getElementById('btn-refresh-lab-tree'),
+    statelabSnapId: document.getElementById('statelab-snap-id'),
+    statelabStopTime: document.getElementById('statelab-stop-time'),
+    statelabObjCount: document.getElementById('statelab-obj-count'),
+    statelabMemSize: document.getElementById('statelab-mem-size'),
+    statelabThreadsCount: document.getElementById('statelab-threads-count'),
+    statelabStateHash: document.getElementById('statelab-state-hash'),
+    latStopTime: document.getElementById('lat-stop-time'),
+    latThreadTime: document.getElementById('lat-thread-time'),
+    latMemoryTime: document.getElementById('lat-memory-time'),
+    latResumeTime: document.getElementById('lat-resume-time'),
+    latTotalStopTime: document.getElementById('lat-total-stop-time'),
+    statelabTreeContainer: document.getElementById('statelab-tree-container'),
+    impactTargetLabel: document.getElementById('impact-target-label'),
+    impactDirectList: document.getElementById('impact-direct-list'),
+    impactParentList: document.getElementById('impact-parent-list'),
+    impactSharedList: document.getElementById('impact-shared-list'),
+    impactRefThreadsList: document.getElementById('impact-ref-threads-list'),
+    impactPotThreadsList: document.getElementById('impact-pot-threads-list'),
+    badgeReplayCap: document.getElementById('badge-replay-cap'),
+    replayValCapability: document.getElementById('replay-val-capability'),
+    replayValAttempted: document.getElementById('replay-val-attempted'),
+    replayValCompleted: document.getElementById('replay-val-completed'),
+    replayValVerified: document.getElementById('replay-val-verified'),
+    replayValSource: document.getElementById('replay-val-source'),
+    btnRunReplayAction: document.getElementById('btn-run-replay-action'),
+
+    // State Lab Modals
+    modalFastCapture: document.getElementById('modal-fast-capture'),
+    btnCloseFastCaptureModal: document.getElementById('btn-close-fast-capture-modal'),
+    btnCancelFastCapture: document.getElementById('btn-cancel-fast-capture'),
+    formFastCapture: document.getElementById('form-fast-capture'),
+    groupTargetPath: document.getElementById('group-target-path'),
+    capTargetPath: document.getElementById('cap-target-path'),
+    capPid: document.getElementById('cap-pid'),
+    capTimeout: document.getElementById('cap-timeout'),
+    modalSnapshotMutate: document.getElementById('modal-snapshot-mutate'),
+    btnCloseSnapMutateModal: document.getElementById('btn-close-snap-mutate-modal'),
+    btnCancelSnapMutate: document.getElementById('btn-cancel-snap-mutate'),
+    formSnapshotMutate: document.getElementById('form-snapshot-mutate'),
+    snapMutTarget: document.getElementById('snap-mut-target'),
+    snapMutValue: document.getElementById('snap-mut-value'),
+    snapMutBranchName: document.getElementById('snap-mut-branch-name'),
   };
 
   // --------------------------------------------------------------------------
@@ -487,6 +542,11 @@
       renderMemoryObjectsList();
     } else if (tabId === 'tab-history-diff') {
       renderStateGraph();
+    } else if (tabId === 'tab-state-lab') {
+      loadStateLabTree();
+      if (state.selectedLabSnapshotId) {
+        selectLabSnapshot(state.selectedLabSnapshotId);
+      }
     }
   }
 
@@ -776,6 +836,28 @@
 
     // Render Threads detail table
     renderThreads(data.threads_detail, data.observation_point);
+
+    const branchStatus = branchIso.status || branchIsoCap || 'UNAVAILABLE';
+
+    // Fast Runtime Capture & State Laboratory summary
+    if (el.sumCaptureBackend) {
+      el.sumCaptureBackend.textContent = data.capture_backend || 'process_vm_readv';
+    }
+    if (el.statelabBackendBadge) {
+      el.statelabBackendBadge.textContent = data.capture_backend || 'process_vm_readv';
+    }
+    if (data.last_capture_latency_report) {
+      const rep = data.last_capture_latency_report;
+      state.lastCaptureReport = rep;
+      if (el.sumCaptureLatency) {
+        el.sumCaptureLatency.textContent = `${(rep.total_stop_time_ms || 0).toFixed(2)} ms`;
+      }
+      renderCaptureLatencyReport(rep);
+    }
+    if (data.state_lab_tree) {
+      state.stateLabTree = data.state_lab_tree;
+      renderStateLabTree(data.state_lab_tree);
+    }
 
     if (el.expCpBackend) el.expCpBackend.textContent = backendName;
     if (el.expCpSemantics) el.expCpSemantics.textContent = semantics;
@@ -2858,6 +2940,424 @@
     });
   }
 
+  // --------------------------------------------------------------------------
+  // Tab 7: State Laboratory & Fast Runtime Capture
+  // --------------------------------------------------------------------------
+
+  function renderCaptureLatencyReport(rep) {
+    if (!rep) return;
+    if (el.latStopTime) el.latStopTime.textContent = `${(rep.stop_time_ms || 0).toFixed(2)} ms`;
+    if (el.latThreadTime) el.latThreadTime.textContent = `${(rep.thread_metadata_time_ms || 0).toFixed(2)} ms`;
+    if (el.latMemoryTime) el.latMemoryTime.textContent = `${(rep.memory_capture_time_ms || 0).toFixed(2)} ms`;
+    if (el.latResumeTime) el.latResumeTime.textContent = `${(rep.resume_time_ms || 0).toFixed(2)} ms`;
+    if (el.latTotalStopTime) {
+      el.latTotalStopTime.textContent = `${(rep.total_stop_time_ms || 0).toFixed(2)} ms`;
+      if (rep.total_stop_time_ms < 10) {
+        el.latTotalStopTime.style.color = 'var(--accent)';
+      } else {
+        el.latTotalStopTime.style.color = 'var(--warning)';
+      }
+    }
+    if (el.statelabStopTime) {
+      el.statelabStopTime.textContent = `${(rep.total_stop_time_ms || 0).toFixed(2)} ms`;
+    }
+  }
+
+  function renderStateLabTree(treeData) {
+    if (!el.statelabTreeContainer) return;
+    if (!treeData || !treeData.roots || treeData.roots.length === 0) {
+      el.statelabTreeContainer.innerHTML = '<div class="text-muted text-center p-4">No snapshots registered in State Laboratory yet. Click [Capture State] to begin.</div>';
+      return;
+    }
+
+    const snaps = treeData.snapshots || {};
+    let html = '';
+
+    function renderNode(snapId, depth) {
+      const s = snaps[snapId];
+      if (!s) return '';
+      const isSelected = state.selectedLabSnapshotId === snapId;
+      const shortHash = (s.state_hash || '').substring(0, 8);
+      const isMutation = Boolean(s.is_mutation);
+      const branchBadge = s.branch_name ? `<span class="badge badge-info text-xs">${escapeHtml(s.branch_name)}</span>` : '';
+      const typeBadge = isMutation
+        ? `<span class="badge badge-warning text-xs">Mutation: ${escapeHtml(s.mutated_path || 'field')}</span>`
+        : (s.parent_id ? `<span class="badge badge-neutral text-xs">Branch</span>` : `<span class="badge badge-success text-xs">Root Snapshot</span>`);
+
+      const indent = depth * 24;
+
+      let nodeHtml = `
+        <div class="branch-tree-node ${isSelected ? 'active' : ''}" style="margin-left: ${indent}px;" data-snap-id="${escapeHtml(snapId)}">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="tree-icon">${depth > 0 ? (isMutation ? '✏️' : '🌿') : '📸'}</span>
+            <span class="mono font-semibold">${escapeHtml(snapId)}</span>
+            ${branchBadge}
+            ${typeBadge}
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="mono text-xs text-muted">Hash: ${escapeHtml(shortHash)}</span>
+            <span class="text-xs text-muted">${s.objects_count || 0} objs</span>
+          </div>
+        </div>
+      `;
+
+      if (s.children && s.children.length > 0) {
+        for (const childId of s.children) {
+          nodeHtml += renderNode(childId, depth + 1);
+        }
+      }
+      return nodeHtml;
+    }
+
+    for (const rootId of treeData.roots) {
+      html += renderNode(rootId, 0);
+    }
+    el.statelabTreeContainer.innerHTML = html;
+
+    el.statelabTreeContainer.querySelectorAll('.branch-tree-node').forEach((node) => {
+      node.addEventListener('click', () => {
+        const sid = node.getAttribute('data-snap-id');
+        if (sid) selectLabSnapshot(sid);
+      });
+    });
+  }
+
+  async function selectLabSnapshot(snapshotId) {
+    if (!snapshotId) return;
+    state.selectedLabSnapshotId = snapshotId;
+
+    if (el.statelabTreeContainer) {
+      el.statelabTreeContainer.querySelectorAll('.branch-tree-node').forEach((n) => {
+        n.classList.toggle('active', n.getAttribute('data-snap-id') === snapshotId);
+      });
+    }
+
+    if (el.statelabSnapId) el.statelabSnapId.textContent = snapshotId;
+
+    // Fetch snapshot details
+    const res = await apiGet(`/api/state/${snapshotId}`);
+    if (res.success && res.data) {
+      const snap = res.data;
+      const sh = snap.state_hash || 'N/A';
+      if (el.statelabStateHash) el.statelabStateHash.textContent = sh.length > 12 ? sh.substring(0, 12) + '...' : sh;
+      if (el.statelabObjCount) el.statelabObjCount.textContent = (snap.objects && snap.objects.length) || 0;
+      if (el.statelabThreadsCount) el.statelabThreadsCount.textContent = (snap.threads && snap.threads.length) || 1;
+
+      const prov = snap.provenance || {};
+      const lat = prov.latency_report || prov.capture_latency || {};
+      if (lat.total_stop_time_ms !== undefined) {
+        renderCaptureLatencyReport(lat);
+      } else if (snap.parent_id) {
+        // Logical branch mutation
+        if (el.statelabStopTime) el.statelabStopTime.textContent = '0.00 ms (Offline)';
+        if (el.latStopTime) el.latStopTime.textContent = '0.00 ms';
+        if (el.latThreadTime) el.latThreadTime.textContent = '0.00 ms';
+        if (el.latMemoryTime) el.latMemoryTime.textContent = '0.00 ms';
+        if (el.latResumeTime) el.latResumeTime.textContent = '0.00 ms';
+        if (el.latTotalStopTime) el.latTotalStopTime.textContent = '0.00 ms (Offline Logical State)';
+      }
+
+      const memSize = prov.captured_bytes || snap.captured_bytes || 0;
+      if (el.statelabMemSize) el.statelabMemSize.textContent = formatBytes(memSize);
+
+      const isMutationBranch = Boolean(snap.parent_id);
+      const repCap = (state.runtime && state.runtime.capabilities && state.runtime.capabilities.replay && state.runtime.capabilities.replay.capability) || 'UNAVAILABLE';
+      if (el.badgeReplayCap) {
+        el.badgeReplayCap.textContent = repCap;
+        el.badgeReplayCap.className = `badge badge-${repCap === 'SUPPORTED' ? 'success' : repCap === 'CONDITIONAL' ? 'warning' : 'neutral'} text-xs`;
+      }
+      if (el.replayValCapability) el.replayValCapability.textContent = repCap;
+      if (el.btnRunReplayAction) {
+        el.btnRunReplayAction.disabled = (repCap === 'UNAVAILABLE' || !isMutationBranch);
+        el.btnRunReplayAction.title = !isMutationBranch ? 'Replay requires a mutated branch' : '';
+      }
+    }
+
+    await loadImpactAnalysis(snapshotId);
+  }
+
+  async function loadImpactAnalysis(snapshotId, targetPath) {
+    let url = `/api/impact/${snapshotId}`;
+    if (targetPath) {
+      url += `?target_path=${encodeURIComponent(targetPath)}`;
+    }
+    const res = await apiGet(url);
+    if (!res.success || !res.data) {
+      renderImpactData({
+        target_path: targetPath || 'None selected',
+        directly_affected_objects: [],
+        parent_objects: [],
+        shared_objects: [],
+        referencing_threads: [],
+        potentially_affected_threads: []
+      });
+      return;
+    }
+    renderImpactData(res.data);
+  }
+
+  function renderImpactData(data) {
+    if (el.impactTargetLabel) {
+      el.impactTargetLabel.textContent = data.target_path || 'No mutation target specified';
+    }
+
+    function renderTagList(container, items, tagClass = '') {
+      if (!container) return;
+      if (!items || items.length === 0) {
+        container.innerHTML = `<li class="tag text-muted">None</li>`;
+        return;
+      }
+      container.innerHTML = items.map(it => {
+        const label = typeof it === 'object' ? (it.name || it.path || it.id || JSON.stringify(it)) : String(it);
+        return `<li class="tag ${tagClass}">${escapeHtml(label)}</li>`;
+      }).join('');
+    }
+
+    renderTagList(el.impactDirectList, data.directly_affected_objects, 'tag-accent');
+    renderTagList(el.impactParentList, data.parent_objects);
+    renderTagList(el.impactSharedList, data.shared_objects);
+    renderTagList(el.impactRefThreadsList, data.referencing_threads, 'tag-warning');
+    renderTagList(el.impactPotThreadsList, data.potentially_affected_threads);
+  }
+
+  async function loadStateLabTree() {
+    const res = await apiGet('/api/state-lab/tree');
+    if (res.success && res.data) {
+      state.stateLabTree = res.data;
+      renderStateLabTree(res.data);
+      if (!state.selectedLabSnapshotId && res.data.roots && res.data.roots.length > 0) {
+        selectLabSnapshot(res.data.roots[0]);
+      }
+    }
+  }
+
+  function initFastCaptureModal() {
+    if (!el.modalFastCapture) return;
+
+    const radios = el.formFastCapture.querySelectorAll('input[name="cap-mode"]');
+    radios.forEach((r) => {
+      r.addEventListener('change', () => {
+        if (el.groupTargetPath) {
+          el.groupTargetPath.style.display = r.value === 'TARGETED' ? 'block' : 'none';
+        }
+      });
+    });
+
+    const openCaptureModal = () => {
+      if (el.capPid && state.runtime && state.runtime.pid) {
+        el.capPid.value = state.runtime.pid;
+      }
+      el.modalFastCapture.style.display = 'flex';
+    };
+
+    if (el.btnFastCapture) el.btnFastCapture.addEventListener('click', openCaptureModal);
+    if (el.btnLabOpenCapture) el.btnLabOpenCapture.addEventListener('click', openCaptureModal);
+
+    if (el.btnCloseFastCaptureModal) {
+      el.btnCloseFastCaptureModal.addEventListener('click', () => {
+        el.modalFastCapture.style.display = 'none';
+      });
+    }
+    if (el.btnCancelFastCapture) {
+      el.btnCancelFastCapture.addEventListener('click', () => {
+        el.modalFastCapture.style.display = 'none';
+      });
+    }
+
+    if (el.formFastCapture) {
+      el.formFastCapture.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const mode = el.formFastCapture.elements['cap-mode'].value || 'FULL';
+        const targetPath = el.capTargetPath ? el.capTargetPath.value.trim() : '';
+        const pid = el.capPid && el.capPid.value ? parseInt(el.capPid.value, 10) : (state.runtime && state.runtime.pid);
+        const timeoutMs = el.capTimeout ? parseInt(el.capTimeout.value, 10) : 1000;
+
+        showToast(`Initiating ${mode} capture (<10ms stop time)...`, 'info');
+        el.modalFastCapture.style.display = 'none';
+
+        const res = await apiPost('/api/capture', {
+          mode,
+          target_path: targetPath,
+          pid,
+          timeout_ms: timeoutMs
+        });
+
+        if (!res.success) {
+          showToast(res.error ? res.error.message : 'Fast capture failed', 'error');
+          return;
+        }
+
+        const snapData = res.data;
+        const stopTime = snapData.latency_report ? snapData.latency_report.total_stop_time_ms.toFixed(2) : '0';
+        showToast(`Snapshot ${snapData.snapshot_id} captured in ${stopTime} ms stop time!`, 'success');
+
+        if (snapData.latency_report) {
+          renderCaptureLatencyReport(snapData.latency_report);
+        }
+        if (snapData.tree) {
+          renderStateLabTree(snapData.tree);
+        }
+
+        await loadRuntimeOverview();
+        await loadStatesAndGraph();
+        await selectLabSnapshot(snapData.snapshot_id);
+      });
+    }
+  }
+
+  function initSnapshotMutateModal() {
+    if (!el.modalSnapshotMutate) return;
+
+    if (el.btnLabOpenMutate) {
+      el.btnLabOpenMutate.addEventListener('click', () => {
+        if (!state.selectedLabSnapshotId) {
+          const defaultId = state.selectedStateId || (state.stateLabTree && state.stateLabTree.roots && state.stateLabTree.roots[0]);
+          if (defaultId) {
+            state.selectedLabSnapshotId = defaultId;
+          } else {
+            showToast('No snapshot available to mutate. Capture a snapshot first.', 'warning');
+            return;
+          }
+        }
+        if (state.currentMutationTarget && el.snapMutTarget) {
+          el.snapMutTarget.value = state.currentMutationTarget.semantic_path || state.currentMutationTarget.path || '';
+        }
+        el.modalSnapshotMutate.style.display = 'flex';
+      });
+    }
+
+    if (el.btnCloseSnapMutateModal) {
+      el.btnCloseSnapMutateModal.addEventListener('click', () => {
+        el.modalSnapshotMutate.style.display = 'none';
+      });
+    }
+    if (el.btnCancelSnapMutate) {
+      el.btnCancelSnapMutate.addEventListener('click', () => {
+        el.modalSnapshotMutate.style.display = 'none';
+      });
+    }
+
+    if (el.formSnapshotMutate) {
+      el.formSnapshotMutate.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const targetPath = el.snapMutTarget.value.trim();
+        let newVal = el.snapMutValue.value.trim();
+        const branchName = el.snapMutBranchName.value.trim() || undefined;
+
+        if (!isNaN(newVal) && newVal !== '') {
+          newVal = Number(newVal);
+        } else if (newVal.toLowerCase() === 'true') {
+          newVal = true;
+        } else if (newVal.toLowerCase() === 'false') {
+          newVal = false;
+        }
+
+        showToast(`Mutating snapshot branch (${targetPath})...`, 'info');
+        el.modalSnapshotMutate.style.display = 'none';
+
+        const res = await apiPost(`/api/snapshots/${state.selectedLabSnapshotId}/mutate`, {
+          target_path: targetPath,
+          new_value: newVal,
+          branch_name: branchName
+        });
+
+        if (!res.success) {
+          showToast(res.error ? res.error.message : 'Snapshot mutation failed', 'error');
+          return;
+        }
+
+        const mutData = res.data;
+        showToast(`Mutated branch ${mutData.child_id} created with verified isolation!`, 'success');
+
+        await loadStateLabTree();
+        await selectLabSnapshot(mutData.child_id);
+      });
+    }
+  }
+
+  function initLabBranchAndReplay() {
+    if (el.btnLabOpenBranch) {
+      el.btnLabOpenBranch.addEventListener('click', async () => {
+        if (!state.selectedLabSnapshotId) {
+          const defaultId = state.selectedStateId || (state.stateLabTree && state.stateLabTree.roots && state.stateLabTree.roots[0]);
+          if (defaultId) state.selectedLabSnapshotId = defaultId;
+          else {
+            showToast('Capture a snapshot first before branching.', 'warning');
+            return;
+          }
+        }
+        const branchName = prompt('Enter new branch name (e.g. branch_b):', 'branch_' + Date.now().toString(36).slice(-4));
+        if (branchName === null) return;
+
+        showToast(`Creating snapshot branch...`, 'info');
+        const res = await apiPost(`/api/snapshots/${state.selectedLabSnapshotId}/branch`, {
+          branch_name: branchName.trim()
+        });
+
+        if (!res.success) {
+          showToast(res.error ? res.error.message : 'Branch creation failed', 'error');
+          return;
+        }
+
+        const branchData = res.data;
+        showToast(`Branch ${branchData.branch_id} created successfully!`, 'success');
+        await loadStateLabTree();
+        await selectLabSnapshot(branchData.branch_id);
+      });
+    }
+
+    if (el.btnRefreshLabTree) {
+      el.btnRefreshLabTree.addEventListener('click', () => {
+        showToast('Refreshing State Laboratory tree...', 'info');
+        loadStateLabTree();
+      });
+    }
+
+    if (el.btnRunReplayAction) {
+      el.btnRunReplayAction.addEventListener('click', async () => {
+        if (!state.selectedLabSnapshotId) {
+          showToast('Select a mutation snapshot first', 'warning');
+          return;
+        }
+        showToast('Initiating live target replay & readback verification...', 'info');
+        el.btnRunReplayAction.disabled = true;
+
+        const res = await apiPost(`/api/snapshots/${state.selectedLabSnapshotId}/replay`, {
+          pid: state.runtime && state.runtime.pid,
+          timeout_ms: state.globalTimeoutMs || 1000
+        });
+        el.btnRunReplayAction.disabled = false;
+
+        if (!res.success) {
+          showToast(res.error ? res.error.message : 'Replay failed', 'error');
+          if (el.replayValAttempted) el.replayValAttempted.textContent = 'Yes';
+          if (el.replayValCompleted) el.replayValCompleted.textContent = 'Failed';
+          if (el.replayValVerified) el.replayValVerified.textContent = 'No';
+          return;
+        }
+
+        const rep = res.data;
+        if (el.replayValAttempted) el.replayValAttempted.textContent = rep.attempted ? 'Yes' : 'No';
+        if (el.replayValCompleted) el.replayValCompleted.textContent = rep.completed ? 'Yes' : 'No';
+        if (el.replayValVerified) {
+          el.replayValVerified.textContent = rep.verified ? 'Verified ✓' : 'Unverified ✗';
+          el.replayValVerified.className = `font-mono text-xs ${rep.verified ? 'text-accent' : 'text-danger'}`;
+        }
+        if (el.replayValSource) {
+          el.replayValSource.textContent = rep.verification_source || 'readback';
+        }
+
+        if (rep.verified) {
+          showToast('Live mutation successfully replayed and verified via readback!', 'success');
+        } else if (rep.completed) {
+          showToast('Live mutation executed but readback verification could not confirm value', 'warning');
+        } else {
+          showToast('Replay could not be completed on target process', 'warning');
+        }
+      });
+    }
+  }
+
   function bindEvents() {
     el.btnRefresh.addEventListener('click', async () => {
       showToast('Refreshing runtime state...', 'info');
@@ -3095,10 +3595,14 @@
     initMutationPreview();
     initJsonViewerButtons();
     initObserveDialog();
+    initFastCaptureModal();
+    initSnapshotMutateModal();
+    initLabBranchAndReplay();
     bindEvents();
 
     await loadRuntimeOverview();
     await loadStatesAndGraph();
+    await loadStateLabTree();
   }
 
   window.addEventListener('DOMContentLoaded', init);

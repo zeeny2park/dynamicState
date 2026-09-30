@@ -89,10 +89,73 @@ Recursive Semantic Reachability Traversal
   (자율 코딩 에이전트 전용 의미론적 런타임 인터페이스 구축: GDB 명령어 및 메모리 주소를 철저히 은닉하고, JSON 스키마 기반 Agent Runtime Protocol, 결정론적 후보 랭커(Candidate Ranker), 전이 분석기(Transition Analyzer), 사실 기반 증거 모델(Evidence Model), 구조적 불변식 후보 탐지기(Invariant Detector), 엄격한 안전 경계(Safety Boundary) 및 참조 구현체 `AgentRuntime` 제공)
 - **Phase 5.1**: *"Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis"*  
   (프로덕션/실시간 애플리케이션을 위한 무중단 원시 메모리 캡처 및 사후 DWARF 오프라인 의미 분석: Linux `process_vm_readv()` 기반 고속 복사, `RawMemorySnapshot` 디스크 영속 아티팩트, 부분 일관성(`NON_ATOMIC`) 모델, `OfflineMemoryAnalyzer` 의미론적 객체 그래프 복원, CLI 도구(`capture-memory`, `analyze-memory`), LOW_IMPACT 모드 엄격한 관측 전용 경계 보장)
-- **Phase 5.2 (Complete)**: *"Production-grade Low-Impact Observation Hardening"*  
+-**Phase 5.2 (Complete)**: *"Production-grade Low-Impact Observation Hardening"*  
   (ELF `PT_LOAD` 세그먼트 기반의 정확한 `load_bias` 계산, `RuntimeModule` 모델 및 `/proc/<pid>/maps` 모듈 검색, Build ID / `.gnu_debuglink` CRC 디버그 아티팩트 provenance 검증, `DebugArtifactProvider` 및 `DebugInfoProvider` 추상화, `ObservationBackend` 명시적 모델(`GDBObservationBackend` vs `LowImpactObservationBackend`), 오프라인 스냅샷 내 가짜 스레드/프레임 제거 및 실행 상태 `availability="UNAVAILABLE"` 명시화, 프로세스 종료(`ESRCH`) graceful handling, CLI 서브커맨드 `list-modules` 및 `runtime-info` 지원)
 - **Web UI MVP (Complete)**: *"Runtime State Explorer for Human Validation"*  
   (인간 엔지니어가 런타임 상태, DWARF 객체 그래프, 결정론적 변이 후보, 상태 전이 및 상태 해시, 상태 전이 그래프(SVG), 스냅샷 diff, 자율 탐색 진행 상황을 시각적으로 검증할 수 있는 경량 단일 페이지 웹 UI. 외부 pip 의존성 없는 Python 표준 라이브러리 기반 HTTP 서버, AgentRuntime 1:1 래핑 Web API 어댑터, 임의 GDB/Shell/메모리 쓰기 차단 안전 경계, LOW_IMPACT 관측 전용 표시 및 변이 차단, UNKNOWN 메타데이터 정직성 보장)
+- **Phase 6 (Complete)**: *"Fast Runtime Snapshot + Offline State Laboratory"*  
+  (실행 중 프로세스의 중단 시간을 10ms 미만(실측 0.99~4.27ms)으로 최소화하는 고속 런타임 캡처 아키텍처: 중단 중 DWARF traversal 및 포인터 탐색을 완전히 배제하고 `process_vm_readv` 원시 메모리 캡처 즉시 프로세스를 재개(`SIGCONT`), 오프라인 의미론적 상태 엔진(`OfflineSemanticEngine`)을 통한 DWARF/객체 그래프/계층적 경로(`Session.worker.state.counter`) 복원, 불변 논리 스냅샷 복사 기반 State Laboratory(`StateLaboratory`, `SnapshotMutator`, `compute_semantic_diff`), 다중 스레드 동시성 환경에서의 스레드 영향 분석기(`ThreadImpactAnalyzer` - 직접 참조 스레드와 구조적 도달 가능 스레드 분리), 실시간 프로세스 읽기 검증 기반 Replay(`StateReplayer`), 그리고 7번째 탭 🔬 State Laboratory UI 제공)
+
+---
+
+## Fast Runtime Snapshot + Offline State Laboratory (Phase 6)
+
+### 1. Motivation: Moving Away from Slow GDB Halts
+
+기존 dynamicState의 주된 실행 모델은 GDB로 타깃 프로세스를 정지시키고(Stop), 중단된 상태에서 DWARF 디버그 정보를 파싱하여 객체 그래프를 순회(Traversal)한 뒤 값을 변경하고 계속 실행(Continue)하는 방식이었습니다.
+
+하지만 이 방식은 다음과 같은 근본적인 한계가 있었습니다:
+1. **타깃 프로세스 장기 중단**: DWARF 순회 및 포인터 체이싱으로 인해 프로세스가 수백 ms 이상 정지되어 실시간 타이머, 하트비트, 네트워크 연결이 끊어짐
+2. **다중 스레드 체크포인트 불안정**: GDB native checkpoint는 multithread 프로세스에서 fork() 불가로 실패함
+3. **라이브 메모리 오염 위험**: 실행 중인 프로세스 메모리를 직접 수정할 때 다른 스레드와의 레이스 컨디션 및 예기치 못한 크래시 발생
+
+Phase 6에서는 이 한계를 극복하기 위해 **초단기 캡처(<10ms) + 오프라인 상태 실험실(State Laboratory)** 아키텍처로 진화했습니다.
+
+```text
+    Running Process
+          │
+          │ ultra-short capture (< 10 ms stop time)
+          ▼
+    Raw Runtime Snapshot
+          │
+          │ process immediately resumes (SIGCONT)
+          ▼
+    Offline Semantic State Engine
+          │
+          ├── DWARF Symbol & Type Resolution
+          ├── Object Graph Reconstruction (Cycle-Safe BFS)
+          ├── Semantic Paths (e.g. Session.worker.state.counter)
+          ├── Deterministic State Hash (SHA-256)
+          ├── State Diff Engine (Changed, Added, Removed)
+          ├── Immutable Snapshot Mutation (Copy-on-Write)
+          └── Snapshot Branch Tree Lineage
+                │
+                ├── State Laboratory
+                │     ├── Snapshot Branch Isolation (Always Verified)
+                │     └── Thread Impact Analysis (Observed vs Potential Reachability)
+                │
+                ▼ (Optional & Explicit)
+     Live Target Replay with Readback Verification
+```
+
+### 2. Core Principles & Safety Guarantees
+
+1. **최소 정지 시간 보장 (< 10 ms)**:
+   - 메모리 맵(`/proc/<pid>/maps`) 사전 분석 및 버퍼 사전 할당
+   - `SIGSTOP` 직후 `process_vm_readv` 메모리 캡처 수행
+   - 메모리 읽기 완료 즉시 `SIGCONT`로 프로세스를 깨우고, DWARF 파싱 및 객체 복원은 사후 오프라인에서 수행
+   - 실측 프로세스 정지 시간: **0.99 ms (단일 스레드) ~ 4.27 ms (4 스레드 C++ 타깃)**
+2. **Fail-Open 안전 복원 정책 (`CaptureSafetyPolicy`)**:
+   - 캡처 도중 타임아웃 초과나 예외가 발생하더라도 `finally:` 블록에서 반드시 `SIGCONT`를 호출하여 프로세스가 정지 상태로 방치되지 않도록 보장
+3. **불변 스냅샷 변이 (Immutable Snapshot Mutation)**:
+   - 기본 변이는 라이브 프로세스가 아닌 논리적 스냅샷 노드를 대상으로 수행
+   - 부모 스냅샷 $S_0$에서 $S_1$을 생성해도 $S_0$는 100% 불변(Immutable) 유지
+   - 형제 브랜치($S_1, S_2$) 간 완벽한 상태 격리 보장
+4. **정직한 스레드 영향 분석 (`ThreadImpactAnalyzer`)**:
+   - 다중 스레드 환경에서 허구의 "Thread Isolated" 주장을 배제
+   - 직접 관측된 영향(`observed_impact`)과 정적 객체 도달 가능성에 기반한 잠재적 영향(`potentially_affected_threads`)을 엄격히 구분
+5. **라이브 리플레이 읽기 검증 (`StateReplayer`)**:
+   - 오프라인에서 검증된 변이를 라이브 프로세스에 적용할 때 `capability`, `attempted`, `completed`, `verified` 4단계를 명확히 분리하고 readback으로 변경값을 실측 검증
 
 ---
 

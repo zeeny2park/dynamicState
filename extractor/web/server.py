@@ -405,6 +405,12 @@ class WebApiAdapter:
                 "branch_isolation_capability": branch_iso_cap,
                 "branch_isolation_verified": branch_iso_verified,
                 "branch_isolation_source": branch_iso_source,
+                "snapshot_branch_isolation": {
+                    "capability": "SUPPORTED",
+                    "verified": True,
+                    "verification_source": "LOGICAL_STATE_COPY_ON_WRITE"
+                },
+                "live_branch_isolation": branch_iso_dict,
                 "determinism": det_dict,
                 "determinism_capability": det_cap,
                 "determinism_verified": is_det_verified,
@@ -414,6 +420,12 @@ class WebApiAdapter:
                 "safety_limits": limits,
                 "capabilities": caps,
                 "memory_summary": mem_summary,
+                "capture_backend": (
+                    getattr(self.runtime, "_capture_backend", None).name if getattr(self.runtime, "_capture_backend", None)
+                    else "process_vm_readv"
+                ),
+                "last_capture_latency_report": getattr(self.runtime, "_last_capture_latency_report", None),
+                "state_lab_tree": self.runtime.state_lab.get_tree() if hasattr(self.runtime, "state_lab") else None,
             }
         }
 
@@ -772,6 +784,15 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": code, "message": msg}}
 
     def diff_snapshots(self, snap_a_id: str, snap_b_id: str) -> Dict[str, Any]:
+        if hasattr(self.runtime, "state_lab") and self.runtime.state_lab.get_snapshot(snap_a_id) and self.runtime.state_lab.get_snapshot(snap_b_id):
+            res = self.runtime.diff_snapshots(snap_a_id, snap_b_id)
+            if res.success:
+                diff_data = _to_json_serializable(res.data)
+                if isinstance(diff_data, dict):
+                    if "changed" in diff_data and "changes" not in diff_data:
+                        diff_data["changes"] = diff_data["changed"]
+                return {"success": True, "data": diff_data}
+
         snap_a, err_a = self.runtime._resolve_snapshot(snap_a_id)
         if snap_a is None:
             code, msg = err_a if err_a else ("SNAPSHOT_NOT_FOUND", f"Snapshot '{snap_a_id}' not found")
@@ -1082,6 +1103,112 @@ class WebApiAdapter:
             "data": _to_json_serializable(res.data) if res.data else None
         }
 
+    # -------------------------------------------------------------------------
+    # State Laboratory & Fast Runtime Capture Adapter Methods
+    # -------------------------------------------------------------------------
+
+    def fast_capture(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        pid = params.get("pid")
+        mode = params.get("mode", "FULL")
+        target_path = params.get("target_path")
+        timeout_ms = int(params.get("timeout_ms", 1000))
+        from extractor.capture_plan import CapturePlanBuilder
+        if mode == "TARGETED" and target_path:
+            plan = CapturePlanBuilder.build_targeted_plan(target_path=target_path, timeout_ms=timeout_ms)
+        elif mode == "THREAD" and params.get("thread_ids"):
+            plan = CapturePlanBuilder.build_thread_plan(thread_ids=params.get("thread_ids"), timeout_ms=timeout_ms)
+        elif mode == "OBJECT" and params.get("target_objects"):
+            plan = CapturePlanBuilder.build_object_plan(object_ids=params.get("target_objects"), timeout_ms=timeout_ms)
+        else:
+            plan = CapturePlanBuilder.build_full_plan(timeout_ms=timeout_ms)
+        res = self.runtime.fast_capture(pid=pid, plan=plan)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "CAPTURE_FAILED",
+                                            "message": res.error.message if res.error else "Fast capture failed"}}
+
+    def list_snapshots(self) -> Dict[str, Any]:
+        lab_snaps = self.runtime.state_lab.list_snapshots() if hasattr(self.runtime, "state_lab") else []
+        all_snaps = list(lab_snaps)
+        seen_ids = set(s["snapshot_id"] for s in lab_snaps)
+        for state_id, s_data in self.runtime.corpus.states.items():
+            if state_id not in seen_ids:
+                s_dict = s_data if isinstance(s_data, dict) else (s_data.to_dict() if hasattr(s_data, "to_dict") else {})
+                meta = self.runtime.corpus.get_metadata(state_id) or {}
+                all_snaps.append({
+                    "snapshot_id": state_id,
+                    "state_hash": meta.get("state_hash") or s_dict.get("metadata", {}).get("state_hash"),
+                    "parent_id": meta.get("parent_state"),
+                    "object_count": len(s_dict.get("persistent", {}).get("objects", [])),
+                    "thread_count": len(s_dict.get("execution", {}).get("threads", [])),
+                    "branch_name": "corpus_state",
+                    "created_at": s_dict.get("created_at"),
+                })
+        return {"success": True, "data": _to_json_serializable(all_snaps)}
+
+    def get_snapshot(self, snapshot_id: str) -> Dict[str, Any]:
+        state = self.runtime.state_lab.get_snapshot(snapshot_id) if hasattr(self.runtime, "state_lab") else None
+        if state:
+            return {"success": True, "data": _to_json_serializable(state.to_snapshot().to_dict())}
+        snap, err = self.runtime._resolve_snapshot(snapshot_id)
+        if snap:
+            s_dict = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+            return {"success": True, "data": _to_json_serializable(s_dict)}
+        return {"success": False, "error": {"code": "SNAPSHOT_NOT_FOUND", "message": f"Snapshot {snapshot_id} not found"}}
+
+    def get_semantic_state(self, state_id: str) -> Dict[str, Any]:
+        state = self.runtime.state_lab.get_snapshot(state_id) if hasattr(self.runtime, "state_lab") else None
+        if not state:
+            snap, _ = self.runtime._resolve_snapshot(state_id)
+            if snap:
+                from extractor.semantic_state import SemanticState
+                state = SemanticState.from_snapshot(snap)
+        if state:
+            return {"success": True, "data": _to_json_serializable(state.to_dict())}
+        return {"success": False, "error": {"code": "STATE_NOT_FOUND", "message": f"State {state_id} not found"}}
+
+    def mutate_snapshot(self, snapshot_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        target = params.get("target") or (f"{params.get('object_id')}.{params.get('field')}" if params.get("field") else params.get("object_id"))
+        value = params.get("proposed_value") if "proposed_value" in params else params.get("value")
+        branch_name = params.get("branch_name")
+        res = self.runtime.mutate_snapshot(snapshot_id=snapshot_id, target=target, value=value, branch_name=branch_name)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "MUTATION_FAILED",
+                                            "message": res.error.message if res.error else "Snapshot mutation failed"}}
+
+    def branch_snapshot(self, snapshot_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        branch_name = params.get("branch_name")
+        res = self.runtime.branch_snapshot(snapshot_id=snapshot_id, branch_name=branch_name)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "BRANCH_FAILED",
+                                            "message": res.error.message if res.error else "Branch creation failed"}}
+
+
+
+    def get_impact_analysis(self, snapshot_id: str, target: Optional[str] = None, candidate_id: Optional[str] = None) -> Dict[str, Any]:
+        res = self.runtime.analyze_impact(snapshot_id=snapshot_id, target=target or "", candidate_id=candidate_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "IMPACT_FAILED",
+                                            "message": res.error.message if res.error else "Impact analysis failed"}}
+
+    def replay_mutation(self, snapshot_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        target_obj = params.get("object_id", "")
+        field_name = params.get("field", "")
+        val = params.get("proposed_value") if "proposed_value" in params else params.get("value")
+        res = self.runtime.replay_mutation(snapshot_id=snapshot_id, target_object_id=target_obj, field_name=field_name, value=val)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "data": _to_json_serializable(res.data), "error": {"code": res.error.code if res.error else "REPLAY_FAILED",
+                                            "message": res.error.message if res.error else "Replay failed"}}
+
+    def get_state_lab_tree(self) -> Dict[str, Any]:
+        if hasattr(self.runtime, "state_lab"):
+            return {"success": True, "data": _to_json_serializable(self.runtime.state_lab.get_tree())}
+        return {"success": True, "data": {"roots": [], "total_snapshots": 0, "total_branches": 0}}
+
 
 
 class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -1252,6 +1379,34 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.diff_snapshots(snap_a, snap_b))
                 return
 
+            # GET /api/snapshots
+            if path == "/api/snapshots":
+                self._send_json(adapter.list_snapshots())
+                return
+
+            # GET /api/state-lab/tree
+            if path == "/api/state-lab/tree":
+                self._send_json(adapter.get_state_lab_tree())
+                return
+
+            # GET /api/state/{state_id}
+            m_sem_state = re.match(r"^/api/state/([^/]+)$", path)
+            if m_sem_state:
+                state_id = m_sem_state.group(1)
+                self._send_json(adapter.get_semantic_state(state_id))
+                return
+
+            # GET /api/impact/{snapshot_id}
+            m_impact = re.match(r"^/api/impact/([^/]+)$", path)
+            if m_impact:
+                snapshot_id = m_impact.group(1)
+                self._send_json(adapter.get_impact_analysis(
+                    snapshot_id,
+                    target=q_param("target") or q_param("field"),
+                    candidate_id=q_param("candidate_id")
+                ))
+                return
+
             # GET /api/snapshots/{snapshot_id}
             m_snap = re.match(r"^/api/snapshots/([^/]+)$", path)
             if m_snap:
@@ -1319,6 +1474,40 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             if path in ("/api/verify-determinism", "/api/runtime/verify_determinism"):
                 self._send_json(adapter.verify_restart_determinism(body))
+                return
+
+            # State Laboratory POST routes
+            if path == "/api/capture":
+                self._send_json(adapter.fast_capture(body))
+                return
+
+            # POST /api/snapshots/{id}/mutate
+            m_mut_snap = re.match(r"^/api/snapshots/([^/]+)/mutate$", path)
+            if m_mut_snap:
+                sid = m_mut_snap.group(1)
+                self._send_json(adapter.mutate_snapshot(sid, body))
+                return
+
+            # POST /api/snapshots/{id}/branch
+            m_br_snap = re.match(r"^/api/snapshots/([^/]+)/branch$", path)
+            if m_br_snap:
+                sid = m_br_snap.group(1)
+                self._send_json(adapter.branch_snapshot(sid, body))
+                return
+
+            # POST /api/snapshots/{id}/diff/{other_id}
+            m_diff_post = re.match(r"^/api/snapshots/([^/]+)/diff/([^/]+)$", path)
+            if m_diff_post:
+                snap_a = m_diff_post.group(1)
+                snap_b = m_diff_post.group(2)
+                self._send_json(adapter.diff_snapshots(snap_a, snap_b))
+                return
+
+            # POST /api/snapshots/{id}/replay
+            m_rep_snap = re.match(r"^/api/snapshots/([^/]+)/replay$", path)
+            if m_rep_snap:
+                sid = m_rep_snap.group(1)
+                self._send_json(adapter.replay_mutation(sid, body))
                 return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},

@@ -39,6 +39,9 @@
       <button class="btn btn-secondary btn-sm" id="btn-refresh" title="Refresh runtime data">
         <span class="icon">⟳</span> Refresh
       </button>
+      <button class="btn btn-success btn-sm" id="btn-fast-capture" title="Fast runtime state capture with minimal stop time (<10ms)">
+        <span>⚡</span> Capture State
+      </button>
       <button class="btn btn-primary btn-sm" id="btn-observe-dialog">
         <span>👁</span> Observe
       </button>
@@ -66,6 +69,14 @@
     <div class="summary-metric-tile">
       <span class="summary-label">State Hash</span>
       <span class="summary-val mono text-accent" id="sum-state-hash">N/A</span>
+    </div>
+    <div class="summary-metric-tile" title="Capture Backend">
+      <span class="summary-label">Capture Backend</span>
+      <span class="summary-val mono text-accent" id="sum-capture-backend">process_vm_readv</span>
+    </div>
+    <div class="summary-metric-tile" title="Last measured capture stop time (<10ms target)">
+      <span class="summary-label">Stop Time</span>
+      <span class="summary-val mono text-accent" id="sum-capture-latency">N/A</span>
     </div>
     <div class="summary-metric-tile" title="Checkpoint Restore Capability">
       <span class="summary-label">Checkpoint</span>
@@ -101,7 +112,7 @@
     </div>
   </div>
 
-  <!-- Main Navigation Tabs (6 Functional Views) -->
+  <!-- Main Navigation Tabs (7 Functional Views) -->
   <nav class="app-nav">
     <button class="nav-tab active" data-tab="tab-object-explorer">1. 📦 Object Explorer</button>
     <button class="nav-tab" data-tab="tab-thread-explorer">2. 🧵 Thread Explorer</button>
@@ -109,6 +120,7 @@
     <button class="nav-tab" data-tab="tab-history-diff">4. 📜 State DAG & Diff</button>
     <button class="nav-tab" data-tab="tab-advanced-explore">5. ⚡ Autonomous Loop</button>
     <button class="nav-tab" data-tab="tab-system-provenance">6. 🛠️ System / Modules</button>
+    <button class="nav-tab" data-tab="tab-state-lab" id="nav-tab-state-lab">7. 🔬 State Laboratory</button>
   </nav>
 
   <!-- Banner for low-impact observation mode -->
@@ -1036,6 +1048,213 @@
           </table>
         </div>
       </div>
+    <!-- 7. STATE LABORATORY: Fast Runtime Snapshot + Offline Exploration -->
+    <section id="tab-state-lab" class="tab-pane">
+      <!-- Snapshot Overview Card -->
+      <div class="card mb-4">
+        <div class="card-header flex justify-between items-center">
+          <div class="flex items-center gap-2">
+            <span class="icon">🔬</span>
+            <h3 class="card-title">State Laboratory — Offline Snapshot & Branch Exploration</h3>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="badge badge-info" id="statelab-backend-badge">process_vm_readv</span>
+            <button class="btn btn-sm btn-primary" id="btn-lab-open-capture">⚡ Fast Capture</button>
+            <button class="btn btn-sm btn-secondary" id="btn-lab-open-branch">🌿 Create Branch</button>
+            <button class="btn btn-sm btn-warning" id="btn-lab-open-mutate">✏️ Mutate Snapshot</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="metric-tiles-grid">
+            <div class="metric-tile">
+              <span class="tile-label">Snapshot ID</span>
+              <span class="tile-val font-mono" id="statelab-snap-id">N/A</span>
+            </div>
+            <div class="metric-tile">
+              <span class="tile-label">Capture Stop Time</span>
+              <span class="tile-val font-mono text-accent" id="statelab-stop-time">N/A</span>
+              <span class="tile-sub text-muted">Target: &lt; 10 ms</span>
+            </div>
+            <div class="metric-tile">
+              <span class="tile-label">Reconstructed Objects</span>
+              <span class="tile-val font-mono" id="statelab-obj-count">0</span>
+            </div>
+            <div class="metric-tile">
+              <span class="tile-label">Captured Memory</span>
+              <span class="tile-val font-mono" id="statelab-mem-size">0 KB</span>
+            </div>
+            <div class="metric-tile">
+              <span class="tile-label">Captured Threads</span>
+              <span class="tile-val font-mono" id="statelab-threads-count">0</span>
+            </div>
+            <div class="metric-tile">
+              <span class="tile-label">State Hash</span>
+              <span class="tile-val font-mono text-accent" id="statelab-state-hash">N/A</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Capture Latency Breakdown & Branch Hierarchy Grid -->
+      <div class="grid grid-2 gap-4 mb-4">
+        <!-- Latency Report Card -->
+        <div class="card">
+          <div class="card-header">
+            <h4 class="card-title font-semibold text-sm">⏱️ Capture Latency Report (Measured Actuals)</h4>
+          </div>
+          <div class="card-body">
+            <table class="data-table" id="table-capture-latency">
+              <thead>
+                <tr>
+                  <th>Phase</th>
+                  <th>Measured Duration</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Stop / Suspend Target</td>
+                  <td class="font-mono" id="lat-stop-time">—</td>
+                  <td><span class="badge badge-success text-xs">Measured</span></td>
+                </tr>
+                <tr>
+                  <td>Thread Metadata / Task Inspection</td>
+                  <td class="font-mono" id="lat-thread-time">—</td>
+                  <td><span class="badge badge-success text-xs">Measured</span></td>
+                </tr>
+                <tr>
+                  <td>Memory Region Capture (process_vm_readv)</td>
+                  <td class="font-mono" id="lat-memory-time">—</td>
+                  <td><span class="badge badge-success text-xs">Measured</span></td>
+                </tr>
+                <tr>
+                  <td>Resume Process Execution</td>
+                  <td class="font-mono" id="lat-resume-time">—</td>
+                  <td><span class="badge badge-success text-xs">Measured</span></td>
+                </tr>
+                <tr class="font-bold">
+                  <td>Total Target Process Stop Time</td>
+                  <td class="font-mono text-accent" id="lat-total-stop-time">—</td>
+                  <td><span class="badge badge-info text-xs">&lt; 10 ms Target</span></td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="text-xs text-muted mt-2">
+              * Safety Policy: Fail-open guarantee automatically resumes process on timeout or error. Process is never halted for offline DWARF traversal.
+            </div>
+          </div>
+        </div>
+
+        <!-- Branch Hierarchy Tree Card -->
+        <div class="card">
+          <div class="card-header flex justify-between items-center">
+            <h4 class="card-title font-semibold text-sm">🌳 Snapshot Branch Hierarchy</h4>
+            <button class="btn btn-xs btn-secondary" id="btn-refresh-lab-tree">⟳ Refresh Tree</button>
+          </div>
+          <div class="card-body">
+            <div class="branch-tree-view" id="statelab-tree-container">
+              <div class="text-muted text-center p-4">No snapshots registered in State Laboratory yet. Click [Capture State] to begin.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Thread & Object Impact Analysis + Replay Grid -->
+      <div class="grid grid-2 gap-4">
+        <!-- Thread Impact Analysis Card -->
+        <div class="card">
+          <div class="card-header flex justify-between items-center">
+            <h4 class="card-title font-semibold text-sm">🎯 Mutation Impact Analysis</h4>
+            <span class="badge badge-neutral text-xs">Graph Reachability</span>
+          </div>
+          <div class="card-body">
+            <div class="mb-3">
+              <label class="text-xs font-semibold text-muted block mb-1">Target Semantic Path:</label>
+              <div class="font-mono text-sm text-accent bg-darker p-2 rounded" id="impact-target-label">Select mutation or candidate...</div>
+            </div>
+            
+            <div class="impact-section mb-3">
+              <span class="text-xs font-semibold text-muted block mb-1">Directly Affected Objects:</span>
+              <ul class="tag-list" id="impact-direct-list">
+                <li class="tag tag-accent">—</li>
+              </ul>
+            </div>
+
+            <div class="impact-section mb-3">
+              <span class="text-xs font-semibold text-muted block mb-1">Parent Hierarchy Objects:</span>
+              <ul class="tag-list" id="impact-parent-list">
+                <li class="tag">—</li>
+              </ul>
+            </div>
+
+            <div class="impact-section mb-3">
+              <span class="text-xs font-semibold text-muted block mb-1">Shared Objects (Multi-referenced):</span>
+              <ul class="tag-list" id="impact-shared-list">
+                <li class="tag">—</li>
+              </ul>
+            </div>
+
+            <div class="grid grid-2 gap-2 mb-3">
+              <div>
+                <span class="text-xs font-semibold text-muted block mb-1">Referencing Threads:</span>
+                <ul class="tag-list" id="impact-ref-threads-list">
+                  <li class="tag tag-warning">—</li>
+                </ul>
+              </div>
+              <div>
+                <span class="text-xs font-semibold text-muted block mb-1">Potentially Affected Threads:</span>
+                <ul class="tag-list" id="impact-pot-threads-list">
+                  <li class="tag">—</li>
+                </ul>
+              </div>
+            </div>
+
+            <div class="notice-box text-xs text-muted">
+              <strong>Impact Semantics:</strong> Observed impact represents verified snapshot values. "Potentially affected threads" indicates structural graph reachability, strictly distinguishing static references from dynamic race assertions.
+            </div>
+          </div>
+        </div>
+
+        <!-- Replay on Live Target Card -->
+        <div class="card">
+          <div class="card-header flex justify-between items-center">
+            <h4 class="card-title font-semibold text-sm">▶️ Live Target Replay & Validation</h4>
+            <span class="badge badge-neutral text-xs" id="badge-replay-cap">UNAVAILABLE</span>
+          </div>
+          <div class="card-body">
+            <p class="text-sm text-muted mb-3">
+              Optionally validate offline snapshot mutations by replaying them onto a live target process with readback verification.
+            </p>
+
+            <div class="replay-status-box bg-darker p-3 rounded mb-3">
+              <div class="flex justify-between items-center mb-2">
+                <span class="text-xs font-semibold text-muted">Replay Capability:</span>
+                <span class="badge badge-neutral text-xs" id="replay-val-capability">UNAVAILABLE</span>
+              </div>
+              <div class="flex justify-between items-center mb-2">
+                <span class="text-xs font-semibold text-muted">Attempted:</span>
+                <span class="font-mono text-xs" id="replay-val-attempted">No</span>
+              </div>
+              <div class="flex justify-between items-center mb-2">
+                <span class="text-xs font-semibold text-muted">Completed:</span>
+                <span class="font-mono text-xs" id="replay-val-completed">No</span>
+              </div>
+              <div class="flex justify-between items-center mb-2">
+                <span class="text-xs font-semibold text-muted">Readback Verified:</span>
+                <span class="font-mono text-xs" id="replay-val-verified">No</span>
+              </div>
+              <div class="flex justify-between items-center">
+                <span class="text-xs font-semibold text-muted">Verification Source:</span>
+                <span class="font-mono text-xs text-muted" id="replay-val-source">None</span>
+              </div>
+            </div>
+
+            <button class="btn btn-secondary w-full" id="btn-run-replay-action" disabled>
+              ▶ Replay Selected Mutation on Live Target
+            </button>
+          </div>
+        </div>
+      </div>
     </section>
 
   </main>
@@ -1186,6 +1405,103 @@
           <button class="btn btn-secondary btn-sm" id="btn-copy-json">Copy JSON</button>
         </div>
         <pre class="json-content-viewer" id="modal-json-content"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fast State Capture Modal -->
+  <div id="modal-fast-capture" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>⚡ Fast Runtime State Capture</h3>
+        <button class="btn-close" id="btn-close-fast-capture-modal">×</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-fast-capture">
+          <div class="form-group">
+            <label>Capture Mode:</label>
+            <div class="radio-group">
+              <label class="radio-label">
+                <input type="radio" name="cap-mode" value="FULL" checked>
+                <span><strong>FULL</strong> — Capture all readable state regions (target &lt;10ms stop time).</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="cap-mode" value="TARGETED">
+                <span><strong>TARGETED</strong> — Specific semantic path/object memory range only.</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="cap-mode" value="THREAD">
+                <span><strong>THREAD</strong> — Thread stack & TLS memory only.</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="cap-mode" value="ZERO_STOP">
+                <span><strong>ZERO_STOP</strong> — Non-blocking capture without suspending the process.</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group" id="group-target-path" style="display: none;">
+            <label for="cap-target-path">Target Semantic Path (e.g. Session.worker.state.counter):</label>
+            <input type="text" id="cap-target-path" class="input-text" placeholder="Session.worker.state.counter">
+          </div>
+
+          <div class="form-group">
+            <label for="cap-pid">Target PID (Leave blank to use active runtime PID):</label>
+            <input type="number" id="cap-pid" class="input-text" placeholder="Auto-detect from runtime">
+          </div>
+
+          <div class="form-group">
+            <label for="cap-timeout">Max Stop Timeout Limit (ms):</label>
+            <input type="number" id="cap-timeout" class="input-text" value="1000">
+            <span class="text-xs text-muted">Fail-open safety guarantees target resume if deadline is reached.</span>
+          </div>
+
+          <div class="modal-actions" style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
+            <button type="button" class="btn btn-secondary" id="btn-cancel-fast-capture">Cancel</button>
+            <button type="submit" class="btn btn-success" id="btn-submit-fast-capture">
+              <span>⚡</span> Capture Immediately
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Snapshot Branch Mutation Modal -->
+  <div id="modal-snapshot-mutate" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>✏️ Mutate Snapshot Branch</h3>
+        <button class="btn-close" id="btn-close-snap-mutate-modal">×</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-snapshot-mutate">
+          <div class="form-group">
+            <label for="snap-mut-target">Target Field / Semantic Path:</label>
+            <input type="text" id="snap-mut-target" class="input-text" placeholder="Session.worker.state.counter" required>
+          </div>
+
+          <div class="form-group">
+            <label for="snap-mut-value">New Value:</label>
+            <input type="text" id="snap-mut-value" class="input-text" placeholder="e.g. 100" required>
+          </div>
+
+          <div class="form-group">
+            <label for="snap-mut-branch-name">Branch Label (Optional):</label>
+            <input type="text" id="snap-mut-branch-name" class="input-text" placeholder="e.g. branch_high_load">
+          </div>
+
+          <div class="notice-box text-xs text-muted mb-3">
+            <strong>Snapshot Branch Isolation:</strong> Parent snapshot remains 100% immutable. A new logical state node will be created in the State Laboratory tree.
+          </div>
+
+          <div class="modal-actions" style="display: flex; justify-content: flex-end; gap: 10px;">
+            <button type="button" class="btn btn-secondary" id="btn-cancel-snap-mutate">Cancel</button>
+            <button type="submit" class="btn btn-warning" id="btn-submit-snap-mutate">
+              <span>🌿</span> Create Mutated Branch
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   </div>

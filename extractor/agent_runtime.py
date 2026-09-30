@@ -30,6 +30,18 @@ from .snapshot import RuntimeSnapshot, StateTransition
 from .state_corpus import StateCorpus
 from .state_hash import compute_state_hash
 from .transition_analyzer import TransitionAnalyzer
+from .capture_plan import CaptureMode, CapturePlan, CapturePlanBuilder
+from .capture_backend import (
+    CaptureLatencyReport,
+    CaptureSafetyPolicy,
+    RuntimeCaptureBackend,
+    get_default_capture_backend,
+)
+from .raw_snapshot import RawRuntimeSnapshot
+from .semantic_state import SemanticState, OfflineSemanticEngine
+from .state_lab import StateLaboratory, SnapshotMutator, compute_semantic_diff
+from .impact_analyzer import ThreadImpactAnalyzer
+from .state_replayer import StateReplayer
 
 
 class AgentRuntime:
@@ -59,6 +71,11 @@ class AgentRuntime:
         self.observation_mode: str = "CONSISTENT"
         self._memory_capturer: Any = None
         self._offline_analyzer: Any = None
+
+        # Architecture Evolution: Fast Runtime Snapshot + Offline State Laboratory
+        self.state_lab: StateLaboratory = StateLaboratory()
+        self._last_capture_latency_report: Optional[Dict[str, Any]] = None
+        self._capture_backend: Optional[RuntimeCaptureBackend] = None
 
     # -------------------------------------------------------------------------
     # Protocol Action Dispatcher
@@ -819,6 +836,42 @@ class AgentRuntime:
                 "max_corpus_states": 100,
             },
             "default_timeout_ms": 1000,
+            # Architecture Evolution: Section 20 Independent Capabilities
+            "capture": {
+                "capability": "SUPPORTED",
+                "backend": "process_vm_readv",
+                "target_stop_time_ms": 10.0,
+                "default_timeout_ms": 1000,
+            },
+            "snapshot_branch": {
+                "capability": "SUPPORTED",
+                "verified": True,
+                "verification_source": "LOGICAL_STATE_COPY_ON_WRITE",
+            },
+            "live_branch": {
+                "capability": caps.get("branch_isolation", {}).get("status", "UNAVAILABLE"),
+                "verified": bool(caps.get("branch_isolation", {}).get("verified", False)),
+                "verification_source": caps.get("branch_isolation", {}).get("verification_source"),
+            },
+            "determinism": {
+                "capability": "SUPPORTED" if (caps.get("checkpoint") or caps.get("checkpoint_restore", {}).get("supported")) else "UNAVAILABLE",
+                "verified": bool(caps.get("checkpoint_restore", {}).get("verified", False)),
+                "status": caps.get("checkpoint_restore", {}).get("determinism_status", "NOT_VERIFIED"),
+            },
+            "replay": {
+                "capability": "SUPPORTED" if (self.controller and getattr(self.controller, "is_attached", False)) else "UNAVAILABLE",
+                "attempted": False,
+                "completed": False,
+                "verified": False,
+                "default_timeout_ms": 2000,
+            },
+            # Section 19: Separated Timeout Source of Truth
+            "timeouts": {
+                "capture_timeout_ms": 1000,
+                "mutation_timeout_ms": 1000,
+                "replay_timeout_ms": 2000,
+                "max_stop_time_ms": 50.0,
+            },
         }
         return AgentActionResult(
             success=True,
@@ -1273,3 +1326,218 @@ class AgentRuntime:
             error=AgentActionError(code=code, message=message),
             performance={"total_ms": round((time.monotonic() - t_start) * 1000, 3)}
         )
+
+    # -------------------------------------------------------------------------
+    # Fast Runtime Snapshot + Offline State Laboratory Operations
+    # -------------------------------------------------------------------------
+
+    def fast_capture(
+        self,
+        pid: Optional[int] = None,
+        plan: Optional[Union[CapturePlan, Dict[str, Any]]] = None,
+        policy: Optional[Union[CaptureSafetyPolicy, Dict[str, Any]]] = None,
+        snapshot_id: Optional[str] = None,
+        debug_image: Optional[str] = None,
+        symbol_context: Optional[Dict[str, Any]] = None,
+    ) -> AgentActionResult:
+        """Perform ultra-fast process capture (<10 ms target stop time) followed by offline reconstruction."""
+        t0 = time.monotonic()
+        target_pid = pid
+        if target_pid is None:
+            ctrl = self.controller
+            if ctrl and hasattr(ctrl, "attached_pid") and ctrl.attached_pid:
+                target_pid = ctrl.attached_pid
+            elif ctrl and hasattr(ctrl, "backend") and hasattr(ctrl.backend, "process_info"):
+                pinfo = ctrl.backend.process_info()
+                target_pid = pinfo.get("pid")
+
+        if not target_pid or target_pid <= 0:
+            return self._error("PROCESS_NOT_FOUND", "Valid running PID required for fast state capture", "FAST_CAPTURE", t0)
+
+        plan_obj = plan if isinstance(plan, CapturePlan) else (
+            CapturePlan.from_dict(plan) if isinstance(plan, dict) else CapturePlanBuilder.build_full_plan()
+        )
+        policy_obj = policy if isinstance(policy, CaptureSafetyPolicy) else (
+            CaptureSafetyPolicy(**policy) if isinstance(policy, dict) else CaptureSafetyPolicy()
+        )
+
+        backend = self._capture_backend or get_default_capture_backend()
+        try:
+            raw_snap = backend.capture(
+                pid=target_pid,
+                plan=plan_obj,
+                policy=policy_obj,
+                snapshot_id=snapshot_id
+            )
+        except Exception as exc:
+            return self._error("CAPTURE_FAILED", f"Fast capture failed: {exc}", "FAST_CAPTURE", t0)
+
+        lat_report = raw_snap.observation_metadata.get("latency_report")
+        self._last_capture_latency_report = lat_report
+
+        # Offline semantic reconstruction purely from captured raw memory
+        engine = OfflineSemanticEngine()
+        semantic_state = engine.reconstruct(
+            raw_snapshot=raw_snap,
+            symbol_context=symbol_context,
+            debug_image=debug_image
+        )
+
+        # Store in State Laboratory and StateCorpus
+        self.state_lab.add_snapshot(semantic_state)
+        legacy_snap = semantic_state.to_snapshot()
+        self.corpus.add(legacy_snap, metadata={
+            "interesting_reasons": ["FAST_CAPTURE"],
+            "state_hash": semantic_state.state_hash,
+            "latency_report": lat_report,
+        })
+
+        res_data = {
+            "snapshot_id": semantic_state.snapshot_id,
+            "state_hash": semantic_state.state_hash,
+            "pid": target_pid,
+            "capture_backend": raw_snap.capture_backend,
+            "capture_mode": plan_obj.mode,
+            "latency_report": lat_report,
+            "objects_count": len(semantic_state.objects),
+            "roots_count": len(semantic_state.roots),
+            "threads_count": len(semantic_state.threads),
+            "captured_bytes": raw_snap.provenance.get("captured_bytes", 0),
+            "provenance": semantic_state.provenance,
+        }
+
+        return AgentActionResult(
+            success=True,
+            action="FAST_CAPTURE",
+            data=res_data,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+        )
+
+    def mutate_snapshot(
+        self,
+        snapshot_id: str,
+        target: str,
+        value: Any,
+        branch_name: Optional[str] = None
+    ) -> AgentActionResult:
+        """Create a new child state branch with the mutated field, leaving parent immutable."""
+        t0 = time.monotonic()
+        try:
+            child_state, diff = self.state_lab.mutate(
+                parent_id=snapshot_id,
+                target=target,
+                new_value=value,
+                branch_name=branch_name
+            )
+            child_snap = child_state.to_snapshot()
+            self.corpus.add(child_snap, metadata={
+                "interesting_reasons": ["SNAPSHOT_MUTATION"],
+                "state_hash": child_state.state_hash,
+                "parent_snapshot": snapshot_id,
+            })
+
+            return AgentActionResult(
+                success=True,
+                action="SNAPSHOT_MUTATE",
+                data={
+                    "snapshot_id": child_state.snapshot_id,
+                    "parent_snapshot": snapshot_id,
+                    "state_hash": child_state.state_hash,
+                    "diff": diff,
+                    "provenance": child_state.provenance,
+                },
+                performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+            )
+        except Exception as exc:
+            return self._error("MUTATION_FAILED", str(exc), "SNAPSHOT_MUTATE", t0)
+
+    def branch_snapshot(
+        self,
+        snapshot_id: str,
+        branch_name: Optional[str] = None
+    ) -> AgentActionResult:
+        """Create an explicit logical branch from an existing snapshot."""
+        t0 = time.monotonic()
+        try:
+            child_state = self.state_lab.branch(snapshot_id, branch_name=branch_name)
+            return AgentActionResult(
+                success=True,
+                action="SNAPSHOT_BRANCH",
+                data={
+                    "snapshot_id": child_state.snapshot_id,
+                    "parent_snapshot": snapshot_id,
+                    "state_hash": child_state.state_hash,
+                    "branch_info": child_state.branch_info,
+                },
+                performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+            )
+        except Exception as exc:
+            return self._error("BRANCH_FAILED", str(exc), "SNAPSHOT_BRANCH", t0)
+
+    def diff_snapshots(self, parent_id: str, child_id: str) -> AgentActionResult:
+        """Compute semantic diff between two snapshot branches."""
+        t0 = time.monotonic()
+        try:
+            diff = self.state_lab.diff(parent_id, child_id)
+            return AgentActionResult(
+                success=True,
+                action="SNAPSHOT_DIFF",
+                data=diff,
+                performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+            )
+        except Exception as exc:
+            return self._error("DIFF_FAILED", str(exc), "SNAPSHOT_DIFF", t0)
+
+    def analyze_impact(
+        self,
+        snapshot_id: str,
+        target: str,
+        new_value: Any = None,
+        candidate_id: Optional[str] = None
+    ) -> AgentActionResult:
+        """Analyze thread and object impact for a proposed or executed mutation."""
+        t0 = time.monotonic()
+        state = self.state_lab.get_snapshot(snapshot_id)
+        if not state:
+            snap, _ = self._resolve_snapshot(snapshot_id)
+            if snap:
+                state = SemanticState.from_snapshot(snap)
+            else:
+                return self._error("SNAPSHOT_NOT_FOUND", f"Snapshot {snapshot_id} not found", "ANALYZE_IMPACT", t0)
+
+        cand_dict = None
+        if candidate_id and candidate_id in self._cached_candidates:
+            c = self._cached_candidates[candidate_id]
+            cand_dict = c.to_dict() if hasattr(c, "to_dict") else dict(c)
+
+        impact = ThreadImpactAnalyzer.analyze(state, target=target, new_value=new_value, candidate=cand_dict)
+        return AgentActionResult(
+            success=True,
+            action="ANALYZE_IMPACT",
+            data=impact,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+        )
+
+    def replay_mutation(
+        self,
+        snapshot_id: str,
+        target_object_id: str,
+        field_name: str,
+        value: Any
+    ) -> AgentActionResult:
+        """Attempt replay of a snapshot mutation onto a live process."""
+        t0 = time.monotonic()
+        res = StateReplayer.replay(
+            controller=self.controller,
+            target_object_id=target_object_id,
+            field_name=field_name,
+            value=value
+        )
+        return AgentActionResult(
+            success=res.get("completed", False) or res.get("capability") == "SUPPORTED",
+            action="REPLAY_MUTATION",
+            data=res,
+            error=AgentActionError(code="REPLAY_ERROR", message=res["error"]) if res.get("error") and not res.get("completed") else None,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+        )
+

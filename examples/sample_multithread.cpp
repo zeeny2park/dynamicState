@@ -102,6 +102,12 @@ int main(int argc, char** argv) {
 
     // INITIAL OBSERVATION POINT (THREADS = 4)
     observation_checkpoint();
+    if (const char* hold = std::getenv("SAMPLE_HOLD_MS")) {
+        int hold_ms = std::atoi(hold);
+        if (hold_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
+        }
+    }
 
     // 1. Crash branch isolation trigger
     if (g_state.state == 139) {
