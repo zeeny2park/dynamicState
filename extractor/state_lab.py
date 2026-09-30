@@ -215,6 +215,8 @@ class SnapshotMutator:
             "target_object_id": target_obj_id,
             "target_field": target_field_name,
             "new_value": new_value,
+            "mutation_type": "SEMANTIC_MUTATION",
+            "live_process_modified": False,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 

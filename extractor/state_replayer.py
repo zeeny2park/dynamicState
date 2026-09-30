@@ -14,6 +14,23 @@ class StateReplayer:
     """Manages replay of offline snapshot mutations onto real target processes."""
 
     @staticmethod
+    def get_mutation_capabilities(controller: Optional[Any] = None) -> Dict[str, bool]:
+        """Distinguish semantic mutation from live process write and verification capabilities."""
+        can_write_live = False
+        can_verify_live = False
+        if controller is not None:
+            if hasattr(controller, "mutate"):
+                can_write_live = True
+            if hasattr(controller, "get_field"):
+                can_verify_live = True
+
+        return {
+            "CAN_MUTATE_SEMANTIC_STATE": True,
+            "CAN_WRITE_LIVE_PROCESS": can_write_live,
+            "CAN_VERIFY_LIVE_WRITE": can_verify_live,
+        }
+
+    @staticmethod
     def replay(
         controller: Optional[Any],
         target_object_id: str,
@@ -23,18 +40,17 @@ class StateReplayer:
     ) -> Dict[str, Any]:
         """Attempt replay of a snapshot mutation onto a live process."""
         target_str = f"{target_object_id}.{field_name}" if field_name else target_object_id
+        caps = StateReplayer.get_mutation_capabilities(controller)
 
         # 1. Capability check
-        can_replay = False
-        if controller is not None:
-            if hasattr(controller, "is_attached") and controller.is_attached:
-                can_replay = True
-            elif hasattr(controller, "mutate"):
-                can_replay = True
+        can_replay = caps["CAN_WRITE_LIVE_PROCESS"]
 
         if not can_replay:
             return {
                 "capability": "UNAVAILABLE",
+                "capabilities": caps,
+                "mutation_type": "LIVE_PROCESS_MUTATION",
+                "mutation_status": "NOT_ATTEMPTED",
                 "attempted": False,
                 "completed": False,
                 "verified": False,
@@ -82,8 +98,18 @@ class StateReplayer:
         except Exception as exc:
             error_msg = str(exc)
 
+        if not completed:
+            mutation_status = "FAILED"
+        elif verified:
+            mutation_status = "APPLIED_VERIFIED"
+        else:
+            mutation_status = "APPLIED_UNVERIFIED"
+
         return {
             "capability": "SUPPORTED",
+            "capabilities": caps,
+            "mutation_type": "LIVE_PROCESS_MUTATION",
+            "mutation_status": mutation_status,
             "attempted": attempted,
             "completed": completed,
             "verified": verified,

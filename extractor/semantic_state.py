@@ -23,7 +23,7 @@ def compute_semantic_state_hash(
     objects: List[Dict[str, Any]],
     threads: Optional[List[Dict[str, Any]]] = None
 ) -> str:
-    """Computes a deterministic SHA-256 state hash from canonical semantic object states."""
+    """Computes a deterministic full SHA-256 state hash from canonical semantic object states."""
     h = hashlib.sha256()
 
     # 1. Deterministic roots hash
@@ -31,15 +31,24 @@ def compute_semantic_state_hash(
     for r in sorted_roots:
         h.update(f"ROOT:{r.get('name')}:{r.get('type')}:{r.get('object_ref')}".encode("utf-8"))
 
-    # 2. Deterministic objects hash
-    sorted_objs = sorted(objects, key=lambda o: o.get("object_id", ""))
+    # 2. Deterministic objects hash independent of allocation order
+    sorted_objs = sorted(
+        objects,
+        key=lambda o: (
+            o.get("type", ""),
+            o.get("canonical_type", ""),
+            o.get("primary_path", ""),
+            o.get("address", 0),
+            o.get("object_id", ""),
+        )
+    )
     for obj in sorted_objs:
         oid = obj.get("object_id", "")
         otype = obj.get("type", "")
         h.update(f"OBJ:{oid}:{otype}".encode("utf-8"))
 
         fields = obj.get("fields", [])
-        sorted_fields = sorted(fields, key=lambda f: f.get("name", ""))
+        sorted_fields = sorted(fields, key=lambda f: (f.get("name", ""), f.get("type", "")))
         for f in sorted_fields:
             fname = f.get("name", "")
             ftype = f.get("type", "")
@@ -55,7 +64,7 @@ def compute_semantic_state_hash(
             tstate = t.get("state", "")
             h.update(f"TH:{tid}:{tstate}".encode("utf-8"))
 
-    return h.hexdigest()[:16]
+    return h.hexdigest()
 
 
 @dataclass
@@ -63,6 +72,7 @@ class SemanticState:
     """Independent semantic state representation reconstructed offline from runtime snapshot."""
     snapshot_id: str
     state_hash: str
+    state_hash_algorithm: str = "SHA-256"
     roots: List[Dict[str, Any]] = field(default_factory=list)
     objects: List[Dict[str, Any]] = field(default_factory=list)
     semantic_paths: Dict[str, str] = field(default_factory=dict)  # path -> object_id
@@ -72,6 +82,10 @@ class SemanticState:
     references: List[Dict[str, Any]] = field(default_factory=list)
     provenance: Dict[str, Any] = field(default_factory=dict)
     branch_info: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def state_hash_short(self) -> str:
+        return self.state_hash[:16] if self.state_hash else ""
 
     def get_object(self, object_id: str) -> Optional[Dict[str, Any]]:
         for o in self.objects:
@@ -112,6 +126,8 @@ class SemanticState:
         return {
             "snapshot_id": self.snapshot_id,
             "state_hash": self.state_hash,
+            "state_hash_short": self.state_hash_short,
+            "state_hash_algorithm": self.state_hash_algorithm,
             "roots": self.roots,
             "objects": self.objects,
             "semantic_paths": self.semantic_paths,
@@ -240,15 +256,6 @@ class OfflineSemanticEngine:
                     paths_by_obj[oref].append(rname)
                 queue.append((oref, rname))
 
-        # Direct root names if roots map by index
-        for idx, o in enumerate(objects):
-            oid = o.get("object_id")
-            if oid and not paths_by_obj[oid] and idx < len(roots):
-                rname = roots[idx].get("name")
-                if rname:
-                    paths_by_obj[oid].append(rname)
-                    queue.append((oid, rname))
-
         # BFS traverse fields
         while queue:
             curr_id, curr_path = queue.popleft()
@@ -313,7 +320,7 @@ class OfflineSemanticEngine:
                     load_bias = res.load_bias
                     diagnostics.extend(res.diagnostics)
 
-                    if res.status != "SYMBOL_MISMATCH":
+                    if res.status not in ("SYMBOL_MISMATCH", "LOAD_BIAS_UNRESOLVED", "DECODE_ERROR"):
                         roots = res.roots
                         objects = res.objects
                         references = res.references

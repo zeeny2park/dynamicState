@@ -193,19 +193,31 @@ class CppObjectDecoder:
             # (A) Primitive Base Type
             if tag == "DW_TAG_base_type":
                 sz = m_type.byte_size or 4
+                f_prov = {
+                    "source": "RAW_SNAPSHOT",
+                    "runtime_address": hex(m_addr),
+                    "member_offset": m_rel_offset,
+                    "type": clean_m_type,
+                    "captured_range": [hex(m_addr), hex(m_addr + sz)],
+                    "dwarf": {
+                        "type": clean_m_type,
+                        "member": member.name,
+                        "die_offset": hex(m_type.die_offset) if m_type else None,
+                    },
+                    "root_name": parent_path.split(".")[0].split("->")[0],
+                    "object_address": hex(base_address),
+                    "canonical_type": obj_dict.get("canonical_type", ""),
+                    "member_name": member.name,
+                }
                 if not self.reader.contains(m_addr, sz):
+                    f_prov["status"] = "MEMORY_NOT_CAPTURED"
                     field_entry = {
                         "name": member.name,
                         "type": clean_m_type,
                         "value": None,
                         "status": "MEMORY_NOT_CAPTURED",
                         "address": hex(m_addr),
-                        "provenance": {
-                            "source": "RAW_SNAPSHOT",
-                            "dwarf_type_die": hex(m_type.die_offset),
-                            "memory_range": [hex(m_addr), hex(m_addr + sz)],
-                            "status": "MEMORY_NOT_CAPTURED"
-                        }
+                        "provenance": f_prov
                     }
                     obj_dict["fields"].append(field_entry)
                     obj_dict["status"] = "PARTIAL"
@@ -218,34 +230,47 @@ class CppObjectDecoder:
                     })
                 else:
                     val = self._read_primitive_val(m_addr, m_type)
+                    f_prov["status"] = "RESOLVED"
+                    f_prov["build_id"] = self.index.build_id
                     field_entry = {
                         "name": member.name,
                         "type": clean_m_type,
                         "value": val,
                         "status": "RESOLVED",
                         "address": hex(m_addr),
-                        "provenance": {
-                            "source": "RAW_SNAPSHOT",
-                            "dwarf_type_die": hex(m_type.die_offset),
-                            "member_die": hex(member.die_offset) if member.die_offset else None,
-                            "memory_range": [hex(m_addr), hex(m_addr + sz)],
-                            "build_id": self.index.build_id,
-                            "status": "RESOLVED"
-                        }
+                        "provenance": f_prov
                     }
                     obj_dict["fields"].append(field_entry)
 
             # (B) Enumeration Type
             elif tag == "DW_TAG_enumeration_type":
                 sz = m_type.byte_size or 4
+                f_prov = {
+                    "source": "RAW_SNAPSHOT",
+                    "runtime_address": hex(m_addr),
+                    "member_offset": m_rel_offset,
+                    "type": clean_m_type,
+                    "captured_range": [hex(m_addr), hex(m_addr + sz)],
+                    "dwarf": {
+                        "type": clean_m_type,
+                        "member": member.name,
+                        "die_offset": hex(m_type.die_offset) if m_type else None,
+                    },
+                    "root_name": parent_path.split(".")[0].split("->")[0],
+                    "object_address": hex(base_address),
+                    "canonical_type": obj_dict.get("canonical_type", ""),
+                    "member_name": member.name,
+                }
                 raw_int, st = self.reader.read_integer(m_addr, sz, signed=True)
                 if st != "COMPLETE" or raw_int is None:
+                    f_prov["status"] = "MEMORY_NOT_CAPTURED"
                     field_entry = {
                         "name": member.name,
                         "type": clean_m_type,
                         "value": None,
                         "status": "MEMORY_NOT_CAPTURED",
                         "address": hex(m_addr),
+                        "provenance": f_prov
                     }
                     obj_dict["fields"].append(field_entry)
                     obj_dict["status"] = "PARTIAL"
@@ -258,6 +283,7 @@ class CppObjectDecoder:
                     })
                 else:
                     enum_name = m_type.enum_values.get(raw_int, str(raw_int))
+                    f_prov["status"] = "RESOLVED"
                     field_entry = {
                         "name": member.name,
                         "type": clean_m_type,
@@ -265,20 +291,31 @@ class CppObjectDecoder:
                         "raw_value": raw_int,
                         "status": "RESOLVED",
                         "address": hex(m_addr),
-                        "provenance": {
-                            "source": "RAW_SNAPSHOT",
-                            "dwarf_type_die": hex(m_type.die_offset),
-                            "member_die": hex(member.die_offset) if member.die_offset else None,
-                            "memory_range": [hex(m_addr), hex(m_addr + sz)],
-                            "status": "RESOLVED"
-                        }
+                        "provenance": f_prov
                     }
                     obj_dict["fields"].append(field_entry)
 
             # (C) Pointer / Reference Type
             elif tag in ("DW_TAG_pointer_type", "DW_TAG_reference_type", "DW_TAG_rvalue_reference_type"):
+                f_prov = {
+                    "source": "RAW_SNAPSHOT",
+                    "runtime_address": hex(m_addr),
+                    "member_offset": m_rel_offset,
+                    "type": clean_m_type,
+                    "captured_range": [hex(m_addr), hex(m_addr + self.pointer_size)],
+                    "dwarf": {
+                        "type": clean_m_type,
+                        "member": member.name,
+                        "die_offset": hex(m_type.die_offset) if m_type else None,
+                    },
+                    "root_name": parent_path.split(".")[0].split("->")[0],
+                    "object_address": hex(base_address),
+                    "canonical_type": obj_dict.get("canonical_type", ""),
+                    "member_name": member.name,
+                }
                 ptr_val, st = self.reader.read_pointer(m_addr)
                 if st != "COMPLETE" or ptr_val is None:
+                    f_prov["status"] = "MEMORY_NOT_CAPTURED"
                     field_entry = {
                         "name": member.name,
                         "type": clean_m_type,
@@ -287,6 +324,7 @@ class CppObjectDecoder:
                         "object_ref": None,
                         "status": "MEMORY_NOT_CAPTURED",
                         "address": hex(m_addr),
+                        "provenance": f_prov
                     }
                     obj_dict["fields"].append(field_entry)
                     obj_dict["status"] = "PARTIAL"
@@ -298,6 +336,7 @@ class CppObjectDecoder:
                         "recoverable": True,
                     })
                 elif ptr_val == 0:
+                    f_prov["status"] = "NULL_PTR"
                     field_entry = {
                         "name": member.name,
                         "type": clean_m_type,
@@ -306,6 +345,7 @@ class CppObjectDecoder:
                         "object_ref": None,
                         "status": "NULL_PTR",
                         "address": hex(m_addr),
+                        "provenance": f_prov
                     }
                     obj_dict["fields"].append(field_entry)
                 else:
@@ -313,17 +353,56 @@ class CppObjectDecoder:
                     target_sz = target_t.byte_size if target_t and target_t.byte_size else 1
 
                     if not self.reader.contains(ptr_val, target_sz):
-                        field_entry = {
-                            "name": member.name,
-                            "type": clean_m_type,
-                            "value": hex(ptr_val),
-                            "reference": None,
-                            "object_ref": None,
-                            "status": "OUTSIDE_CAPTURE",
-                            "target_status": "OUTSIDE_CAPTURE",
-                            "address": hex(m_addr),
-                        }
-                        obj_dict["fields"].append(field_entry)
+                        if target_t and target_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"):
+                            target_storage = "heap" if self.reader.is_heap(ptr_val) else ("stack" if self.reader.is_stack(ptr_val) else "global")
+                            target_id = self.decode_object(
+                                address=ptr_val,
+                                type_offset=m_type.target_type_offset,
+                                path=m_path,
+                                storage=target_storage,
+                            )
+                            f_prov["status"] = "PARTIAL"
+                            field_entry = {
+                                "name": member.name,
+                                "type": clean_m_type,
+                                "value": hex(ptr_val),
+                                "reference": target_id,
+                                "object_ref": target_id,
+                                "status": "RESOLVED",
+                                "target_status": "MEMORY_NOT_CAPTURED",
+                                "address": hex(m_addr),
+                                "provenance": f_prov
+                            }
+                            obj_dict["fields"].append(field_entry)
+                            self.references.append({
+                                "from_id": obj_dict["object_id"],
+                                "to_id": target_id,
+                                "field": member.name,
+                                "type": "pointer",
+                            })
+                            obj_dict["status"] = "PARTIAL"
+                        else:
+                            f_prov["status"] = "MEMORY_NOT_CAPTURED"
+                            field_entry = {
+                                "name": member.name,
+                                "type": clean_m_type,
+                                "value": None,
+                                "reference": None,
+                                "object_ref": None,
+                                "status": "MEMORY_NOT_CAPTURED",
+                                "target_status": "MEMORY_NOT_CAPTURED",
+                                "address": hex(m_addr),
+                                "provenance": f_prov
+                            }
+                            obj_dict["fields"].append(field_entry)
+                            obj_dict["status"] = "PARTIAL"
+                            self.diagnostics.append({
+                                "code": "MEMORY_NOT_CAPTURED",
+                                "address": hex(ptr_val),
+                                "size": target_sz,
+                                "object": f"{m_path}->deref",
+                                "recoverable": True,
+                            })
                     else:
                         target_storage = "heap" if self.reader.is_heap(ptr_val) else ("stack" if self.reader.is_stack(ptr_val) else "global")
                         target_id = self.decode_object(
@@ -332,6 +411,7 @@ class CppObjectDecoder:
                             path=m_path,
                             storage=target_storage,
                         )
+                        f_prov["status"] = "RESOLVED"
                         field_entry = {
                             "name": member.name,
                             "type": clean_m_type,
@@ -340,13 +420,7 @@ class CppObjectDecoder:
                             "object_ref": target_id,
                             "status": "RESOLVED",
                             "address": hex(m_addr),
-                            "provenance": {
-                                "source": "RAW_SNAPSHOT",
-                                "dwarf_type_die": hex(m_type.die_offset),
-                                "member_die": hex(member.die_offset) if member.die_offset else None,
-                                "memory_range": [hex(m_addr), hex(m_addr + self.pointer_size)],
-                                "status": "RESOLVED"
-                            }
+                            "provenance": f_prov
                         }
                         obj_dict["fields"].append(field_entry)
                         self.references.append({
@@ -602,7 +676,7 @@ class DwarfRuntimeResolver:
         self.debug_image_path = os.path.abspath(debug_image_path)
         self.allow_symbol_mismatch = allow_symbol_mismatch
 
-    def calculate_load_bias(self, debug_index: DwarfIndex) -> int:
+    def calculate_load_bias(self, debug_index: DwarfIndex) -> Optional[int]:
         """Calculate runtime load bias: runtime_base_vaddr - first_pt_load_p_vaddr."""
         first_load_vaddr = 0
         if debug_index.pt_loads:
@@ -668,7 +742,12 @@ class DwarfRuntimeResolver:
             runtime_base = s_val if isinstance(s_val, int) else int(str(s_val), 16)
             return runtime_base - first_load_vaddr
 
-        return 0
+        # 3. For non-PIE fixed executables (ET_EXEC), default load bias is 0
+        if getattr(debug_index, "elf_type", "ET_DYN") == "ET_EXEC":
+            return 0
+
+        # Unresolved for PIE
+        return None
 
     def resolve(self, target_variable: Optional[str] = None) -> ResolutionResult:
         """Execute full DWARF semantic reconstruction."""
@@ -723,6 +802,21 @@ class DwarfRuntimeResolver:
 
         # 2. PIE / ASLR Load bias
         load_bias = self.calculate_load_bias(dwarf_index)
+        if load_bias is None:
+            diagnostics.append({
+                "code": "LOAD_BIAS_UNRESOLVED",
+                "message": "Cannot determine runtime load bias for PIE binary; executable memory mapping not found in snapshot.",
+                "recoverable": False
+            })
+            return ResolutionResult(
+                status="LOAD_BIAS_UNRESOLVED",
+                load_bias=0,
+                pointer_size=dwarf_index.pointer_size,
+                endianness=dwarf_index.endianness,
+                build_id=dbg_bid,
+                debug_image_path=self.debug_image_path,
+                diagnostics=diagnostics
+            )
 
         # 3. Create TypedMemoryReader
         reader = TypedMemoryReader(

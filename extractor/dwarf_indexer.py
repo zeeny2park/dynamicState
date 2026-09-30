@@ -76,6 +76,7 @@ class DwarfIndex:
     endianness: str = "little"
     elf_class: str = "ELF64"
     architecture: str = "x86_64"
+    elf_type: str = "ET_DYN"
     pt_loads: List[Dict[str, Any]] = field(default_factory=list)
 
     types_by_die: Dict[int, DwarfType] = field(default_factory=dict)
@@ -215,6 +216,7 @@ class DwarfIndexer:
             endianness=endianness,
             elf_class=elf_info.elf_class,
             architecture=elf_info.architecture,
+            elf_type=elf_info.elf_type or "ET_DYN",
             pt_loads=elf_info.pt_loads,
         )
 

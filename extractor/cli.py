@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .memory_capture import MemoryCapture
 from .offline_analyzer import OfflineMemoryAnalyzer
@@ -96,6 +97,10 @@ def main():
                              help="Display discovered DWARF roots")
     anlz_parser.add_argument("--show-object", type=str, default=None,
                              help="Display specific object or hierarchical semantic path")
+    anlz_parser.add_argument("--show-objects", action="store_true", default=False,
+                             help="Display all decoded objects")
+    anlz_parser.add_argument("--show-provenance", action="store_true", default=False,
+                             help="Display detailed provenance for objects and fields")
     anlz_parser.add_argument("--show-diagnostics", action="store_true", default=False,
                              help="Display structured diagnostics")
     anlz_parser.add_argument("--output", type=str, default=None,
@@ -309,6 +314,10 @@ def main():
                                 start = int(parts[2], 16)
                                 with open(os.path.join(mem_dir, fn), "rb") as bf:
                                     snap.register_buffer(start, bf.read())
+                            elif len(parts) >= 3:
+                                start = int(parts[1], 16)
+                                with open(os.path.join(mem_dir, fn), "rb") as bf:
+                                    snap.register_buffer(start, bf.read())
         except Exception as e:
             print(f"ERROR: Failed loading snapshot: {e}", file=sys.stderr)
             sys.exit(1)
@@ -333,15 +342,27 @@ def main():
                     print(f"  Actual Build ID:   {d.get('actual_build_id')}", file=sys.stderr)
             sys.exit(1)
 
-        # Output format matching Section 30
-        print("Semantic State\n")
+        # Output format matching Section 21
+        print("Semantic State")
+        print(f"Status: {status}\n")
+
         objs_by_id = {o["object_id"]: o for o in sem_state.objects}
         visited_nodes = set()
 
-        def _print_tree(node_id: str, indent: int):
-            if node_id in visited_nodes:
+        if sem_state.roots:
+            print("Root:")
+            for r in sem_state.roots:
+                print(f"  {r.get('name')}: {r.get('type')}")
+            print()
+
+        def _print_tree(node_id: str, indent: int, ancestors: Optional[Set[str]] = None):
+            if ancestors is None:
+                ancestors = set()
+            if node_id in ancestors or indent > 12:
                 return
-            visited_nodes.add(node_id)
+            curr_ancestors = set(ancestors)
+            curr_ancestors.add(node_id)
+
             obj = objs_by_id.get(node_id)
             if not obj:
                 return
@@ -351,16 +372,20 @@ def main():
                 fval = f.get("value")
                 fst = f.get("status", "")
                 if fref and fref in objs_by_id:
-                    print(f"{'  ' * indent}{fname}")
-                    _print_tree(fref, indent + 1)
+                    child_t = objs_by_id[fref].get("type", "")
+                    type_suffix = f": {child_t}" if child_t else ""
+                    print(f"{'  ' * indent}{fname}{type_suffix}")
+                    if fref in curr_ancestors:
+                        continue
+                    _print_tree(fref, indent + 1, curr_ancestors)
                 else:
                     val_str = f"{fval}" if fval is not None else (fst or "None")
                     print(f"{'  ' * indent}{fname}: {val_str}")
 
         for r in sem_state.roots:
             rname = r.get("name", "Root")
-            print(f"{rname}")
             ref = r.get("object_ref")
+            print(f"{rname}")
             if ref and ref in objs_by_id:
                 _print_tree(ref, 1)
 
@@ -374,6 +399,11 @@ def main():
             for r in sem_state.roots:
                 print(f"  - {r.get('name')}: {r.get('type')} at 0x{r.get('address', 0):x} ({r.get('kind')})")
 
+        if args.show_objects:
+            print("\nObjects:")
+            for o in sem_state.objects:
+                print(f"  - [{o.get('object_id')}]: {o.get('type')} at {o.get('hex_address', hex(o.get('address', 0)))} (status: {o.get('status')})")
+
         if args.show_object:
             target_obj = sem_state.get_object_by_path(args.show_object)
             if not target_obj:
@@ -383,6 +413,18 @@ def main():
                 print(json.dumps(target_obj, indent=2))
             else:
                 print(f"\nObject not found: {args.show_object}", file=sys.stderr)
+
+        if args.show_provenance:
+            print("\nProvenance:")
+            for o in sem_state.objects:
+                oid = o.get("object_id")
+                otype = o.get("type")
+                opath = o.get("primary_path", oid)
+                print(f"  Object [{opath}] ({otype} at {hex(o.get('address', 0))}):")
+                for f in o.get("fields", []):
+                    fprov = f.get("provenance")
+                    if fprov:
+                        print(f"    - {f.get('name')}: {json.dumps(fprov)}")
 
         if args.show_diagnostics and diagnostics:
             print("\nDiagnostics:")

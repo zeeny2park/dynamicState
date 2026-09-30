@@ -94,6 +94,34 @@ class RawRuntimeSnapshot:
             return CaptureLatencyReport.from_dict(rep)
         return rep
 
+    @property
+    def stop_latency_us(self) -> float:
+        rep = self.latency_report
+        return getattr(rep, "stop_latency_us", 0.0) if rep else 0.0
+
+    @property
+    def memory_read_latency_us(self) -> float:
+        rep = self.latency_report
+        return getattr(rep, "memory_capture_latency_us", 0.0) if rep else 0.0
+
+    @property
+    def capture_latency_us(self) -> float:
+        return self.memory_read_latency_us
+
+    @property
+    def resume_latency_us(self) -> float:
+        rep = self.latency_report
+        return getattr(rep, "resume_latency_us", 0.0) if rep else 0.0
+
+    @property
+    def total_capture_latency_us(self) -> float:
+        rep = self.latency_report
+        return getattr(rep, "total_capture_latency_us", 0.0) if rep else self.capture_duration_us
+
+    @property
+    def bytes_captured(self) -> int:
+        return sum(r.get("captured_bytes", 0) for r in self.memory_regions)
+
     def register_buffer(self, start: int, data: bytes):
         end = start + len(data)
         self._buffers[(start, end)] = data

@@ -34,6 +34,22 @@ class CaptureLatencyReport:
     target_capture_latency_ms: float = 10.0
     actual_capture_latency_ms: float = 0.0
 
+    # Microsecond-precision metrics
+    stop_latency_us: float = 0.0
+    thread_metadata_latency_us: float = 0.0
+    memory_capture_latency_us: float = 0.0
+    resume_latency_us: float = 0.0
+    total_stop_time_us: float = 0.0
+    total_capture_latency_us: float = 0.0
+
+    @property
+    def capture_latency_us(self) -> float:
+        return self.memory_capture_latency_us
+
+    @property
+    def read_latency_us(self) -> float:
+        return self.memory_capture_latency_us
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "stop_latency_ms": round(self.stop_latency_ms, 3),
@@ -43,6 +59,14 @@ class CaptureLatencyReport:
             "total_stop_time_ms": round(self.total_stop_time_ms, 3),
             "target_capture_latency_ms": self.target_capture_latency_ms,
             "actual_capture_latency_ms": round(self.actual_capture_latency_ms, 3),
+            "stop_latency_us": round(self.stop_latency_us, 1),
+            "thread_metadata_latency_us": round(self.thread_metadata_latency_us, 1),
+            "memory_capture_latency_us": round(self.memory_capture_latency_us, 1),
+            "capture_latency_us": round(self.memory_capture_latency_us, 1),
+            "read_latency_us": round(self.memory_capture_latency_us, 1),
+            "resume_latency_us": round(self.resume_latency_us, 1),
+            "total_stop_time_us": round(self.total_stop_time_us, 1),
+            "total_capture_latency_us": round(self.total_capture_latency_us, 1),
         }
 
     @classmethod
@@ -55,6 +79,12 @@ class CaptureLatencyReport:
             total_stop_time_ms=data.get("total_stop_time_ms", 0.0),
             target_capture_latency_ms=data.get("target_capture_latency_ms", 10.0),
             actual_capture_latency_ms=data.get("actual_capture_latency_ms", 0.0),
+            stop_latency_us=data.get("stop_latency_us", data.get("stop_latency_ms", 0.0) * 1000.0),
+            thread_metadata_latency_us=data.get("thread_metadata_latency_us", data.get("thread_metadata_latency_ms", 0.0) * 1000.0),
+            memory_capture_latency_us=data.get("memory_capture_latency_us", data.get("memory_capture_latency_ms", 0.0) * 1000.0),
+            resume_latency_us=data.get("resume_latency_us", data.get("resume_latency_ms", 0.0) * 1000.0),
+            total_stop_time_us=data.get("total_stop_time_us", data.get("total_stop_time_ms", 0.0) * 1000.0),
+            total_capture_latency_us=data.get("total_capture_latency_us", data.get("actual_capture_latency_ms", 0.0) * 1000.0),
         )
 
 
@@ -184,6 +214,9 @@ def _read_thread_metadata(pid: int) -> List[Dict[str, Any]]:
                         "thread_id": tid,
                         "name": t_name,
                         "state": t_state,
+                        "stop_status": "STOPPED" if t_state in ("STOPPED", "TRACING_STOP") else "NOT_STOPPED",
+                        "capture_participation": True,
+                        "registers_availability": "REGISTER_STATE_UNAVAILABLE",
                         "function": None,
                         "location": None,
                     })
@@ -194,6 +227,9 @@ def _read_thread_metadata(pid: int) -> List[Dict[str, Any]]:
             "thread_id": pid,
             "name": None,
             "state": "STOPPED",
+            "stop_status": "STOPPED",
+            "capture_participation": True,
+            "registers_availability": "REGISTER_STATE_UNAVAILABLE",
             "function": None,
             "location": None,
         })
@@ -255,7 +291,15 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
 
         sid = snapshot_id or "RS_{:06d}_{:04d}".format(pid, int(time.time() * 1000) % 10000)
         t_overall_start_ns = time.monotonic_ns()
-        suspended = False
+        wall_clock_start = datetime.now(timezone.utc).isoformat()
+        
+        # State machine tracking
+        state_history = ["INITIALIZED"]
+        capture_status = "COMPLETED"
+        stop_requested = False
+        stop_confirmed = False
+        resume_confirmed = False
+        diagnostics: List[Dict[str, Any]] = []
 
         # Read binary executable path and build_id
         exe_path = ""
@@ -275,11 +319,12 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             except Exception:
                 pass
 
-        t_stop_start = 0
-        t_stopped = 0
+        t_stop_requested = 0
+        t_stop_confirmed = 0
         t_threads = 0
         t_memory = 0
-        t_resumed = 0
+        t_resume_requested = 0
+        t_resume_confirmed = 0
 
         raw_regions: List[Dict[str, Any]] = []
         thread_metadata: List[Dict[str, Any]] = []
@@ -347,33 +392,54 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
 
         try:
             # 1. Ultra-short suspend
-            t_stop_start = time.monotonic_ns()
             if should_suspend:
+                state_history.append("STOP_REQUESTED")
+                stop_requested = True
+                t_stop_requested = time.monotonic_ns()
                 try:
                     os.kill(pid, signal.SIGSTOP)
-                    # Spin wait for STOP state in /proc/<pid>/stat with safety deadline
-                    deadline_stop = t_stop_start + int(policy.max_stop_time_ms * 1_000_000)
+                    deadline_stop = t_stop_requested + int(policy.max_stop_time_ms * 1_000_000)
                     while time.monotonic_ns() < deadline_stop:
                         stat_path = f"/proc/{pid}/stat"
                         if os.path.exists(stat_path):
-                            with open(stat_path, "r") as f:
-                                content = f.read()
-                                rparen = content.rfind(")")
-                                if rparen != -1 and "T" in content[rparen + 1:].split()[0]:
-                                    suspended = True
-                                    break
+                            try:
+                                with open(stat_path, "r") as f:
+                                    content = f.read()
+                                    rparen = content.rfind(")")
+                                    if rparen != -1 and content[rparen + 1:].split()[0] in ("T", "t"):
+                                        stop_confirmed = True
+                                        break
+                            except Exception:
+                                pass
                         try:
                             os.sched_yield()
                         except Exception:
                             pass
-                    if not suspended:
-                        # Process might already be stopped or in ptrace stop
-                        suspended = True
-                except Exception:
-                    pass
-            t_stopped = time.monotonic_ns()
+                except Exception as exc:
+                    diagnostics.append({
+                        "code": "STOP_SIGNAL_ERROR",
+                        "message": f"SIGSTOP failed: {exc}",
+                        "level": "ERROR"
+                    })
+
+                t_stop_confirmed = time.monotonic_ns()
+                if stop_confirmed:
+                    state_history.append("STOP_CONFIRMED")
+                else:
+                    state_history.append("STOP_UNCONFIRMED")
+                    capture_status = "STOP_UNCONFIRMED"
+                    completeness = "PARTIAL"
+                    diagnostics.append({
+                        "code": "STOP_UNCONFIRMED",
+                        "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms",
+                        "level": "WARNING"
+                    })
+            else:
+                t_stop_requested = time.monotonic_ns()
+                t_stop_confirmed = t_stop_requested
 
             # 2. Capture thread metadata
+            state_history.append("CAPTURING")
             thread_metadata = _read_thread_metadata(pid)
             t_threads = time.monotonic_ns()
 
@@ -394,12 +460,45 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
 
         finally:
             # 4. GUARANTEED FAIL-OPEN RESUME IMMEDIATELY
-            if suspended:
+            if stop_requested:
+                state_history.append("RESUME_REQUESTED")
+                t_resume_requested = time.monotonic_ns()
                 try:
                     os.kill(pid, signal.SIGCONT)
-                except Exception:
-                    pass
-            t_resumed = time.monotonic_ns()
+                    # Poll briefly for resume confirmation
+                    deadline_res = t_resume_requested + int(20 * 1_000_000)
+                    while time.monotonic_ns() < deadline_res:
+                        stat_path = f"/proc/{pid}/stat"
+                        if os.path.exists(stat_path):
+                            try:
+                                with open(stat_path, "r") as f:
+                                    content = f.read()
+                                    rparen = content.rfind(")")
+                                    if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
+                                        resume_confirmed = True
+                                        break
+                            except Exception:
+                                pass
+                        try:
+                            os.sched_yield()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    diagnostics.append({
+                        "code": "RESUME_SIGNAL_ERROR",
+                        "message": f"SIGCONT failed: {exc}",
+                        "level": "ERROR"
+                    })
+                t_resume_confirmed = time.monotonic_ns()
+                if resume_confirmed:
+                    state_history.append("RESUME_CONFIRMED")
+                else:
+                    state_history.append("RESUME_UNCONFIRMED")
+            else:
+                t_resume_requested = t_memory
+                t_resume_confirmed = t_memory
+
+        wall_clock_end = datetime.now(timezone.utc).isoformat()
 
         # 5. Offline post-processing of buffers (target process is already resumed!)
         for item, nread in read_results:
@@ -436,41 +535,68 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "error": f"ERRNO_{ctypes.get_errno()}"
                 })
 
-        # Compute exact measured latencies
-        stop_latency = (t_stopped - t_stop_start) / 1_000_000.0 if should_suspend else 0.0
-        thread_latency = (t_threads - t_stopped) / 1_000_000.0
-        memory_latency = (t_memory - t_threads) / 1_000_000.0
-        resume_latency = (t_resumed - t_memory) / 1_000_000.0 if should_suspend else 0.0
-        total_stop_time = (t_resumed - t_stopped) / 1_000_000.0 if should_suspend else 0.0
-        total_capture_time = (t_resumed - t_overall_start_ns) / 1_000_000.0
+        # Compute exact measured microsecond and millisecond latencies
+        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if should_suspend else 0.0
+        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
+        memory_latency_us = (t_memory - t_threads) / 1000.0
+        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if should_suspend else 0.0
+        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
+        total_capture_time_us = (t_resume_confirmed - t_overall_start_ns) / 1000.0
 
         latency_report = CaptureLatencyReport(
-            stop_latency_ms=stop_latency,
-            thread_metadata_latency_ms=thread_latency,
-            memory_capture_latency_ms=memory_latency,
-            resume_latency_ms=resume_latency,
-            total_stop_time_ms=total_stop_time,
+            stop_latency_ms=stop_latency_us / 1000.0,
+            thread_metadata_latency_ms=thread_latency_us / 1000.0,
+            memory_capture_latency_ms=memory_latency_us / 1000.0,
+            resume_latency_ms=resume_latency_us / 1000.0,
+            total_stop_time_ms=total_stop_time_us / 1000.0,
             target_capture_latency_ms=10.0,
-            actual_capture_latency_ms=total_capture_time,
+            actual_capture_latency_ms=total_capture_time_us / 1000.0,
+            stop_latency_us=stop_latency_us,
+            thread_metadata_latency_us=thread_latency_us,
+            memory_capture_latency_us=memory_latency_us,
+            resume_latency_us=resume_latency_us,
+            total_stop_time_us=total_stop_time_us,
+            total_capture_latency_us=total_capture_time_us,
         )
 
         obs_meta = {
             "capture_backend": self.name,
             "capture_mode": plan.mode,
-            "capture_start": datetime.fromtimestamp(t_overall_start_ns / 1e9, tz=timezone.utc).isoformat(),
-            "capture_end": datetime.fromtimestamp(t_resumed / 1e9, tz=timezone.utc).isoformat(),
+            "capture_status": capture_status,
+            "stop_state_machine": {
+                "states": state_history,
+                "stop_confirmed": stop_confirmed,
+                "resume_confirmed": resume_confirmed,
+                "current": state_history[-1],
+            },
+            "capture_start": wall_clock_start,
+            "capture_end": wall_clock_end,
+            "stop_requested": wall_clock_start,
             "observation_point": observation_point,
             "latency_report": latency_report.to_dict(),
             "memory_maps": all_maps,
+            "diagnostics": diagnostics,
         }
 
         provenance = {
             "capture_backend": self.name,
+            "capture_status": capture_status,
+            "snapshot_consistency": "PROCESS_STOPPED_MEMORY_SNAPSHOT",
+            "stop_state_machine": {
+                "states": state_history,
+                "stop_confirmed": stop_confirmed,
+                "resume_confirmed": resume_confirmed,
+            },
             "pid": pid,
-            "timestamp": obs_meta["capture_start"],
-            "capture_start": obs_meta["capture_start"],
-            "capture_end": obs_meta["capture_end"],
-            "duration": total_capture_time,
+            "timestamp": wall_clock_start,
+            "capture_start": wall_clock_start,
+            "capture_end": wall_clock_end,
+            "stop_latency_us": stop_latency_us,
+            "memory_read_latency_us": memory_latency_us,
+            "capture_latency_us": memory_latency_us,
+            "resume_latency_us": resume_latency_us,
+            "total_capture_latency_us": total_capture_time_us,
+            "duration": total_capture_time_us / 1000.0,
             "thread_count": len(thread_metadata),
             "captured_region_count": len(raw_regions),
             "captured_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions),
@@ -479,10 +605,11 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 "path": exe_path,
                 "build_id": build_id
             },
-            "actual_capture_latency_ms": round(total_capture_time, 3),
+            "actual_capture_latency_ms": round(total_capture_time_us / 1000.0, 3),
             "target_capture_latency_ms": 10.0,
-            "total_stop_time_ms": round(total_stop_time, 3),
+            "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3),
             "latency_report": latency_report.to_dict(),
+            "diagnostics": diagnostics,
         }
 
         raw_snap = RawRuntimeSnapshot(
@@ -490,11 +617,11 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             pid=pid,
             executable=exe_path,
             executable_build_id=build_id,
-            timestamp=obs_meta["capture_start"],
-            capture_duration_us=round(total_capture_time * 1000.0, 1),
+            timestamp=wall_clock_start,
+            capture_duration_us=round(total_capture_time_us, 1),
             thread_metadata=thread_metadata,
             memory_regions=raw_regions,
-            register_state={},
+            register_state={"status": "REGISTER_STATE_UNAVAILABLE"},
             captured_ranges=captured_ranges,
             raw_memory={"total_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions)},
             capture_backend=self.name,
@@ -533,8 +660,15 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
 
         sid = snapshot_id or "RS_{:06d}_{:04d}".format(pid, int(time.time() * 1000) % 10000)
         t_overall_start_ns = time.monotonic_ns()
-        suspended = False
+        wall_clock_start = datetime.now(timezone.utc).isoformat()
         should_suspend = (plan.mode != CaptureMode.ZERO_STOP.value)
+
+        state_history = ["INITIALIZED"]
+        capture_status = "COMPLETED"
+        stop_requested = False
+        stop_confirmed = False
+        resume_confirmed = False
+        diagnostics: List[Dict[str, Any]] = []
 
         exe_path = ""
         try:
@@ -544,16 +678,69 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         except Exception:
             pass
 
-        t_stop_start = time.monotonic_ns()
+        build_id = None
+        if exe_path and os.path.exists(exe_path):
+            try:
+                from .debug_image import inspect_elf
+                info = inspect_elf(exe_path)
+                build_id = info.build_id
+            except Exception:
+                pass
+
+        t_stop_requested = 0
+        t_stop_confirmed = 0
+        t_threads = 0
+        t_memory = 0
+        t_resume_requested = 0
+        t_resume_confirmed = 0
+
         try:
             if should_suspend:
+                state_history.append("STOP_REQUESTED")
+                stop_requested = True
+                t_stop_requested = time.monotonic_ns()
                 try:
                     os.kill(pid, signal.SIGSTOP)
-                    suspended = True
-                except Exception:
-                    pass
-            t_stopped = time.monotonic_ns()
+                    deadline_stop = t_stop_requested + int(policy.max_stop_time_ms * 1_000_000)
+                    while time.monotonic_ns() < deadline_stop:
+                        stat_path = f"/proc/{pid}/stat"
+                        if os.path.exists(stat_path):
+                            try:
+                                with open(stat_path, "r") as f:
+                                    content = f.read()
+                                    rparen = content.rfind(")")
+                                    if rparen != -1 and content[rparen + 1:].split()[0] in ("T", "t"):
+                                        stop_confirmed = True
+                                        break
+                            except Exception:
+                                pass
+                        try:
+                            os.sched_yield()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    diagnostics.append({
+                        "code": "STOP_SIGNAL_ERROR",
+                        "message": f"SIGSTOP failed: {exc}",
+                        "level": "ERROR"
+                    })
 
+                t_stop_confirmed = time.monotonic_ns()
+                if stop_confirmed:
+                    state_history.append("STOP_CONFIRMED")
+                else:
+                    state_history.append("STOP_UNCONFIRMED")
+                    capture_status = "STOP_UNCONFIRMED"
+                    diagnostics.append({
+                        "code": "STOP_UNCONFIRMED",
+                        "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms",
+                        "level": "WARNING"
+                    })
+            else:
+                t_stop_requested = time.monotonic_ns()
+                t_stop_confirmed = t_stop_requested
+
+            state_history.append("CAPTURING")
             thread_metadata = _read_thread_metadata(pid)
             t_threads = time.monotonic_ns()
 
@@ -594,56 +781,135 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                         pass
             t_memory = time.monotonic_ns()
         finally:
-            if suspended:
+            if stop_requested:
+                state_history.append("RESUME_REQUESTED")
+                t_resume_requested = time.monotonic_ns()
                 try:
                     os.kill(pid, signal.SIGCONT)
-                except Exception:
-                    pass
-            t_resumed = time.monotonic_ns()
+                    deadline_res = t_resume_requested + int(20 * 1_000_000)
+                    while time.monotonic_ns() < deadline_res:
+                        stat_path = f"/proc/{pid}/stat"
+                        if os.path.exists(stat_path):
+                            try:
+                                with open(stat_path, "r") as f:
+                                    content = f.read()
+                                    rparen = content.rfind(")")
+                                    if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
+                                        resume_confirmed = True
+                                        break
+                            except Exception:
+                                pass
+                        try:
+                            os.sched_yield()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    diagnostics.append({
+                        "code": "RESUME_SIGNAL_ERROR",
+                        "message": f"SIGCONT failed: {exc}",
+                        "level": "ERROR"
+                    })
+                t_resume_confirmed = time.monotonic_ns()
+                if resume_confirmed:
+                    state_history.append("RESUME_CONFIRMED")
+                else:
+                    state_history.append("RESUME_UNCONFIRMED")
+            else:
+                t_resume_requested = t_memory
+                t_resume_confirmed = t_memory
 
-        total_stop_time = (t_resumed - t_stopped) / 1_000_000.0 if should_suspend else 0.0
-        total_capture_time = (t_resumed - t_overall_start_ns) / 1_000_000.0
+        wall_clock_end = datetime.now(timezone.utc).isoformat()
+
+        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if should_suspend else 0.0
+        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
+        memory_latency_us = (t_memory - t_threads) / 1000.0
+        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if should_suspend else 0.0
+        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
+        total_capture_time_us = (t_resume_confirmed - t_overall_start_ns) / 1000.0
 
         latency_report = CaptureLatencyReport(
-            stop_latency_ms=(t_stopped - t_stop_start) / 1_000_000.0 if should_suspend else 0.0,
-            thread_metadata_latency_ms=(t_threads - t_stopped) / 1_000_000.0,
-            memory_capture_latency_ms=(t_memory - t_threads) / 1_000_000.0,
-            resume_latency_ms=(t_resumed - t_memory) / 1_000_000.0 if should_suspend else 0.0,
-            total_stop_time_ms=total_stop_time,
+            stop_latency_ms=stop_latency_us / 1000.0,
+            thread_metadata_latency_ms=thread_latency_us / 1000.0,
+            memory_capture_latency_ms=memory_latency_us / 1000.0,
+            resume_latency_ms=resume_latency_us / 1000.0,
+            total_stop_time_ms=total_stop_time_us / 1000.0,
             target_capture_latency_ms=10.0,
-            actual_capture_latency_ms=total_capture_time,
+            actual_capture_latency_ms=total_capture_time_us / 1000.0,
+            stop_latency_us=stop_latency_us,
+            thread_metadata_latency_us=thread_latency_us,
+            memory_capture_latency_us=memory_latency_us,
+            resume_latency_us=resume_latency_us,
+            total_stop_time_us=total_stop_time_us,
+            total_capture_latency_us=total_capture_time_us,
         )
+
+        obs_meta = {
+            "capture_backend": self.name,
+            "capture_mode": plan.mode,
+            "capture_status": capture_status,
+            "stop_state_machine": {
+                "states": state_history,
+                "stop_confirmed": stop_confirmed,
+                "resume_confirmed": resume_confirmed,
+                "current": state_history[-1],
+            },
+            "capture_start": wall_clock_start,
+            "capture_end": wall_clock_end,
+            "stop_requested": wall_clock_start,
+            "observation_point": observation_point,
+            "latency_report": latency_report.to_dict(),
+            "memory_maps": all_maps,
+            "diagnostics": diagnostics,
+        }
 
         provenance = {
             "capture_backend": self.name,
+            "capture_status": capture_status,
+            "snapshot_consistency": "PROCESS_STOPPED_MEMORY_SNAPSHOT",
+            "stop_state_machine": {
+                "states": state_history,
+                "stop_confirmed": stop_confirmed,
+                "resume_confirmed": resume_confirmed,
+            },
             "pid": pid,
-            "timestamp": datetime.fromtimestamp(t_overall_start_ns / 1e9, tz=timezone.utc).isoformat(),
-            "duration": total_capture_time,
+            "timestamp": wall_clock_start,
+            "capture_start": wall_clock_start,
+            "capture_end": wall_clock_end,
+            "stop_latency_us": stop_latency_us,
+            "memory_read_latency_us": memory_latency_us,
+            "capture_latency_us": memory_latency_us,
+            "resume_latency_us": resume_latency_us,
+            "total_capture_latency_us": total_capture_time_us,
+            "duration": total_capture_time_us / 1000.0,
             "thread_count": len(thread_metadata),
             "captured_region_count": len(raw_regions),
             "captured_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions),
             "observation_point": observation_point,
-            "executable_identity": {"path": exe_path},
-            "actual_capture_latency_ms": round(total_capture_time, 3),
+            "executable_identity": {
+                "path": exe_path,
+                "build_id": build_id
+            },
+            "actual_capture_latency_ms": round(total_capture_time_us / 1000.0, 3),
             "target_capture_latency_ms": 10.0,
-            "total_stop_time_ms": round(total_stop_time, 3),
+            "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3),
             "latency_report": latency_report.to_dict(),
+            "diagnostics": diagnostics,
         }
 
         return RawRuntimeSnapshot(
             snapshot_id=sid,
             pid=pid,
             executable=exe_path,
-            executable_build_id=None,
-            timestamp=provenance["timestamp"],
-            capture_duration_us=round(total_capture_time * 1000.0, 1),
+            executable_build_id=build_id,
+            timestamp=wall_clock_start,
+            capture_duration_us=round(total_capture_time_us, 1),
             thread_metadata=thread_metadata,
             memory_regions=raw_regions,
-            register_state={},
+            register_state={"status": "REGISTER_STATE_UNAVAILABLE"},
             captured_ranges=captured_ranges,
             raw_memory={"total_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions)},
             capture_backend=self.name,
-            observation_metadata={"latency_report": latency_report.to_dict(), "memory_maps": all_maps},
+            observation_metadata=obs_meta,
             completeness="COMPLETE",
             provenance=provenance,
             _buffers=buffers,
