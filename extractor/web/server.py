@@ -1248,6 +1248,10 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def do_HEAD(self) -> None:
+        """Handle HEAD requests by processing GET headers without error."""
+        self.do_GET()
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
