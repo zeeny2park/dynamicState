@@ -17,6 +17,7 @@ target/collector/dynamicstate-collector
 state.json
 tmp_*
 corpus/
+build/
 
 # Snapshot outputs (preserve directory with .gitkeep)
 snapshots/*.json

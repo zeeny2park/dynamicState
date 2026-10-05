@@ -399,12 +399,24 @@
   };
 
   // --------------------------------------------------------------------------
-  // API Helpers
+  // API Helpers (subpath & reverse-proxy aware)
   // --------------------------------------------------------------------------
+
+  const _rawPath = (window.location && window.location.pathname) ? window.location.pathname : '';
+  const _basePath = _rawPath.endsWith('/')
+    ? _rawPath.slice(0, -1)
+    : _rawPath.replace(/\/[^/]*$/, '');
+
+  function getApiUrl(endpoint) {
+    if (!endpoint.startsWith('/')) {
+      endpoint = '/' + endpoint;
+    }
+    return _basePath ? `${_basePath}${endpoint}` : endpoint;
+  }
 
   async function apiGet(endpoint) {
     try {
-      const res = await fetch(endpoint);
+      const res = await fetch(getApiUrl(endpoint));
       return await res.json();
     } catch (err) {
       console.error(`API GET ${endpoint} error:`, err);
@@ -414,7 +426,7 @@
 
   async function apiPost(endpoint, body = {}) {
     try {
-      const res = await fetch(endpoint, {
+      const res = await fetch(getApiUrl(endpoint), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
