@@ -1144,7 +1144,8 @@ class WebApiAdapter:
             plan = CapturePlanBuilder.build_object_plan(object_ids=params.get("target_objects"), timeout_ms=timeout_ms)
         else:
             plan = CapturePlanBuilder.build_full_plan(timeout_ms=timeout_ms)
-        res = self.runtime.fast_capture(pid=pid, plan=plan)
+        debug_image = params.get("debug_image")
+        res = self.runtime.fast_capture(pid=pid, plan=plan, debug_image=debug_image)
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
         return {"success": False, "error": {"code": res.error.code if res.error else "CAPTURE_FAILED",

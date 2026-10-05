@@ -270,6 +270,17 @@ def main():
                 except Exception as exc:
                     print(f"WARNING: Could not preload snapshot {args.snapshot}: {exc}", file=sys.stderr)
 
+        if args.pid:
+            try:
+                print(f"Pre-capturing running process PID {args.pid}...")
+                res = runtime.fast_capture(pid=args.pid, debug_image=args.debug_image)
+                if res.success:
+                    print(f"Successfully captured PID {args.pid}: snapshot {res.data.get('snapshot_id')}")
+                else:
+                    print(f"WARNING: Initial capture of PID {args.pid} failed: {res.error.message if res.error else 'Unknown error'}", file=sys.stderr)
+            except Exception as exc:
+                print(f"WARNING: Could not pre-capture PID {args.pid}: {exc}", file=sys.stderr)
+
         server = run_server(runtime=runtime, host=args.host, port=args.port)
         url = f"http://{args.host}:{args.port}"
         print("========================================")

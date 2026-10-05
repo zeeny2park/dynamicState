@@ -83,7 +83,7 @@ class StateCorpus:
         """
         snap_dict = snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
         s_hash = compute_state_hash(snap_dict)
-        snapshot_id = (snap_dict.get("snapshot") or {}).get("snapshot_id") or "S_UNKNOWN"
+        snapshot_id = snap_dict.get("snapshot_id") or (snap_dict.get("snapshot") or {}).get("snapshot_id") or "S_UNKNOWN"
 
         if s_hash in self.hash_to_state:
             state_id = self.hash_to_state[s_hash]
