@@ -1625,6 +1625,8 @@ class AgentRuntime:
             err_code = "INVESTIGATION_ERROR"
             if "Invalid PID" in err_msg or "out of valid range" in err_msg or "Conflicting target" in err_msg:
                 err_code = "INVALID_PARAM"
+            elif "exited during capture" in err_msg or ("ESRCH" in err_msg and "exited" in err_msg):
+                err_code = "TARGET_EXITED"
             elif "not found (ESRCH)" in err_msg:
                 err_code = "TARGET_NOT_FOUND"
             elif "Permission denied" in err_msg:

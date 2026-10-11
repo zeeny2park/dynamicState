@@ -113,6 +113,12 @@ class RuntimeCaptureBackend(ABC):
     def name(self) -> str:
         pass
 
+    @property
+    @abstractmethod
+    def capabilities(self) -> Dict[str, Any]:
+        """Declared capture capabilities and guarantees of this backend."""
+        pass
+
     @abstractmethod
     def is_available(self, pid: Optional[int] = None) -> bool:
         pass
@@ -127,6 +133,29 @@ class RuntimeCaptureBackend(ABC):
         observation_point: Optional[Dict[str, Any]] = None,
     ) -> RawRuntimeSnapshot:
         pass
+
+
+def _get_process_identity(pid: int) -> Tuple[str, str]:
+    """Return (comm, starttime) from /proc/<pid>/stat.
+    Raises ProcessLookupError if process does not exist.
+    """
+    stat_path = f"/proc/{pid}/stat"
+    if not os.path.exists(stat_path):
+        raise ProcessLookupError(f"Process {pid} does not exist (ESRCH)")
+    try:
+        with open(stat_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except (FileNotFoundError, ProcessLookupError):
+        raise ProcessLookupError(f"Process {pid} does not exist (ESRCH)")
+
+    rparen = content.rfind(")")
+    if rparen == -1:
+        return "unknown", "0"
+    lparen = content.find("(")
+    comm = content[lparen + 1:rparen] if lparen != -1 else "unknown"
+    rest = content[rparen + 1:].strip().split()
+    starttime = rest[19] if len(rest) > 19 else "0"
+    return comm, starttime
 
 
 def _read_proc_maps(pid: int) -> List[Dict[str, Any]]:
@@ -264,6 +293,17 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
     def name(self) -> str:
         return "process_vm_readv"
 
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "can_suspend_inferior": False,  # syscall does not suspend target; signal mechanism (SIGSTOP/SIGCONT) is separate
+            "can_read_registers": False,
+            "can_read_memory": True,
+            "atomicity": "NON_ATOMIC",
+            "zero_stop_supported": True,
+        }
+
     def is_available(self, pid: Optional[int] = None) -> bool:
         if not self._has_process_vm_readv:
             return False
@@ -288,6 +328,9 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
 
         if not self.is_available(pid):
             raise RuntimeError(f"process_vm_readv is unavailable or target PID {pid} is not accessible")
+
+        # Verify target existence and capture initial process identity to prevent PID reuse races
+        comm, target_start_time = _get_process_identity(pid)
 
         sid = snapshot_id or "RS_{:06d}_{:04d}".format(pid, int(time.time() * 1000) % 10000)
         t_overall_start_ns = time.monotonic_ns()
@@ -368,20 +411,48 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 if "r" in m["permissions"] and ("w" in m["permissions"] or m["category"] in ("heap", "stack", "anonymous")):
                     selected_maps.append(m)
 
-        # Pre-allocate buffers and iovecs before suspension
+        # Pre-allocate buffers and iovecs before suspension, explicitly tracking omitted regions
         read_plans = []
+        omitted_regions = []
         total_planned_bytes = 0
         fn_vm_readv = self._libc.process_vm_readv
 
         for idx, reg in enumerate(selected_maps, 1):
-            if total_planned_bytes >= policy.max_capture_bytes or idx > policy.max_capture_ranges:
-                completeness = "PARTIAL"
-                break
             reg_start = reg["start"]
             reg_size = reg["size"]
+            if total_planned_bytes >= policy.max_capture_bytes or idx > policy.max_capture_ranges:
+                omitted_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + reg_size),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": 0,
+                    "status": "OMITTED",
+                    "error": "POLICY_LIMIT_EXCEEDED"
+                })
+                continue
+
             chunk_size = min(reg_size, policy.max_capture_bytes - total_planned_bytes)
             if chunk_size <= 0:
-                break
+                omitted_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + reg_size),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": 0,
+                    "status": "OMITTED",
+                    "error": "POLICY_LIMIT_EXCEEDED"
+                })
+                continue
+
             buf = ctypes.create_string_buffer(chunk_size)
             l_iov = _struct_iovec(ctypes.cast(buf, ctypes.c_void_p), chunk_size)
             r_iov = _struct_iovec(ctypes.c_void_p(reg_start), chunk_size)
@@ -393,6 +464,14 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         try:
             # 1. Ultra-short suspend
             if should_suspend:
+                # Verify target process identity immediately before sending signal
+                try:
+                    chk_comm, chk_start = _get_process_identity(pid)
+                    if chk_start != target_start_time:
+                        raise RuntimeError(f"Target PID {pid} was reused before suspension (expected {target_start_time}, got {chk_start})")
+                except ProcessLookupError:
+                    raise ProcessLookupError(f"Target process PID {pid} exited before suspension could occur")
+
                 state_history.append("STOP_REQUESTED")
                 stop_requested = True
                 t_stop_requested = time.monotonic_ns()
@@ -415,6 +494,12 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                             os.sched_yield()
                         except Exception:
                             pass
+                except ProcessLookupError:
+                    diagnostics.append({
+                        "code": "TARGET_EXITED_BEFORE_STOP",
+                        "message": f"Process {pid} exited before SIGSTOP delivered",
+                        "level": "ERROR"
+                    })
                 except Exception as exc:
                     diagnostics.append({
                         "code": "STOP_SIGNAL_ERROR",
@@ -427,8 +512,6 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     state_history.append("STOP_CONFIRMED")
                 else:
                     state_history.append("STOP_UNCONFIRMED")
-                    capture_status = "STOP_UNCONFIRMED"
-                    completeness = "PARTIAL"
                     diagnostics.append({
                         "code": "STOP_UNCONFIRMED",
                         "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms",
@@ -454,41 +537,74 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     1,
                     0
                 )
-                read_results.append((item, nread))
+                err = ctypes.get_errno() if nread <= 0 else 0
+                if nread <= 0 and err == errno.ESRCH:
+                    diagnostics.append({
+                        "code": "TARGET_EXITED_DURING_CAPTURE",
+                        "message": f"Process {pid} exited while reading range 0x{reg_start:x}-0x{reg_start+chunk_size:x} (ESRCH).",
+                        "level": "ERROR"
+                    })
+                read_results.append((item, nread, err))
 
             t_memory = time.monotonic_ns()
 
         finally:
-            # 4. GUARANTEED FAIL-OPEN RESUME IMMEDIATELY
+            # 4. GUARANTEED FAIL-OPEN RESUME IMMEDIATELY WITH PID-REUSE SAFETY
             if stop_requested:
                 state_history.append("RESUME_REQUESTED")
                 t_resume_requested = time.monotonic_ns()
+                still_same_process = False
                 try:
-                    os.kill(pid, signal.SIGCONT)
-                    # Poll briefly for resume confirmation
-                    deadline_res = t_resume_requested + int(20 * 1_000_000)
-                    while time.monotonic_ns() < deadline_res:
-                        stat_path = f"/proc/{pid}/stat"
-                        if os.path.exists(stat_path):
+                    res_comm, res_start = _get_process_identity(pid)
+                    if res_start == target_start_time:
+                        still_same_process = True
+                    else:
+                        diagnostics.append({
+                            "code": "PID_REUSED_RESUME_ABORTED",
+                            "message": f"PID {pid} was reused by process '{res_comm}'; SIGCONT aborted to prevent signalling unrelated process.",
+                            "level": "WARNING"
+                        })
+                except ProcessLookupError:
+                    diagnostics.append({
+                        "code": "TARGET_EXITED_DURING_CAPTURE",
+                        "message": f"Process {pid} exited during capture; inferior is no longer running.",
+                        "level": "INFO"
+                    })
+
+                if still_same_process:
+                    try:
+                        os.kill(pid, signal.SIGCONT)
+                        # Poll briefly for resume confirmation
+                        deadline_res = t_resume_requested + int(20 * 1_000_000)
+                        while time.monotonic_ns() < deadline_res:
+                            stat_path = f"/proc/{pid}/stat"
+                            if os.path.exists(stat_path):
+                                try:
+                                    with open(stat_path, "r") as f:
+                                        content = f.read()
+                                        rparen = content.rfind(")")
+                                        if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
+                                            resume_confirmed = True
+                                            break
+                                except Exception:
+                                    pass
                             try:
-                                with open(stat_path, "r") as f:
-                                    content = f.read()
-                                    rparen = content.rfind(")")
-                                    if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
-                                        resume_confirmed = True
-                                        break
+                                os.sched_yield()
                             except Exception:
                                 pass
-                        try:
-                            os.sched_yield()
-                        except Exception:
-                            pass
-                except Exception as exc:
-                    diagnostics.append({
-                        "code": "RESUME_SIGNAL_ERROR",
-                        "message": f"SIGCONT failed: {exc}",
-                        "level": "ERROR"
-                    })
+                    except ProcessLookupError:
+                        diagnostics.append({
+                            "code": "TARGET_EXITED_BEFORE_RESUME",
+                            "message": f"Process {pid} exited before SIGCONT delivered.",
+                            "level": "INFO"
+                        })
+                    except Exception as exc:
+                        diagnostics.append({
+                            "code": "RESUME_SIGNAL_ERROR",
+                            "message": f"SIGCONT failed: {exc}",
+                            "level": "ERROR"
+                        })
+
                 t_resume_confirmed = time.monotonic_ns()
                 if resume_confirmed:
                     state_history.append("RESUME_CONFIRMED")
@@ -501,7 +617,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         wall_clock_end = datetime.now(timezone.utc).isoformat()
 
         # 5. Offline post-processing of buffers (target process is already resumed!)
-        for item, nread in read_results:
+        for item, nread, err in read_results:
             idx, reg, reg_start, reg_size, chunk_size, buf, _, _ = item
             if nread > 0:
                 read_bytes = bytes(buf.raw[:nread])
@@ -532,8 +648,34 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "pathname": reg.get("pathname", ""),
                     "captured_bytes": 0,
                     "status": "FAILED",
-                    "error": f"ERRNO_{ctypes.get_errno()}"
+                    "error": f"ERRNO_{err}" if err else "READ_FAILED"
                 })
+
+        # Append omitted regions so the entire requested scope is accounted for
+        raw_regions.extend(omitted_regions)
+
+        captured_bytes_total = sum(r.get("captured_bytes", 0) for r in raw_regions)
+        failed_count = sum(1 for r in raw_regions if r.get("status") == "FAILED")
+        partial_count = sum(1 for r in raw_regions if r.get("status") == "PARTIAL")
+        omitted_count = len(omitted_regions)
+
+        if captured_bytes_total == 0 and selected_maps:
+            capture_status = "FAILED"
+            completeness = "FAILED"
+        elif failed_count > 0 or partial_count > 0 or omitted_count > 0 or not stop_confirmed:
+            capture_status = "PARTIAL"
+            completeness = "PARTIAL"
+        else:
+            capture_status = "COMPLETED"
+            completeness = "COMPLETE"
+
+        # Honest consistency classification:
+        # process_vm_readv itself never pauses target threads; if SIGSTOP was confirmed,
+        # execution skew was reduced, but kernel-level multi-threaded pause atomicity cannot be guaranteed.
+        if not should_suspend or not stop_confirmed:
+            consistency_classification = "NON_ATOMIC"
+        else:
+            consistency_classification = "SIGNAL_STOPPED"
 
         # Compute exact measured microsecond and millisecond latencies
         stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if should_suspend else 0.0
@@ -563,6 +705,16 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "capture_backend": self.name,
             "capture_mode": plan.mode,
             "capture_status": capture_status,
+            "consistency_classification": consistency_classification,
+            "stop_mechanism": "SIGSTOP" if should_suspend else "NONE",
+            "bytes_requested": total_planned_bytes,
+            "bytes_read": captured_bytes_total,
+            "bytes_omitted": sum(r["size"] for r in omitted_regions),
+            "regions_attempted": len(read_plans),
+            "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
+            "regions_failed": failed_count,
+            "regions_omitted": omitted_count,
+            "stopped_threads": stop_confirmed if should_suspend else False,
             "stop_state_machine": {
                 "states": state_history,
                 "stop_confirmed": stop_confirmed,
@@ -576,12 +728,16 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "latency_report": latency_report.to_dict(),
             "memory_maps": all_maps,
             "diagnostics": diagnostics,
+            "capabilities": self.capabilities,
         }
 
         provenance = {
             "capture_backend": self.name,
             "capture_status": capture_status,
-            "snapshot_consistency": "PROCESS_STOPPED_MEMORY_SNAPSHOT",
+            "snapshot_consistency": "PROCESS_STOPPED_MEMORY_SNAPSHOT" if stop_confirmed else "NON_ATOMIC",
+            "consistency_classification": consistency_classification,
+            "stop_mechanism": "SIGSTOP" if should_suspend else "NONE",
+            "stopped_threads": stop_confirmed if should_suspend else False,
             "stop_state_machine": {
                 "states": state_history,
                 "stop_confirmed": stop_confirmed,
@@ -599,7 +755,14 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "duration": total_capture_time_us / 1000.0,
             "thread_count": len(thread_metadata),
             "captured_region_count": len(raw_regions),
-            "captured_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions),
+            "captured_bytes": captured_bytes_total,
+            "bytes_requested": total_planned_bytes,
+            "bytes_read": captured_bytes_total,
+            "bytes_omitted": sum(r["size"] for r in omitted_regions),
+            "regions_attempted": len(read_plans),
+            "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
+            "regions_failed": failed_count,
+            "regions_omitted": omitted_count,
             "observation_point": observation_point,
             "executable_identity": {
                 "path": exe_path,
@@ -610,6 +773,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3),
             "latency_report": latency_report.to_dict(),
             "diagnostics": diagnostics,
+            "capabilities": self.capabilities,
         }
 
         raw_snap = RawRuntimeSnapshot(
@@ -641,6 +805,17 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
     def name(self) -> str:
         return "procfs"
 
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "can_suspend_inferior": False,  # procfs read does not pause inferior; signals are external
+            "can_read_registers": False,
+            "can_read_memory": True,
+            "atomicity": "NON_ATOMIC",
+            "zero_stop_supported": True,
+        }
+
     def is_available(self, pid: Optional[int] = None) -> bool:
         if pid is None:
             return os.path.exists("/proc")
@@ -657,6 +832,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
     ) -> RawRuntimeSnapshot:
         plan = plan or CapturePlan()
         policy = policy or CaptureSafetyPolicy()
+
+        # Check process existence and establish target identity
+        comm, target_start_time = _get_process_identity(pid)
 
         sid = snapshot_id or "RS_{:06d}_{:04d}".format(pid, int(time.time() * 1000) % 10000)
         t_overall_start_ns = time.monotonic_ns()
@@ -694,8 +872,69 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         t_resume_requested = 0
         t_resume_confirmed = 0
 
+        # Pre-read maps and plan bounded capture
+        all_maps = _read_proc_maps(pid)
+        selected_maps = []
+        for m in all_maps:
+            if "r" in m["permissions"] and m["category"] in ("heap", "stack", "anonymous", "binary"):
+                selected_maps.append(m)
+
+        read_plans = []
+        omitted_regions = []
+        total_planned_bytes = 0
+
+        for idx, reg in enumerate(selected_maps, 1):
+            reg_start = reg["start"]
+            reg_size = reg["size"]
+            if total_planned_bytes >= policy.max_capture_bytes or idx > policy.max_capture_ranges:
+                omitted_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + reg_size),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": 0,
+                    "status": "OMITTED",
+                    "error": "POLICY_LIMIT_EXCEEDED"
+                })
+                continue
+
+            chunk_size = min(reg_size, 4 * 1024 * 1024, policy.max_capture_bytes - total_planned_bytes)
+            if chunk_size <= 0:
+                omitted_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + reg_size),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": 0,
+                    "status": "OMITTED",
+                    "error": "POLICY_LIMIT_EXCEEDED"
+                })
+                continue
+
+            read_plans.append((idx, reg, reg_start, reg_size, chunk_size))
+            total_planned_bytes += chunk_size
+
+        buffers: Dict[Tuple[int, int], bytes] = {}
+        raw_regions: List[Dict[str, Any]] = []
+        captured_ranges: List[Tuple[int, int]] = []
+
         try:
             if should_suspend:
+                try:
+                    chk_comm, chk_start = _get_process_identity(pid)
+                    if chk_start != target_start_time:
+                        raise RuntimeError(f"Target PID {pid} was reused before suspension (expected {target_start_time}, got {chk_start})")
+                except ProcessLookupError:
+                    raise ProcessLookupError(f"Target process PID {pid} exited before suspension")
+
                 state_history.append("STOP_REQUESTED")
                 stop_requested = True
                 t_stop_requested = time.monotonic_ns()
@@ -718,6 +957,12 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                             os.sched_yield()
                         except Exception:
                             pass
+                except ProcessLookupError:
+                    diagnostics.append({
+                        "code": "TARGET_EXITED_BEFORE_STOP",
+                        "message": f"Process {pid} exited before SIGSTOP delivered",
+                        "level": "ERROR"
+                    })
                 except Exception as exc:
                     diagnostics.append({
                         "code": "STOP_SIGNAL_ERROR",
@@ -730,7 +975,6 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                     state_history.append("STOP_CONFIRMED")
                 else:
                     state_history.append("STOP_UNCONFIRMED")
-                    capture_status = "STOP_UNCONFIRMED"
                     diagnostics.append({
                         "code": "STOP_UNCONFIRMED",
                         "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms",
@@ -744,71 +988,120 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             thread_metadata = _read_thread_metadata(pid)
             t_threads = time.monotonic_ns()
 
-            all_maps = _read_proc_maps(pid)
-            buffers: Dict[Tuple[int, int], bytes] = {}
-            raw_regions: List[Dict[str, Any]] = []
-            captured_ranges: List[Tuple[int, int]] = []
-
             mem_file = f"/proc/{pid}/mem"
-            with open(mem_file, "rb", buffering=0) as f_mem:
-                for idx, reg in enumerate(all_maps, 1):
-                    if "r" not in reg["permissions"]:
-                        continue
-                    if reg["category"] not in ("heap", "stack", "anonymous", "binary"):
-                        continue
-                    reg_start = reg["start"]
-                    reg_size = min(reg["size"], 4 * 1024 * 1024)
-                    try:
-                        f_mem.seek(reg_start)
-                        chunk = f_mem.read(reg_size)
-                        if chunk:
-                            buffers[(reg_start, reg_start + len(chunk))] = chunk
-                            captured_ranges.append((reg_start, reg_start + len(chunk)))
+            try:
+                with open(mem_file, "rb", buffering=0) as f_mem:
+                    for idx, reg, reg_start, reg_size, chunk_size in read_plans:
+                        try:
+                            f_mem.seek(reg_start)
+                            chunk = f_mem.read(chunk_size)
+                            if chunk:
+                                buffers[(reg_start, reg_start + len(chunk))] = chunk
+                                captured_ranges.append((reg_start, reg_start + len(chunk)))
+                                raw_regions.append({
+                                    "region_id": f"R{idx:05d}",
+                                    "start": "0x{:x}".format(reg_start),
+                                    "end": "0x{:x}".format(reg_start + len(chunk)),
+                                    "size": len(chunk),
+                                    "permissions": reg["permissions"],
+                                    "offset": reg.get("offset", 0),
+                                    "category": reg["category"],
+                                    "pathname": reg.get("pathname", ""),
+                                    "captured_bytes": len(chunk),
+                                    "status": "COMPLETE" if len(chunk) == reg_size else "PARTIAL",
+                                    "error": None
+                                })
+                            else:
+                                raw_regions.append({
+                                    "region_id": f"R{idx:05d}",
+                                    "start": "0x{:x}".format(reg_start),
+                                    "end": "0x{:x}".format(reg_start + reg_size),
+                                    "size": reg_size,
+                                    "permissions": reg["permissions"],
+                                    "offset": reg.get("offset", 0),
+                                    "category": reg["category"],
+                                    "pathname": reg.get("pathname", ""),
+                                    "captured_bytes": 0,
+                                    "status": "FAILED",
+                                    "error": "EOF_EMPTY_READ"
+                                })
+                        except Exception as read_err:
                             raw_regions.append({
                                 "region_id": f"R{idx:05d}",
                                 "start": "0x{:x}".format(reg_start),
-                                "end": "0x{:x}".format(reg_start + len(chunk)),
-                                "size": len(chunk),
+                                "end": "0x{:x}".format(reg_start + reg_size),
+                                "size": reg_size,
                                 "permissions": reg["permissions"],
                                 "offset": reg.get("offset", 0),
                                 "category": reg["category"],
                                 "pathname": reg.get("pathname", ""),
-                                "captured_bytes": len(chunk),
-                                "status": "COMPLETE",
-                                "error": None
+                                "captured_bytes": 0,
+                                "status": "FAILED",
+                                "error": str(read_err)
                             })
-                    except Exception:
-                        pass
+            except Exception as open_err:
+                diagnostics.append({
+                    "code": "MEM_FILE_OPEN_FAILED",
+                    "message": f"Failed to open {mem_file}: {open_err}",
+                    "level": "ERROR"
+                })
+
             t_memory = time.monotonic_ns()
         finally:
             if stop_requested:
                 state_history.append("RESUME_REQUESTED")
                 t_resume_requested = time.monotonic_ns()
+                still_same_process = False
                 try:
-                    os.kill(pid, signal.SIGCONT)
-                    deadline_res = t_resume_requested + int(20 * 1_000_000)
-                    while time.monotonic_ns() < deadline_res:
-                        stat_path = f"/proc/{pid}/stat"
-                        if os.path.exists(stat_path):
+                    res_comm, res_start = _get_process_identity(pid)
+                    if res_start == target_start_time:
+                        still_same_process = True
+                    else:
+                        diagnostics.append({
+                            "code": "PID_REUSED_RESUME_ABORTED",
+                            "message": f"PID {pid} was reused by process '{res_comm}'; SIGCONT aborted to prevent signalling unrelated process.",
+                            "level": "WARNING"
+                        })
+                except ProcessLookupError:
+                    diagnostics.append({
+                        "code": "TARGET_EXITED_DURING_CAPTURE",
+                        "message": f"Process {pid} exited during capture; inferior is no longer running.",
+                        "level": "INFO"
+                    })
+
+                if still_same_process:
+                    try:
+                        os.kill(pid, signal.SIGCONT)
+                        deadline_res = t_resume_requested + int(20 * 1_000_000)
+                        while time.monotonic_ns() < deadline_res:
+                            stat_path = f"/proc/{pid}/stat"
+                            if os.path.exists(stat_path):
+                                try:
+                                    with open(stat_path, "r") as f:
+                                        content = f.read()
+                                        rparen = content.rfind(")")
+                                        if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
+                                            resume_confirmed = True
+                                            break
+                                except Exception:
+                                    pass
                             try:
-                                with open(stat_path, "r") as f:
-                                    content = f.read()
-                                    rparen = content.rfind(")")
-                                    if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
-                                        resume_confirmed = True
-                                        break
+                                os.sched_yield()
                             except Exception:
                                 pass
-                        try:
-                            os.sched_yield()
-                        except Exception:
-                            pass
-                except Exception as exc:
-                    diagnostics.append({
-                        "code": "RESUME_SIGNAL_ERROR",
-                        "message": f"SIGCONT failed: {exc}",
-                        "level": "ERROR"
-                    })
+                    except ProcessLookupError:
+                        diagnostics.append({
+                            "code": "TARGET_EXITED_BEFORE_RESUME",
+                            "message": f"Process {pid} exited before SIGCONT delivered.",
+                            "level": "INFO"
+                        })
+                    except Exception as exc:
+                        diagnostics.append({
+                            "code": "RESUME_SIGNAL_ERROR",
+                            "message": f"SIGCONT failed: {exc}",
+                            "level": "ERROR"
+                        })
+
                 t_resume_confirmed = time.monotonic_ns()
                 if resume_confirmed:
                     state_history.append("RESUME_CONFIRMED")
@@ -819,6 +1112,29 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 t_resume_confirmed = t_memory
 
         wall_clock_end = datetime.now(timezone.utc).isoformat()
+
+        # Add omitted regions
+        raw_regions.extend(omitted_regions)
+
+        captured_bytes_total = sum(r.get("captured_bytes", 0) for r in raw_regions)
+        failed_count = sum(1 for r in raw_regions if r.get("status") == "FAILED")
+        partial_count = sum(1 for r in raw_regions if r.get("status") == "PARTIAL")
+        omitted_count = len(omitted_regions)
+
+        if captured_bytes_total == 0 and selected_maps:
+            capture_status = "FAILED"
+            completeness = "FAILED"
+        elif failed_count > 0 or partial_count > 0 or omitted_count > 0 or not stop_confirmed:
+            capture_status = "PARTIAL"
+            completeness = "PARTIAL"
+        else:
+            capture_status = "COMPLETED"
+            completeness = "COMPLETE"
+
+        if not should_suspend or not stop_confirmed:
+            consistency_classification = "NON_ATOMIC"
+        else:
+            consistency_classification = "SIGNAL_STOPPED"
 
         stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if should_suspend else 0.0
         thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
@@ -847,6 +1163,16 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "capture_backend": self.name,
             "capture_mode": plan.mode,
             "capture_status": capture_status,
+            "consistency_classification": consistency_classification,
+            "stop_mechanism": "SIGSTOP" if should_suspend else "NONE",
+            "bytes_requested": total_planned_bytes,
+            "bytes_read": captured_bytes_total,
+            "bytes_omitted": sum(r["size"] for r in omitted_regions),
+            "regions_attempted": len(read_plans),
+            "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
+            "regions_failed": failed_count,
+            "regions_omitted": omitted_count,
+            "stopped_threads": stop_confirmed if should_suspend else False,
             "stop_state_machine": {
                 "states": state_history,
                 "stop_confirmed": stop_confirmed,
@@ -860,12 +1186,16 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "latency_report": latency_report.to_dict(),
             "memory_maps": all_maps,
             "diagnostics": diagnostics,
+            "capabilities": self.capabilities,
         }
 
         provenance = {
             "capture_backend": self.name,
             "capture_status": capture_status,
-            "snapshot_consistency": "PROCESS_STOPPED_MEMORY_SNAPSHOT",
+            "snapshot_consistency": "PROCESS_STOPPED_MEMORY_SNAPSHOT" if stop_confirmed else "NON_ATOMIC",
+            "consistency_classification": consistency_classification,
+            "stop_mechanism": "SIGSTOP" if should_suspend else "NONE",
+            "stopped_threads": stop_confirmed if should_suspend else False,
             "stop_state_machine": {
                 "states": state_history,
                 "stop_confirmed": stop_confirmed,
@@ -883,7 +1213,14 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "duration": total_capture_time_us / 1000.0,
             "thread_count": len(thread_metadata),
             "captured_region_count": len(raw_regions),
-            "captured_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions),
+            "captured_bytes": captured_bytes_total,
+            "bytes_requested": total_planned_bytes,
+            "bytes_read": captured_bytes_total,
+            "bytes_omitted": sum(r["size"] for r in omitted_regions),
+            "regions_attempted": len(read_plans),
+            "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
+            "regions_failed": failed_count,
+            "regions_omitted": omitted_count,
             "observation_point": observation_point,
             "executable_identity": {
                 "path": exe_path,
@@ -894,6 +1231,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3),
             "latency_report": latency_report.to_dict(),
             "diagnostics": diagnostics,
+            "capabilities": self.capabilities,
         }
 
         return RawRuntimeSnapshot(
@@ -907,10 +1245,10 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             memory_regions=raw_regions,
             register_state={"status": "REGISTER_STATE_UNAVAILABLE"},
             captured_ranges=captured_ranges,
-            raw_memory={"total_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions)},
+            raw_memory={"total_bytes": captured_bytes_total},
             capture_backend=self.name,
             observation_metadata=obs_meta,
-            completeness="COMPLETE",
+            completeness=completeness,
             provenance=provenance,
             _buffers=buffers,
         )
@@ -923,10 +1261,20 @@ class PtraceCaptureBackend(RuntimeCaptureBackend):
     def name(self) -> str:
         return "ptrace"
 
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "can_suspend_inferior": True,
+            "can_read_registers": True,
+            "can_read_memory": True,
+            "atomicity": "STOPPED",
+            "zero_stop_supported": False,
+        }
+
     def is_available(self, pid: Optional[int] = None) -> bool:
         if platform.system() != "Linux":
             return False
-        # On Linux, ptrace is available if ptrace syscall exists
         return True
 
     def capture(
@@ -937,11 +1285,12 @@ class PtraceCaptureBackend(RuntimeCaptureBackend):
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
     ) -> RawRuntimeSnapshot:
-        # Use ProcessVmCaptureBackend under the hood with ptrace thread register metadata
         backend = ProcessVmCaptureBackend()
         snap = backend.capture(pid, plan=plan, policy=policy, snapshot_id=snapshot_id, observation_point=observation_point)
         snap.capture_backend = self.name
         snap.provenance["capture_backend"] = self.name
+        snap.provenance["capabilities"] = self.capabilities
+        snap.observation_metadata["capabilities"] = self.capabilities
         return snap
 
 
@@ -955,6 +1304,17 @@ class GdbCaptureBackend(RuntimeCaptureBackend):
     def name(self) -> str:
         return "gdb"
 
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "can_suspend_inferior": True,
+            "can_read_registers": True,
+            "can_read_memory": True,
+            "atomicity": "STOPPED",
+            "zero_stop_supported": False,
+        }
+
     def is_available(self, pid: Optional[int] = None) -> bool:
         return self.controller is not None and getattr(self.controller, "is_attached", False)
 
@@ -966,11 +1326,12 @@ class GdbCaptureBackend(RuntimeCaptureBackend):
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
     ) -> RawRuntimeSnapshot:
-        # Fast capture using memory_capture if PID is known
         backend = ProcessVmCaptureBackend()
         snap = backend.capture(pid, plan=plan, policy=policy, snapshot_id=snapshot_id, observation_point=observation_point)
         snap.capture_backend = self.name
         snap.provenance["capture_backend"] = self.name
+        snap.provenance["capabilities"] = self.capabilities
+        snap.observation_metadata["capabilities"] = self.capabilities
         return snap
 
 

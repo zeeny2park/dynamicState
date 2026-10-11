@@ -60,7 +60,12 @@
     invBadgeConsistency: document.getElementById('inv-badge-consistency'),
     invConsistencyWarning: document.getElementById('inv-consistency-warning'),
     invTxtConsistency: document.getElementById('inv-txt-consistency'),
+    invTxtBackend: document.getElementById('inv-txt-backend'),
+    invTxtStopMech: document.getElementById('inv-txt-stop-mech'),
     invTxtDuration: document.getElementById('inv-txt-duration'),
+    invTxtBytes: document.getElementById('inv-txt-bytes'),
+    invTxtRegions: document.getElementById('inv-txt-regions'),
+    invTxtReadStatus: document.getElementById('inv-txt-read-status'),
     invTxtPartialReads: document.getElementById('inv-txt-partial-reads'),
     invTxtFailedReads: document.getElementById('inv-txt-failed-reads'),
     invLimitationsContainer: document.getElementById('inv-limitations-container'),
@@ -3937,15 +3942,14 @@
         showToast('Please specify a target PID for live capture.', 'warning');
         return;
       }
-      // Extract numeric PID: accept e.g. "2048", "PID 2048", "PID: 2048"
-      const match = rawPid.match(/\b\d+\b/);
-      if (!match) {
-        showToast(`Invalid PID format: "${rawPid}". Please enter a numeric PID.`, 'error');
+      // Strictly require a complete decimal integer without signs, letters, or decimals
+      if (!/^\d+$/.test(rawPid)) {
+        showToast(`Invalid PID format: "${rawPid}". Please enter a positive decimal integer without signs or letters.`, 'error');
         return;
       }
-      pid = parseInt(match[0], 10);
-      if (isNaN(pid) || pid <= 0 || pid > 2147483647) {
-        showToast(`PID ${pid} is out of valid range.`, 'error');
+      pid = parseInt(rawPid, 10);
+      if (isNaN(pid) || pid <= 0 || pid > 2147483647 || String(pid) !== rawPid) {
+        showToast(`PID ${rawPid} is out of valid range (1 - 2147483647).`, 'error');
         return;
       }
       debugImage = (el.invInputLiveDebugImage && el.invInputLiveDebugImage.value.trim()) || undefined;
@@ -4282,13 +4286,38 @@
     if (el.invTxtConsistency) el.invTxtConsistency.textContent = consLevel;
     if (el.invBadgeConsistency) {
       el.invBadgeConsistency.textContent = consLevel;
-      el.invBadgeConsistency.className = `badge ${consLevel === 'STOPPED' || consLevel === 'ATOMIC' ? 'badge-success' : (consLevel === 'NON_ATOMIC' ? 'badge-warning' : '')}`;
+      el.invBadgeConsistency.className = `badge ${consLevel === 'STOPPED' || consLevel === 'SIGNAL_STOPPED' || consLevel === 'ATOMIC' ? 'badge-success' : (consLevel === 'NON_ATOMIC' ? 'badge-warning' : '')}`;
     }
     if (el.invConsistencyWarning) {
       el.invConsistencyWarning.style.display = consLevel === 'NON_ATOMIC' ? 'block' : 'none';
     }
+    const backendName = idInfo.capture_backend || inv.target_ref?.capture_backend || 'offline';
+    const fallbackNotice = inv.target_ref?.backend_fallback ? ' (fallback)' : '';
+    if (el.invTxtBackend) el.invTxtBackend.textContent = `${backendName}${fallbackNotice}`;
+    if (el.invTxtStopMech) {
+      const stopMech = qInfo.stop_mechanism || 'NONE';
+      const stopStatus = qInfo.stopped_threads ? ' (confirmed)' : (stopMech !== 'NONE' ? ' (unconfirmed)' : '');
+      el.invTxtStopMech.textContent = `${stopMech}${stopStatus}`;
+    }
     if (el.invTxtDuration) {
       el.invTxtDuration.textContent = qInfo.duration_us ? `${(qInfo.duration_us / 1000).toFixed(2)} ms` : 'N/A';
+    }
+    if (el.invTxtBytes) {
+      const bCap = qInfo.bytes_captured ?? 0;
+      const bReq = qInfo.bytes_requested ?? bCap;
+      const bOmit = qInfo.bytes_omitted ? ` (${qInfo.bytes_omitted}B omitted)` : '';
+      el.invTxtBytes.textContent = `${bCap}B / ${bReq}B${bOmit}`;
+    }
+    if (el.invTxtRegions) {
+      const rRead = qInfo.regions_read ?? 0;
+      const rAtt = qInfo.regions_attempted ?? 0;
+      el.invTxtRegions.textContent = `${rRead} / ${rAtt}`;
+    }
+    if (el.invTxtReadStatus) {
+      const pReads = qInfo.partial_reads || 0;
+      const fReads = qInfo.failed_reads || 0;
+      const oRegions = qInfo.omitted_regions_count || 0;
+      el.invTxtReadStatus.textContent = `${pReads} / ${fReads} / ${oRegions}`;
     }
     if (el.invTxtPartialReads) el.invTxtPartialReads.textContent = String(qInfo.partial_reads || 0);
     if (el.invTxtFailedReads) el.invTxtFailedReads.textContent = String(qInfo.failed_reads || 0);
@@ -4524,12 +4553,20 @@
 
   function renderStaticLinks(staticDetails) {
     if (!el.invStaticLinksList) return;
+    const lStatus = staticDetails.linkage_status || 'UNKNOWN';
     if (el.invBadgeStaticProvider) {
-      el.invBadgeStaticProvider.textContent = staticDetails.provider || 'DWARF';
+      el.invBadgeStaticProvider.textContent = `${staticDetails.provider || 'DWARF'} (${lStatus})`;
+      el.invBadgeStaticProvider.className = `badge ${lStatus === 'VERIFIED' ? 'badge-success' : (lStatus === 'MISMATCH' ? 'badge-danger' : 'badge-warning')}`;
     }
     const resolved = staticDetails.resolved_links || [];
+    let noticeHtml = '';
+    if (lStatus === 'UNVERIFIED' || lStatus === 'MISMATCH' || lStatus === 'UNAVAILABLE') {
+      const msg = staticDetails.reason || (lStatus === 'MISMATCH' ? 'Build ID mismatch prevents verified static code correlation.' : 'Module build ID unverified or debug image unavailable.');
+      noticeHtml = `<div class="banner banner-warning text-xs mb-2" style="padding: 6px 10px;"><strong>Static Linkage ${escapeHtml(lStatus)}:</strong> ${escapeHtml(msg)}</div>`;
+    }
+
     if (!resolved || resolved.length === 0) {
-      el.invStaticLinksList.innerHTML = '<div class="empty-state text-xs p-3">No static links resolved. Check debug artifact path and symbol tables.</div>';
+      el.invStaticLinksList.innerHTML = `${noticeHtml}<div class="empty-state text-xs p-3">No static links resolved. Check debug artifact path and symbol tables.</div>`;
       return;
     }
 

@@ -233,21 +233,36 @@ class InvestigationManager:
         # Target parameter validation and live PID processing
         parsed_pid = None
         if pid is not None:
-            try:
-                if isinstance(pid, str):
-                    pid_str = pid.strip()
-                    m = re.search(r'\b\d+\b', pid_str)
-                    if not m:
-                        raise ValueError(f"No numeric PID found in '{pid}'")
-                    parsed_pid = int(m.group(0))
-                else:
-                    parsed_pid = int(pid)
-            except (ValueError, TypeError):
+            if isinstance(pid, bool):
                 session.status = "FAILED"
                 session.stages["target_identity"] = {
                     "status": "FAILED",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "details": {"error": f"Invalid PID format: '{pid}'. Target PID must be an integer."},
+                    "details": {"error": f"Invalid PID format: boolean {pid}. Target PID must be an integer."},
+                }
+                session.summary["error"] = f"Invalid PID format: boolean {pid}"
+                return session.to_dict()
+
+            if isinstance(pid, int):
+                parsed_pid = pid
+            elif isinstance(pid, str):
+                pid_str = pid.strip()
+                if not pid_str.isdigit():
+                    session.status = "FAILED"
+                    session.stages["target_identity"] = {
+                        "status": "FAILED",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "details": {"error": f"Invalid PID format: '{pid}'. Target PID must be a decimal integer without signs, decimals, or characters."},
+                    }
+                    session.summary["error"] = f"Invalid PID format: '{pid}'"
+                    return session.to_dict()
+                parsed_pid = int(pid_str)
+            else:
+                session.status = "FAILED"
+                session.stages["target_identity"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"Invalid PID format: {pid}. Target PID must be an integer."},
                 }
                 session.summary["error"] = f"Invalid PID format: '{pid}'"
                 return session.to_dict()
@@ -257,7 +272,7 @@ class InvestigationManager:
                 session.stages["target_identity"] = {
                     "status": "FAILED",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "details": {"error": f"PID {parsed_pid} is out of valid range."},
+                    "details": {"error": f"PID {parsed_pid} is out of valid range (1 - 2147483647)."},
                 }
                 session.summary["error"] = f"PID {parsed_pid} is out of valid range"
                 return session.to_dict()
@@ -294,7 +309,7 @@ class InvestigationManager:
                 session.summary["error"] = "Target authorization required for live process capture"
                 return session.to_dict()
 
-            # Target is authorized: verify process existence
+            # Target is authorized: verify process existence before capture
             try:
                 os.kill(parsed_pid, 0)
             except ProcessLookupError:
@@ -316,27 +331,59 @@ class InvestigationManager:
                 session.summary["error"] = f"Permission denied accessing PID {parsed_pid} (EPERM)"
                 return session.to_dict()
 
-            # Perform live capture
+            # Select capture backend without silent fallback
+            from .capture_backend import ProcessVmCaptureBackend, ProcfsCaptureBackend
+            vm_backend = ProcessVmCaptureBackend()
+            proc_backend = ProcfsCaptureBackend()
+            selected_backend = None
+            fallback_reason = None
+
+            if vm_backend.is_available(parsed_pid):
+                selected_backend = vm_backend
+            elif proc_backend.is_available(parsed_pid):
+                selected_backend = proc_backend
+                fallback_reason = "process_vm_readv is unavailable or restricted; fell back to procfs (/proc/<pid>/mem)."
+            else:
+                session.status = "FAILED"
+                session.stages["capture_quality"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"No usable capture backend available for PID {parsed_pid} (both process_vm_readv and /proc/{parsed_pid}/mem inaccessible)."},
+                }
+                session.summary["error"] = f"No usable capture backend available for PID {parsed_pid}"
+                return session.to_dict()
+
+            session.target_ref["capture_backend"] = selected_backend.name
+            session.target_ref["backend_fallback"] = bool(fallback_reason)
+            session.target_ref["fallback_reason"] = fallback_reason
+            session.target_ref["backend_capabilities"] = selected_backend.capabilities
+
             try:
-                from .capture_backend import ProcessVmCaptureBackend, ProcfsCaptureBackend
-                backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(parsed_pid) else ProcfsCaptureBackend()
-                if not backend.is_available(parsed_pid):
+                live_snap = selected_backend.capture(pid=parsed_pid)
+                if live_snap.bytes_captured == 0:
                     session.status = "FAILED"
                     session.stages["capture_quality"] = {
                         "status": "FAILED",
                         "completed_at": datetime.now(timezone.utc).isoformat(),
-                        "details": {"error": f"Live capture backend is unavailable for PID {parsed_pid}."},
+                        "details": {"error": f"Live memory capture yielded 0 bytes for PID {parsed_pid}."},
                     }
-                    session.summary["error"] = f"Live capture backend unavailable for PID {parsed_pid}"
+                    session.summary["error"] = f"Live memory capture failed: 0 bytes read for PID {parsed_pid}"
                     return session.to_dict()
 
-                live_snap = backend.capture(pid=parsed_pid)
                 snap_dir = os.path.join(self.corpus_dir, "memory_snapshots", f"live_pid_{parsed_pid}_{uuid.uuid4().hex[:6]}")
                 live_snap.save(snap_dir)
                 session.target_ref["memory_snapshot_path"] = snap_dir
                 session.target_ref["live_capture"] = True
                 session.target_ref["capture_source"] = "LIVE_PROCESS"
-                session.target_ref["capture_backend"] = getattr(backend, "name", "process_vm_readv")
+            except ProcessLookupError as proc_err:
+                session.status = "FAILED"
+                session.stages["capture_quality"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"Target process PID {parsed_pid} exited during capture (ESRCH): {proc_err}."},
+                }
+                session.summary["error"] = f"Target process exited during capture (ESRCH)"
+                return session.to_dict()
             except Exception as cap_exc:
                 session.status = "FAILED"
                 session.stages["capture_quality"] = {
@@ -372,16 +419,8 @@ class InvestigationManager:
             # Stage 5: Synthesis & Next Steps
             self._execute_stage_synthesis(session)
 
-            # Set overall status
-            failed_stages = [k for k, v in session.stages.items() if v["status"] == "FAILED"]
-            partial_stages = [k for k, v in session.stages.items() if v["status"] == "PARTIAL"]
-            if failed_stages:
-                session.status = "FAILED" if len(failed_stages) >= 2 else "PARTIAL"
-            elif partial_stages:
-                session.status = "PARTIAL"
-            else:
-                session.status = "COMPLETED"
-            session.summary["status"] = session.status
+            # Preserve honest overall status synthesized by pipeline
+            session.status = session.summary.get("status", session.status)
 
         except Exception as exc:
             session.status = "FAILED"
@@ -841,14 +880,31 @@ class InvestigationManager:
                 raw_snap = RawRuntimeSnapshot.load(cand)
 
         consistency_level = "UNKNOWN"
+        stop_mechanism = "NONE"
+        stopped_threads = False
         partial_reads = 0
         failed_reads = 0
+        omitted_regions = 0
+        bytes_requested = 0
+        bytes_captured = 0
+        bytes_omitted = 0
+        regions_attempted = 0
         duration_us = 0.0
         missing_regions: List[str] = []
         limitations: List[str] = []
 
         if raw_snap:
             duration_us = raw_snap.capture_duration_us
+            bytes_captured = raw_snap.bytes_captured
+            prov = getattr(raw_snap, "provenance", {}) or {}
+            obs_meta = getattr(raw_snap, "observation_metadata", {}) or {}
+
+            bytes_requested = prov.get("bytes_requested") or obs_meta.get("bytes_requested") or bytes_captured
+            bytes_omitted = prov.get("bytes_omitted") or obs_meta.get("bytes_omitted") or 0
+            regions_attempted = prov.get("regions_attempted") or obs_meta.get("regions_attempted") or len(raw_snap.memory_regions)
+            stop_mechanism = prov.get("stop_mechanism") or obs_meta.get("stop_mechanism") or ("SIGSTOP" if prov.get("stop_state_machine", {}).get("stop_confirmed") else "NONE")
+            stopped_threads = prov.get("stopped_threads", False)
+
             # Examine memory regions
             for r in raw_snap.memory_regions:
                 st = r.get("status")
@@ -857,24 +913,40 @@ class InvestigationManager:
                 elif st == "FAILED":
                     failed_reads += 1
                     missing_regions.append(r.get("pathname", r.get("region_id", "unknown")))
+                elif st == "OMITTED":
+                    omitted_regions += 1
+                    missing_regions.append(f"{r.get('region_id', 'unknown')} (omitted: policy limit)")
 
-            # Check backend
-            backend = raw_snap.capture_backend
-            if "process_vm_readv" in backend:
+            backend = raw_snap.capture_backend or "unknown"
+            raw_consistency = prov.get("snapshot_consistency") or obs_meta.get("consistency_classification")
+            if raw_consistency == NON_ATOMIC or ("process_vm_readv" in backend and not stopped_threads):
                 consistency_level = NON_ATOMIC
-                limitations.append("process_vm_readv zero-stop capture is potentially NON_ATOMIC across multiple memory regions.")
-            elif "gdb" in backend.lower() or "ptrace" in backend.lower():
+                limitations.append("Capture is NON_ATOMIC across multiple memory regions. Pointers may exhibit slight execution skew.")
+            elif raw_consistency in ("PROCESS_STOPPED_MEMORY_SNAPSHOT", "SIGNAL_STOPPED", STOPPED) or stopped_threads:
                 consistency_level = STOPPED
+                limitations.append("Target process was signalled (SIGSTOP/SIGCONT); inferior stopped during read, but kernel atomicity across threads is not guaranteed.")
             else:
-                consistency_level = "UNKNOWN"
+                consistency_level = NON_ATOMIC
+                limitations.append("Capture atomicity cannot be established; treated as NON_ATOMIC.")
+
+            if t_ref.get("backend_fallback"):
+                limitations.append(f"Fallback backend: {t_ref.get('fallback_reason')}")
         else:
             limitations.append("Operating purely on semantic snapshot artifact; raw capture metadata not available.")
 
         quality_details = {
             "consistency_level": consistency_level,
+            "stop_mechanism": stop_mechanism,
+            "stopped_threads": stopped_threads,
             "duration_us": duration_us,
+            "bytes_requested": bytes_requested,
+            "bytes_captured": bytes_captured,
+            "bytes_omitted": bytes_omitted,
+            "regions_attempted": regions_attempted,
+            "regions_read": regions_attempted - failed_reads - omitted_regions,
             "partial_reads": partial_reads,
             "failed_reads": failed_reads,
+            "omitted_regions_count": omitted_regions,
             "missing_regions_count": len(missing_regions),
             "limitations": limitations,
         }
@@ -886,7 +958,7 @@ class InvestigationManager:
             source="raw_snapshot_metadata",
             session_id=session.investigation_id,
             parent_evidence_ids=parents,
-            observation=f"Capture consistency: {consistency_level}, partial reads: {partial_reads}, failed: {failed_reads}.",
+            observation=f"Capture consistency: {consistency_level}, requested: {bytes_requested}B, captured: {bytes_captured}B, partial: {partial_reads}, failed: {failed_reads}, omitted: {omitted_regions}.",
             capture_quality=quality_details,
             details=quality_details,
         ))
@@ -904,6 +976,17 @@ class InvestigationManager:
                 status="CONFIRMED",
             ))
 
+        if bytes_captured == 0 and regions_attempted > 0:
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_zero_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title="No Memory Captured (0 Bytes)",
+                description=f"Capture completed but 0 bytes could be read across {regions_attempted} attempted memory regions.",
+                evidence_ids=[ev.evidence_id],
+                confidence="high",
+                status="UNRESOLVED",
+            ))
+
         if partial_reads > 0 or failed_reads > 0:
             session.findings.append(InvestigationFinding(
                 finding_id=f"fnd_miss_{uuid.uuid4().hex[:8]}",
@@ -915,8 +998,30 @@ class InvestigationManager:
                 status="UNRESOLVED",
             ))
 
+        if omitted_regions > 0:
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_omit_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title=f"Memory Regions Omitted Due to Policy Bounds ({omitted_regions})",
+                description=f"{omitted_regions} memory regions ({bytes_omitted} bytes) were omitted to satisfy safety bounds.",
+                evidence_ids=[ev.evidence_id],
+                confidence="high",
+                status="CONFIRMED",
+            ))
+
+        # Assign honest stage status
+        if raw_snap:
+            if bytes_captured == 0 and regions_attempted > 0:
+                stage_status = "FAILED"
+            elif failed_reads > 0 or partial_reads > 0 or omitted_regions > 0:
+                stage_status = "PARTIAL"
+            else:
+                stage_status = "COMPLETED"
+        else:
+            stage_status = "PARTIAL"
+
         session.stages["capture_quality"] = {
-            "status": "COMPLETED",
+            "status": stage_status,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "details": quality_details,
         }
@@ -956,7 +1061,12 @@ class InvestigationManager:
             session.stages["semantic_interpretation"] = {
                 "status": "PARTIAL",
                 "completed_at": datetime.now(timezone.utc).isoformat(),
-                "details": {"error": err_msg},
+                "details": {
+                    "error": err_msg,
+                    "decoding_status": "UNAVAILABLE",
+                    "objects_count": 0,
+                    "roots_count": 0,
+                },
             }
             return
 
@@ -1050,13 +1160,64 @@ class InvestigationManager:
         if not session.findings and first_field_finding:
             session.findings.append(first_field_finding)
 
+        has_partial_objects = False
+        has_memory_not_captured = False
+        uncaptured_pointer_details: List[str] = []
+
+        for obj in objs:
+            o_dict = obj if isinstance(obj, dict) else (obj.to_dict() if hasattr(obj, "to_dict") else asdict(obj))
+            if o_dict.get("status") == "PARTIAL":
+                has_partial_objects = True
+            for f in o_dict.get("fields", []):
+                if f.get("status") == "MEMORY_NOT_CAPTURED" or f.get("target_status") == "MEMORY_NOT_CAPTURED":
+                    has_memory_not_captured = True
+                    uncaptured_pointer_details.append(f"{o_dict.get('object_id')}.{f.get('name')}")
+
+        diagnostics = getattr(semantic_state, "diagnostics", []) or []
+        for d in diagnostics:
+            if isinstance(d, dict) and d.get("code") == "MEMORY_NOT_CAPTURED":
+                has_memory_not_captured = True
+
+        if has_memory_not_captured or has_partial_objects:
+            decoding_status = "PARTIAL"
+            stage_status = "PARTIAL"
+        elif not objs and not roots:
+            decoding_status = "FAILED"
+            stage_status = "FAILED"
+        else:
+            decoding_status = "COMPLETED"
+            stage_status = "COMPLETED"
+
+        if has_memory_not_captured:
+            ev = session.ledger.add_record(EvidenceRecord(
+                evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+                nature=NATURE_OBSERVATION,
+                source="cpp_object_decoder",
+                session_id=session.investigation_id,
+                parent_evidence_ids=parents,
+                observation=f"Pointers outside captured memory detected ({len(uncaptured_pointer_details)} uncaptured references). Fields classified as MEMORY_NOT_CAPTURED.",
+                details={"uncaptured_references": uncaptured_pointer_details[:20]},
+            ))
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_mnc_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title="Pointers Outside Captured Memory (MEMORY_NOT_CAPTURED)",
+                description=f"One or more pointer targets reside outside captured memory regions ({len(uncaptured_pointer_details)} references). Classified as MEMORY_NOT_CAPTURED rather than null or dropped.",
+                evidence_ids=[ev.evidence_id],
+                confidence="high",
+                status="UNRESOLVED",
+            ))
+
         session.stages["semantic_interpretation"] = {
-            "status": "COMPLETED",
+            "status": stage_status,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "details": {
+                "decoding_status": decoding_status,
                 "objects_count": len(objs),
                 "roots_count": len(roots),
                 "state_hash": getattr(semantic_state, "state_hash", None),
+                "has_memory_not_captured": has_memory_not_captured,
+                "uncaptured_pointers_count": len(uncaptured_pointer_details),
             },
         }
 
@@ -1067,7 +1228,29 @@ class InvestigationManager:
             session.stages["static_code_link"] = {
                 "status": "PARTIAL",
                 "completed_at": datetime.now(timezone.utc).isoformat(),
-                "details": {"status": "NO_STATIC_PROVIDER", "linked_count": 0},
+                "details": {
+                    "status": "NO_STATIC_PROVIDER",
+                    "linkage_status": "UNAVAILABLE",
+                    "linked_count": 0,
+                    "reason": "Static code provider unavailable or debug image missing",
+                },
+            }
+            return
+
+        t_ident = session.stages["target_identity"].get("details", {})
+        build_id_status = t_ident.get("build_id_status")
+
+        if build_id_status in (IDENTITY_MISMATCH, "MISMATCH"):
+            session.stages["static_code_link"] = {
+                "status": "FAILED",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "details": {
+                    "provider": provider.get_provider_name(),
+                    "linkage_status": "MISMATCH",
+                    "status": "BUILD_ID_MISMATCH",
+                    "linked_count": 0,
+                    "reason": "Target executable build ID mismatches debug image. Refusing to decode static links.",
+                },
             }
             return
 
@@ -1203,11 +1386,31 @@ class InvestigationManager:
                         details=res,
                     ))
 
+        # Determine linkage status
+        if build_id_status not in (IDENTITY_VERIFIED_MATCH, "VERIFIED"):
+            linkage_status = "UNVERIFIED"
+            stage_status = "PARTIAL"
+        elif load_bias_status != "RESOLVED":
+            linkage_status = "UNVERIFIED"
+            stage_status = "PARTIAL"
+        elif linked_count == 0:
+            linkage_status = "UNVERIFIED"
+            stage_status = "PARTIAL"
+        else:
+            has_verified_addr = any(r.get("is_verified", False) and r.get("link_kind") in (LINK_KIND_GLOBAL_VARIABLE, LINK_KIND_FUNCTION_ADDRESS) for r in resolved_links)
+            if has_verified_addr:
+                linkage_status = "VERIFIED"
+                stage_status = "COMPLETED"
+            else:
+                linkage_status = "PARTIAL"
+                stage_status = "PARTIAL"
+
         session.stages["static_code_link"] = {
-            "status": "COMPLETED" if linked_count > 0 else "PARTIAL",
+            "status": stage_status,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "details": {
                 "provider": provider.get_provider_name(),
+                "linkage_status": linkage_status,
                 "linked_count": linked_count,
                 "resolved_links": resolved_links,
                 "load_bias_provenance": load_bias_provenance,
@@ -1294,39 +1497,84 @@ class InvestigationManager:
 
         semantic_details = session.stages.get("semantic_interpretation", {}).get("details", {})
         quality_details = session.stages.get("capture_quality", {}).get("details", {})
+        static_details = session.stages.get("static_code_link", {}).get("details", {})
+
         objects_examined = semantic_details.get("objects_count", 0)
         roots_examined = semantic_details.get("roots_count", 0)
-        regions_examined = quality_details.get("regions_count", len(getattr(session.active_snapshot, "memory_regions", [])) if hasattr(session.active_snapshot, "memory_regions") else 0)
+        regions_examined = quality_details.get("regions_read", quality_details.get("regions_attempted", len(getattr(session.active_snapshot, "memory_regions", [])) if hasattr(session.active_snapshot, "memory_regions") else 0))
+        bytes_captured = quality_details.get("bytes_captured", 0)
+
+        capture_status = quality_details.get("capture_status")
+        if not capture_status:
+            cq_st = session.stages.get("capture_quality", {}).get("status", "UNKNOWN")
+            capture_status = "FAILED" if cq_st == "FAILED" else ("PARTIAL" if cq_st == "PARTIAL" else "COMPLETED")
+
+        decoding_status = semantic_details.get("decoding_status")
+        if not decoding_status:
+            si_st = session.stages.get("semantic_interpretation", {}).get("status", "UNKNOWN")
+            decoding_status = "FAILED" if si_st == "FAILED" else ("PARTIAL" if si_st == "PARTIAL" else "COMPLETED")
+
+        static_linkage_status = static_details.get("linkage_status")
+        if not static_linkage_status:
+            sl_st = session.stages.get("static_code_link", {}).get("status", "UNKNOWN")
+            static_linkage_status = "VERIFIED" if sl_st == "COMPLETED" else "UNVERIFIED"
 
         unresolved_checks = []
-        if not session.static_provider or not session.static_provider.is_available():
-            unresolved_checks.append("Static symbol and call-graph linkage unavailable (no DWARF static provider)")
+        if static_linkage_status in ("UNVERIFIED", "MISMATCH", "UNAVAILABLE", "PARTIAL"):
+            unresolved_checks.append(f"Static symbol and call-graph linkage ({static_linkage_status}): unverified or incomplete debug correlation")
         if quality_details.get("consistency_level") == NON_ATOMIC:
             unresolved_checks.append("Non-atomic capture: cross-region invariants not guaranteed atomic")
         if quality_details.get("failed_reads", 0) > 0:
             unresolved_checks.append(f"{quality_details['failed_reads']} memory regions failed to read")
+        if quality_details.get("omitted_regions_count", 0) > 0:
+            unresolved_checks.append(f"{quality_details['omitted_regions_count']} memory regions omitted by safety policy limits")
+        if semantic_details.get("has_memory_not_captured"):
+            unresolved_checks.append(f"{semantic_details.get('uncaptured_pointers_count', 0)} pointer targets outside captured regions (MEMORY_NOT_CAPTURED)")
         unresolved_checks.append("Heap allocations without active global roots remain unmapped")
         unresolved_checks.append("Private/local symbols and unexercised code paths unverified")
 
-        failed_stages = [k for k, v in session.stages.items() if v["status"] == "FAILED"]
-        partial_stages = [k for k, v in session.stages.items() if v["status"] == "PARTIAL"]
-        computed_status = "FAILED" if len(failed_stages) >= 2 else ("PARTIAL" if (failed_stages or partial_stages) else "COMPLETED")
+        # Determine overall investigation status
+        if session.status == "BLOCKED":
+            computed_status = "BLOCKED"
+        elif (
+            any(v.get("status") == "FAILED" for v in session.stages.values())
+            or capture_status == "FAILED"
+            or decoding_status == "FAILED"
+            or static_linkage_status == "MISMATCH"
+        ):
+            computed_status = "FAILED"
+        elif (
+            capture_status == "PARTIAL"
+            or decoding_status in ("PARTIAL", "UNAVAILABLE")
+            or static_linkage_status in ("UNVERIFIED", "MISMATCH", "UNAVAILABLE", "PARTIAL")
+            or any(v.get("status") == "PARTIAL" for v in session.stages.values())
+        ):
+            computed_status = "PARTIAL"
+        else:
+            computed_status = "COMPLETED"
+
+        session.status = computed_status
 
         zero_notice = None
         if len(session.findings) == 0:
             if computed_status == "COMPLETED":
                 zero_notice = (
-                    f"Investigation completed with 0 findings in inspected scope ({objects_examined} objects, {roots_examined} roots). "
-                    "This does not imply validation of unmapped heap regions, private symbols, or uninspected invariants."
+                    f"Investigation completed with 0 findings in inspected scope ({objects_examined} objects, {roots_examined} roots, {regions_examined} regions, {bytes_captured} bytes). "
+                    "This scope is bounded: it does not imply validation of unmapped heap regions, private symbols, threads not captured, or uninspected invariants."
                 )
             else:
                 zero_notice = (
-                    "Partial investigation completed with 0 findings because analysis scope was incomplete or restricted."
+                    f"Investigation ended with status '{computed_status}' and 0 findings. "
+                    f"Analysis scope was incomplete or restricted ({objects_examined} objects, {roots_examined} roots). "
+                    "Unmapped heap regions, private symbols, and uninspected invariants remain unverified."
                 )
 
         session.summary = {
             "goal": session.goal,
             "status": computed_status,
+            "capture_status": capture_status,
+            "decoding_status": decoding_status,
+            "static_linkage_status": static_linkage_status,
             "facts_count": facts_cnt,
             "hypotheses_count": hypo_cnt,
             "unknowns_count": unknown_cnt,
@@ -1337,6 +1585,7 @@ class InvestigationManager:
                 "objects_examined": objects_examined,
                 "roots_examined": roots_examined,
                 "regions_examined": regions_examined,
+                "bytes_inspected": bytes_captured,
                 "unresolved_checks": unresolved_checks,
             },
             "zero_findings_notice": zero_notice,
