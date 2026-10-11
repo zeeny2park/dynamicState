@@ -74,6 +74,32 @@
     invTxtLedgerCount: document.getElementById('inv-txt-ledger-count'),
     btnDownloadLedger: document.getElementById('btn-download-ledger'),
 
+    // Modernized Launchpad & Two-Level Header elements
+    hdrTxtTarget: document.getElementById('hdr-txt-target'),
+    hdrBadgeCaptureQuality: document.getElementById('hdr-badge-capture-quality'),
+    hdrBadgeInvestigationState: document.getElementById('hdr-badge-investigation-state'),
+    btnToggleTechDetails: document.getElementById('btn-toggle-tech-details'),
+    runtimeSummaryBar: document.getElementById('runtime-summary-bar'),
+
+    btnEntrySnapshot: document.getElementById('btn-entry-snapshot'),
+    btnEntryLive: document.getElementById('btn-entry-live'),
+    panelEntrySnapshot: document.getElementById('panel-entry-snapshot'),
+    panelEntryLive: document.getElementById('panel-entry-live'),
+    invInputLiveTarget: document.getElementById('inv-input-live-target'),
+    invInputLiveDebugImage: document.getElementById('inv-input-live-debug-image'),
+    invRecentSessionsContainer: document.getElementById('inv-recent-sessions-container'),
+    invRecentSessionsList: document.getElementById('inv-recent-sessions-list'),
+    invAlertBanner: document.getElementById('inv-alert-banner'),
+    invAlertIcon: document.getElementById('inv-alert-icon'),
+    invAlertMessage: document.getElementById('inv-alert-message'),
+    invCmpSelectA: document.getElementById('inv-cmp-select-a'),
+    invCmpSelectB: document.getElementById('inv-cmp-select-b'),
+    btnRunInlineCompare: document.getElementById('btn-run-inline-compare'),
+    invLineageContainer: document.getElementById('inv-lineage-container'),
+    invLineageContent: document.getElementById('inv-lineage-content'),
+    btnCloseLineage: document.getElementById('btn-close-lineage'),
+    invDetailsRawEvidence: document.getElementById('inv-details-raw-evidence'),
+
     // Header & Global Status Bar
     txtRuntimeStatus: document.getElementById('txt-runtime-status'),
     pillRuntimeStatus: document.getElementById('pill-runtime-status'),
@@ -626,15 +652,18 @@
   // --------------------------------------------------------------------------
 
   function initModeToggle() {
-    if (!el.btnModeBasic || !el.btnModeAdvanced) return;
-
-    el.btnModeBasic.addEventListener('click', () => {
-      setMode(false);
-    });
-
-    el.btnModeAdvanced.addEventListener('click', () => {
-      setMode(true);
-    });
+    if (el.btnModeBasic) {
+      el.btnModeBasic.addEventListener('click', () => setMode(false));
+    }
+    if (el.btnModeAdvanced) {
+      el.btnModeAdvanced.addEventListener('click', () => setMode(true));
+    }
+    if (el.btnToggleTechDetails && el.runtimeSummaryBar) {
+      el.btnToggleTechDetails.addEventListener('click', () => {
+        const isExp = el.runtimeSummaryBar.classList.toggle('expanded');
+        el.btnToggleTechDetails.classList.toggle('active', isExp);
+      });
+    }
   }
 
   function setMode(isAdvanced) {
@@ -643,10 +672,16 @@
     if (el.btnModeAdvanced) el.btnModeAdvanced.classList.toggle('active', isAdvanced);
     document.body.classList.toggle('advanced-mode', isAdvanced);
 
-    // Re-render currently visible components that differ between basic & advanced
+    // Expand or collapse raw evidence details according to mode
+    if (el.invDetailsRawEvidence) {
+      el.invDetailsRawEvidence.open = isAdvanced;
+    }
+
+    // Re-render currently visible components while preserving state (activeTab, activeInvestigation, selectedObjectId)
     renderMemoryObjectsList();
     if (state.selectedObjectId) selectObject(state.selectedObjectId);
     if (state.candidates && state.candidates.length > 0) renderCandidatesTable(state.candidates);
+    renderInvestigationOverview();
   }
 
   // --------------------------------------------------------------------------
@@ -721,6 +756,18 @@
     if (el.badgeObsMode) {
       el.badgeObsMode.textContent = mode;
       el.badgeObsMode.className = 'mode-badge' + (mode === 'LOW_IMPACT' ? ' low-impact' : '');
+    }
+
+    // Level 1 Primary Header status updates
+    if (el.hdrTxtTarget) {
+      if (data.pid) el.hdrTxtTarget.textContent = `PID ${data.pid}${data.binary ? ` (${data.binary})` : ''}`;
+      else if (state.selectedStateId) el.hdrTxtTarget.textContent = `Snapshot: ${state.selectedStateId}`;
+      else el.hdrTxtTarget.textContent = 'No target loaded';
+    }
+    if (el.hdrBadgeCaptureQuality) {
+      const q = data.consistency_level || (status === 'STOPPED' ? 'STOPPED' : (mode === 'LOW_IMPACT' ? 'NON_ATOMIC' : 'UNKNOWN'));
+      el.hdrBadgeCaptureQuality.textContent = q;
+      el.hdrBadgeCaptureQuality.className = `badge ${q === 'STOPPED' || q === 'ATOMIC' ? 'badge-success' : (q === 'NON_ATOMIC' ? 'badge-warning' : 'badge-neutral')}`;
     }
 
     // Top Summary Bar Updates
@@ -3661,12 +3708,57 @@
   // Investigation Overview (Phase C)
   // --------------------------------------------------------------------------
 
+  // --------------------------------------------------------------------------
+  // Investigation Overview (Modernized Investigation-First Workspace)
+  // --------------------------------------------------------------------------
+
   function initInvestigationOverview() {
     if (el.btnRunInvestigation) {
       el.btnRunInvestigation.addEventListener('click', runInvestigation);
     }
     if (el.btnRefreshInvestigation) {
       el.btnRefreshInvestigation.addEventListener('click', loadActiveInvestigation);
+    }
+
+    // Launchpad Entry Switcher (Offline Snapshot vs Live Process)
+    if (el.btnEntrySnapshot && el.btnEntryLive) {
+      el.btnEntrySnapshot.addEventListener('click', () => {
+        el.btnEntrySnapshot.classList.add('active');
+        el.btnEntryLive.classList.remove('active');
+        if (el.panelEntrySnapshot) el.panelEntrySnapshot.style.display = 'block';
+        if (el.panelEntryLive) el.panelEntryLive.style.display = 'none';
+      });
+
+      el.btnEntryLive.addEventListener('click', () => {
+        el.btnEntryLive.classList.add('active');
+        el.btnEntrySnapshot.classList.remove('active');
+        if (el.panelEntryLive) el.panelEntryLive.style.display = 'block';
+        if (el.panelEntrySnapshot) el.panelEntrySnapshot.style.display = 'none';
+      });
+    }
+
+    // Inline Snapshot Comparison button
+    if (el.btnRunInlineCompare) {
+      el.btnRunInlineCompare.addEventListener('click', () => {
+        const snapA = el.invCmpSelectA ? el.invCmpSelectA.value.trim() : '';
+        const snapB = el.invCmpSelectB ? el.invCmpSelectB.value.trim() : '';
+        if (!snapA || !snapB) {
+          showToast('Please select both Baseline A and Observed B snapshots to compare.', 'warning');
+          return;
+        }
+        if (snapA === snapB) {
+          showToast('Select two different snapshots to compare state changes.', 'warning');
+          return;
+        }
+        compareSnapshots(snapA, snapB);
+      });
+    }
+
+    // Close Lineage Trace button
+    if (el.btnCloseLineage && el.invLineageContainer) {
+      el.btnCloseLineage.addEventListener('click', () => {
+        el.invLineageContainer.style.display = 'none';
+      });
     }
 
     // Filter pills for findings
@@ -3713,8 +3805,51 @@
     }
   }
 
+  async function loadRecentInvestigationSessions() {
+    try {
+      const res = await apiGet('/api/investigations');
+      if (res.success && Array.isArray(res.data) && res.data.length > 0) {
+        if (el.invRecentSessionsContainer) el.invRecentSessionsContainer.style.display = 'flex';
+        if (el.invRecentSessionsList) {
+          el.invRecentSessionsList.innerHTML = res.data.slice(-6).reverse().map(sess => {
+            const sid = sess.investigation_id || 'session';
+            const isActive = state.activeInvestigation && state.activeInvestigation.investigation_id === sid;
+            const statusBadge = sess.status === 'COMPLETED' ? 'badge-success' : (sess.status === 'PARTIAL' ? 'badge-warning' : 'badge-danger');
+            return `
+              <span class="inv-session-pill ${isActive ? 'active' : ''}" onclick="window.__loadInvestigationSession('${escapeHtml(sid)}')">
+                ${escapeHtml(sid.substring(0, 14))}... <span class="badge ${statusBadge} text-xs">${escapeHtml(sess.status || '')}</span>
+              </span>
+            `;
+          }).join('');
+        }
+      } else {
+        if (el.invRecentSessionsContainer) el.invRecentSessionsContainer.style.display = 'none';
+      }
+    } catch (e) {
+      if (el.invRecentSessionsContainer) el.invRecentSessionsContainer.style.display = 'none';
+    }
+  }
+
+  window.__loadInvestigationSession = async function (investigationId) {
+    if (!investigationId) return;
+    try {
+      showToast(`Loading session ${investigationId}...`, 'info');
+      const repRes = await apiGet(`/api/investigation/report?investigation_id=${investigationId}`);
+      if (repRes.success && repRes.data) {
+        state.activeInvestigation = repRes.data;
+        renderInvestigationOverview();
+        await loadRecentInvestigationSessions();
+      } else {
+        showToast(`Failed to load session ${investigationId}`, 'error');
+      }
+    } catch (e) {
+      showToast(`Error loading session: ${String(e)}`, 'error');
+    }
+  };
+
   async function loadActiveInvestigation() {
     try {
+      await loadRecentInvestigationSessions();
       const res = await apiGet('/api/investigations');
       if (res.success && Array.isArray(res.data) && res.data.length > 0) {
         const latest = res.data[res.data.length - 1];
@@ -3734,13 +3869,37 @@
 
   async function runInvestigation() {
     const goal = (el.invInputGoal && el.invInputGoal.value.trim()) || 'General state investigation';
-    const snapshotId = (el.invSelectSnapshot && el.invSelectSnapshot.value) || undefined;
-    const debugImage = (el.invInputDebugImage && el.invInputDebugImage.value.trim()) || undefined;
-    const authorizeTarget = el.invCheckAuthorize ? el.invCheckAuthorize.checked : false;
+    
+    // Check which entry panel is active (Snapshot vs Live)
+    const isLive = el.panelEntryLive && el.panelEntryLive.style.display !== 'none';
+    let snapshotId, debugImage, authorizeTarget;
+
+    if (isLive) {
+      snapshotId = undefined;
+      debugImage = (el.invInputLiveDebugImage && el.invInputLiveDebugImage.value.trim()) || undefined;
+      authorizeTarget = el.invCheckAuthorize ? el.invCheckAuthorize.checked : false;
+    } else {
+      snapshotId = (el.invSelectSnapshot && el.invSelectSnapshot.value) || undefined;
+      debugImage = (el.invInputDebugImage && el.invInputDebugImage.value.trim()) || undefined;
+      authorizeTarget = false;
+    }
 
     if (el.btnRunInvestigation) {
       el.btnRunInvestigation.disabled = true;
       el.btnRunInvestigation.textContent = '⏳ Investigating...';
+    }
+
+    // Set intermediate running state
+    if (el.invBadgeStatus) {
+      el.invBadgeStatus.textContent = 'RUNNING';
+      el.invBadgeStatus.className = 'badge badge-info';
+    }
+    if (el.hdrBadgeInvestigationState) {
+      el.hdrBadgeInvestigationState.textContent = 'RUNNING';
+      el.hdrBadgeInvestigationState.className = 'badge badge-info';
+    }
+    if (el.invFindingsList) {
+      el.invFindingsList.innerHTML = '<div class="empty-state text-xs p-3">⏳ Investigation in progress... Analyzing runtime memory and verifying typed structures.</div>';
     }
 
     try {
@@ -3756,6 +3915,7 @@
       if (res.success && res.data) {
         state.activeInvestigation = res.data;
         renderInvestigationOverview();
+        await loadRecentInvestigationSessions();
         showToast('Investigation completed successfully!', 'success');
       } else {
         const msg = (res.error && res.error.message) || 'Investigation failed';
@@ -3763,10 +3923,14 @@
         if (res.data) {
           state.activeInvestigation = res.data;
           renderInvestigationOverview();
+          await loadRecentInvestigationSessions();
+        } else {
+          renderFailedInvestigationOverview(msg);
         }
       }
     } catch (err) {
       showToast(`Investigation error: ${String(err)}`, 'error');
+      renderFailedInvestigationOverview(String(err));
     } finally {
       if (el.btnRunInvestigation) {
         el.btnRunInvestigation.disabled = false;
@@ -3798,27 +3962,94 @@
     }
   }
 
+  function renderFailedInvestigationOverview(errorMsg) {
+    if (el.invBadgeStatus) {
+      el.invBadgeStatus.textContent = 'FAILED';
+      el.invBadgeStatus.className = 'badge badge-danger';
+    }
+    if (el.hdrBadgeInvestigationState) {
+      el.hdrBadgeInvestigationState.textContent = 'FAILED';
+      el.hdrBadgeInvestigationState.className = 'badge badge-danger';
+    }
+    if (el.invAlertBanner) {
+      el.invAlertBanner.className = 'banner banner-danger mb-3';
+      el.invAlertBanner.style.display = 'flex';
+      if (el.invAlertIcon) el.invAlertIcon.textContent = '❌';
+      if (el.invAlertMessage) el.invAlertMessage.innerHTML = `<strong>Investigation Failed:</strong> ${escapeHtml(errorMsg)}`;
+    }
+    if (el.invFindingsList) {
+      el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3 text-danger">Investigation failed: ${escapeHtml(errorMsg)}</div>`;
+    }
+  }
+
   function renderEmptyInvestigationOverview() {
     if (el.invBadgeStatus) {
       el.invBadgeStatus.textContent = 'IDLE / READY';
       el.invBadgeStatus.className = 'badge badge-info';
     }
+    if (el.hdrBadgeInvestigationState) {
+      el.hdrBadgeInvestigationState.textContent = 'NOT_STARTED';
+      el.hdrBadgeInvestigationState.className = 'badge badge-neutral';
+    }
     if (el.invTxtId) el.invTxtId.textContent = 'Ready for investigation goal';
+    if (el.invAlertBanner) el.invAlertBanner.style.display = 'none';
+
+    if (el.invFindingsList) {
+      el.invFindingsList.innerHTML = '<div class="empty-state text-xs p-3">Investigation not started. Select an entry path above, enter an objective, and click "Start Investigation".</div>';
+    }
+    if (el.invStepsContainer) {
+      el.invStepsContainer.innerHTML = '<div class="empty-state text-xs p-3">Start an investigation to receive evidence-driven recommendations.</div>';
+    }
+    if (el.invComparisonsContent) {
+      el.invComparisonsContent.innerHTML = '<div class="empty-state text-xs p-3">No comparison performed yet. Select two snapshots above to isolate state diffs.</div>';
+    }
+    if (el.invStaticLinksList) {
+      el.invStaticLinksList.innerHTML = '<div class="empty-state text-xs p-3">No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.</div>';
+    }
     populateInvestigationSnapshots();
   }
 
   function populateInvestigationSnapshots() {
-    if (!el.invSelectSnapshot) return;
-    const currVal = el.invSelectSnapshot.value;
-    el.invSelectSnapshot.innerHTML = '<option value="">(Current / Active State)</option>';
-    if (state.states && state.states.length > 0) {
-      state.states.forEach(s => {
+    const snapshots = (state.states && state.states.length > 0) ? state.states : [];
+    
+    // 1. Populate Target Snapshot select
+    if (el.invSelectSnapshot) {
+      const currVal = el.invSelectSnapshot.value;
+      el.invSelectSnapshot.innerHTML = '<option value="">(Current / Active State)</option>';
+      snapshots.forEach(s => {
         const sid = s.state_id || s.snapshot_id || s;
         const opt = document.createElement('option');
         opt.value = sid;
         opt.textContent = `Snapshot: ${sid}`;
         if (sid === currVal) opt.selected = true;
         el.invSelectSnapshot.appendChild(opt);
+      });
+    }
+
+    // 2. Populate Comparison Snapshot A and Snapshot B selects
+    if (el.invCmpSelectA) {
+      const currA = el.invCmpSelectA.value;
+      el.invCmpSelectA.innerHTML = '<option value="">(Select Snapshot)</option>';
+      snapshots.forEach((s, idx) => {
+        const sid = s.state_id || s.snapshot_id || s;
+        const opt = document.createElement('option');
+        opt.value = sid;
+        opt.textContent = `${sid}`;
+        if (sid === currA || (!currA && idx === 0)) opt.selected = true;
+        el.invCmpSelectA.appendChild(opt);
+      });
+    }
+
+    if (el.invCmpSelectB) {
+      const currB = el.invCmpSelectB.value;
+      el.invCmpSelectB.innerHTML = '<option value="">(Select Snapshot)</option>';
+      snapshots.forEach((s, idx) => {
+        const sid = s.state_id || s.snapshot_id || s;
+        const opt = document.createElement('option');
+        opt.value = sid;
+        opt.textContent = `${sid}`;
+        if (sid === currB || (!currB && idx === 1)) opt.selected = true;
+        el.invCmpSelectB.appendChild(opt);
       });
     }
   }
@@ -3831,10 +4062,16 @@
       return;
     }
 
-    // Status Banner
+    const st = inv.status || 'UNKNOWN';
+
+    // Status Banner & Header Pill
     if (el.invBadgeStatus) {
-      el.invBadgeStatus.textContent = inv.status || 'UNKNOWN';
-      el.invBadgeStatus.className = `badge ${inv.status === 'COMPLETED' ? 'badge-success' : (inv.status === 'PARTIAL' ? 'badge-warning' : 'badge-danger')}`;
+      el.invBadgeStatus.textContent = st;
+      el.invBadgeStatus.className = `badge ${st === 'COMPLETED' ? 'badge-success' : (st === 'PARTIAL' ? 'badge-warning' : (st === 'BLOCKED' ? 'badge-danger' : 'badge-danger'))}`;
+    }
+    if (el.hdrBadgeInvestigationState) {
+      el.hdrBadgeInvestigationState.textContent = st;
+      el.hdrBadgeInvestigationState.className = `badge ${st === 'COMPLETED' ? 'badge-success' : (st === 'PARTIAL' ? 'badge-warning' : (st === 'BLOCKED' ? 'badge-danger' : 'badge-info'))}`;
     }
     if (el.invTxtId) {
       el.invTxtId.textContent = `Session: ${inv.investigation_id || 'N/A'}`;
@@ -3845,9 +4082,9 @@
     const updateStagePill = (id, stageName) => {
       const p = document.getElementById(id);
       if (p) {
-        const st = stages[stageName]?.status || 'PENDING';
-        p.className = `stage-pill ${st.toLowerCase()}`;
-        p.title = `${stageName}: ${st}`;
+        const s = stages[stageName]?.status || 'PENDING';
+        p.className = `stage-pill ${s.toLowerCase()}`;
+        p.title = `${stageName}: ${s}`;
       }
     };
     updateStagePill('pill-stage-identity', 'target_identity');
@@ -3857,21 +4094,76 @@
     updateStagePill('pill-stage-static', 'static_code_link');
     updateStagePill('pill-stage-synthesis', 'report_synthesis');
 
-    // 1. Target & Build Identity Card
+    // Dynamic Alert Banner Handling
     const idInfo = stages.target_identity?.details || inv.target_identity || {};
+    const qInfo = stages.capture_quality?.details || inv.capture_quality || {};
+    const bStatus = idInfo.build_id_status || 'NOT_AVAILABLE';
+
+    let totalFindings = 0;
+    if (inv.findings && typeof inv.findings === 'object' && !Array.isArray(inv.findings)) {
+      totalFindings = (inv.findings.observed_facts?.length || 0) + (inv.findings.hypotheses?.length || 0) + (inv.findings.unknowns?.length || 0);
+    } else if (Array.isArray(inv.findings)) {
+      totalFindings = inv.findings.length;
+    } else if (inv.findings_count !== undefined) {
+      totalFindings = inv.findings_count;
+    }
+
+    if (el.invAlertBanner) {
+      if (st === 'BLOCKED' || bStatus === 'MISMATCH') {
+        el.invAlertBanner.className = 'banner banner-warning mb-3';
+        el.invAlertBanner.style.display = 'flex';
+        if (el.invAlertIcon) el.invAlertIcon.textContent = '🛑';
+        if (el.invAlertMessage) {
+          el.invAlertMessage.innerHTML = `<strong>Investigation Blocked:</strong> Build-ID or identity mismatch detected (${escapeHtml(idInfo.build_id_reason || 'Target binary does not match debug artifact')}). Semantic reconstruction stopped to prevent false interpretations.`;
+        }
+      } else if (st === 'PARTIAL' || qInfo.consistency_level === 'NON_ATOMIC') {
+        el.invAlertBanner.className = 'banner banner-warning mb-3';
+        el.invAlertBanner.style.display = 'flex';
+        if (el.invAlertIcon) el.invAlertIcon.textContent = '⚠️';
+        if (el.invAlertMessage) {
+          el.invAlertMessage.innerHTML = `<strong>Partial Reconstruction Notice:</strong> Zero-stop non-atomic capture or missing memory regions. Some object fields or symbol links may be incomplete or reflect cross-region execution skew.`;
+        }
+      } else if (st === 'COMPLETED' && totalFindings === 0) {
+        el.invAlertBanner.className = 'banner banner-info mb-3';
+        el.invAlertBanner.style.display = 'flex';
+        if (el.invAlertIcon) el.invAlertIcon.textContent = '✅';
+        if (el.invAlertMessage) {
+          el.invAlertMessage.innerHTML = `<strong>Investigation Completed (0 Inconsistencies):</strong> Analyzed runtime memory state and verified all checked types and invariants without discovering anomalies.`;
+        }
+      } else {
+        el.invAlertBanner.style.display = 'none';
+      }
+    }
+
+    // 1. Target & Build Identity Card
     if (el.invTxtExec) el.invTxtExec.textContent = idInfo.executable || 'offline_artifact';
     if (el.invTxtTargetBid) el.invTxtTargetBid.textContent = idInfo.target_build_id || 'N/A';
     if (el.invTxtDebugImage) el.invTxtDebugImage.textContent = idInfo.debug_image || 'None';
     if (el.invTxtDebugBid) el.invTxtDebugBid.textContent = idInfo.debug_build_id || 'N/A';
     if (el.invTxtPid) el.invTxtPid.textContent = idInfo.pid ? `PID ${idInfo.pid}` : 'Offline';
     if (el.invBadgeBuildStatus) {
-      const bStatus = idInfo.build_id_status || 'NOT_AVAILABLE';
       el.invBadgeBuildStatus.textContent = bStatus;
-      el.invBadgeBuildStatus.className = `badge ${bStatus === 'VERIFIED' ? 'badge-success' : (bStatus === 'MISMATCH' ? 'badge-danger' : 'badge-warning')}`;
+      const isOk = bStatus === 'VERIFIED_MATCH' || bStatus === 'VERIFIED';
+      const isMismatch = bStatus === 'MISMATCH';
+      el.invBadgeBuildStatus.className = `badge ${isOk ? 'badge-success' : (isMismatch ? 'badge-danger' : 'badge-warning')}`;
+    }
+    const reasonEl = document.getElementById('inv-txt-build-reason');
+    if (reasonEl) reasonEl.textContent = idInfo.build_id_reason || '';
+    const persistEl = document.getElementById('inv-txt-persistence');
+    if (persistEl) persistEl.textContent = inv.persistence || 'EPHEMERAL_PROCESS_LOCAL';
+
+    // Update Header Target & Quality pills
+    if (el.hdrTxtTarget) {
+      if (inv.snapshot_id) el.hdrTxtTarget.textContent = `Snapshot: ${inv.snapshot_id}`;
+      else if (idInfo.pid) el.hdrTxtTarget.textContent = `PID ${idInfo.pid}`;
+      else if (idInfo.executable) el.hdrTxtTarget.textContent = idInfo.executable;
+    }
+    if (el.hdrBadgeCaptureQuality && qInfo.consistency_level) {
+      el.hdrBadgeCaptureQuality.textContent = qInfo.consistency_level;
+      el.hdrBadgeCaptureQuality.className = `badge ${qInfo.consistency_level === 'STOPPED' || qInfo.consistency_level === 'ATOMIC' ? 'badge-success' : (qInfo.consistency_level === 'NON_ATOMIC' ? 'badge-warning' : 'badge-neutral')}`;
     }
 
     // 2. Capture Quality & Consistency Card
-    const qInfo = stages.capture_quality?.details || inv.capture_quality || {};
     const consLevel = qInfo.consistency_level || 'UNKNOWN';
     if (el.invTxtConsistency) el.invTxtConsistency.textContent = consLevel;
     if (el.invBadgeConsistency) {
@@ -3916,7 +4208,10 @@
   function renderFindings() {
     if (!el.invFindingsList) return;
     const inv = state.activeInvestigation;
-    if (!inv) return;
+    if (!inv) {
+      el.invFindingsList.innerHTML = '<div class="empty-state text-xs p-3">Investigation not started. Select an entry path and click "Start Investigation".</div>';
+      return;
+    }
 
     let findings = [];
     if (inv.findings && typeof inv.findings === 'object' && !Array.isArray(inv.findings)) {
@@ -3933,7 +4228,16 @@
     const filtered = filter === 'all' ? findings : findings.filter(f => f.category === filter);
 
     if (filtered.length === 0) {
-      el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3">No findings matching '${filter}'.</div>`;
+      if (inv.status === 'COMPLETED' && findings.length === 0) {
+        el.invFindingsList.innerHTML = `
+          <div class="empty-state-clean text-xs p-3" style="background-color: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 6px;">
+            <strong style="color: var(--success); font-size: 0.95rem;">✅ Completed: 0 Findings / Anomalies Detected</strong>
+            <div class="text-muted mt-1">The investigation evaluated memory state and invariants without finding anomalies or unexpected mutations.</div>
+          </div>
+        `;
+      } else {
+        el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3">No findings matching '${filter}'.</div>`;
+      }
       return;
     }
 
@@ -3942,7 +4246,7 @@
       const badgeClass = cat === 'fact' ? 'badge-fact' : (cat === 'hypothesis' ? 'badge-hypothesis' : 'badge-unknown');
       const catLabel = cat === 'fact' ? 'Observed Fact' : (cat === 'hypothesis' ? 'Hypothesis' : 'Unknown');
       const cPathHtml = f.c_type_path ? `<span class="finding-path">${escapeHtml(f.c_type_path)}</span>` : '';
-      const jumpHtml = f.object_id ? `<button type="button" class="jump-link" onclick="window.__jumpToObject('${f.object_id}')">Inspect in Object Explorer ➔</button>` : '';
+      const jumpHtml = f.object_id ? `<button type="button" class="jump-link" onclick="window.__jumpToObject('${escapeHtml(f.object_id)}', '${escapeHtml(f.field_name || '')}')">Inspect in Object Explorer ➔</button>` : '';
 
       return `
         <div class="finding-card ${cat}">
@@ -3986,13 +4290,64 @@
   function renderComparisons(comparisons) {
     if (!el.invComparisonsContent) return;
     if (!comparisons || comparisons.length === 0) {
-      el.invComparisonsContent.innerHTML = '<div class="empty-state text-xs p-3">No comparisons recorded. Click \'Compare 2 Snapshots\' to compare.</div>';
+      el.invComparisonsContent.innerHTML = '<div class="empty-state text-xs p-3">No comparisons recorded. Select two snapshots above to isolate state diffs.</div>';
       return;
     }
 
     el.invComparisonsContent.innerHTML = comparisons.map(c => {
       const summary = c.diff_summary || c.summary || {};
       const uncHtml = c.uncertainty ? `<div class="banner banner-warning text-xs mb-2" style="padding: 4px 8px;">${escapeHtml(c.uncertainty)}</div>` : '';
+      
+      // Render detailed differences list if available
+      const changes = c.changes || [];
+      let changesHtml = '';
+      if (changes && changes.length > 0) {
+        changesHtml = `
+          <div style="margin-top: 10px;">
+            <div style="font-weight: 600; margin-bottom: 4px;">Changed & Unavailable Fields:</div>
+            <table class="diff-table">
+              <thead>
+                <tr>
+                  <th>Field / Path</th>
+                  <th>Baseline A</th>
+                  <th>Observed B</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${changes.map(chg => {
+                  const kind = chg.kind || 'value_change';
+                  let beforeVal = escapeHtml(String(chg.before !== undefined ? chg.before : ''));
+                  let afterVal = escapeHtml(String(chg.after !== undefined ? chg.after : ''));
+                  let badge = '<span class="diff-badge-modified">MODIFIED</span>';
+
+                  if (kind === 'field_unavailable') {
+                    badge = '<span class="diff-badge-unavailable">UNAVAILABLE IN SNAPSHOT</span>';
+                    afterVal = '<span class="text-warning">Unavailable (Not Unchanged)</span>';
+                  } else if (kind === 'field_added') {
+                    badge = '<span class="diff-badge-added">FIELD ADDED</span>';
+                    beforeVal = '<span class="text-muted">None</span>';
+                  } else if (kind === 'object_added' || kind === 'object_created') {
+                    badge = '<span class="diff-badge-added">OBJECT CREATED</span>';
+                  } else if (kind === 'object_removed') {
+                    badge = '<span class="badge badge-danger">OBJECT REMOVED</span>';
+                  }
+
+                  return `
+                    <tr>
+                      <td class="mono" style="color: var(--accent);">${escapeHtml(chg.path || chg.field || 'unknown')}</td>
+                      <td class="mono">${beforeVal}</td>
+                      <td class="mono">${afterVal}</td>
+                      <td>${badge}</td>
+                    </tr>
+                  `;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+
       return `
         <div style="background-color: rgba(31, 41, 55, 0.4); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; margin-bottom: 8px;" class="text-xs">
           <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
@@ -4004,8 +4359,11 @@
             <span>Value changes: <strong>${summary.value_changes || 0}</strong></span>
             <span>Objects added: <strong>${summary.objects_created || 0}</strong></span>
             <span>Objects removed: <strong>${summary.objects_removed || 0}</strong></span>
+            <span>Unavailable fields: <strong>${summary.fields_unavailable || 0}</strong></span>
+            <span>Added fields: <strong>${summary.fields_added || 0}</strong></span>
             <span>Ref changes: <strong>${summary.reference_changes || 0}</strong></span>
           </div>
+          ${changesHtml}
         </div>
       `;
     }).join('');
@@ -4024,13 +4382,30 @@
 
     el.invStaticLinksList.innerHTML = resolved.map(l => {
       const loc = (l.decl_file ? `${l.decl_file}:${l.decl_line}` : '') || (l.static_address || '');
+      const kind = l.link_kind || (l.type ? 'TYPE_DEFINITION' : 'GLOBAL_VARIABLE');
+      const isType = kind === 'TYPE_DEFINITION';
+      const isVerified = l.is_verified 
+        ? '<span class="badge badge-success text-xs" style="margin-left: 6px;">VERIFIED SYMBOL</span>' 
+        : '<span class="badge badge-warning text-xs" style="margin-left: 6px;">CANDIDATE REFERENCE</span>';
+      
+      const typeNoticeHtml = isType 
+        ? '<div class="text-xs text-muted" style="margin-top: 2px;">ℹ️ Type match defines layout only; does NOT prove which function created or modified this object.</div>' 
+        : '';
+      const limHtml = l.relationship_limitation ? `<div class="text-xs text-warning" style="margin-top: 2px;">⚠️ ${escapeHtml(l.relationship_limitation)}</div>` : '';
+
       return `
-        <div style="padding: 6px 8px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
-          <div>
-            <span class="mono" style="color: var(--accent); font-weight: 600;">${escapeHtml(l.symbol_name || l.type || 'Symbol')}</span>
-            <div class="text-xs text-muted">Basis: ${escapeHtml(l.link_basis || 'exact_match')}</div>
+        <div style="padding: 6px 8px; border-bottom: 1px solid var(--border-color);">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span class="mono" style="color: var(--accent); font-weight: 600;">${escapeHtml(l.symbol_name || l.type || 'Symbol')}</span>
+              <span class="badge badge-secondary text-xs" style="margin-left: 6px;">${escapeHtml(kind)}</span>
+              ${isVerified}
+            </div>
+            <span class="mono text-xs text-muted">${escapeHtml(loc)}</span>
           </div>
-          <span class="mono text-xs text-muted">${escapeHtml(loc)}</span>
+          <div class="text-xs text-muted" style="margin-top: 2px;">Basis: ${escapeHtml(l.link_basis || 'exact_match')}</div>
+          ${typeNoticeHtml}
+          ${limHtml}
         </div>
       `;
     }).join('');
@@ -4047,11 +4422,14 @@
     }
 
     el.tbodyRawEvidence.innerHTML = records.map(r => {
+      const parentsHtml = r.parent_evidence_ids && r.parent_evidence_ids.length > 0
+        ? `<div class="text-xs text-muted" style="margin-top: 2px;">Parents: ${r.parent_evidence_ids.map(p => `<button type="button" class="jump-link mono" onclick="window.__followEvidence('${escapeHtml(p)}')">${escapeHtml(p)}</button>`).join(', ')}</div>`
+        : '';
       return `
         <tr>
-          <td class="mono">${escapeHtml(r.evidence_id || '')}</td>
+          <td class="mono">${escapeHtml(r.evidence_id || '')}${parentsHtml}</td>
           <td><span class="badge">${escapeHtml(r.evidence_type || '')}</span></td>
-          <td>${escapeHtml(r.nature || 'observation')}</td>
+          <td><span class="badge ${r.nature === 'observation' ? 'badge-fact' : (r.nature === 'inference' ? 'badge-hypothesis' : 'badge-warning')}">${escapeHtml(r.nature || 'observation')}</span></td>
           <td class="text-muted">${escapeHtml(r.source || '')}</td>
           <td>${escapeHtml(r.observation || JSON.stringify(r.provenance || {}))}</td>
         </tr>
@@ -4059,11 +4437,63 @@
     }).join('');
   }
 
-  // Global helper for jumping to object in Explorer tab
-  window.__jumpToObject = function (objectId) {
+  // Global helper for tracing provenance lineage for evidence
+  window.__followEvidence = async function (evidenceId) {
+    if (!evidenceId || !state.activeInvestigation || !state.activeInvestigation.investigation_id) return;
+    const invId = state.activeInvestigation.investigation_id;
+    try {
+      showToast(`Tracing provenance lineage for evidence ${evidenceId}...`, 'info');
+      const res = await apiGet(`/api/investigation/follow?investigation_id=${invId}&evidence_id=${evidenceId}`);
+      if (res.success && res.data) {
+        const lineage = res.data.provenance_chain || [];
+        if (el.invLineageContainer && el.invLineageContent) {
+          el.invLineageContainer.style.display = 'block';
+          if (lineage.length === 0) {
+            el.invLineageContent.innerHTML = `<div>Evidence record <span class="mono">${escapeHtml(evidenceId)}</span> has no recorded ancestor lineage.</div>`;
+          } else {
+            el.invLineageContent.innerHTML = lineage.map((node, i) => {
+              const isCycle = node.status === 'CYCLE_DETECTED';
+              const isMissing = node.status === 'UNRESOLVED_PARENT';
+              const cls = isCycle ? 'lineage-step lineage-cycle' : 'lineage-step';
+              return `
+                <div class="${cls}">
+                  <strong>Step ${i + 1}:</strong> <span class="mono">${escapeHtml(node.evidence_id)}</span>
+                  ${isCycle ? '<span class="badge badge-danger text-xs">CYCLE DETECTED</span>' : ''}
+                  ${isMissing ? '<span class="badge badge-warning text-xs">UNRESOLVED PARENT</span>' : ''}
+                  <div class="text-muted text-xs">${escapeHtml(node.reason || `${node.nature || 'record'} from ${node.source || 'unknown'}`)}</div>
+                </div>
+              `;
+            }).join('');
+          }
+          el.invLineageContainer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      } else {
+        showToast(`Could not trace evidence: ${res.error?.message || 'Record not found'}`, 'warning');
+      }
+    } catch (e) {
+      showToast(`Lineage trace failed: ${String(e)}`, 'error');
+    }
+  };
+
+  // Global helper for jumping to object and highlighting field in Explorer tab
+  window.__jumpToObject = function (objectId, fieldName) {
+    if (!objectId) return;
     switchTab('tab-object-explorer');
     selectObject(objectId);
-    showToast(`Focused on object ${objectId}`, 'info');
+    if (fieldName && el.tableSemanticFields) {
+      setTimeout(() => {
+        const rows = el.tableSemanticFields.querySelectorAll('tr');
+        rows.forEach(r => {
+          const nameCell = r.querySelector('.field-name');
+          if (nameCell && nameCell.textContent.trim() === fieldName) {
+            r.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            r.style.outline = '2px solid var(--accent)';
+            setTimeout(() => { r.style.outline = ''; }, 2500);
+          }
+        });
+      }, 100);
+    }
+    showToast(`Focused on object ${objectId}${fieldName ? ` (${fieldName})` : ''}`, 'info');
   };
 
   // --------------------------------------------------------------------------

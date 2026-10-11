@@ -56,6 +56,7 @@ class EvidenceRecord:
     session_id: Optional[str] = None
     finding_id: Optional[str] = None
     observation: str = ""
+    parent_evidence_ids: List[str] = field(default_factory=list)
 
     # Provenance details
     provenance: Dict[str, Any] = field(default_factory=dict)
@@ -77,11 +78,8 @@ class EvidenceRecord:
             self.evidence_id = f"ev_{uuid.uuid4().hex[:12]}"
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).isoformat()
-        if self.evidence_type not in VALID_EVIDENCE_TYPES:
-            # Tolerant for future extensions, but normalized
-            pass
         if self.nature not in VALID_NATURES:
-            self.nature = NATURE_OBSERVATION
+            raise ValueError(f"Invalid evidence nature '{self.nature}'. Expected one of {sorted(VALID_NATURES)}")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary without None values for optional fields."""
@@ -92,6 +90,7 @@ class EvidenceRecord:
             "source": self.source,
             "timestamp": self.timestamp,
             "observation": self.observation,
+            "parent_evidence_ids": list(self.parent_evidence_ids),
             "schema_version": self.schema_version,
             "provenance": self.provenance,
             "details": self.details,
@@ -121,6 +120,14 @@ class EvidenceRecord:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EvidenceRecord":
         """Deserialize from dictionary, maintaining backward compatibility with missing fields."""
+        parent_ids = data.get("parent_evidence_ids")
+        if parent_ids is None:
+            prov = data.get("provenance", {})
+            if isinstance(prov, dict):
+                parent_ids = prov.get("parent_evidence_ids", [])
+            else:
+                parent_ids = []
+
         return cls(
             evidence_id=data.get("evidence_id") or f"ev_{uuid.uuid4().hex[:12]}",
             evidence_type=data.get("evidence_type", EVIDENCE_TYPE_OBJECT_STATE),
@@ -130,6 +137,7 @@ class EvidenceRecord:
             session_id=data.get("session_id"),
             finding_id=data.get("finding_id"),
             observation=data.get("observation", ""),
+            parent_evidence_ids=list(parent_ids or []),
             provenance=data.get("provenance", {}),
             target_identity=data.get("target_identity"),
             snapshot_ref=data.get("snapshot_ref"),
@@ -157,7 +165,7 @@ class EvidenceLedger:
         self._by_finding: Dict[str, List[EvidenceRecord]] = {}
 
     def add_record(self, record: Union[EvidenceRecord, Dict[str, Any]]) -> EvidenceRecord:
-        """Add an evidence record to the ledger."""
+        """Add an evidence record to the ledger, rejecting duplicate IDs."""
         if isinstance(record, dict):
             record = EvidenceRecord.from_dict(record)
         if not record.session_id:
@@ -165,6 +173,9 @@ class EvidenceLedger:
 
         # Schema validation
         self.validate_record(record)
+
+        if record.evidence_id in self._by_id:
+            raise ValueError(f"Duplicate evidence_id '{record.evidence_id}': record with this ID already exists in ledger.")
 
         self._records.append(record)
         self._by_id[record.evidence_id] = record
@@ -212,29 +223,77 @@ class EvidenceLedger:
             ]
         return results
 
-    def get_provenance_chain(self, finding_id: Optional[str] = None, evidence_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Trace provenance link chain from finding/evidence down to artifact/snapshot."""
-        records = []
-        if evidence_id and evidence_id in self._by_id:
-            records.append(self._by_id[evidence_id])
-        elif finding_id:
-            records.extend(self._by_finding.get(finding_id, []))
-
+    def trace_provenance_chain(self, evidence_id: str) -> List[Dict[str, Any]]:
+        """Trace recursive provenance lineage for an evidence record with cycle detection and deterministic ordering."""
         chain: List[Dict[str, Any]] = []
-        for r in records:
+        visited: Set[str] = set()
+
+        def _dfs(eid: str, path: List[str]):
+            if eid in path:
+                # Cycle detected
+                chain.append({
+                    "evidence_id": eid,
+                    "status": "CYCLE_DETECTED",
+                    "cycle_path": path + [eid],
+                    "reason": f"Cyclic provenance lineage detected involving '{eid}'.",
+                })
+                return
+
+            if eid in visited:
+                return
+            visited.add(eid)
+
+            rec = self.get_record(eid)
+            if not rec:
+                chain.append({
+                    "evidence_id": eid,
+                    "status": "UNRESOLVED_PARENT",
+                    "reason": f"Parent evidence '{eid}' not found in ledger.",
+                })
+                return
+
             step = {
-                "evidence_id": r.evidence_id,
-                "evidence_type": r.evidence_type,
-                "nature": r.nature,
-                "source": r.source,
-                "provenance": r.provenance,
-                "snapshot_ref": r.snapshot_ref,
-                "target_identity": r.target_identity,
-                "object_info": r.object_observation or r.field_observation,
-                "static_link": r.static_code_link,
+                "evidence_id": rec.evidence_id,
+                "evidence_type": rec.evidence_type,
+                "nature": rec.nature,
+                "source": rec.source,
+                "parent_evidence_ids": list(rec.parent_evidence_ids),
+                "provenance": rec.provenance,
+                "snapshot_ref": rec.snapshot_ref,
+                "target_identity": rec.target_identity,
+                "object_info": rec.object_observation or rec.field_observation,
+                "static_link": rec.static_code_link,
+                "status": "RESOLVED",
             }
             chain.append(step)
+
+            # Traverse parents deterministically (sorted)
+            sorted_parents = sorted(rec.parent_evidence_ids)
+            for pid in sorted_parents:
+                _dfs(pid, path + [eid])
+
+        _dfs(evidence_id, [])
         return chain
+
+    def get_provenance_chain(self, finding_id: Optional[str] = None, evidence_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Trace provenance link chain from finding/evidence down to artifact/snapshot."""
+        if evidence_id:
+            return self.trace_provenance_chain(evidence_id)
+
+        if finding_id:
+            records = self.query(finding_id=finding_id)
+            combined_chain: List[Dict[str, Any]] = []
+            seen_eids: Set[str] = set()
+            for r in records:
+                sub_chain = self.trace_provenance_chain(r.evidence_id)
+                for item in sub_chain:
+                    eid = item.get("evidence_id")
+                    if eid and eid not in seen_eids:
+                        seen_eids.add(eid)
+                        combined_chain.append(item)
+            return combined_chain
+
+        return []
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize full ledger to dictionary."""
@@ -266,3 +325,4 @@ class EvidenceLedger:
     def from_json(cls, json_str: str) -> "EvidenceLedger":
         """Reconstruct EvidenceLedger from JSON string."""
         return cls.from_dict(json.loads(json_str))
+

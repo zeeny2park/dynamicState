@@ -498,9 +498,10 @@ def main():
                 print("================================================================================")
                 print(f" dynamicState Investigation Report: {report.get('investigation_id')}")
                 print("================================================================================")
-                print(f"Goal:   {report.get('goal')}")
-                print(f"Status: {report.get('status')}")
-                print(f"Date:   {report.get('created_at')}\n")
+                print(f"Goal:        {report.get('goal')}")
+                print(f"Status:      {report.get('status')}")
+                print(f"Persistence: {report.get('persistence', 'EPHEMERAL_PROCESS_LOCAL')}")
+                print(f"Date:        {report.get('created_at')}\n")
 
                 # Target Identity
                 t_id = report.get("target_ref", {})
@@ -509,7 +510,8 @@ def main():
                 print(f"  Executable:     {t_details.get('executable', 'offline_artifact')}")
                 print(f"  Target Build ID:{t_details.get('target_build_id') or 'N/A'}")
                 print(f"  Debug Build ID: {t_details.get('debug_build_id') or 'N/A'}")
-                print(f"  Status:         {t_details.get('build_id_status', 'UNKNOWN')}\n")
+                reason_str = f" ({t_details.get('build_id_reason')})" if t_details.get("build_id_reason") else ""
+                print(f"  Build ID Status:{t_details.get('build_id_status', 'UNKNOWN')}{reason_str}\n")
 
                 # Capture Quality
                 q_details = report.get("stages", {}).get("capture_quality", {}).get("details", {})
@@ -521,6 +523,19 @@ def main():
                     print(f"  * Note: {lim}")
                 print()
 
+                # Static Code Links
+                static_details = report.get("stages", {}).get("static_code_link", {}).get("details", {})
+                if static_details.get("resolved_links"):
+                    print("--- [ Static Code References ] ---")
+                    for link in static_details["resolved_links"]:
+                        kind = link.get("link_kind", "UNRESOLVED")
+                        verified = "[VERIFIED]" if link.get("is_verified") else "[CANDIDATE]"
+                        sym = link.get("symbol_name") or link.get("type", "unknown")
+                        lim = f" (⚠️ {link['relationship_limitation']})" if link.get("relationship_limitation") else ""
+                        loc = f" at {link.get('decl_file', 'source')}:{link.get('decl_line', '?')}" if link.get('decl_file') else ""
+                        print(f"  * {verified} {kind}: {sym}{loc}{lim}")
+                    print()
+
                 # Findings
                 findings = report.get("findings", [])
                 facts = [f for f in findings if f.get("category") == "fact"]
@@ -531,7 +546,8 @@ def main():
                 if facts:
                     print("  [Observed Facts]")
                     for f in facts:
-                        print(f"    * {f.get('title')}: {f.get('description')}")
+                        status_str = f" [{f.get('status')}]" if f.get("status") else ""
+                        print(f"    *{status_str} {f.get('title')}: {f.get('description')}")
                         if f.get("c_type_path"):
                             print(f"      Path: {f.get('c_type_path')}")
                 if hypotheses:
@@ -541,7 +557,8 @@ def main():
                 if unknowns:
                     print("  [Unknowns / Unresolved Data]")
                     for f in unknowns:
-                        print(f"    ! {f.get('title')}: {f.get('description')}")
+                        status_str = f" [{f.get('status')}]" if f.get("status") else ""
+                        print(f"    !{status_str} {f.get('title')}: {f.get('description')}")
                 print()
 
                 # Recommended Next Steps

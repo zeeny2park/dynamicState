@@ -110,7 +110,7 @@ class TestInvestigationE2EFixture(unittest.TestCase):
         # 3. Verify Target Identity Stage
         id_stage = session_info["stages"]["target_identity"]
         self.assertEqual(id_stage["status"], "COMPLETED")
-        self.assertEqual(id_stage["details"]["build_id_status"], "VERIFIED")
+        self.assertIn(id_stage["details"]["build_id_status"], ("VERIFIED_MATCH", "VERIFIED"))
         self.assertIsNotNone(id_stage["details"]["target_build_id"])
         self.assertEqual(
             id_stage["details"]["target_build_id"],
@@ -153,16 +153,82 @@ class TestInvestigationE2EFixture(unittest.TestCase):
         self.assertIn("provenance_chain", ev_data)
         self.assertEqual(ev_data["evidence"]["evidence_id"], ev_id)
 
-        # 9. Verify Cross-Observation Comparison
+        # 9. Verify Cross-Observation Comparison and Value Diffs
         cmp_res = self.mgr.compare_observations(inv_id, snap1_dir, snap2_dir)
         self.assertNotIn("error", cmp_res)
         summary = cmp_res["summary"]
         self.assertGreaterEqual(summary["value_changes"], 1)
 
+        # Assert changed field with before and after values
+        value_changes = [c for c in cmp_res["changes"] if c.get("kind") == "value_change"]
+        self.assertGreater(len(value_changes), 0)
+        first_change = value_changes[0]
+        self.assertIn("before", first_change)
+        self.assertIn("after", first_change)
+        self.assertNotEqual(first_change["before"], first_change["after"])
+
         # Check uncertainty note presence due to low-impact zero-stop capture
-        if cq_stage["details"]["consistency_level"] == "NON_ATOMIC":
+        is_non_atomic = (cq_stage["details"]["consistency_level"] == "NON_ATOMIC")
+        if is_non_atomic:
             self.assertIsNotNone(cmp_res["uncertainty"])
             self.assertIn("non-atomically", cmp_res["uncertainty"])
+
+        # 10. Verify Non-Atomic capture quality label propagated to comparison finding
+        session = self.mgr.sessions[inv_id]
+        diff_findings = [f for f in session.findings if "fnd_cmp_" in f.finding_id]
+        self.assertGreater(len(diff_findings), 0)
+        cmp_finding = diff_findings[0]
+        if is_non_atomic:
+            self.assertEqual(cmp_finding.status, "POSSIBLY_INCONSISTENT")
+            self.assertIn("non-atomic", cmp_finding.description.lower())
+
+        # 11. Traverse Reverse Provenance Chain from diff finding back to capture quality & identity
+        diff_ev_id = cmp_finding.evidence_ids[0]
+        diff_ev_data = self.mgr.get_evidence(inv_id, evidence_id=diff_ev_id)
+        diff_chain = diff_ev_data.get("provenance_chain", [])
+        self.assertGreaterEqual(len(diff_chain), 2)
+        chain_types = [step.get("evidence_type") for step in diff_chain]
+        self.assertIn("COMPARISON", chain_types)
+        self.assertTrue("CAPTURE_QUALITY" in chain_types or "RUNTIME_IDENTITY" in chain_types)
+        # All steps in valid lineage must be resolved
+        for step in diff_chain:
+            self.assertEqual(step.get("status"), "RESOLVED")
+
+        # 12. Prove Static Linking distinguishes Type Definition from actual Function Relationships
+        from extractor.modules import RuntimeModule
+        from extractor.static_analyzer import (
+            LINK_KIND_GLOBAL_VARIABLE,
+            LINK_KIND_FUNCTION_ADDRESS,
+            LINK_KIND_TYPE_DEFINITION,
+            LINK_KIND_UNRESOLVED,
+            IDENTITY_MISMATCH,
+        )
+        static_provider = session.static_provider
+        # A. Function address match
+        if static_stage["details"]["resolved_links"]:
+            first_link = static_stage["details"]["resolved_links"][0]
+            self.assertIn(first_link.get("link_kind"), (LINK_KIND_GLOBAL_VARIABLE, LINK_KIND_FUNCTION_ADDRESS, LINK_KIND_TYPE_DEFINITION))
+
+        # B. Intentional Build ID Mismatch blocks static resolution
+        mismatched_mod = RuntimeModule(
+            module_id="main_executable",
+            path=self.debug_bin,
+            runtime_base=0x555555554000,
+            runtime_end=0x555555560000,
+            load_bias=0x555555554000,
+            build_id="intentionally_wrong_build_id",
+            load_bias_status="RESOLVED",
+            build_id_status=IDENTITY_MISMATCH,
+        )
+        blocked_res = static_provider.resolve_runtime_to_code(
+            0x555555554000 + 0x1000,
+            module=mismatched_mod,
+            type_name="Session",
+        )
+        self.assertEqual(blocked_res["status"], "UNRESOLVED_BUILD_ID_MISMATCH")
+        self.assertEqual(blocked_res["link_kind"], LINK_KIND_UNRESOLVED)
+        self.assertFalse(blocked_res["is_verified"])
+        self.assertIn("mismatches debug image", blocked_res["reason"])
 
 
 if __name__ == "__main__":

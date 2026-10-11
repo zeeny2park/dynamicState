@@ -2838,6 +2838,9 @@ body.advanced-mode .basic-only {
   cursor: pointer;
   text-decoration: underline;
   font-size: 0.8rem;
+  background: none;
+  border: none;
+  padding: 0;
 }
 
 .jump-link:hover {
@@ -2855,4 +2858,266 @@ body.advanced-mode .basic-only {
   align-items: center;
   gap: 4px;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Modernized Two-Level Header & Secondary Technical Bar                      */
+/* -------------------------------------------------------------------------- */
+
+.tech-badge-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 4px 10px;
+  border-right: 1px solid var(--border-color);
+}
+
+.status-pill.status-target,
+.status-pill.status-quality,
+.status-pill.status-investigation {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+}
+
+.pill-label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.pill-val {
+  color: var(--text-main);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+/* Secondary technical bar is collapsible in basic mode, always expanded in advanced mode */
+body:not(.advanced-mode) .runtime-summary-bar:not(.expanded) {
+  display: none;
+}
+
+body:not(.advanced-mode) .runtime-summary-bar.expanded {
+  display: flex;
+}
+
+body.advanced-mode .runtime-summary-bar {
+  display: flex !important;
+}
+
+#btn-toggle-tech-details.active {
+  background-color: var(--bg-input);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Investigation Launchpad & Entry Paths                                      */
+/* -------------------------------------------------------------------------- */
+
+.inv-launchpad {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.inv-launchpad-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.inv-launchpad-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.inv-entry-selector {
+  display: flex;
+  gap: 6px;
+}
+
+.inv-entry-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inv-entry-panel {
+  background-color: rgba(31, 41, 55, 0.4);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.inv-entry-panel.active {
+  border-color: var(--accent);
+}
+
+.inv-entry-desc {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.inv-form-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.inv-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 200px;
+}
+
+.inv-goal-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.inv-goal-input-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 280px;
+}
+
+.inv-goal-label {
+  font-weight: 600;
+  color: var(--accent);
+  font-size: 0.85rem;
+}
+
+.inv-goal-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-lg {
+  padding: 8px 16px;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.inv-recent-sessions {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inv-session-pills {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.inv-session-pill {
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  transition: all 0.15s ease;
+}
+
+.inv-session-pill:hover,
+.inv-session-pill.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Modernized Comparisons & Detailed Diff Table                               */
+/* -------------------------------------------------------------------------- */
+
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
+
+.diff-table th {
+  text-align: left;
+  padding: 6px 8px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 0.75rem;
+}
+
+.diff-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(46, 56, 77, 0.5);
+  font-size: 0.8rem;
+}
+
+.diff-badge-unavailable {
+  background-color: rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.diff-badge-modified {
+  background-color: rgba(56, 189, 248, 0.2);
+  color: #38bdf8;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.diff-badge-added {
+  background-color: rgba(16, 185, 129, 0.2);
+  color: #34d399;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Lineage Trace Viewer                                                       */
+/* -------------------------------------------------------------------------- */
+
+.lineage-step {
+  padding: 6px 10px;
+  border-left: 3px solid var(--accent);
+  background-color: rgba(56, 189, 248, 0.05);
+  margin-bottom: 6px;
+  border-radius: 0 4px 4px 0;
+}
+
+.lineage-cycle {
+  border-left-color: var(--danger);
+  background-color: rgba(239, 68, 68, 0.08);
+}
+
 

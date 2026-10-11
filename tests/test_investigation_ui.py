@@ -284,6 +284,96 @@ class TestInvestigationUI(unittest.TestCase):
         self.assertFalse(resp.get("success"))
         self.assertEqual(resp["error"]["code"], "INVALID_PARAM")
 
+    def test_two_level_header_and_launchpad_ui_elements(self):
+        """Verify Level 1 primary status bar, Level 2 technical bar, and Launchpad UI elements."""
+        status, _, body = self._get_raw("/")
+        self.assertEqual(status, 200)
+        html = body.decode("utf-8")
+
+        # Level 1 Primary Header
+        self.assertIn("header-primary-status", html)
+        self.assertIn("hdr-txt-target", html)
+        self.assertIn("hdr-badge-capture-quality", html)
+        self.assertIn("hdr-badge-investigation-state", html)
+        self.assertIn("btn-toggle-tech-details", html)
+
+        # Level 2 Secondary Technical Bar
+        self.assertIn("runtime-summary-bar", html)
+        self.assertIn("tech-badge-group", html)
+
+        # Honest defaults: Disconnected and Unverified (no false 'Supported' claims)
+        self.assertIn("status-disconnected", html)
+        self.assertIn("Unverified", html)
+
+        # Launchpad & Entry Paths
+        self.assertIn("inv-launchpad", html)
+        self.assertIn("btn-entry-snapshot", html)
+        self.assertIn("btn-entry-live", html)
+        self.assertIn("panel-entry-snapshot", html)
+        self.assertIn("panel-entry-live", html)
+        self.assertIn("inv-recent-sessions-container", html)
+
+        # Dynamic Alert Banner
+        self.assertIn("inv-alert-banner", html)
+
+        # Inline Comparison controls
+        self.assertIn("inv-cmp-select-a", html)
+        self.assertIn("inv-cmp-select-b", html)
+        self.assertIn("btn-run-inline-compare", html)
+
+        # Lineage viewer
+        self.assertIn("inv-lineage-container", html)
+        self.assertIn("btn-close-lineage", html)
+
+    def test_follow_evidence_returns_provenance_lineage(self):
+        """Verify /api/investigation/follow returns provenance_chain for evidence records."""
+        # 1. Start investigation
+        status, resp = self._post_json("/api/investigation/start", {
+            "goal": "Verify provenance lineage trace",
+            "snapshot_id": "snap_alpha_ui",
+        })
+        self.assertEqual(status, 200)
+        inv_id = resp["data"]["investigation_id"]
+
+        # 2. Get evidence list
+        status, resp = self._get_json(f"/api/investigation/evidence?investigation_id={inv_id}")
+        self.assertEqual(status, 200)
+        records = resp["data"]["records"]
+        self.assertGreater(len(records), 0)
+        first_eid = records[0]["evidence_id"]
+
+        # 3. Follow evidence
+        status, resp = self._get_json(f"/api/investigation/follow?investigation_id={inv_id}&evidence_id={first_eid}")
+        self.assertEqual(status, 200)
+        data = resp["data"]
+        self.assertEqual(data["evidence_id"], first_eid)
+        self.assertIn("provenance_chain", data)
+        self.assertIsInstance(data["provenance_chain"], list)
+
+    def test_compare_observations_returns_diff_changes(self):
+        """Verify /api/investigation/compare returns structured diff changes list."""
+        status, resp = self._post_json("/api/investigation/start", {
+            "goal": "Test compare diff changes",
+            "snapshot_id": "snap_alpha_ui",
+        })
+        self.assertEqual(status, 200)
+        inv_id = resp["data"]["investigation_id"]
+
+        status, resp = self._post_json("/api/investigation/compare", {
+            "investigation_id": inv_id,
+            "snapshot_a": "snap_alpha_ui",
+            "snapshot_b": "snap_beta_ui",
+        })
+        self.assertEqual(status, 200)
+        data = resp["data"]
+        self.assertIn("changes", data)
+        self.assertIsInstance(data["changes"], list)
+        self.assertGreater(len(data["changes"]), 0)
+        # Verify first change has field path, kind, before, after
+        chg = data["changes"][0]
+        self.assertIn("path", chg)
+        self.assertIn("kind", chg)
+
 
 if __name__ == "__main__":
     unittest.main()

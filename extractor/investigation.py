@@ -44,9 +44,22 @@ from .state_corpus import StateCorpus
 from .state_diff import StateDiffEngine
 from .state_lab import compute_semantic_diff
 from .static_analyzer import (
+    IDENTITY_DEBUG_ID_UNAVAILABLE,
+    IDENTITY_INCOMPLETE,
+    IDENTITY_MISMATCH,
+    IDENTITY_TARGET_ID_UNAVAILABLE,
+    IDENTITY_VERIFIED_MATCH,
+    LINK_KIND_CALL_RELATIONSHIP,
+    LINK_KIND_FIELD_WRITE_CANDIDATE,
+    LINK_KIND_FUNCTION_ADDRESS,
+    LINK_KIND_GLOBAL_VARIABLE,
+    LINK_KIND_SOURCE_LOCATION,
+    LINK_KIND_TYPE_DEFINITION,
+    LINK_KIND_UNRESOLVED,
     DwarfStaticAnalysisProvider,
     NullStaticAnalysisProvider,
     StaticAnalysisProvider,
+    validate_module_identity,
 )
 
 
@@ -138,6 +151,7 @@ class InvestigationSession:
         self.comparison_results: List[Dict[str, Any]] = []
         self.static_provider: StaticAnalysisProvider = NullStaticAnalysisProvider()
         self.summary: Dict[str, Any] = {}
+        self.persistence: str = "EPHEMERAL_PROCESS_LOCAL"
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to JSON-serializable dictionary."""
@@ -146,6 +160,7 @@ class InvestigationSession:
             "goal": self.goal,
             "status": self.status,
             "created_at": self.created_at,
+            "persistence": self.persistence,
             "target_ref": self.target_ref,
             "safety": self.safety,
             "budgets": self.budgets,
@@ -213,6 +228,66 @@ class InvestigationManager:
             "debug_image": debug_image,
             "constraints": constraints or {},
         }
+
+        # Check pid-only without existing snapshot
+        if pid and not snapshot_id and not memory_snapshot_path:
+            if not authorize_target:
+                session.status = "BLOCKED"
+                session.stages["target_identity"] = {
+                    "status": "BLOCKED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"Live process capture for PID {pid} requires explicit authorize_target=True."},
+                }
+                session.findings.append(InvestigationFinding(
+                    finding_id=f"fnd_auth_{uuid.uuid4().hex[:8]}",
+                    category="unknown",
+                    title="Target Process Authorization Required",
+                    description=f"PID {pid} was specified without an existing offline snapshot. Live process inspection requires explicit authorize_target=True.",
+                    confidence="high",
+                    status="UNRESOLVED",
+                ))
+                session.summary["error"] = "Target authorization required for live process capture"
+                return session.to_dict()
+
+            # Target is authorized: verify process existence
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                session.status = "FAILED"
+                session.stages["target_identity"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"Target process PID {pid} does not exist (ESRCH)."},
+                }
+                session.summary["error"] = f"Target PID {pid} not found (ESRCH)"
+                return session.to_dict()
+            except PermissionError:
+                session.status = "FAILED"
+                session.stages["target_identity"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"Permission denied accessing PID {pid} (EPERM)."},
+                }
+                session.summary["error"] = f"Permission denied accessing PID {pid} (EPERM)"
+                return session.to_dict()
+
+            # Perform live capture
+            try:
+                from .capture_backend import ProcessVmCaptureBackend, ProcfsCaptureBackend
+                backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(pid) else ProcfsCaptureBackend()
+                live_snap = backend.capture(pid=pid)
+                snap_dir = os.path.join(self.corpus_dir, "memory_snapshots", f"live_pid_{pid}_{uuid.uuid4().hex[:6]}")
+                live_snap.save(snap_dir)
+                session.target_ref["memory_snapshot_path"] = snap_dir
+            except Exception as cap_exc:
+                session.status = "FAILED"
+                session.stages["capture_quality"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"Live memory capture failed for PID {pid}: {cap_exc}"},
+                }
+                session.summary["error"] = f"Live memory capture failed: {cap_exc}"
+                return session.to_dict()
 
         if static_provider:
             session.static_provider = static_provider
@@ -362,11 +437,18 @@ class InvestigationManager:
 
 
         # Record comparison evidence in ledger
+        parents = []
+        if getattr(session, "capture_quality_evidence_id", None):
+            parents.append(session.capture_quality_evidence_id)
+        elif getattr(session, "identity_evidence_id", None):
+            parents.append(session.identity_evidence_id)
+
         ev = session.ledger.add_record(EvidenceRecord(
             evidence_type=EVIDENCE_TYPE_COMPARISON,
             nature=NATURE_OBSERVATION,
             source="state_diff",
             session_id=session.investigation_id,
+            parent_evidence_ids=parents,
             observation=f"Semantic comparison between {snapshot_a} and {snapshot_b}: {diff_dict['summary']['value_changes']} value changes, {diff_dict['summary']['objects_created']} added, {diff_dict['summary']['objects_removed']} removed.",
             comparison_observation={
                 "snapshot_a": snapshot_a,
@@ -380,21 +462,58 @@ class InvestigationManager:
         ))
 
         # Add findings from significant differences
-        if diff_dict["summary"]["value_changes"] > 0 or diff_dict["summary"]["objects_created"] > 0:
-            for chg in diff_dict["changes"][:10]:
-                if chg.get("kind") == "value_change":
+        if (
+            diff_dict["summary"]["value_changes"] > 0
+            or diff_dict["summary"]["objects_created"] > 0
+            or diff_dict["summary"].get("fields_unavailable", 0) > 0
+            or diff_dict["summary"].get("fields_added", 0) > 0
+        ):
+            for chg in diff_dict["changes"][:20]:
+                kind = chg.get("kind")
+                if kind == "value_change":
                     fnd_id = f"fnd_cmp_{uuid.uuid4().hex[:8]}"
+                    status = "POSSIBLY_INCONSISTENT" if uncertainty else "OBSERVED"
                     fnd = InvestigationFinding(
                         finding_id=fnd_id,
                         category="fact",
                         title=f"Field value change in {chg.get('path', 'unknown')}",
-                        description=f"Field changed from {chg.get('before')} to {chg.get('after')} between observations.",
+                        description=f"Field changed from {chg.get('before')} to {chg.get('after')} between observations." + (f" Note: {uncertainty}" if uncertainty else ""),
+                        c_type_path=chg.get("path"),
+                        object_id=chg.get("object_id"),
+                        field_name=chg.get("field"),
+                        evidence_ids=[ev.evidence_id],
+                        confidence="medium" if uncertainty else "high",
+                        status=status,
+                    )
+                    session.findings.append(fnd)
+                elif kind == "field_unavailable":
+                    fnd_id = f"fnd_cmp_{uuid.uuid4().hex[:8]}"
+                    fnd = InvestigationFinding(
+                        finding_id=fnd_id,
+                        category="unknown",
+                        title=f"Field unavailable in comparison: {chg.get('path', 'unknown')}",
+                        description=f"Field '{chg.get('field')}' present in one observation was unavailable/missing in the other observation. Never reported as unchanged.",
                         c_type_path=chg.get("path"),
                         object_id=chg.get("object_id"),
                         field_name=chg.get("field"),
                         evidence_ids=[ev.evidence_id],
                         confidence="high",
-                        status="CONFIRMED",
+                        status="UNAVAILABLE",
+                    )
+                    session.findings.append(fnd)
+                elif kind == "field_added":
+                    fnd_id = f"fnd_cmp_{uuid.uuid4().hex[:8]}"
+                    fnd = InvestigationFinding(
+                        finding_id=fnd_id,
+                        category="fact",
+                        title=f"Field added in observation: {chg.get('path', 'unknown')}",
+                        description=f"Field '{chg.get('field')}' with value {chg.get('after')} was added in subsequent observation.",
+                        c_type_path=chg.get("path"),
+                        object_id=chg.get("object_id"),
+                        field_name=chg.get("field"),
+                        evidence_ids=[ev.evidence_id],
+                        confidence="high",
+                        status="OBSERVED",
                     )
                     session.findings.append(fnd)
 
@@ -404,6 +523,7 @@ class InvestigationManager:
             "diff_summary": diff_dict["summary"],
             "uncertainty": uncertainty,
             "evidence_id": ev.evidence_id,
+            "changes": diff_dict.get("changes", [])[:50],
         })
 
         session.stages["observation_comparison"] = {
@@ -441,6 +561,7 @@ class InvestigationManager:
             "related_fields": [],
             "related_static_symbols": [],
             "related_evidence": [],
+            "provenance_chain": session.ledger.trace_provenance_chain(evidence_id),
         }
 
         # 1. Connected object and fields
@@ -545,18 +666,15 @@ class InvestigationManager:
         target_build_id = raw_snap.executable_build_id if raw_snap else None
         pid = raw_snap.pid if raw_snap else t_ref.get("pid")
 
-        build_id_status = "NOT_AVAILABLE"
         dbg_build_id = None
         if dbg_path and os.path.exists(dbg_path):
             try:
                 dbg_ident = inspect_elf(dbg_path)
                 dbg_build_id = dbg_ident.build_id
-                if target_build_id and dbg_build_id:
-                    build_id_status = "VERIFIED" if target_build_id == dbg_build_id else "MISMATCH"
-                elif dbg_build_id:
-                    build_id_status = "AVAILABLE_IN_DEBUG_IMAGE"
             except Exception:
-                build_id_status = "UNREADABLE"
+                dbg_build_id = None
+
+        build_id_status, reason = validate_module_identity(target_build_id, dbg_build_id)
 
         identity_details = {
             "pid": pid,
@@ -565,6 +683,7 @@ class InvestigationManager:
             "debug_image": dbg_path,
             "debug_build_id": dbg_build_id,
             "build_id_status": build_id_status,
+            "build_id_reason": reason,
         }
 
         # Record Identity Evidence
@@ -573,13 +692,25 @@ class InvestigationManager:
             nature=NATURE_OBSERVATION,
             source="debug_image_inspect",
             session_id=session.investigation_id,
-            observation=f"Target executable identity: {target_exec or 'unknown'}, Build ID status: {build_id_status}.",
+            observation=f"Target executable identity: {target_exec or 'unknown'}, Build ID status: {build_id_status} ({reason}).",
             target_identity=identity_details,
             details=identity_details,
         ))
 
-        # Add Finding if mismatch detected
-        if build_id_status == "MISMATCH":
+        # Add Findings according to explicit identity state
+        has_binary_context = bool(target_exec or dbg_path or target_build_id or dbg_build_id)
+        if build_id_status == IDENTITY_VERIFIED_MATCH:
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_id_{uuid.uuid4().hex[:8]}",
+                category="fact",
+                title="Debug Image Build ID Verified",
+                description=reason,
+                evidence_ids=[ev.evidence_id],
+                confidence="high",
+                status="VERIFIED",
+            ))
+            stage_status = "COMPLETED"
+        elif build_id_status == IDENTITY_MISMATCH:
             session.findings.append(InvestigationFinding(
                 finding_id=f"fnd_id_{uuid.uuid4().hex[:8]}",
                 category="unknown",
@@ -589,9 +720,46 @@ class InvestigationManager:
                 confidence="high",
                 status="UNRESOLVED",
             ))
+            stage_status = "FAILED"
+        elif build_id_status == IDENTITY_TARGET_ID_UNAVAILABLE and has_binary_context:
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_id_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title="Target Build ID Unavailable",
+                description=reason,
+                evidence_ids=[ev.evidence_id],
+                confidence="high",
+                status="UNRESOLVED",
+            ))
+            stage_status = "PARTIAL"
+        elif build_id_status == IDENTITY_DEBUG_ID_UNAVAILABLE and has_binary_context:
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_id_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title="Debug Image Build ID Unavailable",
+                description=reason,
+                evidence_ids=[ev.evidence_id],
+                confidence="high",
+                status="UNRESOLVED",
+            ))
+            stage_status = "PARTIAL"
+        elif build_id_status == IDENTITY_INCOMPLETE and has_binary_context:
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_id_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title="Build ID Evidence Incomplete",
+                description=reason,
+                evidence_ids=[ev.evidence_id],
+                confidence="high",
+                status="UNRESOLVED",
+            ))
+            stage_status = "PARTIAL"
+        else:
+            stage_status = "PARTIAL"
 
+        session.identity_evidence_id = ev.evidence_id
         session.stages["target_identity"] = {
-            "status": "COMPLETED" if build_id_status != "MISMATCH" else "PARTIAL",
+            "status": stage_status,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "details": identity_details,
         }
@@ -646,15 +814,18 @@ class InvestigationManager:
             "limitations": limitations,
         }
 
+        parents = [session.identity_evidence_id] if getattr(session, "identity_evidence_id", None) else []
         ev = session.ledger.add_record(EvidenceRecord(
             evidence_type=EVIDENCE_TYPE_CAPTURE_QUALITY,
             nature=NATURE_OBSERVATION,
             source="raw_snapshot_metadata",
             session_id=session.investigation_id,
+            parent_evidence_ids=parents,
             observation=f"Capture consistency: {consistency_level}, partial reads: {partial_reads}, failed: {failed_reads}.",
             capture_quality=quality_details,
             details=quality_details,
         ))
+        session.capture_quality_evidence_id = ev.evidence_id
 
         # Record findings for capture quality issues
         if consistency_level == NON_ATOMIC:
@@ -713,15 +884,6 @@ class InvestigationManager:
             except Exception:
                 pass
 
-        if not semantic_state and not snap_id and not mem_snap_path:
-            # Check if any snapshot exists in corpus only if no target was specified
-            states = sorted(self.corpus.states.keys())
-            if states:
-                try:
-                    semantic_state = self.corpus.get(states[-1])
-                except Exception:
-                    pass
-
         session.active_snapshot = semantic_state
 
         if not semantic_state:
@@ -733,9 +895,12 @@ class InvestigationManager:
             }
             return
 
-
         objs = getattr(semantic_state, "objects", []) or (semantic_state.get("persistent", {}).get("objects", []) if isinstance(semantic_state, dict) else [])
         roots = getattr(semantic_state, "roots", []) or []
+
+        cap_ev_id = getattr(session, "capture_quality_evidence_id", None)
+        parents = [cap_ev_id] if cap_ev_id else []
+        root_evidence_map: Dict[str, str] = {}
 
         # Record Evidence for discovered typed roots and objects
         for r in roots[:5]:
@@ -745,10 +910,14 @@ class InvestigationManager:
                 nature=NATURE_OBSERVATION,
                 source="offline_dwarf_reconstruction",
                 session_id=session.investigation_id,
+                parent_evidence_ids=parents,
                 observation=f"Discovered typed root: {r_dict.get('name')} of type {r_dict.get('type')}.",
                 object_observation=r_dict,
                 details=r_dict,
             ))
+            r_ref = r_dict.get("object_ref")
+            if r_ref:
+                root_evidence_map[r_ref] = ev.evidence_id
             session.findings.append(InvestigationFinding(
                 finding_id=f"fnd_root_{uuid.uuid4().hex[:8]}",
                 category="fact",
@@ -758,7 +927,7 @@ class InvestigationManager:
                 object_id=r_dict.get("object_ref"),
                 evidence_ids=[ev.evidence_id],
                 confidence="high",
-                status="CONFIRMED",
+                status="OBSERVED",
             ))
 
         # Sample reachable objects and fields
@@ -768,6 +937,8 @@ class InvestigationManager:
             oid = o_dict.get("object_id")
             otype = o_dict.get("type")
             path = o_dict.get("primary_path", oid)
+
+            parent_ids = [root_evidence_map[oid]] if oid in root_evidence_map else parents
 
             for f in o_dict.get("fields", [])[:10]:
                 fname = f.get("name")
@@ -779,6 +950,7 @@ class InvestigationManager:
                     nature=NATURE_OBSERVATION,
                     source="typed_object_graph",
                     session_id=session.investigation_id,
+                    parent_evidence_ids=parent_ids,
                     observation=f"Observed {fpath} = {fval} (type {f.get('type')}).",
                     field_observation={
                         "object_id": oid,
@@ -794,14 +966,14 @@ class InvestigationManager:
                 finding_candidate = InvestigationFinding(
                     finding_id=f"fnd_fld_{uuid.uuid4().hex[:8]}",
                     category="fact",
-                    title=f"Runtime Field Value: {fpath}",
+                    title=f"Observed Field: {fpath}",
                     description=f"Field {fname} observed with value {fval} ({f.get('type')}).",
                     c_type_path=fpath,
                     object_id=oid,
                     field_name=fname,
                     evidence_ids=[ev.evidence_id],
-                    confidence="high",
-                    status="CONFIRMED",
+                    confidence="OBSERVED",
+                    status="OBSERVED",
                 )
                 if first_field_finding is None:
                     first_field_finding = finding_candidate
@@ -812,7 +984,6 @@ class InvestigationManager:
 
         if not session.findings and first_field_finding:
             session.findings.append(first_field_finding)
-
 
         session.stages["semantic_interpretation"] = {
             "status": "COMPLETED",
@@ -844,27 +1015,66 @@ class InvestigationManager:
         objs = getattr(snap, "objects", []) or (snap.get("persistent", {}).get("objects", []) if isinstance(snap, dict) else [])
         items_to_resolve = list(roots[:5]) + list(objs[:10])
 
-        # Retrieve dynamic load bias from snapshot provenance if available
+        # Retrieve dynamic load bias from snapshot provenance or compute via ModuleAddressResolver
+        t_ref = session.target_ref
         t_ident = session.stages["target_identity"].get("details", {})
         prov = getattr(snap, "provenance", {}) if hasattr(snap, "provenance") else (snap.get("provenance", {}) if isinstance(snap, dict) else {})
         real_load_bias = prov.get("load_bias") if isinstance(prov, dict) else None
+        load_bias_status = "UNRESOLVED"
+        load_bias_provenance: Dict[str, Any] = {}
+
         if isinstance(real_load_bias, str):
             try:
                 real_load_bias = int(real_load_bias, 16) if real_load_bias.startswith("0x") else int(real_load_bias)
+                load_bias_status = "RESOLVED"
+                load_bias_provenance = {"source": "snapshot_provenance", "load_bias": f"0x{real_load_bias:x}"}
             except ValueError:
-                real_load_bias = 0x555555554000
-        elif not isinstance(real_load_bias, int):
-            real_load_bias = 0x555555554000
+                real_load_bias = None
+        elif isinstance(real_load_bias, int):
+            load_bias_status = "RESOLVED"
+            load_bias_provenance = {"source": "snapshot_provenance", "load_bias": f"0x{real_load_bias:x}"}
+
+        # If not in provenance, calculate dynamically using ModuleAddressResolver from memory mappings and ELF PT_LOAD
+        if real_load_bias is None:
+            raw_snap = None
+            if t_ref.get("memory_snapshot_path") and os.path.exists(t_ref["memory_snapshot_path"]):
+                raw_snap = RawRuntimeSnapshot.load(t_ref["memory_snapshot_path"])
+            elif t_ref.get("snapshot_id"):
+                cand = os.path.join(self.corpus_dir, "memory_snapshots", t_ref["snapshot_id"])
+                if os.path.exists(cand):
+                    raw_snap = RawRuntimeSnapshot.load(cand)
+
+            dbg_image_path = t_ident.get("debug_image") or t_ref.get("debug_image")
+            if raw_snap and getattr(raw_snap, "memory_regions", None) and dbg_image_path and os.path.exists(dbg_image_path):
+                try:
+                    elf_info = inspect_elf(dbg_image_path)
+                    calc_bias = ModuleAddressResolver.calculate_load_bias(raw_snap.memory_regions, elf_info)
+                    real_load_bias = calc_bias
+                    load_bias_status = "RESOLVED"
+                    load_bias_provenance = {
+                        "source": "ModuleAddressResolver.calculate_load_bias",
+                        "elf_type": elf_info.elf_type,
+                        "pt_loads": len(elf_info.pt_loads),
+                        "load_bias": f"0x{calc_bias:x}",
+                    }
+                except Exception as e:
+                    real_load_bias = None
+                    load_bias_status = "UNRESOLVED"
+                    load_bias_provenance = {"source": "ModuleAddressResolver", "error": str(e)}
+            else:
+                real_load_bias = None
+                load_bias_status = "UNRESOLVED"
+                load_bias_provenance = {"reason": "Mapping evidence unavailable or ambiguous"}
 
         main_mod = RuntimeModule(
             module_id="main_executable",
             path=t_ident.get("executable", "main"),
-            runtime_base=real_load_bias,
-            runtime_end=real_load_bias + 0x1000000,
+            runtime_base=real_load_bias if real_load_bias is not None else 0,
+            runtime_end=(real_load_bias + 0x1000000) if real_load_bias is not None else 0,
             load_bias=real_load_bias,
             build_id=t_ident.get("target_build_id"),
-            load_bias_status="RESOLVED",
-            build_id_status=t_ident.get("build_id_status", "VERIFIED"),
+            load_bias_status=load_bias_status,
+            build_id_status=t_ident.get("build_id_status", "INCOMPLETE"),
         )
 
         for item in items_to_resolve:
@@ -874,28 +1084,45 @@ class InvestigationManager:
             item_name = o_dict.get("name") or o_dict.get("primary_path") or o_dict.get("object_id")
             if addr and isinstance(addr, int) and addr > 0:
                 res = provider.resolve_runtime_to_code(addr, module=main_mod, type_name=otype)
-                if res.get("status") == "RESOLVED":
+                if res.get("status") in ("RESOLVED", "RESOLVED_TYPE_MATCH"):
                     linked_count += 1
                     resolved_links.append(res)
+                    link_kind = res.get("link_kind", LINK_KIND_TYPE_DEFINITION if res.get("status") == "RESOLVED_TYPE_MATCH" else LINK_KIND_GLOBAL_VARIABLE)
+                    is_type_only = (link_kind == LINK_KIND_TYPE_DEFINITION)
+
+                    parent_ids = []
+                    matching_ev = session.ledger.query(object_id=o_dict.get("object_id"))
+                    if matching_ev:
+                        parent_ids = [matching_ev[0].evidence_id]
+                    elif getattr(session, "capture_quality_evidence_id", None):
+                        parent_ids = [session.capture_quality_evidence_id]
+
                     ev = session.ledger.add_record(EvidenceRecord(
                         evidence_type=EVIDENCE_TYPE_STATIC_LINK,
                         nature=NATURE_OBSERVATION,
                         source=provider.get_provider_name(),
                         session_id=session.investigation_id,
-                        observation=f"Linked runtime object {item_name} ({otype}) to static symbol {res.get('symbol_name')}.",
+                        parent_evidence_ids=parent_ids,
+                        observation=f"Linked runtime object {item_name} ({otype}) via {link_kind}: {res.get('symbol_name') or res.get('type')}.",
                         static_code_link=res,
+                        provenance=load_bias_provenance,
                         details=res,
                     ))
+
+                    finding_status = "TYPE_ONLY" if is_type_only else "VERIFIED"
+                    title = f"Static Type Definition: {res.get('type')}" if is_type_only else f"Static Code Correlation: {res.get('symbol_name')}"
+                    desc = res.get("relationship_limitation") if is_type_only else f"Correlated via {res.get('link_basis')} ({link_kind}) at {res.get('decl_file', 'source')}:{res.get('decl_line', '?')}."
+
                     session.findings.append(InvestigationFinding(
                         finding_id=f"fnd_static_{uuid.uuid4().hex[:8]}",
                         category="fact",
-                        title=f"Static Code Correlation: {res.get('symbol_name')}",
-                        description=f"Correlated via {res.get('link_basis')} at {res.get('decl_file', 'source')}:{res.get('decl_line', '?')}.",
+                        title=title,
+                        description=desc,
                         c_type_path=item_name or otype,
                         object_id=o_dict.get("object_id") or o_dict.get("object_ref"),
                         evidence_ids=[ev.evidence_id],
-                        confidence="high",
-                        status="CONFIRMED",
+                        confidence="medium" if is_type_only else "high",
+                        status=finding_status,
                     ))
 
                 elif "UNRESOLVED" in str(res.get("status")):
@@ -907,6 +1134,7 @@ class InvestigationManager:
                         session_id=session.investigation_id,
                         observation=f"Unresolved static link for {o_dict.get('object_id')} at 0x{addr:x}: {res.get('reason')}.",
                         static_code_link=res,
+                        provenance=load_bias_provenance,
                         details=res,
                     ))
 
@@ -917,6 +1145,8 @@ class InvestigationManager:
                 "provider": provider.get_provider_name(),
                 "linked_count": linked_count,
                 "resolved_links": resolved_links,
+                "load_bias_provenance": load_bias_provenance,
+                "load_bias_status": load_bias_status,
             },
         }
 

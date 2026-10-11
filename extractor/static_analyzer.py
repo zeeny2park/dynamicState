@@ -15,6 +15,49 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer
 from .modules import ModuleAddressResolver, RuntimeModule
 
 
+# Link kinds
+LINK_KIND_TYPE_DEFINITION = "TYPE_DEFINITION"
+LINK_KIND_GLOBAL_VARIABLE = "GLOBAL_VARIABLE"
+LINK_KIND_FUNCTION_ADDRESS = "FUNCTION_ADDRESS"
+LINK_KIND_CALL_RELATIONSHIP = "CALL_RELATIONSHIP"
+LINK_KIND_FIELD_WRITE_CANDIDATE = "FIELD_WRITE_CANDIDATE"
+LINK_KIND_SOURCE_LOCATION = "SOURCE_LOCATION"
+LINK_KIND_UNRESOLVED = "UNRESOLVED"
+
+# Identity status constants
+IDENTITY_VERIFIED_MATCH = "VERIFIED_MATCH"
+IDENTITY_MISMATCH = "MISMATCH"
+IDENTITY_TARGET_ID_UNAVAILABLE = "TARGET_ID_UNAVAILABLE"
+IDENTITY_DEBUG_ID_UNAVAILABLE = "DEBUG_ID_UNAVAILABLE"
+IDENTITY_INCOMPLETE = "INCOMPLETE"
+
+
+def validate_module_identity(
+    target_build_id: Optional[str],
+    debug_build_id: Optional[str],
+) -> Tuple[str, str]:
+    """Validate target module vs debug image identity.
+
+    Returns (status, reason) where status is one of:
+    - VERIFIED_MATCH: Both have Build IDs and they match exactly.
+    - MISMATCH: Both have Build IDs and they conflict.
+    - TARGET_ID_UNAVAILABLE: Target lacks Build ID (debug Build ID alone does not prove match).
+    - DEBUG_ID_UNAVAILABLE: Debug artifact lacks Build ID.
+    - INCOMPLETE: Insufficient identity evidence.
+    """
+    if target_build_id and debug_build_id:
+        if target_build_id == debug_build_id:
+            return IDENTITY_VERIFIED_MATCH, "Target module and debug image Build IDs match."
+        else:
+            return IDENTITY_MISMATCH, f"Target Build ID '{target_build_id}' conflicts with debug image Build ID '{debug_build_id}'."
+    elif not target_build_id and debug_build_id:
+        return IDENTITY_TARGET_ID_UNAVAILABLE, "Target module Build ID cannot be established; debug image Build ID alone does not prove a match."
+    elif target_build_id and not debug_build_id:
+        return IDENTITY_DEBUG_ID_UNAVAILABLE, "Debug image does not contain a GNU Build ID."
+    else:
+        return IDENTITY_INCOMPLETE, "Insufficient identity evidence: neither target module nor debug image provided a Build ID."
+
+
 class StaticAnalysisProvider(ABC):
     """Abstract interface for static analysis backends (DWARF, REA, Ghidra, etc.)."""
 
@@ -104,6 +147,8 @@ class NullStaticAnalysisProvider(StaticAnalysisProvider):
     ) -> Dict[str, Any]:
         return {
             "status": "UNRESOLVED_NO_PROVIDER",
+            "link_kind": LINK_KIND_UNRESOLVED,
+            "is_verified": False,
             "runtime_address": "0x{:x}".format(runtime_addr),
             "link_basis": None,
             "reason": "No static analysis backend configured.",
@@ -150,17 +195,37 @@ class MockStaticAnalysisProvider(StaticAnalysisProvider):
         if runtime_addr in self.custom_mappings:
             return self.custom_mappings[runtime_addr]
 
-        if module and module.build_id_status == "MISMATCH":
+        if module and module.build_id_status in (IDENTITY_MISMATCH, "MISMATCH"):
             return {
                 "status": "UNRESOLVED_BUILD_ID_MISMATCH",
+                "link_kind": LINK_KIND_UNRESOLVED,
+                "is_verified": False,
                 "runtime_address": "0x{:x}".format(runtime_addr),
                 "link_basis": None,
                 "reason": f"Module '{module.module_id}' build ID mismatches debug image.",
             }
 
-        if module and module.load_bias_status != "RESOLVED":
+        if module and module.build_id_status in (
+            IDENTITY_TARGET_ID_UNAVAILABLE,
+            IDENTITY_DEBUG_ID_UNAVAILABLE,
+            IDENTITY_INCOMPLETE,
+            "NOT_AVAILABLE",
+            "UNREADABLE",
+        ):
+            return {
+                "status": "UNRESOLVED_IDENTITY_UNVERIFIED",
+                "link_kind": LINK_KIND_UNRESOLVED,
+                "is_verified": False,
+                "runtime_address": "0x{:x}".format(runtime_addr),
+                "link_basis": None,
+                "reason": f"Module '{module.module_id}' identity cannot be reliably verified ({module.build_id_status}).",
+            }
+
+        if module and (module.load_bias_status != "RESOLVED" or module.load_bias is None):
             return {
                 "status": "UNRESOLVED_LOAD_BIAS",
+                "link_kind": LINK_KIND_UNRESOLVED,
+                "is_verified": False,
                 "runtime_address": "0x{:x}".format(runtime_addr),
                 "link_basis": None,
                 "reason": "Cannot translate runtime address with UNRESOLVED load bias.",
@@ -176,6 +241,8 @@ class MockStaticAnalysisProvider(StaticAnalysisProvider):
             fn = self.functions[hex_static]
             return {
                 "status": "RESOLVED",
+                "link_kind": LINK_KIND_FUNCTION_ADDRESS,
+                "is_verified": True,
                 "runtime_address": "0x{:x}".format(runtime_addr),
                 "static_address": hex_static,
                 "symbol_name": fn.get("name"),
@@ -184,8 +251,23 @@ class MockStaticAnalysisProvider(StaticAnalysisProvider):
                 "link_basis": "mock_static_address_match",
             }
 
+        if type_name:
+            return {
+                "status": "RESOLVED_TYPE_MATCH",
+                "link_kind": LINK_KIND_TYPE_DEFINITION,
+                "is_verified": True,
+                "is_relationship_candidate": False,
+                "runtime_address": "0x{:x}".format(runtime_addr),
+                "static_address": hex_static,
+                "type": type_name,
+                "link_basis": "mock_type_definition_match",
+                "relationship_limitation": "Type match establishes TYPE_DEFINITION only; does NOT prove function ownership or field write.",
+            }
+
         return {
             "status": "UNRESOLVED_ADDRESS_NOT_FOUND",
+            "link_kind": LINK_KIND_UNRESOLVED,
+            "is_verified": False,
             "runtime_address": "0x{:x}".format(runtime_addr),
             "static_address": hex_static,
             "link_basis": None,
@@ -289,7 +371,12 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
             return self._parsed_symbols[symbol_name]
         return None
 
-    def find_references(self, name_or_addr: Union[str, int], module: Optional[RuntimeModule] = None) -> List[Dict[str, Any]]:
+    def find_references(
+        self,
+        name_or_addr: Union[str, int],
+        module: Optional[RuntimeModule] = None,
+        disassembly_text: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         # Lightweight static reference discovery via objdump disassembly if available
         refs: List[Dict[str, Any]] = []
         sym_name = str(name_or_addr)
@@ -298,27 +385,37 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
             if fn:
                 sym_name = fn.get("name", hex(name_or_addr))
 
-        if not self.debug_artifact_path:
-            return refs
+        lines = []
+        if disassembly_text is not None:
+            lines = disassembly_text.splitlines()
+        elif self.debug_artifact_path:
+            try:
+                cmd = ["objdump", "-d", "-C", self.debug_artifact_path]
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode == 0:
+                    lines = proc.stdout.splitlines()
+            except Exception:
+                lines = []
 
-        try:
-            cmd = ["objdump", "-d", "-C", self.debug_artifact_path]
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if proc.returncode == 0:
-                current_fn = None
-                for line in proc.stdout.splitlines():
-                    if line.endswith(">:") and "<" in line:
-                        current_fn = line.split("<")[-1].rstrip(">:")
-                    elif sym_name in line and current_fn and current_fn != sym_name:
-                        refs.append({
-                            "caller_function": current_fn,
-                            "reference_site": line.strip(),
-                            "target": sym_name,
-                        })
-                        if len(refs) >= 20:  # Bound result
-                            break
-        except Exception:
-            pass
+        current_fn = None
+        for line in lines:
+            if line.endswith(">:") and "<" in line:
+                current_fn = line.split("<")[-1].rstrip(">:")
+            elif sym_name in line and current_fn and current_fn != sym_name:
+                is_write = any(w in line for w in ("mov", "str", "stw", "stx", "="))
+                refs.append({
+                    "caller_function": current_fn,
+                    "reference_site": line.strip(),
+                    "target": sym_name,
+                    "link_kind": LINK_KIND_FIELD_WRITE_CANDIDATE if is_write else LINK_KIND_CALL_RELATIONSHIP,
+                    "is_verified": False,
+                    "is_candidate_only": True,
+                    "confidence": "CANDIDATE",
+                    "basis": "disassembly_text_match",
+                    "limitation": "Disassembly text search establishes candidate reference only, not proof of verified call edge or field write.",
+                })
+                if len(refs) >= 20:  # Bound result
+                    break
         return refs
 
     def get_call_relationships(self, function_name: str, module: Optional[RuntimeModule] = None) -> Dict[str, Any]:
@@ -341,23 +438,41 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
         if module is None:
             return {
                 "status": "UNRESOLVED_NO_MODULE",
+                "link_kind": LINK_KIND_UNRESOLVED,
+                "is_verified": False,
                 "runtime_address": "0x{:x}".format(runtime_addr),
                 "link_basis": None,
                 "reason": "No runtime module associated with the observation address.",
             }
 
-        if module.build_id_status == "MISMATCH":
+        if module.build_id_status in (IDENTITY_MISMATCH, "MISMATCH"):
             return {
                 "status": "UNRESOLVED_BUILD_ID_MISMATCH",
+                "link_kind": LINK_KIND_UNRESOLVED,
+                "is_verified": False,
                 "runtime_address": "0x{:x}".format(runtime_addr),
                 "module_id": module.module_id,
                 "link_basis": None,
-                "reason": f"Module build ID mismatches debug image. Refusing to decode runtime address silently.",
+                "reason": "Module build ID mismatches debug image. Refusing to decode runtime address silently.",
+            }
+
+        if module.build_id_status not in (IDENTITY_VERIFIED_MATCH, "VERIFIED"):
+            return {
+                "status": "UNRESOLVED_IDENTITY_UNVERIFIED",
+                "link_kind": LINK_KIND_UNRESOLVED,
+                "is_verified": False,
+                "runtime_address": "0x{:x}".format(runtime_addr),
+                "module_id": module.module_id,
+                "build_id_status": module.build_id_status,
+                "link_basis": None,
+                "reason": f"Module '{module.module_id}' identity cannot be reliably verified (status: {module.build_id_status}).",
             }
 
         if module.load_bias_status != "RESOLVED" or module.load_bias is None:
             return {
                 "status": "UNRESOLVED_LOAD_BIAS",
+                "link_kind": LINK_KIND_UNRESOLVED,
+                "is_verified": False,
                 "runtime_address": "0x{:x}".format(runtime_addr),
                 "module_id": module.module_id,
                 "link_basis": None,
@@ -376,6 +491,8 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
                     t_name = idx.get_type_name(v.type_offset)
                     return {
                         "status": "RESOLVED",
+                        "link_kind": LINK_KIND_GLOBAL_VARIABLE,
+                        "is_verified": True,
                         "runtime_address": "0x{:x}".format(runtime_addr),
                         "static_address": hex_static,
                         "module_id": module.module_id,
@@ -393,6 +510,8 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
             offset = fn.get("offset", 0)
             return {
                 "status": "RESOLVED",
+                "link_kind": LINK_KIND_FUNCTION_ADDRESS,
+                "is_verified": True,
                 "runtime_address": "0x{:x}".format(runtime_addr),
                 "static_address": hex_static,
                 "module_id": module.module_id,
@@ -402,13 +521,16 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
                 "link_basis": "symbol_table_address_range",
             }
 
-        # 3. Check type name heuristic match if address is on heap/stack
+        # 3. Check type name match if address is on heap/stack (establishes TYPE_DEFINITION only!)
         if type_name and idx and type_name in idx.types_by_name:
             t_candidates = idx.types_by_name[type_name]
             if t_candidates:
                 t = t_candidates[0]
                 return {
                     "status": "RESOLVED_TYPE_MATCH",
+                    "link_kind": LINK_KIND_TYPE_DEFINITION,
+                    "is_verified": True,
+                    "is_relationship_candidate": False,
                     "runtime_address": "0x{:x}".format(runtime_addr),
                     "static_address": hex_static,
                     "module_id": module.module_id,
@@ -417,10 +539,13 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
                     "link_basis": "dwarf_type_definition_match",
                     "decl_file": t.decl_file,
                     "decl_line": t.decl_line,
+                    "relationship_limitation": "Type match establishes TYPE_DEFINITION only; does NOT prove function ownership or field write.",
                 }
 
         return {
             "status": "UNRESOLVED_ADDRESS_NOT_FOUND",
+            "link_kind": LINK_KIND_UNRESOLVED,
+            "is_verified": False,
             "runtime_address": "0x{:x}".format(runtime_addr),
             "static_address": hex_static,
             "module_id": module.module_id,

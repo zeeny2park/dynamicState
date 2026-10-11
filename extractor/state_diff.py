@@ -84,9 +84,11 @@ class StateDiffEngine:
         changes.extend(self._execution_changes(a, b))
         summary = {
             "value_changes": sum(c["kind"] == "value_change" for c in changes),
-            "availability_changes": sum(c["kind"] == "availability_change" for c in changes),
-            "objects_created": sum(c["kind"] == "object_created" for c in changes),
-            "objects_removed": sum(c["kind"] == "object_removed" for c in changes),
+            "availability_changes": sum(c["kind"] in ("availability_change", "field_unavailable") for c in changes),
+            "objects_created": sum(c["kind"] in ("object_created", "field_added") for c in changes),
+            "objects_removed": sum(c["kind"] in ("object_removed", "field_unavailable") for c in changes),
+            "fields_unavailable": sum(c["kind"] == "field_unavailable" for c in changes),
+            "fields_added": sum(c["kind"] == "field_added" for c in changes),
             "reference_changes": sum(c["kind"] == "reference_change" for c in changes),
             "execution_changes": sum(c["kind"] == "execution_change" for c in changes),
         }
@@ -111,8 +113,34 @@ class StateDiffEngine:
         fields_b = {f.get("name"): f for f in after.get("fields", [])}
         for name in sorted(set(fields_a) | set(fields_b)):
             left, right = fields_a.get(name), fields_b.get(name)
-            if left is None or right is None:
+            if left is None and right is not None:
+                path = "{}.{}".format(after.get("type"), name)
+                changes.append({
+                    "kind": "field_added",
+                    "object_id": after.get("object_id"),
+                    "type": after.get("type"),
+                    "field": name,
+                    "path": path,
+                    "before": None,
+                    "after": right.get("value"),
+                    "identity": identity_meta,
+                })
                 continue
+            if right is None and left is not None:
+                path = "{}.{}".format(before.get("type"), name)
+                changes.append({
+                    "kind": "field_unavailable",
+                    "object_id": before.get("object_id"),
+                    "type": before.get("type"),
+                    "field": name,
+                    "path": path,
+                    "before": left.get("value"),
+                    "after": None,
+                    "identity": identity_meta,
+                    "reason": "Field absent or unreadable in subsequent observation.",
+                })
+                continue
+
             compared += 1
             path = "{}.{}".format(after.get("type"), name)
             if left.get("availability") != right.get("availability"):

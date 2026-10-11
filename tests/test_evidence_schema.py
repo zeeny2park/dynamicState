@@ -91,13 +91,60 @@ class TestEvidenceSchema(unittest.TestCase):
         self.assertEqual(hypo_rec.nature, "hypothesis")
         self.assertNotEqual(obs_rec.nature, inf_rec.nature)
 
-    def test_invalid_nature_normalizes_safely(self):
-        record = EvidenceRecord(
-            evidence_id="ev_inv_nature",
-            evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
-            nature="unsupported_wild_guess",
+    def test_invalid_nature_is_rejected(self):
+        with self.assertRaises(ValueError):
+            EvidenceRecord(
+                evidence_id="ev_inv_nature",
+                evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+                nature="unsupported_wild_guess",
+            )
+
+    def test_duplicate_evidence_id_rejected(self):
+        ledger = EvidenceLedger()
+        rec1 = EvidenceRecord(evidence_id="ev_dup_1", observation="First")
+        ledger.add_record(rec1)
+        rec2 = EvidenceRecord(evidence_id="ev_dup_1", observation="Second")
+        with self.assertRaises(ValueError):
+            ledger.add_record(rec2)
+
+    def test_provenance_chain_with_unresolved_parent(self):
+        ledger = EvidenceLedger()
+        rec = EvidenceRecord(
+            evidence_id="ev_child",
+            parent_evidence_ids=["ev_missing_parent"],
+            observation="Child with missing parent",
         )
-        self.assertEqual(record.nature, NATURE_OBSERVATION)
+        ledger.add_record(rec)
+        chain = ledger.trace_provenance_chain("ev_child")
+        self.assertEqual(len(chain), 2)
+        self.assertEqual(chain[0]["evidence_id"], "ev_child")
+        self.assertEqual(chain[0]["status"], "RESOLVED")
+        self.assertEqual(chain[1]["evidence_id"], "ev_missing_parent")
+        self.assertEqual(chain[1]["status"], "UNRESOLVED_PARENT")
+
+    def test_provenance_chain_cycle_detection(self):
+        ledger = EvidenceLedger()
+        rec_a = EvidenceRecord(evidence_id="ev_a", parent_evidence_ids=["ev_b"])
+        rec_b = EvidenceRecord(evidence_id="ev_b", parent_evidence_ids=["ev_a"])
+        ledger.add_record(rec_a)
+        ledger.add_record(rec_b)
+        chain = ledger.trace_provenance_chain("ev_a")
+        cycle_entries = [c for c in chain if c.get("status") == "CYCLE_DETECTED"]
+        self.assertTrue(len(cycle_entries) > 0)
+        self.assertIn("ev_a", cycle_entries[0]["cycle_path"])
+
+    def test_deterministic_parent_traversal_ordering(self):
+        ledger = EvidenceLedger()
+        p1 = EvidenceRecord(evidence_id="ev_p1")
+        p2 = EvidenceRecord(evidence_id="ev_p2")
+        child = EvidenceRecord(evidence_id="ev_child", parent_evidence_ids=["ev_p2", "ev_p1"])
+        ledger.add_record(p1)
+        ledger.add_record(p2)
+        ledger.add_record(child)
+        chain = ledger.trace_provenance_chain("ev_child")
+        self.assertEqual(chain[0]["evidence_id"], "ev_child")
+        self.assertEqual(chain[1]["evidence_id"], "ev_p1")
+        self.assertEqual(chain[2]["evidence_id"], "ev_p2")
 
 
 class TestEvidenceProvenanceAndLedger(unittest.TestCase):

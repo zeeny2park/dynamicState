@@ -7,25 +7,35 @@
   <link rel="stylesheet" href="static/app.css">
 </head>
 <body>
-  <!-- Top Navigation & System Status Bar -->
+  <!-- ===================================================================== -->
+  <!-- Level 1: Primary Header & Investigation Status Bar                    -->
+  <!-- ===================================================================== -->
   <header class="app-header">
     <div class="header-brand">
       <div class="brand-title">dynamicState</div>
-      <div class="brand-subtitle">Runtime State Explorer & Object Workspace</div>
+      <div class="brand-subtitle">C/C++ Runtime Investigation Workspace</div>
     </div>
     
-    <div class="header-status">
-      <div class="status-pill" id="pill-runtime-status">
+    <div class="header-status" id="header-primary-status">
+      <!-- Connection Status -->
+      <div class="status-pill" id="pill-runtime-status" title="Target connection status">
         <span class="dot"></span>
         <span id="txt-runtime-status">DISCONNECTED</span>
       </div>
-      <div class="mode-badge" id="badge-obs-mode">CONSISTENT</div>
-      <div class="meta-tag" id="tag-pid">PID: N/A</div>
-      <div class="meta-tag" id="tag-arch">Arch: UNKNOWN</div>
-      <div class="meta-tag" id="tag-endian">Endian: UNKNOWN</div>
-      <div class="meta-tag" id="tag-elf">ELF: UNKNOWN</div>
-      <div class="meta-tag meta-obs-point" id="tag-header-obs-point" title="Active observation point (deterministic breakpoint for state capture/mutation)">
-        <span>📍</span> <span id="txt-header-obs-point">Point: Not available</span>
+      <!-- Target / Snapshot -->
+      <div class="status-pill status-target" id="pill-target-info" title="Current target process or active snapshot">
+        <span class="pill-label">Target:</span>
+        <span class="pill-val mono" id="hdr-txt-target">No target loaded</span>
+      </div>
+      <!-- Capture Quality -->
+      <div class="status-pill status-quality" id="pill-quality-info" title="Memory snapshot consistency level">
+        <span class="pill-label">Capture:</span>
+        <span class="badge badge-neutral" id="hdr-badge-capture-quality">UNKNOWN</span>
+      </div>
+      <!-- Investigation State -->
+      <div class="status-pill status-investigation" id="pill-investigation-info" title="Investigation workflow state">
+        <span class="pill-label">Investigation:</span>
+        <span class="badge badge-neutral" id="hdr-badge-investigation-state">NOT_STARTED</span>
       </div>
     </div>
 
@@ -36,10 +46,14 @@
         <button type="button" class="btn btn-sm btn-mode" id="btn-mode-advanced">⚙️ Advanced</button>
       </div>
 
+      <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-tech-details" title="Toggle technical hardware, ELF, and backend details">
+        ⚙️ Technical Details
+      </button>
+
       <button class="btn btn-secondary btn-sm" id="btn-refresh" title="Refresh runtime data">
         <span class="icon">⟳</span> Refresh
       </button>
-      <button class="btn btn-success btn-sm" id="btn-fast-capture" title="Fast runtime state capture with minimal stop time (<10ms)">
+      <button class="btn btn-success btn-sm" id="btn-fast-capture" title="Fast runtime state capture with minimal stop time">
         <span>⚡</span> Capture State
       </button>
       <button class="btn btn-primary btn-sm" id="btn-observe-dialog">
@@ -48,11 +62,24 @@
     </div>
   </header>
 
-  <!-- Runtime Memory & State Summary Bar (Top Overview) -->
-  <div class="runtime-summary-bar">
+  <!-- ===================================================================== -->
+  <!-- Level 2: Secondary Technical Details Bar (Collapsible / Advanced)     -->
+  <!-- ===================================================================== -->
+  <div class="runtime-summary-bar" id="runtime-summary-bar">
+    <div class="tech-badge-group">
+      <span class="meta-tag" id="tag-pid">PID: N/A</span>
+      <span class="meta-tag" id="tag-arch">Arch: UNKNOWN</span>
+      <span class="meta-tag" id="tag-endian">Endian: UNKNOWN</span>
+      <span class="meta-tag" id="tag-elf">ELF: UNKNOWN</span>
+      <span class="mode-badge" id="badge-obs-mode">CONSISTENT</span>
+      <span class="meta-tag meta-obs-point" id="tag-header-obs-point" style="display: none;" title="Active observation point (deterministic breakpoint for state capture/mutation)">
+        <span>📍</span> <span id="txt-header-obs-point">Point: Not available</span>
+      </span>
+    </div>
+
     <div class="summary-metric-tile">
       <span class="summary-label">Runtime</span>
-      <span class="summary-val status-badge" id="sum-runtime-status">STOPPED</span>
+      <span class="summary-val status-badge status-disconnected" id="sum-runtime-status">DISCONNECTED</span>
     </div>
     <div class="summary-metric-tile">
       <span class="summary-label">Active Threads</span>
@@ -74,17 +101,17 @@
       <span class="summary-label">Capture Backend</span>
       <span class="summary-val mono text-accent" id="sum-capture-backend">process_vm_readv</span>
     </div>
-    <div class="summary-metric-tile" title="Last measured capture stop time (<10ms target)">
-      <span class="summary-label">Stop Time</span>
+    <div class="summary-metric-tile" title="Measured capture stop duration">
+      <span class="summary-label">Stop Duration</span>
       <span class="summary-val mono text-accent" id="sum-capture-latency">N/A</span>
     </div>
     <div class="summary-metric-tile" title="Checkpoint Restore Capability">
       <span class="summary-label">Checkpoint</span>
-      <span class="summary-val" id="sum-checkpoint-status"><span class="badge badge-success">Supported</span></span>
+      <span class="summary-val" id="sum-checkpoint-status"><span class="badge badge-neutral">Unverified</span></span>
     </div>
     <div class="summary-metric-tile" title="Sibling mutation branch isolation capability & verification">
       <span class="summary-label">Branch Isolation</span>
-      <span class="summary-val" id="sum-isolation-status"><span class="badge badge-success">Supported</span></span>
+      <span class="summary-val" id="sum-isolation-status"><span class="badge badge-neutral">Unverified</span></span>
     </div>
     <div class="summary-metric-tile" title="Restart reproducibility verification status">
       <span class="summary-label">Determinism</span>
@@ -139,33 +166,92 @@
   <main class="app-main">
 
     <!-- ===================================================================== -->
-    <!-- TAB 0: 🔍 Investigation Overview (Evidence-First Agent Workflow)       -->
+    <!-- TAB 0: 🔍 Investigation Overview (Investigation-First Workflow)        -->
     <!-- ===================================================================== -->
     <section id="tab-investigation-overview" class="tab-pane active">
       <div class="inv-container">
         
-        <!-- Investigation Controls & Goal Input -->
-        <div class="inv-toolbar">
-          <div class="inv-toolbar-row">
-            <span style="font-weight: 600; color: var(--accent);">🎯 Goal:</span>
-            <input type="text" id="inv-input-goal" class="inv-goal-input" 
-                   placeholder="Enter natural language investigation goal (e.g. 'Investigate worker counter mismatch or crash')..." 
-                   value="Investigate runtime state discrepancy & verify typed objects">
-            <button type="button" id="btn-run-investigation" class="btn btn-primary">🚀 Start Investigation</button>
-            <button type="button" id="btn-refresh-investigation" class="btn btn-secondary">🔄 Refresh</button>
+        <!-- Investigation Entry Launchpad (Two clear paths: Snapshot vs Live) -->
+        <div class="inv-launchpad">
+          <div class="inv-launchpad-header">
+            <div>
+              <div class="inv-launchpad-title">🔍 Investigation Workspace</div>
+              <div class="text-xs text-muted">Select an entry path to analyze runtime memory, reconstruct C++ object graphs, and verify evidence integrity.</div>
+            </div>
+            <div class="inv-entry-selector">
+              <button type="button" class="btn btn-tab-pill active" id="btn-entry-snapshot" data-entry="snapshot">📁 Offline Snapshot Analysis</button>
+              <button type="button" class="btn btn-tab-pill" id="btn-entry-live" data-entry="live">⚡ Live Target Capture</button>
+            </div>
           </div>
-          <div class="inv-toolbar-row text-xs">
-            <label>Snapshot Target:</label>
-            <select id="inv-select-snapshot" class="form-select text-xs" style="min-width: 180px;">
-              <option value="">(Current / Active State)</option>
-            </select>
-            <label>Debug Image:</label>
-            <input type="text" id="inv-input-debug-image" class="form-input text-xs" style="min-width: 200px;" 
-                   placeholder="Optional debug image path (e.g. build/app_debug.elf)">
-            <label style="margin-left: auto;">
-              <input type="checkbox" id="inv-check-authorize" style="margin-right: 4px;">
-              Authorize Live Target (Default: Read-Only)
-            </label>
+
+          <!-- Entry Path Panels -->
+          <div class="inv-entry-panels">
+            <!-- Panel A: Offline Snapshot Analysis -->
+            <div class="inv-entry-panel active" id="panel-entry-snapshot">
+              <div class="inv-entry-desc text-xs">
+                <span class="badge badge-success text-xs">SAFE & DETERMINISTIC</span>
+                <span>Analyze a previously captured memory snapshot offline. Zero target stop time, zero execution interference, completely repeatable.</span>
+              </div>
+              <div class="inv-form-row">
+                <div class="inv-form-field">
+                  <label for="inv-select-snapshot" class="text-xs">Snapshot Target:</label>
+                  <select id="inv-select-snapshot" class="form-select text-xs">
+                    <option value="">(Current / Active State)</option>
+                  </select>
+                </div>
+                <div class="inv-form-field">
+                  <label for="inv-input-debug-image" class="text-xs">Debug Image (ELF with DWARF):</label>
+                  <input type="text" id="inv-input-debug-image" class="form-input text-xs" 
+                         placeholder="e.g. build/app_debug.elf (same Build-ID required)">
+                </div>
+              </div>
+            </div>
+
+            <!-- Panel B: Live Process Capture -->
+            <div class="inv-entry-panel" id="panel-entry-live" style="display: none;">
+              <div class="inv-entry-desc text-xs">
+                <span class="badge badge-warning text-xs">REQUIRES AUTHORIZATION</span>
+                <span>Connect to an authorized running process. Pauses briefly for fast non-invasive memory capture via <code>process_vm_readv</code>, then immediately resumes.</span>
+              </div>
+              <div class="inv-form-row">
+                <div class="inv-form-field">
+                  <label for="inv-input-live-target" class="text-xs">Live Target PID / Command:</label>
+                  <input type="text" id="inv-input-live-target" class="form-input text-xs" 
+                         placeholder="e.g. PID 2048 or /bin/worker_app">
+                </div>
+                <div class="inv-form-field">
+                  <label for="inv-input-live-debug-image" class="text-xs">Debug Image (ELF with DWARF):</label>
+                  <input type="text" id="inv-input-live-debug-image" class="form-input text-xs" 
+                         placeholder="e.g. build/app_debug.elf">
+                </div>
+                <div class="inv-form-field" style="display: flex; align-items: flex-end; padding-bottom: 4px;">
+                  <label class="text-xs" style="cursor: pointer;">
+                    <input type="checkbox" id="inv-check-authorize" style="margin-right: 4px;">
+                    Authorize Live Capture (brief SIGSTOP / resume)
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Unified Goal Row & Prominent Action Button -->
+          <div class="inv-goal-row">
+            <div class="inv-goal-input-wrap">
+              <label for="inv-input-goal" class="inv-goal-label">🎯 Goal:</label>
+              <input type="text" id="inv-input-goal" class="inv-goal-input" 
+                     placeholder="State your investigation objective (e.g. 'Investigate worker counter mismatch', 'Verify state transition')..." 
+                     value="Investigate runtime state discrepancy & verify typed objects">
+            </div>
+            <div class="inv-goal-actions">
+              <button type="button" id="btn-run-investigation" class="btn btn-primary btn-lg">🚀 Start Investigation</button>
+              <button type="button" id="btn-refresh-investigation" class="btn btn-secondary">🔄 Refresh</button>
+            </div>
+          </div>
+
+          <!-- Recent Investigation Sessions (Honest: Only displayed if backend has sessions) -->
+          <div id="inv-recent-sessions-container" class="inv-recent-sessions" style="display: none;">
+            <span class="text-xs text-muted" style="font-weight: 600;">Recent Sessions:</span>
+            <div id="inv-recent-sessions-list" class="inv-session-pills"></div>
           </div>
         </div>
 
@@ -188,6 +274,12 @@
           </div>
         </div>
 
+        <!-- Dynamic Investigation Alert Banner (Empty / Blocked / Partial / Clean completed) -->
+        <div id="inv-alert-banner" class="banner mb-3" style="display: none; border-radius: 6px; padding: 10px 16px;">
+          <span id="inv-alert-icon" style="font-size: 1.1rem; margin-right: 8px;">ℹ️</span>
+          <span id="inv-alert-message" class="text-xs"></span>
+        </div>
+
         <!-- 2-Column Overview Dashboard Grid -->
         <div class="inv-dashboard-grid">
           
@@ -206,6 +298,8 @@
                 <div><span class="text-muted">Debug Image:</span> <span class="mono" id="inv-txt-debug-image">None</span></div>
                 <div><span class="text-muted">Debug Build ID:</span> <span class="mono" id="inv-txt-debug-bid">N/A</span></div>
                 <div><span class="text-muted">PID / Inferior:</span> <span class="mono" id="inv-txt-pid">Offline</span></div>
+                <div><span class="text-muted">Identity Status:</span> <span class="mono" id="inv-txt-build-reason"></span></div>
+                <div><span class="text-muted">Persistence:</span> <span class="badge badge-info" id="inv-txt-persistence">EPHEMERAL_PROCESS_LOCAL</span></div>
               </div>
             </div>
 
@@ -233,10 +327,22 @@
             <div class="inv-card">
               <div class="inv-card-header">
                 <span class="inv-card-title">⚖️ Observation Comparisons</span>
-                <button type="button" id="btn-modal-compare" class="btn btn-secondary text-xs">Compare 2 Snapshots</button>
+                <button type="button" id="btn-modal-compare" class="btn btn-secondary text-xs" style="display: none;">Compare Prompt</button>
+              </div>
+              <!-- Inline Snapshot Comparison Controls -->
+              <div class="inv-cmp-controls" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <label class="text-xs text-muted">Baseline A:</label>
+                <select id="inv-cmp-select-a" class="form-select form-select-xs" style="min-width: 130px;">
+                  <option value="">(Select Snapshot)</option>
+                </select>
+                <label class="text-xs text-muted">Observed B:</label>
+                <select id="inv-cmp-select-b" class="form-select form-select-xs" style="min-width: 130px;">
+                  <option value="">(Select Snapshot)</option>
+                </select>
+                <button type="button" id="btn-run-inline-compare" class="btn btn-secondary btn-xs">Compare Snapshots</button>
               </div>
               <div id="inv-comparisons-content">
-                <div class="empty-state text-xs p-3">No comparison performed yet. Click 'Compare 2 Snapshots' to isolate state diffs.</div>
+                <div class="empty-state text-xs p-3">No comparison performed yet. Select two snapshots above to isolate state diffs.</div>
               </div>
             </div>
 
@@ -287,7 +393,7 @@
 
             <!-- Expandable Advanced Details (Raw Addresses & Evidence Ledger) -->
             <div class="inv-card">
-              <details class="advanced-view">
+              <details class="advanced-view" id="inv-details-raw-evidence">
                 <summary style="cursor: pointer; font-weight: 600; color: var(--accent); padding: 4px 0;">
                   ⚙️ Advanced Details & Raw Evidence Ledger (Expand)
                 </summary>
@@ -310,6 +416,14 @@
                         <tr><td colspan="5" class="text-center text-muted">Ledger empty.</td></tr>
                       </tbody>
                     </table>
+                  </div>
+                  <!-- Lineage Trace Viewer -->
+                  <div id="inv-lineage-container" class="card p-2 text-xs" style="display: none; background-color: var(--bg-input); border-radius: 4px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                      <strong>Provenance Lineage Trace:</strong>
+                      <button type="button" class="btn btn-xs btn-outline" id="btn-close-lineage">Close</button>
+                    </div>
+                    <div id="inv-lineage-content" class="mono text-xs"></div>
                   </div>
                   <div style="display: flex; gap: 8px;">
                     <button type="button" id="btn-download-ledger" class="btn btn-secondary text-xs">📥 Export Ledger JSON</button>
