@@ -7,6 +7,8 @@ Tests acceptance criterion 7:
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -375,5 +377,208 @@ class TestInvestigationUI(unittest.TestCase):
         self.assertIn("kind", chg)
 
 
+    def test_live_target_pid_propagation_and_validation(self):
+        """Regression test for P1: Live target PID transmission, range checking, authorization, and capture."""
+        # Spawn an isolated target child process for live capture testing
+        child_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            target_pid = child_proc.pid
+
+            # 1. Valid live PID with explicit authorization -> Live capture executed
+            status, resp = self._post_json("/api/investigation/start", {
+                "goal": "Live process capture test",
+                "pid": target_pid,
+                "authorize_target": True,
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(resp.get("success"))
+            data = resp["data"]
+            self.assertIn("inv_", data["investigation_id"])
+            self.assertEqual(data["target_ref"]["pid"], target_pid)
+            self.assertTrue(data["target_ref"].get("live_capture"))
+            self.assertEqual(data["target_ref"].get("capture_source"), "LIVE_PROCESS")
+            self.assertEqual(data["persistence"], "EPHEMERAL_PROCESS_LOCAL")
+
+            # 2. Live PID without authorization -> BLOCKED
+            status, resp = self._post_json("/api/investigation/start", {
+                "goal": "Unauthorized live capture attempt",
+                "pid": target_pid,
+                "authorize_target": False,
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(resp.get("success"))
+            data = resp["data"]
+            self.assertEqual(data["status"], "BLOCKED")
+            self.assertEqual(data["stages"]["target_identity"]["status"], "BLOCKED")
+            self.assertIn("authorize_target=True", data["stages"]["target_identity"]["details"]["error"])
+            auth_fnd = next((f for f in data["findings"] if "Authorization" in f["title"]), None)
+            self.assertIsNotNone(auth_fnd)
+
+            # 3. Invalid PID format -> INVALID_PARAM
+            status, resp = self._post_json("/api/investigation/start", {
+                "goal": "Invalid PID format test",
+                "pid": "invalid_pid_string",
+                "authorize_target": True,
+            })
+            self.assertEqual(status, 200)
+            self.assertFalse(resp.get("success"))
+            self.assertEqual(resp["error"]["code"], "INVALID_PARAM")
+            self.assertIn("Invalid PID format", resp["error"]["message"])
+
+            # 4. Out-of-range negative PID -> INVALID_PARAM
+            status, resp = self._post_json("/api/investigation/start", {
+                "goal": "Negative PID test",
+                "pid": -42,
+                "authorize_target": True,
+            })
+            self.assertEqual(status, 200)
+            self.assertFalse(resp.get("success"))
+            self.assertEqual(resp["error"]["code"], "INVALID_PARAM")
+            self.assertIn("out of valid range", resp["error"]["message"])
+
+            # 5. Conflicting live PID and offline snapshot -> INVALID_PARAM
+            status, resp = self._post_json("/api/investigation/start", {
+                "goal": "Ambiguous target parameters test",
+                "pid": target_pid,
+                "snapshot_id": "snap_alpha_ui",
+                "authorize_target": True,
+            })
+            self.assertEqual(status, 200)
+            self.assertFalse(resp.get("success"))
+            self.assertEqual(resp["error"]["code"], "INVALID_PARAM")
+            self.assertIn("Conflicting target parameters", resp["error"]["message"])
+
+            # 6. Non-existent PID with authorization -> TARGET_NOT_FOUND (ESRCH)
+            status, resp = self._post_json("/api/investigation/start", {
+                "goal": "Non-existent PID test",
+                "pid": 999999999,
+                "authorize_target": True,
+            })
+            self.assertEqual(status, 200)
+            self.assertFalse(resp.get("success"))
+            self.assertEqual(resp["error"]["code"], "TARGET_NOT_FOUND")
+            self.assertIn("ESRCH", resp["error"]["message"])
+        finally:
+            child_proc.kill()
+            child_proc.wait()
+
+    def test_scoped_zero_findings_messaging(self):
+        """Regression test for P1: Honest zero-findings reporting and explicit analysis scope bounds."""
+        # Start investigation on empty/non-existent snapshot
+        status, resp = self._post_json("/api/investigation/start", {
+            "goal": "Zero-findings scope verification",
+            "snapshot_id": "snap_nonexistent_empty",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(resp.get("success"))
+        data = resp["data"]
+        inv_id = data["investigation_id"]
+
+        # Status response contains scope measurements and honest notice
+        status_resp = self._get_json(f"/api/investigation/status?investigation_id={inv_id}")[1]
+        summary = status_resp["data"]["summary"]
+        self.assertIn("scope", summary)
+        self.assertIn("unresolved_checks", summary["scope"])
+        self.assertGreater(len(summary["scope"]["unresolved_checks"]), 0)
+
+        # Incomplete / partial investigation with 0 findings does NOT claim clean validation
+        self.assertIn("zero_findings_notice", summary)
+        self.assertIn("incomplete or restricted", summary["zero_findings_notice"])
+
+        # Report response contains scoped findings_summary
+        rep_resp = self._get_json(f"/api/investigation/report?investigation_id={inv_id}")[1]
+        findings_summary = rep_resp["data"]["findings_summary"]
+        self.assertEqual(findings_summary["total"], 0)
+        self.assertIn("scope", findings_summary)
+        self.assertIn("zero_findings_notice", findings_summary)
+
+    def test_capture_method_and_consistency_descriptions(self):
+        """Verify UI copy and metadata accurately describe capture methods, suspension, and NON_ATOMIC warnings."""
+        # 1. Verify index.html copy
+        status, _, body = self._get_raw("/")
+        self.assertEqual(status, 200)
+        html = body.decode("utf-8")
+        self.assertIn("Live Target PID:", html)
+        self.assertIn("Authorize Target Signal (SIGSTOP / SIGCONT) &amp; Memory Read", html)
+        self.assertIn("Memory capture was performed without pausing target threads", html)
+        self.assertIn("cross-region execution skew", html)
+
+        # 2. Verify app.js deduplication, selection preservation, and scoped messaging
+        status, _, body = self._get_raw("/static/app.js")
+        self.assertEqual(status, 200)
+        js = body.decode("utf-8")
+        self.assertIn("investigationLoadSeq", js)
+        self.assertIn("renderRecentInvestigationSessions", js)
+        self.assertIn("selectedInvestigationId", js)
+        self.assertIn("Scope Boundaries &amp; Uninspected Checks:", js)
+        self.assertIn("Zero findings recorded does NOT indicate clean state", js)
+
+    def test_investigation_session_loading_and_selection_preservation(self):
+        """Verify session loading API, non-latest selection preservation, and ephemeral reporting."""
+        # 1. Start session Alpha
+        status, resp_a = self._post_json("/api/investigation/start", {
+            "goal": "Session Alpha for selection test",
+            "snapshot_id": "snap_alpha_ui",
+        })
+        self.assertEqual(status, 200)
+        inv_a = resp_a["data"]["investigation_id"]
+
+        # 2. Start session Beta
+        status, resp_b = self._post_json("/api/investigation/start", {
+            "goal": "Session Beta for selection test",
+            "snapshot_id": "snap_beta_ui",
+        })
+        self.assertEqual(status, 200)
+        inv_b = resp_b["data"]["investigation_id"]
+
+        # 3. List sessions: both must be present in order
+        status, resp_list = self._get_json("/api/investigations")
+        self.assertEqual(status, 200)
+        sessions = resp_list["data"]
+        ids = [s["investigation_id"] for s in sessions]
+        self.assertIn(inv_a, ids)
+        self.assertIn(inv_b, ids)
+
+        # 4. User selects Alpha (not latest): report returns Alpha specifically
+        status, rep_a = self._get_json(f"/api/investigation/report?investigation_id={inv_a}")
+        self.assertEqual(status, 200)
+        self.assertEqual(rep_a["data"]["investigation_id"], inv_a)
+        self.assertEqual(rep_a["data"]["goal"], "Session Alpha for selection test")
+
+        # 5. Stale / nonexistent session ID handling
+        status, rep_stale = self._get_json("/api/investigation/report?investigation_id=inv_stale_99999")
+        self.assertEqual(status, 200)
+        self.assertIn("error", rep_stale)
+
+    def test_clean_completed_zero_findings_scope_distinction(self):
+        """Verify distinction between COMPLETED with 0 findings vs PARTIAL with 0 findings."""
+        # 1. Start investigation on valid snapshot with 0 anomalies (clean state)
+        status, resp = self._post_json("/api/investigation/start", {
+            "goal": "Clean verification test",
+            "snapshot_id": "snap_alpha_ui",
+        })
+        self.assertEqual(status, 200)
+        data = resp["data"]
+        self.assertIn(data["status"], ["COMPLETED", "PARTIAL"])
+        scope = data["summary"]["scope"]
+        self.assertIn("objects_examined", scope)
+        self.assertIn("roots_examined", scope)
+        self.assertIn("unresolved_checks", scope)
+
+        # 2. Start investigation on nonexistent snapshot (partial state with 0 findings)
+        status, resp_partial = self._post_json("/api/investigation/start", {
+            "goal": "Partial verification test",
+            "snapshot_id": "snap_missing_artifact",
+        })
+        self.assertEqual(status, 200)
+        partial_data = resp_partial["data"]
+        self.assertEqual(partial_data["status"], "PARTIAL")
+        self.assertEqual(partial_data["findings_count"], 0)
+        notice = partial_data["summary"].get("zero_findings_notice")
+        self.assertIsNotNone(notice)
+        self.assertIn("incomplete or restricted", notice)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -211,13 +211,13 @@
             <div class="inv-entry-panel" id="panel-entry-live" style="display: none;">
               <div class="inv-entry-desc text-xs">
                 <span class="badge badge-warning text-xs">REQUIRES AUTHORIZATION</span>
-                <span>Connect to an authorized running process. Pauses briefly for fast non-invasive memory capture via <code>process_vm_readv</code>, then immediately resumes.</span>
+                <span>Connect to an authorized running process. Memory pages are read via <code>process_vm_readv</code>. To reduce skew, the capture backend signals the target (SIGSTOP/SIGCONT); if unstopped or active multi-threaded, capture is NON_ATOMIC.</span>
               </div>
               <div class="inv-form-row">
                 <div class="inv-form-field">
-                  <label for="inv-input-live-target" class="text-xs">Live Target PID / Command:</label>
+                  <label for="inv-input-live-target" class="text-xs">Live Target PID:</label>
                   <input type="text" id="inv-input-live-target" class="form-input text-xs" 
-                         placeholder="e.g. PID 2048 or /bin/worker_app">
+                         placeholder="e.g. 2048 (numeric PID required)">
                 </div>
                 <div class="inv-form-field">
                   <label for="inv-input-live-debug-image" class="text-xs">Debug Image (ELF with DWARF):</label>
@@ -227,7 +227,7 @@
                 <div class="inv-form-field" style="display: flex; align-items: flex-end; padding-bottom: 4px;">
                   <label class="text-xs" style="cursor: pointer;">
                     <input type="checkbox" id="inv-check-authorize" style="margin-right: 4px;">
-                    Authorize Live Capture (brief SIGSTOP / resume)
+                    Authorize Target Signal (SIGSTOP / SIGCONT) &amp; Memory Read
                   </label>
                 </div>
               </div>
@@ -310,7 +310,7 @@
                 <span id="inv-badge-consistency" class="badge badge-warning">UNKNOWN</span>
               </div>
               <div id="inv-consistency-warning" class="banner banner-warning text-xs mb-2" style="display: none; padding: 6px 10px;">
-                <strong>NON_ATOMIC Warning:</strong> Zero-stop capture may contain cross-region execution skew.
+                <strong>NON_ATOMIC Warning:</strong> Memory capture was performed without pausing target threads (or with unconfirmed stop). Snapshot may reflect cross-region execution skew.
               </div>
               <div class="key-value-list text-xs" id="inv-quality-list">
                 <div><span class="text-muted">Consistency Level:</span> <strong id="inv-txt-consistency">UNKNOWN</strong></div>

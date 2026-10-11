@@ -1620,11 +1620,21 @@ class AgentRuntime:
                 budgets=budgets,
                 authorize_target=authorize_target,
             )
+            status = res.get("status")
+            err_msg = res.get("summary", {}).get("error", "Investigation failed")
+            err_code = "INVESTIGATION_ERROR"
+            if "Invalid PID" in err_msg or "out of valid range" in err_msg or "Conflicting target" in err_msg:
+                err_code = "INVALID_PARAM"
+            elif "not found (ESRCH)" in err_msg:
+                err_code = "TARGET_NOT_FOUND"
+            elif "Permission denied" in err_msg:
+                err_code = "PERMISSION_DENIED"
+
             return AgentActionResult(
-                success=res.get("status") in ("COMPLETED", "PARTIAL", "RUNNING"),
+                success=status in ("COMPLETED", "PARTIAL", "RUNNING", "BLOCKED"),
                 action="START_INVESTIGATION",
                 data=res,
-                error=AgentActionError(code="INVESTIGATION_ERROR", message=res.get("summary", {}).get("error", "Investigation failed")) if res.get("status") == "FAILED" else None,
+                error=AgentActionError(code=err_code, message=err_msg) if status == "FAILED" else None,
                 performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
             )
         except Exception as exc:

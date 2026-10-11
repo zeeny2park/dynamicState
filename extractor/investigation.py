@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 import os
+import re
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -229,20 +230,64 @@ class InvestigationManager:
             "constraints": constraints or {},
         }
 
-        # Check pid-only without existing snapshot
-        if pid and not snapshot_id and not memory_snapshot_path:
+        # Target parameter validation and live PID processing
+        parsed_pid = None
+        if pid is not None:
+            try:
+                if isinstance(pid, str):
+                    pid_str = pid.strip()
+                    m = re.search(r'\b\d+\b', pid_str)
+                    if not m:
+                        raise ValueError(f"No numeric PID found in '{pid}'")
+                    parsed_pid = int(m.group(0))
+                else:
+                    parsed_pid = int(pid)
+            except (ValueError, TypeError):
+                session.status = "FAILED"
+                session.stages["target_identity"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"Invalid PID format: '{pid}'. Target PID must be an integer."},
+                }
+                session.summary["error"] = f"Invalid PID format: '{pid}'"
+                return session.to_dict()
+
+            if parsed_pid <= 0 or parsed_pid > 2147483647:
+                session.status = "FAILED"
+                session.stages["target_identity"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"PID {parsed_pid} is out of valid range."},
+                }
+                session.summary["error"] = f"PID {parsed_pid} is out of valid range"
+                return session.to_dict()
+
+            # Prevent ambiguous targets: do not permit live capture and offline snapshot simultaneously
+            if snapshot_id or memory_snapshot_path:
+                session.status = "FAILED"
+                session.stages["target_identity"] = {
+                    "status": "FAILED",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"error": f"Conflicting target parameters: cannot specify both live PID ({parsed_pid}) and offline snapshot."},
+                }
+                session.summary["error"] = "Conflicting target parameters: cannot specify both live PID and offline snapshot"
+                return session.to_dict()
+
+            session.target_ref["pid"] = parsed_pid
+
+            # Check authorization for live process capture
             if not authorize_target:
                 session.status = "BLOCKED"
                 session.stages["target_identity"] = {
                     "status": "BLOCKED",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "details": {"error": f"Live process capture for PID {pid} requires explicit authorize_target=True."},
+                    "details": {"error": f"Live process capture for PID {parsed_pid} requires explicit authorize_target=True."},
                 }
                 session.findings.append(InvestigationFinding(
                     finding_id=f"fnd_auth_{uuid.uuid4().hex[:8]}",
                     category="unknown",
                     title="Target Process Authorization Required",
-                    description=f"PID {pid} was specified without an existing offline snapshot. Live process inspection requires explicit authorize_target=True.",
+                    description=f"PID {parsed_pid} was specified without an existing offline snapshot. Live process inspection requires explicit authorize_target=True.",
                     confidence="high",
                     status="UNRESOLVED",
                 ))
@@ -251,40 +296,53 @@ class InvestigationManager:
 
             # Target is authorized: verify process existence
             try:
-                os.kill(pid, 0)
+                os.kill(parsed_pid, 0)
             except ProcessLookupError:
                 session.status = "FAILED"
                 session.stages["target_identity"] = {
                     "status": "FAILED",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "details": {"error": f"Target process PID {pid} does not exist (ESRCH)."},
+                    "details": {"error": f"Target process PID {parsed_pid} does not exist (ESRCH)."},
                 }
-                session.summary["error"] = f"Target PID {pid} not found (ESRCH)"
+                session.summary["error"] = f"Target PID {parsed_pid} not found (ESRCH)"
                 return session.to_dict()
             except PermissionError:
                 session.status = "FAILED"
                 session.stages["target_identity"] = {
                     "status": "FAILED",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "details": {"error": f"Permission denied accessing PID {pid} (EPERM)."},
+                    "details": {"error": f"Permission denied accessing PID {parsed_pid} (EPERM)."},
                 }
-                session.summary["error"] = f"Permission denied accessing PID {pid} (EPERM)"
+                session.summary["error"] = f"Permission denied accessing PID {parsed_pid} (EPERM)"
                 return session.to_dict()
 
             # Perform live capture
             try:
                 from .capture_backend import ProcessVmCaptureBackend, ProcfsCaptureBackend
-                backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(pid) else ProcfsCaptureBackend()
-                live_snap = backend.capture(pid=pid)
-                snap_dir = os.path.join(self.corpus_dir, "memory_snapshots", f"live_pid_{pid}_{uuid.uuid4().hex[:6]}")
+                backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(parsed_pid) else ProcfsCaptureBackend()
+                if not backend.is_available(parsed_pid):
+                    session.status = "FAILED"
+                    session.stages["capture_quality"] = {
+                        "status": "FAILED",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "details": {"error": f"Live capture backend is unavailable for PID {parsed_pid}."},
+                    }
+                    session.summary["error"] = f"Live capture backend unavailable for PID {parsed_pid}"
+                    return session.to_dict()
+
+                live_snap = backend.capture(pid=parsed_pid)
+                snap_dir = os.path.join(self.corpus_dir, "memory_snapshots", f"live_pid_{parsed_pid}_{uuid.uuid4().hex[:6]}")
                 live_snap.save(snap_dir)
                 session.target_ref["memory_snapshot_path"] = snap_dir
+                session.target_ref["live_capture"] = True
+                session.target_ref["capture_source"] = "LIVE_PROCESS"
+                session.target_ref["capture_backend"] = getattr(backend, "name", "process_vm_readv")
             except Exception as cap_exc:
                 session.status = "FAILED"
                 session.stages["capture_quality"] = {
                     "status": "FAILED",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "details": {"error": f"Live memory capture failed for PID {pid}: {cap_exc}"},
+                    "details": {"error": f"Live memory capture failed for PID {parsed_pid}: {cap_exc}"},
                 }
                 session.summary["error"] = f"Live memory capture failed: {cap_exc}"
                 return session.to_dict()
@@ -323,6 +381,7 @@ class InvestigationManager:
                 session.status = "PARTIAL"
             else:
                 session.status = "COMPLETED"
+            session.summary["status"] = session.status
 
         except Exception as exc:
             session.status = "FAILED"
@@ -624,11 +683,15 @@ class InvestigationManager:
             "created_at": session.created_at,
             "target_identity": session.stages["target_identity"].get("details", {}),
             "capture_quality": session.stages["capture_quality"].get("details", {}),
+            "stages": session.stages,
+            "summary": session.summary,
             "findings_summary": {
                 "total": len(session.findings),
                 "facts_count": len(facts),
                 "hypotheses_count": len(hypotheses),
                 "unknowns_count": len(unknowns),
+                "scope": session.summary.get("scope", {}),
+                "zero_findings_notice": session.summary.get("zero_findings_notice"),
             },
             "findings": {
                 "observed_facts": facts,
@@ -678,12 +741,14 @@ class InvestigationManager:
 
         identity_details = {
             "pid": pid,
-            "executable": target_exec or "offline_artifact",
+            "executable": target_exec or ("live_process" if t_ref.get("live_capture") else "offline_artifact"),
             "target_build_id": target_build_id,
             "debug_image": dbg_path,
             "debug_build_id": dbg_build_id,
             "build_id_status": build_id_status,
             "build_id_reason": reason,
+            "capture_source": t_ref.get("capture_source", "OFFLINE_SNAPSHOT"),
+            "capture_backend": t_ref.get("capture_backend", "corpus"),
         }
 
         # Record Identity Evidence
@@ -1222,14 +1287,59 @@ class InvestigationManager:
 
         session.next_steps = steps
 
-        # Summary
+        # Summary & Explicit Analysis Scope
+        facts_cnt = sum(1 for f in session.findings if f.category == "fact")
+        hypo_cnt = sum(1 for f in session.findings if f.category == "hypothesis")
+        unknown_cnt = sum(1 for f in session.findings if f.category == "unknown")
+
+        semantic_details = session.stages.get("semantic_interpretation", {}).get("details", {})
+        quality_details = session.stages.get("capture_quality", {}).get("details", {})
+        objects_examined = semantic_details.get("objects_count", 0)
+        roots_examined = semantic_details.get("roots_count", 0)
+        regions_examined = quality_details.get("regions_count", len(getattr(session.active_snapshot, "memory_regions", [])) if hasattr(session.active_snapshot, "memory_regions") else 0)
+
+        unresolved_checks = []
+        if not session.static_provider or not session.static_provider.is_available():
+            unresolved_checks.append("Static symbol and call-graph linkage unavailable (no DWARF static provider)")
+        if quality_details.get("consistency_level") == NON_ATOMIC:
+            unresolved_checks.append("Non-atomic capture: cross-region invariants not guaranteed atomic")
+        if quality_details.get("failed_reads", 0) > 0:
+            unresolved_checks.append(f"{quality_details['failed_reads']} memory regions failed to read")
+        unresolved_checks.append("Heap allocations without active global roots remain unmapped")
+        unresolved_checks.append("Private/local symbols and unexercised code paths unverified")
+
+        failed_stages = [k for k, v in session.stages.items() if v["status"] == "FAILED"]
+        partial_stages = [k for k, v in session.stages.items() if v["status"] == "PARTIAL"]
+        computed_status = "FAILED" if len(failed_stages) >= 2 else ("PARTIAL" if (failed_stages or partial_stages) else "COMPLETED")
+
+        zero_notice = None
+        if len(session.findings) == 0:
+            if computed_status == "COMPLETED":
+                zero_notice = (
+                    f"Investigation completed with 0 findings in inspected scope ({objects_examined} objects, {roots_examined} roots). "
+                    "This does not imply validation of unmapped heap regions, private symbols, or uninspected invariants."
+                )
+            else:
+                zero_notice = (
+                    "Partial investigation completed with 0 findings because analysis scope was incomplete or restricted."
+                )
+
         session.summary = {
             "goal": session.goal,
-            "facts_count": sum(1 for f in session.findings if f.category == "fact"),
-            "hypotheses_count": sum(1 for f in session.findings if f.category == "hypothesis"),
-            "unknowns_count": sum(1 for f in session.findings if f.category == "unknown"),
+            "status": computed_status,
+            "facts_count": facts_cnt,
+            "hypotheses_count": hypo_cnt,
+            "unknowns_count": unknown_cnt,
+            "total_findings": len(session.findings),
             "next_steps_count": len(steps),
             "evidence_count": len(session.ledger._records),
+            "scope": {
+                "objects_examined": objects_examined,
+                "roots_examined": roots_examined,
+                "regions_examined": regions_examined,
+                "unresolved_checks": unresolved_checks,
+            },
+            "zero_findings_notice": zero_notice,
         }
 
         session.stages["report_synthesis"] = {

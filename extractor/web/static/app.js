@@ -35,6 +35,7 @@
     lastCaptureReport: null,
     stateLabTree: null,
     activeInvestigation: null,
+    selectedInvestigationId: null,
     investigationFindingFilter: 'all',
   };
 
@@ -3805,63 +3806,118 @@
     }
   }
 
+  let investigationLoadSeq = 0;
+
+  function renderRecentInvestigationSessions(sessionsList, activeId) {
+    if (!el.invRecentSessionsContainer) return;
+    if (Array.isArray(sessionsList) && sessionsList.length > 0) {
+      el.invRecentSessionsContainer.style.display = 'flex';
+      if (el.invRecentSessionsList) {
+        el.invRecentSessionsList.innerHTML = sessionsList.slice(-6).reverse().map(sess => {
+          const sid = sess.investigation_id || 'session';
+          const isActive = sid === activeId;
+          const statusBadge = sess.status === 'COMPLETED' ? 'badge-success' : (sess.status === 'PARTIAL' ? 'badge-warning' : (sess.status === 'BLOCKED' ? 'badge-danger' : 'badge-danger'));
+          return `
+            <span class="inv-session-pill ${isActive ? 'active' : ''}" onclick="window.__loadInvestigationSession('${escapeHtml(sid)}')">
+              ${escapeHtml(sid.substring(0, 14))}... <span class="badge ${statusBadge} text-xs">${escapeHtml(sess.status || '')}</span>
+            </span>
+          `;
+        }).join('');
+      }
+    } else {
+      el.invRecentSessionsContainer.style.display = 'none';
+      if (el.invRecentSessionsList) el.invRecentSessionsList.innerHTML = '';
+    }
+  }
+
   async function loadRecentInvestigationSessions() {
     try {
       const res = await apiGet('/api/investigations');
-      if (res.success && Array.isArray(res.data) && res.data.length > 0) {
-        if (el.invRecentSessionsContainer) el.invRecentSessionsContainer.style.display = 'flex';
-        if (el.invRecentSessionsList) {
-          el.invRecentSessionsList.innerHTML = res.data.slice(-6).reverse().map(sess => {
-            const sid = sess.investigation_id || 'session';
-            const isActive = state.activeInvestigation && state.activeInvestigation.investigation_id === sid;
-            const statusBadge = sess.status === 'COMPLETED' ? 'badge-success' : (sess.status === 'PARTIAL' ? 'badge-warning' : 'badge-danger');
-            return `
-              <span class="inv-session-pill ${isActive ? 'active' : ''}" onclick="window.__loadInvestigationSession('${escapeHtml(sid)}')">
-                ${escapeHtml(sid.substring(0, 14))}... <span class="badge ${statusBadge} text-xs">${escapeHtml(sess.status || '')}</span>
-              </span>
-            `;
-          }).join('');
-        }
+      if (res.success && Array.isArray(res.data)) {
+        renderRecentInvestigationSessions(res.data, state.selectedInvestigationId);
       } else {
-        if (el.invRecentSessionsContainer) el.invRecentSessionsContainer.style.display = 'none';
+        renderRecentInvestigationSessions([], null);
       }
-    } catch (e) {
-      if (el.invRecentSessionsContainer) el.invRecentSessionsContainer.style.display = 'none';
+    } catch (_) {
+      renderRecentInvestigationSessions([], null);
     }
   }
 
   window.__loadInvestigationSession = async function (investigationId) {
     if (!investigationId) return;
-    try {
-      showToast(`Loading session ${investigationId}...`, 'info');
-      const repRes = await apiGet(`/api/investigation/report?investigation_id=${investigationId}`);
-      if (repRes.success && repRes.data) {
-        state.activeInvestigation = repRes.data;
-        renderInvestigationOverview();
-        await loadRecentInvestigationSessions();
-      } else {
-        showToast(`Failed to load session ${investigationId}`, 'error');
-      }
-    } catch (e) {
-      showToast(`Error loading session: ${String(e)}`, 'error');
-    }
+    await loadActiveInvestigation(investigationId);
   };
 
-  async function loadActiveInvestigation() {
+  async function loadActiveInvestigation(targetSessionId) {
+    const seq = ++investigationLoadSeq;
     try {
-      await loadRecentInvestigationSessions();
       const res = await apiGet('/api/investigations');
-      if (res.success && Array.isArray(res.data) && res.data.length > 0) {
-        const latest = res.data[res.data.length - 1];
-        const repRes = await apiGet(`/api/investigation/report?investigation_id=${latest.investigation_id}`);
-        if (repRes.success && repRes.data) {
-          state.activeInvestigation = repRes.data;
-          renderInvestigationOverview();
-          return;
-        }
+      if (seq !== investigationLoadSeq) return;
+
+      const sessions = (res.success && Array.isArray(res.data)) ? res.data : [];
+
+      if (sessions.length === 0) {
+        state.activeInvestigation = null;
+        state.selectedInvestigationId = null;
+        try { sessionStorage.removeItem('dynamicstate_selected_inv_id'); } catch (_) {}
+        renderRecentInvestigationSessions([], null);
+        renderEmptyInvestigationOverview();
+        return;
       }
-      renderEmptyInvestigationOverview();
+
+      // Preserve selection priority:
+      // 1. Explicit targetSessionId passed into function
+      // 2. state.selectedInvestigationId if it exists in sessions
+      // 3. Stored session in sessionStorage if it exists in sessions
+      // 4. Latest session in list
+      let chosenId = targetSessionId;
+      if (!chosenId && state.selectedInvestigationId && sessions.some(s => s.investigation_id === state.selectedInvestigationId)) {
+        chosenId = state.selectedInvestigationId;
+      }
+      if (!chosenId) {
+        try {
+          const stored = sessionStorage.getItem('dynamicstate_selected_inv_id');
+          if (stored && sessions.some(s => s.investigation_id === stored)) {
+            chosenId = stored;
+          }
+        } catch (_) {}
+      }
+      if (!chosenId) {
+        chosenId = sessions[sessions.length - 1].investigation_id;
+      }
+
+      const repRes = await apiGet(`/api/investigation/report?investigation_id=${encodeURIComponent(chosenId)}`);
+      if (seq !== investigationLoadSeq) return;
+
+      if (repRes.success && repRes.data) {
+        state.activeInvestigation = repRes.data;
+        state.selectedInvestigationId = chosenId;
+        try { sessionStorage.setItem('dynamicstate_selected_inv_id', chosenId); } catch (_) {}
+        renderRecentInvestigationSessions(sessions, chosenId);
+        renderInvestigationOverview();
+      } else {
+        // Stale or deleted session ID: try latest session instead
+        const fallback = sessions[sessions.length - 1].investigation_id;
+        if (fallback !== chosenId) {
+          const fbRes = await apiGet(`/api/investigation/report?investigation_id=${encodeURIComponent(fallback)}`);
+          if (seq !== investigationLoadSeq) return;
+          if (fbRes.success && fbRes.data) {
+            state.activeInvestigation = fbRes.data;
+            state.selectedInvestigationId = fallback;
+            try { sessionStorage.setItem('dynamicstate_selected_inv_id', fallback); } catch (_) {}
+            renderRecentInvestigationSessions(sessions, fallback);
+            renderInvestigationOverview();
+            return;
+          }
+        }
+        state.activeInvestigation = null;
+        state.selectedInvestigationId = null;
+        try { sessionStorage.removeItem('dynamicstate_selected_inv_id'); } catch (_) {}
+        renderRecentInvestigationSessions(sessions, null);
+        renderEmptyInvestigationOverview();
+      }
     } catch (e) {
+      if (seq !== investigationLoadSeq) return;
       console.warn('Failed to load active investigation:', e);
       renderEmptyInvestigationOverview();
     }
@@ -3872,13 +3928,30 @@
     
     // Check which entry panel is active (Snapshot vs Live)
     const isLive = el.panelEntryLive && el.panelEntryLive.style.display !== 'none';
-    let snapshotId, debugImage, authorizeTarget;
+    let snapshotId, debugImage, authorizeTarget, pid;
 
     if (isLive) {
       snapshotId = undefined;
+      const rawPid = (el.invInputLiveTarget && el.invInputLiveTarget.value.trim()) || '';
+      if (!rawPid) {
+        showToast('Please specify a target PID for live capture.', 'warning');
+        return;
+      }
+      // Extract numeric PID: accept e.g. "2048", "PID 2048", "PID: 2048"
+      const match = rawPid.match(/\b\d+\b/);
+      if (!match) {
+        showToast(`Invalid PID format: "${rawPid}". Please enter a numeric PID.`, 'error');
+        return;
+      }
+      pid = parseInt(match[0], 10);
+      if (isNaN(pid) || pid <= 0 || pid > 2147483647) {
+        showToast(`PID ${pid} is out of valid range.`, 'error');
+        return;
+      }
       debugImage = (el.invInputLiveDebugImage && el.invInputLiveDebugImage.value.trim()) || undefined;
       authorizeTarget = el.invCheckAuthorize ? el.invCheckAuthorize.checked : false;
     } else {
+      pid = undefined;
       snapshotId = (el.invSelectSnapshot && el.invSelectSnapshot.value) || undefined;
       debugImage = (el.invInputDebugImage && el.invInputDebugImage.value.trim()) || undefined;
       authorizeTarget = false;
@@ -3907,6 +3980,7 @@
       const payload = {
         goal: goal,
         snapshot_id: snapshotId,
+        pid: pid,
         debug_image: debugImage,
         authorize_target: authorizeTarget,
       };
@@ -3914,16 +3988,24 @@
       const res = await apiPost('/api/investigation/start', payload);
       if (res.success && res.data) {
         state.activeInvestigation = res.data;
+        state.selectedInvestigationId = res.data.investigation_id;
+        try { sessionStorage.setItem('dynamicstate_selected_inv_id', res.data.investigation_id); } catch (_) {}
         renderInvestigationOverview();
-        await loadRecentInvestigationSessions();
-        showToast('Investigation completed successfully!', 'success');
+        await loadActiveInvestigation(res.data.investigation_id);
+        if (res.data.status === 'BLOCKED') {
+          showToast('Investigation blocked: Target authorization required', 'warning');
+        } else {
+          showToast('Investigation completed successfully!', 'success');
+        }
       } else {
         const msg = (res.error && res.error.message) || 'Investigation failed';
         showToast(`Investigation error: ${msg}`, 'error');
         if (res.data) {
           state.activeInvestigation = res.data;
+          state.selectedInvestigationId = res.data.investigation_id;
+          try { sessionStorage.setItem('dynamicstate_selected_inv_id', res.data.investigation_id); } catch (_) {}
           renderInvestigationOverview();
-          await loadRecentInvestigationSessions();
+          await loadActiveInvestigation(res.data.investigation_id);
         } else {
           renderFailedInvestigationOverview(msg);
         }
@@ -4109,12 +4191,34 @@
     }
 
     if (el.invAlertBanner) {
-      if (st === 'BLOCKED' || bStatus === 'MISMATCH') {
+      if (st === 'BLOCKED') {
+        el.invAlertBanner.className = 'banner banner-danger mb-3';
+        el.invAlertBanner.style.display = 'flex';
+        if (el.invAlertIcon) el.invAlertIcon.textContent = '🛑';
+        const pidVal = idInfo.pid || inv.target_ref?.pid;
+        const errText = idInfo.error || stages.target_identity?.details?.error || inv.summary?.error || '';
+        let msg = 'Target process authorization required for live process capture.';
+        if (pidVal) {
+          msg = `Target process authorization required for live capture of PID ${escapeHtml(pidVal)}. Inspection blocked without stopping the process.`;
+        }
+        if (errText) msg = escapeHtml(errText);
+        if (el.invAlertMessage) {
+          el.invAlertMessage.innerHTML = `<strong>Investigation Blocked:</strong> ${msg}`;
+        }
+      } else if (bStatus === 'MISMATCH') {
         el.invAlertBanner.className = 'banner banner-warning mb-3';
         el.invAlertBanner.style.display = 'flex';
         if (el.invAlertIcon) el.invAlertIcon.textContent = '🛑';
         if (el.invAlertMessage) {
           el.invAlertMessage.innerHTML = `<strong>Investigation Blocked:</strong> Build-ID or identity mismatch detected (${escapeHtml(idInfo.build_id_reason || 'Target binary does not match debug artifact')}). Semantic reconstruction stopped to prevent false interpretations.`;
+        }
+      } else if (st === 'FAILED') {
+        el.invAlertBanner.className = 'banner banner-danger mb-3';
+        el.invAlertBanner.style.display = 'flex';
+        if (el.invAlertIcon) el.invAlertIcon.textContent = '❌';
+        const failMsg = inv.summary?.error || stages.target_identity?.details?.error || stages.capture_quality?.details?.error || 'Investigation stage failed.';
+        if (el.invAlertMessage) {
+          el.invAlertMessage.innerHTML = `<strong>Investigation Failed:</strong> ${escapeHtml(failMsg)}`;
         }
       } else if (st === 'PARTIAL' || qInfo.consistency_level === 'NON_ATOMIC') {
         el.invAlertBanner.className = 'banner banner-warning mb-3';
@@ -4126,9 +4230,14 @@
       } else if (st === 'COMPLETED' && totalFindings === 0) {
         el.invAlertBanner.className = 'banner banner-info mb-3';
         el.invAlertBanner.style.display = 'flex';
-        if (el.invAlertIcon) el.invAlertIcon.textContent = '✅';
+        if (el.invAlertIcon) el.invAlertIcon.textContent = 'ℹ️';
+        const sc = inv.summary?.scope || {};
+        const objCount = sc.objects_examined ?? (stages.semantic_interpretation?.details?.objects_count || 0);
+        const rootCount = sc.roots_examined ?? (stages.semantic_interpretation?.details?.roots_count || 0);
+        const scopeDesc = objCount > 0 ? `inspected ${objCount} objects, ${rootCount} roots` : 'inspected scope';
+        const notice = inv.summary?.zero_findings_notice || `No anomalies detected in inspected scope (${scopeDesc}). Unexamined memory regions, private symbols, and uninspected code paths remain unverified.`;
         if (el.invAlertMessage) {
-          el.invAlertMessage.innerHTML = `<strong>Investigation Completed (0 Inconsistencies):</strong> Analyzed runtime memory state and verified all checked types and invariants without discovering anomalies.`;
+          el.invAlertMessage.innerHTML = `<strong>Investigation Completed (0 Findings):</strong> ${escapeHtml(notice)}`;
         }
       } else {
         el.invAlertBanner.style.display = 'none';
@@ -4140,7 +4249,10 @@
     if (el.invTxtTargetBid) el.invTxtTargetBid.textContent = idInfo.target_build_id || 'N/A';
     if (el.invTxtDebugImage) el.invTxtDebugImage.textContent = idInfo.debug_image || 'None';
     if (el.invTxtDebugBid) el.invTxtDebugBid.textContent = idInfo.debug_build_id || 'N/A';
-    if (el.invTxtPid) el.invTxtPid.textContent = idInfo.pid ? `PID ${idInfo.pid}` : 'Offline';
+    if (el.invTxtPid) {
+      const pidVal = idInfo.pid || inv.target_ref?.pid;
+      el.invTxtPid.textContent = pidVal ? `PID ${pidVal}` : 'Offline';
+    }
     if (el.invBadgeBuildStatus) {
       el.invBadgeBuildStatus.textContent = bStatus;
       const isOk = bStatus === 'VERIFIED_MATCH' || bStatus === 'VERIFIED';
@@ -4154,9 +4266,11 @@
 
     // Update Header Target & Quality pills
     if (el.hdrTxtTarget) {
+      const pidVal = idInfo.pid || inv.target_ref?.pid;
       if (inv.snapshot_id) el.hdrTxtTarget.textContent = `Snapshot: ${inv.snapshot_id}`;
-      else if (idInfo.pid) el.hdrTxtTarget.textContent = `PID ${idInfo.pid}`;
+      else if (pidVal) el.hdrTxtTarget.textContent = `Live PID: ${pidVal}`;
       else if (idInfo.executable) el.hdrTxtTarget.textContent = idInfo.executable;
+      else el.hdrTxtTarget.textContent = 'Target: Offline';
     }
     if (el.hdrBadgeCaptureQuality && qInfo.consistency_level) {
       el.hdrBadgeCaptureQuality.textContent = qInfo.consistency_level;
@@ -4229,14 +4343,53 @@
 
     if (filtered.length === 0) {
       if (inv.status === 'COMPLETED' && findings.length === 0) {
+        const sc = inv.summary?.scope || {};
+        const objCount = sc.objects_examined ?? (stages.semantic_interpretation?.details?.objects_count || 0);
+        const rootCount = sc.roots_examined ?? (stages.semantic_interpretation?.details?.roots_count || 0);
+        const scopeText = objCount > 0 ? `Inspected ${objCount} objects and ${rootCount} roots.` : 'Inspected available target memory.';
+        const unresolvedList = Array.isArray(sc.unresolved_checks) && sc.unresolved_checks.length > 0 
+          ? `<ul class="mt-2 text-muted" style="padding-left: 18px; margin-bottom: 0;">${sc.unresolved_checks.map(u => `<li>${escapeHtml(u)}</li>`).join('')}</ul>`
+          : '<div class="text-muted mt-1">Unmapped heap allocations, private symbols, and uninspected runtime invariants remain unverified.</div>';
+
         el.invFindingsList.innerHTML = `
-          <div class="empty-state-clean text-xs p-3" style="background-color: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 6px;">
-            <strong style="color: var(--success); font-size: 0.95rem;">✅ Completed: 0 Findings / Anomalies Detected</strong>
-            <div class="text-muted mt-1">The investigation evaluated memory state and invariants without finding anomalies or unexpected mutations.</div>
+          <div class="empty-state-clean text-xs p-3" style="background-color: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 6px;">
+            <strong style="color: var(--accent); font-size: 0.95rem;">ℹ️ Completed: 0 Findings in Inspected Scope</strong>
+            <div class="mt-1">${scopeText} No discrepancies identified within inspected structures.</div>
+            <div class="mt-2" style="font-weight: 600; color: var(--text-secondary);">Scope Boundaries &amp; Uninspected Checks:</div>
+            ${unresolvedList}
+          </div>
+        `;
+      } else if (inv.status === 'PARTIAL' && findings.length === 0) {
+        const partialReason = stages.semantic_interpretation?.details?.error 
+          || stages.target_identity?.details?.build_id_reason 
+          || stages.capture_quality?.details?.error 
+          || inv.summary?.error 
+          || 'Target snapshot could not be fully resolved or debug artifacts were incomplete.';
+        el.invFindingsList.innerHTML = `
+          <div class="empty-state text-xs p-3" style="background-color: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 6px;">
+            <strong style="color: var(--warning); font-size: 0.95rem;">⚠️ Partial Analysis: 0 Findings Recorded</strong>
+            <div class="text-muted mt-1">Analysis scope was incomplete: ${escapeHtml(partialReason)}</div>
+            <div class="text-muted mt-1">Zero findings recorded does NOT indicate clean state; inspection was restricted.</div>
+          </div>
+        `;
+      } else if (inv.status === 'BLOCKED') {
+        const blockReason = stages.target_identity?.details?.error || inv.summary?.error || 'Target authorization or identity validation blocked analysis.';
+        el.invFindingsList.innerHTML = `
+          <div class="empty-state text-xs p-3" style="background-color: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 6px;">
+            <strong style="color: var(--danger); font-size: 0.95rem;">🛑 Investigation Blocked</strong>
+            <div class="text-muted mt-1">${escapeHtml(blockReason)}</div>
+          </div>
+        `;
+      } else if (inv.status === 'FAILED') {
+        const failReason = inv.summary?.error || stages.target_identity?.details?.error || stages.capture_quality?.details?.error || 'Investigation stage failed.';
+        el.invFindingsList.innerHTML = `
+          <div class="empty-state text-xs p-3" style="background-color: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 6px;">
+            <strong style="color: var(--danger); font-size: 0.95rem;">❌ Investigation Failed</strong>
+            <div class="text-muted mt-1">${escapeHtml(failReason)}</div>
           </div>
         `;
       } else {
-        el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3">No findings matching '${filter}'.</div>`;
+        el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3">No findings matching '${escapeHtml(filter)}'.</div>`;
       }
       return;
     }

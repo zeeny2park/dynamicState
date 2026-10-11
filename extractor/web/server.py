@@ -1251,8 +1251,14 @@ class WebApiAdapter:
         )
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
-        return {"success": False, "error": {"code": res.error.code if res.error else "INVESTIGATION_FAILED",
-                                            "message": res.error.message if res.error else "Investigation failed"}}
+        return {
+            "success": False,
+            "data": _to_json_serializable(res.data) if res.data else None,
+            "error": {
+                "code": res.error.code if res.error else "INVESTIGATION_FAILED",
+                "message": res.error.message if res.error else "Investigation failed"
+            }
+        }
 
     def get_investigation_status(self, investigation_id: Optional[str]) -> Dict[str, Any]:
         if not investigation_id:
