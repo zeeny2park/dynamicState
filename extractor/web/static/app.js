@@ -21,7 +21,7 @@
     searchQuery: '',
     candidates: [],
     stateGraphData: { nodes: [], edges: [] },
-    activeTab: 'tab-object-explorer',
+    activeTab: 'tab-investigation-overview',
     activeSubtab: 'subtab-dag',
     centerView: 'tree', // 'tree', 'table', 'graph'
     jsonViewerCache: {},
@@ -34,10 +34,46 @@
     selectedLabSnapshotId: null,
     lastCaptureReport: null,
     stateLabTree: null,
+    activeInvestigation: null,
+    investigationFindingFilter: 'all',
   };
 
   // DOM Elements Cache
   const el = {
+    // TAB 0: Investigation Overview
+    invInputGoal: document.getElementById('inv-input-goal'),
+    btnRunInvestigation: document.getElementById('btn-run-investigation'),
+    btnRefreshInvestigation: document.getElementById('btn-refresh-investigation'),
+    invSelectSnapshot: document.getElementById('inv-select-snapshot'),
+    invInputDebugImage: document.getElementById('inv-input-debug-image'),
+    invCheckAuthorize: document.getElementById('inv-check-authorize'),
+    invBadgeStatus: document.getElementById('inv-badge-status'),
+    invTxtId: document.getElementById('inv-txt-id'),
+    invStagePills: document.getElementById('inv-stage-pills'),
+    invBadgeBuildStatus: document.getElementById('inv-badge-build-status'),
+    invTxtExec: document.getElementById('inv-txt-exec'),
+    invTxtTargetBid: document.getElementById('inv-txt-target-bid'),
+    invTxtDebugImage: document.getElementById('inv-txt-debug-image'),
+    invTxtDebugBid: document.getElementById('inv-txt-debug-bid'),
+    invTxtPid: document.getElementById('inv-txt-pid'),
+    invBadgeConsistency: document.getElementById('inv-badge-consistency'),
+    invConsistencyWarning: document.getElementById('inv-consistency-warning'),
+    invTxtConsistency: document.getElementById('inv-txt-consistency'),
+    invTxtDuration: document.getElementById('inv-txt-duration'),
+    invTxtPartialReads: document.getElementById('inv-txt-partial-reads'),
+    invTxtFailedReads: document.getElementById('inv-txt-failed-reads'),
+    invLimitationsContainer: document.getElementById('inv-limitations-container'),
+    invComparisonsContent: document.getElementById('inv-comparisons-content'),
+    btnModalCompare: document.getElementById('btn-modal-compare'),
+    invStepsContainer: document.getElementById('inv-steps-container'),
+    invStepsCount: document.getElementById('inv-steps-count'),
+    invFindingsList: document.getElementById('inv-findings-list'),
+    invBadgeStaticProvider: document.getElementById('inv-badge-static-provider'),
+    invStaticLinksList: document.getElementById('inv-static-links-list'),
+    tbodyRawEvidence: document.getElementById('tbody-raw-evidence'),
+    invTxtLedgerCount: document.getElementById('inv-txt-ledger-count'),
+    btnDownloadLedger: document.getElementById('btn-download-ledger'),
+
     // Header & Global Status Bar
     txtRuntimeStatus: document.getElementById('txt-runtime-status'),
     pillRuntimeStatus: document.getElementById('pill-runtime-status'),
@@ -546,7 +582,9 @@
       p.classList.toggle('active', p.id === tabId);
     });
 
-    if (tabId === 'tab-object-explorer') {
+    if (tabId === 'tab-investigation-overview') {
+      renderInvestigationOverview();
+    } else if (tabId === 'tab-object-explorer') {
       renderMemoryObjectsList();
       if (state.centerView === 'tree') renderReferenceTree();
       else if (state.centerView === 'table') renderReferenceTable();
@@ -3620,6 +3658,415 @@
   }
 
   // --------------------------------------------------------------------------
+  // Investigation Overview (Phase C)
+  // --------------------------------------------------------------------------
+
+  function initInvestigationOverview() {
+    if (el.btnRunInvestigation) {
+      el.btnRunInvestigation.addEventListener('click', runInvestigation);
+    }
+    if (el.btnRefreshInvestigation) {
+      el.btnRefreshInvestigation.addEventListener('click', loadActiveInvestigation);
+    }
+
+    // Filter pills for findings
+    const filterPills = [
+      { btn: document.getElementById('btn-filter-find-all'), filter: 'all' },
+      { btn: document.getElementById('btn-filter-find-facts'), filter: 'fact' },
+      { btn: document.getElementById('btn-filter-find-hypo'), filter: 'hypothesis' },
+      { btn: document.getElementById('btn-filter-find-unknown'), filter: 'unknown' },
+    ];
+    filterPills.forEach(({ btn, filter }) => {
+      if (btn) {
+        btn.addEventListener('click', () => {
+          filterPills.forEach(p => p.btn && p.btn.classList.toggle('active', p.filter === filter));
+          state.investigationFindingFilter = filter;
+          renderFindings();
+        });
+      }
+    });
+
+    if (el.btnDownloadLedger) {
+      el.btnDownloadLedger.addEventListener('click', () => {
+        if (!state.activeInvestigation || !state.activeInvestigation.evidence_ledger) {
+          showToast('No evidence ledger to export.', 'warning');
+          return;
+        }
+        const blob = new Blob([JSON.stringify(state.activeInvestigation.evidence_ledger, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `evidence_ledger_${state.activeInvestigation.investigation_id || 'session'}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+    }
+
+    if (el.btnModalCompare) {
+      el.btnModalCompare.addEventListener('click', () => {
+        const snapA = prompt('Enter first snapshot ID or path to compare:');
+        if (!snapA) return;
+        const snapB = prompt('Enter second snapshot ID or path to compare:');
+        if (!snapB) return;
+        compareSnapshots(snapA.trim(), snapB.trim());
+      });
+    }
+  }
+
+  async function loadActiveInvestigation() {
+    try {
+      const res = await apiGet('/api/investigations');
+      if (res.success && Array.isArray(res.data) && res.data.length > 0) {
+        const latest = res.data[res.data.length - 1];
+        const repRes = await apiGet(`/api/investigation/report?investigation_id=${latest.investigation_id}`);
+        if (repRes.success && repRes.data) {
+          state.activeInvestigation = repRes.data;
+          renderInvestigationOverview();
+          return;
+        }
+      }
+      renderEmptyInvestigationOverview();
+    } catch (e) {
+      console.warn('Failed to load active investigation:', e);
+      renderEmptyInvestigationOverview();
+    }
+  }
+
+  async function runInvestigation() {
+    const goal = (el.invInputGoal && el.invInputGoal.value.trim()) || 'General state investigation';
+    const snapshotId = (el.invSelectSnapshot && el.invSelectSnapshot.value) || undefined;
+    const debugImage = (el.invInputDebugImage && el.invInputDebugImage.value.trim()) || undefined;
+    const authorizeTarget = el.invCheckAuthorize ? el.invCheckAuthorize.checked : false;
+
+    if (el.btnRunInvestigation) {
+      el.btnRunInvestigation.disabled = true;
+      el.btnRunInvestigation.textContent = '⏳ Investigating...';
+    }
+
+    try {
+      showToast('Starting evidence-first investigation...', 'info');
+      const payload = {
+        goal: goal,
+        snapshot_id: snapshotId,
+        debug_image: debugImage,
+        authorize_target: authorizeTarget,
+      };
+
+      const res = await apiPost('/api/investigation/start', payload);
+      if (res.success && res.data) {
+        state.activeInvestigation = res.data;
+        renderInvestigationOverview();
+        showToast('Investigation completed successfully!', 'success');
+      } else {
+        const msg = (res.error && res.error.message) || 'Investigation failed';
+        showToast(`Investigation error: ${msg}`, 'error');
+        if (res.data) {
+          state.activeInvestigation = res.data;
+          renderInvestigationOverview();
+        }
+      }
+    } catch (err) {
+      showToast(`Investigation error: ${String(err)}`, 'error');
+    } finally {
+      if (el.btnRunInvestigation) {
+        el.btnRunInvestigation.disabled = false;
+        el.btnRunInvestigation.textContent = '🚀 Start Investigation';
+      }
+    }
+  }
+
+  async function compareSnapshots(snapA, snapB) {
+    if (!state.activeInvestigation || !state.activeInvestigation.investigation_id) {
+      showToast('Start an investigation first to record comparison evidence.', 'warning');
+      return;
+    }
+    try {
+      showToast(`Comparing ${snapA} and ${snapB}...`, 'info');
+      const res = await apiPost('/api/investigation/compare', {
+        investigation_id: state.activeInvestigation.investigation_id,
+        snapshot_a: snapA,
+        snapshot_b: snapB,
+      });
+      if (res.success) {
+        showToast('Comparison completed!', 'success');
+        await loadActiveInvestigation();
+      } else {
+        showToast(`Comparison error: ${res.error?.message || 'Failed'}`, 'error');
+      }
+    } catch (err) {
+      showToast(`Comparison error: ${String(err)}`, 'error');
+    }
+  }
+
+  function renderEmptyInvestigationOverview() {
+    if (el.invBadgeStatus) {
+      el.invBadgeStatus.textContent = 'IDLE / READY';
+      el.invBadgeStatus.className = 'badge badge-info';
+    }
+    if (el.invTxtId) el.invTxtId.textContent = 'Ready for investigation goal';
+    populateInvestigationSnapshots();
+  }
+
+  function populateInvestigationSnapshots() {
+    if (!el.invSelectSnapshot) return;
+    const currVal = el.invSelectSnapshot.value;
+    el.invSelectSnapshot.innerHTML = '<option value="">(Current / Active State)</option>';
+    if (state.states && state.states.length > 0) {
+      state.states.forEach(s => {
+        const sid = s.state_id || s.snapshot_id || s;
+        const opt = document.createElement('option');
+        opt.value = sid;
+        opt.textContent = `Snapshot: ${sid}`;
+        if (sid === currVal) opt.selected = true;
+        el.invSelectSnapshot.appendChild(opt);
+      });
+    }
+  }
+
+  function renderInvestigationOverview() {
+    populateInvestigationSnapshots();
+    const inv = state.activeInvestigation;
+    if (!inv) {
+      renderEmptyInvestigationOverview();
+      return;
+    }
+
+    // Status Banner
+    if (el.invBadgeStatus) {
+      el.invBadgeStatus.textContent = inv.status || 'UNKNOWN';
+      el.invBadgeStatus.className = `badge ${inv.status === 'COMPLETED' ? 'badge-success' : (inv.status === 'PARTIAL' ? 'badge-warning' : 'badge-danger')}`;
+    }
+    if (el.invTxtId) {
+      el.invTxtId.textContent = `Session: ${inv.investigation_id || 'N/A'}`;
+    }
+
+    // Stage progress pills
+    const stages = inv.stages || {};
+    const updateStagePill = (id, stageName) => {
+      const p = document.getElementById(id);
+      if (p) {
+        const st = stages[stageName]?.status || 'PENDING';
+        p.className = `stage-pill ${st.toLowerCase()}`;
+        p.title = `${stageName}: ${st}`;
+      }
+    };
+    updateStagePill('pill-stage-identity', 'target_identity');
+    updateStagePill('pill-stage-quality', 'capture_quality');
+    updateStagePill('pill-stage-semantic', 'semantic_interpretation');
+    updateStagePill('pill-stage-comparison', 'observation_comparison');
+    updateStagePill('pill-stage-static', 'static_code_link');
+    updateStagePill('pill-stage-synthesis', 'report_synthesis');
+
+    // 1. Target & Build Identity Card
+    const idInfo = stages.target_identity?.details || inv.target_identity || {};
+    if (el.invTxtExec) el.invTxtExec.textContent = idInfo.executable || 'offline_artifact';
+    if (el.invTxtTargetBid) el.invTxtTargetBid.textContent = idInfo.target_build_id || 'N/A';
+    if (el.invTxtDebugImage) el.invTxtDebugImage.textContent = idInfo.debug_image || 'None';
+    if (el.invTxtDebugBid) el.invTxtDebugBid.textContent = idInfo.debug_build_id || 'N/A';
+    if (el.invTxtPid) el.invTxtPid.textContent = idInfo.pid ? `PID ${idInfo.pid}` : 'Offline';
+    if (el.invBadgeBuildStatus) {
+      const bStatus = idInfo.build_id_status || 'NOT_AVAILABLE';
+      el.invBadgeBuildStatus.textContent = bStatus;
+      el.invBadgeBuildStatus.className = `badge ${bStatus === 'VERIFIED' ? 'badge-success' : (bStatus === 'MISMATCH' ? 'badge-danger' : 'badge-warning')}`;
+    }
+
+    // 2. Capture Quality & Consistency Card
+    const qInfo = stages.capture_quality?.details || inv.capture_quality || {};
+    const consLevel = qInfo.consistency_level || 'UNKNOWN';
+    if (el.invTxtConsistency) el.invTxtConsistency.textContent = consLevel;
+    if (el.invBadgeConsistency) {
+      el.invBadgeConsistency.textContent = consLevel;
+      el.invBadgeConsistency.className = `badge ${consLevel === 'STOPPED' || consLevel === 'ATOMIC' ? 'badge-success' : (consLevel === 'NON_ATOMIC' ? 'badge-warning' : '')}`;
+    }
+    if (el.invConsistencyWarning) {
+      el.invConsistencyWarning.style.display = consLevel === 'NON_ATOMIC' ? 'block' : 'none';
+    }
+    if (el.invTxtDuration) {
+      el.invTxtDuration.textContent = qInfo.duration_us ? `${(qInfo.duration_us / 1000).toFixed(2)} ms` : 'N/A';
+    }
+    if (el.invTxtPartialReads) el.invTxtPartialReads.textContent = String(qInfo.partial_reads || 0);
+    if (el.invTxtFailedReads) el.invTxtFailedReads.textContent = String(qInfo.failed_reads || 0);
+    if (el.invLimitationsContainer) {
+      const lims = qInfo.limitations || [];
+      if (lims.length > 0) {
+        el.invLimitationsContainer.innerHTML = lims.map(l => `<div>&bull; ${escapeHtml(l)}</div>`).join('');
+      } else {
+        el.invLimitationsContainer.innerHTML = '<em>No known limitations recorded.</em>';
+      }
+    }
+
+    // 3. Render Comparisons
+    renderComparisons(inv.comparisons || inv.comparison_results || []);
+
+    // 4. Render Recommended Next Steps
+    renderNextSteps(inv.recommended_next_steps || inv.next_steps || []);
+
+    // 5. Render Findings
+    renderFindings();
+
+    // 6. Render Static Links
+    const staticInfo = stages.static_code_link?.details || inv.static_code_links || {};
+    renderStaticLinks(staticInfo);
+
+    // 7. Render Raw Evidence
+    const ledger = inv.evidence_ledger || {};
+    renderRawEvidence(ledger);
+  }
+
+  function renderFindings() {
+    if (!el.invFindingsList) return;
+    const inv = state.activeInvestigation;
+    if (!inv) return;
+
+    let findings = [];
+    if (inv.findings && typeof inv.findings === 'object' && !Array.isArray(inv.findings)) {
+      findings = [
+        ...(inv.findings.observed_facts || []),
+        ...(inv.findings.hypotheses || []),
+        ...(inv.findings.unknowns || []),
+      ];
+    } else if (Array.isArray(inv.findings)) {
+      findings = inv.findings;
+    }
+
+    const filter = state.investigationFindingFilter || 'all';
+    const filtered = filter === 'all' ? findings : findings.filter(f => f.category === filter);
+
+    if (filtered.length === 0) {
+      el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3">No findings matching '${filter}'.</div>`;
+      return;
+    }
+
+    el.invFindingsList.innerHTML = filtered.map(f => {
+      const cat = f.category || 'fact';
+      const badgeClass = cat === 'fact' ? 'badge-fact' : (cat === 'hypothesis' ? 'badge-hypothesis' : 'badge-unknown');
+      const catLabel = cat === 'fact' ? 'Observed Fact' : (cat === 'hypothesis' ? 'Hypothesis' : 'Unknown');
+      const cPathHtml = f.c_type_path ? `<span class="finding-path">${escapeHtml(f.c_type_path)}</span>` : '';
+      const jumpHtml = f.object_id ? `<button type="button" class="jump-link" onclick="window.__jumpToObject('${f.object_id}')">Inspect in Object Explorer ➔</button>` : '';
+
+      return `
+        <div class="finding-card ${cat}">
+          <div class="finding-header">
+            <span class="finding-title">${escapeHtml(f.title || 'Finding')}</span>
+            <span class="${badgeClass}">${catLabel}</span>
+          </div>
+          ${cPathHtml ? `<div style="margin-bottom: 6px;">${cPathHtml}</div>` : ''}
+          <div class="finding-desc">${escapeHtml(f.description || '')}</div>
+          <div class="finding-footer">
+            <span class="text-xs text-muted">Status: <strong>${escapeHtml(f.status || 'CONFIRMED')}</strong></span>
+            ${jumpHtml}
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderNextSteps(steps) {
+    if (!el.invStepsContainer) return;
+    if (el.invStepsCount) el.invStepsCount.textContent = `${steps.length} steps`;
+    if (!steps || steps.length === 0) {
+      el.invStepsContainer.innerHTML = '<div class="empty-state text-xs p-3">No next steps formulated yet.</div>';
+      return;
+    }
+
+    el.invStepsContainer.innerHTML = steps.map((s, idx) => {
+      const riskColor = s.risk_level === 'MUTATION' ? 'var(--danger)' : 'var(--text-muted)';
+      return `
+        <div class="step-card">
+          <div class="step-header">
+            <span class="step-suggestion-badge">${s.is_suggestion ? 'SUGGESTION' : 'EXECUTED'}</span>
+            <span class="step-desc">${idx + 1}. ${escapeHtml(s.description)}</span>
+          </div>
+          <div class="step-rationale">${escapeHtml(s.rationale)} <span style="color: ${riskColor}; font-size: 0.75rem;">(Risk: ${escapeHtml(s.risk_level || 'READ_ONLY')})</span></div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderComparisons(comparisons) {
+    if (!el.invComparisonsContent) return;
+    if (!comparisons || comparisons.length === 0) {
+      el.invComparisonsContent.innerHTML = '<div class="empty-state text-xs p-3">No comparisons recorded. Click \'Compare 2 Snapshots\' to compare.</div>';
+      return;
+    }
+
+    el.invComparisonsContent.innerHTML = comparisons.map(c => {
+      const summary = c.diff_summary || c.summary || {};
+      const uncHtml = c.uncertainty ? `<div class="banner banner-warning text-xs mb-2" style="padding: 4px 8px;">${escapeHtml(c.uncertainty)}</div>` : '';
+      return `
+        <div style="background-color: rgba(31, 41, 55, 0.4); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; margin-bottom: 8px;" class="text-xs">
+          <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+            <strong>${escapeHtml(c.snapshot_a || 'A')} &harr; ${escapeHtml(c.snapshot_b || 'B')}</strong>
+            <span class="badge badge-info">Diff</span>
+          </div>
+          ${uncHtml}
+          <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+            <span>Value changes: <strong>${summary.value_changes || 0}</strong></span>
+            <span>Objects added: <strong>${summary.objects_created || 0}</strong></span>
+            <span>Objects removed: <strong>${summary.objects_removed || 0}</strong></span>
+            <span>Ref changes: <strong>${summary.reference_changes || 0}</strong></span>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderStaticLinks(staticDetails) {
+    if (!el.invStaticLinksList) return;
+    if (el.invBadgeStaticProvider) {
+      el.invBadgeStaticProvider.textContent = staticDetails.provider || 'DWARF';
+    }
+    const resolved = staticDetails.resolved_links || [];
+    if (!resolved || resolved.length === 0) {
+      el.invStaticLinksList.innerHTML = '<div class="empty-state text-xs p-3">No static links resolved. Check debug artifact path and symbol tables.</div>';
+      return;
+    }
+
+    el.invStaticLinksList.innerHTML = resolved.map(l => {
+      const loc = (l.decl_file ? `${l.decl_file}:${l.decl_line}` : '') || (l.static_address || '');
+      return `
+        <div style="padding: 6px 8px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <span class="mono" style="color: var(--accent); font-weight: 600;">${escapeHtml(l.symbol_name || l.type || 'Symbol')}</span>
+            <div class="text-xs text-muted">Basis: ${escapeHtml(l.link_basis || 'exact_match')}</div>
+          </div>
+          <span class="mono text-xs text-muted">${escapeHtml(loc)}</span>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderRawEvidence(ledger) {
+    if (!el.tbodyRawEvidence) return;
+    const records = ledger.records || [];
+    if (el.invTxtLedgerCount) el.invTxtLedgerCount.textContent = String(records.length);
+
+    if (records.length === 0) {
+      el.tbodyRawEvidence.innerHTML = '<tr><td colspan="5" class="text-center text-muted">Ledger empty.</td></tr>';
+      return;
+    }
+
+    el.tbodyRawEvidence.innerHTML = records.map(r => {
+      return `
+        <tr>
+          <td class="mono">${escapeHtml(r.evidence_id || '')}</td>
+          <td><span class="badge">${escapeHtml(r.evidence_type || '')}</span></td>
+          <td>${escapeHtml(r.nature || 'observation')}</td>
+          <td class="text-muted">${escapeHtml(r.source || '')}</td>
+          <td>${escapeHtml(r.observation || JSON.stringify(r.provenance || {}))}</td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  // Global helper for jumping to object in Explorer tab
+  window.__jumpToObject = function (objectId) {
+    switchTab('tab-object-explorer');
+    selectObject(objectId);
+    showToast(`Focused on object ${objectId}`, 'info');
+  };
+
+  // --------------------------------------------------------------------------
   // Application Bootstrap
   // --------------------------------------------------------------------------
 
@@ -3632,11 +4079,13 @@
     initFastCaptureModal();
     initSnapshotMutateModal();
     initLabBranchAndReplay();
+    initInvestigationOverview();
     bindEvents();
 
     await loadRuntimeOverview();
     await loadStatesAndGraph();
     await loadStateLabTree();
+    await loadActiveInvestigation();
   }
 
   window.addEventListener('DOMContentLoaded', init);

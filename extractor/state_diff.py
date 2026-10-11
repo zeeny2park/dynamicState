@@ -100,8 +100,10 @@ class StateDiffEngine:
 
     def _object_map(self, snapshot: Dict[str, Any]) -> Dict[Any, Dict[str, Any]]:
         persistent = snapshot.get("persistent") or {}
+        objs = persistent.get("objects") if isinstance(persistent, dict) and "objects" in persistent else (snapshot.get("objects") or [])
         # Address+type is an observation identity, never a lifetime guarantee.
-        return {self.matcher.identity_key(o): o for o in persistent.get("objects", [])}
+        return {self.matcher.identity_key(o): o for o in objs}
+
 
     def _diff_object(self, before, after, objects_a, objects_b, identity_meta):
         changes, compared = [], 0

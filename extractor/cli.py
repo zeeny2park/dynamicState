@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .memory_capture import MemoryCapture
 from .offline_analyzer import OfflineMemoryAnalyzer
+from .investigation import InvestigationManager
 
 
 def main():
@@ -105,6 +106,27 @@ def main():
                              help="Display structured diagnostics")
     anlz_parser.add_argument("--output", type=str, default=None,
                              help="Optional output path to save semantic state JSON")
+
+    # 8. investigate
+    inv_parser = subparsers.add_parser("investigate", help="Execute an evidence-first investigation workflow")
+    inv_parser.add_argument("--goal", type=str, required=True, help="Natural language investigation goal")
+    inv_parser.add_argument("--snapshot", type=str, default=None, help="Snapshot ID or path")
+    inv_parser.add_argument("--memory-snapshot", type=str, default=None, help="Path to raw memory snapshot directory")
+    inv_parser.add_argument("--debug-image", type=str, default=None, help="Path to external debug image / ELF binary")
+    inv_parser.add_argument("--pid", type=int, default=None, help="Target process PID")
+    inv_parser.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (default: corpus)")
+    inv_parser.add_argument("--output", type=str, default=None, help="Path to save investigation report JSON")
+    inv_parser.add_argument("--json", action="store_true", default=False, help="Print output in JSON format")
+    inv_parser.add_argument("--authorize-target", action="store_true", default=False, help="Explicitly authorize live target interaction")
+
+    # 9. compare
+    cmp_parser = subparsers.add_parser("compare", help="Compare two observations semantically with uncertainty tracking")
+    cmp_parser.add_argument("--snapshot-a", type=str, required=True, help="First snapshot ID or path")
+    cmp_parser.add_argument("--snapshot-b", type=str, required=True, help="Second snapshot ID or path")
+    cmp_parser.add_argument("--debug-image", type=str, default=None, help="Optional external debug image")
+    cmp_parser.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (default: corpus)")
+    cmp_parser.add_argument("--output", type=str, default=None, help="Path to save comparison JSON")
+    cmp_parser.add_argument("--json", action="store_true", default=False, help="Print output in JSON format")
 
     args = parser.parse_args()
 
@@ -450,6 +472,131 @@ def main():
             print(f"\nSaved semantic state to {out_p}")
 
         sys.exit(0 if status in ("COMPLETE", "PARTIAL") else 1)
+
+    elif args.command == "investigate":
+        mgr = InvestigationManager(corpus_dir=args.corpus)
+        try:
+            report = mgr.start_investigation(
+                goal=args.goal,
+                snapshot_id=args.snapshot,
+                memory_snapshot_path=args.memory_snapshot,
+                pid=args.pid,
+                debug_image=args.debug_image,
+                authorize_target=args.authorize_target,
+            )
+
+            if args.output:
+                out_p = os.path.abspath(args.output)
+                os.makedirs(os.path.dirname(out_p), exist_ok=True)
+                with open(out_p, "w", encoding="utf-8") as f:
+                    json.dump(report, f, indent=2)
+                print(f"Investigation report saved to {out_p}")
+
+            if args.json:
+                print(json.dumps(report, indent=2, ensure_ascii=False))
+            else:
+                print("================================================================================")
+                print(f" dynamicState Investigation Report: {report.get('investigation_id')}")
+                print("================================================================================")
+                print(f"Goal:   {report.get('goal')}")
+                print(f"Status: {report.get('status')}")
+                print(f"Date:   {report.get('created_at')}\n")
+
+                # Target Identity
+                t_id = report.get("target_ref", {})
+                t_details = report.get("stages", {}).get("target_identity", {}).get("details", {})
+                print("--- [ Target & Build Identity ] ---")
+                print(f"  Executable:     {t_details.get('executable', 'offline_artifact')}")
+                print(f"  Target Build ID:{t_details.get('target_build_id') or 'N/A'}")
+                print(f"  Debug Build ID: {t_details.get('debug_build_id') or 'N/A'}")
+                print(f"  Status:         {t_details.get('build_id_status', 'UNKNOWN')}\n")
+
+                # Capture Quality
+                q_details = report.get("stages", {}).get("capture_quality", {}).get("details", {})
+                print("--- [ Capture Quality & Consistency ] ---")
+                print(f"  Consistency:    {q_details.get('consistency_level', 'UNKNOWN')}")
+                print(f"  Partial Reads:  {q_details.get('partial_reads', 0)}")
+                print(f"  Failed Reads:   {q_details.get('failed_reads', 0)}")
+                for lim in q_details.get("limitations", []):
+                    print(f"  * Note: {lim}")
+                print()
+
+                # Findings
+                findings = report.get("findings", [])
+                facts = [f for f in findings if f.get("category") == "fact"]
+                hypotheses = [f for f in findings if f.get("category") == "hypothesis"]
+                unknowns = [f for f in findings if f.get("category") == "unknown"]
+
+                print(f"--- [ Findings ({len(findings)}) ] ---")
+                if facts:
+                    print("  [Observed Facts]")
+                    for f in facts:
+                        print(f"    * {f.get('title')}: {f.get('description')}")
+                        if f.get("c_type_path"):
+                            print(f"      Path: {f.get('c_type_path')}")
+                if hypotheses:
+                    print("  [Hypotheses / Potential Invariants]")
+                    for f in hypotheses:
+                        print(f"    ? {f.get('title')}: {f.get('description')}")
+                if unknowns:
+                    print("  [Unknowns / Unresolved Data]")
+                    for f in unknowns:
+                        print(f"    ! {f.get('title')}: {f.get('description')}")
+                print()
+
+                # Recommended Next Steps
+                next_steps = report.get("next_steps", [])
+                if next_steps:
+                    print(f"--- [ Recommended Next Steps ({len(next_steps)}) ] ---")
+                    for i, step in enumerate(next_steps, 1):
+                        sug = "[SUGGESTION]" if step.get("is_suggestion") else "[EXECUTED]"
+                        print(f"  {i}. {sug} {step.get('description')}")
+                        print(f"     Rationale: {step.get('rationale')} (Risk: {step.get('risk_level')})")
+                print("================================================================================")
+
+            sys.exit(0 if report.get("status") in ("COMPLETED", "PARTIAL") else 1)
+
+        except Exception as exc:
+            print(f"ERROR: Investigation failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "compare":
+        mgr = InvestigationManager(corpus_dir=args.corpus)
+        try:
+            session = mgr.start_investigation(
+                goal=f"Compare {args.snapshot_a} vs {args.snapshot_b}",
+                snapshot_id=args.snapshot_a,
+                debug_image=args.debug_image
+            )
+            cmp_res = mgr.compare_observations(
+                session["investigation_id"],
+                args.snapshot_a,
+                args.snapshot_b
+            )
+
+            if args.output:
+                out_p = os.path.abspath(args.output)
+                os.makedirs(os.path.dirname(out_p), exist_ok=True)
+                with open(out_p, "w", encoding="utf-8") as f:
+                    json.dump(cmp_res, f, indent=2)
+                print(f"Comparison saved to {out_p}")
+
+            if args.json:
+                print(json.dumps(cmp_res, indent=2, ensure_ascii=False))
+            else:
+                print(f"Comparison: {args.snapshot_a} <-> {args.snapshot_b}")
+                print(f"Summary: {json.dumps(cmp_res.get('summary', {}), indent=2)}")
+                if cmp_res.get("uncertainty"):
+                    print(f"Uncertainty: {cmp_res['uncertainty']}")
+                changes = cmp_res.get("changes", [])
+                print(f"Changes ({len(changes)}):")
+                for c in changes[:20]:
+                    print(f"  - [{c.get('kind')}] {c.get('path', c.get('object_id'))}: {c.get('before')} -> {c.get('after')}")
+
+            sys.exit(0)
+        except Exception as exc:
+            print(f"ERROR: Comparison failed: {exc}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

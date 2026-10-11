@@ -112,9 +112,10 @@
     </div>
   </div>
 
-  <!-- Main Navigation Tabs (7 Functional Views) -->
+  <!-- Main Navigation Tabs (8 Functional Views) -->
   <nav class="app-nav">
-    <button class="nav-tab active" data-tab="tab-object-explorer">1. 📦 Object Explorer</button>
+    <button class="nav-tab active" data-tab="tab-investigation-overview" id="nav-tab-investigation">0. 🔍 Investigation Overview</button>
+    <button class="nav-tab" data-tab="tab-object-explorer">1. 📦 Object Explorer</button>
     <button class="nav-tab" data-tab="tab-thread-explorer">2. 🧵 Thread Explorer</button>
     <button class="nav-tab" data-tab="tab-memory-snapshot">3. 🧠 Memory Snapshot</button>
     <button class="nav-tab" data-tab="tab-history-diff">4. 📜 State DAG & Diff</button>
@@ -138,9 +139,197 @@
   <main class="app-main">
 
     <!-- ===================================================================== -->
+    <!-- TAB 0: 🔍 Investigation Overview (Evidence-First Agent Workflow)       -->
+    <!-- ===================================================================== -->
+    <section id="tab-investigation-overview" class="tab-pane active">
+      <div class="inv-container">
+        
+        <!-- Investigation Controls & Goal Input -->
+        <div class="inv-toolbar">
+          <div class="inv-toolbar-row">
+            <span style="font-weight: 600; color: var(--accent);">🎯 Goal:</span>
+            <input type="text" id="inv-input-goal" class="inv-goal-input" 
+                   placeholder="Enter natural language investigation goal (e.g. 'Investigate worker counter mismatch or crash')..." 
+                   value="Investigate runtime state discrepancy & verify typed objects">
+            <button type="button" id="btn-run-investigation" class="btn btn-primary">🚀 Start Investigation</button>
+            <button type="button" id="btn-refresh-investigation" class="btn btn-secondary">🔄 Refresh</button>
+          </div>
+          <div class="inv-toolbar-row text-xs">
+            <label>Snapshot Target:</label>
+            <select id="inv-select-snapshot" class="form-select text-xs" style="min-width: 180px;">
+              <option value="">(Current / Active State)</option>
+            </select>
+            <label>Debug Image:</label>
+            <input type="text" id="inv-input-debug-image" class="form-input text-xs" style="min-width: 200px;" 
+                   placeholder="Optional debug image path (e.g. build/app_debug.elf)">
+            <label style="margin-left: auto;">
+              <input type="checkbox" id="inv-check-authorize" style="margin-right: 4px;">
+              Authorize Live Target (Default: Read-Only)
+            </label>
+          </div>
+        </div>
+
+        <!-- Investigation Status & Stage Progress Bar -->
+        <div class="inv-card" id="inv-card-status-bar" style="padding: 12px 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-weight: 600;">Status:</span>
+              <span id="inv-badge-status" class="badge badge-info">IDLE / READY</span>
+              <span class="text-muted text-xs mono" id="inv-txt-id">No active session</span>
+            </div>
+            <div class="stage-pills-container" id="inv-stage-pills">
+              <span class="stage-pill" id="pill-stage-identity">1. Identity</span>
+              <span class="stage-pill" id="pill-stage-quality">2. Capture Quality</span>
+              <span class="stage-pill" id="pill-stage-semantic">3. Typed Objects</span>
+              <span class="stage-pill" id="pill-stage-comparison">4. Comparison</span>
+              <span class="stage-pill" id="pill-stage-static">5. Static Links</span>
+              <span class="stage-pill" id="pill-stage-synthesis">6. Report</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2-Column Overview Dashboard Grid -->
+        <div class="inv-dashboard-grid">
+          
+          <!-- LEFT COLUMN: Identity, Quality, Comparisons, Next Steps -->
+          <div style="display: flex; flex-direction: column; gap: 16px;">
+            
+            <!-- 1. Target & Build Identity Card -->
+            <div class="inv-card">
+              <div class="inv-card-header">
+                <span class="inv-card-title">🏷️ Target & Build Identity</span>
+                <span id="inv-badge-build-status" class="badge">NOT_VERIFIED</span>
+              </div>
+              <div class="key-value-list text-xs" id="inv-target-identity-list">
+                <div><span class="text-muted">Executable:</span> <span class="mono" id="inv-txt-exec">None loaded</span></div>
+                <div><span class="text-muted">Target Build ID:</span> <span class="mono" id="inv-txt-target-bid">N/A</span></div>
+                <div><span class="text-muted">Debug Image:</span> <span class="mono" id="inv-txt-debug-image">None</span></div>
+                <div><span class="text-muted">Debug Build ID:</span> <span class="mono" id="inv-txt-debug-bid">N/A</span></div>
+                <div><span class="text-muted">PID / Inferior:</span> <span class="mono" id="inv-txt-pid">Offline</span></div>
+              </div>
+            </div>
+
+            <!-- 2. Capture Quality & Consistency Card -->
+            <div class="inv-card">
+              <div class="inv-card-header">
+                <span class="inv-card-title">🛡️ Capture Quality & Constraints</span>
+                <span id="inv-badge-consistency" class="badge badge-warning">UNKNOWN</span>
+              </div>
+              <div id="inv-consistency-warning" class="banner banner-warning text-xs mb-2" style="display: none; padding: 6px 10px;">
+                <strong>NON_ATOMIC Warning:</strong> Zero-stop capture may contain cross-region execution skew.
+              </div>
+              <div class="key-value-list text-xs" id="inv-quality-list">
+                <div><span class="text-muted">Consistency Level:</span> <strong id="inv-txt-consistency">UNKNOWN</strong></div>
+                <div><span class="text-muted">Capture Duration:</span> <span class="mono" id="inv-txt-duration">0.0 ms</span></div>
+                <div><span class="text-muted">Partial Reads:</span> <span class="mono" id="inv-txt-partial-reads">0</span></div>
+                <div><span class="text-muted">Failed Regions:</span> <span class="mono" id="inv-txt-failed-reads">0</span></div>
+              </div>
+              <div id="inv-limitations-container" class="text-xs text-muted mt-2">
+                <em>No limitations reported.</em>
+              </div>
+            </div>
+
+            <!-- 3. Observation Comparisons -->
+            <div class="inv-card">
+              <div class="inv-card-header">
+                <span class="inv-card-title">⚖️ Observation Comparisons</span>
+                <button type="button" id="btn-modal-compare" class="btn btn-secondary text-xs">Compare 2 Snapshots</button>
+              </div>
+              <div id="inv-comparisons-content">
+                <div class="empty-state text-xs p-3">No comparison performed yet. Click 'Compare 2 Snapshots' to isolate state diffs.</div>
+              </div>
+            </div>
+
+            <!-- 4. Recommended Next Steps -->
+            <div class="inv-card">
+              <div class="inv-card-header">
+                <span class="inv-card-title">📋 Recommended Next Steps</span>
+                <span class="text-xs text-muted" id="inv-steps-count">0 steps</span>
+              </div>
+              <div id="inv-steps-container">
+                <div class="empty-state text-xs p-3">Start an investigation to receive evidence-driven recommendations.</div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- RIGHT COLUMN: Findings (Facts, Hypotheses, Unknowns) & Static Links -->
+          <div style="display: flex; flex-direction: column; gap: 16px;">
+            
+            <!-- Findings Group -->
+            <div class="inv-card">
+              <div class="inv-card-header">
+                <span class="inv-card-title">🔎 Investigation Findings</span>
+                <div style="display: flex; gap: 4px;">
+                  <button type="button" class="btn-tab-pill active" id="btn-filter-find-all" data-filter="all">All</button>
+                  <button type="button" class="btn-tab-pill" id="btn-filter-find-facts" data-filter="fact">🟢 Facts</button>
+                  <button type="button" class="btn-tab-pill" id="btn-filter-find-hypo" data-filter="hypothesis">🟡 Hypotheses</button>
+                  <button type="button" class="btn-tab-pill" id="btn-filter-find-unknown" data-filter="unknown">⚪ Unknowns</button>
+                </div>
+              </div>
+              
+              <!-- Findings List -->
+              <div id="inv-findings-list" style="max-height: 480px; overflow-y: auto;">
+                <div class="empty-state text-xs p-3">No findings generated. Enter an investigation goal and click 'Start Investigation'.</div>
+              </div>
+            </div>
+
+            <!-- Resolved Static Code References -->
+            <div class="inv-card">
+              <div class="inv-card-header">
+                <span class="inv-card-title">📜 Resolved Static-Code References</span>
+                <span id="inv-badge-static-provider" class="badge">DWARF</span>
+              </div>
+              <div id="inv-static-links-list" class="text-xs" style="max-height: 220px; overflow-y: auto;">
+                <div class="empty-state text-xs p-3">No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.</div>
+              </div>
+            </div>
+
+            <!-- Expandable Advanced Details (Raw Addresses & Evidence Ledger) -->
+            <div class="inv-card">
+              <details class="advanced-view">
+                <summary style="cursor: pointer; font-weight: 600; color: var(--accent); padding: 4px 0;">
+                  ⚙️ Advanced Details & Raw Evidence Ledger (Expand)
+                </summary>
+                <div style="margin-top: 10px; display: flex; flex-direction: column; gap: 10px;">
+                  <div class="text-xs text-muted">
+                    Evidence Ledger Schema: <code>1.0.0</code> &bull; Records stored: <span id="inv-txt-ledger-count">0</span>
+                  </div>
+                  <div class="table-container" style="max-height: 200px; overflow-y: auto;">
+                    <table class="data-table text-xs" id="table-raw-evidence">
+                      <thead>
+                        <tr>
+                          <th>Evidence ID</th>
+                          <th>Type</th>
+                          <th>Nature</th>
+                          <th>Source</th>
+                          <th>Details</th>
+                        </tr>
+                      </thead>
+                      <tbody id="tbody-raw-evidence">
+                        <tr><td colspan="5" class="text-center text-muted">Ledger empty.</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style="display: flex; gap: 8px;">
+                    <button type="button" id="btn-download-ledger" class="btn btn-secondary text-xs">📥 Export Ledger JSON</button>
+                  </div>
+                </div>
+              </details>
+            </div>
+
+          </div>
+
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
     <!-- TAB 1: 📦 Object Explorer (Android Studio / HeapHero 3-Pane Workspace)-->
     <!-- ===================================================================== -->
-    <section id="tab-object-explorer" class="tab-pane active">
+    <section id="tab-object-explorer" class="tab-pane">
+
       <div class="explorer-workspace">
         
         <!-- PANE 1: Object Explorer (Left) -->

@@ -1233,6 +1233,89 @@ class WebApiAdapter:
             return {"success": True, "data": _to_json_serializable(self.runtime.state_lab.get_tree())}
         return {"success": True, "data": {"roots": [], "total_snapshots": 0, "total_branches": 0}}
 
+    # -------------------------------------------------------------------------
+    # Investigation Workflow API
+    # -------------------------------------------------------------------------
+
+    def start_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        goal = params.get("goal") or "General state investigation"
+        res = self.runtime.start_investigation(
+            goal=goal,
+            snapshot_id=params.get("snapshot_id"),
+            memory_snapshot_path=params.get("memory_snapshot_path"),
+            pid=params.get("pid"),
+            debug_image=params.get("debug_image"),
+            constraints=params.get("constraints"),
+            budgets=params.get("budgets"),
+            authorize_target=bool(params.get("authorize_target", False)),
+        )
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "INVESTIGATION_FAILED",
+                                            "message": res.error.message if res.error else "Investigation failed"}}
+
+    def get_investigation_status(self, investigation_id: Optional[str]) -> Dict[str, Any]:
+        if not investigation_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        res = self.runtime.get_investigation_status(investigation_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
+                                            "message": res.error.message if res.error else "Investigation status not found"}}
+
+    def get_evidence(self, investigation_id: Optional[str], evidence_id: Optional[str] = None, finding_id: Optional[str] = None) -> Dict[str, Any]:
+        if not investigation_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        res = self.runtime.get_evidence(investigation_id, evidence_id=evidence_id, finding_id=finding_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
+                                            "message": res.error.message if res.error else "Evidence not found"}}
+
+    def compare_observations(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        snap_a = params.get("snapshot_a")
+        snap_b = params.get("snapshot_b")
+        if not inv_id or not snap_a or not snap_b:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id, snapshot_a, and snapshot_b are required"}}
+        res = self.runtime.compare_observations(inv_id, snap_a, snap_b)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "COMPARE_FAILED",
+                                            "message": res.error.message if res.error else "Comparison failed"}}
+
+    def follow_evidence(self, investigation_id: Optional[str], evidence_id: Optional[str], direction: str = "related_objects") -> Dict[str, Any]:
+        if not investigation_id or not evidence_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id and evidence_id are required"}}
+        res = self.runtime.follow_evidence(investigation_id, evidence_id, direction=direction)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
+                                            "message": res.error.message if res.error else "Failed to follow evidence"}}
+
+    def get_next_steps(self, investigation_id: Optional[str]) -> Dict[str, Any]:
+        if not investigation_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        res = self.runtime.get_next_steps(investigation_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
+                                            "message": res.error.message if res.error else "Failed to get next steps"}}
+
+    def get_investigation_report(self, investigation_id: Optional[str]) -> Dict[str, Any]:
+        if not investigation_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        res = self.runtime.get_investigation_report(investigation_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
+                                            "message": res.error.message if res.error else "Report not found"}}
+
+    def list_investigations(self) -> Dict[str, Any]:
+        sessions = getattr(self.runtime.investigation_manager, "sessions", {})
+        summaries = [s.to_dict() for s in sessions.values()]
+        return {"success": True, "data": _to_json_serializable(summaries)}
+
 
 
 class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -1461,6 +1544,44 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.verify_restart_determinism({}))
                 return
 
+            # GET /api/investigation/status
+            if path == "/api/investigation/status":
+                self._send_json(adapter.get_investigation_status(q_param("investigation_id")))
+                return
+
+            # GET /api/investigation/evidence
+            if path == "/api/investigation/evidence":
+                self._send_json(adapter.get_evidence(
+                    q_param("investigation_id"),
+                    evidence_id=q_param("evidence_id"),
+                    finding_id=q_param("finding_id")
+                ))
+                return
+
+            # GET /api/investigation/follow
+            if path == "/api/investigation/follow":
+                self._send_json(adapter.follow_evidence(
+                    q_param("investigation_id"),
+                    q_param("evidence_id"),
+                    direction=q_param("direction", "related_objects")
+                ))
+                return
+
+            # GET /api/investigation/next-steps
+            if path == "/api/investigation/next-steps":
+                self._send_json(adapter.get_next_steps(q_param("investigation_id")))
+                return
+
+            # GET /api/investigation/report
+            if path == "/api/investigation/report":
+                self._send_json(adapter.get_investigation_report(q_param("investigation_id")))
+                return
+
+            # GET /api/investigations
+            if path == "/api/investigations":
+                self._send_json(adapter.list_investigations())
+                return
+
             # Unrecognized API endpoint
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
                             status=404)
@@ -1536,6 +1657,15 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if m_rep_snap:
                 sid = m_rep_snap.group(1)
                 self._send_json(adapter.replay_mutation(sid, body))
+                return
+
+            # Investigation POST routes
+            if path == "/api/investigation/start":
+                self._send_json(adapter.start_investigation(body))
+                return
+
+            if path == "/api/investigation/compare":
+                self._send_json(adapter.compare_observations(body))
                 return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},

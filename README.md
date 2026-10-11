@@ -1,8 +1,8 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `DYNAMICSTATE_MULTITHREAD_BRANCH_ISOLATION_AND_EXPLORATION_HARDENING_COMPLETE`** — Multithread Checkpoint/Restore & Exploration Hardening Complete  
-> Verified with 229 Unit/Integration Tests, Multithread Branch Isolation Suite, Real GDB 9.2 Containerized Multithread Suite, Subprocess Lifecycle Integration Suite, Native C99 Target Collector Suite (with mapping race & process starttime validation), Web API Security Suite, and 24-step End-to-End Acceptance Scenario.
+> **Status: `DYNAMICSTATE_INVESTIGATION_WORKFLOW_AND_EVIDENCE_LEDGER_COMPLETE`** — Agent-First Investigation Workflow Inspired by REA Complete  
+> Verified with 321 Unit/Integration Tests (Full Discovery), Multithread Branch Isolation Suite, Real GDB 9.2 Containerized Multithread Suite, Subprocess Lifecycle Integration Suite, Native C99 Target Collector Suite (with mapping race & process starttime validation), Web API Security Suite, and Real C++ PIE Binary Investigation E2E Fixture.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
@@ -21,6 +21,8 @@ GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 �
                     ▼
                AgentRuntime
                     │
+                    ├── Investigation Manager (Goal-driven Hypothesis & Evidence Ledger)
+                    ├── Static Analysis Provider (DWARF / Host-side Code Correlation)
                     ├── Compact Context (AgentStateContext)
                     ├── Object & Field Inspection (AgentObject, AgentField)
                     ├── Candidate Ranker (Deterministic Priority Scoring)
@@ -89,12 +91,14 @@ Recursive Semantic Reachability Traversal
   (자율 코딩 에이전트 전용 의미론적 런타임 인터페이스 구축: GDB 명령어 및 메모리 주소를 철저히 은닉하고, JSON 스키마 기반 Agent Runtime Protocol, 결정론적 후보 랭커(Candidate Ranker), 전이 분석기(Transition Analyzer), 사실 기반 증거 모델(Evidence Model), 구조적 불변식 후보 탐지기(Invariant Detector), 엄격한 안전 경계(Safety Boundary) 및 참조 구현체 `AgentRuntime` 제공)
 - **Phase 5.1**: *"Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis"*  
   (프로덕션/실시간 애플리케이션을 위한 무중단 원시 메모리 캡처 및 사후 DWARF 오프라인 의미 분석: Linux `process_vm_readv()` 기반 고속 복사, `RawMemorySnapshot` 디스크 영속 아티팩트, 부분 일관성(`NON_ATOMIC`) 모델, `OfflineMemoryAnalyzer` 의미론적 객체 그래프 복원, CLI 도구(`capture-memory`, `analyze-memory`), LOW_IMPACT 모드 엄격한 관측 전용 경계 보장)
--**Phase 5.2 (Complete)**: *"Production-grade Low-Impact Observation Hardening"*  
+- **Phase 5.2 (Complete)**: *"Production-grade Low-Impact Observation Hardening"*  
   (ELF `PT_LOAD` 세그먼트 기반의 정확한 `load_bias` 계산, `RuntimeModule` 모델 및 `/proc/<pid>/maps` 모듈 검색, Build ID / `.gnu_debuglink` CRC 디버그 아티팩트 provenance 검증, `DebugArtifactProvider` 및 `DebugInfoProvider` 추상화, `ObservationBackend` 명시적 모델(`GDBObservationBackend` vs `LowImpactObservationBackend`), 오프라인 스냅샷 내 가짜 스레드/프레임 제거 및 실행 상태 `availability="UNAVAILABLE"` 명시화, 프로세스 종료(`ESRCH`) graceful handling, CLI 서브커맨드 `list-modules` 및 `runtime-info` 지원)
 - **Web UI MVP (Complete)**: *"Runtime State Explorer for Human Validation"*  
   (인간 엔지니어가 런타임 상태, DWARF 객체 그래프, 결정론적 변이 후보, 상태 전이 및 상태 해시, 상태 전이 그래프(SVG), 스냅샷 diff, 자율 탐색 진행 상황을 시각적으로 검증할 수 있는 경량 단일 페이지 웹 UI. 외부 pip 의존성 없는 Python 표준 라이브러리 기반 HTTP 서버, AgentRuntime 1:1 래핑 Web API 어댑터, 임의 GDB/Shell/메모리 쓰기 차단 안전 경계, LOW_IMPACT 관측 전용 표시 및 변이 차단, UNKNOWN 메타데이터 정직성 보장)
 - **Phase 6 (Complete)**: *"Fast Runtime Snapshot + Offline State Laboratory"*  
   (실행 중 프로세스의 중단 시간을 10ms 미만(실측 0.99~4.27ms)으로 최소화하는 고속 런타임 캡처 아키텍처: 중단 중 DWARF traversal 및 포인터 탐색을 완전히 배제하고 `process_vm_readv` 원시 메모리 캡처 즉시 프로세스를 재개(`SIGCONT`), 오프라인 의미론적 상태 엔진(`OfflineSemanticEngine`)을 통한 DWARF/객체 그래프/계층적 경로(`Session.worker.state.counter`) 복원, 불변 논리 스냅샷 복사 기반 State Laboratory(`StateLaboratory`, `SnapshotMutator`, `compute_semantic_diff`), 다중 스레드 동시성 환경에서의 스레드 영향 분석기(`ThreadImpactAnalyzer` - 직접 참조 스레드와 구조적 도달 가능 스레드 분리), 실시간 프로세스 읽기 검증 기반 Replay(`StateReplayer`), 그리고 7번째 탭 🔬 State Laboratory UI 제공)
+- **Phase 7 (Complete)**: *"Agent-First Investigation Workflow & Evidence Ledger (Inspired by REA)"*  
+  (REA(Reverse Engineer Anything)의 체계적 조사 흐름과 코드 연결 정적 분석 철학을 계승하여 dynamicState를 자연어 요청 기반의 증거 중심 조사(Evidence-First Investigation) 워크플로로 확장: 버전화된 기계 판독 가능 증거 원장(`EvidenceLedger` v1.0.0), 엄격한 사실(Facts)·가설(Hypotheses)·불명(Unknowns) 삼원 분류, 타깃/빌드 ID 일치성 검증, DWARF 기반 정적-동적 코드 연결(`StaticAnalysisProvider`), 고수준 조사 API(`start_investigation`, `compare_observations`, `follow_evidence`, `get_next_steps`), 읽기 전용 기본 안전 정책, 그리고 엔지니어가 원시 주소 없이도 직관적으로 파악할 수 있는 `0. 🔍 Investigation Overview` UI 탭 제공)
 
 ---
 
@@ -156,6 +160,153 @@ Phase 6에서는 이 한계를 극복하기 위해 **초단기 캡처(<10ms) + �
    - 직접 관측된 영향(`observed_impact`)과 정적 객체 도달 가능성에 기반한 잠재적 영향(`potentially_affected_threads`)을 엄격히 구분
 5. **라이브 리플레이 읽기 검증 (`StateReplayer`)**:
    - 오프라인에서 검증된 변이를 라이브 프로세스에 적용할 때 `capability`, `attempted`, `completed`, `verified` 4단계를 명확히 분리하고 readback으로 변경값을 실측 검증
+
+---
+
+## Agent-First Investigation Workflow & Evidence Ledger (Phase 7)
+
+### 1. Motivation: From Runtime Inspection to Evidence-First Investigation
+
+기존 dynamicState는 GDB 중단점 관측, 초고속 메모리 캡처, 오프라인 DWARF 복원, 상태 실험실(State Laboratory) 등 강력한 런타임 검사 기능들을 갖추고 있었으나, 자연어 요청을 받은 자율 코딩 에이전트(Autonomous Coding Agent) 관점에서는 다음과 같은 간극이 존재했습니다:
+1. **분절된 도구 호출**: 타깃 확인, 스냅샷 획득, DWARF 복원, diff 분석, 소스코드 연결이 각각 별개의 저수준 작업으로 흩어져 있어 에이전트가 단일 목표(Goal)를 중심으로 체계적인 조사를 수행하기 어려움
+2. **증거 출처(Provenance) 및 정합성 불확실성 추적 부재**: 관측된 사실(Direct Observation)과 모델의 추론(Inference/Hypothesis)이 명확히 분리되지 않거나, `process_vm_readv`의 비원자적(NON_ATOMIC) 캡처 한계가 조사 결론에 솔직하게 반영되지 못할 위험
+3. **정적 코드와 동적 런타임 간 연결 고리 부재**: 런타임 힙/스택 주소나 구조체 인스턴스가 실제 리포지토리의 소스 파일, 함수, 정적 기호와 어떻게 결합하는지 명확한 증거(ASLR load_bias, Build ID 일치성) 없이 추측에 의존할 가능성
+
+Phase 7에서는 **REA (Reverse Engineer Anything)** 의 증거 중심 조사 파이프라인과 정적 분석 연결 철학을 dynamicState의 아키텍처에 내재화하여, 자율 코딩 에이전트가 자연어 목표로부터 체계적인 런타임 조사를 수행할 수 있는 완결된 **Agent-First Investigation Workflow**를 구현했습니다.
+
+```text
+               Agent / Engineer Natural-Language Goal
+                                 │
+                                 ▼
+                     start_investigation()
+                                 │
+  ┌──────────────────────────────┴──────────────────────────────┐
+  │ 1. Target & Build Identity Validation                       │
+  │    (ELF header, GNU Build ID, /proc/exe check)              │
+  ├─────────────────────────────────────────────────────────────┤
+  │ 2. Runtime Capture Quality Validation                       │
+  │    (Completeness %, consistency: ATOMIC / NON_ATOMIC, races)│
+  ├─────────────────────────────────────────────────────────────┤
+  │ 3. DWARF Typed Object Interpretation                        │
+  │    (OfflineSemanticEngine, hierarchical semantic paths)     │
+  ├─────────────────────────────────────────────────────────────┤
+  │ 4. Semantic Observation Comparison (when 2 snapshots given) │
+  │    (StateDiffEngine: Changed, Added, Removed + skew flags)  │
+  ├─────────────────────────────────────────────────────────────┤
+  │ 5. Static Code Evidence Linking                             │
+  │    (DwarfStaticAnalysisProvider: ASLR load bias + symbols)  │
+  ├─────────────────────────────────────────────────────────────┤
+  │ 6. Evidence-Driven Next Steps & Report Generation           │
+  │    (Facts / Hypotheses / Unknowns tri-partition)            │
+  └──────────────────────────────┬──────────────────────────────┘
+                                 │
+                                 ▼
+                      EvidenceLedger (v1.0.0)
+                                 │
+                 ┌───────────────┴───────────────┐
+                 ▼                               ▼
+       Agent Runtime Protocol            Web UI Overview
+       (JSON Actions & Results)        (Tab 0: 🔍 Investigation)
+```
+
+---
+
+### 2. Phase A: Evidence Ledger & Machine-Readable Schema (v1.0.0)
+
+모든 조사 단계에서 생성되는 사실과 분석 결과는 버전화된 기계 판독 가능 증거 모델인 `EvidenceLedger`에 영속화됩니다 (`extractor/evidence_ledger.py`).
+
+#### 핵심 설계 원칙:
+- **경량 참조 모델**: 수십 MB에 달하는 원시 메모리 스냅샷 바이너리를 복제하지 않고, 기존 스냅샷 경로(`snapshot_ref`) 및 아티팩트 메타데이터를 참조
+- **관측(Observation) vs 추론(Inference) 엄격 분리**:
+  - `nature: "observation"`: 런타임 메모리, ELF 헤더, DWARF 디버그 정보로부터 직접 관측된 사실
+  - `nature: "inference"`: 정적 분석 기호 매핑, 원인 가설, 불변식 제안 등 도출된 결론
+  - `nature: "hypothesis"`: 에이전트 또는 엔지니어가 설정한 검증 대상 가설
+- **완전한 출처 체인(Provenance Chain)**: 각 증거 레코드는 상위 증거(`parent_evidence_ids`)를 추적하여, 결론(Finding) → 도달 객체/필드 → 원시 스냅샷 메모리까지 100% 역추적 가능
+- **하위 호환성 및 스키마 검증**: 스키마 버전 `1.0.0` 명시, 누락된 선택 필드의 안전한 기본값 처리, 알 수 없는 메타데이터에 대한 정직한 `UNKNOWN` 표기
+
+```json
+{
+  "evidence_id": "ev_obj_0_worker_count",
+  "session_id": "inv_20261011_045512_829792",
+  "timestamp": 1791694512.83,
+  "evidence_type": "typed_object",
+  "source": "OfflineSemanticEngine",
+  "nature": "observation",
+  "parent_evidence_ids": ["ev_cap_001"],
+  "snapshot_ref": "/tmp/snapshots/snap_001.raw",
+  "consistency": {
+    "level": "NON_ATOMIC",
+    "mapping_race_detected": false,
+    "completeness_pct": 100.0,
+    "limitations": ["Low-impact process_vm_readv capture is inherently non-atomic."]
+  },
+  "object_identity": {
+    "object_id": "obj_0",
+    "canonical_type": "WorkerPool",
+    "semantic_path": "Session.worker_pool.count",
+    "field_name": "count",
+    "field_value": 4,
+    "address": "0x555555562000"
+  }
+}
+```
+
+---
+
+### 3. Phase B: Agent Investigation API
+
+기존에 안정적으로 검증된 엔진(`OfflineSemanticEngine`, `StateDiffEngine`, `RawMemorySnapshot`, `ELFParser`)을 래핑하여 에이전트 전용 고수준 API를 제공합니다 (`extractor/investigation.py`):
+
+| API 작업 | 주요 파라미터 | 반환 내용 및 안전 보장 |
+| :--- | :--- | :--- |
+| `start_investigation` | `goal`, `snapshot_id`/`path`, `debug_image`, `pid`, `constraints`, `budgets`, `authorize_target` | 조사 세션 초기화 및 단계별 파이프라인 자동 실행. 타깃 프로세스 접근 시 `authorize_target=True` 필수 요구. 기본 동작은 100% 읽기 전용 및 오프라인 스냅샷 지원. |
+| `get_investigation_status` | `investigation_id` | 조사 진행 상태(`COMPLETED`, `RUNNING`, `PARTIAL`, `FAILED`), 완료 단계 및 통계 반환. 누락된 데이터나 비정합성은 명시적 `PARTIAL` 및 이유 보고. |
+| `get_evidence` | `investigation_id`, `evidence_id`, `finding_id` | 특정 증거 레코드의 상세 내용 및 상위 출처 체인(Provenance Lineage) 검색. |
+| `compare_observations` | `snapshot_a`, `snapshot_b`, `investigation_id` | 두 스냅샷 간 의미론적 객체/필드 차이 비교. 비원자적 캡처 스냅샷 비교 시 실행 스큐(skew) 불확실성 주의보 자동 첨부. |
+| `follow_evidence` | `investigation_id`, `evidence_id`, `direction` | 특정 증거 레코드로부터 관련된 상위 출처(`parents`), 하위 파생 증거(`children`), 또는 동일 객체 필드/정적 기호(`related`) 탐색. |
+| `get_next_steps` | `investigation_id` | 증거 기반의 실행 가능한 다음 조치 제안. 실행된 조치와 제안된 조치를 명확히 분리 표기. |
+| `generate_report` | `investigation_id` | 관측된 사실(Facts), 검증 대상 가설(Hypotheses), 미확인 불명(Unknowns)으로 구조화된 종합 마크다운/JSON 보고서 생성. |
+
+#### 다중 프로토콜 접근 지원:
+- **Agent Runtime Protocol (ARP)**: `START_INVESTIGATION`, `GET_INVESTIGATION_STATUS`, `GET_EVIDENCE`, `COMPARE_OBSERVATIONS`, `FOLLOW_EVIDENCE`, `GET_NEXT_STEPS`, `GET_INVESTIGATION_REPORT`
+- **CLI Commands**:
+  ```bash
+  # 오프라인 스냅샷 조사 시작
+  dynamic-state investigate --goal "Verify worker state" --snapshot-dir /path/to/snap --debug-image /path/to/bin.debug
+  
+  # 두 스냅샷 의미론적 비교
+  dynamic-state compare /path/to/snapA /path/to/snapB --debug-image /path/to/bin.debug
+  ```
+- **Web REST API**: `POST /api/investigation/start`, `GET /api/investigation/status`, `POST /api/investigation/compare`, `GET /api/investigation/report` 등
+
+---
+
+### 4. REA-Inspired Static Analysis Integration
+
+정적 분석과 런타임 동적 증거 간의 방어 가능한 연결(Defensible Basis)을 제공하기 위해 교체 가능한 `StaticAnalysisProvider` 인터페이스를 구현했습니다 (`extractor/static_analyzer.py`):
+
+- **`DwarfStaticAnalysisProvider`**: 호스트 측 DWARF 컴파일 유닛(CU), 서브프로그램(Subprogram DIE), 변수 위치 표현식, 심볼 테이블(`nm`/`readelf`)을 파싱하여 런타임 메모리 주소를 정적 소스코드 위치와 결합
+- **ASLR Load Bias 보정**: PIE(Position Independent Executable) 바이너리의 런타임 주소에서 동적 `load_bias`를 차감하여 정적 DWARF 가상 주소(VMA)로 정확히 변환
+- **GNU Build ID 교차 검증**: 실행 중인 프로세스의 모듈 Build ID와 디버그 이미지의 Build ID가 엄격히 일치할 때만 링크 생성. 불일치 시 조용한 오작동 대신 명시적 경고 레코드 생성
+- **플러그형 백엔드**: REA, Ghidra, IDA 등 외부 정적 분석 도구로 추후 확장 가능한 추상 인터페이스 유지 (테스트용 `MockStaticAnalysisProvider`, 비활성화용 `NullStaticAnalysisProvider`)
+
+---
+
+### 5. Phase C: Investigation Overview UI (Tab 0)
+
+인간 엔지니어가 메모리 주소나 내부 객체 ID를 몰라도 조사의 핵심 내용과 결론을 한눈에 파악할 수 있는 개요 화면을 제공합니다 (`extractor/web/static/`):
+
+- **🎯 Investigation Goal & Target Identity Card**: 조사 목표, 타깃 PID, 실행 파일 경로, 빌드 ID 일치성, 모듈 아키텍처
+- **🛡️ Capture Quality & Consistency Card**: 일관성 수준(`ATOMIC` vs `NON_ATOMIC`), 캡처 완료율, 매핑 레이스 발생 여부, 알려진 한계 안내
+- **📊 Structured Findings Grouping**:
+  - 🟢 **Observed Facts**: 런타임 메모리 및 DWARF로부터 실측된 불변의 사실
+  - 🟡 **Hypotheses / Inferences**: 상관관계 또는 휴리스틱에 기반한 가설 (증거 출처 링크 포함)
+  - ⚪ **Unknowns / Limitations**: 미수집 메모리 영역, 불일치 빌드, 최적화로 누락된 필드
+- **⚖️ Observation Comparisons**: 두 스냅샷 간 의미론적 차이점 요약 및 비원자적 스냅샷 스큐 안내
+- **🔗 Resolved Static Links**: 의미론적 타입/필드와 C/C++ 소스코드 함수 및 파일 위치(`worker.cpp:42`) 연결 카드
+- **💡 Recommended Next Steps**: 증거에 근거한 구체적인 후속 조치 가이드
+- **⚙️ Advanced Raw View**: 원시 16진수 주소(`0x...`) 및 전체 증거 원장 JSON 뷰어 (클릭 시 아코디언 확장)
+- **Direct Navigation**: 개요 탭의 객체 검사 버튼 클릭 시 `2. 📦 Runtime Objects` 탭의 해당 객체로 즉시 점프
 
 ---
 
@@ -1003,53 +1154,65 @@ python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 테스트 (195 unit tests across all modules, including Web API suite)
+# 1. 단위 테스트 (321 unit/integration tests across all modules, including Phase 7 Investigation & Evidence Ledger suite)
 python3 -m unittest discover -s tests -v
 
-# 2. Web UI MVP End-to-End 수락 시나리오 (24개 스텝 전수 검증)
+# 2. Phase 7 조사 워크플로 및 증거 원장 전용 테스트 스위트 (29개 테스트)
+python3 -m unittest tests/test_evidence_schema.py -v
+python3 -m unittest tests/test_investigation_identity_and_static.py -v
+python3 -m unittest tests/test_investigation_comparison.py -v
+python3 -m unittest tests/test_investigation_api.py -v
+python3 -m unittest tests/test_investigation_ui.py -v
+python3 -m unittest tests/test_investigation_backward_compatibility.py -v
+python3 -m unittest tests/test_investigation_e2e_fixture.py -v
+
+# 3. Web UI MVP End-to-End 수락 시나리오 (24개 스텝 전수 검증)
 bash tests/manual_acceptance_web_ui.sh
 
-# 2. Phase 1 & 2 GDB 기본 통합 테스트
+# 4. Phase 1 & 2 GDB 기본 통합 테스트
 bash tests/integration_gdb.sh
 
-# 3. Phase 3 상태 전이 E2E 통합 테스트
+# 5. Phase 3 상태 전이 E2E 통합 테스트
 bash tests/integration_state_transition.sh
 
-# 4. Phase 3 타입 변이 및 유효성 검증 테스트
+# 6. Phase 3 타입 변이 및 유효성 검증 테스트
 bash tests/integration_mutation_validation.sh
 
-# 5. Phase 3 크래시(SIGSEGV) 및 타임아웃 전이 테스트
+# 7. Phase 3 크래시(SIGSEGV) 및 타임아웃 전이 테스트
 bash tests/integration_transition_failure.sh
 
-# 6. Phase 3 종합 통합 테스트
+# 8. Phase 3 종합 통합 테스트
 bash tests/integration_phase3.sh
 
-# 7. Phase 4 코퍼스 저장 및 중복 제거 탐색 테스트
+# 9. Phase 4 코퍼스 저장 및 중복 제거 탐색 테스트
 bash tests/integration_exploration.sh
 
-# 8. Phase 4 Branch-safe 독립 후보 전이 통합 테스트
+# 10. Phase 4 Branch-safe 독립 후보 전이 통합 테스트
 bash tests/integration_exploration_branching.sh
 
-# 9. Phase 4.1 StateExplorer.run() 자율 브랜칭 GDB 통합 테스트
+# 11. Phase 4.1 StateExplorer.run() 자율 브랜칭 GDB 통합 테스트
 bash tests/integration_explorer_real_gdb.sh
 
-# 10. Phase 4.1 크래시/타임아웃 장애 격리 GDB 통합 테스트
+# 12. Phase 4.1 크래시/타임아웃 장애 격리 GDB 통합 테스트
 bash tests/integration_explorer_failure_isolation.sh
 
-# 11. External Debug Image 호환성/Build-ID 불일치 거부 및 상태 추출 통합 테스트
+# 13. External Debug Image 호환성/Build-ID 불일치 거부 및 상태 추출 통합 테스트
 bash tests/integration_stripped_debug_image.sh
 
-# 12. Stripped 바이너리 상태 전이 및 상태 공간 탐색 통합 테스트
+# 14. Stripped 바이너리 상태 전이 및 상태 공간 탐색 통합 테스트
 bash tests/integration_stripped_transition.sh
 
-# 13. Phase 5 Agent Runtime Protocol 종단간 시뮬레이션 통합 테스트
+# 15. Phase 5 Agent Runtime Protocol 종단간 시뮬레이션 통합 테스트
 bash tests/integration_agent_runtime.sh
 
-# 14. Phase 5.1 Low-Impact Memory Snapshot + Offline Analysis E2E 통합 테스트
+# 16. Phase 5.1 Low-Impact Memory Snapshot + Offline Analysis E2E 통합 테스트
 bash tests/integration_low_impact_snapshot.sh
 
-# 15. Phase 5.2 Production-Grade Low-Impact Observation Hardening 통합 테스트
+# 17. Phase 5.2 Production-Grade Low-Impact Observation Hardening 통합 테스트
 bash tests/integration_phase5_2_hardening.sh
+
+# 18. 전체 통합 테스트 자동 실행 스크립트
+bash run_all_tests.sh
 ```
 
 ---
@@ -1069,9 +1232,17 @@ bash tests/integration_phase5_2_hardening.sh
 
 ## Human-Centric Memory Snapshot Explorer & Web UI
 
-The Web UI is structured into **6 clear tabs** with the primary focus on understanding runtime memory:
+The Web UI is structured into **8 clear tabs** providing progressive disclosure from high-level agent investigation down to low-level byte and graph inspectors:
 
-1. **🧠 Memory Snapshot (Default First Screen)**:
+0. **🔍 Investigation Overview (Default First Screen)**:
+   - **Goal & Target Identity**: User/agent natural-language goal, Target PID, Executable, GNU Build ID match status, and architecture.
+   - **Capture Quality & Consistency**: Atomic / Non-Atomic capture status, completeness %, mapping race warning, and honest limitations.
+   - **Structured Findings**: Facts (observed runtime state), Hypotheses (inferences), and Unknowns (missing regions, unmapped symbols).
+   - **Observation Comparisons**: Semantic diff summary between observations with non-atomic capture skew notices.
+   - **Resolved Static Links**: C/C++ source file/function links resolved via DWARF static analyzer with ASLR load bias compensation.
+   - **Recommended Next Steps**: Evidence-driven actionable follow-ups clearly distinguishing executed vs suggested actions.
+   - **Advanced Raw View**: Hexadecimal memory addresses (`0x...`) and raw machine-readable Evidence Ledger JSON viewer.
+1. **🧠 Memory Snapshot**:
    - **Capture Status**: Status (`COMPLETE`/`PARTIAL`), Total Captured Size (MB), Capture Duration (ms), Consistency Level, Architecture, Pointer Width, Endianness.
    - **Memory Breakdown**: Visual proportional stacked bar and category cards (Heap, Stack, Global Data, Executable Code, Shared Libraries, Other Mappings).
    - **Discovered Semantic Runtime Objects**: Discovered count, storage breakdown, and an expandable ASCII/box semantic hierarchy preview with direct "Inspect →" actions.
@@ -1081,6 +1252,7 @@ The Web UI is structured into **6 clear tabs** with the primary focus on underst
 4. **📜 History / State Diff**: Checkpoint timeline and semantic diffs showing exact field-level state transitions.
 5. **⚡ Advanced Exploration**: Mutation candidate inspection, hypothesis execution, continue, rollback, and autonomous exploration loop.
 6. **🛠️ System / Provenance**: ELF metadata, Build ID matching, loaded modules table, and GDB compatibility report.
+7. **🔬 State Laboratory**: Fast snapshot inspection, branch isolation verification, thread impact analysis, and state replay.
 
 ---
 
@@ -1102,6 +1274,12 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 
 | Component / Feature | Implementation Status | Test Scope | Verification Level | Real Target Evidence |
 | :--- | :--- | :--- | :--- | :--- |
+| **Evidence Ledger (v1.0.0)** | Complete | 8 unit tests, schema validation, backward compat | **UNIT TESTED** | Validates schema, provenance chains, optional fields |
+| **Agent Investigation API** | Complete | 10 unit/integration tests, ARP protocol, CLI, REST | **INTEGRATION TESTED** | Real C++ sample, offline snapshots, authorized live targets |
+| **Static-Dynamic Code Linking** | Complete | 6 unit tests, DWARF subprogram / CU parser | **INTEGRATION TESTED** | ASLR load bias adjustment, GNU Build ID cross-validation |
+| **Semantic Observation Diff** | Complete | 2 unit tests, multi-snapshot comparison | **UNIT TESTED** | Diff engine with honest non-atomic skew warnings |
+| **Investigation Overview UI** | Complete | 4 UI structure & rendering tests, mock/real API | **INTEGRATION TESTED** | Renders facts/hypotheses/unknowns, jump-to-object |
+| **Real C++ PIE Investigation E2E** | Complete | 1 end-to-end fixture test on compiled C++ binary | **REAL TARGET VALIDATED** | Stripped ELF, external DWARF, process_vm_readv capture |
 | **Memory Snapshot Explorer (Web UI)** | Complete | 13 API tests, 2 lifecycle tests, 24 acceptance steps | **REAL TARGET VALIDATED** | Verified via browser & automated acceptance harness |
 | **Subprocess Server Lifecycle** | Complete | Real `subprocess.Popen` with SIGINT/SIGTERM | **INTEGRATION TESTED** | Clean exit (code 0), immediate port re-bind |
 | **GDB Version Fallback Elimination** | Complete | 6 unit tests with explicit `status="UNKNOWN"` | **UNIT TESTED** | Unknown GDB returns `status="UNKNOWN"`, `major=None` |
@@ -1111,5 +1289,6 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 | **LOW_IMPACT process_vm_readv Capture** | Complete | Process memory capture & mapping race detection | **REAL TARGET VALIDATED** | Tested on live Linux processes on AArch64 host |
 | **Offline DWARF Semantic Reconstruction** | Complete | Unstripped debug image + raw snapshot bundles | **INTEGRATION TESTED** | Reconstructs semantic graph without live process |
 | **Branch-Safe State Exploration** | Complete | Checkpoint-restore, crash isolation (SIGSEGV) | **INTEGRATION TESTED** | Verified multi-branch exploration |
+
 
 

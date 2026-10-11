@@ -109,6 +109,17 @@ class AgentAction(_SubscriptableModel):
     memory_snapshot_id: Optional[str] = None
     debug_image: Optional[str] = None
     mode: Optional[str] = None
+    goal: Optional[str] = None
+    investigation_id: Optional[str] = None
+    evidence_id: Optional[str] = None
+    finding_id: Optional[str] = None
+    snapshot_a: Optional[str] = None
+    snapshot_b: Optional[str] = None
+    direction: Optional[str] = None
+    constraints: Optional[Dict[str, Any]] = None
+    budgets: Optional[Dict[str, Any]] = None
+    authorize_target: bool = False
+    memory_snapshot_path: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -134,7 +145,18 @@ class AgentAction(_SubscriptableModel):
             max_bytes=data.get("max_bytes"),
             memory_snapshot_id=data.get("memory_snapshot_id"),
             debug_image=data.get("debug_image"),
-            mode=data.get("mode")
+            mode=data.get("mode"),
+            goal=data.get("goal"),
+            investigation_id=data.get("investigation_id"),
+            evidence_id=data.get("evidence_id"),
+            finding_id=data.get("finding_id"),
+            snapshot_a=data.get("snapshot_a"),
+            snapshot_b=data.get("snapshot_b"),
+            direction=data.get("direction"),
+            constraints=data.get("constraints"),
+            budgets=data.get("budgets"),
+            authorize_target=bool(data.get("authorize_target", False)),
+            memory_snapshot_path=data.get("memory_snapshot_path")
         )
 
 

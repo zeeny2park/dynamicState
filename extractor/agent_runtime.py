@@ -42,6 +42,8 @@ from .semantic_state import SemanticState, OfflineSemanticEngine
 from .state_lab import StateLaboratory, SnapshotMutator, compute_semantic_diff
 from .impact_analyzer import ThreadImpactAnalyzer
 from .state_replayer import StateReplayer
+from .investigation import InvestigationManager
+from .static_analyzer import StaticAnalysisProvider
 
 
 class AgentRuntime:
@@ -76,6 +78,9 @@ class AgentRuntime:
         self.state_lab: StateLaboratory = StateLaboratory()
         self._last_capture_latency_report: Optional[Dict[str, Any]] = None
         self._capture_backend: Optional[RuntimeCaptureBackend] = None
+
+        # Evidence-first Investigation Workflow
+        self.investigation_manager: InvestigationManager = InvestigationManager(corpus_dir=self.corpus_dir)
 
     # -------------------------------------------------------------------------
     # Protocol Action Dispatcher
@@ -191,6 +196,41 @@ class AgentRuntime:
             elif act == "GET_SNAPSHOT_PROVENANCE":
                 target = action.snapshot_id or action.memory_snapshot_id
                 return self.get_snapshot_provenance(target)
+            elif act == "START_INVESTIGATION":
+                return self.start_investigation(
+                    goal=action.goal or "General state investigation",
+                    snapshot_id=action.snapshot_id,
+                    memory_snapshot_path=action.memory_snapshot_path,
+                    pid=action.pid,
+                    debug_image=action.debug_image,
+                    constraints=action.constraints,
+                    budgets=action.budgets,
+                    authorize_target=action.authorize_target
+                )
+            elif act == "GET_INVESTIGATION_STATUS":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.get_investigation_status(action.investigation_id)
+            elif act == "GET_EVIDENCE":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.get_evidence(action.investigation_id, evidence_id=action.evidence_id, finding_id=action.finding_id)
+            elif act == "COMPARE_OBSERVATIONS":
+                if not action.investigation_id or not action.snapshot_a or not action.snapshot_b:
+                    return self._error("INVALID_FIELD", "investigation_id, snapshot_a, and snapshot_b are required", act, t0)
+                return self.compare_observations(action.investigation_id, action.snapshot_a, action.snapshot_b)
+            elif act == "FOLLOW_EVIDENCE":
+                if not action.investigation_id or not action.evidence_id:
+                    return self._error("INVALID_FIELD", "investigation_id and evidence_id are required", act, t0)
+                return self.follow_evidence(action.investigation_id, action.evidence_id, direction=action.direction or "related_objects")
+            elif act == "GET_NEXT_STEPS":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.get_next_steps(action.investigation_id)
+            elif act == "GET_INVESTIGATION_REPORT":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.get_investigation_report(action.investigation_id)
             else:
                 return self._error("CAPABILITY_UNSUPPORTED", f"Action '{act}' is not supported by ARP", act, t0)
         except Exception as exc:
@@ -872,6 +912,17 @@ class AgentRuntime:
                 "replay_timeout_ms": 2000,
                 "max_stop_time_ms": 50.0,
             },
+            # Evidence-First Investigation Workflow Capabilities
+            "investigation": {
+                "capability": "SUPPORTED",
+                "evidence_ledger": True,
+                "offline_investigation": True,
+                "observation_comparison": True,
+                "follow_evidence": True,
+                "static_code_link": True,
+                "schema_version": "1.0.0",
+                "read_only_default": True,
+            },
         }
         return AgentActionResult(
             success=True,
@@ -1539,5 +1590,134 @@ class AgentRuntime:
             data=res,
             error=AgentActionError(code="REPLAY_ERROR", message=res["error"]) if res.get("error") and not res.get("completed") else None,
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)}
+        )
+
+    # -------------------------------------------------------------------------
+    # Investigation Workflow API (Evidence-First Investigation)
+    # -------------------------------------------------------------------------
+
+    def start_investigation(
+        self,
+        goal: str,
+        snapshot_id: Optional[str] = None,
+        memory_snapshot_path: Optional[str] = None,
+        pid: Optional[int] = None,
+        debug_image: Optional[str] = None,
+        constraints: Optional[Dict[str, Any]] = None,
+        budgets: Optional[Dict[str, Any]] = None,
+        authorize_target: bool = False,
+    ) -> AgentActionResult:
+        """Start an evidence-first investigation wrapping existing capabilities."""
+        t0 = time.monotonic()
+        try:
+            res = self.investigation_manager.start_investigation(
+                goal=goal,
+                snapshot_id=snapshot_id,
+                memory_snapshot_path=memory_snapshot_path,
+                pid=pid,
+                debug_image=debug_image,
+                constraints=constraints,
+                budgets=budgets,
+                authorize_target=authorize_target,
+            )
+            return AgentActionResult(
+                success=res.get("status") in ("COMPLETED", "PARTIAL", "RUNNING"),
+                action="START_INVESTIGATION",
+                data=res,
+                error=AgentActionError(code="INVESTIGATION_ERROR", message=res.get("summary", {}).get("error", "Investigation failed")) if res.get("status") == "FAILED" else None,
+                performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+            )
+        except Exception as exc:
+            return self._error("INVESTIGATION_ERROR", str(exc), "START_INVESTIGATION", t0)
+
+    def get_investigation_status(self, investigation_id: str) -> AgentActionResult:
+        """Retrieve progress and stage status for an investigation session."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.get_investigation_status(investigation_id)
+        if "error" in res and res.get("status") == "NOT_FOUND":
+            return self._error("NOT_FOUND", res["error"], "GET_INVESTIGATION_STATUS", t0)
+        return AgentActionResult(
+            success=True,
+            action="GET_INVESTIGATION_STATUS",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def get_evidence(
+        self,
+        investigation_id: str,
+        evidence_id: Optional[str] = None,
+        finding_id: Optional[str] = None,
+    ) -> AgentActionResult:
+        """Retrieve machine-readable evidence and provenance chain."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.get_evidence(investigation_id, evidence_id=evidence_id, finding_id=finding_id)
+        if "error" in res:
+            return self._error("NOT_FOUND", res["error"], "GET_EVIDENCE", t0)
+        return AgentActionResult(
+            success=True,
+            action="GET_EVIDENCE",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def compare_observations(
+        self,
+        investigation_id: str,
+        snapshot_a: str,
+        snapshot_b: str,
+    ) -> AgentActionResult:
+        """Compare two runtime observations semantically, logging uncertainty and differences."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.compare_observations(investigation_id, snapshot_a, snapshot_b)
+        if "error" in res:
+            return self._error("COMPARE_ERROR", res["error"], "COMPARE_OBSERVATIONS", t0)
+        return AgentActionResult(
+            success=True,
+            action="COMPARE_OBSERVATIONS",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def follow_evidence(
+        self,
+        investigation_id: str,
+        evidence_id: str,
+        direction: str = "related_objects",
+    ) -> AgentActionResult:
+        """Discover connected objects, fields, functions, or static references."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.follow_evidence(investigation_id, evidence_id, direction=direction)
+        if "error" in res:
+            return self._error("NOT_FOUND", res["error"], "FOLLOW_EVIDENCE", t0)
+        return AgentActionResult(
+            success=True,
+            action="FOLLOW_EVIDENCE",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def get_next_steps(self, investigation_id: str) -> AgentActionResult:
+        """Propose evidence-driven follow-up recommendations."""
+        t0 = time.monotonic()
+        steps = self.investigation_manager.get_next_steps(investigation_id)
+        return AgentActionResult(
+            success=True,
+            action="GET_NEXT_STEPS",
+            data={"investigation_id": investigation_id, "next_steps": steps},
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def get_investigation_report(self, investigation_id: str) -> AgentActionResult:
+        """Synthesize a complete evidence-first investigation report."""
+        t0 = time.monotonic()
+        rep = self.investigation_manager.generate_report(investigation_id)
+        if "error" in rep:
+            return self._error("NOT_FOUND", rep["error"], "GET_INVESTIGATION_REPORT", t0)
+        return AgentActionResult(
+            success=True,
+            action="GET_INVESTIGATION_REPORT",
+            data=rep,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
         )
 
