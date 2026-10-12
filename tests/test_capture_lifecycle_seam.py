@@ -1361,6 +1361,190 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
             self.assertEqual(assessment.get("trust_level"), "UNTRUSTED")
 
 
+    def test_raw_snapshot_from_dict_partial_map_and_thread_never_retains_complete(self):
+        """Specifically test that map_enumeration.status == PARTIAL or thread_enumeration.status == PARTIAL degrades completeness."""
+        # 1. PARTIAL map enumeration
+        data_map_partial = {
+            "snapshot_id": "S_MAP_PARTIAL",
+            "completeness": "COMPLETE",
+            "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 100}],
+            "provenance": {
+                "capture_status": "COMPLETED",
+                "bytes_requested": 100,
+                "bytes_read": 100,
+                "map_enumeration": {"status": "PARTIAL", "error_type": "MALFORMED"},
+                "thread_enumeration": {"status": "SUCCESS_WITH_RESULTS", "is_synthetic": False},
+            },
+        }
+        snap_map_p = RawRuntimeSnapshot.from_dict(data_map_partial)
+        self.assertEqual(snap_map_p.completeness, "PARTIAL", "PARTIAL map enumeration MUST downgrade completeness from COMPLETE to PARTIAL")
+
+        # 2. PARTIAL thread enumeration
+        data_th_partial = {
+            "snapshot_id": "S_TH_PARTIAL",
+            "completeness": "COMPLETE",
+            "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 100}],
+            "provenance": {
+                "capture_status": "COMPLETED",
+                "bytes_requested": 100,
+                "bytes_read": 100,
+                "map_enumeration": {"status": "SUCCESS_WITH_RESULTS"},
+                "thread_enumeration": {"status": "PARTIAL", "error_type": "IO_ERROR"},
+            },
+        }
+        snap_th_p = RawRuntimeSnapshot.from_dict(data_th_partial)
+        self.assertEqual(snap_th_p.completeness, "PARTIAL", "PARTIAL thread enumeration MUST downgrade completeness from COMPLETE to PARTIAL")
+
+        # 3. Both PARTIAL
+        data_both_partial = {
+            "snapshot_id": "S_BOTH_PARTIAL",
+            "completeness": "COMPLETE",
+            "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 100}],
+            "provenance": {
+                "capture_status": "COMPLETED",
+                "bytes_requested": 100,
+                "bytes_read": 100,
+                "map_enumeration": {"status": "PARTIAL"},
+                "thread_enumeration": {"status": "PARTIAL"},
+            },
+        }
+        snap_both_p = RawRuntimeSnapshot.from_dict(data_both_partial)
+        self.assertEqual(snap_both_p.completeness, "PARTIAL")
+
+    def test_raw_snapshot_from_dict_byte_shortfall_degrades_quality(self):
+        """Byte shortfall (bytes_read < bytes_requested) or zero bytes degrades completeness."""
+        # Shortfall: 200 requested, 100 read -> PARTIAL
+        data_short = {
+            "snapshot_id": "S_SHORT",
+            "completeness": "COMPLETE",
+            "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 100}],
+            "provenance": {
+                "capture_status": "COMPLETED",
+                "bytes_requested": 200,
+                "bytes_read": 100,
+                "map_enumeration": {"status": "SUCCESS_WITH_RESULTS"},
+                "thread_enumeration": {"status": "SUCCESS_WITH_RESULTS"},
+            },
+        }
+        snap_short = RawRuntimeSnapshot.from_dict(data_short)
+        self.assertEqual(snap_short.completeness, "PARTIAL")
+
+        # Zero read: 200 requested, 0 read -> FAILED
+        data_zero = {
+            "snapshot_id": "S_ZERO",
+            "completeness": "COMPLETE",
+            "memory_regions": [],
+            "provenance": {
+                "capture_status": "COMPLETED",
+                "bytes_requested": 200,
+                "bytes_read": 0,
+                "map_enumeration": {"status": "SUCCESS_WITH_RESULTS"},
+                "thread_enumeration": {"status": "SUCCESS_WITH_RESULTS"},
+            },
+        }
+        snap_zero = RawRuntimeSnapshot.from_dict(data_zero)
+        self.assertEqual(snap_zero.completeness, "FAILED")
+
+    def test_raw_snapshot_legacy_snapshot_policy(self):
+        """Legacy snapshots without provenance preserve declared status only if coherent with data."""
+        # Legacy snapshot with regions and buffers preserves COMPLETE
+        data_legacy_valid = {
+            "snapshot_id": "S_LEGACY_VALID",
+            "completeness": "COMPLETE",
+            "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 64}],
+            "captured_ranges": [["0x1000", "0x1040"]],
+        }
+        snap_l_v = RawRuntimeSnapshot.from_dict(data_legacy_valid)
+        self.assertEqual(snap_l_v.completeness, "COMPLETE")
+        self.assertTrue(snap_l_v.provenance.get("is_legacy"))
+
+        # Legacy snapshot with NO memory regions and NO ranges cannot claim COMPLETE -> PARTIAL
+        data_legacy_empty = {
+            "snapshot_id": "S_LEGACY_EMPTY",
+            "completeness": "COMPLETE",
+            "memory_regions": [],
+            "captured_ranges": [],
+        }
+        snap_l_e = RawRuntimeSnapshot.from_dict(data_legacy_empty)
+        self.assertEqual(snap_l_e.completeness, "PARTIAL")
+
+        # Monotonicity: legacy snapshot declared FAILED or INVALID never upgraded to COMPLETE
+        for bad_status in ("FAILED", "INVALID", "PARTIAL"):
+            data_bad = {
+                "snapshot_id": f"S_LEGACY_{bad_status}",
+                "completeness": bad_status,
+                "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 64}],
+            }
+            snap_bad = RawRuntimeSnapshot.from_dict(data_bad)
+            self.assertEqual(snap_bad.completeness, bad_status, f"Legacy status {bad_status} must never be upgraded")
+
+    def test_thread_enumeration_outcomes_and_synthetic_isolation(self):
+        """Thread enumeration outcomes: SUCCESS_EMPTY or FAILED marks threads as synthetic/unverified."""
+        # 1. FAILED thread enumeration in live capture produces PARTIAL capture
+        adapter_fail = MockProcessTargetAdapter(initial_state="RUNNING")
+        adapter_fail.read_thread_metadata = lambda pid: ThreadMetadataResult(
+            [{
+                "thread_id": adapter_fail.pid,
+                "name": None,
+                "state": "UNKNOWN",
+                "stop_status": "UNKNOWN",
+                "is_synthetic": True,
+                "verified_observation": False,
+                "capture_participation": False,
+                "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+                "function": None,
+                "location": None,
+            }],
+            status="FAILED",
+            error_type="TARGET_EXITED",
+            error="Task directory missing",
+            is_synthetic=True,
+        )
+        handle_fail = ProcessTargetHandle(pid=adapter_fail.pid, adapter=adapter_fail)
+        policy_fail = CaptureSafetyPolicy(target_handle=handle_fail, mem_reader=lambda p, a, s: b"X" * s)
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        backend = ProcessVmCaptureBackend()
+
+        snap_fail = backend.capture(adapter_fail.pid, plan=plan, policy=policy_fail)
+        self.assertEqual(snap_fail.completeness, "PARTIAL")
+        self.assertEqual(snap_fail.provenance["thread_enumeration"]["status"], "FAILED")
+        self.assertTrue(snap_fail.provenance["thread_enumeration"]["is_synthetic"])
+
+        # 2. SUCCESS_EMPTY thread enumeration produces PARTIAL capture
+        adapter_empty = MockProcessTargetAdapter(initial_state="RUNNING")
+        adapter_empty.read_thread_metadata = lambda pid: ThreadMetadataResult(
+            [],
+            status="SUCCESS_EMPTY",
+            error_type=None,
+            error=None,
+            is_synthetic=False,
+        )
+        handle_empty = ProcessTargetHandle(pid=adapter_empty.pid, adapter=adapter_empty)
+        policy_empty = CaptureSafetyPolicy(target_handle=handle_empty, mem_reader=lambda p, a, s: b"Y" * s)
+
+        snap_empty = backend.capture(adapter_empty.pid, plan=plan, policy=policy_empty)
+        self.assertEqual(snap_empty.completeness, "PARTIAL")
+        self.assertEqual(snap_empty.provenance["thread_enumeration"]["status"], "SUCCESS_EMPTY")
+
+    def test_map_enumeration_full_mode_empty_or_failed_is_fatal(self):
+        """In FULL mode, map enumeration failure or empty result is fatal (completeness FAILED)."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        adapter.read_proc_maps = lambda pid: ProcMapsResult(
+            [],
+            status="SUCCESS_EMPTY",
+            error_type=None,
+            error=None,
+        )
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+        policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"Z" * s)
+        plan_full = CapturePlan(mode=CaptureMode.FULL.value)
+        backend = ProcessVmCaptureBackend()
+
+        snap_full = backend.capture(adapter.pid, plan=plan_full, policy=policy)
+        self.assertEqual(snap_full.completeness, "FAILED")
+        self.assertEqual(snap_full.provenance["capture_status"], "FAILED")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -967,11 +967,18 @@ class DwarfRuntimeResolver:
                 obj["capture_quality"] = "PARTIAL"
                 obj["verified"] = False
                 obj["trust_classification"] = "UNVERIFIED_PARTIAL_CAPTURE"
+                for f in obj.get("fields", []):
+                    f["capture_quality"] = "PARTIAL"
+                    f["verified"] = False
+                    if isinstance(f.get("provenance"), dict):
+                        f["provenance"]["capture_quality"] = "PARTIAL"
+                        f["provenance"]["verified"] = False
             for r in roots:
                 r["capture_quality"] = "PARTIAL"
                 r["verified"] = False
                 if isinstance(r.get("provenance"), dict):
                     r["provenance"]["capture_quality"] = "PARTIAL"
+                    r["provenance"]["verified"] = False
 
         if is_partial_capture or has_uncaptured or has_partial or has_unsupported:
             state_status = "PARTIAL"

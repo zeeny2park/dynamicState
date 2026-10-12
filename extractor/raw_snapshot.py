@@ -85,6 +85,14 @@ class RawRuntimeSnapshot:
                     "build_id": self.executable_build_id
                 }
             }
+        self.completeness, self.provenance = self._enforce_canonical_quality_contract(
+            completeness=self.completeness,
+            provenance=self.provenance,
+            memory_regions=self.memory_regions,
+            thread_metadata=self.thread_metadata,
+            observation_metadata=self.observation_metadata,
+            captured_ranges=self.captured_ranges,
+        )
 
     @property
     def latency_report(self):
@@ -174,6 +182,107 @@ class RawRuntimeSnapshot:
         }
 
     @classmethod
+    def _enforce_canonical_quality_contract(
+        cls,
+        completeness: str,
+        provenance: Dict[str, Any],
+        memory_regions: List[Dict[str, Any]],
+        thread_metadata: List[Dict[str, Any]],
+        observation_metadata: Optional[Dict[str, Any]] = None,
+        captured_ranges: Optional[List[Tuple[int, int]]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Define and enforce the monotonic capture quality contract across the system.
+
+        Canonical quality states:
+        - COMPLETE: Target identity verified, inferior confirmed stopped and all threads settled,
+                    all requested memory regions captured, and map/thread metadata enumerated successfully.
+        - PARTIAL:  Target identity verified and capture was safe, but some non-fatal regions,
+                    thread metadata, or optional sections were missing or truncated, or map enumeration
+                    failed during targeted capture with explicit usable ranges, or capture was non-atomic.
+        - INVALID:  Process identity mismatch, PID reuse detected, target exited before capture,
+                    stop could not be verified safely, or memory read could not be confirmed as belonging
+                    to the intended process.
+        - FAILED:   Fatal capture error, permission denied, 0 bytes read on an intended capture,
+                    or map enumeration failed in FULL capture mode.
+
+        Monotonicity guarantee:
+        Downstream transformations may preserve or lower trust, never upgrade it without new validating evidence.
+        """
+        prov = dict(provenance or {})
+        obs_meta = dict(observation_metadata or {})
+        id_contract = prov.get("identity_contract", {}) or obs_meta.get("identity_contract", {}) or {}
+
+        # 1. INVALID conditions (identity mismatch, PID reuse, unverified stop safety)
+        if (
+            id_contract.get("identity_mismatch_detected")
+            or id_contract.get("validity") == "INVALID"
+            or prov.get("capture_status") == "INVALID"
+            or obs_meta.get("capture_status") == "INVALID"
+            or completeness == "INVALID"
+        ):
+            return "INVALID", prov
+
+        # 2. FAILED conditions (fatal capture errors, 0 bytes read, or full-mode map failure)
+        bytes_req = prov.get("bytes_requested") or obs_meta.get("bytes_requested", 0)
+        bytes_read = prov.get("bytes_read", prov.get("captured_bytes", 0))
+        cap_mode = prov.get("capture_mode") or obs_meta.get("capture_mode")
+        map_status = prov.get("map_enumeration", {}).get("status") or obs_meta.get("map_enumeration", {}).get("status")
+
+        if (
+            prov.get("capture_status") == "FAILED"
+            or obs_meta.get("capture_status") == "FAILED"
+            or id_contract.get("validity") == "FAILED"
+            or completeness == "FAILED"
+            or (bytes_req > 0 and bytes_read == 0)
+            or (cap_mode == "FULL" and (map_status == "FAILED" or (map_status == "SUCCESS_EMPTY" and len(memory_regions) == 0)))
+        ):
+            return "FAILED", prov
+
+        # 3. PARTIAL conditions (incomplete enumeration, partial reads, missing threads, non-atomic)
+        if completeness == "PARTIAL":
+            return "PARTIAL", prov
+
+        thread_enum = prov.get("thread_enumeration", {}) or obs_meta.get("thread_enumeration", {})
+        thread_status = thread_enum.get("status")
+        thread_synthetic = thread_enum.get("is_synthetic", False)
+
+        has_failed_reg = any(r.get("status") in ("FAILED", "PARTIAL", "OMITTED") for r in memory_regions)
+        has_byte_shortfall = (bytes_req > 0 and bytes_read < bytes_req)
+        has_partial_maps = map_status in ("PARTIAL", "FAILED")
+        has_partial_threads = (
+            thread_status in ("PARTIAL", "FAILED", "SUCCESS_EMPTY")
+            or thread_synthetic
+            or any(t.get("is_synthetic") is True or t.get("verified_observation") is False for t in thread_metadata)
+        )
+
+        guarantees = obs_meta.get("lifecycle_guarantees", {})
+        was_stopped = obs_meta.get("was_already_stopped", False)
+        stop_unconfirmed = (not was_stopped and guarantees.get("process_stop_requested", False) and not guarantees.get("process_stop_confirmed", False))
+        threads_unconfirmed = ((guarantees.get("process_stop_requested", False) or was_stopped) and not guarantees.get("all_threads_stopped", False) and guarantees.get("process_stop_confirmed", False))
+        is_non_atomic = (obs_meta.get("consistency_classification") == "NON_ATOMIC" or prov.get("snapshot_consistency") == "NON_ATOMIC")
+
+        if (
+            has_failed_reg
+            or has_byte_shortfall
+            or has_partial_maps
+            or has_partial_threads
+            or stop_unconfirmed
+            or threads_unconfirmed
+            or is_non_atomic
+        ):
+            return "PARTIAL", prov
+
+        # 4. Legacy snapshot policy:
+        # If provenance is missing or marked legacy, preserve declared status only if coherent with data
+        if not provenance or prov.get("is_legacy"):
+            prov["is_legacy"] = True
+            prov["legacy_policy"] = "PRESERVE_DECLARED_STATUS_IF_COHERENT"
+            if len(memory_regions) == 0 and (not captured_ranges or len(captured_ranges) == 0):
+                return "PARTIAL", prov
+
+        return "COMPLETE", prov
+
+    @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RawRuntimeSnapshot":
         ranges = []
         for r in data.get("captured_ranges", []):
@@ -182,25 +291,20 @@ class RawRuntimeSnapshot:
                 e = int(r[1], 16) if isinstance(r[1], str) and r[1].startswith("0x") else int(r[1])
                 ranges.append((s, e))
 
-        completeness = data.get("completeness", "COMPLETE")
+        declared_comp = data.get("completeness", "COMPLETE")
         prov = data.get("provenance", {}) or {}
-        id_contract = prov.get("identity_contract", {}) or {}
+        obs_meta = data.get("observation_metadata", {}) or {}
+        mem_regs = data.get("memory_regions", [])
+        th_meta = data.get("thread_metadata", [])
 
-        # Enforce canonical status consistency and guard against tampering or corrupted states:
-        if id_contract.get("identity_mismatch_detected") or prov.get("capture_status") == "INVALID" or id_contract.get("validity") == "INVALID":
-            completeness = "INVALID"
-        elif prov.get("capture_status") == "FAILED" or id_contract.get("validity") == "FAILED":
-            completeness = "FAILED"
-        elif completeness == "COMPLETE":
-            mem_regs = data.get("memory_regions", [])
-            has_failed_reg = any(r.get("status") in ("FAILED", "PARTIAL", "OMITTED") for r in mem_regs)
-            map_status = prov.get("map_enumeration", {}).get("status")
-            thread_status = prov.get("thread_enumeration", {}).get("status")
-            thread_synthetic = prov.get("thread_enumeration", {}).get("is_synthetic", False)
-            if has_failed_reg or (map_status == "FAILED") or (thread_status == "FAILED") or thread_synthetic:
-                completeness = "PARTIAL"
-            elif prov.get("bytes_requested", 0) > 0 and prov.get("bytes_read", 0) == 0:
-                completeness = "FAILED"
+        completeness, prov = cls._enforce_canonical_quality_contract(
+            completeness=declared_comp,
+            provenance=prov,
+            memory_regions=mem_regs,
+            thread_metadata=th_meta,
+            observation_metadata=obs_meta,
+            captured_ranges=ranges,
+        )
 
         return cls(
             snapshot_id=data["snapshot_id"],
@@ -209,13 +313,13 @@ class RawRuntimeSnapshot:
             executable_build_id=data.get("executable_build_id"),
             timestamp=data.get("timestamp", datetime.now(timezone.utc).isoformat()),
             capture_duration_us=float(data.get("capture_duration_us", 0.0)),
-            thread_metadata=data.get("thread_metadata", []),
-            memory_regions=data.get("memory_regions", []),
+            thread_metadata=th_meta,
+            memory_regions=mem_regs,
             register_state=data.get("register_state", {}),
             captured_ranges=ranges,
             raw_memory=data.get("raw_memory", {}),
             capture_backend=data.get("capture_backend", "unknown"),
-            observation_metadata=data.get("observation_metadata", {}),
+            observation_metadata=obs_meta,
             completeness=completeness,
             provenance=prov,
         )

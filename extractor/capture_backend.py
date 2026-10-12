@@ -1781,8 +1781,15 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in handle.identity_checkpoints)
         any_checkpoint_failed = any(not cp.get("verified", False) for cp in handle.identity_checkpoints)
 
-        thread_enum_failed = getattr(thread_metadata, "is_synthetic", False) or (getattr(thread_metadata, "status", "") == "FAILED")
-        map_enum_failed = getattr(all_maps, "status", "") == "FAILED"
+        thread_enum_failed = (
+            getattr(thread_metadata, "is_synthetic", False)
+            or (getattr(thread_metadata, "status", "") in ("FAILED", "PARTIAL", "SUCCESS_EMPTY"))
+            or any(t.get("is_synthetic") is True or t.get("verified_observation") is False for t in thread_metadata)
+        )
+        map_enum_failed = (
+            getattr(all_maps, "status", "") in ("FAILED", "PARTIAL")
+            or (getattr(all_maps, "status", "") == "SUCCESS_EMPTY" and plan.mode == CaptureMode.FULL.value)
+        )
 
         if any_pid_reused:
             capture_status = "INVALID"
@@ -1927,6 +1934,8 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "observation_point": observation_point,
             "latency_report": latency_report.to_dict(),
             "memory_maps": all_maps,
+            "map_enumeration": all_maps.to_dict() if hasattr(all_maps, "to_dict") else {"status": getattr(all_maps, "status", "UNKNOWN")},
+            "thread_enumeration": thread_metadata.to_dict() if hasattr(thread_metadata, "to_dict") else {"status": getattr(thread_metadata, "status", "UNKNOWN"), "is_synthetic": getattr(thread_metadata, "is_synthetic", False)},
             "diagnostics": diagnostics,
             "identity_contract": identity_contract,
             "capabilities": self.capabilities,
@@ -1934,6 +1943,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
 
         provenance = {
             "capture_backend": self.name,
+            "capture_mode": plan.mode,
             "capture_status": capture_status,
             "snapshot_consistency": snapshot_consistency,
             "consistency_classification": consistency_classification,
@@ -2691,8 +2701,15 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in handle.identity_checkpoints)
         any_checkpoint_failed = any(not cp.get("verified", False) for cp in handle.identity_checkpoints)
 
-        thread_enum_failed = getattr(thread_metadata, "is_synthetic", False) or (getattr(thread_metadata, "status", "") == "FAILED")
-        map_enum_failed = getattr(all_maps, "status", "") == "FAILED"
+        thread_enum_failed = (
+            getattr(thread_metadata, "is_synthetic", False)
+            or (getattr(thread_metadata, "status", "") in ("FAILED", "PARTIAL", "SUCCESS_EMPTY"))
+            or any(t.get("is_synthetic") is True or t.get("verified_observation") is False for t in thread_metadata)
+        )
+        map_enum_failed = (
+            getattr(all_maps, "status", "") in ("FAILED", "PARTIAL")
+            or (getattr(all_maps, "status", "") == "SUCCESS_EMPTY" and plan.mode == CaptureMode.FULL.value)
+        )
 
         if any_pid_reused:
             capture_status = "INVALID"
@@ -2836,6 +2853,8 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "observation_point": observation_point,
             "latency_report": latency_report.to_dict(),
             "memory_maps": all_maps,
+            "map_enumeration": all_maps.to_dict() if hasattr(all_maps, "to_dict") else {"status": getattr(all_maps, "status", "UNKNOWN")},
+            "thread_enumeration": thread_metadata.to_dict() if hasattr(thread_metadata, "to_dict") else {"status": getattr(thread_metadata, "status", "UNKNOWN"), "is_synthetic": getattr(thread_metadata, "is_synthetic", False)},
             "diagnostics": diagnostics,
             "identity_contract": identity_contract,
             "capabilities": self.capabilities,
@@ -2843,6 +2862,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
 
         provenance = {
             "capture_backend": self.name,
+            "capture_mode": plan.mode,
             "capture_status": capture_status,
             "snapshot_consistency": snapshot_consistency,
             "consistency_classification": consistency_classification,

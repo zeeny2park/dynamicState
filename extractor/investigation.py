@@ -758,11 +758,6 @@ class InvestigationManager:
         if not session:
             return {"error": f"Investigation '{investigation_id}' not found"}
 
-        # Group findings
-        facts = [f.to_dict() for f in session.findings if f.category == "fact"]
-        hypotheses = [f.to_dict() for f in session.findings if f.category == "hypothesis"]
-        unknowns = [f.to_dict() for f in session.findings if f.category == "unknown"]
-
         # Prominently highlight capture quality when data is incomplete or unverified
         cap_stage = session.stages.get("capture_quality", {})
         cap_details = cap_stage.get("details", {})
@@ -775,6 +770,20 @@ class InvestigationManager:
         elif cap_status == "PARTIAL":
             trust_level = "PARTIALLY_TRUSTED"
             trust_caveat = "Capture quality is PARTIAL. Findings may reflect incomplete memory layout, unread regions, or execution skew."
+
+        # Monotonicity & trust boundary: when capture is UNTRUSTED, suppress observed_facts
+        if trust_level == "UNTRUSTED":
+            for f in session.findings:
+                if f.category == "fact":
+                    f.category = "unknown"
+                    f.status = "UNTRUSTED"
+                    f.confidence = "low"
+                    f.uncertainty = trust_caveat
+
+        # Group findings
+        facts = [f.to_dict() for f in session.findings if f.category == "fact"]
+        hypotheses = [f.to_dict() for f in session.findings if f.category == "hypothesis"]
+        unknowns = [f.to_dict() for f in session.findings if f.category == "unknown"]
 
         return {
             "investigation_id": session.investigation_id,
@@ -886,8 +895,16 @@ class InvestigationManager:
         # Layout caveat
         finding.layout_caveat = nav_result.get("layout_caveat") or LAYOUT_MUTATION_CAVEAT
 
-        # Function candidates
-        finding.function_candidates = nav_result.get("candidates", [])
+        # Function candidates - explicitly qualify as static references rather than confirmed root causes
+        raw_candidates = nav_result.get("candidates", [])
+        qualified_candidates = []
+        for cand in raw_candidates:
+            c_dict = dict(cand) if isinstance(cand, dict) else {"symbol": str(cand)}
+            c_dict["candidate_kind"] = "static_reference"
+            c_dict["confirmed_root_cause"] = False
+            c_dict["relationship_limitation"] = "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
+            qualified_candidates.append(c_dict)
+        finding.function_candidates = qualified_candidates
         finding.code_navigation = nav_result
 
     def _execute_stage_identity(self, session: InvestigationSession) -> None:
@@ -1303,7 +1320,7 @@ class InvestigationManager:
                     type_name=f.get("type") or otype,
                     observed_value=fval,
                     evidence_ids=[ev.evidence_id],
-                    confidence="medium" if is_partial_snap else "OBSERVED",
+                    confidence="medium" if is_partial_snap else "high",
                     status="UNVERIFIED_PARTIAL" if is_partial_snap else "OBSERVED",
                     uncertainty="Observed from PARTIAL capture snapshot." if is_partial_snap else None,
                 )

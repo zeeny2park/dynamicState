@@ -104,16 +104,41 @@ class StateDiffEngine:
         # Evaluate snapshot completeness / quality to determine trust classification
         def _get_comp(snap: Any, data: Dict[str, Any]) -> str:
             c = getattr(snap, "completeness", None) or getattr(snap, "status", None)
-            if c:
+            if c and str(c).upper() in ("INVALID", "FAILED", "PARTIAL"):
                 return str(c).upper()
-            c = data.get("completeness") or data.get("status")
-            if c:
-                return str(c).upper()
-            prov = data.get("provenance", {})
+            c_dict = data.get("completeness") or data.get("status")
+            if c_dict and str(c_dict).upper() in ("INVALID", "FAILED", "PARTIAL"):
+                return str(c_dict).upper()
+
+            prov = getattr(snap, "provenance", None) or data.get("provenance", {})
+            obs = getattr(snap, "observation_metadata", None) or data.get("observation_metadata", {})
+
             if isinstance(prov, dict):
-                c = prov.get("capture_status") or prov.get("validity")
-                if c:
-                    return str(c).upper()
+                id_contract = prov.get("identity_contract", {}) or {}
+                if id_contract.get("identity_mismatch_detected") or id_contract.get("validity") == "INVALID":
+                    return "INVALID"
+                st = prov.get("capture_status") or id_contract.get("validity")
+                if st and str(st).upper() in ("INVALID", "FAILED", "PARTIAL"):
+                    return str(st).upper()
+                if prov.get("map_enumeration", {}).get("status") in ("PARTIAL", "FAILED"):
+                    return "PARTIAL"
+                if prov.get("thread_enumeration", {}).get("status") in ("PARTIAL", "FAILED", "SUCCESS_EMPTY") or prov.get("thread_enumeration", {}).get("is_synthetic"):
+                    return "PARTIAL"
+
+            if isinstance(obs, dict):
+                if obs.get("capture_status") in ("INVALID", "FAILED", "PARTIAL"):
+                    return str(obs.get("capture_status")).upper()
+                if obs.get("consistency_classification") == "NON_ATOMIC":
+                    return "PARTIAL"
+                if obs.get("map_enumeration", {}).get("status") in ("PARTIAL", "FAILED"):
+                    return "PARTIAL"
+                if obs.get("thread_enumeration", {}).get("status") in ("PARTIAL", "FAILED", "SUCCESS_EMPTY") or obs.get("thread_enumeration", {}).get("is_synthetic"):
+                    return "PARTIAL"
+
+            if c:
+                return str(c).upper()
+            if c_dict:
+                return str(c_dict).upper()
             return "COMPLETE"
 
         comp_a = _get_comp(before, a)
@@ -153,6 +178,7 @@ class StateDiffEngine:
                 chg["trust"] = "PARTIAL"
                 chg["identity_confidence"] = "uncertain"
                 chg["capture_quality"] = "PARTIAL"
+                chg["verified"] = False
             else:
                 chg["trust"] = "TRUSTED"
 

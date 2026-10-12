@@ -439,6 +439,70 @@ class TestCppE2EInvestigation(unittest.TestCase):
         self.assertEqual(len(report_invalid["findings"]["observed_facts"]), 0)
         self.assertEqual(report_invalid["capture_quality_assessment"]["trust_level"], "UNTRUSTED")
 
+        # 5. FAILED snapshot verification
+        failed_snap = RawRuntimeSnapshot(
+            snapshot_id="failed_test_snap",
+            pid=12345,
+            executable=self.debug_bin,
+            executable_build_id=None,
+            timestamp="",
+            capture_duration_us=100.0,
+            completeness="FAILED",
+            provenance={"capture_status": "FAILED", "bytes_requested": 1000, "bytes_read": 0},
+        )
+        failed_dir = os.path.join(self.work_dir, "failed_snap")
+        failed_snap.save(failed_dir)
+        inv_failed = self.mgr.start_investigation(
+            goal="Test failed snapshot refusal",
+            memory_snapshot_path=failed_dir,
+            debug_image=self.debug_bin,
+            authorize_target=False,
+        )
+        self.assertEqual(inv_failed["stages"]["capture_quality"]["status"], "FAILED")
+        report_failed = self.mgr.generate_report(inv_failed["investigation_id"])
+        self.assertEqual(len(report_failed["findings"]["observed_facts"]), 0)
+        self.assertEqual(report_failed["findings_summary"]["facts_count"], 0)
+        self.assertEqual(report_failed["capture_quality_assessment"]["trust_level"], "UNTRUSTED")
+
+        # 6. PARTIAL snapshot verification (never generates unqualified high-confidence facts)
+        partial_snap = RawRuntimeSnapshot(
+            snapshot_id="partial_test_snap",
+            pid=12345,
+            executable=self.debug_bin,
+            executable_build_id=None,
+            timestamp="",
+            capture_duration_us=100.0,
+            completeness="PARTIAL",
+            provenance={
+                "capture_status": "COMPLETED",
+                "bytes_requested": 1000,
+                "bytes_read": 1000,
+                "thread_enumeration": {"status": "PARTIAL", "is_synthetic": False},
+                "map_enumeration": {"status": "SUCCESS_WITH_RESULTS"},
+            },
+        )
+        partial_dir = os.path.join(self.work_dir, "partial_snap")
+        partial_snap.save(partial_dir)
+        inv_partial = self.mgr.start_investigation(
+            goal="Test partial snapshot trust qualification",
+            memory_snapshot_path=partial_dir,
+            debug_image=self.debug_bin,
+            authorize_target=False,
+        )
+        self.assertEqual(inv_partial["stages"]["capture_quality"]["status"], "PARTIAL")
+        report_partial = self.mgr.generate_report(inv_partial["investigation_id"])
+        self.assertEqual(report_partial["capture_quality_assessment"]["trust_level"], "PARTIALLY_TRUSTED")
+        for f in report_partial["findings"]["observed_facts"]:
+            self.assertEqual(f["confidence"], "medium", "PARTIAL capture facts must never be high confidence")
+            self.assertEqual(f["status"], "UNVERIFIED_PARTIAL")
+            self.assertIsNotNone(f.get("uncertainty"))
+
+        # 7. Function candidates are explicitly static references, never confirmed root causes
+        for finding in report_partial["findings"]["observed_facts"] + report_partial["findings"]["hypotheses"] + report_partial["findings"]["unknowns"]:
+            for cand in finding.get("function_candidates", []):
+                self.assertEqual(cand.get("candidate_kind"), "static_reference")
+                self.assertFalse(cand.get("confirmed_root_cause", False))
+
 
 if __name__ == "__main__":
     unittest.main()
