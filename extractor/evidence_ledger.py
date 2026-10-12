@@ -48,7 +48,7 @@ VALID_NATURES = {NATURE_OBSERVATION, NATURE_INFERENCE, NATURE_HYPOTHESIS}
 @dataclass
 class EvidenceRecord:
     """Individual machine-readable evidence entry with full provenance."""
-    evidence_id: str = ""
+    evidence_id: Optional[str] = None
     evidence_type: str = EVIDENCE_TYPE_OBJECT_STATE
     nature: str = NATURE_OBSERVATION  # "observation", "inference", or "hypothesis"
     source: str = "runtime_collector"  # e.g., "raw_snapshot", "offline_analyzer", "dwarf", "static_provider", "state_diff"
@@ -74,12 +74,25 @@ class EvidenceRecord:
     schema_version: str = EVIDENCE_SCHEMA_VERSION
 
     def __post_init__(self):
-        if not self.evidence_id:
+        if self.evidence_id is not None:
+            if not isinstance(self.evidence_id, str) or not self.evidence_id.strip():
+                raise ValueError("evidence_id must be a non-empty string")
+        else:
             self.evidence_id = f"ev_{uuid.uuid4().hex[:12]}"
+
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).isoformat()
+        if not isinstance(self.evidence_type, str) or not self.evidence_type.strip():
+            raise ValueError("evidence_type must be a non-empty string")
+        if self.evidence_type not in VALID_EVIDENCE_TYPES:
+            raise ValueError(f"Invalid evidence_type '{self.evidence_type}'. Expected one of {sorted(VALID_EVIDENCE_TYPES)}")
         if self.nature not in VALID_NATURES:
             raise ValueError(f"Invalid evidence nature '{self.nature}'. Expected one of {sorted(VALID_NATURES)}")
+        if not isinstance(self.parent_evidence_ids, (list, tuple)):
+            raise TypeError("parent_evidence_ids must be a list of strings")
+        for pid in self.parent_evidence_ids:
+            if not isinstance(pid, str) or not pid.strip():
+                raise ValueError(f"Invalid parent_evidence_id '{pid}' in parent_evidence_ids")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary without None values for optional fields."""
@@ -120,6 +133,27 @@ class EvidenceRecord:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EvidenceRecord":
         """Deserialize from dictionary, maintaining backward compatibility with missing fields."""
+        eid = data.get("evidence_id")
+        if "evidence_id" in data and eid is not None:
+            if not isinstance(eid, str) or not eid.strip():
+                raise ValueError("evidence_id in data must be a non-empty string")
+        elif eid is None:
+            eid = f"ev_{uuid.uuid4().hex[:12]}"
+
+        # Normalize evidence_type for legacy compatibility
+        etype = data.get("evidence_type", EVIDENCE_TYPE_OBJECT_STATE)
+        if isinstance(etype, str) and etype.upper() in VALID_EVIDENCE_TYPES:
+            etype = etype.upper()
+        elif etype not in VALID_EVIDENCE_TYPES:
+            raise ValueError(f"Invalid evidence_type '{etype}'. Expected one of {sorted(VALID_EVIDENCE_TYPES)}")
+
+        # Normalize nature for legacy compatibility
+        nat = data.get("nature", NATURE_OBSERVATION)
+        if isinstance(nat, str) and nat.lower() in VALID_NATURES:
+            nat = nat.lower()
+        elif nat not in VALID_NATURES:
+            raise ValueError(f"Invalid nature '{nat}'. Expected one of {sorted(VALID_NATURES)}")
+
         parent_ids = data.get("parent_evidence_ids")
         if parent_ids is None:
             prov = data.get("provenance", {})
@@ -127,11 +161,22 @@ class EvidenceRecord:
                 parent_ids = prov.get("parent_evidence_ids", [])
             else:
                 parent_ids = []
+        elif not isinstance(parent_ids, (list, tuple)):
+            raise TypeError("parent_evidence_ids must be a list or tuple of strings")
+
+        # Validate dictionary fields if provided
+        for field_name in [
+            "snapshot_ref", "target_identity", "capture_quality",
+            "object_observation", "field_observation", "static_code_link",
+            "comparison_observation", "provenance", "details"
+        ]:
+            if field_name in data and data[field_name] is not None and not isinstance(data[field_name], dict):
+                raise TypeError(f"Field '{field_name}' must be a dictionary when provided, got {type(data[field_name]).__name__}")
 
         return cls(
-            evidence_id=data.get("evidence_id") or f"ev_{uuid.uuid4().hex[:12]}",
-            evidence_type=data.get("evidence_type", EVIDENCE_TYPE_OBJECT_STATE),
-            nature=data.get("nature", NATURE_OBSERVATION),
+            evidence_id=eid,
+            evidence_type=etype,
+            nature=nat,
             source=data.get("source", "unknown"),
             timestamp=data.get("timestamp", ""),
             session_id=data.get("session_id"),
@@ -185,13 +230,33 @@ class EvidenceLedger:
         return record
 
     def validate_record(self, record: EvidenceRecord) -> None:
-        """Validate record structure and consistency."""
-        if not record.evidence_id:
-            raise ValueError("EvidenceRecord must have a valid non-empty evidence_id")
-        if not record.evidence_type:
-            raise ValueError("EvidenceRecord must specify evidence_type")
-        if record.nature not in VALID_NATURES:
+        """Validate record structure, types, and consistency."""
+        if not record.evidence_id or not isinstance(record.evidence_id, str) or not record.evidence_id.strip():
+            raise ValueError("EvidenceRecord must have a valid non-empty string evidence_id")
+        if not record.evidence_type or not isinstance(record.evidence_type, str) or record.evidence_type not in VALID_EVIDENCE_TYPES:
+            raise ValueError(f"Invalid evidence_type '{record.evidence_type}'. Expected one of {sorted(VALID_EVIDENCE_TYPES)}")
+        if not record.nature or record.nature not in VALID_NATURES:
             raise ValueError(f"Invalid nature '{record.nature}'. Expected one of {sorted(VALID_NATURES)}")
+        if record.session_id is not None and (not isinstance(record.session_id, str) or not record.session_id.strip()):
+            raise ValueError("session_id must be a non-empty string when provided")
+        if not isinstance(record.parent_evidence_ids, (list, tuple)):
+            raise TypeError("parent_evidence_ids must be a list or tuple of strings")
+        for pid in record.parent_evidence_ids:
+            if not isinstance(pid, str) or not pid.strip():
+                raise ValueError(f"Invalid parent_evidence_id '{pid}' in parent_evidence_ids: must be a non-empty string")
+        for field_name, val in [
+            ("snapshot_ref", record.snapshot_ref),
+            ("target_identity", record.target_identity),
+            ("capture_quality", record.capture_quality),
+            ("object_observation", record.object_observation),
+            ("field_observation", record.field_observation),
+            ("static_code_link", record.static_code_link),
+            ("comparison_observation", record.comparison_observation),
+            ("provenance", record.provenance),
+            ("details", record.details),
+        ]:
+            if val is not None and not isinstance(val, dict):
+                raise TypeError(f"Field '{field_name}' must be a dictionary when provided, got {type(val).__name__}")
 
     def get_record(self, evidence_id: str) -> Optional[EvidenceRecord]:
         """Look up record by unique ID."""

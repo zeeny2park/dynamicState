@@ -96,6 +96,7 @@ class CaptureSafetyPolicy:
     max_capture_ranges: int = 500
     timeout_ms: int = 1000
     fail_open: bool = True  # Always resume target on error or timeout
+    force_fallback: bool = False  # If True, bypass pidfd and use starttime verification fallback
 
 
 class _struct_iovec(ctypes.Structure):
@@ -133,6 +134,275 @@ class RuntimeCaptureBackend(ABC):
         observation_point: Optional[Dict[str, Any]] = None,
     ) -> RawRuntimeSnapshot:
         pass
+
+
+def _get_process_state(pid: int) -> Dict[str, Any]:
+    """Return detailed process state dict from /proc/<pid>/stat.
+    Raises ProcessLookupError if process does not exist.
+    """
+    stat_path = f"/proc/{pid}/stat"
+    if not os.path.exists(stat_path):
+        raise ProcessLookupError(f"Process {pid} does not exist (ESRCH)")
+    try:
+        with open(stat_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except (FileNotFoundError, ProcessLookupError):
+        raise ProcessLookupError(f"Process {pid} does not exist (ESRCH)")
+
+    rparen = content.rfind(")")
+    if rparen == -1:
+        return {
+            "comm": "unknown",
+            "state": "UNKNOWN",
+            "state_char": "?",
+            "starttime": "0",
+            "is_stopped": False,
+            "is_tracing_stop": False,
+        }
+    lparen = content.find("(")
+    comm = content[lparen + 1:rparen] if lparen != -1 else "unknown"
+    rest = content[rparen + 1:].strip().split()
+    state_char = rest[0] if len(rest) > 0 else "?"
+    starttime = rest[19] if len(rest) > 19 else "0"
+
+    state_map = {
+        "R": "RUNNING",
+        "S": "SLEEPING",
+        "D": "DISK_SLEEP",
+        "T": "STOPPED",
+        "t": "TRACING_STOP",
+        "Z": "ZOMBIE",
+    }
+    state_desc = state_map.get(state_char, f"STATE_{state_char}")
+    is_stopped = state_char in ("T", "t")
+    is_tracing_stop = (state_char == "t")
+
+    return {
+        "comm": comm,
+        "state": state_desc,
+        "state_char": state_char,
+        "starttime": starttime,
+        "is_stopped": is_stopped,
+        "is_tracing_stop": is_tracing_stop,
+    }
+
+
+def _get_threads_state(pid: int) -> Dict[str, Any]:
+    """Return thread states breakdown from /proc/<pid>/task."""
+    task_dir = f"/proc/{pid}/task"
+    threads = []
+    stopped_count = 0
+    running_count = 0
+    try:
+        if os.path.exists(task_dir):
+            for entry in os.listdir(task_dir):
+                if entry.isdigit():
+                    tid = int(entry)
+                    stat_path = os.path.join(task_dir, entry, "stat")
+                    t_state = "UNKNOWN"
+                    t_char = "?"
+                    is_t_stopped = False
+                    try:
+                        with open(stat_path, "r", encoding="utf-8") as f:
+                            stat_content = f.read()
+                            rparen = stat_content.rfind(")")
+                            if rparen != -1:
+                                t_char = stat_content[rparen + 1:].strip().split()[0]
+                                state_map = {
+                                    "R": "RUNNING",
+                                    "S": "SLEEPING",
+                                    "D": "DISK_SLEEP",
+                                    "T": "STOPPED",
+                                    "t": "TRACING_STOP",
+                                    "Z": "ZOMBIE",
+                                }
+                                t_state = state_map.get(t_char, t_char)
+                                is_t_stopped = t_char in ("T", "t")
+                    except Exception:
+                        pass
+                    if is_t_stopped:
+                        stopped_count += 1
+                    else:
+                        running_count += 1
+                    threads.append({
+                        "tid": tid,
+                        "state": t_state,
+                        "state_char": t_char,
+                        "is_stopped": is_t_stopped,
+                    })
+    except Exception:
+        pass
+
+    total = len(threads)
+    if total == 0:
+        total = 1
+        stopped_count = 0
+        running_count = 1
+
+    return {
+        "threads": threads,
+        "total_count": total,
+        "stopped_count": stopped_count,
+        "running_count": running_count,
+        "all_stopped": (stopped_count == total and total > 0),
+        "any_stopped": (stopped_count > 0),
+        "mixed_states": (stopped_count > 0 and running_count > 0),
+    }
+
+
+class ProcessTargetHandle:
+    """Safe process identification and signal transmission mechanism.
+
+    Mitigates PID reuse race conditions:
+    1. Primary: Linux pidfd (pidfd_open + pidfd_send_signal).
+       Pins the exact process kernel instance so reused PIDs cannot receive signals.
+    2. Fallback: Verifies (comm, starttime) immediately before signal transmission.
+       Documents limitations: fallback cannot guarantee complete immunity against kernel
+       scheduling races between /proc/<pid>/stat read and signal syscall.
+    """
+
+    def __init__(self, pid: int, force_fallback: bool = False):
+        self.pid = pid
+        self.force_fallback = force_fallback
+        self.pidfd: Optional[int] = None
+        self.pidfd_supported: bool = False
+        self.pidfd_used: bool = False
+        self.initial_identity: Dict[str, Any] = {}
+        self.pre_signal_identity: Optional[Dict[str, Any]] = None
+        self.post_capture_identity: Optional[Dict[str, Any]] = None
+        self.closed: bool = False
+
+    def open(self) -> None:
+        self.initial_identity = _get_process_state(self.pid)
+        if (
+            not self.force_fallback
+            and platform.system() == "Linux"
+            and hasattr(os, "pidfd_open")
+            and hasattr(signal, "pidfd_send_signal")
+        ):
+            try:
+                self.pidfd = os.pidfd_open(self.pid, 0)
+                self.pidfd_supported = True
+                self.pidfd_used = True
+            except (OSError, AttributeError):
+                self.pidfd = None
+                self.pidfd_supported = False
+                self.pidfd_used = False
+        else:
+            self.pidfd_supported = False
+            self.pidfd_used = False
+
+    def send_signal(self, sig: int) -> Tuple[bool, Optional[str]]:
+        if self.closed:
+            return False, "HANDLE_CLOSED"
+
+        try:
+            self.pre_signal_identity = _get_process_state(self.pid)
+        except ProcessLookupError:
+            return False, "TARGET_EXITED"
+        except Exception as e:
+            return False, f"IDENTITY_READ_ERROR: {e}"
+
+        if self.pidfd_used and self.pidfd is not None:
+            try:
+                signal.pidfd_send_signal(self.pidfd, sig)
+                return True, None
+            except ProcessLookupError:
+                return False, "TARGET_EXITED"
+            except PermissionError:
+                return False, "PERMISSION_DENIED"
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    return False, "TARGET_EXITED"
+                elif exc.errno == errno.EPERM:
+                    return False, "PERMISSION_DENIED"
+                return False, f"SIGNAL_ERROR_ERRNO_{exc.errno}"
+            except Exception as exc:
+                return False, f"SIGNAL_ERROR_{exc}"
+        else:
+            # Fallback path: verify starttime before os.kill
+            if self.pre_signal_identity.get("starttime") != self.initial_identity.get("starttime"):
+                return False, "PID_REUSED"
+            try:
+                os.kill(self.pid, sig)
+                return True, None
+            except ProcessLookupError:
+                return False, "TARGET_EXITED"
+            except PermissionError:
+                return False, "PERMISSION_DENIED"
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    return False, "TARGET_EXITED"
+                elif exc.errno == errno.EPERM:
+                    return False, "PERMISSION_DENIED"
+                return False, f"SIGNAL_ERROR_ERRNO_{exc.errno}"
+            except Exception as exc:
+                return False, f"SIGNAL_ERROR_{exc}"
+
+    def verify_identity(self) -> Tuple[bool, str]:
+        if self.closed:
+            return False, "HANDLE_CLOSED"
+
+        if self.pidfd_used and self.pidfd is not None:
+            try:
+                signal.pidfd_send_signal(self.pidfd, 0)
+                try:
+                    self.post_capture_identity = _get_process_state(self.pid)
+                except Exception:
+                    pass
+                return True, "PIDFD_VERIFIED"
+            except ProcessLookupError:
+                return False, "TARGET_EXITED"
+            except PermissionError:
+                return True, "PIDFD_EXISTS_EPERM"
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    return False, "TARGET_EXITED"
+                elif exc.errno == errno.EPERM:
+                    return True, "PIDFD_EXISTS_EPERM"
+                return False, f"PIDFD_ERROR_ERRNO_{exc.errno}"
+        else:
+            try:
+                curr = _get_process_state(self.pid)
+                self.post_capture_identity = curr
+                if curr.get("starttime") != self.initial_identity.get("starttime"):
+                    return False, "PID_REUSED"
+                return True, "FALLBACK_VERIFIED"
+            except ProcessLookupError:
+                return False, "TARGET_EXITED"
+            except Exception as e:
+                return False, f"IDENTITY_CHECK_FAILED: {e}"
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        return {
+            "pidfd_supported": self.pidfd_supported,
+            "pidfd_used": self.pidfd_used,
+            "mitigation_mechanism": "PIDFD" if self.pidfd_used else "STAT_STARTTIME_CHECK_FALLBACK",
+            "fallback_caveat": (
+                None
+                if self.pidfd_used
+                else "Fallback starttime verification cannot guarantee complete immunity to kernel PID recycling races between stat read and signal delivery."
+            ),
+            "initial_identity": self.initial_identity,
+            "pre_signal_identity": self.pre_signal_identity,
+            "post_capture_identity": self.post_capture_identity,
+        }
+
+    def close(self) -> None:
+        if self.pidfd is not None:
+            try:
+                os.close(self.pidfd)
+            except Exception:
+                pass
+            self.pidfd = None
+        self.closed = True
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 
 def _get_process_identity(pid: int) -> Tuple[str, str]:
@@ -302,6 +572,35 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "can_read_memory": True,
             "atomicity": "NON_ATOMIC",
             "zero_stop_supported": True,
+            "syscall_suspends": False,
+            "suspension_method": "signal_external",
+            "mode_behaviors": {
+                "ZERO_STOP": {
+                    "suspends_process": False,
+                    "atomicity": "NON_ATOMIC",
+                    "description": "Zero-stop live capture: reads target memory without pausing process; snapshot is NOT atomic.",
+                },
+                "FULL": {
+                    "suspends_process": True,
+                    "atomicity": "CONDITIONAL_ON_STOP",
+                    "description": "Signals target with SIGSTOP; consistency depends on stop confirmation.",
+                },
+                "TARGETED": {
+                    "suspends_process": True,
+                    "atomicity": "CONDITIONAL_ON_STOP",
+                    "description": "Signals target with SIGSTOP; captures selected semantic ranges.",
+                },
+                "THREAD": {
+                    "suspends_process": True,
+                    "atomicity": "CONDITIONAL_ON_STOP",
+                    "description": "Signals target with SIGSTOP; captures thread stack memory.",
+                },
+                "OBJECT": {
+                    "suspends_process": True,
+                    "atomicity": "CONDITIONAL_ON_STOP",
+                    "description": "Signals target with SIGSTOP; captures object memory ranges.",
+                },
+            },
         }
 
     def is_available(self, pid: Optional[int] = None) -> bool:
@@ -329,20 +628,44 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         if not self.is_available(pid):
             raise RuntimeError(f"process_vm_readv is unavailable or target PID {pid} is not accessible")
 
-        # Verify target existence and capture initial process identity to prevent PID reuse races
-        comm, target_start_time = _get_process_identity(pid)
+        # Use ProcessTargetHandle for pidfd support and strict PID reuse mitigation
+        force_fb = getattr(policy, "force_fallback", False)
+        handle = ProcessTargetHandle(pid, force_fallback=force_fb)
+        handle.open()
+
+        initial_ident = handle.initial_identity
+        initial_threads = _get_threads_state(pid)
+        was_already_stopped = initial_ident.get("is_stopped", False)
+        is_tracing_stop = initial_ident.get("is_tracing_stop", False)
+        target_start_time = initial_ident.get("starttime", "0")
+        comm = initial_ident.get("comm", "unknown")
 
         sid = snapshot_id or "RS_{:06d}_{:04d}".format(pid, int(time.time() * 1000) % 10000)
         t_overall_start_ns = time.monotonic_ns()
         wall_clock_start = datetime.now(timezone.utc).isoformat()
-        
+
         # State machine tracking
         state_history = ["INITIALIZED"]
         capture_status = "COMPLETED"
         stop_requested = False
         stop_confirmed = False
         resume_confirmed = False
+        suspension_caused_by_capture = False
         diagnostics: List[Dict[str, Any]] = []
+
+        if is_tracing_stop:
+            diagnostics.append({
+                "code": "TRACING_STOP_OBSERVED",
+                "message": f"Process {pid} is in TRACING_STOP ('t'). It may be attached to a debugger/tracer. External signal control may conflict with tracer.",
+                "level": "WARNING"
+            })
+
+        if initial_threads.get("mixed_states"):
+            diagnostics.append({
+                "code": "MIXED_THREAD_STATES_AT_START",
+                "message": f"Process {pid} threads have heterogeneous states: {initial_threads['stopped_count']} stopped, {initial_threads['running_count']} active.",
+                "level": "INFO"
+            })
 
         # Read binary executable path and build_id
         exe_path = ""
@@ -375,7 +698,20 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         buffers: Dict[Tuple[int, int], bytes] = {}
         completeness = "COMPLETE"
 
+        # Determine suspension intent based on plan and preexisting state
         should_suspend = (plan.mode != CaptureMode.ZERO_STOP.value)
+        if plan.mode == CaptureMode.ZERO_STOP.value:
+            should_suspend = False
+            state_history.append("ZERO_STOP_MODE")
+        elif was_already_stopped:
+            should_suspend = False
+            stop_confirmed = True
+            state_history.append("PREEXISTING_STOP_PRESERVED")
+            diagnostics.append({
+                "code": "PREEXISTING_STOPPED_STATE_PRESERVED",
+                "message": f"Target process {pid} was already stopped ({initial_ident.get('state')}) before capture. SIGSTOP was skipped and SIGCONT will not be sent, preserving original stop state.",
+                "level": "INFO"
+            })
 
         # 0. Pre-read maps and pre-allocate capture buffers BEFORE suspending process
         all_maps = _read_proc_maps(pid)
@@ -464,25 +800,44 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         try:
             # 1. Ultra-short suspend
             if should_suspend:
-                # Verify target process identity immediately before sending signal
-                try:
-                    chk_comm, chk_start = _get_process_identity(pid)
-                    if chk_start != target_start_time:
-                        raise RuntimeError(f"Target PID {pid} was reused before suspension (expected {target_start_time}, got {chk_start})")
-                except ProcessLookupError:
-                    raise ProcessLookupError(f"Target process PID {pid} exited before suspension could occur")
-
                 state_history.append("STOP_REQUESTED")
                 stop_requested = True
+                suspension_caused_by_capture = True
                 t_stop_requested = time.monotonic_ns()
-                try:
-                    os.kill(pid, signal.SIGSTOP)
+
+                sig_ok, sig_err = handle.send_signal(signal.SIGSTOP)
+                if not sig_ok:
+                    if sig_err == "TARGET_EXITED":
+                        diagnostics.append({
+                            "code": "TARGET_EXITED_BEFORE_STOP",
+                            "message": f"Process {pid} exited before SIGSTOP delivered",
+                            "level": "ERROR"
+                        })
+                    elif sig_err == "PID_REUSED":
+                        diagnostics.append({
+                            "code": "PID_REUSED_STOP_ABORTED",
+                            "message": f"Target PID {pid} was reused; SIGSTOP aborted to prevent signalling unrelated process",
+                            "level": "ERROR"
+                        })
+                    elif sig_err == "PERMISSION_DENIED":
+                        diagnostics.append({
+                            "code": "STOP_PERMISSION_DENIED",
+                            "message": f"Permission denied (EPERM) delivering SIGSTOP to process {pid}",
+                            "level": "ERROR"
+                        })
+                    else:
+                        diagnostics.append({
+                            "code": "STOP_SIGNAL_ERROR",
+                            "message": f"SIGSTOP failed: {sig_err}",
+                            "level": "ERROR"
+                        })
+                else:
                     deadline_stop = t_stop_requested + int(policy.max_stop_time_ms * 1_000_000)
                     while time.monotonic_ns() < deadline_stop:
                         stat_path = f"/proc/{pid}/stat"
                         if os.path.exists(stat_path):
                             try:
-                                with open(stat_path, "r") as f:
+                                with open(stat_path, "r", encoding="utf-8") as f:
                                     content = f.read()
                                     rparen = content.rfind(")")
                                     if rparen != -1 and content[rparen + 1:].split()[0] in ("T", "t"):
@@ -494,18 +849,6 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                             os.sched_yield()
                         except Exception:
                             pass
-                except ProcessLookupError:
-                    diagnostics.append({
-                        "code": "TARGET_EXITED_BEFORE_STOP",
-                        "message": f"Process {pid} exited before SIGSTOP delivered",
-                        "level": "ERROR"
-                    })
-                except Exception as exc:
-                    diagnostics.append({
-                        "code": "STOP_SIGNAL_ERROR",
-                        "message": f"SIGSTOP failed: {exc}",
-                        "level": "ERROR"
-                    })
 
                 t_stop_confirmed = time.monotonic_ns()
                 if stop_confirmed:
@@ -514,7 +857,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     state_history.append("STOP_UNCONFIRMED")
                     diagnostics.append({
                         "code": "STOP_UNCONFIRMED",
-                        "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms",
+                        "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms. Memory captured under this condition is NON_ATOMIC.",
                         "level": "WARNING"
                     })
             else:
@@ -549,70 +892,91 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             t_memory = time.monotonic_ns()
 
         finally:
-            # 4. GUARANTEED FAIL-OPEN RESUME IMMEDIATELY WITH PID-REUSE SAFETY
-            if stop_requested:
-                state_history.append("RESUME_REQUESTED")
-                t_resume_requested = time.monotonic_ns()
-                still_same_process = False
-                try:
-                    res_comm, res_start = _get_process_identity(pid)
-                    if res_start == target_start_time:
+            try:
+                # 4. GUARANTEED FAIL-OPEN RESUME IMMEDIATELY WITH PID-REUSE SAFETY
+                if suspension_caused_by_capture:
+                    state_history.append("RESUME_REQUESTED")
+                    t_resume_requested = time.monotonic_ns()
+                    still_same_process = False
+                    is_same, ident_status = handle.verify_identity()
+                    if is_same:
                         still_same_process = True
                     else:
-                        diagnostics.append({
-                            "code": "PID_REUSED_RESUME_ABORTED",
-                            "message": f"PID {pid} was reused by process '{res_comm}'; SIGCONT aborted to prevent signalling unrelated process.",
-                            "level": "WARNING"
-                        })
-                except ProcessLookupError:
-                    diagnostics.append({
-                        "code": "TARGET_EXITED_DURING_CAPTURE",
-                        "message": f"Process {pid} exited during capture; inferior is no longer running.",
-                        "level": "INFO"
-                    })
+                        if ident_status == "PID_REUSED":
+                            diagnostics.append({
+                                "code": "PID_REUSED_RESUME_ABORTED",
+                                "message": f"PID {pid} was reused; SIGCONT aborted to prevent signalling unrelated process.",
+                                "level": "WARNING"
+                            })
+                        elif ident_status == "TARGET_EXITED":
+                            diagnostics.append({
+                                "code": "TARGET_EXITED_DURING_CAPTURE",
+                                "message": f"Process {pid} exited during capture; inferior is no longer running.",
+                                "level": "INFO"
+                            })
+                        else:
+                            diagnostics.append({
+                                "code": "IDENTITY_VERIFICATION_FAILED",
+                                "message": f"Process verification failed ({ident_status}); SIGCONT aborted.",
+                                "level": "WARNING"
+                            })
 
-                if still_same_process:
-                    try:
-                        os.kill(pid, signal.SIGCONT)
-                        # Poll briefly for resume confirmation
-                        deadline_res = t_resume_requested + int(20 * 1_000_000)
-                        while time.monotonic_ns() < deadline_res:
-                            stat_path = f"/proc/{pid}/stat"
-                            if os.path.exists(stat_path):
+                    if still_same_process:
+                        res_ok, res_err = handle.send_signal(signal.SIGCONT)
+                        if not res_ok:
+                            if res_err == "TARGET_EXITED":
+                                diagnostics.append({
+                                    "code": "TARGET_EXITED_BEFORE_RESUME",
+                                    "message": f"Process {pid} exited before SIGCONT delivered.",
+                                    "level": "INFO"
+                                })
+                            elif res_err == "PERMISSION_DENIED":
+                                diagnostics.append({
+                                    "code": "RESUME_PERMISSION_DENIED",
+                                    "message": f"Permission denied delivering SIGCONT to process {pid}.",
+                                    "level": "ERROR"
+                                })
+                            else:
+                                diagnostics.append({
+                                    "code": "RESUME_SIGNAL_ERROR",
+                                    "message": f"SIGCONT failed: {res_err}",
+                                    "level": "ERROR"
+                                })
+                        else:
+                            # Poll briefly for resume confirmation
+                            deadline_res = t_resume_requested + int(20 * 1_000_000)
+                            while time.monotonic_ns() < deadline_res:
+                                stat_path = f"/proc/{pid}/stat"
+                                if os.path.exists(stat_path):
+                                    try:
+                                        with open(stat_path, "r", encoding="utf-8") as f:
+                                            content = f.read()
+                                            rparen = content.rfind(")")
+                                            if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
+                                                resume_confirmed = True
+                                                break
+                                    except Exception:
+                                        pass
                                 try:
-                                    with open(stat_path, "r") as f:
-                                        content = f.read()
-                                        rparen = content.rfind(")")
-                                        if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
-                                            resume_confirmed = True
-                                            break
+                                    os.sched_yield()
                                 except Exception:
                                     pass
-                            try:
-                                os.sched_yield()
-                            except Exception:
-                                pass
-                    except ProcessLookupError:
-                        diagnostics.append({
-                            "code": "TARGET_EXITED_BEFORE_RESUME",
-                            "message": f"Process {pid} exited before SIGCONT delivered.",
-                            "level": "INFO"
-                        })
-                    except Exception as exc:
-                        diagnostics.append({
-                            "code": "RESUME_SIGNAL_ERROR",
-                            "message": f"SIGCONT failed: {exc}",
-                            "level": "ERROR"
-                        })
 
-                t_resume_confirmed = time.monotonic_ns()
-                if resume_confirmed:
-                    state_history.append("RESUME_CONFIRMED")
+                    t_resume_confirmed = time.monotonic_ns()
+                    if resume_confirmed:
+                        state_history.append("RESUME_CONFIRMED")
+                    else:
+                        state_history.append("RESUME_UNCONFIRMED")
+                elif was_already_stopped:
+                    # Target was already stopped before capture; preserve existing stopped state!
+                    state_history.append("PREEXISTING_STOP_RETAINED")
+                    t_resume_requested = t_memory
+                    t_resume_confirmed = t_memory
                 else:
-                    state_history.append("RESUME_UNCONFIRMED")
-            else:
-                t_resume_requested = t_memory
-                t_resume_confirmed = t_memory
+                    t_resume_requested = t_memory
+                    t_resume_confirmed = t_memory
+            finally:
+                handle.close()
 
         wall_clock_end = datetime.now(timezone.utc).isoformat()
 
@@ -662,7 +1026,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         if captured_bytes_total == 0 and selected_maps:
             capture_status = "FAILED"
             completeness = "FAILED"
-        elif failed_count > 0 or partial_count > 0 or omitted_count > 0 or not stop_confirmed:
+        elif failed_count > 0 or partial_count > 0 or omitted_count > 0 or (should_suspend and not stop_confirmed):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
         else:
@@ -670,12 +1034,19 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             completeness = "COMPLETE"
 
         # Honest consistency classification:
-        # process_vm_readv itself never pauses target threads; if SIGSTOP was confirmed,
-        # execution skew was reduced, but kernel-level multi-threaded pause atomicity cannot be guaranteed.
-        if not should_suspend or not stop_confirmed:
+        if plan.mode == CaptureMode.ZERO_STOP.value:
             consistency_classification = "NON_ATOMIC"
-        else:
+        elif was_already_stopped:
+            consistency_classification = "PREEXISTING_STOPPED"
+        elif should_suspend and stop_confirmed:
             consistency_classification = "SIGNAL_STOPPED"
+        else:
+            consistency_classification = "NON_ATOMIC"
+
+        if consistency_classification in ("SIGNAL_STOPPED", "PREEXISTING_STOPPED") and completeness == "COMPLETE":
+            snapshot_consistency = "PROCESS_STOPPED_MEMORY_SNAPSHOT"
+        else:
+            snapshot_consistency = "NON_ATOMIC"
 
         # Compute exact measured microsecond and millisecond latencies
         stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if should_suspend else 0.0
@@ -706,7 +1077,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "capture_mode": plan.mode,
             "capture_status": capture_status,
             "consistency_classification": consistency_classification,
-            "stop_mechanism": "SIGSTOP" if should_suspend else "NONE",
+            "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
             "bytes_requested": total_planned_bytes,
             "bytes_read": captured_bytes_total,
             "bytes_omitted": sum(r["size"] for r in omitted_regions),
@@ -714,13 +1085,20 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
             "regions_failed": failed_count,
             "regions_omitted": omitted_count,
-            "stopped_threads": stop_confirmed if should_suspend else False,
+            "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
+            "was_already_stopped": was_already_stopped,
+            "suspension_caused_by_capture": suspension_caused_by_capture,
+            "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
                 "states": state_history,
                 "stop_confirmed": stop_confirmed,
                 "resume_confirmed": resume_confirmed,
+                "was_already_stopped": was_already_stopped,
+                "suspension_caused_by_capture": suspension_caused_by_capture,
                 "current": state_history[-1],
             },
+            "initial_process_state": initial_ident,
+            "initial_threads_state": initial_threads,
             "capture_start": wall_clock_start,
             "capture_end": wall_clock_end,
             "stop_requested": wall_clock_start,
@@ -734,14 +1112,19 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         provenance = {
             "capture_backend": self.name,
             "capture_status": capture_status,
-            "snapshot_consistency": "PROCESS_STOPPED_MEMORY_SNAPSHOT" if stop_confirmed else "NON_ATOMIC",
+            "snapshot_consistency": snapshot_consistency,
             "consistency_classification": consistency_classification,
-            "stop_mechanism": "SIGSTOP" if should_suspend else "NONE",
-            "stopped_threads": stop_confirmed if should_suspend else False,
+            "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
+            "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
+            "was_already_stopped": was_already_stopped,
+            "suspension_caused_by_capture": suspension_caused_by_capture,
+            "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
                 "states": state_history,
                 "stop_confirmed": stop_confirmed,
                 "resume_confirmed": resume_confirmed,
+                "was_already_stopped": was_already_stopped,
+                "suspension_caused_by_capture": suspension_caused_by_capture,
             },
             "pid": pid,
             "timestamp": wall_clock_start,
@@ -814,6 +1197,35 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "can_read_memory": True,
             "atomicity": "NON_ATOMIC",
             "zero_stop_supported": True,
+            "syscall_suspends": False,
+            "suspension_method": "signal_external",
+            "mode_behaviors": {
+                "ZERO_STOP": {
+                    "suspends_process": False,
+                    "atomicity": "NON_ATOMIC",
+                    "description": "Zero-stop live capture via procfs: reads /proc/<pid>/mem without pausing process; snapshot is NOT atomic.",
+                },
+                "FULL": {
+                    "suspends_process": True,
+                    "atomicity": "CONDITIONAL_ON_STOP",
+                    "description": "Signals target with SIGSTOP; consistency depends on stop confirmation.",
+                },
+                "TARGETED": {
+                    "suspends_process": True,
+                    "atomicity": "CONDITIONAL_ON_STOP",
+                    "description": "Signals target with SIGSTOP; captures selected semantic ranges.",
+                },
+                "THREAD": {
+                    "suspends_process": True,
+                    "atomicity": "CONDITIONAL_ON_STOP",
+                    "description": "Signals target with SIGSTOP; captures thread stack memory.",
+                },
+                "OBJECT": {
+                    "suspends_process": True,
+                    "atomicity": "CONDITIONAL_ON_STOP",
+                    "description": "Signals target with SIGSTOP; captures object memory ranges.",
+                },
+            },
         }
 
     def is_available(self, pid: Optional[int] = None) -> bool:
@@ -833,20 +1245,43 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         plan = plan or CapturePlan()
         policy = policy or CaptureSafetyPolicy()
 
-        # Check process existence and establish target identity
-        comm, target_start_time = _get_process_identity(pid)
+        # Check process existence and establish target identity with ProcessTargetHandle
+        force_fb = getattr(policy, "force_fallback", False)
+        handle = ProcessTargetHandle(pid, force_fallback=force_fb)
+        handle.open()
+
+        initial_ident = handle.initial_identity
+        initial_threads = _get_threads_state(pid)
+        was_already_stopped = initial_ident.get("is_stopped", False)
+        is_tracing_stop = initial_ident.get("is_tracing_stop", False)
+        target_start_time = initial_ident.get("starttime", "0")
+        comm = initial_ident.get("comm", "unknown")
 
         sid = snapshot_id or "RS_{:06d}_{:04d}".format(pid, int(time.time() * 1000) % 10000)
         t_overall_start_ns = time.monotonic_ns()
         wall_clock_start = datetime.now(timezone.utc).isoformat()
-        should_suspend = (plan.mode != CaptureMode.ZERO_STOP.value)
 
         state_history = ["INITIALIZED"]
         capture_status = "COMPLETED"
         stop_requested = False
         stop_confirmed = False
         resume_confirmed = False
+        suspension_caused_by_capture = False
         diagnostics: List[Dict[str, Any]] = []
+
+        if is_tracing_stop:
+            diagnostics.append({
+                "code": "TRACING_STOP_OBSERVED",
+                "message": f"Process {pid} is in TRACING_STOP ('t'). It may be attached to a debugger/tracer. External signal control may conflict with tracer.",
+                "level": "WARNING"
+            })
+
+        if initial_threads.get("mixed_states"):
+            diagnostics.append({
+                "code": "MIXED_THREAD_STATES_AT_START",
+                "message": f"Process {pid} threads have heterogeneous states: {initial_threads['stopped_count']} stopped, {initial_threads['running_count']} active.",
+                "level": "INFO"
+            })
 
         exe_path = ""
         try:
@@ -871,6 +1306,21 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         t_memory = 0
         t_resume_requested = 0
         t_resume_confirmed = 0
+
+        # Determine suspension intent based on plan and preexisting state
+        should_suspend = (plan.mode != CaptureMode.ZERO_STOP.value)
+        if plan.mode == CaptureMode.ZERO_STOP.value:
+            should_suspend = False
+            state_history.append("ZERO_STOP_MODE")
+        elif was_already_stopped:
+            should_suspend = False
+            stop_confirmed = True
+            state_history.append("PREEXISTING_STOP_PRESERVED")
+            diagnostics.append({
+                "code": "PREEXISTING_STOPPED_STATE_PRESERVED",
+                "message": f"Target process {pid} was already stopped ({initial_ident.get('state')}) before capture. SIGSTOP was skipped and SIGCONT will not be sent, preserving original stop state.",
+                "level": "INFO"
+            })
 
         # Pre-read maps and plan bounded capture
         all_maps = _read_proc_maps(pid)
@@ -928,24 +1378,44 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
 
         try:
             if should_suspend:
-                try:
-                    chk_comm, chk_start = _get_process_identity(pid)
-                    if chk_start != target_start_time:
-                        raise RuntimeError(f"Target PID {pid} was reused before suspension (expected {target_start_time}, got {chk_start})")
-                except ProcessLookupError:
-                    raise ProcessLookupError(f"Target process PID {pid} exited before suspension")
-
                 state_history.append("STOP_REQUESTED")
                 stop_requested = True
+                suspension_caused_by_capture = True
                 t_stop_requested = time.monotonic_ns()
-                try:
-                    os.kill(pid, signal.SIGSTOP)
+
+                sig_ok, sig_err = handle.send_signal(signal.SIGSTOP)
+                if not sig_ok:
+                    if sig_err == "TARGET_EXITED":
+                        diagnostics.append({
+                            "code": "TARGET_EXITED_BEFORE_STOP",
+                            "message": f"Process {pid} exited before SIGSTOP delivered",
+                            "level": "ERROR"
+                        })
+                    elif sig_err == "PID_REUSED":
+                        diagnostics.append({
+                            "code": "PID_REUSED_STOP_ABORTED",
+                            "message": f"Target PID {pid} was reused; SIGSTOP aborted to prevent signalling unrelated process",
+                            "level": "ERROR"
+                        })
+                    elif sig_err == "PERMISSION_DENIED":
+                        diagnostics.append({
+                            "code": "STOP_PERMISSION_DENIED",
+                            "message": f"Permission denied (EPERM) delivering SIGSTOP to process {pid}",
+                            "level": "ERROR"
+                        })
+                    else:
+                        diagnostics.append({
+                            "code": "STOP_SIGNAL_ERROR",
+                            "message": f"SIGSTOP failed: {sig_err}",
+                            "level": "ERROR"
+                        })
+                else:
                     deadline_stop = t_stop_requested + int(policy.max_stop_time_ms * 1_000_000)
                     while time.monotonic_ns() < deadline_stop:
                         stat_path = f"/proc/{pid}/stat"
                         if os.path.exists(stat_path):
                             try:
-                                with open(stat_path, "r") as f:
+                                with open(stat_path, "r", encoding="utf-8") as f:
                                     content = f.read()
                                     rparen = content.rfind(")")
                                     if rparen != -1 and content[rparen + 1:].split()[0] in ("T", "t"):
@@ -957,18 +1427,6 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                             os.sched_yield()
                         except Exception:
                             pass
-                except ProcessLookupError:
-                    diagnostics.append({
-                        "code": "TARGET_EXITED_BEFORE_STOP",
-                        "message": f"Process {pid} exited before SIGSTOP delivered",
-                        "level": "ERROR"
-                    })
-                except Exception as exc:
-                    diagnostics.append({
-                        "code": "STOP_SIGNAL_ERROR",
-                        "message": f"SIGSTOP failed: {exc}",
-                        "level": "ERROR"
-                    })
 
                 t_stop_confirmed = time.monotonic_ns()
                 if stop_confirmed:
@@ -977,7 +1435,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                     state_history.append("STOP_UNCONFIRMED")
                     diagnostics.append({
                         "code": "STOP_UNCONFIRMED",
-                        "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms",
+                        "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms. Memory captured under this condition is NON_ATOMIC.",
                         "level": "WARNING"
                     })
             else:
@@ -1048,68 +1506,88 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
 
             t_memory = time.monotonic_ns()
         finally:
-            if stop_requested:
-                state_history.append("RESUME_REQUESTED")
-                t_resume_requested = time.monotonic_ns()
-                still_same_process = False
-                try:
-                    res_comm, res_start = _get_process_identity(pid)
-                    if res_start == target_start_time:
+            try:
+                if suspension_caused_by_capture:
+                    state_history.append("RESUME_REQUESTED")
+                    t_resume_requested = time.monotonic_ns()
+                    still_same_process = False
+                    is_same, ident_status = handle.verify_identity()
+                    if is_same:
                         still_same_process = True
                     else:
-                        diagnostics.append({
-                            "code": "PID_REUSED_RESUME_ABORTED",
-                            "message": f"PID {pid} was reused by process '{res_comm}'; SIGCONT aborted to prevent signalling unrelated process.",
-                            "level": "WARNING"
-                        })
-                except ProcessLookupError:
-                    diagnostics.append({
-                        "code": "TARGET_EXITED_DURING_CAPTURE",
-                        "message": f"Process {pid} exited during capture; inferior is no longer running.",
-                        "level": "INFO"
-                    })
+                        if ident_status == "PID_REUSED":
+                            diagnostics.append({
+                                "code": "PID_REUSED_RESUME_ABORTED",
+                                "message": f"PID {pid} was reused; SIGCONT aborted to prevent signalling unrelated process.",
+                                "level": "WARNING"
+                            })
+                        elif ident_status == "TARGET_EXITED":
+                            diagnostics.append({
+                                "code": "TARGET_EXITED_DURING_CAPTURE",
+                                "message": f"Process {pid} exited during capture; inferior is no longer running.",
+                                "level": "INFO"
+                            })
+                        else:
+                            diagnostics.append({
+                                "code": "IDENTITY_VERIFICATION_FAILED",
+                                "message": f"Process verification failed ({ident_status}); SIGCONT aborted.",
+                                "level": "WARNING"
+                            })
 
-                if still_same_process:
-                    try:
-                        os.kill(pid, signal.SIGCONT)
-                        deadline_res = t_resume_requested + int(20 * 1_000_000)
-                        while time.monotonic_ns() < deadline_res:
-                            stat_path = f"/proc/{pid}/stat"
-                            if os.path.exists(stat_path):
+                    if still_same_process:
+                        res_ok, res_err = handle.send_signal(signal.SIGCONT)
+                        if not res_ok:
+                            if res_err == "TARGET_EXITED":
+                                diagnostics.append({
+                                    "code": "TARGET_EXITED_BEFORE_RESUME",
+                                    "message": f"Process {pid} exited before SIGCONT delivered.",
+                                    "level": "INFO"
+                                })
+                            elif res_err == "PERMISSION_DENIED":
+                                diagnostics.append({
+                                    "code": "RESUME_PERMISSION_DENIED",
+                                    "message": f"Permission denied delivering SIGCONT to process {pid}.",
+                                    "level": "ERROR"
+                                })
+                            else:
+                                diagnostics.append({
+                                    "code": "RESUME_SIGNAL_ERROR",
+                                    "message": f"SIGCONT failed: {res_err}",
+                                    "level": "ERROR"
+                                })
+                        else:
+                            deadline_res = t_resume_requested + int(20 * 1_000_000)
+                            while time.monotonic_ns() < deadline_res:
+                                stat_path = f"/proc/{pid}/stat"
+                                if os.path.exists(stat_path):
+                                    try:
+                                        with open(stat_path, "r", encoding="utf-8") as f:
+                                            content_stat = f.read()
+                                            rparen = content_stat.rfind(")")
+                                            if rparen != -1 and content_stat[rparen + 1:].split()[0] not in ("T", "t"):
+                                                resume_confirmed = True
+                                                break
+                                    except Exception:
+                                        pass
                                 try:
-                                    with open(stat_path, "r") as f:
-                                        content = f.read()
-                                        rparen = content.rfind(")")
-                                        if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
-                                            resume_confirmed = True
-                                            break
+                                    os.sched_yield()
                                 except Exception:
                                     pass
-                            try:
-                                os.sched_yield()
-                            except Exception:
-                                pass
-                    except ProcessLookupError:
-                        diagnostics.append({
-                            "code": "TARGET_EXITED_BEFORE_RESUME",
-                            "message": f"Process {pid} exited before SIGCONT delivered.",
-                            "level": "INFO"
-                        })
-                    except Exception as exc:
-                        diagnostics.append({
-                            "code": "RESUME_SIGNAL_ERROR",
-                            "message": f"SIGCONT failed: {exc}",
-                            "level": "ERROR"
-                        })
 
-                t_resume_confirmed = time.monotonic_ns()
-                if resume_confirmed:
-                    state_history.append("RESUME_CONFIRMED")
+                    t_resume_confirmed = time.monotonic_ns()
+                    if resume_confirmed:
+                        state_history.append("RESUME_CONFIRMED")
+                    else:
+                        state_history.append("RESUME_UNCONFIRMED")
+                elif was_already_stopped:
+                    state_history.append("PREEXISTING_STOP_RETAINED")
+                    t_resume_requested = t_memory
+                    t_resume_confirmed = t_memory
                 else:
-                    state_history.append("RESUME_UNCONFIRMED")
-            else:
-                t_resume_requested = t_memory
-                t_resume_confirmed = t_memory
+                    t_resume_requested = t_memory
+                    t_resume_confirmed = t_memory
+            finally:
+                handle.close()
 
         wall_clock_end = datetime.now(timezone.utc).isoformat()
 
@@ -1131,10 +1609,19 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             capture_status = "COMPLETED"
             completeness = "COMPLETE"
 
-        if not should_suspend or not stop_confirmed:
+        if plan.mode == CaptureMode.ZERO_STOP.value:
             consistency_classification = "NON_ATOMIC"
-        else:
+        elif was_already_stopped:
+            consistency_classification = "PREEXISTING_STOPPED"
+        elif should_suspend and stop_confirmed:
             consistency_classification = "SIGNAL_STOPPED"
+        else:
+            consistency_classification = "NON_ATOMIC"
+
+        if consistency_classification in ("SIGNAL_STOPPED", "PREEXISTING_STOPPED") and completeness == "COMPLETE":
+            snapshot_consistency = "PROCESS_STOPPED_MEMORY_SNAPSHOT"
+        else:
+            snapshot_consistency = "NON_ATOMIC"
 
         stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if should_suspend else 0.0
         thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
@@ -1164,7 +1651,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "capture_mode": plan.mode,
             "capture_status": capture_status,
             "consistency_classification": consistency_classification,
-            "stop_mechanism": "SIGSTOP" if should_suspend else "NONE",
+            "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
             "bytes_requested": total_planned_bytes,
             "bytes_read": captured_bytes_total,
             "bytes_omitted": sum(r["size"] for r in omitted_regions),
@@ -1172,13 +1659,20 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
             "regions_failed": failed_count,
             "regions_omitted": omitted_count,
-            "stopped_threads": stop_confirmed if should_suspend else False,
+            "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
+            "was_already_stopped": was_already_stopped,
+            "suspension_caused_by_capture": suspension_caused_by_capture,
+            "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
                 "states": state_history,
                 "stop_confirmed": stop_confirmed,
                 "resume_confirmed": resume_confirmed,
+                "was_already_stopped": was_already_stopped,
+                "suspension_caused_by_capture": suspension_caused_by_capture,
                 "current": state_history[-1],
             },
+            "initial_process_state": initial_ident,
+            "thread_state_analysis": initial_threads,
             "capture_start": wall_clock_start,
             "capture_end": wall_clock_end,
             "stop_requested": wall_clock_start,
@@ -1192,14 +1686,19 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         provenance = {
             "capture_backend": self.name,
             "capture_status": capture_status,
-            "snapshot_consistency": "PROCESS_STOPPED_MEMORY_SNAPSHOT" if stop_confirmed else "NON_ATOMIC",
+            "snapshot_consistency": snapshot_consistency,
             "consistency_classification": consistency_classification,
-            "stop_mechanism": "SIGSTOP" if should_suspend else "NONE",
-            "stopped_threads": stop_confirmed if should_suspend else False,
+            "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
+            "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
+            "was_already_stopped": was_already_stopped,
+            "suspension_caused_by_capture": suspension_caused_by_capture,
+            "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
                 "states": state_history,
                 "stop_confirmed": stop_confirmed,
                 "resume_confirmed": resume_confirmed,
+                "was_already_stopped": was_already_stopped,
+                "suspension_caused_by_capture": suspension_caused_by_capture,
             },
             "pid": pid,
             "timestamp": wall_clock_start,

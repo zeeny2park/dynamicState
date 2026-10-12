@@ -67,28 +67,44 @@ class StateDiffEngine:
         identity_meta = self.matcher.metadata()
         for key in sorted(objects_b.keys() - objects_a.keys()):
             obj = objects_b[key]
-            changes.append({"kind": "object_created", "object_id": obj.get("object_id"),
-                            "type": obj.get("type"), "address": obj.get("address"),
-                            "identity": identity_meta,
-                            "identity_confidence": "low"})
+            addr = obj.get("address")
+            typ = obj.get("type")
+            is_uncertain = (addr is None or typ is None or addr == 0 or str(addr) in ("0", "None", ""))
+            confidence = "uncertain" if is_uncertain else identity_meta.get("confidence", "low")
+            changes.append({
+                "kind": "object_created",
+                "object_id": obj.get("object_id"),
+                "type": obj.get("type"),
+                "address": obj.get("address"),
+                "identity": identity_meta,
+                "identity_confidence": confidence,
+            })
         for key in sorted(objects_a.keys() - objects_b.keys()):
             obj = objects_a[key]
-            changes.append({"kind": "object_removed", "object_id": obj.get("object_id"),
-                            "type": obj.get("type"), "address": obj.get("address"),
-                            "identity": identity_meta,
-                            "identity_confidence": "low"})
+            addr = obj.get("address")
+            typ = obj.get("type")
+            is_uncertain = (addr is None or typ is None or addr == 0 or str(addr) in ("0", "None", ""))
+            confidence = "uncertain" if is_uncertain else identity_meta.get("confidence", "low")
+            changes.append({
+                "kind": "object_removed",
+                "object_id": obj.get("object_id"),
+                "type": obj.get("type"),
+                "address": obj.get("address"),
+                "identity": identity_meta,
+                "identity_confidence": confidence,
+            })
         for key in sorted(objects_a.keys() & objects_b.keys()):
             added, compared = self._diff_object(objects_a[key], objects_b[key], objects_a, objects_b, identity_meta)
             changes.extend(added)
             fields_compared += compared
         changes.extend(self._execution_changes(a, b))
         summary = {
-            "value_changes": sum(c["kind"] == "value_change" for c in changes),
-            "availability_changes": sum(c["kind"] in ("availability_change", "field_unavailable") for c in changes),
-            "objects_created": sum(c["kind"] in ("object_created", "field_added") for c in changes),
-            "objects_removed": sum(c["kind"] in ("object_removed", "field_unavailable") for c in changes),
-            "fields_unavailable": sum(c["kind"] == "field_unavailable" for c in changes),
+            "objects_created": sum(c["kind"] == "object_created" for c in changes),
+            "objects_removed": sum(c["kind"] == "object_removed" for c in changes),
             "fields_added": sum(c["kind"] == "field_added" for c in changes),
+            "fields_unavailable": sum(c["kind"] == "field_unavailable" for c in changes),
+            "availability_changes": sum(c["kind"] == "availability_change" for c in changes),
+            "value_changes": sum(c["kind"] == "value_change" for c in changes),
             "reference_changes": sum(c["kind"] == "reference_change" for c in changes),
             "execution_changes": sum(c["kind"] == "execution_change" for c in changes),
         }

@@ -31,6 +31,36 @@ IDENTITY_TARGET_ID_UNAVAILABLE = "TARGET_ID_UNAVAILABLE"
 IDENTITY_DEBUG_ID_UNAVAILABLE = "DEBUG_ID_UNAVAILABLE"
 IDENTITY_INCOMPLETE = "INCOMPLETE"
 
+from dataclasses import asdict, dataclass
+
+# Evidence level constants
+EVIDENCE_LEVEL_OBSERVED = "observed"
+EVIDENCE_LEVEL_STATIC = "static"
+EVIDENCE_LEVEL_INDIRECT = "indirect"
+EVIDENCE_LEVEL_UNKNOWN = "unknown"
+
+LAYOUT_MUTATION_CAVEAT = (
+    "DWARF member declaration specifies struct memory layout only; "
+    "it does NOT prove where this field was mutated at runtime."
+)
+
+
+@dataclass
+class FunctionCandidate:
+    """Represents a candidate function correlated to an object or field."""
+    function_name: str
+    source_location: Optional[str]
+    related_target: str
+    reason: str
+    evidence_level: str  # "observed", "static", "indirect", "unknown"
+    basis_source: str
+    limitations: str
+    thread_id: Optional[Union[int, str]] = None
+    frame_level: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 def validate_module_identity(
     target_build_id: Optional[str],
@@ -564,3 +594,196 @@ def get_static_provider(
     elif backend == "dwarf":
         return DwarfStaticAnalysisProvider(debug_artifact_path)
     return NullStaticAnalysisProvider()
+
+
+def resolve_function_candidates(
+    target_object: Dict[str, Any],
+    target_field: Optional[Union[Dict[str, Any], str]] = None,
+    snapshot: Optional[Dict[str, Any]] = None,
+    static_provider: Optional[StaticAnalysisProvider] = None,
+) -> Dict[str, Any]:
+    """Correlate candidate functions to a target C++ object and field with explicit evidence levels.
+
+    Assigns one of four grounded evidence tiers:
+    - observed: Function was actively observed on a thread call stack in this runtime snapshot.
+    - static: Function is a DWARF member function of the class or has a direct static reference in disassembly.
+    - indirect: Function is a caller/callee of candidate functions in the static call graph.
+    - unknown: Symbol match without verified DWARF debug information or unverified module Build ID.
+
+    Crucial Caveat:
+    DWARF member declaration lines specify struct memory layout only; they do NOT prove where
+    this field was mutated at runtime.
+    """
+    obj_type = target_object.get("type") or target_object.get("canonical_type") or ""
+    clean_type = re.sub(r"\b(struct|class|enum)\s+", "", str(obj_type)).strip()
+    obj_id = target_object.get("object_id", "")
+    obj_name = target_object.get("display_name") or target_object.get("semantic_name") or target_object.get("name") or obj_id
+
+    field_name: Optional[str] = None
+    field_decl_file: Optional[str] = None
+    field_decl_line: Optional[int] = None
+    if isinstance(target_field, dict):
+        field_name = target_field.get("name")
+        field_decl_file = target_field.get("decl_file")
+        field_decl_line = target_field.get("decl_line")
+    elif target_field:
+        field_name = str(target_field)
+
+    # If field_name was given as str, try finding it in target_object["fields"]
+    if field_name and not field_decl_file:
+        for f in target_object.get("fields", []):
+            if isinstance(f, dict) and f.get("name") == field_name:
+                field_decl_file = f.get("decl_file")
+                field_decl_line = f.get("decl_line")
+                break
+
+    related_target = f"{clean_type}.{field_name}" if field_name else clean_type
+
+    raw_candidates: List[FunctionCandidate] = []
+
+    # 1. Check runtime snapshot execution context for OBSERVED evidence
+    if snapshot:
+        snap_dict = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+        s_inner = snap_dict.get("snapshot", snap_dict)
+        execution = snap_dict.get("execution") or s_inner.get("execution") or {}
+        threads = execution.get("threads") or []
+        for t in threads:
+            t_id = t.get("thread_id", "unknown")
+            frames = t.get("frames") or []
+            for fr in frames:
+                fn_name = fr.get("function") or fr.get("name")
+                if not fn_name:
+                    continue
+                loc = fr.get("location") or fr.get("source_location")
+                lvl = fr.get("level", 0)
+
+                # Direct match to type or field
+                is_type_match = bool(clean_type and (clean_type in fn_name or fn_name.startswith(f"{clean_type}::")))
+                is_field_match = bool(field_name and field_name in fn_name)
+
+                if is_type_match or is_field_match:
+                    raw_candidates.append(FunctionCandidate(
+                        function_name=fn_name,
+                        source_location=loc,
+                        related_target=related_target,
+                        reason=f"Active on Thread {t_id} call stack (frame {lvl}) associated with {clean_type}",
+                        evidence_level=EVIDENCE_LEVEL_OBSERVED,
+                        basis_source="thread_call_stack",
+                        limitations="Observed active on thread call stack; runtime mutation of this specific field remains unverified.",
+                        thread_id=t_id,
+                        frame_level=lvl,
+                    ))
+                else:
+                    raw_candidates.append(FunctionCandidate(
+                        function_name=fn_name,
+                        source_location=loc,
+                        related_target=f"Thread {t_id}",
+                        reason=f"Active on Thread {t_id} call stack (frame {lvl}) during capture",
+                        evidence_level=EVIDENCE_LEVEL_OBSERVED,
+                        basis_source="thread_call_stack",
+                        limitations="Observed active on thread call stack; structural association with target object is unverified.",
+                        thread_id=t_id,
+                        frame_level=lvl,
+                    ))
+
+    # 2. Check Static Provider (DWARF Index & Disassembly) for STATIC and INDIRECT evidence
+    if static_provider and static_provider.is_available():
+        # A) Check subprograms in DWARF index
+        if hasattr(static_provider, "_get_index"):
+            idx = static_provider._get_index()
+            if idx and hasattr(idx, "subprograms"):
+                for subp in idx.subprograms:
+                    s_name = subp.name
+                    if not s_name:
+                        continue
+                    loc = f"{subp.decl_file}:{subp.decl_line}" if (subp.decl_file and subp.decl_line) else None
+                    if clean_type and (s_name.startswith(f"{clean_type}::") or f"::{clean_type}::" in s_name):
+                        raw_candidates.append(FunctionCandidate(
+                            function_name=s_name,
+                            source_location=loc,
+                            related_target=related_target,
+                            reason=f"Class member function of '{clean_type}' declared in DWARF",
+                            evidence_level=EVIDENCE_LEVEL_STATIC,
+                            basis_source="dwarf_subprogram_scope",
+                            limitations="Class member function declared in DWARF; runtime execution or field mutation in this snapshot is not verified.",
+                        ))
+                    elif s_name == clean_type:  # Constructor
+                        raw_candidates.append(FunctionCandidate(
+                            function_name=f"{clean_type}::{s_name}",
+                            source_location=loc,
+                            related_target=related_target,
+                            reason=f"Constructor for class '{clean_type}' declared in DWARF",
+                            evidence_level=EVIDENCE_LEVEL_STATIC,
+                            basis_source="dwarf_subprogram_scope",
+                            limitations="Constructor declared in DWARF; runtime execution in this snapshot is not verified.",
+                        ))
+
+        # B) Check Static References (disassembly)
+        query_sym = field_name or clean_type
+        if query_sym:
+            refs = static_provider.find_references(query_sym)
+            for r in refs:
+                caller = r.get("caller_function")
+                if caller:
+                    raw_candidates.append(FunctionCandidate(
+                        function_name=caller,
+                        source_location=r.get("source_location"),
+                        related_target=related_target,
+                        reason=f"Static reference to '{query_sym}' in disassembly",
+                        evidence_level=EVIDENCE_LEVEL_STATIC,
+                        basis_source="disassembly_reference",
+                        limitations="Static reference in binary disassembly; runtime execution of this instruction path is unverified.",
+                    ))
+                    # C) Check Call relationships for INDIRECT candidates
+                    call_rel = static_provider.get_call_relationships(caller)
+                    for indirect_caller in call_rel.get("callers", []):
+                        if indirect_caller != caller:
+                            raw_candidates.append(FunctionCandidate(
+                                function_name=indirect_caller,
+                                source_location=None,
+                                related_target=caller,
+                                reason=f"Caller of candidate function '{caller}' in static call graph",
+                                evidence_level=EVIDENCE_LEVEL_INDIRECT,
+                                basis_source="call_graph_reference",
+                                limitations="Indirect relationship via static call graph; execution path unverified in this snapshot.",
+                            ))
+
+    # 3. Deduplication by function_name prioritizing tier: observed > static > indirect > unknown
+    tier_order = {
+        EVIDENCE_LEVEL_OBSERVED: 0,
+        EVIDENCE_LEVEL_STATIC: 1,
+        EVIDENCE_LEVEL_INDIRECT: 2,
+        EVIDENCE_LEVEL_UNKNOWN: 3,
+    }
+
+    best_by_name: Dict[str, FunctionCandidate] = {}
+    for cand in raw_candidates:
+        fn = cand.function_name
+        if fn not in best_by_name:
+            best_by_name[fn] = cand
+        else:
+            cur_tier = tier_order.get(best_by_name[fn].evidence_level, 99)
+            new_tier = tier_order.get(cand.evidence_level, 99)
+            if new_tier < cur_tier:
+                best_by_name[fn] = cand
+
+    # Sort candidates by tier order, then function_name
+    deduped = sorted(best_by_name.values(), key=lambda c: (tier_order.get(c.evidence_level, 99), c.function_name))
+
+    return {
+        "target_object_id": obj_id,
+        "target_object_name": obj_name,
+        "target_type": clean_type,
+        "target_field": field_name,
+        "field_decl_file": field_decl_file,
+        "field_decl_line": field_decl_line,
+        "layout_caveat": LAYOUT_MUTATION_CAVEAT,
+        "candidates": [c.to_dict() for c in deduped],
+        "total_candidates": len(deduped),
+        "counts_by_tier": {
+            EVIDENCE_LEVEL_OBSERVED: sum(1 for c in deduped if c.evidence_level == EVIDENCE_LEVEL_OBSERVED),
+            EVIDENCE_LEVEL_STATIC: sum(1 for c in deduped if c.evidence_level == EVIDENCE_LEVEL_STATIC),
+            EVIDENCE_LEVEL_INDIRECT: sum(1 for c in deduped if c.evidence_level == EVIDENCE_LEVEL_INDIRECT),
+            EVIDENCE_LEVEL_UNKNOWN: sum(1 for c in deduped if c.evidence_level == EVIDENCE_LEVEL_UNKNOWN),
+        },
+    }

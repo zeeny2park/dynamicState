@@ -37,10 +37,20 @@
     activeInvestigation: null,
     selectedInvestigationId: null,
     investigationFindingFilter: 'all',
+    currentLang: 'en',
+    navHistory: [],
+    selectedFieldName: null,
+    candidateTierFilter: 'all',
+    showingRawJson: false,
   };
 
   // DOM Elements Cache
   const el = {
+    // Language Toggle
+    groupLangToggle: document.getElementById('group-lang-toggle'),
+    btnLangEn: document.getElementById('btn-lang-en'),
+    btnLangKo: document.getElementById('btn-lang-ko'),
+
     // TAB 0: Investigation Overview
     invInputGoal: document.getElementById('inv-input-goal'),
     btnRunInvestigation: document.getElementById('btn-run-investigation'),
@@ -193,6 +203,29 @@
 
     inspFieldsCount: document.getElementById('insp-fields-count'),
     tableSemanticFields: document.querySelector('#table-semantic-fields tbody'),
+
+    // Code Navigation & Breadcrumbs DOM Elements
+    btnNavBack: document.getElementById('btn-nav-back'),
+    navBreadcrumbsTrail: document.getElementById('nav-breadcrumbs-trail'),
+    navHistoryInfo: document.getElementById('nav-history-info'),
+    inspValDwarfLoc: document.getElementById('insp-val-dwarf-loc'),
+    inspValInterpretation: document.getElementById('insp-val-interpretation'),
+    cardCodeNavigation: document.getElementById('card-code-navigation'),
+    badgeCodeNavTarget: document.getElementById('badge-code-nav-target'),
+    codeNavTargetName: document.getElementById('code-nav-target-name'),
+    codeNavTargetLoc: document.getElementById('code-nav-target-loc'),
+    codeNavTargetInterp: document.getElementById('code-nav-target-interp'),
+    tbodyCandidateFunctions: document.getElementById('tbody-candidate-functions'),
+    codeNavTierChips: document.getElementById('code-nav-tier-chips'),
+    countTierAll: document.getElementById('count-tier-all'),
+    countTierObserved: document.getElementById('count-tier-observed'),
+    countTierStatic: document.getElementById('count-tier-static'),
+    countTierIndirect: document.getElementById('count-tier-indirect'),
+    countTierUnknown: document.getElementById('count-tier-unknown'),
+    inspectorRawJsonBody: document.getElementById('inspector-raw-json-body'),
+    preObjRawJson: document.getElementById('pre-obj-raw-json'),
+    btnCopyObjJson: document.getElementById('btn-copy-obj-json'),
+    inspectorScrollBody: document.querySelector('.inspector-scroll-body'),
 
     badgeTotalRefsCount: document.getElementById('badge-total-refs-count'),
     badgeOutgoingCount: document.getElementById('badge-outgoing-count'),
@@ -507,14 +540,14 @@
   }
 
   function showToast(message, type = 'info') {
-    const t = document.createElement('div');
-    t.className = `toast ${type}`;
+    const toastEl = document.createElement('div');
+    toastEl.className = `toast ${type}`;
     const icon = type === 'success' ? '✓' : type === 'error' ? '⚠️' : 'ℹ';
-    t.innerHTML = `<span>${icon}</span> <span>${escapeHtml(message)}</span>`;
-    el.toastContainer.appendChild(t);
+    toastEl.innerHTML = `<span>${icon}</span> <span>${escapeHtml(message)}</span>`;
+    el.toastContainer.appendChild(toastEl);
     setTimeout(() => {
-      t.style.opacity = '0';
-      setTimeout(() => t.remove(), 250);
+      toastEl.style.opacity = '0';
+      setTimeout(() => toastEl.remove(), 250);
     }, 3500);
   }
 
@@ -688,6 +721,663 @@
     if (state.selectedObjectId) selectObject(state.selectedObjectId);
     if (state.candidates && state.candidates.length > 0) renderCandidatesTable(state.candidates);
     renderInvestigationOverview();
+  }
+
+  // ==========================================================================
+  // Internationalization (i18n): English (en) and Korean (ko) Support
+  // ==========================================================================
+
+  const TRANSLATIONS = {
+    en: {
+      // Header & Navigation
+      hdr_brand_subtitle: 'C/C++ Runtime Investigation Workspace',
+      pill_runtime_status_title: 'Target connection status',
+      txt_disconnected: 'DISCONNECTED',
+      txt_connected: 'CONNECTED',
+      txt_paused: 'PAUSED',
+      txt_stopped: 'STOPPED',
+      txt_running: 'RUNNING',
+      hdr_lbl_target: 'Target:',
+      no_target_loaded: 'No target loaded',
+      hdr_lbl_capture: 'Capture:',
+      hdr_lbl_investigation: 'Investigation:',
+      title_mode_toggle: 'Switch between human-friendly Basic view and technical Advanced view',
+      btn_mode_basic: '👤 Basic',
+      btn_mode_advanced: '⚙️ Advanced',
+      title_lang_toggle: 'Switch language (English / 한국어)',
+      btn_tech_details: '⚙️ Technical Details',
+      btn_tech_details_title: 'Toggle technical hardware, ELF, and backend details',
+      btn_refresh: 'Refresh',
+      btn_refresh_title: 'Refresh runtime data',
+      btn_fast_capture: 'Capture State',
+      btn_fast_capture_title: 'Fast runtime state capture with minimal stop time',
+      btn_observe: 'Observe',
+
+      // Summary Bar
+      sum_lbl_runtime: 'Runtime',
+      sum_lbl_active_threads: 'Active Threads',
+      sum_lbl_discovered_objects: 'Discovered Objects',
+      sum_lbl_root_variables: 'Root Variables',
+      sum_lbl_state_hash: 'State Hash',
+      sum_lbl_capture_backend: 'Capture Backend',
+      sum_title_capture_backend: 'Capture Backend',
+      sum_lbl_stop_duration: 'Stop Duration',
+      sum_title_stop_duration: 'Measured capture stop duration',
+      sum_lbl_checkpoint: 'Checkpoint',
+      sum_title_checkpoint: 'Checkpoint Restore Capability',
+      sum_lbl_branch_isolation: 'Branch Isolation',
+      sum_title_branch_isolation: 'Sibling mutation branch isolation capability & verification',
+      sum_lbl_determinism: 'Determinism',
+      sum_title_determinism: 'Restart reproducibility verification status',
+      sum_lbl_observation_point: 'Observation Point',
+      sum_title_obs_point: 'Observation Point (deterministic breakpoint)',
+      sum_lbl_timeout: 'Timeout (Source of Truth)',
+      sum_title_timeout: 'Execution Timeout Source of Truth',
+      sum_lbl_active_snapshot: 'Active State / Snapshot',
+
+      // Navigation Tabs
+      nav_tab_0: '0. 🔍 Investigation Overview',
+      nav_tab_1: '1. 📦 Object Explorer',
+      nav_tab_2: '2. 🧵 Thread Explorer',
+      nav_tab_3: '3. 🧠 Memory Snapshot',
+      nav_tab_4: '4. 📜 State DAG & Diff',
+      nav_tab_5: '5. ⚡ Autonomous Loop',
+      nav_tab_6: '6. 🛠️ System / Modules',
+      nav_tab_7: '7. 🔬 State Laboratory',
+
+      // Investigation Launchpad
+      inv_launchpad_title: '🔍 Investigation Workspace',
+      inv_launchpad_subtitle: 'Select an entry path to analyze runtime memory, reconstruct C++ object graphs, and verify evidence integrity.',
+      btn_entry_snapshot: '📁 Offline Snapshot Analysis',
+      btn_entry_live: '⚡ Live Target Capture',
+      badge_safe_det: 'SAFE & DETERMINISTIC',
+      desc_entry_snapshot: 'Analyze a previously captured memory snapshot offline. Zero target stop time, zero execution interference, completely repeatable.',
+      lbl_snapshot_target: 'Snapshot Target:',
+      opt_active_state: '(Current / Active State)',
+      lbl_debug_image: 'Debug Image (ELF with DWARF):',
+      ph_debug_image: 'e.g. build/app_debug.elf (same Build-ID required)',
+      badge_req_auth: 'REQUIRES AUTHORIZATION',
+      desc_entry_live: 'Connect to an authorized running process. Memory pages are read via <code>process_vm_readv</code>. To reduce skew, the capture backend signals the target (SIGSTOP/SIGCONT); if unstopped or active multi-threaded, capture is NON_ATOMIC.',
+      lbl_live_target_pid: 'Live Target PID:',
+      ph_live_pid: 'e.g. 2048 (numeric PID required)',
+      lbl_live_debug_image: 'Debug Image (ELF with DWARF):',
+      ph_live_debug_image: 'e.g. build/app_debug.elf',
+      lbl_authorize_check: 'Authorize Target Signal (SIGSTOP / SIGCONT) & Memory Read',
+      lbl_goal: '🎯 Goal:',
+      ph_goal: 'State your investigation objective (e.g. \'Investigate worker counter mismatch\', \'Verify state transition\')...',
+      btn_run_investigation: '🚀 Start Investigation',
+      btn_refresh_investigation: '🔄 Refresh',
+      lbl_recent_sessions: 'Recent Sessions:',
+
+      // Status Bar & Stages
+      lbl_inv_status: 'Status:',
+      stage_1: '1. Identity',
+      stage_2: '2. Capture Quality',
+      stage_3: '3. Typed Objects',
+      stage_4: '4. Comparison',
+      stage_5: '5. Static Links',
+      stage_6: '6. Report',
+
+      // Cards
+      title_card_target_build: '🏷️ Target & Build Identity',
+      lbl_executable: 'Executable:',
+      lbl_target_build_id: 'Target Build ID:',
+      lbl_debug_image_card: 'Debug Image:',
+      lbl_debug_build_id: 'Debug Build ID:',
+      lbl_pid_inferior: 'PID / Inferior:',
+      lbl_identity_status: 'Identity Status:',
+      lbl_persistence: 'Persistence:',
+
+      title_card_capture_quality: '🛡️ Capture Quality & Constraints',
+      lbl_consistency_level: 'Consistency Level:',
+      lbl_capture_backend: 'Capture Backend:',
+      lbl_stop_mechanism: 'Stop Mechanism:',
+      lbl_capture_duration: 'Capture Duration:',
+      lbl_bytes_captured: 'Bytes Captured / Req:',
+      lbl_regions_read: 'Regions Read / Total:',
+      lbl_partial_failed: 'Partial / Failed / Omitted:',
+
+      title_card_comparisons: '⚖️ Observation Comparisons',
+      lbl_baseline_a: 'Baseline A:',
+      lbl_observed_b: 'Observed B:',
+      opt_select_snapshot: '(Select Snapshot)',
+      btn_compare_snapshots: 'Compare Snapshots',
+      empty_no_comparison: 'No comparison performed yet. Select two snapshots above to isolate state diffs.',
+
+      title_card_next_steps: '📋 Recommended Next Steps',
+      empty_next_steps_init: 'Start an investigation to receive evidence-driven recommendations.',
+
+      title_card_findings: '🔎 Investigation Findings',
+      filter_all: 'All',
+      filter_facts: '🟢 Facts',
+      filter_hypo: '🟡 Hypotheses',
+      filter_unknown: '⚪ Unknowns',
+      empty_findings_init: 'No findings generated. Enter an investigation goal and click \'Start Investigation\'.',
+
+      title_card_static_links: '📜 Resolved Static-Code References',
+      empty_static_links_init: 'No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.',
+
+      summary_advanced_details: '⚙️ Advanced Details & Raw Evidence Ledger (Expand)',
+      th_evidence_id: 'Evidence ID',
+      th_type: 'Type',
+      th_nature: 'Nature',
+      th_source: 'Source',
+      th_details: 'Details',
+      btn_export_ledger: '📥 Export Ledger JSON',
+
+      // Object Explorer
+      title_object_explorer: 'Object Explorer',
+      lbl_sort: 'Sort:',
+      opt_name_asc: 'Name (A-Z)',
+      opt_name_desc: 'Name (Z-A)',
+      opt_type_asc: 'Type (A-Z)',
+      opt_fields_desc: 'Fields (High-Low)',
+      opt_refs_desc: 'Refs (High-Low)',
+      opt_addr_asc: 'Address (0x...)',
+      ph_search_objects: 'Filter by name, type, field, thread...',
+      btn_clear_filter_title: 'Clear filter',
+      pill_roots: 'Roots',
+      pill_heap: 'Heap',
+      pill_globals: 'Globals',
+      pill_stack: 'Stack/Locals',
+      pill_types: 'By Type',
+      msg_select_state_objects: 'Select a state to inspect objects',
+      bc_roots: 'Roots',
+      bc_all_objects: 'All Objects',
+      btn_view_tree: '🌲 Reference Tree',
+      btn_view_table: '📊 Table',
+      btn_view_graph: '🕸️ Topology Graph',
+      txt_tree_toolbar: 'Expandable reference hierarchy from application roots:',
+      btn_expand_all: 'Expand All',
+      btn_collapse_all: 'Collapse All',
+      th_semantic_name: 'Semantic Name',
+      th_scope: 'Scope',
+      th_fields: 'Fields',
+      th_outgoing_refs: 'Outgoing Refs',
+      th_incoming_refs: 'Incoming Refs',
+      th_action: 'Action',
+      btn_reset_topology: 'Reset Graph',
+      txt_click_node_inspect: 'Click any node to inspect',
+
+      // Object Inspector
+      title_select_object: 'Select an Object',
+      sub_select_object: 'Select an object from the explorer to inspect',
+      title_identity_scope: 'Identity & Scope',
+      lbl_semantic_name: 'Semantic Name:',
+      lbl_storage_scope: 'Storage Scope:',
+      lbl_state_status: 'State Status:',
+      lbl_root_source: 'Root Source:',
+      lbl_thread: 'Thread:',
+      lbl_object_id: 'Object ID:',
+      lbl_memory_address: 'Memory Address:',
+      lbl_dwarf_type: 'DWARF Type:',
+      lbl_snapshot_range: 'Snapshot Range:',
+      lbl_build_id: 'Build ID:',
+      title_semantic_fields: 'Semantic Fields',
+      th_field: 'Field',
+      th_value: 'Value',
+      th_pointer: 'Pointer',
+      th_mutability: 'Mutability',
+
+      // Thread Explorer
+      title_active_threads: 'Active Threads & Observation Context',
+      sub_active_threads: 'Live thread execution state, source code locations, and active observation points',
+      th_role_label: 'Role / Label',
+      th_state: 'State',
+      th_current_function: 'Current Function',
+      th_source_location: 'Source Location',
+      th_frames: 'Frames',
+      th_obs_context: 'Observation Context',
+
+      // Memory Snapshot
+      title_capture_status: 'Capture Status',
+      sub_capture_status: 'Execution capture parameters and memory consistency guarantees',
+      lbl_capture_status: 'Capture Status',
+      lbl_captured_mem: 'Captured Memory',
+      lbl_memory_regions: 'Memory Regions',
+      lbl_arch_endian: 'Architecture / Endian',
+      cap_target_binary: 'Target binary characteristics',
+
+      // State DAG & Diff
+      subnav_dag: 'State Transition Graph',
+      subnav_diff: 'Semantic State Diff',
+      title_corpus_states: 'Corpus States',
+      ph_search_states: 'Search state ID or hash...',
+      msg_no_corpus_states: 'No states recorded in corpus',
+      title_state_graph: 'State Transition Graph (Corpus History)',
+      sub_state_graph: 'Directed edges indicate typed mutations & continuous execution',
+      btn_fit_view: 'Fit View',
+      btn_graph_json: 'Graph JSON',
+      btn_inspect_objects: 'Inspect in Object Explorer',
+      btn_diff_parent: 'Diff with Parent',
+      btn_propose_mutations: 'Propose Mutations',
+      title_state_diff: 'Semantic State Diff',
+      sub_state_diff: 'Compare field modifications, pointer rewrites, and object lifecycle between two snapshots',
+      lbl_diff_a: 'Snapshot A (Parent):',
+      lbl_diff_b: 'Snapshot B (Child):',
+      btn_compute_diff: 'Compute Diff',
+
+      // State Laboratory
+      title_state_lab: 'State Laboratory — Offline Snapshot & Branch Exploration',
+      btn_lab_fast_capture: '⚡ Fast Capture',
+      btn_lab_create_branch: '🌿 Create Branch',
+      btn_lab_mutate_snapshot: '✏️ Mutate Snapshot',
+      lbl_snapshot_id: 'Snapshot ID',
+      lbl_capture_stop_time: 'Capture Stop Time',
+      lbl_reconstructed_objects: 'Reconstructed Objects',
+      lbl_captured_threads: 'Captured Threads',
+
+      // Modals
+      title_modal_observe: 'Initiate Target Observation',
+      lbl_obs_mode: 'Observation Mode:',
+      lbl_obs_pid: 'Attach to Existing Target PID (Optional):',
+      lbl_obs_debug_image: 'Debug Image Path (Optional):',
+      lbl_obs_policy: 'Snapshot Policy:',
+      btn_cancel: 'Cancel',
+      btn_capture_observation: 'Capture Observation',
+      title_fast_capture_modal: '⚡ Fast Runtime State Capture',
+      lbl_capture_mode: 'Capture Mode:',
+      btn_capture_immediately: 'Capture Immediately',
+      title_snap_mutate_modal: '✏️ Mutate Snapshot Branch',
+      btn_create_mutated_branch: 'Create Mutated Branch',
+
+      // Dynamic Findings & Scopes
+      scope_boundaries_header: 'Scope Boundaries &amp; Uninspected Checks:',
+      zero_findings_not_clean: 'Zero findings recorded does NOT indicate clean state; inspection was restricted.',
+      observed_fact: 'Observed Fact',
+      hypothesis: 'Hypothesis',
+      unknown: 'Unknown',
+      inspect_in_obj_explorer: 'Inspect in Object Explorer ➔',
+      clean_completed_title: 'Completed: 0 Findings in Inspected Scope',
+      inv_empty_findings_init: 'Investigation not started. Select an entry path above, enter an objective, and click "Start Investigation".',
+      analysis_scope_incomplete: 'Analysis scope was incomplete:',
+      clean_completed_no_disc: 'No discrepancies identified within inspected structures.',
+      zero_findings_unverified_fallback: 'Unmapped heap allocations, private symbols, and uninspected runtime invariants remain unverified.',
+      partial_0_findings_title: 'Partial Analysis: 0 Findings Recorded',
+      inv_blocked_title: 'Investigation Blocked',
+      inv_failed_title: 'Investigation Failed',
+      no_active_session: 'No active session',
+      ready_investigation_goal: 'Ready for investigation goal',
+      badge_status_idle: 'IDLE / READY',
+      toast_investigation_started: 'Investigation started...',
+      toast_investigation_completed: 'Investigation completed',
+      toast_investigation_refreshed: 'Investigation data refreshed',
+    },
+    ko: {
+      // Header & Navigation
+      hdr_brand_subtitle: 'C/C++ 런타임 상태 분석 워크스페이스',
+      pill_runtime_status_title: '대상 프로세스 연결 상태',
+      txt_disconnected: '연결 끊김',
+      txt_connected: '연결됨',
+      txt_paused: '일시 정지됨',
+      txt_stopped: '정지됨',
+      txt_running: '실행 중',
+      hdr_lbl_target: '대상:',
+      no_target_loaded: '로드된 대상 없음',
+      hdr_lbl_capture: '캡처:',
+      hdr_lbl_investigation: '조사:',
+      title_mode_toggle: '사용자 친화적 기본 보기와 기술적 고급 보기 간 전환',
+      btn_mode_basic: '👤 기본',
+      btn_mode_advanced: '⚙️ 고급',
+      title_lang_toggle: '언어 전환 (English / 한국어)',
+      btn_tech_details: '⚙️ 기술 상세',
+      btn_tech_details_title: '하드웨어, ELF 및 백엔드 기술 상세 전환',
+      btn_refresh: '새로고침',
+      btn_refresh_title: '런타임 데이터 새로고침',
+      btn_fast_capture: '상태 캡처',
+      btn_fast_capture_title: '최소 정지 시간으로 빠른 런타임 상태 캡처',
+      btn_observe: '관측',
+
+      // Summary Bar
+      sum_lbl_runtime: '런타임',
+      sum_lbl_active_threads: '활성 스레드',
+      sum_lbl_discovered_objects: '발견된 객체',
+      sum_lbl_root_variables: '루트 변수',
+      sum_lbl_state_hash: '상태 해시',
+      sum_lbl_capture_backend: '캡처 백엔드',
+      sum_title_capture_backend: '캡처 백엔드',
+      sum_lbl_stop_duration: '정지 시간',
+      sum_title_stop_duration: '측정된 캡처 정지 시간',
+      sum_lbl_checkpoint: '체크포인트',
+      sum_title_checkpoint: '체크포인트 복원 역량',
+      sum_lbl_branch_isolation: '브랜치 격리',
+      sum_title_branch_isolation: '형제 변이 브랜치 격리 역량 및 검증',
+      sum_lbl_determinism: '결정론성',
+      sum_title_determinism: '재시작 재현성 검증 상태',
+      sum_lbl_observation_point: '관측 지점',
+      sum_title_obs_point: '관측 지점 (결정론적 중단점)',
+      sum_lbl_timeout: '타임아웃 (단일 진실 공급원)',
+      sum_title_timeout: '실행 타임아웃 단일 진실 공급원',
+      sum_lbl_active_snapshot: '활성 상태 / 스냅샷',
+
+      // Navigation Tabs
+      nav_tab_0: '0. 🔍 조사 개요',
+      nav_tab_1: '1. 📦 객체 탐색기',
+      nav_tab_2: '2. 🧵 스레드 탐색기',
+      nav_tab_3: '3. 🧠 메모리 스냅샷',
+      nav_tab_4: '4. 📜 상태 DAG 및 차이',
+      nav_tab_5: '5. ⚡ 자율 루프',
+      nav_tab_6: '6. 🛠️ 시스템 / 모듈',
+      nav_tab_7: '7. 🔬 상태 실험실',
+
+      // Investigation Launchpad
+      inv_launchpad_title: '🔍 조사 워크스페이스',
+      inv_launchpad_subtitle: '런타임 메모리를 분석하고 C++ 객체 그래프를 재구성하며 증거 무결성을 검증할 진입 경로를 선택하세요.',
+      btn_entry_snapshot: '📁 오프라인 스냅샷 분석',
+      btn_entry_live: '⚡ 라이브 대상 캡처',
+      badge_safe_det: '안전 및 결정론적',
+      desc_entry_snapshot: '이전에 캡처된 메모리 스냅샷을 오프라인에서 분석합니다. 대상 정지 시간 0, 실행 간섭 없음, 완전한 재현성 보장.',
+      lbl_snapshot_target: '스냅샷 대상:',
+      opt_active_state: '(현재 / 활성 상태)',
+      lbl_debug_image: '디버그 이미지 (DWARF 포함 ELF):',
+      ph_debug_image: '예: build/app_debug.elf (동일 Build-ID 필요)',
+      badge_req_auth: '권한 승인 필요',
+      desc_entry_live: '권한이 부여된 실행 중인 프로세스에 연결합니다. 메모리 페이지는 <code>process_vm_readv</code>를 통해 읽힙니다. 편향을 줄이기 위해 백엔드가 대상을 신호(SIGSTOP/SIGCONT)로 정지시키며, 정지되지 않거나 활성 멀티스레드인 경우 캡처는 NON_ATOMIC으로 처리됩니다.',
+      lbl_live_target_pid: '라이브 대상 PID:',
+      ph_live_pid: '예: 2048 (숫자 PID 필요)',
+      lbl_live_debug_image: '디버그 이미지 (DWARF 포함 ELF):',
+      ph_live_debug_image: '예: build/app_debug.elf',
+      lbl_authorize_check: '대상 신호(SIGSTOP / SIGCONT) 전송 및 메모리 읽기 승인',
+      lbl_goal: '🎯 조사 목표:',
+      ph_goal: '조사 목표를 입력하세요 (예: \'워커 카운터 불일치 조사\', \'상태 전이 검증\')...',
+      btn_run_investigation: '🚀 조사 시작',
+      btn_refresh_investigation: '🔄 새로고침',
+      lbl_recent_sessions: '최근 세션:',
+
+      // Status Bar & Stages
+      lbl_inv_status: '상태:',
+      stage_1: '1. 대상 식별',
+      stage_2: '2. 캡처 품질',
+      stage_3: '3. 타입 객체',
+      stage_4: '4. 상태 비교',
+      stage_5: '5. 정적 링크',
+      stage_6: '6. 보고서',
+
+      // Cards
+      title_card_target_build: '🏷️ 대상 및 빌드 식별',
+      lbl_executable: '실행 파일:',
+      lbl_target_build_id: '대상 빌드 ID:',
+      lbl_debug_image_card: '디버그 이미지:',
+      lbl_debug_build_id: '디버그 빌드 ID:',
+      lbl_pid_inferior: 'PID / 인피리어:',
+      lbl_identity_status: '식별 상태:',
+      lbl_persistence: '영속성:',
+
+      title_card_capture_quality: '🛡️ 캡처 품질 및 제약사항',
+      lbl_consistency_level: '일관성 수준:',
+      lbl_capture_backend: '캡처 백엔드:',
+      lbl_stop_mechanism: '정지 메커니즘:',
+      lbl_capture_duration: '캡처 소요 시간:',
+      lbl_bytes_captured: '캡처 바이트 / 요청:',
+      lbl_regions_read: '읽은 영역 / 전체:',
+      lbl_partial_failed: '부분 / 실패 / 생략:',
+
+      title_card_comparisons: '⚖️ 관측 비교 분석',
+      lbl_baseline_a: '기준 A:',
+      lbl_observed_b: '관측 B:',
+      opt_select_snapshot: '(스냅샷 선택)',
+      btn_compare_snapshots: '스냅샷 비교',
+      empty_no_comparison: '아직 수행된 비교가 없습니다. 위에서 두 개의 스냅샷을 선택하여 상태 차이를 격리하세요.',
+
+      title_card_next_steps: '📋 권장 다음 단계',
+      empty_next_steps_init: '증거 기반 권장 단계를 받으려면 조사를 시작하세요.',
+
+      title_card_findings: '🔎 조사 발견 사항',
+      filter_all: '전체',
+      filter_facts: '🟢 관측 사실',
+      filter_hypo: '🟡 가설',
+      filter_unknown: '⚪ 미확인',
+      empty_findings_init: '생성된 발견 사항이 없습니다. 조사 목표를 입력하고 \'조사 시작\'을 클릭하세요.',
+
+      title_card_static_links: '📜 확인된 정적 코드 참조',
+      empty_static_links_init: '해결된 정적 코드 링크가 없습니다. 런타임 객체와 소스 심볼을 연결하려면 유효한 디버그 이미지를 제공하세요.',
+
+      summary_advanced_details: '⚙️ 고급 상세 정보 및 원시 증거 원장 (펼치기)',
+      th_evidence_id: '증거 ID',
+      th_type: '유형',
+      th_nature: '성격',
+      th_source: '출처',
+      th_details: '상세 정보',
+      btn_export_ledger: '📥 원장 JSON 내보내기',
+
+      // Object Explorer
+      title_object_explorer: '객체 탐색기',
+      lbl_sort: '정렬:',
+      opt_name_asc: '이름 (A-Z)',
+      opt_name_desc: '이름 (Z-A)',
+      opt_type_asc: '타입 (A-Z)',
+      opt_fields_desc: '필드 수 (높은순)',
+      opt_refs_desc: '참조 수 (높은순)',
+      opt_addr_asc: '주소 (0x...)',
+      ph_search_objects: '이름, 타입, 필드, 스레드로 필터링...',
+      btn_clear_filter_title: '필터 초기화',
+      pill_roots: '루트',
+      pill_heap: '힙',
+      pill_globals: '전역',
+      pill_stack: '스택/로컬',
+      pill_types: '타입별',
+      msg_select_state_objects: '객체를 검사할 상태를 선택하세요',
+      bc_roots: '루트',
+      bc_all_objects: '전체 객체',
+      btn_view_tree: '🌲 참조 트리',
+      btn_view_table: '📊 표 보기',
+      btn_view_graph: '🕸️ 위상 그래프',
+      txt_tree_toolbar: '애플리케이션 루트로부터 확장 가능한 참조 계층 구조:',
+      btn_expand_all: '모두 펼치기',
+      btn_collapse_all: '모두 접기',
+      th_semantic_name: '의미론적 이름',
+      th_scope: '스코프',
+      th_fields: '필드',
+      th_outgoing_refs: '나가는 참조',
+      th_incoming_refs: '들어오는 참조',
+      th_action: '작업',
+      btn_reset_topology: '그래프 초기화',
+      txt_click_node_inspect: '노드를 클릭하여 검사하세요',
+
+      // Object Inspector
+      title_select_object: '객체 선택',
+      sub_select_object: '검사할 객체를 탐색기에서 선택하세요',
+      title_identity_scope: '식별 및 스코프',
+      lbl_semantic_name: '의미론적 이름:',
+      lbl_storage_scope: '저장소 스코프:',
+      lbl_state_status: '상태 상황:',
+      lbl_root_source: '루트 출처:',
+      lbl_thread: '스레드:',
+      lbl_object_id: '객체 ID:',
+      lbl_memory_address: '메모리 주소:',
+      lbl_dwarf_type: 'DWARF 타입:',
+      lbl_snapshot_range: '스냅샷 범위:',
+      lbl_build_id: '빌드 ID:',
+      title_semantic_fields: '의미론적 필드',
+      th_field: '필드',
+      th_value: '값',
+      th_pointer: '포인터',
+      th_mutability: '가변성',
+
+      // Thread Explorer
+      title_active_threads: '활성 스레드 및 관측 컨텍스트',
+      sub_active_threads: '실시간 스레드 실행 상태, 소스 코드 위치 및 활성 관측 지점',
+      th_role_label: '역할 / 라벨',
+      th_state: '상태',
+      th_current_function: '현재 함수',
+      th_source_location: '소스 위치',
+      th_frames: '프레임',
+      th_obs_context: '관측 컨텍스트',
+
+      // Memory Snapshot
+      title_capture_status: '캡처 상태',
+      sub_capture_status: '실행 캡처 매개변수 및 메모리 일관성 보장',
+      lbl_capture_status: '캡처 상태',
+      lbl_captured_mem: '캡처된 메모리',
+      lbl_memory_regions: '메모리 영역',
+      lbl_arch_endian: '아키텍처 / 엔디언',
+      cap_target_binary: '대상 바이너리 특성',
+
+      // State DAG & Diff
+      subnav_dag: '상태 전이 그래프',
+      subnav_diff: '의미론적 상태 차이',
+      title_corpus_states: '말뭉치 상태',
+      ph_search_states: '상태 ID 또는 해시 검색...',
+      msg_no_corpus_states: '말뭉치에 기록된 상태 없음',
+      title_state_graph: '상태 전이 그래프 (말뭉치 이력)',
+      sub_state_graph: '방향성 간선은 타입 변이 및 연속 실행을 나타냅니다',
+      btn_fit_view: '화면 맞춤',
+      btn_graph_json: '그래프 JSON',
+      btn_inspect_objects: '객체 탐색기에서 검사',
+      btn_diff_parent: '부모와 비교',
+      btn_propose_mutations: '변이 제안',
+      title_state_diff: '의미론적 상태 차이',
+      sub_state_diff: '두 스냅샷 간의 필드 수정, 포인터 재작성 및 객체 수명 주기 비교',
+      lbl_diff_a: '스냅샷 A (부모):',
+      lbl_diff_b: '스냅샷 B (자식):',
+      btn_compute_diff: '차이 계산',
+
+      // State Laboratory
+      title_state_lab: '상태 실험실 — 오프라인 스냅샷 및 브랜치 탐색',
+      btn_lab_fast_capture: '⚡ 빠른 캡처',
+      btn_lab_create_branch: '🌿 브랜치 생성',
+      btn_lab_mutate_snapshot: '✏️ 스냅샷 변이',
+      lbl_snapshot_id: '스냅샷 ID',
+      lbl_capture_stop_time: '캡처 정지 시간',
+      lbl_reconstructed_objects: '재구성된 객체',
+      lbl_captured_threads: '캡처된 스레드',
+
+      // Modals
+      title_modal_observe: '대상 관측 시작',
+      lbl_obs_mode: '관측 모드:',
+      lbl_obs_pid: '기존 대상 PID에 연결 (선택 사항):',
+      lbl_obs_debug_image: '디버그 이미지 경로 (선택 사항):',
+      lbl_obs_policy: '스냅샷 정책:',
+      btn_cancel: '취소',
+      btn_capture_observation: '관측 캡처',
+      title_fast_capture_modal: '⚡ 빠른 런타임 상태 캡처',
+      lbl_capture_mode: '캡처 모드:',
+      btn_capture_immediately: '즉시 캡처',
+      title_snap_mutate_modal: '✏️ 스냅샷 브랜치 변이',
+      btn_create_mutated_branch: '변이된 브랜치 생성',
+
+      // Dynamic Findings & Scopes
+      scope_boundaries_header: '조사 범위 경계 및 미검사 항목:',
+      zero_findings_not_clean: '기록된 발견 사항이 없다고 해서 안전한 상태를 의미하지 않습니다. 조사가 제한되었습니다.',
+      observed_fact: '관측 사실',
+      hypothesis: '가설',
+      unknown: '미확인',
+      inspect_in_obj_explorer: '객체 탐색기에서 검사 ➔',
+      clean_completed_title: '완료: 검사된 범위 내 0건의 발견 사항',
+      inv_empty_findings_init: '조사가 시작되지 않았습니다. 위에서 진입 경로를 선택하고 목표를 입력한 뒤 "조사 시작"을 클릭하세요.',
+      analysis_scope_incomplete: '분석 범위가 불완전했습니다:',
+      clean_completed_no_disc: '검사된 구조 내에서 이상 불일치가 감지되지 않았습니다.',
+      zero_findings_unverified_fallback: '매핑되지 않은 힙 할당, 비공개 심볼 및 미검사 런타임 불변조건은 검증되지 않은 상태로 유지됩니다.',
+      partial_0_findings_title: '부분 분석: 0건의 발견 사항 기록됨',
+      inv_blocked_title: '조사 차단됨',
+      inv_failed_title: '조사 실패',
+      no_active_session: '활성 세션 없음',
+      ready_investigation_goal: '조사 목표 대기 중',
+      badge_status_idle: '대기 / 준비 완료',
+      toast_investigation_started: '조사가 시작되었습니다...',
+      toast_investigation_completed: '조사가 완료되었습니다',
+      toast_investigation_refreshed: '조사 데이터가 새로고침되었습니다',
+    }
+  };
+
+  function t(key, fallback) {
+    const lang = state.currentLang || 'en';
+    if (TRANSLATIONS[lang] && TRANSLATIONS[lang][key] !== undefined) {
+      return TRANSLATIONS[lang][key];
+    }
+    if (TRANSLATIONS.en && TRANSLATIONS.en[key] !== undefined) {
+      return TRANSLATIONS.en[key];
+    }
+    return fallback !== undefined ? fallback : key;
+  }
+
+  function applyTranslations(lang) {
+    const dict = TRANSLATIONS[lang] || TRANSLATIONS.en;
+    if (!dict) return;
+
+    // Elements with data-i18n
+    const elements = document.querySelectorAll('[data-i18n]');
+    elements.forEach(elem => {
+      const key = elem.getAttribute('data-i18n');
+      if (dict[key] !== undefined) {
+        if (elem.getAttribute('data-i18n-html') === 'true') {
+          elem.innerHTML = dict[key];
+        } else {
+          elem.textContent = dict[key];
+        }
+      }
+    });
+
+    // Elements with data-i18n-placeholder
+    const inputs = document.querySelectorAll('[data-i18n-placeholder]');
+    inputs.forEach(elem => {
+      const key = elem.getAttribute('data-i18n-placeholder');
+      if (dict[key] !== undefined) {
+        elem.placeholder = dict[key];
+      }
+    });
+
+    // Elements with data-i18n-title
+    const titled = document.querySelectorAll('[data-i18n-title]');
+    titled.forEach(elem => {
+      const key = elem.getAttribute('data-i18n-title');
+      if (dict[key] !== undefined) {
+        elem.title = dict[key];
+      }
+    });
+  }
+
+  function setLanguage(lang, persist = true) {
+    if (lang !== 'en' && lang !== 'ko') lang = 'en';
+    state.currentLang = lang;
+    if (persist) {
+      try {
+        localStorage.setItem('dynamicstate_language', lang);
+      } catch (_) {}
+    }
+
+    if (el.btnLangEn) el.btnLangEn.classList.toggle('active', lang === 'en');
+    if (el.btnLangKo) el.btnLangKo.classList.toggle('active', lang === 'ko');
+    document.documentElement.lang = lang;
+
+    applyTranslations(lang);
+
+    // Refresh dynamic views
+    if (state.runtime) {
+      renderRuntimeOverview(state.runtime);
+    }
+    renderInvestigationOverview();
+    if (state.memorySummary) {
+      renderMemorySummary(state.memorySummary);
+    }
+    renderMemoryObjectsList();
+    if (state.selectedObjectId) {
+      selectObject(state.selectedObjectId);
+    }
+    if (state.candidates && state.candidates.length > 0) {
+      renderCandidatesTable(state.candidates);
+    }
+  }
+
+  function initI18n() {
+    let initialLang = 'en';
+    try {
+      const saved = localStorage.getItem('dynamicstate_language');
+      if (saved === 'ko' || saved === 'en') {
+        initialLang = saved;
+      } else if (navigator.language && navigator.language.toLowerCase().startsWith('ko')) {
+        initialLang = 'ko';
+      }
+    } catch (_) {}
+
+    if (el.btnLangEn) {
+      el.btnLangEn.addEventListener('click', () => setLanguage('en'));
+    }
+    if (el.btnLangKo) {
+      el.btnLangKo.addEventListener('click', () => setLanguage('ko'));
+    }
+
+    setLanguage(initialLang, false);
   }
 
   // --------------------------------------------------------------------------
@@ -1425,16 +2115,19 @@
         if (st !== 'stack') return false;
       }
 
-      // Search Query
+      // Search Query: supports name, type, field name/value, and hex address
       if (!query) return true;
       const matchesId = (o.object_id || '').toLowerCase().includes(query);
       const matchesSemantic = (o.semantic_name || '').toLowerCase().includes(query);
+      const matchesDisplayName = (o.display_name || '').toLowerCase().includes(query);
       const matchesType = (o.type || '').toLowerCase().includes(query);
       const matchesCleaned = (o.cleaned_type || '').toLowerCase().includes(query);
+      const addrHex = (typeof o.address === 'number' ? '0x' + o.address.toString(16) : String(o.address || '')).toLowerCase();
+      const matchesAddress = addrHex.includes(query) || Boolean(o.hex_address && o.hex_address.toLowerCase().includes(query));
       const matchesField = (o.fields || []).some((f) => {
         return (f.name || '').toLowerCase().includes(query) || String(f.value || '').toLowerCase().includes(query);
       });
-      return matchesId || matchesSemantic || matchesType || matchesCleaned || matchesField;
+      return matchesId || matchesSemantic || matchesDisplayName || matchesType || matchesCleaned || matchesAddress || matchesField;
     });
 
     // 2. Sorting
@@ -1714,9 +2407,167 @@
   // Right Pane: Object Inspector & Reference Navigation
   // --------------------------------------------------------------------------
 
-  function selectObject(objectId) {
+  function pushNavHistory(objectId, fieldName = null) {
     if (!objectId) return;
+    if (!state.navHistory) state.navHistory = [];
+    state.navHistory.push({ objectId, fieldName });
+    if (state.navHistory.length > 50) state.navHistory.shift();
+    updateNavHistoryControls();
+  }
+
+  function navigateBack() {
+    if (!state.navHistory || state.navHistory.length === 0) return;
+    const prev = state.navHistory.pop();
+    updateNavHistoryControls();
+    if (prev && prev.objectId) {
+      selectObject(prev.objectId, false, prev.fieldName);
+    }
+  }
+
+  function updateNavHistoryControls() {
+    if (el.btnNavBack) {
+      el.btnNavBack.disabled = !state.navHistory || state.navHistory.length === 0;
+    }
+    if (el.navHistoryInfo) {
+      el.navHistoryInfo.textContent = `History: ${state.navHistory ? state.navHistory.length : 0}`;
+    }
+  }
+
+  function updateBreadcrumbs(obj, fieldName = null) {
+    if (!el.navBreadcrumbsTrail) return;
+    if (!obj) {
+      el.navBreadcrumbsTrail.innerHTML = '<span class="crumb-item active">Explorer</span>';
+      return;
+    }
+    const cleanType = obj.cleaned_type || obj.type || 'Object';
+    const dispName = obj.display_name || obj.semantic_name || `${cleanType}@${obj.address ? '0x' + Number(obj.address).toString(16) : obj.object_id}`;
+
+    let html = `<span class="crumb-item" id="crumb-root">Explorer</span><span class="crumb-sep">/</span>`;
+    if (fieldName) {
+      html += `<span class="crumb-item" id="crumb-obj">${escapeHtml(dispName)}</span><span class="crumb-sep">/</span>`;
+      html += `<span class="crumb-item active mono text-accent"><code>${escapeHtml(fieldName)}</code></span>`;
+    } else {
+      html += `<span class="crumb-item active">${escapeHtml(dispName)}</span>`;
+    }
+    el.navBreadcrumbsTrail.innerHTML = html;
+
+    const crumbObj = el.navBreadcrumbsTrail.querySelector('#crumb-obj');
+    if (crumbObj) {
+      crumbObj.addEventListener('click', () => {
+        selectObject(obj.object_id, false, null);
+      });
+    }
+  }
+
+  let currentNavCandidates = [];
+
+  async function renderCodeNavigation(obj, targetFieldName = null) {
+    if (!el.cardCodeNavigation) return;
+    if (!obj) {
+      if (el.tbodyCandidateFunctions) {
+        el.tbodyCandidateFunctions.innerHTML = '<tr><td colspan="5" class="text-muted text-center">Select an object or field to view candidate functions</td></tr>';
+      }
+      return;
+    }
+
+    const cleanType = obj.cleaned_type || obj.canonical_type || (obj.type ? obj.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
+    const targetLabel = targetFieldName ? `${cleanType}.${targetFieldName}` : `${cleanType} (All)`;
+    if (el.badgeCodeNavTarget) el.badgeCodeNavTarget.textContent = targetFieldName ? `Field: ${targetFieldName}` : 'All Object Functions';
+    if (el.codeNavTargetName) el.codeNavTargetName.textContent = targetLabel;
+
+    let targetLoc = '—';
+    if (targetFieldName) {
+      const f = (obj.fields || []).find(field => field.name === targetFieldName);
+      if (f && f.decl_file && f.decl_line) {
+        targetLoc = `${f.decl_file}:${f.decl_line}`;
+      }
+    }
+    if (targetLoc === '—') {
+      const oFile = obj.decl_file || obj.type_decl_file;
+      const oLine = obj.decl_line || obj.type_decl_line;
+      if (oFile && oLine) {
+        targetLoc = `${oFile}:${oLine}`;
+      }
+    }
+    if (el.codeNavTargetLoc) el.codeNavTargetLoc.textContent = targetLoc;
+
+    if (el.codeNavTargetInterp) {
+      const interp = obj.synthetic ? 'Interpreted' : 'Observed';
+      el.codeNavTargetInterp.textContent = interp;
+      el.codeNavTargetInterp.className = 'badge ' + (interp === 'Observed' ? 'badge-success' : 'badge-warning');
+    }
+
+    // Try fetching from API or fallback to preloaded
+    let navData = null;
+    try {
+      const q = targetFieldName ? `?field=${encodeURIComponent(targetFieldName)}` : '';
+      const snapQ = state.activeStateId ? `${q ? '&' : '?'}snapshot_id=${encodeURIComponent(state.activeStateId)}` : '';
+      const res = await apiGet(`/api/objects/${encodeURIComponent(obj.object_id)}/code-navigation${q}${snapQ}`);
+      if (res && res.success && res.data) {
+        navData = res.data;
+      }
+    } catch (e) {
+      console.warn('Could not fetch code-navigation endpoint:', e);
+    }
+
+    if (!navData) {
+      navData = obj.code_navigation || { candidates: obj.function_candidates || [] };
+    }
+
+    currentNavCandidates = navData.candidates || [];
+
+    // Update tier counts
+    const counts = navData.counts_by_tier || {
+      observed: currentNavCandidates.filter(c => c.evidence_level === 'observed').length,
+      static: currentNavCandidates.filter(c => c.evidence_level === 'static').length,
+      indirect: currentNavCandidates.filter(c => c.evidence_level === 'indirect').length,
+      unknown: currentNavCandidates.filter(c => c.evidence_level === 'unknown').length,
+    };
+
+    if (el.countTierAll) el.countTierAll.textContent = currentNavCandidates.length;
+    if (el.countTierObserved) el.countTierObserved.textContent = counts.observed || 0;
+    if (el.countTierStatic) el.countTierStatic.textContent = counts.static || 0;
+    if (el.countTierIndirect) el.countTierIndirect.textContent = counts.indirect || 0;
+    if (el.countTierUnknown) el.countTierUnknown.textContent = counts.unknown || 0;
+
+    applyCandidateFilter();
+  }
+
+  function applyCandidateFilter() {
+    if (!el.tbodyCandidateFunctions) return;
+    const filter = state.candidateTierFilter || 'all';
+    const filtered = filter === 'all'
+      ? currentNavCandidates
+      : currentNavCandidates.filter(c => c.evidence_level === filter);
+
+    if (filtered.length === 0) {
+      el.tbodyCandidateFunctions.innerHTML = `<tr><td colspan="5" class="text-muted text-center">No candidate functions found for tier '${escapeHtml(filter)}'</td></tr>`;
+      return;
+    }
+
+    el.tbodyCandidateFunctions.innerHTML = filtered.map(c => {
+      const tier = c.evidence_level || 'unknown';
+      const tierClass = tier === 'observed' ? 'tier-observed' : (tier === 'static' ? 'tier-static' : (tier === 'indirect' ? 'tier-indirect' : 'tier-unknown'));
+      const loc = c.source_location || '—';
+      return `
+        <tr>
+          <td><strong class="mono text-accent">${escapeHtml(c.function_name)}</strong></td>
+          <td><span class="tier-chip ${tierClass}" title="Evidence Tier: ${escapeHtml(tier)}">${escapeHtml(tier)}</span></td>
+          <td><span class="mono text-xs">${escapeHtml(loc)}</span></td>
+          <td><span class="text-xs">${escapeHtml(c.reason || 'Correlated candidate')}</span></td>
+          <td><span class="text-muted text-xs">${escapeHtml(c.limitations || 'Execution unverified')}</span></td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  function selectObject(objectId, pushHistory = true, selectedFieldName = null) {
+    if (!objectId) return;
+    if (pushHistory && state.selectedObjectId && state.selectedObjectId !== objectId) {
+      pushNavHistory(state.selectedObjectId, state.selectedFieldName);
+    }
     state.selectedObjectId = objectId;
+    state.selectedFieldName = selectedFieldName;
 
     // 1. Highlight in list & table
     if (el.listMemoryObjects) {
@@ -1751,10 +2602,11 @@
     const additionalPaths = obj.additional_paths || [];
     const cleanedType = obj.cleaned_type || obj.canonical_type || (obj.type ? obj.type.replace(/\b(struct|class|enum)\s+/g, '') : 'Unknown');
 
-    // 2. Update Center Breadcrumb
+    // 2. Update Center Breadcrumb & Nav Toolbar
     if (el.bcCurrentName) {
       el.bcCurrentName.textContent = `${semanticName} (${cleanedType})`;
     }
+    updateBreadcrumbs(obj, selectedFieldName);
 
     // 3. Populate Inspector Header
     if (el.memObjTitle) el.memObjTitle.textContent = `${semanticName} — ${cleanedType}`;
@@ -1792,6 +2644,16 @@
     if (el.inspValRoot) el.inspValRoot.textContent = obj.root_source || (storage === 'GLOBAL' ? 'Global Variable' : storage === 'STACK' ? 'Stack Local' : 'Heap Allocated');
     if (el.inspValThread) el.inspValThread.textContent = obj.thread_name || (state.runtime && state.runtime.threads ? `${state.runtime.threads} Thread(s)` : 'N/A');
 
+    // DWARF Source Location and Interpretation
+    const dwarfLoc = (obj.decl_file && obj.decl_line) ? `${obj.decl_file}:${obj.decl_line}` : (obj.type_decl_file && obj.type_decl_line ? `${obj.type_decl_file}:${obj.type_decl_line}` : '—');
+    if (el.inspValDwarfLoc) el.inspValDwarfLoc.textContent = dwarfLoc;
+
+    const interp = obj.synthetic ? 'Interpreted' : (obj.status === 'PARTIAL' ? 'Partial' : 'Observed');
+    if (el.inspValInterpretation) {
+      el.inspValInterpretation.textContent = interp;
+      el.inspValInterpretation.className = 'badge ' + (interp === 'Observed' ? 'badge-success' : 'badge-warning');
+    }
+
     if (el.memTechId) el.memTechId.textContent = obj.object_id;
     if (el.memTechAddr) el.memTechAddr.textContent = addrHex;
     if (el.memTechDwarf) el.memTechDwarf.textContent = obj.dwarf_type || obj.type || '—';
@@ -1812,7 +2674,7 @@
 
     if (fields.length === 0) {
       if (el.tableSemanticFields) {
-        el.tableSemanticFields.innerHTML = `<tr><td colspan="6" class="text-muted text-center">No fields defined for this object</td></tr>`;
+        el.tableSemanticFields.innerHTML = `<tr><td colspan="7" class="text-muted text-center">No fields defined for this object</td></tr>`;
       }
     } else {
       let fieldsHtml = '';
@@ -1822,6 +2684,10 @@
         const isMut = mutStatus === 'mutable' || isFieldMutable(f.type, f.mutability);
         const valHtml = formatSemanticValue(f.value, f.type, f.object_ref);
         const cleanedFieldType = f.cleaned_type || (f.type ? f.type.replace(/\b(struct|class|enum)\s+/g, '') : '');
+        const fLoc = (f.decl_file && f.decl_line) ? `${getBaseName(f.decl_file)}:${f.decl_line}` : '—';
+        const fLocFull = (f.decl_file && f.decl_line) ? `${f.decl_file}:${f.decl_line}` : '';
+        const isFieldSelected = Boolean(selectedFieldName && f.name === selectedFieldName);
+        const rowStyle = isFieldSelected ? 'style="outline: 2px solid var(--accent);"' : '';
 
         let refChipHtml = '<span class="text-muted">—</span>';
         if (isRef) {
@@ -1839,14 +2705,16 @@
           : '<span class="badge badge-neutral">READ_ONLY</span>';
 
         fieldsHtml += `
-          <tr>
+          <tr ${rowStyle}>
             <td><strong>${escapeHtml(f.name)}</strong></td>
             <td class="mono text-accent">${escapeHtml(cleanedFieldType)}</td>
             <td>${valHtml}</td>
+            <td><span class="mono text-xs text-muted" title="${escapeHtml(fLocFull)}">${escapeHtml(fLoc)}</span></td>
             <td>${refChipHtml}</td>
             <td>${mutBadgeHtml}</td>
             <td>
-              ${isMut ? `<button class="field-mutate-btn" data-object-id="${objectId}" data-field-name="${f.name}">⚡ Mutate</button>` : '<span class="text-muted">—</span>'}
+              ${isMut ? `<button class="field-mutate-btn" data-object-id="${objectId}" data-field-name="${f.name}">⚡ Mutate</button>` : ''}
+              <button class="field-code-btn" data-object-id="${objectId}" data-field-name="${f.name}" title="View candidate functions for this field">🔍 Code</button>
             </td>
           </tr>
         `;
@@ -1873,7 +2741,27 @@
             }
           });
         });
+
+        // Field Code Navigation button handlers
+        el.tableSemanticFields.querySelectorAll('.field-code-btn').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const fName = btn.getAttribute('data-field-name');
+            selectObject(objectId, true, fName);
+            if (el.cardCodeNavigation) {
+              el.cardCodeNavigation.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+          });
+        });
       }
+    }
+
+    // Render Code Navigation and Candidate Functions
+    renderCodeNavigation(obj, selectedFieldName);
+
+    // Update Raw JSON view if currently visible
+    if (state.showingRawJson && el.preObjRawJson) {
+      el.preObjRawJson.textContent = JSON.stringify(obj, null, 2);
     }
 
     // 6. Reference Relations (HeapHero / Android Studio Incoming & Outgoing)
@@ -2054,9 +2942,9 @@
     if (el.inspMutObsPoint) el.inspMutObsPoint.textContent = obsText;
   }
 
-  function jumpToObject(objectId) {
+  function jumpToObject(objectId, fieldName = null) {
     if (!objectId) return;
-    selectObject(objectId);
+    selectObject(objectId, true, fieldName);
 
     const listItem = el.listMemoryObjects ? el.listMemoryObjects.querySelector(`[data-object-id="${objectId}"]`) : null;
     if (listItem) {
@@ -3553,6 +4441,53 @@
       });
     }
 
+    // Explorer Nav Toolbar Back Button
+    if (el.btnNavBack) {
+      el.btnNavBack.addEventListener('click', () => {
+        navigateBack();
+      });
+    }
+
+    // Inspector Formatted vs Raw JSON View Toggle
+    if (el.btnViewObjJson) {
+      el.btnViewObjJson.addEventListener('click', () => {
+        state.showingRawJson = !state.showingRawJson;
+        if (el.inspectorScrollBody) {
+          el.inspectorScrollBody.style.display = state.showingRawJson ? 'none' : 'block';
+        }
+        if (el.inspectorRawJsonBody) {
+          el.inspectorRawJsonBody.style.display = state.showingRawJson ? 'block' : 'none';
+        }
+        el.btnViewObjJson.textContent = state.showingRawJson ? 'Formatted' : 'JSON';
+        if (state.showingRawJson && el.preObjRawJson) {
+          const obj = state.objects.find(o => o.object_id === state.selectedObjectId);
+          el.preObjRawJson.textContent = obj ? JSON.stringify(obj, null, 2) : '// No object selected';
+        }
+      });
+    }
+
+    if (el.btnCopyObjJson) {
+      el.btnCopyObjJson.addEventListener('click', () => {
+        if (el.preObjRawJson && el.preObjRawJson.textContent) {
+          navigator.clipboard.writeText(el.preObjRawJson.textContent).then(() => {
+            showToast('Object JSON copied to clipboard', 'success');
+          });
+        }
+      });
+    }
+
+    // Candidate Functions Tier Filter Chips
+    if (el.codeNavTierChips) {
+      el.codeNavTierChips.querySelectorAll('.tier-filter-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+          el.codeNavTierChips.querySelectorAll('.tier-filter-chip').forEach(c => c.classList.remove('active'));
+          chip.classList.add('active');
+          state.candidateTierFilter = chip.getAttribute('data-tier') || 'all';
+          applyCandidateFilter();
+        });
+      });
+    }
+
     // Integrated Field Mutation Trigger
     if (el.btnInspRunMutation) {
       el.btnInspRunMutation.addEventListener('click', () => {
@@ -4070,27 +5005,27 @@
 
   function renderEmptyInvestigationOverview() {
     if (el.invBadgeStatus) {
-      el.invBadgeStatus.textContent = 'IDLE / READY';
+      el.invBadgeStatus.textContent = t('badge_status_idle', 'IDLE / READY');
       el.invBadgeStatus.className = 'badge badge-info';
     }
     if (el.hdrBadgeInvestigationState) {
       el.hdrBadgeInvestigationState.textContent = 'NOT_STARTED';
       el.hdrBadgeInvestigationState.className = 'badge badge-neutral';
     }
-    if (el.invTxtId) el.invTxtId.textContent = 'Ready for investigation goal';
+    if (el.invTxtId) el.invTxtId.textContent = t('ready_investigation_goal', 'Ready for investigation goal');
     if (el.invAlertBanner) el.invAlertBanner.style.display = 'none';
 
     if (el.invFindingsList) {
-      el.invFindingsList.innerHTML = '<div class="empty-state text-xs p-3">Investigation not started. Select an entry path above, enter an objective, and click "Start Investigation".</div>';
+      el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3">${t('inv_empty_findings_init', 'Investigation not started. Select an entry path above, enter an objective, and click "Start Investigation".')}</div>`;
     }
     if (el.invStepsContainer) {
-      el.invStepsContainer.innerHTML = '<div class="empty-state text-xs p-3">Start an investigation to receive evidence-driven recommendations.</div>';
+      el.invStepsContainer.innerHTML = `<div class="empty-state text-xs p-3">${t('empty_next_steps_init', 'Start an investigation to receive evidence-driven recommendations.')}</div>`;
     }
     if (el.invComparisonsContent) {
-      el.invComparisonsContent.innerHTML = '<div class="empty-state text-xs p-3">No comparison performed yet. Select two snapshots above to isolate state diffs.</div>';
+      el.invComparisonsContent.innerHTML = `<div class="empty-state text-xs p-3">${t('empty_no_comparison', 'No comparison performed yet. Select two snapshots above to isolate state diffs.')}</div>`;
     }
     if (el.invStaticLinksList) {
-      el.invStaticLinksList.innerHTML = '<div class="empty-state text-xs p-3">No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.</div>';
+      el.invStaticLinksList.innerHTML = `<div class="empty-state text-xs p-3">${t('empty_static_links_init', 'No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.')}</div>`;
     }
     populateInvestigationSnapshots();
   }
@@ -4375,16 +5310,18 @@
         const sc = inv.summary?.scope || {};
         const objCount = sc.objects_examined ?? (stages.semantic_interpretation?.details?.objects_count || 0);
         const rootCount = sc.roots_examined ?? (stages.semantic_interpretation?.details?.roots_count || 0);
-        const scopeText = objCount > 0 ? `Inspected ${objCount} objects and ${rootCount} roots.` : 'Inspected available target memory.';
+        const scopeText = objCount > 0 
+          ? (state.currentLang === 'ko' ? `${objCount}개 객체 및 ${rootCount}개 루트 검사 완료.` : `Inspected ${objCount} objects and ${rootCount} roots.`) 
+          : (state.currentLang === 'ko' ? '사용 가능한 대상 메모리 검사 완료.' : 'Inspected available target memory.');
         const unresolvedList = Array.isArray(sc.unresolved_checks) && sc.unresolved_checks.length > 0 
           ? `<ul class="mt-2 text-muted" style="padding-left: 18px; margin-bottom: 0;">${sc.unresolved_checks.map(u => `<li>${escapeHtml(u)}</li>`).join('')}</ul>`
-          : '<div class="text-muted mt-1">Unmapped heap allocations, private symbols, and uninspected runtime invariants remain unverified.</div>';
+          : `<div class="text-muted mt-1">${t('zero_findings_unverified_fallback', 'Unmapped heap allocations, private symbols, and uninspected runtime invariants remain unverified.')}</div>`;
 
         el.invFindingsList.innerHTML = `
           <div class="empty-state-clean text-xs p-3" style="background-color: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 6px;">
-            <strong style="color: var(--accent); font-size: 0.95rem;">ℹ️ Completed: 0 Findings in Inspected Scope</strong>
-            <div class="mt-1">${scopeText} No discrepancies identified within inspected structures.</div>
-            <div class="mt-2" style="font-weight: 600; color: var(--text-secondary);">Scope Boundaries &amp; Uninspected Checks:</div>
+            <strong style="color: var(--accent); font-size: 0.95rem;">ℹ️ ${t('clean_completed_title', 'Completed: 0 Findings in Inspected Scope')}</strong>
+            <div class="mt-1">${scopeText} ${t('clean_completed_no_disc', 'No discrepancies identified within inspected structures.')}</div>
+            <div class="mt-2" style="font-weight: 600; color: var(--text-secondary);">${t('scope_boundaries_header', 'Scope Boundaries &amp; Uninspected Checks:')}</div>
             ${unresolvedList}
           </div>
         `;
@@ -4393,32 +5330,32 @@
           || stages.target_identity?.details?.build_id_reason 
           || stages.capture_quality?.details?.error 
           || inv.summary?.error 
-          || 'Target snapshot could not be fully resolved or debug artifacts were incomplete.';
+          || (state.currentLang === 'ko' ? '대상 스냅샷을 완전히 해결할 수 없거나 디버그 아티팩트가 불완전합니다.' : 'Target snapshot could not be fully resolved or debug artifacts were incomplete.');
         el.invFindingsList.innerHTML = `
           <div class="empty-state text-xs p-3" style="background-color: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 6px;">
-            <strong style="color: var(--warning); font-size: 0.95rem;">⚠️ Partial Analysis: 0 Findings Recorded</strong>
-            <div class="text-muted mt-1">Analysis scope was incomplete: ${escapeHtml(partialReason)}</div>
-            <div class="text-muted mt-1">Zero findings recorded does NOT indicate clean state; inspection was restricted.</div>
+            <strong style="color: var(--warning); font-size: 0.95rem;">⚠️ ${t('partial_0_findings_title', 'Partial Analysis: 0 Findings Recorded')}</strong>
+            <div class="text-muted mt-1">${t('analysis_scope_incomplete', 'Analysis scope was incomplete:')} ${escapeHtml(partialReason)}</div>
+            <div class="text-muted mt-1">${t('zero_findings_not_clean', 'Zero findings recorded does NOT indicate clean state; inspection was restricted.')}</div>
           </div>
         `;
       } else if (inv.status === 'BLOCKED') {
-        const blockReason = stages.target_identity?.details?.error || inv.summary?.error || 'Target authorization or identity validation blocked analysis.';
+        const blockReason = stages.target_identity?.details?.error || inv.summary?.error || (state.currentLang === 'ko' ? '대상 권한 승인 또는 식별 검증으로 인해 분석이 차단되었습니다.' : 'Target authorization or identity validation blocked analysis.');
         el.invFindingsList.innerHTML = `
           <div class="empty-state text-xs p-3" style="background-color: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 6px;">
-            <strong style="color: var(--danger); font-size: 0.95rem;">🛑 Investigation Blocked</strong>
+            <strong style="color: var(--danger); font-size: 0.95rem;">🛑 ${t('inv_blocked_title', 'Investigation Blocked')}</strong>
             <div class="text-muted mt-1">${escapeHtml(blockReason)}</div>
           </div>
         `;
       } else if (inv.status === 'FAILED') {
-        const failReason = inv.summary?.error || stages.target_identity?.details?.error || stages.capture_quality?.details?.error || 'Investigation stage failed.';
+        const failReason = inv.summary?.error || stages.target_identity?.details?.error || stages.capture_quality?.details?.error || (state.currentLang === 'ko' ? '조사 단계 실행 실패.' : 'Investigation stage failed.');
         el.invFindingsList.innerHTML = `
           <div class="empty-state text-xs p-3" style="background-color: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 6px;">
-            <strong style="color: var(--danger); font-size: 0.95rem;">❌ Investigation Failed</strong>
+            <strong style="color: var(--danger); font-size: 0.95rem;">❌ ${t('inv_failed_title', 'Investigation Failed')}</strong>
             <div class="text-muted mt-1">${escapeHtml(failReason)}</div>
           </div>
         `;
       } else {
-        el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3">No findings matching '${escapeHtml(filter)}'.</div>`;
+        el.invFindingsList.innerHTML = `<div class="empty-state text-xs p-3">${state.currentLang === 'ko' ? `'${escapeHtml(filter)}' 조건과 일치하는 발견 사항이 없습니다.` : `No findings matching '${escapeHtml(filter)}'.`}</div>`;
       }
       return;
     }
@@ -4426,9 +5363,9 @@
     el.invFindingsList.innerHTML = filtered.map(f => {
       const cat = f.category || 'fact';
       const badgeClass = cat === 'fact' ? 'badge-fact' : (cat === 'hypothesis' ? 'badge-hypothesis' : 'badge-unknown');
-      const catLabel = cat === 'fact' ? 'Observed Fact' : (cat === 'hypothesis' ? 'Hypothesis' : 'Unknown');
+      const catLabel = cat === 'fact' ? t('observed_fact', 'Observed Fact') : (cat === 'hypothesis' ? t('hypothesis', 'Hypothesis') : t('unknown', 'Unknown'));
       const cPathHtml = f.c_type_path ? `<span class="finding-path">${escapeHtml(f.c_type_path)}</span>` : '';
-      const jumpHtml = f.object_id ? `<button type="button" class="jump-link" onclick="window.__jumpToObject('${escapeHtml(f.object_id)}', '${escapeHtml(f.field_name || '')}')">Inspect in Object Explorer ➔</button>` : '';
+      const jumpHtml = f.object_id ? `<button type="button" class="jump-link" onclick="window.__jumpToObject('${escapeHtml(f.object_id)}', '${escapeHtml(f.field_name || '')}')">${t('inspect_in_obj_explorer', 'Inspect in Object Explorer ➔')}</button>` : '';
 
       return `
         <div class="finding-card ${cat}">
@@ -4669,12 +5606,12 @@
   window.__jumpToObject = function (objectId, fieldName) {
     if (!objectId) return;
     switchTab('tab-object-explorer');
-    selectObject(objectId);
+    selectObject(objectId, true, fieldName);
     if (fieldName && el.tableSemanticFields) {
       setTimeout(() => {
         const rows = el.tableSemanticFields.querySelectorAll('tr');
         rows.forEach(r => {
-          const nameCell = r.querySelector('.field-name');
+          const nameCell = r.querySelector('td strong');
           if (nameCell && nameCell.textContent.trim() === fieldName) {
             r.scrollIntoView({ behavior: 'smooth', block: 'center' });
             r.style.outline = '2px solid var(--accent)';
@@ -4693,6 +5630,7 @@
   async function init() {
     initTabs();
     initModeToggle();
+    initI18n();
     initMutationPreview();
     initJsonViewerButtons();
     initObserveDialog();

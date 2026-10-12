@@ -77,6 +77,10 @@ class InvestigationFinding:
     evidence_ids: List[str] = field(default_factory=list)
     confidence: str = "high"
     status: str = "CONFIRMED"  # CONFIRMED, CANDIDATE, UNRESOLVED, SUSPECT
+    priority: str = "MEDIUM"  # HIGH, MEDIUM, LOW
+    uncertainty: Optional[str] = None
+    thread_id: Optional[Union[int, str]] = None
+    execution_context: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

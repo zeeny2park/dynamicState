@@ -13,51 +13,57 @@
   <header class="app-header">
     <div class="header-brand">
       <div class="brand-title">dynamicState</div>
-      <div class="brand-subtitle">C/C++ Runtime Investigation Workspace</div>
+      <div class="brand-subtitle" data-i18n="hdr_brand_subtitle">C/C++ Runtime Investigation Workspace</div>
     </div>
     
     <div class="header-status" id="header-primary-status">
       <!-- Connection Status -->
-      <div class="status-pill" id="pill-runtime-status" title="Target connection status">
+      <div class="status-pill" id="pill-runtime-status" title="Target connection status" data-i18n-title="pill_runtime_status_title">
         <span class="dot"></span>
         <span id="txt-runtime-status">DISCONNECTED</span>
       </div>
       <!-- Target / Snapshot -->
-      <div class="status-pill status-target" id="pill-target-info" title="Current target process or active snapshot">
-        <span class="pill-label">Target:</span>
+      <div class="status-pill status-target" id="pill-target-info" title="Current target process or active snapshot" data-i18n-title="pill_target_info_title">
+        <span class="pill-label" data-i18n="hdr_lbl_target">Target:</span>
         <span class="pill-val mono" id="hdr-txt-target">No target loaded</span>
       </div>
       <!-- Capture Quality -->
-      <div class="status-pill status-quality" id="pill-quality-info" title="Memory snapshot consistency level">
-        <span class="pill-label">Capture:</span>
+      <div class="status-pill status-quality" id="pill-quality-info" title="Memory snapshot consistency level" data-i18n-title="pill_quality_info_title">
+        <span class="pill-label" data-i18n="hdr_lbl_capture">Capture:</span>
         <span class="badge badge-neutral" id="hdr-badge-capture-quality">UNKNOWN</span>
       </div>
       <!-- Investigation State -->
-      <div class="status-pill status-investigation" id="pill-investigation-info" title="Investigation workflow state">
-        <span class="pill-label">Investigation:</span>
+      <div class="status-pill status-investigation" id="pill-investigation-info" title="Investigation workflow state" data-i18n-title="pill_investigation_info_title">
+        <span class="pill-label" data-i18n="hdr_lbl_investigation">Investigation:</span>
         <span class="badge badge-neutral" id="hdr-badge-investigation-state">NOT_STARTED</span>
       </div>
     </div>
 
     <div class="header-actions">
       <!-- Human-Centric Basic vs Advanced Mode Toggle -->
-      <div class="mode-toggle-group" id="group-mode-toggle" title="Switch between human-friendly Basic view and technical Advanced view">
-        <button type="button" class="btn btn-sm btn-mode active" id="btn-mode-basic">👤 Basic</button>
-        <button type="button" class="btn btn-sm btn-mode" id="btn-mode-advanced">⚙️ Advanced</button>
+      <div class="mode-toggle-group" id="group-mode-toggle" title="Switch between human-friendly Basic view and technical Advanced view" data-i18n-title="title_mode_toggle">
+        <button type="button" class="btn btn-sm btn-mode active" id="btn-mode-basic" data-i18n="btn_mode_basic">👤 Basic</button>
+        <button type="button" class="btn btn-sm btn-mode" id="btn-mode-advanced" data-i18n="btn_mode_advanced">⚙️ Advanced</button>
       </div>
 
-      <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-tech-details" title="Toggle technical hardware, ELF, and backend details">
+      <!-- Language Toggle Group (English / 한국어) -->
+      <div class="lang-toggle-group" id="group-lang-toggle" title="Switch language (English / 한국어)" data-i18n-title="title_lang_toggle">
+        <button type="button" class="btn btn-sm btn-lang active" id="btn-lang-en" data-lang="en">EN</button>
+        <button type="button" class="btn btn-sm btn-lang" id="btn-lang-ko" data-lang="ko">한국어</button>
+      </div>
+
+      <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-tech-details" title="Toggle technical hardware, ELF, and backend details" data-i18n="btn_tech_details" data-i18n-title="btn_tech_details_title">
         ⚙️ Technical Details
       </button>
 
-      <button class="btn btn-secondary btn-sm" id="btn-refresh" title="Refresh runtime data">
-        <span class="icon">⟳</span> Refresh
+      <button class="btn btn-secondary btn-sm" id="btn-refresh" title="Refresh runtime data" data-i18n-title="btn_refresh_title">
+        <span class="icon">⟳</span> <span data-i18n="btn_refresh">Refresh</span>
       </button>
-      <button class="btn btn-success btn-sm" id="btn-fast-capture" title="Fast runtime state capture with minimal stop time">
-        <span>⚡</span> Capture State
+      <button class="btn btn-success btn-sm" id="btn-fast-capture" title="Fast runtime state capture with minimal stop time" data-i18n-title="btn_fast_capture_title">
+        <span>⚡</span> <span data-i18n="btn_fast_capture">Capture State</span>
       </button>
       <button class="btn btn-primary btn-sm" id="btn-observe-dialog">
-        <span>👁</span> Observe
+        <span>👁</span> <span data-i18n="btn_observe">Observe</span>
       </button>
     </div>
   </header>
@@ -78,51 +84,51 @@
     </div>
 
     <div class="summary-metric-tile">
-      <span class="summary-label">Runtime</span>
+      <span class="summary-label" data-i18n="sum_lbl_runtime">Runtime</span>
       <span class="summary-val status-badge status-disconnected" id="sum-runtime-status">DISCONNECTED</span>
     </div>
     <div class="summary-metric-tile">
-      <span class="summary-label">Active Threads</span>
+      <span class="summary-label" data-i18n="sum_lbl_active_threads">Active Threads</span>
       <span class="summary-val" id="sum-thread-count">1</span>
     </div>
     <div class="summary-metric-tile">
-      <span class="summary-label">Discovered Objects</span>
+      <span class="summary-label" data-i18n="sum_lbl_discovered_objects">Discovered Objects</span>
       <span class="summary-val" id="sum-object-count">0</span>
     </div>
     <div class="summary-metric-tile">
-      <span class="summary-label">Root Variables</span>
+      <span class="summary-label" data-i18n="sum_lbl_root_variables">Root Variables</span>
       <span class="summary-val" id="sum-root-count">0</span>
     </div>
     <div class="summary-metric-tile">
-      <span class="summary-label">State Hash</span>
+      <span class="summary-label" data-i18n="sum_lbl_state_hash">State Hash</span>
       <span class="summary-val mono text-accent" id="sum-state-hash">N/A</span>
     </div>
-    <div class="summary-metric-tile" title="Capture Backend">
-      <span class="summary-label">Capture Backend</span>
+    <div class="summary-metric-tile" title="Capture Backend" data-i18n-title="sum_title_capture_backend">
+      <span class="summary-label" data-i18n="sum_lbl_capture_backend">Capture Backend</span>
       <span class="summary-val mono text-accent" id="sum-capture-backend">process_vm_readv</span>
     </div>
-    <div class="summary-metric-tile" title="Measured capture stop duration">
-      <span class="summary-label">Stop Duration</span>
+    <div class="summary-metric-tile" title="Measured capture stop duration" data-i18n-title="sum_title_stop_duration">
+      <span class="summary-label" data-i18n="sum_lbl_stop_duration">Stop Duration</span>
       <span class="summary-val mono text-accent" id="sum-capture-latency">N/A</span>
     </div>
-    <div class="summary-metric-tile" title="Checkpoint Restore Capability">
-      <span class="summary-label">Checkpoint</span>
+    <div class="summary-metric-tile" title="Checkpoint Restore Capability" data-i18n-title="sum_title_checkpoint">
+      <span class="summary-label" data-i18n="sum_lbl_checkpoint">Checkpoint</span>
       <span class="summary-val" id="sum-checkpoint-status"><span class="badge badge-neutral">Unverified</span></span>
     </div>
-    <div class="summary-metric-tile" title="Sibling mutation branch isolation capability & verification">
-      <span class="summary-label">Branch Isolation</span>
+    <div class="summary-metric-tile" title="Sibling mutation branch isolation capability & verification" data-i18n-title="sum_title_branch_isolation">
+      <span class="summary-label" data-i18n="sum_lbl_branch_isolation">Branch Isolation</span>
       <span class="summary-val" id="sum-isolation-status"><span class="badge badge-neutral">Unverified</span></span>
     </div>
-    <div class="summary-metric-tile" title="Restart reproducibility verification status">
-      <span class="summary-label">Determinism</span>
+    <div class="summary-metric-tile" title="Restart reproducibility verification status" data-i18n-title="sum_title_determinism">
+      <span class="summary-label" data-i18n="sum_lbl_determinism">Determinism</span>
       <span class="summary-val" id="sum-determinism-status"><span class="badge badge-neutral">Not verified</span></span>
     </div>
-    <div class="summary-metric-tile summary-obs-tile" title="Observation Point (deterministic breakpoint)">
-      <span class="summary-label">Observation Point</span>
+    <div class="summary-metric-tile summary-obs-tile" title="Observation Point (deterministic breakpoint)" data-i18n-title="sum_title_obs_point">
+      <span class="summary-label" data-i18n="sum_lbl_observation_point">Observation Point</span>
       <span class="summary-val mono text-accent" id="sum-obs-point">Not available</span>
     </div>
-    <div class="summary-control-tile" title="Execution Timeout Source of Truth">
-      <label for="select-global-timeout" class="summary-label">Timeout (Source of Truth)</label>
+    <div class="summary-control-tile" title="Execution Timeout Source of Truth" data-i18n-title="sum_title_timeout">
+      <label for="select-global-timeout" class="summary-label" data-i18n="sum_lbl_timeout">Timeout (Source of Truth)</label>
       <select id="select-global-timeout" class="input-select input-select-sm">
         <option value="100">100 ms</option>
         <option value="500">500 ms</option>
@@ -132,7 +138,7 @@
       </select>
     </div>
     <div class="summary-control-tile">
-      <label for="select-snapshot-id" class="summary-label">Active State / Snapshot</label>
+      <label for="select-snapshot-id" class="summary-label" data-i18n="sum_lbl_active_snapshot">Active State / Snapshot</label>
       <select id="select-snapshot-id" class="input-select input-select-sm">
         <option value="">(Select Snapshot / State)</option>
       </select>
@@ -141,14 +147,14 @@
 
   <!-- Main Navigation Tabs (8 Functional Views) -->
   <nav class="app-nav">
-    <button class="nav-tab active" data-tab="tab-investigation-overview" id="nav-tab-investigation">0. 🔍 Investigation Overview</button>
-    <button class="nav-tab" data-tab="tab-object-explorer">1. 📦 Object Explorer</button>
-    <button class="nav-tab" data-tab="tab-thread-explorer">2. 🧵 Thread Explorer</button>
-    <button class="nav-tab" data-tab="tab-memory-snapshot">3. 🧠 Memory Snapshot</button>
-    <button class="nav-tab" data-tab="tab-history-diff">4. 📜 State DAG & Diff</button>
-    <button class="nav-tab" data-tab="tab-advanced-explore">5. ⚡ Autonomous Loop</button>
-    <button class="nav-tab" data-tab="tab-system-provenance">6. 🛠️ System / Modules</button>
-    <button class="nav-tab" data-tab="tab-state-lab" id="nav-tab-state-lab">7. 🔬 State Laboratory</button>
+    <button class="nav-tab active" data-tab="tab-investigation-overview" id="nav-tab-investigation" data-i18n="nav_tab_0">0. 🔍 Investigation Overview</button>
+    <button class="nav-tab" data-tab="tab-object-explorer" data-i18n="nav_tab_1">1. 📦 Object Explorer</button>
+    <button class="nav-tab" data-tab="tab-thread-explorer" data-i18n="nav_tab_2">2. 🧵 Thread Explorer</button>
+    <button class="nav-tab" data-tab="tab-memory-snapshot" data-i18n="nav_tab_3">3. 🧠 Memory Snapshot</button>
+    <button class="nav-tab" data-tab="tab-history-diff" data-i18n="nav_tab_4">4. 📜 State DAG & Diff</button>
+    <button class="nav-tab" data-tab="tab-advanced-explore" data-i18n="nav_tab_5">5. ⚡ Autonomous Loop</button>
+    <button class="nav-tab" data-tab="tab-system-provenance" data-i18n="nav_tab_6">6. 🛠️ System / Modules</button>
+    <button class="nav-tab" data-tab="tab-state-lab" id="nav-tab-state-lab" data-i18n="nav_tab_7">7. 🔬 State Laboratory</button>
   </nav>
 
   <!-- Banner for low-impact observation mode -->
@@ -175,12 +181,12 @@
         <div class="inv-launchpad">
           <div class="inv-launchpad-header">
             <div>
-              <div class="inv-launchpad-title">🔍 Investigation Workspace</div>
-              <div class="text-xs text-muted">Select an entry path to analyze runtime memory, reconstruct C++ object graphs, and verify evidence integrity.</div>
+              <div class="inv-launchpad-title" data-i18n="inv_launchpad_title">🔍 Investigation Workspace</div>
+              <div class="text-xs text-muted" data-i18n="inv_launchpad_subtitle">Select an entry path to analyze runtime memory, reconstruct C++ object graphs, and verify evidence integrity.</div>
             </div>
             <div class="inv-entry-selector">
-              <button type="button" class="btn btn-tab-pill active" id="btn-entry-snapshot" data-entry="snapshot">📁 Offline Snapshot Analysis</button>
-              <button type="button" class="btn btn-tab-pill" id="btn-entry-live" data-entry="live">⚡ Live Target Capture</button>
+              <button type="button" class="btn btn-tab-pill active" id="btn-entry-snapshot" data-entry="snapshot" data-i18n="btn_entry_snapshot">📁 Offline Snapshot Analysis</button>
+              <button type="button" class="btn btn-tab-pill" id="btn-entry-live" data-entry="live" data-i18n="btn_entry_live">⚡ Live Target Capture</button>
             </div>
           </div>
 
@@ -189,20 +195,21 @@
             <!-- Panel A: Offline Snapshot Analysis -->
             <div class="inv-entry-panel active" id="panel-entry-snapshot">
               <div class="inv-entry-desc text-xs">
-                <span class="badge badge-success text-xs">SAFE & DETERMINISTIC</span>
-                <span>Analyze a previously captured memory snapshot offline. Zero target stop time, zero execution interference, completely repeatable.</span>
+                <span class="badge badge-success text-xs" data-i18n="badge_safe_det">SAFE & DETERMINISTIC</span>
+                <span data-i18n="desc_entry_snapshot">Analyze a previously captured memory snapshot offline. Zero target stop time, zero execution interference, completely repeatable.</span>
               </div>
               <div class="inv-form-row">
                 <div class="inv-form-field">
-                  <label for="inv-select-snapshot" class="text-xs">Snapshot Target:</label>
+                  <label for="inv-select-snapshot" class="text-xs" data-i18n="lbl_snapshot_target">Snapshot Target:</label>
                   <select id="inv-select-snapshot" class="form-select text-xs">
-                    <option value="">(Current / Active State)</option>
+                    <option value="" data-i18n="opt_active_state">(Current / Active State)</option>
                   </select>
                 </div>
                 <div class="inv-form-field">
-                  <label for="inv-input-debug-image" class="text-xs">Debug Image (ELF with DWARF):</label>
+                  <label for="inv-input-debug-image" class="text-xs" data-i18n="lbl_debug_image">Debug Image (ELF with DWARF):</label>
                   <input type="text" id="inv-input-debug-image" class="form-input text-xs" 
-                         placeholder="e.g. build/app_debug.elf (same Build-ID required)">
+                         placeholder="e.g. build/app_debug.elf (same Build-ID required)"
+                         data-i18n-placeholder="ph_debug_image">
                 </div>
               </div>
             </div>
@@ -210,24 +217,26 @@
             <!-- Panel B: Live Process Capture -->
             <div class="inv-entry-panel" id="panel-entry-live" style="display: none;">
               <div class="inv-entry-desc text-xs">
-                <span class="badge badge-warning text-xs">REQUIRES AUTHORIZATION</span>
-                <span>Connect to an authorized running process. Memory pages are read via <code>process_vm_readv</code>. To reduce skew, the capture backend signals the target (SIGSTOP/SIGCONT); if unstopped or active multi-threaded, capture is NON_ATOMIC.</span>
+                <span class="badge badge-warning text-xs" data-i18n="badge_req_auth">REQUIRES AUTHORIZATION</span>
+                <span data-i18n="desc_entry_live" data-i18n-html="true">Connect to an authorized running process. Memory pages are read via <code>process_vm_readv</code>. To reduce skew, the capture backend signals the target (SIGSTOP/SIGCONT); if unstopped or active multi-threaded, capture is NON_ATOMIC.</span>
               </div>
               <div class="inv-form-row">
                 <div class="inv-form-field">
-                  <label for="inv-input-live-target" class="text-xs">Live Target PID:</label>
+                  <label for="inv-input-live-target" class="text-xs" data-i18n="lbl_live_target_pid">Live Target PID:</label>
                   <input type="text" id="inv-input-live-target" class="form-input text-xs" 
-                         placeholder="e.g. 2048 (numeric PID required)">
+                         placeholder="e.g. 2048 (numeric PID required)"
+                         data-i18n-placeholder="ph_live_pid">
                 </div>
                 <div class="inv-form-field">
-                  <label for="inv-input-live-debug-image" class="text-xs">Debug Image (ELF with DWARF):</label>
+                  <label for="inv-input-live-debug-image" class="text-xs" data-i18n="lbl_live_debug_image">Debug Image (ELF with DWARF):</label>
                   <input type="text" id="inv-input-live-debug-image" class="form-input text-xs" 
-                         placeholder="e.g. build/app_debug.elf">
+                         placeholder="e.g. build/app_debug.elf"
+                         data-i18n-placeholder="ph_live_debug_image">
                 </div>
                 <div class="inv-form-field" style="display: flex; align-items: flex-end; padding-bottom: 4px;">
                   <label class="text-xs" style="cursor: pointer;">
                     <input type="checkbox" id="inv-check-authorize" style="margin-right: 4px;">
-                    Authorize Target Signal (SIGSTOP / SIGCONT) &amp; Memory Read
+                    <span data-i18n="lbl_authorize_check">Authorize Target Signal (SIGSTOP / SIGCONT) &amp; Memory Read</span>
                   </label>
                 </div>
               </div>
@@ -237,20 +246,21 @@
           <!-- Unified Goal Row & Prominent Action Button -->
           <div class="inv-goal-row">
             <div class="inv-goal-input-wrap">
-              <label for="inv-input-goal" class="inv-goal-label">🎯 Goal:</label>
+              <label for="inv-input-goal" class="inv-goal-label" data-i18n="lbl_goal">🎯 Goal:</label>
               <input type="text" id="inv-input-goal" class="inv-goal-input" 
                      placeholder="State your investigation objective (e.g. 'Investigate worker counter mismatch', 'Verify state transition')..." 
+                     data-i18n-placeholder="ph_goal"
                      value="Investigate runtime state discrepancy & verify typed objects">
             </div>
             <div class="inv-goal-actions">
-              <button type="button" id="btn-run-investigation" class="btn btn-primary btn-lg">🚀 Start Investigation</button>
-              <button type="button" id="btn-refresh-investigation" class="btn btn-secondary">🔄 Refresh</button>
+              <button type="button" id="btn-run-investigation" class="btn btn-primary btn-lg" data-i18n="btn_run_investigation">🚀 Start Investigation</button>
+              <button type="button" id="btn-refresh-investigation" class="btn btn-secondary" data-i18n="btn_refresh_investigation">🔄 Refresh</button>
             </div>
           </div>
 
           <!-- Recent Investigation Sessions (Honest: Only displayed if backend has sessions) -->
           <div id="inv-recent-sessions-container" class="inv-recent-sessions" style="display: none;">
-            <span class="text-xs text-muted" style="font-weight: 600;">Recent Sessions:</span>
+            <span class="text-xs text-muted" style="font-weight: 600;" data-i18n="lbl_recent_sessions">Recent Sessions:</span>
             <div id="inv-recent-sessions-list" class="inv-session-pills"></div>
           </div>
         </div>
@@ -259,17 +269,17 @@
         <div class="inv-card" id="inv-card-status-bar" style="padding: 12px 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
             <div style="display: flex; align-items: center; gap: 10px;">
-              <span style="font-weight: 600;">Status:</span>
+              <span style="font-weight: 600;" data-i18n="lbl_inv_status">Status:</span>
               <span id="inv-badge-status" class="badge badge-info">IDLE / READY</span>
               <span class="text-muted text-xs mono" id="inv-txt-id">No active session</span>
             </div>
             <div class="stage-pills-container" id="inv-stage-pills">
-              <span class="stage-pill" id="pill-stage-identity">1. Identity</span>
-              <span class="stage-pill" id="pill-stage-quality">2. Capture Quality</span>
-              <span class="stage-pill" id="pill-stage-semantic">3. Typed Objects</span>
-              <span class="stage-pill" id="pill-stage-comparison">4. Comparison</span>
-              <span class="stage-pill" id="pill-stage-static">5. Static Links</span>
-              <span class="stage-pill" id="pill-stage-synthesis">6. Report</span>
+              <span class="stage-pill" id="pill-stage-identity" data-i18n="stage_1">1. Identity</span>
+              <span class="stage-pill" id="pill-stage-quality" data-i18n="stage_2">2. Capture Quality</span>
+              <span class="stage-pill" id="pill-stage-semantic" data-i18n="stage_3">3. Typed Objects</span>
+              <span class="stage-pill" id="pill-stage-comparison" data-i18n="stage_4">4. Comparison</span>
+              <span class="stage-pill" id="pill-stage-static" data-i18n="stage_5">5. Static Links</span>
+              <span class="stage-pill" id="pill-stage-synthesis" data-i18n="stage_6">6. Report</span>
             </div>
           </div>
         </div>
@@ -289,37 +299,37 @@
             <!-- 1. Target & Build Identity Card -->
             <div class="inv-card">
               <div class="inv-card-header">
-                <span class="inv-card-title">🏷️ Target & Build Identity</span>
+                <span class="inv-card-title" data-i18n="title_card_target_build">🏷️ Target & Build Identity</span>
                 <span id="inv-badge-build-status" class="badge">NOT_VERIFIED</span>
               </div>
               <div class="key-value-list text-xs" id="inv-target-identity-list">
-                <div><span class="text-muted">Executable:</span> <span class="mono" id="inv-txt-exec">None loaded</span></div>
-                <div><span class="text-muted">Target Build ID:</span> <span class="mono" id="inv-txt-target-bid">N/A</span></div>
-                <div><span class="text-muted">Debug Image:</span> <span class="mono" id="inv-txt-debug-image">None</span></div>
-                <div><span class="text-muted">Debug Build ID:</span> <span class="mono" id="inv-txt-debug-bid">N/A</span></div>
-                <div><span class="text-muted">PID / Inferior:</span> <span class="mono" id="inv-txt-pid">Offline</span></div>
-                <div><span class="text-muted">Identity Status:</span> <span class="mono" id="inv-txt-build-reason"></span></div>
-                <div><span class="text-muted">Persistence:</span> <span class="badge badge-info" id="inv-txt-persistence">EPHEMERAL_PROCESS_LOCAL</span></div>
+                <div><span class="text-muted" data-i18n="lbl_executable">Executable:</span> <span class="mono" id="inv-txt-exec">None loaded</span></div>
+                <div><span class="text-muted" data-i18n="lbl_target_build_id">Target Build ID:</span> <span class="mono" id="inv-txt-target-bid">N/A</span></div>
+                <div><span class="text-muted" data-i18n="lbl_debug_image_card">Debug Image:</span> <span class="mono" id="inv-txt-debug-image">None</span></div>
+                <div><span class="text-muted" data-i18n="lbl_debug_build_id">Debug Build ID:</span> <span class="mono" id="inv-txt-debug-bid">N/A</span></div>
+                <div><span class="text-muted" data-i18n="lbl_pid_inferior">PID / Inferior:</span> <span class="mono" id="inv-txt-pid">Offline</span></div>
+                <div><span class="text-muted" data-i18n="lbl_identity_status">Identity Status:</span> <span class="mono" id="inv-txt-build-reason"></span></div>
+                <div><span class="text-muted" data-i18n="lbl_persistence">Persistence:</span> <span class="badge badge-info" id="inv-txt-persistence">EPHEMERAL_PROCESS_LOCAL</span></div>
               </div>
             </div>
 
             <!-- 2. Capture Quality & Consistency Card -->
             <div class="inv-card">
               <div class="inv-card-header">
-                <span class="inv-card-title">🛡️ Capture Quality & Constraints</span>
+                <span class="inv-card-title" data-i18n="title_card_capture_quality">🛡️ Capture Quality & Constraints</span>
                 <span id="inv-badge-consistency" class="badge badge-warning">UNKNOWN</span>
               </div>
               <div id="inv-consistency-warning" class="banner banner-warning text-xs mb-2" style="display: none; padding: 6px 10px;">
                 <strong>NON_ATOMIC Warning:</strong> Memory capture was performed without pausing target threads (or with unconfirmed stop). Snapshot may reflect cross-region execution skew.
               </div>
               <div class="key-value-list text-xs" id="inv-quality-list">
-                <div><span class="text-muted">Consistency Level:</span> <strong id="inv-txt-consistency">UNKNOWN</strong></div>
-                <div><span class="text-muted">Capture Backend:</span> <span class="mono" id="inv-txt-backend">N/A</span></div>
-                <div><span class="text-muted">Stop Mechanism:</span> <span class="mono" id="inv-txt-stop-mech">NONE</span></div>
-                <div><span class="text-muted">Capture Duration:</span> <span class="mono" id="inv-txt-duration">0.0 ms</span></div>
-                <div><span class="text-muted">Bytes Captured / Req:</span> <span class="mono" id="inv-txt-bytes">0 / 0</span></div>
-                <div><span class="text-muted">Regions Read / Total:</span> <span class="mono" id="inv-txt-regions">0 / 0</span></div>
-                <div><span class="text-muted">Partial / Failed / Omitted:</span> <span class="mono" id="inv-txt-read-status">0 / 0 / 0</span></div>
+                <div><span class="text-muted" data-i18n="lbl_consistency_level">Consistency Level:</span> <strong id="inv-txt-consistency">UNKNOWN</strong></div>
+                <div><span class="text-muted" data-i18n="lbl_capture_backend">Capture Backend:</span> <span class="mono" id="inv-txt-backend">N/A</span></div>
+                <div><span class="text-muted" data-i18n="lbl_stop_mechanism">Stop Mechanism:</span> <span class="mono" id="inv-txt-stop-mech">NONE</span></div>
+                <div><span class="text-muted" data-i18n="lbl_capture_duration">Capture Duration:</span> <span class="mono" id="inv-txt-duration">0.0 ms</span></div>
+                <div><span class="text-muted" data-i18n="lbl_bytes_captured">Bytes Captured / Req:</span> <span class="mono" id="inv-txt-bytes">0 / 0</span></div>
+                <div><span class="text-muted" data-i18n="lbl_regions_read">Regions Read / Total:</span> <span class="mono" id="inv-txt-regions">0 / 0</span></div>
+                <div><span class="text-muted" data-i18n="lbl_partial_failed">Partial / Failed / Omitted:</span> <span class="mono" id="inv-txt-read-status">0 / 0 / 0</span></div>
               </div>
               <div id="inv-limitations-container" class="text-xs text-muted mt-2">
                 <em>No limitations reported.</em>
@@ -329,34 +339,34 @@
             <!-- 3. Observation Comparisons -->
             <div class="inv-card">
               <div class="inv-card-header">
-                <span class="inv-card-title">⚖️ Observation Comparisons</span>
+                <span class="inv-card-title" data-i18n="title_card_comparisons">⚖️ Observation Comparisons</span>
                 <button type="button" id="btn-modal-compare" class="btn btn-secondary text-xs" style="display: none;">Compare Prompt</button>
               </div>
               <!-- Inline Snapshot Comparison Controls -->
               <div class="inv-cmp-controls" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-                <label class="text-xs text-muted">Baseline A:</label>
+                <label class="text-xs text-muted" data-i18n="lbl_baseline_a">Baseline A:</label>
                 <select id="inv-cmp-select-a" class="form-select form-select-xs" style="min-width: 130px;">
-                  <option value="">(Select Snapshot)</option>
+                  <option value="" data-i18n="opt_select_snapshot">(Select Snapshot)</option>
                 </select>
-                <label class="text-xs text-muted">Observed B:</label>
+                <label class="text-xs text-muted" data-i18n="lbl_observed_b">Observed B:</label>
                 <select id="inv-cmp-select-b" class="form-select form-select-xs" style="min-width: 130px;">
-                  <option value="">(Select Snapshot)</option>
+                  <option value="" data-i18n="opt_select_snapshot">(Select Snapshot)</option>
                 </select>
-                <button type="button" id="btn-run-inline-compare" class="btn btn-secondary btn-xs">Compare Snapshots</button>
+                <button type="button" id="btn-run-inline-compare" class="btn btn-secondary btn-xs" data-i18n="btn_compare_snapshots">Compare Snapshots</button>
               </div>
               <div id="inv-comparisons-content">
-                <div class="empty-state text-xs p-3">No comparison performed yet. Select two snapshots above to isolate state diffs.</div>
+                <div class="empty-state text-xs p-3" data-i18n="empty_no_comparison">No comparison performed yet. Select two snapshots above to isolate state diffs.</div>
               </div>
             </div>
 
             <!-- 4. Recommended Next Steps -->
             <div class="inv-card">
               <div class="inv-card-header">
-                <span class="inv-card-title">📋 Recommended Next Steps</span>
+                <span class="inv-card-title" data-i18n="title_card_next_steps">📋 Recommended Next Steps</span>
                 <span class="text-xs text-muted" id="inv-steps-count">0 steps</span>
               </div>
               <div id="inv-steps-container">
-                <div class="empty-state text-xs p-3">Start an investigation to receive evidence-driven recommendations.</div>
+                <div class="empty-state text-xs p-3" data-i18n="empty_next_steps_init">Start an investigation to receive evidence-driven recommendations.</div>
               </div>
             </div>
 
@@ -368,36 +378,36 @@
             <!-- Findings Group -->
             <div class="inv-card">
               <div class="inv-card-header">
-                <span class="inv-card-title">🔎 Investigation Findings</span>
+                <span class="inv-card-title" data-i18n="title_card_findings">🔎 Investigation Findings</span>
                 <div style="display: flex; gap: 4px;">
-                  <button type="button" class="btn-tab-pill active" id="btn-filter-find-all" data-filter="all">All</button>
-                  <button type="button" class="btn-tab-pill" id="btn-filter-find-facts" data-filter="fact">🟢 Facts</button>
-                  <button type="button" class="btn-tab-pill" id="btn-filter-find-hypo" data-filter="hypothesis">🟡 Hypotheses</button>
-                  <button type="button" class="btn-tab-pill" id="btn-filter-find-unknown" data-filter="unknown">⚪ Unknowns</button>
+                  <button type="button" class="btn-tab-pill active" id="btn-filter-find-all" data-filter="all" data-i18n="filter_all">All</button>
+                  <button type="button" class="btn-tab-pill" id="btn-filter-find-facts" data-filter="fact" data-i18n="filter_facts">🟢 Facts</button>
+                  <button type="button" class="btn-tab-pill" id="btn-filter-find-hypo" data-filter="hypothesis" data-i18n="filter_hypo">🟡 Hypotheses</button>
+                  <button type="button" class="btn-tab-pill" id="btn-filter-find-unknown" data-filter="unknown" data-i18n="filter_unknown">⚪ Unknowns</button>
                 </div>
               </div>
               
               <!-- Findings List -->
               <div id="inv-findings-list" style="max-height: 480px; overflow-y: auto;">
-                <div class="empty-state text-xs p-3">No findings generated. Enter an investigation goal and click 'Start Investigation'.</div>
+                <div class="empty-state text-xs p-3" data-i18n="empty_findings_init">No findings generated. Enter an investigation goal and click 'Start Investigation'.</div>
               </div>
             </div>
 
             <!-- Resolved Static Code References -->
             <div class="inv-card">
               <div class="inv-card-header">
-                <span class="inv-card-title">📜 Resolved Static-Code References</span>
+                <span class="inv-card-title" data-i18n="title_card_static_links">📜 Resolved Static-Code References</span>
                 <span id="inv-badge-static-provider" class="badge">DWARF</span>
               </div>
               <div id="inv-static-links-list" class="text-xs" style="max-height: 220px; overflow-y: auto;">
-                <div class="empty-state text-xs p-3">No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.</div>
+                <div class="empty-state text-xs p-3" data-i18n="empty_static_links_init">No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.</div>
               </div>
             </div>
 
             <!-- Expandable Advanced Details (Raw Addresses & Evidence Ledger) -->
             <div class="inv-card">
               <details class="advanced-view" id="inv-details-raw-evidence">
-                <summary style="cursor: pointer; font-weight: 600; color: var(--accent); padding: 4px 0;">
+                <summary style="cursor: pointer; font-weight: 600; color: var(--accent); padding: 4px 0;" data-i18n="summary_advanced_details">
                   ⚙️ Advanced Details & Raw Evidence Ledger (Expand)
                 </summary>
                 <div style="margin-top: 10px; display: flex; flex-direction: column; gap: 10px;">
@@ -408,11 +418,11 @@
                     <table class="data-table text-xs" id="table-raw-evidence">
                       <thead>
                         <tr>
-                          <th>Evidence ID</th>
-                          <th>Type</th>
-                          <th>Nature</th>
-                          <th>Source</th>
-                          <th>Details</th>
+                          <th data-i18n="th_evidence_id">Evidence ID</th>
+                          <th data-i18n="th_type">Type</th>
+                          <th data-i18n="th_nature">Nature</th>
+                          <th data-i18n="th_source">Source</th>
+                          <th data-i18n="th_details">Details</th>
                         </tr>
                       </thead>
                       <tbody id="tbody-raw-evidence">
@@ -429,7 +439,7 @@
                     <div id="inv-lineage-content" class="mono text-xs"></div>
                   </div>
                   <div style="display: flex; gap: 8px;">
-                    <button type="button" id="btn-download-ledger" class="btn btn-secondary text-xs">📥 Export Ledger JSON</button>
+                    <button type="button" id="btn-download-ledger" class="btn btn-secondary text-xs" data-i18n="btn_export_ledger">📥 Export Ledger JSON</button>
                   </div>
                 </div>
               </details>
@@ -447,24 +457,37 @@
     <!-- ===================================================================== -->
     <section id="tab-object-explorer" class="tab-pane">
 
+      <!-- Navigation Breadcrumb & History Toolbar -->
+      <div class="explorer-nav-toolbar" id="explorer-nav-toolbar">
+        <button type="button" class="btn btn-outline btn-sm" id="btn-nav-back" title="Navigate back" disabled>
+          <span>←</span> Back
+        </button>
+        <div class="nav-breadcrumbs-container" id="nav-breadcrumbs-trail">
+          <span class="crumb-item active">Explorer</span>
+        </div>
+        <div class="nav-toolbar-actions">
+          <span class="text-xs text-muted" id="nav-history-info">History: 0</span>
+        </div>
+      </div>
+
       <div class="explorer-workspace">
         
         <!-- PANE 1: Object Explorer (Left) -->
         <div class="pane-card pane-explorer" id="pane-object-explorer">
           <div class="pane-header">
             <div class="pane-title-group">
-              <h4>Object Explorer</h4>
+              <h4 data-i18n="title_object_explorer">Object Explorer</h4>
               <span class="badge badge-neutral" id="badge-mem-objects-count">0</span>
             </div>
             <div class="sort-control">
-              <label for="select-obj-sort" class="text-xs text-muted">Sort:</label>
+              <label for="select-obj-sort" class="text-xs text-muted" data-i18n="lbl_sort">Sort:</label>
               <select id="select-obj-sort" class="input-select input-select-sm">
-                <option value="name-asc">Name (A-Z)</option>
-                <option value="name-desc">Name (Z-A)</option>
-                <option value="type-asc">Type (A-Z)</option>
-                <option value="fields-desc">Fields (High-Low)</option>
-                <option value="refs-desc">Refs (High-Low)</option>
-                <option value="addr-asc" class="advanced-only">Address (0x...)</option>
+                <option value="name-asc" data-i18n="opt_name_asc">Name (A-Z)</option>
+                <option value="name-desc" data-i18n="opt_name_desc">Name (Z-A)</option>
+                <option value="type-asc" data-i18n="opt_type_asc">Type (A-Z)</option>
+                <option value="fields-desc" data-i18n="opt_fields_desc">Fields (High-Low)</option>
+                <option value="refs-desc" data-i18n="opt_refs_desc">Refs (High-Low)</option>
+                <option value="addr-asc" class="advanced-only" data-i18n="opt_addr_asc">Address (0x...)</option>
               </select>
             </div>
           </div>
@@ -473,19 +496,19 @@
           <div class="pane-search-bar">
             <div class="search-input-wrap">
               <span class="search-icon">🔍</span>
-              <input type="text" id="input-search-objects" class="input-text" placeholder="Filter by name, type, field, thread...">
-              <button type="button" class="btn-clear-search" id="btn-clear-obj-search" title="Clear filter">×</button>
+              <input type="text" id="input-search-objects" class="input-text" placeholder="Filter by name, type, field, thread..." data-i18n-placeholder="ph_search_objects">
+              <button type="button" class="btn-clear-search" id="btn-clear-obj-search" title="Clear filter" data-i18n-title="btn_clear_filter_title">×</button>
             </div>
           </div>
 
           <!-- Logical Grouping Pills (Roots, Objects, Types based on real backend data) -->
           <div class="explorer-filter-pills" id="filter-obj-group">
-            <button class="filter-pill active" data-group="all">All</button>
-            <button class="filter-pill" data-group="roots" title="Roots (Globals, Frame Locals, Statics)">Roots</button>
-            <button class="filter-pill" data-group="heap" title="Heap / Persistent allocated objects">Heap</button>
-            <button class="filter-pill" data-group="globals" title="Global memory objects">Globals</button>
-            <button class="filter-pill" data-group="stack" title="Stack / Frame local objects">Stack/Locals</button>
-            <button class="filter-pill" data-group="types" title="Group objects by their C/C++ type">By Type</button>
+            <button class="filter-pill active" data-group="all" data-i18n="filter_all">All</button>
+            <button class="filter-pill" data-group="roots" title="Roots (Globals, Frame Locals, Statics)" data-i18n="pill_roots">Roots</button>
+            <button class="filter-pill" data-group="heap" title="Heap / Persistent allocated objects" data-i18n="pill_heap">Heap</button>
+            <button class="filter-pill" data-group="globals" title="Global memory objects" data-i18n="pill_globals">Globals</button>
+            <button class="filter-pill" data-group="stack" title="Stack / Frame local objects" data-i18n="pill_stack">Stack/Locals</button>
+            <button class="filter-pill" data-group="types" title="Group objects by their C/C++ type" data-i18n="pill_types">By Type</button>
           </div>
 
           <div id="mem-graph-truncated-warning" class="banner banner-info" style="display: none; padding: 4px 8px; margin: 6px 0; font-size: 0.75rem;">
@@ -494,7 +517,7 @@
 
           <!-- Object List / Accordion Container -->
           <div class="pane-list-container" id="list-memory-objects">
-            <div class="text-muted text-center p-3">Select a state to inspect objects</div>
+            <div class="text-muted text-center p-3" data-i18n="msg_select_state_objects">Select a state to inspect objects</div>
           </div>
         </div>
 
@@ -502,22 +525,22 @@
         <div class="pane-card pane-center" id="pane-reference-center">
           <div class="pane-header">
             <div class="center-breadcrumb mono" id="center-breadcrumb">
-              <span>Roots</span> <span class="bc-sep">/</span> <span class="bc-current" id="bc-current-name">All Objects</span>
+              <span data-i18n="bc_roots">Roots</span> <span class="bc-sep">/</span> <span class="bc-current" id="bc-current-name" data-i18n="bc_all_objects">All Objects</span>
             </div>
             <div class="center-view-tabs">
-              <button type="button" class="btn-tab-pill active" id="btn-view-tree" data-view="tree">🌲 Reference Tree</button>
-              <button type="button" class="btn-tab-pill" id="btn-view-table" data-view="table">📊 Table</button>
-              <button type="button" class="btn-tab-pill" id="btn-view-graph" data-view="graph">🕸️ Topology Graph</button>
+              <button type="button" class="btn-tab-pill active" id="btn-view-tree" data-view="tree" data-i18n="btn_view_tree">🌲 Reference Tree</button>
+              <button type="button" class="btn-tab-pill" id="btn-view-table" data-view="table" data-i18n="btn_view_table">📊 Table</button>
+              <button type="button" class="btn-tab-pill" id="btn-view-graph" data-view="graph" data-i18n="btn_view_graph">🕸️ Topology Graph</button>
             </div>
           </div>
 
           <!-- View 1: Reference Tree View (Android Studio Heap Dump Tree style) -->
           <div class="center-view-content active" id="view-reference-tree">
             <div class="ref-tree-toolbar">
-              <span class="text-xs text-muted">Expandable reference hierarchy from application roots:</span>
+              <span class="text-xs text-muted" data-i18n="txt_tree_toolbar">Expandable reference hierarchy from application roots:</span>
               <div style="display: flex; gap: 6px;">
-                <button class="btn btn-sm btn-secondary" id="btn-expand-all-tree">Expand All</button>
-                <button class="btn btn-sm btn-secondary" id="btn-collapse-all-tree">Collapse All</button>
+                <button class="btn btn-sm btn-secondary" id="btn-expand-all-tree" data-i18n="btn_expand_all">Expand All</button>
+                <button class="btn btn-sm btn-secondary" id="btn-collapse-all-tree" data-i18n="btn_collapse_all">Collapse All</button>
               </div>
             </div>
             <div class="ref-tree-body" id="tree-reference-container">
@@ -531,13 +554,13 @@
               <table class="data-table" id="table-objects-summary">
                 <thead>
                   <tr>
-                    <th>Semantic Name</th>
-                    <th>Type</th>
-                    <th>Scope</th>
-                    <th>Fields</th>
-                    <th>Outgoing Refs</th>
-                    <th>Incoming Refs</th>
-                    <th>Action</th>
+                    <th data-i18n="th_semantic_name">Semantic Name</th>
+                    <th data-i18n="th_type">Type</th>
+                    <th data-i18n="th_scope">Scope</th>
+                    <th data-i18n="th_fields">Fields</th>
+                    <th data-i18n="th_outgoing_refs">Outgoing Refs</th>
+                    <th data-i18n="th_incoming_refs">Incoming Refs</th>
+                    <th data-i18n="th_action">Action</th>
                   </tr>
                 </thead>
                 <tbody id="tbody-objects-summary">
@@ -550,8 +573,8 @@
           <!-- View 3: SVG Topology Graph View -->
           <div class="center-view-content" id="view-topology-graph" style="display: none;">
             <div class="graph-toolbar" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-              <button class="btn btn-sm btn-secondary" id="btn-reset-topology">Reset Graph</button>
-              <span class="text-xs text-muted">Click any node to inspect</span>
+              <button class="btn btn-sm btn-secondary" id="btn-reset-topology" data-i18n="btn_reset_topology">Reset Graph</button>
+              <span class="text-xs text-muted" data-i18n="txt_click_node_inspect">Click any node to inspect</span>
             </div>
             <div class="svg-container" style="flex: 1; border: 1px solid var(--border-color); border-radius: 6px; overflow: hidden; background: var(--bg-main);">
               <svg id="topology-graph-svg" width="100%" height="450"></svg>
@@ -567,8 +590,8 @@
                 <span class="badge badge-info" id="mem-obj-type-badge">Type</span>
                 <span class="badge" id="mem-obj-storage-badge">HEAP</span>
               </div>
-              <h4 id="mem-obj-title">Select an Object</h4>
-              <div class="text-muted text-xs" id="mem-obj-subtitle">Select an object from the explorer to inspect</div>
+              <h4 id="mem-obj-title" data-i18n="title_select_object">Select an Object</h4>
+              <div class="text-muted text-xs" id="mem-obj-subtitle" data-i18n="sub_select_object">Select an object from the explorer to inspect</div>
             </div>
             <button class="btn btn-outline btn-sm btn-view-obj-json" id="btn-view-obj-json" title="View raw JSON">JSON</button>
           </div>
@@ -576,50 +599,58 @@
           <div class="inspector-scroll-body">
             <!-- 1. Identity & Scope Card -->
             <div class="inspector-card">
-              <div class="inspector-card-title">Identity & Scope</div>
+              <div class="inspector-card-title" data-i18n="title_identity_scope">Identity & Scope</div>
               <table class="key-value-table text-xs">
                 <tr>
-                  <td>Semantic Name:</td>
+                  <td data-i18n="lbl_semantic_name">Semantic Name:</td>
                   <td class="mono font-semibold text-accent" id="insp-val-name">—</td>
                 </tr>
                 <tr>
-                  <td>Type:</td>
+                  <td data-i18n="lbl_type">Type:</td>
                   <td class="mono" id="insp-val-type">—</td>
                 </tr>
                 <tr>
-                  <td>Storage Scope:</td>
+                  <td data-i18n="lbl_storage_scope">Storage Scope:</td>
                   <td><span class="badge" id="insp-val-storage">—</span></td>
                 </tr>
                 <tr>
-                  <td>State Status:</td>
+                  <td data-i18n="lbl_state_status">State Status:</td>
                   <td><span class="badge" id="insp-val-status">—</span></td>
                 </tr>
                 <tr>
-                  <td>Root Source:</td>
+                  <td data-i18n="lbl_dwarf_source">DWARF Source:</td>
+                  <td class="mono font-semibold text-accent" id="insp-val-dwarf-loc">—</td>
+                </tr>
+                <tr>
+                  <td data-i18n="lbl_interpretation">Interpretation:</td>
+                  <td><span class="badge" id="insp-val-interpretation">Observed</span></td>
+                </tr>
+                <tr>
+                  <td data-i18n="lbl_root_source">Root Source:</td>
                   <td id="insp-val-root">—</td>
                 </tr>
                 <tr>
-                  <td>Thread:</td>
+                  <td data-i18n="lbl_thread">Thread:</td>
                   <td id="insp-val-thread">—</td>
                 </tr>
                 <tr class="advanced-only">
-                  <td>Object ID:</td>
+                  <td data-i18n="lbl_object_id">Object ID:</td>
                   <td class="mono text-muted" id="mem-tech-id">—</td>
                 </tr>
                 <tr class="advanced-only">
-                  <td>Memory Address:</td>
+                  <td data-i18n="lbl_memory_address">Memory Address:</td>
                   <td class="mono text-muted" id="mem-tech-addr">—</td>
                 </tr>
                 <tr class="advanced-only">
-                  <td>DWARF Type:</td>
+                  <td data-i18n="lbl_dwarf_type">DWARF Type:</td>
                   <td class="mono text-muted" id="mem-tech-dwarf">—</td>
                 </tr>
                 <tr class="advanced-only">
-                  <td>Snapshot Range:</td>
+                  <td data-i18n="lbl_snapshot_range">Snapshot Range:</td>
                   <td class="mono text-muted" id="mem-tech-range">—</td>
                 </tr>
                 <tr class="advanced-only">
-                  <td>Build ID:</td>
+                  <td data-i18n="lbl_build_id">Build ID:</td>
                   <td class="mono text-muted" id="mem-tech-build-id">—</td>
                 </tr>
               </table>
@@ -628,25 +659,72 @@
             <!-- 2. Semantic Fields Card -->
             <div class="inspector-card">
               <div class="inspector-card-header">
-                <div class="inspector-card-title">Semantic Fields</div>
+                <div class="inspector-card-title" data-i18n="title_semantic_fields">Semantic Fields</div>
                 <span class="text-xs text-muted" id="insp-fields-count">0 fields</span>
               </div>
               <div class="table-container">
                 <table class="data-table text-xs" id="table-semantic-fields">
                   <thead>
                     <tr>
-                      <th>Field</th>
-                      <th>Type</th>
-                      <th>Value</th>
-                      <th>Pointer</th>
-                      <th>Mutability</th>
-                      <th>Action</th>
+                      <th data-i18n="th_field">Field</th>
+                      <th data-i18n="th_type">Type</th>
+                      <th data-i18n="th_value">Value</th>
+                      <th data-i18n="th_source">Source</th>
+                      <th data-i18n="th_pointer">Pointer</th>
+                      <th data-i18n="th_mutability">Mutability</th>
+                      <th data-i18n="th_action">Action</th>
                     </tr>
                   </thead>
                   <tbody>
-                    <tr><td colspan="6" class="text-muted text-center">No fields available</td></tr>
+                    <tr><td colspan="7" class="text-muted text-center">No fields available</td></tr>
                   </tbody>
                 </table>
+              </div>
+            </div>
+
+            <!-- Code Navigation & Candidate Functions Card -->
+            <div class="inspector-card" id="card-code-navigation">
+              <div class="inspector-card-header">
+                <div class="inspector-card-title">Code Navigation &amp; Candidate Functions</div>
+                <span class="badge badge-info" id="badge-code-nav-target">All Functions</span>
+              </div>
+              <div class="code-nav-body">
+                <!-- Crucial Layout vs Mutation Caveat Banner -->
+                <div class="code-nav-caveat-box" id="code-nav-caveat-box">
+                  <strong>⚠️ DWARF Layout Caveat:</strong>
+                  <span id="text-dwarf-layout-caveat">DWARF member declarations specify struct memory layout only; they do <em>NOT</em> prove where this field was mutated at runtime.</span>
+                </div>
+
+                <div class="code-nav-meta-row text-xs mt-2 mb-2" style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+                  <span>Target: <strong id="code-nav-target-name" class="mono text-accent">—</strong></span>
+                  <span id="code-nav-loc-wrap">Location: <span id="code-nav-target-loc" class="mono">—</span></span>
+                  <span id="code-nav-interp-wrap">Status: <span id="code-nav-target-interp" class="badge badge-success">Observed</span></span>
+                </div>
+
+                <div class="code-nav-tier-chips mb-2" id="code-nav-tier-chips" style="display: flex; gap: 6px; flex-wrap: wrap;">
+                  <button type="button" class="tier-filter-chip tier-all active" data-tier="all">All (<span id="count-tier-all">0</span>)</button>
+                  <button type="button" class="tier-filter-chip tier-observed" data-tier="observed" title="Actively observed on thread call stack in this snapshot">Observed (<span id="count-tier-observed">0</span>)</button>
+                  <button type="button" class="tier-filter-chip tier-static" data-tier="static" title="DWARF class member or direct disassembly reference">Static (<span id="count-tier-static">0</span>)</button>
+                  <button type="button" class="tier-filter-chip tier-indirect" data-tier="indirect" title="Call graph caller/callee or indirect reference">Indirect (<span id="count-tier-indirect">0</span>)</button>
+                  <button type="button" class="tier-filter-chip tier-unknown" data-tier="unknown" title="Symbol heuristic without verified debug info">Unknown (<span id="count-tier-unknown">0</span>)</button>
+                </div>
+
+                <div class="table-container">
+                  <table class="data-table text-xs" id="table-candidate-functions">
+                    <thead>
+                      <tr>
+                        <th>Candidate Function</th>
+                        <th>Evidence Tier</th>
+                        <th>Source Location</th>
+                        <th>Basis / Reason</th>
+                        <th>Limitations</th>
+                      </tr>
+                    </thead>
+                    <tbody id="tbody-candidate-functions">
+                      <tr><td colspan="5" class="text-muted text-center">Select an object or field to view candidate functions</td></tr>
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
 
@@ -733,6 +811,15 @@
                 </tr>
               </table>
             </div>
+          </div>
+
+          <!-- Raw Object JSON Body (Toggled via JSON button) -->
+          <div class="inspector-raw-json-body" id="inspector-raw-json-body" style="display: none; padding: 12px; height: calc(100% - 70px); overflow: auto;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <strong class="text-xs">Raw Object JSON:</strong>
+              <button type="button" class="btn btn-xs btn-outline" id="btn-copy-obj-json">Copy JSON</button>
+            </div>
+            <pre class="json-code-block mono text-xs" id="pre-obj-raw-json" style="background: var(--bg-input); padding: 10px; border-radius: 4px; overflow: auto; max-height: calc(100vh - 250px);"></pre>
           </div>
         </div>
       </div>
@@ -827,10 +914,10 @@
     <section id="tab-thread-explorer" class="tab-pane">
       <div class="section-title-row">
         <div style="display: flex; align-items: baseline; gap: 10px;">
-          <h3>Active Threads & Observation Context</h3>
+          <h3 data-i18n="title_active_threads">Active Threads & Observation Context</h3>
           <span class="badge badge-neutral" id="badge-threads-count">1 Thread</span>
         </div>
-        <span class="subtext">Live thread execution state, source code locations, and active observation points</span>
+        <span class="subtext" data-i18n="sub_active_threads">Live thread execution state, source code locations, and active observation points</span>
       </div>
 
       <div class="card thread-explorer-card" id="card-thread-explorer">
@@ -838,13 +925,13 @@
           <table class="data-table" id="table-threads">
             <thead>
               <tr>
-                <th>Thread</th>
-                <th>Role / Label</th>
-                <th>State</th>
-                <th>Current Function</th>
-                <th>Source Location</th>
-                <th>Frames</th>
-                <th>Observation Context</th>
+                <th data-i18n="th_thread">Thread</th>
+                <th data-i18n="th_role_label">Role / Label</th>
+                <th data-i18n="th_state">State</th>
+                <th data-i18n="th_current_function">Current Function</th>
+                <th data-i18n="th_source_location">Source Location</th>
+                <th data-i18n="th_frames">Frames</th>
+                <th data-i18n="th_obs_context">Observation Context</th>
               </tr>
             </thead>
             <tbody id="tbody-threads">
@@ -882,35 +969,35 @@
 
       <!-- Capture Status Grid -->
       <div class="section-title-row" style="margin-top: 20px;">
-        <h3>Capture Status</h3>
-        <span class="subtext">Execution capture parameters and memory consistency guarantees</span>
+        <h3 data-i18n="title_capture_status">Capture Status</h3>
+        <span class="subtext" data-i18n="sub_capture_status">Execution capture parameters and memory consistency guarantees</span>
       </div>
 
       <div class="overview-grid status-grid">
         <div class="card status-card">
-          <div class="metric-label">Capture Status</div>
+          <div class="metric-label" data-i18n="lbl_capture_status">Capture Status</div>
           <div class="metric-val text-accent" id="stat-status">COMPLETE</div>
           <div class="card-caption" id="stat-status-sub">No errors or partial reads</div>
         </div>
         <div class="card status-card">
-          <div class="metric-label">Captured Memory</div>
+          <div class="metric-label" data-i18n="lbl_captured_mem">Captured Memory</div>
           <div class="metric-val" id="stat-captured-mb">0.00 MB</div>
           <div class="card-caption" id="stat-captured-bytes">0 bytes across regions</div>
         </div>
         <div class="card status-card">
-          <div class="metric-label">Capture Duration</div>
+          <div class="metric-label" data-i18n="lbl_capture_duration">Capture Duration</div>
           <div class="metric-val" id="stat-duration">N/A</div>
           <div class="card-caption" id="stat-consistency">Consistency: CONSISTENT</div>
         </div>
         <div class="card status-card">
-          <div class="metric-label">Memory Regions</div>
+          <div class="metric-label" data-i18n="lbl_memory_regions">Memory Regions</div>
           <div class="metric-val" id="stat-region-count">0</div>
           <div class="card-caption" id="stat-arch">Arch: UNKNOWN</div>
         </div>
         <div class="card status-card">
-          <div class="metric-label">Architecture / Endian</div>
+          <div class="metric-label" data-i18n="lbl_arch_endian">Architecture / Endian</div>
           <div class="metric-val mono text-sm" id="stat-pointer-endian">Pointer: N/A · Endian: N/A</div>
-          <div class="card-caption">Target binary characteristics</div>
+          <div class="card-caption" data-i18n="cap_target_binary">Target binary characteristics</div>
         </div>
       </div>
 
@@ -1023,8 +1110,8 @@
     <!-- ===================================================================== -->
     <section id="tab-history-diff" class="tab-pane">
       <div class="subnav-pill-group">
-        <button class="subnav-pill active" data-subtab="subtab-dag">State Transition Graph</button>
-        <button class="subnav-pill" data-subtab="subtab-diff">Semantic State Diff</button>
+        <button class="subnav-pill active" data-subtab="subtab-dag" data-i18n="subnav_dag">State Transition Graph</button>
+        <button class="subnav-pill" data-subtab="subtab-diff" data-i18n="subnav_diff">Semantic State Diff</button>
       </div>
 
       <!-- Subtab 1: State Transition Graph -->
@@ -1032,26 +1119,26 @@
         <div class="split-view">
           <div class="split-sidebar">
             <div class="sidebar-header">
-              <h3>Corpus States</h3>
+              <h3 data-i18n="title_corpus_states">Corpus States</h3>
               <span class="badge badge-neutral" id="badge-states-count">0</span>
             </div>
             <div class="filter-box">
-              <input type="text" id="input-search-states" class="input-text" placeholder="Search state ID or hash...">
+              <input type="text" id="input-search-states" class="input-text" placeholder="Search state ID or hash..." data-i18n-placeholder="ph_search_states">
             </div>
             <div class="list-container" id="list-states">
-              <div class="text-muted text-center p-3">No states recorded in corpus</div>
+              <div class="text-muted text-center p-3" data-i18n="msg_no_corpus_states">No states recorded in corpus</div>
             </div>
           </div>
 
           <div class="split-main">
             <div class="panel-header">
               <div class="panel-title-group">
-                <h3>State Transition Graph (Corpus History)</h3>
-                <span class="subtext">Directed edges indicate typed mutations & continuous execution</span>
+                <h3 data-i18n="title_state_graph">State Transition Graph (Corpus History)</h3>
+                <span class="subtext" data-i18n="sub_state_graph">Directed edges indicate typed mutations & continuous execution</span>
               </div>
               <div class="panel-actions">
-                <button class="btn btn-outline btn-sm" id="btn-reset-graph">Fit View</button>
-                <button class="btn btn-outline btn-sm btn-view-json" data-entity="state-graph">Graph JSON</button>
+                <button class="btn btn-outline btn-sm" id="btn-reset-graph" data-i18n="btn_fit_view">Fit View</button>
+                <button class="btn btn-outline btn-sm btn-view-json" data-entity="state-graph" data-i18n="btn_graph_json">Graph JSON</button>
               </div>
             </div>
 
@@ -1074,9 +1161,9 @@
                 <div><strong>Observations:</strong> <span id="detail-observations" class="mono">1</span></div>
               </div>
               <div class="state-actions-row">
-                <button class="btn btn-primary btn-sm" id="btn-inspect-state-objects">Inspect in Object Explorer</button>
-                <button class="btn btn-secondary btn-sm" id="btn-state-diff-parent">Diff with Parent</button>
-                <button class="btn btn-secondary btn-sm" id="btn-state-mutate">Propose Mutations</button>
+                <button class="btn btn-primary btn-sm" id="btn-inspect-state-objects" data-i18n="btn_inspect_objects">Inspect in Object Explorer</button>
+                <button class="btn btn-secondary btn-sm" id="btn-state-diff-parent" data-i18n="btn_diff_parent">Diff with Parent</button>
+                <button class="btn btn-secondary btn-sm" id="btn-state-mutate" data-i18n="btn_propose_mutations">Propose Mutations</button>
               </div>
             </div>
           </div>
@@ -1087,19 +1174,19 @@
       <div id="subtab-diff" class="subtab-content" style="margin-top: 16px;">
         <div class="pane-header">
           <div>
-            <h3>Semantic State Diff</h3>
-            <span class="subtext">Compare field modifications, pointer rewrites, and object lifecycle between two snapshots</span>
+            <h3 data-i18n="title_state_diff">Semantic State Diff</h3>
+            <span class="subtext" data-i18n="sub_state_diff">Compare field modifications, pointer rewrites, and object lifecycle between two snapshots</span>
           </div>
           <div class="diff-selectors-row">
             <div class="select-item">
-              <label>Snapshot A (Parent):</label>
+              <label data-i18n="lbl_diff_a">Snapshot A (Parent):</label>
               <input type="text" id="input-diff-a" class="input-text" placeholder="State ID or Snapshot ID">
             </div>
             <div class="select-item">
-              <label>Snapshot B (Child):</label>
+              <label data-i18n="lbl_diff_b">Snapshot B (Child):</label>
               <input type="text" id="input-diff-b" class="input-text" placeholder="State ID or Snapshot ID">
             </div>
-            <button class="btn btn-primary btn-sm" id="btn-run-diff">Compute Diff</button>
+            <button class="btn btn-primary btn-sm" id="btn-run-diff" data-i18n="btn_compute_diff">Compute Diff</button>
           </div>
         </div>
 
@@ -1377,40 +1464,40 @@
         <div class="card-header flex justify-between items-center">
           <div class="flex items-center gap-2">
             <span class="icon">🔬</span>
-            <h3 class="card-title">State Laboratory — Offline Snapshot & Branch Exploration</h3>
+            <h3 class="card-title" data-i18n="title_state_lab">State Laboratory — Offline Snapshot & Branch Exploration</h3>
           </div>
           <div class="flex items-center gap-2">
             <span class="badge badge-info" id="statelab-backend-badge">process_vm_readv</span>
-            <button class="btn btn-sm btn-primary" id="btn-lab-open-capture">⚡ Fast Capture</button>
-            <button class="btn btn-sm btn-secondary" id="btn-lab-open-branch">🌿 Create Branch</button>
-            <button class="btn btn-sm btn-warning" id="btn-lab-open-mutate">✏️ Mutate Snapshot</button>
+            <button class="btn btn-sm btn-primary" id="btn-lab-open-capture" data-i18n="btn_lab_fast_capture">⚡ Fast Capture</button>
+            <button class="btn btn-sm btn-secondary" id="btn-lab-open-branch" data-i18n="btn_lab_create_branch">🌿 Create Branch</button>
+            <button class="btn btn-sm btn-warning" id="btn-lab-open-mutate" data-i18n="btn_lab_mutate_snapshot">✏️ Mutate Snapshot</button>
           </div>
         </div>
         <div class="card-body">
           <div class="metric-tiles-grid">
             <div class="metric-tile">
-              <span class="tile-label">Snapshot ID</span>
+              <span class="tile-label" data-i18n="lbl_snapshot_id">Snapshot ID</span>
               <span class="tile-val font-mono" id="statelab-snap-id">N/A</span>
             </div>
             <div class="metric-tile">
-              <span class="tile-label">Capture Stop Time</span>
+              <span class="tile-label" data-i18n="lbl_capture_stop_time">Capture Stop Time</span>
               <span class="tile-val font-mono text-accent" id="statelab-stop-time">N/A</span>
               <span class="tile-sub text-muted">Target: &lt; 10 ms</span>
             </div>
             <div class="metric-tile">
-              <span class="tile-label">Reconstructed Objects</span>
+              <span class="tile-label" data-i18n="lbl_reconstructed_objects">Reconstructed Objects</span>
               <span class="tile-val font-mono" id="statelab-obj-count">0</span>
             </div>
             <div class="metric-tile">
-              <span class="tile-label">Captured Memory</span>
+              <span class="tile-label" data-i18n="lbl_captured_mem">Captured Memory</span>
               <span class="tile-val font-mono" id="statelab-mem-size">0 KB</span>
             </div>
             <div class="metric-tile">
-              <span class="tile-label">Captured Threads</span>
+              <span class="tile-label" data-i18n="lbl_captured_threads">Captured Threads</span>
               <span class="tile-val font-mono" id="statelab-threads-count">0</span>
             </div>
             <div class="metric-tile">
-              <span class="tile-label">State Hash</span>
+              <span class="tile-label" data-i18n="lbl_state_hash">State Hash</span>
               <span class="tile-val font-mono text-accent" id="statelab-state-hash">N/A</span>
             </div>
           </div>
@@ -1589,13 +1676,13 @@
   <div id="modal-observe" class="modal-backdrop" style="display: none;">
     <div class="modal-card">
       <div class="modal-header">
-        <h3>Initiate Target Observation</h3>
+        <h3 data-i18n="title_modal_observe">Initiate Target Observation</h3>
         <button class="btn-close" id="btn-close-observe-modal">×</button>
       </div>
       <div class="modal-body">
         <form id="form-observe">
           <div class="form-group">
-            <label>Observation Mode:</label>
+            <label data-i18n="lbl_obs_mode">Observation Mode:</label>
             <div class="radio-group">
               <label class="radio-label">
                 <input type="radio" name="obs-mode" value="CONSISTENT" checked>
@@ -1609,17 +1696,17 @@
           </div>
 
           <div class="form-group">
-            <label for="obs-pid">Attach to Existing Target PID (Optional):</label>
+            <label for="obs-pid" data-i18n="lbl_obs_pid">Attach to Existing Target PID (Optional):</label>
             <input type="number" id="obs-pid" class="input-text" placeholder="e.g. 1234">
           </div>
 
           <div class="form-group">
-            <label for="obs-debug-image">Debug Image Path (Optional):</label>
+            <label for="obs-debug-image" data-i18n="lbl_obs_debug_image">Debug Image Path (Optional):</label>
             <input type="text" id="obs-debug-image" class="input-text" placeholder="/path/to/binary.debug">
           </div>
 
           <div class="form-group">
-            <label for="obs-policy">Snapshot Policy:</label>
+            <label for="obs-policy" data-i18n="lbl_obs_policy">Snapshot Policy:</label>
             <select id="obs-policy" class="input-select">
               <option value="HEAP_AND_STACK" selected>Heap + Stack + Globals</option>
               <option value="HEAP_ONLY">Heap Only</option>
@@ -1628,8 +1715,8 @@
           </div>
 
           <div class="modal-actions">
-            <button type="button" class="btn btn-secondary" id="btn-cancel-observe">Cancel</button>
-            <button type="submit" class="btn btn-primary" id="btn-submit-observe">Capture Observation</button>
+            <button type="button" class="btn btn-secondary" id="btn-cancel-observe" data-i18n="btn_cancel">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-submit-observe" data-i18n="btn_capture_observation">Capture Observation</button>
           </div>
         </form>
       </div>
@@ -1735,13 +1822,13 @@
   <div id="modal-fast-capture" class="modal-backdrop" style="display: none;">
     <div class="modal-card">
       <div class="modal-header">
-        <h3>⚡ Fast Runtime State Capture</h3>
+        <h3 data-i18n="title_fast_capture_modal">⚡ Fast Runtime State Capture</h3>
         <button class="btn-close" id="btn-close-fast-capture-modal">×</button>
       </div>
       <div class="modal-body">
         <form id="form-fast-capture">
           <div class="form-group">
-            <label>Capture Mode:</label>
+            <label data-i18n="lbl_capture_mode">Capture Mode:</label>
             <div class="radio-group">
               <label class="radio-label">
                 <input type="radio" name="cap-mode" value="FULL" checked>
@@ -1779,9 +1866,9 @@
           </div>
 
           <div class="modal-actions" style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
-            <button type="button" class="btn btn-secondary" id="btn-cancel-fast-capture">Cancel</button>
+            <button type="button" class="btn btn-secondary" id="btn-cancel-fast-capture" data-i18n="btn_cancel">Cancel</button>
             <button type="submit" class="btn btn-success" id="btn-submit-fast-capture">
-              <span>⚡</span> Capture Immediately
+              <span>⚡</span> <span data-i18n="btn_capture_immediately">Capture Immediately</span>
             </button>
           </div>
         </form>
@@ -1793,7 +1880,7 @@
   <div id="modal-snapshot-mutate" class="modal-backdrop" style="display: none;">
     <div class="modal-card">
       <div class="modal-header">
-        <h3>✏️ Mutate Snapshot Branch</h3>
+        <h3 data-i18n="title_snap_mutate_modal">✏️ Mutate Snapshot Branch</h3>
         <button class="btn-close" id="btn-close-snap-mutate-modal">×</button>
       </div>
       <div class="modal-body">
@@ -1818,9 +1905,9 @@
           </div>
 
           <div class="modal-actions" style="display: flex; justify-content: flex-end; gap: 10px;">
-            <button type="button" class="btn btn-secondary" id="btn-cancel-snap-mutate">Cancel</button>
+            <button type="button" class="btn btn-secondary" id="btn-cancel-snap-mutate" data-i18n="btn_cancel">Cancel</button>
             <button type="submit" class="btn btn-warning" id="btn-submit-snap-mutate">
-              <span>🌿</span> Create Mutated Branch
+              <span>🌿</span> <span data-i18n="btn_create_mutated_branch">Create Mutated Branch</span>
             </button>
           </div>
         </form>

@@ -22,6 +22,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from extractor.agent_runtime import AgentRuntime
 from extractor.state_diff import StateDiffEngine
 from extractor.state_hash import compute_state_hash
+from extractor.static_analyzer import (
+    StaticAnalysisProvider,
+    get_static_provider,
+    resolve_function_candidates,
+    LAYOUT_MUTATION_CAVEAT,
+)
 
 
 def _to_json_serializable(val: Any) -> Any:
@@ -667,6 +673,11 @@ class WebApiAdapter:
                     data["dwarf_type"] = prov.get("dwarf_type") or cleaned_type
                     data["build_id"] = prov.get("build_id") or snap_dict.get("provenance", {}).get("executable_identity", {}).get("build_id")
                     data["memory_range"] = prov.get("memory_range")
+                    data["decl_file"] = o_dict.get("decl_file")
+                    data["decl_line"] = o_dict.get("decl_line")
+                    data["type_decl_file"] = o_dict.get("decl_file")
+                    data["type_decl_line"] = o_dict.get("decl_line")
+                    data["display_name"] = o_dict.get("display_name") or o_dict.get("name") or data.get("semantic_name") or (f"{cleaned_type}@{addr}" if addr else object_id)
                 else:
                     addr = data.get("address")
                     data["identity"] = f"{cleaned_type}@{addr}" if addr else f"{cleaned_type}:{object_id}"
@@ -676,6 +687,7 @@ class WebApiAdapter:
                     data["dwarf_type"] = data.get("provenance", {}).get("dwarf_type") or cleaned_type
                     data["build_id"] = data.get("provenance", {}).get("build_id")
                     data["memory_range"] = data.get("provenance", {}).get("memory_range")
+                    data["display_name"] = data.get("display_name") or data.get("name") or data.get("semantic_name") or (f"{cleaned_type}@{addr}" if addr else object_id)
 
                 # Semantic state classification: REAL, PARTIAL, SYNTHETIC, UNRESOLVED
                 if data.get("synthetic"):
@@ -729,9 +741,13 @@ class WebApiAdapter:
                 data["additional_paths"] = []
                 addr = data.get("address")
                 data["identity"] = f"{cleaned_type}@{addr}" if addr else f"{cleaned_type}:{object_id}"
+                data["display_name"] = data.get("display_name") or data.get("name") or (f"{cleaned_type}@{addr}" if addr else object_id)
 
-            # Enrich fields with mutability, cleaned_type, and semantic_path
+            # Enrich fields with mutability, cleaned_type, semantic_path, decl_file, decl_line, and interpretation
             sem_base = data.get("semantic_path") or data.get("semantic_name") or cleaned_type
+            raw_fields = (o_dict.get("fields", []) if 'o_dict' in locals() and o_dict else [])
+            rf_map = {rf.get("name"): rf for rf in raw_fields if isinstance(rf, dict)}
+
             for f in data.get("fields", []):
                 if isinstance(f, dict):
                     fname = f.get("name")
@@ -740,6 +756,34 @@ class WebApiAdapter:
                         f["mutability"] = _is_field_mutable(f.get("type", ""))
                     if "cleaned_type" not in f:
                         f["cleaned_type"] = _clean_type_name(f.get("type", ""))
+                    rf = rf_map.get(fname, {})
+                    if not f.get("decl_file"):
+                        f["decl_file"] = rf.get("decl_file")
+                    if not f.get("decl_line"):
+                        f["decl_line"] = rf.get("decl_line")
+                    if not f.get("type_decl_file"):
+                        f["type_decl_file"] = rf.get("type_decl_file")
+                    if not f.get("type_decl_line"):
+                        f["type_decl_line"] = rf.get("type_decl_line")
+
+                    f_st = f.get("status") or rf.get("status") or "RESOLVED"
+                    if data.get("synthetic"):
+                        f["interpretation"] = "interpreted"
+                    elif f_st == "RESOLVED":
+                        f["interpretation"] = "observed"
+                    else:
+                        f["interpretation"] = "unrecoverable"
+
+            # Attach code navigation candidates
+            static_prov = self._resolve_static_provider(snap_dict if 'snap_dict' in locals() else None)
+            nav_info = resolve_function_candidates(
+                target_object=data,
+                target_field=None,
+                snapshot=snap_dict if 'snap_dict' in locals() else None,
+                static_provider=static_prov,
+            )
+            data["code_navigation"] = nav_info
+            data["function_candidates"] = nav_info.get("candidates", [])
 
         return {"success": True, "data": data}
 
@@ -765,6 +809,79 @@ class WebApiAdapter:
         obj_data = _to_json_serializable(obj_res.data)
         fields = obj_data.get("fields", [])
         return {"success": True, "data": fields}
+
+    def _resolve_static_provider(self, snapshot_dict: Optional[Dict[str, Any]] = None) -> StaticAnalysisProvider:
+        debug_path = None
+        if hasattr(self.runtime, "controller") and hasattr(self.runtime.controller, "debug_image_path"):
+            debug_path = self.runtime.controller.debug_image_path
+        if not debug_path and snapshot_dict:
+            prov = snapshot_dict.get("provenance") or {}
+            debug_path = prov.get("debug_image_path") or prov.get("executable_identity", {}).get("path")
+            if not debug_path:
+                proc = snapshot_dict.get("process") or {}
+                debug_path = proc.get("binary")
+        if not debug_path or not os.path.exists(debug_path):
+            default_elf = os.path.abspath("build/app_debug.elf")
+            if os.path.exists(default_elf):
+                debug_path = default_elf
+
+        if debug_path and os.path.exists(debug_path):
+            return get_static_provider(backend="dwarf", debug_artifact_path=debug_path)
+        return get_static_provider(backend="null")
+
+    def get_code_navigation(self, object_id: str, field_name: Optional[str] = None,
+                           snapshot_id: Optional[str] = None) -> Dict[str, Any]:
+        """Correlate candidate functions and source code locations for an object and optional field."""
+        snap, err = self.runtime._resolve_snapshot(snapshot_id)
+        if err:
+            return {
+                "success": False,
+                "error": {"code": err[0], "message": err[1]}
+            }
+
+        snap_dict = snap.to_dict() if hasattr(snap, "to_dict") else dict(snap)
+        s_inner = snap_dict.get("snapshot", snap_dict)
+        persistent = snap_dict.get("persistent") or s_inner.get("persistent") or {}
+        raw_objs = persistent.get("objects", [])
+
+        target_obj = next((o for o in raw_objs if (o.get("object_id") if isinstance(o, dict) else getattr(o, "object_id", None)) == object_id), None)
+        if not target_obj:
+            res = self.runtime.inspect_object(object_id, snapshot_id=snapshot_id)
+            if not res.success:
+                return {
+                    "success": False,
+                    "error": {"code": res.error.code if res.error else "INVALID_OBJECT",
+                              "message": res.error.message if res.error else f"Object '{object_id}' not found"}
+                }
+            target_obj = _to_json_serializable(res.data)
+
+        obj_dict = target_obj if isinstance(target_obj, dict) else (target_obj.to_dict() if hasattr(target_obj, "to_dict") else asdict(target_obj))
+
+        target_field = None
+        if field_name:
+            for f in obj_dict.get("fields", []):
+                f_d = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
+                if f_d.get("name") == field_name:
+                    target_field = f_d
+                    break
+            if not target_field:
+                target_field = {"name": field_name}
+
+        static_prov = self._resolve_static_provider(snap_dict)
+        nav_result = resolve_function_candidates(
+            target_object=obj_dict,
+            target_field=target_field,
+            snapshot=snap_dict,
+            static_provider=static_prov,
+        )
+
+        nav_result["type_decl_file"] = obj_dict.get("decl_file")
+        nav_result["type_decl_line"] = obj_dict.get("decl_line")
+        addr_val = obj_dict.get("address")
+        nav_result["object_address"] = obj_dict.get("hex_address") or (hex(addr_val) if isinstance(addr_val, int) else addr_val)
+        nav_result["object_size"] = obj_dict.get("size")
+
+        return {"success": True, "data": nav_result}
 
     def list_transitions(self) -> Dict[str, Any]:
         transitions = []
@@ -1456,6 +1573,29 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if m_state:
                 state_id = m_state.group(1)
                 self._send_json(adapter.inspect_state(state_id))
+                return
+
+            # GET /api/states/{state_id}/objects/{object_id}/code-navigation
+            m_state_obj_nav = re.match(r"^/api/states/([^/]+)/objects/([^/]+)/code-navigation$", path)
+            if m_state_obj_nav:
+                state_id = m_state_obj_nav.group(1)
+                object_id = m_state_obj_nav.group(2)
+                self._send_json(adapter.get_code_navigation(
+                    object_id,
+                    field_name=q_param("field") or q_param("field_path"),
+                    snapshot_id=state_id
+                ))
+                return
+
+            # GET /api/objects/{object_id}/code-navigation
+            m_obj_nav = re.match(r"^/api/objects/([^/]+)/code-navigation$", path)
+            if m_obj_nav:
+                object_id = m_obj_nav.group(1)
+                self._send_json(adapter.get_code_navigation(
+                    object_id,
+                    field_name=q_param("field") or q_param("field_path"),
+                    snapshot_id=q_param("snapshot_id")
+                ))
                 return
 
             # GET /api/objects/{object_id}/fields

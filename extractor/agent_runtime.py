@@ -368,14 +368,30 @@ class AgentRuntime:
             }
             if f.get("object_ref"):
                 field_dict["object_ref"] = f.get("object_ref")
+            if f.get("decl_file"):
+                field_dict["decl_file"] = f.get("decl_file")
+            if f.get("decl_line"):
+                field_dict["decl_line"] = f.get("decl_line")
+            if f.get("type_decl_file"):
+                field_dict["type_decl_file"] = f.get("type_decl_file")
+            if f.get("type_decl_line"):
+                field_dict["type_decl_line"] = f.get("type_decl_line")
+            if f.get("status"):
+                field_dict["status"] = f.get("status")
+            if f.get("provenance"):
+                field_dict["provenance"] = f.get("provenance")
             fields.append(field_dict)
 
+        disp_name = obj.get("display_name") or obj.get("name")
         agent_obj = AgentObject(
             object_id=obj.get("object_id", ""),
             type=obj.get("type", "Unknown"),
             storage=obj.get("storage"),
             fields=fields,
-            identity_hint=f"{obj.get('type')}:{obj.get('object_id')}"
+            identity_hint=f"{obj.get('type')}:{obj.get('object_id')}",
+            display_name=disp_name,
+            decl_file=obj.get("decl_file"),
+            decl_line=obj.get("decl_line"),
         )
 
         return AgentActionResult(
@@ -1326,9 +1342,17 @@ class AgentRuntime:
         if snapshot_id:
             if self.controller and snapshot_id in self.controller.snapshots:
                 return self.controller.snapshots[snapshot_id], None
+            if hasattr(self, "memory_snapshots") and snapshot_id in self.memory_snapshots:
+                return self.memory_snapshots[snapshot_id], None
             c_snap = self.corpus.get(snapshot_id)
             if c_snap:
                 return c_snap, None
+            if hasattr(self, "corpus") and hasattr(self.corpus, "states"):
+                for s_id, s_meta in self.corpus.states.items():
+                    if s_meta.get("snapshot_id") == snapshot_id:
+                        c_snap = self.corpus.get(s_id)
+                        if c_snap:
+                            return c_snap, None
             return None, ("SNAPSHOT_NOT_FOUND", f"Snapshot '{snapshot_id}' not found")
 
         # Default to latest controller snapshot

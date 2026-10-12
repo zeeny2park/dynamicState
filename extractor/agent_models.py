@@ -194,6 +194,9 @@ class AgentObject(_SubscriptableModel):
     storage: Optional[str] = None
     fields: List[Dict[str, Any]] = field(default_factory=list)
     identity_hint: Optional[str] = None
+    display_name: Optional[str] = None
+    decl_file: Optional[str] = None
+    decl_line: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res: Dict[str, Any] = {
@@ -205,6 +208,12 @@ class AgentObject(_SubscriptableModel):
             res["storage"] = self.storage
         if self.identity_hint is not None:
             res["identity_hint"] = self.identity_hint
+        if self.display_name is not None:
+            res["display_name"] = self.display_name
+        if self.decl_file is not None:
+            res["decl_file"] = self.decl_file
+        if self.decl_line is not None:
+            res["decl_line"] = self.decl_line
         return res
 
     @classmethod
@@ -214,7 +223,10 @@ class AgentObject(_SubscriptableModel):
             type=data["type"],
             storage=data.get("storage"),
             fields=data.get("fields", []),
-            identity_hint=data.get("identity_hint")
+            identity_hint=data.get("identity_hint"),
+            display_name=data.get("display_name") or data.get("name"),
+            decl_file=data.get("decl_file"),
+            decl_line=data.get("decl_line"),
         )
 
 

@@ -90,6 +90,11 @@ class CppObjectDecoder:
         self.visited[identity_key] = obj_id
 
         byte_size = canon_t.byte_size if canon_t else self.pointer_size
+        display_name = custom_name or (
+            f"{path} ({clean_name})"
+            if path and path != clean_name and not path.startswith("0x") and not path.startswith("obj_")
+            else f"{clean_name}@{hex(address)}"
+        )
         obj_dict: Dict[str, Any] = {
             "object_id": obj_id,
             "type": clean_name,
@@ -98,6 +103,10 @@ class CppObjectDecoder:
             "hex_address": hex(address),
             "size": byte_size,
             "storage": storage,
+            "display_name": display_name,
+            "name": display_name,
+            "decl_file": canon_t.decl_file if canon_t else None,
+            "decl_line": canon_t.decl_line if canon_t else None,
             "fields": [],
             "provenance": {
                 "source": "RAW_SNAPSHOT",
@@ -107,6 +116,8 @@ class CppObjectDecoder:
                 "build_id": self.index.build_id,
                 "dwarf_type": clean_name,
                 "synthetic": False,
+                "decl_file": canon_t.decl_file if canon_t else None,
+                "decl_line": canon_t.decl_line if canon_t else None,
             },
             "synthetic": False,
             "status": "COMPLETE",
@@ -183,6 +194,8 @@ class CppObjectDecoder:
                     "value": None,
                     "status": "UNRESOLVED_TYPE",
                     "address": hex(m_addr),
+                    "decl_file": member.decl_file,
+                    "decl_line": member.decl_line,
                 }
                 obj_dict["fields"].append(field_entry)
                 obj_dict["status"] = "PARTIAL"
@@ -517,6 +530,22 @@ class CppObjectDecoder:
                     "object": m_path,
                     "recoverable": True,
                 })
+
+            if obj_dict["fields"]:
+                last_f = obj_dict["fields"][-1]
+                if last_f.get("name") == member.name:
+                    last_f["decl_file"] = member.decl_file
+                    last_f["decl_line"] = member.decl_line
+                    if m_type:
+                        last_f["type_decl_file"] = m_type.decl_file
+                        last_f["type_decl_line"] = m_type.decl_line
+                    if "provenance" in last_f and isinstance(last_f["provenance"], dict):
+                        d_prov = last_f["provenance"].setdefault("dwarf", {})
+                        d_prov["decl_file"] = member.decl_file
+                        d_prov["decl_line"] = member.decl_line
+                        if m_type:
+                            d_prov["type_decl_file"] = m_type.decl_file
+                            d_prov["type_decl_line"] = m_type.decl_line
 
     def _read_primitive_val(self, address: int, dwarf_t: DwarfType) -> Any:
         sz = dwarf_t.byte_size or 4
