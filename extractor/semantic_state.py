@@ -320,7 +320,7 @@ class OfflineSemanticEngine:
                     load_bias = res.load_bias
                     diagnostics.extend(res.diagnostics)
 
-                    if res.status not in ("SYMBOL_MISMATCH", "LOAD_BIAS_UNRESOLVED", "DECODE_ERROR"):
+                    if res.status not in ("SYMBOL_MISMATCH", "LOAD_BIAS_UNRESOLVED", "DECODE_ERROR", "INVALID_CAPTURE", "FAILED_CAPTURE"):
                         roots = res.roots
                         objects = res.objects
                         references = res.references

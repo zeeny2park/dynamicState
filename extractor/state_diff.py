@@ -10,6 +10,8 @@ class StateDiff:
     summary: Dict[str, int]
     changes: List[Dict[str, Any]] = field(default_factory=list)
     performance: Dict[str, Any] = field(default_factory=dict)
+    trust_classification: str = "TRUSTED"
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -98,6 +100,62 @@ class StateDiffEngine:
             changes.extend(added)
             fields_compared += compared
         changes.extend(self._execution_changes(a, b))
+
+        # Evaluate snapshot completeness / quality to determine trust classification
+        def _get_comp(snap: Any, data: Dict[str, Any]) -> str:
+            c = getattr(snap, "completeness", None) or getattr(snap, "status", None)
+            if c:
+                return str(c).upper()
+            c = data.get("completeness") or data.get("status")
+            if c:
+                return str(c).upper()
+            prov = data.get("provenance", {})
+            if isinstance(prov, dict):
+                c = prov.get("capture_status") or prov.get("validity")
+                if c:
+                    return str(c).upper()
+            return "COMPLETE"
+
+        comp_a = _get_comp(before, a)
+        comp_b = _get_comp(after, b)
+
+        diff_diagnostics: List[Dict[str, Any]] = []
+        if comp_a == "INVALID" or comp_b == "INVALID":
+            trust_classification = "UNTRUSTED_INVALID_CAPTURE"
+            diff_diagnostics.append({
+                "code": "DIFF_UNTRUSTED_INVALID_CAPTURE",
+                "message": "Snapshot diff contains an INVALID capture snapshot (PID reuse or target identity mismatch). Comparison cannot produce verified facts.",
+                "level": "ERROR"
+            })
+        elif comp_a == "FAILED" or comp_b == "FAILED":
+            trust_classification = "UNTRUSTED_FAILED_CAPTURE"
+            diff_diagnostics.append({
+                "code": "DIFF_UNTRUSTED_FAILED_CAPTURE",
+                "message": "Snapshot diff contains a FAILED capture snapshot. Comparison cannot produce verified facts.",
+                "level": "ERROR"
+            })
+        elif comp_a == "PARTIAL" or comp_b == "PARTIAL":
+            trust_classification = "PARTIALLY_TRUSTED"
+            diff_diagnostics.append({
+                "code": "DIFF_PARTIALLY_TRUSTED",
+                "message": "Snapshot diff contains a PARTIAL capture snapshot. Missing fields or values may reflect partial capture.",
+                "level": "WARNING"
+            })
+        else:
+            trust_classification = "TRUSTED"
+
+        for chg in changes:
+            if trust_classification in ("UNTRUSTED_INVALID_CAPTURE", "UNTRUSTED_FAILED_CAPTURE"):
+                chg["trust"] = "UNTRUSTED"
+                chg["identity_confidence"] = "untrusted"
+                chg["verified"] = False
+            elif trust_classification == "PARTIALLY_TRUSTED":
+                chg["trust"] = "PARTIAL"
+                chg["identity_confidence"] = "uncertain"
+                chg["capture_quality"] = "PARTIAL"
+            else:
+                chg["trust"] = "TRUSTED"
+
         summary = {
             "total_changes": len(changes),
             "objects_created": sum(c["kind"] == "object_created" for c in changes),
@@ -113,9 +171,17 @@ class StateDiffEngine:
             "observation_availability_changes": sum(c["kind"] in ("availability_change", "field_unavailable") for c in changes),
             "identity_ambiguities": sum(c.get("identity_confidence") == "uncertain" for c in changes),
         }
-        return StateDiff(summary, changes, {"total_ms": round((time.monotonic() - start) * 1000, 3),
-                                             "objects_compared": len(objects_a.keys() & objects_b.keys()),
-                                             "fields_compared": fields_compared})
+        return StateDiff(
+            summary,
+            changes,
+            {
+                "total_ms": round((time.monotonic() - start) * 1000, 3),
+                "objects_compared": len(objects_a.keys() & objects_b.keys()),
+                "fields_compared": fields_compared,
+            },
+            trust_classification=trust_classification,
+            diagnostics=diff_diagnostics,
+        )
 
     @staticmethod
     def _data(snapshot: Any) -> Dict[str, Any]:

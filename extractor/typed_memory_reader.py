@@ -59,6 +59,8 @@ class TypedMemoryReader:
 
     def is_captured(self, address: int, size: int = 1) -> bool:
         """Check if memory range [address, address + size) is captured in buffers."""
+        if getattr(self.snapshot, "completeness", "COMPLETE") in ("INVALID", "FAILED"):
+            return False
         if size <= 0:
             return True
         end_addr = address + size
@@ -69,6 +71,8 @@ class TypedMemoryReader:
 
     def is_in_captured_ranges(self, address: int, size: int = 1) -> bool:
         """Check if memory range is reported in snapshot captured_ranges."""
+        if getattr(self.snapshot, "completeness", "COMPLETE") in ("INVALID", "FAILED"):
+            return False
         if size <= 0:
             return True
         end_addr = address + size
@@ -113,9 +117,14 @@ class TypedMemoryReader:
         
         Returns:
             (bytes, "COMPLETE") on success
+            (None, "INVALID" | "FAILED") if snapshot capture was invalid/failed
             (None, "MEMORY_NOT_CAPTURED") if uncaptured
             (None, "OUTSIDE_CAPTURE") if outside any known process memory
         """
+        snap_comp = getattr(self.snapshot, "completeness", "COMPLETE")
+        if snap_comp in ("INVALID", "FAILED"):
+            return None, snap_comp
+
         if size <= 0:
             return b"", "COMPLETE"
 

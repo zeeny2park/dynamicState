@@ -519,8 +519,9 @@ class InvestigationManager:
         diff_engine = StateDiffEngine()
         diff_res = diff_engine.diff(snap_a, snap_b)
         diff_dict = diff_res.to_dict()
+        diff_trust = getattr(diff_res, "trust_classification", "TRUSTED")
 
-        # Check uncertainty: if either snapshot was NON_ATOMIC or captured via process_vm_readv
+        # Check uncertainty: if either snapshot was NON_ATOMIC, PARTIAL, or untrusted
         uncertainty = None
         def _get_consistency_level(s: Any) -> Optional[str]:
             if isinstance(s, dict):
@@ -546,9 +547,12 @@ class InvestigationManager:
 
         level_a = _get_consistency_level(snap_a)
         level_b = _get_consistency_level(snap_b)
-        if level_a == NON_ATOMIC or level_b == NON_ATOMIC:
+        if diff_trust in ("UNTRUSTED_INVALID_CAPTURE", "UNTRUSTED_FAILED_CAPTURE"):
+            uncertainty = f"Comparison is untrusted due to capture quality failure: {diff_trust}. Verified facts suppressed."
+        elif diff_trust == "PARTIALLY_TRUSTED":
+            uncertainty = "One or both snapshots have PARTIAL capture quality; diff may reflect incomplete reads or non-atomic execution skew."
+        elif level_a == NON_ATOMIC or level_b == NON_ATOMIC:
             uncertainty = "One or both snapshots were captured non-atomically (process_vm_readv zero-stop). Value diffs may reflect minor execution skew."
-
 
         # Record comparison evidence in ledger
         parents = []
@@ -563,20 +567,32 @@ class InvestigationManager:
             source="state_diff",
             session_id=session.investigation_id,
             parent_evidence_ids=parents,
-            observation=f"Semantic comparison between {snapshot_a} and {snapshot_b}: {diff_dict['summary']['value_changes']} value changes, {diff_dict['summary']['objects_created']} added, {diff_dict['summary']['objects_removed']} removed.",
+            observation=f"Semantic comparison between {snapshot_a} and {snapshot_b}: {diff_dict['summary']['value_changes']} value changes, {diff_dict['summary']['objects_created']} added, {diff_dict['summary']['objects_removed']} removed (trust: {diff_trust}).",
             comparison_observation={
                 "snapshot_a": snapshot_a,
                 "snapshot_b": snapshot_b,
                 "summary": diff_dict["summary"],
                 "changes_count": len(diff_dict["changes"]),
                 "performance": diff_dict["performance"],
+                "trust_classification": diff_trust,
             },
             uncertainty=uncertainty,
-            details={"changes": diff_dict["changes"][:30]},  # Limit payload size
+            details={"changes": diff_dict["changes"][:30], "trust_classification": diff_trust},
         ))
 
-        # Add findings from significant differences
-        if (
+        # Add findings: NEVER generate category="fact" findings if capture diff is untrusted!
+        if diff_trust in ("UNTRUSTED_INVALID_CAPTURE", "UNTRUSTED_FAILED_CAPTURE"):
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_untrusted_cmp_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title=f"Untrusted Snapshot Comparison ({diff_trust})",
+                description=f"Comparison between {snapshot_a} and {snapshot_b} is {diff_trust}. Verified runtime facts suppressed to prevent false conclusions.",
+                evidence_ids=[ev.evidence_id],
+                confidence="low",
+                status="UNTRUSTED",
+                uncertainty=uncertainty,
+            ))
+        elif (
             diff_dict["summary"]["value_changes"] > 0
             or diff_dict["summary"]["objects_created"] > 0
             or diff_dict["summary"].get("fields_unavailable", 0) > 0
@@ -632,7 +648,7 @@ class InvestigationManager:
                         finding_id=fnd_id,
                         category="fact",
                         title=f"Field added in observation: {chg.get('path', 'unknown')}",
-                        description=f"Field '{chg.get('field')}' with value {chg.get('after')} was added in subsequent observation.",
+                        description=f"Field '{chg.get('field')}' with value {chg.get('after')} was added in subsequent observation." + (f" Note: {uncertainty}" if uncertainty else ""),
                         c_type_path=chg.get("path"),
                         object_id=chg.get("object_id"),
                         field_name=chg.get("field"),
@@ -640,8 +656,9 @@ class InvestigationManager:
                         observed_value=chg.get("after"),
                         after_value=chg.get("after"),
                         evidence_ids=[ev.evidence_id],
-                        confidence="high",
-                        status="OBSERVED",
+                        confidence="medium" if uncertainty else "high",
+                        status="UNVERIFIED_PARTIAL" if (diff_trust == "PARTIALLY_TRUSTED") else "OBSERVED",
+                        uncertainty=uncertainty,
                     )
                     self._enrich_finding_navigation(session, fnd, snapshot=snap_b)
                     session.findings.append(fnd)
@@ -746,6 +763,19 @@ class InvestigationManager:
         hypotheses = [f.to_dict() for f in session.findings if f.category == "hypothesis"]
         unknowns = [f.to_dict() for f in session.findings if f.category == "unknown"]
 
+        # Prominently highlight capture quality when data is incomplete or unverified
+        cap_stage = session.stages.get("capture_quality", {})
+        cap_details = cap_stage.get("details", {})
+        cap_status = cap_stage.get("status", "UNKNOWN")
+        trust_level = "TRUSTED"
+        trust_caveat = None
+        if cap_status in ("FAILED", "INVALID"):
+            trust_level = "UNTRUSTED"
+            trust_caveat = f"Capture quality is {cap_status}. Data is untrusted and cannot substantiate verified runtime facts."
+        elif cap_status == "PARTIAL":
+            trust_level = "PARTIALLY_TRUSTED"
+            trust_caveat = "Capture quality is PARTIAL. Findings may reflect incomplete memory layout, unread regions, or execution skew."
+
         return {
             "investigation_id": session.investigation_id,
             "goal": session.goal,
@@ -753,6 +783,12 @@ class InvestigationManager:
             "created_at": session.created_at,
             "target_identity": session.stages["target_identity"].get("details", {}),
             "capture_quality": session.stages["capture_quality"].get("details", {}),
+            "capture_quality_assessment": {
+                "status": cap_status,
+                "trust_level": trust_level,
+                "caveat": trust_caveat,
+                "details": cap_details,
+            },
             "stages": session.stages,
             "summary": session.summary,
             "findings_summary": {
@@ -1118,9 +1154,9 @@ class InvestigationManager:
 
         # Assign honest stage status
         if raw_snap:
-            if bytes_captured == 0 and regions_attempted > 0:
+            if getattr(raw_snap, "completeness", None) in ("INVALID", "FAILED") or (bytes_captured == 0 and regions_attempted > 0):
                 stage_status = "FAILED"
-            elif failed_reads > 0 or partial_reads > 0 or omitted_regions > 0:
+            elif getattr(raw_snap, "completeness", None) == "PARTIAL" or failed_reads > 0 or partial_reads > 0 or omitted_regions > 0:
                 stage_status = "PARTIAL"
             else:
                 stage_status = "COMPLETED"
@@ -1141,6 +1177,7 @@ class InvestigationManager:
         mem_snap_path = t_ref.get("memory_snapshot_path")
 
         semantic_state = None
+        raw_snap = None
 
         # A: Offline DWARF reconstruction from RawRuntimeSnapshot
         if (mem_snap_path and os.path.exists(mem_snap_path)) or (snap_id and os.path.exists(os.path.join(self.corpus_dir, "memory_snapshots", snap_id or ""))):
@@ -1180,6 +1217,12 @@ class InvestigationManager:
         objs = getattr(semantic_state, "objects", []) or (semantic_state.get("persistent", {}).get("objects", []) if isinstance(semantic_state, dict) else [])
         roots = getattr(semantic_state, "roots", []) or []
 
+        is_partial_snap = False
+        if raw_snap:
+            is_partial_snap = (getattr(raw_snap, "completeness", None) == "PARTIAL")
+        elif isinstance(semantic_state, dict):
+            is_partial_snap = (semantic_state.get("completeness") == "PARTIAL" or semantic_state.get("status") == "PARTIAL")
+
         cap_ev_id = getattr(session, "capture_quality_evidence_id", None)
         parents = [cap_ev_id] if cap_ev_id else []
         root_evidence_map: Dict[str, str] = {}
@@ -1204,13 +1247,14 @@ class InvestigationManager:
                 finding_id=f"fnd_root_{uuid.uuid4().hex[:8]}",
                 category="fact",
                 title=f"Root Object Observed: {r_dict.get('name')}",
-                description=f"Global/static root of canonical type {r_dict.get('type')}.",
+                description=f"Global/static root of canonical type {r_dict.get('type')}." + (" Note: Snapshot capture is PARTIAL." if is_partial_snap else ""),
                 c_type_path=r_dict.get("name"),
                 object_id=r_dict.get("object_ref") or r_dict.get("object_id"),
                 type_name=r_dict.get("type"),
                 evidence_ids=[ev.evidence_id],
-                confidence="high",
-                status="OBSERVED",
+                confidence="medium" if is_partial_snap else "high",
+                status="UNVERIFIED_PARTIAL" if is_partial_snap else "OBSERVED",
+                uncertainty="Observed from PARTIAL capture snapshot." if is_partial_snap else None,
             )
             self._enrich_finding_navigation(session, fnd_root, target_object=r_dict, snapshot=semantic_state)
             session.findings.append(fnd_root)
@@ -1252,15 +1296,16 @@ class InvestigationManager:
                     finding_id=f"fnd_fld_{uuid.uuid4().hex[:8]}",
                     category="fact",
                     title=f"Observed Field: {fpath}",
-                    description=f"Field {fname} observed with value {fval} ({f.get('type')}).",
+                    description=f"Field {fname} observed with value {fval} ({f.get('type')})." + (" Note: Snapshot capture is PARTIAL." if is_partial_snap else ""),
                     c_type_path=fpath,
                     object_id=oid,
                     field_name=fname,
                     type_name=f.get("type") or otype,
                     observed_value=fval,
                     evidence_ids=[ev.evidence_id],
-                    confidence="OBSERVED",
-                    status="OBSERVED",
+                    confidence="medium" if is_partial_snap else "OBSERVED",
+                    status="UNVERIFIED_PARTIAL" if is_partial_snap else "OBSERVED",
+                    uncertainty="Observed from PARTIAL capture snapshot." if is_partial_snap else None,
                 )
                 self._enrich_finding_navigation(session, finding_candidate, target_object=o_dict, target_field=f, snapshot=semantic_state)
                 if first_field_finding is None:

@@ -182,6 +182,26 @@ class RawRuntimeSnapshot:
                 e = int(r[1], 16) if isinstance(r[1], str) and r[1].startswith("0x") else int(r[1])
                 ranges.append((s, e))
 
+        completeness = data.get("completeness", "COMPLETE")
+        prov = data.get("provenance", {}) or {}
+        id_contract = prov.get("identity_contract", {}) or {}
+
+        # Enforce canonical status consistency and guard against tampering or corrupted states:
+        if id_contract.get("identity_mismatch_detected") or prov.get("capture_status") == "INVALID" or id_contract.get("validity") == "INVALID":
+            completeness = "INVALID"
+        elif prov.get("capture_status") == "FAILED" or id_contract.get("validity") == "FAILED":
+            completeness = "FAILED"
+        elif completeness == "COMPLETE":
+            mem_regs = data.get("memory_regions", [])
+            has_failed_reg = any(r.get("status") in ("FAILED", "PARTIAL", "OMITTED") for r in mem_regs)
+            map_status = prov.get("map_enumeration", {}).get("status")
+            thread_status = prov.get("thread_enumeration", {}).get("status")
+            thread_synthetic = prov.get("thread_enumeration", {}).get("is_synthetic", False)
+            if has_failed_reg or (map_status == "FAILED") or (thread_status == "FAILED") or thread_synthetic:
+                completeness = "PARTIAL"
+            elif prov.get("bytes_requested", 0) > 0 and prov.get("bytes_read", 0) == 0:
+                completeness = "FAILED"
+
         return cls(
             snapshot_id=data["snapshot_id"],
             pid=data.get("pid", 0),
@@ -196,8 +216,8 @@ class RawRuntimeSnapshot:
             raw_memory=data.get("raw_memory", {}),
             capture_backend=data.get("capture_backend", "unknown"),
             observation_metadata=data.get("observation_metadata", {}),
-            completeness=data.get("completeness", "COMPLETE"),
-            provenance=data.get("provenance", {}),
+            completeness=completeness,
+            provenance=prov,
         )
 
     def save(self, output_dir: str):

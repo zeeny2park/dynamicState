@@ -307,6 +307,16 @@ class ProcessTargetHandle:
             return self.adapter.get_threads_state(self.pid)
         return _get_threads_state(self.pid)
 
+    def read_proc_maps(self) -> Any:
+        if self.adapter and hasattr(self.adapter, "read_proc_maps"):
+            return self.adapter.read_proc_maps(self.pid)
+        return _read_proc_maps(self.pid)
+
+    def read_thread_metadata(self) -> Any:
+        if self.adapter and hasattr(self.adapter, "read_thread_metadata"):
+            return self.adapter.read_thread_metadata(self.pid)
+        return _read_thread_metadata(self.pid)
+
     def _pidfd_open(self, pid: int, flags: int = 0) -> int:
         if self.adapter and hasattr(self.adapter, "pidfd_open"):
             return self.adapter.pidfd_open(pid, flags)
@@ -646,111 +656,391 @@ def _get_process_identity(pid: int) -> Tuple[str, str]:
     return comm, starttime
 
 
-def _read_proc_maps(pid: int) -> List[Dict[str, Any]]:
-    """Parse /proc/<pid>/maps quickly."""
-    regions = []
+class ProcMapsResult(list):
+    """Container for parsed /proc/<pid>/maps regions preserving list compatibility with explicit enumeration status."""
+
+    def __init__(
+        self,
+        regions: Optional[Any] = None,
+        status: str = "SUCCESS_WITH_RESULTS",
+        error_type: Optional[str] = None,
+        error: Optional[str] = None,
+        diagnostics: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(regions or [])
+        self.status = status  # SUCCESS_WITH_RESULTS, SUCCESS_EMPTY, FAILED, PARTIAL
+        self.error_type = error_type  # PERMISSION_DENIED, TARGET_EXITED, MALFORMED, IO_ERROR
+        self.error = error
+        self.diagnostics = list(diagnostics or [])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "error_type": self.error_type,
+            "error": self.error,
+            "region_count": len(self),
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+class ThreadMetadataResult(list):
+    """Container for parsed /proc/<pid>/task thread records preserving list compatibility with explicit enumeration status."""
+
+    def __init__(
+        self,
+        threads: Optional[Any] = None,
+        status: str = "SUCCESS_WITH_RESULTS",
+        error_type: Optional[str] = None,
+        error: Optional[str] = None,
+        is_synthetic: bool = False,
+        diagnostics: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(threads or [])
+        self.status = status  # SUCCESS_WITH_RESULTS, SUCCESS_EMPTY, FAILED, PARTIAL
+        self.error_type = error_type  # PERMISSION_DENIED, TARGET_EXITED, IO_ERROR, TASK_DIR_MISSING
+        self.error = error
+        self.is_synthetic = is_synthetic
+        self.diagnostics = list(diagnostics or [])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "error_type": self.error_type,
+            "error": self.error,
+            "is_synthetic": self.is_synthetic,
+            "thread_count": len(self),
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+def _read_proc_maps(pid: int) -> ProcMapsResult:
+    """Parse /proc/<pid>/maps with explicit outcome modeling and structured error details."""
     maps_path = f"/proc/{pid}/maps"
+    diagnostics: List[Dict[str, Any]] = []
+
     try:
         with open(maps_path, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split(maxsplit=5)
-                if len(parts) >= 5:
-                    addr_range = parts[0]
-                    perms = parts[1]
-                    offset = parts[2]
-                    dev = parts[3]
-                    inode = parts[4]
-                    pathname = parts[5] if len(parts) > 5 else ""
-                    s_str, e_str = addr_range.split("-")
-                    start = int(s_str, 16)
-                    end = int(e_str, 16)
-                    cat = "unknown"
-                    if pathname == "[heap]":
-                        cat = "heap"
-                    elif pathname.startswith("[stack"):
-                        cat = "stack"
-                    elif pathname.endswith(".so") or ".so." in pathname:
-                        cat = "library"
-                    elif pathname and not pathname.startswith("["):
-                        cat = "binary"
-                    elif not pathname:
-                        cat = "anonymous"
+            lines = f.readlines()
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        err_msg = f"Process {pid} maps not found (ESRCH): {exc}"
+        diagnostics.append({"code": "MAPS_TARGET_EXITED", "message": err_msg, "level": "ERROR"})
+        return ProcMapsResult(
+            [],
+            status="FAILED",
+            error_type="TARGET_EXITED",
+            error=err_msg,
+            diagnostics=diagnostics,
+        )
+    except PermissionError as exc:
+        err_msg = f"Permission denied reading /proc/{pid}/maps: {exc}"
+        diagnostics.append({"code": "MAPS_PERMISSION_DENIED", "message": err_msg, "level": "ERROR"})
+        return ProcMapsResult(
+            [],
+            status="FAILED",
+            error_type="PERMISSION_DENIED",
+            error=err_msg,
+            diagnostics=diagnostics,
+        )
+    except Exception as exc:
+        err_msg = f"Failed to read /proc/{pid}/maps: {exc}"
+        diagnostics.append({"code": "MAPS_IO_ERROR", "message": err_msg, "level": "ERROR"})
+        return ProcMapsResult(
+            [],
+            status="FAILED",
+            error_type="IO_ERROR",
+            error=err_msg,
+            diagnostics=diagnostics,
+        )
 
-                    regions.append({
-                        "start": start,
-                        "end": end,
-                        "size": end - start,
-                        "permissions": perms,
-                        "offset": int(offset, 16) if isinstance(offset, str) else offset,
-                        "category": cat,
-                        "pathname": pathname
-                    })
-    except Exception:
-        pass
-    return regions
+    if not lines:
+        return ProcMapsResult(
+            [],
+            status="SUCCESS_EMPTY",
+            error_type=None,
+            error=None,
+            diagnostics=[{"code": "MAPS_EMPTY", "message": f"/proc/{pid}/maps is empty", "level": "INFO"}],
+        )
+
+    regions = []
+    malformed_count = 0
+    for line in lines:
+        line_str = line.strip()
+        if not line_str:
+            continue
+        parts = line_str.split(maxsplit=5)
+        if len(parts) < 5:
+            malformed_count += 1
+            continue
+        try:
+            addr_range = parts[0]
+            perms = parts[1]
+            offset = parts[2]
+            dev = parts[3]
+            inode = parts[4]
+            pathname = parts[5] if len(parts) > 5 else ""
+            if "-" not in addr_range:
+                malformed_count += 1
+                continue
+            s_str, e_str = addr_range.split("-")
+            start = int(s_str, 16)
+            end = int(e_str, 16)
+        except Exception:
+            malformed_count += 1
+            continue
+
+        cat = "unknown"
+        if pathname == "[heap]":
+            cat = "heap"
+        elif pathname.startswith("[stack"):
+            cat = "stack"
+        elif pathname.endswith(".so") or ".so." in pathname:
+            cat = "library"
+        elif pathname and not pathname.startswith("["):
+            cat = "binary"
+        elif not pathname:
+            cat = "anonymous"
+
+        regions.append({
+            "start": start,
+            "end": end,
+            "size": end - start,
+            "permissions": perms,
+            "offset": int(offset, 16) if isinstance(offset, str) else offset,
+            "category": cat,
+            "pathname": pathname
+        })
+
+    if malformed_count > 0:
+        if regions:
+            diagnostics.append({
+                "code": "MAPS_PARTIALLY_MALFORMED",
+                "message": f"{malformed_count} malformed lines found in /proc/{pid}/maps",
+                "level": "WARNING"
+            })
+            return ProcMapsResult(
+                regions,
+                status="PARTIAL",
+                error_type="MALFORMED",
+                error=f"{malformed_count} malformed map lines",
+                diagnostics=diagnostics,
+            )
+        else:
+            diagnostics.append({
+                "code": "MAPS_ENTIRELY_MALFORMED",
+                "message": f"All lines in /proc/{pid}/maps were malformed",
+                "level": "ERROR"
+            })
+            return ProcMapsResult(
+                [],
+                status="FAILED",
+                error_type="MALFORMED",
+                error=f"All {malformed_count} lines malformed",
+                diagnostics=diagnostics,
+            )
+
+    return ProcMapsResult(
+        regions,
+        status="SUCCESS_WITH_RESULTS" if regions else "SUCCESS_EMPTY",
+        error_type=None,
+        error=None,
+        diagnostics=diagnostics,
+    )
 
 
-def _read_thread_metadata(pid: int) -> List[Dict[str, Any]]:
-    """Read thread information quickly from /proc/<pid>/task."""
+def _read_thread_metadata(pid: int) -> ThreadMetadataResult:
+    """Read thread information quickly from /proc/<pid>/task with explicit outcome modeling."""
     threads = []
     task_dir = f"/proc/{pid}/task"
-    try:
-        if os.path.exists(task_dir):
-            for entry in os.listdir(task_dir):
-                if entry.isdigit():
-                    tid = int(entry)
-                    t_name = None
-                    comm_path = os.path.join(task_dir, entry, "comm")
-                    try:
-                        with open(comm_path, "r") as f:
-                            t_name = f.read().strip() or None
-                    except Exception:
-                        pass
+    diagnostics: List[Dict[str, Any]] = []
 
-                    t_state = "UNKNOWN"
-                    stat_path = os.path.join(task_dir, entry, "stat")
-                    try:
-                        with open(stat_path, "r") as f:
-                            stat_content = f.read()
-                            rparen = stat_content.rfind(")")
-                            if rparen != -1:
-                                state_char = stat_content[rparen + 1:].strip().split()[0]
-                                state_map = {
-                                    "R": "RUNNING",
-                                    "S": "SLEEPING",
-                                    "D": "DISK_SLEEP",
-                                    "T": "STOPPED",
-                                    "t": "TRACING_STOP",
-                                    "Z": "ZOMBIE",
-                                }
-                                t_state = state_map.get(state_char, state_char)
-                    except Exception:
-                        pass
-
-                    threads.append({
-                        "thread_id": tid,
-                        "name": t_name,
-                        "state": t_state,
-                        "stop_status": "STOPPED" if t_state in ("STOPPED", "TRACING_STOP") else "NOT_STOPPED",
-                        "capture_participation": True,
-                        "registers_availability": "REGISTER_STATE_UNAVAILABLE",
-                        "function": None,
-                        "location": None,
-                    })
-    except Exception:
-        pass
-    if not threads:
-        threads.append({
+    if not os.path.exists(task_dir):
+        err_msg = f"Task directory {task_dir} does not exist (TARGET_EXITED)"
+        diagnostics.append({"code": "THREAD_TASK_DIR_MISSING", "message": err_msg, "level": "WARNING"})
+        placeholder = [{
             "thread_id": pid,
             "name": None,
-            "state": "STOPPED",
-            "stop_status": "STOPPED",
-            "capture_participation": True,
+            "state": "UNKNOWN",
+            "stop_status": "UNKNOWN",
+            "is_synthetic": True,
+            "verified_observation": False,
+            "capture_participation": False,
             "registers_availability": "REGISTER_STATE_UNAVAILABLE",
             "function": None,
             "location": None,
+        }]
+        return ThreadMetadataResult(
+            placeholder,
+            status="FAILED",
+            error_type="TARGET_EXITED",
+            error=err_msg,
+            is_synthetic=True,
+            diagnostics=diagnostics,
+        )
+
+    try:
+        entries = os.listdir(task_dir)
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        err_msg = f"Process {pid} exited while enumerating task directory: {exc}"
+        diagnostics.append({"code": "THREAD_TARGET_EXITED", "message": err_msg, "level": "WARNING"})
+        placeholder = [{
+            "thread_id": pid,
+            "name": None,
+            "state": "UNKNOWN",
+            "stop_status": "UNKNOWN",
+            "is_synthetic": True,
+            "verified_observation": False,
+            "capture_participation": False,
+            "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+            "function": None,
+            "location": None,
+        }]
+        return ThreadMetadataResult(
+            placeholder,
+            status="FAILED",
+            error_type="TARGET_EXITED",
+            error=err_msg,
+            is_synthetic=True,
+            diagnostics=diagnostics,
+        )
+    except PermissionError as exc:
+        err_msg = f"Permission denied accessing {task_dir}: {exc}"
+        diagnostics.append({"code": "THREAD_PERMISSION_DENIED", "message": err_msg, "level": "ERROR"})
+        placeholder = [{
+            "thread_id": pid,
+            "name": None,
+            "state": "UNKNOWN",
+            "stop_status": "UNKNOWN",
+            "is_synthetic": True,
+            "verified_observation": False,
+            "capture_participation": False,
+            "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+            "function": None,
+            "location": None,
+        }]
+        return ThreadMetadataResult(
+            placeholder,
+            status="FAILED",
+            error_type="PERMISSION_DENIED",
+            error=err_msg,
+            is_synthetic=True,
+            diagnostics=diagnostics,
+        )
+    except Exception as exc:
+        err_msg = f"Failed to list {task_dir}: {exc}"
+        diagnostics.append({"code": "THREAD_IO_ERROR", "message": err_msg, "level": "ERROR"})
+        placeholder = [{
+            "thread_id": pid,
+            "name": None,
+            "state": "UNKNOWN",
+            "stop_status": "UNKNOWN",
+            "is_synthetic": True,
+            "verified_observation": False,
+            "capture_participation": False,
+            "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+            "function": None,
+            "location": None,
+        }]
+        return ThreadMetadataResult(
+            placeholder,
+            status="FAILED",
+            error_type="IO_ERROR",
+            error=err_msg,
+            is_synthetic=True,
+            diagnostics=diagnostics,
+        )
+
+    task_read_errors = 0
+    for entry in entries:
+        if entry.isdigit():
+            tid = int(entry)
+            t_name = None
+            comm_path = os.path.join(task_dir, entry, "comm")
+            try:
+                with open(comm_path, "r", encoding="utf-8") as f:
+                    t_name = f.read().strip() or None
+            except Exception:
+                pass
+
+            t_state = "UNKNOWN"
+            stat_path = os.path.join(task_dir, entry, "stat")
+            try:
+                with open(stat_path, "r", encoding="utf-8") as f:
+                    stat_content = f.read()
+                    rparen = stat_content.rfind(")")
+                    if rparen != -1:
+                        state_char = stat_content[rparen + 1:].strip().split()[0]
+                        state_map = {
+                            "R": "RUNNING",
+                            "S": "SLEEPING",
+                            "D": "DISK_SLEEP",
+                            "T": "STOPPED",
+                            "t": "TRACING_STOP",
+                            "Z": "ZOMBIE",
+                        }
+                        t_state = state_map.get(state_char, state_char)
+            except Exception:
+                task_read_errors += 1
+
+            threads.append({
+                "thread_id": tid,
+                "name": t_name,
+                "state": t_state,
+                "stop_status": "STOPPED" if t_state in ("STOPPED", "TRACING_STOP") else ("UNKNOWN" if t_state == "UNKNOWN" else "NOT_STOPPED"),
+                "is_synthetic": False,
+                "verified_observation": (t_state != "UNKNOWN"),
+                "capture_participation": True,
+                "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+                "function": None,
+                "location": None,
+            })
+
+    if not threads:
+        err_msg = f"No threads could be enumerated for process {pid}"
+        placeholder = [{
+            "thread_id": pid,
+            "name": None,
+            "state": "UNKNOWN",
+            "stop_status": "UNKNOWN",
+            "is_synthetic": True,
+            "verified_observation": False,
+            "capture_participation": False,
+            "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+            "function": None,
+            "location": None,
+        }]
+        return ThreadMetadataResult(
+            placeholder,
+            status="FAILED",
+            error_type="IO_ERROR",
+            error=err_msg,
+            is_synthetic=True,
+            diagnostics=diagnostics,
+        )
+
+    threads.sort(key=lambda t: t["thread_id"])
+    if task_read_errors > 0:
+        diagnostics.append({
+            "code": "THREAD_PARTIAL_READ_ERRORS",
+            "message": f"{task_read_errors} thread stat reads failed",
+            "level": "WARNING"
         })
-    return sorted(threads, key=lambda t: t["thread_id"])
+        return ThreadMetadataResult(
+            threads,
+            status="PARTIAL",
+            error_type="IO_ERROR",
+            error=f"{task_read_errors} thread stat reads failed",
+            is_synthetic=False,
+            diagnostics=diagnostics,
+        )
+
+    return ThreadMetadataResult(
+        threads,
+        status="SUCCESS_WITH_RESULTS",
+        error_type=None,
+        error=None,
+        is_synthetic=False,
+        diagnostics=diagnostics,
+    )
 
 
 class ProcessVmCaptureBackend(RuntimeCaptureBackend):
@@ -956,8 +1246,9 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 "message": f"Target process identity check failed ({ident_status_maps}) before maps collection; aborting capture.",
                 "level": "ERROR"
             })
-        all_maps = _read_proc_maps(pid) if is_same_maps else []
-        if is_same_maps:
+            all_maps = ProcMapsResult([], status="FAILED", error_type="TARGET_EXITED", error="Identity check failed before maps read")
+        else:
+            all_maps = handle.read_proc_maps()
             is_same_post_maps, ident_status_post_maps = handle.record_checkpoint("POST_MAPS_READ")
             if not is_same_post_maps:
                 diagnostics.append({
@@ -965,7 +1256,13 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "message": f"Target process identity changed ({ident_status_post_maps}) after reading maps.",
                     "level": "ERROR"
                 })
+
+        if hasattr(all_maps, "diagnostics"):
+            diagnostics.extend(all_maps.diagnostics)
+
         selected_maps = []
+        maps_enumeration_failed = (getattr(all_maps, "status", "SUCCESS_WITH_RESULTS") == "FAILED")
+        explicit_ranges_used_without_maps = False
 
         if plan.mode == CaptureMode.TARGETED.value and plan.memory_ranges:
             for r_start, r_end in plan.memory_ranges:
@@ -977,6 +1274,13 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "category": "targeted",
                     "pathname": "[targeted_range]"
                 })
+            if maps_enumeration_failed:
+                explicit_ranges_used_without_maps = True
+                diagnostics.append({
+                    "code": "MAPS_ENUMERATION_FAILED_EXPLICIT_RANGES_USED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}), but explicit target ranges were supplied. Layout could not be verified against proc maps; capture quality is capped at PARTIAL.",
+                    "level": "WARNING"
+                })
         elif plan.mode == CaptureMode.OBJECT.value and plan.memory_ranges:
             for r_start, r_end in plan.memory_ranges:
                 selected_maps.append({
@@ -987,15 +1291,36 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "category": "object",
                     "pathname": "[object_range]"
                 })
+            if maps_enumeration_failed:
+                explicit_ranges_used_without_maps = True
+                diagnostics.append({
+                    "code": "MAPS_ENUMERATION_FAILED_EXPLICIT_RANGES_USED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}), but explicit target ranges were supplied. Layout could not be verified against proc maps; capture quality is capped at PARTIAL.",
+                    "level": "WARNING"
+                })
         elif plan.mode == CaptureMode.THREAD.value and plan.thread_ids:
-            for m in all_maps:
-                if m["category"] == "stack" and "r" in m["permissions"]:
-                    selected_maps.append(m)
+            if maps_enumeration_failed:
+                diagnostics.append({
+                    "code": "MAP_ENUMERATION_FAILED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}). Cannot locate thread stack maps in THREAD mode.",
+                    "level": "ERROR"
+                })
+            else:
+                for m in all_maps:
+                    if m["category"] == "stack" and "r" in m["permissions"]:
+                        selected_maps.append(m)
         else:
             # FULL: Capture mutable runtime state (heap, stack, writable data/bss/anonymous)
-            for m in all_maps:
-                if "r" in m["permissions"] and ("w" in m["permissions"] or m["category"] in ("heap", "stack", "anonymous")):
-                    selected_maps.append(m)
+            if maps_enumeration_failed:
+                diagnostics.append({
+                    "code": "MAP_ENUMERATION_FAILED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}). FULL capture mode requires valid memory maps; cannot proceed.",
+                    "level": "ERROR"
+                })
+            else:
+                for m in all_maps:
+                    if "r" in m["permissions"] and ("w" in m["permissions"] or m["category"] in ("heap", "stack", "anonymous")):
+                        selected_maps.append(m)
 
         if not selected_maps and plan.memory_ranges:
             for r_start, r_end in plan.memory_ranges:
@@ -1006,6 +1331,13 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "permissions": "rw-p",
                     "category": "targeted",
                     "pathname": "[targeted_range]"
+                })
+            if maps_enumeration_failed and not explicit_ranges_used_without_maps:
+                explicit_ranges_used_without_maps = True
+                diagnostics.append({
+                    "code": "MAPS_ENUMERATION_FAILED_EXPLICIT_RANGES_USED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}), but explicit target ranges were supplied. Layout could not be verified against proc maps; capture quality is capped at PARTIAL.",
+                    "level": "WARNING"
                 })
 
         # Pre-allocate buffers and iovecs before suspension, explicitly tracking omitted regions
@@ -1116,7 +1448,10 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                                 curr_st = handle.get_process_state()
                                 if curr_st.get("is_stopped"):
                                     stop_confirmed = True
-                                    break
+                                    curr_threads = handle.get_threads_state()
+                                    if curr_threads.get("all_stopped", False):
+                                        all_threads_stopped = True
+                                        break
                             except Exception:
                                 pass
                             try:
@@ -1145,8 +1480,9 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     stop_confirmed = True
 
             # 2. Check thread consistency
-            curr_threads = handle.get_threads_state()
-            all_threads_stopped = curr_threads.get("all_stopped", False)
+            if not all_threads_stopped:
+                curr_threads = handle.get_threads_state()
+                all_threads_stopped = curr_threads.get("all_stopped", False)
             if (should_suspend or was_already_stopped) and not all_threads_stopped:
                 diagnostics.append({
                     "code": "THREAD_STATES_HETEROGENEOUS",
@@ -1157,9 +1493,39 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             # 3. Capture thread metadata
             state_history.append("CAPTURING")
             is_same_th, ident_status_th = handle.record_checkpoint("PRE_THREAD_METADATA")
-            thread_metadata = _read_thread_metadata(pid) if is_same_th else []
+            if not is_same_th:
+                thread_metadata = ThreadMetadataResult(
+                    [{
+                        "thread_id": pid,
+                        "name": None,
+                        "state": "UNKNOWN",
+                        "stop_status": "UNKNOWN",
+                        "is_synthetic": True,
+                        "verified_observation": False,
+                        "capture_participation": False,
+                        "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+                        "function": None,
+                        "location": None,
+                    }],
+                    status="FAILED",
+                    error_type=ident_status_th,
+                    error="Identity verification failed before thread metadata collection",
+                    is_synthetic=True,
+                )
+            else:
+                thread_metadata = handle.read_thread_metadata()
             handle.record_checkpoint("POST_THREAD_METADATA")
             t_threads = time.monotonic_ns()
+
+            if getattr(thread_metadata, "is_synthetic", False) or getattr(thread_metadata, "status", "") == "FAILED":
+                all_threads_stopped = False
+                diagnostics.append({
+                    "code": "THREAD_ENUMERATION_FAILED",
+                    "message": f"Thread enumeration failed ({getattr(thread_metadata, 'error_type', 'UNKNOWN')}: {getattr(thread_metadata, 'error', '')}). Thread states are UNVERIFIED.",
+                    "level": "WARNING"
+                })
+            if hasattr(thread_metadata, "diagnostics"):
+                diagnostics.extend(thread_metadata.diagnostics)
 
             # 4. Read memory into pre-allocated buffers
             is_same_mem, ident_status_mem = handle.record_checkpoint("PRE_MEMORY_READ")
@@ -1182,8 +1548,28 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     except Exception:
                         nread = -1
                         err = errno.EIO
+                elif fn_vm_readv:
+                    nread = fn_vm_readv(
+                        pid,
+                        ctypes.byref(l_iov),
+                        1,
+                        ctypes.byref(r_iov),
+                        1,
+                        0
+                    )
+                    err = ctypes.get_errno() if nread <= 0 else 0
+                    if nread <= 0 and err in (errno.ENOSYS, errno.EPERM) and handle.mem_pinned and handle.mem_fd is not None:
+                        # Fallback to pinned /proc/<pid>/mem if process_vm_readv is not permitted or syscall unsupported
+                        try:
+                            read_bytes = handle.read_mem(reg_start, chunk_size)
+                            if read_bytes is not None:
+                                nread = len(read_bytes)
+                                ctypes.memmove(buf, read_bytes, nread)
+                                err = 0
+                        except Exception:
+                            pass
                 elif handle.mem_pinned and handle.mem_fd is not None:
-                    # Preferred pinned path: read via pinned /proc/<pid>/mem descriptor
+                    # Fallback when fn_vm_readv is not available
                     try:
                         read_bytes = handle.read_mem(reg_start, chunk_size)
                         if read_bytes is not None:
@@ -1196,16 +1582,6 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     except Exception:
                         nread = -1
                         err = errno.EIO
-                elif fn_vm_readv:
-                    nread = fn_vm_readv(
-                        pid,
-                        ctypes.byref(l_iov),
-                        1,
-                        ctypes.byref(r_iov),
-                        1,
-                        0
-                    )
-                    err = ctypes.get_errno() if nread <= 0 else 0
                 else:
                     nread = -1
                     err = errno.ENOSYS
@@ -1405,10 +1781,16 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in handle.identity_checkpoints)
         any_checkpoint_failed = any(not cp.get("verified", False) for cp in handle.identity_checkpoints)
 
+        thread_enum_failed = getattr(thread_metadata, "is_synthetic", False) or (getattr(thread_metadata, "status", "") == "FAILED")
+        map_enum_failed = getattr(all_maps, "status", "") == "FAILED"
+
         if any_pid_reused:
             capture_status = "INVALID"
             completeness = "INVALID"
-        elif (bytes_read == 0 and selected_maps) or (any_target_exited and bytes_read == 0):
+        elif maps_enumeration_failed and not explicit_ranges_used_without_maps:
+            capture_status = "FAILED"
+            completeness = "FAILED"
+        elif (bytes_read == 0 and selected_maps) or (any_target_exited and bytes_read == 0) or (len(selected_maps) == 0 and plan.mode == CaptureMode.FULL.value):
             capture_status = "FAILED"
             completeness = "FAILED"
         elif (
@@ -1420,6 +1802,9 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             or (suspension_caused_by_capture and not resume_confirmed)
             or (plan.mode == CaptureMode.ZERO_STOP.value)
             or any_checkpoint_failed
+            or explicit_ranges_used_without_maps
+            or thread_enum_failed
+            or map_enum_failed
         ):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
@@ -1605,6 +1990,8 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "diagnostics": diagnostics,
             "identity_contract": identity_contract,
             "capabilities": self.capabilities,
+            "map_enumeration": all_maps.to_dict() if hasattr(all_maps, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if all_maps else "SUCCESS_EMPTY"},
+            "thread_enumeration": thread_metadata.to_dict() if hasattr(thread_metadata, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if thread_metadata else "FAILED", "is_synthetic": False},
         }
 
         raw_snap = RawRuntimeSnapshot(
@@ -1798,8 +2185,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 "message": f"Target process identity check failed ({ident_status_maps}) before maps collection; aborting capture.",
                 "level": "ERROR"
             })
-        all_maps = _read_proc_maps(pid) if is_same_maps else []
-        if is_same_maps:
+            all_maps = ProcMapsResult([], status="FAILED", error_type="TARGET_EXITED", error="Identity check failed before maps read")
+        else:
+            all_maps = handle.read_proc_maps()
             is_same_post_maps, ident_status_post_maps = handle.record_checkpoint("POST_MAPS_READ")
             if not is_same_post_maps:
                 diagnostics.append({
@@ -1807,10 +2195,71 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                     "message": f"Target process identity changed ({ident_status_post_maps}) after reading maps.",
                     "level": "ERROR"
                 })
+
+        if hasattr(all_maps, "diagnostics"):
+            diagnostics.extend(all_maps.diagnostics)
+
         selected_maps = []
-        for m in all_maps:
-            if "r" in m["permissions"] and m["category"] in ("heap", "stack", "anonymous", "binary"):
-                selected_maps.append(m)
+        maps_enumeration_failed = (getattr(all_maps, "status", "SUCCESS_WITH_RESULTS") == "FAILED")
+        explicit_ranges_used_without_maps = False
+
+        if plan.mode == CaptureMode.TARGETED.value and plan.memory_ranges:
+            for r_start, r_end in plan.memory_ranges:
+                selected_maps.append({
+                    "start": r_start,
+                    "end": r_end,
+                    "size": r_end - r_start,
+                    "permissions": "rw-p",
+                    "category": "targeted",
+                    "pathname": "[targeted_range]"
+                })
+            if maps_enumeration_failed:
+                explicit_ranges_used_without_maps = True
+                diagnostics.append({
+                    "code": "MAPS_ENUMERATION_FAILED_EXPLICIT_RANGES_USED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}), but explicit target ranges were supplied. Layout could not be verified against proc maps; capture quality is capped at PARTIAL.",
+                    "level": "WARNING"
+                })
+        elif plan.mode == CaptureMode.OBJECT.value and plan.memory_ranges:
+            for r_start, r_end in plan.memory_ranges:
+                selected_maps.append({
+                    "start": r_start,
+                    "end": r_end,
+                    "size": r_end - r_start,
+                    "permissions": "rw-p",
+                    "category": "object",
+                    "pathname": "[object_range]"
+                })
+            if maps_enumeration_failed:
+                explicit_ranges_used_without_maps = True
+                diagnostics.append({
+                    "code": "MAPS_ENUMERATION_FAILED_EXPLICIT_RANGES_USED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}), but explicit target ranges were supplied. Layout could not be verified against proc maps; capture quality is capped at PARTIAL.",
+                    "level": "WARNING"
+                })
+        elif plan.mode == CaptureMode.THREAD.value and plan.thread_ids:
+            if maps_enumeration_failed:
+                diagnostics.append({
+                    "code": "MAP_ENUMERATION_FAILED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}). Cannot locate thread stack maps in THREAD mode.",
+                    "level": "ERROR"
+                })
+            else:
+                for m in all_maps:
+                    if m["category"] == "stack" and "r" in m["permissions"]:
+                        selected_maps.append(m)
+        else:
+            # FULL: Capture mutable runtime state (heap, stack, writable data/bss/anonymous/binary)
+            if maps_enumeration_failed:
+                diagnostics.append({
+                    "code": "MAP_ENUMERATION_FAILED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}). FULL capture mode requires valid memory maps; cannot proceed.",
+                    "level": "ERROR"
+                })
+            else:
+                for m in all_maps:
+                    if "r" in m["permissions"] and m["category"] in ("heap", "stack", "anonymous", "binary"):
+                        selected_maps.append(m)
 
         if not selected_maps and plan.memory_ranges:
             for r_start, r_end in plan.memory_ranges:
@@ -1821,6 +2270,13 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                     "permissions": "rw-p",
                     "category": "targeted",
                     "pathname": "[targeted_range]"
+                })
+            if maps_enumeration_failed and not explicit_ranges_used_without_maps:
+                explicit_ranges_used_without_maps = True
+                diagnostics.append({
+                    "code": "MAPS_ENUMERATION_FAILED_EXPLICIT_RANGES_USED",
+                    "message": f"Memory map enumeration failed ({getattr(all_maps, 'error_type', 'UNKNOWN')}: {getattr(all_maps, 'error', '')}), but explicit target ranges were supplied. Layout could not be verified against proc maps; capture quality is capped at PARTIAL.",
+                    "level": "WARNING"
                 })
 
         read_plans = []
@@ -1928,7 +2384,10 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                                 curr_st = handle.get_process_state()
                                 if curr_st.get("is_stopped"):
                                     stop_confirmed = True
-                                    break
+                                    curr_threads = handle.get_threads_state()
+                                    if curr_threads.get("all_stopped", False):
+                                        all_threads_stopped = True
+                                        break
                             except Exception:
                                 pass
                             try:
@@ -1957,8 +2416,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                     stop_confirmed = True
 
             # Check thread consistency
-            curr_threads = handle.get_threads_state()
-            all_threads_stopped = curr_threads.get("all_stopped", False)
+            if not all_threads_stopped:
+                curr_threads = handle.get_threads_state()
+                all_threads_stopped = curr_threads.get("all_stopped", False)
             if (should_suspend or was_already_stopped) and not all_threads_stopped:
                 diagnostics.append({
                     "code": "THREAD_STATES_HETEROGENEOUS",
@@ -1968,9 +2428,39 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
 
             state_history.append("CAPTURING")
             is_same_th, ident_status_th = handle.record_checkpoint("PRE_THREAD_METADATA")
-            thread_metadata = _read_thread_metadata(pid) if is_same_th else []
+            if not is_same_th:
+                thread_metadata = ThreadMetadataResult(
+                    [{
+                        "thread_id": pid,
+                        "name": None,
+                        "state": "UNKNOWN",
+                        "stop_status": "UNKNOWN",
+                        "is_synthetic": True,
+                        "verified_observation": False,
+                        "capture_participation": False,
+                        "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+                        "function": None,
+                        "location": None,
+                    }],
+                    status="FAILED",
+                    error_type=ident_status_th,
+                    error="Identity verification failed before thread metadata collection",
+                    is_synthetic=True,
+                )
+            else:
+                thread_metadata = handle.read_thread_metadata()
             handle.record_checkpoint("POST_THREAD_METADATA")
             t_threads = time.monotonic_ns()
+
+            if getattr(thread_metadata, "is_synthetic", False) or getattr(thread_metadata, "status", "") == "FAILED":
+                all_threads_stopped = False
+                diagnostics.append({
+                    "code": "THREAD_ENUMERATION_FAILED",
+                    "message": f"Thread enumeration failed ({getattr(thread_metadata, 'error_type', 'UNKNOWN')}: {getattr(thread_metadata, 'error', '')}). Thread states are UNVERIFIED.",
+                    "level": "WARNING"
+                })
+            if hasattr(thread_metadata, "diagnostics"):
+                diagnostics.extend(thread_metadata.diagnostics)
 
             is_same_mem, ident_status_mem = handle.record_checkpoint("PRE_MEMORY_READ")
             mem_file = f"/proc/{pid}/mem"
@@ -2201,10 +2691,16 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in handle.identity_checkpoints)
         any_checkpoint_failed = any(not cp.get("verified", False) for cp in handle.identity_checkpoints)
 
+        thread_enum_failed = getattr(thread_metadata, "is_synthetic", False) or (getattr(thread_metadata, "status", "") == "FAILED")
+        map_enum_failed = getattr(all_maps, "status", "") == "FAILED"
+
         if any_pid_reused:
             capture_status = "INVALID"
             completeness = "INVALID"
-        elif (bytes_read == 0 and selected_maps) or (any_target_exited and bytes_read == 0):
+        elif maps_enumeration_failed and not explicit_ranges_used_without_maps:
+            capture_status = "FAILED"
+            completeness = "FAILED"
+        elif (bytes_read == 0 and selected_maps) or (any_target_exited and bytes_read == 0) or (len(selected_maps) == 0 and plan.mode == CaptureMode.FULL.value):
             capture_status = "FAILED"
             completeness = "FAILED"
         elif (
@@ -2216,6 +2712,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             or (suspension_caused_by_capture and not resume_confirmed)
             or (plan.mode == CaptureMode.ZERO_STOP.value)
             or any_checkpoint_failed
+            or explicit_ranges_used_without_maps
+            or thread_enum_failed
+            or map_enum_failed
         ):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
@@ -2400,6 +2899,8 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "diagnostics": diagnostics,
             "identity_contract": identity_contract,
             "capabilities": self.capabilities,
+            "map_enumeration": all_maps.to_dict() if hasattr(all_maps, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if all_maps else "SUCCESS_EMPTY"},
+            "thread_enumeration": thread_metadata.to_dict() if hasattr(thread_metadata, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if thread_metadata else "FAILED", "is_synthetic": False},
         }
 
         return RawRuntimeSnapshot(

@@ -782,14 +782,46 @@ class DwarfRuntimeResolver:
         """Execute full DWARF semantic reconstruction."""
         diagnostics = []
 
-        if not os.path.exists(self.debug_image_path):
+        # Check snapshot capture validity before attempting DWARF decoding
+        snap_comp = getattr(self.snapshot, "completeness", "COMPLETE")
+        snap_prov = getattr(self.snapshot, "provenance", {}) or {}
+        snap_status = snap_prov.get("capture_status")
+        if snap_comp == "INVALID" or snap_status == "INVALID":
             return ResolutionResult(
-                status="DECODE_ERROR",
+                status="INVALID_CAPTURE",
                 diagnostics=[{
-                    "code": "MISSING_DEBUG_IMAGE",
-                    "message": f"Debug image artifact not found: {self.debug_image_path}",
+                    "code": "INVALID_CAPTURE_IDENTITY",
+                    "message": "Refusing to decode snapshot: capture identity is INVALID (PID reuse or identity mismatch detected).",
                     "recoverable": False
                 }]
+            )
+        if snap_comp == "FAILED" or snap_status == "FAILED":
+            return ResolutionResult(
+                status="FAILED_CAPTURE",
+                diagnostics=[{
+                    "code": "FAILED_CAPTURE",
+                    "message": "Refusing to decode snapshot: snapshot capture FAILED.",
+                    "recoverable": False
+                }]
+            )
+
+        is_partial_capture = (snap_comp == "PARTIAL" or snap_status == "PARTIAL")
+        if is_partial_capture:
+            diagnostics.append({
+                "code": "PARTIAL_CAPTURE_DECODED",
+                "message": "Snapshot capture is PARTIAL; decoded variables and object nodes represent incomplete or non-atomic state.",
+                "level": "WARNING"
+            })
+
+        if not os.path.exists(self.debug_image_path):
+            diagnostics.append({
+                "code": "MISSING_DEBUG_IMAGE",
+                "message": f"Debug image artifact not found: {self.debug_image_path}",
+                "recoverable": False
+            })
+            return ResolutionResult(
+                status="DECODE_ERROR",
+                diagnostics=diagnostics
             )
 
         try:
@@ -930,7 +962,18 @@ class DwarfRuntimeResolver:
         has_uncaptured = any(d.get("code") == "MEMORY_NOT_CAPTURED" for d in diagnostics)
         has_unsupported = any(d.get("code") == "UNSUPPORTED_TYPE" for d in diagnostics)
 
-        if has_uncaptured or has_partial or has_unsupported:
+        if is_partial_capture:
+            for obj in objects:
+                obj["capture_quality"] = "PARTIAL"
+                obj["verified"] = False
+                obj["trust_classification"] = "UNVERIFIED_PARTIAL_CAPTURE"
+            for r in roots:
+                r["capture_quality"] = "PARTIAL"
+                r["verified"] = False
+                if isinstance(r.get("provenance"), dict):
+                    r["provenance"]["capture_quality"] = "PARTIAL"
+
+        if is_partial_capture or has_uncaptured or has_partial or has_unsupported:
             state_status = "PARTIAL"
         else:
             state_status = "COMPLETE"

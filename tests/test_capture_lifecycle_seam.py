@@ -27,9 +27,17 @@ from extractor.capture_backend import (
     ProcfsCaptureBackend,
     ProcessTargetHandle,
     CaptureSafetyPolicy,
+    ProcMapsResult,
+    ThreadMetadataResult,
+    _read_proc_maps,
+    _read_thread_metadata,
 )
 from extractor.capture_plan import CapturePlan, CaptureMode
 from extractor.raw_snapshot import RawRuntimeSnapshot
+from extractor.cpp_decoder import DwarfRuntimeResolver
+from extractor.state_diff import StateDiffEngine
+from extractor.investigation import InvestigationManager, InvestigationFinding
+from unittest.mock import patch, mock_open
 
 
 class MockProcessTargetAdapter:
@@ -65,6 +73,9 @@ class MockProcessTargetAdapter:
         self.fail_resume_signal: Optional[str] = None
         self.target_exits_during_cleanup: bool = False
         self.target_resumes_independently_before_cleanup: bool = False
+        self.fail_maps: bool = False
+        self.fail_thread_metadata: bool = False
+        self.mock_maps: Optional[List[Dict[str, Any]]] = None
 
     def open(self, handle: ProcessTargetHandle) -> None:
         handle.initial_identity = self.get_process_state(self.pid)
@@ -73,6 +84,70 @@ class MockProcessTargetAdapter:
 
     def close(self, handle: ProcessTargetHandle) -> None:
         self.closed = True
+
+    def read_proc_maps(self, pid: int) -> ProcMapsResult:
+        if self.fail_maps:
+            return ProcMapsResult(
+                [],
+                status="FAILED",
+                error_type="PERMISSION_DENIED",
+                error="Mocked proc maps permission error",
+                diagnostics=[{"code": "MAPS_PERMISSION_DENIED", "message": "Mocked", "level": "ERROR"}],
+            )
+        regions = self.mock_maps if self.mock_maps is not None else [
+            {
+                "start": 0x1000,
+                "end": 0x5000,
+                "size": 0x4000,
+                "permissions": "rw-p",
+                "offset": 0,
+                "category": "anonymous",
+                "pathname": "",
+            }
+        ]
+        return ProcMapsResult(regions, status="SUCCESS_WITH_RESULTS" if regions else "SUCCESS_EMPTY")
+
+    def read_thread_metadata(self, pid: int) -> ThreadMetadataResult:
+        if self.fail_thread_metadata:
+            return ThreadMetadataResult(
+                [{
+                    "thread_id": pid,
+                    "name": None,
+                    "state": "UNKNOWN",
+                    "stop_status": "UNKNOWN",
+                    "is_synthetic": True,
+                    "verified_observation": False,
+                    "capture_participation": False,
+                    "registers_availability": "REGISTER_STATE_UNAVAILABLE",
+                    "function": None,
+                    "location": None,
+                }],
+                status="FAILED",
+                error_type="PERMISSION_DENIED",
+                error="Mocked thread metadata error",
+                is_synthetic=True,
+            )
+        threads = []
+        for i in range(self.thread_count):
+            tid = pid if i == 0 else pid + i
+            if i == 0:
+                is_st = (self.state in ("STOPPED", "TRACING_STOP"))
+            else:
+                is_st = self.all_threads_stopped and (self.state in ("STOPPED", "TRACING_STOP"))
+            st = "T" if is_st else "S"
+            threads.append({
+                "thread_id": tid,
+                "name": f"mock_th_{i}",
+                "state": st,
+                "stop_status": "STOPPED" if is_st else "RUNNING",
+                "is_synthetic": False,
+                "verified_observation": True,
+                "capture_participation": True,
+                "registers_availability": "AVAILABLE",
+                "function": "mock_func",
+                "location": "mock.cpp:1",
+            })
+        return ThreadMetadataResult(threads, status="SUCCESS_WITH_RESULTS", is_synthetic=False)
 
     def get_process_state(self, pid: int) -> Dict[str, Any]:
         is_stopped = (self.state == "STOPPED")
@@ -563,6 +638,41 @@ class MockPidfdRaceAdapter:
             "mixed_states": False,
         }
 
+    def read_proc_maps(self, pid: int) -> ProcMapsResult:
+        regions = [
+            {
+                "start": 0x1000,
+                "end": 0x5000,
+                "size": 0x4000,
+                "permissions": "rw-p",
+                "offset": 0,
+                "category": "anonymous",
+                "pathname": "",
+            }
+        ]
+        return ProcMapsResult(regions, status="SUCCESS_WITH_RESULTS")
+
+    def read_thread_metadata(self, pid: int) -> ThreadMetadataResult:
+        is_st = getattr(self, "stopped", False)
+        return ThreadMetadataResult(
+            [
+                {
+                    "thread_id": pid,
+                    "name": "main",
+                    "state": "T" if is_st else "R",
+                    "stop_status": "STOPPED" if is_st else "RUNNING",
+                    "is_synthetic": False,
+                    "verified_observation": True,
+                    "capture_participation": True,
+                    "registers_availability": "AVAILABLE",
+                    "function": "main",
+                    "location": "app.cpp:10",
+                }
+            ],
+            status="SUCCESS_WITH_RESULTS",
+            is_synthetic=False,
+        )
+
     def pidfd_open(self, pid: int, flags: int = 0) -> int:
         if self.pidfd_errno == errno.ESRCH:
             raise ProcessLookupError("No such process")
@@ -882,6 +992,373 @@ class TestPinnedIdentityAndValidityInvariants(unittest.TestCase):
             "POST_RESUME",
         ]
         self.assertEqual(checkpoint_names, expected)
+
+
+
+class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
+    """Deterministic regression tests proving Capture Quality Contract & Evidence Trust Enforcement.
+
+    Covers:
+    1. _read_proc_maps explicit outcomes (SUCCESS_WITH_RESULTS, SUCCESS_EMPTY, FAILED, PARTIAL)
+       and structured error types (PERMISSION_DENIED, TARGET_EXITED, MALFORMED, IO_ERROR).
+    2. _read_thread_metadata explicit outcomes and synthetic unverified placeholder contract.
+    3. FULL capture mode fails explicitly when map enumeration fails.
+    4. TARGETED/OBJECT capture mode with explicit ranges falls back to PARTIAL quality with
+       diagnostic MAPS_ENUMERATION_FAILED_EXPLICIT_RANGES_USED.
+    5. TARGETED capture mode fails if explicit ranges cannot be read.
+    6. Thread enumeration failure demotes snapshot to PARTIAL and NON_ATOMIC.
+    7. DwarfRuntimeResolver refuses INVALID and FAILED snapshots, annotates PARTIAL.
+    8. StateDiffEngine assigns trust classification (UNTRUSTED_INVALID, UNTRUSTED_FAILED, PARTIAL).
+    9. Investigation suppresses fact findings when diff is untrusted.
+    10. Investigation report includes capture_quality_assessment with honest trust level.
+    """
+
+    def test_read_proc_maps_all_outcomes(self):
+        """Verify _read_proc_maps distinguishes success, empty, malformed, permission denied, and exited."""
+        # 1. Target exited / file not found
+        res_exited = _read_proc_maps(99999999)
+        self.assertEqual(res_exited.status, "FAILED")
+        self.assertEqual(res_exited.error_type, "TARGET_EXITED")
+        self.assertEqual(len(res_exited), 0)
+        self.assertTrue(any(d["code"] == "MAPS_TARGET_EXITED" for d in res_exited.diagnostics))
+
+        # 2. Permission denied
+        with patch("builtins.open", side_effect=PermissionError("Permission denied")):
+            res_perm = _read_proc_maps(12345)
+            self.assertEqual(res_perm.status, "FAILED")
+            self.assertEqual(res_perm.error_type, "PERMISSION_DENIED")
+            self.assertEqual(len(res_perm), 0)
+            self.assertTrue(any(d["code"] == "MAPS_PERMISSION_DENIED" for d in res_perm.diagnostics))
+
+        # 3. Generic IO error
+        with patch("builtins.open", side_effect=OSError("I/O failure")):
+            res_io = _read_proc_maps(12345)
+            self.assertEqual(res_io.status, "FAILED")
+            self.assertEqual(res_io.error_type, "IO_ERROR")
+            self.assertEqual(len(res_io), 0)
+            self.assertTrue(any(d["code"] == "MAPS_IO_ERROR" for d in res_io.diagnostics))
+
+        # 4. Success empty
+        with patch("builtins.open", mock_open(read_data="")):
+            res_empty = _read_proc_maps(12345)
+            self.assertEqual(res_empty.status, "SUCCESS_EMPTY")
+            self.assertIsNone(res_empty.error_type)
+            self.assertEqual(len(res_empty), 0)
+
+        # 5. All lines malformed -> FAILED MALFORMED
+        malformed_data = "garbage line 1\ngarbage line 2\n"
+        with patch("builtins.open", mock_open(read_data=malformed_data)):
+            res_mal = _read_proc_maps(12345)
+            self.assertEqual(res_mal.status, "FAILED")
+            self.assertEqual(res_mal.error_type, "MALFORMED")
+            self.assertEqual(len(res_mal), 0)
+            self.assertTrue(any(d["code"] == "MAPS_ENTIRELY_MALFORMED" for d in res_mal.diagnostics))
+
+        # 6. Partially malformed -> PARTIAL MALFORMED
+        part_data = (
+            "00400000-00452000 r-xp 00000000 08:02 173521 /usr/bin/test_app\n"
+            "malformed line without ranges\n"
+        )
+        with patch("builtins.open", mock_open(read_data=part_data)):
+            res_part = _read_proc_maps(12345)
+            self.assertEqual(res_part.status, "PARTIAL")
+            self.assertEqual(res_part.error_type, "MALFORMED")
+            self.assertEqual(len(res_part), 1)
+            self.assertTrue(any(d["code"] == "MAPS_PARTIALLY_MALFORMED" for d in res_part.diagnostics))
+
+        # 7. Success with results
+        valid_data = (
+            "00400000-00452000 r-xp 00000000 08:02 173521 /usr/bin/test_app\n"
+            "7fff5be07000-7fff5be28000 rw-p 00000000 00:00 0 [stack]\n"
+        )
+        with patch("builtins.open", mock_open(read_data=valid_data)):
+            res_valid = _read_proc_maps(12345)
+            self.assertEqual(res_valid.status, "SUCCESS_WITH_RESULTS")
+            self.assertIsNone(res_valid.error_type)
+            self.assertEqual(len(res_valid), 2)
+            self.assertEqual(res_valid[0]["category"], "binary")
+            self.assertEqual(res_valid[1]["category"], "stack")
+
+    def test_read_thread_metadata_all_outcomes(self):
+        """Verify _read_thread_metadata outcome modeling and synthetic placeholder marking."""
+        # 1. Non-existent PID / task directory
+        res_exited = _read_thread_metadata(99999999)
+        self.assertEqual(res_exited.status, "FAILED")
+        self.assertEqual(res_exited.error_type, "TARGET_EXITED")
+        self.assertTrue(res_exited.is_synthetic)
+        self.assertEqual(len(res_exited), 1)
+        synthetic_th = res_exited[0]
+        self.assertTrue(synthetic_th["is_synthetic"])
+        self.assertEqual(synthetic_th["state"], "UNKNOWN")
+        self.assertEqual(synthetic_th["stop_status"], "UNKNOWN")
+        self.assertFalse(synthetic_th["verified_observation"])
+        self.assertFalse(synthetic_th["capture_participation"])
+
+        # 2. Permission denied on task directory
+        with patch("os.path.exists", return_value=True), patch("os.listdir", side_effect=PermissionError("Denied")):
+            res_perm = _read_thread_metadata(12345)
+            self.assertEqual(res_perm.status, "FAILED")
+            self.assertEqual(res_perm.error_type, "PERMISSION_DENIED")
+            self.assertTrue(res_perm.is_synthetic)
+            self.assertEqual(len(res_perm), 1)
+            self.assertFalse(res_perm[0]["verified_observation"])
+
+    def test_full_mode_fails_on_map_enumeration_error(self):
+        """FULL capture mode must fail when map enumeration fails, never returning COMPLETE."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        adapter.fail_maps = True
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+
+        plan = CapturePlan(mode=CaptureMode.FULL.value)
+        policy = CaptureSafetyPolicy(target_handle=handle)
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy, handle=handle)
+        self.assertEqual(snap.completeness, "FAILED")
+        self.assertEqual(snap.observation_metadata["capture_status"], "FAILED")
+        diag_codes = [d["code"] for d in snap.observation_metadata.get("diagnostics", [])]
+        self.assertIn("MAP_ENUMERATION_FAILED", diag_codes)
+        self.assertEqual(snap.raw_memory["total_bytes"], 0)
+
+    def test_targeted_mode_with_explicit_ranges_when_maps_fail(self):
+        """TARGETED mode with explicit ranges proceeds if maps fail, but is capped at PARTIAL."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        adapter.fail_maps = True
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1200)])
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=lambda p, a, s: b"X" * s,
+        )
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy, handle=handle)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertEqual(snap.observation_metadata["capture_status"], "PARTIAL")
+        diag_codes = [d["code"] for d in snap.observation_metadata.get("diagnostics", [])]
+        self.assertIn("MAPS_ENUMERATION_FAILED_EXPLICIT_RANGES_USED", diag_codes)
+        self.assertEqual(snap.raw_memory["total_bytes"], 512)
+
+    def test_targeted_mode_fails_when_explicit_ranges_cannot_be_read(self):
+        """TARGETED mode with failed maps fails completely if reading explicit ranges fails."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        adapter.fail_maps = True
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1200)])
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=lambda p, a, s: None,  # Read fails
+        )
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy, handle=handle)
+        self.assertEqual(snap.completeness, "FAILED")
+        self.assertEqual(snap.observation_metadata["capture_status"], "FAILED")
+        self.assertEqual(snap.raw_memory["total_bytes"], 0)
+
+    def test_thread_enumeration_failure_demotes_to_partial_and_non_atomic(self):
+        """Thread enumeration failure prevents COMPLETE status and atomic consistency."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        adapter.fail_thread_metadata = True
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1200)])
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=lambda p, a, s: b"Y" * s,
+        )
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy, handle=handle)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertEqual(snap.observation_metadata["consistency_classification"], "NON_ATOMIC")
+        self.assertFalse(snap.observation_metadata["all_threads_stopped"])
+        diag_codes = [d["code"] for d in snap.observation_metadata.get("diagnostics", [])]
+        self.assertIn("THREAD_ENUMERATION_FAILED", diag_codes)
+
+    def test_dwarf_resolver_rejects_invalid_and_failed_snapshots(self):
+        """DwarfRuntimeResolver refuses to decode INVALID and FAILED snapshots, annotates PARTIAL."""
+        # 1. INVALID snapshot
+        snap_invalid = RawRuntimeSnapshot(
+            snapshot_id="SNAP_INV",
+            pid=123,
+            executable="/bin/app",
+            executable_build_id="b1",
+            timestamp="2026-10-12T00:00:00Z",
+            capture_duration_us=100.0,
+            completeness="INVALID",
+            observation_metadata={"capture_status": "INVALID"},
+        )
+        resolver_inv = DwarfRuntimeResolver(snapshot=snap_invalid, debug_image_path="/bin/app")
+        res_inv = resolver_inv.resolve()
+        self.assertEqual(res_inv.status, "INVALID_CAPTURE")
+        self.assertEqual(res_inv.diagnostics[0]["code"], "INVALID_CAPTURE_IDENTITY")
+        self.assertEqual(len(res_inv.objects), 0)
+
+        # 2. FAILED snapshot
+        snap_failed = RawRuntimeSnapshot(
+            snapshot_id="SNAP_FAIL",
+            pid=123,
+            executable="/bin/app",
+            executable_build_id="b1",
+            timestamp="2026-10-12T00:00:00Z",
+            capture_duration_us=100.0,
+            completeness="FAILED",
+            observation_metadata={"capture_status": "FAILED"},
+        )
+        resolver_fail = DwarfRuntimeResolver(snapshot=snap_failed, debug_image_path="/bin/app")
+        res_fail = resolver_fail.resolve()
+        self.assertEqual(res_fail.status, "FAILED_CAPTURE")
+        self.assertEqual(res_fail.diagnostics[0]["code"], "FAILED_CAPTURE")
+        self.assertEqual(len(res_fail.objects), 0)
+
+        # 3. PARTIAL snapshot
+        snap_partial = RawRuntimeSnapshot(
+            snapshot_id="SNAP_PART",
+            pid=123,
+            executable="/bin/app",
+            executable_build_id="b1",
+            timestamp="2026-10-12T00:00:00Z",
+            capture_duration_us=100.0,
+            completeness="PARTIAL",
+            observation_metadata={"capture_status": "PARTIAL"},
+        )
+        resolver_part = DwarfRuntimeResolver(snapshot=snap_partial, debug_image_path="/bin/app")
+        res_part = resolver_part.resolve()
+        self.assertTrue(any(d.get("code") == "PARTIAL_CAPTURE_DECODED" for d in res_part.diagnostics))
+
+    def test_state_diff_trust_classification(self):
+        """StateDiffEngine assigns proper trust classification when diffing untrusted captures."""
+        diff_engine = StateDiffEngine()
+
+        snap_complete = {
+            "completeness": "COMPLETE",
+            "objects": [{
+                "object_id": "obj1",
+                "type": "Config",
+                "address": 0x1000,
+                "fields": [{"name": "threshold", "value": 10, "type": "int"}],
+            }],
+        }
+        snap_invalid = {
+            "completeness": "INVALID",
+            "objects": [{
+                "object_id": "obj1",
+                "type": "Config",
+                "address": 0x1000,
+                "fields": [{"name": "threshold", "value": 20, "type": "int"}],
+            }],
+        }
+
+        # COMPLETE vs INVALID
+        diff_inv = diff_engine.diff(snap_complete, snap_invalid)
+        self.assertEqual(diff_inv.trust_classification, "UNTRUSTED_INVALID_CAPTURE")
+        self.assertTrue(len(diff_inv.changes) > 0)
+        for ch in diff_inv.changes:
+            self.assertEqual(ch.get("trust"), "UNTRUSTED")
+            self.assertFalse(ch.get("verified", False))
+
+        # COMPLETE vs FAILED
+        snap_failed = {
+            "completeness": "FAILED",
+            "objects": [],
+        }
+        diff_fail = diff_engine.diff(snap_complete, snap_failed)
+        self.assertEqual(diff_fail.trust_classification, "UNTRUSTED_FAILED_CAPTURE")
+
+        # COMPLETE vs PARTIAL
+        snap_partial = {
+            "completeness": "PARTIAL",
+            "objects": [{
+                "object_id": "obj1",
+                "type": "Config",
+                "address": 0x1000,
+                "fields": [{"name": "threshold", "value": 20, "type": "int"}],
+            }],
+        }
+        diff_part = diff_engine.diff(snap_complete, snap_partial)
+        self.assertEqual(diff_part.trust_classification, "PARTIALLY_TRUSTED")
+        for ch in diff_part.changes:
+            self.assertEqual(ch.get("trust"), "PARTIAL")
+
+    def test_investigation_suppresses_facts_from_untrusted_diffs(self):
+        """compare_observations suppresses category='fact' findings when diff is untrusted."""
+        diff_engine = StateDiffEngine()
+
+        snap_complete = RawRuntimeSnapshot(
+            snapshot_id="S_COMP",
+            pid=100,
+            executable="/bin/app",
+            executable_build_id="b1",
+            timestamp="2026-10-12T00:00:00Z",
+            capture_duration_us=100.0,
+            completeness="COMPLETE",
+        )
+        snap_complete.register_buffer(0x1000, b"VAL_A")
+
+        snap_invalid = RawRuntimeSnapshot(
+            snapshot_id="S_INV",
+            pid=100,
+            executable="/bin/app",
+            executable_build_id="b1",
+            timestamp="2026-10-12T00:00:01Z",
+            capture_duration_us=100.0,
+            completeness="INVALID",
+        )
+        snap_invalid.register_buffer(0x1000, b"VAL_B")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dir_a = os.path.join(tmpdir, "snap_a")
+            dir_b = os.path.join(tmpdir, "snap_b")
+            snap_complete.save(dir_a)
+            snap_invalid.save(dir_b)
+
+            mgr = InvestigationManager(corpus_dir=tmpdir)
+            inv = mgr.start_investigation(goal="test untrusted diff", memory_snapshot_path=dir_a)
+            inv_id = inv["investigation_id"]
+            mgr.compare_observations(inv_id, dir_a, dir_b)
+
+            session = mgr.sessions[inv_id]
+            # Must NOT generate verified facts
+            fact_findings = [f for f in session.findings if f.category == "fact"]
+            self.assertEqual(len(fact_findings), 0)
+
+            # Must generate warning untrusted finding
+            untrusted_findings = [f for f in session.findings if "Untrusted Snapshot Comparison" in f.title]
+            self.assertTrue(len(untrusted_findings) > 0)
+            self.assertEqual(untrusted_findings[0].status, "UNTRUSTED")
+
+    def test_investigation_pipeline_assessment_honors_capture_quality(self):
+        """Investigation pipeline execution marks stage FAILED and report UNTRUSTED for invalid captures."""
+        snap_inv = RawRuntimeSnapshot(
+            snapshot_id="SNAP_INV_PIPE",
+            pid=100,
+            executable="/bin/app",
+            executable_build_id="b1",
+            timestamp="2026-10-12T00:00:00Z",
+            capture_duration_us=100.0,
+            completeness="INVALID",
+            observation_metadata={"capture_status": "INVALID"},
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snap_dir = os.path.join(tmpdir, "snap_inv")
+            snap_inv.save(snap_dir)
+
+            mgr = InvestigationManager(corpus_dir=tmpdir)
+            inv = mgr.start_investigation(goal="test invalid snap pipeline", memory_snapshot_path=snap_dir)
+            inv_id = inv["investigation_id"]
+            report = mgr.generate_report(inv_id)
+
+            # Capture quality stage must be FAILED
+            quality_stage = report["stages"].get("capture_quality", {})
+            self.assertEqual(quality_stage.get("status"), "FAILED")
+
+            # Report assessment must be UNTRUSTED
+            assessment = report.get("capture_quality_assessment", {})
+            self.assertEqual(assessment.get("status"), "FAILED")
+            self.assertEqual(assessment.get("trust_level"), "UNTRUSTED")
 
 
 if __name__ == "__main__":

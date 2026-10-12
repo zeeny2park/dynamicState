@@ -129,6 +129,16 @@ class TestCppE2EInvestigation(unittest.TestCase):
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
             snap = backend.capture(pid=proc.pid)
+            # Explicitly assert snapshot capture quality contract before saving/decoding
+            self.assertEqual(snap.completeness, "COMPLETE")
+            self.assertEqual(snap.provenance["capture_status"], "COMPLETED")
+            self.assertEqual(snap.provenance["bytes_requested"], snap.provenance["bytes_read"])
+            self.assertGreater(snap.provenance["bytes_read"], 0)
+            self.assertEqual(snap.provenance["identity_contract"]["validity"], "COMPLETE")
+            self.assertEqual(snap.provenance["map_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertEqual(snap.provenance["thread_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertFalse(snap.provenance["thread_enumeration"]["is_synthetic"])
+
             snap_dir = os.path.join(self.corpus_dir, "memory_snapshots", "snap_scenario_a")
             snap.save(snap_dir)
         finally:
@@ -198,6 +208,16 @@ class TestCppE2EInvestigation(unittest.TestCase):
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
             snap = backend.capture(pid=proc.pid)
+            # Explicitly assert snapshot quality contract before investigation/decoding
+            self.assertEqual(snap.completeness, "COMPLETE")
+            self.assertEqual(snap.provenance["capture_status"], "COMPLETED")
+            self.assertEqual(snap.provenance["bytes_requested"], snap.provenance["bytes_read"])
+            self.assertGreater(snap.provenance["bytes_read"], 0)
+            self.assertEqual(snap.provenance["identity_contract"]["validity"], "COMPLETE")
+            self.assertEqual(snap.provenance["map_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertEqual(snap.provenance["thread_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertFalse(snap.provenance["thread_enumeration"]["is_synthetic"])
+
             snap_dir = os.path.join(self.corpus_dir, "memory_snapshots", "snap_scenario_b")
             snap.save(snap_dir)
         finally:
@@ -244,6 +264,14 @@ class TestCppE2EInvestigation(unittest.TestCase):
 
             # Capture Snapshot 1 (State A)
             snap1 = backend.capture(pid=proc.pid)
+            self.assertEqual(snap1.completeness, "COMPLETE")
+            self.assertEqual(snap1.provenance["capture_status"], "COMPLETED")
+            self.assertEqual(snap1.provenance["bytes_requested"], snap1.provenance["bytes_read"])
+            self.assertGreater(snap1.provenance["bytes_read"], 0)
+            self.assertEqual(snap1.provenance["map_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertEqual(snap1.provenance["thread_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertFalse(snap1.provenance["thread_enumeration"]["is_synthetic"])
+
             snap1_dir = os.path.join(self.corpus_dir, "memory_snapshots", "snap_c_01")
             snap1.save(snap1_dir)
 
@@ -252,6 +280,14 @@ class TestCppE2EInvestigation(unittest.TestCase):
 
             # Capture Snapshot 2 (State B)
             snap2 = backend.capture(pid=proc.pid)
+            self.assertEqual(snap2.completeness, "COMPLETE")
+            self.assertEqual(snap2.provenance["capture_status"], "COMPLETED")
+            self.assertEqual(snap2.provenance["bytes_requested"], snap2.provenance["bytes_read"])
+            self.assertGreater(snap2.provenance["bytes_read"], 0)
+            self.assertEqual(snap2.provenance["map_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertEqual(snap2.provenance["thread_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertFalse(snap2.provenance["thread_enumeration"]["is_synthetic"])
+
             snap2_dir = os.path.join(self.corpus_dir, "memory_snapshots", "snap_c_02")
             snap2.save(snap2_dir)
 
@@ -329,6 +365,14 @@ class TestCppE2EInvestigation(unittest.TestCase):
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
             snap = backend.capture(pid=proc.pid)
+            # Explicitly assert snapshot quality contract before verifying thread records
+            self.assertEqual(snap.completeness, "COMPLETE")
+            self.assertEqual(snap.provenance["capture_status"], "COMPLETED")
+            self.assertEqual(snap.provenance["identity_contract"]["validity"], "COMPLETE")
+            self.assertEqual(snap.provenance["map_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertEqual(snap.provenance["thread_enumeration"]["status"], "SUCCESS_WITH_RESULTS")
+            self.assertFalse(snap.provenance["thread_enumeration"]["is_synthetic"])
+
             snap_dir = os.path.join(self.corpus_dir, "memory_snapshots", "snap_scenario_d")
             snap.save(snap_dir)
 
@@ -369,6 +413,31 @@ class TestCppE2EInvestigation(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             with ProcessTargetHandle(99999999, expected_starttime="12345") as handle:
                 handle.verify_identity()
+
+        # 4. Refuse decoding of an INVALID snapshot
+        invalid_snap = RawRuntimeSnapshot(
+            snapshot_id="invalid_test_snap",
+            pid=12345,
+            executable=self.debug_bin,
+            executable_build_id=None,
+            timestamp="",
+            capture_duration_us=100.0,
+            completeness="INVALID",
+            provenance={"capture_status": "INVALID"},
+        )
+        invalid_dir = os.path.join(self.work_dir, "invalid_snap")
+        invalid_snap.save(invalid_dir)
+        inv_invalid = self.mgr.start_investigation(
+            goal="Test invalid snapshot decode refusal",
+            memory_snapshot_path=invalid_dir,
+            debug_image=self.debug_bin,
+            authorize_target=False,
+        )
+        self.assertEqual(inv_invalid["stages"]["capture_quality"]["status"], "FAILED")
+        self.assertEqual(inv_invalid["stages"]["semantic_interpretation"]["status"], "FAILED")
+        report_invalid = self.mgr.generate_report(inv_invalid["investigation_id"])
+        self.assertEqual(len(report_invalid["findings"]["observed_facts"]), 0)
+        self.assertEqual(report_invalid["capture_quality_assessment"]["trust_level"], "UNTRUSTED")
 
 
 if __name__ == "__main__":
