@@ -23,10 +23,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gdb gcc g++ make
 
-      - name: Build target collector
+      - name: Build target collector and test fixtures
         run: |
           make -C target/collector
+          g++ -fPIE -pie -g -O0 -fno-inline -fno-omit-frame-pointer -Wl,--build-id=sha1 tests/fixtures/real_runtime/main.cpp -o /tmp/real_runtime_app_debug.elf -lpthread
+          strip -s -o /tmp/real_runtime_app_prod.stripped /tmp/real_runtime_app_debug.elf
 
-      - name: Run all unittests and integration tests
+      - name: Run Capture Safety and Diff Accuracy Tests
+        run: |
+          python3 -m unittest tests/test_capture_safety_and_diff_accuracy.py
+
+      - name: Run Process Lifecycle and Seam Invariants Tests
+        run: |
+          python3 -m unittest tests/test_capture_lifecycle_seam.py
+
+      - name: Run Real Runtime Validation Tests
+        run: |
+          python3 -m unittest tests/test_real_runtime_validation.py
+
+      - name: Run End-to-End C++ Investigation Pipeline Tests
+        run: |
+          python3 -m unittest tests/test_cpp_e2e_investigation.py
+
+      - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests
+

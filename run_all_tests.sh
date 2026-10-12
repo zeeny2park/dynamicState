@@ -36,23 +36,47 @@ if command -v make >/dev/null 2>&1 && [ -d "target/collector" ]; then
     run_step "Build Target Collector (C)" make -C target/collector || true
 fi
 
-# 2. Compile multithread sample targets
+# 2. Compile multithread sample targets and real runtime C++ fixture
 if command -v g++ >/dev/null 2>&1; then
     run_step "Compile Deterministic Multithread Sample" \
         g++ -g -O0 -pthread examples/sample_multithread.cpp -o /tmp/sample_multithread
     run_step "Compile Nondeterministic Multithread Sample" \
         g++ -g -O0 -pthread examples/sample_multithread_nondet.cpp -o /tmp/sample_multithread_nondet
+    if [ -f "tests/fixtures/real_runtime/main.cpp" ]; then
+        run_step "Compile Real Runtime C++ Fixture (Debug ELF with build-id)" \
+            g++ -fPIE -pie -g -O0 -fno-inline -fno-omit-frame-pointer -Wl,--build-id=sha1 tests/fixtures/real_runtime/main.cpp -o /tmp/real_runtime_app_debug.elf -lpthread
+        if command -v strip >/dev/null 2>&1; then
+            run_step "Create Stripped Companion for Real Runtime Fixture" \
+                strip -s -o /tmp/real_runtime_app_prod.stripped /tmp/real_runtime_app_debug.elf
+        fi
+    fi
 fi
 
-# 3. Discover and run all unit and integration tests
+# 3. Dedicated Capture Safety, Process Identity, and Diff Accuracy Suite
+run_step "Capture Safety and Snapshot Diff Accuracy Suite" \
+    python3 -m unittest tests/test_capture_safety_and_diff_accuracy.py
+
+# 4. Process Target Lifecycle, Pinned Identity, and Seam Invariants Suite
+run_step "Process Target Lifecycle, Pinned Identity & Seam Invariants Suite" \
+    python3 -m unittest tests/test_capture_lifecycle_seam.py
+
+# 5. Live Process Real Runtime Validation Suite
+run_step "Live Process Real Runtime Validation Suite" \
+    python3 -m unittest tests/test_real_runtime_validation.py
+
+# 6. End-to-End C++ Investigation Pipeline Suite (Scenarios A-E)
+run_step "End-to-End C++ Investigation Pipeline Suite (Scenarios A-E)" \
+    python3 -m unittest tests/test_cpp_e2e_investigation.py
+
+# 7. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 
-# 4. Multithread determinism & branch isolation specific tests
+# 8. Multithread determinism & branch isolation specific tests
 run_step "Multithread Restart Determinism & Branch Isolation Suite" \
     python3 -m unittest tests/test_multithread_exploration.py
 
-# 5. Web API & UI Lifecycle Suite
+# 9. Web API & UI Lifecycle Suite
 run_step "Web API & Server Lifecycle Tests" \
     python3 -m unittest tests/test_web_api.py tests/test_web_server_lifecycle.py
 

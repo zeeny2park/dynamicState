@@ -97,6 +97,10 @@ class CaptureSafetyPolicy:
     timeout_ms: int = 1000
     fail_open: bool = True  # Always resume target on error or timeout
     force_fallback: bool = False  # If True, bypass pidfd and use starttime verification fallback
+    target_handle: Optional[Any] = None  # Injectable ProcessTargetHandle for testing/seams
+    mem_reader: Optional[Any] = None  # Injectable memory read seam
+    expected_identity: Optional[Dict[str, Any]] = None  # Expected target identity to prevent PID reuse
+    expected_starttime: Optional[str] = None  # Expected /proc/<pid>/stat starttime
 
 
 class _struct_iovec(ctypes.Structure):
@@ -255,49 +259,237 @@ class ProcessTargetHandle:
 
     Mitigates PID reuse race conditions:
     1. Primary: Linux pidfd (pidfd_open + pidfd_send_signal).
-       Pins the exact process kernel instance so reused PIDs cannot receive signals.
-    2. Fallback: Verifies (comm, starttime) immediately before signal transmission.
+       Verifies that the process identity observed before calling pidfd_open()
+       matches the identity pinned by the opened pidfd. If a PID reuse race occurs
+       between stat read and pidfd_open, the pidfd is closed immediately and signal
+       transmission is rejected.
+    2. Fallback: Verifies (comm, starttime) before signal transmission when pidfd
+       is genuinely unsupported by the kernel or forced fallback is enabled.
        Documents limitations: fallback cannot guarantee complete immunity against kernel
        scheduling races between /proc/<pid>/stat read and signal syscall.
     """
 
-    def __init__(self, pid: int, force_fallback: bool = False):
+    def __init__(
+        self,
+        pid: int,
+        force_fallback: bool = False,
+        adapter: Optional[Any] = None,
+        expected_identity: Optional[Dict[str, Any]] = None,
+        expected_starttime: Optional[str] = None,
+    ):
         self.pid = pid
         self.force_fallback = force_fallback
+        self.adapter = adapter
+        self.expected_identity: Dict[str, Any] = dict(expected_identity or {})
+        if expected_starttime and "starttime" not in self.expected_identity:
+            self.expected_identity["starttime"] = expected_starttime
         self.pidfd: Optional[int] = None
         self.pidfd_supported: bool = False
         self.pidfd_used: bool = False
+        self.identity_mismatch: bool = False
+        self.open_status: str = "UNINITIALIZED"
         self.initial_identity: Dict[str, Any] = {}
         self.pre_signal_identity: Optional[Dict[str, Any]] = None
         self.post_capture_identity: Optional[Dict[str, Any]] = None
+        self.mem_fd: Optional[int] = None
+        self.mem_pinned: bool = False
+        self.mem_pin_error: Optional[str] = None
+        self.identity_checkpoints: List[Dict[str, Any]] = []
         self.closed: bool = False
 
+    def get_process_state(self) -> Dict[str, Any]:
+        if self.adapter and hasattr(self.adapter, "get_process_state"):
+            return self.adapter.get_process_state(self.pid)
+        return _get_process_state(self.pid)
+
+    def get_threads_state(self) -> Dict[str, Any]:
+        if self.adapter and hasattr(self.adapter, "get_threads_state"):
+            return self.adapter.get_threads_state(self.pid)
+        return _get_threads_state(self.pid)
+
+    def _pidfd_open(self, pid: int, flags: int = 0) -> int:
+        if self.adapter and hasattr(self.adapter, "pidfd_open"):
+            return self.adapter.pidfd_open(pid, flags)
+        if hasattr(os, "pidfd_open"):
+            return os.pidfd_open(pid, flags)
+        raise OSError(errno.ENOSYS, "pidfd_open syscall unavailable on this platform")
+
+    def _close_pidfd(self, fd: int) -> None:
+        if self.adapter and hasattr(self.adapter, "close_pidfd"):
+            self.adapter.close_pidfd(fd)
+            return
+        os.close(fd)
+
     def open(self) -> None:
-        self.initial_identity = _get_process_state(self.pid)
-        if (
+        if self.closed:
+            raise RuntimeError("Cannot open a closed ProcessTargetHandle")
+        if self.adapter and hasattr(self.adapter, "open"):
+            self.adapter.open(self)
+            return
+
+        # 1. Observe target process identity before pidfd_open
+        try:
+            pre_identity = self.get_process_state()
+        except ProcessLookupError:
+            self.open_status = "TARGET_EXITED"
+            raise
+        except PermissionError:
+            self.open_status = "PERMISSION_DENIED"
+            raise
+        except Exception as e:
+            self.open_status = "IDENTITY_READ_ERROR"
+            raise
+
+        # If expected identity was supplied, verify pre-identity against it immediately
+        if self.expected_identity:
+            exp_starttime = str(self.expected_identity.get("starttime", ""))
+            obs_starttime = str(pre_identity.get("starttime", ""))
+            if exp_starttime and obs_starttime and exp_starttime != obs_starttime:
+                self.identity_mismatch = True
+                self.open_status = "IDENTITY_MISMATCH"
+                raise ProcessLookupError(
+                    f"Process identity mismatch before pidfd_open: PID {self.pid} expected starttime {exp_starttime}, got {obs_starttime}"
+                )
+
+        # 2. Attempt to open pidfd if supported and not forced to fallback
+        can_try_pidfd = (
             not self.force_fallback
             and platform.system() == "Linux"
-            and hasattr(os, "pidfd_open")
-            and hasattr(signal, "pidfd_send_signal")
-        ):
+            and (hasattr(os, "pidfd_open") or (self.adapter and hasattr(self.adapter, "pidfd_open")))
+            and (hasattr(signal, "pidfd_send_signal") or (self.adapter and hasattr(self.adapter, "send_signal")))
+        )
+
+        if can_try_pidfd:
             try:
-                self.pidfd = os.pidfd_open(self.pid, 0)
+                self.pidfd = self._pidfd_open(self.pid, 0)
                 self.pidfd_supported = True
-                self.pidfd_used = True
-            except (OSError, AttributeError):
+            except ProcessLookupError:
+                self.open_status = "TARGET_EXITED"
+                raise
+            except PermissionError:
+                self.open_status = "PERMISSION_DENIED"
+                raise
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    self.open_status = "TARGET_EXITED"
+                    raise ProcessLookupError(f"Target process {self.pid} exited before pidfd_open")
+                elif exc.errno == errno.EPERM:
+                    self.open_status = "PERMISSION_DENIED"
+                    raise PermissionError(f"Permission denied opening pidfd for process {self.pid}")
+                elif exc.errno in (errno.ENOSYS, errno.EOPNOTSUPP) or isinstance(exc, AttributeError):
+                    # Kernel or environment does not support pidfd
+                    self.pidfd = None
+                    self.pidfd_supported = False
+                    self.open_status = "UNSUPPORTED_PIDFD"
+                else:
+                    self.pidfd = None
+                    self.pidfd_supported = False
+                    self.open_status = "PIDFD_INIT_FAILED"
+                    raise
+            except Exception:
                 self.pidfd = None
                 self.pidfd_supported = False
+                self.open_status = "PIDFD_INIT_FAILED"
+                raise
+
+        # 3. If pidfd was successfully opened, VERIFY identity matches pre-open identity
+        if self.pidfd is not None:
+            try:
+                # With pidfd pinned in kernel, read identity again
+                post_identity = self.get_process_state()
+            except Exception as e:
+                # Target exited right after pidfd_open
+                try:
+                    self._close_pidfd(self.pidfd)
+                except Exception:
+                    pass
+                self.pidfd = None
                 self.pidfd_used = False
-        else:
-            self.pidfd_supported = False
-            self.pidfd_used = False
+                self.open_status = "TARGET_EXITED"
+                raise ProcessLookupError(f"Failed to read target process state after pidfd_open: {e}")
+
+            # Check if PID was reused between pre_identity read and pidfd_open
+            starttime_match = (
+                str(post_identity.get("starttime", "")) == str(pre_identity.get("starttime", ""))
+            )
+            comm_match = (
+                post_identity.get("comm") == pre_identity.get("comm")
+            )
+            if not starttime_match or not comm_match:
+                # PID REUSE RACE DETECTED!
+                # Close pidfd immediately and NEVER fall back to PID-based signal!
+                try:
+                    self._close_pidfd(self.pidfd)
+                except Exception:
+                    pass
+                self.pidfd = None
+                self.pidfd_used = False
+                self.identity_mismatch = True
+                self.open_status = "IDENTITY_MISMATCH"
+                raise ProcessLookupError(
+                    f"PID reuse race detected: process {self.pid} identity changed during pidfd_open "
+                    f"(starttime: {pre_identity.get('starttime')} -> {post_identity.get('starttime')}, "
+                    f"comm: {pre_identity.get('comm')} -> {post_identity.get('comm')})"
+                )
+
+            # Identity successfully verified and pinned!
+            self.pidfd_used = True
+            self.initial_identity = post_identity
+            self.open_status = "PIDFD_OPENED"
+            self._try_pin_mem()
+            return
+
+        # 4. Fallback path (only when pidfd is unsupported or force_fallback is True)
+        self.pidfd_used = False
+        self.initial_identity = pre_identity
+        self.open_status = "FALLBACK_INITIALIZED"
+        self._try_pin_mem()
+
+    def _try_pin_mem(self) -> None:
+        """Attempt to retain an open descriptor to /proc/<pid>/mem to safely pin memory context."""
+        if platform.system() == "Linux" and not (self.adapter and hasattr(self.adapter, "open")):
+            try:
+                mem_path = f"/proc/{self.pid}/mem"
+                flags = os.O_RDONLY
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
+                self.mem_fd = os.open(mem_path, flags)
+                self.mem_pinned = True
+            except Exception as e:
+                self.mem_fd = None
+                self.mem_pinned = False
+                self.mem_pin_error = str(e)
+
+    def read_mem(self, address: int, size: int) -> Optional[bytes]:
+        """Read memory from pinned /proc/<pid>/mem descriptor if available."""
+        if self.closed or not self.mem_pinned or self.mem_fd is None:
+            return None
+        try:
+            return os.pread(self.mem_fd, size, address)
+        except Exception:
+            return None
+
+    def record_checkpoint(self, checkpoint_name: str) -> Tuple[bool, str]:
+        """Verify identity and record checkpoint in audit trail."""
+        is_same, status = self.verify_identity()
+        self.identity_checkpoints.append({
+            "name": checkpoint_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "verified": is_same,
+            "status": status,
+        })
+        return is_same, status
 
     def send_signal(self, sig: int) -> Tuple[bool, Optional[str]]:
         if self.closed:
             return False, "HANDLE_CLOSED"
+        if self.identity_mismatch:
+            return False, "IDENTITY_MISMATCH"
+        if self.adapter and hasattr(self.adapter, "send_signal"):
+            return self.adapter.send_signal(self, sig)
 
         try:
-            self.pre_signal_identity = _get_process_state(self.pid)
+            self.pre_signal_identity = self.get_process_state()
         except ProcessLookupError:
             return False, "TARGET_EXITED"
         except Exception as e:
@@ -342,28 +534,34 @@ class ProcessTargetHandle:
     def verify_identity(self) -> Tuple[bool, str]:
         if self.closed:
             return False, "HANDLE_CLOSED"
+        if self.identity_mismatch:
+            return False, "IDENTITY_MISMATCH"
+        if self.adapter and hasattr(self.adapter, "verify_identity"):
+            return self.adapter.verify_identity(self)
 
         if self.pidfd_used and self.pidfd is not None:
             try:
                 signal.pidfd_send_signal(self.pidfd, 0)
                 try:
-                    self.post_capture_identity = _get_process_state(self.pid)
+                    curr = self.get_process_state()
+                    self.post_capture_identity = curr
+                    if self.initial_identity and curr.get("starttime") != self.initial_identity.get("starttime"):
+                        self.identity_mismatch = True
+                        return False, "PID_REUSED"
                 except Exception:
                     pass
                 return True, "PIDFD_VERIFIED"
-            except ProcessLookupError:
-                return False, "TARGET_EXITED"
-            except PermissionError:
-                return True, "PIDFD_EXISTS_EPERM"
-            except OSError as exc:
-                if exc.errno == errno.ESRCH:
+            except (ProcessLookupError, OSError) as exc:
+                if getattr(exc, "errno", None) == errno.ESRCH or isinstance(exc, ProcessLookupError):
                     return False, "TARGET_EXITED"
-                elif exc.errno == errno.EPERM:
+                elif getattr(exc, "errno", None) == errno.EPERM or isinstance(exc, PermissionError):
                     return True, "PIDFD_EXISTS_EPERM"
-                return False, f"PIDFD_ERROR_ERRNO_{exc.errno}"
+                return False, f"PIDFD_ERROR_ERRNO_{getattr(exc, 'errno', 'UNKNOWN')}"
+            except Exception as e:
+                return False, f"PIDFD_ERROR_{e}"
         else:
             try:
-                curr = _get_process_state(self.pid)
+                curr = self.get_process_state()
                 self.post_capture_identity = curr
                 if curr.get("starttime") != self.initial_identity.get("starttime"):
                     return False, "PID_REUSED"
@@ -375,23 +573,43 @@ class ProcessTargetHandle:
 
     def get_diagnostics(self) -> Dict[str, Any]:
         return {
+            "status": self.open_status,
             "pidfd_supported": self.pidfd_supported,
             "pidfd_used": self.pidfd_used,
-            "mitigation_mechanism": "PIDFD" if self.pidfd_used else "STAT_STARTTIME_CHECK_FALLBACK",
+            "identity_mismatch": self.identity_mismatch,
+            "mitigation_mechanism": (
+                "PIDFD"
+                if self.pidfd_used
+                else "STAT_STARTTIME_CHECK_FALLBACK"
+            ),
+            "memory_pin_status": "MEM_PINNED" if self.mem_pinned else "MEM_UNPINNED",
+            "mem_pinned": self.mem_pinned,
+            "mem_pin_error": self.mem_pin_error,
             "fallback_caveat": (
                 None
                 if self.pidfd_used
-                else "Fallback starttime verification cannot guarantee complete immunity to kernel PID recycling races between stat read and signal delivery."
+                else "Fallback starttime verification cannot guarantee complete immunity against kernel PID recycling races between stat read and signal delivery."
             ),
             "initial_identity": self.initial_identity,
             "pre_signal_identity": self.pre_signal_identity,
             "post_capture_identity": self.post_capture_identity,
+            "identity_checkpoints": list(self.identity_checkpoints),
+            "closed": self.closed,
         }
 
     def close(self) -> None:
+        if self.adapter and hasattr(self.adapter, "close"):
+            self.adapter.close(self)
+        if self.mem_fd is not None:
+            try:
+                os.close(self.mem_fd)
+            except Exception:
+                pass
+            self.mem_fd = None
+            self.mem_pinned = False
         if self.pidfd is not None:
             try:
-                os.close(self.pidfd)
+                self._close_pidfd(self.pidfd)
             except Exception:
                 pass
             self.pidfd = None
@@ -567,7 +785,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
     def capabilities(self) -> Dict[str, Any]:
         return {
             "name": self.name,
-            "can_suspend_inferior": False,  # syscall does not suspend target; signal mechanism (SIGSTOP/SIGCONT) is separate
+            "can_suspend_inferior": True,  # backend can suspend target via external signals (SIGSTOP/SIGCONT) when requested by capture plan
             "can_read_registers": False,
             "can_read_memory": True,
             "atomicity": "NON_ATOMIC",
@@ -621,20 +839,33 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         policy: Optional[CaptureSafetyPolicy] = None,
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
+        handle: Optional[ProcessTargetHandle] = None,
     ) -> RawRuntimeSnapshot:
         plan = plan or CapturePlan()
         policy = policy or CaptureSafetyPolicy()
 
-        if not self.is_available(pid):
+        handle = handle or getattr(policy, "target_handle", None)
+        if handle is None and not self.is_available(pid):
             raise RuntimeError(f"process_vm_readv is unavailable or target PID {pid} is not accessible")
 
         # Use ProcessTargetHandle for pidfd support and strict PID reuse mitigation
         force_fb = getattr(policy, "force_fallback", False)
-        handle = ProcessTargetHandle(pid, force_fallback=force_fb)
-        handle.open()
+        exp_id = getattr(policy, "expected_identity", None)
+        exp_st = getattr(policy, "expected_starttime", None)
+        handle = handle or ProcessTargetHandle(
+            pid,
+            force_fallback=force_fb,
+            expected_identity=exp_id,
+            expected_starttime=exp_st,
+        )
+        try:
+            handle.open()
+        except Exception:
+            handle.close()
+            raise
 
         initial_ident = handle.initial_identity
-        initial_threads = _get_threads_state(pid)
+        initial_threads = handle.get_threads_state()
         was_already_stopped = initial_ident.get("is_stopped", False)
         is_tracing_stop = initial_ident.get("is_tracing_stop", False)
         target_start_time = initial_ident.get("starttime", "0")
@@ -649,8 +880,11 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         capture_status = "COMPLETED"
         stop_requested = False
         stop_confirmed = False
+        resume_requested = False
         resume_confirmed = False
         suspension_caused_by_capture = False
+        all_threads_stopped = False
+        memory_read_completed = False
         diagnostics: List[Dict[str, Any]] = []
 
         if is_tracing_stop:
@@ -714,7 +948,23 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             })
 
         # 0. Pre-read maps and pre-allocate capture buffers BEFORE suspending process
-        all_maps = _read_proc_maps(pid)
+        handle.record_checkpoint("POST_OPEN")
+        is_same_maps, ident_status_maps = handle.record_checkpoint("PRE_MAPS_READ")
+        if not is_same_maps:
+            diagnostics.append({
+                "code": f"MAPS_READ_ABORTED_{ident_status_maps}",
+                "message": f"Target process identity check failed ({ident_status_maps}) before maps collection; aborting capture.",
+                "level": "ERROR"
+            })
+        all_maps = _read_proc_maps(pid) if is_same_maps else []
+        if is_same_maps:
+            is_same_post_maps, ident_status_post_maps = handle.record_checkpoint("POST_MAPS_READ")
+            if not is_same_post_maps:
+                diagnostics.append({
+                    "code": f"MAPS_READ_INVALIDATED_{ident_status_post_maps}",
+                    "message": f"Target process identity changed ({ident_status_post_maps}) after reading maps.",
+                    "level": "ERROR"
+                })
         selected_maps = []
 
         if plan.mode == CaptureMode.TARGETED.value and plan.memory_ranges:
@@ -747,16 +997,30 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 if "r" in m["permissions"] and ("w" in m["permissions"] or m["category"] in ("heap", "stack", "anonymous")):
                     selected_maps.append(m)
 
+        if not selected_maps and plan.memory_ranges:
+            for r_start, r_end in plan.memory_ranges:
+                selected_maps.append({
+                    "start": r_start,
+                    "end": r_end,
+                    "size": r_end - r_start,
+                    "permissions": "rw-p",
+                    "category": "targeted",
+                    "pathname": "[targeted_range]"
+                })
+
         # Pre-allocate buffers and iovecs before suspension, explicitly tracking omitted regions
         read_plans = []
         omitted_regions = []
-        total_planned_bytes = 0
-        fn_vm_readv = self._libc.process_vm_readv
+        bytes_requested = sum(m["size"] for m in selected_maps)
+        bytes_attempted = 0
+        bytes_omitted = 0
+        fn_vm_readv = self._libc.process_vm_readv if self._libc else None
 
         for idx, reg in enumerate(selected_maps, 1):
             reg_start = reg["start"]
             reg_size = reg["size"]
-            if total_planned_bytes >= policy.max_capture_bytes or idx > policy.max_capture_ranges:
+            if bytes_attempted >= policy.max_capture_bytes or idx > policy.max_capture_ranges:
+                bytes_omitted += reg_size
                 omitted_regions.append({
                     "region_id": f"R{idx:05d}",
                     "start": "0x{:x}".format(reg_start),
@@ -772,8 +1036,9 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 })
                 continue
 
-            chunk_size = min(reg_size, policy.max_capture_bytes - total_planned_bytes)
+            chunk_size = min(reg_size, policy.max_capture_bytes - bytes_attempted)
             if chunk_size <= 0:
+                bytes_omitted += reg_size
                 omitted_regions.append({
                     "region_id": f"R{idx:05d}",
                     "start": "0x{:x}".format(reg_start),
@@ -788,99 +1053,163 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     "error": "POLICY_LIMIT_EXCEEDED"
                 })
                 continue
+
+            tail_omitted = reg_size - chunk_size
+            if tail_omitted > 0:
+                bytes_omitted += tail_omitted
 
             buf = ctypes.create_string_buffer(chunk_size)
             l_iov = _struct_iovec(ctypes.cast(buf, ctypes.c_void_p), chunk_size)
             r_iov = _struct_iovec(ctypes.c_void_p(reg_start), chunk_size)
-            read_plans.append((idx, reg, reg_start, reg_size, chunk_size, buf, l_iov, r_iov))
-            total_planned_bytes += chunk_size
+            read_plans.append((idx, reg, reg_start, reg_size, chunk_size, tail_omitted, buf, l_iov, r_iov))
+            bytes_attempted += chunk_size
 
         read_results = []
 
         try:
             # 1. Ultra-short suspend
             if should_suspend:
-                state_history.append("STOP_REQUESTED")
-                stop_requested = True
-                suspension_caused_by_capture = True
-                t_stop_requested = time.monotonic_ns()
-
-                sig_ok, sig_err = handle.send_signal(signal.SIGSTOP)
-                if not sig_ok:
-                    if sig_err == "TARGET_EXITED":
-                        diagnostics.append({
-                            "code": "TARGET_EXITED_BEFORE_STOP",
-                            "message": f"Process {pid} exited before SIGSTOP delivered",
-                            "level": "ERROR"
-                        })
-                    elif sig_err == "PID_REUSED":
-                        diagnostics.append({
-                            "code": "PID_REUSED_STOP_ABORTED",
-                            "message": f"Target PID {pid} was reused; SIGSTOP aborted to prevent signalling unrelated process",
-                            "level": "ERROR"
-                        })
-                    elif sig_err == "PERMISSION_DENIED":
-                        diagnostics.append({
-                            "code": "STOP_PERMISSION_DENIED",
-                            "message": f"Permission denied (EPERM) delivering SIGSTOP to process {pid}",
-                            "level": "ERROR"
-                        })
-                    else:
-                        diagnostics.append({
-                            "code": "STOP_SIGNAL_ERROR",
-                            "message": f"SIGSTOP failed: {sig_err}",
-                            "level": "ERROR"
-                        })
+                is_same_pre_stop, ident_status_pre_stop = handle.record_checkpoint("PRE_SUSPEND")
+                if not is_same_pre_stop:
+                    suspension_caused_by_capture = False
+                    diagnostics.append({
+                        "code": f"STOP_ABORTED_{ident_status_pre_stop}",
+                        "message": f"Target process identity check failed ({ident_status_pre_stop}) before SIGSTOP; suspension aborted.",
+                        "level": "ERROR"
+                    })
                 else:
-                    deadline_stop = t_stop_requested + int(policy.max_stop_time_ms * 1_000_000)
-                    while time.monotonic_ns() < deadline_stop:
-                        stat_path = f"/proc/{pid}/stat"
-                        if os.path.exists(stat_path):
+                    state_history.append("STOP_REQUESTED")
+                    stop_requested = True
+                    t_stop_requested = time.monotonic_ns()
+
+                    sig_ok, sig_err = handle.send_signal(signal.SIGSTOP)
+                    if not sig_ok:
+                        suspension_caused_by_capture = False
+                        if sig_err == "TARGET_EXITED":
+                            diagnostics.append({
+                                "code": "TARGET_EXITED_BEFORE_STOP",
+                                "message": f"Process {pid} exited before SIGSTOP delivered",
+                                "level": "ERROR"
+                            })
+                        elif sig_err == "PID_REUSED":
+                            diagnostics.append({
+                                "code": "PID_REUSED_STOP_ABORTED",
+                                "message": f"Target PID {pid} was reused; SIGSTOP aborted to prevent signalling unrelated process",
+                                "level": "ERROR"
+                            })
+                        elif sig_err == "PERMISSION_DENIED":
+                            diagnostics.append({
+                                "code": "STOP_PERMISSION_DENIED",
+                                "message": f"Permission denied (EPERM) delivering SIGSTOP to process {pid}",
+                                "level": "ERROR"
+                            })
+                        else:
+                            diagnostics.append({
+                                "code": "STOP_SIGNAL_ERROR",
+                                "message": f"SIGSTOP failed: {sig_err}",
+                                "level": "ERROR"
+                            })
+                    else:
+                        deadline_stop = t_stop_requested + int(policy.max_stop_time_ms * 1_000_000)
+                        while time.monotonic_ns() < deadline_stop:
                             try:
-                                with open(stat_path, "r", encoding="utf-8") as f:
-                                    content = f.read()
-                                    rparen = content.rfind(")")
-                                    if rparen != -1 and content[rparen + 1:].split()[0] in ("T", "t"):
-                                        stop_confirmed = True
-                                        break
+                                curr_st = handle.get_process_state()
+                                if curr_st.get("is_stopped"):
+                                    stop_confirmed = True
+                                    break
                             except Exception:
                                 pass
-                        try:
-                            os.sched_yield()
-                        except Exception:
-                            pass
+                            try:
+                                os.sched_yield()
+                            except Exception:
+                                pass
 
-                t_stop_confirmed = time.monotonic_ns()
-                if stop_confirmed:
-                    state_history.append("STOP_CONFIRMED")
-                else:
-                    state_history.append("STOP_UNCONFIRMED")
-                    diagnostics.append({
-                        "code": "STOP_UNCONFIRMED",
-                        "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms. Memory captured under this condition is NON_ATOMIC.",
-                        "level": "WARNING"
-                    })
+                        t_stop_confirmed = time.monotonic_ns()
+                        if stop_confirmed:
+                            suspension_caused_by_capture = True
+                            state_history.append("STOP_CONFIRMED")
+                            handle.record_checkpoint("POST_SUSPEND")
+                        else:
+                            suspension_caused_by_capture = False
+                            state_history.append("STOP_UNCONFIRMED")
+                            diagnostics.append({
+                                "code": "STOP_UNCONFIRMED",
+                                "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms. Memory captured under this condition is NON_ATOMIC.",
+                                "level": "WARNING"
+                            })
             else:
+                handle.record_checkpoint("PRE_SUSPEND_SKIPPED")
                 t_stop_requested = time.monotonic_ns()
                 t_stop_confirmed = t_stop_requested
+                if was_already_stopped:
+                    stop_confirmed = True
 
-            # 2. Capture thread metadata
+            # 2. Check thread consistency
+            curr_threads = handle.get_threads_state()
+            all_threads_stopped = curr_threads.get("all_stopped", False)
+            if (should_suspend or was_already_stopped) and not all_threads_stopped:
+                diagnostics.append({
+                    "code": "THREAD_STATES_HETEROGENEOUS",
+                    "message": f"Process {pid} leader stopped, but not all threads are confirmed stopped ({curr_threads.get('stopped_count')}/{curr_threads.get('total_count')}). Snapshot is NON_ATOMIC.",
+                    "level": "WARNING"
+                })
+
+            # 3. Capture thread metadata
             state_history.append("CAPTURING")
-            thread_metadata = _read_thread_metadata(pid)
+            is_same_th, ident_status_th = handle.record_checkpoint("PRE_THREAD_METADATA")
+            thread_metadata = _read_thread_metadata(pid) if is_same_th else []
+            handle.record_checkpoint("POST_THREAD_METADATA")
             t_threads = time.monotonic_ns()
 
-            # 3. Read memory into pre-allocated buffers
+            # 4. Read memory into pre-allocated buffers
+            is_same_mem, ident_status_mem = handle.record_checkpoint("PRE_MEMORY_READ")
+            mem_reader = getattr(policy, "mem_reader", None)
             for item in read_plans:
-                idx, reg, reg_start, reg_size, chunk_size, buf, l_iov, r_iov = item
-                nread = fn_vm_readv(
-                    pid,
-                    ctypes.byref(l_iov),
-                    1,
-                    ctypes.byref(r_iov),
-                    1,
-                    0
-                )
-                err = ctypes.get_errno() if nread <= 0 else 0
+                idx, reg, reg_start, reg_size, chunk_size, tail_omitted, buf, l_iov, r_iov = item
+                if not is_same_mem:
+                    nread = -1
+                    err = errno.ESRCH
+                elif mem_reader:
+                    try:
+                        read_data = mem_reader(pid, reg_start, chunk_size)
+                        if read_data is not None:
+                            nread = len(read_data)
+                            ctypes.memmove(buf, read_data, nread)
+                            err = 0
+                        else:
+                            nread = -1
+                            err = errno.EIO
+                    except Exception:
+                        nread = -1
+                        err = errno.EIO
+                elif handle.mem_pinned and handle.mem_fd is not None:
+                    # Preferred pinned path: read via pinned /proc/<pid>/mem descriptor
+                    try:
+                        read_bytes = handle.read_mem(reg_start, chunk_size)
+                        if read_bytes is not None:
+                            nread = len(read_bytes)
+                            ctypes.memmove(buf, read_bytes, nread)
+                            err = 0
+                        else:
+                            nread = -1
+                            err = errno.EIO
+                    except Exception:
+                        nread = -1
+                        err = errno.EIO
+                elif fn_vm_readv:
+                    nread = fn_vm_readv(
+                        pid,
+                        ctypes.byref(l_iov),
+                        1,
+                        ctypes.byref(r_iov),
+                        1,
+                        0
+                    )
+                    err = ctypes.get_errno() if nread <= 0 else 0
+                else:
+                    nread = -1
+                    err = errno.ENOSYS
+
                 if nread <= 0 and err == errno.ESRCH:
                     diagnostics.append({
                         "code": "TARGET_EXITED_DURING_CAPTURE",
@@ -889,16 +1218,19 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     })
                 read_results.append((item, nread, err))
 
+            memory_read_completed = True
+            handle.record_checkpoint("POST_MEMORY_READ")
             t_memory = time.monotonic_ns()
 
         finally:
             try:
-                # 4. GUARANTEED FAIL-OPEN RESUME IMMEDIATELY WITH PID-REUSE SAFETY
+                # 5. GUARANTEED FAIL-OPEN RESUME IMMEDIATELY WITH PID-REUSE SAFETY
                 if suspension_caused_by_capture:
+                    resume_requested = True
                     state_history.append("RESUME_REQUESTED")
                     t_resume_requested = time.monotonic_ns()
                     still_same_process = False
-                    is_same, ident_status = handle.verify_identity()
+                    is_same, ident_status = handle.record_checkpoint("PRE_RESUME")
                     if is_same:
                         still_same_process = True
                     else:
@@ -922,51 +1254,70 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                             })
 
                     if still_same_process:
-                        res_ok, res_err = handle.send_signal(signal.SIGCONT)
-                        if not res_ok:
-                            if res_err == "TARGET_EXITED":
+                        # Check if target already resumed independently
+                        try:
+                            post_check = handle.get_process_state()
+                            if not post_check.get("is_stopped"):
+                                resume_confirmed = True
+                                state_history.append("TARGET_RESUMED_INDEPENDENTLY")
                                 diagnostics.append({
-                                    "code": "TARGET_EXITED_BEFORE_RESUME",
-                                    "message": f"Process {pid} exited before SIGCONT delivered.",
+                                    "code": "TARGET_RESUMED_INDEPENDENTLY",
+                                    "message": f"Process {pid} was already active before SIGCONT; target resumed independently.",
                                     "level": "INFO"
                                 })
-                            elif res_err == "PERMISSION_DENIED":
-                                diagnostics.append({
-                                    "code": "RESUME_PERMISSION_DENIED",
-                                    "message": f"Permission denied delivering SIGCONT to process {pid}.",
-                                    "level": "ERROR"
-                                })
+                        except Exception:
+                            pass
+
+                        if not resume_confirmed:
+                            res_ok, res_err = handle.send_signal(signal.SIGCONT)
+                            if not res_ok:
+                                if res_err == "TARGET_EXITED":
+                                    diagnostics.append({
+                                        "code": "TARGET_EXITED_BEFORE_RESUME",
+                                        "message": f"Process {pid} exited before SIGCONT delivered.",
+                                        "level": "INFO"
+                                    })
+                                elif res_err == "PERMISSION_DENIED":
+                                    diagnostics.append({
+                                        "code": "RESUME_PERMISSION_DENIED",
+                                        "message": f"Permission denied delivering SIGCONT to process {pid}.",
+                                        "level": "ERROR"
+                                    })
+                                else:
+                                    diagnostics.append({
+                                        "code": "RESUME_SIGNAL_ERROR",
+                                        "message": f"SIGCONT failed: {res_err}",
+                                        "level": "ERROR"
+                                    })
                             else:
-                                diagnostics.append({
-                                    "code": "RESUME_SIGNAL_ERROR",
-                                    "message": f"SIGCONT failed: {res_err}",
-                                    "level": "ERROR"
-                                })
-                        else:
-                            # Poll briefly for resume confirmation
-                            deadline_res = t_resume_requested + int(20 * 1_000_000)
-                            while time.monotonic_ns() < deadline_res:
-                                stat_path = f"/proc/{pid}/stat"
-                                if os.path.exists(stat_path):
+                                # Poll briefly for resume confirmation
+                                deadline_res = t_resume_requested + int(20 * 1_000_000)
+                                while time.monotonic_ns() < deadline_res:
                                     try:
-                                        with open(stat_path, "r", encoding="utf-8") as f:
-                                            content = f.read()
-                                            rparen = content.rfind(")")
-                                            if rparen != -1 and content[rparen + 1:].split()[0] not in ("T", "t"):
-                                                resume_confirmed = True
-                                                break
+                                        st_res = handle.get_process_state()
+                                        if not st_res.get("is_stopped"):
+                                            resume_confirmed = True
+                                            break
                                     except Exception:
                                         pass
-                                try:
-                                    os.sched_yield()
-                                except Exception:
-                                    pass
+                                    try:
+                                        os.sched_yield()
+                                    except Exception:
+                                        pass
 
-                    t_resume_confirmed = time.monotonic_ns()
-                    if resume_confirmed:
-                        state_history.append("RESUME_CONFIRMED")
+                                t_resume_confirmed = time.monotonic_ns()
+                                if resume_confirmed:
+                                    state_history.append("RESUME_CONFIRMED")
+                                    handle.record_checkpoint("POST_RESUME")
+                                else:
+                                    state_history.append("RESUME_UNCONFIRMED")
+                                    diagnostics.append({
+                                        "code": "RESUME_UNCONFIRMED",
+                                        "message": f"Process {pid} did not confirm running state within timeout after SIGCONT.",
+                                        "level": "WARNING"
+                                    })
                     else:
-                        state_history.append("RESUME_UNCONFIRMED")
+                        t_resume_confirmed = time.monotonic_ns()
                 elif was_already_stopped:
                     # Target was already stopped before capture; preserve existing stopped state!
                     state_history.append("PREEXISTING_STOP_RETAINED")
@@ -981,26 +1332,51 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         wall_clock_end = datetime.now(timezone.utc).isoformat()
 
         # 5. Offline post-processing of buffers (target process is already resumed!)
+        bytes_read = 0
+        bytes_failed = 0
+        bytes_unread = 0
+
         for item, nread, err in read_results:
-            idx, reg, reg_start, reg_size, chunk_size, buf, _, _ = item
-            if nread > 0:
+            idx, reg, reg_start, reg_size, chunk_size, tail_omitted, buf, _, _ = item
+            if nread == chunk_size:
                 read_bytes = bytes(buf.raw[:nread])
                 buffers[(reg_start, reg_start + nread)] = read_bytes
                 captured_ranges.append((reg_start, reg_start + nread))
+                bytes_read += nread
                 raw_regions.append({
                     "region_id": f"R{idx:05d}",
                     "start": "0x{:x}".format(reg_start),
                     "end": "0x{:x}".format(reg_start + nread),
-                    "size": nread,
+                    "size": reg_size,
                     "permissions": reg["permissions"],
                     "offset": reg.get("offset", 0),
                     "category": reg["category"],
                     "pathname": reg.get("pathname", ""),
                     "captured_bytes": nread,
-                    "status": "COMPLETE" if nread == reg_size else "PARTIAL",
+                    "status": "COMPLETE" if tail_omitted == 0 else "PARTIAL",
+                    "error": None
+                })
+            elif nread > 0:
+                read_bytes = bytes(buf.raw[:nread])
+                buffers[(reg_start, reg_start + nread)] = read_bytes
+                captured_ranges.append((reg_start, reg_start + nread))
+                bytes_read += nread
+                bytes_unread += (chunk_size - nread)
+                raw_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + nread),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": nread,
+                    "status": "PARTIAL",
                     "error": None
                 })
             else:
+                bytes_failed += chunk_size
                 raw_regions.append({
                     "region_id": f"R{idx:05d}",
                     "start": "0x{:x}".format(reg_start),
@@ -1018,43 +1394,94 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         # Append omitted regions so the entire requested scope is accounted for
         raw_regions.extend(omitted_regions)
 
-        captured_bytes_total = sum(r.get("captured_bytes", 0) for r in raw_regions)
-        failed_count = sum(1 for r in raw_regions if r.get("status") == "FAILED")
-        partial_count = sum(1 for r in raw_regions if r.get("status") == "PARTIAL")
-        omitted_count = len(omitted_regions)
+        regions_complete = sum(1 for r in raw_regions if r.get("status") == "COMPLETE")
+        regions_partial = sum(1 for r in raw_regions if r.get("status") == "PARTIAL")
+        regions_failed = sum(1 for r in raw_regions if r.get("status") == "FAILED")
+        regions_omitted = len(omitted_regions)
+        regions_read = regions_complete + regions_partial
+        regions_attempted = regions_read + regions_failed + regions_omitted
 
-        if captured_bytes_total == 0 and selected_maps:
+        any_pid_reused = any(cp.get("status") == "PID_REUSED" for cp in handle.identity_checkpoints) or handle.identity_mismatch
+        any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in handle.identity_checkpoints)
+        any_checkpoint_failed = any(not cp.get("verified", False) for cp in handle.identity_checkpoints)
+
+        if any_pid_reused:
+            capture_status = "INVALID"
+            completeness = "INVALID"
+        elif (bytes_read == 0 and selected_maps) or (any_target_exited and bytes_read == 0):
             capture_status = "FAILED"
             completeness = "FAILED"
-        elif failed_count > 0 or partial_count > 0 or omitted_count > 0 or (should_suspend and not stop_confirmed):
+        elif (
+            regions_failed > 0
+            or regions_partial > 0
+            or regions_omitted > 0
+            or (should_suspend and not stop_confirmed)
+            or ((should_suspend or was_already_stopped) and not all_threads_stopped)
+            or (suspension_caused_by_capture and not resume_confirmed)
+            or (plan.mode == CaptureMode.ZERO_STOP.value)
+            or any_checkpoint_failed
+        ):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
         else:
             capture_status = "COMPLETED"
             completeness = "COMPLETE"
 
+        lifecycle_guarantees = {
+            "process_stop_requested": stop_requested,
+            "process_stop_confirmed": stop_confirmed,
+            "all_threads_stopped": all_threads_stopped if (should_suspend or was_already_stopped) else False,
+            "memory_read_completed": memory_read_completed,
+            "resume_requested": resume_requested,
+            "resume_confirmed": resume_confirmed,
+        }
+
         # Honest consistency classification:
-        if plan.mode == CaptureMode.ZERO_STOP.value:
+        if completeness == "INVALID":
+            snapshot_consistency = "INVALID"
+            consistency_classification = "INVALID"
+        elif completeness == "FAILED":
+            snapshot_consistency = "FAILED"
+            consistency_classification = "FAILED"
+        elif plan.mode == CaptureMode.ZERO_STOP.value:
             consistency_classification = "NON_ATOMIC"
+            snapshot_consistency = "NON_ATOMIC"
+        elif not stop_confirmed:
+            consistency_classification = "NON_ATOMIC"
+            snapshot_consistency = "NON_ATOMIC"
+        elif (should_suspend or was_already_stopped) and not all_threads_stopped:
+            consistency_classification = "NON_ATOMIC"
+            snapshot_consistency = "NON_ATOMIC"
         elif was_already_stopped:
             consistency_classification = "PREEXISTING_STOPPED"
+            snapshot_consistency = "PROCESS_STOPPED_MEMORY_SNAPSHOT" if completeness == "COMPLETE" else "NON_ATOMIC"
         elif should_suspend and stop_confirmed:
             consistency_classification = "SIGNAL_STOPPED"
+            snapshot_consistency = "PROCESS_STOPPED_MEMORY_SNAPSHOT" if completeness == "COMPLETE" else "NON_ATOMIC"
         else:
             consistency_classification = "NON_ATOMIC"
-
-        if consistency_classification in ("SIGNAL_STOPPED", "PREEXISTING_STOPPED") and completeness == "COMPLETE":
-            snapshot_consistency = "PROCESS_STOPPED_MEMORY_SNAPSHOT"
-        else:
             snapshot_consistency = "NON_ATOMIC"
 
+        identity_contract = {
+            "target_pid": pid,
+            "initial_starttime": initial_ident.get("starttime"),
+            "initial_comm": initial_ident.get("comm"),
+            "pidfd_supported": handle.pidfd_supported,
+            "pidfd_used": handle.pidfd_used,
+            "mem_pinned": handle.mem_pinned,
+            "mem_pin_error": handle.mem_pin_error,
+            "checkpoints": list(handle.identity_checkpoints),
+            "identity_mismatch_detected": any_pid_reused,
+            "validity": completeness,
+        }
+
         # Compute exact measured microsecond and millisecond latencies
-        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if should_suspend else 0.0
-        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
-        memory_latency_us = (t_memory - t_threads) / 1000.0
-        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if should_suspend else 0.0
-        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
-        total_capture_time_us = (t_resume_confirmed - t_overall_start_ns) / 1000.0
+        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if (should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0) else 0.0
+        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if (should_suspend and t_threads > 0 and t_stop_confirmed > 0) else 0.0
+        memory_latency_us = (t_memory - t_threads) / 1000.0 if (t_memory > 0 and t_threads > 0) else 0.0
+        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0) else 0.0
+        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0) else 0.0
+        total_capture_time_us = max(0.0, (t_resume_confirmed - t_overall_start_ns) / 1000.0) if t_resume_confirmed > 0 else max(0.0, (time.monotonic_ns() - t_overall_start_ns) / 1000.0)
 
         latency_report = CaptureLatencyReport(
             stop_latency_ms=stop_latency_us / 1000.0,
@@ -1078,16 +1505,26 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "capture_status": capture_status,
             "consistency_classification": consistency_classification,
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
-            "bytes_requested": total_planned_bytes,
-            "bytes_read": captured_bytes_total,
-            "bytes_omitted": sum(r["size"] for r in omitted_regions),
-            "regions_attempted": len(read_plans),
-            "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
-            "regions_failed": failed_count,
-            "regions_omitted": omitted_count,
+            "captured_bytes": bytes_read,
+            "bytes_requested": bytes_requested,
+            "bytes_read": bytes_read,
+            "bytes_omitted": bytes_omitted,
+            "bytes_failed": bytes_failed,
+            "bytes_unread": bytes_unread,
+            "regions_complete": regions_complete,
+            "regions_partial": regions_partial,
+            "regions_failed": regions_failed,
+            "regions_omitted": regions_omitted,
+            "regions_read": regions_read,
+            "regions_attempted": regions_attempted,
             "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
+            "all_threads_stopped": all_threads_stopped,
             "was_already_stopped": was_already_stopped,
             "suspension_caused_by_capture": suspension_caused_by_capture,
+            "actual_capture_suspended_target": suspension_caused_by_capture,
+            "stop_duration_ms": round(total_stop_time_us / 1000.0, 3),
+            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3),
+            "lifecycle_guarantees": lifecycle_guarantees,
             "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
                 "states": state_history,
@@ -1106,6 +1543,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "latency_report": latency_report.to_dict(),
             "memory_maps": all_maps,
             "diagnostics": diagnostics,
+            "identity_contract": identity_contract,
             "capabilities": self.capabilities,
         }
 
@@ -1116,8 +1554,13 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "consistency_classification": consistency_classification,
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
             "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
+            "all_threads_stopped": all_threads_stopped,
             "was_already_stopped": was_already_stopped,
             "suspension_caused_by_capture": suspension_caused_by_capture,
+            "actual_capture_suspended_target": suspension_caused_by_capture,
+            "stop_duration_ms": round(total_stop_time_us / 1000.0, 3),
+            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3),
+            "lifecycle_guarantees": lifecycle_guarantees,
             "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
                 "states": state_history,
@@ -1138,14 +1581,18 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "duration": total_capture_time_us / 1000.0,
             "thread_count": len(thread_metadata),
             "captured_region_count": len(raw_regions),
-            "captured_bytes": captured_bytes_total,
-            "bytes_requested": total_planned_bytes,
-            "bytes_read": captured_bytes_total,
-            "bytes_omitted": sum(r["size"] for r in omitted_regions),
-            "regions_attempted": len(read_plans),
-            "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
-            "regions_failed": failed_count,
-            "regions_omitted": omitted_count,
+            "captured_bytes": bytes_read,
+            "bytes_requested": bytes_requested,
+            "bytes_read": bytes_read,
+            "bytes_omitted": bytes_omitted,
+            "bytes_failed": bytes_failed,
+            "bytes_unread": bytes_unread,
+            "regions_complete": regions_complete,
+            "regions_partial": regions_partial,
+            "regions_failed": regions_failed,
+            "regions_omitted": regions_omitted,
+            "regions_read": regions_read,
+            "regions_attempted": regions_attempted,
             "observation_point": observation_point,
             "executable_identity": {
                 "path": exe_path,
@@ -1156,6 +1603,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3),
             "latency_report": latency_report.to_dict(),
             "diagnostics": diagnostics,
+            "identity_contract": identity_contract,
             "capabilities": self.capabilities,
         }
 
@@ -1170,7 +1618,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             memory_regions=raw_regions,
             register_state={"status": "REGISTER_STATE_UNAVAILABLE"},
             captured_ranges=captured_ranges,
-            raw_memory={"total_bytes": sum(r.get("captured_bytes", 0) for r in raw_regions)},
+            raw_memory={"total_bytes": bytes_read},
             capture_backend=self.name,
             observation_metadata=obs_meta,
             completeness=completeness,
@@ -1192,7 +1640,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
     def capabilities(self) -> Dict[str, Any]:
         return {
             "name": self.name,
-            "can_suspend_inferior": False,  # procfs read does not pause inferior; signals are external
+            "can_suspend_inferior": True,  # backend can suspend target via external signals (SIGSTOP/SIGCONT) when requested by capture plan
             "can_read_registers": False,
             "can_read_memory": True,
             "atomicity": "NON_ATOMIC",
@@ -1241,17 +1689,33 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         policy: Optional[CaptureSafetyPolicy] = None,
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
+        handle: Optional[ProcessTargetHandle] = None,
     ) -> RawRuntimeSnapshot:
         plan = plan or CapturePlan()
         policy = policy or CaptureSafetyPolicy()
 
+        handle = handle or getattr(policy, "target_handle", None)
+        if handle is None and not self.is_available(pid):
+            raise RuntimeError(f"procfs is unavailable or target PID {pid} is not accessible")
+
         # Check process existence and establish target identity with ProcessTargetHandle
         force_fb = getattr(policy, "force_fallback", False)
-        handle = ProcessTargetHandle(pid, force_fallback=force_fb)
-        handle.open()
+        exp_id = getattr(policy, "expected_identity", None)
+        exp_st = getattr(policy, "expected_starttime", None)
+        handle = handle or ProcessTargetHandle(
+            pid,
+            force_fallback=force_fb,
+            expected_identity=exp_id,
+            expected_starttime=exp_st,
+        )
+        try:
+            handle.open()
+        except Exception:
+            handle.close()
+            raise
 
         initial_ident = handle.initial_identity
-        initial_threads = _get_threads_state(pid)
+        initial_threads = handle.get_threads_state()
         was_already_stopped = initial_ident.get("is_stopped", False)
         is_tracing_stop = initial_ident.get("is_tracing_stop", False)
         target_start_time = initial_ident.get("starttime", "0")
@@ -1265,8 +1729,11 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         capture_status = "COMPLETED"
         stop_requested = False
         stop_confirmed = False
+        resume_requested = False
         resume_confirmed = False
         suspension_caused_by_capture = False
+        all_threads_stopped = False
+        memory_read_completed = False
         diagnostics: List[Dict[str, Any]] = []
 
         if is_tracing_stop:
@@ -1322,21 +1789,51 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 "level": "INFO"
             })
 
-        # Pre-read maps and plan bounded capture
-        all_maps = _read_proc_maps(pid)
+        # 0. Pre-read maps and plan bounded capture
+        handle.record_checkpoint("POST_OPEN")
+        is_same_maps, ident_status_maps = handle.record_checkpoint("PRE_MAPS_READ")
+        if not is_same_maps:
+            diagnostics.append({
+                "code": f"MAPS_READ_ABORTED_{ident_status_maps}",
+                "message": f"Target process identity check failed ({ident_status_maps}) before maps collection; aborting capture.",
+                "level": "ERROR"
+            })
+        all_maps = _read_proc_maps(pid) if is_same_maps else []
+        if is_same_maps:
+            is_same_post_maps, ident_status_post_maps = handle.record_checkpoint("POST_MAPS_READ")
+            if not is_same_post_maps:
+                diagnostics.append({
+                    "code": f"MAPS_READ_INVALIDATED_{ident_status_post_maps}",
+                    "message": f"Target process identity changed ({ident_status_post_maps}) after reading maps.",
+                    "level": "ERROR"
+                })
         selected_maps = []
         for m in all_maps:
             if "r" in m["permissions"] and m["category"] in ("heap", "stack", "anonymous", "binary"):
                 selected_maps.append(m)
 
+        if not selected_maps and plan.memory_ranges:
+            for r_start, r_end in plan.memory_ranges:
+                selected_maps.append({
+                    "start": r_start,
+                    "end": r_end,
+                    "size": r_end - r_start,
+                    "permissions": "rw-p",
+                    "category": "targeted",
+                    "pathname": "[targeted_range]"
+                })
+
         read_plans = []
         omitted_regions = []
-        total_planned_bytes = 0
+        bytes_requested = sum(m["size"] for m in selected_maps)
+        bytes_attempted = 0
+        bytes_omitted = 0
 
         for idx, reg in enumerate(selected_maps, 1):
             reg_start = reg["start"]
             reg_size = reg["size"]
-            if total_planned_bytes >= policy.max_capture_bytes or idx > policy.max_capture_ranges:
+            if bytes_attempted >= policy.max_capture_bytes or idx > policy.max_capture_ranges:
+                bytes_omitted += reg_size
                 omitted_regions.append({
                     "region_id": f"R{idx:05d}",
                     "start": "0x{:x}".format(reg_start),
@@ -1352,8 +1849,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 })
                 continue
 
-            chunk_size = min(reg_size, 4 * 1024 * 1024, policy.max_capture_bytes - total_planned_bytes)
+            chunk_size = min(reg_size, 4 * 1024 * 1024, policy.max_capture_bytes - bytes_attempted)
             if chunk_size <= 0:
+                bytes_omitted += reg_size
                 omitted_regions.append({
                     "region_id": f"R{idx:05d}",
                     "start": "0x{:x}".format(reg_start),
@@ -1369,149 +1867,171 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 })
                 continue
 
-            read_plans.append((idx, reg, reg_start, reg_size, chunk_size))
-            total_planned_bytes += chunk_size
+            tail_omitted = reg_size - chunk_size
+            if tail_omitted > 0:
+                bytes_omitted += tail_omitted
+
+            read_plans.append((idx, reg, reg_start, reg_size, chunk_size, tail_omitted))
+            bytes_attempted += chunk_size
 
         buffers: Dict[Tuple[int, int], bytes] = {}
         raw_regions: List[Dict[str, Any]] = []
         captured_ranges: List[Tuple[int, int]] = []
+        read_results = []
 
         try:
             if should_suspend:
-                state_history.append("STOP_REQUESTED")
-                stop_requested = True
-                suspension_caused_by_capture = True
-                t_stop_requested = time.monotonic_ns()
-
-                sig_ok, sig_err = handle.send_signal(signal.SIGSTOP)
-                if not sig_ok:
-                    if sig_err == "TARGET_EXITED":
-                        diagnostics.append({
-                            "code": "TARGET_EXITED_BEFORE_STOP",
-                            "message": f"Process {pid} exited before SIGSTOP delivered",
-                            "level": "ERROR"
-                        })
-                    elif sig_err == "PID_REUSED":
-                        diagnostics.append({
-                            "code": "PID_REUSED_STOP_ABORTED",
-                            "message": f"Target PID {pid} was reused; SIGSTOP aborted to prevent signalling unrelated process",
-                            "level": "ERROR"
-                        })
-                    elif sig_err == "PERMISSION_DENIED":
-                        diagnostics.append({
-                            "code": "STOP_PERMISSION_DENIED",
-                            "message": f"Permission denied (EPERM) delivering SIGSTOP to process {pid}",
-                            "level": "ERROR"
-                        })
-                    else:
-                        diagnostics.append({
-                            "code": "STOP_SIGNAL_ERROR",
-                            "message": f"SIGSTOP failed: {sig_err}",
-                            "level": "ERROR"
-                        })
+                is_same_pre_stop, ident_status_pre_stop = handle.record_checkpoint("PRE_SUSPEND")
+                if not is_same_pre_stop:
+                    suspension_caused_by_capture = False
+                    diagnostics.append({
+                        "code": f"STOP_ABORTED_{ident_status_pre_stop}",
+                        "message": f"Target process identity check failed ({ident_status_pre_stop}) before SIGSTOP; suspension aborted.",
+                        "level": "ERROR"
+                    })
                 else:
-                    deadline_stop = t_stop_requested + int(policy.max_stop_time_ms * 1_000_000)
-                    while time.monotonic_ns() < deadline_stop:
-                        stat_path = f"/proc/{pid}/stat"
-                        if os.path.exists(stat_path):
+                    state_history.append("STOP_REQUESTED")
+                    stop_requested = True
+                    t_stop_requested = time.monotonic_ns()
+
+                    sig_ok, sig_err = handle.send_signal(signal.SIGSTOP)
+                    if not sig_ok:
+                        suspension_caused_by_capture = False
+                        if sig_err == "TARGET_EXITED":
+                            diagnostics.append({
+                                "code": "TARGET_EXITED_BEFORE_STOP",
+                                "message": f"Process {pid} exited before SIGSTOP delivered",
+                                "level": "ERROR"
+                            })
+                        elif sig_err == "PID_REUSED":
+                            diagnostics.append({
+                                "code": "PID_REUSED_STOP_ABORTED",
+                                "message": f"Target PID {pid} was reused; SIGSTOP aborted to prevent signalling unrelated process",
+                                "level": "ERROR"
+                            })
+                        elif sig_err == "PERMISSION_DENIED":
+                            diagnostics.append({
+                                "code": "STOP_PERMISSION_DENIED",
+                                "message": f"Permission denied (EPERM) delivering SIGSTOP to process {pid}",
+                                "level": "ERROR"
+                            })
+                        else:
+                            diagnostics.append({
+                                "code": "STOP_SIGNAL_ERROR",
+                                "message": f"SIGSTOP failed: {sig_err}",
+                                "level": "ERROR"
+                            })
+                    else:
+                        deadline_stop = t_stop_requested + int(policy.max_stop_time_ms * 1_000_000)
+                        while time.monotonic_ns() < deadline_stop:
                             try:
-                                with open(stat_path, "r", encoding="utf-8") as f:
-                                    content = f.read()
-                                    rparen = content.rfind(")")
-                                    if rparen != -1 and content[rparen + 1:].split()[0] in ("T", "t"):
-                                        stop_confirmed = True
-                                        break
+                                curr_st = handle.get_process_state()
+                                if curr_st.get("is_stopped"):
+                                    stop_confirmed = True
+                                    break
                             except Exception:
                                 pass
-                        try:
-                            os.sched_yield()
-                        except Exception:
-                            pass
+                            try:
+                                os.sched_yield()
+                            except Exception:
+                                pass
 
-                t_stop_confirmed = time.monotonic_ns()
-                if stop_confirmed:
-                    state_history.append("STOP_CONFIRMED")
-                else:
-                    state_history.append("STOP_UNCONFIRMED")
-                    diagnostics.append({
-                        "code": "STOP_UNCONFIRMED",
-                        "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms. Memory captured under this condition is NON_ATOMIC.",
-                        "level": "WARNING"
-                    })
+                        t_stop_confirmed = time.monotonic_ns()
+                        if stop_confirmed:
+                            suspension_caused_by_capture = True
+                            state_history.append("STOP_CONFIRMED")
+                            handle.record_checkpoint("POST_SUSPEND")
+                        else:
+                            suspension_caused_by_capture = False
+                            state_history.append("STOP_UNCONFIRMED")
+                            diagnostics.append({
+                                "code": "STOP_UNCONFIRMED",
+                                "message": f"Process {pid} did not enter stopped state within {policy.max_stop_time_ms} ms. Memory captured under this condition is NON_ATOMIC.",
+                                "level": "WARNING"
+                            })
             else:
+                handle.record_checkpoint("PRE_SUSPEND_SKIPPED")
                 t_stop_requested = time.monotonic_ns()
                 t_stop_confirmed = t_stop_requested
+                if was_already_stopped:
+                    stop_confirmed = True
 
-            state_history.append("CAPTURING")
-            thread_metadata = _read_thread_metadata(pid)
-            t_threads = time.monotonic_ns()
-
-            mem_file = f"/proc/{pid}/mem"
-            try:
-                with open(mem_file, "rb", buffering=0) as f_mem:
-                    for idx, reg, reg_start, reg_size, chunk_size in read_plans:
-                        try:
-                            f_mem.seek(reg_start)
-                            chunk = f_mem.read(chunk_size)
-                            if chunk:
-                                buffers[(reg_start, reg_start + len(chunk))] = chunk
-                                captured_ranges.append((reg_start, reg_start + len(chunk)))
-                                raw_regions.append({
-                                    "region_id": f"R{idx:05d}",
-                                    "start": "0x{:x}".format(reg_start),
-                                    "end": "0x{:x}".format(reg_start + len(chunk)),
-                                    "size": len(chunk),
-                                    "permissions": reg["permissions"],
-                                    "offset": reg.get("offset", 0),
-                                    "category": reg["category"],
-                                    "pathname": reg.get("pathname", ""),
-                                    "captured_bytes": len(chunk),
-                                    "status": "COMPLETE" if len(chunk) == reg_size else "PARTIAL",
-                                    "error": None
-                                })
-                            else:
-                                raw_regions.append({
-                                    "region_id": f"R{idx:05d}",
-                                    "start": "0x{:x}".format(reg_start),
-                                    "end": "0x{:x}".format(reg_start + reg_size),
-                                    "size": reg_size,
-                                    "permissions": reg["permissions"],
-                                    "offset": reg.get("offset", 0),
-                                    "category": reg["category"],
-                                    "pathname": reg.get("pathname", ""),
-                                    "captured_bytes": 0,
-                                    "status": "FAILED",
-                                    "error": "EOF_EMPTY_READ"
-                                })
-                        except Exception as read_err:
-                            raw_regions.append({
-                                "region_id": f"R{idx:05d}",
-                                "start": "0x{:x}".format(reg_start),
-                                "end": "0x{:x}".format(reg_start + reg_size),
-                                "size": reg_size,
-                                "permissions": reg["permissions"],
-                                "offset": reg.get("offset", 0),
-                                "category": reg["category"],
-                                "pathname": reg.get("pathname", ""),
-                                "captured_bytes": 0,
-                                "status": "FAILED",
-                                "error": str(read_err)
-                            })
-            except Exception as open_err:
+            # Check thread consistency
+            curr_threads = handle.get_threads_state()
+            all_threads_stopped = curr_threads.get("all_stopped", False)
+            if (should_suspend or was_already_stopped) and not all_threads_stopped:
                 diagnostics.append({
-                    "code": "MEM_FILE_OPEN_FAILED",
-                    "message": f"Failed to open {mem_file}: {open_err}",
-                    "level": "ERROR"
+                    "code": "THREAD_STATES_HETEROGENEOUS",
+                    "message": f"Process {pid} leader stopped, but not all threads are confirmed stopped ({curr_threads.get('stopped_count')}/{curr_threads.get('total_count')}). Snapshot is NON_ATOMIC.",
+                    "level": "WARNING"
                 })
 
+            state_history.append("CAPTURING")
+            is_same_th, ident_status_th = handle.record_checkpoint("PRE_THREAD_METADATA")
+            thread_metadata = _read_thread_metadata(pid) if is_same_th else []
+            handle.record_checkpoint("POST_THREAD_METADATA")
+            t_threads = time.monotonic_ns()
+
+            is_same_mem, ident_status_mem = handle.record_checkpoint("PRE_MEMORY_READ")
+            mem_file = f"/proc/{pid}/mem"
+            mem_reader = getattr(policy, "mem_reader", None)
+            if not is_same_mem:
+                for item in read_plans:
+                    read_results.append((item, b"", f"IDENTITY_{ident_status_mem}"))
+            elif mem_reader:
+                for item in read_plans:
+                    idx, reg, reg_start, reg_size, chunk_size, tail_omitted = item
+                    try:
+                        read_data = mem_reader(pid, reg_start, chunk_size)
+                        if read_data is not None:
+                            read_results.append((item, read_data, None))
+                        else:
+                            read_results.append((item, b"", "MEM_READ_FAILED"))
+                    except Exception as ex:
+                        read_results.append((item, b"", str(ex)))
+            elif handle.mem_pinned and handle.mem_fd is not None:
+                # Prefer pinned /proc/<pid>/mem descriptor
+                for item in read_plans:
+                    idx, reg, reg_start, reg_size, chunk_size, tail_omitted = item
+                    try:
+                        read_data = handle.read_mem(reg_start, chunk_size)
+                        if read_data is not None:
+                            read_results.append((item, read_data, None))
+                        else:
+                            read_results.append((item, b"", "MEM_READ_FAILED"))
+                    except Exception as ex:
+                        read_results.append((item, b"", str(ex)))
+            else:
+                try:
+                    with open(mem_file, "rb", buffering=0) as f_mem:
+                        for item in read_plans:
+                            idx, reg, reg_start, reg_size, chunk_size, tail_omitted = item
+                            try:
+                                f_mem.seek(reg_start)
+                                chunk = f_mem.read(chunk_size)
+                                read_results.append((item, chunk, None if chunk else "EOF_EMPTY_READ"))
+                            except Exception as read_err:
+                                read_results.append((item, b"", str(read_err)))
+                except Exception as open_err:
+                    diagnostics.append({
+                        "code": "MEM_FILE_OPEN_FAILED",
+                        "message": f"Failed to open {mem_file}: {open_err}",
+                        "level": "ERROR"
+                    })
+                    for item in read_plans:
+                        read_results.append((item, b"", str(open_err)))
+
+            memory_read_completed = True
+            handle.record_checkpoint("POST_MEMORY_READ")
             t_memory = time.monotonic_ns()
         finally:
             try:
                 if suspension_caused_by_capture:
+                    resume_requested = True
                     state_history.append("RESUME_REQUESTED")
                     t_resume_requested = time.monotonic_ns()
                     still_same_process = False
-                    is_same, ident_status = handle.verify_identity()
+                    is_same, ident_status = handle.record_checkpoint("PRE_RESUME")
                     if is_same:
                         still_same_process = True
                     else:
@@ -1535,50 +2055,68 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                             })
 
                     if still_same_process:
-                        res_ok, res_err = handle.send_signal(signal.SIGCONT)
-                        if not res_ok:
-                            if res_err == "TARGET_EXITED":
+                        try:
+                            post_check = handle.get_process_state()
+                            if not post_check.get("is_stopped"):
+                                resume_confirmed = True
+                                state_history.append("TARGET_RESUMED_INDEPENDENTLY")
                                 diagnostics.append({
-                                    "code": "TARGET_EXITED_BEFORE_RESUME",
-                                    "message": f"Process {pid} exited before SIGCONT delivered.",
+                                    "code": "TARGET_RESUMED_INDEPENDENTLY",
+                                    "message": f"Process {pid} was already active before SIGCONT; target resumed independently.",
                                     "level": "INFO"
                                 })
-                            elif res_err == "PERMISSION_DENIED":
-                                diagnostics.append({
-                                    "code": "RESUME_PERMISSION_DENIED",
-                                    "message": f"Permission denied delivering SIGCONT to process {pid}.",
-                                    "level": "ERROR"
-                                })
+                        except Exception:
+                            pass
+
+                        if not resume_confirmed:
+                            res_ok, res_err = handle.send_signal(signal.SIGCONT)
+                            if not res_ok:
+                                if res_err == "TARGET_EXITED":
+                                    diagnostics.append({
+                                        "code": "TARGET_EXITED_BEFORE_RESUME",
+                                        "message": f"Process {pid} exited before SIGCONT delivered.",
+                                        "level": "INFO"
+                                    })
+                                elif res_err == "PERMISSION_DENIED":
+                                    diagnostics.append({
+                                        "code": "RESUME_PERMISSION_DENIED",
+                                        "message": f"Permission denied delivering SIGCONT to process {pid}.",
+                                        "level": "ERROR"
+                                    })
+                                else:
+                                    diagnostics.append({
+                                        "code": "RESUME_SIGNAL_ERROR",
+                                        "message": f"SIGCONT failed: {res_err}",
+                                        "level": "ERROR"
+                                    })
                             else:
-                                diagnostics.append({
-                                    "code": "RESUME_SIGNAL_ERROR",
-                                    "message": f"SIGCONT failed: {res_err}",
-                                    "level": "ERROR"
-                                })
-                        else:
-                            deadline_res = t_resume_requested + int(20 * 1_000_000)
-                            while time.monotonic_ns() < deadline_res:
-                                stat_path = f"/proc/{pid}/stat"
-                                if os.path.exists(stat_path):
+                                deadline_res = t_resume_requested + int(20 * 1_000_000)
+                                while time.monotonic_ns() < deadline_res:
                                     try:
-                                        with open(stat_path, "r", encoding="utf-8") as f:
-                                            content_stat = f.read()
-                                            rparen = content_stat.rfind(")")
-                                            if rparen != -1 and content_stat[rparen + 1:].split()[0] not in ("T", "t"):
-                                                resume_confirmed = True
-                                                break
+                                        st_res = handle.get_process_state()
+                                        if not st_res.get("is_stopped"):
+                                            resume_confirmed = True
+                                            break
                                     except Exception:
                                         pass
-                                try:
-                                    os.sched_yield()
-                                except Exception:
-                                    pass
+                                    try:
+                                        os.sched_yield()
+                                    except Exception:
+                                        pass
 
-                    t_resume_confirmed = time.monotonic_ns()
-                    if resume_confirmed:
-                        state_history.append("RESUME_CONFIRMED")
+                                t_resume_confirmed = time.monotonic_ns()
+                                if resume_confirmed:
+                                    state_history.append("RESUME_CONFIRMED")
+                                    handle.record_checkpoint("POST_RESUME")
+                                else:
+                                    state_history.append("RESUME_UNCONFIRMED")
+                                    diagnostics.append({
+                                        "code": "RESUME_UNCONFIRMED",
+                                        "message": f"Process {pid} did not confirm running state within timeout after SIGCONT.",
+                                        "level": "WARNING"
+                                    })
                     else:
-                        state_history.append("RESUME_UNCONFIRMED")
+                        t_resume_confirmed = time.monotonic_ns()
                 elif was_already_stopped:
                     state_history.append("PREEXISTING_STOP_RETAINED")
                     t_resume_requested = t_memory
@@ -1591,44 +2129,154 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
 
         wall_clock_end = datetime.now(timezone.utc).isoformat()
 
-        # Add omitted regions
+        # Offline post-processing of buffers
+        bytes_read = 0
+        bytes_failed = 0
+        bytes_unread = 0
+
+        for item, chunk, err in read_results:
+            idx, reg, reg_start, reg_size, chunk_size, tail_omitted = item
+            nread = len(chunk) if chunk else 0
+            if nread == chunk_size:
+                buffers[(reg_start, reg_start + nread)] = chunk
+                captured_ranges.append((reg_start, reg_start + nread))
+                bytes_read += nread
+                raw_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + nread),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": nread,
+                    "status": "COMPLETE" if tail_omitted == 0 else "PARTIAL",
+                    "error": None
+                })
+            elif nread > 0:
+                buffers[(reg_start, reg_start + nread)] = chunk
+                captured_ranges.append((reg_start, reg_start + nread))
+                bytes_read += nread
+                bytes_unread += (chunk_size - nread)
+                raw_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + nread),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": nread,
+                    "status": "PARTIAL",
+                    "error": None
+                })
+            else:
+                bytes_failed += chunk_size
+                raw_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + reg_size),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": 0,
+                    "status": "FAILED",
+                    "error": err or "READ_FAILED"
+                })
+
         raw_regions.extend(omitted_regions)
 
-        captured_bytes_total = sum(r.get("captured_bytes", 0) for r in raw_regions)
-        failed_count = sum(1 for r in raw_regions if r.get("status") == "FAILED")
-        partial_count = sum(1 for r in raw_regions if r.get("status") == "PARTIAL")
-        omitted_count = len(omitted_regions)
+        regions_complete = sum(1 for r in raw_regions if r.get("status") == "COMPLETE")
+        regions_partial = sum(1 for r in raw_regions if r.get("status") == "PARTIAL")
+        regions_failed = sum(1 for r in raw_regions if r.get("status") == "FAILED")
+        regions_omitted = len(omitted_regions)
+        regions_read = regions_complete + regions_partial
+        regions_attempted = regions_read + regions_failed + regions_omitted
 
-        if captured_bytes_total == 0 and selected_maps:
+        any_pid_reused = any(cp.get("status") == "PID_REUSED" for cp in handle.identity_checkpoints) or handle.identity_mismatch
+        any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in handle.identity_checkpoints)
+        any_checkpoint_failed = any(not cp.get("verified", False) for cp in handle.identity_checkpoints)
+
+        if any_pid_reused:
+            capture_status = "INVALID"
+            completeness = "INVALID"
+        elif (bytes_read == 0 and selected_maps) or (any_target_exited and bytes_read == 0):
             capture_status = "FAILED"
             completeness = "FAILED"
-        elif failed_count > 0 or partial_count > 0 or omitted_count > 0 or not stop_confirmed:
+        elif (
+            regions_failed > 0
+            or regions_partial > 0
+            or regions_omitted > 0
+            or (should_suspend and not stop_confirmed)
+            or ((should_suspend or was_already_stopped) and not all_threads_stopped)
+            or (suspension_caused_by_capture and not resume_confirmed)
+            or (plan.mode == CaptureMode.ZERO_STOP.value)
+            or any_checkpoint_failed
+        ):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
         else:
             capture_status = "COMPLETED"
             completeness = "COMPLETE"
 
-        if plan.mode == CaptureMode.ZERO_STOP.value:
+        lifecycle_guarantees = {
+            "process_stop_requested": stop_requested,
+            "process_stop_confirmed": stop_confirmed,
+            "all_threads_stopped": all_threads_stopped if (should_suspend or was_already_stopped) else False,
+            "memory_read_completed": memory_read_completed,
+            "resume_requested": resume_requested,
+            "resume_confirmed": resume_confirmed,
+        }
+
+        # Honest consistency classification:
+        if completeness == "INVALID":
+            snapshot_consistency = "INVALID"
+            consistency_classification = "INVALID"
+        elif completeness == "FAILED":
+            snapshot_consistency = "FAILED"
+            consistency_classification = "FAILED"
+        elif plan.mode == CaptureMode.ZERO_STOP.value:
             consistency_classification = "NON_ATOMIC"
+            snapshot_consistency = "NON_ATOMIC"
+        elif not stop_confirmed:
+            consistency_classification = "NON_ATOMIC"
+            snapshot_consistency = "NON_ATOMIC"
+        elif (should_suspend or was_already_stopped) and not all_threads_stopped:
+            consistency_classification = "NON_ATOMIC"
+            snapshot_consistency = "NON_ATOMIC"
         elif was_already_stopped:
             consistency_classification = "PREEXISTING_STOPPED"
+            snapshot_consistency = "PROCESS_STOPPED_MEMORY_SNAPSHOT" if completeness == "COMPLETE" else "NON_ATOMIC"
         elif should_suspend and stop_confirmed:
             consistency_classification = "SIGNAL_STOPPED"
+            snapshot_consistency = "PROCESS_STOPPED_MEMORY_SNAPSHOT" if completeness == "COMPLETE" else "NON_ATOMIC"
         else:
             consistency_classification = "NON_ATOMIC"
-
-        if consistency_classification in ("SIGNAL_STOPPED", "PREEXISTING_STOPPED") and completeness == "COMPLETE":
-            snapshot_consistency = "PROCESS_STOPPED_MEMORY_SNAPSHOT"
-        else:
             snapshot_consistency = "NON_ATOMIC"
 
-        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if should_suspend else 0.0
-        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
-        memory_latency_us = (t_memory - t_threads) / 1000.0
-        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if should_suspend else 0.0
-        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if should_suspend else 0.0
-        total_capture_time_us = (t_resume_confirmed - t_overall_start_ns) / 1000.0
+        identity_contract = {
+            "target_pid": pid,
+            "initial_starttime": initial_ident.get("starttime"),
+            "initial_comm": initial_ident.get("comm"),
+            "pidfd_supported": handle.pidfd_supported,
+            "pidfd_used": handle.pidfd_used,
+            "mem_pinned": handle.mem_pinned,
+            "mem_pin_error": handle.mem_pin_error,
+            "checkpoints": list(handle.identity_checkpoints),
+            "identity_mismatch_detected": any_pid_reused,
+            "validity": completeness,
+        }
+
+        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if (should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0) else 0.0
+        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if (should_suspend and t_threads > 0 and t_stop_confirmed > 0) else 0.0
+        memory_latency_us = (t_memory - t_threads) / 1000.0 if (t_memory > 0 and t_threads > 0) else 0.0
+        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0) else 0.0
+        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0) else 0.0
+        total_capture_time_us = max(0.0, (t_resume_confirmed - t_overall_start_ns) / 1000.0) if t_resume_confirmed > 0 else max(0.0, (time.monotonic_ns() - t_overall_start_ns) / 1000.0)
 
         latency_report = CaptureLatencyReport(
             stop_latency_ms=stop_latency_us / 1000.0,
@@ -1652,16 +2300,26 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "capture_status": capture_status,
             "consistency_classification": consistency_classification,
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
-            "bytes_requested": total_planned_bytes,
-            "bytes_read": captured_bytes_total,
-            "bytes_omitted": sum(r["size"] for r in omitted_regions),
-            "regions_attempted": len(read_plans),
-            "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
-            "regions_failed": failed_count,
-            "regions_omitted": omitted_count,
+            "captured_bytes": bytes_read,
+            "bytes_requested": bytes_requested,
+            "bytes_read": bytes_read,
+            "bytes_omitted": bytes_omitted,
+            "bytes_failed": bytes_failed,
+            "bytes_unread": bytes_unread,
+            "regions_complete": regions_complete,
+            "regions_partial": regions_partial,
+            "regions_failed": regions_failed,
+            "regions_omitted": regions_omitted,
+            "regions_read": regions_read,
+            "regions_attempted": regions_attempted,
             "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
+            "all_threads_stopped": all_threads_stopped,
             "was_already_stopped": was_already_stopped,
             "suspension_caused_by_capture": suspension_caused_by_capture,
+            "actual_capture_suspended_target": suspension_caused_by_capture,
+            "stop_duration_ms": round(total_stop_time_us / 1000.0, 3),
+            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3),
+            "lifecycle_guarantees": lifecycle_guarantees,
             "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
                 "states": state_history,
@@ -1680,6 +2338,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "latency_report": latency_report.to_dict(),
             "memory_maps": all_maps,
             "diagnostics": diagnostics,
+            "identity_contract": identity_contract,
             "capabilities": self.capabilities,
         }
 
@@ -1690,8 +2349,13 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "consistency_classification": consistency_classification,
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
             "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
+            "all_threads_stopped": all_threads_stopped,
             "was_already_stopped": was_already_stopped,
             "suspension_caused_by_capture": suspension_caused_by_capture,
+            "actual_capture_suspended_target": suspension_caused_by_capture,
+            "stop_duration_ms": round(total_stop_time_us / 1000.0, 3),
+            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3),
+            "lifecycle_guarantees": lifecycle_guarantees,
             "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
                 "states": state_history,
@@ -1712,14 +2376,18 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "duration": total_capture_time_us / 1000.0,
             "thread_count": len(thread_metadata),
             "captured_region_count": len(raw_regions),
-            "captured_bytes": captured_bytes_total,
-            "bytes_requested": total_planned_bytes,
-            "bytes_read": captured_bytes_total,
-            "bytes_omitted": sum(r["size"] for r in omitted_regions),
-            "regions_attempted": len(read_plans),
-            "regions_read": len([r for r in raw_regions if r.get("captured_bytes", 0) > 0]),
-            "regions_failed": failed_count,
-            "regions_omitted": omitted_count,
+            "captured_bytes": bytes_read,
+            "bytes_requested": bytes_requested,
+            "bytes_read": bytes_read,
+            "bytes_omitted": bytes_omitted,
+            "bytes_failed": bytes_failed,
+            "bytes_unread": bytes_unread,
+            "regions_complete": regions_complete,
+            "regions_partial": regions_partial,
+            "regions_failed": regions_failed,
+            "regions_omitted": regions_omitted,
+            "regions_read": regions_read,
+            "regions_attempted": regions_attempted,
             "observation_point": observation_point,
             "executable_identity": {
                 "path": exe_path,
@@ -1730,6 +2398,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3),
             "latency_report": latency_report.to_dict(),
             "diagnostics": diagnostics,
+            "identity_contract": identity_contract,
             "capabilities": self.capabilities,
         }
 
@@ -1744,7 +2413,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             memory_regions=raw_regions,
             register_state={"status": "REGISTER_STATE_UNAVAILABLE"},
             captured_ranges=captured_ranges,
-            raw_memory={"total_bytes": captured_bytes_total},
+            raw_memory={"total_bytes": bytes_read},
             capture_backend=self.name,
             observation_metadata=obs_meta,
             completeness=completeness,

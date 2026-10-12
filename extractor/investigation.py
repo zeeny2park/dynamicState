@@ -61,6 +61,8 @@ from .static_analyzer import (
     NullStaticAnalysisProvider,
     StaticAnalysisProvider,
     validate_module_identity,
+    resolve_function_candidates,
+    LAYOUT_MUTATION_CAVEAT,
 )
 
 
@@ -81,6 +83,16 @@ class InvestigationFinding:
     uncertainty: Optional[str] = None
     thread_id: Optional[Union[int, str]] = None
     execution_context: Optional[str] = None
+    type_name: Optional[str] = None
+    source_location: Optional[str] = None
+    type_decl_location: Optional[str] = None
+    function_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    code_navigation: Optional[Dict[str, Any]] = None
+    observed_value: Any = None
+    before_value: Any = None
+    after_value: Any = None
+    layout_caveat: Optional[str] = None
+    unavailable_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -583,10 +595,16 @@ class InvestigationManager:
                         c_type_path=chg.get("path"),
                         object_id=chg.get("object_id"),
                         field_name=chg.get("field"),
+                        type_name=chg.get("type"),
+                        observed_value=chg.get("after"),
+                        before_value=chg.get("before"),
+                        after_value=chg.get("after"),
                         evidence_ids=[ev.evidence_id],
                         confidence="medium" if uncertainty else "high",
                         status=status,
+                        uncertainty=uncertainty,
                     )
+                    self._enrich_finding_navigation(session, fnd, snapshot=snap_b)
                     session.findings.append(fnd)
                 elif kind == "field_unavailable":
                     fnd_id = f"fnd_cmp_{uuid.uuid4().hex[:8]}"
@@ -598,10 +616,15 @@ class InvestigationManager:
                         c_type_path=chg.get("path"),
                         object_id=chg.get("object_id"),
                         field_name=chg.get("field"),
+                        type_name=chg.get("type"),
+                        before_value=chg.get("before"),
+                        unavailable_reason=chg.get("reason") or "Field absent or unreadable in subsequent observation.",
                         evidence_ids=[ev.evidence_id],
                         confidence="high",
                         status="UNAVAILABLE",
+                        uncertainty="Field missing in comparison observation",
                     )
+                    self._enrich_finding_navigation(session, fnd, snapshot=snap_a)
                     session.findings.append(fnd)
                 elif kind == "field_added":
                     fnd_id = f"fnd_cmp_{uuid.uuid4().hex[:8]}"
@@ -613,10 +636,14 @@ class InvestigationManager:
                         c_type_path=chg.get("path"),
                         object_id=chg.get("object_id"),
                         field_name=chg.get("field"),
+                        type_name=chg.get("type"),
+                        observed_value=chg.get("after"),
+                        after_value=chg.get("after"),
                         evidence_ids=[ev.evidence_id],
                         confidence="high",
                         status="OBSERVED",
                     )
+                    self._enrich_finding_navigation(session, fnd, snapshot=snap_b)
                     session.findings.append(fnd)
 
         session.comparison_results.append({
@@ -750,6 +777,82 @@ class InvestigationManager:
     # -------------------------------------------------------------------------
     # Stage Execution Internals
     # -------------------------------------------------------------------------
+
+    def _enrich_finding_navigation(
+        self,
+        session: InvestigationSession,
+        finding: InvestigationFinding,
+        target_object: Optional[Dict[str, Any]] = None,
+        target_field: Optional[Dict[str, Any]] = None,
+        snapshot: Optional[Any] = None,
+    ) -> None:
+        """Enrich an InvestigationFinding with DWARF source locations, candidate functions, and layout caveat."""
+        snap = snapshot or session.active_snapshot
+        snap_dict = snap.to_dict() if hasattr(snap, "to_dict") else (snap if isinstance(snap, dict) else {})
+        s_inner = snap_dict.get("snapshot", snap_dict)
+        persistent = snap_dict.get("persistent") or s_inner.get("persistent") or {}
+        raw_objs = persistent.get("objects", []) or snap_dict.get("objects", []) or []
+
+        # Find target object if not passed
+        if target_object is None and finding.object_id:
+            for o in raw_objs:
+                o_d = o if isinstance(o, dict) else (o.to_dict() if hasattr(o, "to_dict") else asdict(o))
+                if o_d.get("object_id") == finding.object_id or o_d.get("object_ref") == finding.object_id:
+                    target_object = o_d
+                    break
+
+        if target_object is None:
+            target_object = {
+                "object_id": finding.object_id or "",
+                "type": finding.type_name or finding.c_type_path or "",
+                "fields": [],
+            }
+
+        # Find target field if not passed
+        if target_field is None and finding.field_name and isinstance(target_object, dict):
+            for f in target_object.get("fields", []):
+                f_d = f if isinstance(f, dict) else (f.to_dict() if hasattr(f, "to_dict") else asdict(f))
+                if f_d.get("name") == finding.field_name:
+                    target_field = f_d
+                    break
+            if target_field is None:
+                target_field = {"name": finding.field_name}
+
+        static_prov = session.static_provider
+        try:
+            nav_result = resolve_function_candidates(
+                target_object=target_object,
+                target_field=target_field,
+                snapshot=snap_dict,
+                static_provider=static_prov,
+            )
+        except Exception:
+            nav_result = {}
+
+        # Set type name
+        if not finding.type_name or finding.type_name in ("int", "bool", "char", "float", "double", "uint64_t", "int32_t", "void"):
+            finding.type_name = nav_result.get("target_type") or target_object.get("type")
+
+        # Set source location (field declaration)
+        field_decl_file = nav_result.get("field_decl_file")
+        field_decl_line = nav_result.get("field_decl_line")
+        if field_decl_file and field_decl_line is not None:
+            finding.source_location = f"{field_decl_file}:{field_decl_line}"
+        elif isinstance(target_field, dict) and target_field.get("decl_file") and target_field.get("decl_line"):
+            finding.source_location = f"{target_field.get('decl_file')}:{target_field.get('decl_line')}"
+
+        # Set type declaration location
+        type_decl_file = target_object.get("decl_file")
+        type_decl_line = target_object.get("decl_line")
+        if type_decl_file and type_decl_line is not None:
+            finding.type_decl_location = f"{type_decl_file}:{type_decl_line}"
+
+        # Layout caveat
+        finding.layout_caveat = nav_result.get("layout_caveat") or LAYOUT_MUTATION_CAVEAT
+
+        # Function candidates
+        finding.function_candidates = nav_result.get("candidates", [])
+        finding.code_navigation = nav_result
 
     def _execute_stage_identity(self, session: InvestigationSession) -> None:
         """Stage 1: Validate Target and Debug Image Identity."""
@@ -1097,17 +1200,20 @@ class InvestigationManager:
             r_ref = r_dict.get("object_ref")
             if r_ref:
                 root_evidence_map[r_ref] = ev.evidence_id
-            session.findings.append(InvestigationFinding(
+            fnd_root = InvestigationFinding(
                 finding_id=f"fnd_root_{uuid.uuid4().hex[:8]}",
                 category="fact",
                 title=f"Root Object Observed: {r_dict.get('name')}",
                 description=f"Global/static root of canonical type {r_dict.get('type')}.",
                 c_type_path=r_dict.get("name"),
-                object_id=r_dict.get("object_ref"),
+                object_id=r_dict.get("object_ref") or r_dict.get("object_id"),
+                type_name=r_dict.get("type"),
                 evidence_ids=[ev.evidence_id],
                 confidence="high",
                 status="OBSERVED",
-            ))
+            )
+            self._enrich_finding_navigation(session, fnd_root, target_object=r_dict, snapshot=semantic_state)
+            session.findings.append(fnd_root)
 
         # Sample reachable objects and fields
         first_field_finding = None
@@ -1150,10 +1256,13 @@ class InvestigationManager:
                     c_type_path=fpath,
                     object_id=oid,
                     field_name=fname,
+                    type_name=f.get("type") or otype,
+                    observed_value=fval,
                     evidence_ids=[ev.evidence_id],
                     confidence="OBSERVED",
                     status="OBSERVED",
                 )
+                self._enrich_finding_navigation(session, finding_candidate, target_object=o_dict, target_field=f, snapshot=semantic_state)
                 if first_field_finding is None:
                     first_field_finding = finding_candidate
 
@@ -1421,6 +1530,12 @@ class InvestigationManager:
                 "load_bias_status": load_bias_status,
             },
         }
+
+        # Re-enrich all session findings now that static provider has been verified and loaded
+        if provider and provider.is_available():
+            for fnd in session.findings:
+                if fnd.object_id or fnd.field_name:
+                    self._enrich_finding_navigation(session, fnd, snapshot=session.active_snapshot)
 
     def _execute_stage_synthesis(self, session: InvestigationSession) -> None:
         """Stage 5: Synthesize Findings, Invariant Hypotheses, and Next Steps."""

@@ -428,24 +428,29 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
                 lines = []
 
         current_fn = None
+        sym_pattern = re.compile(rf"\b{re.escape(sym_name)}\b")
         for line in lines:
             if line.endswith(">:") and "<" in line:
-                current_fn = line.split("<")[-1].rstrip(">:")
-            elif sym_name in line and current_fn and current_fn != sym_name:
-                is_write = any(w in line for w in ("mov", "str", "stw", "stx", "="))
-                refs.append({
-                    "caller_function": current_fn,
-                    "reference_site": line.strip(),
-                    "target": sym_name,
-                    "link_kind": LINK_KIND_FIELD_WRITE_CANDIDATE if is_write else LINK_KIND_CALL_RELATIONSHIP,
-                    "is_verified": False,
-                    "is_candidate_only": True,
-                    "confidence": "CANDIDATE",
-                    "basis": "disassembly_text_match",
-                    "limitation": "Disassembly text search establishes candidate reference only, not proof of verified call edge or field write.",
-                })
-                if len(refs) >= 20:  # Bound result
-                    break
+                idx = line.find("<")
+                current_fn = line[idx + 1:-2]
+            elif current_fn and sym_name != current_fn:
+                if any(current_fn.startswith(p) for p in ("std::", "__", "_")):
+                    continue
+                if sym_pattern.search(line):
+                    is_write = any(w in line for w in ("mov", "str", "stw", "stx", "="))
+                    refs.append({
+                        "caller_function": current_fn,
+                        "reference_site": line.strip(),
+                        "target": sym_name,
+                        "link_kind": LINK_KIND_FIELD_WRITE_CANDIDATE if is_write else LINK_KIND_CALL_RELATIONSHIP,
+                        "is_verified": False,
+                        "is_candidate_only": True,
+                        "confidence": "CANDIDATE",
+                        "basis": "disassembly_text_match",
+                        "limitation": "Disassembly text search establishes candidate reference only, not proof of verified call edge or field write.",
+                    })
+                    if len(refs) >= 20:  # Bound result
+                        break
         return refs
 
     def get_call_relationships(self, function_name: str, module: Optional[RuntimeModule] = None) -> Dict[str, Any]:
@@ -718,6 +723,23 @@ def resolve_function_candidates(
                             limitations="Constructor declared in DWARF; runtime execution in this snapshot is not verified.",
                         ))
 
+                    elif not (subp.decl_file and ("/usr/include" in subp.decl_file or "/usr/lib" in subp.decl_file)):
+                        s_lower = s_name.lower()
+                        if not (s_name.startswith("_") or "<" in s_name or ">" in s_name or "~" in s_name or any(s_lower.startswith(p) for p in ("std::", "operator", "unique_ptr", "tuple", "allocator"))):
+                            s_tokens = set(t.lower() for t in re.findall(r"[A-Za-z0-9]+", s_name) if len(t) >= 4)
+                            target_tokens = set(t.lower() for t in re.findall(r"[A-Za-z0-9]+", f"{clean_type} {obj_name} {field_name}") if len(t) >= 4)
+                            common = s_tokens & target_tokens
+                            if common:
+                                raw_candidates.append(FunctionCandidate(
+                                    function_name=s_name,
+                                    source_location=loc,
+                                    related_target=related_target,
+                                    reason=f"Candidate function referencing {', '.join(sorted(common))} in DWARF subprogram scope",
+                                    evidence_level=EVIDENCE_LEVEL_STATIC,
+                                    basis_source="dwarf_subprogram_scope",
+                                    limitations="Correlated via DWARF subprogram symbols; runtime execution or field mutation in this snapshot is not verified.",
+                                ))
+
         # B) Check Static References (disassembly)
         query_sym = field_name or clean_type
         if query_sym:
@@ -734,19 +756,22 @@ def resolve_function_candidates(
                         basis_source="disassembly_reference",
                         limitations="Static reference in binary disassembly; runtime execution of this instruction path is unverified.",
                     ))
-                    # C) Check Call relationships for INDIRECT candidates
-                    call_rel = static_provider.get_call_relationships(caller)
-                    for indirect_caller in call_rel.get("callers", []):
-                        if indirect_caller != caller:
-                            raw_candidates.append(FunctionCandidate(
-                                function_name=indirect_caller,
-                                source_location=None,
-                                related_target=caller,
-                                reason=f"Caller of candidate function '{caller}' in static call graph",
-                                evidence_level=EVIDENCE_LEVEL_INDIRECT,
-                                basis_source="call_graph_reference",
-                                limitations="Indirect relationship via static call graph; execution path unverified in this snapshot.",
-                            ))
+
+        # C) Check Call relationships for callers of static candidates (INDIRECT candidates)
+        static_cands = [c for c in raw_candidates if c.evidence_level == EVIDENCE_LEVEL_STATIC]
+        for sc in static_cands[:10]:
+            call_rel = static_provider.get_call_relationships(sc.function_name)
+            for indirect_caller in call_rel.get("callers", []):
+                if indirect_caller != sc.function_name:
+                    raw_candidates.append(FunctionCandidate(
+                        function_name=indirect_caller,
+                        source_location=None,
+                        related_target=sc.function_name,
+                        reason=f"Caller of candidate function '{sc.function_name}' in static call graph",
+                        evidence_level=EVIDENCE_LEVEL_INDIRECT,
+                        basis_source="call_graph_reference",
+                        limitations="Indirect relationship via static call graph; execution path unverified in this snapshot.",
+                    ))
 
     # 3. Deduplication by function_name prioritizing tier: observed > static > indirect > unknown
     tier_order = {

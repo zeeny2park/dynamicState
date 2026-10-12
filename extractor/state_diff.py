@@ -99,6 +99,7 @@ class StateDiffEngine:
             fields_compared += compared
         changes.extend(self._execution_changes(a, b))
         summary = {
+            "total_changes": len(changes),
             "objects_created": sum(c["kind"] == "object_created" for c in changes),
             "objects_removed": sum(c["kind"] == "object_removed" for c in changes),
             "fields_added": sum(c["kind"] == "field_added" for c in changes),
@@ -107,6 +108,10 @@ class StateDiffEngine:
             "value_changes": sum(c["kind"] == "value_change" for c in changes),
             "reference_changes": sum(c["kind"] == "reference_change" for c in changes),
             "execution_changes": sum(c["kind"] == "execution_change" for c in changes),
+            "object_lifecycle_changes": sum(c["kind"] in ("object_created", "object_removed") for c in changes),
+            "field_level_changes": sum(c["kind"] in ("field_added", "field_unavailable", "value_change", "reference_change") for c in changes),
+            "observation_availability_changes": sum(c["kind"] in ("availability_change", "field_unavailable") for c in changes),
+            "identity_ambiguities": sum(c.get("identity_confidence") == "uncertain" for c in changes),
         }
         return StateDiff(summary, changes, {"total_ms": round((time.monotonic() - start) * 1000, 3),
                                              "objects_compared": len(objects_a.keys() & objects_b.keys()),
@@ -114,7 +119,13 @@ class StateDiffEngine:
 
     @staticmethod
     def _data(snapshot: Any) -> Dict[str, Any]:
-        return snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
+        if snapshot is None:
+            return {}
+        if hasattr(snapshot, "to_dict"):
+            return snapshot.to_dict()
+        if isinstance(snapshot, dict):
+            return snapshot
+        return {}
 
     def _object_map(self, snapshot: Dict[str, Any]) -> Dict[Any, Dict[str, Any]]:
         persistent = snapshot.get("persistent") or {}

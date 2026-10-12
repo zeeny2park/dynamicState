@@ -369,6 +369,68 @@ class TestSnapshotDiffStatisticsAccuracy(unittest.TestCase):
         events = result.changes
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["identity_confidence"], "uncertain")
+        self.assertEqual(result.summary["identity_ambiguities"], 1)
+
+    def test_reference_change_vs_value_change(self):
+        """Distinguish pointer/reference changes from primitive value changes."""
+        before_state = _make_snapshot([
+            _make_obj("obj_0001", "0x1000", "Node", [
+                {"name": "val", "value": 10},
+                {"name": "next", "value": "0x2000", "object_ref": "obj_0002"},
+            ])
+        ])
+        after_state = _make_snapshot([
+            _make_obj("obj_0001", "0x1000", "Node", [
+                {"name": "val", "value": 20},  # value_change
+                {"name": "next", "value": "0x3000", "object_ref": "obj_0003"},  # reference_change
+            ])
+        ])
+
+        diff_engine = StateDiffEngine()
+        result = diff_engine.diff(before_state, after_state)
+        summary = result.summary
+
+        self.assertEqual(summary["value_changes"], 1)
+        self.assertEqual(summary["reference_changes"], 1)
+        self.assertEqual(summary["objects_created"], 0)
+        self.assertEqual(summary["objects_removed"], 0)
+        self.assertEqual(summary["field_level_changes"], 2)
+
+    def test_empty_and_identical_snapshots(self):
+        """Diffing empty or identical snapshots produces 0 changes."""
+        diff_engine = StateDiffEngine()
+
+        # None inputs
+        res_none = diff_engine.diff(None, None)
+        self.assertEqual(len(res_none.changes), 0)
+        self.assertEqual(res_none.summary["total_changes"], 0)
+
+        # Empty dicts
+        res_empty = diff_engine.diff({}, {})
+        self.assertEqual(len(res_empty.changes), 0)
+
+        # Identical snapshots
+        snap = _make_snapshot([_make_obj("obj_0001", "0x1000", "A", [{"name": "x", "value": 1}])])
+        res_identical = diff_engine.diff(snap, snap)
+        self.assertEqual(len(res_identical.changes), 0)
+        self.assertEqual(res_identical.summary["total_changes"], 0)
+
+    def test_serialization_round_trip(self):
+        """StateDiff to_dict produces valid dictionary with all aggregate fields."""
+        before = _make_snapshot([_make_obj("obj_0001", "0x1000", "A", [{"name": "x", "value": 1}])])
+        after = _make_snapshot([_make_obj("obj_0001", "0x1000", "A", [{"name": "x", "value": 2}])])
+
+        diff_engine = StateDiffEngine()
+        res = diff_engine.diff(before, after)
+        d = res.to_dict()
+
+        self.assertIn("summary", d)
+        self.assertIn("changes", d)
+        self.assertIn("object_lifecycle_changes", d["summary"])
+        self.assertIn("field_level_changes", d["summary"])
+        self.assertIn("observation_availability_changes", d["summary"])
+        self.assertIn("identity_ambiguities", d["summary"])
+
 
 
 class TestEvidenceLedgerSchemaValidation(unittest.TestCase):
@@ -522,6 +584,75 @@ class TestEvidenceLedgerSchemaValidation(unittest.TestCase):
         self.assertNotIn("CYCLE_DETECTED", statuses)
         resolved_ids = [step.get("evidence_id") for step in chain if step.get("status") == "RESOLVED"]
         self.assertCountEqual(resolved_ids, ["EV_LEAF", "EV_LEFT", "EV_RIGHT", "EV_ROOT"])
+
+    def test_reject_self_referencing_parent(self):
+        """EvidenceRecord and EvidenceLedger reject self-referential lineage links (A -> A)."""
+        with self.assertRaises(ValueError) as ctx:
+            EvidenceRecord(
+                evidence_id="EV_SELF",
+                evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+                nature=NATURE_OBSERVATION,
+                parent_evidence_ids=["EV_SELF"],
+            )
+        self.assertIn("Self-reference detected", str(ctx.exception))
+
+    def test_reject_empty_or_whitespace_session_and_finding_id(self):
+        """EvidenceRecord rejects empty or whitespace session_id and finding_id."""
+        with self.assertRaises(ValueError):
+            EvidenceRecord(
+                evidence_id="EV_1",
+                evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+                nature=NATURE_OBSERVATION,
+                session_id="",
+            )
+
+        with self.assertRaises(ValueError):
+            EvidenceRecord(
+                evidence_id="EV_2",
+                evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+                nature=NATURE_OBSERVATION,
+                finding_id="   ",
+            )
+
+    def test_unresolved_parent_reported_in_provenance_chain(self):
+        """Missing parent records are reported as UNRESOLVED_PARENT in provenance chain."""
+        ledger = EvidenceLedger()
+        rec = EvidenceRecord(
+            evidence_id="EV_CHILD",
+            evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+            nature=NATURE_OBSERVATION,
+            parent_evidence_ids=["EV_MISSING_PARENT"],
+        )
+        ledger.add_record(rec)
+
+        chain = ledger.trace_provenance_chain("EV_CHILD")
+        statuses = [step.get("status") for step in chain]
+        self.assertIn("UNRESOLVED_PARENT", statuses)
+        unresolved = [step for step in chain if step.get("status") == "UNRESOLVED_PARENT"]
+        self.assertEqual(unresolved[0]["evidence_id"], "EV_MISSING_PARENT")
+
+    def test_deterministic_traversal_order(self):
+        """Multiple parents are traversed in deterministic sorted order."""
+        ledger = EvidenceLedger()
+        for pid in ["EV_Z", "EV_A", "EV_M"]:
+            ledger.add_record(EvidenceRecord(
+                evidence_id=pid,
+                evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+                nature=NATURE_OBSERVATION,
+            ))
+        child = EvidenceRecord(
+            evidence_id="EV_CHILD",
+            evidence_type=EVIDENCE_TYPE_DIAGNOSTIC,
+            nature=NATURE_INFERENCE,
+            parent_evidence_ids=["EV_Z", "EV_A", "EV_M"],  # Unsorted
+        )
+        ledger.add_record(child)
+
+        chain = ledger.trace_provenance_chain("EV_CHILD")
+        visited_ids = [step.get("evidence_id") for step in chain if step.get("status") == "RESOLVED"]
+        # EV_CHILD visited first, then sorted parents EV_A, EV_M, EV_Z
+        self.assertEqual(visited_ids, ["EV_CHILD", "EV_A", "EV_M", "EV_Z"])
+
 
 
 if __name__ == "__main__":

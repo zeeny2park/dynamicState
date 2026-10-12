@@ -88,11 +88,17 @@ class EvidenceRecord:
             raise ValueError(f"Invalid evidence_type '{self.evidence_type}'. Expected one of {sorted(VALID_EVIDENCE_TYPES)}")
         if self.nature not in VALID_NATURES:
             raise ValueError(f"Invalid evidence nature '{self.nature}'. Expected one of {sorted(VALID_NATURES)}")
+        if self.session_id is not None and (not isinstance(self.session_id, str) or not self.session_id.strip()):
+            raise ValueError("session_id must be a non-empty string when provided")
+        if self.finding_id is not None and (not isinstance(self.finding_id, str) or not self.finding_id.strip()):
+            raise ValueError("finding_id must be a non-empty string when provided")
         if not isinstance(self.parent_evidence_ids, (list, tuple)):
             raise TypeError("parent_evidence_ids must be a list of strings")
         for pid in self.parent_evidence_ids:
             if not isinstance(pid, str) or not pid.strip():
                 raise ValueError(f"Invalid parent_evidence_id '{pid}' in parent_evidence_ids")
+        if self.evidence_id in self.parent_evidence_ids:
+            raise ValueError(f"Self-reference detected: record cannot have its own evidence_id '{self.evidence_id}' as a parent")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary without None values for optional fields."""
@@ -239,11 +245,15 @@ class EvidenceLedger:
             raise ValueError(f"Invalid nature '{record.nature}'. Expected one of {sorted(VALID_NATURES)}")
         if record.session_id is not None and (not isinstance(record.session_id, str) or not record.session_id.strip()):
             raise ValueError("session_id must be a non-empty string when provided")
+        if record.finding_id is not None and (not isinstance(record.finding_id, str) or not record.finding_id.strip()):
+            raise ValueError("finding_id must be a non-empty string when provided")
         if not isinstance(record.parent_evidence_ids, (list, tuple)):
             raise TypeError("parent_evidence_ids must be a list or tuple of strings")
         for pid in record.parent_evidence_ids:
             if not isinstance(pid, str) or not pid.strip():
                 raise ValueError(f"Invalid parent_evidence_id '{pid}' in parent_evidence_ids: must be a non-empty string")
+        if record.evidence_id in record.parent_evidence_ids:
+            raise ValueError(f"Self-reference detected: record cannot have its own evidence_id '{record.evidence_id}' as a parent")
         for field_name, val in [
             ("snapshot_ref", record.snapshot_ref),
             ("target_identity", record.target_identity),
@@ -331,6 +341,14 @@ class EvidenceLedger:
                 "status": "RESOLVED",
             }
             chain.append(step)
+
+            if eid in rec.parent_evidence_ids:
+                chain.append({
+                    "evidence_id": eid,
+                    "status": "SELF_REFERENCE",
+                    "reason": f"Self-referencing parent found on evidence '{eid}'.",
+                })
+                return
 
             # Traverse parents deterministically (sorted)
             sorted_parents = sorted(rec.parent_evidence_ids)
