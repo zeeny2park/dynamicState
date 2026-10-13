@@ -156,7 +156,8 @@ class InvestigationSession:
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.status = "CREATED"  # CREATED, RUNNING, COMPLETED, PARTIAL, FAILED, BLOCKED
         self.corpus_dir = os.path.abspath(corpus_dir)
-        self.ledger = EvidenceLedger(session_id=investigation_id)
+        self._session_secret: str = uuid.uuid4().hex
+        self.ledger = EvidenceLedger(session_id=investigation_id, session_secret=self._session_secret)
 
         # Safety configuration (Strict read-only default)
         self.safety = {
@@ -196,6 +197,21 @@ class InvestigationSession:
         self.static_provider: StaticAnalysisProvider = NullStaticAnalysisProvider()
         self.summary: Dict[str, Any] = {}
         self.persistence: str = "EPHEMERAL_PROCESS_LOCAL"
+
+    def attest_causal_proof(
+        self,
+        evidence_id: str,
+        target_function: Optional[str] = None,
+        field_path: Optional[str] = None,
+        verification_type: str = "deterministic_reproduction",
+    ) -> bool:
+        """Attest an authentic proof record in this session's ledger."""
+        return self.ledger.attest_causal_proof(
+            evidence_id=evidence_id,
+            target_function=target_function,
+            field_path=field_path,
+            verification_type=verification_type,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to JSON-serializable dictionary."""
@@ -590,6 +606,9 @@ class InvestigationManager:
         elif getattr(session, "identity_evidence_id", None):
             parents.append(session.identity_evidence_id)
 
+        cmp_completeness = "COMPLETE" if diff_trust == "TRUSTED" else ("PARTIAL" if diff_trust == "PARTIALLY_TRUSTED" else "FAILED")
+        cmp_consistency = "STOPPED" if (level_a != NON_ATOMIC and level_b != NON_ATOMIC) else "NON_ATOMIC"
+
         ev = session.ledger.add_record(EvidenceRecord(
             evidence_type=EVIDENCE_TYPE_COMPARISON,
             nature=NATURE_OBSERVATION,
@@ -606,7 +625,8 @@ class InvestigationManager:
                 "trust_classification": diff_trust,
             },
             uncertainty=uncertainty,
-            details={"changes": diff_dict["changes"][:30], "trust_classification": diff_trust},
+            capture_quality={"completeness": cmp_completeness, "consistency_level": cmp_consistency},
+            details={"changes": diff_dict["changes"][:30], "trust_classification": diff_trust, "consistency_classification": cmp_consistency},
         ))
 
         # Add findings: NEVER generate category="fact" findings if capture diff is untrusted!
@@ -802,6 +822,25 @@ class InvestigationManager:
                 return h.to_dict()
         return None
 
+    def attest_causal_proof(
+        self,
+        investigation_id: str,
+        evidence_id: str,
+        target_function: Optional[str] = None,
+        field_path: Optional[str] = None,
+        verification_type: str = "deterministic_reproduction",
+    ) -> bool:
+        """Attest an authentic proof record in the specified investigation session."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            raise ValueError(f"Investigation '{investigation_id}' not found")
+        return session.attest_causal_proof(
+            evidence_id=evidence_id,
+            target_function=target_function,
+            field_path=field_path,
+            verification_type=verification_type,
+        )
+
     def evaluate_hypothesis(
         self,
         investigation_id: str,
@@ -825,12 +864,39 @@ class InvestigationManager:
 
         new_rec = None
         if new_evidence_data:
+            # Defensive copy & disarm external caller input
+            new_data = dict(new_evidence_data)
+            new_details = dict(new_data.get("details", {}))
+            new_prov = dict(new_data.get("provenance", {}))
+
+            # External caller cannot claim trusted verifier attestation
+            new_prov["submission_channel"] = "external_caller"
+            new_prov.pop("verifier_attestation", None)
+
+            # Any caller-supplied causal claims are marked as unverified caller claims
+            new_details["caller_submitted"] = True
+            if (
+                new_details.get("verified_transition") is True
+                or new_details.get("causal_proof") is True
+                or new_details.get("reproduction_verified") is True
+                or new_details.get("transition_verified") is True
+                or new_details.get("verified_writer") is True
+                or "transition" in str(new_data.get("observation", "")).lower()
+            ):
+                new_details["unverified_caller_claim"] = True
+                new_details["verified_transition"] = False
+                new_details["causal_proof"] = False
+                new_data["source"] = "unverified_caller"
+
+            new_data["details"] = new_details
+            new_data["provenance"] = new_prov
+
             try:
-                new_rec = EvidenceRecord.from_dict(new_evidence_data)
+                new_rec = EvidenceRecord.from_dict(new_data)
                 session.ledger.add_record(new_rec)
             except Exception as exc:
-                if "Duplicate evidence_id" in str(exc) and new_evidence_data.get("evidence_id"):
-                    new_rec = session.ledger.get_record(new_evidence_data["evidence_id"])
+                if "Duplicate evidence_id" in str(exc) and new_data.get("evidence_id"):
+                    new_rec = session.ledger.get_record(new_data["evidence_id"])
                 else:
                     return {"success": False, "error": f"Failed to attach evidence: {exc}"}
 
@@ -910,14 +976,17 @@ class InvestigationManager:
         if result_data:
             obs_text = result_data.get("observation", f"Observed {target_obs.question}")
             details = dict(result_data.get("details", {}))
+            details["caller_submitted"] = True
             outcome = result_data.get("outcome", details.get("outcome", "SUPPORTED"))
             # Invariant 9: Caller-submitted results cannot fabricate causal proof without verification
-            if not session.safety.get("target_authorized", False) and (
+            if (
                 outcome == "VALIDATED"
                 or details.get("verified_transition") is True
                 or details.get("causal_proof") is True
+                or details.get("reproduction_verified") is True
+                or details.get("transition_verified") is True
+                or details.get("verified_writer") is True
             ):
-                details["caller_submitted"] = True
                 details["unverified_caller_claim"] = True
                 details["verified_transition"] = False
                 details["causal_proof"] = False
@@ -959,6 +1028,8 @@ class InvestigationManager:
             observation=obs_text,
             parent_evidence_ids=[e for e in target_hypo.supporting_evidence_ids if session.ledger.get_record(e)],
             details=details,
+            provenance={"submission_channel": "external_caller" if result_data else "internal_observer"},
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(ev_record)
 

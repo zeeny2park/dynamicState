@@ -46,6 +46,9 @@ from extractor.investigation import (
     InvestigationFinding,
     InvestigationManager,
 )
+from extractor.agent_models import AgentAction
+from extractor.agent_runtime import AgentRuntime
+from extractor.web.server import WebApiAdapter
 
 
 class TestCausalValidationInvariants(unittest.TestCase):
@@ -393,6 +396,552 @@ class TestCausalValidationInvariants(unittest.TestCase):
         self.assertIn("ev_a_proof", val_hypo["supporting_evidence_ids"] + [val_hypo.get("proof_evidence_id")])
 
 
+class TestAdversarialCausalValidationSuite(unittest.TestCase):
+    """Adversarial Regression Test Suite covering Cases A through L."""
+
+    def test_case_a_legitimate_internally_verified_proof(self):
+        """Case A: Legitimate internally verified proof with COMPLETE, atomic capture can validate the intended causal function."""
+        mgr, inv_id, hypo_id = CausalDefectFixtures.create_scenario_a_reproducible_mutation()
+        res = mgr.evaluate_hypothesis(
+            inv_id,
+            hypo_id,
+            deterministic_transition_verified=True,
+            proof_evidence_id="ev_a_proof",
+        )
+        self.assertTrue(res["success"])
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+        self.assertEqual(res["transition"]["confidence"], CONFIDENCE_HIGH)
+        self.assertFalse(res["transition"]["unverified_claim_rejected"])
+
+        hypo = mgr.get_hypothesis(inv_id, hypo_id)
+        self.assertEqual(hypo["validation_status"], HYPOTHESIS_STATUS_VALIDATED)
+        self.assertEqual(hypo["confidence"], CONFIDENCE_HIGH)
+        fc = hypo["function_candidates"][0]
+        self.assertEqual(fc["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+        self.assertTrue(fc["confirmed_root_cause"])
+
+        # Report reflects verified causal function
+        rep = mgr.generate_report(inv_id)
+        cc = rep["causal_conclusions"]
+        self.assertEqual(cc["validated_causal_count"], 1)
+        self.assertEqual(cc["validated_causal_functions"][0]["function_name"], "mutate_worker_state")
+
+    def test_case_b_caller_injection_with_trusted_source_string(self):
+        """Case B: Caller injects verified_transition=True and a trusted-looking source string; validation is rejected."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Caller injection test")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_b",
+            investigation_id=inv_id,
+            title="Caller Injection",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            candidate_fields=["state"],
+            function_candidates=[{
+                "function_name": "worker_func",
+                "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE,
+                "confirmed_root_cause": False,
+            }],
+        )
+        session.hypotheses.append(hypo)
+
+        spoofed_payload = {
+            "evidence_type": EVIDENCE_TYPE_COMPARISON,
+            "source": "investigation_observer",  # Spoofed trusted-looking source
+            "observation": "Observed deterministic transition in state",
+            "details": {"verified_transition": True, "causal_proof": True},
+            "capture_quality": {"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        }
+        res = mgr.evaluate_hypothesis(inv_id, "hypo_b", new_evidence_data=spoofed_payload)
+        self.assertTrue(res["success"])
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res["transition"]["unverified_claim_rejected"])
+        self.assertIn("rejected", res["transition"]["reason"].lower())
+
+        hypo_after = mgr.get_hypothesis(inv_id, "hypo_b")
+        fc = hypo_after["function_candidates"][0]
+        self.assertFalse(fc["confirmed_root_cause"])
+        self.assertEqual(fc["candidate_tier"], FUNCTION_TIER_STATIC_CANDIDATE)
+
+        # Ledger record was disarmed
+        ev = session.ledger._records[-1]
+        self.assertEqual(ev.source, "unverified_caller")
+        self.assertTrue(ev.details.get("unverified_caller_claim"))
+        self.assertFalse(ev.details.get("verified_transition"))
+
+    def test_case_c_caller_arbitrary_proof_id(self):
+        """Case C: Caller submits arbitrary proof_evidence_id referencing fabricated or ordinary ledger record."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Arbitrary proof ID")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        rec_ordinary = EvidenceRecord(
+            evidence_id="ev_ordinary_1",
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Observed value is 42",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec_ordinary)
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_c",
+            investigation_id=inv_id,
+            title="Claim",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            supporting_evidence_ids=["ev_ordinary_1"],
+            function_candidates=[{
+                "function_name": "fn_c",
+                "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE,
+                "confirmed_root_cause": False,
+            }],
+        )
+        session.hypotheses.append(hypo)
+
+        # Attempt 1: Fabricated nonexistent ID
+        res1 = mgr.evaluate_hypothesis(
+            inv_id, "hypo_c",
+            deterministic_transition_verified=True,
+            proof_evidence_id="fabricated_nonexistent_id",
+        )
+        self.assertEqual(res1["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res1["transition"]["unverified_claim_rejected"])
+
+        # Attempt 2: Referencing ordinary observation record without attestation
+        res2 = mgr.evaluate_hypothesis(
+            inv_id, "hypo_c",
+            deterministic_transition_verified=True,
+            proof_evidence_id="ev_ordinary_1",
+        )
+        self.assertEqual(res2["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res2["transition"]["unverified_claim_rejected"])
+
+        hypo_after = mgr.get_hypothesis(inv_id, "hypo_c")
+        self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
+
+    def test_case_d_caller_proof_markers_and_observation_strings(self):
+        """Case D: Caller supplies causal_proof=True, reproduction_verified=True, or proof-like observation text."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Marker injection")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_d",
+            investigation_id=inv_id,
+            title="Claim D",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            candidate_fields=["counter"],
+            function_candidates=[{
+                "function_name": "inc_fn",
+                "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE,
+                "confirmed_root_cause": False,
+            }],
+        )
+        session.hypotheses.append(hypo)
+
+        marker_payload = {
+            "evidence_type": EVIDENCE_TYPE_COMPARISON,
+            "source": "collector",
+            "observation": "Deterministic transition reproduced in counter",
+            "details": {
+                "reproduction_verified": True,
+                "transition_verified": True,
+                "verified_writer": True,
+                "causal_proof": True,
+            },
+            "capture_quality": {"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        }
+        res = mgr.evaluate_hypothesis(inv_id, "hypo_d", new_evidence_data=marker_payload)
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res["transition"]["unverified_claim_rejected"])
+        hypo_after = mgr.get_hypothesis(inv_id, "hypo_d")
+        self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
+
+    def test_case_e_missing_quality_malformed_partial_non_atomic(self):
+        """Case E: Evidence with missing capture_quality, PARTIAL quality, or NON_ATOMIC consistency fails closed."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Quality ceilings")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        # 1. Missing capture quality
+        rec_missing = EvidenceRecord(
+            evidence_id="ev_missing_q",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Observed diff without quality metadata",
+            capture_quality=None,
+        )
+        session.ledger.add_record(rec_missing)
+        with self.assertRaises(ValueError):
+            session.attest_causal_proof("ev_missing_q")
+
+        # 2. PARTIAL capture completeness
+        rec_partial = EvidenceRecord(
+            evidence_id="ev_partial_q",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Observed diff under partial capture",
+            capture_quality={"completeness": "PARTIAL", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec_partial)
+        with self.assertRaises(ValueError):
+            session.attest_causal_proof("ev_partial_q")
+
+        # 3. NON_ATOMIC consistency
+        rec_non_atomic = EvidenceRecord(
+            evidence_id="ev_non_atomic_q",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Observed diff under non-atomic consistency",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "NON_ATOMIC"},
+        )
+        session.ledger.add_record(rec_non_atomic)
+        with self.assertRaises(ValueError):
+            session.attest_causal_proof("ev_non_atomic_q")
+
+    def test_case_f_complete_proof_with_degraded_parent(self):
+        """Case F: A proof record is COMPLETE but has a PARTIAL/UNTRUSTED/missing parent; causal validation is rejected."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Degraded ancestry")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        # Degraded parent (PARTIAL)
+        rec_parent = EvidenceRecord(
+            evidence_id="ev_parent_partial",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Parent diff under PARTIAL capture",
+            capture_quality={"completeness": "PARTIAL", "consistency_level": "NON_ATOMIC"},
+        )
+        session.ledger.add_record(rec_parent)
+
+        # Child proof is COMPLETE and attested
+        rec_child = EvidenceRecord(
+            evidence_id="ev_child_proof",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Child reproduction observation",
+            parent_evidence_ids=["ev_parent_partial"],
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            details={"target_function": "worker_mutate", "field_path": "obj.status"},
+        )
+        session.ledger.add_record(rec_child)
+        session.attest_causal_proof("ev_child_proof", target_function="worker_mutate", field_path="obj.status")
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_f",
+            investigation_id=inv_id,
+            title="Degraded Ancestry",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            candidate_fields=["obj.status"],
+            supporting_evidence_ids=["ev_parent_partial", "ev_child_proof"],
+            function_candidates=[{
+                "function_name": "worker_mutate",
+                "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED,
+                "confirmed_root_cause": False,
+            }],
+        )
+        session.hypotheses.append(hypo)
+
+        res = mgr.evaluate_hypothesis(inv_id, "hypo_f", proof_evidence_id="ev_child_proof")
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res["transition"]["unverified_claim_rejected"])
+        self.assertIn("PARTIAL ancestor", res["transition"]["reason"])
+
+        hypo_after = mgr.get_hypothesis(inv_id, "hypo_f")
+        self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
+
+    def test_case_g_cross_investigation_and_mismatched_target(self):
+        """Case G: Cross-investigation evidence IDs and mismatched target field/function are rejected."""
+        mgr = InvestigationManager()
+        start1 = mgr.start_investigation(goal="Session 1")
+        inv_id1 = start1["investigation_id"]
+        session1 = mgr.sessions[inv_id1]
+
+        start2 = mgr.start_investigation(goal="Session 2")
+        inv_id2 = start2["investigation_id"]
+        session2 = mgr.sessions[inv_id2]
+
+        rec_sess1 = EvidenceRecord(
+            evidence_id="ev_sess1_proof",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id1,
+            observation="Observed diff in session 1",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            details={"target_function": "worker_fn", "field_path": "obj.flag"},
+        )
+        session1.ledger.add_record(rec_sess1)
+        session1.attest_causal_proof("ev_sess1_proof", target_function="worker_fn", field_path="obj.flag")
+
+        # Adversary attempts to attach session 1 proof into session 2
+        session2.ledger._records.append(rec_sess1)
+        session2.ledger._by_id["ev_sess1_proof"] = rec_sess1
+
+        hypo2 = InvestigationHypothesis(
+            hypothesis_id="hypo_g",
+            investigation_id=inv_id2,
+            title="Cross-Session",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            candidate_fields=["obj.flag"],
+            supporting_evidence_ids=["ev_sess1_proof"],
+            function_candidates=[{
+                "function_name": "worker_fn",
+                "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED,
+                "confirmed_root_cause": False,
+            }],
+        )
+        session2.hypotheses.append(hypo2)
+
+        res_cross = mgr.evaluate_hypothesis(inv_id2, "hypo_g", proof_evidence_id="ev_sess1_proof")
+        self.assertEqual(res_cross["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res_cross["transition"]["unverified_claim_rejected"])
+        self.assertIn("token", res_cross["transition"]["reason"].lower())
+
+        # Mismatched target field check
+        rec_mismatch = EvidenceRecord(
+            evidence_id="ev_mismatch",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id2,
+            observation="Observed diff on different field",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            details={"target_function": "worker_fn", "field_path": "obj.totally_different_field"},
+        )
+        session2.ledger.add_record(rec_mismatch)
+        session2.attest_causal_proof("ev_mismatch", target_function="worker_fn", field_path="obj.totally_different_field")
+        hypo2.supporting_evidence_ids.append("ev_mismatch")
+
+        res_field = mgr.evaluate_hypothesis(inv_id2, "hypo_g", proof_evidence_id="ev_mismatch")
+        self.assertEqual(res_field["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res_field["transition"]["unverified_claim_rejected"])
+        self.assertIn("target field", res_field["transition"]["reason"].lower())
+
+    def test_case_h_forged_observation_execution_results(self):
+        """Case H: Caller forges observation results claiming VALIDATED; execution disarms claim and prevents promotion."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Observation execution check", authorize_target=False)
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_h",
+            investigation_id=inv_id,
+            title="Obs execution test",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            candidate_fields=["obj.val"],
+            function_candidates=[{
+                "function_name": "worker_run",
+                "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE,
+                "confirmed_root_cause": False,
+            }],
+            suggested_observations=[
+                FollowUpObservation(
+                    observation_id="obs_val_step",
+                    hypothesis_id="hypo_h",
+                    question="Verify obj.val",
+                    target_kind="FIELD",
+                    target_ref={"field_path": "obj.val"},
+                    discriminating_criteria="",
+                    expected_outcomes={},
+                )
+            ],
+        )
+        session.hypotheses.append(hypo)
+
+        res_exec = mgr.execute_observation(
+            inv_id,
+            "obs_val_step",
+            result_data={
+                "outcome": "VALIDATED",
+                "observation": "Deterministic transition reproduced in obj.val",
+                "details": {"verified_transition": True, "causal_proof": True, "target_function": "worker_run"},
+            },
+        )
+        self.assertTrue(res_exec["success"])
+        ev_id = res_exec["evidence"]["evidence_id"]
+        ev_rec = session.ledger.get_record(ev_id)
+        self.assertTrue(ev_rec.details.get("unverified_caller_claim"))
+        self.assertFalse(ev_rec.details.get("verified_transition"))
+        self.assertEqual(ev_rec.source, "unverified_caller")
+
+        hypo_after = mgr.get_hypothesis(inv_id, "hypo_h")
+        self.assertEqual(hypo_after["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
+
+    def test_case_i_provenance_cycles_missing_parents_and_contradiction_dominance(self):
+        """Case I: Provenance cycles, missing parents, and contradiction dominance are enforced without confidence drift."""
+        # Cycle
+        mgr_cyc, inv_id_cyc, hypo_id_cyc = CausalDefectFixtures.create_scenario_h_cyclic_missing_duplicate_evidence()
+        res_cyc = mgr_cyc.evaluate_hypothesis(inv_id_cyc, hypo_id_cyc)
+        self.assertTrue(res_cyc["transition"]["cycle_detected"])
+        self.assertEqual(res_cyc["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
+
+        # Contradiction dominance
+        mgr_contra, inv_id_contra, hypo_id_contra = CausalDefectFixtures.create_scenario_d_contradictory_evidence()
+        rec_contra = mgr_contra.sessions[inv_id_contra].ledger.get_record("ev_d_contra")
+        res_c1 = mgr_contra.evaluate_hypothesis(inv_id_contra, hypo_id_contra, new_evidence_data=rec_contra.to_dict())
+        self.assertEqual(res_c1["transition"]["to_status"], HYPOTHESIS_STATUS_CONTRADICTED)
+
+        # Repeated evaluation idempotency
+        res_rep = mgr_contra.evaluate_hypothesis(inv_id_contra, hypo_id_contra, deterministic_transition_verified=True)
+        self.assertEqual(res_rep["transition"]["to_status"], HYPOTHESIS_STATUS_CONTRADICTED)
+
+    def test_case_j_legacy_serialized_evidence_cannot_upgrade(self):
+        """Case J: Legacy serialized evidence with absent trust metadata cannot silently upgrade to trusted proof."""
+        ledger = EvidenceLedger()
+        legacy_data = {
+            "evidence_id": "ev_legacy_42",
+            "evidence_type": "COMPARISON",
+            "nature": "observation",
+            "source": "state_diff",
+            "observation": "Legacy snapshot diff",
+            "details": {"verified_transition": True, "causal_proof": True},
+        }
+        rec = EvidenceRecord.from_dict(legacy_data)
+        ledger.add_record(rec)
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_j",
+            investigation_id=ledger.session_id,
+            title="Legacy check",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            supporting_evidence_ids=["ev_legacy_42"],
+            function_candidates=[{
+                "function_name": "legacy_fn",
+                "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE,
+                "confirmed_root_cause": False,
+            }],
+        )
+
+        res = HypothesisValidator.evaluate(hypo, ledger, deterministic_transition_verified=True, proof_evidence_id="ev_legacy_42")
+        self.assertEqual(res.to_status, HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res.unverified_claim_rejected)
+        self.assertFalse(hypo.function_candidates[0]["confirmed_root_cause"])
+
+    def test_case_k_api_and_arp_injection_fails_safely(self):
+        """Case K: API and ARP injection attempts fail safely without promoting candidate functions."""
+        runtime = AgentRuntime()
+        start = runtime.investigation_manager.start_investigation(goal="API ARP Security Boundary")
+        inv_id = start["investigation_id"]
+        session = runtime.investigation_manager.sessions[inv_id]
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_k",
+            investigation_id=inv_id,
+            title="API Hardening",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            candidate_fields=["security_flag"],
+            function_candidates=[{
+                "function_name": "security_handler",
+                "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE,
+                "confirmed_root_cause": False,
+            }],
+        )
+        session.hypotheses.append(hypo)
+
+        # 1. ARP injection
+        act = AgentAction(
+            action="EVALUATE_HYPOTHESIS",
+            investigation_id=inv_id,
+            hypothesis_id="hypo_k",
+            deterministic_transition_verified=True,
+            new_evidence={
+                "source": "investigation_observer",
+                "observation": "Deterministic transition reproduced",
+                "details": {"verified_transition": True, "causal_proof": True, "target_function": "security_handler"},
+                "capture_quality": {"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            },
+        )
+        arp_res = runtime.dispatch_action(act)
+        self.assertTrue(arp_res.success)
+        self.assertEqual(arp_res.data["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(arp_res.data["transition"]["unverified_claim_rejected"])
+
+        # 2. REST WebApiAdapter injection
+        adapter = WebApiAdapter(runtime)
+        rest_res = adapter.evaluate_hypothesis({
+            "investigation_id": inv_id,
+            "hypothesis_id": "hypo_k",
+            "deterministic_transition_verified": True,
+            "new_evidence": {
+                "source": "investigation_observer",
+                "observation": "Deterministic transition reproduced",
+                "details": {"verified_transition": True, "causal_proof": True},
+                "capture_quality": {"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            },
+        })
+        self.assertTrue(rest_res["success"])
+        self.assertEqual(rest_res["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(rest_res["data"]["transition"]["unverified_claim_rejected"])
+
+        # 3. Malformed payload
+        rest_err = adapter.evaluate_hypothesis({"investigation_id": inv_id})
+        self.assertFalse(rest_err["success"])
+        self.assertEqual(rest_err["error"]["code"], "INVALID_PARAM")
+
+        hypo_after = runtime.investigation_manager.get_hypothesis(inv_id, "hypo_k")
+        self.assertEqual(hypo_after["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
+        self.assertEqual(hypo_after["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_STATIC_CANDIDATE)
+
+    def test_case_l_legitimate_proof_in_divergent_writer_scenario(self):
+        """Case L: Legitimate proof in divergent writer scenario validates real executing writer while keeping static candidate distinct."""
+        mgr, inv_id, hypo_id = CausalDefectFixtures.create_scenario_c_different_writer_than_leading_candidate()
+        res = mgr.evaluate_hypothesis(
+            inv_id,
+            hypo_id,
+            deterministic_transition_verified=True,
+            proof_evidence_id="ev_c_proof",
+        )
+        self.assertTrue(res["success"])
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+
+        hypo = mgr.get_hypothesis(inv_id, hypo_id)
+        cands = hypo["function_candidates"]
+        log_cand = next(c for c in cands if c["function_name"] == "log_status")
+        upd_cand = next(c for c in cands if c["function_name"] == "update_flags")
+
+        # log_status is purely static candidate
+        self.assertEqual(log_cand["candidate_tier"], FUNCTION_TIER_STATIC_CANDIDATE)
+        self.assertFalse(log_cand["confirmed_root_cause"])
+        self.assertIn("not confirmed root-cause function", log_cand["tier_limitation"])
+
+        # update_flags is genuine validated causal function
+        self.assertEqual(upd_cand["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+        self.assertTrue(upd_cand["confirmed_root_cause"])
+        self.assertIn("verified", upd_cand["tier_limitation"].lower())
+        self.assertNotIn("not confirmed", upd_cand["tier_limitation"].lower())
+
+
 class TestFalsePositiveEvaluationHarness(unittest.TestCase):
     """Test suite verifying the machine-readable false-positive evaluation harness."""
 
@@ -402,12 +951,12 @@ class TestFalsePositiveEvaluationHarness(unittest.TestCase):
         report = evaluator.run_all()
 
         metrics = report["summary_metrics"]
-        self.assertEqual(metrics["total_cases_evaluated"], 12)
+        self.assertEqual(metrics["total_cases_evaluated"], 18)
         self.assertEqual(metrics["correct_causal_validations_tp"], 2)
         self.assertEqual(metrics["false_causal_validations_fp"], 0, "CRITICAL SLA BREACH: False causal validations must be 0!")
         self.assertEqual(metrics["missed_causal_validations_fn"], 0)
-        self.assertEqual(metrics["correctly_inconclusive_or_rejected_tn"], 10)
-        self.assertGreaterEqual(metrics["unsupported_promotions_blocked"], 3)
+        self.assertEqual(metrics["correctly_inconclusive_or_rejected_tn"], 16)
+        self.assertGreaterEqual(metrics["unsupported_promotions_blocked"], 6)
         self.assertEqual(metrics["causal_validation_precision"], 1.0)
         self.assertEqual(metrics["causal_validation_recall"], 1.0)
         self.assertEqual(metrics["false_positive_rate"], 0.0)

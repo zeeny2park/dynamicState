@@ -206,14 +206,72 @@ class EvidenceRecord:
 class EvidenceLedger:
     """Versioned container and query index for evidence records within an investigation."""
 
-    def __init__(self, session_id: Optional[str] = None, schema_version: str = EVIDENCE_SCHEMA_VERSION):
+    def __init__(
+        self,
+        session_id: Optional[str] = None,
+        schema_version: str = EVIDENCE_SCHEMA_VERSION,
+        session_secret: Optional[str] = None,
+    ):
         self.session_id: str = session_id or f"inv_sess_{uuid.uuid4().hex[:8]}"
         self.schema_version: str = schema_version
+        self.session_secret: str = session_secret or uuid.uuid4().hex
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self._records: List[EvidenceRecord] = []
         self._by_id: Dict[str, EvidenceRecord] = {}
         self._by_type: Dict[str, List[EvidenceRecord]] = {}
         self._by_finding: Dict[str, List[EvidenceRecord]] = {}
+
+    def attest_causal_proof(
+        self,
+        evidence_id: str,
+        target_function: Optional[str] = None,
+        field_path: Optional[str] = None,
+        verification_type: str = "deterministic_reproduction",
+    ) -> bool:
+        """Attest an authentic proof record in this ledger with the session secret."""
+        rec = self.get_record(evidence_id)
+        if not rec:
+            raise ValueError(f"Evidence record '{evidence_id}' does not exist in ledger")
+
+        p_details = rec.details or {}
+        p_prov = rec.provenance or {}
+        if (
+            p_details.get("caller_submitted") is True
+            or p_details.get("unverified_caller_claim") is True
+            or rec.source == "unverified_caller"
+            or p_prov.get("submission_channel") == "external_caller"
+        ):
+            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' originated from unverified external caller")
+
+        cq = rec.capture_quality
+        if not cq or not isinstance(cq, dict):
+            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' lacks capture quality metadata")
+        comp = cq.get("completeness") or cq.get("status")
+        if comp != "COMPLETE":
+            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' has non-complete capture quality '{comp}'")
+        cons = cq.get("consistency_level") or cq.get("consistency_classification") or p_details.get("consistency_classification")
+        if cons not in ("STOPPED", "ATOMIC", "CONSISTENT") or p_details.get("is_non_atomic") is True:
+            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' lacks atomic/stopped consistency '{cons}'")
+
+        if rec.session_id and rec.session_id != self.session_id:
+            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' belongs to session '{rec.session_id}', not '{self.session_id}'")
+
+        # Stamp authentic internal attestation
+        rec.provenance["verifier_attestation"] = {
+            "token": self.session_secret,
+            "investigation_id": self.session_id,
+            "target_function": target_function,
+            "field_path": field_path,
+            "verification_type": verification_type,
+            "attested_at": datetime.now(timezone.utc).isoformat(),
+        }
+        rec.details["verified_transition"] = True
+        rec.details["causal_proof"] = True
+        if target_function and "target_function" not in rec.details:
+            rec.details["target_function"] = target_function
+        if field_path and "field_path" not in rec.details:
+            rec.details["field_path"] = field_path
+        return True
 
     def add_record(self, record: Union[EvidenceRecord, Dict[str, Any]]) -> EvidenceRecord:
         """Add an evidence record to the ledger, rejecting duplicate IDs."""
@@ -267,6 +325,25 @@ class EvidenceLedger:
         ]:
             if val is not None and not isinstance(val, dict):
                 raise TypeError(f"Field '{field_name}' must be a dictionary when provided, got {type(val).__name__}")
+
+        # Invalidate unauthenticated or caller-forged verifier attestations
+        if record.provenance and "verifier_attestation" in record.provenance:
+            att = record.provenance.get("verifier_attestation")
+            if not isinstance(att, dict) or att.get("token") != self.session_secret or att.get("investigation_id") != self.session_id:
+                record.provenance["verifier_attestation"] = None
+                record.provenance["attestation_rejected"] = "Invalid, unverified, or cross-session attestation token"
+
+        # Disarm attestation if record is marked caller_submitted
+        p_details = record.details or {}
+        p_prov = record.provenance or {}
+        if (
+            p_details.get("caller_submitted") is True
+            or p_details.get("unverified_caller_claim") is True
+            or record.source == "unverified_caller"
+            or p_prov.get("submission_channel") == "external_caller"
+        ):
+            if record.provenance:
+                record.provenance["verifier_attestation"] = None
 
     def get_record(self, evidence_id: str) -> Optional[EvidenceRecord]:
         """Look up record by unique ID."""

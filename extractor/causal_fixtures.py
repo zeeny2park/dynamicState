@@ -143,6 +143,11 @@ class CausalDefectFixtures:
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_proof)
+        session.attest_causal_proof(
+            evidence_id="ev_a_proof",
+            target_function="mutate_worker_state",
+            field_path="WorkerState.counter",
+        )
 
         return mgr, inv_id, hypo.hypothesis_id
 
@@ -264,6 +269,11 @@ class CausalDefectFixtures:
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_proof)
+        session.attest_causal_proof(
+            evidence_id="ev_c_proof",
+            target_function="update_flags",
+            field_path="State.flags",
+        )
 
         return mgr, inv_id, hypo.hypothesis_id
 

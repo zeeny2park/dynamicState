@@ -543,22 +543,35 @@ class ValidationTransitionResult:
 class HypothesisValidator:
     """Evaluates and validates hypotheses against the Evidence Ledger with strict criteria."""
 
-    @staticmethod
-    def check_provenance_integrity(ledger: EvidenceLedger, start_evidence_id: str, max_depth: int = 50) -> Tuple[bool, Optional[str]]:
-        """Verify that the evidence provenance graph is acyclic and has no missing parent records.
+    @classmethod
+    def check_provenance_ancestry_quality(
+        cls,
+        ledger: EvidenceLedger,
+        start_evidence_id: str,
+        max_depth: int = 50,
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """Verify provenance acyclicity, presence of parent records, and ancestor capture quality.
 
-        Returns: (has_cycle: bool, error_message: Optional[str])
+        Returns: (is_valid: bool, error_message: Optional[str], quality_summary: Dict[str, Any])
         """
         visited: Set[str] = set()
         stack: Set[str] = set()
+        quality_summary: Dict[str, Any] = {
+            "has_untrusted_ancestor": False,
+            "has_partial_ancestor": False,
+            "has_non_atomic_ancestor": False,
+            "has_missing_quality_ancestor": False,
+            "has_cross_session_ancestor": False,
+            "ancestor_count": 0,
+        }
 
         def _dfs(eid: str, depth: int) -> Tuple[bool, Optional[str]]:
             if depth > max_depth:
-                return True, "Maximum provenance depth exceeded (potential cycle)"
+                return False, "Maximum provenance depth exceeded (potential cycle)"
             if eid in stack:
-                return True, f"Cycle detected in evidence provenance involving '{eid}'"
+                return False, f"Cycle detected in evidence provenance involving '{eid}'"
             if eid in visited:
-                return False, None
+                return True, None
 
             visited.add(eid)
             stack.add(eid)
@@ -566,22 +579,58 @@ class HypothesisValidator:
             rec = ledger.get_record(eid)
             if not rec:
                 stack.remove(eid)
-                return False, None
+                return True, None
+
+            # Check ancestor quality (depth > 0: parent and higher ancestors)
+            if depth > 0:
+                quality_summary["ancestor_count"] += 1
+                if rec.session_id and rec.session_id != ledger.session_id:
+                    quality_summary["has_cross_session_ancestor"] = True
+
+                cq = rec.capture_quality
+                if not cq or not isinstance(cq, dict):
+                    quality_summary["has_missing_quality_ancestor"] = True
+                else:
+                    c_status = cq.get("completeness") or cq.get("status")
+                    if not c_status or c_status in ("FAILED", "INVALID", "UNTRUSTED"):
+                        quality_summary["has_untrusted_ancestor"] = True
+                    elif c_status == "PARTIAL":
+                        quality_summary["has_partial_ancestor"] = True
+
+                    c_level = cq.get("consistency_level") or cq.get("consistency_classification") or (rec.details or {}).get("consistency_classification")
+                    if not c_level or c_level not in ("STOPPED", "ATOMIC", "CONSISTENT") or (rec.details or {}).get("is_non_atomic") is True:
+                        quality_summary["has_non_atomic_ancestor"] = True
 
             for parent_id in rec.parent_evidence_ids:
                 parent_rec = ledger.get_record(parent_id)
                 if not parent_rec:
                     stack.remove(eid)
                     return False, f"Missing parent evidence record '{parent_id}' referenced by '{eid}'"
-                cycle, err = _dfs(parent_id, depth + 1)
-                if cycle or err:
+                ok, err = _dfs(parent_id, depth + 1)
+                if not ok or err:
                     stack.remove(eid)
-                    return cycle, err
+                    return False, err
 
             stack.remove(eid)
-            return False, None
+            return True, None
 
-        return _dfs(start_evidence_id, 0)
+        ok, err = _dfs(start_evidence_id, 0)
+        return ok, err, quality_summary
+
+    @classmethod
+    def check_provenance_integrity(
+        cls,
+        ledger: EvidenceLedger,
+        start_evidence_id: str,
+        max_depth: int = 50,
+    ) -> Tuple[bool, Optional[str]]:
+        """Verify that the evidence provenance graph is strictly acyclic and all referenced parent records exist.
+
+        Returns: (has_cycle: bool, error_message: Optional[str])
+        """
+        ok, err, _ = cls.check_provenance_ancestry_quality(ledger, start_evidence_id, max_depth)
+        has_cycle = (not ok) and (err is not None) and ("cycle" in err.lower())
+        return has_cycle, err
 
     @classmethod
     def detect_cycles(cls, ledger: EvidenceLedger, start_evidence_id: str, max_depth: int = 50) -> bool:
@@ -624,14 +673,14 @@ class HypothesisValidator:
     ) -> Tuple[bool, str, Optional[EvidenceRecord]]:
         """Verify whether an auditable, independent evidence record in the ledger proves the causal relationship.
 
-        Criteria for Valid Causal Proof:
-        1. A caller-supplied Boolean WITHOUT an auditable, verified proof record is strictly rejected.
-        2. The proof evidence record MUST exist in the ledger with valid provenance.
-        3. The proof record's capture quality must be COMPLETE (never PARTIAL, FAILED, INVALID, or UNTRUSTED).
-        4. Capture consistency must NOT be NON_ATOMIC (atomic stop required for causal temporal ordering).
-        5. The record must have NO provenance cycles and NO missing parent records.
-        6. The record must NOT be duplicate or synthetic/unauthorized caller fabrication.
-        7. The record details must demonstrate explicit causal criteria: verified_transition/causal_proof/reproduction_verified
+        Strict Canonical Proof Contract:
+        1. A caller-supplied Boolean or proof ID WITHOUT authentic internal verifier attestation is rejected.
+        2. The proof evidence record MUST exist in the ledger with authentic verifier attestation matching ledger secret.
+        3. Cross-investigation, replayed, or synthetic proof records are rejected.
+        4. Proof record and all required ancestors must have COMPLETE capture quality (never PARTIAL, FAILED, INVALID, or UNTRUSTED).
+        5. Capture consistency must be atomic/stopped (never NON_ATOMIC or unknown).
+        6. Provenance graph must be strictly acyclic with NO missing parent records.
+        7. Scope must match the hypothesis target field and/or function candidate.
         """
         # 1. Locate the candidate proof record
         proof_rec: Optional[EvidenceRecord] = None
@@ -647,8 +696,10 @@ class HypothesisValidator:
                     continue
                 obs_lower = cand.observation.lower()
                 cand_details = cand.details or {}
+                cand_prov = cand.provenance or {}
                 has_causal_marker = (
-                    cand_details.get("verified_transition") is True
+                    "verifier_attestation" in cand_prov
+                    or cand_details.get("verified_transition") is True
                     or cand_details.get("causal_proof") is True
                     or cand_details.get("reproduction_verified") is True
                     or cand_details.get("transition_verified") is True
@@ -672,37 +723,143 @@ class HypothesisValidator:
                 )
             return False, "Awaiting verified causal transition proof evidence", None
 
-        # 2. Check if proof record was an unverified caller submission
         p_details = proof_rec.details or {}
-        if p_details.get("caller_submitted") is True or p_details.get("unverified_caller_claim") is True or proof_rec.source == "unverified_caller":
+        p_prov = proof_rec.provenance or {}
+
+        # 2. Check if proof record was an unverified caller submission
+        if (
+            p_details.get("caller_submitted") is True
+            or p_details.get("unverified_caller_claim") is True
+            or proof_rec.source == "unverified_caller"
+            or p_prov.get("submission_channel") == "external_caller"
+        ):
             return (
                 False,
                 f"Proof evidence '{proof_rec.evidence_id}' was submitted by unverified caller without independent execution",
                 proof_rec,
             )
 
-        # 3. Check capture quality of proof record
-        cq = proof_rec.capture_quality or {}
-        c_status = cq.get("completeness") or cq.get("status") or "COMPLETE"
-        if c_status in ("FAILED", "INVALID", "UNTRUSTED"):
+        # 3. Check capture quality and consistency of proof record itself
+        cq = proof_rec.capture_quality
+        if not cq or not isinstance(cq, dict):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' lacks capture quality metadata; causal validation rejected",
+                proof_rec,
+            )
+        c_status = cq.get("completeness") or cq.get("status")
+        if not c_status or c_status in ("FAILED", "INVALID", "UNTRUSTED"):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has {c_status or 'MISSING'} capture quality; causal validation rejected",
+                proof_rec,
+            )
+        if c_status != "COMPLETE":
             return (
                 False,
                 f"Proof evidence '{proof_rec.evidence_id}' has {c_status} capture quality; causal validation rejected",
                 proof_rec,
             )
 
-        # 4. Check provenance integrity (cycles and missing parents)
-        has_cycle, prov_err = cls.check_provenance_integrity(ledger, proof_rec.evidence_id)
-        if has_cycle:
+        c_level = cq.get("consistency_level") or cq.get("consistency_classification") or p_details.get("consistency_classification")
+        if not c_level or c_level not in ("STOPPED", "ATOMIC", "CONSISTENT") or p_details.get("is_non_atomic") is True:
             return (
                 False,
-                f"Proof evidence '{proof_rec.evidence_id}' is part of a cyclic provenance graph",
+                f"Proof evidence '{proof_rec.evidence_id}' lacks atomic/stopped consistency ({c_level or 'UNKNOWN'}); causal validation rejected",
                 proof_rec,
             )
-        if prov_err:
+
+        # 4. Verify internal verifier attestation
+        attestation = p_prov.get("verifier_attestation")
+        if not attestation or not isinstance(attestation, dict):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' lacks authentic internal verifier attestation",
+                proof_rec,
+            )
+        if attestation.get("token") != ledger.session_secret:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has invalid or unverified attestation token",
+                proof_rec,
+            )
+        if attestation.get("investigation_id") != hypothesis.investigation_id:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' attestation belongs to investigation '{attestation.get('investigation_id')}', not '{hypothesis.investigation_id}'",
+                proof_rec,
+            )
+
+        # 5. Check cross-investigation record ownership
+        if proof_rec.session_id and proof_rec.session_id != hypothesis.investigation_id:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' belongs to session '{proof_rec.session_id}', rejected as cross-investigation evidence",
+                proof_rec,
+            )
+
+        # 6. Check provenance integrity and ancestry quality
+        ok, prov_err, anc_summary = cls.check_provenance_ancestry_quality(ledger, proof_rec.evidence_id)
+        if not ok or prov_err:
+            if "cycle" in str(prov_err).lower():
+                return (
+                    False,
+                    f"Proof evidence '{proof_rec.evidence_id}' is part of a cyclic provenance graph",
+                    proof_rec,
+                )
             return (
                 False,
                 f"Proof evidence '{proof_rec.evidence_id}' provenance error: {prov_err}",
+                proof_rec,
+            )
+        if anc_summary.get("has_untrusted_ancestor"):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has untrusted/failed ancestor evidence in provenance chain; causal validation rejected",
+                proof_rec,
+            )
+        if anc_summary.get("has_missing_quality_ancestor"):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has ancestor with missing capture quality in provenance chain; causal validation rejected",
+                proof_rec,
+            )
+        if anc_summary.get("has_partial_ancestor"):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has PARTIAL ancestor evidence in provenance chain; causal validation rejected",
+                proof_rec,
+            )
+        if anc_summary.get("has_non_atomic_ancestor"):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has NON_ATOMIC ancestor evidence in provenance chain; causal validation rejected",
+                proof_rec,
+            )
+        if anc_summary.get("has_cross_session_ancestor"):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has cross-session ancestor evidence in provenance chain; causal validation rejected",
+                proof_rec,
+            )
+
+        # 7. Check scope / target identity binding
+        target_fields = getattr(hypothesis, "candidate_fields", []) or []
+        proof_field = p_details.get("field_path") or attestation.get("field_path") or ""
+        if target_fields and proof_field:
+            if not any(f.lower() in proof_field.lower() or proof_field.lower() in f.lower() for f in target_fields):
+                return (
+                    False,
+                    f"Proof evidence '{proof_rec.evidence_id}' target field '{proof_field}' does not match hypothesis candidate fields {target_fields}",
+                    proof_rec,
+                )
+
+        proof_fn = p_details.get("target_function") or attestation.get("target_function") or p_details.get("writer_function")
+        cand_fns = [fc.get("function_name") for fc in hypothesis.function_candidates if fc.get("function_name")]
+        if proof_fn and cand_fns and proof_fn not in cand_fns:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' target function '{proof_fn}' does not match any hypothesis function candidate",
                 proof_rec,
             )
 
@@ -763,7 +920,7 @@ class HypothesisValidator:
             if rec:
                 cq = rec.capture_quality or {}
                 c_status = cq.get("completeness") or cq.get("status")
-                if c_status in ("FAILED", "INVALID"):
+                if c_status in ("FAILED", "INVALID", "UNTRUSTED"):
                     has_untrusted_evidence = True
                 elif c_status == "PARTIAL":
                     has_partial_evidence = True
@@ -798,7 +955,7 @@ class HypothesisValidator:
                         hypothesis.supporting_evidence_ids.append(new_evidence.evidence_id)
                         cq = new_evidence.capture_quality or {}
                         c_status = cq.get("completeness") or cq.get("status")
-                        if c_status in ("FAILED", "INVALID"):
+                        if c_status in ("FAILED", "INVALID", "UNTRUSTED"):
                             has_untrusted_evidence = True
                         elif c_status == "PARTIAL":
                             has_partial_evidence = True
@@ -835,7 +992,7 @@ class HypothesisValidator:
         elif has_untrusted_evidence:
             new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
             new_conf = CONFIDENCE_LOW
-            reason = "Supporting evidence originates from FAILED or INVALID capture; cannot support hypothesis."
+            reason = "Supporting evidence originates from FAILED, INVALID, or missing capture quality; cannot support hypothesis."
         elif supp_count > 0:
             proof_valid, proof_msg, proof_rec = cls.verify_causal_proof(
                 hypothesis,
@@ -885,11 +1042,20 @@ class HypothesisValidator:
                             fc["tier_limitation"] = "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
             else:
                 # Causal proof was not established
-                new_status = HYPOTHESIS_STATUS_SUPPORTED
-                new_conf = CONFIDENCE_MEDIUM if (not has_partial_evidence and not has_non_atomic_evidence) else CONFIDENCE_LOW
-                if deterministic_transition_verified:
+                if proof_rec and (proof_rec.capture_quality or {}).get("completeness") in ("FAILED", "INVALID", "UNTRUSTED"):
+                    new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+                    new_conf = CONFIDENCE_LOW
+                else:
+                    new_status = HYPOTHESIS_STATUS_SUPPORTED
+                    new_conf = CONFIDENCE_MEDIUM if (not has_partial_evidence and not has_non_atomic_evidence) else CONFIDENCE_LOW
+                if deterministic_transition_verified or proof_evidence_id or (new_evidence and ((new_evidence.details or {}).get("unverified_caller_claim") or (new_evidence.details or {}).get("caller_submitted"))):
                     unverified_claim_rejected = True
-                    reason = f"Supported by {supp_count} observation(s); caller-supplied deterministic_transition_verified boolean rejected ({proof_msg})."
+                    if has_partial_evidence:
+                        reason = f"Supported by {supp_count} observation(s); capture quality is PARTIAL; capped at SUPPORTED ({proof_msg})."
+                    elif has_non_atomic_evidence:
+                        reason = f"Supported by {supp_count} observation(s); capture consistency is NON_ATOMIC; capped at SUPPORTED ({proof_msg})."
+                    else:
+                        reason = f"Supported by {supp_count} observation(s); causal proof rejected ({proof_msg})."
                 else:
                     reason = f"Supported by {supp_count} observation(s); awaiting explicit causal validation."
         else:

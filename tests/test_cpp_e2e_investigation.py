@@ -29,6 +29,7 @@ from extractor.capture_backend import (
     ProcfsCaptureBackend,
 )
 from extractor.debug_image import inspect_elf
+from extractor.evidence_ledger import EvidenceRecord
 from extractor.investigation import InvestigationManager
 from extractor.raw_snapshot import RawRuntimeSnapshot
 from extractor.static_analyzer import (
@@ -384,22 +385,31 @@ class TestCppE2EInvestigation(unittest.TestCase):
         self.assertTrue(unverified_eval["transition"]["unverified_claim_rejected"])
 
         # Legitimate validation with verified diff comparison evidence
+        proof_eid = f"ev_cpp_proof_{inv_id}"
+        rec_proof = EvidenceRecord(
+            evidence_id=proof_eid,
+            evidence_type="COMPARISON",
+            nature="observation",
+            source="investigation_observer",
+            session_id=inv_id,
+            observation="Deterministic transition reproduced: counter 42 -> 100 via mutate_worker_state",
+            details={
+                "target_function": "mutate_worker_state",
+                "field_path": "State.counter",
+            },
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        self.mgr.sessions[inv_id].ledger.add_record(rec_proof)
+        self.mgr.attest_causal_proof(
+            inv_id,
+            proof_eid,
+            target_function="mutate_worker_state",
+            field_path="State.counter",
+        )
         verified_eval = self.mgr.evaluate_hypothesis(
             inv_id,
             h_id,
-            new_evidence_data={
-                "evidence_id": f"ev_cpp_proof_{inv_id}",
-                "evidence_type": "comparison",
-                "nature": "observation",
-                "source": "investigation_observer",
-                "observation": "Deterministic transition reproduced: counter 42 -> 100 via mutate_worker_state",
-                "details": {
-                    "verified_transition": True,
-                    "target_function": "mutate_worker_state",
-                    "field_path": "State.counter",
-                },
-                "capture_quality": {"completeness": "COMPLETE"},
-            },
+            proof_evidence_id=proof_eid,
             deterministic_transition_verified=True,
         )
         self.assertTrue(verified_eval["success"])

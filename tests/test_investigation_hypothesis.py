@@ -436,14 +436,17 @@ class TestHypothesisValidator(unittest.TestCase):
             evidence_type=EVIDENCE_TYPE_COMPARISON,
             nature=NATURE_OBSERVATION,
             source="test",
+            session_id=self.ledger.session_id,
             observation="Deterministic transition reproduced 42 -> 100",
-            capture_quality={"completeness": "COMPLETE"},
+            details={"target_function": "mutate_state"},
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         self.ledger.add_record(rec_supp)
+        self.ledger.attest_causal_proof("ev_det_1", target_function="mutate_state")
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_valid",
-            investigation_id="inv_1",
+            investigation_id=self.ledger.session_id,
             title="Valid Claim",
             claim="Function mutate_state caused counter transition",
             proposed_mechanism="mutate_state wrote counter=100",
@@ -460,6 +463,7 @@ class TestHypothesisValidator(unittest.TestCase):
             hypo,
             self.ledger,
             deterministic_transition_verified=True,
+            proof_evidence_id="ev_det_1",
         )
 
         self.assertEqual(res.to_status, HYPOTHESIS_STATUS_VALIDATED)
@@ -592,21 +596,31 @@ class TestInvestigationManagerHypothesisIntegration(unittest.TestCase):
         self.assertTrue(unverified_eval["transition"]["unverified_claim_rejected"])
 
         # 6b. Evaluate with verifiable deterministic transition proof evidence
+        proof_eid = "ev_proof_full"
+        rec_proof = EvidenceRecord(
+            evidence_id=proof_eid,
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="investigation_observer",
+            session_id=inv_id,
+            observation="Deterministic transition reproduced 42 -> 100",
+            details={
+                "target_function": "update_counter",
+                "field_path": "State.counter",
+            },
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec_proof)
+        self.manager.attest_causal_proof(
+            inv_id,
+            proof_eid,
+            target_function="update_counter",
+            field_path="State.counter",
+        )
         eval_res = self.manager.evaluate_hypothesis(
             inv_id,
             hypo_id,
-            new_evidence_data={
-                "evidence_id": "ev_proof_full",
-                "evidence_type": EVIDENCE_TYPE_COMPARISON,
-                "nature": NATURE_OBSERVATION,
-                "source": "investigation_observer",
-                "observation": "Deterministic transition reproduced 42 -> 100",
-                "details": {
-                    "verified_transition": True,
-                    "target_function": "update_counter",
-                },
-                "capture_quality": {"completeness": "COMPLETE"},
-            },
+            proof_evidence_id=proof_eid,
             deterministic_transition_verified=True,
         )
         self.assertTrue(eval_res["success"])
@@ -728,19 +742,42 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
         self.assertEqual(eval_res_bool["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
         self.assertTrue(eval_res_bool["data"]["transition"]["unverified_claim_rejected"])
 
-        # 5b. EVALUATE_HYPOTHESIS with verified proof evidence succeeds
-        eval_res = self.adapter.evaluate_hypothesis({
+        # 5b. EVALUATE_HYPOTHESIS with unverified caller new_evidence is disarmed and rejected
+        eval_res_injected = self.adapter.evaluate_hypothesis({
             "investigation_id": inv_id,
             "hypothesis_id": hypo_id,
             "new_evidence": {
-                "evidence_id": "ev_proof_arp",
+                "evidence_id": "ev_proof_injected",
                 "evidence_type": EVIDENCE_TYPE_COMPARISON,
                 "nature": NATURE_OBSERVATION,
                 "source": "investigation_observer",
                 "observation": "Deterministic transition reproduced 1 -> 2",
                 "details": {"verified_transition": True},
-                "capture_quality": {"completeness": "COMPLETE"},
+                "capture_quality": {"completeness": "COMPLETE", "consistency_level": "STOPPED"},
             },
+            "deterministic_transition_verified": True,
+        })
+        self.assertTrue(eval_res_injected["success"])
+        self.assertEqual(eval_res_injected["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(eval_res_injected["data"]["transition"]["unverified_claim_rejected"])
+
+        # 5c. EVALUATE_HYPOTHESIS with authentic internal verifier attested proof succeeds
+        rec_arp_proof = EvidenceRecord(
+            evidence_id="ev_proof_arp",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="investigation_observer",
+            session_id=inv_id,
+            observation="Deterministic transition reproduced 1 -> 2",
+            details={"field_path": "obj_x.val"},
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec_arp_proof)
+        self.runtime.investigation_manager.attest_causal_proof(inv_id, "ev_proof_arp", field_path="obj_x.val")
+        eval_res = self.adapter.evaluate_hypothesis({
+            "investigation_id": inv_id,
+            "hypothesis_id": hypo_id,
+            "proof_evidence_id": "ev_proof_arp",
             "deterministic_transition_verified": True,
         })
         self.assertTrue(eval_res["success"])

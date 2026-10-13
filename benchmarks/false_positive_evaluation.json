@@ -1,25 +1,25 @@
 {
   "evaluation_metadata": {
-    "timestamp_utc": "2026-10-13T19:15:18.472112+00:00",
+    "timestamp_utc": "2026-10-13T19:54:09.882872+00:00",
     "framework": "dynamicState Causal Validation Evaluator v1.0",
     "denominator_definitions": {
-      "total_scenarios": "Total evaluated deterministic test cases (N=12)",
+      "total_scenarios": "Total evaluated deterministic test cases (N=18)",
       "ground_truth_causal_positives": "Cases where causal relationship is genuinely proven (N=2)",
-      "ground_truth_non_positives": "Cases where causality is unproven, contradictory, non-atomic, or partial (N=10)",
+      "ground_truth_non_positives": "Cases where causality is unproven, contradictory, non-atomic, or partial (N=16)",
       "false_causal_validation_rate": "FP / ground_truth_non_positives (MUST BE 0.0)",
       "unsupported_promotions_blocked": "Cases where unverified boolean or forged proof was explicitly rejected"
     },
     "production_applicability_notice": "Measurements reflect deterministic synthetic fixtures and unit/integration defect scenarios. Synthetic fixture accuracy must not be conflated with real-world production capture accuracy."
   },
   "summary_metrics": {
-    "total_cases_evaluated": 12,
+    "total_cases_evaluated": 18,
     "ground_truth_causal_positives": 2,
-    "ground_truth_non_positives": 10,
+    "ground_truth_non_positives": 16,
     "correct_causal_validations_tp": 2,
     "false_causal_validations_fp": 0,
     "missed_causal_validations_fn": 0,
-    "correctly_inconclusive_or_rejected_tn": 10,
-    "unsupported_promotions_blocked": 3,
+    "correctly_inconclusive_or_rejected_tn": 16,
+    "unsupported_promotions_blocked": 10,
     "causal_validation_precision": 1.0,
     "causal_validation_recall": 1.0,
     "false_positive_rate": 0.0,
@@ -27,20 +27,27 @@
   },
   "breakdown_by_capture_quality": {
     "COMPLETE": {
-      "total": 10,
+      "total": 14,
       "tp": 2,
       "fp": 0,
-      "tn": 8,
+      "tn": 12,
       "fn": 0
     },
     "PARTIAL": {
+      "total": 2,
+      "tp": 0,
+      "fp": 0,
+      "tn": 2,
+      "fn": 0
+    },
+    "FAILED": {
       "total": 1,
       "tp": 0,
       "fp": 0,
       "tn": 1,
       "fn": 0
     },
-    "FAILED": {
+    "UNKNOWN": {
       "total": 1,
       "tp": 0,
       "fp": 0,
@@ -129,15 +136,15 @@
       "consistency_level": "NON_ATOMIC",
       "ground_truth_is_causal": false,
       "evaluation_status": "SUPPORTED",
-      "evaluation_confidence": "MEDIUM",
+      "evaluation_confidence": "LOW",
       "candidate_tier": "EVIDENCE_SUPPORTED_CANDIDATE",
       "confirmed_root_cause": false,
-      "unverified_claim_rejected": false,
+      "unverified_claim_rejected": true,
       "is_true_positive": false,
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Causal transition observed, but capture quality is PARTIAL; capped at SUPPORTED."
+      "reason": "Supported by 1 observation(s); capture quality is PARTIAL; capped at SUPPORTED (Proof evidence 'ev_e_diff' has PARTIAL capture quality; causal validation rejected)."
     },
     {
       "case_id": "case_06_scenario_e_non_atomic",
@@ -155,7 +162,7 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); caller-supplied deterministic_transition_verified boolean rejected (Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements)."
+      "reason": "Supported by 1 observation(s); capture consistency is NON_ATOMIC; capped at SUPPORTED (Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements)."
     },
     {
       "case_id": "case_07_scenario_g_boolean_injection",
@@ -173,7 +180,7 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); caller-supplied deterministic_transition_verified boolean rejected (Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements)."
     },
     {
       "case_id": "case_08_scenario_g_fake_proof_id",
@@ -191,7 +198,7 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); caller-supplied deterministic_transition_verified boolean rejected (Referenced proof evidence 'fake_fabricated_id_999' does not exist in ledger)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Referenced proof evidence 'fake_fabricated_id_999' does not exist in ledger)."
     },
     {
       "case_id": "case_09_scenario_h_cycle",
@@ -263,7 +270,115 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supporting evidence originates from FAILED or INVALID capture; cannot support hypothesis."
+      "reason": "Supporting evidence originates from FAILED, INVALID, or missing capture quality; cannot support hypothesis."
+    },
+    {
+      "case_id": "case_13_case_d_caller_markers",
+      "scenario": "Case D: Caller Causal Proof Markers",
+      "description": "Caller supplies causal_proof=True, reproduction_verified=True, and transition text without attestation; rejected.",
+      "capture_quality": "COMPLETE",
+      "consistency_level": "STOPPED",
+      "ground_truth_is_causal": false,
+      "evaluation_status": "SUPPORTED",
+      "evaluation_confidence": "MEDIUM",
+      "candidate_tier": "STATIC_CANDIDATE",
+      "confirmed_root_cause": false,
+      "unverified_claim_rejected": true,
+      "is_true_positive": false,
+      "is_false_positive": false,
+      "is_true_negative": true,
+      "is_false_negative": false,
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_ec1ddd4a0770' was submitted by unverified caller without independent execution)."
+    },
+    {
+      "case_id": "case_14_case_f_degraded_parent",
+      "scenario": "Case F: COMPLETE Child with Degraded Parent",
+      "description": "Child proof is COMPLETE and attested but derives from PARTIAL parent; rejected.",
+      "capture_quality": "PARTIAL",
+      "consistency_level": "NON_ATOMIC",
+      "ground_truth_is_causal": false,
+      "evaluation_status": "SUPPORTED",
+      "evaluation_confidence": "LOW",
+      "candidate_tier": "EVIDENCE_SUPPORTED_CANDIDATE",
+      "confirmed_root_cause": false,
+      "unverified_claim_rejected": true,
+      "is_true_positive": false,
+      "is_false_positive": false,
+      "is_true_negative": true,
+      "is_false_negative": false,
+      "reason": "Supported by 2 observation(s); capture quality is PARTIAL; capped at SUPPORTED (Proof evidence 'ev_child_proof' has PARTIAL ancestor evidence in provenance chain; causal validation rejected)."
+    },
+    {
+      "case_id": "case_15_case_g_cross_investigation",
+      "scenario": "Case G: Cross-Investigation Proof Replay",
+      "description": "Proof record attested in session 1 replayed in session 2; rejected by token/session check.",
+      "capture_quality": "COMPLETE",
+      "consistency_level": "STOPPED",
+      "ground_truth_is_causal": false,
+      "evaluation_status": "SUPPORTED",
+      "evaluation_confidence": "MEDIUM",
+      "candidate_tier": "EVIDENCE_SUPPORTED_CANDIDATE",
+      "confirmed_root_cause": false,
+      "unverified_claim_rejected": true,
+      "is_true_positive": false,
+      "is_false_positive": false,
+      "is_true_negative": true,
+      "is_false_negative": false,
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_sess1_proof' has invalid or unverified attestation token)."
+    },
+    {
+      "case_id": "case_16_case_h_forged_observation",
+      "scenario": "Case H: Forged Observation Execution Result",
+      "description": "Caller supplies result_data claiming VALIDATED without internal verification; disarmed.",
+      "capture_quality": "COMPLETE",
+      "consistency_level": "STOPPED",
+      "ground_truth_is_causal": false,
+      "evaluation_status": "SUPPORTED",
+      "evaluation_confidence": "MEDIUM",
+      "candidate_tier": "STATIC_CANDIDATE",
+      "confirmed_root_cause": false,
+      "unverified_claim_rejected": true,
+      "is_true_positive": false,
+      "is_false_positive": false,
+      "is_true_negative": true,
+      "is_false_negative": false,
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_obs_2fb5abe4' was submitted by unverified caller without independent execution)."
+    },
+    {
+      "case_id": "case_17_case_j_legacy_serialized",
+      "scenario": "Case J: Legacy Serialized Evidence Without Trust Metadata",
+      "description": "Legacy serialized evidence without verifier_attestation or quality; cannot upgrade to proof.",
+      "capture_quality": "UNKNOWN",
+      "consistency_level": "UNKNOWN",
+      "ground_truth_is_causal": false,
+      "evaluation_status": "SUPPORTED",
+      "evaluation_confidence": "MEDIUM",
+      "candidate_tier": "STATIC_CANDIDATE",
+      "confirmed_root_cause": false,
+      "unverified_claim_rejected": true,
+      "is_true_positive": false,
+      "is_false_positive": false,
+      "is_true_negative": true,
+      "is_false_negative": false,
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_legacy_record' lacks capture quality metadata; causal validation rejected)."
+    },
+    {
+      "case_id": "case_18_case_k_api_injection",
+      "scenario": "Case K: ARP / REST Adapter Injection Attempts",
+      "description": "External caller passes forged transition claims via AgentAction and WebApiAdapter; safely rejected.",
+      "capture_quality": "COMPLETE",
+      "consistency_level": "STOPPED",
+      "ground_truth_is_causal": false,
+      "evaluation_status": "SUPPORTED",
+      "evaluation_confidence": "MEDIUM",
+      "candidate_tier": "STATIC_CANDIDATE",
+      "confirmed_root_cause": false,
+      "unverified_claim_rejected": true,
+      "is_true_positive": false,
+      "is_false_positive": false,
+      "is_true_negative": true,
+      "is_false_negative": false,
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_9f9ea8864f6e' was submitted by unverified caller without independent execution)."
     }
   ]
 }
