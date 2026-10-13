@@ -32,8 +32,22 @@ fi
 
 mkdir -p "${TARGET_DIR}"
 
+# 1. Clean up stale workflows in .github/workflows/ that do not exist in ci/workflows/
+STALE_COUNT=0
+for dst_file in "${TARGET_DIR}"/*.yml "${TARGET_DIR}"/*.yaml; do
+    [ -e "${dst_file}" ] || continue
+    fname="$(basename "${dst_file}")"
+    src_file="${SOURCE_DIR}/${fname}"
+    if [ ! -f "${src_file}" ]; then
+        echo "  [STALE] Removing stale workflow: .github/workflows/${fname}"
+        rm -f "${dst_file}"
+        STALE_COUNT=$((STALE_COUNT + 1))
+    fi
+done
+
+# 2. Copy canonical workflows from ci/workflows/ to .github/workflows/
 SYNCED_COUNT=0
-for src_file in "${SOURCE_DIR}"/*.yml; do
+for src_file in "${SOURCE_DIR}"/*.yml "${SOURCE_DIR}"/*.yaml; do
     [ -e "${src_file}" ] || continue
     fname="$(basename "${src_file}")"
     dst_file="${TARGET_DIR}/${fname}"
@@ -45,19 +59,32 @@ done
 echo ""
 echo "Validating workflow parity..."
 MISMATCH_COUNT=0
-for src_file in "${SOURCE_DIR}"/*.yml; do
+for src_file in "${SOURCE_DIR}"/*.yml "${SOURCE_DIR}"/*.yaml; do
     [ -e "${src_file}" ] || continue
     fname="$(basename "${src_file}")"
     dst_file="${TARGET_DIR}/${fname}"
-    if ! cmp -s "${src_file}" "${dst_file}"; then
+    if [ ! -f "${dst_file}" ]; then
+        echo "  [MISSING] ${fname} missing from .github/workflows/!" >&2
+        MISMATCH_COUNT=$((MISMATCH_COUNT + 1))
+    elif ! cmp -s "${src_file}" "${dst_file}"; then
         echo "  [MISMATCH] ${fname} differs between source and target!" >&2
         MISMATCH_COUNT=$((MISMATCH_COUNT + 1))
     fi
 done
 
+for dst_file in "${TARGET_DIR}"/*.yml "${TARGET_DIR}"/*.yaml; do
+    [ -e "${dst_file}" ] || continue
+    fname="$(basename "${dst_file}")"
+    src_file="${SOURCE_DIR}/${fname}"
+    if [ ! -f "${src_file}" ]; then
+        echo "  [EXTRA] ${fname} exists in .github/workflows/ but not in ci/workflows/!" >&2
+        MISMATCH_COUNT=$((MISMATCH_COUNT + 1))
+    fi
+done
+
 if [ "${MISMATCH_COUNT}" -eq 0 ]; then
-    echo "SUCCESS: All ${SYNCED_COUNT} workflows synchronized with 100% parity."
+    echo "SUCCESS: All ${SYNCED_COUNT} workflows synchronized with 100% parity (stale cleaned: ${STALE_COUNT})."
 else
-    echo "ERROR: ${MISMATCH_COUNT} workflow files had mismatches!" >&2
+    echo "ERROR: ${MISMATCH_COUNT} workflow parity issues detected!" >&2
     exit 1
 fi

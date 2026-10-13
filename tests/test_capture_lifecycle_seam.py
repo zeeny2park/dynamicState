@@ -1618,6 +1618,78 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         self.assertEqual(snap_full.completeness, "FAILED")
         self.assertEqual(snap_full.provenance["capture_status"], "FAILED")
 
+    def test_stop_budget_compliance_vs_temporal_consistency(self):
+        """Demonstrate that stop_budget_compliance and temporal_consistency are orthogonal.
+
+        When stop budget is exceeded, completeness is demoted to PARTIAL and
+        stop_budget_compliance is EXCEEDED, but temporal_consistency remains ATOMIC_STOPPED
+        because the target remained stopped during observation.
+        """
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+
+        def slow_reader(p, a, s):
+            import time
+            time.sleep(0.003)  # 3 ms read
+            return b"A" * s
+
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=slow_reader,
+            max_stop_time_ms=1.0,  # 1 ms limit vs 3 ms read
+        )
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1000 + 4096)])
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertEqual(snap.provenance["stop_budget_compliance"], "EXCEEDED")
+        self.assertEqual(snap.provenance["temporal_consistency"], "ATOMIC_STOPPED")
+        self.assertEqual(snap.observation_metadata["stop_budget_compliance"], "EXCEEDED")
+        self.assertEqual(snap.observation_metadata["temporal_consistency"], "ATOMIC_STOPPED")
+        self.assertTrue(snap.provenance["stop_budget_exceeded"])
+
+    def test_latency_report_unavailable_reasons_preserved(self):
+        """Unavailable timings record None and preserve explicit reason in unavailable_reasons."""
+        # Pre-existing stopped target: suspension and resume are not performed by capture
+        adapter = MockProcessTargetAdapter(initial_state="STOPPED")
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+        policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"B" * s)
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x2000, 0x2000 + 1024)])
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        lat = snap.latency_report
+        self.assertIsNotNone(lat)
+        self.assertIsNone(lat.stop_latency_us)
+        self.assertIsNone(lat.resume_latency_us)
+        self.assertIsNone(lat.total_stop_time_us)
+        self.assertIn("stop_latency", lat.unavailable_reasons)
+        self.assertEqual(lat.unavailable_reasons["stop_latency"], "PREEXISTING_STOP_PRESERVED")
+        self.assertEqual(snap.provenance["stop_budget_compliance"], "NOT_APPLICABLE")
+        self.assertEqual(snap.provenance["temporal_consistency"], "PREEXISTING_STOPPED")
+
+    def test_procfs_no_4mb_truncation(self):
+        """ProcfsCaptureBackend reads mappings larger than 4MB in full without artificial truncation."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+        # 8 MB range
+        range_size = 8 * 1024 * 1024
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=lambda p, a, s: b"M" * s,
+            max_capture_bytes=64 * 1024 * 1024,
+        )
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x10000000, 0x10000000 + range_size)])
+        backend = ProcfsCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        self.assertEqual(snap.completeness, "COMPLETE")
+        self.assertEqual(snap.provenance["bytes_read"], range_size)
+        self.assertEqual(snap.provenance["bytes_omitted"], 0)
+        self.assertEqual(snap.provenance["regions_complete"], 1)
+        self.assertEqual(snap.provenance["regions_omitted"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

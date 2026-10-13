@@ -105,12 +105,14 @@ class RawRuntimeSnapshot:
     @property
     def stop_latency_us(self) -> float:
         rep = self.latency_report
-        return getattr(rep, "stop_latency_us", 0.0) if rep else 0.0
+        val = getattr(rep, "stop_latency_us", None) if rep else None
+        return float(val) if val is not None else 0.0
 
     @property
     def memory_read_latency_us(self) -> float:
         rep = self.latency_report
-        return getattr(rep, "memory_capture_latency_us", 0.0) if rep else 0.0
+        val = getattr(rep, "memory_capture_latency_us", None) if rep else None
+        return float(val) if val is not None else 0.0
 
     @property
     def capture_latency_us(self) -> float:
@@ -119,12 +121,14 @@ class RawRuntimeSnapshot:
     @property
     def resume_latency_us(self) -> float:
         rep = self.latency_report
-        return getattr(rep, "resume_latency_us", 0.0) if rep else 0.0
+        val = getattr(rep, "resume_latency_us", None) if rep else None
+        return float(val) if val is not None else 0.0
 
     @property
     def total_capture_latency_us(self) -> float:
         rep = self.latency_report
-        return getattr(rep, "total_capture_latency_us", 0.0) if rep else self.capture_duration_us
+        val = getattr(rep, "total_capture_latency_us", None) if rep else None
+        return float(val) if val is not None else self.capture_duration_us
 
     @property
     def bytes_captured(self) -> int:
@@ -134,8 +138,10 @@ class RawRuntimeSnapshot:
         end = start + len(data)
         self._buffers[(start, end)] = data
 
-    def read_bytes(self, address: int, size: int) -> Optional[bytes]:
+    def read_bytes(self, address: Any, size: int) -> Optional[bytes]:
         """Read arbitrary byte slice from registered memory buffers."""
+        if isinstance(address, str):
+            address = int(address, 16) if address.startswith("0x") else int(address)
         for (b_start, b_end), buf in self._buffers.items():
             if b_start <= address and (address + size) <= b_end:
                 offset = address - b_start

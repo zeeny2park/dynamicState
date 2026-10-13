@@ -11,10 +11,13 @@ Measures and reports real-world capture overhead and percentiles against running
 - Memory throughput (MB/s)
 
 Reports:
-- Percentiles: p50 (median), p90, p95, p99, min, max, mean, stddev
+- Percentiles: p50 (median), p90, p95, p99, min, max, mean, stddev, sample_count
+- Byte accounting: requested, read, omitted, failed, unread bytes, success rate
+- Completeness qualification and payload integrity verification (ELF header magic)
 - Comparison between ProcessVmCaptureBackend and ProcfsCaptureBackend
-- Environment metadata (kernel, CPU model, architecture, compiler, compile flags)
-- Stop budget enforcement validation
+- Environment metadata (git commit SHA, kernel, CPU model, architecture, compiler)
+- Stop budget SLA enforcement validation
+- Comparison against stored baseline (benchmarks/baseline_results.json)
 - Machine-readable JSON output and human-readable console tables.
 """
 
@@ -64,8 +67,37 @@ def get_compiler_version() -> str:
         return "Unknown"
 
 
+def get_git_metadata() -> Dict[str, Any]:
+    """Retrieve current git commit, branch, and status."""
+    meta = {
+        "git_commit": "UNKNOWN",
+        "git_branch": "UNKNOWN",
+        "git_dirty": False,
+    }
+    try:
+        res = subprocess.run(["git", "rev-parse", "HEAD"], stdout=subprocess.PIPE, text=True, check=True)
+        meta["git_commit"] = res.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], stdout=subprocess.PIPE, text=True, check=True)
+        meta["git_branch"] = res.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(["git", "status", "--porcelain"], stdout=subprocess.PIPE, text=True, check=True)
+        meta["git_dirty"] = bool(res.stdout.strip())
+    except Exception:
+        pass
+
+    return meta
+
+
 def collect_environment_metadata() -> Dict[str, Any]:
-    """Collect host environment and hardware metadata."""
+    """Collect host environment, hardware, and git metadata."""
+    git_meta = get_git_metadata()
     return {
         "os": platform.system(),
         "platform": platform.platform(),
@@ -80,23 +112,32 @@ def collect_environment_metadata() -> Dict[str, Any]:
         ],
         "python_version": platform.python_version(),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": git_meta["git_commit"],
+        "git_branch": git_meta["git_branch"],
+        "git_dirty": git_meta["git_dirty"],
     }
 
 
-def compute_percentiles(values: List[float]) -> Dict[str, float]:
-    """Compute min, p50, p90, p95, p99, max, mean, and stddev."""
-    if not values:
+def compute_percentiles(values: List[Optional[float]]) -> Dict[str, Optional[float]]:
+    """Compute min, p50, p90, p95, p99, max, mean, stddev, and sample count.
+
+    Preserves nulls when values are empty or unavailable; never substitutes 0.0.
+    """
+    valid_values = [v for v in values if v is not None and isinstance(v, (int, float)) and math.isfinite(v)]
+    if not valid_values:
         return {
-            "min": 0.0,
-            "p50": 0.0,
-            "p90": 0.0,
-            "p95": 0.0,
-            "p99": 0.0,
-            "max": 0.0,
-            "mean": 0.0,
-            "stddev": 0.0,
+            "min": None,
+            "p50": None,
+            "p90": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+            "mean": None,
+            "stddev": None,
+            "sample_count": 0,
         }
-    sorted_v = sorted(values)
+
+    sorted_v = sorted(valid_values)
     n = len(sorted_v)
 
     def percentile(p: float) -> float:
@@ -117,8 +158,46 @@ def compute_percentiles(values: List[float]) -> Dict[str, float]:
         "p95": round(percentile(95.0), 2),
         "p99": round(percentile(99.0), 2),
         "max": round(sorted_v[-1], 2),
-        "mean": round(statistics.mean(values), 2),
-        "stddev": round(statistics.stdev(values) if n > 1 else 0.0, 2),
+        "mean": round(statistics.mean(valid_values), 2),
+        "stddev": round(statistics.stdev(valid_values) if n > 1 else 0.0, 2),
+        "sample_count": n,
+    }
+
+
+def verify_snapshot_payload(snap: RawRuntimeSnapshot) -> Dict[str, Any]:
+    """Verify that the captured snapshot payload contains valid data and headers (ELF magic)."""
+    if not snap.memory_regions:
+        return {
+            "payload_valid": False,
+            "elf_magic_found": False,
+            "total_bytes_verified": 0,
+            "region_count": 0,
+            "reason": "NO_MEMORY_REGIONS",
+        }
+
+    total_bytes = 0
+    elf_magic_found = False
+    valid_buffers_count = 0
+    for reg in snap.memory_regions:
+        raw_start = reg.get("start", 0)
+        start = int(raw_start, 16) if isinstance(raw_start, str) and raw_start.startswith("0x") else int(raw_start)
+        size = int(reg.get("size", 0))
+        b_read = int(reg.get("captured_bytes", 0))
+        total_bytes += b_read
+        if b_read > 0 and size > 0:
+            data = snap.read_bytes(start, min(size, b_read, 16))
+            if data and len(data) >= 4 and data[:4] == b"\x7fELF":
+                elf_magic_found = True
+            if data:
+                valid_buffers_count += 1
+
+    valid = total_bytes > 0 and valid_buffers_count > 0
+    return {
+        "payload_valid": valid,
+        "elf_magic_found": elf_magic_found,
+        "total_bytes_verified": total_bytes,
+        "region_count": len(snap.memory_regions),
+        "valid_buffers_count": valid_buffers_count,
     }
 
 
@@ -180,7 +259,10 @@ def run_backend_benchmarks(
     policy: CaptureSafetyPolicy,
 ) -> Dict[str, Any]:
     """Execute benchmark iterations for a single capture backend."""
-    raw_measurements: Dict[str, List[float]] = {
+    if iterations < 1:
+        raise ValueError(f"iterations must be >= 1, got {iterations}")
+
+    raw_measurements: Dict[str, List[Optional[float]]] = {
         "stop_latency_us": [],
         "thread_metadata_latency_us": [],
         "memory_capture_latency_us": [],
@@ -189,48 +271,96 @@ def run_backend_benchmarks(
         "total_capture_time_us": [],
     }
     captured_bytes_list: List[int] = []
+    requested_bytes_list: List[int] = []
+    omitted_bytes_list: List[int] = []
+    failed_bytes_list: List[int] = []
+    unread_bytes_list: List[int] = []
     quality_counts: Dict[str, int] = {}
+    accumulated_unavailable_reasons: Dict[str, str] = {}
+    last_payload_verification: Optional[Dict[str, Any]] = None
 
-    for _ in range(iterations):
+    for idx in range(iterations):
         snap = backend.capture(pid, plan=plan, policy=policy)
         prov = snap.provenance or {}
         lat_report = prov.get("latency_report", {})
 
-        stop_lat = lat_report.get("stop_latency_us", prov.get("stop_latency_us", 0.0))
-        th_lat = lat_report.get("thread_metadata_latency_us", 0.0)
-        mem_lat = lat_report.get("memory_capture_latency_us", prov.get("memory_read_latency_us", 0.0))
-        res_lat = lat_report.get("resume_latency_us", prov.get("resume_latency_us", 0.0))
-        tot_stop = lat_report.get("total_stop_time_us", prov.get("total_stop_time_ms", 0.0) * 1000.0)
-        tot_cap = lat_report.get("total_capture_latency_us", prov.get("total_capture_latency_us", 0.0))
+        # Extract timings directly; preserve None if unmeasured
+        stop_lat = lat_report.get("stop_latency_us")
+        th_lat = lat_report.get("thread_metadata_latency_us")
+        mem_lat = lat_report.get("memory_capture_latency_us")
+        res_lat = lat_report.get("resume_latency_us")
+        tot_stop = lat_report.get("total_stop_time_us")
+        tot_cap = lat_report.get("total_capture_latency_us")
 
-        raw_measurements["stop_latency_us"].append(float(stop_lat))
-        raw_measurements["thread_metadata_latency_us"].append(float(th_lat))
-        raw_measurements["memory_capture_latency_us"].append(float(mem_lat))
-        raw_measurements["resume_latency_us"].append(float(res_lat))
-        raw_measurements["total_stop_time_us"].append(float(tot_stop))
-        raw_measurements["total_capture_time_us"].append(float(tot_cap))
+        raw_measurements["stop_latency_us"].append(float(stop_lat) if stop_lat is not None else None)
+        raw_measurements["thread_metadata_latency_us"].append(float(th_lat) if th_lat is not None else None)
+        raw_measurements["memory_capture_latency_us"].append(float(mem_lat) if mem_lat is not None else None)
+        raw_measurements["resume_latency_us"].append(float(res_lat) if res_lat is not None else None)
+        raw_measurements["total_stop_time_us"].append(float(tot_stop) if tot_stop is not None else None)
+        raw_measurements["total_capture_time_us"].append(float(tot_cap) if tot_cap is not None else None)
 
+        unav = lat_report.get("unavailable_reasons", {})
+        if isinstance(unav, dict):
+            accumulated_unavailable_reasons.update(unav)
+
+        b_req = prov.get("bytes_requested", 0)
         b_read = prov.get("bytes_read", 0)
+        b_omit = prov.get("bytes_omitted", 0)
+        b_fail = prov.get("bytes_failed", 0)
+        b_unread = prov.get("bytes_unread", 0)
+
+        requested_bytes_list.append(b_req)
         captured_bytes_list.append(b_read)
+        omitted_bytes_list.append(b_omit)
+        failed_bytes_list.append(b_fail)
+        unread_bytes_list.append(b_unread)
 
         q = snap.completeness
         quality_counts[q] = quality_counts.get(q, 0) + 1
 
+        if idx == 0 or idx == iterations - 1:
+            last_payload_verification = verify_snapshot_payload(snap)
+
     # Summarize stats
-    stats_summary: Dict[str, Dict[str, float]] = {}
+    stats_summary: Dict[str, Dict[str, Optional[float]]] = {}
     for metric_name, values in raw_measurements.items():
         stats_summary[metric_name] = compute_percentiles(values)
 
     avg_bytes = statistics.mean(captured_bytes_list) if captured_bytes_list else 0
-    p50_mem_time_sec = (stats_summary["memory_capture_latency_us"]["p50"] or 1.0) / 1_000_000.0
+    avg_req_bytes = statistics.mean(requested_bytes_list) if requested_bytes_list else 0
+    avg_omit_bytes = statistics.mean(omitted_bytes_list) if omitted_bytes_list else 0
+    avg_fail_bytes = statistics.mean(failed_bytes_list) if failed_bytes_list else 0
+    avg_unread_bytes = statistics.mean(unread_bytes_list) if unread_bytes_list else 0
+
+    p50_mem_val = stats_summary["memory_capture_latency_us"]["p50"]
+    p50_mem_time_sec = (p50_mem_val or 1.0) / 1_000_000.0 if p50_mem_val is not None else 0.0
     throughput_mb_s = round((avg_bytes / (1024.0 * 1024.0)) / p50_mem_time_sec, 2) if p50_mem_time_sec > 0 else 0.0
+
+    complete_count = quality_counts.get("COMPLETE", 0)
+    success_rate = round(complete_count / float(iterations), 4)
 
     return {
         "backend": backend.name,
         "iterations": iterations,
         "quality_distribution": quality_counts,
+        "success_rate": success_rate,
+        "completeness_qualification": "ALL_COMPLETE" if complete_count == iterations else "CONTAINS_NON_COMPLETE",
         "mean_captured_bytes": round(avg_bytes, 1),
         "throughput_mb_s": throughput_mb_s,
+        "byte_accounting": {
+            "mean_requested_bytes": round(avg_req_bytes, 1),
+            "mean_captured_bytes": round(avg_bytes, 1),
+            "mean_omitted_bytes": round(avg_omit_bytes, 1),
+            "mean_failed_bytes": round(avg_fail_bytes, 1),
+            "mean_unread_bytes": round(avg_unread_bytes, 1),
+        },
+        "payload_integrity": last_payload_verification or {
+            "payload_valid": False,
+            "elf_magic_found": False,
+            "total_bytes_verified": 0,
+            "region_count": 0,
+        },
+        "unavailable_reasons": accumulated_unavailable_reasons,
         "metrics": stats_summary,
     }
 
@@ -265,22 +395,146 @@ def validate_budget_enforcement(pid: int) -> Dict[str, Any]:
     }
 
 
+def validate_benchmark_report_schema(report: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Validate JSON schema and ensure all metric values are finite numeric or null."""
+    errors: List[str] = []
+    if not isinstance(report, dict):
+        return False, ["Report must be a dictionary"]
+
+    for req_key in ["environment", "benchmark_parameters", "backends", "budget_enforcement"]:
+        if req_key not in report:
+            errors.append(f"Missing required top-level key: {req_key}")
+
+    env = report.get("environment", {})
+    if isinstance(env, dict):
+        for k in ["os", "kernel_release", "architecture", "cpu_model", "compiler", "timestamp_utc", "git_commit"]:
+            if k not in env:
+                errors.append(f"Missing environment key: {k}")
+    else:
+        errors.append("environment must be a dictionary")
+
+    params = report.get("benchmark_parameters", {})
+    if isinstance(params, dict):
+        iters = params.get("iterations")
+        if not isinstance(iters, int) or iters < 1:
+            errors.append(f"benchmark_parameters.iterations must be integer >= 1 (got {iters})")
+    else:
+        errors.append("benchmark_parameters must be a dictionary")
+
+    backends = report.get("backends", [])
+    if not isinstance(backends, list) or len(backends) == 0:
+        errors.append("backends must be a non-empty list")
+    else:
+        for b in backends:
+            if not isinstance(b, dict):
+                errors.append("backend entry must be a dictionary")
+                continue
+            b_name = b.get("backend", "unknown")
+            if "metrics" not in b:
+                errors.append(f"Backend '{b_name}' missing 'metrics'")
+            else:
+                for m_name, m_val in b["metrics"].items():
+                    if not isinstance(m_val, dict):
+                        errors.append(f"Metric '{m_name}' in backend '{b_name}' must be a dictionary")
+                        continue
+                    for p_key in ["min", "p50", "p90", "p95", "p99", "max", "mean", "stddev"]:
+                        val = m_val.get(p_key)
+                        if val is not None:
+                            if not isinstance(val, (int, float)) or not math.isfinite(val):
+                                errors.append(f"Metric '{m_name}.{p_key}' in backend '{b_name}' is not finite numeric: {val}")
+            if "byte_accounting" not in b:
+                errors.append(f"Backend '{b_name}' missing 'byte_accounting'")
+            if "success_rate" not in b:
+                errors.append(f"Backend '{b_name}' missing 'success_rate'")
+
+    budget = report.get("budget_enforcement", {})
+    if isinstance(budget, dict):
+        for k in ["budget_limit_ms", "policy_enforced", "completeness_demoted_to_partial"]:
+            if k not in budget:
+                errors.append(f"budget_enforcement missing key: {k}")
+    else:
+        errors.append("budget_enforcement must be a dictionary")
+
+    return (len(errors) == 0, errors)
+
+
+def compare_with_baseline(
+    current_results: List[Dict[str, Any]],
+    baseline_path: str,
+) -> Dict[str, Any]:
+    """Compare current benchmark results against baseline stored in JSON."""
+    comparison: Dict[str, Any] = {
+        "baseline_available": False,
+        "comparisons": {},
+    }
+    if not os.path.exists(baseline_path):
+        return comparison
+
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as f:
+            baseline_data = json.load(f)
+    except Exception as e:
+        comparison["error"] = f"Failed to load baseline: {e}"
+        return comparison
+
+    comparison["baseline_available"] = True
+    baseline_backends = {b.get("backend"): b for b in baseline_data.get("backends", [])}
+
+    for cur in current_results:
+        b_name = cur.get("backend")
+        base = baseline_backends.get(b_name)
+        if not base:
+            continue
+
+        cur_p50_stop = cur.get("metrics", {}).get("total_stop_time_us", {}).get("p50")
+        base_p50_stop = base.get("metrics", {}).get("total_stop_time_us", {}).get("p50")
+
+        cur_p50_mem = cur.get("metrics", {}).get("memory_capture_latency_us", {}).get("p50")
+        base_p50_mem = base.get("metrics", {}).get("memory_capture_latency_us", {}).get("p50")
+
+        comparison["comparisons"][b_name] = {
+            "captured_bytes": {
+                "baseline": base.get("mean_captured_bytes"),
+                "current": cur.get("mean_captured_bytes"),
+            },
+            "quality": {
+                "baseline": base.get("quality_distribution"),
+                "current": cur.get("quality_distribution"),
+            },
+            "throughput_mb_s": {
+                "baseline": base.get("throughput_mb_s"),
+                "current": cur.get("throughput_mb_s"),
+            },
+            "total_stop_p50_us": {
+                "baseline": base_p50_stop,
+                "current": cur_p50_stop,
+            },
+            "mem_read_p50_us": {
+                "baseline": base_p50_mem,
+                "current": cur_p50_mem,
+            },
+        }
+
+    return comparison
+
+
 def format_console_table(results: Dict[str, Any]) -> str:
     """Format benchmark results as a clean text table."""
     lines = []
-    lines.append("=" * 88)
+    lines.append("=" * 96)
     lines.append(" dynamicState Capture Performance Benchmark Results")
-    lines.append("=" * 88)
+    lines.append("=" * 96)
 
     env = results.get("environment", {})
-    lines.append(f"Host: {env.get('os')} ({env.get('architecture')}) | Kernel: {env.get('kernel_release')}")
-    lines.append(f"CPU:  {env.get('cpu_model')} ({env.get('cpu_count')} cores)")
-    lines.append(f"G++:  {env.get('compiler')}")
-    lines.append("-" * 88)
+    lines.append(f"Host:   {env.get('os')} ({env.get('architecture')}) | Kernel: {env.get('kernel_release')}")
+    lines.append(f"CPU:    {env.get('cpu_model')} ({env.get('cpu_count')} cores)")
+    lines.append(f"G++:    {env.get('compiler')}")
+    lines.append(f"Git:    {env.get('git_commit', 'UNKNOWN')[:12]} (branch: {env.get('git_branch')}, dirty: {env.get('git_dirty')})")
+    lines.append("-" * 96)
 
     header = f"{'Backend':<20} {'Phase':<24} {'p50 (us)':>10} {'p95 (us)':>10} {'p99 (us)':>10} {'Max (us)':>10}"
     lines.append(header)
-    lines.append("-" * 88)
+    lines.append("-" * 96)
 
     for b_data in results.get("backends", []):
         b_name = b_data.get("backend", "")
@@ -295,25 +549,53 @@ def format_console_table(results: Dict[str, Any]) -> str:
         ]
         for key, label in metric_labels:
             m = metrics.get(key, {})
-            row = (
-                f"{b_name:<20} {label:<24} "
-                f"{m.get('p50', 0):>10.1f} {m.get('p95', 0):>10.1f} "
-                f"{m.get('p99', 0):>10.1f} {m.get('max', 0):>10.1f}"
-            )
+            p50_str = f"{m.get('p50'):.1f}" if m.get("p50") is not None else "null"
+            p95_str = f"{m.get('p95'):.1f}" if m.get("p95") is not None else "null"
+            p99_str = f"{m.get('p99'):.1f}" if m.get("p99") is not None else "null"
+            max_str = f"{m.get('max'):.1f}" if m.get("max") is not None else "null"
+            row = f"{b_name:<20} {label:<24} {p50_str:>10} {p95_str:>10} {p99_str:>10} {max_str:>10}"
             lines.append(row)
             b_name = ""  # Only show backend name on first row of group
-        lines.append(f"  Throughput: {b_data.get('throughput_mb_s', 0):.2f} MB/s | Quality: {b_data.get('quality_distribution')}")
-        lines.append("-" * 88)
+
+        byte_acc = b_data.get("byte_accounting", {})
+        lines.append(
+            f"  Bytes: Read={byte_acc.get('mean_captured_bytes'):,.0f} | "
+            f"Req={byte_acc.get('mean_requested_bytes'):,.0f} | "
+            f"Omit={byte_acc.get('mean_omitted_bytes'):,.0f} | "
+            f"Fail={byte_acc.get('mean_failed_bytes'):,.0f}"
+        )
+        payload = b_data.get("payload_integrity", {})
+        lines.append(
+            f"  Throughput: {b_data.get('throughput_mb_s', 0):.2f} MB/s | "
+            f"Quality: {b_data.get('quality_distribution')} (Success: {b_data.get('success_rate') * 100:.1f}%) | "
+            f"Payload: {'VALID' if payload.get('payload_valid') else 'INVALID'} (ELF: {'YES' if payload.get('elf_magic_found') else 'NO'})"
+        )
+        lines.append("-" * 96)
 
     budget = results.get("budget_enforcement", {})
     lines.append(
-        f"Stop Budget Policy Check: "
+        f"Stop Budget SLA Enforcement: "
         f"limit={budget.get('budget_limit_ms')}ms, "
         f"observed={budget.get('observed_stop_ms')}ms -> "
         f"Enforced={budget.get('policy_enforced')} "
         f"(Degraded={budget.get('completeness_demoted_to_partial')})"
     )
-    lines.append("=" * 88)
+
+    base_comp = results.get("baseline_comparison", {})
+    if base_comp.get("baseline_available"):
+        lines.append("-" * 96)
+        lines.append(" Baseline Comparison Summary:")
+        for b_name, cmp_info in base_comp.get("comparisons", {}).items():
+            b_bytes = cmp_info.get("captured_bytes", {})
+            b_stop = cmp_info.get("total_stop_p50_us", {})
+            b_qual = cmp_info.get("quality", {})
+            lines.append(
+                f"  [{b_name}] Bytes: {b_bytes.get('current'):,.0f} (baseline: {b_bytes.get('baseline'):,.0f}) | "
+                f"Stop p50: {b_stop.get('current')} us (baseline: {b_stop.get('baseline')} us) | "
+                f"Quality: {b_qual.get('current')} (baseline: {b_qual.get('baseline')})"
+            )
+
+    lines.append("=" * 96)
     return "\n".join(lines)
 
 
@@ -322,8 +604,12 @@ def run_benchmark(
     output_path: Optional[str] = None,
     smoke: bool = False,
     emit_json: bool = False,
+    baseline_path: Optional[str] = "benchmarks/baseline_results.json",
 ) -> int:
     """Main benchmark runner function."""
+    if iterations < 1:
+        raise ValueError(f"iterations must be >= 1, got {iterations}")
+
     if smoke:
         iterations = min(iterations, 3)
 
@@ -359,6 +645,9 @@ def run_benchmark(
             # Benchmark 3: Validate budget enforcement
             budget_validation = validate_budget_enforcement(pid)
 
+        # 4. Compare with baseline if available
+        base_comp = compare_with_baseline(backend_results, baseline_path) if baseline_path else {}
+
         final_report = {
             "environment": env_meta,
             "benchmark_parameters": {
@@ -367,9 +656,15 @@ def run_benchmark(
             },
             "backends": backend_results,
             "budget_enforcement": budget_validation,
+            "baseline_comparison": base_comp,
         }
 
-        # 4. Output results
+        # 5. Validate schema
+        valid, schema_errors = validate_benchmark_report_schema(final_report)
+        if not valid:
+            raise RuntimeError(f"Generated benchmark report failed schema validation: {schema_errors}")
+
+        # 6. Output results
         if output_path:
             out_dir = os.path.dirname(os.path.abspath(output_path))
             os.makedirs(out_dir, exist_ok=True)
@@ -392,13 +687,18 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="Run quick 3-iteration smoke test suitable for CI")
     parser.add_argument("--output", "-o", type=str, default=None, help="Save machine-readable JSON results to specified file")
     parser.add_argument("--json", action="store_true", help="Output JSON results to stdout")
+    parser.add_argument("--baseline", type=str, default="benchmarks/baseline_results.json", help="Path to stored baseline JSON")
     args = parser.parse_args()
+
+    if args.iterations < 1:
+        parser.error("--iterations must be at least 1")
 
     sys.exit(run_benchmark(
         iterations=args.iterations,
         output_path=args.output,
         smoke=args.smoke,
         emit_json=args.json,
+        baseline_path=args.baseline,
     ))
 
 

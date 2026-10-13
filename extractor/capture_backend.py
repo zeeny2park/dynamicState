@@ -25,72 +25,95 @@ from .raw_snapshot import RawMemoryRegion, RawRuntimeSnapshot
 
 @dataclass
 class CaptureLatencyReport:
-    """Exact latency measurements for each phase of runtime state capture."""
-    stop_latency_ms: float = 0.0
-    thread_metadata_latency_ms: float = 0.0
-    memory_capture_latency_ms: float = 0.0
-    resume_latency_ms: float = 0.0
-    total_stop_time_ms: float = 0.0
+    """Exact latency measurements for each phase of runtime state capture.
+
+    Non-available measurements are represented as None (null in JSON) with an
+    explicit reason in `unavailable_reasons`, rather than fabricating 0.0.
+    """
+    stop_latency_ms: Optional[float] = None
+    thread_metadata_latency_ms: Optional[float] = None
+    memory_capture_latency_ms: Optional[float] = None
+    resume_latency_ms: Optional[float] = None
+    total_stop_time_ms: Optional[float] = None
     target_capture_latency_ms: float = 10.0
-    actual_capture_latency_ms: float = 0.0
+    actual_capture_latency_ms: Optional[float] = None
 
     # Microsecond-precision metrics
-    stop_latency_us: float = 0.0
-    thread_metadata_latency_us: float = 0.0
-    memory_capture_latency_us: float = 0.0
-    resume_latency_us: float = 0.0
-    total_stop_time_us: float = 0.0
-    total_capture_latency_us: float = 0.0
+    stop_latency_us: Optional[float] = None
+    thread_metadata_latency_us: Optional[float] = None
+    memory_capture_latency_us: Optional[float] = None
+    resume_latency_us: Optional[float] = None
+    total_stop_time_us: Optional[float] = None
+    total_capture_latency_us: Optional[float] = None
+    unavailable_reasons: Dict[str, str] = field(default_factory=dict)
 
     @property
-    def capture_latency_us(self) -> float:
+    def capture_latency_us(self) -> Optional[float]:
         return self.memory_capture_latency_us
 
     @property
-    def read_latency_us(self) -> float:
+    def read_latency_us(self) -> Optional[float]:
         return self.memory_capture_latency_us
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "stop_latency_ms": round(self.stop_latency_ms, 3),
-            "thread_metadata_latency_ms": round(self.thread_metadata_latency_ms, 3),
-            "memory_capture_latency_ms": round(self.memory_capture_latency_ms, 3),
-            "resume_latency_ms": round(self.resume_latency_ms, 3),
-            "total_stop_time_ms": round(self.total_stop_time_ms, 3),
+            "stop_latency_ms": round(self.stop_latency_ms, 3) if self.stop_latency_ms is not None else None,
+            "thread_metadata_latency_ms": round(self.thread_metadata_latency_ms, 3) if self.thread_metadata_latency_ms is not None else None,
+            "memory_capture_latency_ms": round(self.memory_capture_latency_ms, 3) if self.memory_capture_latency_ms is not None else None,
+            "resume_latency_ms": round(self.resume_latency_ms, 3) if self.resume_latency_ms is not None else None,
+            "total_stop_time_ms": round(self.total_stop_time_ms, 3) if self.total_stop_time_ms is not None else None,
             "target_capture_latency_ms": self.target_capture_latency_ms,
-            "actual_capture_latency_ms": round(self.actual_capture_latency_ms, 3),
-            "stop_latency_us": round(self.stop_latency_us, 1),
-            "thread_metadata_latency_us": round(self.thread_metadata_latency_us, 1),
-            "memory_capture_latency_us": round(self.memory_capture_latency_us, 1),
-            "capture_latency_us": round(self.memory_capture_latency_us, 1),
-            "read_latency_us": round(self.memory_capture_latency_us, 1),
-            "resume_latency_us": round(self.resume_latency_us, 1),
-            "total_stop_time_us": round(self.total_stop_time_us, 1),
-            "total_capture_latency_us": round(self.total_capture_latency_us, 1),
+            "actual_capture_latency_ms": round(self.actual_capture_latency_ms, 3) if self.actual_capture_latency_ms is not None else None,
+            "stop_latency_us": round(self.stop_latency_us, 1) if self.stop_latency_us is not None else None,
+            "thread_metadata_latency_us": round(self.thread_metadata_latency_us, 1) if self.thread_metadata_latency_us is not None else None,
+            "memory_capture_latency_us": round(self.memory_capture_latency_us, 1) if self.memory_capture_latency_us is not None else None,
+            "capture_latency_us": round(self.memory_capture_latency_us, 1) if self.memory_capture_latency_us is not None else None,
+            "read_latency_us": round(self.memory_capture_latency_us, 1) if self.memory_capture_latency_us is not None else None,
+            "resume_latency_us": round(self.resume_latency_us, 1) if self.resume_latency_us is not None else None,
+            "total_stop_time_us": round(self.total_stop_time_us, 1) if self.total_stop_time_us is not None else None,
+            "total_capture_latency_us": round(self.total_capture_latency_us, 1) if self.total_capture_latency_us is not None else None,
+            "unavailable_reasons": dict(self.unavailable_reasons),
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CaptureLatencyReport":
         return cls(
-            stop_latency_ms=data.get("stop_latency_ms", 0.0),
-            thread_metadata_latency_ms=data.get("thread_metadata_latency_ms", 0.0),
-            memory_capture_latency_ms=data.get("memory_capture_latency_ms", 0.0),
-            resume_latency_ms=data.get("resume_latency_ms", 0.0),
-            total_stop_time_ms=data.get("total_stop_time_ms", 0.0),
+            stop_latency_ms=data.get("stop_latency_ms"),
+            thread_metadata_latency_ms=data.get("thread_metadata_latency_ms"),
+            memory_capture_latency_ms=data.get("memory_capture_latency_ms"),
+            resume_latency_ms=data.get("resume_latency_ms"),
+            total_stop_time_ms=data.get("total_stop_time_ms"),
             target_capture_latency_ms=data.get("target_capture_latency_ms", 10.0),
-            actual_capture_latency_ms=data.get("actual_capture_latency_ms", 0.0),
-            stop_latency_us=data.get("stop_latency_us", data.get("stop_latency_ms", 0.0) * 1000.0),
-            thread_metadata_latency_us=data.get("thread_metadata_latency_us", data.get("thread_metadata_latency_ms", 0.0) * 1000.0),
-            memory_capture_latency_us=data.get("memory_capture_latency_us", data.get("memory_capture_latency_ms", 0.0) * 1000.0),
-            resume_latency_us=data.get("resume_latency_us", data.get("resume_latency_ms", 0.0) * 1000.0),
-            total_stop_time_us=data.get("total_stop_time_us", data.get("total_stop_time_ms", 0.0) * 1000.0),
-            total_capture_latency_us=data.get("total_capture_latency_us", data.get("actual_capture_latency_ms", 0.0) * 1000.0),
+            actual_capture_latency_ms=data.get("actual_capture_latency_ms"),
+            stop_latency_us=data.get("stop_latency_us"),
+            thread_metadata_latency_us=data.get("thread_metadata_latency_us"),
+            memory_capture_latency_us=data.get("memory_capture_latency_us"),
+            resume_latency_us=data.get("resume_latency_us"),
+            total_stop_time_us=data.get("total_stop_time_us"),
+            total_capture_latency_us=data.get("total_capture_latency_us"),
+            unavailable_reasons=data.get("unavailable_reasons", {}),
         )
 
 
 @dataclass
 class CaptureSafetyPolicy:
-    """Safety bounds for capturing state from running processes."""
+    """Safety bounds and SLA policy for capturing state from running processes.
+
+    Stop-Budget Semantics & Limitations:
+    - max_stop_time_ms: SLA detection threshold (target SLA), NOT a preemptive OS hard real-time bound.
+      In standard Linux user-space (using synchronous process_vm_readv or /proc/<pid>/mem read syscalls),
+      the operating system does not provide preemptible sub-millisecond memory transfer primitives.
+      Work is bounded BEFORE suspension via `max_capture_bytes` and `max_capture_ranges`.
+      Once suspended, if the actual suspension time exceeds `max_stop_time_ms`, the capture engine
+      detects the overrun, records the stable diagnostic `STOP_BUDGET_EXCEEDED`, and demotes the
+      snapshot completeness from COMPLETE to PARTIAL.
+      CRITICAL: Identity validation, fail-open resumption, and cleanup are NEVER bypassed or sacrificed
+      to satisfy a timer.
+    - max_capture_bytes: Hard upper bound on bytes to attempt reading across all regions.
+    - max_capture_ranges: Hard upper bound on the number of distinct memory regions to process.
+    - timeout_ms: Maximum duration for overall capture operation.
+    - fail_open: Guarantees that target processes suspended by the capture engine are resumed via finally:.
+    """
     max_stop_time_ms: float = 50.0
     max_capture_bytes: int = 64 * 1024 * 1024
     max_capture_ranges: int = 500
@@ -1778,16 +1801,45 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         regions_attempted = regions_read + regions_failed + regions_omitted
 
         # Compute exact measured microsecond and millisecond latencies before quality determination
-        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if (should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0) else 0.0
-        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if (should_suspend and t_threads > 0 and t_stop_confirmed > 0) else 0.0
-        memory_latency_us = (t_memory - t_threads) / 1000.0 if (t_memory > 0 and t_threads > 0) else 0.0
-        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0) else 0.0
-        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0) else 0.0
-        total_stop_time_ms = total_stop_time_us / 1000.0
+        unavailable_reasons: Dict[str, str] = {}
+        if should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0:
+            stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0
+        else:
+            stop_latency_us = None
+            unavailable_reasons["stop_latency"] = "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SUSPENSION_SKIPPED" if not should_suspend else "STOP_UNCONFIRMED")
+
+        if t_threads > 0 and t_stop_confirmed > 0:
+            thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0
+        elif t_threads > 0 and t_stop_requested > 0:
+            thread_latency_us = (t_threads - t_stop_requested) / 1000.0
+        else:
+            thread_latency_us = None
+            unavailable_reasons["thread_metadata_latency"] = "THREAD_METADATA_SKIPPED_OR_FAILED"
+
+        if t_memory > 0 and t_threads > 0:
+            memory_latency_us = (t_memory - t_threads) / 1000.0
+        else:
+            memory_latency_us = None
+            unavailable_reasons["memory_capture_latency"] = "MEMORY_READ_NOT_ATTEMPTED_OR_FAILED"
+
+        if suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0:
+            resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0
+        else:
+            resume_latency_us = None
+            unavailable_reasons["resume_latency"] = "PREEXISTING_STOP_PRESERVED" if was_already_stopped else "NO_RESUME_PERFORMED"
+
+        if suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0:
+            total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0
+            total_stop_time_ms = total_stop_time_us / 1000.0
+        else:
+            total_stop_time_us = None
+            total_stop_time_ms = None
+            unavailable_reasons["total_stop_time"] = "TARGET_WAS_NOT_STOPPED_BY_CAPTURE"
+
         total_capture_time_us = max(0.0, (t_resume_confirmed - t_overall_start_ns) / 1000.0) if t_resume_confirmed > 0 else max(0.0, (time.monotonic_ns() - t_overall_start_ns) / 1000.0)
 
         stop_budget_exceeded = False
-        if policy and getattr(policy, "max_stop_time_ms", 0) > 0 and suspension_caused_by_capture:
+        if policy and getattr(policy, "max_stop_time_ms", 0) > 0 and total_stop_time_ms is not None:
             if total_stop_time_ms > policy.max_stop_time_ms:
                 stop_budget_exceeded = True
                 diagnostics.append({
@@ -1888,26 +1940,30 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         }
 
         latency_report = CaptureLatencyReport(
-            stop_latency_ms=stop_latency_us / 1000.0,
-            thread_metadata_latency_ms=thread_latency_us / 1000.0,
-            memory_capture_latency_ms=memory_latency_us / 1000.0,
-            resume_latency_ms=resume_latency_us / 1000.0,
-            total_stop_time_ms=total_stop_time_us / 1000.0,
+            stop_latency_ms=round(stop_latency_us / 1000.0, 3) if stop_latency_us is not None else None,
+            thread_metadata_latency_ms=round(thread_latency_us / 1000.0, 3) if thread_latency_us is not None else None,
+            memory_capture_latency_ms=round(memory_latency_us / 1000.0, 3) if memory_latency_us is not None else None,
+            resume_latency_ms=round(resume_latency_us / 1000.0, 3) if resume_latency_us is not None else None,
+            total_stop_time_ms=round(total_stop_time_ms, 3) if total_stop_time_ms is not None else None,
             target_capture_latency_ms=10.0,
-            actual_capture_latency_ms=total_capture_time_us / 1000.0,
-            stop_latency_us=stop_latency_us,
-            thread_metadata_latency_us=thread_latency_us,
-            memory_capture_latency_us=memory_latency_us,
-            resume_latency_us=resume_latency_us,
-            total_stop_time_us=total_stop_time_us,
-            total_capture_latency_us=total_capture_time_us,
+            actual_capture_latency_ms=round(total_capture_time_us / 1000.0, 3) if total_capture_time_us is not None else None,
+            stop_latency_us=round(stop_latency_us, 1) if stop_latency_us is not None else None,
+            thread_metadata_latency_us=round(thread_latency_us, 1) if thread_latency_us is not None else None,
+            memory_capture_latency_us=round(memory_latency_us, 1) if memory_latency_us is not None else None,
+            resume_latency_us=round(resume_latency_us, 1) if resume_latency_us is not None else None,
+            total_stop_time_us=round(total_stop_time_us, 1) if total_stop_time_us is not None else None,
+            total_capture_latency_us=round(total_capture_time_us, 1) if total_capture_time_us is not None else None,
+            unavailable_reasons=unavailable_reasons,
         )
 
         obs_meta = {
             "capture_backend": self.name,
             "capture_mode": plan.mode,
             "capture_status": capture_status,
+            "completeness": completeness,
             "consistency_classification": consistency_classification,
+            "temporal_consistency": "ATOMIC_STOPPED" if (should_suspend and stop_confirmed and all_threads_stopped) else ("PREEXISTING_STOPPED" if was_already_stopped else "NON_ATOMIC"),
+            "stop_budget_compliance": "EXCEEDED" if stop_budget_exceeded else ("COMPLIANT" if total_stop_time_ms is not None else "NOT_APPLICABLE"),
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
             "captured_bytes": bytes_read,
             "bytes_requested": bytes_requested,
@@ -1926,8 +1982,8 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "was_already_stopped": was_already_stopped,
             "suspension_caused_by_capture": suspension_caused_by_capture,
             "actual_capture_suspended_target": suspension_caused_by_capture,
-            "stop_duration_ms": round(total_stop_time_us / 1000.0, 3),
-            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3),
+            "stop_duration_ms": round(total_stop_time_ms, 3) if total_stop_time_ms is not None else None,
+            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3) if total_capture_time_us is not None else None,
             "lifecycle_guarantees": lifecycle_guarantees,
             "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
@@ -1964,9 +2020,11 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "all_threads_stopped": all_threads_stopped,
             "was_already_stopped": was_already_stopped,
             "suspension_caused_by_capture": suspension_caused_by_capture,
-            "actual_capture_suspended_target": suspension_caused_by_capture,
-            "stop_duration_ms": round(total_stop_time_us / 1000.0, 3),
-            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3),
+            "stop_duration_ms": round(total_stop_time_ms, 3) if total_stop_time_ms is not None else None,
+            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3) if total_capture_time_us is not None else None,
+            "total_stop_time_ms": round(total_stop_time_ms, 3) if total_stop_time_ms is not None else None,
+            "stop_budget_compliance": "EXCEEDED" if stop_budget_exceeded else ("COMPLIANT" if total_stop_time_ms is not None else "NOT_APPLICABLE"),
+            "temporal_consistency": "ATOMIC_STOPPED" if (should_suspend and stop_confirmed and all_threads_stopped) else ("PREEXISTING_STOPPED" if was_already_stopped else "NON_ATOMIC"),
             "lifecycle_guarantees": lifecycle_guarantees,
             "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
@@ -2005,9 +2063,9 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 "path": exe_path,
                 "build_id": build_id
             },
-            "actual_capture_latency_ms": round(total_capture_time_us / 1000.0, 3),
+            "actual_capture_latency_ms": round(total_capture_time_us / 1000.0, 3) if total_capture_time_us is not None else None,
             "target_capture_latency_ms": 10.0,
-            "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3),
+            "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3) if total_stop_time_us is not None else None,
             "latency_report": latency_report.to_dict(),
             "diagnostics": diagnostics,
             "identity_contract": identity_contract,
@@ -2281,7 +2339,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 })
             else:
                 for m in all_maps:
-                    if "r" in m["permissions"] and m["category"] in ("heap", "stack", "anonymous", "binary"):
+                    if "r" in m["permissions"] and ("w" in m["permissions"] or m["category"] in ("heap", "stack", "anonymous")):
                         selected_maps.append(m)
 
         if not selected_maps and plan.memory_ranges:
@@ -2328,7 +2386,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 })
                 continue
 
-            chunk_size = min(reg_size, 4 * 1024 * 1024, policy.max_capture_bytes - bytes_attempted)
+            chunk_size = min(reg_size, policy.max_capture_bytes - bytes_attempted)
             if chunk_size <= 0:
                 bytes_omitted += reg_size
                 omitted_regions.append({
@@ -2711,16 +2769,45 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         regions_attempted = regions_read + regions_failed + regions_omitted
 
         # Compute exact measured microsecond and millisecond latencies before quality determination
-        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if (should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0) else 0.0
-        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if (should_suspend and t_threads > 0 and t_stop_confirmed > 0) else 0.0
-        memory_latency_us = (t_memory - t_threads) / 1000.0 if (t_memory > 0 and t_threads > 0) else 0.0
-        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0) else 0.0
-        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0) else 0.0
-        total_stop_time_ms = total_stop_time_us / 1000.0
+        unavailable_reasons: Dict[str, str] = {}
+        if should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0:
+            stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0
+        else:
+            stop_latency_us = None
+            unavailable_reasons["stop_latency"] = "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SUSPENSION_SKIPPED" if not should_suspend else "STOP_UNCONFIRMED")
+
+        if t_threads > 0 and t_stop_confirmed > 0:
+            thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0
+        elif t_threads > 0 and t_stop_requested > 0:
+            thread_latency_us = (t_threads - t_stop_requested) / 1000.0
+        else:
+            thread_latency_us = None
+            unavailable_reasons["thread_metadata_latency"] = "THREAD_METADATA_SKIPPED_OR_FAILED"
+
+        if t_memory > 0 and t_threads > 0:
+            memory_latency_us = (t_memory - t_threads) / 1000.0
+        else:
+            memory_latency_us = None
+            unavailable_reasons["memory_capture_latency"] = "MEMORY_READ_NOT_ATTEMPTED_OR_FAILED"
+
+        if suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0:
+            resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0
+        else:
+            resume_latency_us = None
+            unavailable_reasons["resume_latency"] = "PREEXISTING_STOP_PRESERVED" if was_already_stopped else "NO_RESUME_PERFORMED"
+
+        if suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0:
+            total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0
+            total_stop_time_ms = total_stop_time_us / 1000.0
+        else:
+            total_stop_time_us = None
+            total_stop_time_ms = None
+            unavailable_reasons["total_stop_time"] = "TARGET_WAS_NOT_STOPPED_BY_CAPTURE"
+
         total_capture_time_us = max(0.0, (t_resume_confirmed - t_overall_start_ns) / 1000.0) if t_resume_confirmed > 0 else max(0.0, (time.monotonic_ns() - t_overall_start_ns) / 1000.0)
 
         stop_budget_exceeded = False
-        if policy and getattr(policy, "max_stop_time_ms", 0) > 0 and suspension_caused_by_capture:
+        if policy and getattr(policy, "max_stop_time_ms", 0) > 0 and total_stop_time_ms is not None:
             if total_stop_time_ms > policy.max_stop_time_ms:
                 stop_budget_exceeded = True
                 diagnostics.append({
@@ -2821,26 +2908,30 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         }
 
         latency_report = CaptureLatencyReport(
-            stop_latency_ms=stop_latency_us / 1000.0,
-            thread_metadata_latency_ms=thread_latency_us / 1000.0,
-            memory_capture_latency_ms=memory_latency_us / 1000.0,
-            resume_latency_ms=resume_latency_us / 1000.0,
-            total_stop_time_ms=total_stop_time_us / 1000.0,
+            stop_latency_ms=round(stop_latency_us / 1000.0, 3) if stop_latency_us is not None else None,
+            thread_metadata_latency_ms=round(thread_latency_us / 1000.0, 3) if thread_latency_us is not None else None,
+            memory_capture_latency_ms=round(memory_latency_us / 1000.0, 3) if memory_latency_us is not None else None,
+            resume_latency_ms=round(resume_latency_us / 1000.0, 3) if resume_latency_us is not None else None,
+            total_stop_time_ms=round(total_stop_time_ms, 3) if total_stop_time_ms is not None else None,
             target_capture_latency_ms=10.0,
-            actual_capture_latency_ms=total_capture_time_us / 1000.0,
-            stop_latency_us=stop_latency_us,
-            thread_metadata_latency_us=thread_latency_us,
-            memory_capture_latency_us=memory_latency_us,
-            resume_latency_us=resume_latency_us,
-            total_stop_time_us=total_stop_time_us,
-            total_capture_latency_us=total_capture_time_us,
+            actual_capture_latency_ms=round(total_capture_time_us / 1000.0, 3) if total_capture_time_us is not None else None,
+            stop_latency_us=round(stop_latency_us, 1) if stop_latency_us is not None else None,
+            thread_metadata_latency_us=round(thread_latency_us, 1) if thread_latency_us is not None else None,
+            memory_capture_latency_us=round(memory_latency_us, 1) if memory_latency_us is not None else None,
+            resume_latency_us=round(resume_latency_us, 1) if resume_latency_us is not None else None,
+            total_stop_time_us=round(total_stop_time_us, 1) if total_stop_time_us is not None else None,
+            total_capture_latency_us=round(total_capture_time_us, 1) if total_capture_time_us is not None else None,
+            unavailable_reasons=unavailable_reasons,
         )
 
         obs_meta = {
             "capture_backend": self.name,
             "capture_mode": plan.mode,
             "capture_status": capture_status,
+            "completeness": completeness,
             "consistency_classification": consistency_classification,
+            "temporal_consistency": "ATOMIC_STOPPED" if (should_suspend and stop_confirmed and all_threads_stopped) else ("PREEXISTING_STOPPED" if was_already_stopped else "NON_ATOMIC"),
+            "stop_budget_compliance": "EXCEEDED" if stop_budget_exceeded else ("COMPLIANT" if total_stop_time_ms is not None else "NOT_APPLICABLE"),
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
             "captured_bytes": bytes_read,
             "bytes_requested": bytes_requested,
@@ -2859,8 +2950,8 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "was_already_stopped": was_already_stopped,
             "suspension_caused_by_capture": suspension_caused_by_capture,
             "actual_capture_suspended_target": suspension_caused_by_capture,
-            "stop_duration_ms": round(total_stop_time_us / 1000.0, 3),
-            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3),
+            "stop_duration_ms": round(total_stop_time_ms, 3) if total_stop_time_ms is not None else None,
+            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3) if total_capture_time_us is not None else None,
             "lifecycle_guarantees": lifecycle_guarantees,
             "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
@@ -2898,8 +2989,11 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "was_already_stopped": was_already_stopped,
             "suspension_caused_by_capture": suspension_caused_by_capture,
             "actual_capture_suspended_target": suspension_caused_by_capture,
-            "stop_duration_ms": round(total_stop_time_us / 1000.0, 3),
-            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3),
+            "stop_duration_ms": round(total_stop_time_ms, 3) if total_stop_time_ms is not None else None,
+            "total_capture_duration_ms": round(total_capture_time_us / 1000.0, 3) if total_capture_time_us is not None else None,
+            "total_stop_time_ms": round(total_stop_time_ms, 3) if total_stop_time_ms is not None else None,
+            "stop_budget_compliance": "EXCEEDED" if stop_budget_exceeded else ("COMPLIANT" if total_stop_time_ms is not None else "NOT_APPLICABLE"),
+            "temporal_consistency": "ATOMIC_STOPPED" if (should_suspend and stop_confirmed and all_threads_stopped) else ("PREEXISTING_STOPPED" if was_already_stopped else "NON_ATOMIC"),
             "lifecycle_guarantees": lifecycle_guarantees,
             "pid_reuse_mitigation": handle.get_diagnostics(),
             "stop_state_machine": {
@@ -2938,9 +3032,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 "path": exe_path,
                 "build_id": build_id
             },
-            "actual_capture_latency_ms": round(total_capture_time_us / 1000.0, 3),
+            "actual_capture_latency_ms": round(total_capture_time_us / 1000.0, 3) if total_capture_time_us is not None else None,
             "target_capture_latency_ms": 10.0,
-            "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3),
+            "total_stop_time_ms": round(total_stop_time_us / 1000.0, 3) if total_stop_time_us is not None else None,
             "latency_report": latency_report.to_dict(),
             "diagnostics": diagnostics,
             "identity_contract": identity_contract,

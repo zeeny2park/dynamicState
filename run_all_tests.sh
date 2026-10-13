@@ -84,7 +84,11 @@ run_step "Web API & Server Lifecycle Tests" \
 run_step "CI Workflow Parity & Discoverability Suite" \
     python3 -m unittest tests/test_ci_workflow_parity.py
 
-# 11. Performance Benchmark Smoke Test
+# 11. Performance Benchmark Integrity & Unit Suite
+run_step "Capture Benchmark Integrity & Schema Suite" \
+    python3 -m unittest tests/test_capture_benchmark.py
+
+# 12. Performance Benchmark Smoke Test
 run_step "Capture Performance Benchmark Smoke Test" \
     python3 -m benchmarks.capture_benchmark --smoke
 
