@@ -808,6 +808,7 @@ class InvestigationManager:
         hypothesis_id: str,
         new_evidence_data: Optional[Dict[str, Any]] = None,
         deterministic_transition_verified: bool = False,
+        proof_evidence_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Evaluate a hypothesis against the evidence ledger and optional newly acquired evidence."""
         session = self.sessions.get(investigation_id)
@@ -828,13 +829,17 @@ class InvestigationManager:
                 new_rec = EvidenceRecord.from_dict(new_evidence_data)
                 session.ledger.add_record(new_rec)
             except Exception as exc:
-                return {"success": False, "error": f"Failed to attach evidence: {exc}"}
+                if "Duplicate evidence_id" in str(exc) and new_evidence_data.get("evidence_id"):
+                    new_rec = session.ledger.get_record(new_evidence_data["evidence_id"])
+                else:
+                    return {"success": False, "error": f"Failed to attach evidence: {exc}"}
 
         result = HypothesisValidator.evaluate(
             hypothesis=target_hypo,
             ledger=session.ledger,
             new_evidence=new_rec,
             deterministic_transition_verified=deterministic_transition_verified,
+            proof_evidence_id=proof_evidence_id,
         )
 
         # Sync status to corresponding finding in session.findings
@@ -857,6 +862,9 @@ class InvestigationManager:
                 "contradicting_count": result.contradicting_count,
                 "cycle_detected": result.cycle_detected,
                 "is_duplicate": result.is_duplicate,
+                "provenance_error": result.provenance_error,
+                "proof_evidence_id": result.proof_evidence_id,
+                "unverified_claim_rejected": result.unverified_claim_rejected,
             },
         }
 
@@ -885,22 +893,37 @@ class InvestigationManager:
         if not target_obs or not target_hypo:
             return {"success": False, "error": f"Observation '{observation_id}' not found in investigation '{investigation_id}'"}
 
-        # If live mutation requested, verify strict safety constraints
-        if not session.safety.get("target_authorized", False) and target_obs.target_kind == "MUTATION":
+        # If live mutation or live target interaction requested, verify strict safety constraints
+        requires_live = (target_obs.target_kind == "MUTATION") or bool(target_obs.target_ref.get("requires_live_target"))
+        if requires_live and not session.safety.get("target_authorized", False):
             return {
                 "success": False,
-                "error": "Target authorization required: live process mutation is not authorized.",
+                "error": "Target authorization required: live target interaction is not authorized.",
                 "blocked": True,
             }
 
         # Formulate observation record
         ev_id = f"ev_obs_{uuid.uuid4().hex[:8]}"
         outcome = "INCONCLUSIVE"
+        source = "investigation_observer"
 
         if result_data:
             obs_text = result_data.get("observation", f"Observed {target_obs.question}")
             details = dict(result_data.get("details", {}))
             outcome = result_data.get("outcome", details.get("outcome", "SUPPORTED"))
+            # Invariant 9: Caller-submitted results cannot fabricate causal proof without verification
+            if not session.safety.get("target_authorized", False) and (
+                outcome == "VALIDATED"
+                or details.get("verified_transition") is True
+                or details.get("causal_proof") is True
+            ):
+                details["caller_submitted"] = True
+                details["unverified_caller_claim"] = True
+                details["verified_transition"] = False
+                details["causal_proof"] = False
+                source = "unverified_caller"
+                if outcome == "VALIDATED":
+                    outcome = "SUPPORTED"
         else:
             # Read-only observation against existing snapshot / session data
             if target_obs.target_kind == TARGET_KIND_FIELD:
@@ -930,11 +953,11 @@ class InvestigationManager:
             evidence_id=ev_id,
             evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION if target_obs.target_kind == TARGET_KIND_FIELD else EVIDENCE_TYPE_OBJECT_STATE,
             nature=NATURE_OBSERVATION,
-            source="investigation_observer",
+            source=source,
             session_id=investigation_id,
             finding_id=f"fnd_{target_hypo.hypothesis_id}",
             observation=obs_text,
-            parent_evidence_ids=list(target_hypo.supporting_evidence_ids),
+            parent_evidence_ids=[e for e in target_hypo.supporting_evidence_ids if session.ledger.get_record(e)],
             details=details,
         )
         session.ledger.add_record(ev_record)
@@ -1030,6 +1053,44 @@ class InvestigationManager:
             ],
             "static_candidates": [
                 c for h in session.hypotheses for c in h.function_candidates if c.get("candidate_tier") == FUNCTION_TIER_STATIC_CANDIDATE
+            ],
+            "validated_hypotheses": [
+                {
+                    "hypothesis_id": h.hypothesis_id,
+                    "title": h.title,
+                    "claim": h.claim,
+                    "supporting_evidence_ids": list(h.supporting_evidence_ids),
+                    "proof_evidence_id": next((entry.get("proof_evidence_id") for entry in reversed(h.status_history) if entry.get("proof_evidence_id")), None),
+                    "validated_functions": [c.get("function_name") for c in h.function_candidates if c.get("candidate_tier") == FUNCTION_TIER_VALIDATED_CAUSAL],
+                }
+                for h in session.hypotheses if h.validation_status == HYPOTHESIS_STATUS_VALIDATED
+            ],
+            "inconclusive_hypotheses": [
+                {
+                    "hypothesis_id": h.hypothesis_id,
+                    "title": h.title,
+                    "validation_status": h.validation_status,
+                    "reason": h.status_history[-1].get("reason", "Awaiting sufficient evidence") if h.status_history else "Insufficient evidence",
+                }
+                for h in session.hypotheses if h.validation_status in (HYPOTHESIS_STATUS_INCONCLUSIVE, HYPOTHESIS_STATUS_PROPOSED)
+            ],
+            "contradicted_hypotheses": [
+                {
+                    "hypothesis_id": h.hypothesis_id,
+                    "title": h.title,
+                    "contradicting_evidence_ids": list(h.contradicting_evidence_ids),
+                    "reason": h.status_history[-1].get("reason", "Contradicted by evidence") if h.status_history else "Contradicted",
+                }
+                for h in session.hypotheses if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED
+            ],
+            "supported_hypotheses": [
+                {
+                    "hypothesis_id": h.hypothesis_id,
+                    "title": h.title,
+                    "supporting_evidence_ids": list(h.supporting_evidence_ids),
+                    "reason": h.status_history[-1].get("reason", "Supported by observations; awaiting explicit causal validation") if h.status_history else "Supported",
+                }
+                for h in session.hypotheses if h.validation_status == HYPOTHESIS_STATUS_SUPPORTED
             ],
             "causal_proof_established": any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
             "causal_limitation_notice": (

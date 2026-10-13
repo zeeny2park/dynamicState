@@ -359,6 +359,60 @@ class TestCppE2EInvestigation(unittest.TestCase):
         val_cands = fnd_val.get("function_candidates", [])
         self.assertTrue(any(c["function_name"] == "advance_shared_node" and "main.cpp:54" in str(c.get("source_location")) for c in val_cands))
 
+        # 4. Verify Causal Hypothesis Generation & Hardened Validation Loop on Real Process Diffs
+        session = self.mgr.sessions[inv_id]
+        self.mgr._execute_stage_synthesis(session)
+        hypos = self.mgr.get_hypotheses(inv_id)
+        self.assertGreaterEqual(len(hypos), 1)
+
+        counter_hypo = next((h for h in hypos if "counter" in h["title"].lower() or "counter" in h["claim"].lower()), hypos[0])
+        h_id = counter_hypo["hypothesis_id"]
+
+        # Invariant 1: Static candidate mutate_worker_state is NOT initially confirmed
+        cands_h = counter_hypo.get("function_candidates", [])
+        mutate_cand = next((c for c in cands_h if c.get("function_name") == "mutate_worker_state"), cands_h[0] if cands_h else {})
+        self.assertFalse(mutate_cand.get("confirmed_root_cause", False))
+
+        # Invariant 3: Caller supplying boolean alone is rejected!
+        unverified_eval = self.mgr.evaluate_hypothesis(
+            inv_id,
+            h_id,
+            deterministic_transition_verified=True,
+        )
+        self.assertTrue(unverified_eval["success"])
+        self.assertEqual(unverified_eval["transition"]["to_status"], "SUPPORTED")
+        self.assertTrue(unverified_eval["transition"]["unverified_claim_rejected"])
+
+        # Legitimate validation with verified diff comparison evidence
+        verified_eval = self.mgr.evaluate_hypothesis(
+            inv_id,
+            h_id,
+            new_evidence_data={
+                "evidence_id": f"ev_cpp_proof_{inv_id}",
+                "evidence_type": "comparison",
+                "nature": "observation",
+                "source": "investigation_observer",
+                "observation": "Deterministic transition reproduced: counter 42 -> 100 via mutate_worker_state",
+                "details": {
+                    "verified_transition": True,
+                    "target_function": "mutate_worker_state",
+                    "field_path": "State.counter",
+                },
+                "capture_quality": {"completeness": "COMPLETE"},
+            },
+            deterministic_transition_verified=True,
+        )
+        self.assertTrue(verified_eval["success"])
+        self.assertEqual(verified_eval["transition"]["to_status"], "VALIDATED")
+
+        # Report exposes causal conclusions
+        final_report = self.mgr.generate_report(inv_id)
+        cc = final_report["causal_conclusions"]
+        self.assertTrue(cc["causal_proof_established"])
+        self.assertEqual(cc["validated_causal_count"], 1)
+        # Invariant 1: Static DWARF candidate remains STATIC_CANDIDATE and is NOT silently confirmed as root cause!
+        self.assertTrue(any(f.get("function_name") == "mutate_worker_state" and not f.get("confirmed_root_cause") for f in cc["static_candidates"]))
+
     def test_scenario_d_worker_threads_and_thread_consistency(self):
         """Scenario D: worker threads worker_a_fn/worker_b_fn in thread metadata -> thread consistency verification."""
         proc = self._start_process(self.debug_bin)

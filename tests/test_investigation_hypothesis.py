@@ -581,10 +581,32 @@ class TestInvestigationManagerHypothesisIntegration(unittest.TestCase):
         updated_hypo = self.manager.get_hypothesis(inv_id, hypo_id)
         self.assertEqual(updated_hypo["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
 
-        # 6. Evaluate hypothesis directly with deterministic transition proof
+        # 6a. Attempt evaluation with caller-supplied boolean alone (Invariant 3: rejected!)
+        unverified_eval = self.manager.evaluate_hypothesis(
+            inv_id,
+            hypo_id,
+            deterministic_transition_verified=True,
+        )
+        self.assertTrue(unverified_eval["success"])
+        self.assertEqual(unverified_eval["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(unverified_eval["transition"]["unverified_claim_rejected"])
+
+        # 6b. Evaluate with verifiable deterministic transition proof evidence
         eval_res = self.manager.evaluate_hypothesis(
             inv_id,
             hypo_id,
+            new_evidence_data={
+                "evidence_id": "ev_proof_full",
+                "evidence_type": EVIDENCE_TYPE_COMPARISON,
+                "nature": NATURE_OBSERVATION,
+                "source": "investigation_observer",
+                "observation": "Deterministic transition reproduced 42 -> 100",
+                "details": {
+                    "verified_transition": True,
+                    "target_function": "update_counter",
+                },
+                "capture_quality": {"completeness": "COMPLETE"},
+            },
             deterministic_transition_verified=True,
         )
         self.assertTrue(eval_res["success"])
@@ -696,10 +718,29 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
         obs_res = self.runtime.dispatch_action(obs_act)
         self.assertTrue(obs_res.success)
 
-        # 5. EVALUATE_HYPOTHESIS via WebAdapter
+        # 5a. EVALUATE_HYPOTHESIS with boolean alone is rejected (Invariant 3)
+        eval_res_bool = self.adapter.evaluate_hypothesis({
+            "investigation_id": inv_id,
+            "hypothesis_id": hypo_id,
+            "deterministic_transition_verified": True,
+        })
+        self.assertTrue(eval_res_bool["success"])
+        self.assertEqual(eval_res_bool["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(eval_res_bool["data"]["transition"]["unverified_claim_rejected"])
+
+        # 5b. EVALUATE_HYPOTHESIS with verified proof evidence succeeds
         eval_res = self.adapter.evaluate_hypothesis({
             "investigation_id": inv_id,
             "hypothesis_id": hypo_id,
+            "new_evidence": {
+                "evidence_id": "ev_proof_arp",
+                "evidence_type": EVIDENCE_TYPE_COMPARISON,
+                "nature": NATURE_OBSERVATION,
+                "source": "investigation_observer",
+                "observation": "Deterministic transition reproduced 1 -> 2",
+                "details": {"verified_transition": True},
+                "capture_quality": {"completeness": "COMPLETE"},
+            },
             "deterministic_transition_verified": True,
         })
         self.assertTrue(eval_res["success"])

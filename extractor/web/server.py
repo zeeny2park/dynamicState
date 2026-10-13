@@ -1455,7 +1455,14 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id and hypothesis_id are required"}}
         new_ev = params.get("new_evidence")
         det_trans = bool(params.get("deterministic_transition_verified", False))
-        res = self.runtime.evaluate_hypothesis(inv_id, hypo_id, new_evidence=new_ev, deterministic_transition_verified=det_trans)
+        proof_eid = params.get("proof_evidence_id")
+        res = self.runtime.evaluate_hypothesis(
+            inv_id,
+            hypo_id,
+            new_evidence=new_ev,
+            deterministic_transition_verified=det_trans,
+            proof_evidence_id=proof_eid,
+        )
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
         return {"success": False, "error": {"code": res.error.code if res.error else "EVAL_ERROR",

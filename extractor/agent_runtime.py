@@ -243,6 +243,7 @@ class AgentRuntime:
                     action.hypothesis_id,
                     new_evidence=action.new_evidence,
                     deterministic_transition_verified=getattr(action, "deterministic_transition_verified", False),
+                    proof_evidence_id=getattr(action, "proof_evidence_id", None),
                 )
             elif act == "EXECUTE_OBSERVATION":
                 if not action.investigation_id or not action.observation_id:
@@ -1795,6 +1796,7 @@ class AgentRuntime:
         hypothesis_id: str,
         new_evidence: Optional[Dict[str, Any]] = None,
         deterministic_transition_verified: bool = False,
+        proof_evidence_id: Optional[str] = None,
     ) -> AgentActionResult:
         """Evaluate a hypothesis against the evidence ledger."""
         t0 = time.monotonic()
@@ -1803,6 +1805,7 @@ class AgentRuntime:
             hypothesis_id,
             new_evidence_data=new_evidence,
             deterministic_transition_verified=deterministic_transition_verified,
+            proof_evidence_id=proof_evidence_id,
         )
         if not res.get("success", False):
             return self._error("HYPOTHESIS_EVAL_ERROR", res.get("error", "Failed to evaluate hypothesis"), "EVALUATE_HYPOTHESIS", t0)

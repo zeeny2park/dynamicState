@@ -535,38 +535,59 @@ class ValidationTransitionResult:
     contradicting_count: int
     cycle_detected: bool = False
     is_duplicate: bool = False
+    provenance_error: Optional[str] = None
+    proof_evidence_id: Optional[str] = None
+    unverified_claim_rejected: bool = False
 
 
 class HypothesisValidator:
     """Evaluates and validates hypotheses against the Evidence Ledger with strict criteria."""
 
     @staticmethod
-    def detect_cycles(ledger: EvidenceLedger, start_evidence_id: str, max_depth: int = 50) -> bool:
-        """Verify that the evidence provenance graph is strictly acyclic."""
+    def check_provenance_integrity(ledger: EvidenceLedger, start_evidence_id: str, max_depth: int = 50) -> Tuple[bool, Optional[str]]:
+        """Verify that the evidence provenance graph is acyclic and has no missing parent records.
+
+        Returns: (has_cycle: bool, error_message: Optional[str])
+        """
         visited: Set[str] = set()
         stack: Set[str] = set()
 
-        def _dfs(eid: str, depth: int) -> bool:
+        def _dfs(eid: str, depth: int) -> Tuple[bool, Optional[str]]:
             if depth > max_depth:
-                return True  # Treat excessive depth as potential cycle
+                return True, "Maximum provenance depth exceeded (potential cycle)"
             if eid in stack:
-                return True  # Cycle detected!
+                return True, f"Cycle detected in evidence provenance involving '{eid}'"
             if eid in visited:
-                return False
+                return False, None
 
             visited.add(eid)
             stack.add(eid)
 
             rec = ledger.get_record(eid)
-            if rec:
-                for parent_id in rec.parent_evidence_ids:
-                    if _dfs(parent_id, depth + 1):
-                        return True
+            if not rec:
+                stack.remove(eid)
+                return False, None
+
+            for parent_id in rec.parent_evidence_ids:
+                parent_rec = ledger.get_record(parent_id)
+                if not parent_rec:
+                    stack.remove(eid)
+                    return False, f"Missing parent evidence record '{parent_id}' referenced by '{eid}'"
+                cycle, err = _dfs(parent_id, depth + 1)
+                if cycle or err:
+                    stack.remove(eid)
+                    return cycle, err
 
             stack.remove(eid)
-            return False
+            return False, None
 
         return _dfs(start_evidence_id, 0)
+
+    @classmethod
+    def detect_cycles(cls, ledger: EvidenceLedger, start_evidence_id: str, max_depth: int = 50) -> bool:
+        """Verify that the evidence provenance graph is strictly acyclic."""
+        has_cycle, _ = cls.check_provenance_integrity(ledger, start_evidence_id, max_depth)
+        return has_cycle
 
     @staticmethod
     def is_duplicate_evidence(ledger: EvidenceLedger, record: EvidenceRecord, existing_records: List[EvidenceRecord]) -> bool:
@@ -582,7 +603,110 @@ class HypothesisValidator:
                 and ex.details == record.details
             ):
                 return True
+            # Same underlying observation_id in details
+            if ex.details and record.details:
+                ex_obs_id = ex.details.get("observation_id")
+                rec_obs_id = record.details.get("observation_id")
+                if ex_obs_id and ex_obs_id == rec_obs_id:
+                    return True
+            # Same finding_id and observation text
+            if ex.finding_id and ex.finding_id == record.finding_id and ex.observation == record.observation:
+                return True
         return False
+
+    @classmethod
+    def verify_causal_proof(
+        cls,
+        hypothesis: InvestigationHypothesis,
+        ledger: EvidenceLedger,
+        proof_evidence_id: Optional[str] = None,
+        deterministic_transition_verified: bool = False,
+    ) -> Tuple[bool, str, Optional[EvidenceRecord]]:
+        """Verify whether an auditable, independent evidence record in the ledger proves the causal relationship.
+
+        Criteria for Valid Causal Proof:
+        1. A caller-supplied Boolean WITHOUT an auditable, verified proof record is strictly rejected.
+        2. The proof evidence record MUST exist in the ledger with valid provenance.
+        3. The proof record's capture quality must be COMPLETE (never PARTIAL, FAILED, INVALID, or UNTRUSTED).
+        4. Capture consistency must NOT be NON_ATOMIC (atomic stop required for causal temporal ordering).
+        5. The record must have NO provenance cycles and NO missing parent records.
+        6. The record must NOT be duplicate or synthetic/unauthorized caller fabrication.
+        7. The record details must demonstrate explicit causal criteria: verified_transition/causal_proof/reproduction_verified
+        """
+        # 1. Locate the candidate proof record
+        proof_rec: Optional[EvidenceRecord] = None
+        if proof_evidence_id:
+            proof_rec = ledger.get_record(proof_evidence_id)
+            if not proof_rec:
+                return False, f"Referenced proof evidence '{proof_evidence_id}' does not exist in ledger", None
+        else:
+            # Search supporting evidence records in ledger
+            for eid in hypothesis.supporting_evidence_ids:
+                cand = ledger.get_record(eid)
+                if not cand:
+                    continue
+                obs_lower = cand.observation.lower()
+                cand_details = cand.details or {}
+                has_causal_marker = (
+                    cand_details.get("verified_transition") is True
+                    or cand_details.get("causal_proof") is True
+                    or cand_details.get("reproduction_verified") is True
+                    or cand_details.get("transition_verified") is True
+                    or cand_details.get("verified_writer") is True
+                    or "deterministic transition reproduced" in obs_lower
+                    or "reproduced deterministic mutation" in obs_lower
+                    or "verified deterministic transition" in obs_lower
+                    or (cand.evidence_type == EVIDENCE_TYPE_COMPARISON and "transition" in obs_lower)
+                )
+                if has_causal_marker:
+                    proof_rec = cand
+                    break
+
+        # If no qualifying proof record was found:
+        if not proof_rec:
+            if deterministic_transition_verified:
+                return (
+                    False,
+                    "Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements",
+                    None,
+                )
+            return False, "Awaiting verified causal transition proof evidence", None
+
+        # 2. Check if proof record was an unverified caller submission
+        p_details = proof_rec.details or {}
+        if p_details.get("caller_submitted") is True or p_details.get("unverified_caller_claim") is True or proof_rec.source == "unverified_caller":
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' was submitted by unverified caller without independent execution",
+                proof_rec,
+            )
+
+        # 3. Check capture quality of proof record
+        cq = proof_rec.capture_quality or {}
+        c_status = cq.get("completeness") or cq.get("status") or "COMPLETE"
+        if c_status in ("FAILED", "INVALID", "UNTRUSTED"):
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has {c_status} capture quality; causal validation rejected",
+                proof_rec,
+            )
+
+        # 4. Check provenance integrity (cycles and missing parents)
+        has_cycle, prov_err = cls.check_provenance_integrity(ledger, proof_rec.evidence_id)
+        if has_cycle:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' is part of a cyclic provenance graph",
+                proof_rec,
+            )
+        if prov_err:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' provenance error: {prov_err}",
+                proof_rec,
+            )
+
+        return True, f"Causal relationship verified by evidence record '{proof_rec.evidence_id}'", proof_rec
 
     @classmethod
     def evaluate(
@@ -591,31 +715,49 @@ class HypothesisValidator:
         ledger: EvidenceLedger,
         new_evidence: Optional[EvidenceRecord] = None,
         deterministic_transition_verified: bool = False,
+        proof_evidence_id: Optional[str] = None,
     ) -> ValidationTransitionResult:
         """Evaluate a hypothesis against the evidence ledger and optional newly acquired evidence.
 
         Strict Enforcements:
         1. A hypothesis must NEVER become VALIDATED merely because an LLM claimed it or a static candidate matches.
         2. VALIDATED requires:
-           - Explicit causal criteria satisfied (e.g. deterministic transition verification or verified stack write)
+           - Explicit causal criteria satisfied by verified, independent evidence in the ledger
            - Complete capture quality (no UNTRUSTED or PARTIAL)
+           - Atomic capture consistency (no NON_ATOMIC)
            - Supporting evidence > 0
            - Contradicting evidence == 0
         3. Contradicting evidence immediately transitions hypothesis to CONTRADICTED.
-        4. PARTIAL / UNTRUSTED / INVALID captures cap status at INCONCLUSIVE or PROPOSED.
+        4. PARTIAL / UNTRUSTED / INVALID / NON_ATOMIC captures cap status at INCONCLUSIVE or SUPPORTED.
         5. Duplicate evidence does NOT count as independent corroboration.
-        6. Cyclic provenance is rejected and flagged.
+        6. Cyclic provenance and missing parent records are rejected and flagged.
+        7. STATIC_CANDIDATE from DWARF/source can never become confirmed root cause.
         """
         old_status = hypothesis.validation_status
         old_conf = hypothesis.confidence
 
         cycle_found = False
+        prov_error: Optional[str] = None
+
         if new_evidence and new_evidence.evidence_id:
-            cycle_found = cls.detect_cycles(ledger, new_evidence.evidence_id)
+            c_found, p_err = cls.check_provenance_integrity(ledger, new_evidence.evidence_id)
+            if c_found:
+                cycle_found = True
+            if p_err and not prov_error:
+                prov_error = p_err
+
+        # Check existing supporting evidence for provenance integrity
+        for eid in hypothesis.supporting_evidence_ids:
+            c_found, p_err = cls.check_provenance_integrity(ledger, eid)
+            if c_found:
+                cycle_found = True
+            if p_err and not prov_error:
+                prov_error = p_err
 
         # Inspect capture quality across all supporting evidence
         has_untrusted_evidence = False
         has_partial_evidence = False
+        has_non_atomic_evidence = False
         for eid in hypothesis.supporting_evidence_ids:
             rec = ledger.get_record(eid)
             if rec:
@@ -625,17 +767,21 @@ class HypothesisValidator:
                     has_untrusted_evidence = True
                 elif c_status == "PARTIAL":
                     has_partial_evidence = True
+                c_level = cq.get("consistency_level") or cq.get("consistency_classification") or (rec.details or {}).get("consistency_classification")
+                if c_level == "NON_ATOMIC" or (rec.details or {}).get("is_non_atomic") is True:
+                    has_non_atomic_evidence = True
 
         # Process newly attached evidence
         new_is_duplicate = False
         trigger_eid = None
         if new_evidence:
             trigger_eid = new_evidence.evidence_id
-            existing = [ledger.get_record(e) for e in hypothesis.supporting_evidence_ids if ledger.get_record(e)]
+            existing_ids = list(dict.fromkeys(hypothesis.supporting_evidence_ids + hypothesis.contradicting_evidence_ids))
+            existing = [ledger.get_record(e) for e in existing_ids if ledger.get_record(e)]
             if cls.is_duplicate_evidence(ledger, new_evidence, existing):
                 new_is_duplicate = True
 
-            if not new_is_duplicate and not cycle_found:
+            if not new_is_duplicate and not cycle_found and not prov_error:
                 # Check if evidence outcome is contradicting
                 is_contradiction = False
                 details = new_evidence.details or {}
@@ -650,20 +796,39 @@ class HypothesisValidator:
                 else:
                     if new_evidence.evidence_id not in hypothesis.supporting_evidence_ids:
                         hypothesis.supporting_evidence_ids.append(new_evidence.evidence_id)
+                        cq = new_evidence.capture_quality or {}
+                        c_status = cq.get("completeness") or cq.get("status")
+                        if c_status in ("FAILED", "INVALID"):
+                            has_untrusted_evidence = True
+                        elif c_status == "PARTIAL":
+                            has_partial_evidence = True
+                        c_level = cq.get("consistency_level") or cq.get("consistency_classification") or details.get("consistency_classification")
+                        if c_level == "NON_ATOMIC" or details.get("is_non_atomic") is True:
+                            has_non_atomic_evidence = True
 
-        # Check evidence counts
+        # Deduplicate evidence ID lists for strict idempotency
+        hypothesis.supporting_evidence_ids = list(dict.fromkeys(hypothesis.supporting_evidence_ids))
+        hypothesis.contradicting_evidence_ids = list(dict.fromkeys(hypothesis.contradicting_evidence_ids))
+
         supp_count = len(hypothesis.supporting_evidence_ids)
         contra_count = len(hypothesis.contradicting_evidence_ids)
 
         new_status = old_status
         new_conf = old_conf
         reason = "Status unchanged."
+        unverified_claim_rejected = False
+        verified_proof_rec: Optional[EvidenceRecord] = None
 
         if cycle_found:
             new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
             new_conf = CONFIDENCE_LOW
             reason = "Cyclic evidence provenance detected; evaluation halted to prevent recursive reasoning."
+        elif prov_error:
+            new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+            new_conf = CONFIDENCE_LOW
+            reason = f"Evidence provenance integrity violation: {prov_error}."
         elif contra_count > 0:
+            # Contradiction dominance: even repeated evaluation or duplicate supporting records cannot override
             new_status = HYPOTHESIS_STATUS_CONTRADICTED
             new_conf = CONFIDENCE_HIGH
             reason = f"Contradicted by {contra_count} independent observation(s)."
@@ -672,32 +837,66 @@ class HypothesisValidator:
             new_conf = CONFIDENCE_LOW
             reason = "Supporting evidence originates from FAILED or INVALID capture; cannot support hypothesis."
         elif supp_count > 0:
-            if deterministic_transition_verified:
-                # Explicit causal proof demonstrated!
-                if not has_partial_evidence:
-                    new_status = HYPOTHESIS_STATUS_VALIDATED
-                    new_conf = CONFIDENCE_HIGH
-                    reason = "Deterministic transition verified causal relationship; all criteria satisfied."
-                    # Upgrade function candidate if present
-                    for fc in hypothesis.function_candidates:
-                        if fc.get("candidate_tier") == FUNCTION_TIER_EVIDENCE_SUPPORTED:
-                            fc["candidate_tier"] = FUNCTION_TIER_VALIDATED_CAUSAL
-                            fc["confirmed_root_cause"] = True
-                            fc["tier_limitation"] = "Causal role verified via deterministic reproduction."
-                else:
+            proof_valid, proof_msg, proof_rec = cls.verify_causal_proof(
+                hypothesis,
+                ledger,
+                proof_evidence_id=proof_evidence_id,
+                deterministic_transition_verified=deterministic_transition_verified,
+            )
+
+            if proof_valid and proof_rec:
+                verified_proof_rec = proof_rec
+                proof_cq = proof_rec.capture_quality or {}
+                proof_c_status = proof_cq.get("completeness") or proof_cq.get("status")
+                proof_level = proof_cq.get("consistency_level") or proof_cq.get("consistency_classification") or (proof_rec.details or {}).get("consistency_classification")
+                is_proof_partial = (proof_c_status == "PARTIAL")
+                is_proof_non_atomic = (proof_level == "NON_ATOMIC") or (proof_rec.details or {}).get("is_non_atomic") is True
+
+                if has_partial_evidence or is_proof_partial:
                     new_status = HYPOTHESIS_STATUS_SUPPORTED
                     new_conf = CONFIDENCE_MEDIUM
                     reason = "Causal transition observed, but capture quality is PARTIAL; capped at SUPPORTED."
+                elif has_non_atomic_evidence or is_proof_non_atomic:
+                    new_status = HYPOTHESIS_STATUS_SUPPORTED
+                    new_conf = CONFIDENCE_LOW
+                    reason = "Causal transition observed, but capture consistency is NON_ATOMIC; capped at SUPPORTED."
+                else:
+                    # Validated with full causal proof!
+                    new_status = HYPOTHESIS_STATUS_VALIDATED
+                    new_conf = CONFIDENCE_HIGH
+                    reason = f"Deterministic transition verified causal relationship via evidence {proof_rec.evidence_id}; all criteria satisfied."
+
+                    # Upgrade function candidate if present (Invariant 1 & 2: STATIC_CANDIDATE never promoted!)
+                    target_fn = (proof_rec.details or {}).get("target_function") or (proof_rec.details or {}).get("writer_function") or (proof_rec.details or {}).get("executing_function")
+                    for fc in hypothesis.function_candidates:
+                        tier = fc.get("candidate_tier")
+                        fn_name = fc.get("function_name")
+                        if tier == FUNCTION_TIER_EVIDENCE_SUPPORTED:
+                            if not target_fn or fn_name == target_fn:
+                                fc["candidate_tier"] = FUNCTION_TIER_VALIDATED_CAUSAL
+                                fc["confirmed_root_cause"] = True
+                                fc["tier_limitation"] = f"Causal role verified via deterministic reproduction in evidence {proof_rec.evidence_id}."
+                            else:
+                                fc["confirmed_root_cause"] = False
+                                fc["tier_limitation"] = f"Observed in execution, but causal proof evidence identifies {target_fn} as the causal writer."
+                        elif tier == FUNCTION_TIER_STATIC_CANDIDATE:
+                            # Invariant 1: static candidates remain static candidates
+                            fc["confirmed_root_cause"] = False
+                            fc["tier_limitation"] = "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
             else:
-                # Supported by observations, but not causally proven
+                # Causal proof was not established
                 new_status = HYPOTHESIS_STATUS_SUPPORTED
-                new_conf = CONFIDENCE_MEDIUM if not has_partial_evidence else CONFIDENCE_LOW
-                reason = f"Supported by {supp_count} observation(s); awaiting explicit causal validation."
+                new_conf = CONFIDENCE_MEDIUM if (not has_partial_evidence and not has_non_atomic_evidence) else CONFIDENCE_LOW
+                if deterministic_transition_verified:
+                    unverified_claim_rejected = True
+                    reason = f"Supported by {supp_count} observation(s); caller-supplied deterministic_transition_verified boolean rejected ({proof_msg})."
+                else:
+                    reason = f"Supported by {supp_count} observation(s); awaiting explicit causal validation."
         else:
             new_status = HYPOTHESIS_STATUS_PROPOSED
             reason = "Awaiting follow-up observation evidence."
 
-        status_changed = (new_status != old_status)
+        status_changed = (new_status != old_status) or (new_conf != old_conf)
         if status_changed:
             hypothesis.validation_status = new_status
             hypothesis.confidence = new_conf
@@ -708,6 +907,8 @@ class HypothesisValidator:
                 "timestamp": hypothesis.updated_at,
                 "reason": reason,
                 "trigger_evidence_id": trigger_eid,
+                "proof_evidence_id": verified_proof_rec.evidence_id if verified_proof_rec else None,
+                "unverified_claim_rejected": unverified_claim_rejected,
             })
 
         return ValidationTransitionResult(
@@ -722,4 +923,7 @@ class HypothesisValidator:
             contradicting_count=contra_count,
             cycle_detected=cycle_found,
             is_duplicate=new_is_duplicate,
+            provenance_error=prov_error,
+            proof_evidence_id=verified_proof_rec.evidence_id if verified_proof_rec else None,
+            unverified_claim_rejected=unverified_claim_rejected,
         )

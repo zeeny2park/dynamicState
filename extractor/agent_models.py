@@ -126,6 +126,7 @@ class AgentAction(_SubscriptableModel):
     new_evidence: Optional[Dict[str, Any]] = None
     result_data: Optional[Dict[str, Any]] = None
     deterministic_transition_verified: bool = False
+    proof_evidence_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -169,6 +170,7 @@ class AgentAction(_SubscriptableModel):
             new_evidence=data.get("new_evidence"),
             result_data=data.get("result_data"),
             deterministic_transition_verified=bool(data.get("deterministic_transition_verified", False)),
+            proof_evidence_id=data.get("proof_evidence_id"),
         )
 
 
