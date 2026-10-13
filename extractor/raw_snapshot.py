@@ -212,6 +212,18 @@ class RawRuntimeSnapshot:
         obs_meta = dict(observation_metadata or {})
         id_contract = prov.get("identity_contract", {}) or obs_meta.get("identity_contract", {}) or {}
 
+        # 0. Malformed or unknown completeness values: never silently upgrade to COMPLETE
+        valid_completeness = {"COMPLETE", "PARTIAL", "INVALID", "FAILED"}
+        if completeness not in valid_completeness:
+            original_comp = str(completeness)
+            prov.setdefault("diagnostics", []).append({
+                "code": "MALFORMED_QUALITY_VALUE",
+                "message": f"Malformed or unknown completeness value '{original_comp}' conservatively clamped to PARTIAL.",
+                "level": "WARNING"
+            })
+            prov["original_malformed_completeness"] = original_comp
+            completeness = "PARTIAL"
+
         # 1. INVALID conditions (identity mismatch, PID reuse, unverified stop safety)
         if (
             id_contract.get("identity_mismatch_detected")
@@ -238,7 +250,7 @@ class RawRuntimeSnapshot:
         ):
             return "FAILED", prov
 
-        # 3. PARTIAL conditions (incomplete enumeration, partial reads, missing threads, non-atomic)
+        # 3. PARTIAL conditions (incomplete enumeration, partial reads, missing threads, non-atomic, budget exceeded)
         if completeness == "PARTIAL":
             return "PARTIAL", prov
 
@@ -248,6 +260,22 @@ class RawRuntimeSnapshot:
 
         has_failed_reg = any(r.get("status") in ("FAILED", "PARTIAL", "OMITTED") for r in memory_regions)
         has_byte_shortfall = (bytes_req > 0 and bytes_read < bytes_req)
+
+        # Byte accounting invariant: requested == read + omitted + failed + unread
+        bytes_omitted = prov.get("bytes_omitted", 0)
+        bytes_failed = prov.get("bytes_failed", 0)
+        bytes_unread = prov.get("bytes_unread", 0)
+        has_accounting_mismatch = False
+        if bytes_req > 0:
+            bytes_accounted = bytes_read + bytes_omitted + bytes_failed + bytes_unread
+            if bytes_accounted != bytes_req:
+                has_accounting_mismatch = True
+                prov.setdefault("diagnostics", []).append({
+                    "code": "BYTE_ACCOUNTING_INVARIANT_VIOLATED",
+                    "message": f"Requested bytes ({bytes_req}) does not match sum of read ({bytes_read}), omitted ({bytes_omitted}), failed ({bytes_failed}), and unread ({bytes_unread}).",
+                    "level": "WARNING"
+                })
+
         has_partial_maps = map_status in ("PARTIAL", "FAILED")
         has_partial_threads = (
             thread_status in ("PARTIAL", "FAILED", "SUCCESS_EMPTY")
@@ -260,24 +288,40 @@ class RawRuntimeSnapshot:
         stop_unconfirmed = (not was_stopped and guarantees.get("process_stop_requested", False) and not guarantees.get("process_stop_confirmed", False))
         threads_unconfirmed = ((guarantees.get("process_stop_requested", False) or was_stopped) and not guarantees.get("all_threads_stopped", False) and guarantees.get("process_stop_confirmed", False))
         is_non_atomic = (obs_meta.get("consistency_classification") == "NON_ATOMIC" or prov.get("snapshot_consistency") == "NON_ATOMIC")
+        stop_budget_exceeded = prov.get("stop_budget_exceeded", False) or any(d.get("code") == "STOP_BUDGET_EXCEEDED" for d in prov.get("diagnostics", []))
 
         if (
             has_failed_reg
             or has_byte_shortfall
+            or has_accounting_mismatch
             or has_partial_maps
             or has_partial_threads
             or stop_unconfirmed
             or threads_unconfirmed
             or is_non_atomic
+            or stop_budget_exceeded
         ):
             return "PARTIAL", prov
 
-        # 4. Legacy snapshot policy:
-        # If provenance is missing or marked legacy, preserve declared status only if coherent with data
-        if not provenance or prov.get("is_legacy"):
+        # 4. Legacy snapshot conservative policy:
+        # If provenance is missing or marked legacy, do not infer COMPLETE merely because memory regions exist.
+        # Classify unverifiable quality conservatively as PARTIAL under legacy migration policy,
+        # unless modern verifiable lifecycle guarantees exist.
+        is_legacy = (not provenance) or prov.get("is_legacy", False)
+        if is_legacy:
             prov["is_legacy"] = True
-            prov["legacy_policy"] = "PRESERVE_DECLARED_STATUS_IF_COHERENT"
-            if len(memory_regions) == 0 and (not captured_ranges or len(captured_ranges) == 0):
+            prov["legacy_migration_policy"] = "CONSERVATIVE_UNVERIFIABLE_TO_PARTIAL"
+            has_verifiable_guarantees = (
+                guarantees.get("process_stop_confirmed") is True
+                and guarantees.get("all_threads_stopped") is True
+                and not has_failed_reg
+            )
+            if not has_verifiable_guarantees:
+                prov.setdefault("diagnostics", []).append({
+                    "code": "LEGACY_SNAPSHOT_UNVERIFIABLE",
+                    "message": "Snapshot lacks modern verified lifecycle provenance; classified conservatively as PARTIAL under legacy migration policy.",
+                    "level": "WARNING"
+                })
                 return "PARTIAL", prov
 
         return "COMPLETE", prov

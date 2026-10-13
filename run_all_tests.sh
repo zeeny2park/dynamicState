@@ -80,6 +80,14 @@ run_step "Multithread Restart Determinism & Branch Isolation Suite" \
 run_step "Web API & Server Lifecycle Tests" \
     python3 -m unittest tests/test_web_api.py tests/test_web_server_lifecycle.py
 
+# 10. CI Workflow Parity & Discoverability Suite
+run_step "CI Workflow Parity & Discoverability Suite" \
+    python3 -m unittest tests/test_ci_workflow_parity.py
+
+# 11. Performance Benchmark Smoke Test
+run_step "Capture Performance Benchmark Smoke Test" \
+    python3 -m benchmarks.capture_benchmark --smoke
+
 # 6. GDB 9.2 Compatibility Test (Docker if available)
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo ""

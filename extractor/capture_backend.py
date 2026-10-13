@@ -1777,6 +1777,25 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         regions_read = regions_complete + regions_partial
         regions_attempted = regions_read + regions_failed + regions_omitted
 
+        # Compute exact measured microsecond and millisecond latencies before quality determination
+        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if (should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0) else 0.0
+        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if (should_suspend and t_threads > 0 and t_stop_confirmed > 0) else 0.0
+        memory_latency_us = (t_memory - t_threads) / 1000.0 if (t_memory > 0 and t_threads > 0) else 0.0
+        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0) else 0.0
+        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0) else 0.0
+        total_stop_time_ms = total_stop_time_us / 1000.0
+        total_capture_time_us = max(0.0, (t_resume_confirmed - t_overall_start_ns) / 1000.0) if t_resume_confirmed > 0 else max(0.0, (time.monotonic_ns() - t_overall_start_ns) / 1000.0)
+
+        stop_budget_exceeded = False
+        if policy and getattr(policy, "max_stop_time_ms", 0) > 0 and suspension_caused_by_capture:
+            if total_stop_time_ms > policy.max_stop_time_ms:
+                stop_budget_exceeded = True
+                diagnostics.append({
+                    "code": "STOP_BUDGET_EXCEEDED",
+                    "message": f"Process suspension duration ({total_stop_time_ms:.2f} ms) exceeded budget of {policy.max_stop_time_ms:.2f} ms.",
+                    "level": "WARNING"
+                })
+
         any_pid_reused = any(cp.get("status") == "PID_REUSED" for cp in handle.identity_checkpoints) or handle.identity_mismatch
         any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in handle.identity_checkpoints)
         any_checkpoint_failed = any(not cp.get("verified", False) for cp in handle.identity_checkpoints)
@@ -1812,6 +1831,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             or explicit_ranges_used_without_maps
             or thread_enum_failed
             or map_enum_failed
+            or stop_budget_exceeded
         ):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
@@ -1866,14 +1886,6 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "identity_mismatch_detected": any_pid_reused,
             "validity": completeness,
         }
-
-        # Compute exact measured microsecond and millisecond latencies
-        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if (should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0) else 0.0
-        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if (should_suspend and t_threads > 0 and t_stop_confirmed > 0) else 0.0
-        memory_latency_us = (t_memory - t_threads) / 1000.0 if (t_memory > 0 and t_threads > 0) else 0.0
-        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0) else 0.0
-        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0) else 0.0
-        total_capture_time_us = max(0.0, (t_resume_confirmed - t_overall_start_ns) / 1000.0) if t_resume_confirmed > 0 else max(0.0, (time.monotonic_ns() - t_overall_start_ns) / 1000.0)
 
         latency_report = CaptureLatencyReport(
             stop_latency_ms=stop_latency_us / 1000.0,
@@ -2000,6 +2012,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "diagnostics": diagnostics,
             "identity_contract": identity_contract,
             "capabilities": self.capabilities,
+            "stop_budget_exceeded": stop_budget_exceeded,
             "map_enumeration": all_maps.to_dict() if hasattr(all_maps, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if all_maps else "SUCCESS_EMPTY"},
             "thread_enumeration": thread_metadata.to_dict() if hasattr(thread_metadata, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if thread_metadata else "FAILED", "is_synthetic": False},
         }
@@ -2697,6 +2710,25 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         regions_read = regions_complete + regions_partial
         regions_attempted = regions_read + regions_failed + regions_omitted
 
+        # Compute exact measured microsecond and millisecond latencies before quality determination
+        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if (should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0) else 0.0
+        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if (should_suspend and t_threads > 0 and t_stop_confirmed > 0) else 0.0
+        memory_latency_us = (t_memory - t_threads) / 1000.0 if (t_memory > 0 and t_threads > 0) else 0.0
+        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0) else 0.0
+        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0) else 0.0
+        total_stop_time_ms = total_stop_time_us / 1000.0
+        total_capture_time_us = max(0.0, (t_resume_confirmed - t_overall_start_ns) / 1000.0) if t_resume_confirmed > 0 else max(0.0, (time.monotonic_ns() - t_overall_start_ns) / 1000.0)
+
+        stop_budget_exceeded = False
+        if policy and getattr(policy, "max_stop_time_ms", 0) > 0 and suspension_caused_by_capture:
+            if total_stop_time_ms > policy.max_stop_time_ms:
+                stop_budget_exceeded = True
+                diagnostics.append({
+                    "code": "STOP_BUDGET_EXCEEDED",
+                    "message": f"Process suspension duration ({total_stop_time_ms:.2f} ms) exceeded budget of {policy.max_stop_time_ms:.2f} ms.",
+                    "level": "WARNING"
+                })
+
         any_pid_reused = any(cp.get("status") == "PID_REUSED" for cp in handle.identity_checkpoints) or handle.identity_mismatch
         any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in handle.identity_checkpoints)
         any_checkpoint_failed = any(not cp.get("verified", False) for cp in handle.identity_checkpoints)
@@ -2732,6 +2764,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             or explicit_ranges_used_without_maps
             or thread_enum_failed
             or map_enum_failed
+            or stop_budget_exceeded
         ):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
@@ -2786,13 +2819,6 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "identity_mismatch_detected": any_pid_reused,
             "validity": completeness,
         }
-
-        stop_latency_us = (t_stop_confirmed - t_stop_requested) / 1000.0 if (should_suspend and t_stop_confirmed > 0 and t_stop_requested > 0) else 0.0
-        thread_latency_us = (t_threads - t_stop_confirmed) / 1000.0 if (should_suspend and t_threads > 0 and t_stop_confirmed > 0) else 0.0
-        memory_latency_us = (t_memory - t_threads) / 1000.0 if (t_memory > 0 and t_threads > 0) else 0.0
-        resume_latency_us = (t_resume_confirmed - t_resume_requested) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_resume_requested > 0) else 0.0
-        total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0 if (suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0) else 0.0
-        total_capture_time_us = max(0.0, (t_resume_confirmed - t_overall_start_ns) / 1000.0) if t_resume_confirmed > 0 else max(0.0, (time.monotonic_ns() - t_overall_start_ns) / 1000.0)
 
         latency_report = CaptureLatencyReport(
             stop_latency_ms=stop_latency_us / 1000.0,
@@ -2919,6 +2945,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "diagnostics": diagnostics,
             "identity_contract": identity_contract,
             "capabilities": self.capabilities,
+            "stop_budget_exceeded": stop_budget_exceeded,
             "map_enumeration": all_maps.to_dict() if hasattr(all_maps, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if all_maps else "SUCCESS_EMPTY"},
             "thread_enumeration": thread_metadata.to_dict() if hasattr(thread_metadata, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if thread_metadata else "FAILED", "is_synthetic": False},
         }

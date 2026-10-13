@@ -88,6 +88,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         """Launch target process and wait for synchronized READY signal."""
         proc = subprocess.Popen(
             [binary_path],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
@@ -105,6 +106,11 @@ class TestRealRuntimeValidation(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=1)
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
         if proc.stdout:
             proc.stdout.close()
         if proc.stderr:
@@ -594,6 +600,98 @@ class TestRealRuntimeValidation(unittest.TestCase):
         finally:
             self._stop_target_process(proc)
 
+    # --------------------------------------------------------------------------
+    # 21. Real Procfs Mem Fallback Mechanism Validation
+    # --------------------------------------------------------------------------
+    def test_18_procfs_mem_fallback_real_runtime(self):
+        """Validate that ProcfsCaptureBackend (/proc/<pid>/mem) safely captures real running process."""
+        proc = self._start_target_process(self.pie_stripped)
+        try:
+            backend = ProcfsCaptureBackend()
+            snap = backend.capture(pid=proc.pid)
+
+            self.assertGreater(snap.bytes_captured, 0, "Procfs backend must capture memory bytes")
+            self.assertEqual(snap.pid, proc.pid)
+            self.assertEqual(snap.capture_backend, "procfs")
+
+            # Verify process remains alive and resumed
+            self.assertIsNone(proc.poll(), "Process must remain running after procfs capture")
+
+            # Offline semantic decoding should still succeed
+            engine = OfflineSemanticEngine()
+            state = engine.reconstruct(raw_snapshot=snap, debug_image=self.pie_debug)
+            state_obj = state.get_object_by_path("g_session.worker.state")
+            counter_field = [f for f in state_obj["fields"] if f["name"] == "counter"][0]
+            self.assertEqual(counter_field["value"], 42)
+        finally:
+            self._stop_target_process(proc)
+
+    # --------------------------------------------------------------------------
+    # 22. Concurrent Mutations and Thread Progress Validation
+    # --------------------------------------------------------------------------
+    def test_19_concurrent_mutations_and_thread_churn(self):
+        """Verify capture safety while worker threads continuously mutate memory."""
+        proc = self._start_target_process(self.pie_stripped)
+        try:
+            backend = ProcessVmCaptureBackend()
+            engine = OfflineSemanticEngine()
+
+            # First capture
+            snap1 = backend.capture(pid=proc.pid)
+            self.assertEqual(snap1.completeness, "COMPLETE")
+            state1 = engine.reconstruct(raw_snapshot=snap1, debug_image=self.pie_debug)
+            obj_t_a_1 = state1.get_object_by_path("g_thread_a")
+            counter_1 = [f for f in obj_t_a_1["fields"] if f["name"] == "counter"][0]["value"]
+
+            # Allow worker threads to continue incrementing
+            time.sleep(0.02)
+
+            # Second capture
+            snap2 = backend.capture(pid=proc.pid)
+            self.assertEqual(snap2.completeness, "COMPLETE")
+            state2 = engine.reconstruct(raw_snapshot=snap2, debug_image=self.pie_debug)
+            obj_t_a_2 = state2.get_object_by_path("g_thread_a")
+            counter_2 = [f for f in obj_t_a_2["fields"] if f["name"] == "counter"][0]["value"]
+
+            # Workers should have advanced between captures
+            self.assertGreater(
+                counter_2, counter_1,
+                f"Worker thread counter must advance between captures: {counter_1} -> {counter_2}"
+            )
+        finally:
+            self._stop_target_process(proc)
+
+    # --------------------------------------------------------------------------
+    # 23. Process Cleanup and Lifecycle Semantics (No Orphaned SIGSTOP or Zombies)
+    # --------------------------------------------------------------------------
+    def test_20_process_cleanup_and_no_orphaned_state(self):
+        """Verify back-to-back captures leave no orphaned SIGSTOP or zombie states."""
+        proc = self._start_target_process(self.pie_stripped)
+        try:
+            backend = ProcessVmCaptureBackend()
+
+            for i in range(5):
+                snap = backend.capture(pid=proc.pid)
+                self.assertEqual(snap.completeness, "COMPLETE")
+                # Immediately check /proc/<pid>/stat
+                with open(f"/proc/{proc.pid}/stat", "r", encoding="utf-8") as f:
+                    fields = f.read().split()
+                # Field 2 is comm (in parens), field 3 is state
+                # Process state must NOT be 'T' (stopped) or 'Z' (zombie)
+                rparen_idx = "".join(fields).rfind(")")
+                state_char = fields[2] if fields[1].endswith(")") else "S"
+                self.assertNotIn(state_char, ("T", "Z"), f"Target should be running/sleeping, not stopped: got {state_char}")
+                self.assertIsNone(proc.poll(), f"Target process exited unexpectedly on iteration {i}")
+
+            # Send clean stop command via stdin
+            proc.stdin.write("STOP\n")
+            proc.stdin.flush()
+            ret = proc.wait(timeout=2.0)
+            self.assertEqual(ret, 0, f"Target process should terminate cleanly with code 0: got {ret}")
+        finally:
+            self._stop_target_process(proc)
+
 
 if __name__ == "__main__":
     unittest.main()
+

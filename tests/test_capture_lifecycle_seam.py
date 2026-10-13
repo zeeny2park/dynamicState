@@ -1446,19 +1446,38 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         self.assertEqual(snap_zero.completeness, "FAILED")
 
     def test_raw_snapshot_legacy_snapshot_policy(self):
-        """Legacy snapshots without provenance preserve declared status only if coherent with data."""
-        # Legacy snapshot with regions and buffers preserves COMPLETE
-        data_legacy_valid = {
-            "snapshot_id": "S_LEGACY_VALID",
+        """Legacy snapshots without provenance are classified conservatively as PARTIAL under migration policy unless verifiable guarantees exist."""
+        # 1. Legacy snapshot with regions but no verified lifecycle guarantees degrades conservatively to PARTIAL
+        data_legacy_unverified = {
+            "snapshot_id": "S_LEGACY_UNVERIFIED",
             "completeness": "COMPLETE",
             "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 64}],
             "captured_ranges": [["0x1000", "0x1040"]],
         }
-        snap_l_v = RawRuntimeSnapshot.from_dict(data_legacy_valid)
+        snap_l_u = RawRuntimeSnapshot.from_dict(data_legacy_unverified)
+        self.assertEqual(snap_l_u.completeness, "PARTIAL")
+        self.assertTrue(snap_l_u.provenance.get("is_legacy"))
+        self.assertEqual(snap_l_u.provenance.get("legacy_migration_policy"), "CONSERVATIVE_UNVERIFIABLE_TO_PARTIAL")
+        self.assertTrue(any(d["code"] == "LEGACY_SNAPSHOT_UNVERIFIABLE" for d in snap_l_u.provenance.get("diagnostics", [])))
+
+        # 2. Legacy snapshot with verified lifecycle guarantees preserves COMPLETE
+        data_legacy_verified = {
+            "snapshot_id": "S_LEGACY_VERIFIED",
+            "completeness": "COMPLETE",
+            "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 64}],
+            "captured_ranges": [["0x1000", "0x1040"]],
+            "observation_metadata": {
+                "lifecycle_guarantees": {
+                    "process_stop_confirmed": True,
+                    "all_threads_stopped": True,
+                }
+            }
+        }
+        snap_l_v = RawRuntimeSnapshot.from_dict(data_legacy_verified)
         self.assertEqual(snap_l_v.completeness, "COMPLETE")
         self.assertTrue(snap_l_v.provenance.get("is_legacy"))
 
-        # Legacy snapshot with NO memory regions and NO ranges cannot claim COMPLETE -> PARTIAL
+        # 3. Legacy snapshot with NO memory regions and NO ranges cannot claim COMPLETE -> PARTIAL
         data_legacy_empty = {
             "snapshot_id": "S_LEGACY_EMPTY",
             "completeness": "COMPLETE",
@@ -1468,7 +1487,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         snap_l_e = RawRuntimeSnapshot.from_dict(data_legacy_empty)
         self.assertEqual(snap_l_e.completeness, "PARTIAL")
 
-        # Monotonicity: legacy snapshot declared FAILED or INVALID never upgraded to COMPLETE
+        # 4. Monotonicity: legacy snapshot declared FAILED or INVALID never upgraded to COMPLETE
         for bad_status in ("FAILED", "INVALID", "PARTIAL"):
             data_bad = {
                 "snapshot_id": f"S_LEGACY_{bad_status}",
@@ -1477,6 +1496,61 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
             }
             snap_bad = RawRuntimeSnapshot.from_dict(data_bad)
             self.assertEqual(snap_bad.completeness, bad_status, f"Legacy status {bad_status} must never be upgraded")
+
+    def test_malformed_and_unknown_completeness_handling(self):
+        """Malformed or unknown quality values must never silently upgrade to COMPLETE."""
+        for malformed_val in ("UNKNOWN", "CORRUPTED", "", "CUSTOM_INVALID_STATE", None):
+            data = {
+                "snapshot_id": "S_MALFORMED",
+                "completeness": malformed_val,
+                "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 64}],
+                "captured_ranges": [["0x1000", "0x1040"]],
+            }
+            snap = RawRuntimeSnapshot.from_dict(data)
+            self.assertEqual(snap.completeness, "PARTIAL")
+            self.assertTrue(any(d["code"] == "MALFORMED_QUALITY_VALUE" for d in snap.provenance.get("diagnostics", [])))
+
+    def test_byte_accounting_invariant_mismatch(self):
+        """Byte accounting mismatch between requested and read+omitted+failed must degrade to PARTIAL."""
+        data_mismatch = {
+            "snapshot_id": "S_BYTE_MISMATCH",
+            "completeness": "COMPLETE",
+            "memory_regions": [{"region_id": "R1", "status": "COMPLETE", "captured_bytes": 64}],
+            "provenance": {
+                "bytes_requested": 128,
+                "bytes_read": 64,
+                "bytes_omitted": 0,
+                "bytes_failed": 0,
+                "bytes_unread": 0,
+                "identity_contract": {"validity": "COMPLETE"},
+            },
+            "observation_metadata": {
+                "lifecycle_guarantees": {"process_stop_confirmed": True, "all_threads_stopped": True}
+            }
+        }
+        snap = RawRuntimeSnapshot.from_dict(data_mismatch)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertTrue(any(d["code"] == "BYTE_ACCOUNTING_INVARIANT_VIOLATED" for d in snap.provenance.get("diagnostics", [])))
+
+    def test_stop_budget_exceeded_degrades_to_partial(self):
+        """When total suspension time exceeds max_stop_time_ms budget, capture degrades to PARTIAL."""
+        import time as _t
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+
+        def slow_mem_reader(p, a, s):
+            _t.sleep(0.005)  # 5ms duration
+            return b"A" * s
+
+        # Budget of 2ms, but memory reading takes ~5ms
+        policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=slow_mem_reader, max_stop_time_ms=2.0)
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertTrue(snap.provenance.get("stop_budget_exceeded"))
+        self.assertTrue(any(d["code"] == "STOP_BUDGET_EXCEEDED" for d in snap.provenance.get("diagnostics", [])))
 
     def test_thread_enumeration_outcomes_and_synthetic_isolation(self):
         """Thread enumeration outcomes: SUCCESS_EMPTY or FAILED marks threads as synthetic/unverified."""

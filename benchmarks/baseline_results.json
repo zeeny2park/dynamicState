@@ -1,0 +1,179 @@
+{
+  "environment": {
+    "os": "Linux",
+    "platform": "Linux-6.17.0-1014-oracle-aarch64-with-glibc2.39",
+    "kernel_release": "6.17.0-1014-oracle",
+    "architecture": "aarch64",
+    "cpu_model": "aarch64",
+    "cpu_count": 4,
+    "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "compile_flags": [
+      "-fPIE",
+      "-pie",
+      "-g",
+      "-O0",
+      "-fno-inline",
+      "-fno-omit-frame-pointer",
+      "-Wl,--build-id=sha1",
+      "-lpthread"
+    ],
+    "python_version": "3.12.3",
+    "timestamp_utc": "2026-10-13T00:19:03.756068+00:00"
+  },
+  "benchmark_parameters": {
+    "iterations": 20,
+    "smoke_mode": false
+  },
+  "backends": [
+    {
+      "backend": "process_vm_readv",
+      "iterations": 20,
+      "quality_distribution": {
+        "COMPLETE": 20
+      },
+      "mean_captured_bytes": 25706496,
+      "throughput_mb_s": 6799.6,
+      "metrics": {
+        "stop_latency_us": {
+          "min": 170.4,
+          "p50": 203.15,
+          "p90": 245.37,
+          "p95": 281.54,
+          "p99": 712.31,
+          "max": 820.0,
+          "mean": 232.21,
+          "stddev": 140.09
+        },
+        "thread_metadata_latency_us": {
+          "min": 246.1,
+          "p50": 251.65,
+          "p90": 290.72,
+          "p95": 294.43,
+          "p99": 306.96,
+          "max": 310.1,
+          "mean": 259.71,
+          "stddev": 19.07
+        },
+        "memory_capture_latency_us": {
+          "min": 3551.9,
+          "p50": 3605.45,
+          "p90": 3781.81,
+          "p95": 3866.1,
+          "p99": 4448.26,
+          "max": 4593.8,
+          "mean": 3692.22,
+          "stddev": 224.69
+        },
+        "resume_latency_us": {
+          "min": 128.2,
+          "p50": 132.95,
+          "p90": 149.35,
+          "p95": 153.95,
+          "p99": 162.31,
+          "max": 164.4,
+          "mean": 136.47,
+          "stddev": 9.37
+        },
+        "total_stop_time_us": {
+          "min": 3928.6,
+          "p50": 4005.4,
+          "p90": 4161.82,
+          "p95": 4261.71,
+          "p99": 4888.02,
+          "max": 5044.6,
+          "mean": 4088.95,
+          "stddev": 236.6
+        },
+        "total_capture_time_us": {
+          "min": 5267.3,
+          "p50": 5407.0,
+          "p90": 11563.53,
+          "p95": 12424.73,
+          "p99": 14197.51,
+          "max": 14640.7,
+          "mean": 6849.99,
+          "stddev": 2951.94
+        }
+      }
+    },
+    {
+      "backend": "procfs",
+      "iterations": 20,
+      "quality_distribution": {
+        "PARTIAL": 20
+      },
+      "mean_captured_bytes": 13111296,
+      "throughput_mb_s": 4639.93,
+      "metrics": {
+        "stop_latency_us": {
+          "min": 152.8,
+          "p50": 184.95,
+          "p90": 197.12,
+          "p95": 198.27,
+          "p99": 199.33,
+          "max": 199.6,
+          "mean": 180.94,
+          "stddev": 15.27
+        },
+        "thread_metadata_latency_us": {
+          "min": 236.2,
+          "p50": 238.85,
+          "p90": 259.48,
+          "p95": 260.32,
+          "p99": 262.14,
+          "max": 262.6,
+          "mean": 243.49,
+          "stddev": 9.01
+        },
+        "memory_capture_latency_us": {
+          "min": 2648.4,
+          "p50": 2694.85,
+          "p90": 2735.06,
+          "p95": 2737.84,
+          "p99": 2758.21,
+          "max": 2763.3,
+          "mean": 2699.24,
+          "stddev": 28.77
+        },
+        "resume_latency_us": {
+          "min": 119.4,
+          "p50": 126.6,
+          "p90": 137.03,
+          "p95": 145.6,
+          "p99": 148.56,
+          "max": 149.3,
+          "mean": 129.09,
+          "stddev": 7.5
+        },
+        "total_stop_time_us": {
+          "min": 3009.6,
+          "p50": 3073.35,
+          "p90": 3111.92,
+          "p95": 3115.12,
+          "p99": 3133.66,
+          "max": 3138.3,
+          "mean": 3072.76,
+          "stddev": 35.51
+        },
+        "total_capture_time_us": {
+          "min": 3594.9,
+          "p50": 3714.15,
+          "p90": 3781.52,
+          "p95": 3805.24,
+          "p99": 3807.37,
+          "max": 3807.9,
+          "mean": 3710.28,
+          "stddev": 52.15
+        }
+      }
+    }
+  ],
+  "budget_enforcement": {
+    "budget_limit_ms": 2.0,
+    "observed_stop_ms": 5.547,
+    "budget_exceeded_flag": true,
+    "diagnostic_emitted": true,
+    "completeness_demoted_to_partial": true,
+    "policy_enforced": true
+  }
+}
