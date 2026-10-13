@@ -18,106 +18,112 @@
       "-lpthread"
     ],
     "python_version": "3.12.3",
-    "timestamp_utc": "2026-10-13T05:14:02.572911+00:00",
-    "git_commit": "48f522d36c29e8e2dae722e759e2553c2c98fb88",
+    "timestamp_utc": "2026-10-13T10:17:11.419707+00:00",
+    "git_commit": "cada583fa18b88ff9458811305471cf7c7fe45ee",
     "git_branch": "main",
     "git_dirty": true
   },
   "benchmark_parameters": {
     "iterations": 20,
-    "smoke_mode": false
+    "smoke_mode": false,
+    "acceptance_mode": true
   },
   "backends": [
     {
       "backend": "process_vm_readv",
       "iterations": 20,
+      "successful_captures": 20,
+      "failed_captures": 0,
       "quality_distribution": {
         "COMPLETE": 20
       },
       "success_rate": 1.0,
       "completeness_qualification": "ALL_COMPLETE",
       "mean_captured_bytes": 25706496,
-      "throughput_mb_s": 6817.47,
+      "throughput_mb_s": 6954.59,
       "byte_accounting": {
         "mean_requested_bytes": 25706496,
         "mean_captured_bytes": 25706496,
         "mean_omitted_bytes": 0,
         "mean_failed_bytes": 0,
-        "mean_unread_bytes": 0
+        "mean_unread_bytes": 0,
+        "invariants_satisfied": true,
+        "accounting_violations": []
       },
       "payload_integrity": {
         "payload_valid": true,
-        "elf_magic_found": false,
         "total_bytes_verified": 25706496,
         "region_count": 16,
-        "valid_buffers_count": 16
+        "valid_buffers_count": 16,
+        "elf_header_expected": false,
+        "elf_magic_found": false
       },
       "unavailable_reasons": {},
       "metrics": {
         "stop_latency_us": {
-          "min": 171.5,
-          "p50": 200.4,
-          "p90": 228.81,
-          "p95": 257.9,
-          "p99": 315.58,
-          "max": 330.0,
-          "mean": 205.1,
-          "stddev": 36.3,
+          "min": 173.0,
+          "p50": 211.25,
+          "p90": 239.75,
+          "p95": 242.76,
+          "p99": 267.91,
+          "max": 274.2,
+          "mean": 210.22,
+          "stddev": 26.28,
           "sample_count": 20
         },
         "thread_metadata_latency_us": {
-          "min": 241.6,
-          "p50": 253.25,
-          "p90": 282.35,
-          "p95": 287.33,
-          "p99": 301.47,
-          "max": 305.0,
-          "mean": 260.04,
-          "stddev": 16.71,
+          "min": 239.4,
+          "p50": 258.0,
+          "p90": 290.0,
+          "p95": 295.49,
+          "p99": 296.86,
+          "max": 297.2,
+          "mean": 262.88,
+          "stddev": 20.12,
           "sample_count": 20
         },
         "memory_capture_latency_us": {
-          "min": 3393.2,
-          "p50": 3596.0,
-          "p90": 3684.7,
-          "p95": 3764.54,
-          "p99": 4266.67,
-          "max": 4392.2,
-          "mean": 3634.55,
-          "stddev": 192.29,
+          "min": 3312.5,
+          "p50": 3525.1,
+          "p90": 3684.16,
+          "p95": 3754.38,
+          "p99": 4389.35,
+          "max": 4548.1,
+          "mean": 3571.28,
+          "stddev": 250.76,
           "sample_count": 20
         },
         "resume_latency_us": {
-          "min": 126.4,
-          "p50": 135.05,
-          "p90": 147.45,
-          "p95": 147.98,
-          "p99": 149.12,
-          "max": 149.4,
-          "mean": 135.29,
-          "stddev": 6.41,
+          "min": 133.3,
+          "p50": 139.15,
+          "p90": 166.44,
+          "p95": 167.65,
+          "p99": 180.57,
+          "max": 183.8,
+          "mean": 144.07,
+          "stddev": 13.05,
           "sample_count": 20
         },
         "total_stop_time_us": {
-          "min": 3775.0,
-          "p50": 4001.4,
-          "p90": 4094.1,
-          "p95": 4161.83,
-          "p99": 4698.85,
-          "max": 4833.1,
-          "mean": 4030.32,
-          "stddev": 203.14,
+          "min": 3712.3,
+          "p50": 3945.2,
+          "p90": 4076.47,
+          "p95": 4193.85,
+          "p99": 4833.01,
+          "max": 4992.8,
+          "mean": 3978.65,
+          "stddev": 261.65,
           "sample_count": 20
         },
         "total_capture_time_us": {
-          "min": 5217.7,
-          "p50": 5387.9,
-          "p90": 12203.34,
-          "p95": 13001.87,
-          "p99": 15284.45,
-          "max": 15855.1,
-          "mean": 6927.67,
-          "stddev": 3269.98,
+          "min": 5145.1,
+          "p50": 5354.35,
+          "p90": 11794.27,
+          "p95": 12365.41,
+          "p99": 15086.28,
+          "max": 15766.5,
+          "mean": 6814.59,
+          "stddev": 3166.21,
           "sample_count": 20
         }
       }
@@ -125,101 +131,113 @@
     {
       "backend": "procfs",
       "iterations": 20,
+      "successful_captures": 20,
+      "failed_captures": 0,
       "quality_distribution": {
         "COMPLETE": 20
       },
       "success_rate": 1.0,
       "completeness_qualification": "ALL_COMPLETE",
       "mean_captured_bytes": 25706496,
-      "throughput_mb_s": 4640.78,
+      "throughput_mb_s": 4781.9,
       "byte_accounting": {
         "mean_requested_bytes": 25706496,
         "mean_captured_bytes": 25706496,
         "mean_omitted_bytes": 0,
         "mean_failed_bytes": 0,
-        "mean_unread_bytes": 0
+        "mean_unread_bytes": 0,
+        "invariants_satisfied": true,
+        "accounting_violations": []
       },
       "payload_integrity": {
         "payload_valid": true,
-        "elf_magic_found": false,
         "total_bytes_verified": 25706496,
         "region_count": 16,
-        "valid_buffers_count": 16
+        "valid_buffers_count": 16,
+        "elf_header_expected": false,
+        "elf_magic_found": false
       },
       "unavailable_reasons": {},
       "metrics": {
         "stop_latency_us": {
-          "min": 154.0,
-          "p50": 187.45,
-          "p90": 195.28,
-          "p95": 201.92,
-          "p99": 209.74,
-          "max": 211.7,
-          "mean": 179.44,
-          "stddev": 17.45,
+          "min": 159.8,
+          "p50": 176.05,
+          "p90": 209.6,
+          "p95": 224.54,
+          "p99": 232.75,
+          "max": 234.8,
+          "mean": 184.84,
+          "stddev": 20.73,
           "sample_count": 20
         },
         "thread_metadata_latency_us": {
-          "min": 235.0,
-          "p50": 239.65,
-          "p90": 273.67,
-          "p95": 275.28,
-          "p99": 276.58,
-          "max": 276.9,
-          "mean": 248.19,
-          "stddev": 15.51,
+          "min": 232.8,
+          "p50": 239.95,
+          "p90": 277.02,
+          "p95": 278.12,
+          "p99": 278.34,
+          "max": 278.4,
+          "mean": 246.19,
+          "stddev": 15.27,
           "sample_count": 20
         },
         "memory_capture_latency_us": {
-          "min": 5185.9,
-          "p50": 5282.65,
-          "p90": 5393.0,
-          "p95": 5409.67,
-          "p99": 5430.49,
-          "max": 5435.7,
-          "mean": 5299.43,
-          "stddev": 70.35,
+          "min": 5086.3,
+          "p50": 5126.75,
+          "p90": 5171.19,
+          "p95": 5215.23,
+          "p99": 5420.89,
+          "max": 5472.3,
+          "mean": 5146.78,
+          "stddev": 81.52,
           "sample_count": 20
         },
         "resume_latency_us": {
-          "min": 119.8,
-          "p50": 127.9,
-          "p90": 136.6,
-          "p95": 138.46,
-          "p99": 139.37,
-          "max": 139.6,
-          "mean": 129.08,
-          "stddev": 5.65,
+          "min": 125.0,
+          "p50": 134.1,
+          "p90": 171.78,
+          "p95": 175.62,
+          "p99": 209.36,
+          "max": 217.8,
+          "mean": 142.93,
+          "stddev": 22.06,
           "sample_count": 20
         },
         "total_stop_time_us": {
-          "min": 5549.8,
-          "p50": 5661.4,
-          "p90": 5774.67,
-          "p95": 5778.6,
-          "p99": 5801.32,
-          "max": 5807.0,
-          "mean": 5677.11,
-          "stddev": 69.79,
+          "min": 5465.8,
+          "p50": 5509.35,
+          "p90": 5576.61,
+          "p95": 5615.78,
+          "p99": 5826.84,
+          "max": 5879.6,
+          "mean": 5536.23,
+          "stddev": 88.83,
           "sample_count": 20
         },
         "total_capture_time_us": {
-          "min": 6202.5,
-          "p50": 6312.15,
-          "p90": 6411.33,
-          "p95": 6421.67,
-          "p99": 6465.29,
-          "max": 6476.2,
-          "mean": 6321.27,
-          "stddev": 72.16,
+          "min": 6078.7,
+          "p50": 6149.85,
+          "p90": 6239.69,
+          "p95": 6268.93,
+          "p99": 6468.51,
+          "max": 6518.4,
+          "mean": 6180.58,
+          "stddev": 93.28,
           "sample_count": 20
         }
       }
     }
   ],
+  "backend_equivalence": {
+    "equivalent_workload": true,
+    "qualification": "EQUIVALENT_WORKLOAD",
+    "bytes_match": true,
+    "quality_match": true,
+    "reasons": []
+  },
   "budget_enforcement": {
     "budget_limit_ms": 2.0,
-    "observed_stop_ms": 5.567,
+    "observed_stop_ms": 5.5,
     "budget_exceeded_flag": true,
     "diagnostic_emitted": true,
     "completeness_demoted_to_partial": true,
@@ -227,6 +245,7 @@
   },
   "baseline_comparison": {
     "baseline_available": true,
+    "compatible_environment": true,
     "comparisons": {
       "process_vm_readv": {
         "captured_bytes": {
@@ -243,15 +262,15 @@
         },
         "throughput_mb_s": {
           "baseline": 6799.6,
-          "current": 6817.47
+          "current": 6954.59
         },
         "total_stop_p50_us": {
           "baseline": 4005.4,
-          "current": 4001.4
+          "current": 3945.2
         },
         "mem_read_p50_us": {
           "baseline": 3605.45,
-          "current": 3596.0
+          "current": 3525.1
         }
       },
       "procfs": {
@@ -269,17 +288,22 @@
         },
         "throughput_mb_s": {
           "baseline": 4639.93,
-          "current": 4640.78
+          "current": 4781.9
         },
         "total_stop_p50_us": {
           "baseline": 3073.35,
-          "current": 5661.4
+          "current": 5509.35
         },
         "mem_read_p50_us": {
           "baseline": 2694.85,
-          "current": 5282.65
+          "current": 5126.75
         }
       }
     }
+  },
+  "acceptance_gates": {
+    "passed": true,
+    "failures": [],
+    "mode": "ACCEPTANCE"
   }
 }

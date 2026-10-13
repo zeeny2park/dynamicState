@@ -3,18 +3,21 @@
 Ensures:
 1. Canonical workflows in ci/workflows/ and discoverable workflows in .github/workflows/
    both exist and are synchronized with 100% byte-for-byte parity.
-2. .github/workflows/test.yml defines valid triggers (push, pull_request), runner environment,
-   and all required verification stages in exact dependency order.
-3. .github/workflows/gdb92.yml defines valid Docker / GDB 9.2 verification steps.
-4. scripts/sync_workflows.sh synchronizes workflows, reports mismatches, and cleans up
-   stale workflow files.
-5. OAuth token 'workflow' scope boundary is clearly documented in ci/README.md.
+2. The parity test strictly fails if workflow files are missing, stale, or modified,
+   and does not silently repair repository state during assertion.
+3. .github/workflows/test.yml and gdb92.yml are syntactically valid YAML and define
+   required triggers (push/pull_request on main), runner environment (ubuntu-22.04),
+   Python setup (3.10), system packages, and pipeline stages in exact dependency order.
+4. scripts/sync_workflows.sh is executable and verifiably repairs drift, missing files,
+   and stale files when tested in an isolated temporary directory.
+5. OAuth token 'workflow' scope boundary and synchronization procedure are documented in ci/README.md.
 """
 
 import os
 import subprocess
 import tempfile
 import unittest
+import yaml
 
 
 class TestCIWorkflowParity(unittest.TestCase):
@@ -29,45 +32,80 @@ class TestCIWorkflowParity(unittest.TestCase):
         self.sync_script = os.path.join(self.repo_root, "scripts", "sync_workflows.sh")
         self.readme_path = os.path.join(self.repo_root, "ci", "README.md")
 
-    def test_github_workflows_exist_and_match_canonical(self):
-        """Verify that discoverable .github/workflows/ files exist and have exact byte parity with ci/workflows/."""
-        self.assertTrue(os.path.isdir(self.github_dir), f".github/workflows/ must exist at {self.github_dir}")
-        self.assertTrue(os.path.exists(self.github_test_yml), f"{self.github_test_yml} must exist")
-        self.assertTrue(os.path.exists(self.github_gdb_yml), f"{self.github_gdb_yml} must exist")
+    def test_github_workflows_directory_and_file_set(self):
+        """Verify that .github/workflows exists and contains the exact expected workflow files."""
+        self.assertTrue(
+            os.path.isdir(self.github_dir),
+            f".github/workflows/ directory must exist at {self.github_dir}",
+        )
+        self.assertTrue(
+            os.path.exists(self.github_test_yml),
+            f"Expected {self.github_test_yml} to exist in repository",
+        )
+        self.assertTrue(
+            os.path.exists(self.github_gdb_yml),
+            f"Expected {self.github_gdb_yml} to exist in repository",
+        )
 
         canonical_files = sorted([f for f in os.listdir(self.ci_dir) if f.endswith((".yml", ".yaml"))])
         github_files = sorted([f for f in os.listdir(self.github_dir) if f.endswith((".yml", ".yaml"))])
 
+        # Parity must fail if any workflow file is missing or any stale file is present
         self.assertEqual(
             canonical_files,
             github_files,
-            f"Set of workflow files in .github/workflows/ ({github_files}) must exactly match ci/workflows/ ({canonical_files})",
+            f"Workflow files in .github/workflows/ ({github_files}) do not match ci/workflows/ ({canonical_files})",
         )
 
+    def test_github_workflows_exact_byte_parity(self):
+        """Verify that every file in .github/workflows/ is byte-for-byte identical to ci/workflows/.
+
+        Strictly inspects state without modifying or repairing files in-place.
+        """
+        canonical_files = sorted([f for f in os.listdir(self.ci_dir) if f.endswith((".yml", ".yaml"))])
         for fname in canonical_files:
             ci_path = os.path.join(self.ci_dir, fname)
             gh_path = os.path.join(self.github_dir, fname)
+            self.assertTrue(
+                os.path.exists(gh_path),
+                f"Missing workflow file in .github/workflows/: {fname}",
+            )
             with open(ci_path, "rb") as cf, open(gh_path, "rb") as gf:
                 ci_bytes = cf.read()
                 gh_bytes = gf.read()
-            self.assertEqual(ci_bytes, gh_bytes, f"Workflow file {fname} in .github/workflows/ must be identical to ci/workflows/{fname}")
+            self.assertEqual(
+                ci_bytes,
+                gh_bytes,
+                f"Byte mismatch detected between ci/workflows/{fname} and .github/workflows/{fname}. Run scripts/sync_workflows.sh to synchronize.",
+            )
 
-    def test_test_workflow_triggers_and_stages(self):
-        """Verify test.yml contains required triggers, runner environment, and pipeline stages."""
+    def test_test_workflow_yaml_syntax_and_schema(self):
+        """Validate YAML syntax and structural schema of test.yml using PyYAML."""
         with open(self.github_test_yml, "r", encoding="utf-8") as f:
-            content = f.read()
+            doc = yaml.safe_load(f)
 
-        # Triggers and environment
-        self.assertIn("name: Test Suite", content)
-        self.assertIn("push:", content)
-        self.assertIn("pull_request:", content)
-        self.assertIn("main", content)
-        self.assertIn("ubuntu-22.04", content)
-        self.assertIn("actions/checkout@v4", content)
-        self.assertIn("actions/setup-python@v5", content)
+        self.assertIsInstance(doc, dict, "test.yml must parse to a YAML mapping")
+        self.assertEqual(doc.get("name"), "Test Suite")
 
-        # Essential steps
-        expected_steps = [
+        # Triggers
+        triggers = doc.get("on") or doc.get(True)  # YAML 'on' can parse as bool in some parsers
+        self.assertIsInstance(triggers, dict, "Workflow triggers must be a mapping")
+        self.assertEqual(triggers.get("push", {}).get("branches"), ["main"])
+        self.assertEqual(triggers.get("pull_request", {}).get("branches"), ["main"])
+
+        # Job configuration
+        jobs = doc.get("jobs", {})
+        self.assertIn("test", jobs, "Must define 'test' job")
+        test_job = jobs["test"]
+        self.assertEqual(test_job.get("runs-on"), "ubuntu-22.04")
+
+        steps = test_job.get("steps", [])
+        step_names = [s.get("name") for s in steps if isinstance(s, dict)]
+
+        expected_stages = [
+            "Checkout repository",
+            "Set up Python",
+            "Install system dependencies",
             "Build target collector and test fixtures",
             "Run Capture Safety and Diff Accuracy Tests",
             "Run Process Lifecycle and Seam Invariants Tests",
@@ -77,71 +115,113 @@ class TestCIWorkflowParity(unittest.TestCase):
             "Run CI Workflow Parity Tests",
             "Run Performance Benchmark Smoke Test",
         ]
-        for step in expected_steps:
-            self.assertIn(step, content, f"Workflow step '{step}' must be present in .github/workflows/test.yml")
+        for stage in expected_stages:
+            self.assertIn(stage, step_names, f"Pipeline step '{stage}' must be present in test.yml")
 
-        # Command invocations
-        self.assertIn("python3 -m unittest tests/test_capture_safety_and_diff_accuracy.py", content)
-        self.assertIn("python3 -m unittest tests/test_capture_lifecycle_seam.py", content)
-        self.assertIn("python3 -m unittest tests/test_real_runtime_validation.py", content)
-        self.assertIn("python3 -m unittest tests/test_cpp_e2e_investigation.py", content)
-        self.assertIn("python3 -m unittest discover tests", content)
-        self.assertIn("python3 -m unittest tests/test_ci_workflow_parity.py", content)
-        self.assertIn("python3 -m benchmarks.capture_benchmark --smoke", content)
+        # Verify command invocations in steps
+        all_run_commands = "\n".join(s.get("run", "") for s in steps if isinstance(s, dict))
+        self.assertIn("python3 -m unittest tests/test_capture_safety_and_diff_accuracy.py", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_capture_lifecycle_seam.py", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_real_runtime_validation.py", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_cpp_e2e_investigation.py", all_run_commands)
+        self.assertIn("python3 -m unittest discover tests", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_ci_workflow_parity.py", all_run_commands)
+        self.assertIn("python3 -m benchmarks.capture_benchmark --smoke", all_run_commands)
 
-    def test_gdb92_workflow_structure(self):
-        """Verify gdb92.yml contains Docker / GDB 9.2 test job."""
+    def test_gdb92_workflow_yaml_syntax_and_schema(self):
+        """Validate YAML syntax and structural schema of gdb92.yml using PyYAML."""
         with open(self.github_gdb_yml, "r", encoding="utf-8") as f:
-            content = f.read()
+            doc = yaml.safe_load(f)
 
-        self.assertIn("GDB 9.2", content)
-        self.assertIn("docker/gdb92/Dockerfile", content)
+        self.assertIsInstance(doc, dict, "gdb92.yml must parse to a YAML mapping")
+        self.assertIn("GDB 9.2", doc.get("name", ""))
 
-    def test_sync_script_execution_and_stale_cleanup(self):
-        """Verify scripts/sync_workflows.sh executes cleanly and cleans up stale files."""
+        jobs = doc.get("jobs", {})
+        self.assertIn("gdb92-docker", jobs)
+        job = jobs["gdb92-docker"]
+        self.assertEqual(job.get("runs-on"), "ubuntu-22.04")
+
+        steps = job.get("steps", [])
+        all_runs = "\n".join(s.get("run", "") for s in steps if isinstance(s, dict))
+        self.assertIn("docker/gdb92/Dockerfile", all_runs)
+        self.assertIn("tests/integration_gdb92.py", all_runs)
+
+    def test_sync_script_is_executable(self):
+        """Verify scripts/sync_workflows.sh exists and is marked executable."""
         self.assertTrue(os.path.exists(self.sync_script), "scripts/sync_workflows.sh must exist")
-        self.assertTrue(os.access(self.sync_script, os.X_OK), "scripts/sync_workflows.sh must be executable")
+        self.assertTrue(
+            os.access(self.sync_script, os.X_OK),
+            "scripts/sync_workflows.sh must have executable permissions (+x)",
+        )
 
-        # Run sync script in place
-        res = subprocess.run([self.sync_script], capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, f"sync_workflows.sh failed with error:\n{res.stderr}")
-        self.assertIn("SUCCESS", res.stdout)
+    def test_sync_script_repairs_drift_in_isolated_directory(self):
+        """Verify scripts/sync_workflows.sh repairs drift, missing files, and stale files in an isolated temp directory."""
+        with tempfile.TemporaryDirectory(prefix="test_sync_") as tmp_dir:
+            tmp_src = os.path.join(tmp_dir, "canonical")
+            tmp_tgt = os.path.join(tmp_dir, "target")
+            os.makedirs(tmp_src, exist_ok=True)
+            os.makedirs(tmp_tgt, exist_ok=True)
 
-        # Test stale cleanup in a temporary directory simulation
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_ci = os.path.join(tmp_dir, "ci", "workflows")
-            tmp_gh = os.path.join(tmp_dir, ".github", "workflows")
-            os.makedirs(tmp_ci, exist_ok=True)
-            os.makedirs(tmp_gh, exist_ok=True)
+            # 1. Canonical source workflows
+            src_wf1 = os.path.join(tmp_src, "test.yml")
+            src_wf2 = os.path.join(tmp_src, "gdb92.yml")
+            with open(src_wf1, "w") as f:
+                f.write("name: Canonical Test\n")
+            with open(src_wf2, "w") as f:
+                f.write("name: Canonical GDB\n")
 
-            # Create canonical file
-            with open(os.path.join(tmp_ci, "test.yml"), "w") as f:
-                f.write("dummy: test\n")
-            # Create canonical and stale files in target
-            with open(os.path.join(tmp_gh, "test.yml"), "w") as f:
-                f.write("dummy: old\n")
-            with open(os.path.join(tmp_gh, "stale.yml"), "w") as f:
-                f.write("dummy: stale\n")
+            # 2. Target with drift:
+            # - test.yml has stale modified content
+            # - gdb92.yml is completely missing
+            # - stale.yml is an obsolete extra workflow that should be deleted
+            tgt_wf1 = os.path.join(tmp_tgt, "test.yml")
+            tgt_stale = os.path.join(tmp_tgt, "stale.yml")
+            with open(tgt_wf1, "w") as f:
+                f.write("name: Outdated Test\n")
+            with open(tgt_stale, "w") as f:
+                f.write("name: Stale Extra Workflow\n")
 
-            # Clean stale files
-            for fname in os.listdir(tmp_gh):
-                if fname.endswith((".yml", ".yaml")):
-                    src = os.path.join(tmp_ci, fname)
-                    if not os.path.exists(src):
-                        os.remove(os.path.join(tmp_gh, fname))
+            # 3. Execute the sync script pointing to the isolated test directories
+            env = os.environ.copy()
+            env["SYNC_SOURCE_DIR"] = tmp_src
+            env["SYNC_TARGET_DIR"] = tmp_tgt
+            res = subprocess.run([self.sync_script], capture_output=True, text=True, env=env)
 
-            self.assertFalse(os.path.exists(os.path.join(tmp_gh, "stale.yml")))
-            self.assertTrue(os.path.exists(os.path.join(tmp_gh, "test.yml")))
+            self.assertEqual(
+                res.returncode,
+                0,
+                f"sync_workflows.sh failed in isolated test:\nStdout: {res.stdout}\nStderr: {res.stderr}",
+            )
+            self.assertIn("SUCCESS", res.stdout)
+            self.assertIn("Removing stale workflow: .github/workflows/stale.yml", res.stdout)
+
+            # 4. Verify stale workflow was removed
+            self.assertFalse(
+                os.path.exists(tgt_stale),
+                "stale.yml must have been removed by sync_workflows.sh",
+            )
+
+            # 5. Verify byte parity between source and target
+            for fname in ["test.yml", "gdb92.yml"]:
+                s_file = os.path.join(tmp_src, fname)
+                d_file = os.path.join(tmp_tgt, fname)
+                self.assertTrue(os.path.exists(d_file), f"{fname} must exist in target after sync")
+                with open(s_file, "rb") as sf, open(d_file, "rb") as df:
+                    self.assertEqual(
+                        sf.read(),
+                        df.read(),
+                        f"{fname} content in target must match source byte-for-byte",
+                    )
 
     def test_workflow_permission_boundary_documented(self):
         """Verify that ci/README.md documents the OAuth token 'workflow' scope boundary."""
-        self.assertTrue(os.path.exists(self.readme_path), "ci/README.md must document workflow synchronization")
-
+        self.assertTrue(os.path.exists(self.readme_path), "ci/README.md must exist")
         with open(self.readme_path, "r", encoding="utf-8") as f:
             content = f.read()
 
         self.assertIn("workflow", content)
         self.assertIn("OAuth", content)
+        self.assertIn("scripts/sync_workflows.sh", content)
 
 
 if __name__ == "__main__":

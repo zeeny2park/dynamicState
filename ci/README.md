@@ -17,15 +17,14 @@ This directory contains the automated CI workflows for dynamicState.
 
 ### Activating in GitHub Actions & Drift Prevention
 
-The canonical workflow definitions are maintained under `ci/workflows/test.yml`.
-To activate these workflows directly on GitHub Actions:
+The canonical workflow definitions are maintained under `ci/workflows/test.yml` and `ci/workflows/gdb92.yml`.
+To activate these workflows directly on GitHub Actions or synchronize drift:
 ```bash
-mkdir -p .github/workflows
-cp ci/workflows/*.yml .github/workflows/
+./scripts/sync_workflows.sh
 git add .github/workflows
 git commit -m "ci: enable GitHub Actions workflows"
 git push
 ```
 *(Requires a GitHub personal access token with the `workflow` scope. GitHub OAuth tokens lacking the `workflow` scope will be rejected by GitHub's pre-receive hook).*
 
-To prevent drift between `ci/workflows/` and `.github/workflows/`, all changes to workflow specifications must be authored in `ci/workflows/` and synced via `cp ci/workflows/*.yml .github/workflows/`.
+To prevent drift between `ci/workflows/` and `.github/workflows/`, all changes to workflow specifications must be authored in `ci/workflows/` and synced via `./scripts/sync_workflows.sh`.

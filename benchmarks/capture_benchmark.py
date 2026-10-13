@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated Performance Benchmark for dynamicState Runtime Capture Engine.
+"""Automated Performance Benchmark & Acceptance Gates for dynamicState Runtime Capture Engine.
 
 Measures and reports real-world capture overhead and percentiles against running C++ processes:
 - Stop latency (SIGSTOP to stopped confirmation)
@@ -10,11 +10,14 @@ Measures and reports real-world capture overhead and percentiles against running
 - Total capture wall-clock duration
 - Memory throughput (MB/s)
 
-Reports:
+Reports and Enforces:
 - Percentiles: p50 (median), p90, p95, p99, min, max, mean, stddev, sample_count
-- Byte accounting: requested, read, omitted, failed, unread bytes, success rate
-- Completeness qualification and payload integrity verification (ELF header magic)
-- Comparison between ProcessVmCaptureBackend and ProcfsCaptureBackend
+- Byte accounting invariants: requested == read + omitted + failed + unread (per run and aggregate)
+- Realistic payload integrity verification: valid non-empty memory buffers and expected ELF headers
+- Workload equivalence evaluation between backends (requested bytes, quality outcomes)
+- Acceptance gates distinguishing smoke mode (sanity & invariants) from performance acceptance runs
+- Strict nonzero exit code on failed captures, invariant violations, or quality degradation
+- Safe baseline protection: safeguards baseline_results.json against unreviewed/smoke overwrites
 - Environment metadata (git commit SHA, kernel, CPU model, architecture, compiler)
 - Stop budget SLA enforcement validation
 - Comparison against stored baseline (benchmarks/baseline_results.json)
@@ -165,39 +168,65 @@ def compute_percentiles(values: List[Optional[float]]) -> Dict[str, Optional[flo
 
 
 def verify_snapshot_payload(snap: RawRuntimeSnapshot) -> Dict[str, Any]:
-    """Verify that the captured snapshot payload contains valid data and headers (ELF magic)."""
+    """Verify that the captured snapshot payload contains valid data buffers and headers where expected.
+
+    Checks:
+    - At least one memory buffer is captured and readable.
+    - Total read bytes match reported captured bytes.
+    - If a mapping contains an executable binary file header at offset 0, asserts valid ELF magic (\\x7fELF).
+    - If only runtime memory (heap, stack, anonymous) was requested, does not falsely expect ELF magic.
+    """
     if not snap.memory_regions:
         return {
             "payload_valid": False,
-            "elf_magic_found": False,
             "total_bytes_verified": 0,
             "region_count": 0,
+            "valid_buffers_count": 0,
+            "elf_header_expected": False,
+            "elf_magic_found": False,
             "reason": "NO_MEMORY_REGIONS",
         }
 
     total_bytes = 0
-    elf_magic_found = False
     valid_buffers_count = 0
+    elf_header_expected = False
+    elf_magic_found = False
+
     for reg in snap.memory_regions:
         raw_start = reg.get("start", 0)
         start = int(raw_start, 16) if isinstance(raw_start, str) and raw_start.startswith("0x") else int(raw_start)
         size = int(reg.get("size", 0))
         b_read = int(reg.get("captured_bytes", 0))
         total_bytes += b_read
+
+        pathname = str(reg.get("pathname", ""))
+        category = str(reg.get("category", ""))
+        # An ELF header is realistically expected ONLY if the mapping is an executable/binary file header mapping
+        is_binary_header = (
+            (pathname.endswith(".elf") or pathname.endswith(".so") or category == "binary")
+            and reg.get("permissions", "").startswith("r")
+            and reg.get("offset", 0) == 0
+        )
+        if is_binary_header:
+            elf_header_expected = True
+
         if b_read > 0 and size > 0:
             data = snap.read_bytes(start, min(size, b_read, 16))
-            if data and len(data) >= 4 and data[:4] == b"\x7fELF":
-                elf_magic_found = True
             if data:
                 valid_buffers_count += 1
+                if data[:4] == b"\x7fELF":
+                    elf_magic_found = True
 
-    valid = total_bytes > 0 and valid_buffers_count > 0
+    elf_ok = (not elf_header_expected) or elf_magic_found
+    valid = total_bytes > 0 and valid_buffers_count > 0 and elf_ok
+
     return {
         "payload_valid": valid,
-        "elf_magic_found": elf_magic_found,
         "total_bytes_verified": total_bytes,
         "region_count": len(snap.memory_regions),
         "valid_buffers_count": valid_buffers_count,
+        "elf_header_expected": elf_header_expected,
+        "elf_magic_found": elf_magic_found,
     }
 
 
@@ -258,7 +287,7 @@ def run_backend_benchmarks(
     plan: CapturePlan,
     policy: CaptureSafetyPolicy,
 ) -> Dict[str, Any]:
-    """Execute benchmark iterations for a single capture backend."""
+    """Execute benchmark iterations for a single capture backend with strict invariant accounting."""
     if iterations < 1:
         raise ValueError(f"iterations must be >= 1, got {iterations}")
 
@@ -278,13 +307,21 @@ def run_backend_benchmarks(
     quality_counts: Dict[str, int] = {}
     accumulated_unavailable_reasons: Dict[str, str] = {}
     last_payload_verification: Optional[Dict[str, Any]] = None
+    accounting_violations: List[Dict[str, Any]] = []
+    failed_captures_count = 0
 
     for idx in range(iterations):
-        snap = backend.capture(pid, plan=plan, policy=policy)
+        try:
+            snap = backend.capture(pid, plan=plan, policy=policy)
+        except Exception as e:
+            failed_captures_count += 1
+            quality_counts["FAILED"] = quality_counts.get("FAILED", 0) + 1
+            continue
+
         prov = snap.provenance or {}
         lat_report = prov.get("latency_report", {})
 
-        # Extract timings directly; preserve None if unmeasured
+        # Extract timings directly; preserve None if unmeasured (never substitute 0.0)
         stop_lat = lat_report.get("stop_latency_us")
         th_lat = lat_report.get("thread_metadata_latency_us")
         mem_lat = lat_report.get("memory_capture_latency_us")
@@ -308,6 +345,16 @@ def run_backend_benchmarks(
         b_omit = prov.get("bytes_omitted", 0)
         b_fail = prov.get("bytes_failed", 0)
         b_unread = prov.get("bytes_unread", 0)
+
+        # Check byte-accounting invariant per iteration
+        expected_sum = b_read + b_omit + b_fail + b_unread
+        if b_req != expected_sum:
+            accounting_violations.append({
+                "iteration": idx + 1,
+                "bytes_requested": b_req,
+                "components_sum": expected_sum,
+                "discrepancy": b_req - expected_sum,
+            })
 
         requested_bytes_list.append(b_req)
         captured_bytes_list.append(b_read)
@@ -334,14 +381,17 @@ def run_backend_benchmarks(
 
     p50_mem_val = stats_summary["memory_capture_latency_us"]["p50"]
     p50_mem_time_sec = (p50_mem_val or 1.0) / 1_000_000.0 if p50_mem_val is not None else 0.0
-    throughput_mb_s = round((avg_bytes / (1024.0 * 1024.0)) / p50_mem_time_sec, 2) if p50_mem_time_sec > 0 else 0.0
+    throughput_mb_s = round((avg_bytes / (1024.0 * 1024.0)) / p50_mem_time_sec, 2) if (p50_mem_time_sec > 0 and avg_bytes > 0) else 0.0
 
     complete_count = quality_counts.get("COMPLETE", 0)
     success_rate = round(complete_count / float(iterations), 4)
+    aggregate_accounting_ok = len(accounting_violations) == 0 and (round(avg_req_bytes, 1) == round(avg_bytes + avg_omit_bytes + avg_fail_bytes + avg_unread_bytes, 1))
 
     return {
         "backend": backend.name,
         "iterations": iterations,
+        "successful_captures": iterations - failed_captures_count,
+        "failed_captures": failed_captures_count,
         "quality_distribution": quality_counts,
         "success_rate": success_rate,
         "completeness_qualification": "ALL_COMPLETE" if complete_count == iterations else "CONTAINS_NON_COMPLETE",
@@ -353,12 +403,16 @@ def run_backend_benchmarks(
             "mean_omitted_bytes": round(avg_omit_bytes, 1),
             "mean_failed_bytes": round(avg_fail_bytes, 1),
             "mean_unread_bytes": round(avg_unread_bytes, 1),
+            "invariants_satisfied": aggregate_accounting_ok,
+            "accounting_violations": accounting_violations,
         },
         "payload_integrity": last_payload_verification or {
             "payload_valid": False,
-            "elf_magic_found": False,
             "total_bytes_verified": 0,
             "region_count": 0,
+            "valid_buffers_count": 0,
+            "elf_header_expected": False,
+            "elf_magic_found": False,
         },
         "unavailable_reasons": accumulated_unavailable_reasons,
         "metrics": stats_summary,
@@ -392,6 +446,41 @@ def validate_budget_enforcement(pid: int) -> Dict[str, Any]:
         "diagnostic_emitted": has_diag,
         "completeness_demoted_to_partial": is_partial,
         "policy_enforced": budget_exceeded and has_diag and is_partial,
+    }
+
+
+def evaluate_backend_equivalence(backend_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Evaluate whether compared backends executed equivalent workloads."""
+    if len(backend_results) < 2:
+        return {
+            "equivalent_workload": True,
+            "qualification": "SINGLE_BACKEND",
+            "details": "Only one backend evaluated",
+            "reasons": [],
+        }
+
+    b1, b2 = backend_results[0], backend_results[1]
+    req1 = b1.get("byte_accounting", {}).get("mean_requested_bytes", 0)
+    req2 = b2.get("byte_accounting", {}).get("mean_requested_bytes", 0)
+    qual1 = b1.get("quality_distribution", {})
+    qual2 = b2.get("quality_distribution", {})
+
+    bytes_match = (req1 == req2)
+    quality_match = (qual1 == qual2)
+    equivalent = bytes_match and quality_match
+
+    reasons: List[str] = []
+    if not bytes_match:
+        reasons.append(f"Requested bytes differ: {b1.get('backend')}={req1:,.0f} vs {b2.get('backend')}={req2:,.0f}")
+    if not quality_match:
+        reasons.append(f"Quality outcomes differ: {b1.get('backend')}={qual1} vs {b2.get('backend')}={qual2}")
+
+    return {
+        "equivalent_workload": equivalent,
+        "qualification": "EQUIVALENT_WORKLOAD" if equivalent else "NON_EQUIVALENT_WORKLOAD",
+        "bytes_match": bytes_match,
+        "quality_match": quality_match,
+        "reasons": reasons,
     }
 
 
@@ -458,13 +547,83 @@ def validate_benchmark_report_schema(report: Dict[str, Any]) -> Tuple[bool, List
     return (len(errors) == 0, errors)
 
 
+def evaluate_benchmark_acceptance_gates(
+    report: Dict[str, Any],
+    smoke: bool = False,
+    acceptance: bool = False,
+) -> Tuple[bool, List[str]]:
+    """Evaluate all correctness, invariant, payload, SLA, and performance gates.
+
+    Returns (True, []) if all required gates pass, or (False, [failures]) if any gate fails.
+    """
+    failures: List[str] = []
+
+    # Gate 1: Schema validation
+    schema_valid, schema_errors = validate_benchmark_report_schema(report)
+    if not schema_valid:
+        failures.extend([f"Schema: {err}" for err in schema_errors])
+
+    # Gate 2: SLA Budget Enforcement verification
+    be = report.get("budget_enforcement", {})
+    if not be.get("policy_enforced"):
+        failures.append("Stop budget SLA policy was not enforced when limit exceeded")
+    if not be.get("completeness_demoted_to_partial"):
+        failures.append("Stop budget overrun did not demote completeness to PARTIAL")
+
+    # Gate 3: Backend correctness, accounting, and payload
+    for b in report.get("backends", []):
+        b_name = b.get("backend", "unknown")
+        failed_caps = b.get("failed_captures", 0)
+        if failed_caps > 0:
+            failures.append(f"Backend '{b_name}' had {failed_caps} failed capture exceptions")
+
+        # All iterations in standard benchmark must achieve COMPLETE
+        q_dist = b.get("quality_distribution", {})
+        total_iters = b.get("iterations", 0)
+        complete_count = q_dist.get("COMPLETE", 0)
+        if complete_count != total_iters:
+            failures.append(
+                f"Backend '{b_name}' failed quality gate: expected all {total_iters} iterations COMPLETE, got {q_dist}"
+            )
+
+        # Byte accounting invariants
+        byte_acc = b.get("byte_accounting", {})
+        if not byte_acc.get("invariants_satisfied", False):
+            failures.append(f"Backend '{b_name}' violated byte accounting invariants: {byte_acc.get('accounting_violations')}")
+
+        # Payload integrity
+        payload = b.get("payload_integrity", {})
+        if not payload.get("payload_valid"):
+            failures.append(f"Backend '{b_name}' failed payload integrity verification (reason: {payload.get('reason')})")
+
+    # Gate 4: Backend Equivalence
+    equiv = report.get("backend_equivalence", {})
+    if not equiv.get("equivalent_workload", True):
+        failures.append(f"Backends did not execute equivalent workloads: {equiv.get('reasons')}")
+
+    # Gate 5: Performance acceptance mode gates (only when --acceptance flag is set)
+    if acceptance:
+        iters = report.get("benchmark_parameters", {}).get("iterations", 0)
+        if iters < 10:
+            failures.append(f"Performance acceptance mode requires at least 10 iterations (got {iters})")
+        for b in report.get("backends", []):
+            b_name = b.get("backend", "unknown")
+            tput = b.get("throughput_mb_s", 0)
+            if tput is None or tput <= 0:
+                failures.append(f"Backend '{b_name}' reported non-positive throughput: {tput}")
+
+    return (len(failures) == 0, failures)
+
+
 def compare_with_baseline(
     current_results: List[Dict[str, Any]],
+    current_env: Dict[str, Any],
     baseline_path: str,
 ) -> Dict[str, Any]:
     """Compare current benchmark results against baseline stored in JSON."""
     comparison: Dict[str, Any] = {
         "baseline_available": False,
+        "compatible_environment": True,
         "comparisons": {},
     }
     if not os.path.exists(baseline_path):
@@ -478,6 +637,20 @@ def compare_with_baseline(
         return comparison
 
     comparison["baseline_available"] = True
+    base_env = baseline_data.get("environment", {})
+
+    # Check environment compatibility
+    arch_match = base_env.get("architecture") == current_env.get("architecture")
+    os_match = base_env.get("os") == current_env.get("os")
+    compatible = arch_match and os_match
+    comparison["compatible_environment"] = compatible
+    if not compatible:
+        comparison["compatibility_caveat"] = (
+            f"Baseline environment ({base_env.get('os')}/{base_env.get('architecture')}) differs from "
+            f"current environment ({current_env.get('os')}/{current_env.get('architecture')}). "
+            f"Latency numbers are for structural reference only."
+        )
+
     baseline_backends = {b.get("backend"): b for b in baseline_data.get("backends", [])}
 
     for cur in current_results:
@@ -565,10 +738,11 @@ def format_console_table(results: Dict[str, Any]) -> str:
             f"Fail={byte_acc.get('mean_failed_bytes'):,.0f}"
         )
         payload = b_data.get("payload_integrity", {})
+        elf_str = " (ELF: YES)" if payload.get("elf_magic_found") else (" (ELF: EXPECTED BUT MISSING)" if payload.get("elf_header_expected") else "")
         lines.append(
             f"  Throughput: {b_data.get('throughput_mb_s', 0):.2f} MB/s | "
             f"Quality: {b_data.get('quality_distribution')} (Success: {b_data.get('success_rate') * 100:.1f}%) | "
-            f"Payload: {'VALID' if payload.get('payload_valid') else 'INVALID'} (ELF: {'YES' if payload.get('elf_magic_found') else 'NO'})"
+            f"Payload: {'VALID' if payload.get('payload_valid') else 'INVALID'}{elf_str}"
         )
         lines.append("-" * 96)
 
@@ -581,10 +755,27 @@ def format_console_table(results: Dict[str, Any]) -> str:
         f"(Degraded={budget.get('completeness_demoted_to_partial')})"
     )
 
+    equiv = results.get("backend_equivalence", {})
+    lines.append(
+        f"Workload Equivalence: {equiv.get('qualification', 'UNKNOWN')} "
+        f"(Equal Work: {equiv.get('bytes_match', True)}, Equal Quality: {equiv.get('quality_match', True)})"
+    )
+
+    gates = results.get("acceptance_gates", {})
+    lines.append(
+        f"Acceptance Gates: {'ALL PASSED' if gates.get('passed') else 'FAILED'} "
+        f"(Mode: {gates.get('mode')})"
+    )
+    if not gates.get("passed"):
+        for f in gates.get("failures", []):
+            lines.append(f"  [GATE FAILURE] {f}")
+
     base_comp = results.get("baseline_comparison", {})
     if base_comp.get("baseline_available"):
         lines.append("-" * 96)
         lines.append(" Baseline Comparison Summary:")
+        if not base_comp.get("compatible_environment", True):
+            lines.append(f"  * Note: {base_comp.get('compatibility_caveat')}")
         for b_name, cmp_info in base_comp.get("comparisons", {}).items():
             b_bytes = cmp_info.get("captured_bytes", {})
             b_stop = cmp_info.get("total_stop_p50_us", {})
@@ -603,15 +794,24 @@ def run_benchmark(
     iterations: int = 20,
     output_path: Optional[str] = None,
     smoke: bool = False,
+    acceptance: bool = False,
     emit_json: bool = False,
     baseline_path: Optional[str] = "benchmarks/baseline_results.json",
 ) -> int:
-    """Main benchmark runner function."""
+    """Main benchmark runner function with strict acceptance gates and nonzero exit on failures."""
     if iterations < 1:
         raise ValueError(f"iterations must be >= 1, got {iterations}")
 
     if smoke:
         iterations = min(iterations, 3)
+
+    # Protect canonical baseline against accidental overwrite
+    if output_path and os.path.abspath(output_path) == os.path.abspath("benchmarks/baseline_results.json"):
+        if smoke:
+            raise ValueError(
+                "Cannot overwrite canonical benchmarks/baseline_results.json with a smoke run. "
+                "Specify a separate output path (e.g. benchmarks/latest_results.json)."
+            )
 
     work_dir = tempfile.mkdtemp(prefix="dynstate_bench_")
     fixture_src = os.path.abspath("tests/fixtures/real_runtime/main.cpp")
@@ -645,26 +845,36 @@ def run_benchmark(
             # Benchmark 3: Validate budget enforcement
             budget_validation = validate_budget_enforcement(pid)
 
-        # 4. Compare with baseline if available
-        base_comp = compare_with_baseline(backend_results, baseline_path) if baseline_path else {}
+        # 4. Compare backends for workload equivalence
+        backend_equiv = evaluate_backend_equivalence(backend_results)
+
+        # 5. Compare with baseline if available
+        base_comp = compare_with_baseline(backend_results, env_meta, baseline_path) if baseline_path else {}
 
         final_report = {
             "environment": env_meta,
             "benchmark_parameters": {
                 "iterations": iterations,
                 "smoke_mode": smoke,
+                "acceptance_mode": acceptance,
             },
             "backends": backend_results,
+            "backend_equivalence": backend_equiv,
             "budget_enforcement": budget_validation,
             "baseline_comparison": base_comp,
         }
 
-        # 5. Validate schema
-        valid, schema_errors = validate_benchmark_report_schema(final_report)
-        if not valid:
-            raise RuntimeError(f"Generated benchmark report failed schema validation: {schema_errors}")
+        # 6. Evaluate acceptance gates
+        passed, gate_failures = evaluate_benchmark_acceptance_gates(
+            final_report, smoke=smoke, acceptance=acceptance
+        )
+        final_report["acceptance_gates"] = {
+            "passed": passed,
+            "failures": gate_failures,
+            "mode": "SMOKE" if smoke else ("ACCEPTANCE" if acceptance else "STANDARD"),
+        }
 
-        # 6. Output results
+        # 7. Output results
         if output_path:
             out_dir = os.path.dirname(os.path.abspath(output_path))
             os.makedirs(out_dir, exist_ok=True)
@@ -676,15 +886,21 @@ def run_benchmark(
         else:
             print(format_console_table(final_report))
 
+        if not passed:
+            for f in gate_failures:
+                print(f"[BENCHMARK GATE FAILURE] {f}", file=sys.stderr)
+            return 1
+
         return 0
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="dynamicState Runtime Capture Performance Benchmark")
+    parser = argparse.ArgumentParser(description="dynamicState Runtime Capture Performance Benchmark & Acceptance Gates")
     parser.add_argument("--iterations", "-n", type=int, default=20, help="Number of benchmark capture iterations (default: 20)")
     parser.add_argument("--smoke", action="store_true", help="Run quick 3-iteration smoke test suitable for CI")
+    parser.add_argument("--acceptance", action="store_true", help="Enforce strict performance acceptance gates against regression")
     parser.add_argument("--output", "-o", type=str, default=None, help="Save machine-readable JSON results to specified file")
     parser.add_argument("--json", action="store_true", help="Output JSON results to stdout")
     parser.add_argument("--baseline", type=str, default="benchmarks/baseline_results.json", help="Path to stored baseline JSON")
@@ -697,6 +913,7 @@ def main():
         iterations=args.iterations,
         output_path=args.output,
         smoke=args.smoke,
+        acceptance=args.acceptance,
         emit_json=args.json,
         baseline_path=args.baseline,
     ))

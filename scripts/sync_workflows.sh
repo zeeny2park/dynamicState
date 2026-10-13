@@ -20,10 +20,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-SOURCE_DIR="${REPO_ROOT}/ci/workflows"
-TARGET_DIR="${REPO_ROOT}/.github/workflows"
+SOURCE_DIR="${SYNC_SOURCE_DIR:-${REPO_ROOT}/ci/workflows}"
+TARGET_DIR="${SYNC_TARGET_DIR:-${REPO_ROOT}/.github/workflows}"
 
-echo "=== Syncing CI workflows from ci/workflows/ to .github/workflows/ ==="
+echo "=== Syncing CI workflows from ${SOURCE_DIR} to ${TARGET_DIR} ==="
 
 if [ ! -d "${SOURCE_DIR}" ]; then
     echo "ERROR: Source directory ${SOURCE_DIR} not found!" >&2
