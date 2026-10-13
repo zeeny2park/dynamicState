@@ -5360,12 +5360,160 @@
       return;
     }
 
-    el.invFindingsList.innerHTML = filtered.map(f => {
+    let conclusionsHtml = '';
+    if (inv.causal_conclusions && (filter === 'all' || filter === 'hypothesis')) {
+      const cc = inv.causal_conclusions;
+      const proofBadge = cc.causal_proof_established
+        ? '<span class="badge badge-success text-xs">CAUSAL PROOF ESTABLISHED</span>'
+        : '<span class="badge badge-warning text-xs">HYPOTHESIS / CANDIDATE STAGE</span>';
+      
+      conclusionsHtml = `
+        <div style="background-color: rgba(31, 41, 55, 0.4); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; margin-bottom: 12px;" class="text-xs">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <strong>Causal Conclusions Summary</strong>
+            ${proofBadge}
+          </div>
+          <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 6px;">
+            <span>Hypotheses: <strong>${cc.hypotheses_count || 0}</strong></span>
+            <span>Supported: <strong style="color: var(--accent);">${cc.supported_hypotheses_count || 0}</strong></span>
+            <span>Validated: <strong style="color: var(--success);">${cc.validated_causal_count || 0}</strong></span>
+            <span>Contradicted: <strong style="color: var(--danger);">${cc.contradicted_count || 0}</strong></span>
+            <span>Inconclusive: <strong style="color: var(--warning);">${cc.inconclusive_count || 0}</strong></span>
+          </div>
+          ${cc.causal_limitation_notice ? `<div class="text-muted" style="font-size: 0.75rem;">⚠️ ${escapeHtml(cc.causal_limitation_notice)}</div>` : ''}
+        </div>
+      `;
+    }
+
+    const renderedFindings = filtered.map(f => {
       const cat = f.category || 'fact';
       const badgeClass = cat === 'fact' ? 'badge-fact' : (cat === 'hypothesis' ? 'badge-hypothesis' : 'badge-unknown');
       const catLabel = cat === 'fact' ? t('observed_fact', 'Observed Fact') : (cat === 'hypothesis' ? t('hypothesis', 'Hypothesis') : t('unknown', 'Unknown'));
       const cPathHtml = f.c_type_path ? `<span class="finding-path">${escapeHtml(f.c_type_path)}</span>` : '';
       const jumpHtml = f.object_id ? `<button type="button" class="jump-link" onclick="window.__jumpToObject('${escapeHtml(f.object_id)}', '${escapeHtml(f.field_name || '')}')">${t('inspect_in_obj_explorer', 'Inspect in Object Explorer ➔')}</button>` : '';
+
+      if (cat === 'hypothesis') {
+        const hypo = (inv.hypotheses || []).find(h => h.hypothesis_id === f.finding_id || h.hypothesis_id === f.title || (f.title && f.title.includes(h.hypothesis_id)));
+        const hypoStatus = (hypo ? hypo.status : f.status) || 'PROPOSED';
+        let statusBadgeClass = 'badge-neutral';
+        if (hypoStatus === 'VALIDATED') statusBadgeClass = 'badge-success';
+        else if (hypoStatus === 'SUPPORTED') statusBadgeClass = 'badge-info';
+        else if (hypoStatus === 'CONTRADICTED') statusBadgeClass = 'badge-danger';
+        else if (hypoStatus === 'INCONCLUSIVE') statusBadgeClass = 'badge-warning';
+
+        const conf = hypo?.confidence || f.confidence || 'SPECULATIVE';
+        let confBadgeClass = 'badge-neutral';
+        if (conf === 'HIGH') confBadgeClass = 'badge-success';
+        else if (conf === 'MEDIUM') confBadgeClass = 'badge-info';
+        else if (conf === 'LOW') confBadgeClass = 'badge-warning';
+
+        // Function Candidates
+        const funcCandidates = hypo?.function_candidates || [];
+        let funcCandidatesHtml = '';
+        if (funcCandidates.length > 0) {
+          funcCandidatesHtml = `
+            <div style="margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--border-color);">
+              <div style="font-weight: 600; font-size: 0.8rem; margin-bottom: 4px; color: var(--text-secondary);">Function Candidates:</div>
+              ${funcCandidates.map(fc => {
+                const tier = fc.candidate_tier || (fc.confirmed_root_cause ? 'VALIDATED_CAUSAL_FUNCTION' : 'STATIC_CANDIDATE');
+                let tierBadge = '<span class="badge badge-warning text-xs">STATIC CANDIDATE (UNPROVEN)</span>';
+                if (tier === 'VALIDATED_CAUSAL_FUNCTION') {
+                  tierBadge = '<span class="badge badge-success text-xs">VALIDATED CAUSAL FUNCTION</span>';
+                } else if (tier === 'EVIDENCE_SUPPORTED_CANDIDATE') {
+                  tierBadge = '<span class="badge badge-info text-xs">EVIDENCE-SUPPORTED CANDIDATE</span>';
+                }
+                const fnName = fc.function_name || fc.name || 'unknown_fn';
+                const fileLoc = fc.source_file ? ` <span class="mono text-muted text-xs">(${escapeHtml(fc.source_file)}:${fc.source_line || 0})</span>` : '';
+                return `<div style="margin-bottom: 4px;"><strong class="mono" style="color: var(--accent);">${escapeHtml(fnName)}</strong>${fileLoc} ${tierBadge}</div>`;
+              }).join('')}
+              <div class="text-xs text-muted" style="margin-top: 2px;">ℹ️ Static DWARF association alone does not constitute proven causality.</div>
+            </div>
+          `;
+        }
+
+        // Suggested Observations
+        const observations = hypo?.suggested_observations || [];
+        let obsHtml = '';
+        if (observations.length > 0) {
+          obsHtml = `
+            <div style="margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--border-color);">
+              <div style="font-weight: 600; font-size: 0.8rem; margin-bottom: 4px; color: var(--text-secondary);">Follow-Up Observation Plans:</div>
+              ${observations.map(obs => {
+                const isExec = obs.is_executed;
+                const obsBadge = isExec ? '<span class="badge badge-success text-xs">EXECUTED</span>' : '<span class="badge badge-neutral text-xs">SUGGESTED</span>';
+                const disc = obs.discriminating_criteria ? `<div class="text-xs text-muted" style="margin-top: 2px;"><strong>Discriminating Criteria:</strong> ${escapeHtml(obs.discriminating_criteria)}</div>` : '';
+                const safety = (obs.safety_constraints && obs.safety_constraints.length > 0) ? `<div class="text-xs text-muted" style="margin-top: 2px;"><strong>Safety Constraints:</strong> ${escapeHtml(obs.safety_constraints.join(', '))}</div>` : '';
+                const execBtn = (!isExec && inv.investigation_id) ? `<button type="button" class="btn btn-xs btn-outline mt-1" onclick="window.__executeObservation('${escapeHtml(inv.investigation_id)}', '${escapeHtml(obs.observation_id)}')">Execute Observation</button>` : '';
+                return `
+                  <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); padding: 6px 8px; border-radius: 4px; margin-bottom: 6px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                      <span class="mono text-xs font-semibold" style="color: var(--text-main);">${escapeHtml(obs.observation_id || '')}: ${escapeHtml(obs.question || '')}</span>
+                      ${obsBadge}
+                    </div>
+                    ${disc}
+                    ${safety}
+                    ${execBtn}
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          `;
+        }
+
+        // Validation History Trail
+        const history = hypo?.status_history || [];
+        let histHtml = '';
+        if (history.length > 0) {
+          histHtml = `
+            <details style="margin-top: 8px;">
+              <summary style="cursor: pointer; font-size: 0.8rem; color: var(--accent);">📜 Validation History (${history.length} transition${history.length > 1 ? 's' : ''})</summary>
+              <div style="padding: 6px 8px; font-size: 0.75rem; background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); border-radius: 4px; margin-top: 4px;">
+                ${history.map(h => `
+                  <div style="margin-bottom: 4px; border-bottom: 1px dashed rgba(255,255,255,0.1); padding-bottom: 2px;">
+                    <span class="mono text-muted">${escapeHtml(h.timestamp || '')}</span>: 
+                    <strong>${escapeHtml(h.from_status || 'INIT')} &rarr; ${escapeHtml(h.to_status || '')}</strong>
+                    <div class="text-muted" style="margin-top: 1px;">&mdash; <em>${escapeHtml(h.transition_reason || '')}</em></div>
+                  </div>
+                `).join('')}
+              </div>
+            </details>
+          `;
+        }
+
+        const evalBtn = (inv.investigation_id && hypo?.hypothesis_id) ? `
+          <button type="button" class="btn btn-xs btn-secondary" onclick="window.__evaluateHypothesis('${escapeHtml(inv.investigation_id)}', '${escapeHtml(hypo.hypothesis_id)}')">
+            Evaluate Hypothesis
+          </button>
+        ` : '';
+
+        return `
+          <div class="finding-card hypothesis">
+            <div class="finding-header">
+              <span class="finding-title">${escapeHtml(f.title || hypo?.claim || 'Hypothesis')}</span>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <span class="badge ${statusBadgeClass}">${escapeHtml(hypoStatus)}</span>
+                <span class="${badgeClass}">${catLabel}</span>
+              </div>
+            </div>
+            ${cPathHtml ? `<div style="margin-bottom: 6px;">${cPathHtml}</div>` : ''}
+            <div class="finding-desc">${escapeHtml(hypo?.proposed_mechanism || f.description || '')}</div>
+            <div style="margin-top: 6px;" class="text-xs">
+              <strong>Confidence:</strong> <span class="badge ${confBadgeClass}">${escapeHtml(conf)}</span>
+              ${hypo?.confidence_rationale ? `<span class="text-muted" style="margin-left: 6px;">(${escapeHtml(hypo.confidence_rationale)})</span>` : ''}
+            </div>
+            ${funcCandidatesHtml}
+            ${obsHtml}
+            ${histHtml}
+            <div class="finding-footer" style="margin-top: 8px;">
+              <span class="text-xs text-muted">Hypothesis ID: <strong>${escapeHtml(hypo?.hypothesis_id || f.finding_id || '')}</strong></span>
+              <div style="display: flex; gap: 6px;">
+                ${evalBtn}
+                ${jumpHtml}
+              </div>
+            </div>
+          </div>
+        `;
+      }
 
       return `
         <div class="finding-card ${cat}">
@@ -5382,6 +5530,8 @@
         </div>
       `;
     }).join('');
+
+    el.invFindingsList.innerHTML = conclusionsHtml + renderedFindings;
   }
 
   function renderNextSteps(steps) {
@@ -5621,6 +5771,46 @@
       }, 100);
     }
     showToast(`Focused on object ${objectId}${fieldName ? ` (${fieldName})` : ''}`, 'info');
+  };
+
+  // Global helper for evaluating hypothesis
+  window.__evaluateHypothesis = async function (invId, hypoId) {
+    if (!invId || !hypoId) return;
+    try {
+      showToast(`Evaluating hypothesis ${hypoId}...`, 'info');
+      const res = await apiPost('/api/investigation/hypotheses/evaluate', {
+        investigation_id: invId,
+        hypothesis_id: hypoId,
+      });
+      if (res.success) {
+        showToast(`Hypothesis evaluated: ${res.data?.status || 'updated'}`, 'success');
+        await loadActiveInvestigation(invId);
+      } else {
+        showToast(`Evaluation failed: ${res.error?.message || 'Error'}`, 'error');
+      }
+    } catch (e) {
+      showToast(`Evaluation error: ${String(e)}`, 'error');
+    }
+  };
+
+  // Global helper for executing follow-up observation
+  window.__executeObservation = async function (invId, obsId) {
+    if (!invId || !obsId) return;
+    try {
+      showToast(`Executing observation ${obsId}...`, 'info');
+      const res = await apiPost('/api/investigation/observe', {
+        investigation_id: invId,
+        observation_id: obsId,
+      });
+      if (res.success) {
+        showToast(`Observation recorded: ${obsId}`, 'success');
+        await loadActiveInvestigation(invId);
+      } else {
+        showToast(`Observation failed: ${res.error?.message || 'Error'}`, 'error');
+      }
+    } catch (e) {
+      showToast(`Observation error: ${String(e)}`, 'error');
+    }
   };
 
   // --------------------------------------------------------------------------

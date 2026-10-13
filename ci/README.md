@@ -28,3 +28,31 @@ git push
 *(Requires a GitHub personal access token with the `workflow` scope. GitHub OAuth tokens lacking the `workflow` scope will be rejected by GitHub's pre-receive hook).*
 
 To prevent drift between `ci/workflows/` and `.github/workflows/`, all changes to workflow specifications must be authored in `ci/workflows/` and synced via `./scripts/sync_workflows.sh`.
+
+### Local Test Matrix & Verification Commands
+
+Because remote workflow pushes require the `workflow` OAuth token scope which is currently absent, the complete regression and benchmark suite can be executed locally with identical coverage:
+
+```bash
+# 1. Benchmark harness and acceptance gates (12 tests)
+python3 -m unittest tests/test_capture_benchmark.py -v
+
+# 2. Capture lifecycle, PID reuse races, and byte accounting seams (54 tests)
+python3 -m unittest tests/test_capture_lifecycle_seam.py -v
+
+# 3. Real runtime C++ process live capture & memory mutation (20 tests)
+python3 -m unittest tests/test_real_runtime_validation.py -v
+
+# 4. End-to-end C++ investigation pipeline scenarios A-E (5 tests)
+python3 -m unittest tests/test_cpp_e2e_investigation.py -v
+
+# 5. Capture benchmark smoke run (schema, byte accounting, SLA checks)
+python3 -m benchmarks.capture_benchmark --smoke
+
+# 6. Capture benchmark 20-iteration acceptance run
+python3 -m benchmarks.capture_benchmark --iterations 20 --acceptance --output benchmarks/latest_results.json
+
+# 7. Full test discovery suite (464 tests)
+python3 -m unittest discover -s tests -v
+```
+

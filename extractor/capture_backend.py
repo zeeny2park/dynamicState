@@ -124,6 +124,7 @@ class CaptureSafetyPolicy:
     mem_reader: Optional[Any] = None  # Injectable memory read seam
     expected_identity: Optional[Dict[str, Any]] = None  # Expected target identity to prevent PID reuse
     expected_starttime: Optional[str] = None  # Expected /proc/<pid>/stat starttime
+    simulate_mapping_race: bool = False  # Inject mapping race condition for deterministic testing
 
 
 class _struct_iovec(ctypes.Structure):
@@ -1730,6 +1731,47 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
 
         wall_clock_end = datetime.now(timezone.utc).isoformat()
 
+        # Ensure all read plans are accounted for even if an unhandled exception occurred
+        processed_plan_indices = {r[0][0] for r in read_results}
+        for item in read_plans:
+            if item[0] not in processed_plan_indices:
+                read_results.append((item, -1, errno.EIO))
+
+        mapping_race_detected = False
+        if getattr(policy, "simulate_mapping_race", False):
+            mapping_race_detected = True
+
+        for item, nread, err in read_results:
+            if nread <= 0 and err == errno.EFAULT and not explicit_ranges_used_without_maps:
+                mapping_race_detected = True
+                break
+
+        any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in getattr(handle, "identity_checkpoints", []))
+        if not mapping_race_detected and not any_target_exited and hasattr(handle, "read_proc_maps"):
+            try:
+                post_maps = handle.read_proc_maps()
+                if getattr(post_maps, "status", None) in ("SUCCESS_WITH_RESULTS", "SUCCESS_EMPTY"):
+                    for m in selected_maps:
+                        s, e = m["start"], m["end"]
+                        pre_cov = next((pm for pm in all_maps if pm.get("start", 0) <= s and pm.get("end", 0) >= e), None)
+                        if pre_cov is not None:
+                            post_cov = next((pm for pm in post_maps if pm.get("start", 0) <= s and pm.get("end", 0) >= e), None)
+                            if post_cov is None or "r" not in post_cov.get("permissions", ""):
+                                mapping_race_detected = True
+                                break
+                            if pre_cov.get("permissions") != post_cov.get("permissions") or pre_cov.get("offset") != post_cov.get("offset") or pre_cov.get("pathname") != post_cov.get("pathname"):
+                                mapping_race_detected = True
+                                break
+            except Exception:
+                pass
+
+        if mapping_race_detected:
+            diagnostics.append({
+                "code": "MAPPING_RACE_DETECTED",
+                "message": "Memory mapping changed or invalidated during capture; snapshot completeness demoted to PARTIAL.",
+                "level": "WARNING"
+            })
+
         # 5. Offline post-processing of buffers (target process is already resumed!)
         bytes_read = 0
         bytes_failed = 0
@@ -1884,6 +1926,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             or thread_enum_failed
             or map_enum_failed
             or stop_budget_exceeded
+            or mapping_race_detected
         ):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
@@ -1965,6 +2008,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "temporal_consistency": "ATOMIC_STOPPED" if (should_suspend and stop_confirmed and all_threads_stopped) else ("PREEXISTING_STOPPED" if was_already_stopped else "NON_ATOMIC"),
             "stop_budget_compliance": "EXCEEDED" if stop_budget_exceeded else ("COMPLIANT" if total_stop_time_ms is not None else "NOT_APPLICABLE"),
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
+            "mapping_race_detected": mapping_race_detected,
             "captured_bytes": bytes_read,
             "bytes_requested": bytes_requested,
             "bytes_read": bytes_read,
@@ -2016,6 +2060,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "snapshot_consistency": snapshot_consistency,
             "consistency_classification": consistency_classification,
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
+            "mapping_race_detected": mapping_race_detected,
             "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
             "all_threads_stopped": all_threads_stopped,
             "was_already_stopped": was_already_stopped,
@@ -2700,6 +2745,47 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
 
         wall_clock_end = datetime.now(timezone.utc).isoformat()
 
+        # Ensure all read plans are accounted for even if an unhandled exception occurred
+        processed_plan_indices = {r[0][0] for r in read_results}
+        for item in read_plans:
+            if item[0] not in processed_plan_indices:
+                read_results.append((item, b"", "UNPROCESSED_DUE_TO_ERROR"))
+
+        mapping_race_detected = False
+        if getattr(policy, "simulate_mapping_race", False):
+            mapping_race_detected = True
+
+        for item, chunk, err in read_results:
+            if (not chunk) and err and ("EFAULT" in str(err) or "bad address" in str(err).lower()) and not explicit_ranges_used_without_maps:
+                mapping_race_detected = True
+                break
+
+        any_target_exited = any(cp.get("status") == "TARGET_EXITED" for cp in getattr(handle, "identity_checkpoints", []))
+        if not mapping_race_detected and not any_target_exited and hasattr(handle, "read_proc_maps"):
+            try:
+                post_maps = handle.read_proc_maps()
+                if getattr(post_maps, "status", None) in ("SUCCESS_WITH_RESULTS", "SUCCESS_EMPTY"):
+                    for m in selected_maps:
+                        s, e = m["start"], m["end"]
+                        pre_cov = next((pm for pm in all_maps if pm.get("start", 0) <= s and pm.get("end", 0) >= e), None)
+                        if pre_cov is not None:
+                            post_cov = next((pm for pm in post_maps if pm.get("start", 0) <= s and pm.get("end", 0) >= e), None)
+                            if post_cov is None or "r" not in post_cov.get("permissions", ""):
+                                mapping_race_detected = True
+                                break
+                            if pre_cov.get("permissions") != post_cov.get("permissions") or pre_cov.get("offset") != post_cov.get("offset") or pre_cov.get("pathname") != post_cov.get("pathname"):
+                                mapping_race_detected = True
+                                break
+            except Exception:
+                pass
+
+        if mapping_race_detected:
+            diagnostics.append({
+                "code": "MAPPING_RACE_DETECTED",
+                "message": "Memory mapping changed or invalidated during capture; snapshot completeness demoted to PARTIAL.",
+                "level": "WARNING"
+            })
+
         # Offline post-processing of buffers
         bytes_read = 0
         bytes_failed = 0
@@ -2852,6 +2938,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             or thread_enum_failed
             or map_enum_failed
             or stop_budget_exceeded
+            or mapping_race_detected
         ):
             capture_status = "PARTIAL"
             completeness = "PARTIAL"
@@ -2933,6 +3020,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "temporal_consistency": "ATOMIC_STOPPED" if (should_suspend and stop_confirmed and all_threads_stopped) else ("PREEXISTING_STOPPED" if was_already_stopped else "NON_ATOMIC"),
             "stop_budget_compliance": "EXCEEDED" if stop_budget_exceeded else ("COMPLIANT" if total_stop_time_ms is not None else "NOT_APPLICABLE"),
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
+            "mapping_race_detected": mapping_race_detected,
             "captured_bytes": bytes_read,
             "bytes_requested": bytes_requested,
             "bytes_read": bytes_read,
@@ -2984,6 +3072,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "snapshot_consistency": snapshot_consistency,
             "consistency_classification": consistency_classification,
             "stop_mechanism": "PREEXISTING_STOP_PRESERVED" if was_already_stopped else ("SIGSTOP" if should_suspend else "NONE"),
+            "mapping_race_detected": mapping_race_detected,
             "stopped_threads": stop_confirmed if (should_suspend or was_already_stopped) else False,
             "all_threads_stopped": all_threads_stopped,
             "was_already_stopped": was_already_stopped,

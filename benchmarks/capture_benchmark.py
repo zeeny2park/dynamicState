@@ -531,6 +531,9 @@ def validate_benchmark_report_schema(report: Dict[str, Any]) -> Tuple[bool, List
                         if val is not None:
                             if not isinstance(val, (int, float)) or not math.isfinite(val):
                                 errors.append(f"Metric '{m_name}.{p_key}' in backend '{b_name}' is not finite numeric: {val}")
+                    sc = m_val.get("sample_count")
+                    if sc is not None and (not isinstance(sc, int) or sc < 0):
+                        errors.append(f"Metric '{m_name}' in backend '{b_name}' has invalid integer 'sample_count': {sc}")
             if "byte_accounting" not in b:
                 errors.append(f"Backend '{b_name}' missing 'byte_accounting'")
             if "success_rate" not in b:
@@ -590,6 +593,24 @@ def evaluate_benchmark_acceptance_gates(
         byte_acc = b.get("byte_accounting", {})
         if not byte_acc.get("invariants_satisfied", False):
             failures.append(f"Backend '{b_name}' violated byte accounting invariants: {byte_acc.get('accounting_violations')}")
+        if byte_acc.get("accounting_violations"):
+            failures.append(f"Backend '{b_name}' had {len(byte_acc['accounting_violations'])} byte accounting violations")
+
+        # Required performance metrics must contain valid samples or explicit unavailable reasons
+        unav = b.get("unavailable_reasons", {})
+        metrics = b.get("metrics", {})
+        if not metrics:
+            failures.append(f"Backend '{b_name}' missing required metrics dictionary")
+        for m_name, m_data in metrics.items():
+            sc = m_data.get("sample_count")
+            p50_val = m_data.get("p50")
+            if sc == 0 or (p50_val is None and sc is None):
+                # Measurement is absent / unmeasured; must be explained in unavailable_reasons
+                m_base = m_name.replace("_us", "").replace("_ms", "")
+                if m_name not in unav and m_base not in unav:
+                    failures.append(
+                        f"Backend '{b_name}' metric '{m_name}' is unmeasured with 0 samples but lacks explicit unavailable reason"
+                    )
 
         # Payload integrity
         payload = b.get("payload_integrity", {})
@@ -875,6 +896,14 @@ def run_benchmark(
         }
 
         # 7. Output results
+        # Protect canonical baseline against accidental overwrite on gate failure or smoke run
+        is_canonical_baseline = baseline_path and output_path and (os.path.abspath(output_path) == os.path.abspath(baseline_path))
+        if is_canonical_baseline and not passed:
+            raise RuntimeError(
+                "Cannot overwrite canonical baseline because benchmark acceptance gates failed. "
+                "Resolve failures or output to a different file."
+            )
+
         if output_path:
             out_dir = os.path.dirname(os.path.abspath(output_path))
             os.makedirs(out_dir, exist_ok=True)

@@ -295,6 +295,12 @@ class RawRuntimeSnapshot:
         threads_unconfirmed = ((guarantees.get("process_stop_requested", False) or was_stopped) and not guarantees.get("all_threads_stopped", False) and guarantees.get("process_stop_confirmed", False))
         is_non_atomic = (obs_meta.get("consistency_classification") == "NON_ATOMIC" or prov.get("snapshot_consistency") == "NON_ATOMIC")
         stop_budget_exceeded = prov.get("stop_budget_exceeded", False) or any(d.get("code") == "STOP_BUDGET_EXCEEDED" for d in prov.get("diagnostics", []))
+        mapping_race_detected = (
+            prov.get("mapping_race_detected", False)
+            or obs_meta.get("mapping_race_detected", False)
+            or any(d.get("code") == "MAPPING_RACE_DETECTED" for d in prov.get("diagnostics", []))
+            or any(d.get("code") == "MAPPING_RACE_DETECTED" for d in obs_meta.get("diagnostics", []))
+        )
 
         if (
             has_failed_reg
@@ -306,7 +312,16 @@ class RawRuntimeSnapshot:
             or threads_unconfirmed
             or is_non_atomic
             or stop_budget_exceeded
+            or mapping_race_detected
         ):
+            if mapping_race_detected:
+                prov["mapping_race_detected"] = True
+                if not any(d.get("code") == "MAPPING_RACE_DETECTED" for d in prov.get("diagnostics", [])):
+                    prov.setdefault("diagnostics", []).append({
+                        "code": "MAPPING_RACE_DETECTED",
+                        "message": "Memory mapping changed or invalidated during capture; snapshot completeness demoted to PARTIAL.",
+                        "level": "WARNING"
+                    })
             return "PARTIAL", prov
 
         # 4. Legacy snapshot conservative policy:

@@ -39,6 +39,12 @@ EVIDENCE_LEVEL_STATIC = "static"
 EVIDENCE_LEVEL_INDIRECT = "indirect"
 EVIDENCE_LEVEL_UNKNOWN = "unknown"
 
+# Explicit function candidate tiers
+FUNCTION_TIER_STATIC_CANDIDATE = "STATIC_CANDIDATE"
+FUNCTION_TIER_EVIDENCE_SUPPORTED = "EVIDENCE_SUPPORTED_CANDIDATE"
+FUNCTION_TIER_VALIDATED_CAUSAL = "VALIDATED_CAUSAL_FUNCTION"
+FUNCTION_TIER_UNKNOWN = "UNKNOWN"
+
 LAYOUT_MUTATION_CAVEAT = (
     "DWARF member declaration specifies struct memory layout only; "
     "it does NOT prove where this field was mutated at runtime."
@@ -57,6 +63,16 @@ class FunctionCandidate:
     limitations: str
     thread_id: Optional[Union[int, str]] = None
     frame_level: Optional[int] = None
+    causal_classification: str = FUNCTION_TIER_STATIC_CANDIDATE
+    confirmed_root_cause: bool = False
+
+    def __post_init__(self):
+        if self.evidence_level == EVIDENCE_LEVEL_OBSERVED:
+            self.causal_classification = FUNCTION_TIER_EVIDENCE_SUPPORTED
+        elif self.evidence_level in (EVIDENCE_LEVEL_STATIC, EVIDENCE_LEVEL_INDIRECT):
+            self.causal_classification = FUNCTION_TIER_STATIC_CANDIDATE
+        elif self.evidence_level == EVIDENCE_LEVEL_UNKNOWN:
+            self.causal_classification = FUNCTION_TIER_UNKNOWN
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

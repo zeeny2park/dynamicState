@@ -1690,6 +1690,142 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         self.assertEqual(snap.provenance["regions_complete"], 1)
         self.assertEqual(snap.provenance["regions_omitted"], 0)
 
+    def test_mapping_race_detected_demotes_to_partial_process_vm(self):
+        """Mapping race simulated via policy demotes ProcessVmCaptureBackend completeness to PARTIAL."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=lambda p, a, s: b"X" * s,
+            simulate_mapping_race=True,
+        )
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)])
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertTrue(snap.provenance.get("mapping_race_detected"))
+        self.assertTrue(any(d.get("code") == "MAPPING_RACE_DETECTED" for d in snap.provenance.get("diagnostics", [])))
+
+    def test_mapping_race_detected_demotes_to_partial_procfs(self):
+        """Mapping race simulated via policy demotes ProcfsCaptureBackend completeness to PARTIAL."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=lambda p, a, s: b"Y" * s,
+            simulate_mapping_race=True,
+        )
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)])
+        backend = ProcfsCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertTrue(snap.provenance.get("mapping_race_detected"))
+        self.assertTrue(any(d.get("code") == "MAPPING_RACE_DETECTED" for d in snap.provenance.get("diagnostics", [])))
+
+    def test_mapping_race_post_maps_layout_shift(self):
+        """Post-capture maps verification detects unmapped/shifted region and demotes to PARTIAL."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        adapter.mock_maps = [
+            {"start": 0x1000, "end": 0x3000, "size": 0x2000, "permissions": "rw-p", "offset": 0, "category": "anonymous", "pathname": ""}
+        ]
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+
+        call_count = [0]
+        orig_read_maps = adapter.read_proc_maps
+        def dynamic_read_maps(pid):
+            call_count[0] += 1
+            if call_count[0] > 1:
+                return ProcMapsResult([], status="SUCCESS_EMPTY")
+            return orig_read_maps(pid)
+
+        adapter.read_proc_maps = dynamic_read_maps
+        policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"Z" * s)
+        plan = CapturePlan(mode=CaptureMode.FULL.value)
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertTrue(snap.provenance.get("mapping_race_detected"))
+        self.assertTrue(any(d.get("code") == "MAPPING_RACE_DETECTED" for d in snap.provenance.get("diagnostics", [])))
+
+    def test_short_read_and_unread_byte_accounting(self):
+        """Short read accounts for unread bytes and enforces exact byte accounting invariant."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=lambda p, a, s: b"S" * 1024,
+        )
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1000 + 4096)])
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        prov = snap.provenance
+        b_req = prov["bytes_requested"]
+        b_read = prov["bytes_read"]
+        b_omit = prov["bytes_omitted"]
+        b_fail = prov["bytes_failed"]
+        b_unread = prov["bytes_unread"]
+
+        self.assertEqual(b_req, 4096)
+        self.assertEqual(b_read, 1024)
+        self.assertEqual(b_unread, 3072)
+        self.assertEqual(b_fail, 0)
+        self.assertEqual(b_omit, 0)
+        self.assertEqual(b_req, b_read + b_omit + b_fail + b_unread)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertEqual(snap.memory_regions[0]["status"], "PARTIAL")
+
+    def test_inaccessible_range_accounting(self):
+        """Inaccessible or EFAULT range records failed bytes and enforces invariant."""
+        adapter = MockProcessTargetAdapter(initial_state="RUNNING")
+        handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
+        policy = CaptureSafetyPolicy(
+            target_handle=handle,
+            mem_reader=lambda p, a, s: None,
+        )
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1000 + 4096)])
+        backend = ProcessVmCaptureBackend()
+
+        snap = backend.capture(adapter.pid, plan=plan, policy=policy)
+        prov = snap.provenance
+        self.assertEqual(prov["bytes_requested"], 4096)
+        self.assertEqual(prov["bytes_read"], 0)
+        self.assertEqual(prov["bytes_failed"], 4096)
+        self.assertEqual(prov["bytes_unread"], 0)
+        self.assertEqual(prov["bytes_omitted"], 0)
+        self.assertEqual(prov["bytes_requested"], prov["bytes_read"] + prov["bytes_omitted"] + prov["bytes_failed"] + prov["bytes_unread"])
+        self.assertEqual(snap.completeness, "FAILED")
+        self.assertEqual(snap.memory_regions[0]["status"], "FAILED")
+
+    def test_mapping_race_monotonic_degradation_in_raw_snapshot(self):
+        """RawRuntimeSnapshot._enforce_canonical_quality_contract never upgrades mapping race to COMPLETE."""
+        data = {
+            "snapshot_id": "RS_TEST_RACE",
+            "pid": 12345,
+            "executable": "/bin/app",
+            "executable_build_id": "sha1-abc",
+            "timestamp": "2026-10-13T00:00:00Z",
+            "capture_duration_us": 1000.0,
+            "thread_metadata": [{"thread_id": 12345, "state": "STOPPED", "verified_observation": True, "is_synthetic": False}],
+            "memory_regions": [{"region_id": "R00001", "start": "0x1000", "end": "0x2000", "size": 0x1000, "captured_bytes": 0x1000, "status": "COMPLETE"}],
+            "captured_ranges": [["0x1000", "0x2000"]],
+            "completeness": "COMPLETE",
+            "provenance": {
+                "capture_backend": "process_vm_readv",
+                "mapping_race_detected": True,
+                "bytes_requested": 0x1000,
+                "bytes_read": 0x1000,
+                "lifecycle_guarantees": {"process_stop_confirmed": True, "all_threads_stopped": True},
+            },
+        }
+        snap = RawRuntimeSnapshot.from_dict(data)
+        self.assertEqual(snap.completeness, "PARTIAL")
+        self.assertTrue(snap.provenance.get("mapping_race_detected"))
+        self.assertTrue(any(d.get("code") == "MAPPING_RACE_DETECTED" for d in snap.provenance.get("diagnostics", [])))
+
 
 if __name__ == "__main__":
     unittest.main()

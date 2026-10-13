@@ -1439,6 +1439,40 @@ class WebApiAdapter:
         summaries = [s.to_dict() for s in sessions.values()]
         return {"success": True, "data": _to_json_serializable(summaries)}
 
+    def get_hypotheses(self, investigation_id: Optional[str], status_filter: Optional[str] = None) -> Dict[str, Any]:
+        if not investigation_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        res = self.runtime.get_hypotheses(investigation_id, status_filter=status_filter)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
+                                            "message": res.error.message if res.error else "Failed to get hypotheses"}}
+
+    def evaluate_hypothesis(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        hypo_id = params.get("hypothesis_id")
+        if not inv_id or not hypo_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id and hypothesis_id are required"}}
+        new_ev = params.get("new_evidence")
+        det_trans = bool(params.get("deterministic_transition_verified", False))
+        res = self.runtime.evaluate_hypothesis(inv_id, hypo_id, new_evidence=new_ev, deterministic_transition_verified=det_trans)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "EVAL_ERROR",
+                                            "message": res.error.message if res.error else "Failed to evaluate hypothesis"}}
+
+    def execute_observation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        obs_id = params.get("observation_id")
+        if not inv_id or not obs_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id and observation_id are required"}}
+        res_data = params.get("result_data")
+        res = self.runtime.execute_observation(inv_id, obs_id, result_data=res_data)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "OBSERVATION_ERROR",
+                                            "message": res.error.message if res.error else "Failed to execute observation"}}
+
 
 
 class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -1723,6 +1757,14 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_investigation_report(q_param("investigation_id")))
                 return
 
+            # GET /api/investigation/hypotheses
+            if path == "/api/investigation/hypotheses":
+                self._send_json(adapter.get_hypotheses(
+                    q_param("investigation_id"),
+                    status_filter=q_param("status_filter")
+                ))
+                return
+
             # GET /api/investigations
             if path == "/api/investigations":
                 self._send_json(adapter.list_investigations())
@@ -1812,6 +1854,14 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
             if path == "/api/investigation/compare":
                 self._send_json(adapter.compare_observations(body))
+                return
+
+            if path in ("/api/investigation/hypotheses/evaluate", "/api/investigation/evaluate"):
+                self._send_json(adapter.evaluate_hypothesis(body))
+                return
+
+            if path == "/api/investigation/observe":
+                self._send_json(adapter.execute_observation(body))
                 return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},

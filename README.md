@@ -1330,7 +1330,48 @@ dynamicState includes an automated benchmark harness measuring process suspensio
    python3 -m benchmarks.capture_benchmark --iterations 20 --acceptance --output benchmarks/latest_results.json
    ```
 
-### Stop Budget SLA vs Real-Time Semantics
-- `CaptureSafetyPolicy.max_stop_time_ms` is an **SLA detection and bounding threshold**, not an OS hard real-time preemption primitive.
-- Work volume is strictly bounded pre-suspension (`max_capture_bytes`, `max_capture_ranges`).
-- When total suspension time exceeds the threshold, `STOP_BUDGET_EXCEEDED` is emitted and capture completeness is degraded to `PARTIAL`. Target resumption and process identity verification remain fail-open and uncompromised.
+4. **Local Test Suite Commands**:
+   ```bash
+   # Benchmark harness & acceptance gates integrity
+   python3 -m unittest tests/test_capture_benchmark.py -v
+
+   # Capture lifecycle, identity race, and invariant seams (54 tests)
+   python3 -m unittest tests/test_capture_lifecycle_seam.py -v
+
+   # Real runtime C++ process live capture & mutation validation (20 tests)
+   python3 -m unittest tests/test_real_runtime_validation.py -v
+
+   # End-to-end C++ investigation pipeline scenarios A-E (5 tests)
+   python3 -m unittest tests/test_cpp_e2e_investigation.py -v
+
+   # Full test discovery suite (464 tests)
+   python3 -m unittest discover -s tests -v
+   ```
+
+### Canonical Capture Quality Contract
+Capture quality follows a strict, monotonic trust contract from initial capture through deserialization, typed decoding, StateDiff, EvidenceLedger, and investigation reports:
+- **`COMPLETE`**: 100% of requested bytes read (`bytes_requested == bytes_read`), target stop confirmed, target resume confirmed, thread and map enumeration succeeded without synthetic fallbacks, and zero mapping races detected.
+- **`PARTIAL`**: Incomplete byte capture (`bytes_read < bytes_requested`), mapping race detected (`MAPPING_RACE_DETECTED` from concurrent unmapping, permission changes, or layout shift), thread or map enumeration partial or empty, target resume unconfirmed, or suspension exceeded budget (`STOP_BUDGET_EXCEEDED`).
+- **`FAILED`**: Zero bytes read, target process exited prior to capture, permission denied (`EPERM`/`EACCES`), or unrecoverable I/O error.
+- **`INVALID`**: Target identity mismatch or PID reuse detected (`PID_REUSED`), indicating captured bytes cannot be attributed to the intended inferior.
+- **Monotonic Degradation**: Once degraded to `PARTIAL`, `FAILED`, or `INVALID`, downstream components never promote the snapshot back to `COMPLETE`. EvidenceLedger tags findings from non-COMPLETE captures with explicit caveats.
+
+### Stop Budget SLA vs Temporal Consistency
+`CaptureSafetyPolicy.max_stop_time_ms` and snapshot consistency are orthogonal:
+- **Stop Budget SLA (`stop_budget_compliance`)**: An SLA detection and bounding threshold (e.g., limit = 2.0 ms), not an OS real-time scheduling guarantee. Work volume is pre-bounded (`max_capture_bytes`). If target suspension exceeds the threshold, `STOP_BUDGET_EXCEEDED` is recorded and quality is demoted to `PARTIAL`, but target resumption is never aborted.
+- **Temporal Consistency (`temporal_consistency`)**: Characterizes cross-region and cross-thread alignment (`ATOMIC_STOPPED`, `SIGNAL_STOPPED`, `NON_ATOMIC`, `UNVERIFIED_TEMPORAL`).
+- **Orthogonality**: A capture can be compliant with its stop budget but non-atomic (e.g., zero-stop mode), or atomic while exceeding its stop budget. Compliance with a stop budget does not imply atomicity, nor vice versa.
+
+### Backend Equivalence & Spatial vs Temporal Identity
+dynamicState supports both `process_vm_readv` (direct syscall) and `procfs` (`/proc/<pid>/mem` fallback):
+- **Equivalence**: Both backends capture equivalent memory ranges, byte counts, and region mappings under equivalent policies.
+- **Spatial Equivalence != Temporal Identity**: Matching address ranges between snapshots or between backends do **NOT** imply temporal identity for non-atomic captures. Active threads continue to mutate memory state between reads; therefore, spatial equivalence confirms identical layout selection, while temporal variance is honestly tracked in the provenance metadata.
+
+### Benchmark Baseline Protection & Failure Reproduction
+- **Baseline Protection**: The canonical reference baseline at `benchmarks/baseline_results.json` is protected against accidental overwriting. Neither `--smoke` runs nor failed `--acceptance` runs can overwrite the baseline.
+- **Failure Reproduction**: Running with `--acceptance` enforces non-zero exit codes upon any byte accounting violations, missing required metrics/samples, payload corruptions, or quality downgrades. Detailed diagnostic messages are emitted directly to stderr and recorded in the JSON output.
+
+### Local Validation & GitHub Actions Constraint Notice
+> [!NOTE]
+> **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.
+

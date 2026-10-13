@@ -231,6 +231,23 @@ class AgentRuntime:
                 if not action.investigation_id:
                     return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
                 return self.get_investigation_report(action.investigation_id)
+            elif act == "GET_HYPOTHESES":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.get_hypotheses(action.investigation_id, status_filter=action.status_filter)
+            elif act == "EVALUATE_HYPOTHESIS":
+                if not action.investigation_id or not action.hypothesis_id:
+                    return self._error("INVALID_FIELD", "investigation_id and hypothesis_id are required", act, t0)
+                return self.evaluate_hypothesis(
+                    action.investigation_id,
+                    action.hypothesis_id,
+                    new_evidence=action.new_evidence,
+                    deterministic_transition_verified=getattr(action, "deterministic_transition_verified", False),
+                )
+            elif act == "EXECUTE_OBSERVATION":
+                if not action.investigation_id or not action.observation_id:
+                    return self._error("INVALID_FIELD", "investigation_id and observation_id are required", act, t0)
+                return self.execute_observation(action.investigation_id, action.observation_id, result_data=action.result_data)
             else:
                 return self._error("CAPABILITY_UNSUPPORTED", f"Action '{act}' is not supported by ARP", act, t0)
         except Exception as exc:
@@ -1756,4 +1773,67 @@ class AgentRuntime:
             data=rep,
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
         )
+
+    def get_hypotheses(
+        self,
+        investigation_id: str,
+        status_filter: Optional[str] = None,
+    ) -> AgentActionResult:
+        """Retrieve structured hypotheses for an investigation session."""
+        t0 = time.monotonic()
+        hypos = self.investigation_manager.get_hypotheses(investigation_id, status_filter=status_filter)
+        return AgentActionResult(
+            success=True,
+            action="GET_HYPOTHESES",
+            data={"investigation_id": investigation_id, "hypotheses": hypos},
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def evaluate_hypothesis(
+        self,
+        investigation_id: str,
+        hypothesis_id: str,
+        new_evidence: Optional[Dict[str, Any]] = None,
+        deterministic_transition_verified: bool = False,
+    ) -> AgentActionResult:
+        """Evaluate a hypothesis against the evidence ledger."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.evaluate_hypothesis(
+            investigation_id,
+            hypothesis_id,
+            new_evidence_data=new_evidence,
+            deterministic_transition_verified=deterministic_transition_verified,
+        )
+        if not res.get("success", False):
+            return self._error("HYPOTHESIS_EVAL_ERROR", res.get("error", "Failed to evaluate hypothesis"), "EVALUATE_HYPOTHESIS", t0)
+        return AgentActionResult(
+            success=True,
+            action="EVALUATE_HYPOTHESIS",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def execute_observation(
+        self,
+        investigation_id: str,
+        observation_id: str,
+        result_data: Optional[Dict[str, Any]] = None,
+    ) -> AgentActionResult:
+        """Execute or record an observation step, update ledger, and re-evaluate hypotheses."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.execute_observation(
+            investigation_id,
+            observation_id,
+            result_data=result_data,
+        )
+        if not res.get("success", False):
+            code = "AUTHORIZATION_REQUIRED" if res.get("blocked") else "OBSERVATION_ERROR"
+            return self._error(code, res.get("error", "Failed to execute observation"), "EXECUTE_OBSERVATION", t0)
+        return AgentActionResult(
+            success=True,
+            action="EXECUTE_OBSERVATION",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
 

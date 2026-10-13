@@ -120,6 +120,12 @@ class AgentAction(_SubscriptableModel):
     budgets: Optional[Dict[str, Any]] = None
     authorize_target: bool = False
     memory_snapshot_path: Optional[str] = None
+    hypothesis_id: Optional[str] = None
+    observation_id: Optional[str] = None
+    status_filter: Optional[str] = None
+    new_evidence: Optional[Dict[str, Any]] = None
+    result_data: Optional[Dict[str, Any]] = None
+    deterministic_transition_verified: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -156,7 +162,13 @@ class AgentAction(_SubscriptableModel):
             constraints=data.get("constraints"),
             budgets=data.get("budgets"),
             authorize_target=bool(data.get("authorize_target", False)),
-            memory_snapshot_path=data.get("memory_snapshot_path")
+            memory_snapshot_path=data.get("memory_snapshot_path"),
+            hypothesis_id=data.get("hypothesis_id"),
+            observation_id=data.get("observation_id"),
+            status_filter=data.get("status_filter"),
+            new_evidence=data.get("new_evidence"),
+            result_data=data.get("result_data"),
+            deterministic_transition_verified=bool(data.get("deterministic_transition_verified", False)),
         )
 
 

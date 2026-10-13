@@ -36,6 +36,32 @@ from .evidence_ledger import (
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
 )
+from .hypothesis import (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_LOW,
+    CONFIDENCE_MEDIUM,
+    CONFIDENCE_SPECULATIVE,
+    DeterministicHypothesisGenerator,
+    FollowUpObservation,
+    FUNCTION_TIER_EVIDENCE_SUPPORTED,
+    FUNCTION_TIER_STATIC_CANDIDATE,
+    FUNCTION_TIER_UNKNOWN,
+    FUNCTION_TIER_VALIDATED_CAUSAL,
+    HYPOTHESIS_STATUS_CONTRADICTED,
+    HYPOTHESIS_STATUS_INCONCLUSIVE,
+    HYPOTHESIS_STATUS_PROPOSED,
+    HYPOTHESIS_STATUS_SUPPORTED,
+    HYPOTHESIS_STATUS_VALIDATED,
+    HypothesisGenerator,
+    HypothesisValidator,
+    InvestigationHypothesis,
+    TARGET_KIND_COMPARISON,
+    TARGET_KIND_FIELD,
+    TARGET_KIND_OBJECT,
+    TARGET_KIND_SNAPSHOT,
+    TARGET_KIND_THREAD,
+    ValidationTransitionResult,
+)
 from .modules import ModuleAddressResolver, RuntimeModule, discover_modules
 from .raw_snapshot import RawRuntimeSnapshot
 from .semantic_state import OfflineSemanticEngine, SemanticState
@@ -163,6 +189,7 @@ class InvestigationSession:
 
         self.target_ref: Dict[str, Any] = {}
         self.findings: List[InvestigationFinding] = []
+        self.hypotheses: List[InvestigationHypothesis] = []
         self.next_steps: List[InvestigationNextStep] = []
         self.active_snapshot: Optional[Any] = None
         self.comparison_results: List[Dict[str, Any]] = []
@@ -184,6 +211,8 @@ class InvestigationSession:
             "stages": self.stages,
             "findings_count": len(self.findings),
             "findings": [f.to_dict() for f in self.findings],
+            "hypotheses_count": len(self.hypotheses),
+            "hypotheses": [h.to_dict() for h in self.hypotheses],
             "evidence_count": len(self.ledger._records),
             "next_steps": [s.to_dict() for s in self.next_steps],
             "comparison_results": self.comparison_results,
@@ -752,6 +781,202 @@ class InvestigationManager:
             return []
         return [s.to_dict() for s in session.next_steps]
 
+    def get_hypotheses(self, investigation_id: str, status_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve structured hypotheses for an investigation session, optionally filtered by status."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return []
+        hypos = session.hypotheses
+        if status_filter:
+            f_upper = status_filter.upper()
+            hypos = [h for h in hypos if h.validation_status.upper() == f_upper]
+        return [h.to_dict() for h in hypos]
+
+    def get_hypothesis(self, investigation_id: str, hypothesis_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a single hypothesis by ID."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return None
+        for h in session.hypotheses:
+            if h.hypothesis_id == hypothesis_id:
+                return h.to_dict()
+        return None
+
+    def evaluate_hypothesis(
+        self,
+        investigation_id: str,
+        hypothesis_id: str,
+        new_evidence_data: Optional[Dict[str, Any]] = None,
+        deterministic_transition_verified: bool = False,
+    ) -> Dict[str, Any]:
+        """Evaluate a hypothesis against the evidence ledger and optional newly acquired evidence."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+
+        target_hypo = None
+        for h in session.hypotheses:
+            if h.hypothesis_id == hypothesis_id:
+                target_hypo = h
+                break
+        if not target_hypo:
+            return {"success": False, "error": f"Hypothesis '{hypothesis_id}' not found in investigation '{investigation_id}'"}
+
+        new_rec = None
+        if new_evidence_data:
+            try:
+                new_rec = EvidenceRecord.from_dict(new_evidence_data)
+                session.ledger.add_record(new_rec)
+            except Exception as exc:
+                return {"success": False, "error": f"Failed to attach evidence: {exc}"}
+
+        result = HypothesisValidator.evaluate(
+            hypothesis=target_hypo,
+            ledger=session.ledger,
+            new_evidence=new_rec,
+            deterministic_transition_verified=deterministic_transition_verified,
+        )
+
+        # Sync status to corresponding finding in session.findings
+        for f in session.findings:
+            if f.finding_id == f"fnd_{hypothesis_id}" or (f.category == "hypothesis" and hypothesis_id in f.evidence_ids):
+                f.status = target_hypo.validation_status
+                f.confidence = target_hypo.confidence.lower()
+
+        return {
+            "success": True,
+            "hypothesis": target_hypo.to_dict(),
+            "transition": {
+                "from_status": result.from_status,
+                "to_status": result.to_status,
+                "status_changed": result.status_changed,
+                "confidence": result.confidence,
+                "reason": result.reason,
+                "trigger_evidence_id": result.trigger_evidence_id,
+                "supporting_count": result.supporting_count,
+                "contradicting_count": result.contradicting_count,
+                "cycle_detected": result.cycle_detected,
+                "is_duplicate": result.is_duplicate,
+            },
+        }
+
+    def execute_observation(
+        self,
+        investigation_id: str,
+        observation_id: str,
+        result_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Execute or record an observation step, update ledger, and re-evaluate affected hypotheses."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+
+        target_obs = None
+        target_hypo = None
+        for h in session.hypotheses:
+            for obs in h.suggested_observations:
+                if obs.observation_id == observation_id:
+                    target_obs = obs
+                    target_hypo = h
+                    break
+            if target_obs:
+                break
+
+        if not target_obs or not target_hypo:
+            return {"success": False, "error": f"Observation '{observation_id}' not found in investigation '{investigation_id}'"}
+
+        # If live mutation requested, verify strict safety constraints
+        if not session.safety.get("target_authorized", False) and target_obs.target_kind == "MUTATION":
+            return {
+                "success": False,
+                "error": "Target authorization required: live process mutation is not authorized.",
+                "blocked": True,
+            }
+
+        # Formulate observation record
+        ev_id = f"ev_obs_{uuid.uuid4().hex[:8]}"
+        outcome = "INCONCLUSIVE"
+
+        if result_data:
+            obs_text = result_data.get("observation", f"Observed {target_obs.question}")
+            details = dict(result_data.get("details", {}))
+            outcome = result_data.get("outcome", details.get("outcome", "SUPPORTED"))
+        else:
+            # Read-only observation against existing snapshot / session data
+            if target_obs.target_kind == TARGET_KIND_FIELD:
+                f_path = target_obs.target_ref.get("field_path", "")
+                obs_text = f"Inspected field {f_path} in snapshot."
+                details = {"field_path": f_path, "outcome": "SUPPORTED"}
+                outcome = "SUPPORTED"
+            elif target_obs.target_kind == TARGET_KIND_THREAD:
+                th_id = target_obs.target_ref.get("thread_id", "all")
+                obs_text = f"Inspected thread {th_id} call stack in snapshot."
+                details = {"thread_id": th_id, "outcome": "SUPPORTED"}
+                outcome = "SUPPORTED"
+            elif target_obs.target_kind == TARGET_KIND_COMPARISON:
+                obs_text = f"Compared observation against baseline."
+                details = {"comparison": target_obs.target_ref, "outcome": "SUPPORTED"}
+                outcome = "SUPPORTED"
+            else:
+                obs_text = f"Executed observation: {target_obs.question}"
+                details = {"target_ref": target_obs.target_ref, "outcome": "SUPPORTED"}
+                outcome = "SUPPORTED"
+
+        details["observation_id"] = observation_id
+        details["hypothesis_id"] = target_hypo.hypothesis_id
+        details["outcome"] = outcome
+
+        ev_record = EvidenceRecord(
+            evidence_id=ev_id,
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION if target_obs.target_kind == TARGET_KIND_FIELD else EVIDENCE_TYPE_OBJECT_STATE,
+            nature=NATURE_OBSERVATION,
+            source="investigation_observer",
+            session_id=investigation_id,
+            finding_id=f"fnd_{target_hypo.hypothesis_id}",
+            observation=obs_text,
+            parent_evidence_ids=list(target_hypo.supporting_evidence_ids),
+            details=details,
+        )
+        session.ledger.add_record(ev_record)
+
+        # Mark observation executed
+        target_obs.executed = True
+        target_obs.is_suggestion = False
+        target_obs.result_evidence_id = ev_id
+
+        # Also update in session.next_steps if present
+        for ns in session.next_steps:
+            if ns.step_id == observation_id:
+                ns.executed = True
+                ns.is_suggestion = False
+
+        # Re-evaluate hypothesis
+        eval_result = HypothesisValidator.evaluate(
+            hypothesis=target_hypo,
+            ledger=session.ledger,
+            new_evidence=ev_record,
+        )
+
+        # Sync finding
+        for f in session.findings:
+            if f.finding_id == f"fnd_{target_hypo.hypothesis_id}":
+                f.status = target_hypo.validation_status
+                f.confidence = target_hypo.confidence.lower()
+
+        return {
+            "success": True,
+            "observation": target_obs.to_dict(),
+            "evidence": ev_record.to_dict(),
+            "evaluation": {
+                "hypothesis_id": target_hypo.hypothesis_id,
+                "from_status": eval_result.from_status,
+                "to_status": eval_result.to_status,
+                "status_changed": eval_result.status_changed,
+                "confidence": eval_result.confidence,
+                "reason": eval_result.reason,
+            },
+        }
+
     def generate_report(self, investigation_id: str) -> Dict[str, Any]:
         """Synthesize a complete investigation report."""
         session = self.sessions.get(investigation_id)
@@ -779,11 +1004,39 @@ class InvestigationManager:
                     f.status = "UNTRUSTED"
                     f.confidence = "low"
                     f.uncertainty = trust_caveat
+            for h in session.hypotheses:
+                h.validation_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+                h.confidence = CONFIDENCE_LOW
+                h.confidence_rationale = trust_caveat
 
         # Group findings
         facts = [f.to_dict() for f in session.findings if f.category == "fact"]
         hypotheses = [f.to_dict() for f in session.findings if f.category == "hypothesis"]
         unknowns = [f.to_dict() for f in session.findings if f.category == "unknown"]
+
+        # Structured causal conclusions
+        causal_conclusions = {
+            "established_facts_count": len(facts),
+            "hypotheses_count": len(session.hypotheses),
+            "supported_hypotheses_count": sum(1 for h in session.hypotheses if h.validation_status == HYPOTHESIS_STATUS_SUPPORTED),
+            "validated_causal_count": sum(1 for h in session.hypotheses if h.validation_status == HYPOTHESIS_STATUS_VALIDATED),
+            "contradicted_count": sum(1 for h in session.hypotheses if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED),
+            "inconclusive_count": sum(1 for h in session.hypotheses if h.validation_status in (HYPOTHESIS_STATUS_INCONCLUSIVE, HYPOTHESIS_STATUS_PROPOSED)),
+            "validated_causal_functions": [
+                c for h in session.hypotheses for c in h.function_candidates if c.get("candidate_tier") == FUNCTION_TIER_VALIDATED_CAUSAL
+            ],
+            "evidence_supported_candidates": [
+                c for h in session.hypotheses for c in h.function_candidates if c.get("candidate_tier") == FUNCTION_TIER_EVIDENCE_SUPPORTED
+            ],
+            "static_candidates": [
+                c for h in session.hypotheses for c in h.function_candidates if c.get("candidate_tier") == FUNCTION_TIER_STATIC_CANDIDATE
+            ],
+            "causal_proof_established": any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
+            "causal_limitation_notice": (
+                None if any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses)
+                else "Static function candidates and comparative observations alone do not constitute proven causality. Additional deterministic mutation verification or instruction-level trace required."
+            ),
+        }
 
         return {
             "investigation_id": session.investigation_id,
@@ -813,6 +1066,8 @@ class InvestigationManager:
                 "hypotheses": hypotheses,
                 "unknowns": unknowns,
             },
+            "hypotheses": [h.to_dict() for h in session.hypotheses],
+            "causal_conclusions": causal_conclusions,
             "comparisons": session.comparison_results,
             "static_code_links": session.stages["static_code_link"].get("details", {}),
             "recommended_next_steps": [s.to_dict() for s in session.next_steps],
@@ -1601,47 +1856,78 @@ class InvestigationManager:
 
     def _execute_stage_synthesis(self, session: InvestigationSession) -> None:
         """Stage 5: Synthesize Findings, Invariant Hypotheses, and Next Steps."""
-        # 1. Synthesize hypotheses from findings
-        facts = [f for f in session.findings if f.category == "fact"]
-        if facts:
-            counter_facts = [f for f in facts if f.field_name and "counter" in f.field_name.lower()]
-            if counter_facts:
-                cf = counter_facts[0]
-                ev = session.ledger.add_record(EvidenceRecord(
-                    evidence_type=EVIDENCE_TYPE_HYPOTHESIS,
-                    nature=NATURE_HYPOTHESIS,
-                    source="investigation_analyzer",
-                    session_id=session.investigation_id,
-                    observation=f"Hypothesis: Discrepancy or unexpected value in {cf.c_type_path} may indicate race condition or missing synchronization.",
-                    details={"related_finding": cf.finding_id},
-                ))
-                session.findings.append(InvestigationFinding(
-                    finding_id=f"fnd_hypo_{uuid.uuid4().hex[:8]}",
-                    category="hypothesis",
-                    title=f"Potential Logic or Synchronization Invariant in {cf.c_type_path}",
-                    description="Field value observation suggests a potential invariant or boundary condition to verify under mutation or comparison.",
-                    c_type_path=cf.c_type_path,
-                    object_id=cf.object_id,
-                    field_name=cf.field_name,
-                    evidence_ids=[ev.evidence_id],
-                    confidence="medium",
-                    status="CANDIDATE",
-                ))
+        # 1. Synthesize hypotheses from findings using DeterministicHypothesisGenerator
+        generator = DeterministicHypothesisGenerator()
+        generated_hypotheses = generator.generate(session)
+
+        for hypo in generated_hypotheses:
+            session.hypotheses.append(hypo)
+
+            # Register as an EvidenceRecord of type HYPOTHESIS
+            ev = session.ledger.add_record(EvidenceRecord(
+                evidence_id=f"ev_{hypo.hypothesis_id}",
+                evidence_type=EVIDENCE_TYPE_HYPOTHESIS,
+                nature=NATURE_HYPOTHESIS,
+                source="DeterministicHypothesisGenerator",
+                session_id=session.investigation_id,
+                observation=hypo.claim,
+                parent_evidence_ids=list(hypo.supporting_evidence_ids),
+                details={
+                    "hypothesis_id": hypo.hypothesis_id,
+                    "proposed_mechanism": hypo.proposed_mechanism,
+                    "validation_status": hypo.validation_status,
+                    "confidence": hypo.confidence,
+                    "validation_criteria": hypo.validation_criteria,
+                    "assumptions": hypo.assumptions,
+                    "unresolved_questions": hypo.unresolved_questions,
+                },
+            ))
+
+            # Mirror as an InvestigationFinding so legacy finding lists reflect hypotheses
+            session.findings.append(InvestigationFinding(
+                finding_id=f"fnd_{hypo.hypothesis_id}",
+                category="hypothesis",
+                title=hypo.title,
+                description=hypo.claim,
+                c_type_path=hypo.candidate_fields[0] if hypo.candidate_fields else None,
+                object_id=hypo.candidate_objects[0] if hypo.candidate_objects else None,
+                field_name=hypo.candidate_fields[0] if hypo.candidate_fields else None,
+                evidence_ids=[ev.evidence_id] + list(hypo.supporting_evidence_ids),
+                confidence=hypo.confidence.lower(),
+                status=hypo.validation_status,
+                function_candidates=hypo.function_candidates,
+                uncertainty=hypo.confidence_rationale if hypo.confidence in (CONFIDENCE_LOW, CONFIDENCE_SPECULATIVE) else None,
+            ))
 
         # 2. Formulate Next Steps
         steps: List[InvestigationNextStep] = []
 
+        # Add follow-up observation steps from hypotheses
+        for hypo in session.hypotheses:
+            for obs in hypo.suggested_observations:
+                steps.append(InvestigationNextStep(
+                    step_id=obs.observation_id,
+                    description=obs.question,
+                    rationale=obs.discriminating_criteria,
+                    is_suggestion=obs.is_suggestion,
+                    executed=obs.executed,
+                    risk_level="READ_ONLY",
+                    required_inputs=list(obs.target_ref.keys()),
+                    action_type="INSPECT" if obs.target_kind in (TARGET_KIND_FIELD, TARGET_KIND_OBJECT, TARGET_KIND_THREAD) else "COMPARE",
+                ))
+
         # Suggestion 1: Compare with previous/baseline snapshot if only 1 observation
-        steps.append(InvestigationNextStep(
-            step_id=f"step_{uuid.uuid4().hex[:6]}",
-            description="Capture or compare against a baseline snapshot to isolate state diffs.",
-            rationale="Comparing two observation points isolates value and reference modifications deterministically.",
-            is_suggestion=True,
-            executed=False,
-            risk_level="READ_ONLY",
-            required_inputs=["baseline_snapshot_id"],
-            action_type="COMPARE",
-        ))
+        if not session.comparison_results:
+            steps.append(InvestigationNextStep(
+                step_id=f"step_{uuid.uuid4().hex[:6]}",
+                description="Capture or compare against a baseline snapshot to isolate state diffs.",
+                rationale="Comparing two observation points isolates value and reference modifications deterministically.",
+                is_suggestion=True,
+                executed=False,
+                risk_level="READ_ONLY",
+                required_inputs=["baseline_snapshot_id"],
+                action_type="COMPARE",
+            ))
 
         # Suggestion 2: Deep inspect dominant typed root
         roots_stage = session.stages.get("semantic_interpretation", {}).get("details", {})
