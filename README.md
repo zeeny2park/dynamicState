@@ -1289,6 +1289,48 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 | **LOW_IMPACT process_vm_readv Capture** | Complete | Process memory capture & mapping race detection | **REAL TARGET VALIDATED** | Tested on live Linux processes on AArch64 host |
 | **Offline DWARF Semantic Reconstruction** | Complete | Unstripped debug image + raw snapshot bundles | **INTEGRATION TESTED** | Reconstructs semantic graph without live process |
 | **Branch-Safe State Exploration** | Complete | Checkpoint-restore, crash isolation (SIGSEGV) | **INTEGRATION TESTED** | Verified multi-branch exploration |
+| **Workflow Parity & Drift Prevention** | Complete | 7 unit tests, PyYAML validation, isolated directory repair | **REAL TARGET VALIDATED** | Byte-for-byte parity between ci/workflows and .github/workflows |
+| **Capture Performance & Acceptance Gates** | Complete | 12 unit tests, ELF verification, byte accounting, SLA checks | **REAL TARGET VALIDATED** | 20-run benchmark across process_vm_readv & procfs |
 
+---
 
+## Continuous Integration & Workflow Synchronization
 
+Canonical CI workflow definitions are maintained under `ci/workflows/`:
+- `ci/workflows/test.yml`: Full test suite, compiler build, E2E investigation, and benchmark smoke validation.
+- `ci/workflows/gdb92.yml`: Dockerized legacy GDB 9.2 compatibility verification.
+
+### Synchronizing Workflows
+To synchronize canonical workflows to `.github/workflows/` or repair drift:
+```bash
+./scripts/sync_workflows.sh
+```
+> [!NOTE]
+> **GitHub Actions Permissions Note**: GitHub enforces that creating or updating workflows under `.github/workflows/` requires an OAuth token or personal access token with the `workflow` scope. When operating with an OAuth App token lacking `workflow` scope, pushes touching `.github/workflows/` are rejected by GitHub's pre-receive hook. The canonical definitions remain under `ci/workflows/`, and `scripts/sync_workflows.sh` provides deterministic synchronization.
+
+---
+
+## Performance Benchmarking & Acceptance Gates
+
+dynamicState includes an automated benchmark harness measuring process suspension overhead, memory throughput, and quality invariants against a running C++ process.
+
+### Reproducible Commands
+1. **Smoke Validation** (CI-safe, 3 iterations, checks schema, byte accounting, payload integrity, and SLA gates):
+   ```bash
+   python3 -m benchmarks.capture_benchmark --smoke
+   ```
+
+2. **Full Benchmark Run** (20 iterations, generates environment-specific report without overwriting baseline):
+   ```bash
+   python3 -m benchmarks.capture_benchmark --iterations 20 --output benchmarks/latest_results.json
+   ```
+
+3. **Performance Acceptance Run** (20 iterations, enforces statistical sample gates and workload equivalence):
+   ```bash
+   python3 -m benchmarks.capture_benchmark --iterations 20 --acceptance --output benchmarks/latest_results.json
+   ```
+
+### Stop Budget SLA vs Real-Time Semantics
+- `CaptureSafetyPolicy.max_stop_time_ms` is an **SLA detection and bounding threshold**, not an OS hard real-time preemption primitive.
+- Work volume is strictly bounded pre-suspension (`max_capture_bytes`, `max_capture_ranges`).
+- When total suspension time exceeds the threshold, `STOP_BUDGET_EXCEEDED` is emitted and capture completeness is degraded to `PARTIAL`. Target resumption and process identity verification remain fail-open and uncompromised.
