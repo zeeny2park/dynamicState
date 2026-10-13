@@ -714,7 +714,11 @@ class CausalValidationEvaluator:
             observation="Child reproduction observation",
             parent_evidence_ids=["ev_par_partial"],
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
-            details={"target_function": "worker_mutate", "field_path": "obj.status"},
+            details={
+                "target_function": "worker_mutate",
+                "field_path": "obj.status",
+                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
+            },
         )
         session.ledger.add_record(rec_child)
         session.attest_causal_proof("ev_child_proof", target_function="worker_mutate", field_path="obj.status")
@@ -782,7 +786,11 @@ class CausalValidationEvaluator:
             session_id=inv_id1,
             observation="Observed diff in session 1",
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
-            details={"target_function": "worker_fn", "field_path": "obj.flag"},
+            details={
+                "target_function": "worker_fn",
+                "field_path": "obj.flag",
+                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
+            },
         )
         session1.ledger.add_record(rec_sess1)
         session1.attest_causal_proof("ev_sess1_proof", target_function="worker_fn", field_path="obj.flag")

@@ -29,6 +29,8 @@ from .evidence_ledger import (
     NATURE_HYPOTHESIS,
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
+    compute_attestation_signature,
+    compute_evidence_fingerprint,
 )
 
 # -----------------------------------------------------------------------------
@@ -787,6 +789,34 @@ class HypothesisValidator:
             return (
                 False,
                 f"Proof evidence '{proof_rec.evidence_id}' attestation belongs to investigation '{attestation.get('investigation_id')}', not '{hypothesis.investigation_id}'",
+                proof_rec,
+            )
+
+        # Check cryptographic signature and tamper-evident fingerprint
+        expected_fp = compute_evidence_fingerprint(
+            proof_rec,
+            target_function=attestation.get("target_function"),
+            field_path=attestation.get("field_path"),
+        )
+        stored_fp = attestation.get("evidence_fingerprint")
+        if not stored_fp or stored_fp != expected_fp:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' content or scope was tampered after attestation issuance (fingerprint mismatch)",
+                proof_rec,
+            )
+
+        expected_sig = compute_attestation_signature(
+            ledger.session_secret,
+            proof_rec.evidence_id,
+            expected_fp,
+            hypothesis.investigation_id,
+        )
+        stored_sig = attestation.get("token_sig")
+        if not stored_sig or stored_sig != expected_sig:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' has invalid or forged cryptographic attestation signature",
                 proof_rec,
             )
 

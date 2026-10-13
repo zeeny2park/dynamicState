@@ -139,6 +139,11 @@ class CausalDefectFixtures:
                 "verified_transition": True,
                 "target_function": "mutate_worker_state",
                 "field_path": "WorkerState.counter",
+                "execution_provenance": {
+                    "execution_status": "REPRODUCED",
+                    "reproduction_verified": True,
+                    "verifier_method": "deterministic_execution",
+                },
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
@@ -265,6 +270,11 @@ class CausalDefectFixtures:
                 "verified_transition": True,
                 "target_function": "update_flags",
                 "field_path": "State.flags",
+                "execution_provenance": {
+                    "execution_status": "REPRODUCED",
+                    "reproduction_verified": True,
+                    "verifier_method": "deterministic_execution",
+                },
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )

@@ -30,6 +30,7 @@ from .evidence_ledger import (
     EVIDENCE_TYPE_OBJECT_STATE,
     EVIDENCE_TYPE_RUNTIME_IDENTITY,
     EVIDENCE_TYPE_STATIC_LINK,
+    CausalVerificationCapability,
     EvidenceLedger,
     EvidenceRecord,
     NATURE_HYPOTHESIS,
@@ -157,7 +158,12 @@ class InvestigationSession:
         self.status = "CREATED"  # CREATED, RUNNING, COMPLETED, PARTIAL, FAILED, BLOCKED
         self.corpus_dir = os.path.abspath(corpus_dir)
         self._session_secret: str = uuid.uuid4().hex
-        self.ledger = EvidenceLedger(session_id=investigation_id, session_secret=self._session_secret)
+        self._capability_key: str = uuid.uuid4().hex
+        self.ledger = EvidenceLedger(
+            session_id=investigation_id,
+            session_secret=self._session_secret,
+            capability_key=self._capability_key,
+        )
 
         # Safety configuration (Strict read-only default)
         self.safety = {
@@ -198,12 +204,18 @@ class InvestigationSession:
         self.summary: Dict[str, Any] = {}
         self.persistence: str = "EPHEMERAL_PROCESS_LOCAL"
 
+    def issue_verification_capability(self) -> CausalVerificationCapability:
+        """Issue an internal unforgeable capability granting attestation authority."""
+        return self.ledger.issue_verification_capability()
+
     def attest_causal_proof(
         self,
         evidence_id: str,
         target_function: Optional[str] = None,
         field_path: Optional[str] = None,
         verification_type: str = "deterministic_reproduction",
+        capability: Optional[CausalVerificationCapability] = None,
+        execution_provenance: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Attest an authentic proof record in this session's ledger."""
         return self.ledger.attest_causal_proof(
@@ -211,6 +223,8 @@ class InvestigationSession:
             target_function=target_function,
             field_path=field_path,
             verification_type=verification_type,
+            capability=capability,
+            execution_provenance=execution_provenance,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -234,6 +248,32 @@ class InvestigationSession:
             "comparison_results": self.comparison_results,
             "summary": self.summary,
         }
+
+
+class TrustedCausalVerifier:
+    """Internal trusted verifier authorized to execute observations, verify reproductions, and issue causal attestations."""
+
+    def __init__(self, session: InvestigationSession):
+        self._session = session
+        self._capability = session.issue_verification_capability()
+
+    def verify_and_attest(
+        self,
+        evidence_id: str,
+        target_function: Optional[str] = None,
+        field_path: Optional[str] = None,
+        verification_type: str = "deterministic_reproduction",
+        execution_provenance: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Execute verification and attest causal proof using the internal session capability."""
+        return self._session.attest_causal_proof(
+            evidence_id=evidence_id,
+            target_function=target_function,
+            field_path=field_path,
+            verification_type=verification_type,
+            capability=self._capability,
+            execution_provenance=execution_provenance,
+        )
 
 
 class InvestigationManager:
@@ -829,6 +869,8 @@ class InvestigationManager:
         target_function: Optional[str] = None,
         field_path: Optional[str] = None,
         verification_type: str = "deterministic_reproduction",
+        capability: Optional[CausalVerificationCapability] = None,
+        execution_provenance: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Attest an authentic proof record in the specified investigation session."""
         session = self.sessions.get(investigation_id)
@@ -839,6 +881,8 @@ class InvestigationManager:
             target_function=target_function,
             field_path=field_path,
             verification_type=verification_type,
+            capability=capability,
+            execution_provenance=execution_provenance,
         )
 
     def evaluate_hypothesis(
@@ -869,12 +913,14 @@ class InvestigationManager:
             new_details = dict(new_data.get("details", {}))
             new_prov = dict(new_data.get("provenance", {}))
 
-            # External caller cannot claim trusted verifier attestation
+            # External caller cannot claim trusted verifier attestation or execution provenance
             new_prov["submission_channel"] = "external_caller"
             new_prov.pop("verifier_attestation", None)
+            new_prov.pop("execution_provenance", None)
 
             # Any caller-supplied causal claims are marked as unverified caller claims
             new_details["caller_submitted"] = True
+            new_details.pop("execution_provenance", None)
             if (
                 new_details.get("verified_transition") is True
                 or new_details.get("causal_proof") is True
@@ -977,6 +1023,7 @@ class InvestigationManager:
             obs_text = result_data.get("observation", f"Observed {target_obs.question}")
             details = dict(result_data.get("details", {}))
             details["caller_submitted"] = True
+            details.pop("execution_provenance", None)
             outcome = result_data.get("outcome", details.get("outcome", "SUPPORTED"))
             # Invariant 9: Caller-submitted results cannot fabricate causal proof without verification
             if (

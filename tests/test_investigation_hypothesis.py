@@ -438,7 +438,10 @@ class TestHypothesisValidator(unittest.TestCase):
             source="test",
             session_id=self.ledger.session_id,
             observation="Deterministic transition reproduced 42 -> 100",
-            details={"target_function": "mutate_state"},
+            details={
+                "target_function": "mutate_state",
+                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
+            },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         self.ledger.add_record(rec_supp)
@@ -607,6 +610,7 @@ class TestInvestigationManagerHypothesisIntegration(unittest.TestCase):
             details={
                 "target_function": "update_counter",
                 "field_path": "State.counter",
+                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
@@ -769,7 +773,10 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
             source="investigation_observer",
             session_id=inv_id,
             observation="Deterministic transition reproduced 1 -> 2",
-            details={"field_path": "obj_x.val"},
+            details={
+                "field_path": "obj_x.val",
+                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
+            },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_arp_proof)

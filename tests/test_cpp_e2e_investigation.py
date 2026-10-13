@@ -396,6 +396,10 @@ class TestCppE2EInvestigation(unittest.TestCase):
             details={
                 "target_function": "mutate_worker_state",
                 "field_path": "State.counter",
+                "execution_provenance": {
+                    "execution_status": "REPRODUCED",
+                    "reproduction_verified": True,
+                },
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
