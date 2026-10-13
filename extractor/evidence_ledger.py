@@ -14,36 +14,145 @@ import uuid
 from typing import Any, Dict, List, Optional, Set, Union
 
 
-class CausalVerificationCapability:
-    """Internal capability token granting authority to attest causal proof.
+@dataclass(frozen=True)
+class ControlledExecutionResult:
+    """Authentic execution receipt produced by a verified runtime execution or controlled reproduction."""
+    execution_id: str
+    investigation_id: str
+    target_function: str
+    field_path: str
+    before_value: Any
+    after_value: Any
+    execution_status: str  # "REPRODUCED" or "SUCCESS"
+    capture_quality: Dict[str, Any]
+    before_snapshot_ref: Optional[str] = None
+    after_snapshot_ref: Optional[str] = None
+    target_identity: Optional[Dict[str, Any]] = None
+    backend_type: str = "controlled_runtime"
+    executed_at: str = ""
+    receipt_signature: str = ""
 
-    Can only be constructed by internal verification flows within an active InvestigationSession.
-    External payloads, REST adapters, and ARP actions cannot construct or inject a valid capability.
+    def verify_authenticity(self, session_secret: str) -> bool:
+        """Verify the cryptographic authenticity of this execution receipt against session secret."""
+        if not self.receipt_signature:
+            return False
+        expected = compute_receipt_signature(session_secret, self)
+        return hmac.compare_digest(self.receipt_signature, expected)
+
+
+def compute_receipt_signature(session_secret: str, result: "ControlledExecutionResult") -> str:
+    """Compute HMAC-SHA256 signature binding the execution receipt to the session secret."""
+    raw = (
+        f"{result.execution_id}|{result.investigation_id}|{result.target_function}|"
+        f"{result.field_path}|{result.before_value}|{result.after_value}|"
+        f"{result.execution_status}|{result.backend_type}"
+    )
+    return hmac.new(session_secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+class CausalVerificationCapability:
+    """Internal single-use capability token granting authority to attest causal proof.
+
+    Can only be minted by TrustedCausalVerifier within an active InvestigationSession
+    after independent verification of an authentic execution result.
+    Cannot be serialized, constructed by external callers, or reused across investigations/records.
     """
-    def __init__(self, investigation_id: str, capability_key: str):
+    def __init__(
+        self,
+        investigation_id: str,
+        capability_key: str,
+        evidence_id: str,
+        target_function: str,
+        field_path: str,
+        hypothesis_id: str,
+    ):
         self._investigation_id = investigation_id
         self._capability_key = capability_key
+        self._evidence_id = evidence_id
+        self._target_function = target_function
+        self._field_path = field_path
+        self._hypothesis_id = hypothesis_id
+        self._consumed = False
 
-    def is_valid_for(self, ledger_or_session: Any) -> bool:
+    def is_valid_for(
+        self,
+        ledger_or_session: Any,
+        evidence_id: str,
+        target_function: Optional[str] = None,
+        field_path: Optional[str] = None,
+        hypothesis_id: Optional[str] = None,
+    ) -> bool:
+        if self._consumed:
+            return False
         inv_id = getattr(ledger_or_session, "investigation_id", None) or getattr(ledger_or_session, "session_id", None)
         key = getattr(ledger_or_session, "_capability_key", None)
-        return bool(key and self._capability_key == key and inv_id == self._investigation_id)
+        if not key or self._capability_key != key or inv_id != self._investigation_id:
+            return False
+        if self._evidence_id and evidence_id != self._evidence_id:
+            return False
+        if target_function and self._target_function and target_function != self._target_function:
+            return False
+        if field_path and self._field_path and field_path != self._field_path:
+            return False
+        if hypothesis_id and self._hypothesis_id and hypothesis_id != self._hypothesis_id:
+            return False
+        return True
+
+    def consume(self) -> None:
+        if self._consumed:
+            raise RuntimeError("CausalVerificationCapability has already been consumed")
+        self._consumed = True
+
+    @property
+    def is_consumed(self) -> bool:
+        return self._consumed
+
+    @property
+    def hypothesis_id(self) -> str:
+        return self._hypothesis_id
+
+    @property
+    def target_function(self) -> str:
+        return self._target_function
+
+    @property
+    def field_path(self) -> str:
+        return self._field_path
+
+    @property
+    def evidence_id(self) -> str:
+        return self._evidence_id
 
 
 def compute_evidence_fingerprint(
     record: "EvidenceRecord",
     target_function: Optional[str] = None,
     field_path: Optional[str] = None,
+    hypothesis_id: Optional[str] = None,
+    target_identity: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Compute a deterministic SHA256 digest of an evidence record's content, ancestry, quality, and causal scope."""
+    """Compute a deterministic SHA256 digest sealing content, scope, hypothesis, target identity, quality, and ancestry."""
     p_details = record.details or {}
-    fn = target_function or p_details.get("target_function") or ""
-    fld = field_path or p_details.get("field_path") or ""
+    p_prov = record.provenance or {}
+    att = p_prov.get("verifier_attestation") or {}
+
+    fn = target_function or att.get("target_function") or p_details.get("target_function") or ""
+    fld = field_path or att.get("field_path") or p_details.get("field_path") or ""
+    hypo = hypothesis_id or att.get("hypothesis_id") or ""
+
+    t_id = target_identity or att.get("target_identity") or record.target_identity or {}
+    t_id_str = f"{t_id.get('pid')}:{t_id.get('build_id')}:{t_id.get('binary_path')}" if t_id else ""
+    rec_t_id = record.target_identity or {}
+    rec_t_id_str = f"{rec_t_id.get('pid')}:{rec_t_id.get('build_id')}:{rec_t_id.get('binary_path')}" if rec_t_id else ""
+
     cq = record.capture_quality or {}
     cq_str = f"{cq.get('completeness')}:{cq.get('consistency_level')}"
     parents_str = ",".join(sorted(record.parent_evidence_ids or []))
+    snap_str = str(record.snapshot_ref or "")
+
     raw = (
         f"{record.evidence_id}|{record.observation}|{fld}|{fn}|"
+        f"{hypo}|{t_id_str}|{rec_t_id_str}|{snap_str}|"
         f"{parents_str}|{cq_str}|{record.session_id}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -279,9 +388,22 @@ class EvidenceLedger:
         self._by_type: Dict[str, List[EvidenceRecord]] = {}
         self._by_finding: Dict[str, List[EvidenceRecord]] = {}
 
-    def issue_verification_capability(self) -> CausalVerificationCapability:
-        """Issue an internal unforgeable capability granting attestation authority."""
-        return CausalVerificationCapability(self.session_id, self._capability_key)
+    def issue_verification_capability(
+        self,
+        evidence_id: str = "",
+        target_function: str = "",
+        field_path: str = "",
+        hypothesis_id: str = "",
+    ) -> CausalVerificationCapability:
+        """Issue an internal unforgeable capability granting attestation authority for a specific evidence record."""
+        return CausalVerificationCapability(
+            investigation_id=self.session_id,
+            capability_key=self._capability_key,
+            evidence_id=evidence_id,
+            target_function=target_function,
+            field_path=field_path,
+            hypothesis_id=hypothesis_id,
+        )
 
     def attest_causal_proof(
         self,
@@ -291,6 +413,8 @@ class EvidenceLedger:
         verification_type: str = "deterministic_reproduction",
         capability: Optional[CausalVerificationCapability] = None,
         execution_provenance: Optional[Dict[str, Any]] = None,
+        hypothesis_id: Optional[str] = None,
+        target_identity: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Attest an authentic proof record in this ledger with the session secret and cryptographic binding."""
         rec = self.get_record(evidence_id)
@@ -320,26 +444,42 @@ class EvidenceLedger:
         if rec.session_id and rec.session_id != self.session_id:
             raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' belongs to session '{rec.session_id}', not '{self.session_id}'")
 
-        # Authority check: Either an internal capability was provided, or genuine execution provenance exists
-        has_valid_cap = capability is not None and capability.is_valid_for(self)
-
-        # Check execution provenance
-        exec_prov = execution_provenance or p_details.get("execution_provenance") or p_prov.get("execution_provenance")
-        if exec_prov and isinstance(exec_prov, dict):
-            exec_status = exec_prov.get("execution_status") or exec_prov.get("status")
-            repro_verified = exec_prov.get("reproduction_verified") or exec_prov.get("verified_transition")
-            has_valid_exec = bool(exec_status in ("SUCCESS", "REPRODUCED", "CONFIRMED") or repro_verified is True)
-        else:
-            has_valid_exec = False
-
-        if not has_valid_cap and not has_valid_exec:
+        # Authority check: Strictly require genuine internal verification capability!
+        # Caller-supplied booleans, status strings, or raw execution_provenance dictionaries cannot authorize attestation.
+        if capability is None or not isinstance(capability, CausalVerificationCapability):
             raise ValueError(
                 f"Cannot attest causal proof: record '{evidence_id}' lacks genuine execution provenance or internal verification capability. "
-                "Ordinary observations or unverified caller flags cannot be attested."
+                "Caller-supplied booleans, status strings, or execution_provenance dictionaries cannot authorize attestation."
             )
 
+        eff_fn = target_function or capability.target_function
+        eff_field = field_path or capability.field_path
+        eff_hypo = hypothesis_id or capability.hypothesis_id
+
+        if not capability.is_valid_for(
+            self,
+            evidence_id=evidence_id,
+            target_function=eff_fn,
+            field_path=eff_field,
+            hypothesis_id=eff_hypo,
+        ):
+            raise ValueError(
+                f"Cannot attest causal proof: capability is invalid, expired, cross-session, scope-mismatched, or already consumed for record '{evidence_id}'."
+            )
+
+        # Single-use: Consume capability immediately
+        capability.consume()
+
+        eff_tid = target_identity or rec.target_identity
+
         # Compute tamper-evident fingerprint and HMAC signature
-        fingerprint = compute_evidence_fingerprint(rec, target_function, field_path)
+        fingerprint = compute_evidence_fingerprint(
+            record=rec,
+            target_function=eff_fn,
+            field_path=eff_field,
+            hypothesis_id=eff_hypo,
+            target_identity=eff_tid,
+        )
         token_sig = compute_attestation_signature(self.session_secret, rec.evidence_id, fingerprint, self.session_id)
 
         # Stamp authentic internal attestation
@@ -348,19 +488,21 @@ class EvidenceLedger:
             "token_sig": token_sig,
             "evidence_fingerprint": fingerprint,
             "investigation_id": self.session_id,
-            "target_function": target_function,
-            "field_path": field_path,
+            "hypothesis_id": eff_hypo,
+            "target_function": eff_fn,
+            "field_path": eff_field,
+            "target_identity": eff_tid,
             "verification_type": verification_type,
             "attested_at": datetime.now(timezone.utc).isoformat(),
         }
         rec.details["verified_transition"] = True
         rec.details["causal_proof"] = True
-        if exec_prov and isinstance(exec_prov, dict):
-            rec.details["execution_provenance"] = exec_prov
-        if target_function and "target_function" not in rec.details:
-            rec.details["target_function"] = target_function
-        if field_path and "field_path" not in rec.details:
-            rec.details["field_path"] = field_path
+        if execution_provenance and isinstance(execution_provenance, dict):
+            rec.details["execution_provenance"] = execution_provenance
+        if eff_fn and "target_function" not in rec.details:
+            rec.details["target_function"] = eff_fn
+        if eff_field and "field_path" not in rec.details:
+            rec.details["field_path"] = eff_field
         return True
 
     def add_record(self, record: Union[EvidenceRecord, Dict[str, Any]]) -> EvidenceRecord:
@@ -426,7 +568,13 @@ class EvidenceLedger:
                 record.provenance["verifier_attestation"] = None
                 record.provenance["attestation_rejected"] = "Invalid, unverified, or cross-session attestation token"
             else:
-                expected_fp = compute_evidence_fingerprint(record, att.get("target_function"), att.get("field_path"))
+                expected_fp = compute_evidence_fingerprint(
+                    record,
+                    target_function=att.get("target_function"),
+                    field_path=att.get("field_path"),
+                    hypothesis_id=att.get("hypothesis_id"),
+                    target_identity=att.get("target_identity"),
+                )
                 expected_sig = compute_attestation_signature(self.session_secret, record.evidence_id, expected_fp, self.session_id)
                 if att.get("evidence_fingerprint") != expected_fp or att.get("token_sig") != expected_sig:
                     record.provenance["verifier_attestation"] = None

@@ -56,6 +56,7 @@ from extractor.investigation import (
     InvestigationFinding,
     InvestigationManager,
     InvestigationSession,
+    TrustedCausalVerifier,
 )
 from extractor.web.server import WebApiAdapter
 
@@ -445,7 +446,8 @@ class TestHypothesisValidator(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         self.ledger.add_record(rec_supp)
-        self.ledger.attest_causal_proof("ev_det_1", target_function="mutate_state")
+        cap = self.ledger.issue_verification_capability("ev_det_1", target_function="mutate_state", hypothesis_id="hypo_valid")
+        self.ledger.attest_causal_proof("ev_det_1", target_function="mutate_state", capability=cap, hypothesis_id="hypo_valid")
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_valid",
@@ -615,11 +617,13 @@ class TestInvestigationManagerHypothesisIntegration(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_proof)
-        self.manager.attest_causal_proof(
-            inv_id,
+        verifier = TrustedCausalVerifier(session)
+        verifier.verify_and_attest(
             proof_eid,
             target_function="update_counter",
             field_path="State.counter",
+            hypothesis_id=hypo_id,
+            execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True},
         )
         eval_res = self.manager.evaluate_hypothesis(
             inv_id,
@@ -780,7 +784,8 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_arp_proof)
-        self.runtime.investigation_manager.attest_causal_proof(inv_id, "ev_proof_arp", field_path="obj_x.val")
+        verifier = TrustedCausalVerifier(session)
+        verifier.verify_and_attest("ev_proof_arp", field_path="obj_x.val", hypothesis_id=hypo_id, execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
         eval_res = self.adapter.evaluate_hypothesis({
             "investigation_id": inv_id,
             "hypothesis_id": hypo_id,

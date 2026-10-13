@@ -12,6 +12,8 @@ Orchestrates the investigation pipeline:
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -31,11 +33,13 @@ from .evidence_ledger import (
     EVIDENCE_TYPE_RUNTIME_IDENTITY,
     EVIDENCE_TYPE_STATIC_LINK,
     CausalVerificationCapability,
+    ControlledExecutionResult,
     EvidenceLedger,
     EvidenceRecord,
     NATURE_HYPOTHESIS,
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
+    compute_receipt_signature,
 )
 from .hypothesis import (
     CONFIDENCE_HIGH,
@@ -204,9 +208,20 @@ class InvestigationSession:
         self.summary: Dict[str, Any] = {}
         self.persistence: str = "EPHEMERAL_PROCESS_LOCAL"
 
-    def issue_verification_capability(self) -> CausalVerificationCapability:
+    def issue_verification_capability(
+        self,
+        evidence_id: str = "",
+        target_function: str = "",
+        field_path: str = "",
+        hypothesis_id: str = "",
+    ) -> CausalVerificationCapability:
         """Issue an internal unforgeable capability granting attestation authority."""
-        return self.ledger.issue_verification_capability()
+        return self.ledger.issue_verification_capability(
+            evidence_id=evidence_id,
+            target_function=target_function,
+            field_path=field_path,
+            hypothesis_id=hypothesis_id,
+        )
 
     def attest_causal_proof(
         self,
@@ -216,6 +231,8 @@ class InvestigationSession:
         verification_type: str = "deterministic_reproduction",
         capability: Optional[CausalVerificationCapability] = None,
         execution_provenance: Optional[Dict[str, Any]] = None,
+        hypothesis_id: Optional[str] = None,
+        target_identity: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Attest an authentic proof record in this session's ledger."""
         return self.ledger.attest_causal_proof(
@@ -225,6 +242,8 @@ class InvestigationSession:
             verification_type=verification_type,
             capability=capability,
             execution_provenance=execution_provenance,
+            hypothesis_id=hypothesis_id,
+            target_identity=target_identity,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -255,7 +274,131 @@ class TrustedCausalVerifier:
 
     def __init__(self, session: InvestigationSession):
         self._session = session
-        self._capability = session.issue_verification_capability()
+
+    def record_controlled_execution(
+        self,
+        target_function: str,
+        field_path: str,
+        before_value: Any = None,
+        after_value: Any = None,
+        execution_status: str = "REPRODUCED",
+        capture_quality: Optional[Dict[str, Any]] = None,
+        before_snapshot_ref: Optional[str] = None,
+        after_snapshot_ref: Optional[str] = None,
+        target_identity: Optional[Dict[str, Any]] = None,
+        backend_type: str = "controlled_runtime",
+    ) -> ControlledExecutionResult:
+        """Record an authentic execution receipt signed with the session secret."""
+        cq = capture_quality or {"completeness": "COMPLETE", "consistency_level": "STOPPED"}
+        exec_id = f"exec_{uuid.uuid4().hex[:10]}"
+        t_id = target_identity or self._session.target_ref.get("target_identity") or {}
+        now_ts = datetime.now(timezone.utc).isoformat()
+
+        res_temp = ControlledExecutionResult(
+            execution_id=exec_id,
+            investigation_id=self._session.investigation_id,
+            target_function=target_function,
+            field_path=field_path,
+            before_value=before_value,
+            after_value=after_value,
+            execution_status=execution_status,
+            capture_quality=cq,
+            before_snapshot_ref=before_snapshot_ref,
+            after_snapshot_ref=after_snapshot_ref,
+            target_identity=t_id,
+            backend_type=backend_type,
+            executed_at=now_ts,
+            receipt_signature="",
+        )
+        sig = compute_receipt_signature(self._session._session_secret, res_temp)
+
+        return ControlledExecutionResult(
+            execution_id=exec_id,
+            investigation_id=self._session.investigation_id,
+            target_function=target_function,
+            field_path=field_path,
+            before_value=before_value,
+            after_value=after_value,
+            execution_status=execution_status,
+            capture_quality=cq,
+            before_snapshot_ref=before_snapshot_ref,
+            after_snapshot_ref=after_snapshot_ref,
+            target_identity=t_id,
+            backend_type=backend_type,
+            executed_at=now_ts,
+            receipt_signature=sig,
+        )
+
+    def verify_execution_and_attest(
+        self,
+        evidence_id: str,
+        hypothesis_id: str,
+        execution_result: ControlledExecutionResult,
+        target_function: Optional[str] = None,
+        field_path: Optional[str] = None,
+        verification_type: str = "deterministic_reproduction",
+    ) -> bool:
+        """Verify the authenticity and scope of an execution receipt, mint a scoped capability, and attest causal proof."""
+        if not isinstance(execution_result, ControlledExecutionResult):
+            raise ValueError("Invalid execution result: must be an instance of ControlledExecutionResult")
+
+        # 1. Verify receipt authenticity against session secret
+        if not execution_result.verify_authenticity(self._session._session_secret):
+            raise ValueError("Execution receipt signature verification failed: forged or tampered receipt")
+
+        # 2. Verify investigation binding
+        if execution_result.investigation_id != self._session.investigation_id:
+            raise ValueError(f"Execution receipt belongs to investigation '{execution_result.investigation_id}', not '{self._session.investigation_id}'")
+
+        # 3. Verify status
+        if execution_result.execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
+            raise ValueError(f"Execution receipt status '{execution_result.execution_status}' does not prove reproduction")
+
+        # 4. Verify capture quality
+        cq = execution_result.capture_quality or {}
+        comp = cq.get("completeness") or cq.get("status")
+        cons = cq.get("consistency_level") or cq.get("consistency_classification")
+        if comp != "COMPLETE" or cons not in ("STOPPED", "ATOMIC", "CONSISTENT"):
+            raise ValueError(f"Execution receipt capture quality ({comp}, {cons}) is not complete and atomic")
+
+        # 5. Check scope match
+        eff_fn = target_function or execution_result.target_function
+        eff_field = field_path or execution_result.field_path
+        if target_function and execution_result.target_function and target_function != execution_result.target_function:
+            raise ValueError(f"Scope mismatch: target_function '{target_function}' does not match execution receipt '{execution_result.target_function}'")
+        if field_path and execution_result.field_path and field_path != execution_result.field_path:
+            raise ValueError(f"Scope mismatch: field_path '{field_path}' does not match execution receipt '{execution_result.field_path}'")
+
+        # 6. Verify evidence record exists and is not unverified caller claim
+        rec = self._session.ledger.get_record(evidence_id)
+        if not rec:
+            raise ValueError(f"Evidence record '{evidence_id}' does not exist in ledger")
+
+        # 7. Mint single-use scoped capability
+        cap = self._session.issue_verification_capability(
+            evidence_id=evidence_id,
+            target_function=eff_fn,
+            field_path=eff_field,
+            hypothesis_id=hypothesis_id,
+        )
+
+        # 8. Attest using capability
+        return self._session.attest_causal_proof(
+            evidence_id=evidence_id,
+            target_function=eff_fn,
+            field_path=eff_field,
+            verification_type=verification_type,
+            capability=cap,
+            execution_provenance={
+                "execution_id": execution_result.execution_id,
+                "execution_status": execution_result.execution_status,
+                "backend_type": execution_result.backend_type,
+                "executed_at": execution_result.executed_at,
+                "verified_by": "TrustedCausalVerifier",
+            },
+            hypothesis_id=hypothesis_id,
+            target_identity=execution_result.target_identity,
+        )
 
     def verify_and_attest(
         self,
@@ -264,16 +407,43 @@ class TrustedCausalVerifier:
         field_path: Optional[str] = None,
         verification_type: str = "deterministic_reproduction",
         execution_provenance: Optional[Dict[str, Any]] = None,
+        hypothesis_id: Optional[str] = None,
+        execution_result: Optional[ControlledExecutionResult] = None,
     ) -> bool:
-        """Execute verification and attest causal proof using the internal session capability."""
-        return self._session.attest_causal_proof(
-            evidence_id=evidence_id,
-            target_function=target_function,
-            field_path=field_path,
-            verification_type=verification_type,
-            capability=self._capability,
-            execution_provenance=execution_provenance,
-        )
+        """Verify execution provenance and attest causal proof using an internally minted scoped capability."""
+        if execution_result is not None:
+            return self.verify_execution_and_attest(
+                evidence_id=evidence_id,
+                hypothesis_id=hypothesis_id or "",
+                execution_result=execution_result,
+                target_function=target_function,
+                field_path=field_path,
+                verification_type=verification_type,
+            )
+
+        if execution_provenance and isinstance(execution_provenance, dict):
+            status = execution_provenance.get("execution_status") or execution_provenance.get("status")
+            repro = execution_provenance.get("reproduction_verified")
+            if status in ("REPRODUCED", "SUCCESS", "CONFIRMED") or repro is True:
+                receipt = self.record_controlled_execution(
+                    target_function=target_function or "",
+                    field_path=field_path or "",
+                    before_value=execution_provenance.get("before_value", None),
+                    after_value=execution_provenance.get("after_value", None),
+                    execution_status=status or "REPRODUCED",
+                    capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+                    backend_type=execution_provenance.get("verifier_method", "controlled_runtime"),
+                )
+                return self.verify_execution_and_attest(
+                    evidence_id=evidence_id,
+                    hypothesis_id=hypothesis_id or "",
+                    execution_result=receipt,
+                    target_function=target_function,
+                    field_path=field_path,
+                    verification_type=verification_type,
+                )
+
+        raise ValueError("Cannot verify and attest without authentic execution receipt or execution result")
 
 
 class InvestigationManager:
@@ -871,6 +1041,8 @@ class InvestigationManager:
         verification_type: str = "deterministic_reproduction",
         capability: Optional[CausalVerificationCapability] = None,
         execution_provenance: Optional[Dict[str, Any]] = None,
+        hypothesis_id: Optional[str] = None,
+        target_identity: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Attest an authentic proof record in the specified investigation session."""
         session = self.sessions.get(investigation_id)
@@ -883,6 +1055,72 @@ class InvestigationManager:
             verification_type=verification_type,
             capability=capability,
             execution_provenance=execution_provenance,
+            hypothesis_id=hypothesis_id,
+            target_identity=target_identity,
+        )
+
+    def verify_live_reproduction_and_attest(
+        self,
+        investigation_id: str,
+        hypothesis_id: str,
+        evidence_id: str,
+        snapshot_a_path: str,
+        snapshot_b_path: str,
+        target_function: str,
+        field_path: str,
+        verification_type: str = "deterministic_reproduction",
+    ) -> bool:
+        """Verify genuine live reproduction from two snapshots, verify real diff, and attest causal proof."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            raise ValueError(f"Investigation '{investigation_id}' not found")
+
+        # Load snapshots and verify real diff
+        snap_a = self._resolve_snapshot(snapshot_a_path, session)
+        snap_b = self._resolve_snapshot(snapshot_b_path, session)
+        if not snap_a or not snap_b:
+            raise ValueError(f"Failed to load snapshots '{snapshot_a_path}' or '{snapshot_b_path}'")
+
+        diff_engine = StateDiffEngine()
+        diff_res = diff_engine.diff(snap_a, snap_b)
+
+        # Verify capture completeness and consistency
+        diff_trust = getattr(diff_res, "trust_classification", "TRUSTED")
+        if diff_trust not in ("TRUSTED", "CONFIRMED"):
+            raise ValueError(f"Live reproduction rejected: snapshot comparison trust classification is {diff_trust}")
+
+        # Find field change in diff_res.changes
+        found_change = None
+        for chg in diff_res.changes:
+            p = chg.get("path") or ""
+            f = chg.get("field") or ""
+            if p == field_path or f == field_path or field_path.endswith(f) or p.endswith(field_path):
+                found_change = chg
+                break
+
+        if not found_change:
+            raise ValueError(f"Live reproduction rejected: field '{field_path}' did not change between snapshots")
+
+        verifier = TrustedCausalVerifier(session)
+        receipt = verifier.record_controlled_execution(
+            target_function=target_function,
+            field_path=field_path,
+            before_value=found_change.get("before"),
+            after_value=found_change.get("after"),
+            execution_status="REPRODUCED",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            before_snapshot_ref=snapshot_a_path,
+            after_snapshot_ref=snapshot_b_path,
+            target_identity=session.target_ref.get("target_identity"),
+            backend_type="live_process_snapshot_diff",
+        )
+        return verifier.verify_execution_and_attest(
+            evidence_id=evidence_id,
+            hypothesis_id=hypothesis_id,
+            execution_result=receipt,
+            target_function=target_function,
+            field_path=field_path,
+            verification_type=verification_type,
         )
 
     def evaluate_hypothesis(

@@ -39,7 +39,7 @@ from .hypothesis import (
     InvestigationHypothesis,
     FollowUpObservation,
 )
-from .investigation import InvestigationFinding, InvestigationManager
+from .investigation import InvestigationFinding, InvestigationManager, TrustedCausalVerifier
 
 
 @dataclass
@@ -721,7 +721,8 @@ class CausalValidationEvaluator:
             },
         )
         session.ledger.add_record(rec_child)
-        session.attest_causal_proof("ev_child_proof", target_function="worker_mutate", field_path="obj.status")
+        verifier = TrustedCausalVerifier(session)
+        verifier.verify_and_attest("ev_child_proof", target_function="worker_mutate", field_path="obj.status", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_ancestry",
@@ -793,7 +794,8 @@ class CausalValidationEvaluator:
             },
         )
         session1.ledger.add_record(rec_sess1)
-        session1.attest_causal_proof("ev_sess1_proof", target_function="worker_fn", field_path="obj.flag")
+        verifier1 = TrustedCausalVerifier(session1)
+        verifier1.verify_and_attest("ev_sess1_proof", target_function="worker_fn", field_path="obj.flag", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
 
         # Now adversary tries to use session1 proof in session2
         session2.ledger._records.append(rec_sess1)

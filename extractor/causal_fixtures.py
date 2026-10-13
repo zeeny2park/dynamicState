@@ -52,6 +52,7 @@ from .investigation import (
     InvestigationFinding,
     InvestigationManager,
     InvestigationSession,
+    TrustedCausalVerifier,
 )
 
 
@@ -148,10 +149,17 @@ class CausalDefectFixtures:
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_proof)
-        session.attest_causal_proof(
+        verifier = TrustedCausalVerifier(session)
+        verifier.verify_and_attest(
             evidence_id="ev_a_proof",
             target_function="mutate_worker_state",
             field_path="WorkerState.counter",
+            hypothesis_id=hypo.hypothesis_id,
+            execution_provenance={
+                "execution_status": "REPRODUCED",
+                "reproduction_verified": True,
+                "verifier_method": "deterministic_execution",
+            },
         )
 
         return mgr, inv_id, hypo.hypothesis_id
@@ -279,10 +287,17 @@ class CausalDefectFixtures:
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_proof)
-        session.attest_causal_proof(
+        verifier = TrustedCausalVerifier(session)
+        verifier.verify_and_attest(
             evidence_id="ev_c_proof",
             target_function="update_flags",
             field_path="State.flags",
+            hypothesis_id=hypo.hypothesis_id,
+            execution_provenance={
+                "execution_status": "REPRODUCED",
+                "reproduction_verified": True,
+                "verifier_method": "deterministic_execution",
+            },
         )
 
         return mgr, inv_id, hypo.hypothesis_id

@@ -797,6 +797,8 @@ class HypothesisValidator:
             proof_rec,
             target_function=attestation.get("target_function"),
             field_path=attestation.get("field_path"),
+            hypothesis_id=attestation.get("hypothesis_id"),
+            target_identity=attestation.get("target_identity"),
         )
         stored_fp = attestation.get("evidence_fingerprint")
         if not stored_fp or stored_fp != expected_fp:
@@ -817,6 +819,43 @@ class HypothesisValidator:
             return (
                 False,
                 f"Proof evidence '{proof_rec.evidence_id}' has invalid or forged cryptographic attestation signature",
+                proof_rec,
+            )
+
+        # Check hypothesis binding
+        att_hypo_id = attestation.get("hypothesis_id")
+        if att_hypo_id and att_hypo_id != hypothesis.hypothesis_id:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' attestation was issued for hypothesis '{att_hypo_id}', not '{hypothesis.hypothesis_id}'",
+                proof_rec,
+            )
+
+        # Check target identity binding
+        att_tid = attestation.get("target_identity")
+        if att_tid and proof_rec.target_identity and att_tid != proof_rec.target_identity:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' target identity was tampered after attestation issuance",
+                proof_rec,
+            )
+
+        # Check scope tampering between details and attestation
+        att_fn = attestation.get("target_function")
+        p_details_fn = p_details.get("target_function")
+        if att_fn and p_details_fn and att_fn != p_details_fn:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' target function in details '{p_details_fn}' does not match attested function '{att_fn}'",
+                proof_rec,
+            )
+
+        att_fld = attestation.get("field_path")
+        p_details_fld = p_details.get("field_path")
+        if att_fld and p_details_fld and att_fld != p_details_fld:
+            return (
+                False,
+                f"Proof evidence '{proof_rec.evidence_id}' field path in details '{p_details_fld}' does not match attested field '{att_fld}'",
                 proof_rec,
             )
 

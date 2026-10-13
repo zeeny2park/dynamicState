@@ -404,12 +404,26 @@ class TestCppE2EInvestigation(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         self.mgr.sessions[inv_id].ledger.add_record(rec_proof)
-        self.mgr.attest_causal_proof(
-            inv_id,
-            proof_eid,
+        # Direct call to public attest_causal_proof without capability is strictly rejected!
+        with self.assertRaises(ValueError):
+            self.mgr.attest_causal_proof(
+                inv_id,
+                proof_eid,
+                target_function="mutate_worker_state",
+                field_path="State.counter",
+            )
+
+        # Authentically verify live reproduction between snap1 and snap2 and issue attestation
+        att_ok = self.mgr.verify_live_reproduction_and_attest(
+            investigation_id=inv_id,
+            hypothesis_id=h_id,
+            evidence_id=proof_eid,
+            snapshot_a_path=snap1_dir,
+            snapshot_b_path=snap2_dir,
             target_function="mutate_worker_state",
             field_path="State.counter",
         )
+        self.assertTrue(att_ok)
         verified_eval = self.mgr.evaluate_hypothesis(
             inv_id,
             h_id,
