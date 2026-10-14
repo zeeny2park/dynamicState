@@ -1,8 +1,8 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `DYNAMICSTATE_PHASE10_CI_SECURITY_GATES_AND_CAUSAL_VALIDATION_COMPLETE`** — Independent Trust Verification & CI Acceptance Gates Complete  
-> Verified with 400+ Unit/Integration/Security Tests (Full Discovery), 83 Causal Validation & Evidence Authenticity Tests, 16 Phase 10 Independent CI Security Gate Tests, Real C++ PIE ASLR Positive & Negative Controls, Multithread Branch Isolation Suite, Subprocess Lifecycle Integration Suite, Native C99 Target Collector Suite, CI Workflow Parity Suite, and Capture Performance Smoke Benchmark.
+> **Status: `DYNAMICSTATE_PHASE11_REAL_TARGET_VALIDATION_AND_RELEASE_READINESS_COMPLETE`** — Real-Target Validation & Release Readiness Complete  
+> Verified with 594 Unit/Integration/Security Tests (Full Discovery), 83 Causal Validation & Evidence Authenticity Tests, 16 Phase 10 Independent CI Security Gate Tests, 17 Phase 11 Real-Target Matrix & Concurrency Tests, 19 Pipeline Steps in `run_all_tests.sh`, Real C++ PIE ASLR Positive & Negative Controls, Multithread Branch Isolation Suite, Subprocess Lifecycle Integration Suite, Native C99 Target Collector Suite, CI Workflow Parity Suite, and Capture Performance Smoke Benchmark.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
@@ -106,6 +106,8 @@ Recursive Semantic Reachability Traversal
   (`CaptureKeyStore` 통한 키 수명주기(등록, 회전, 폐기, 프로세스 로컬 임시 키 폴백) 관리; Schema 2.0.0 HMAC-SHA256 기반 프로세스 간 오프라인 영속 스냅샷 상호검증; 폐기/미확인 키 Fail-Closed 보장; 비밀값 비노출(Zero Secret Leakage) 원칙 확립; PID 재활용 방지(`/proc/<pid>/stat` 시작 시간 검증); 실 컴파일 C++ PIE 바이너리 포지티브/네거티브 컨트롤 검증)
 - **Phase 10 (Complete)**: *"Independent Trust Verification & CI Acceptance Gates"*  
   (전체 10대 신뢰 경계(Capture Backend, Receipt Issuance, Save/Load, Cross-Process, Investigation, REST, ARP, EvidenceLedger, Controlled Execution, Causal Attestation) 신뢰 행렬(Trust-Boundary Matrix) 명세화; 4대 CI 보안 수락 게이트(`TestTrustBoundaryIngressGates`, `TestKeyLifecycleAndConcurrencyGates`, `TestArtifactIntegrityAndAntiTamperingGates`, `TestRealWorldCppCrossProcessAcceptanceGate`) 및 16개 회귀 테스트 구축; `ci/workflows/test.yml` 및 `run_all_tests.sh` 내 보안 게이트 강제 통합)
+- **Phase 11 (Complete)**: *"Real-Target Validation & Release Readiness"*  
+  (재현 가능한 C++ PIE DWARF/Stripped 9대 매트릭스 검증; 단일 작성자 포지티브/네거티브 컨트롤, 동시성 스레드 루프, 실행 추적 인증을 통한 함수 귀속 분리; 100% 바이트 회계 및 `SIGCONT` fail-open 재개 보장; 정지 시간 SLA 초과(`STOP_BUDGET_EXCEEDED`) 시 정합성 강등; 로컬 19단계 파이프라인(`run_all_tests.sh`) 100% 통과 및 원격 GitHub Actions 실행 현황 명시)
 
 ---
 

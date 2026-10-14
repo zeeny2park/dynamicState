@@ -76,27 +76,31 @@ run_step "Causal Validation & Evidence Authenticity Suite" \
 run_step "Phase 10 Security Gates & Independent Trust Verification Suite" \
     python3 -m unittest tests/test_phase10_ci_security_gates.py
 
-# 9. Discover and run all remaining unit and integration tests
+# 9. Phase 11 Real-Target Validation & Release Readiness Suite
+run_step "Phase 11 Real-Target Validation & Release Readiness Suite" \
+    python3 -m unittest tests/test_phase11_real_target_release_readiness.py
+
+# 10. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 
-# 10. Multithread determinism & branch isolation specific tests
+# 11. Multithread determinism & branch isolation specific tests
 run_step "Multithread Restart Determinism & Branch Isolation Suite" \
     python3 -m unittest tests/test_multithread_exploration.py
 
-# 11. Web API & UI Lifecycle Suite
+# 12. Web API & UI Lifecycle Suite
 run_step "Web API & Server Lifecycle Tests" \
     python3 -m unittest tests/test_web_api.py tests/test_web_server_lifecycle.py
 
-# 12. CI Workflow Parity & Discoverability Suite
+# 13. CI Workflow Parity & Discoverability Suite
 run_step "CI Workflow Parity & Discoverability Suite" \
     python3 -m unittest tests/test_ci_workflow_parity.py
 
-# 13. Performance Benchmark Integrity & Unit Suite
+# 14. Performance Benchmark Integrity & Unit Suite
 run_step "Capture Benchmark Integrity & Schema Suite" \
     python3 -m unittest tests/test_capture_benchmark.py
 
-# 14. Performance Benchmark Smoke Test
+# 15. Performance Benchmark Smoke Test
 run_step "Capture Performance Benchmark Smoke Test" \
     python3 -m benchmarks.capture_benchmark --smoke
 
