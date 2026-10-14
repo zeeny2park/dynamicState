@@ -65,6 +65,10 @@ from .hypothesis import (
     CONFIDENCE_MEDIUM,
     CONFIDENCE_SPECULATIVE,
     DeterministicHypothesisGenerator,
+    EVIDENCE_CLASSIFICATION_FACT,
+    EVIDENCE_CLASSIFICATION_INFERENCE,
+    EVIDENCE_CLASSIFICATION_PROPOSED_ACTION,
+    EVIDENCE_CLASSIFICATION_UNKNOWN,
     FollowUpObservation,
     FUNCTION_TIER_EVIDENCE_SUPPORTED,
     FUNCTION_TIER_STATIC_CANDIDATE,
@@ -78,11 +82,21 @@ from .hypothesis import (
     HypothesisGenerator,
     HypothesisValidator,
     InvestigationHypothesis,
+    OBSERVATION_STATUS_CANCELED,
+    OBSERVATION_STATUS_EXECUTED,
+    OBSERVATION_STATUS_FAILED,
+    OBSERVATION_STATUS_PROPOSED,
+    OBSERVATION_STATUS_VERIFIED,
+    OptionalLLMHypothesisAdapter,
+    PluggableHypothesisEngine,
+    sanitize_and_disarm_llm_hypothesis,
     TARGET_KIND_COMPARISON,
     TARGET_KIND_FIELD,
     TARGET_KIND_OBJECT,
     TARGET_KIND_SNAPSHOT,
     TARGET_KIND_THREAD,
+    VALID_EVIDENCE_CLASSIFICATIONS,
+    VALID_OBSERVATION_STATUSES,
     ValidationTransitionResult,
 )
 from .modules import ModuleAddressResolver, RuntimeModule, discover_modules
@@ -142,9 +156,30 @@ class InvestigationFinding:
     after_value: Any = None
     layout_caveat: Optional[str] = None
     unavailable_reason: Optional[str] = None
+    classification: Optional[str] = None
+    supporting_evidence_ids: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.supporting_evidence_ids and not self.evidence_ids:
+            self.evidence_ids = list(self.supporting_evidence_ids)
+        if not self.classification:
+            if self.category == "fact":
+                self.classification = EVIDENCE_CLASSIFICATION_FACT
+            elif self.category == "hypothesis":
+                self.classification = EVIDENCE_CLASSIFICATION_INFERENCE
+            else:
+                self.classification = EVIDENCE_CLASSIFICATION_UNKNOWN
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if not d.get("classification"):
+            if self.category == "fact":
+                d["classification"] = EVIDENCE_CLASSIFICATION_FACT
+            elif self.category == "hypothesis":
+                d["classification"] = EVIDENCE_CLASSIFICATION_INFERENCE
+            else:
+                d["classification"] = EVIDENCE_CLASSIFICATION_UNKNOWN
+        return d
 
 
 @dataclass
@@ -221,12 +256,14 @@ class InvestigationSession:
         self.target_ref: Dict[str, Any] = {}
         self.findings: List[InvestigationFinding] = []
         self.hypotheses: List[InvestigationHypothesis] = []
+        self.follow_up_observations: List[FollowUpObservation] = []
         self.next_steps: List[InvestigationNextStep] = []
         self.active_snapshot: Optional[Any] = None
         self.comparison_results: List[Dict[str, Any]] = []
         self.static_provider: StaticAnalysisProvider = NullStaticAnalysisProvider()
         self.summary: Dict[str, Any] = {}
         self.persistence: str = "EPHEMERAL_PROCESS_LOCAL"
+        self.timeline: List[Dict[str, Any]] = []
 
     @property
     def session_secret(self) -> str:
@@ -273,6 +310,74 @@ class InvestigationSession:
             target_identity=target_identity,
         )
 
+    def add_timeline_event(
+        self,
+        event_type: str,
+        title: str,
+        summary: str,
+        classification: str = EVIDENCE_CLASSIFICATION_FACT,
+        finding_id: Optional[str] = None,
+        hypothesis_id: Optional[str] = None,
+        observation_id: Optional[str] = None,
+        evidence_ids: Optional[List[str]] = None,
+        status_before: Optional[str] = None,
+        status_after: Optional[str] = None,
+        confidence: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record an auditable, chronological event in the investigation timeline."""
+        evt = {
+            "event_id": f"evt_{uuid.uuid4().hex[:10]}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_type": event_type,
+            "classification": classification,
+            "title": title,
+            "summary": summary,
+            "finding_id": finding_id,
+            "hypothesis_id": hypothesis_id,
+            "observation_id": observation_id,
+            "evidence_ids": list(evidence_ids or []),
+            "status_before": status_before,
+            "status_after": status_after,
+            "confidence": confidence,
+            "details": dict(details or {}),
+        }
+        self.timeline.append(evt)
+        return evt
+
+    def synthesize_causal_conclusions(self) -> Dict[str, Any]:
+        """Synthesize causal conclusions, validating whether genuine causal proof was established and highlighting limitations."""
+        proof_established = any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in self.hypotheses)
+        cap_details = self.stages.get("capture_quality", {}).get("details", {})
+        consistency = cap_details.get("consistency_level") or "UNKNOWN"
+        cap_status = self.stages.get("capture_quality", {}).get("status", "PENDING")
+        limitations = list(cap_details.get("limitations", []))
+
+        notice = None
+        if not proof_established:
+            if consistency == "NON_ATOMIC":
+                notice = "Causal proof blocked: capture consistency is NON_ATOMIC (target running concurrently). Deterministic reproduction required."
+            elif cap_status == "PARTIAL":
+                notice = "Causal proof blocked: capture quality is PARTIAL. Full memory snapshot required."
+            else:
+                notice = "Static function candidates and comparative observations alone do not constitute proven causality. Additional deterministic mutation verification or instruction-level trace required."
+
+        return {
+            "supported_hypotheses": [
+                {
+                    "hypothesis_id": h.hypothesis_id,
+                    "title": h.title,
+                    "supporting_evidence_ids": list(h.supporting_evidence_ids),
+                    "reason": h.status_history[-1].get("reason", "Supported") if h.status_history else "Supported",
+                }
+                for h in self.hypotheses if h.validation_status == HYPOTHESIS_STATUS_SUPPORTED
+            ],
+            "causal_proof_established": proof_established,
+            "causal_limitation_notice": notice,
+            "consistency_level": consistency,
+            "capture_status": cap_status,
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to JSON-serializable dictionary."""
         return {
@@ -293,7 +398,85 @@ class InvestigationSession:
             "next_steps": [s.to_dict() for s in self.next_steps],
             "comparison_results": self.comparison_results,
             "summary": self.summary,
+            "timeline": list(self.timeline),
+            "timeline_count": len(self.timeline),
+            "evidence_ledger": self.ledger.to_dict(),
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], corpus: Optional[StateCorpus] = None) -> "InvestigationSession":
+        """Reconstruct investigation session from serialized data with tamper-resistant revalidation."""
+        inv_id = data.get("investigation_id", f"inv_{uuid.uuid4().hex[:8]}")
+        goal = data.get("goal", "")
+        corpus_dir = data.get("corpus_dir", "corpus")
+        session = cls(
+            investigation_id=inv_id,
+            goal=goal,
+            corpus_dir=corpus_dir,
+            safety=data.get("safety"),
+            budgets=data.get("budgets"),
+            corpus=corpus,
+        )
+        session.created_at = data.get("created_at", session.created_at)
+        session.persistence = data.get("persistence", session.persistence)
+        session.target_ref = dict(data.get("target_ref", {}))
+        session.stages = dict(data.get("stages", session.stages))
+        session.comparison_results = list(data.get("comparison_results", []))
+        session.summary = dict(data.get("summary", {}))
+        session.timeline = list(data.get("timeline", []))
+
+        # Reconstruct ledger if present
+        ledger_data = data.get("evidence_ledger")
+        if ledger_data and isinstance(ledger_data, dict):
+            session.ledger = EvidenceLedger.from_dict(ledger_data)
+            session._session_secret = session.ledger.session_secret
+            session._capability_key = getattr(session.ledger, "capability_key", session.ledger._capability_key)
+
+        # Reconstruct findings
+        session.findings = [
+            InvestigationFinding(**f) if isinstance(f, dict) else f
+            for f in data.get("findings", [])
+        ]
+
+        # Reconstruct hypotheses with strict tamper verification against ledger
+        reconstructed_hypos: List[InvestigationHypothesis] = []
+        for h_data in data.get("hypotheses", []):
+            if isinstance(h_data, dict):
+                h_copy = dict(h_data)
+                # Disarm injected fake evidence IDs not present in ledger
+                h_copy["supporting_evidence_ids"] = [
+                    eid for eid in h_copy.get("supporting_evidence_ids", [])
+                    if session.ledger.get_record(eid) is not None
+                ]
+                h_copy["contradicting_evidence_ids"] = [
+                    eid for eid in h_copy.get("contradicting_evidence_ids", [])
+                    if session.ledger.get_record(eid) is not None
+                ]
+                hypo = InvestigationHypothesis.from_dict(h_copy)
+                # Re-evaluate against ledger to ensure unverified caller claims are not trusted
+                HypothesisValidator.evaluate(hypo, session.ledger)
+                reconstructed_hypos.append(hypo)
+            elif isinstance(h_data, InvestigationHypothesis):
+                h_data.supporting_evidence_ids = [
+                    eid for eid in h_data.supporting_evidence_ids
+                    if session.ledger.get_record(eid) is not None
+                ]
+                h_data.contradicting_evidence_ids = [
+                    eid for eid in h_data.contradicting_evidence_ids
+                    if session.ledger.get_record(eid) is not None
+                ]
+                HypothesisValidator.evaluate(h_data, session.ledger)
+                reconstructed_hypos.append(h_data)
+        session.hypotheses = reconstructed_hypos
+
+        # Reconstruct next steps
+        session.next_steps = [
+            InvestigationNextStep(**ns) if isinstance(ns, dict) else ns
+            for ns in data.get("next_steps", [])
+        ]
+
+        session.status = data.get("status", session.status)
+        return session
 
 
 AUTHORIZED_EXECUTION_BACKENDS = {
@@ -1964,7 +2147,11 @@ class InvestigationManager:
         if new_evidence_data:
             # Defensive copy & disarm external caller input
             new_data = dict(new_evidence_data)
+            obs_str = new_data.get("observation") or new_data.get("summary") or ""
+            new_data["observation"] = obs_str
             new_details = dict(new_data.get("details", {}))
+            if "contradicts_hypothesis_id" in new_data:
+                new_details["contradicts_hypothesis_id"] = new_data["contradicts_hypothesis_id"]
             new_prov = dict(new_data.get("provenance", {}))
 
             # External caller cannot claim trusted verifier attestation or execution provenance
@@ -2006,12 +2193,14 @@ class InvestigationManager:
                 else:
                     return {"success": False, "error": f"Failed to attach evidence: {exc}"}
 
+        cap_details = session.stages.get("capture_quality", {}).get("details", {})
         result = HypothesisValidator.evaluate(
             hypothesis=target_hypo,
             ledger=session.ledger,
             new_evidence=new_rec,
             deterministic_transition_verified=deterministic_transition_verified,
             proof_evidence_id=proof_evidence_id,
+            capture_quality=cap_details,
         )
 
         # Sync status to corresponding finding in session.findings
@@ -2020,9 +2209,29 @@ class InvestigationManager:
                 f.status = target_hypo.validation_status
                 f.confidence = target_hypo.confidence.lower()
 
+        # Record timeline event
+        session.add_timeline_event(
+            event_type="HYPOTHESIS_STATUS_UPDATED" if result.status_changed else "VALIDATION_UPDATED",
+            title=f"Hypothesis Evaluated: {target_hypo.title}",
+            summary=result.reason,
+            classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+            hypothesis_id=hypothesis_id,
+            evidence_ids=[new_rec.evidence_id] if new_rec else [],
+            status_before=result.from_status,
+            status_after=result.to_status,
+            confidence=result.confidence,
+            details={
+                "status_changed": result.status_changed,
+                "supporting_count": result.supporting_count,
+                "contradicting_count": result.contradicting_count,
+                "unverified_claim_rejected": result.unverified_claim_rejected,
+            },
+        )
+
         return {
             "success": True,
             "hypothesis": target_hypo.to_dict(),
+            "new_evidence_id": new_rec.evidence_id if new_rec else (result.trigger_evidence_id or (target_hypo.supporting_evidence_ids[-1] if target_hypo.supporting_evidence_ids else None)),
             "transition": {
                 "from_status": result.from_status,
                 "to_status": result.to_status,
@@ -2062,12 +2271,40 @@ class InvestigationManager:
             if target_obs:
                 break
 
-        if not target_obs or not target_hypo:
+        if not target_obs:
+            for obs in session.follow_up_observations:
+                if obs.observation_id == observation_id:
+                    target_obs = obs
+                    for h in session.hypotheses:
+                        if h.hypothesis_id == obs.hypothesis_id or obs in h.suggested_observations:
+                            target_hypo = h
+                            break
+                    if not target_hypo and session.hypotheses:
+                        target_hypo = session.hypotheses[0]
+                    break
+
+        if not target_obs:
             return {"success": False, "error": f"Observation '{observation_id}' not found in investigation '{investigation_id}'"}
 
         # If live mutation or live target interaction requested, verify strict safety constraints
-        requires_live = (target_obs.target_kind == "MUTATION") or bool(target_obs.target_ref.get("requires_live_target"))
+        t_ref = target_obs.target_ref if isinstance(target_obs.target_ref, dict) else {}
+        requires_live = (
+            (target_obs.target_kind == "MUTATION")
+            or bool(t_ref.get("requires_live_target"))
+            or ("MUTATION" in target_obs.safety_constraints)
+            or ("REQUIRES_AUTHORIZATION" in target_obs.safety_constraints)
+        )
         if requires_live and not session.safety.get("target_authorized", False):
+            target_obs.status = OBSERVATION_STATUS_PROPOSED
+            target_obs.execution_error = "Target authorization required: live target interaction is not authorized."
+            session.add_timeline_event(
+                event_type="OBSERVATION_BLOCKED",
+                title=f"Observation Blocked: {target_obs.observation_id}",
+                summary="Live target interaction not authorized by safety policy.",
+                classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+                observation_id=target_obs.observation_id,
+                hypothesis_id=target_hypo.hypothesis_id,
+            )
             return {
                 "success": False,
                 "error": "Target authorization required: live target interaction is not authorized.",
@@ -2142,6 +2379,10 @@ class InvestigationManager:
 
         # Mark observation executed
         target_obs.executed = True
+        if result_data and (result_data.get("verified") is True or result_data.get("outcome") in ("CONFIRMED", "VERIFIED")):
+            target_obs.status = OBSERVATION_STATUS_VERIFIED
+        else:
+            target_obs.status = OBSERVATION_STATUS_EXECUTED
         target_obs.is_suggestion = False
         target_obs.result_evidence_id = ev_id
 
@@ -2163,6 +2404,21 @@ class InvestigationManager:
             if f.finding_id == f"fnd_{target_hypo.hypothesis_id}":
                 f.status = target_hypo.validation_status
                 f.confidence = target_hypo.confidence.lower()
+
+        # Record timeline event
+        session.add_timeline_event(
+            event_type="OBSERVATION_EXECUTED",
+            title=f"Observation Executed: {target_obs.question}",
+            summary=f"Result: {outcome} ({eval_result.reason})",
+            classification=EVIDENCE_CLASSIFICATION_FACT,
+            observation_id=observation_id,
+            hypothesis_id=target_hypo.hypothesis_id,
+            evidence_ids=[ev_id],
+            status_before=eval_result.from_status,
+            status_after=eval_result.to_status,
+            confidence=eval_result.confidence,
+            details={"outcome": outcome, "observation": obs_text},
+        )
 
         return {
             "success": True,
@@ -2311,7 +2567,338 @@ class InvestigationManager:
             "static_code_links": session.stages["static_code_link"].get("details", {}),
             "recommended_next_steps": [s.to_dict() for s in session.next_steps],
             "evidence_ledger": session.ledger.to_dict(),
+            "timeline": list(session.timeline),
+            "timeline_count": len(session.timeline),
         }
+
+    def get_investigation_timeline(self, investigation_id: str) -> Dict[str, Any]:
+        """Retrieve the auditable, sequential timeline of events for an investigation."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+        return {
+            "success": True,
+            "investigation_id": investigation_id,
+            "total_events": len(session.timeline),
+            "timeline": list(session.timeline),
+        }
+
+    def get_finding_drilldown(self, investigation_id: str, finding_id: str) -> Dict[str, Any]:
+        """Resolve a full evidence drill-down path from finding to grounded code and attribution."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+
+        target_finding = None
+        for f in session.findings:
+            if f.finding_id == finding_id:
+                target_finding = f
+                break
+        if not target_finding:
+            return {"success": False, "error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'"}
+
+        obj_id = target_finding.object_id
+        field_name = target_finding.field_name or (target_finding.c_type_path.split(".")[-1] if target_finding.c_type_path else None)
+        c_path = target_finding.c_type_path or f"{obj_id}.{field_name}"
+
+        # DWARF type / declaration
+        type_name = target_finding.type_name
+        type_decl = target_finding.type_decl_location
+        source_loc = target_finding.source_location
+
+        # Related function candidates & their attribution tier
+        candidates = []
+        for fc in target_finding.function_candidates:
+            c_copy = dict(fc)
+            tier = c_copy.get("candidate_tier") or (FUNCTION_TIER_VALIDATED_CAUSAL if c_copy.get("confirmed_root_cause") else FUNCTION_TIER_STATIC_CANDIDATE)
+            c_copy["candidate_tier"] = tier
+            candidates.append(c_copy)
+
+        # Attribution evidence in ledger
+        attr_records = []
+        for ev in session.ledger._records:
+            ev_details = ev.details or {}
+            ev_att = (ev.provenance or {}).get("verifier_attestation") or {}
+            matches_field = (
+                ev_details.get("field_path") == c_path
+                or ev_att.get("field_path") == c_path
+                or (field_name and field_name in str(ev.observation))
+            )
+            if matches_field:
+                attr_records.append({
+                    "evidence_id": ev.evidence_id,
+                    "evidence_type": ev.evidence_type,
+                    "nature": ev.nature,
+                    "observation": ev.observation,
+                    "capture_quality": ev.capture_quality,
+                    "has_attestation": bool(ev_att),
+                    "function_attribution_verified": bool(ev_att.get("function_attribution_verified")),
+                })
+
+        # Capture quality and limitations
+        cap_stage = session.stages.get("capture_quality", {})
+        cap_details = cap_stage.get("details", {})
+        cap_status = cap_stage.get("status", "COMPLETE")
+        limitations = list(cap_details.get("limitations", []))
+
+        drilldown = {
+            "finding_id": target_finding.finding_id,
+            "title": target_finding.title,
+            "category": target_finding.category,
+            "classification": getattr(target_finding, "classification", EVIDENCE_CLASSIFICATION_FACT if target_finding.category == "fact" else (EVIDENCE_CLASSIFICATION_INFERENCE if target_finding.category == "hypothesis" else EVIDENCE_CLASSIFICATION_UNKNOWN)),
+            "status": target_finding.status,
+            "confidence": target_finding.confidence,
+            "finding": target_finding.to_dict(),
+            "values": {
+                "observed": target_finding.observed_value,
+                "before": target_finding.before_value,
+                "after": target_finding.after_value,
+            },
+            "path": {
+                "object_id": obj_id,
+                "field_name": field_name,
+                "c_type_path": c_path,
+            },
+            "dwarf": {
+                "type_name": type_name,
+                "type_decl_location": type_decl,
+                "source_location": source_loc,
+                "debug_image": session.target_ref.get("debug_image"),
+                "build_id": session.stages.get("target_identity", {}).get("details", {}).get("target_build_id"),
+                "build_id_status": session.stages.get("target_identity", {}).get("details", {}).get("build_id_status"),
+            },
+            "function_candidates": candidates,
+            "attribution_evidence": attr_records,
+            "capture_quality": {
+                "status": cap_status,
+                "consistency_level": cap_details.get("consistency_level", "UNKNOWN"),
+                "limitations": limitations,
+            },
+        }
+        return {"success": True, "drilldown": drilldown}
+
+    def run_investigation_cycle(
+        self,
+        investigation_id: str,
+        max_iterations: int = 5,
+        max_observations: int = 10,
+        stop_on_contradiction: bool = False,
+    ) -> Dict[str, Any]:
+        """Execute a bounded investigation cycle: select discriminating observations, execute, update hypotheses."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+
+        if not session.hypotheses:
+            generator = DeterministicHypothesisGenerator()
+            session.hypotheses = generator.generate(session)
+            for h in session.hypotheses:
+                session.add_timeline_event(
+                    event_type="HYPOTHESIS_PROPOSED",
+                    title=f"Hypothesis Formulated: {h.title}",
+                    summary=h.claim,
+                    classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+                    hypothesis_id=h.hypothesis_id,
+                    details={"confidence": h.confidence, "validation_status": h.validation_status},
+                )
+
+        iterations = 0
+        observations_executed = 0
+        executed_obs_ids = set()
+        stop_reason = "CYCLE_BOUND_REACHED"
+
+        bounded_max_iterations = min(max(1, max_iterations), 20)
+        bounded_max_observations = min(max(1, max_observations), 50)
+
+        for it in range(bounded_max_iterations):
+            iterations += 1
+
+            unresolved = [
+                h for h in session.hypotheses
+                if h.validation_status in (HYPOTHESIS_STATUS_PROPOSED, HYPOTHESIS_STATUS_SUPPORTED)
+            ]
+            if not unresolved:
+                stop_reason = "ALL_HYPOTHESES_RESOLVED"
+                break
+
+            candidate_observations: List[Tuple[FollowUpObservation, InvestigationHypothesis]] = []
+            for h in unresolved:
+                for obs in h.suggested_observations:
+                    if not obs.executed and obs.observation_id not in executed_obs_ids:
+                        candidate_observations.append((obs, h))
+
+            if not candidate_observations:
+                stop_reason = "NO_MORE_OBSERVATIONS"
+                break
+
+            def _obs_score(item: Tuple[FollowUpObservation, InvestigationHypothesis]) -> int:
+                obs, h = item
+                score = 0
+                if obs.discriminating_power == "HIGH":
+                    score += 30
+                elif obs.discriminating_power == "MEDIUM":
+                    score += 15
+                if obs.risk_level == "READ_ONLY":
+                    score += 20
+                elif obs.risk_level == "CAUTION":
+                    score += 5
+                if obs.target_kind in (TARGET_KIND_COMPARISON, TARGET_KIND_FIELD, TARGET_KIND_THREAD):
+                    score += 10
+                return score
+
+            candidate_observations.sort(key=_obs_score, reverse=True)
+            selected_obs, target_hypo = candidate_observations[0]
+            executed_obs_ids.add(selected_obs.observation_id)
+
+            if selected_obs.target_kind == "MUTATION" or selected_obs.target_ref.get("requires_live_target"):
+                if not session.safety.get("target_authorized", False):
+                    selected_obs.status = OBSERVATION_STATUS_PROPOSED
+                    selected_obs.execution_error = "Target authorization required: live target interaction is not authorized."
+                    session.add_timeline_event(
+                        event_type="OBSERVATION_BLOCKED",
+                        title=f"Observation Blocked: {selected_obs.observation_id}",
+                        summary="Live target interaction not authorized by safety policy.",
+                        classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+                        observation_id=selected_obs.observation_id,
+                        hypothesis_id=target_hypo.hypothesis_id,
+                    )
+                    continue
+
+            exec_res = self.execute_observation(
+                investigation_id,
+                selected_obs.observation_id,
+            )
+            if exec_res.get("success"):
+                observations_executed += 1
+                eval_info = exec_res.get("evaluation", {})
+
+                if stop_on_contradiction and eval_info.get("to_status") == HYPOTHESIS_STATUS_CONTRADICTED:
+                    stop_reason = "CONTRADICTION_ENCOUNTERED"
+                    break
+            else:
+                if not exec_res.get("blocked"):
+                    selected_obs.status = OBSERVATION_STATUS_FAILED
+                selected_obs.execution_error = exec_res.get("error", "Execution failed")
+
+            if observations_executed >= bounded_max_observations:
+                stop_reason = "MAX_OBSERVATIONS_REACHED"
+                break
+
+        status_counts = {}
+        for h in session.hypotheses:
+            st = h.validation_status
+            status_counts[st] = status_counts.get(st, 0) + 1
+
+        return {
+            "success": True,
+            "investigation_id": investigation_id,
+            "iterations_run": iterations,
+            "iterations_completed": iterations,
+            "observations_executed": observations_executed,
+            "stop_reason": stop_reason,
+            "hypotheses_summary": status_counts,
+            "total_hypotheses": len(session.hypotheses),
+            "timeline_events_total": len(session.timeline),
+        }
+
+    def step_investigation_cycle(self, investigation_id: str) -> Dict[str, Any]:
+        """Advance the investigation cycle by a single discriminating observation step."""
+        return self.run_investigation_cycle(
+            investigation_id,
+            max_iterations=1,
+            max_observations=1,
+            stop_on_contradiction=False,
+        )
+
+    def propose_hypothesis(self, investigation_id: str, hypothesis_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Propose a new hypothesis for an investigation with defensive sanitization and disarming."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+
+        hypo = sanitize_and_disarm_llm_hypothesis(hypothesis_data, ledger=session.ledger)
+        hypo.investigation_id = investigation_id
+        session.hypotheses.append(hypo)
+
+        ev = session.ledger.add_record(EvidenceRecord(
+            evidence_id=f"ev_{hypo.hypothesis_id}",
+            evidence_type=EVIDENCE_TYPE_HYPOTHESIS,
+            nature=NATURE_HYPOTHESIS,
+            source="ExternalOrLLMProposer",
+            session_id=investigation_id,
+            observation=hypo.claim,
+            parent_evidence_ids=list(hypo.supporting_evidence_ids),
+            details={
+                "hypothesis_id": hypo.hypothesis_id,
+                "proposed_mechanism": hypo.proposed_mechanism,
+                "validation_status": hypo.validation_status,
+                "confidence": hypo.confidence,
+            },
+        ))
+
+        session.findings.append(InvestigationFinding(
+            finding_id=f"fnd_{hypo.hypothesis_id}",
+            category="hypothesis",
+            title=hypo.title,
+            description=hypo.claim,
+            c_type_path=hypo.candidate_fields[0] if hypo.candidate_fields else None,
+            object_id=hypo.candidate_objects[0] if hypo.candidate_objects else None,
+            field_name=hypo.candidate_fields[0] if hypo.candidate_fields else None,
+            evidence_ids=[ev.evidence_id] + list(hypo.supporting_evidence_ids),
+            confidence=hypo.confidence.lower(),
+            status=hypo.validation_status,
+            function_candidates=hypo.function_candidates,
+        ))
+
+        session.add_timeline_event(
+            event_type="HYPOTHESIS_PROPOSED",
+            title=f"Hypothesis Proposed: {hypo.title}",
+            summary=hypo.claim,
+            classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+            hypothesis_id=hypo.hypothesis_id,
+            details={"confidence": hypo.confidence, "validation_status": hypo.validation_status},
+        )
+
+        return {
+            "success": True,
+            "hypothesis": hypo.to_dict(),
+            "evidence_id": ev.evidence_id,
+        }
+
+    def save_session(self, investigation_id: str, file_path: Optional[str] = None) -> Dict[str, Any]:
+        """Serialize and save an investigation session to a dictionary or disk file."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+        data = session.to_dict()
+        data["evidence_ledger"] = session.ledger.to_dict()
+        if file_path:
+            norm = os.path.normpath(file_path)
+            if ".." in norm.split(os.path.sep):
+                raise ValueError(f"Path traversal detected in session save path: '{file_path}'")
+            os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        return {"success": True, "session_data": data, "file_path": file_path}
+
+    def load_session(self, file_path_or_data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """Load and reconstruct an investigation session from serialized dictionary or disk file."""
+        if isinstance(file_path_or_data, str):
+            norm = os.path.normpath(file_path_or_data)
+            if ".." in norm.split(os.path.sep):
+                raise ValueError(f"Path traversal detected in session load path: '{file_path_or_data}'")
+            if not os.path.exists(file_path_or_data):
+                return {"success": False, "error": f"File '{file_path_or_data}' not found"}
+            with open(file_path_or_data, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        elif isinstance(file_path_or_data, dict):
+            data = file_path_or_data
+        else:
+            return {"success": False, "error": "Invalid input: expected file path or dictionary"}
+
+        session = InvestigationSession.from_dict(data, corpus=self.corpus)
+        self.sessions[session.investigation_id] = session
+        return {"success": True, "investigation_id": session.investigation_id, "session": session.to_dict()}
 
     # -------------------------------------------------------------------------
     # Stage Execution Internals

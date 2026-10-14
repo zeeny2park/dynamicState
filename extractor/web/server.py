@@ -1480,6 +1480,83 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": res.error.code if res.error else "OBSERVATION_ERROR",
                                             "message": res.error.message if res.error else "Failed to execute observation"}}
 
+    def get_investigation_timeline(self, investigation_id: Optional[str]) -> Dict[str, Any]:
+        if not investigation_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        res = self.runtime.get_investigation_timeline(investigation_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
+                                            "message": res.error.message if res.error else "Failed to get timeline"}}
+
+    def get_finding_drilldown(self, investigation_id: Optional[str], finding_id: Optional[str]) -> Dict[str, Any]:
+        if not investigation_id or not finding_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id and finding_id are required"}}
+        res = self.runtime.get_finding_drilldown(investigation_id, finding_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
+                                            "message": res.error.message if res.error else "Failed to get finding drilldown"}}
+
+    def run_investigation_cycle(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        if not inv_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        max_iter = int(params.get("max_iterations", 5))
+        max_obs = int(params.get("max_observations", 10))
+        stop_on_contra = bool(params.get("stop_on_contradiction", False))
+        res = self.runtime.run_investigation_cycle(
+            inv_id,
+            max_iterations=max_iter,
+            max_observations=max_obs,
+            stop_on_contradiction=stop_on_contra,
+        )
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "CYCLE_ERROR",
+                                            "message": res.error.message if res.error else "Failed to run cycle"}}
+
+    def step_investigation_cycle(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        if not inv_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        res = self.runtime.step_investigation_cycle(inv_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "CYCLE_STEP_ERROR",
+                                            "message": res.error.message if res.error else "Failed to step cycle"}}
+
+    def propose_hypothesis(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        if not inv_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        hypo_data = params.get("hypothesis_data") or params.get("hypothesis") or params
+        res = self.runtime.propose_hypothesis(inv_id, hypo_data)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "PROPOSAL_ERROR",
+                                            "message": res.error.message if res.error else "Failed to propose hypothesis"}}
+
+    def save_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        if not inv_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        res = self.runtime.save_investigation_session(inv_id, file_path=params.get("file_path"))
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "SAVE_ERROR",
+                                            "message": res.error.message if res.error else "Failed to save session"}}
+
+    def load_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        data_or_path = params.get("file_path") or params.get("session_data") or params
+        res = self.runtime.load_investigation_session(data_or_path)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "LOAD_ERROR",
+                                            "message": res.error.message if res.error else "Failed to load session"}}
+
+
+WebRuntimeAdapter = WebApiAdapter
 
 
 class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -1772,6 +1849,19 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 ))
                 return
 
+            # GET /api/investigation/timeline
+            if path == "/api/investigation/timeline":
+                self._send_json(adapter.get_investigation_timeline(q_param("investigation_id")))
+                return
+
+            # GET /api/investigation/drilldown
+            if path == "/api/investigation/drilldown":
+                self._send_json(adapter.get_finding_drilldown(
+                    q_param("investigation_id"),
+                    q_param("finding_id")
+                ))
+                return
+
             # GET /api/investigations
             if path == "/api/investigations":
                 self._send_json(adapter.list_investigations())
@@ -1869,6 +1959,26 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
             if path == "/api/investigation/observe":
                 self._send_json(adapter.execute_observation(body))
+                return
+
+            if path in ("/api/investigation/cycle", "/api/investigation/run-cycle"):
+                self._send_json(adapter.run_investigation_cycle(body))
+                return
+
+            if path in ("/api/investigation/step", "/api/investigation/step-cycle"):
+                self._send_json(adapter.step_investigation_cycle(body))
+                return
+
+            if path in ("/api/investigation/hypotheses/propose", "/api/investigation/propose-hypothesis", "/api/investigation/propose"):
+                self._send_json(adapter.propose_hypothesis(body))
+                return
+
+            if path == "/api/investigation/save":
+                self._send_json(adapter.save_investigation(body))
+                return
+
+            if path == "/api/investigation/load":
+                self._send_json(adapter.load_investigation(body))
                 return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},

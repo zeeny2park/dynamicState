@@ -54,6 +54,8 @@
     // TAB 0: Investigation Overview
     invInputGoal: document.getElementById('inv-input-goal'),
     btnRunInvestigation: document.getElementById('btn-run-investigation'),
+    btnRunInvestigationCycle: document.getElementById('btn-run-investigation-cycle'),
+    btnStepInvestigationCycle: document.getElementById('btn-step-investigation-cycle'),
     btnRefreshInvestigation: document.getElementById('btn-refresh-investigation'),
     invSelectSnapshot: document.getElementById('inv-select-snapshot'),
     invInputDebugImage: document.getElementById('inv-input-debug-image'),
@@ -83,7 +85,12 @@
     btnModalCompare: document.getElementById('btn-modal-compare'),
     invStepsContainer: document.getElementById('inv-steps-container'),
     invStepsCount: document.getElementById('inv-steps-count'),
+    invTimelineContainer: document.getElementById('inv-timeline-container'),
+    invTimelineCount: document.getElementById('inv-timeline-count'),
     invFindingsList: document.getElementById('inv-findings-list'),
+    invCardDrilldown: document.getElementById('inv-card-drilldown'),
+    invDrilldownContent: document.getElementById('inv-drilldown-content'),
+    btnCloseDrilldown: document.getElementById('btn-close-drilldown'),
     invBadgeStaticProvider: document.getElementById('inv-badge-static-provider'),
     invStaticLinksList: document.getElementById('inv-static-links-list'),
     tbodyRawEvidence: document.getElementById('tbody-raw-evidence'),
@@ -4657,8 +4664,19 @@
     if (el.btnRunInvestigation) {
       el.btnRunInvestigation.addEventListener('click', runInvestigation);
     }
+    if (el.btnRunInvestigationCycle) {
+      el.btnRunInvestigationCycle.addEventListener('click', runInvestigationCycle);
+    }
+    if (el.btnStepInvestigationCycle) {
+      el.btnStepInvestigationCycle.addEventListener('click', stepInvestigationCycle);
+    }
     if (el.btnRefreshInvestigation) {
       el.btnRefreshInvestigation.addEventListener('click', loadActiveInvestigation);
+    }
+    if (el.btnCloseDrilldown && el.invCardDrilldown) {
+      el.btnCloseDrilldown.addEventListener('click', () => {
+        el.invCardDrilldown.style.display = 'none';
+      });
     }
 
     // Launchpad Entry Switcher (Offline Snapshot vs Live Process)
@@ -5281,6 +5299,9 @@
     // 7. Render Raw Evidence
     const ledger = inv.evidence_ledger || {};
     renderRawEvidence(ledger);
+
+    // 8. Render Audit Timeline
+    renderTimeline(inv.timeline || []);
   }
 
   function renderFindings() {
@@ -5508,6 +5529,7 @@
               <span class="text-xs text-muted">Hypothesis ID: <strong>${escapeHtml(hypo?.hypothesis_id || f.finding_id || '')}</strong></span>
               <div style="display: flex; gap: 6px;">
                 ${evalBtn}
+                ${f.finding_id ? `<button type="button" class="btn btn-xs btn-outline" onclick="window.__showFindingDrilldown('${escapeHtml(f.finding_id)}')">🔬 Drill-Down</button>` : ''}
                 ${jumpHtml}
               </div>
             </div>
@@ -5525,7 +5547,10 @@
           <div class="finding-desc">${escapeHtml(f.description || '')}</div>
           <div class="finding-footer">
             <span class="text-xs text-muted">Status: <strong>${escapeHtml(f.status || 'CONFIRMED')}</strong></span>
-            ${jumpHtml}
+            <div style="display: flex; gap: 6px;">
+              ${f.finding_id ? `<button type="button" class="btn btn-xs btn-outline" onclick="window.__showFindingDrilldown('${escapeHtml(f.finding_id)}')">🔬 Drill-Down</button>` : ''}
+              ${jumpHtml}
+            </div>
           </div>
         </div>
       `;
@@ -5812,6 +5837,153 @@
       showToast(`Observation error: ${String(e)}`, 'error');
     }
   };
+
+  function renderTimeline(timeline) {
+    if (!el.invTimelineContainer) return;
+    const countEl = el.invTimelineCount;
+    if (!timeline || timeline.length === 0) {
+      if (countEl) countEl.textContent = '0 events';
+      el.invTimelineContainer.innerHTML = '<div class="empty-state text-xs p-3">Timeline empty. Start an investigation cycle to view audit trail.</div>';
+      return;
+    }
+    if (countEl) countEl.textContent = `${timeline.length} events`;
+    el.invTimelineContainer.innerHTML = timeline.map(evt => {
+      const type = evt.event_type || 'EVENT';
+      let badgeClass = 'badge-neutral';
+      if (type.includes('SUPPORTED') || type.includes('VALIDATED')) badgeClass = 'badge-success';
+      else if (type.includes('CONTRADICTED') || type.includes('FAILED')) badgeClass = 'badge-danger';
+      else if (type.includes('INCONCLUSIVE')) badgeClass = 'badge-warning';
+      else if (type.includes('OBSERVATION')) badgeClass = 'badge-info';
+
+      const ts = evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString() : '';
+      const summary = evt.summary || JSON.stringify(evt.details || {});
+      return `
+        <div style="padding: 6px 8px; border-bottom: 1px solid var(--border-color); font-size: 0.75rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
+            <span class="badge ${badgeClass}" style="font-size: 0.7rem;">${escapeHtml(type)}</span>
+            <span class="text-muted mono">${escapeHtml(ts)}</span>
+          </div>
+          <div>${escapeHtml(summary)}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  async function loadDrilldown(findingId) {
+    if (!state.activeInvestigation || !state.activeInvestigation.investigation_id) return;
+    const invId = state.activeInvestigation.investigation_id;
+    try {
+      const res = await apiGet(`/api/investigation/drilldown?investigation_id=${encodeURIComponent(invId)}&finding_id=${encodeURIComponent(findingId)}`);
+      if (!res.success) {
+        showToast(res.error?.message || 'Failed to load drilldown', 'error');
+        return;
+      }
+      renderDrilldown(res.data?.drilldown || res.data);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  function renderDrilldown(drill) {
+    if (!el.invCardDrilldown || !el.invDrilldownContent) return;
+    el.invCardDrilldown.style.display = 'block';
+    if (!drill) {
+      el.invDrilldownContent.innerHTML = '<div class="empty-state text-xs p-2">No drilldown data available.</div>';
+      return;
+    }
+    const finding = drill.finding || {};
+    const obj = drill.target_object || {};
+    const dwarf = drill.dwarf_symbol || {};
+    const candidates = drill.candidate_functions || [];
+    const attrRecords = drill.attribution_records || [];
+    const limitations = drill.limitations || [];
+
+    el.invDrilldownContent.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
+          <strong>Finding:</strong> <span class="mono">${escapeHtml(finding.finding_id || '')}</span> - ${escapeHtml(finding.title || '')}
+          <div class="text-muted" style="margin-top: 2px;">Path: <span class="mono">${escapeHtml(finding.c_type_path || finding.field_path || 'N/A')}</span> | Class: <span class="badge badge-info text-xs">${escapeHtml(finding.classification || 'FACT')}</span></div>
+        </div>
+        <div style="background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
+          <strong>Target Object & DWARF:</strong>
+          <div>Type: <span class="mono">${escapeHtml(obj.type || dwarf.type_name || 'N/A')}</span></div>
+          <div>Decl: <span class="mono">${escapeHtml(dwarf.decl_file || 'unknown')}:${escapeHtml(String(dwarf.decl_line || 0))}</span></div>
+        </div>
+        <div style="background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
+          <strong>Candidate Functions (${candidates.length}):</strong>
+          ${candidates.length > 0 ? candidates.map(c => `
+            <div style="margin-top: 4px; padding-left: 6px; border-left: 2px solid var(--accent);">
+              <span class="mono font-semibold" style="color: var(--accent);">${escapeHtml(c.function_name || c.name || '')}</span>
+              <span class="badge badge-neutral text-xs">${escapeHtml(c.candidate_tier || 'STATIC_CANDIDATE')}</span>
+              <div class="text-muted text-xs">Source: ${escapeHtml(c.source_file || 'unknown')}:${escapeHtml(String(c.source_line || 0))}</div>
+            </div>
+          `).join('') : '<div class="text-muted">No candidate functions linked via DWARF/static analysis.</div>'}
+        </div>
+        ${attrRecords.length > 0 ? `
+          <div style="background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
+            <strong>Attribution Verification Records:</strong>
+            ${attrRecords.map(r => `<div>&bull; <span class="mono">${escapeHtml(r.evidence_id || '')}</span>: ${escapeHtml(r.summary || '')}</div>`).join('')}
+          </div>
+        ` : ''}
+        ${limitations.length > 0 ? `
+          <div class="text-muted" style="font-size: 0.75rem; border-top: 1px dashed var(--border-color); padding-top: 4px;">
+            ⚠️ Limitations: ${escapeHtml(limitations.join('; '))}
+          </div>
+        ` : ''}
+      </div>
+    `;
+    el.invCardDrilldown.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  async function runInvestigationCycle() {
+    if (!state.activeInvestigation || !state.activeInvestigation.investigation_id) {
+      showToast('Please start an investigation first.', 'warning');
+      return;
+    }
+    const invId = state.activeInvestigation.investigation_id;
+    try {
+      showToast('Running autonomous investigation cycle...', 'info');
+      const res = await apiPost('/api/investigation/cycle', {
+        investigation_id: invId,
+        max_iterations: 5,
+        max_observations: 10
+      });
+      if (!res.success) {
+        showToast(res.error?.message || 'Cycle failed', 'error');
+        return;
+      }
+      showToast('Investigation cycle completed.', 'success');
+      if (res.data?.session) {
+        state.activeInvestigation = res.data.session;
+        renderInvestigationSession(state.activeInvestigation);
+      } else {
+        await loadActiveInvestigation(invId);
+      }
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  async function stepInvestigationCycle() {
+    if (!state.activeInvestigation || !state.activeInvestigation.investigation_id) {
+      showToast('Please start an investigation first.', 'warning');
+      return;
+    }
+    const invId = state.activeInvestigation.investigation_id;
+    try {
+      const res = await apiPost('/api/investigation/step', { investigation_id: invId });
+      if (!res.success) {
+        showToast(res.error?.message || 'Step failed', 'error');
+        return;
+      }
+      showToast('Executed cycle step.', 'success');
+      await loadActiveInvestigation(invId);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  window.__showFindingDrilldown = loadDrilldown;
 
   // --------------------------------------------------------------------------
   // Application Bootstrap

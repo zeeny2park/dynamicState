@@ -127,6 +127,12 @@ class AgentAction(_SubscriptableModel):
     result_data: Optional[Dict[str, Any]] = None
     deterministic_transition_verified: bool = False
     proof_evidence_id: Optional[str] = None
+    hypothesis_data: Optional[Dict[str, Any]] = None
+    max_iterations: int = 5
+    max_observations: int = 10
+    stop_on_contradiction: bool = False
+    file_path: Optional[str] = None
+    session_data: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -171,6 +177,12 @@ class AgentAction(_SubscriptableModel):
             result_data=data.get("result_data"),
             deterministic_transition_verified=bool(data.get("deterministic_transition_verified", False)),
             proof_evidence_id=data.get("proof_evidence_id"),
+            hypothesis_data=data.get("hypothesis_data") or data.get("hypothesis"),
+            max_iterations=int(data.get("max_iterations", 5)),
+            max_observations=int(data.get("max_observations", 10)),
+            stop_on_contradiction=bool(data.get("stop_on_contradiction", False)),
+            file_path=data.get("file_path"),
+            session_data=data.get("session_data"),
         )
 
 

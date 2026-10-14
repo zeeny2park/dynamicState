@@ -282,3 +282,57 @@ Verified in `TestPhase11CaptureLifecycleAndPerformance` and `benchmarks.capture_
 | **INTEGRATION TESTED** | 80+ tests (`test_investigation_hypothesis.py`, `test_multithread_exploration.py`, `test_web_api.py`, `test_ci_workflow_parity.py`) | Subprocess & HTTP | Multi-step hypothesis evaluation, ARP disarming, Web UI lifecycle, CI workflow parity | Automated in CI step 9, 10, 11, 12 |
 | **REAL TARGET VALIDATED** | 58+ tests (`test_real_runtime_validation.py`, `test_cpp_e2e_investigation.py`, `test_phase10_ci_security_gates.py`, `test_phase11_real_target_release_readiness.py`) | Real Linux C++ PIE (ELF & Stripped) | Real syscall captures (`process_vm_readv`, `procfs`), DWARF companion linkage, competing threads, live attribution | Automated in CI step 5, 8, 9 |
 | **CI VERIFIED** | 19 Steps in `run_all_tests.sh`, 594 Total Discovery Tests | Complete Repository | End-to-end regression and benchmark smoke test under fail-closed execution | `run_all_tests.sh` exit code 0 |
+
+---
+
+## Phase 12: Evidence-Driven Root Cause Investigation & Conversational Validation
+
+### Architecture & Conversational Investigation Loop
+
+Phase 12 turns the evidence authenticity and causal-validation system into an interactive, conversational root-cause investigation loop for real C/C++ runtime defects:
+
+```text
+Observed Finding (Memory / DWARF / Diff)
+       │
+       ▼
+Candidate Explanations (Grounded Hypotheses with Mechanism, Assumptions, Unknowns)
+       │
+       ▼
+Discriminating Observation (Follow-up inspection distinguishing competing causes)
+       │
+       ▼
+Validation Attempt (TrustedCausalVerifier / Single-Writer / Trace)
+       │
+       ▼
+Evaluation Outcome (SUPPORTED, CONTRADICTED, or INCONCLUSIVE)
+       │
+       ▼
+Next Best Action (Bounded iteration, safety-checked, fail-closed)
+```
+
+### Core Security & Trust Boundaries Enforced in Phase 12
+
+1. **Static Function Candidate & LLM Non-Promotion Invariant**:
+   - DWARF declarations, struct layout references, symbol names, call graphs, ranking scores, or LLM explanations are strictly classified as `STATIC_CANDIDATE`.
+   - Never promoted to `VALIDATED_CAUSAL_FUNCTION` without independent, authentic runtime evidence (e.g. single-writer isolation or instruction trace).
+   - Any external or LLM-proffered hypothesis claiming `VALIDATED` is automatically disarmed to `STATIC_CANDIDATE` and sanitized (`sanitize_and_disarm_llm_hypothesis`).
+2. **Deterministic Hypothesis Generator & Pluggable Engine**:
+   - Zero external LLM dependency required for core deterministic investigation.
+   - `DeterministicHypothesisGenerator` generates structured hypotheses from memory diffs, scalar boundaries, thread context, and DWARF candidates.
+   - When 2+ functions reference the same field, competing hypotheses are generated with discriminating questions and expected outcomes (`SUPPORTED`, `CONTRADICTED`, `INCONCLUSIVE`).
+3. **Observation Planning & Discriminating Power**:
+   - `FollowUpObservation` specifies `question`, `target_identifier`, `target_kind`, `discriminating_criteria`, `expected_outcomes`, `safety_constraints`, `risk_level`, `estimated_cost`.
+   - Prioritizes offline snapshot analysis before requesting live target interaction.
+   - Live target interactions enforce strict safety authorization policy (`target_authorized=False` blocks execution without silent mutation).
+4. **Degraded Capture Quality Capping**:
+   - Captures with `NON_ATOMIC` consistency or `PARTIAL` completeness cap hypothesis confidence at `LOW`/`SPECULATIVE`.
+   - Blocks causal proof promotion and emits an honest `causal_limitation_notice`.
+5. **Auditable Chronological Timeline**:
+   - Every significant lifecycle event is appended to `session.timeline`:
+     - `INVESTIGATION_STARTED`, `HYPOTHESIS_PROPOSED`, `OBSERVATION_PLANNED`, `OBSERVATION_EXECUTED`, `HYPOTHESIS_STATUS_UPDATED`, `OBSERVATION_BLOCKED`.
+   - Sequential, tamper-evident log queryable via ARP (`GET_INVESTIGATION_TIMELINE`) and REST API (`/api/investigation/timeline`).
+6. **Finding Semantic Drill-Down Inspector**:
+   - Exposes full hierarchical path (`c_type_path`), DWARF declaration location, target Build ID, before/after values, candidate functions with explicit limitations, and matching attribution evidence records.
+7. **Tamper-Resistant Session Persistence**:
+   - `save_session` and `load_session` serialize session and ledger state.
+   - On load, hypotheses are revalidated against the ledger; any injected evidence IDs or forged statuses from file tampering are completely disarmed.

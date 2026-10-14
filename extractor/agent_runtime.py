@@ -249,6 +249,41 @@ class AgentRuntime:
                 if not action.investigation_id or not action.observation_id:
                     return self._error("INVALID_FIELD", "investigation_id and observation_id are required", act, t0)
                 return self.execute_observation(action.investigation_id, action.observation_id, result_data=action.result_data)
+            elif act == "GET_INVESTIGATION_TIMELINE":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.get_investigation_timeline(action.investigation_id)
+            elif act == "GET_FINDING_DRILLDOWN":
+                if not action.investigation_id or not action.finding_id:
+                    return self._error("INVALID_FIELD", "investigation_id and finding_id are required", act, t0)
+                return self.get_finding_drilldown(action.investigation_id, action.finding_id)
+            elif act == "RUN_INVESTIGATION_CYCLE":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.run_investigation_cycle(
+                    action.investigation_id,
+                    max_iterations=action.max_iterations,
+                    max_observations=action.max_observations,
+                    stop_on_contradiction=action.stop_on_contradiction,
+                )
+            elif act == "STEP_INVESTIGATION_CYCLE":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.step_investigation_cycle(action.investigation_id)
+            elif act == "PROPOSE_HYPOTHESIS":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                hypo_data = action.hypothesis_data or action.candidate or {}
+                return self.propose_hypothesis(action.investigation_id, hypo_data)
+            elif act == "SAVE_INVESTIGATION_SESSION":
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                return self.save_investigation_session(action.investigation_id, action.file_path)
+            elif act == "LOAD_INVESTIGATION_SESSION":
+                data_or_path = action.session_data or action.file_path
+                if not data_or_path:
+                    return self._error("INVALID_FIELD", "file_path or session_data is required", act, t0)
+                return self.load_investigation_session(data_or_path)
             else:
                 return self._error("CAPABILITY_UNSUPPORTED", f"Action '{act}' is not supported by ARP", act, t0)
         except Exception as exc:
@@ -1835,6 +1870,108 @@ class AgentRuntime:
         return AgentActionResult(
             success=True,
             action="EXECUTE_OBSERVATION",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def get_investigation_timeline(self, investigation_id: str) -> AgentActionResult:
+        """Retrieve the chronological audit timeline for an investigation session."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.get_investigation_timeline(investigation_id)
+        if not res.get("success", False):
+            return self._error("INVESTIGATION_NOT_FOUND", res.get("error", "Failed to retrieve timeline"), "GET_INVESTIGATION_TIMELINE", t0)
+        return AgentActionResult(
+            success=True,
+            action="GET_INVESTIGATION_TIMELINE",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def get_finding_drilldown(self, investigation_id: str, finding_id: str) -> AgentActionResult:
+        """Resolve full semantic drill-down path from finding to causal attribution."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.get_finding_drilldown(investigation_id, finding_id)
+        if not res.get("success", False):
+            return self._error("FINDING_NOT_FOUND", res.get("error", "Failed to resolve finding drilldown"), "GET_FINDING_DRILLDOWN", t0)
+        return AgentActionResult(
+            success=True,
+            action="GET_FINDING_DRILLDOWN",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def run_investigation_cycle(
+        self,
+        investigation_id: str,
+        max_iterations: int = 5,
+        max_observations: int = 10,
+        stop_on_contradiction: bool = False,
+    ) -> AgentActionResult:
+        """Run an autonomous or bounded iterative investigation cycle."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.run_investigation_cycle(
+            investigation_id,
+            max_iterations=max_iterations,
+            max_observations=max_observations,
+            stop_on_contradiction=stop_on_contradiction,
+        )
+        if not res.get("success", False):
+            return self._error("CYCLE_ERROR", res.get("error", "Investigation cycle failed"), "RUN_INVESTIGATION_CYCLE", t0)
+        return AgentActionResult(
+            success=True,
+            action="RUN_INVESTIGATION_CYCLE",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def step_investigation_cycle(self, investigation_id: str) -> AgentActionResult:
+        """Execute a single step/observation in the investigation cycle."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.step_investigation_cycle(investigation_id)
+        if not res.get("success", False):
+            return self._error("CYCLE_STEP_ERROR", res.get("error", "Failed to step cycle"), "STEP_INVESTIGATION_CYCLE", t0)
+        return AgentActionResult(
+            success=True,
+            action="STEP_INVESTIGATION_CYCLE",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def propose_hypothesis(self, investigation_id: str, hypothesis_data: Dict[str, Any]) -> AgentActionResult:
+        """Propose and validate a new hypothesis (deterministic or LLM-generated)."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.propose_hypothesis(investigation_id, hypothesis_data)
+        if not res.get("success", False):
+            return self._error("PROPOSAL_ERROR", res.get("error", "Failed to propose hypothesis"), "PROPOSE_HYPOTHESIS", t0)
+        return AgentActionResult(
+            success=True,
+            action="PROPOSE_HYPOTHESIS",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def save_investigation_session(self, investigation_id: str, file_path: Optional[str] = None) -> AgentActionResult:
+        """Save investigation session to disk."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.save_session(investigation_id, file_path=file_path)
+        if not res.get("success", False):
+            return self._error("SAVE_ERROR", res.get("error", "Failed to save session"), "SAVE_INVESTIGATION_SESSION", t0)
+        return AgentActionResult(
+            success=True,
+            action="SAVE_INVESTIGATION_SESSION",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def load_investigation_session(self, file_path_or_data: Union[str, Dict[str, Any]]) -> AgentActionResult:
+        """Load and verify an investigation session from disk or dictionary."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.load_session(file_path_or_data)
+        if not res.get("success", False):
+            return self._error("LOAD_ERROR", res.get("error", "Failed to load session"), "LOAD_INVESTIGATION_SESSION", t0)
+        return AgentActionResult(
+            success=True,
+            action="LOAD_INVESTIGATION_SESSION",
             data=res,
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
         )

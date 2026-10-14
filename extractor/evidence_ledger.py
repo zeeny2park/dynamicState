@@ -503,6 +503,14 @@ class EvidenceRecord:
         if self.evidence_id in self.parent_evidence_ids:
             raise ValueError(f"Self-reference detected: record cannot have its own evidence_id '{self.evidence_id}' as a parent")
 
+    @property
+    def summary(self) -> str:
+        return self.observation
+
+    @summary.setter
+    def summary(self, val: str) -> None:
+        self.observation = val
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary without None values for optional fields."""
         prov_copy = dict(self.provenance) if self.provenance else {}
@@ -590,6 +598,11 @@ class EvidenceRecord:
             if field_name in data and data[field_name] is not None and not isinstance(data[field_name], dict):
                 raise TypeError(f"Field '{field_name}' must be a dictionary when provided, got {type(data[field_name]).__name__}")
 
+        obs_val = data.get("observation") or data.get("summary") or ""
+        details_val = dict(data.get("details", {}))
+        if "contradicts_hypothesis_id" in data and "contradicts_hypothesis_id" not in details_val:
+            details_val["contradicts_hypothesis_id"] = data["contradicts_hypothesis_id"]
+
         return cls(
             evidence_id=eid,
             evidence_type=etype,
@@ -598,7 +611,7 @@ class EvidenceRecord:
             timestamp=data.get("timestamp", ""),
             session_id=data.get("session_id"),
             finding_id=data.get("finding_id"),
-            observation=data.get("observation", ""),
+            observation=obs_val,
             parent_evidence_ids=list(parent_ids or []),
             provenance=data.get("provenance", {}),
             target_identity=data.get("target_identity"),
@@ -609,7 +622,7 @@ class EvidenceRecord:
             static_code_link=data.get("static_code_link"),
             comparison_observation=data.get("comparison_observation"),
             uncertainty=data.get("uncertainty"),
-            details=data.get("details", {}),
+            details=details_val,
             schema_version=data.get("schema_version", EVIDENCE_SCHEMA_VERSION),
         )
 
@@ -633,6 +646,10 @@ class EvidenceLedger:
         self._by_id: Dict[str, EvidenceRecord] = {}
         self._by_type: Dict[str, List[EvidenceRecord]] = {}
         self._by_finding: Dict[str, List[EvidenceRecord]] = {}
+
+    @property
+    def capability_key(self) -> str:
+        return self._capability_key
 
     def issue_verification_capability(
         self,
@@ -835,6 +852,38 @@ class EvidenceLedger:
         if record.finding_id:
             self._by_finding.setdefault(record.finding_id, []).append(record)
         return record
+
+    def record(
+        self,
+        evidence_type: str = EVIDENCE_TYPE_OBJECT_STATE,
+        nature: str = NATURE_OBSERVATION,
+        source: str = "runtime_collector",
+        observation: str = "",
+        details: Optional[Dict[str, Any]] = None,
+        summary: Optional[str] = None,
+        capture_quality: Optional[Dict[str, Any]] = None,
+        finding_id: Optional[str] = None,
+        parent_evidence_ids: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> EvidenceRecord:
+        """Convenience method to construct, validate, and add an evidence record to the ledger."""
+        obs_text = observation or summary or ""
+        rec = EvidenceRecord(
+            evidence_id=f"ev_{uuid.uuid4().hex[:10]}",
+            evidence_type=evidence_type,
+            nature=nature,
+            source=source,
+            session_id=session_id or self.session_id,
+            finding_id=finding_id,
+            observation=obs_text,
+            details=details or {},
+            capture_quality=capture_quality or {"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            parent_evidence_ids=parent_evidence_ids or [],
+            provenance=provenance or {},
+        )
+        self.add_record(rec)
+        return rec
 
     def validate_record(self, record: EvidenceRecord) -> None:
         """Validate record structure, types, and consistency."""

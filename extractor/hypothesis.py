@@ -48,6 +48,34 @@ from .evidence_ledger import (
 # Canonical Status and Classification Constants
 # -----------------------------------------------------------------------------
 
+# Evidence and Finding classifications
+EVIDENCE_CLASSIFICATION_FACT = "OBSERVED_FACT"
+EVIDENCE_CLASSIFICATION_INFERENCE = "INFERENCE"
+EVIDENCE_CLASSIFICATION_UNKNOWN = "UNKNOWN"
+EVIDENCE_CLASSIFICATION_PROPOSED_ACTION = "PROPOSED_ACTION"
+
+VALID_EVIDENCE_CLASSIFICATIONS = {
+    EVIDENCE_CLASSIFICATION_FACT,
+    EVIDENCE_CLASSIFICATION_INFERENCE,
+    EVIDENCE_CLASSIFICATION_UNKNOWN,
+    EVIDENCE_CLASSIFICATION_PROPOSED_ACTION,
+}
+
+# Follow-up observation lifecycle states
+OBSERVATION_STATUS_PROPOSED = "proposed"
+OBSERVATION_STATUS_EXECUTED = "executed"
+OBSERVATION_STATUS_FAILED = "failed"
+OBSERVATION_STATUS_VERIFIED = "verified"
+OBSERVATION_STATUS_CANCELED = "canceled"
+
+VALID_OBSERVATION_STATUSES = {
+    OBSERVATION_STATUS_PROPOSED,
+    OBSERVATION_STATUS_EXECUTED,
+    OBSERVATION_STATUS_FAILED,
+    OBSERVATION_STATUS_VERIFIED,
+    OBSERVATION_STATUS_CANCELED,
+}
+
 # Hypothesis validation statuses
 HYPOTHESIS_STATUS_PROPOSED = "PROPOSED"
 HYPOTHESIS_STATUS_SUPPORTED = "SUPPORTED"
@@ -65,6 +93,7 @@ VALID_HYPOTHESIS_STATUSES = {
 
 # Confidence classifications with documented semantics
 CONFIDENCE_HIGH = "HIGH"          # Independent multi-source complete/atomic observations, 0 contradictions
+CONFIDENCE_VERY_HIGH = "HIGH"     # Alias for maximum confidence
 CONFIDENCE_MEDIUM = "MEDIUM"      # Grounded in at least one solid observation, but unverified aspects remain
 CONFIDENCE_LOW = "LOW"            # Based on partial/non-atomic capture or single uncorroborated observation
 CONFIDENCE_SPECULATIVE = "SPECULATIVE"  # Inferred purely from static relationships without direct runtime proof
@@ -117,18 +146,26 @@ VALID_TARGET_KINDS = {
 class FollowUpObservation:
     """Actionable, read-only planned observation designed to test or discriminate a hypothesis."""
     observation_id: str
-    hypothesis_id: str
-    question: str
-    target_kind: str  # FIELD, OBJECT, THREAD, SNAPSHOT, COMPARISON, SOURCE
-    target_ref: Dict[str, Any]
-    discriminating_criteria: str
-    expected_outcomes: Dict[str, str]  # outcome condition description -> resulting status (e.g. {"matches_baseline": "CONTRADICTED"})
+    hypothesis_id: str = ""
+    question: str = ""
+    target_kind: str = TARGET_KIND_FIELD  # FIELD, OBJECT, THREAD, SNAPSHOT, COMPARISON, SOURCE, MUTATION
+    target_ref: Dict[str, Any] = field(default_factory=dict)
+    discriminating_criteria: str = ""
+    expected_outcomes: Dict[str, str] = field(default_factory=dict)  # outcome condition description -> resulting status
     discriminating_power: str = "HIGH"  # HIGH, MEDIUM, LOW
     required_capture_quality: str = "COMPLETE"  # COMPLETE, ANY
     safety_constraints: List[str] = field(default_factory=list)
     is_suggestion: bool = True
     executed: bool = False
     result_evidence_id: Optional[str] = None
+    status: str = OBSERVATION_STATUS_PROPOSED  # proposed, executed, failed, verified, canceled
+    prerequisites: List[str] = field(default_factory=list)
+    risk_level: str = "READ_ONLY"  # READ_ONLY, CAUTION, MUTATION
+    estimated_cost: str = "LOW"  # LOW, MEDIUM, HIGH
+    success_criteria: Optional[str] = None
+    failure_criteria: Optional[str] = None
+    execution_error: Optional[str] = None
+    target_identifier: Optional[str] = None
     created_at: str = ""
 
     def __post_init__(self):
@@ -136,14 +173,24 @@ class FollowUpObservation:
             self.observation_id = f"obs_plan_{uuid.uuid4().hex[:8]}"
         if not self.created_at:
             self.created_at = datetime.now(timezone.utc).isoformat()
+        if self.target_identifier and not self.target_ref:
+            self.target_ref = {"identifier": self.target_identifier}
         if self.target_kind not in VALID_TARGET_KINDS:
             raise ValueError(f"Invalid target_kind '{self.target_kind}'. Expected one of {sorted(VALID_TARGET_KINDS)}")
+        if self.status not in VALID_OBSERVATION_STATUSES:
+            self.status = OBSERVATION_STATUS_EXECUTED if self.executed else OBSERVATION_STATUS_PROPOSED
+        if self.executed and self.status == OBSERVATION_STATUS_PROPOSED:
+            self.status = OBSERVATION_STATUS_EXECUTED
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FollowUpObservation":
+        is_exec = bool(data.get("executed", False))
+        st = data.get("status")
+        if not st:
+            st = OBSERVATION_STATUS_EXECUTED if is_exec else OBSERVATION_STATUS_PROPOSED
         return cls(
             observation_id=data.get("observation_id", f"obs_plan_{uuid.uuid4().hex[:8]}"),
             hypothesis_id=data.get("hypothesis_id", ""),
@@ -156,8 +203,16 @@ class FollowUpObservation:
             required_capture_quality=data.get("required_capture_quality", "COMPLETE"),
             safety_constraints=list(data.get("safety_constraints", [])),
             is_suggestion=data.get("is_suggestion", True),
-            executed=data.get("executed", False),
+            executed=is_exec,
             result_evidence_id=data.get("result_evidence_id"),
+            status=st,
+            prerequisites=list(data.get("prerequisites", [])),
+            risk_level=data.get("risk_level", "READ_ONLY"),
+            estimated_cost=data.get("estimated_cost", "LOW"),
+            success_criteria=data.get("success_criteria"),
+            failure_criteria=data.get("failure_criteria"),
+            execution_error=data.get("execution_error"),
+            target_identifier=data.get("target_identifier"),
             created_at=data.get("created_at", datetime.now(timezone.utc).isoformat()),
         )
 
@@ -170,10 +225,10 @@ class FollowUpObservation:
 class InvestigationHypothesis:
     """A structured, evidence-grounded root-cause hypothesis with auditable validation history."""
     hypothesis_id: str
-    investigation_id: str
-    title: str
-    claim: str
-    proposed_mechanism: str
+    investigation_id: str = ""
+    title: str = ""
+    claim: str = ""
+    proposed_mechanism: str = ""
     supporting_evidence_ids: List[str] = field(default_factory=list)
     contradicting_evidence_ids: List[str] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
@@ -190,13 +245,47 @@ class InvestigationHypothesis:
     status_history: List[Dict[str, Any]] = field(default_factory=list)
     parent_hypothesis_ids: List[str] = field(default_factory=list)
     parent_evidence_ids: List[str] = field(default_factory=list)
+    classification: str = EVIDENCE_CLASSIFICATION_INFERENCE
+    uncertainty: Optional[str] = None
+    discriminating_evidence_needed: List[str] = field(default_factory=list)
+    target_kind: Optional[str] = None
+    target_identifier: Optional[str] = None
+    competing_hypothesis_ids: List[str] = field(default_factory=list)
+    status: Optional[str] = None
     created_at: str = ""
     updated_at: str = ""
     provenance: Dict[str, Any] = field(default_factory=dict)
 
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name == "validation_status" and value is not None and getattr(self, "status", None) != value:
+            super().__setattr__("status", value)
+        elif name == "status" and value is not None and getattr(self, "validation_status", None) != value:
+            super().__setattr__("validation_status", value)
+
+    @property
+    def target_object_id(self) -> Optional[str]:
+        if self.candidate_objects:
+            return self.candidate_objects[0]
+        if self.target_identifier and not "." in self.target_identifier:
+            return self.target_identifier
+        return None
+
+    @property
+    def target_field_path(self) -> Optional[str]:
+        if self.candidate_fields:
+            return self.candidate_fields[0]
+        if self.target_identifier and "." in self.target_identifier:
+            return self.target_identifier
+        return None
+
     def __post_init__(self):
         if not self.hypothesis_id:
             self.hypothesis_id = f"hypo_{uuid.uuid4().hex[:10]}"
+        if self.status:
+            self.validation_status = self.status
+        else:
+            self.status = self.validation_status
         now = datetime.now(timezone.utc).isoformat()
         if not self.created_at:
             self.created_at = now
@@ -206,6 +295,8 @@ class InvestigationHypothesis:
             raise ValueError(f"Invalid validation_status '{self.validation_status}'. Expected one of {sorted(VALID_HYPOTHESIS_STATUSES)}")
         if self.confidence not in VALID_CONFIDENCE_LEVELS:
             raise ValueError(f"Invalid confidence '{self.confidence}'. Expected one of {sorted(VALID_CONFIDENCE_LEVELS)}")
+        if self.classification not in VALID_EVIDENCE_CLASSIFICATIONS:
+            self.classification = EVIDENCE_CLASSIFICATION_INFERENCE
         if not self.status_history:
             self.status_history = [{
                 "from_status": None,
@@ -248,6 +339,12 @@ class InvestigationHypothesis:
             status_history=[dict(h) for h in data.get("status_history", [])],
             parent_hypothesis_ids=list(data.get("parent_hypothesis_ids", [])),
             parent_evidence_ids=list(data.get("parent_evidence_ids", [])),
+            classification=data.get("classification", EVIDENCE_CLASSIFICATION_INFERENCE),
+            uncertainty=data.get("uncertainty"),
+            discriminating_evidence_needed=list(data.get("discriminating_evidence_needed", [])),
+            target_kind=data.get("target_kind"),
+            target_identifier=data.get("target_identifier"),
+            competing_hypothesis_ids=list(data.get("competing_hypothesis_ids", [])),
             created_at=data.get("created_at", datetime.now(timezone.utc).isoformat()),
             updated_at=data.get("updated_at", datetime.now(timezone.utc).isoformat()),
             provenance=dict(data.get("provenance", {})),
@@ -277,6 +374,118 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
     4. DWARF static types and function candidates
     5. Capture quality and temporal consistency constraints
     """
+
+    def generate_from_findings(
+        self,
+        findings: List[Any],
+        function_candidates: Optional[List[Any]] = None,
+        investigation_id: str = "inv_from_findings",
+        capture_quality: Optional[Dict[str, Any]] = None,
+    ) -> List[InvestigationHypothesis]:
+        """Generate hypotheses directly from finding objects and optional correlated function candidates."""
+        hypos: List[InvestigationHypothesis] = []
+        cands_list = list(function_candidates or [])
+
+        norm_candidates = []
+        for c in cands_list:
+            if hasattr(c, "to_dict"):
+                cd = c.to_dict()
+            elif isinstance(c, dict):
+                cd = dict(c)
+            else:
+                cd = {"function_name": str(c)}
+            cd.setdefault("candidate_tier", FUNCTION_TIER_STATIC_CANDIDATE)
+            cd.setdefault("confirmed_root_cause", False)
+            cd.setdefault("tier_limitation", "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function.")
+            norm_candidates.append(cd)
+
+        for finding in findings:
+            obj_id = getattr(finding, "object_id", None) or getattr(finding, "target_identifier", "obj")
+            field_name = getattr(finding, "field_name", "field")
+            c_path = getattr(finding, "c_type_path", None) or f"{obj_id}.{field_name}"
+            supp_eids = list(getattr(finding, "supporting_evidence_ids", []) or getattr(finding, "evidence_ids", []))
+            finding_cands = list(getattr(finding, "function_candidates", []) or [])
+            all_cands = norm_candidates + [
+                (c.to_dict() if hasattr(c, "to_dict") else dict(c)) for c in finding_cands
+            ]
+
+            if len(all_cands) >= 2:
+                for cand in all_cands:
+                    cand_fn = cand.get("function_name", "unknown_fn")
+                    h_id = f"hypo_comp_{uuid.uuid4().hex[:8]}"
+                    other_fns = [c.get("function_name") for c in all_cands if c.get("function_name") != cand_fn]
+                    obs = FollowUpObservation(
+                        observation_id=f"obs_disc_{uuid.uuid4().hex[:6]}",
+                        hypothesis_id=h_id,
+                        question=f"Did '{cand_fn}' execute the mutation on {c_path} instead of {other_fns}?",
+                        target_kind=TARGET_KIND_THREAD,
+                        target_ref={"field_path": c_path, "target_function": cand_fn},
+                        discriminating_criteria=f"Verify execution trace or call stack attributing write to {cand_fn}",
+                        expected_outcomes={
+                            f"{cand_fn}_executed": "SUPPORTED",
+                            "competing_function_executed": "CONTRADICTED",
+                        },
+                        discriminating_power="HIGH",
+                        safety_constraints=["Read-only trace inspection."],
+                        status=OBSERVATION_STATUS_PROPOSED,
+                    )
+                    h = InvestigationHypothesis(
+                        hypothesis_id=h_id,
+                        investigation_id=investigation_id,
+                        title=f"Mutation of {c_path} by {cand_fn}",
+                        claim=f"Function '{cand_fn}' performed the mutation on {c_path}.",
+                        proposed_mechanism=f"Execution in '{cand_fn}' wrote to {field_name}.",
+                        supporting_evidence_ids=supp_eids,
+                        candidate_objects=[obj_id] if obj_id else [],
+                        candidate_fields=[c_path],
+                        function_candidates=[cand],
+                        suggested_observations=[obs],
+                        classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+                        confidence=CONFIDENCE_MEDIUM,
+                        validation_status=HYPOTHESIS_STATUS_PROPOSED,
+                        discriminating_evidence_needed=[
+                            f"Execution trace distinguishing {cand_fn} from competing candidates {other_fns}"
+                        ],
+                    )
+                    hypos.append(h)
+            else:
+                h_id = f"hypo_fnd_{uuid.uuid4().hex[:8]}"
+                cand_fn = all_cands[0].get("function_name") if all_cands else "unknown_function"
+                mech = (
+                    f"Execution in '{cand_fn}' modified {field_name}."
+                    if all_cands
+                    else f"Observed field modification on {c_path}."
+                )
+                obs = FollowUpObservation(
+                    observation_id=f"obs_fnd_{uuid.uuid4().hex[:6]}",
+                    hypothesis_id=h_id,
+                    question=f"Does execution in '{cand_fn}' reproduce mutation of {c_path}?",
+                    target_kind=TARGET_KIND_FIELD,
+                    target_ref={"field_path": c_path},
+                    discriminating_criteria=f"Reproduce modification under single-writer condition for {cand_fn}",
+                    status=OBSERVATION_STATUS_PROPOSED,
+                )
+                h = InvestigationHypothesis(
+                    hypothesis_id=h_id,
+                    investigation_id=investigation_id,
+                    title=f"Mutation of {c_path}",
+                    claim=f"Field {c_path} was modified by {cand_fn}.",
+                    proposed_mechanism=mech,
+                    supporting_evidence_ids=supp_eids,
+                    candidate_objects=[obj_id] if obj_id else [],
+                    candidate_fields=[c_path],
+                    function_candidates=all_cands,
+                    suggested_observations=[obs],
+                    classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+                    confidence=CONFIDENCE_MEDIUM,
+                    validation_status=HYPOTHESIS_STATUS_PROPOSED,
+                    discriminating_evidence_needed=[
+                        f"Discriminative execution trace or call stack evidence isolating {c_path}"
+                    ],
+                )
+                hypos.append(h)
+
+        return hypos
 
     def generate(self, session: Any) -> List[InvestigationHypothesis]:
         hypotheses: List[InvestigationHypothesis] = []
@@ -426,6 +635,9 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                 validation_status=val_status,
                 parent_hypothesis_ids=[],
                 parent_evidence_ids=supp_ev_ids,
+                classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+                uncertainty=conf_rationale if conf in (CONFIDENCE_LOW, CONFIDENCE_SPECULATIVE) else None,
+                discriminating_evidence_needed=[f"Discriminative execution trace or call stack evidence isolating the causal writer of {c_path}"],
                 provenance={
                     "generator": "DeterministicHypothesisGenerator",
                     "rule": "DIFF_VALUE_MUTATION",
@@ -436,6 +648,80 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                 },
             )
             hypotheses.append(h)
+
+            # Competing candidate hypotheses: when 2+ function candidates are linked via DWARF
+            if len(qualified_candidates) >= 2:
+                for cand in qualified_candidates[:3]:
+                    cand_fn = cand.get("function_name")
+                    if not cand_fn:
+                        continue
+                    comp_hypo_id = f"hypo_cand_{cand_fn}_{uuid.uuid4().hex[:6]}"
+                    comp_obs = [
+                        FollowUpObservation(
+                            observation_id=f"obs_fn_{cand_fn}_{uuid.uuid4().hex[:6]}",
+                            hypothesis_id=comp_hypo_id,
+                            question=f"Did function '{cand_fn}' execute the write instruction that mutated {c_path}?",
+                            target_kind=TARGET_KIND_THREAD,
+                            target_ref={"field_path": c_path, "target_function": cand_fn, "thread_id": df.thread_id or "all"},
+                            discriminating_criteria=f"Verify execution trace or call stack frame attributing write of {c_path} specifically to {cand_fn}.",
+                            expected_outcomes={
+                                f"{cand_fn}_executed_write": "SUPPORTED",
+                                "other_function_executed_write": "CONTRADICTED",
+                                "no_active_write_frame": "INCONCLUSIVE",
+                            },
+                            discriminating_power="HIGH",
+                            required_capture_quality="COMPLETE",
+                            safety_constraints=["Read-only trace and call stack inspection."],
+                            status=OBSERVATION_STATUS_PROPOSED,
+                            risk_level="READ_ONLY",
+                            estimated_cost="LOW",
+                            success_criteria=f"Independent evidence confirming {cand_fn} as writer of {c_path}",
+                            failure_criteria=f"Independent evidence showing competing function or idle state",
+                            is_suggestion=True,
+                            executed=False,
+                        )
+                    ]
+                    h_cand = InvestigationHypothesis(
+                        hypothesis_id=comp_hypo_id,
+                        investigation_id=inv_id,
+                        title=f"Mutation of {c_path} Attributed to {cand_fn}",
+                        claim=f"Function '{cand_fn}' is the causal writer that mutated {c_path} from {before_val} to {after_val}.",
+                        proposed_mechanism=f"Thread execution in '{cand_fn}' wrote to offset of {field_name} during the observed transition.",
+                        supporting_evidence_ids=supp_ev_ids,
+                        contradicting_evidence_ids=[],
+                        assumptions=[
+                            f"Function '{cand_fn}' has access to memory containing {c_path}.",
+                            f"Write instruction in '{cand_fn}' was executed within transition window.",
+                        ],
+                        unresolved_questions=[
+                            f"Did '{cand_fn}' execute on any thread during the transition window?",
+                            f"Was another competing function executing concurrently?",
+                        ],
+                        confidence=CONFIDENCE_MEDIUM if not (is_untrusted or is_partial or is_non_atomic) else CONFIDENCE_LOW,
+                        confidence_rationale=f"Candidate function '{cand_fn}' correlated via DWARF; requires independent execution attribution to confirm causality.",
+                        candidate_objects=[df.object_id] if df.object_id else [],
+                        candidate_fields=[field_name],
+                        source_locations=[cand.get("source_file")] if cand.get("source_file") else [],
+                        function_candidates=[cand],
+                        suggested_observations=comp_obs,
+                        validation_criteria=[
+                            f"Independent execution trace or stack frame proving '{cand_fn}' wrote to {c_path}.",
+                            f"Absence of competing writers modifying {c_path} during the window.",
+                        ],
+                        validation_status=HYPOTHESIS_STATUS_PROPOSED,
+                        parent_hypothesis_ids=[hypo_id],
+                        parent_evidence_ids=supp_ev_ids,
+                        classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+                        uncertainty=f"Attribution to '{cand_fn}' is a candidate hypothesis based on static debug symbols, not confirmed causality.",
+                        discriminating_evidence_needed=[f"Verified runtime trace or single-writer isolation proving {cand_fn}"],
+                        provenance={
+                            "generator": "DeterministicHypothesisGenerator",
+                            "rule": "COMPETING_CANDIDATE_ATTRIBUTION",
+                            "target_function": cand_fn,
+                            "field_path": c_path,
+                        },
+                    )
+                    hypotheses.append(h_cand)
 
         # ---------------------------------------------------------------------
         # 2. Field Anomaly / Logic Invariant Hypotheses
@@ -490,6 +776,9 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                         discriminating_power="MEDIUM",
                         required_capture_quality="COMPLETE",
                         safety_constraints=["Read-only comparative analysis."],
+                        status=OBSERVATION_STATUS_PROPOSED,
+                        risk_level="READ_ONLY",
+                        estimated_cost="LOW",
                         is_suggestion=True,
                         executed=False,
                     )
@@ -519,6 +808,9 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                     validation_status=val_status,
                     parent_hypothesis_ids=[],
                     parent_evidence_ids=supp_ev_ids,
+                    classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+                    uncertainty=conf_rationale if conf in (CONFIDENCE_LOW, CONFIDENCE_SPECULATIVE) else None,
+                    discriminating_evidence_needed=[f"Comparison against independent snapshot to prove or disprove invariance"],
                     provenance={
                         "generator": "DeterministicHypothesisGenerator",
                         "rule": "OBSERVED_VALUE_INVARIANT",
@@ -528,6 +820,193 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                 hypotheses.append(h)
 
         return hypotheses
+
+
+# -----------------------------------------------------------------------------
+# Pluggable LLM & External Hypothesis Sanitization
+# -----------------------------------------------------------------------------
+
+def sanitize_and_disarm_llm_hypothesis(
+    raw_data: Dict[str, Any],
+    ledger: Optional[EvidenceLedger] = None,
+) -> InvestigationHypothesis:
+    """Sanitize and disarm an externally supplied or LLM-generated hypothesis.
+
+    Security & Evidence Trust Contract:
+    1. Caller/LLM cannot claim trusted validation: validation_status is forced to PROPOSED.
+    2. Fabricated evidence IDs: any ID not existing in the ledger is stripped.
+    3. Untrusted function candidates: cannot claim VALIDATED_CAUSAL_FUNCTION or confirmed_root_cause=True;
+       downgraded to STATIC_CANDIDATE with explicit tier_limitation.
+    4. Execution traces, verifier attestation, and capability tokens in details/provenance are stripped.
+    5. Unknowns and uncertainties are explicitly recorded rather than fabricated.
+    6. Classification is forced to INFERENCE.
+    """
+    data = dict(raw_data)
+    inv_id = data.get("investigation_id", "")
+    hypo_id = data.get("hypothesis_id") or f"hypo_ext_{uuid.uuid4().hex[:8]}"
+
+    # 1. Filter supporting evidence IDs against actual ledger
+    raw_supp_ids = list(data.get("supporting_evidence_ids", []))
+    verified_supp_ids: List[str] = []
+    fabricated_ids: List[str] = []
+    if ledger:
+        for eid in raw_supp_ids:
+            if ledger.get_record(eid):
+                verified_supp_ids.append(eid)
+            else:
+                fabricated_ids.append(eid)
+    else:
+        fabricated_ids = list(raw_supp_ids)
+        verified_supp_ids = []
+
+    # 2. Filter contradicting evidence IDs
+    raw_contra_ids = list(data.get("contradicting_evidence_ids", []))
+    verified_contra_ids: List[str] = []
+    if ledger:
+        for eid in raw_contra_ids:
+            if ledger.get_record(eid):
+                verified_contra_ids.append(eid)
+    else:
+        verified_contra_ids = []
+
+    # 3. Disarm validation status & confidence
+    val_status = HYPOTHESIS_STATUS_PROPOSED
+    conf = data.get("confidence", CONFIDENCE_SPECULATIVE)
+    if conf not in VALID_CONFIDENCE_LEVELS or conf == CONFIDENCE_HIGH:
+        conf = CONFIDENCE_MEDIUM if verified_supp_ids else CONFIDENCE_SPECULATIVE
+
+    conf_rationale = data.get("confidence_rationale", "")
+    uncertainty_notes: List[str] = []
+    if fabricated_ids:
+        uncertainty_notes.append(f"Stripped {len(fabricated_ids)} ungrounded/fabricated evidence ID(s): {fabricated_ids}")
+        conf = CONFIDENCE_SPECULATIVE
+    if not verified_supp_ids:
+        val_status = HYPOTHESIS_STATUS_PROPOSED
+        uncertainty_notes.append("No verified ledger evidence supports this hypothesis; treated as unverified model inference.")
+
+    # 4. Disarm function candidates
+    raw_candidates = data.get("function_candidates", [])
+    disarmed_candidates: List[Dict[str, Any]] = []
+    for cand in raw_candidates:
+        c_copy = dict(cand)
+        c_copy["candidate_tier"] = FUNCTION_TIER_STATIC_CANDIDATE
+        c_copy["confirmed_root_cause"] = False
+        c_copy["tier_limitation"] = "Model/caller proposed candidate; unproven write causality without verified attestation."
+        c_copy.pop("verifier_attestation", None)
+        c_copy.pop("execution_provenance", None)
+        c_copy.pop("function_attribution_verified", None)
+        disarmed_candidates.append(c_copy)
+
+    # 5. Sanitize suggested observations
+    raw_obs = data.get("suggested_observations", [])
+    clean_obs: List[FollowUpObservation] = []
+    for o in raw_obs:
+        if isinstance(o, dict):
+            o_copy = dict(o)
+            o_copy["executed"] = False
+            o_copy["status"] = OBSERVATION_STATUS_PROPOSED
+            o_copy["result_evidence_id"] = None
+            o_copy.pop("verifier_attestation", None)
+            clean_obs.append(FollowUpObservation.from_dict(o_copy))
+        elif isinstance(o, FollowUpObservation):
+            o.executed = False
+            o.status = OBSERVATION_STATUS_PROPOSED
+            o.result_evidence_id = None
+            clean_obs.append(o)
+
+    # 6. Sanitize provenance
+    prov = dict(data.get("provenance", {}))
+    prov.pop("verifier_attestation", None)
+    prov.pop("token", None)
+    prov.pop("token_sig", None)
+    prov.pop("session_secret", None)
+    prov.pop("capability_key", None)
+    prov["generator"] = "sanitize_and_disarm_llm_hypothesis"
+    prov["trusted"] = False
+    prov["requires_verification"] = True
+    if fabricated_ids:
+        prov["fabricated_evidence_ids_stripped"] = fabricated_ids
+
+    combined_uncertainty = "; ".join(uncertainty_notes) if uncertainty_notes else data.get("uncertainty")
+
+    return InvestigationHypothesis(
+        hypothesis_id=hypo_id,
+        investigation_id=inv_id,
+        title=data.get("title", f"Hypothesis on {data.get('candidate_fields', ['defect'])[0] if data.get('candidate_fields') else 'defect'}"),
+        claim=data.get("claim", ""),
+        proposed_mechanism=data.get("proposed_mechanism", ""),
+        supporting_evidence_ids=verified_supp_ids,
+        contradicting_evidence_ids=verified_contra_ids,
+        assumptions=list(data.get("assumptions", [])),
+        unresolved_questions=list(data.get("unresolved_questions", [])),
+        confidence=conf,
+        confidence_rationale=conf_rationale or ("Inferred from external/LLM model input." if not verified_supp_ids else "Grounded in ledger evidence."),
+        candidate_objects=list(data.get("candidate_objects", [])),
+        candidate_fields=list(data.get("candidate_fields", [])),
+        source_locations=list(data.get("source_locations", [])),
+        function_candidates=disarmed_candidates,
+        suggested_observations=clean_obs,
+        validation_criteria=list(data.get("validation_criteria", [])),
+        validation_status=val_status,
+        classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+        uncertainty=combined_uncertainty,
+        discriminating_evidence_needed=list(data.get("discriminating_evidence_needed", [])),
+        provenance=prov,
+    )
+
+
+class OptionalLLMHypothesisAdapter(HypothesisGenerator):
+    """Optional pluggable LLM adapter that safely generates hypotheses while strictly disarming unverified claims."""
+
+    def __init__(self, provider_fn: Optional[Any] = None, model_name: str = "llm-optional"):
+        self.provider_fn = provider_fn
+        self.model_name = model_name
+        self.enabled = provider_fn is not None
+
+    def is_available(self) -> bool:
+        return self.enabled and self.provider_fn is not None
+
+    def generate(self, session: Any) -> List[InvestigationHypothesis]:
+        if not self.is_available():
+            return []
+        ledger = getattr(session, "ledger", None)
+        try:
+            raw_items = self.provider_fn(session)
+        except Exception:
+            return []
+        if not isinstance(raw_items, list):
+            raw_items = [raw_items] if raw_items else []
+        hypotheses = []
+        for item in raw_items:
+            if isinstance(item, dict):
+                hypo = sanitize_and_disarm_llm_hypothesis(item, ledger=ledger)
+                hypotheses.append(hypo)
+            elif isinstance(item, InvestigationHypothesis):
+                hypo = sanitize_and_disarm_llm_hypothesis(item.to_dict(), ledger=ledger)
+                hypotheses.append(hypo)
+        return hypotheses
+
+
+class PluggableHypothesisEngine:
+    """Orchestrates deterministic and optional secondary hypothesis generators with strict boundary checks."""
+
+    def __init__(
+        self,
+        primary_generator: Optional[HypothesisGenerator] = None,
+        optional_adapter: Optional[HypothesisGenerator] = None,
+    ):
+        self.primary_generator = primary_generator or DeterministicHypothesisGenerator()
+        self.optional_adapter = optional_adapter
+
+    def generate(self, session: Any) -> List[InvestigationHypothesis]:
+        results = list(self.primary_generator.generate(session))
+        if self.optional_adapter and getattr(self.optional_adapter, "is_available", lambda: True)():
+            try:
+                sec_results = self.optional_adapter.generate(session)
+                results.extend(sec_results)
+            except Exception:
+                pass
+        return results
 
 
 # -----------------------------------------------------------------------------
@@ -956,6 +1435,7 @@ class HypothesisValidator:
         new_evidence: Optional[EvidenceRecord] = None,
         deterministic_transition_verified: bool = False,
         proof_evidence_id: Optional[str] = None,
+        capture_quality: Optional[Dict[str, Any]] = None,
     ) -> ValidationTransitionResult:
         """Evaluate a hypothesis against the evidence ledger and optional newly acquired evidence.
 
@@ -973,6 +1453,9 @@ class HypothesisValidator:
         6. Cyclic provenance and missing parent records are rejected and flagged.
         7. STATIC_CANDIDATE from DWARF/source can never become confirmed root cause.
         """
+        if not hypothesis.investigation_id and ledger and getattr(ledger, "session_id", None):
+            hypothesis.investigation_id = ledger.session_id
+
         old_status = hypothesis.validation_status
         old_conf = hypothesis.confidence
 
@@ -1011,9 +1494,20 @@ class HypothesisValidator:
                 if c_level == "NON_ATOMIC" or (rec.details or {}).get("is_non_atomic") is True:
                     has_non_atomic_evidence = True
 
+        if capture_quality:
+            cq_level = capture_quality.get("consistency_level") or capture_quality.get("consistency_classification")
+            cq_comp = capture_quality.get("completeness") or capture_quality.get("status")
+            if cq_level == "NON_ATOMIC":
+                has_non_atomic_evidence = True
+            if cq_comp == "PARTIAL":
+                has_partial_evidence = True
+            if cq_comp in ("FAILED", "INVALID", "UNTRUSTED"):
+                has_untrusted_evidence = True
+
         # Process newly attached evidence
         new_is_duplicate = False
         trigger_eid = None
+        is_inconclusive = False
         if new_evidence:
             trigger_eid = new_evidence.evidence_id
             existing_ids = list(dict.fromkeys(hypothesis.supporting_evidence_ids + hypothesis.contradicting_evidence_ids))
@@ -1030,9 +1524,28 @@ class HypothesisValidator:
                 if details.get("outcome") == "CONTRADICTED" or "contradict" in obs_text or "mismatch" in obs_text:
                     is_contradiction = True
 
+                # Competing function contradiction:
+                # If this hypothesis is bound to a specific function and the observation affirms another function
+                hypo_fn = (hypothesis.provenance or {}).get("target_function")
+                obs_fn = details.get("target_function") or details.get("writer_function")
+                if hypo_fn and obs_fn and hypo_fn != obs_fn and details.get("outcome") in ("SUPPORTED", "VALIDATED"):
+                    is_contradiction = True
+
+                is_inconclusive = (
+                    details.get("outcome") in ("INCONCLUSIVE", "UNKNOWN")
+                    or "inconclusive" in obs_text
+                    or "insufficient" in obs_text
+                )
+
                 if is_contradiction:
                     if new_evidence.evidence_id not in hypothesis.contradicting_evidence_ids:
                         hypothesis.contradicting_evidence_ids.append(new_evidence.evidence_id)
+                    for pid in getattr(new_evidence, "parent_evidence_ids", []):
+                        if pid and pid not in hypothesis.contradicting_evidence_ids:
+                            hypothesis.contradicting_evidence_ids.append(pid)
+                elif is_inconclusive:
+                    # Insufficient/inconclusive evidence cannot count as supporting proof
+                    pass
                 else:
                     if new_evidence.evidence_id not in hypothesis.supporting_evidence_ids:
                         hypothesis.supporting_evidence_ids.append(new_evidence.evidence_id)
@@ -1170,13 +1683,35 @@ class HypothesisValidator:
                 else:
                     reason = f"Supported by {supp_count} observation(s); awaiting explicit causal validation."
         else:
-            new_status = HYPOTHESIS_STATUS_PROPOSED
-            reason = "Awaiting follow-up observation evidence."
+            if new_evidence and is_inconclusive:
+                new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+                new_conf = CONFIDENCE_LOW
+                reason = "Observation returned inconclusive or insufficient evidence; outcome is UNKNOWN."
+            else:
+                new_status = HYPOTHESIS_STATUS_PROPOSED
+                reason = "Awaiting follow-up observation evidence."
+
+        if has_non_atomic_evidence:
+            if new_conf in (CONFIDENCE_HIGH, CONFIDENCE_VERY_HIGH, CONFIDENCE_MEDIUM):
+                new_conf = CONFIDENCE_LOW
+            hypothesis.confidence = new_conf
+            if "non-atomic" not in (hypothesis.confidence_rationale or "").lower():
+                hypothesis.confidence_rationale = (
+                    f"{hypothesis.confidence_rationale or ''} (Confidence capped at {new_conf} due to non-atomic / NON_ATOMIC capture consistency)"
+                ).strip()
+        elif has_partial_evidence:
+            if new_conf in (CONFIDENCE_HIGH, CONFIDENCE_VERY_HIGH):
+                new_conf = CONFIDENCE_MEDIUM
+            hypothesis.confidence = new_conf
+            if "partial" not in (hypothesis.confidence_rationale or "").lower():
+                hypothesis.confidence_rationale = (
+                    f"{hypothesis.confidence_rationale or ''} (Confidence capped at {new_conf} due to PARTIAL capture quality)"
+                ).strip()
 
         status_changed = (new_status != old_status) or (new_conf != old_conf)
+        hypothesis.validation_status = new_status
+        hypothesis.confidence = new_conf
         if status_changed:
-            hypothesis.validation_status = new_status
-            hypothesis.confidence = new_conf
             hypothesis.updated_at = datetime.now(timezone.utc).isoformat()
             hypothesis.status_history.append({
                 "from_status": old_status,
