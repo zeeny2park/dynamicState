@@ -13,9 +13,18 @@ Validates the 10 Critical Causal Validation Invariants across Scenarios A throug
 - Invariant 10: Reports and APIs distinguish hypothesis status from function-candidate tier
 """
 
+import json
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import MagicMock
 
+from extractor.capture_backend import (
+    ProcessVmCaptureBackend,
+    ProcfsCaptureBackend,
+)
 from extractor.causal_fixtures import CausalDefectFixtures
 from extractor.evaluation import CausalValidationEvaluator
 from extractor.evidence_ledger import (
@@ -28,6 +37,7 @@ from extractor.evidence_ledger import (
     NATURE_OBSERVATION,
     compute_attestation_signature,
     compute_evidence_fingerprint,
+    compute_receipt_signature,
 )
 from extractor.hypothesis import (
     CONFIDENCE_HIGH,
@@ -657,7 +667,15 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         )
         session.ledger.add_record(rec_child)
         verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest("ev_child_proof", target_function="worker_mutate", field_path="obj.status", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
+        receipt = verifier.record_controlled_execution(
+            target_function="worker_mutate",
+            field_path="obj.status",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_child_proof",
+            hypothesis_id="hypo_f",
+        )
+        verifier.verify_execution_and_attest(evidence_id="ev_child_proof", hypothesis_id="hypo_f", execution_result=receipt)
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_f",
@@ -710,7 +728,15 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         )
         session1.ledger.add_record(rec_sess1)
         verifier1 = TrustedCausalVerifier(session1)
-        verifier1.verify_and_attest("ev_sess1_proof", target_function="worker_fn", field_path="obj.flag", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
+        receipt1 = verifier1.record_controlled_execution(
+            target_function="worker_fn",
+            field_path="obj.flag",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_sess1_proof",
+            hypothesis_id="hypo_g",
+        )
+        verifier1.verify_execution_and_attest(evidence_id="ev_sess1_proof", hypothesis_id="hypo_g", execution_result=receipt1)
 
         # Adversary attempts to attach session 1 proof into session 2
         session2.ledger._records.append(rec_sess1)
@@ -754,7 +780,15 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         )
         session2.ledger.add_record(rec_mismatch)
         verifier2 = TrustedCausalVerifier(session2)
-        verifier2.verify_and_attest("ev_mismatch", target_function="worker_fn", field_path="obj.totally_different_field", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
+        receipt2 = verifier2.record_controlled_execution(
+            target_function="worker_fn",
+            field_path="obj.totally_different_field",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_mismatch",
+            hypothesis_id="hypo_g",
+        )
+        verifier2.verify_execution_and_attest(evidence_id="ev_mismatch", hypothesis_id="hypo_g", execution_result=receipt2)
         hypo2.supporting_evidence_ids.append("ev_mismatch")
 
         res_field = mgr.evaluate_hypothesis(inv_id2, "hypo_g", proof_evidence_id="ev_mismatch")
@@ -984,38 +1018,56 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
 
     def test_case_b_caller_provided_execution_status_reproduced_cannot_authorize_attestation(self):
         """Case B: Caller-provided execution_status=REPRODUCED cannot authorize attestation."""
-        ledger = EvidenceLedger(session_id="inv_test_b")
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Case B")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
         rec = EvidenceRecord(
             evidence_id="ev_bool_b",
             evidence_type=EVIDENCE_TYPE_COMPARISON,
             nature=NATURE_OBSERVATION,
             source="collector",
-            session_id="inv_test_b",
+            session_id=inv_id,
             observation="Observation with caller booleans",
             details={"execution_status": "REPRODUCED", "execution_provenance": {"execution_status": "REPRODUCED"}},
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
-        ledger.add_record(rec)
+        session.ledger.add_record(rec)
+        verifier = TrustedCausalVerifier(session)
+        with self.assertRaises(ValueError) as ctx_v:
+            verifier.verify_and_attest("ev_bool_b", execution_provenance={"execution_status": "REPRODUCED"})
+        self.assertIn("execution_provenance", str(ctx_v.exception))
+
         with self.assertRaises(ValueError) as ctx:
-            ledger.attest_causal_proof("ev_bool_b", execution_provenance={"execution_status": "REPRODUCED"})
+            session.ledger.attest_causal_proof("ev_bool_b", execution_provenance={"execution_status": "REPRODUCED"})
         self.assertIn("lacks genuine execution provenance", str(ctx.exception))
 
     def test_case_c_caller_provided_reproduction_verified_cannot_authorize_attestation(self):
         """Case C: Caller-provided reproduction_verified=True cannot authorize attestation."""
-        ledger = EvidenceLedger(session_id="inv_test_c")
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Case C")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
         rec = EvidenceRecord(
             evidence_id="ev_bool_c",
             evidence_type=EVIDENCE_TYPE_COMPARISON,
             nature=NATURE_OBSERVATION,
             source="collector",
-            session_id="inv_test_c",
+            session_id=inv_id,
             observation="Observation with caller booleans",
             details={"reproduction_verified": True, "verified_transition": True},
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
-        ledger.add_record(rec)
+        session.ledger.add_record(rec)
+        verifier = TrustedCausalVerifier(session)
+        with self.assertRaises(ValueError) as ctx_v:
+            verifier.verify_and_attest("ev_bool_c", execution_provenance={"reproduction_verified": True})
+        self.assertIn("execution_provenance", str(ctx_v.exception))
+
         with self.assertRaises(ValueError) as ctx:
-            ledger.attest_causal_proof("ev_bool_c", execution_provenance={"reproduction_verified": True})
+            session.ledger.attest_causal_proof("ev_bool_c", execution_provenance={"reproduction_verified": True})
         self.assertIn("lacks genuine execution provenance", str(ctx.exception))
 
     def test_case_d_supplying_execution_provenance_directly_cannot_bypass_verification(self):
@@ -1193,7 +1245,15 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         )
         session.ledger.add_record(rec_proof)
         verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest("ev_tamper_g", target_function="worker_mut", field_path="obj.status", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
+        receipt = verifier.record_controlled_execution(
+            target_function="worker_mut",
+            field_path="obj.status",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_tamper_g",
+            hypothesis_id="hypo_tamper_g",
+        )
+        verifier.verify_execution_and_attest(evidence_id="ev_tamper_g", hypothesis_id="hypo_tamper_g", execution_result=receipt)
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_tamper_g",
@@ -1244,12 +1304,19 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         session.ledger.add_record(rec_proof)
 
         verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest(
-            "ev_scope_h",
+        receipt = verifier.record_controlled_execution(
             target_function="fn_a",
             field_path="obj.val",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_scope_h",
             hypothesis_id="hypo_h_scope",
-            execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True},
+            target_identity={"pid": 1234, "build_id": "build_abc", "binary_path": "/bin/app"},
+        )
+        verifier.verify_execution_and_attest(
+            evidence_id="ev_scope_h",
+            hypothesis_id="hypo_h_scope",
+            execution_result=receipt,
         )
 
         hypo = InvestigationHypothesis(
@@ -1331,7 +1398,15 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session1.ledger.add_record(rec1)
-        cap = session1.issue_verification_capability("ev_cap_reuse", target_function="fn_1", field_path="fld_1")
+        verifier1 = TrustedCausalVerifier(session1)
+        rcpt1 = verifier1.record_controlled_execution(
+            target_function="fn_1",
+            field_path="fld_1",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_cap_reuse",
+        )
+        cap = session1.issue_verification_capability("ev_cap_reuse", target_function="fn_1", field_path="fld_1", execution_result=rcpt1)
         self.assertFalse(cap.is_consumed)
 
         session1.attest_causal_proof("ev_cap_reuse", target_function="fn_1", field_path="fld_1", capability=cap)
@@ -1353,7 +1428,14 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session2.ledger.add_record(rec2)
-        cap_sess1 = session1.issue_verification_capability("ev_cross_cap", target_function="fn_2", field_path="fld_2")
+        rcpt2 = verifier1.record_controlled_execution(
+            target_function="fn_2",
+            field_path="fld_2",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_cross_cap",
+        )
+        cap_sess1 = session1.issue_verification_capability("ev_cross_cap", target_function="fn_2", field_path="fld_2", execution_result=rcpt2)
         with self.assertRaises(ValueError) as ctx:
             session2.attest_causal_proof("ev_cross_cap", target_function="fn_2", field_path="fld_2", capability=cap_sess1)
         self.assertIn("cross-session", str(ctx.exception).lower())
@@ -1374,8 +1456,15 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session1.ledger.add_record(rec_replay)
-        verifier1 = TrustedCausalVerifier(session1)
-        verifier1.verify_and_attest("ev_subst_replay", target_function="worker_subst", field_path="obj.val", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
+        rcpt_replay = verifier1.record_controlled_execution(
+            target_function="worker_subst",
+            field_path="obj.val",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_subst_replay",
+            hypothesis_id="hypo_subst",
+        )
+        verifier1.verify_execution_and_attest(evidence_id="ev_subst_replay", hypothesis_id="hypo_subst", execution_result=rcpt_replay)
 
         # Inject into session 2
         session2.ledger._records.append(rec_replay)
@@ -1448,7 +1537,15 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         )
         session.ledger.add_record(rec_child)
         verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest("ev_child_deg", target_function="mutate_fn", field_path="obj.val", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
+        rcpt = verifier.record_controlled_execution(
+            target_function="mutate_fn",
+            field_path="obj.val",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_child_deg",
+            hypothesis_id="hypo_deg_anc",
+        )
+        verifier.verify_execution_and_attest(evidence_id="ev_child_deg", hypothesis_id="hypo_deg_anc", execution_result=rcpt)
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_deg_anc",
@@ -1635,12 +1732,18 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_new)
-        att_ok = verifier.verify_and_attest(
-            "ev_pos_n",
+        rcpt = verifier.record_controlled_execution(
             target_function="mutate_worker_state",
             field_path="WorkerState.counter",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_pos_n",
             hypothesis_id=hypo_id,
-            execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True},
+        )
+        att_ok = verifier.verify_execution_and_attest(
+            evidence_id="ev_pos_n",
+            hypothesis_id=hypo_id,
+            execution_result=rcpt,
         )
         self.assertTrue(att_ok)
 
@@ -1658,6 +1761,290 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         hypo = mgr.get_hypothesis(inv_id, hypo_id)
         self.assertEqual(hypo["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_STATIC_CANDIDATE)
         self.assertFalse(hypo["function_candidates"][0]["confirmed_root_cause"])
+
+    def test_case_p_fabricated_values_and_unauthorized_backend_rejected(self):
+        """Case P: Fabricated before/after values and arbitrary backend labels raise ValueError in record_controlled_execution."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Fabrication and backend checks")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+        verifier = TrustedCausalVerifier(session)
+
+        # 1. Unauthorized backend label rejected
+        with self.assertRaises(ValueError) as ctx:
+            verifier.record_controlled_execution(
+                target_function="mutate_fn",
+                field_path="obj.val",
+                execution_status="REPRODUCED",
+                backend_type="unauthorized_caller_backend",
+            )
+        self.assertIn("Unauthorized execution backend", str(ctx.exception))
+
+        # 2. Fabricated before/after values not matching snapshot diff rejected
+        snap_a = {
+            "snapshot_id": f"snap_a_{inv_id}",
+            "process": {"pid": 2001, "binary": "/bin/worker", "executable_build_id": "b1"},
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 10}]}]},
+        }
+        snap_b = {
+            "snapshot_id": f"snap_b_{inv_id}",
+            "process": {"pid": 2001, "binary": "/bin/worker", "executable_build_id": "b1"},
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 20}]}]},
+        }
+        mgr.corpus.add(snap_a)
+        mgr.corpus.add(snap_b)
+
+        # Claiming transition 10 -> 999 when actual diff is 10 -> 20
+        with self.assertRaises(ValueError) as ctx2:
+            verifier.record_controlled_execution(
+                target_function="mutate_fn",
+                field_path="State.val",
+                before_value=10,
+                after_value=999,
+                execution_status="REPRODUCED",
+                before_snapshot_ref=snap_a["snapshot_id"],
+                after_snapshot_ref=snap_b["snapshot_id"],
+                backend_type="live_process_snapshot_diff",
+            )
+        self.assertIn("does not match verified snapshot diff", str(ctx2.exception))
+
+    def test_case_q_unauthenticated_or_dummy_signature_receipt_rejected(self):
+        """Case Q: Unauthenticated / dummy signature receipts fail authenticity verification."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Unauthenticated receipt check")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        rec = EvidenceRecord(
+            evidence_id="ev_dummy_sig",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Obs",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec)
+        verifier = TrustedCausalVerifier(session)
+
+        dummy_receipt = ControlledExecutionResult(
+            execution_id="exec_dummy",
+            investigation_id=inv_id,
+            target_function="mutate_fn",
+            field_path="obj.val",
+            before_value=1,
+            after_value=2,
+            execution_status="REPRODUCED",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            backend_type="synthetic_adversarial_fixture",
+            receipt_signature="attacker_dummy_hmac_signature_xyz",
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            verifier.verify_execution_and_attest(
+                evidence_id="ev_dummy_sig",
+                hypothesis_id="hypo_dummy",
+                execution_result=dummy_receipt,
+            )
+        self.assertIn("authenticity verification failed", str(ctx.exception))
+
+    def test_case_r_snapshot_tampering_after_receipt_detected(self):
+        """Case R: Mutating snapshot artifact files on disk after receipt issuance invalidates proof."""
+        temp_dir = tempfile.mkdtemp(prefix="dynstate_tamper_snap_")
+        try:
+            snap_a_file = os.path.join(temp_dir, "snap_a.json")
+            snap_b_file = os.path.join(temp_dir, "snap_b.json")
+            with open(snap_a_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 2001, "binary": "/bin/worker", "executable_build_id": "b1"},
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 10}]}]}
+                }, f)
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 2001, "binary": "/bin/worker", "executable_build_id": "b1"},
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 20}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            start = mgr.start_investigation(goal="Tamper snapshot artifact")
+            inv_id = start["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_tamper_snap",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="collector",
+                session_id=inv_id,
+                observation="Obs",
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+
+            verifier = TrustedCausalVerifier(session)
+            receipt = verifier.record_controlled_execution(
+                target_function="mutate_fn",
+                field_path="State.val",
+                before_value=10,
+                after_value=20,
+                execution_status="REPRODUCED",
+                before_snapshot_ref=snap_a_file,
+                after_snapshot_ref=snap_b_file,
+                backend_type="live_process_snapshot_diff",
+                evidence_id="ev_tamper_snap",
+                hypothesis_id="hypo_tamper_snap",
+            )
+
+            # Adversary tampers with snapshot file on disk after receipt issuance
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 9999}]}]},
+                    "malicious": True
+                }, f)
+
+            with self.assertRaises(ValueError) as ctx:
+                verifier.verify_execution_and_attest(
+                    evidence_id="ev_tamper_snap",
+                    hypothesis_id="hypo_tamper_snap",
+                    execution_result=receipt,
+                )
+            self.assertIn("tampered or modified after receipt issuance", str(ctx.exception))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_case_positive_control_controlled_cpp_execution_validates_end_to_end(self):
+        """Positive Control: Compile main.cpp, run live C++, capture A, mutate via stdin, capture B, verify and validate end-to-end."""
+        fixture_src = os.path.abspath("tests/fixtures/real_runtime/main.cpp")
+        work_dir = tempfile.mkdtemp(prefix="dynstate_pos_ctrl_")
+        try:
+            debug_bin = os.path.join(work_dir, "app_debug.elf")
+            subprocess.run(
+                [
+                    "g++", "-fPIE", "-pie", "-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer",
+                    "-Wl,--build-id=sha1", fixture_src, "-o", debug_bin, "-lpthread"
+                ],
+                check=True
+            )
+
+            corpus_dir = os.path.join(work_dir, "corpus")
+            mgr = InvestigationManager(corpus_dir=corpus_dir)
+
+            proc = subprocess.Popen(
+                [debug_bin],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            try:
+                line = proc.stdout.readline().strip()
+                self.assertEqual(line, "READY")
+
+                backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
+
+                # Capture State A
+                snap_a = backend.capture(pid=proc.pid)
+                self.assertEqual(snap_a.completeness, "COMPLETE")
+                snap_a_dir = os.path.join(corpus_dir, "memory_snapshots", "snap_live_a")
+                snap_a.save(snap_a_dir)
+
+                # Mutate via stdin
+                proc.stdin.write("MUTATE\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline().strip()
+                self.assertEqual(line, "MUTATED")
+
+                # Capture State B
+                snap_b = backend.capture(pid=proc.pid)
+                self.assertEqual(snap_b.completeness, "COMPLETE")
+                snap_b_dir = os.path.join(corpus_dir, "memory_snapshots", "snap_live_b")
+                snap_b.save(snap_b_dir)
+
+                # Stop target process cleanly
+                proc.stdin.write("STOP\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline().strip()
+                self.assertEqual(line, "STOPPED")
+                proc.wait(timeout=2)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=1)
+
+            # Start investigation with debug image
+            inv_res = mgr.start_investigation(
+                goal="Live C++ positive control verification",
+                memory_snapshot_path=snap_a_dir,
+                debug_image=debug_bin,
+                authorize_target=False,
+            )
+            inv_id = inv_res["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            # Compare snapshots
+            cmp_res = mgr.compare_observations(inv_id, snap_a_dir, snap_b_dir)
+            self.assertNotIn("error", cmp_res)
+
+            # Execute synthesis
+            mgr._execute_stage_synthesis(session)
+            hypos = mgr.get_hypotheses(inv_id)
+            diff_hypo = next(h for h in hypos if h.get("hypothesis_id", "").startswith("hypo_diff_") and "State.counter" in h.get("title", ""))
+            hypo_id = diff_hypo["hypothesis_id"]
+
+            # Add proof evidence record
+            proof_eid = f"ev_live_proof_{inv_id}"
+            rec_proof = EvidenceRecord(
+                evidence_id=proof_eid,
+                evidence_type="COMPARISON",
+                nature="observation",
+                source="investigation_observer",
+                session_id=inv_id,
+                observation="Live reproduction of counter 42 -> 100",
+                details={"target_function": "mutate_worker_state", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec_proof)
+
+            # Verify live reproduction and attest
+            att_ok = mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id=hypo_id,
+                evidence_id=proof_eid,
+                snapshot_a_path=snap_a_dir,
+                snapshot_b_path=snap_b_dir,
+                target_function="mutate_worker_state",
+                field_path="State.counter",
+            )
+            self.assertTrue(att_ok)
+
+            # Evaluate hypothesis
+            eval_res = mgr.evaluate_hypothesis(
+                inv_id,
+                hypo_id,
+                proof_evidence_id=proof_eid,
+                deterministic_transition_verified=True,
+            )
+            self.assertTrue(eval_res["success"])
+            self.assertEqual(eval_res["transition"]["to_status"], "VALIDATED")
+
+            # Final report verifies causal conclusions
+            final_report = mgr.generate_report(inv_id)
+            cc = final_report["causal_conclusions"]
+            self.assertTrue(cc["causal_proof_established"])
+            self.assertEqual(cc["validated_causal_count"], 1)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 class TestFalsePositiveEvaluationHarness(unittest.TestCase):

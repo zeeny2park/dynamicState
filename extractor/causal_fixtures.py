@@ -137,29 +137,64 @@ class CausalDefectFixtures:
             observation="Deterministic transition reproduced 42 -> 100 on verified writer mutate_worker_state",
             parent_evidence_ids=["ev_a_diff"],
             details={
-                "verified_transition": True,
                 "target_function": "mutate_worker_state",
                 "field_path": "WorkerState.counter",
-                "execution_provenance": {
-                    "execution_status": "REPRODUCED",
-                    "reproduction_verified": True,
-                    "verifier_method": "deterministic_execution",
-                },
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_proof)
-        verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest(
+
+        # Register verified snapshot artifacts and execute live reproduction verification
+        session.target_ref["target_identity"] = {
+            "pid": 1001,
+            "binary": "/bin/worker",
+            "build_id": "build_scen_a_v1",
+        }
+        snap_a1 = {
+            "snapshot_id": f"snap_a1_{inv_id}",
+            "process": {"pid": 1001, "binary": "/bin/worker", "executable_build_id": "build_scen_a_v1"},
+            "timestamp": "2026-10-13T10:00:00Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {
+                "objects": [
+                    {
+                        "object_id": "obj_worker",
+                        "address": 0x2000,
+                        "type": "WorkerState",
+                        "fields": [{"name": "counter", "value": 42}],
+                    }
+                ]
+            },
+        }
+        snap_a2 = {
+            "snapshot_id": f"snap_a2_{inv_id}",
+            "process": {"pid": 1001, "binary": "/bin/worker", "executable_build_id": "build_scen_a_v1"},
+            "timestamp": "2026-10-13T10:00:05Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {
+                "objects": [
+                    {
+                        "object_id": "obj_worker",
+                        "address": 0x2000,
+                        "type": "WorkerState",
+                        "fields": [{"name": "counter", "value": 100}],
+                    }
+                ]
+            },
+        }
+        mgr.corpus.add(snap_a1)
+        mgr.corpus.add(snap_a2)
+
+        mgr.verify_live_reproduction_and_attest(
+            investigation_id=inv_id,
+            hypothesis_id=hypo.hypothesis_id,
             evidence_id="ev_a_proof",
+            snapshot_a_path=snap_a1["snapshot_id"],
+            snapshot_b_path=snap_a2["snapshot_id"],
             target_function="mutate_worker_state",
             field_path="WorkerState.counter",
-            hypothesis_id=hypo.hypothesis_id,
-            execution_provenance={
-                "execution_status": "REPRODUCED",
-                "reproduction_verified": True,
-                "verifier_method": "deterministic_execution",
-            },
         )
 
         return mgr, inv_id, hypo.hypothesis_id
@@ -275,29 +310,64 @@ class CausalDefectFixtures:
             observation="Verified deterministic write from update_flags into State.flags",
             parent_evidence_ids=["ev_c_diff"],
             details={
-                "verified_transition": True,
                 "target_function": "update_flags",
                 "field_path": "State.flags",
-                "execution_provenance": {
-                    "execution_status": "REPRODUCED",
-                    "reproduction_verified": True,
-                    "verifier_method": "deterministic_execution",
-                },
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_proof)
-        verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest(
+
+        # Register verified snapshot artifacts and execute live reproduction verification
+        session.target_ref["target_identity"] = {
+            "pid": 2002,
+            "binary": "/bin/flags_updater",
+            "build_id": "build_scen_c_v1",
+        }
+        snap_c1 = {
+            "snapshot_id": f"snap_c1_{inv_id}",
+            "process": {"pid": 2002, "binary": "/bin/flags_updater", "executable_build_id": "build_scen_c_v1"},
+            "timestamp": "2026-10-13T10:00:00Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {
+                "objects": [
+                    {
+                        "object_id": "obj_flags",
+                        "address": 0x3000,
+                        "type": "State",
+                        "fields": [{"name": "flags", "value": 7}],
+                    }
+                ]
+            },
+        }
+        snap_c2 = {
+            "snapshot_id": f"snap_c2_{inv_id}",
+            "process": {"pid": 2002, "binary": "/bin/flags_updater", "executable_build_id": "build_scen_c_v1"},
+            "timestamp": "2026-10-13T10:00:05Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {
+                "objects": [
+                    {
+                        "object_id": "obj_flags",
+                        "address": 0x3000,
+                        "type": "State",
+                        "fields": [{"name": "flags", "value": 15}],
+                    }
+                ]
+            },
+        }
+        mgr.corpus.add(snap_c1)
+        mgr.corpus.add(snap_c2)
+
+        mgr.verify_live_reproduction_and_attest(
+            investigation_id=inv_id,
+            hypothesis_id=hypo.hypothesis_id,
             evidence_id="ev_c_proof",
+            snapshot_a_path=snap_c1["snapshot_id"],
+            snapshot_b_path=snap_c2["snapshot_id"],
             target_function="update_flags",
             field_path="State.flags",
-            hypothesis_id=hypo.hypothesis_id,
-            execution_provenance={
-                "execution_status": "REPRODUCED",
-                "reproduction_verified": True,
-                "verifier_method": "deterministic_execution",
-            },
         )
 
         return mgr, inv_id, hypo.hypothesis_id

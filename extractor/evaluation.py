@@ -60,6 +60,7 @@ class TestCaseResult:
     is_true_negative: bool
     is_false_negative: bool
     reason: str
+    evaluation_category: str = "synthetic_security_regression"
 
 
 class CausalValidationEvaluator:
@@ -717,12 +718,9 @@ class CausalValidationEvaluator:
             details={
                 "target_function": "worker_mutate",
                 "field_path": "obj.status",
-                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
             },
         )
         session.ledger.add_record(rec_child)
-        verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest("ev_child_proof", target_function="worker_mutate", field_path="obj.status", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_ancestry",
@@ -739,6 +737,35 @@ class CausalValidationEvaluator:
             }],
         )
         session.hypotheses.append(hypo)
+
+        snap_f1 = {
+            "snapshot_id": f"snap_f1_{inv_id}",
+            "process": {"pid": 5001, "binary": "/bin/worker"},
+            "timestamp": "2026-10-13T10:00:00Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "obj1", "address": 0x4000, "type": "obj", "fields": [{"name": "status", "value": 0}]}]},
+        }
+        snap_f2 = {
+            "snapshot_id": f"snap_f2_{inv_id}",
+            "process": {"pid": 5001, "binary": "/bin/worker"},
+            "timestamp": "2026-10-13T10:00:05Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "obj1", "address": 0x4000, "type": "obj", "fields": [{"name": "status", "value": 1}]}]},
+        }
+        mgr.corpus.add(snap_f1)
+        mgr.corpus.add(snap_f2)
+
+        mgr.verify_live_reproduction_and_attest(
+            investigation_id=inv_id,
+            hypothesis_id="hypo_ancestry",
+            evidence_id="ev_child_proof",
+            snapshot_a_path=snap_f1["snapshot_id"],
+            snapshot_b_path=snap_f2["snapshot_id"],
+            target_function="worker_mutate",
+            field_path="obj.status",
+        )
 
         res = mgr.evaluate_hypothesis(inv_id, "hypo_ancestry", proof_evidence_id="ev_child_proof")
         hypo_dict = mgr.get_hypothesis(inv_id, "hypo_ancestry")
@@ -767,6 +794,7 @@ class CausalValidationEvaluator:
             is_true_negative=is_tn,
             is_false_negative=is_fn,
             reason=res["transition"]["reason"],
+            evaluation_category="synthetic_security_regression",
         ))
 
     def _eval_case_g_cross_investigation(self):
@@ -790,12 +818,49 @@ class CausalValidationEvaluator:
             details={
                 "target_function": "worker_fn",
                 "field_path": "obj.flag",
-                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
             },
         )
         session1.ledger.add_record(rec_sess1)
-        verifier1 = TrustedCausalVerifier(session1)
-        verifier1.verify_and_attest("ev_sess1_proof", target_function="worker_fn", field_path="obj.flag", execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
+
+        hypo_s1 = InvestigationHypothesis(
+            hypothesis_id="hypo_s1",
+            investigation_id=inv_id1,
+            title="Sess 1 Hypo",
+            claim="Claim",
+            proposed_mechanism="Mech",
+            candidate_fields=["obj.flag"],
+            function_candidates=[{"function_name": "worker_fn"}],
+        )
+        session1.hypotheses.append(hypo_s1)
+
+        snap_g1 = {
+            "snapshot_id": f"snap_g1_{inv_id1}",
+            "process": {"pid": 6001, "binary": "/bin/worker"},
+            "timestamp": "2026-10-13T10:00:00Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "obj1", "address": 0x5000, "type": "obj", "fields": [{"name": "flag", "value": 0}]}]},
+        }
+        snap_g2 = {
+            "snapshot_id": f"snap_g2_{inv_id1}",
+            "process": {"pid": 6001, "binary": "/bin/worker"},
+            "timestamp": "2026-10-13T10:00:05Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "obj1", "address": 0x5000, "type": "obj", "fields": [{"name": "flag", "value": 1}]}]},
+        }
+        mgr.corpus.add(snap_g1)
+        mgr.corpus.add(snap_g2)
+
+        mgr.verify_live_reproduction_and_attest(
+            investigation_id=inv_id1,
+            hypothesis_id="hypo_s1",
+            evidence_id="ev_sess1_proof",
+            snapshot_a_path=snap_g1["snapshot_id"],
+            snapshot_b_path=snap_g2["snapshot_id"],
+            target_function="worker_fn",
+            field_path="obj.flag",
+        )
 
         # Now adversary tries to use session1 proof in session2
         session2.ledger._records.append(rec_sess1)
@@ -1088,6 +1153,22 @@ class CausalValidationEvaluator:
             if r.is_false_negative:
                 quality_groups[q]["fn"] += 1
 
+        # Category groupings (distinguishing synthetic regression, defect scenarios, and live execution)
+        category_groups: Dict[str, Dict[str, int]] = {}
+        for r in self.results:
+            cat = getattr(r, "evaluation_category", "synthetic_security_regression")
+            if cat not in category_groups:
+                category_groups[cat] = {"total": 0, "tp": 0, "fp": 0, "tn": 0, "fn": 0}
+            category_groups[cat]["total"] += 1
+            if r.is_true_positive:
+                category_groups[cat]["tp"] += 1
+            if r.is_false_positive:
+                category_groups[cat]["fp"] += 1
+            if r.is_true_negative:
+                category_groups[cat]["tn"] += 1
+            if r.is_false_negative:
+                category_groups[cat]["fn"] += 1
+
         precision = (tp_count / (tp_count + fp_count)) if (tp_count + fp_count) > 0 else 1.0
         recall = (tp_count / (tp_count + fn_count)) if (tp_count + fn_count) > 0 else 1.0
         fpr = (fp_count / negatives_ground_truth) if negatives_ground_truth > 0 else 0.0
@@ -1122,6 +1203,7 @@ class CausalValidationEvaluator:
                 "false_positive_rate": round(fpr, 4),
                 "zero_false_positives_sla_satisfied": (fp_count == 0),
             },
+            "breakdown_by_category": category_groups,
             "breakdown_by_capture_quality": quality_groups,
             "test_cases": [asdict(r) for r in self.results],
         }

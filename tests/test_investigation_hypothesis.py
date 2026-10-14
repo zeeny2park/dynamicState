@@ -25,11 +25,13 @@ from extractor.evidence_ledger import (
     EVIDENCE_TYPE_FIELD_OBSERVATION,
     EVIDENCE_TYPE_HYPOTHESIS,
     EVIDENCE_TYPE_OBJECT_STATE,
+    ControlledExecutionResult,
     EvidenceLedger,
     EvidenceRecord,
     NATURE_HYPOTHESIS,
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
+    compute_receipt_signature,
 )
 from extractor.hypothesis import (
     CONFIDENCE_HIGH,
@@ -446,7 +448,35 @@ class TestHypothesisValidator(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         self.ledger.add_record(rec_supp)
-        cap = self.ledger.issue_verification_capability("ev_det_1", target_function="mutate_state", hypothesis_id="hypo_valid")
+        rcpt_temp = ControlledExecutionResult(
+            execution_id="exec_det_1",
+            investigation_id=self.ledger.session_id,
+            target_function="mutate_state",
+            field_path="",
+            before_value=42,
+            after_value=100,
+            execution_status="REPRODUCED",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            hypothesis_id="hypo_valid",
+            evidence_id="ev_det_1",
+            backend_type="synthetic_adversarial_fixture",
+        )
+        sig = compute_receipt_signature(self.ledger.session_secret, rcpt_temp)
+        rcpt = ControlledExecutionResult(
+            execution_id=rcpt_temp.execution_id,
+            investigation_id=rcpt_temp.investigation_id,
+            target_function=rcpt_temp.target_function,
+            field_path=rcpt_temp.field_path,
+            before_value=rcpt_temp.before_value,
+            after_value=rcpt_temp.after_value,
+            execution_status=rcpt_temp.execution_status,
+            capture_quality=rcpt_temp.capture_quality,
+            hypothesis_id=rcpt_temp.hypothesis_id,
+            evidence_id=rcpt_temp.evidence_id,
+            backend_type=rcpt_temp.backend_type,
+            receipt_signature=sig,
+        )
+        cap = self.ledger.issue_verification_capability("ev_det_1", target_function="mutate_state", hypothesis_id="hypo_valid", execution_result=rcpt)
         self.ledger.attest_causal_proof("ev_det_1", target_function="mutate_state", capability=cap, hypothesis_id="hypo_valid")
 
         hypo = InvestigationHypothesis(
@@ -612,18 +642,37 @@ class TestInvestigationManagerHypothesisIntegration(unittest.TestCase):
             details={
                 "target_function": "update_counter",
                 "field_path": "State.counter",
-                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_proof)
-        verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest(
+
+        snap1 = {
+            "snapshot_id": f"snap1_{inv_id}",
+            "process": {"pid": 3001, "binary": "/bin/app"},
+            "timestamp": "2026-10-13T10:00:00Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "obj1", "address": 0x1000, "type": "State", "fields": [{"name": "counter", "value": 42}]}]},
+        }
+        snap2 = {
+            "snapshot_id": f"snap2_{inv_id}",
+            "process": {"pid": 3001, "binary": "/bin/app"},
+            "timestamp": "2026-10-13T10:00:05Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "obj1", "address": 0x1000, "type": "State", "fields": [{"name": "counter", "value": 100}]}]},
+        }
+        self.manager.corpus.add(snap1)
+        self.manager.corpus.add(snap2)
+        self.manager.verify_live_reproduction_and_attest(
+            inv_id,
+            hypo_id,
             proof_eid,
+            snap1["snapshot_id"],
+            snap2["snapshot_id"],
             target_function="update_counter",
             field_path="State.counter",
-            hypothesis_id=hypo_id,
-            execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True},
         )
         eval_res = self.manager.evaluate_hypothesis(
             inv_id,
@@ -779,13 +828,41 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
             observation="Deterministic transition reproduced 1 -> 2",
             details={
                 "field_path": "obj_x.val",
-                "execution_provenance": {"execution_status": "REPRODUCED", "reproduction_verified": True},
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_arp_proof)
-        verifier = TrustedCausalVerifier(session)
-        verifier.verify_and_attest("ev_proof_arp", field_path="obj_x.val", hypothesis_id=hypo_id, execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True})
+
+        snap_arp1 = {
+            "snapshot_id": f"snap_arp1_{inv_id}",
+            "process": {"pid": 4001, "binary": "/bin/app"},
+            "timestamp": "2026-10-13T10:00:00Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "obj_x", "address": 0x2000, "type": "obj_x", "fields": [{"name": "val", "value": 1}]}]},
+        }
+        snap_arp2 = {
+            "snapshot_id": f"snap_arp2_{inv_id}",
+            "process": {"pid": 4001, "binary": "/bin/app"},
+            "timestamp": "2026-10-13T10:00:05Z",
+            "completeness": "COMPLETE",
+            "consistency": {"level": "STOPPED"},
+            "persistent": {"objects": [{"object_id": "obj_x", "address": 0x2000, "type": "obj_x", "fields": [{"name": "val", "value": 2}]}]},
+        }
+        self.runtime.investigation_manager.corpus.add(snap_arp1)
+        self.runtime.investigation_manager.corpus.add(snap_arp2)
+
+        cands = session.hypotheses[0].function_candidates
+        t_fn = cands[0]["function_name"] if cands else ""
+        self.runtime.investigation_manager.verify_live_reproduction_and_attest(
+            inv_id,
+            hypo_id,
+            "ev_proof_arp",
+            snap_arp1["snapshot_id"],
+            snap_arp2["snapshot_id"],
+            target_function=t_fn,
+            field_path="obj_x.val",
+        )
         eval_res = self.adapter.evaluate_hypothesis({
             "investigation_id": inv_id,
             "hypothesis_id": hypo_id,

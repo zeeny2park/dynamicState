@@ -25,8 +25,12 @@ class ControlledExecutionResult:
     after_value: Any
     execution_status: str  # "REPRODUCED" or "SUCCESS"
     capture_quality: Dict[str, Any]
+    hypothesis_id: str = ""
+    evidence_id: str = ""
     before_snapshot_ref: Optional[str] = None
     after_snapshot_ref: Optional[str] = None
+    before_snapshot_hash: Optional[str] = None
+    after_snapshot_hash: Optional[str] = None
     target_identity: Optional[Dict[str, Any]] = None
     backend_type: str = "controlled_runtime"
     executed_at: str = ""
@@ -41,13 +45,28 @@ class ControlledExecutionResult:
 
 
 def compute_receipt_signature(session_secret: str, result: "ControlledExecutionResult") -> str:
-    """Compute HMAC-SHA256 signature binding the execution receipt to the session secret."""
+    """Compute HMAC-SHA256 signature binding the execution receipt to the session secret and complete execution scope."""
+    tid_str = json.dumps(result.target_identity or {}, sort_keys=True)
+    cq_str = json.dumps(result.capture_quality or {}, sort_keys=True)
     raw = (
-        f"{result.execution_id}|{result.investigation_id}|{result.target_function}|"
-        f"{result.field_path}|{result.before_value}|{result.after_value}|"
-        f"{result.execution_status}|{result.backend_type}"
+        f"{result.execution_id}|{result.investigation_id}|{result.hypothesis_id}|"
+        f"{result.evidence_id}|{result.target_function}|{result.field_path}|"
+        f"{result.before_value}|{result.after_value}|{result.execution_status}|"
+        f"{result.backend_type}|{result.before_snapshot_ref}|{result.after_snapshot_ref}|"
+        f"{result.before_snapshot_hash}|{result.after_snapshot_hash}|"
+        f"{tid_str}|{cq_str}|{result.executed_at}"
     )
     return hmac.new(session_secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def is_atomic_or_stopped_consistency(cons: Any) -> bool:
+    """Check if consistency level represents atomic or stopped execution."""
+    if not cons:
+        return False
+    u = str(cons).upper()
+    if "NON_ATOMIC" in u or "NON-ATOMIC" in u or "INCONSISTENT" in u:
+        return False
+    return u in ("STOPPED", "ATOMIC", "CONSISTENT", "PROCESS_STOPPED_MEMORY_SNAPSHOT", "SIGNAL_STOPPED") or "STOPPED" in u or "ATOMIC" in u or "CONSISTENT" in u
 
 
 class CausalVerificationCapability:
@@ -394,15 +413,51 @@ class EvidenceLedger:
         target_function: str = "",
         field_path: str = "",
         hypothesis_id: str = "",
+        execution_result: Optional[ControlledExecutionResult] = None,
     ) -> CausalVerificationCapability:
-        """Issue an internal unforgeable capability granting attestation authority for a specific evidence record."""
+        """Issue an internal unforgeable capability strictly after authentic execution receipt verification."""
+        if execution_result is None or not isinstance(execution_result, ControlledExecutionResult):
+            raise ValueError("Capability issuance requires an authentic ControlledExecutionResult verified against session secret")
+
+        if not execution_result.verify_authenticity(self.session_secret):
+            raise ValueError("Capability issuance rejected: execution receipt signature verification failed")
+
+        if execution_result.investigation_id != self.session_id:
+            raise ValueError(f"Capability issuance rejected: execution receipt belongs to investigation '{execution_result.investigation_id}', not '{self.session_id}'")
+
+        if execution_result.evidence_id and evidence_id and execution_result.evidence_id != evidence_id:
+            raise ValueError(f"Capability issuance rejected: execution receipt evidence '{execution_result.evidence_id}' does not match '{evidence_id}'")
+
+        if execution_result.hypothesis_id and hypothesis_id and execution_result.hypothesis_id != hypothesis_id:
+            raise ValueError(f"Capability issuance rejected: execution receipt hypothesis '{execution_result.hypothesis_id}' does not match '{hypothesis_id}'")
+
+        if execution_result.target_function and target_function and execution_result.target_function != target_function:
+            raise ValueError(f"Capability issuance rejected: execution receipt target_function '{execution_result.target_function}' does not match '{target_function}'")
+
+        if execution_result.field_path and field_path and execution_result.field_path != field_path:
+            raise ValueError(f"Capability issuance rejected: execution receipt field_path '{execution_result.field_path}' does not match '{field_path}'")
+
+        if execution_result.execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
+            raise ValueError(f"Capability issuance rejected: execution receipt status '{execution_result.execution_status}' does not prove reproduction")
+
+        cq = execution_result.capture_quality or {}
+        comp = cq.get("completeness") or cq.get("status")
+        cons = cq.get("consistency_level") or cq.get("consistency_classification")
+        if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
+            raise ValueError(f"Capability issuance rejected: execution receipt capture quality ({comp}, {cons}) is not complete and atomic")
+
+        eff_eid = evidence_id or execution_result.evidence_id
+        eff_fn = target_function or execution_result.target_function
+        eff_field = field_path or execution_result.field_path
+        eff_hypo = hypothesis_id or execution_result.hypothesis_id
+
         return CausalVerificationCapability(
             investigation_id=self.session_id,
             capability_key=self._capability_key,
-            evidence_id=evidence_id,
-            target_function=target_function,
-            field_path=field_path,
-            hypothesis_id=hypothesis_id,
+            evidence_id=eff_eid,
+            target_function=eff_fn,
+            field_path=eff_field,
+            hypothesis_id=eff_hypo,
         )
 
     def attest_causal_proof(
@@ -438,7 +493,7 @@ class EvidenceLedger:
         if comp != "COMPLETE":
             raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' has non-complete capture quality '{comp}'")
         cons = cq.get("consistency_level") or cq.get("consistency_classification") or p_details.get("consistency_classification")
-        if cons not in ("STOPPED", "ATOMIC", "CONSISTENT") or p_details.get("is_non_atomic") is True:
+        if not is_atomic_or_stopped_consistency(cons) or p_details.get("is_non_atomic") is True:
             raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' lacks atomic/stopped consistency '{cons}'")
 
         if rec.session_id and rec.session_id != self.session_id:

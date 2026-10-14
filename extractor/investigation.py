@@ -40,6 +40,7 @@ from .evidence_ledger import (
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
     compute_receipt_signature,
+    is_atomic_or_stopped_consistency,
 )
 from .hypothesis import (
     CONFIDENCE_HIGH,
@@ -155,12 +156,14 @@ class InvestigationSession:
         corpus_dir: str = "corpus",
         safety: Optional[Dict[str, Any]] = None,
         budgets: Optional[Dict[str, Any]] = None,
+        corpus: Optional[StateCorpus] = None,
     ):
         self.investigation_id = investigation_id
         self.goal = goal
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.status = "CREATED"  # CREATED, RUNNING, COMPLETED, PARTIAL, FAILED, BLOCKED
         self.corpus_dir = os.path.abspath(corpus_dir)
+        self.corpus = corpus if corpus is not None else StateCorpus(self.corpus_dir)
         self._session_secret: str = uuid.uuid4().hex
         self._capability_key: str = uuid.uuid4().hex
         self.ledger = EvidenceLedger(
@@ -214,6 +217,7 @@ class InvestigationSession:
         target_function: str = "",
         field_path: str = "",
         hypothesis_id: str = "",
+        execution_result: Optional[ControlledExecutionResult] = None,
     ) -> CausalVerificationCapability:
         """Issue an internal unforgeable capability granting attestation authority."""
         return self.ledger.issue_verification_capability(
@@ -221,6 +225,7 @@ class InvestigationSession:
             target_function=target_function,
             field_path=field_path,
             hypothesis_id=hypothesis_id,
+            execution_result=execution_result,
         )
 
     def attest_causal_proof(
@@ -269,11 +274,92 @@ class InvestigationSession:
         }
 
 
+AUTHORIZED_EXECUTION_BACKENDS = {
+    "live_process_snapshot_diff",
+    "controlled_gdb_backend",
+    "controlled_runtime_harness",
+    "synthetic_adversarial_fixture",
+}
+
+
+def compute_snapshot_artifact_hash(snap_ref: Any, session: Optional[InvestigationSession] = None) -> str:
+    """Compute a cryptographic SHA256 digest of snapshot artifact data for tamper detection."""
+    if isinstance(snap_ref, str):
+        if os.path.isfile(snap_ref):
+            with open(snap_ref, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        if os.path.isdir(snap_ref):
+            h = hashlib.sha256()
+            for fn in sorted(["metadata.json", "manifest.json", "maps.json"]):
+                fp = os.path.join(snap_ref, fn)
+                if os.path.exists(fp):
+                    with open(fp, "rb") as f:
+                        h.update(f.read())
+            return h.hexdigest()
+
+    snap_dict = snap_ref if isinstance(snap_ref, dict) else (
+        snap_ref.to_dict() if hasattr(snap_ref, "to_dict") else {}
+    )
+    if not snap_dict and isinstance(snap_ref, str) and session is not None:
+        if hasattr(session, "corpus") and session.corpus:
+            snap_dict = session.corpus.get(snap_ref) or {}
+            if not snap_dict:
+                for state_id, meta in session.corpus.states.items():
+                    if meta.get("snapshot_id") == snap_ref or state_id == snap_ref or snap_ref in meta.get("observations", []):
+                        snap_dict = session.corpus.get(state_id) or {}
+                        break
+    return hashlib.sha256(json.dumps(snap_dict, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 class TrustedCausalVerifier:
     """Internal trusted verifier authorized to execute observations, verify reproductions, and issue causal attestations."""
 
     def __init__(self, session: InvestigationSession):
         self._session = session
+
+    def _resolve_snapshot_for_verifier(self, snap_ref: Any) -> Optional[Any]:
+        """Resolve snapshot artifact for internal verification."""
+        if isinstance(snap_ref, dict):
+            return snap_ref
+        if hasattr(snap_ref, "to_dict"):
+            return snap_ref
+        if not isinstance(snap_ref, str):
+            return None
+        if self._session and hasattr(self._session, "corpus") and self._session.corpus:
+            snap_data = self._session.corpus.get(snap_ref)
+            if snap_data:
+                return snap_data
+            for state_id, meta in self._session.corpus.states.items():
+                if meta.get("snapshot_id") == snap_ref or state_id == snap_ref or snap_ref in meta.get("observations", []):
+                    snap_data = self._session.corpus.get(state_id)
+                    if snap_data:
+                        return snap_data
+        if os.path.exists(snap_ref):
+            if snap_ref.endswith(".json"):
+                with open(snap_ref, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            try:
+                from .raw_snapshot import RawRuntimeSnapshot
+                raw_snap = RawRuntimeSnapshot.load(snap_ref)
+                dbg = self._session.target_ref.get("debug_image") if self._session else None
+                if dbg and os.path.exists(dbg):
+                    engine = OfflineSemanticEngine()
+                    try:
+                        decoded = engine.reconstruct(raw_snap, debug_image=dbg)
+                        if decoded and hasattr(decoded, "to_dict"):
+                            return decoded.to_dict()
+                        return decoded
+                    except Exception:
+                        pass
+                return raw_snap
+            except Exception:
+                pass
+            try:
+                from .memory_snapshot import RawMemorySnapshot
+                return RawMemorySnapshot.load(snap_ref)
+            except Exception:
+                pass
+        return None
 
     def record_controlled_execution(
         self,
@@ -287,9 +373,60 @@ class TrustedCausalVerifier:
         after_snapshot_ref: Optional[str] = None,
         target_identity: Optional[Dict[str, Any]] = None,
         backend_type: str = "controlled_runtime",
+        hypothesis_id: str = "",
+        evidence_id: str = "",
     ) -> ControlledExecutionResult:
-        """Record an authentic execution receipt signed with the session secret."""
+        """Record an authentic execution receipt signed with the session secret.
+
+        Strict Trust Boundaries:
+        1. Arbitrary or unauthorized backend labels are strictly rejected.
+        2. Fabricated before/after values without verified snapshot transitions are rejected.
+        3. Real snapshot references are validated against diff changes.
+        """
+        if backend_type not in AUTHORIZED_EXECUTION_BACKENDS:
+            raise ValueError(f"Unauthorized execution backend '{backend_type}'; receipt creation rejected")
+
+        if execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
+            raise ValueError(f"Execution status '{execution_status}' does not prove reproduction")
+
+        hash_a = None
+        hash_b = None
+
+        if before_snapshot_ref and after_snapshot_ref:
+            snap_a = self._resolve_snapshot_for_verifier(before_snapshot_ref)
+            snap_b = self._resolve_snapshot_for_verifier(after_snapshot_ref)
+            if snap_a is None or snap_b is None:
+                raise ValueError(
+                    f"Snapshot artifacts '{before_snapshot_ref}' or '{after_snapshot_ref}' could not be resolved for verification"
+                )
+            hash_a = compute_snapshot_artifact_hash(before_snapshot_ref, self._session)
+            hash_b = compute_snapshot_artifact_hash(after_snapshot_ref, self._session)
+            diff_res = StateDiffEngine().diff(snap_a, snap_b)
+            found = False
+            for chg in diff_res.changes:
+                p = chg.get("path") or ""
+                f = chg.get("field") or ""
+                if p == field_path or f == field_path or field_path.endswith(f) or p.endswith(field_path):
+                    if before_value is not None and chg.get("before") != before_value:
+                        continue
+                    if after_value is not None and chg.get("after") != after_value:
+                        continue
+                    found = True
+                    break
+            if not found:
+                raise ValueError(
+                    f"Fabricated execution values: field '{field_path}' transition "
+                    f"({before_value} -> {after_value}) does not match verified snapshot diff"
+                )
+        elif backend_type != "synthetic_adversarial_fixture":
+            raise ValueError("Cannot record execution without verified snapshot references")
+
         cq = capture_quality or {"completeness": "COMPLETE", "consistency_level": "STOPPED"}
+        comp = cq.get("completeness") or cq.get("status")
+        cons = cq.get("consistency_level") or cq.get("consistency_classification")
+        if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
+            raise ValueError(f"Cannot record execution: capture quality ({comp}, {cons}) is not complete and atomic")
+
         exec_id = f"exec_{uuid.uuid4().hex[:10]}"
         t_id = target_identity or self._session.target_ref.get("target_identity") or {}
         now_ts = datetime.now(timezone.utc).isoformat()
@@ -303,8 +440,12 @@ class TrustedCausalVerifier:
             after_value=after_value,
             execution_status=execution_status,
             capture_quality=cq,
-            before_snapshot_ref=before_snapshot_ref,
-            after_snapshot_ref=after_snapshot_ref,
+            hypothesis_id=hypothesis_id,
+            evidence_id=evidence_id,
+            before_snapshot_ref=str(before_snapshot_ref) if before_snapshot_ref else None,
+            after_snapshot_ref=str(after_snapshot_ref) if after_snapshot_ref else None,
+            before_snapshot_hash=hash_a,
+            after_snapshot_hash=hash_b,
             target_identity=t_id,
             backend_type=backend_type,
             executed_at=now_ts,
@@ -321,8 +462,12 @@ class TrustedCausalVerifier:
             after_value=after_value,
             execution_status=execution_status,
             capture_quality=cq,
-            before_snapshot_ref=before_snapshot_ref,
-            after_snapshot_ref=after_snapshot_ref,
+            hypothesis_id=hypothesis_id,
+            evidence_id=evidence_id,
+            before_snapshot_ref=str(before_snapshot_ref) if before_snapshot_ref else None,
+            after_snapshot_ref=str(after_snapshot_ref) if after_snapshot_ref else None,
+            before_snapshot_hash=hash_a,
+            after_snapshot_hash=hash_b,
             target_identity=t_id,
             backend_type=backend_type,
             executed_at=now_ts,
@@ -344,7 +489,7 @@ class TrustedCausalVerifier:
 
         # 1. Verify receipt authenticity against session secret
         if not execution_result.verify_authenticity(self._session._session_secret):
-            raise ValueError("Execution receipt signature verification failed: forged or tampered receipt")
+            raise ValueError("Execution receipt signature / authenticity verification failed: forged or tampered receipt")
 
         # 2. Verify investigation binding
         if execution_result.investigation_id != self._session.investigation_id:
@@ -358,7 +503,7 @@ class TrustedCausalVerifier:
         cq = execution_result.capture_quality or {}
         comp = cq.get("completeness") or cq.get("status")
         cons = cq.get("consistency_level") or cq.get("consistency_classification")
-        if comp != "COMPLETE" or cons not in ("STOPPED", "ATOMIC", "CONSISTENT"):
+        if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
             raise ValueError(f"Execution receipt capture quality ({comp}, {cons}) is not complete and atomic")
 
         # 5. Check scope match
@@ -369,20 +514,64 @@ class TrustedCausalVerifier:
         if field_path and execution_result.field_path and field_path != execution_result.field_path:
             raise ValueError(f"Scope mismatch: field_path '{field_path}' does not match execution receipt '{execution_result.field_path}'")
 
-        # 6. Verify evidence record exists and is not unverified caller claim
+        # 6. Check hypothesis binding
+        if hypothesis_id and execution_result.hypothesis_id and hypothesis_id != execution_result.hypothesis_id:
+            raise ValueError(f"Hypothesis mismatch: '{hypothesis_id}' does not match execution receipt '{execution_result.hypothesis_id}'")
+
+        # 7. Check evidence binding
+        if evidence_id and execution_result.evidence_id and evidence_id != execution_result.evidence_id:
+            raise ValueError(f"Evidence mismatch: '{evidence_id}' does not match execution receipt '{execution_result.evidence_id}'")
+
+        # 8. Check target identity binding
+        sess_tid = self._session.target_ref.get("target_identity") or {}
+        rec_tid = execution_result.target_identity or {}
+        if sess_tid and rec_tid:
+            if sess_tid.get("build_id") and rec_tid.get("build_id") and sess_tid["build_id"] != rec_tid["build_id"]:
+                raise ValueError(f"Target build identity mismatch: session ({sess_tid['build_id']}) != receipt ({rec_tid['build_id']})")
+            if sess_tid.get("pid") and rec_tid.get("pid") and sess_tid["pid"] != rec_tid["pid"]:
+                raise ValueError(f"Target PID mismatch: session ({sess_tid['pid']}) != receipt ({rec_tid['pid']})")
+
+        # 9. Verify snapshot tamper detection post-issuance
+        if execution_result.before_snapshot_ref and execution_result.before_snapshot_hash and os.path.exists(execution_result.before_snapshot_ref):
+            curr_hash_a = compute_snapshot_artifact_hash(execution_result.before_snapshot_ref, self._session)
+            if curr_hash_a != execution_result.before_snapshot_hash:
+                raise ValueError("Before-snapshot artifact tampered or modified after receipt issuance")
+        if execution_result.after_snapshot_ref and execution_result.after_snapshot_hash and os.path.exists(execution_result.after_snapshot_ref):
+            curr_hash_b = compute_snapshot_artifact_hash(execution_result.after_snapshot_ref, self._session)
+            if curr_hash_b != execution_result.after_snapshot_hash:
+                raise ValueError("After-snapshot artifact tampered or modified after receipt issuance")
+
+        # 10. Verify evidence record exists and is not unverified caller claim
         rec = self._session.ledger.get_record(evidence_id)
         if not rec:
             raise ValueError(f"Evidence record '{evidence_id}' does not exist in ledger")
 
-        # 7. Mint single-use scoped capability
+        p_details = rec.details or {}
+        p_prov = rec.provenance or {}
+        if (
+            p_details.get("caller_submitted") is True
+            or p_details.get("unverified_caller_claim") is True
+            or rec.source == "unverified_caller"
+            or p_prov.get("submission_channel") == "external_caller"
+        ):
+            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' originated from unverified external caller")
+
+        rec_cq = rec.capture_quality or {}
+        r_comp = rec_cq.get("completeness") or rec_cq.get("status")
+        r_cons = rec_cq.get("consistency_level") or rec_cq.get("consistency_classification") or p_details.get("consistency_classification")
+        if r_comp != "COMPLETE" or not is_atomic_or_stopped_consistency(r_cons) or p_details.get("is_non_atomic") is True:
+            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' has degraded capture quality ({r_comp}, {r_cons})")
+
+        # 11. Mint single-use scoped capability
         cap = self._session.issue_verification_capability(
             evidence_id=evidence_id,
             target_function=eff_fn,
             field_path=eff_field,
             hypothesis_id=hypothesis_id,
+            execution_result=execution_result,
         )
 
-        # 8. Attest using capability
+        # 12. Attest using capability
         return self._session.attest_causal_proof(
             evidence_id=evidence_id,
             target_function=eff_fn,
@@ -410,40 +599,28 @@ class TrustedCausalVerifier:
         hypothesis_id: Optional[str] = None,
         execution_result: Optional[ControlledExecutionResult] = None,
     ) -> bool:
-        """Verify execution provenance and attest causal proof using an internally minted scoped capability."""
-        if execution_result is not None:
-            return self.verify_execution_and_attest(
-                evidence_id=evidence_id,
-                hypothesis_id=hypothesis_id or "",
-                execution_result=execution_result,
-                target_function=target_function,
-                field_path=field_path,
-                verification_type=verification_type,
+        """Verify execution result and attest causal proof.
+
+        Caller-supplied execution_provenance dictionaries or booleans are strictly rejected.
+        Only authentic execution receipts (ControlledExecutionResult) are accepted.
+        """
+        if execution_provenance is not None:
+            raise ValueError(
+                "Caller-supplied execution_provenance dictionaries or booleans are rejected. "
+                "Causal proof attestation requires an independently verified ControlledExecutionResult."
             )
-
-        if execution_provenance and isinstance(execution_provenance, dict):
-            status = execution_provenance.get("execution_status") or execution_provenance.get("status")
-            repro = execution_provenance.get("reproduction_verified")
-            if status in ("REPRODUCED", "SUCCESS", "CONFIRMED") or repro is True:
-                receipt = self.record_controlled_execution(
-                    target_function=target_function or "",
-                    field_path=field_path or "",
-                    before_value=execution_provenance.get("before_value", None),
-                    after_value=execution_provenance.get("after_value", None),
-                    execution_status=status or "REPRODUCED",
-                    capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
-                    backend_type=execution_provenance.get("verifier_method", "controlled_runtime"),
-                )
-                return self.verify_execution_and_attest(
-                    evidence_id=evidence_id,
-                    hypothesis_id=hypothesis_id or "",
-                    execution_result=receipt,
-                    target_function=target_function,
-                    field_path=field_path,
-                    verification_type=verification_type,
-                )
-
-        raise ValueError("Cannot verify and attest without authentic execution receipt or execution result")
+        if execution_result is None or not isinstance(execution_result, ControlledExecutionResult):
+            raise ValueError(
+                "Cannot attest causal proof: authentic execution_result (ControlledExecutionResult) is required."
+            )
+        return self.verify_execution_and_attest(
+            evidence_id=evidence_id,
+            hypothesis_id=hypothesis_id or "",
+            execution_result=execution_result,
+            target_function=target_function,
+            field_path=field_path,
+            verification_type=verification_type,
+        )
 
 
 class InvestigationManager:
@@ -490,6 +667,7 @@ class InvestigationManager:
             corpus_dir=self.corpus_dir,
             safety=safety,
             budgets=budgets,
+            corpus=self.corpus,
         )
         self.sessions[inv_id] = session
 
@@ -786,15 +964,29 @@ class InvestigationManager:
                 if isinstance(c, str):
                     return c
                 p = s.get("provenance", {})
-                if isinstance(p, dict) and p.get("capture_backend") == "process_vm_readv":
-                    return NON_ATOMIC
+                if isinstance(p, dict):
+                    if p.get("consistency_classification"):
+                        return p.get("consistency_classification")
+                    if p.get("snapshot_consistency"):
+                        return p.get("snapshot_consistency")
+                    if p.get("capture_mode") == "ZERO_STOP":
+                        return NON_ATOMIC
+                    if p.get("capture_backend") == "process_vm_readv":
+                        return NON_ATOMIC
             else:
                 c = getattr(s, "consistency", None)
                 if c is not None:
                     return c.get("level") if isinstance(c, dict) else getattr(c, "level", None)
                 p = getattr(s, "provenance", None)
-                if isinstance(p, dict) and p.get("capture_backend") == "process_vm_readv":
-                    return NON_ATOMIC
+                if isinstance(p, dict):
+                    if p.get("consistency_classification"):
+                        return p.get("consistency_classification")
+                    if p.get("snapshot_consistency"):
+                        return p.get("snapshot_consistency")
+                    if p.get("capture_mode") == "ZERO_STOP":
+                        return NON_ATOMIC
+                    if p.get("capture_backend") == "process_vm_readv":
+                        return NON_ATOMIC
                 backend = getattr(s, "capture_backend", None)
                 if backend == "process_vm_readv":
                     return NON_ATOMIC
@@ -806,7 +998,7 @@ class InvestigationManager:
             uncertainty = f"Comparison is untrusted due to capture quality failure: {diff_trust}. Verified facts suppressed."
         elif diff_trust == "PARTIALLY_TRUSTED":
             uncertainty = "One or both snapshots have PARTIAL capture quality; diff may reflect incomplete reads or non-atomic execution skew."
-        elif level_a == NON_ATOMIC or level_b == NON_ATOMIC:
+        elif not is_atomic_or_stopped_consistency(level_a) or not is_atomic_or_stopped_consistency(level_b):
             uncertainty = "One or both snapshots were captured non-atomically (process_vm_readv zero-stop). Value diffs may reflect minor execution skew."
 
         # Record comparison evidence in ledger
@@ -817,7 +1009,7 @@ class InvestigationManager:
             parents.append(session.identity_evidence_id)
 
         cmp_completeness = "COMPLETE" if diff_trust == "TRUSTED" else ("PARTIAL" if diff_trust == "PARTIALLY_TRUSTED" else "FAILED")
-        cmp_consistency = "STOPPED" if (level_a != NON_ATOMIC and level_b != NON_ATOMIC) else "NON_ATOMIC"
+        cmp_consistency = "STOPPED" if (is_atomic_or_stopped_consistency(level_a) and is_atomic_or_stopped_consistency(level_b)) else "NON_ATOMIC"
 
         ev = session.ledger.add_record(EvidenceRecord(
             evidence_type=EVIDENCE_TYPE_COMPARISON,
@@ -1075,21 +1267,145 @@ class InvestigationManager:
         if not session:
             raise ValueError(f"Investigation '{investigation_id}' not found")
 
-        # Load snapshots and verify real diff
+        # 1. Verify hypothesis scope
+        target_hypo = None
+        for h in session.hypotheses:
+            if h.hypothesis_id == hypothesis_id:
+                target_hypo = h
+                break
+        if not target_hypo:
+            raise ValueError(f"Hypothesis '{hypothesis_id}' not found in investigation '{investigation_id}'")
+
+        cand_fns = [fc.get("function_name") for fc in target_hypo.function_candidates if fc.get("function_name")]
+        if cand_fns and target_function not in cand_fns:
+            raise ValueError(f"Target function '{target_function}' does not match hypothesis candidates: {cand_fns}")
+
+        target_fields = getattr(target_hypo, "candidate_fields", []) or []
+        if target_fields and not any(f.lower() in field_path.lower() or field_path.lower() in f.lower() for f in target_fields):
+            raise ValueError(f"Field path '{field_path}' does not match hypothesis candidate fields: {target_fields}")
+
+        # 2. Verify evidence record in ledger
+        rec = session.ledger.get_record(evidence_id)
+        if not rec:
+            raise ValueError(f"Evidence record '{evidence_id}' does not exist in ledger")
+        p_details = rec.details or {}
+        p_prov = rec.provenance or {}
+        if (
+            p_details.get("caller_submitted") is True
+            or p_details.get("unverified_caller_claim") is True
+            or rec.source == "unverified_caller"
+            or p_prov.get("submission_channel") == "external_caller"
+        ):
+            raise ValueError(f"Cannot attest causal proof on unverified caller claim '{evidence_id}'")
+
+        rec_cq = rec.capture_quality or {}
+        r_comp = rec_cq.get("completeness") or rec_cq.get("status")
+        r_cons = rec_cq.get("consistency_level") or rec_cq.get("consistency_classification") or p_details.get("consistency_classification")
+        if r_comp != "COMPLETE" or not is_atomic_or_stopped_consistency(r_cons) or p_details.get("is_non_atomic") is True:
+            raise ValueError(f"Cannot attest causal proof: evidence '{evidence_id}' has degraded capture quality ({r_comp}, {r_cons})")
+
+        # 3. Load snapshots through supported parser
         snap_a = self._resolve_snapshot(snapshot_a_path, session)
         snap_b = self._resolve_snapshot(snapshot_b_path, session)
         if not snap_a or not snap_b:
             raise ValueError(f"Failed to load snapshots '{snapshot_a_path}' or '{snapshot_b_path}'")
 
+        # 4. Check capture quality of snapshots
+        def _get_snapshot_quality(snap: Any) -> Tuple[str, str]:
+            if hasattr(snap, "to_dict"):
+                s_dict = snap.to_dict()
+            elif isinstance(snap, dict):
+                s_dict = snap
+            else:
+                s_dict = {}
+            comp = getattr(snap, "completeness", None) or getattr(snap, "status", None) or s_dict.get("completeness") or s_dict.get("status") or "COMPLETE"
+            consistency = getattr(snap, "consistency", None) or s_dict.get("consistency")
+            cons_lvl = None
+            if isinstance(consistency, dict):
+                cons_lvl = consistency.get("level")
+            elif isinstance(consistency, str):
+                cons_lvl = consistency
+            if not cons_lvl:
+                cons_lvl = getattr(snap, "consistency_level", None) or s_dict.get("consistency_level")
+            if not cons_lvl:
+                obs_meta = getattr(snap, "observation_metadata", None) or s_dict.get("observation_metadata") or {}
+                prov = getattr(snap, "provenance", None) or s_dict.get("provenance") or {}
+                if obs_meta.get("consistency_classification"):
+                    cons_lvl = obs_meta.get("consistency_classification")
+                elif prov.get("snapshot_consistency"):
+                    cons_lvl = prov.get("snapshot_consistency")
+                elif obs_meta.get("is_non_atomic") is True or prov.get("is_non_atomic") is True:
+                    cons_lvl = "NON_ATOMIC"
+                else:
+                    cons_lvl = "STOPPED"
+            return str(comp).upper(), str(cons_lvl).upper()
+
+        comp_a, cons_a = _get_snapshot_quality(snap_a)
+        comp_b, cons_b = _get_snapshot_quality(snap_b)
+        if comp_a != "COMPLETE" or comp_b != "COMPLETE":
+            raise ValueError(f"Live reproduction rejected: snapshot capture completeness not COMPLETE (A: {comp_a}, B: {comp_b})")
+        if not is_atomic_or_stopped_consistency(cons_a) or not is_atomic_or_stopped_consistency(cons_b):
+            raise ValueError(f"Live reproduction rejected: snapshot consistency not atomic/stopped (A: {cons_a}, B: {cons_b})")
+
+        # 5. Check snapshot identities, PIDs, and build IDs
+        def _get_snapshot_identity(snap: Any) -> Dict[str, Any]:
+            if hasattr(snap, "to_dict"):
+                d = snap.to_dict()
+            elif isinstance(snap, dict):
+                d = snap
+            else:
+                d = {}
+            pid = getattr(snap, "pid", None) or d.get("pid") or (d.get("process") or {}).get("pid")
+            binary = getattr(snap, "executable", None) or getattr(snap, "binary", None) or d.get("executable") or d.get("binary") or (d.get("process") or {}).get("binary") or (d.get("process") or {}).get("executable")
+            build_id = getattr(snap, "executable_build_id", None) or d.get("executable_build_id") or (d.get("process") or {}).get("executable_build_id")
+            if not build_id and isinstance(d.get("provenance"), dict):
+                build_id = (d["provenance"].get("executable_identity") or {}).get("build_id")
+            return {"pid": pid, "binary": binary, "build_id": build_id}
+
+        id_a = _get_snapshot_identity(snap_a)
+        id_b = _get_snapshot_identity(snap_b)
+
+        if id_a["pid"] is not None and id_b["pid"] is not None and id_a["pid"] != id_b["pid"]:
+            raise ValueError(f"Target PID mismatch between snapshots: {id_a['pid']} != {id_b['pid']}")
+        if id_a["binary"] and id_b["binary"] and os.path.basename(str(id_a["binary"])) != os.path.basename(str(id_b["binary"])):
+            raise ValueError(f"Target binary mismatch between snapshots: {id_a['binary']} != {id_b['binary']}")
+        if id_a["build_id"] and id_b["build_id"] and id_a["build_id"] != id_b["build_id"]:
+            raise ValueError(f"Target build ID mismatch between snapshots: {id_a['build_id']} != {id_b['build_id']}")
+
+        # Verify against session target
+        sess_tid = session.target_ref.get("target_identity") or {}
+        sess_pid = session.target_ref.get("pid")
+        if sess_pid and id_a["pid"] and sess_pid != id_a["pid"]:
+            raise ValueError(f"Snapshot PID {id_a['pid']} does not match session target PID {sess_pid}")
+        if sess_tid.get("build_id") and id_a["build_id"] and sess_tid["build_id"] != id_a["build_id"]:
+            raise ValueError(f"Snapshot build ID does not match session target build ID")
+
+        # 6. Check temporal consistency
+        def _get_timestamp(snap: Any) -> Any:
+            if hasattr(snap, "to_dict"):
+                d = snap.to_dict()
+            elif isinstance(snap, dict):
+                d = snap
+            else:
+                d = {}
+            return getattr(snap, "timestamp_ns", None) or d.get("timestamp_ns") or getattr(snap, "timestamp", None) or d.get("timestamp") or ""
+
+        ts_a = _get_timestamp(snap_a)
+        ts_b = _get_timestamp(snap_b)
+        if ts_a and ts_b and str(ts_b) < str(ts_a):
+            raise ValueError(f"Temporal inconsistency: snapshot B ({ts_b}) precedes snapshot A ({ts_a})")
+
+        # 7. Compute snapshot hashes for post-issuance tamper detection
+        hash_a = compute_snapshot_artifact_hash(snapshot_a_path, session)
+        hash_b = compute_snapshot_artifact_hash(snapshot_b_path, session)
+
+        # 8. Compute and verify diff
         diff_engine = StateDiffEngine()
         diff_res = diff_engine.diff(snap_a, snap_b)
-
-        # Verify capture completeness and consistency
         diff_trust = getattr(diff_res, "trust_classification", "TRUSTED")
         if diff_trust not in ("TRUSTED", "CONFIRMED"):
             raise ValueError(f"Live reproduction rejected: snapshot comparison trust classification is {diff_trust}")
 
-        # Find field change in diff_res.changes
         found_change = None
         for chg in diff_res.changes:
             p = chg.get("path") or ""
@@ -1097,23 +1413,34 @@ class InvestigationManager:
             if p == field_path or f == field_path or field_path.endswith(f) or p.endswith(field_path):
                 found_change = chg
                 break
-
         if not found_change:
             raise ValueError(f"Live reproduction rejected: field '{field_path}' did not change between snapshots")
 
+        before_val = found_change.get("before")
+        after_val = found_change.get("after")
+
+        # 9. Mint ControlledExecutionResult
         verifier = TrustedCausalVerifier(session)
+        t_id = {
+            "pid": id_a["pid"] or id_b["pid"],
+            "binary": id_a["binary"] or id_b["binary"],
+            "build_id": id_a["build_id"] or id_b["build_id"],
+        }
         receipt = verifier.record_controlled_execution(
             target_function=target_function,
             field_path=field_path,
-            before_value=found_change.get("before"),
-            after_value=found_change.get("after"),
+            before_value=before_val,
+            after_value=after_val,
             execution_status="REPRODUCED",
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
-            before_snapshot_ref=snapshot_a_path,
-            after_snapshot_ref=snapshot_b_path,
-            target_identity=session.target_ref.get("target_identity"),
+            before_snapshot_ref=str(snapshot_a_path),
+            after_snapshot_ref=str(snapshot_b_path),
+            target_identity=t_id,
             backend_type="live_process_snapshot_diff",
+            hypothesis_id=hypothesis_id,
+            evidence_id=evidence_id,
         )
+
         return verifier.verify_execution_and_attest(
             evidence_id=evidence_id,
             hypothesis_id=hypothesis_id,
@@ -2498,10 +2825,20 @@ class InvestigationManager:
 
         # 2. Match snapshot_id or state_id in corpus states
         for state_id, meta in self.corpus.states.items():
-            if meta.get("snapshot_id") == snap_ref or state_id == snap_ref:
+            if meta.get("snapshot_id") == snap_ref or state_id == snap_ref or snap_ref in meta.get("observations", []):
                 snap_data = self.corpus.get(state_id)
                 if snap_data:
                     return snap_data
+
+        if session and hasattr(session, "corpus") and session.corpus:
+            snap_data = session.corpus.get(snap_ref)
+            if snap_data:
+                return snap_data
+            for state_id, meta in session.corpus.states.items():
+                if meta.get("snapshot_id") == snap_ref or state_id == snap_ref or snap_ref in meta.get("observations", []):
+                    snap_data = session.corpus.get(state_id)
+                    if snap_data:
+                        return snap_data
 
         # 3. Memory snapshot path or direct json file path
         cand = snap_ref if os.path.exists(snap_ref) else os.path.join(self.corpus_dir, "memory_snapshots", snap_ref)

@@ -1,6 +1,6 @@
 {
   "evaluation_metadata": {
-    "timestamp_utc": "2026-10-13T23:25:59.969791+00:00",
+    "timestamp_utc": "2026-10-14T00:11:54.939713+00:00",
     "framework": "dynamicState Causal Validation Evaluator v1.0",
     "denominator_definitions": {
       "total_scenarios": "Total evaluated deterministic test cases (N=18)",
@@ -24,6 +24,15 @@
     "causal_validation_recall": 1.0,
     "false_positive_rate": 0.0,
     "zero_false_positives_sla_satisfied": true
+  },
+  "breakdown_by_category": {
+    "synthetic_security_regression": {
+      "total": 18,
+      "tp": 2,
+      "fp": 0,
+      "tn": 16,
+      "fn": 0
+    }
   },
   "breakdown_by_capture_quality": {
     "COMPLETE": {
@@ -72,7 +81,8 @@
       "is_false_positive": false,
       "is_true_negative": false,
       "is_false_negative": false,
-      "reason": "Deterministic transition verified causal relationship via evidence ev_a_proof; all criteria satisfied."
+      "reason": "Deterministic transition verified causal relationship via evidence ev_a_proof; all criteria satisfied.",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_02_scenario_b",
@@ -90,7 +100,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); awaiting explicit causal validation."
+      "reason": "Supported by 1 observation(s); awaiting explicit causal validation.",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_03_scenario_c",
@@ -108,7 +119,8 @@
       "is_false_positive": false,
       "is_true_negative": false,
       "is_false_negative": false,
-      "reason": "Deterministic transition verified causal relationship via evidence ev_c_proof; all criteria satisfied."
+      "reason": "Deterministic transition verified causal relationship via evidence ev_c_proof; all criteria satisfied.",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_04_scenario_d",
@@ -126,7 +138,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Contradicted by 1 independent observation(s)."
+      "reason": "Contradicted by 1 independent observation(s).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_05_scenario_e_partial",
@@ -144,7 +157,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); capture quality is PARTIAL; capped at SUPPORTED (Proof evidence 'ev_e_diff' has PARTIAL capture quality; causal validation rejected)."
+      "reason": "Supported by 1 observation(s); capture quality is PARTIAL; capped at SUPPORTED (Proof evidence 'ev_e_diff' has PARTIAL capture quality; causal validation rejected).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_06_scenario_e_non_atomic",
@@ -162,7 +176,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); capture consistency is NON_ATOMIC; capped at SUPPORTED (Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements)."
+      "reason": "Supported by 1 observation(s); capture consistency is NON_ATOMIC; capped at SUPPORTED (Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_07_scenario_g_boolean_injection",
@@ -180,7 +195,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Caller-supplied deterministic_transition_verified boolean rejected: no verified causal proof record in ledger meeting contract requirements).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_08_scenario_g_fake_proof_id",
@@ -198,7 +214,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Referenced proof evidence 'fake_fabricated_id_999' does not exist in ledger)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Referenced proof evidence 'fake_fabricated_id_999' does not exist in ledger).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_09_scenario_h_cycle",
@@ -216,7 +233,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Cyclic evidence provenance detected; evaluation halted to prevent recursive reasoning."
+      "reason": "Cyclic evidence provenance detected; evaluation halted to prevent recursive reasoning.",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_10_scenario_h_missing_parent",
@@ -234,7 +252,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Evidence provenance integrity violation: Missing parent evidence record 'ev_ghost_parent' referenced by 'ev_child'."
+      "reason": "Evidence provenance integrity violation: Missing parent evidence record 'ev_ghost_parent' referenced by 'ev_child'.",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_11_scenario_h_duplicate",
@@ -252,7 +271,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); awaiting explicit causal validation."
+      "reason": "Supported by 1 observation(s); awaiting explicit causal validation.",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_12_boundary_untrusted_capture",
@@ -270,7 +290,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supporting evidence originates from FAILED, INVALID, or missing capture quality; cannot support hypothesis."
+      "reason": "Supporting evidence originates from FAILED, INVALID, or missing capture quality; cannot support hypothesis.",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_13_case_d_caller_markers",
@@ -288,7 +309,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_18856091f4d2' was submitted by unverified caller without independent execution)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_df826d31e534' was submitted by unverified caller without independent execution).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_14_case_f_degraded_parent",
@@ -306,7 +328,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 2 observation(s); capture quality is PARTIAL; capped at SUPPORTED (Proof evidence 'ev_child_proof' has PARTIAL ancestor evidence in provenance chain; causal validation rejected)."
+      "reason": "Supported by 2 observation(s); capture quality is PARTIAL; capped at SUPPORTED (Proof evidence 'ev_child_proof' has PARTIAL ancestor evidence in provenance chain; causal validation rejected).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_15_case_g_cross_investigation",
@@ -324,7 +347,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_sess1_proof' has invalid or unverified attestation token)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_sess1_proof' has invalid or unverified attestation token).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_16_case_h_forged_observation",
@@ -342,7 +366,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_obs_70076d14' was submitted by unverified caller without independent execution)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_obs_65c1d5cc' was submitted by unverified caller without independent execution).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_17_case_j_legacy_serialized",
@@ -360,7 +385,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_legacy_record' lacks capture quality metadata; causal validation rejected)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_legacy_record' lacks capture quality metadata; causal validation rejected).",
+      "evaluation_category": "synthetic_security_regression"
     },
     {
       "case_id": "case_18_case_k_api_injection",
@@ -378,7 +404,8 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_fe5d9f9af8cf' was submitted by unverified caller without independent execution)."
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_f27d4440ca75' was submitted by unverified caller without independent execution).",
+      "evaluation_category": "synthetic_security_regression"
     }
   ]
 }
