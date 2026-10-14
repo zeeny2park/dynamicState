@@ -195,6 +195,7 @@ class CausalDefectFixtures:
             snapshot_b_path=snap_a2["snapshot_id"],
             target_function="mutate_worker_state",
             field_path="WorkerState.counter",
+            attribution_evidence={"function_attribution_verified": True, "attribution_basis": "call_stack_observation"},
         )
 
         return mgr, inv_id, hypo.hypothesis_id
@@ -368,6 +369,7 @@ class CausalDefectFixtures:
             snapshot_b_path=snap_c2["snapshot_id"],
             target_function="update_flags",
             field_path="State.flags",
+            attribution_evidence={"function_attribution_verified": True, "attribution_basis": "call_stack_observation"},
         )
 
         return mgr, inv_id, hypo.hypothesis_id

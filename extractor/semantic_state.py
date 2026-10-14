@@ -122,9 +122,16 @@ class SemanticState:
                 paths.append(p)
         return sorted(list(set(paths)))
 
+    @property
+    def pid(self) -> Optional[int]:
+        return self.provenance.get("pid")
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "snapshot_id": self.snapshot_id,
+            "pid": self.pid,
+            "executable": self.provenance.get("executable"),
+            "executable_build_id": self.provenance.get("executable_build_id"),
             "state_hash": self.state_hash,
             "state_hash_short": self.state_hash_short,
             "state_hash_algorithm": self.state_hash_algorithm,
@@ -394,6 +401,12 @@ class OfflineSemanticEngine:
 
         # 6. Build full provenance
         prov = dict(raw_snapshot.provenance)
+        if raw_snapshot.pid and "pid" not in prov:
+            prov["pid"] = raw_snapshot.pid
+        if raw_snapshot.executable and "executable" not in prov:
+            prov["executable"] = raw_snapshot.executable
+        if raw_snapshot.executable_build_id and "executable_build_id" not in prov:
+            prov["executable_build_id"] = raw_snapshot.executable_build_id
         prov["state_hash"] = state_hash
         prov["object_count"] = len(objects)
         prov["root_count"] = len(roots)

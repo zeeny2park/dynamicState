@@ -41,6 +41,12 @@ from .evidence_ledger import (
     NATURE_OBSERVATION,
     compute_receipt_signature,
     is_atomic_or_stopped_consistency,
+    is_exact_semantic_path_match,
+    PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+    PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+    PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+    TRUSTED_PROVENANCE_CLASSES,
 )
 from .hypothesis import (
     CONFIDENCE_HIGH,
@@ -283,19 +289,72 @@ AUTHORIZED_EXECUTION_BACKENDS = {
 
 
 def compute_snapshot_artifact_hash(snap_ref: Any, session: Optional[InvestigationSession] = None) -> str:
-    """Compute a cryptographic SHA256 digest of snapshot artifact data for tamper detection."""
+    """Compute a cryptographic SHA256 digest of snapshot artifact data for tamper detection.
+
+    For directory-based snapshots:
+    - Recursively traverses all reconstruction-relevant artifact files.
+    - Deterministically hashes normalized relative paths, file sizes, and cryptographic file digests.
+    - Strictly rejects symlinks, path traversal, and empty directories.
+    """
     if isinstance(snap_ref, str):
-        if os.path.isfile(snap_ref):
-            with open(snap_ref, "rb") as f:
-                return hashlib.sha256(f.read()).hexdigest()
-        if os.path.isdir(snap_ref):
+        # Reject path traversal
+        norm = os.path.normpath(snap_ref)
+        if ".." in norm.split(os.path.sep):
+            raise ValueError(f"Path traversal detected in snapshot path: '{snap_ref}'")
+
+        cand_path = snap_ref
+        if not os.path.exists(cand_path) and session is not None:
+            if hasattr(session, "corpus") and session.corpus:
+                ms_path = os.path.join(session.corpus.corpus_dir, "memory_snapshots", snap_ref)
+                if os.path.exists(ms_path):
+                    cand_path = ms_path
+                else:
+                    for state_id, meta in session.corpus.states.items():
+                        if meta.get("snapshot_id") == snap_ref or state_id == snap_ref or snap_ref in meta.get("observations", []):
+                            s_dir = os.path.join(session.corpus.states_dir, state_id)
+                            if os.path.exists(s_dir):
+                                cand_path = s_dir
+                                break
+
+        if os.path.islink(cand_path):
+            raise ValueError(f"Snapshot path '{snap_ref}' is a symbolic link; symlinks are rejected for security")
+
+        if os.path.isfile(cand_path):
             h = hashlib.sha256()
-            for fn in sorted(["metadata.json", "manifest.json", "maps.json"]):
-                fp = os.path.join(snap_ref, fn)
-                if os.path.exists(fp):
-                    with open(fp, "rb") as f:
-                        h.update(f.read())
+            with open(cand_path, "rb") as f:
+                while chunk := f.read(65536):
+                    h.update(chunk)
             return h.hexdigest()
+
+        if os.path.isdir(cand_path):
+            entries = []
+            for root, dirs, files in os.walk(cand_path, followlinks=False):
+                for d in dirs:
+                    d_full = os.path.join(root, d)
+                    if os.path.islink(d_full):
+                        raise ValueError(f"Symbolic link directory detected in snapshot: '{d}'")
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    if os.path.islink(fp):
+                        raise ValueError(f"Symbolic link detected in snapshot artifact: '{fn}'")
+                    rel_p = os.path.relpath(fp, cand_path).replace("\\", "/")
+                    if ".." in rel_p.split("/") or os.path.isabs(rel_p):
+                        raise ValueError(f"Path traversal detected in snapshot file: '{rel_p}'")
+                    sz = os.path.getsize(fp)
+                    fh = hashlib.sha256()
+                    with open(fp, "rb") as f:
+                        while chunk := f.read(65536):
+                            fh.update(chunk)
+                    entries.append((rel_p, sz, fh.hexdigest()))
+
+            if not entries:
+                raise ValueError(f"Snapshot directory '{cand_path}' is empty; no artifact files found")
+
+            # Deterministic sorted manifest
+            manifest_h = hashlib.sha256()
+            for rel_p, sz, f_digest in sorted(entries):
+                manifest_h.update(f"{rel_p}:{sz}:{f_digest}\n".encode("utf-8"))
+            return manifest_h.hexdigest()
 
     snap_dict = snap_ref if isinstance(snap_ref, dict) else (
         snap_ref.to_dict() if hasattr(snap_ref, "to_dict") else {}
@@ -375,19 +434,31 @@ class TrustedCausalVerifier:
         backend_type: str = "controlled_runtime",
         hypothesis_id: str = "",
         evidence_id: str = "",
+        provenance_class: Optional[str] = None,
+        function_attribution_verified: Optional[bool] = None,
+        attribution_basis: str = "",
     ) -> ControlledExecutionResult:
         """Record an authentic execution receipt signed with the session secret.
 
         Strict Trust Boundaries:
         1. Arbitrary or unauthorized backend labels are strictly rejected.
         2. Fabricated before/after values without verified snapshot transitions are rejected.
-        3. Real snapshot references are validated against diff changes.
+        3. Real snapshot references are validated against diff changes using exact semantic path matching.
+        4. Provenance class and function attribution verification are bound into HMAC signature.
         """
         if backend_type not in AUTHORIZED_EXECUTION_BACKENDS:
             raise ValueError(f"Unauthorized execution backend '{backend_type}'; receipt creation rejected")
 
         if execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
             raise ValueError(f"Execution status '{execution_status}' does not prove reproduction")
+
+        eff_prov_class = provenance_class or PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+
+        if function_attribution_verified is not None:
+            eff_attr_ver = function_attribution_verified
+        else:
+            eff_attr_ver = bool(target_function and backend_type != "live_process_snapshot_diff")
+        eff_attr_basis = attribution_basis or ("controlled_execution" if eff_attr_ver else "")
 
         hash_a = None
         hash_b = None
@@ -406,7 +477,7 @@ class TrustedCausalVerifier:
             for chg in diff_res.changes:
                 p = chg.get("path") or ""
                 f = chg.get("field") or ""
-                if p == field_path or f == field_path or field_path.endswith(f) or p.endswith(field_path):
+                if is_exact_semantic_path_match(p, f, field_path):
                     if before_value is not None and chg.get("before") != before_value:
                         continue
                     if after_value is not None and chg.get("after") != after_value:
@@ -448,6 +519,9 @@ class TrustedCausalVerifier:
             after_snapshot_hash=hash_b,
             target_identity=t_id,
             backend_type=backend_type,
+            provenance_class=eff_prov_class,
+            function_attribution_verified=eff_attr_ver,
+            attribution_basis=eff_attr_basis,
             executed_at=now_ts,
             receipt_signature="",
         )
@@ -470,6 +544,9 @@ class TrustedCausalVerifier:
             after_snapshot_hash=hash_b,
             target_identity=t_id,
             backend_type=backend_type,
+            provenance_class=eff_prov_class,
+            function_attribution_verified=eff_attr_ver,
+            attribution_basis=eff_attr_basis,
             executed_at=now_ts,
             receipt_signature=sig,
         )
@@ -1261,13 +1338,46 @@ class InvestigationManager:
         target_function: str,
         field_path: str,
         verification_type: str = "deterministic_reproduction",
+        attribution_evidence: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Verify genuine live reproduction from two snapshots, verify real diff, and attest causal proof."""
         session = self.sessions.get(investigation_id)
         if not session:
             raise ValueError(f"Investigation '{investigation_id}' not found")
 
-        # 1. Verify hypothesis scope
+        # 1. Verify snapshot references and disk artifact existence
+        def _resolve_and_verify_disk_artifact(snap_path: str) -> str:
+            if not isinstance(snap_path, str):
+                raise ValueError(f"Snapshot path must be a string, got {type(snap_path).__name__}")
+            norm = os.path.normpath(snap_path)
+            if ".." in norm.split(os.path.sep):
+                raise ValueError(f"Path traversal detected in snapshot path: '{snap_path}'")
+            if os.path.islink(snap_path):
+                raise ValueError(f"Snapshot path '{snap_path}' is a symbolic link; symlinks are rejected for security")
+
+            cand = snap_path if os.path.exists(snap_path) else os.path.join(self.corpus_dir, "memory_snapshots", snap_path)
+            if not os.path.exists(cand):
+                found_dir = None
+                if session and hasattr(session, "corpus") and session.corpus:
+                    for s_id, s_meta in session.corpus.states.items():
+                        if s_meta.get("snapshot_id") == snap_path or s_id == snap_path or snap_path in s_meta.get("observations", []):
+                            s_dir = os.path.join(session.corpus.states_dir, s_id)
+                            if os.path.exists(s_dir):
+                                found_dir = s_dir
+                                break
+                if found_dir:
+                    cand = found_dir
+                else:
+                    raise ValueError(
+                        f"Snapshot artifact '{snap_path}' does not exist on disk; "
+                        "in-memory dictionaries or unregistered states cannot prove live runtime execution"
+                    )
+            return cand
+
+        disk_a = _resolve_and_verify_disk_artifact(snapshot_a_path)
+        disk_b = _resolve_and_verify_disk_artifact(snapshot_b_path)
+
+        # 2. Verify hypothesis scope
         target_hypo = None
         for h in session.hypotheses:
             if h.hypothesis_id == hypothesis_id:
@@ -1281,10 +1391,10 @@ class InvestigationManager:
             raise ValueError(f"Target function '{target_function}' does not match hypothesis candidates: {cand_fns}")
 
         target_fields = getattr(target_hypo, "candidate_fields", []) or []
-        if target_fields and not any(f.lower() in field_path.lower() or field_path.lower() in f.lower() for f in target_fields):
+        if target_fields and not any(is_exact_semantic_path_match(field_path, field_path.split(".")[-1], f) or is_exact_semantic_path_match(f, f.split(".")[-1], field_path) for f in target_fields):
             raise ValueError(f"Field path '{field_path}' does not match hypothesis candidate fields: {target_fields}")
 
-        # 2. Verify evidence record in ledger
+        # 3. Verify evidence record in ledger
         rec = session.ledger.get_record(evidence_id)
         if not rec:
             raise ValueError(f"Evidence record '{evidence_id}' does not exist in ledger")
@@ -1304,13 +1414,33 @@ class InvestigationManager:
         if r_comp != "COMPLETE" or not is_atomic_or_stopped_consistency(r_cons) or p_details.get("is_non_atomic") is True:
             raise ValueError(f"Cannot attest causal proof: evidence '{evidence_id}' has degraded capture quality ({r_comp}, {r_cons})")
 
-        # 3. Load snapshots through supported parser
+        # 4. Load snapshots through supported parser
         snap_a = self._resolve_snapshot(snapshot_a_path, session)
         snap_b = self._resolve_snapshot(snapshot_b_path, session)
         if not snap_a or not snap_b:
             raise ValueError(f"Failed to load snapshots '{snapshot_a_path}' or '{snapshot_b_path}'")
 
-        # 4. Check capture quality of snapshots
+        # Reject synthetic fixtures impersonating live captures
+        def _is_synthetic_snapshot(snap: Any) -> bool:
+            if getattr(snap, "is_synthetic", False) is True:
+                return True
+            d = snap.to_dict() if hasattr(snap, "to_dict") else (snap if isinstance(snap, dict) else {})
+            if d.get("is_synthetic") is True:
+                return True
+            if (d.get("provenance") or {}).get("is_synthetic") is True:
+                return True
+            if (d.get("observation_metadata") or {}).get("is_synthetic") is True:
+                return True
+            if d.get("provenance_class") == PROVENANCE_CLASS_SYNTHETIC_FIXTURE:
+                return True
+            if d.get("source") in ("synthetic", "in_memory", "unverified"):
+                return True
+            return False
+
+        if _is_synthetic_snapshot(snap_a) or _is_synthetic_snapshot(snap_b):
+            raise ValueError("Live reproduction rejected: synthetic snapshot fixture cannot impersonate live runtime capture")
+
+        # 5. Check capture quality of snapshots
         def _get_snapshot_quality(snap: Any) -> Tuple[str, str]:
             if hasattr(snap, "to_dict"):
                 s_dict = snap.to_dict()
@@ -1347,25 +1477,63 @@ class InvestigationManager:
         if not is_atomic_or_stopped_consistency(cons_a) or not is_atomic_or_stopped_consistency(cons_b):
             raise ValueError(f"Live reproduction rejected: snapshot consistency not atomic/stopped (A: {cons_a}, B: {cons_b})")
 
-        # 5. Check snapshot identities, PIDs, and build IDs
-        def _get_snapshot_identity(snap: Any) -> Dict[str, Any]:
+        # 6. Check snapshot identities, PIDs, and build IDs
+        def _get_snapshot_identity(snap: Any, disk_path: Optional[str] = None) -> Dict[str, Any]:
             if hasattr(snap, "to_dict"):
                 d = snap.to_dict()
             elif isinstance(snap, dict):
                 d = snap
             else:
                 d = {}
-            pid = getattr(snap, "pid", None) or d.get("pid") or (d.get("process") or {}).get("pid")
-            binary = getattr(snap, "executable", None) or getattr(snap, "binary", None) or d.get("executable") or d.get("binary") or (d.get("process") or {}).get("binary") or (d.get("process") or {}).get("executable")
-            build_id = getattr(snap, "executable_build_id", None) or d.get("executable_build_id") or (d.get("process") or {}).get("executable_build_id")
-            if not build_id and isinstance(d.get("provenance"), dict):
-                build_id = (d["provenance"].get("executable_identity") or {}).get("build_id")
+            prov = d.get("provenance") or getattr(snap, "provenance", {}) or {}
+            proc = d.get("process") or prov.get("process") or {}
+            pid = (
+                getattr(snap, "pid", None)
+                or d.get("pid")
+                or proc.get("pid")
+                or prov.get("pid")
+                or (prov.get("executable_identity") or {}).get("pid")
+            )
+            binary = (
+                getattr(snap, "executable", None)
+                or getattr(snap, "binary", None)
+                or d.get("executable")
+                or d.get("binary")
+                or proc.get("binary")
+                or proc.get("executable")
+                or prov.get("executable")
+                or prov.get("binary")
+                or (prov.get("executable_identity") or {}).get("path")
+            )
+            build_id = (
+                getattr(snap, "executable_build_id", None)
+                or d.get("executable_build_id")
+                or proc.get("executable_build_id")
+                or prov.get("executable_build_id")
+                or (prov.get("executable_identity") or {}).get("build_id")
+            )
+            if disk_path and (pid is None or not binary or not build_id):
+                meta_file = os.path.join(disk_path, "snapshot_metadata.json") if os.path.isdir(disk_path) else (disk_path if str(disk_path).endswith(".json") else None)
+                if meta_file and os.path.exists(meta_file):
+                    try:
+                        with open(meta_file, "r", encoding="utf-8") as f:
+                            disk_meta = json.load(f)
+                            if pid is None:
+                                pid = disk_meta.get("pid") or (disk_meta.get("process") or {}).get("pid") or (disk_meta.get("provenance") or {}).get("pid")
+                            if not binary:
+                                binary = disk_meta.get("executable") or disk_meta.get("binary") or (disk_meta.get("process") or {}).get("binary") or (disk_meta.get("process") or {}).get("executable")
+                            if not build_id:
+                                build_id = disk_meta.get("executable_build_id") or (disk_meta.get("process") or {}).get("executable_build_id")
+                    except Exception:
+                        pass
             return {"pid": pid, "binary": binary, "build_id": build_id}
 
-        id_a = _get_snapshot_identity(snap_a)
-        id_b = _get_snapshot_identity(snap_b)
+        id_a = _get_snapshot_identity(snap_a, disk_a)
+        id_b = _get_snapshot_identity(snap_b, disk_b)
 
-        if id_a["pid"] is not None and id_b["pid"] is not None and id_a["pid"] != id_b["pid"]:
+        if id_a["pid"] is None or id_b["pid"] is None:
+            raise ValueError("Snapshot missing required target PID identity")
+        if id_a["pid"] != id_b["pid"]:
             raise ValueError(f"Target PID mismatch between snapshots: {id_a['pid']} != {id_b['pid']}")
         if id_a["binary"] and id_b["binary"] and os.path.basename(str(id_a["binary"])) != os.path.basename(str(id_b["binary"])):
             raise ValueError(f"Target binary mismatch between snapshots: {id_a['binary']} != {id_b['binary']}")
@@ -1380,7 +1548,7 @@ class InvestigationManager:
         if sess_tid.get("build_id") and id_a["build_id"] and sess_tid["build_id"] != id_a["build_id"]:
             raise ValueError(f"Snapshot build ID does not match session target build ID")
 
-        # 6. Check temporal consistency
+        # 7. Check temporal consistency
         def _get_timestamp(snap: Any) -> Any:
             if hasattr(snap, "to_dict"):
                 d = snap.to_dict()
@@ -1395,11 +1563,11 @@ class InvestigationManager:
         if ts_a and ts_b and str(ts_b) < str(ts_a):
             raise ValueError(f"Temporal inconsistency: snapshot B ({ts_b}) precedes snapshot A ({ts_a})")
 
-        # 7. Compute snapshot hashes for post-issuance tamper detection
+        # 8. Compute snapshot hashes for post-issuance tamper detection
         hash_a = compute_snapshot_artifact_hash(snapshot_a_path, session)
         hash_b = compute_snapshot_artifact_hash(snapshot_b_path, session)
 
-        # 8. Compute and verify diff
+        # 9. Compute and verify diff using exact semantic path matching
         diff_engine = StateDiffEngine()
         diff_res = diff_engine.diff(snap_a, snap_b)
         diff_trust = getattr(diff_res, "trust_classification", "TRUSTED")
@@ -1410,7 +1578,7 @@ class InvestigationManager:
         for chg in diff_res.changes:
             p = chg.get("path") or ""
             f = chg.get("field") or ""
-            if p == field_path or f == field_path or field_path.endswith(f) or p.endswith(field_path):
+            if is_exact_semantic_path_match(p, f, field_path):
                 found_change = chg
                 break
         if not found_change:
@@ -1419,7 +1587,33 @@ class InvestigationManager:
         before_val = found_change.get("before")
         after_val = found_change.get("after")
 
-        # 9. Mint ControlledExecutionResult
+        # 10. Verify function attribution evidence
+        func_attr_ver = False
+        attr_basis = "state_transition_only"
+
+        if attribution_evidence and isinstance(attribution_evidence, dict):
+            if attribution_evidence.get("function_attribution_verified") is True:
+                attr_fn = attribution_evidence.get("function_name") or attribution_evidence.get("target_function")
+                if not attr_fn or attr_fn == target_function:
+                    func_attr_ver = True
+                    attr_basis = attribution_evidence.get("attribution_basis") or "runtime_execution_instrumentation"
+        else:
+            th_meta = getattr(snap_b, "thread_metadata", None)
+            if th_meta is None and hasattr(snap_b, "to_dict"):
+                th_meta = snap_b.to_dict().get("thread_metadata")
+            elif th_meta is None and isinstance(snap_b, dict):
+                th_meta = snap_b.get("thread_metadata")
+            if th_meta and isinstance(th_meta, list):
+                for t in th_meta:
+                    if isinstance(t, dict):
+                        fn = t.get("function") or t.get("name")
+                        frames = t.get("call_stack") or t.get("frames") or []
+                        if fn == target_function or any(target_function in str(fr) for fr in frames):
+                            func_attr_ver = True
+                            attr_basis = "thread_call_frame_observation"
+                            break
+
+        # 11. Mint ControlledExecutionResult
         verifier = TrustedCausalVerifier(session)
         t_id = {
             "pid": id_a["pid"] or id_b["pid"],
@@ -1439,6 +1633,9 @@ class InvestigationManager:
             backend_type="live_process_snapshot_diff",
             hypothesis_id=hypothesis_id,
             evidence_id=evidence_id,
+            provenance_class=PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+            function_attribution_verified=func_attr_ver,
+            attribution_basis=attr_basis,
         )
 
         return verifier.verify_execution_and_attest(
@@ -1480,6 +1677,8 @@ class InvestigationManager:
 
             # External caller cannot claim trusted verifier attestation or execution provenance
             new_prov["submission_channel"] = "external_caller"
+            new_prov["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            new_details["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
             new_prov.pop("verifier_attestation", None)
             new_prov.pop("execution_provenance", None)
 

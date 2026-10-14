@@ -1,6 +1,6 @@
 {
   "evaluation_metadata": {
-    "timestamp_utc": "2026-10-14T00:11:54.939713+00:00",
+    "timestamp_utc": "2026-10-14T02:13:10.350892+00:00",
     "framework": "dynamicState Causal Validation Evaluator v1.0",
     "denominator_definitions": {
       "total_scenarios": "Total evaluated deterministic test cases (N=18)",
@@ -309,7 +309,7 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_df826d31e534' was submitted by unverified caller without independent execution).",
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_68119c5bbf04' was submitted by unverified caller without independent execution).",
       "evaluation_category": "synthetic_security_regression"
     },
     {
@@ -366,7 +366,7 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_obs_65c1d5cc' was submitted by unverified caller without independent execution).",
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_obs_27191952' was submitted by unverified caller without independent execution).",
       "evaluation_category": "synthetic_security_regression"
     },
     {
@@ -404,7 +404,7 @@
       "is_false_positive": false,
       "is_true_negative": true,
       "is_false_negative": false,
-      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_f27d4440ca75' was submitted by unverified caller without independent execution).",
+      "reason": "Supported by 1 observation(s); causal proof rejected (Proof evidence 'ev_da82f9cba4bf' was submitted by unverified caller without independent execution).",
       "evaluation_category": "synthetic_security_regression"
     }
   ]

@@ -31,6 +31,12 @@ from .evidence_ledger import (
     NATURE_OBSERVATION,
     compute_attestation_signature,
     compute_evidence_fingerprint,
+    is_exact_semantic_path_match,
+    PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+    PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+    PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+    TRUSTED_PROVENANCE_CLASSES,
 )
 
 # -----------------------------------------------------------------------------
@@ -799,6 +805,9 @@ class HypothesisValidator:
             field_path=attestation.get("field_path"),
             hypothesis_id=attestation.get("hypothesis_id"),
             target_identity=attestation.get("target_identity"),
+            provenance_class=attestation.get("provenance_class"),
+            function_attribution_verified=attestation.get("function_attribution_verified"),
+            attribution_basis=attestation.get("attribution_basis"),
         )
         stored_fp = attestation.get("evidence_fingerprint")
         if not stored_fp or stored_fp != expected_fp:
@@ -916,7 +925,7 @@ class HypothesisValidator:
         target_fields = getattr(hypothesis, "candidate_fields", []) or []
         proof_field = p_details.get("field_path") or attestation.get("field_path") or ""
         if target_fields and proof_field:
-            if not any(f.lower() in proof_field.lower() or proof_field.lower() in f.lower() for f in target_fields):
+            if not any(is_exact_semantic_path_match(proof_field, proof_field.split(".")[-1], f) or is_exact_semantic_path_match(f, f.split(".")[-1], proof_field) for f in target_fields):
                 return (
                     False,
                     f"Proof evidence '{proof_rec.evidence_id}' target field '{proof_field}' does not match hypothesis candidate fields {target_fields}",
@@ -1078,7 +1087,23 @@ class HypothesisValidator:
                 is_proof_partial = (proof_c_status == "PARTIAL")
                 is_proof_non_atomic = (proof_level == "NON_ATOMIC") or (proof_rec.details or {}).get("is_non_atomic") is True
 
-                if has_partial_evidence or is_proof_partial:
+                proof_att = (proof_rec.provenance or {}).get("verifier_attestation") or {}
+                proof_prov_cls = (
+                    proof_att.get("provenance_class")
+                    or (proof_rec.details or {}).get("provenance_class")
+                    or (proof_rec.provenance or {}).get("provenance_class")
+                    or PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+                )
+                is_synthetic_or_unverified = (proof_prov_cls not in TRUSTED_PROVENANCE_CLASSES)
+
+                if is_synthetic_or_unverified:
+                    new_status = HYPOTHESIS_STATUS_SUPPORTED
+                    new_conf = CONFIDENCE_MEDIUM
+                    reason = f"Causal transition supported by evidence {proof_rec.evidence_id}, but provenance class '{proof_prov_cls}' is synthetic/unverified; capped at SUPPORTED."
+                    for fc in hypothesis.function_candidates:
+                        fc["confirmed_root_cause"] = False
+                        fc["tier_limitation"] = f"Provenance class '{proof_prov_cls}' is not trusted live runtime; function cannot be confirmed root cause."
+                elif has_partial_evidence or is_proof_partial:
                     new_status = HYPOTHESIS_STATUS_SUPPORTED
                     new_conf = CONFIDENCE_MEDIUM
                     reason = "Causal transition observed, but capture quality is PARTIAL; capped at SUPPORTED."
@@ -1094,14 +1119,20 @@ class HypothesisValidator:
 
                     # Upgrade function candidate if present (Invariant 1 & 2: STATIC_CANDIDATE never promoted!)
                     target_fn = (proof_rec.details or {}).get("target_function") or (proof_rec.details or {}).get("writer_function") or (proof_rec.details or {}).get("executing_function")
+                    func_attr_ver = bool(proof_att.get("function_attribution_verified", (proof_rec.details or {}).get("function_attribution_verified", False)))
+
                     for fc in hypothesis.function_candidates:
                         tier = fc.get("candidate_tier")
                         fn_name = fc.get("function_name")
                         if tier == FUNCTION_TIER_EVIDENCE_SUPPORTED:
                             if not target_fn or fn_name == target_fn:
-                                fc["candidate_tier"] = FUNCTION_TIER_VALIDATED_CAUSAL
-                                fc["confirmed_root_cause"] = True
-                                fc["tier_limitation"] = f"Causal role verified via deterministic reproduction in evidence {proof_rec.evidence_id}."
+                                if func_attr_ver:
+                                    fc["candidate_tier"] = FUNCTION_TIER_VALIDATED_CAUSAL
+                                    fc["confirmed_root_cause"] = True
+                                    fc["tier_limitation"] = f"Causal role verified via deterministic reproduction and verified function attribution in evidence {proof_rec.evidence_id}."
+                                else:
+                                    fc["confirmed_root_cause"] = False
+                                    fc["tier_limitation"] = f"State transition verified in runtime, but function attribution was not independently verified by execution instrumentation."
                             else:
                                 fc["confirmed_root_cause"] = False
                                 fc["tier_limitation"] = f"Observed in execution, but causal proof evidence identifies {target_fn} as the causal writer."

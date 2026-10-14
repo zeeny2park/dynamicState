@@ -38,7 +38,14 @@ from extractor.evidence_ledger import (
     compute_attestation_signature,
     compute_evidence_fingerprint,
     compute_receipt_signature,
+    is_exact_semantic_path_match,
+    PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+    PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+    PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+    TRUSTED_PROVENANCE_CLASSES,
 )
+from extractor.investigation import compute_snapshot_artifact_hash
 from extractor.hypothesis import (
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
@@ -2045,6 +2052,862 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             self.assertEqual(cc["validated_causal_count"], 1)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+
+
+class TestVerifiableRuntimeProvenancePhase5(unittest.TestCase):
+    """Phase 5: Adversarial regression tests covering Cases A through R."""
+
+    def test_phase5_case_a_caller_provided_execution_provenance_and_booleans_rejected(self):
+        """Case A: Caller-provided execution_provenance dictionaries and booleans cannot mint a receipt or capability."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Phase 5 Case A")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        rec = EvidenceRecord(
+            evidence_id="ev_a_call",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Obs",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec)
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_a",
+            investigation_id=inv_id,
+            title="Hypo A",
+            claim="Claim A",
+            proposed_mechanism="Mech A",
+            supporting_evidence_ids=["ev_a_call"],
+            function_candidates=[{
+                "function_name": "worker_fn",
+                "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED,
+                "confirmed_root_cause": False,
+            }],
+            validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+        )
+        session.hypotheses.append(hypo)
+
+        # Attestation without authentic capability must be rejected
+        with self.assertRaises(ValueError) as ctx:
+            session.ledger.attest_causal_proof(
+                "ev_a_call",
+                target_function="worker_fn",
+                execution_provenance={"execution_status": "REPRODUCED", "reproduction_verified": True},
+            )
+        self.assertIn("lacks genuine execution provenance or internal verification capability", str(ctx.exception))
+
+        # Evaluate with caller boolean claim
+        res = mgr.evaluate_hypothesis(inv_id, "hypo_a", deterministic_transition_verified=True)
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertTrue(res["transition"]["unverified_claim_rejected"])
+
+        # Check candidate tier
+        h_after = mgr.get_hypothesis(inv_id, "hypo_a")
+        fc = h_after["function_candidates"][0]
+        self.assertNotEqual(fc["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+        self.assertFalse(fc["confirmed_root_cause"])
+
+    def test_phase5_case_b_caller_selected_backend_labels_cannot_turn_unverified_input_into_provenance(self):
+        """Case B: Caller-selected backend_type labels cannot turn unverified input into trusted runtime provenance."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Phase 5 Case B")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+        verifier = TrustedCausalVerifier(session)
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_b",
+            investigation_id=inv_id,
+            title="Hypo B",
+            claim="Claim B",
+            proposed_mechanism="Mech B",
+            supporting_evidence_ids=[],
+            function_candidates=[{
+                "function_name": "worker_fn",
+                "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED,
+                "confirmed_root_cause": False,
+            }],
+            validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+        )
+        session.hypotheses.append(hypo)
+
+        with self.assertRaises(ValueError) as ctx:
+            verifier.record_controlled_execution(
+                target_function="worker_fn",
+                field_path="State.val",
+                execution_status="REPRODUCED",
+                backend_type="unauthorized_caller_custom_backend",
+            )
+        self.assertIn("Unauthorized execution backend", str(ctx.exception))
+
+        h_after = mgr.get_hypothesis(inv_id, "hypo_b")
+        self.assertEqual(h_after["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertNotEqual(h_after["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+
+    def test_phase5_case_c_synthetic_fixture_evidence_cannot_promote_real_investigation_to_validated(self):
+        """Case C: SYNTHETIC_FIXTURE evidence cannot promote a real investigation to VALIDATED."""
+        mgr, inv_id, hypo_id = CausalDefectFixtures.create_scenario_a_reproducible_mutation()
+        session = mgr.sessions[inv_id]
+        verifier = TrustedCausalVerifier(session)
+
+        rec_synth = EvidenceRecord(
+            evidence_id="ev_synth_proof",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="synthetic_generator",
+            session_id=inv_id,
+            observation="Synthetic transition simulation",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            provenance={"provenance_class": PROVENANCE_CLASS_SYNTHETIC_FIXTURE},
+        )
+        session.ledger.add_record(rec_synth)
+
+        rcpt = verifier.record_controlled_execution(
+            target_function="mutate_worker_state",
+            field_path="WorkerState.counter",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_synth_proof",
+            hypothesis_id=hypo_id,
+            provenance_class=PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+        )
+        verifier.verify_execution_and_attest(
+            evidence_id="ev_synth_proof",
+            hypothesis_id=hypo_id,
+            execution_result=rcpt,
+        )
+
+        res = mgr.evaluate_hypothesis(inv_id, hypo_id, proof_evidence_id="ev_synth_proof")
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertIn("SYNTHETIC_FIXTURE", res["transition"]["reason"])
+
+        hypo = mgr.get_hypothesis(inv_id, hypo_id)
+        self.assertEqual(hypo["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertFalse(hypo["function_candidates"][0]["confirmed_root_cause"])
+        self.assertNotEqual(hypo["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+
+    def test_phase5_case_d_in_memory_dictionaries_cannot_impersonate_captured_runtime_snapshots(self):
+        """Case D: In-memory dictionaries inserted into StateCorpus cannot impersonate independently captured snapshots."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Phase 5 Case D")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        rec = EvidenceRecord(
+            evidence_id="ev_d",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Obs",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec)
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_d",
+            investigation_id=inv_id,
+            title="Hypo D",
+            claim="Claim D",
+            proposed_mechanism="Mech D",
+            supporting_evidence_ids=["ev_d"],
+            candidate_fields=["State.val"],
+            function_candidates=[{"function_name": "fn_d", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+            validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+        )
+        session.hypotheses.append(hypo)
+
+        with self.assertRaises(ValueError) as ctx:
+            mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="hypo_d",
+                evidence_id="ev_d",
+                snapshot_a_path="nonexistent_in_memory_snap_a",
+                snapshot_b_path="nonexistent_in_memory_snap_b",
+                target_function="fn_d",
+                field_path="State.val",
+            )
+        self.assertIn("does not exist on disk", str(ctx.exception))
+        h_after = mgr.get_hypothesis(inv_id, "hypo_d")
+        self.assertNotEqual(h_after["validation_status"], HYPOTHESIS_STATUS_VALIDATED)
+        self.assertFalse(h_after["function_candidates"][0]["confirmed_root_cause"])
+
+    def test_phase5_case_e_mutating_raw_memory_payload_after_receipt_creation_is_detected(self):
+        """Case E: Mutating a raw memory payload after receipt creation is detected."""
+        temp_dir = tempfile.mkdtemp(prefix="phase5_case_e_")
+        try:
+            snap_a_dir = os.path.join(temp_dir, "snap_a")
+            snap_b_dir = os.path.join(temp_dir, "snap_b")
+            os.makedirs(os.path.join(snap_a_dir, "memory"), exist_ok=True)
+            os.makedirs(os.path.join(snap_b_dir, "memory"), exist_ok=True)
+
+            with open(os.path.join(snap_a_dir, "snapshot_metadata.json"), "w") as f:
+                json.dump({"snapshot_id": "snap_a", "pid": 1234, "executable": "/bin/app", "completeness": "COMPLETE", "consistency_level": "STOPPED"}, f)
+            with open(os.path.join(snap_b_dir, "snapshot_metadata.json"), "w") as f:
+                json.dump({"snapshot_id": "snap_b", "pid": 1234, "executable": "/bin/app", "completeness": "COMPLETE", "consistency_level": "STOPPED"}, f)
+
+            bin_a = os.path.join(snap_a_dir, "memory", "range_0x1000_0x2000.bin")
+            bin_b = os.path.join(snap_b_dir, "memory", "range_0x1000_0x2000.bin")
+            with open(bin_a, "wb") as f:
+                f.write(b"A" * 4096)
+            with open(bin_b, "wb") as f:
+                f.write(b"B" * 4096)
+
+            mgr = InvestigationManager()
+            start = mgr.start_investigation(goal="Phase 5 Case E")
+            inv_id = start["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_e",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="collector",
+                session_id=inv_id,
+                observation="Obs",
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            verifier = TrustedCausalVerifier(session)
+
+            hash_a = compute_snapshot_artifact_hash(snap_a_dir, session)
+            hash_b = compute_snapshot_artifact_hash(snap_b_dir, session)
+
+            res_temp = ControlledExecutionResult(
+                execution_id="exec_e",
+                investigation_id=inv_id,
+                target_function="fn_e",
+                field_path="State.val",
+                before_value=1,
+                after_value=2,
+                execution_status="REPRODUCED",
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+                evidence_id="ev_e",
+                hypothesis_id="hypo_e",
+                before_snapshot_ref=snap_a_dir,
+                after_snapshot_ref=snap_b_dir,
+                before_snapshot_hash=hash_a,
+                after_snapshot_hash=hash_b,
+                backend_type="live_process_snapshot_diff",
+            )
+            sig = compute_receipt_signature(session._session_secret, res_temp)
+            receipt = ControlledExecutionResult(
+                execution_id=res_temp.execution_id,
+                investigation_id=res_temp.investigation_id,
+                target_function=res_temp.target_function,
+                field_path=res_temp.field_path,
+                before_value=res_temp.before_value,
+                after_value=res_temp.after_value,
+                execution_status=res_temp.execution_status,
+                capture_quality=res_temp.capture_quality,
+                evidence_id=res_temp.evidence_id,
+                hypothesis_id=res_temp.hypothesis_id,
+                before_snapshot_ref=res_temp.before_snapshot_ref,
+                after_snapshot_ref=res_temp.after_snapshot_ref,
+                before_snapshot_hash=res_temp.before_snapshot_hash,
+                after_snapshot_hash=res_temp.after_snapshot_hash,
+                backend_type=res_temp.backend_type,
+                receipt_signature=sig,
+            )
+
+            # Adversary tampers with raw memory payload
+            with open(bin_b, "wb") as f:
+                f.write(b"TAMPERED_BYTES" * 100)
+
+            with self.assertRaises(ValueError) as ctx:
+                verifier.verify_execution_and_attest("ev_e", "hypo_e", receipt)
+            self.assertIn("tampered or modified", str(ctx.exception))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase5_case_f_mutating_metadata_maps_manifest_or_thread_data_is_detected(self):
+        """Case F: Mutating metadata, maps, manifest, thread data, or reconstruction artifact is detected."""
+        temp_dir = tempfile.mkdtemp(prefix="phase5_case_f_")
+        try:
+            snap_dir = os.path.join(temp_dir, "snap_f")
+            os.makedirs(snap_dir, exist_ok=True)
+            meta_path = os.path.join(snap_dir, "snapshot_metadata.json")
+            maps_path = os.path.join(snap_dir, "maps.json")
+            with open(meta_path, "w") as f:
+                json.dump({"snapshot_id": "snap_f", "pid": 100}, f)
+            with open(maps_path, "w") as f:
+                json.dump([{"start": "0x1000", "end": "0x2000"}], f)
+
+            mgr = InvestigationManager()
+            start = mgr.start_investigation(goal="Phase 5 Case F")
+            session = mgr.sessions[start["investigation_id"]]
+            initial_hash = compute_snapshot_artifact_hash(snap_dir, session)
+
+            # Mutate maps.json
+            with open(maps_path, "w") as f:
+                json.dump([{"start": "0x1000", "end": "0x9999"}], f)
+
+            tampered_hash = compute_snapshot_artifact_hash(snap_dir, session)
+            self.assertNotEqual(initial_hash, tampered_hash)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase5_case_g_adding_deleting_renaming_replacing_file_in_snapshot_directory_is_detected(self):
+        """Case G: Adding, deleting, renaming, or replacing a file in a snapshot directory is detected."""
+        temp_dir = tempfile.mkdtemp(prefix="phase5_case_g_")
+        try:
+            snap_dir = os.path.join(temp_dir, "snap_g")
+            os.makedirs(snap_dir, exist_ok=True)
+            file1 = os.path.join(snap_dir, "file1.txt")
+            with open(file1, "w") as f:
+                f.write("content1")
+
+            mgr = InvestigationManager()
+            start = mgr.start_investigation(goal="Phase 5 Case G")
+            session = mgr.sessions[start["investigation_id"]]
+            hash1 = compute_snapshot_artifact_hash(snap_dir, session)
+
+            # 1. Adding file
+            file2 = os.path.join(snap_dir, "file2.txt")
+            with open(file2, "w") as f:
+                f.write("content2")
+            hash2 = compute_snapshot_artifact_hash(snap_dir, session)
+            self.assertNotEqual(hash1, hash2)
+
+            # 2. Deleting file
+            os.remove(file2)
+            hash3 = compute_snapshot_artifact_hash(snap_dir, session)
+            self.assertEqual(hash1, hash3)
+
+            # 3. Renaming file
+            renamed = os.path.join(snap_dir, "file1_renamed.txt")
+            os.rename(file1, renamed)
+            hash4 = compute_snapshot_artifact_hash(snap_dir, session)
+            self.assertNotEqual(hash1, hash4)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase5_case_h_symlinks_and_path_traversal_are_rejected_safely(self):
+        """Case H: Symlinks and path traversal are rejected safely."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Phase 5 Case H")
+        inv_id = start["investigation_id"]
+
+        with self.assertRaises(ValueError) as ctx1:
+            mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="hypo_h",
+                evidence_id="ev_h",
+                snapshot_a_path="../../etc/passwd",
+                snapshot_b_path="/tmp/valid",
+                target_function="fn_h",
+                field_path="val",
+            )
+        self.assertIn("Path traversal detected", str(ctx1.exception))
+
+        temp_dir = tempfile.mkdtemp(prefix="phase5_case_h_")
+        try:
+            real_file = os.path.join(temp_dir, "real.json")
+            with open(real_file, "w") as f:
+                json.dump({"snapshot_id": "real"}, f)
+            symlink_file = os.path.join(temp_dir, "symlink.json")
+            os.symlink(real_file, symlink_file)
+
+            with self.assertRaises(ValueError) as ctx2:
+                mgr.verify_live_reproduction_and_attest(
+                    investigation_id=inv_id,
+                    hypothesis_id="hypo_h",
+                    evidence_id="ev_h",
+                    snapshot_a_path=symlink_file,
+                    snapshot_b_path=real_file,
+                    target_function="fn_h",
+                    field_path="val",
+                )
+            self.assertIn("symbolic link", str(ctx2.exception))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase5_case_i_receipt_cannot_be_reused_across_investigations_hypotheses_or_fields(self):
+        """Case I: A receipt cannot be reused across investigations, evidence records, hypotheses, functions, or fields."""
+        mgr = InvestigationManager()
+        start1 = mgr.start_investigation(goal="Phase 5 Case I - 1")
+        start2 = mgr.start_investigation(goal="Phase 5 Case I - 2")
+        inv_1 = start1["investigation_id"]
+        inv_2 = start2["investigation_id"]
+        s1 = mgr.sessions[inv_1]
+        s2 = mgr.sessions[inv_2]
+
+        v1 = TrustedCausalVerifier(s1)
+        v2 = TrustedCausalVerifier(s2)
+
+        rcpt1 = v1.record_controlled_execution(
+            target_function="fn_original",
+            field_path="State.original_field",
+            execution_status="REPRODUCED",
+            backend_type="synthetic_adversarial_fixture",
+            evidence_id="ev_1",
+            hypothesis_id="hypo_1",
+        )
+
+        # Attempt to verify receipt 1 against session 2
+        with self.assertRaises(ValueError) as ctx:
+            v2.verify_execution_and_attest(
+                evidence_id="ev_1",
+                hypothesis_id="hypo_1",
+                execution_result=rcpt1,
+            )
+        self.assertIn("authenticity verification failed", str(ctx.exception))
+
+    def test_phase5_case_j_mismatched_build_ids_pid_identities_or_temporal_order_fail_safely(self):
+        """Case J: Mismatched build IDs, PID/process identities, timestamps, capture quality, or transitions fail safely."""
+        temp_dir = tempfile.mkdtemp(prefix="phase5_case_j_")
+        try:
+            snap_a_file = os.path.join(temp_dir, "snap_a.json")
+            snap_b_file = os.path.join(temp_dir, "snap_b.json")
+
+            # 1. PID mismatch
+            with open(snap_a_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:00Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 10}]}]}
+                }, f)
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 9999, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 20}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            start = mgr.start_investigation(goal="Phase 5 Case J")
+            inv_id = start["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_j",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="collector",
+                session_id=inv_id,
+                observation="Obs",
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_j",
+                investigation_id=inv_id,
+                title="Hypo J",
+                claim="Claim J",
+                proposed_mechanism="Mech J",
+                supporting_evidence_ids=["ev_j"],
+                candidate_fields=["State.val"],
+                function_candidates=[{"function_name": "fn_j", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            with self.assertRaises(ValueError) as ctx_pid:
+                mgr.verify_live_reproduction_and_attest(
+                    investigation_id=inv_id,
+                    hypothesis_id="hypo_j",
+                    evidence_id="ev_j",
+                    snapshot_a_path=snap_a_file,
+                    snapshot_b_path=snap_b_file,
+                    target_function="fn_j",
+                    field_path="State.val",
+                )
+            self.assertIn("Target PID mismatch", str(ctx_pid.exception))
+
+            # 2. Temporal inconsistency
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-13T00:00:00Z",  # Earlier than A
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 20}]}]}
+                }, f)
+            with self.assertRaises(ValueError) as ctx_time:
+                mgr.verify_live_reproduction_and_attest(
+                    investigation_id=inv_id,
+                    hypothesis_id="hypo_j",
+                    evidence_id="ev_j",
+                    snapshot_a_path=snap_a_file,
+                    snapshot_b_path=snap_b_file,
+                    target_function="fn_j",
+                    field_path="State.val",
+                )
+            self.assertIn("Temporal inconsistency", str(ctx_time.exception))
+
+            h_after = mgr.get_hypothesis(inv_id, "hypo_j")
+            self.assertNotEqual(h_after["validation_status"], HYPOTHESIS_STATUS_VALIDATED)
+            self.assertFalse(h_after["function_candidates"][0]["confirmed_root_cause"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase5_case_k_similar_field_suffixes_in_unrelated_objects_rejected(self):
+        """Case K: Similar field suffixes in unrelated objects cannot satisfy requested field-path match."""
+        # 1. Unit test is_exact_semantic_path_match
+        self.assertFalse(is_exact_semantic_path_match("ThreadCounter", "counter", "State.counter"))
+        self.assertFalse(is_exact_semantic_path_match("GlobalState.counter_2", "counter_2", "State.counter"))
+        self.assertTrue(is_exact_semantic_path_match("Session.worker.state", "counter", "State.counter"))
+        self.assertTrue(is_exact_semantic_path_match("WorkerState", "counter", "WorkerState.counter"))
+
+        # 2. verify_live_reproduction_and_attest with cross-object field name collision
+        temp_dir = tempfile.mkdtemp(prefix="phase5_case_k_")
+        try:
+            snap_a_file = os.path.join(temp_dir, "snap_a.json")
+            snap_b_file = os.path.join(temp_dir, "snap_b.json")
+            with open(snap_a_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "ThreadCounter", "fields": [{"name": "counter", "value": 0}]}]}
+                }, f)
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "ThreadCounter", "fields": [{"name": "counter", "value": 5}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            start = mgr.start_investigation(goal="Phase 5 Case K")
+            inv_id = start["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_k",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="collector",
+                session_id=inv_id,
+                observation="Obs",
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_k",
+                investigation_id=inv_id,
+                title="Hypo K",
+                claim="Claim K",
+                proposed_mechanism="Mech K",
+                supporting_evidence_ids=["ev_k"],
+                candidate_fields=["State.counter"],
+                function_candidates=[{"function_name": "fn_k", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            with self.assertRaises(ValueError) as ctx:
+                mgr.verify_live_reproduction_and_attest(
+                    investigation_id=inv_id,
+                    hypothesis_id="hypo_k",
+                    evidence_id="ev_k",
+                    snapshot_a_path=snap_a_file,
+                    snapshot_b_path=snap_b_file,
+                    target_function="fn_k",
+                    field_path="State.counter",  # Only ThreadCounter.counter changed!
+                )
+            self.assertIn("field 'State.counter' did not change between snapshots", str(ctx.exception))
+            h_after = mgr.get_hypothesis(inv_id, "hypo_k")
+            self.assertNotEqual(h_after["validation_status"], HYPOTHESIS_STATUS_VALIDATED)
+            self.assertFalse(h_after["function_candidates"][0]["confirmed_root_cause"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase5_case_l_forged_or_dummy_receipt_signatures_are_rejected(self):
+        """Case L: Forged or dummy receipt signatures are rejected."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Phase 5 Case L")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        rec = EvidenceRecord(
+            evidence_id="ev_l",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="collector",
+            session_id=inv_id,
+            observation="Obs",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec)
+        verifier = TrustedCausalVerifier(session)
+
+        dummy = ControlledExecutionResult(
+            execution_id="exec_dummy_l",
+            investigation_id=inv_id,
+            target_function="fn_l",
+            field_path="State.val",
+            before_value=1,
+            after_value=2,
+            execution_status="REPRODUCED",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            backend_type="synthetic_adversarial_fixture",
+            receipt_signature="forged_dummy_signature_xyz",
+        )
+        with self.assertRaises(ValueError) as ctx:
+            verifier.verify_execution_and_attest("ev_l", "hypo_l", dummy)
+        self.assertIn("authenticity verification failed", str(ctx.exception))
+
+    def test_phase5_case_m_rest_and_arp_payloads_cannot_inject_trusted_receipts(self):
+        """Case M: REST and ARP payloads cannot inject trusted receipts or runtime provenance."""
+        runtime = AgentRuntime()
+        start = runtime.investigation_manager.start_investigation(goal="Phase 5 Case M")
+        inv_id = start["investigation_id"]
+        session = runtime.investigation_manager.sessions[inv_id]
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_m",
+            investigation_id=inv_id,
+            title="Hypo M",
+            claim="Claim M",
+            proposed_mechanism="Mech M",
+            supporting_evidence_ids=[],
+            function_candidates=[{"function_name": "fn_m", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+            validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+        )
+        session.hypotheses.append(hypo)
+
+        action = AgentAction(
+            action="EVALUATE_HYPOTHESIS",
+            investigation_id=inv_id,
+            hypothesis_id="hypo_m",
+            deterministic_transition_verified=True,
+            proof_evidence_id="attacker_injected_proof_id",
+        )
+        res = runtime.dispatch_action(action)
+        self.assertTrue(res.success)
+        eval_data = res.data or {}
+        trans = eval_data.get("transition", {})
+        self.assertNotEqual(trans.get("to_status"), HYPOTHESIS_STATUS_VALIDATED)
+
+    def test_phase5_case_n_partial_non_atomic_failed_invalid_snapshots_capped(self):
+        """Case N: PARTIAL, NON_ATOMIC, FAILED, INVALID, and provenance-incomplete snapshots cannot establish causal proof."""
+        temp_dir = tempfile.mkdtemp(prefix="phase5_case_n_")
+        try:
+            snap_a_file = os.path.join(temp_dir, "snap_a.json")
+            snap_b_file = os.path.join(temp_dir, "snap_b.json")
+            with open(snap_a_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "completeness": "PARTIAL",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 10}]}]}
+                }, f)
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "val", "value": 20}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            start = mgr.start_investigation(goal="Phase 5 Case N")
+            inv_id = start["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_n",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="collector",
+                session_id=inv_id,
+                observation="Obs",
+                capture_quality={"completeness": "PARTIAL", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_n",
+                investigation_id=inv_id,
+                title="Hypo N",
+                claim="Claim N",
+                proposed_mechanism="Mech N",
+                supporting_evidence_ids=["ev_n"],
+                candidate_fields=["State.val"],
+                function_candidates=[{"function_name": "fn_n", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            with self.assertRaises(ValueError) as ctx:
+                mgr.verify_live_reproduction_and_attest(
+                    investigation_id=inv_id,
+                    hypothesis_id="hypo_n",
+                    evidence_id="ev_n",
+                    snapshot_a_path=snap_a_file,
+                    snapshot_b_path=snap_b_file,
+                    target_function="fn_n",
+                    field_path="State.val",
+                )
+            self.assertIn("PARTIAL", str(ctx.exception))
+            h_after = mgr.get_hypothesis(inv_id, "hypo_n")
+            self.assertNotEqual(h_after["validation_status"], HYPOTHESIS_STATUS_VALIDATED)
+            self.assertFalse(h_after["function_candidates"][0]["confirmed_root_cause"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase5_case_o_legacy_imported_artifacts_cannot_acquire_trusted_status(self):
+        """Case O: Legacy/imported artifacts cannot silently acquire trusted runtime status."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Phase 5 Case O")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        rec = EvidenceRecord(
+            evidence_id="ev_imported",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="imported_archive",
+            session_id=inv_id,
+            observation="Imported transition",
+            details={"provenance_class": PROVENANCE_CLASS_IMPORTED_UNVERIFIED},
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec)
+
+        hypo = InvestigationHypothesis(
+            hypothesis_id="hypo_o",
+            investigation_id=inv_id,
+            title="Hypo O",
+            claim="Claim O",
+            proposed_mechanism="Mech O",
+            supporting_evidence_ids=["ev_imported"],
+            function_candidates=[{"function_name": "fn_o", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+            validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+        )
+        session.hypotheses.append(hypo)
+
+        res = mgr.evaluate_hypothesis(inv_id, "hypo_o", proof_evidence_id="ev_imported")
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        h_after = mgr.get_hypothesis(inv_id, "hypo_o")
+        self.assertFalse(h_after["function_candidates"][0]["confirmed_root_cause"])
+        self.assertNotEqual(h_after["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+
+    def test_phase5_case_p_legitimate_supported_live_runtime_positive_control_succeeds(self):
+        """Case P: A legitimate supported live-runtime positive control still succeeds."""
+        mgr, inv_id, hypo_id = CausalDefectFixtures.create_scenario_a_reproducible_mutation()
+        res = mgr.evaluate_hypothesis(inv_id, hypo_id, proof_evidence_id="ev_a_proof", deterministic_transition_verified=True)
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+        hypo = mgr.get_hypothesis(inv_id, hypo_id)
+        self.assertEqual(hypo["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+        self.assertTrue(hypo["function_candidates"][0]["confirmed_root_cause"])
+
+    def test_phase5_case_q_real_field_transition_without_function_attribution_does_not_promote_candidate(self):
+        """Case Q: A real field transition without function attribution does not confirm that function as root cause."""
+        temp_dir = tempfile.mkdtemp(prefix="phase5_case_q_")
+        try:
+            snap_a_file = os.path.join(temp_dir, "snap_a.json")
+            snap_b_file = os.path.join(temp_dir, "snap_b.json")
+            with open(snap_a_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:00Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 10}]}]}
+                }, f)
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 20}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            start = mgr.start_investigation(goal="Phase 5 Case Q")
+            inv_id = start["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_q",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="collector",
+                session_id=inv_id,
+                observation="Obs",
+                details={"target_function": "worker_fn", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_q",
+                investigation_id=inv_id,
+                title="Hypo Q",
+                claim="Claim Q",
+                proposed_mechanism="Mech Q",
+                supporting_evidence_ids=["ev_q"],
+                candidate_fields=["State.counter"],
+                function_candidates=[{"function_name": "worker_fn", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            # verify_live_reproduction_and_attest WITHOUT attribution evidence
+            att_ok = mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="hypo_q",
+                evidence_id="ev_q",
+                snapshot_a_path=snap_a_file,
+                snapshot_b_path=snap_b_file,
+                target_function="worker_fn",
+                field_path="State.counter",
+            )
+            self.assertTrue(att_ok)
+
+            # Evaluate hypothesis: state transition is VALIDATED
+            res = mgr.evaluate_hypothesis(inv_id, "hypo_q", proof_evidence_id="ev_q", deterministic_transition_verified=True)
+            self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+
+            # BUT candidate is NOT promoted to VALIDATED_CAUSAL_FUNCTION
+            h_after = mgr.get_hypothesis(inv_id, "hypo_q")
+            fc = h_after["function_candidates"][0]
+            self.assertEqual(fc["candidate_tier"], FUNCTION_TIER_EVIDENCE_SUPPORTED)
+            self.assertFalse(fc["confirmed_root_cause"])
+            self.assertIn("function attribution was not independently verified", fc["tier_limitation"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase5_case_r_failed_or_interrupted_capture_leaves_no_usable_receipt_or_zombie(self):
+        """Case R: A failed or interrupted capture does not leave a usable receipt, capability, stopped process, orphan, or zombie."""
+        mgr = InvestigationManager()
+        start = mgr.start_investigation(goal="Phase 5 Case R")
+        inv_id = start["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        # Incomplete verification fails cleanly and leaves no capability
+        with self.assertRaises(ValueError):
+            mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="nonexistent_hypo",
+                evidence_id="nonexistent_ev",
+                snapshot_a_path="/invalid/path_a",
+                snapshot_b_path="/invalid/path_b",
+                target_function="fn_r",
+                field_path="val",
+            )
+        self.assertEqual(sum(1 for r in session.ledger._records if (r.details or {}).get("verified_causal_proof")), 0)
+        self.assertEqual(sum(1 for r in session.ledger._records if (r.provenance or {}).get("verifier_attestation")), 0)
 
 
 class TestFalsePositiveEvaluationHarness(unittest.TestCase):

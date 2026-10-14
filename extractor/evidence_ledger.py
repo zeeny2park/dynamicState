@@ -14,6 +14,17 @@ import uuid
 from typing import Any, Dict, List, Optional, Set, Union
 
 
+PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE = "LIVE_RUNTIME_CAPTURE"
+PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION = "CONTROLLED_RUNTIME_REPRODUCTION"
+PROVENANCE_CLASS_SYNTHETIC_FIXTURE = "SYNTHETIC_FIXTURE"
+PROVENANCE_CLASS_IMPORTED_UNVERIFIED = "IMPORTED_UNVERIFIED"
+
+TRUSTED_PROVENANCE_CLASSES = {
+    PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+}
+
+
 @dataclass(frozen=True)
 class ControlledExecutionResult:
     """Authentic execution receipt produced by a verified runtime execution or controlled reproduction."""
@@ -33,8 +44,17 @@ class ControlledExecutionResult:
     after_snapshot_hash: Optional[str] = None
     target_identity: Optional[Dict[str, Any]] = None
     backend_type: str = "controlled_runtime"
+    provenance_class: str = PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+    function_attribution_verified: Optional[bool] = None
+    attribution_basis: str = ""
     executed_at: str = ""
     receipt_signature: str = ""
+
+    @property
+    def is_function_attribution_verified(self) -> bool:
+        if self.function_attribution_verified is not None:
+            return bool(self.function_attribution_verified)
+        return bool(self.target_function and self.backend_type != "live_process_snapshot_diff")
 
     def verify_authenticity(self, session_secret: str) -> bool:
         """Verify the cryptographic authenticity of this execution receipt against session secret."""
@@ -48,11 +68,15 @@ def compute_receipt_signature(session_secret: str, result: "ControlledExecutionR
     """Compute HMAC-SHA256 signature binding the execution receipt to the session secret and complete execution scope."""
     tid_str = json.dumps(result.target_identity or {}, sort_keys=True)
     cq_str = json.dumps(result.capture_quality or {}, sort_keys=True)
+    prov_cls = getattr(result, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
+    attr_ver = getattr(result, "is_function_attribution_verified", getattr(result, "function_attribution_verified", False))
+    attr_basis = getattr(result, "attribution_basis", "")
     raw = (
         f"{result.execution_id}|{result.investigation_id}|{result.hypothesis_id}|"
         f"{result.evidence_id}|{result.target_function}|{result.field_path}|"
         f"{result.before_value}|{result.after_value}|{result.execution_status}|"
-        f"{result.backend_type}|{result.before_snapshot_ref}|{result.after_snapshot_ref}|"
+        f"{result.backend_type}|{prov_cls}|{attr_ver}|{attr_basis}|"
+        f"{result.before_snapshot_ref}|{result.after_snapshot_ref}|"
         f"{result.before_snapshot_hash}|{result.after_snapshot_hash}|"
         f"{tid_str}|{cq_str}|{result.executed_at}"
     )
@@ -84,6 +108,9 @@ class CausalVerificationCapability:
         target_function: str,
         field_path: str,
         hypothesis_id: str,
+        provenance_class: str = PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+        function_attribution_verified: bool = False,
+        attribution_basis: str = "",
     ):
         self._investigation_id = investigation_id
         self._capability_key = capability_key
@@ -91,6 +118,9 @@ class CausalVerificationCapability:
         self._target_function = target_function
         self._field_path = field_path
         self._hypothesis_id = hypothesis_id
+        self._provenance_class = provenance_class
+        self._function_attribution_verified = function_attribution_verified
+        self._attribution_basis = attribution_basis
         self._consumed = False
 
     def is_valid_for(
@@ -142,6 +172,56 @@ class CausalVerificationCapability:
     def evidence_id(self) -> str:
         return self._evidence_id
 
+    @property
+    def provenance_class(self) -> str:
+        return self._provenance_class
+
+    @property
+    def function_attribution_verified(self) -> bool:
+        return self._function_attribution_verified
+
+    @property
+    def attribution_basis(self) -> str:
+        return self._attribution_basis
+
+
+def is_exact_semantic_path_match(diff_path: str, diff_field: str, target_path: str) -> bool:
+    """Compare intended field path using exact semantic path matching on dot boundaries.
+
+    Prevents loose substring and suffix cross-object collisions
+    (e.g., 'ThreadCounter.counter' matching 'State.counter').
+    """
+    if not target_path:
+        return False
+    dp = (diff_path or "").strip()
+    df = (diff_field or "").strip()
+    tp = target_path.strip()
+
+    if dp == tp or (df and df == tp):
+        return True
+
+    full_candidates = [dp]
+    if df and not dp.endswith(f".{df}") and dp != df:
+        full_candidates.append(f"{dp}.{df}")
+    if df and df != dp:
+        full_candidates.append(df)
+
+    t_parts = [p.lower() for p in tp.split(".") if p]
+    if not t_parts:
+        return False
+
+    for cand in full_candidates:
+        c_parts = [p.lower() for p in cand.split(".") if p]
+        if not c_parts:
+            continue
+        if len(t_parts) > 1:
+            if len(c_parts) >= len(t_parts) and c_parts[-len(t_parts):] == t_parts:
+                return True
+        else:
+            if c_parts[-1] == t_parts[0]:
+                return True
+    return False
+
 
 def compute_evidence_fingerprint(
     record: "EvidenceRecord",
@@ -149,6 +229,9 @@ def compute_evidence_fingerprint(
     field_path: Optional[str] = None,
     hypothesis_id: Optional[str] = None,
     target_identity: Optional[Dict[str, Any]] = None,
+    provenance_class: Optional[str] = None,
+    function_attribution_verified: Optional[bool] = None,
+    attribution_basis: Optional[str] = None,
 ) -> str:
     """Compute a deterministic SHA256 digest sealing content, scope, hypothesis, target identity, quality, and ancestry."""
     p_details = record.details or {}
@@ -169,10 +252,20 @@ def compute_evidence_fingerprint(
     parents_str = ",".join(sorted(record.parent_evidence_ids or []))
     snap_str = str(record.snapshot_ref or "")
 
+    prov_cls = provenance_class or att.get("provenance_class") or p_prov.get("provenance_class") or p_details.get("provenance_class") or ""
+    if function_attribution_verified is not None:
+        attr_ver = str(function_attribution_verified)
+    else:
+        attr_ver = str(att.get("function_attribution_verified", p_details.get("function_attribution_verified", False)))
+    if attribution_basis is not None:
+        attr_basis = str(attribution_basis)
+    else:
+        attr_basis = str(att.get("attribution_basis", p_details.get("attribution_basis", "")))
+
     raw = (
         f"{record.evidence_id}|{record.observation}|{fld}|{fn}|"
         f"{hypo}|{t_id_str}|{rec_t_id_str}|{snap_str}|"
-        f"{parents_str}|{cq_str}|{record.session_id}"
+        f"{parents_str}|{cq_str}|{prov_cls}|{attr_ver}|{attr_basis}|{record.session_id}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -458,6 +551,9 @@ class EvidenceLedger:
             target_function=eff_fn,
             field_path=eff_field,
             hypothesis_id=eff_hypo,
+            provenance_class=getattr(execution_result, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION),
+            function_attribution_verified=getattr(execution_result, "is_function_attribution_verified", getattr(execution_result, "function_attribution_verified", False)),
+            attribution_basis=getattr(execution_result, "attribution_basis", ""),
         )
 
     def attest_causal_proof(
@@ -526,6 +622,9 @@ class EvidenceLedger:
         capability.consume()
 
         eff_tid = target_identity or rec.target_identity
+        eff_prov_cls = getattr(capability, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
+        eff_attr_ver = getattr(capability, "function_attribution_verified", False)
+        eff_attr_basis = getattr(capability, "attribution_basis", "")
 
         # Compute tamper-evident fingerprint and HMAC signature
         fingerprint = compute_evidence_fingerprint(
@@ -534,6 +633,9 @@ class EvidenceLedger:
             field_path=eff_field,
             hypothesis_id=eff_hypo,
             target_identity=eff_tid,
+            provenance_class=eff_prov_cls,
+            function_attribution_verified=eff_attr_ver,
+            attribution_basis=eff_attr_basis,
         )
         token_sig = compute_attestation_signature(self.session_secret, rec.evidence_id, fingerprint, self.session_id)
 
@@ -547,13 +649,25 @@ class EvidenceLedger:
             "target_function": eff_fn,
             "field_path": eff_field,
             "target_identity": eff_tid,
+            "provenance_class": eff_prov_cls,
+            "function_attribution_verified": eff_attr_ver,
+            "attribution_basis": eff_attr_basis,
             "verification_type": verification_type,
             "attested_at": datetime.now(timezone.utc).isoformat(),
         }
+        rec.provenance["provenance_class"] = eff_prov_cls
+        rec.details["provenance_class"] = eff_prov_cls
+        rec.details["function_attribution_verified"] = eff_attr_ver
+        rec.details["attribution_basis"] = eff_attr_basis
         rec.details["verified_transition"] = True
         rec.details["causal_proof"] = True
         if execution_provenance and isinstance(execution_provenance, dict):
-            rec.details["execution_provenance"] = execution_provenance
+            safe_exec_prov = {
+                k: v for k, v in execution_provenance.items()
+                if k not in ("token", "token_sig", "provenance_class")
+            }
+            safe_exec_prov["provenance_class"] = eff_prov_cls
+            rec.details["execution_provenance"] = safe_exec_prov
         if eff_fn and "target_function" not in rec.details:
             rec.details["target_function"] = eff_fn
         if eff_field and "field_path" not in rec.details:
@@ -629,6 +743,9 @@ class EvidenceLedger:
                     field_path=att.get("field_path"),
                     hypothesis_id=att.get("hypothesis_id"),
                     target_identity=att.get("target_identity"),
+                    provenance_class=att.get("provenance_class"),
+                    function_attribution_verified=att.get("function_attribution_verified"),
+                    attribution_basis=att.get("attribution_basis"),
                 )
                 expected_sig = compute_attestation_signature(self.session_secret, record.evidence_id, expected_fp, self.session_id)
                 if att.get("evidence_fingerprint") != expected_fp or att.get("token_sig") != expected_sig:
