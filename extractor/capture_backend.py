@@ -19,6 +19,7 @@ import json
 import os
 import platform
 import signal
+import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
@@ -31,6 +32,7 @@ class CaptureKeyStore:
     """Manages capture authentication key lifecycle, rotation, revocation, and resolution."""
 
     def __init__(self):
+        self._lock = threading.RLock()
         self._keys: Dict[str, str] = {}
         self._active_key_id: str = "default"
         self._revoked_keys: Set[str] = set()
@@ -38,100 +40,120 @@ class CaptureKeyStore:
         self._ephemeral_fallback: Optional[str] = None
         self.reload_from_environment()
 
+    def __repr__(self) -> str:
+        with self._lock:
+            kids = sorted(self._keys.keys())
+            rev = sorted(self._revoked_keys)
+            return (
+                f"<CaptureKeyStore configured={self._is_explicitly_configured} "
+                f"active_key_id={self._active_key_id!r} key_ids={kids} revoked_key_ids={rev}>"
+            )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def reload_from_environment(self) -> None:
         """Load keys from environment variables or key files."""
-        self._keys.clear()
-        self._revoked_keys.clear()
-        self._is_explicitly_configured = False
-        self._ephemeral_fallback = None
+        with self._lock:
+            self._keys.clear()
+            self._revoked_keys.clear()
+            self._is_explicitly_configured = False
+            self._ephemeral_fallback = None
 
-        # 1. Check DYNAMICSTATE_CAPTURE_SECRET
-        env_secret = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
-        key_id = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_ID", "default")
-        if env_secret:
-            self._keys[key_id] = env_secret
-            self._active_key_id = key_id
-            self._is_explicitly_configured = True
+            # 1. Check DYNAMICSTATE_CAPTURE_SECRET
+            env_secret = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
+            key_id = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_ID", "default")
+            if env_secret:
+                self._keys[key_id] = env_secret
+                self._active_key_id = key_id
+                self._is_explicitly_configured = True
 
-        # 2. Check DYNAMICSTATE_CAPTURE_KEY_FILE
-        key_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
-        if key_file and os.path.exists(key_file):
-            try:
-                with open(key_file, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                if content.startswith("{"):
-                    data = json.loads(content)
-                    if isinstance(data, dict):
-                        for k, v in data.items():
+            # 2. Check DYNAMICSTATE_CAPTURE_KEY_FILE
+            key_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
+            if key_file and os.path.exists(key_file):
+                try:
+                    with open(key_file, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content.startswith("{"):
+                        data = json.loads(content)
+                        if isinstance(data, dict):
+                            for k, v in data.items():
+                                if isinstance(k, str) and isinstance(v, str):
+                                    self._keys[k] = v
+                            self._is_explicitly_configured = True
+                    elif content:
+                        self._keys["file_default"] = content
+                        if not env_secret:
+                            self._active_key_id = "file_default"
+                        self._is_explicitly_configured = True
+                except Exception:
+                    pass
+
+            # 3. Check DYNAMICSTATE_CAPTURE_KEYRING (JSON string or file path)
+            keyring_spec = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
+            if keyring_spec:
+                try:
+                    if os.path.exists(keyring_spec):
+                        with open(keyring_spec, "r", encoding="utf-8") as f:
+                            keyring_data = json.load(f)
+                    else:
+                        keyring_data = json.loads(keyring_spec)
+                    if isinstance(keyring_data, dict):
+                        for k, v in keyring_data.items():
                             if isinstance(k, str) and isinstance(v, str):
                                 self._keys[k] = v
                         self._is_explicitly_configured = True
-                elif content:
-                    self._keys["file_default"] = content
-                    if not env_secret:
-                        self._active_key_id = "file_default"
-                    self._is_explicitly_configured = True
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-        # 3. Check DYNAMICSTATE_CAPTURE_KEYRING (JSON string or file path)
-        keyring_spec = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
-        if keyring_spec:
-            try:
-                if os.path.exists(keyring_spec):
-                    with open(keyring_spec, "r", encoding="utf-8") as f:
-                        keyring_data = json.load(f)
-                else:
-                    keyring_data = json.loads(keyring_spec)
-                if isinstance(keyring_data, dict):
-                    for k, v in keyring_data.items():
-                        if isinstance(k, str) and isinstance(v, str):
-                            self._keys[k] = v
-                    self._is_explicitly_configured = True
-            except Exception:
-                pass
-
-        # 4. If not configured, initialize process-local ephemeral key
-        if not self._keys:
-            self._ephemeral_fallback = "dynamicstate_ephemeral_key_" + os.urandom(16).hex()
-            self._keys["ephemeral"] = self._ephemeral_fallback
-            self._active_key_id = "ephemeral"
-            self._is_explicitly_configured = False
+            # 4. If not configured, initialize process-local ephemeral key
+            if not self._keys:
+                self._ephemeral_fallback = "dynamicstate_ephemeral_key_" + os.urandom(16).hex()
+                self._keys["ephemeral"] = self._ephemeral_fallback
+                self._active_key_id = "ephemeral"
+                self._is_explicitly_configured = False
 
     @property
     def is_explicitly_configured(self) -> bool:
         """Returns True if a key was provided via env/file/programmatic API rather than ephemeral random."""
-        return self._is_explicitly_configured
+        with self._lock:
+            return self._is_explicitly_configured
 
     def register_key(self, key_id: str, secret: str, is_active: bool = False) -> None:
         """Register a key for signing or verification."""
-        if not key_id or not secret:
-            raise ValueError("key_id and secret must be non-empty strings")
-        self._keys[key_id] = secret
-        self._revoked_keys.discard(key_id)
-        self._is_explicitly_configured = True
-        if is_active or len(self._keys) == 1:
-            self._active_key_id = key_id
+        with self._lock:
+            if not key_id or not secret:
+                raise ValueError("key_id and secret must be non-empty strings")
+            if not isinstance(key_id, str) or not isinstance(secret, str):
+                raise TypeError("key_id and secret must be strings")
+            self._keys[key_id] = secret
+            self._revoked_keys.discard(key_id)
+            self._is_explicitly_configured = True
+            if is_active or len(self._keys) == 1:
+                self._active_key_id = key_id
 
     def rotate_key(self, new_key_id: str, new_secret: str) -> None:
         """Rotate the active signing key while keeping older keys available for verification."""
-        self.register_key(new_key_id, new_secret, is_active=True)
+        with self._lock:
+            self.register_key(new_key_id, new_secret, is_active=True)
 
     def revoke_key(self, key_id: str) -> None:
         """Revoke a key so it will no longer verify any receipts."""
-        self._revoked_keys.add(key_id)
-        if self._active_key_id == key_id:
-            available = [k for k in self._keys.keys() if k not in self._revoked_keys]
-            self._active_key_id = available[0] if available else ""
+        with self._lock:
+            self._revoked_keys.add(key_id)
+            if self._active_key_id == key_id:
+                available = [k for k in self._keys.keys() if k not in self._revoked_keys]
+                self._active_key_id = available[0] if available else ""
 
     def get_active_signing_key(self) -> Tuple[str, str]:
         """Return (key_id, secret) for signing new receipts."""
-        if self._active_key_id in self._revoked_keys or self._active_key_id not in self._keys:
-            available = [k for k in self._keys.keys() if k not in self._revoked_keys]
-            if not available:
-                raise ValueError("No active, non-revoked capture key available for signing")
-            self._active_key_id = available[0]
-        return self._active_key_id, self._keys[self._active_key_id]
+        with self._lock:
+            if self._active_key_id in self._revoked_keys or self._active_key_id not in self._keys:
+                available = [k for k in self._keys.keys() if k not in self._revoked_keys]
+                if not available:
+                    raise ValueError("No active, non-revoked capture key available for signing")
+                self._active_key_id = available[0]
+            return self._active_key_id, self._keys[self._active_key_id]
 
     def verify_receipt(
         self,
@@ -142,46 +164,47 @@ class CaptureKeyStore:
 
         Returns (is_valid: bool, status_reason: str, verified_key_id: Optional[str]).
         """
-        if not receipt.signature:
-            return False, "UNSIGNED_RECEIPT: Capture receipt has no HMAC signature", None
+        with self._lock:
+            if not receipt.signature:
+                return False, "UNSIGNED_RECEIPT: Capture receipt has no HMAC signature", None
 
-        # If explicit secret supplied, test directly
-        if explicit_secret:
-            if receipt.matches_secret(explicit_secret):
-                return True, "VERIFIED", getattr(receipt, "key_id", "explicit")
-            return False, "SIGNATURE_VERIFICATION_FAILED: Signature mismatch with supplied secret", None
+            # If explicit secret supplied, test directly
+            if explicit_secret:
+                if receipt.matches_secret(explicit_secret):
+                    return True, "VERIFIED", getattr(receipt, "key_id", "explicit")
+                return False, "SIGNATURE_VERIFICATION_FAILED: Signature mismatch with supplied secret", None
 
-        # Check key revocation
-        rcpt_kid = getattr(receipt, "key_id", "default") or "default"
-        if rcpt_kid in self._revoked_keys:
-            return False, f"KEY_REVOKED: Key ID '{rcpt_kid}' has been revoked", None
+            # Check key revocation
+            rcpt_kid = getattr(receipt, "key_id", "default") or "default"
+            if rcpt_kid in self._revoked_keys:
+                return False, f"KEY_REVOKED: Key ID '{rcpt_kid}' has been revoked", None
 
-        # In cross-process mode: if the current key store was not explicitly configured (only ephemeral random),
-        # and the receipt specifies a key_id that is NOT our ephemeral key, fail closed with KEY_UNAVAILABLE!
-        if not self._is_explicitly_configured:
-            if rcpt_kid != "ephemeral" or not receipt.matches_secret(self._keys.get("ephemeral", "")):
-                return (
-                    False,
-                    "VERIFICATION_KEY_UNAVAILABLE: No capture authentication key configured in environment "
-                    "(DYNAMICSTATE_CAPTURE_SECRET, DYNAMICSTATE_CAPTURE_KEYRING, or DYNAMICSTATE_CAPTURE_KEY_FILE)",
-                    None,
-                )
+            # In cross-process mode: if the current key store was not explicitly configured (only ephemeral random),
+            # and the receipt specifies a key_id that is NOT our ephemeral key, fail closed with KEY_UNAVAILABLE!
+            if not self._is_explicitly_configured:
+                if rcpt_kid != "ephemeral" or not receipt.matches_secret(self._keys.get("ephemeral", "")):
+                    return (
+                        False,
+                        "VERIFICATION_KEY_UNAVAILABLE: No capture authentication key configured in environment "
+                        "(DYNAMICSTATE_CAPTURE_SECRET, DYNAMICSTATE_CAPTURE_KEYRING, or DYNAMICSTATE_CAPTURE_KEY_FILE)",
+                        None,
+                    )
 
-        # Check candidate keys in keyring
-        # 1. Try receipt's specific key_id first
-        if rcpt_kid in self._keys and rcpt_kid not in self._revoked_keys:
-            if receipt.matches_secret(self._keys[rcpt_kid]):
-                return True, "VERIFIED", rcpt_kid
+            # Check candidate keys in keyring
+            # 1. Try receipt's specific key_id first
+            if rcpt_kid in self._keys and rcpt_kid not in self._revoked_keys:
+                if receipt.matches_secret(self._keys[rcpt_kid]):
+                    return True, "VERIFIED", rcpt_kid
 
-        # 2. Try default / other non-revoked keys in keyring
-        for kid, sec in self._keys.items():
-            if kid != rcpt_kid and kid not in self._revoked_keys:
-                if receipt.matches_secret(sec):
-                    return True, "VERIFIED", kid
+            # 2. Try default / other non-revoked keys in keyring
+            for kid, sec in self._keys.items():
+                if kid != rcpt_kid and kid not in self._revoked_keys:
+                    if receipt.matches_secret(sec):
+                        return True, "VERIFIED", kid
 
-        if rcpt_kid in self._keys:
-            return False, f"SIGNATURE_VERIFICATION_FAILED: Signature mismatch for Key ID '{rcpt_kid}'", None
-        return False, f"KEY_NOT_FOUND: Key ID '{rcpt_kid}' not found in key store", None
+            if rcpt_kid in self._keys:
+                return False, f"SIGNATURE_VERIFICATION_FAILED: Signature mismatch for Key ID '{rcpt_kid}'", None
+            return False, f"KEY_NOT_FOUND: Key ID '{rcpt_kid}' not found in key store", None
 
 
 _DEFAULT_KEY_STORE = CaptureKeyStore()

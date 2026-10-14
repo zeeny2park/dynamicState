@@ -45,6 +45,14 @@ jobs:
         run: |
           python3 -m unittest tests/test_cpp_e2e_investigation.py
 
+      - name: Run Causal Validation and Evidence Authenticity Tests
+        run: |
+          python3 -m unittest tests/test_causal_validation_hardening.py
+
+      - name: Run Security Gates and Independent Trust Verification Tests
+        run: |
+          python3 -m unittest tests/test_phase10_ci_security_gates.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

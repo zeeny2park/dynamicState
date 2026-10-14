@@ -145,22 +145,73 @@ To eliminate loose substring or suffix collisions, comparisons use object-aware 
 
 ---
 
-## 8. Test Suite Classification & Coverage
+## 8. Test Suite Classification, Operational Tiers & Coverage
 
-Test suites are categorized into distinct operational tiers:
+Test suites are categorized into four distinct operational tiers:
 
-- **Category A (Unit Tests & Synthetic Adversarial Fixtures)**: 83 tests in `tests/test_causal_validation_hardening.py` verifying attestation security, HMAC signatures, tamper detection, capability consumption, Phase 8 trust levels (Tests A–L), Phase 9 cross-process evidence trust and key lifecycle suites, and adversarial ingress hardening.
-- **Category B (Artifact Integrity & Manifest Hashing)**: Recursive directory payload hashing, file addition/deletion/modification detection, and path traversal/symlink rejection.
-- **Category C (Offline Reconstruction Tests)**: DWARF type recovery, layout mutation caveats, and offline object graph decoders (`test_offline_analyzer.py`, `test_dwarf_semantic_reconstruction.py`).
-- **Category D (Real Local C++ Process Tests)**: 5 end-to-end integration scenarios in `tests/test_cpp_e2e_investigation.py` and positive control in `test_causal_validation_hardening.py` running live compiled binaries with `g++`, stdin/stdout synchronization, thread workers, and kernel capture backends.
-- **Category E (Capture Backend Dependency Tests)**: Tests utilizing `/proc/<pid>/mem`, `/proc/<pid>/maps`, and `process_vm_readv`.
-- **Category F (Unavailable Environment Fallbacks)**: Clearly marked as NOT RUN when platform dependencies are absent (e.g., non-Linux kernel interfaces).
+### Testing Tiers
+1. **UNIT TESTED**:
+   - `tests/test_causal_validation_hardening.py` (83 tests): Verifies HMAC signatures, receipt tamper detection, token zero-leakage, key store concurrency, capability scope and single-use consumption, artifact manifest hashing, Phase 8 trust claims (A–L), and Phase 9 cross-process offline exchange.
+   - `tests/test_capture_safety_and_diff_accuracy.py` (27 tests): Verifies memory diffing, partial capture handling, path prefix sanitization, and state change accuracy.
+   - `tests/test_capture_lifecycle_seam.py` (54 tests): Verifies process attachment lifecycle, PID pinning, state recovery seams, and `/proc/<pid>/stat` validation.
+2. **INTEGRATION TESTED**:
+   - `tests/test_investigation_hypothesis.py`: Verifies multi-step hypothesis evaluation, evidence linking, and REST/ARP disarming.
+   - `tests/test_multithread_exploration.py`: Verifies branch isolation and multithreaded deterministic execution.
+   - `tests/test_ci_workflow_parity.py` (7 tests): Verifies 100% byte parity and structural YAML schema between canonical `ci/workflows/` and local test runners.
+3. **REAL TARGET VALIDATED**:
+   - `tests/test_real_runtime_validation.py` (20 tests): Live process validation against compiled C/C++ targets under Linux `process_vm_readv` and ptrace with real stop/read/resume latency measurements.
+   - `tests/test_cpp_e2e_investigation.py` (5 tests): Real-world end-to-end investigation pipeline on compiled C++ PIE binaries with active thread workers and ASLR.
+   - `tests/test_phase10_ci_security_gates.py` (16 tests): Dedicated CI security acceptance suite featuring compiled C++ positive controls and cross-process negative controls.
+4. **CI VERIFIED**:
+   - Canonical pipeline defined in `ci/workflows/test.yml` and enforced locally via `run_all_tests.sh`. All tests execute with `set -euo pipefail` and fail closed on any non-zero exit code.
 
 ---
 
 ## 9. Known Limitations & Out-of-Scope Proof Claims
 
-1. **PID Reuse**: Mitigation relies on `/proc/<pid>/stat` start time checks; on non-Linux platforms or without `/proc`, PID reuse cannot be cryptographically proven without OS container/cgroup isolation.
-2. **Zero-Stop Captures**: `process_vm_readv` captures without pausing the target are classified as `NON_ATOMIC` and are capped at `SUPPORTED`.
-3. **Attribution without Instrumentation**: When a process is captured without thread call stack metadata or hardware instruction tracing, the engine proves that the state transition occurred between snapshots, but conservatively marks function attribution as unverified.
-4. **Canonical Benchmark Baselines**: `benchmarks/baseline_results.json` represents static reference numbers and is strictly preserved. Synthetic scenario results are not claimed as real-world precision/recall benchmarks.
+1. **PID Reuse Mitigation**: Relies on `/proc/<pid>/stat` start-time ticks. On systems without `/proc` or non-Linux kernels, PID recycling cannot be verified without container/cgroup namespaces.
+2. **Zero-Stop Captures**: `process_vm_readv` captures performed without pausing the inferior thread group are classified as `NON_ATOMIC` and are capped at `SUPPORTED`.
+3. **Attribution without Instrumentation**: When a process is captured without thread call stack metadata or instruction trace records, the engine validates that the state transition occurred between captures, but conservatively flags function attribution as unverified.
+4. **Canonical Benchmark Baselines**: `benchmarks/baseline_results.json` represents static canonical baseline metrics and is strictly preserved. Synthetic adversarial scenarios are never conflated with real-world accuracy numbers.
+
+---
+
+## 10. Phase 10: Independent Trust Verification & CI Acceptance Gates
+
+Phase 10 enforces all evidence authenticity and causal validation guarantees through automated, non-bypassable CI security gates:
+
+1. **Gate 1: Trust-Boundary Ingress Gate** (`TestTrustBoundaryIngressGates`)
+   - Untrusted caller booleans, fabricated execution dictionaries, and forged verifier tokens via REST or ARP are disarmed immediately.
+   - Single-writer attribution is rejected if the control baseline experienced drift.
+   - Degraded capture quality (`PARTIAL` or non-atomic consistency) caps hypotheses at `SUPPORTED`.
+   - Capabilities enforce strict scope binding (investigation ID, evidence ID, target function, field path) and fail closed on reuse.
+2. **Gate 2: Key Lifecycle & Concurrency Gate** (`TestKeyLifecycleAndConcurrencyGates`)
+   - Thread-safe, atomic key registration, rotation, and revocation under concurrent load (`threading.RLock`).
+   - Revoked keys immediately fail closed (`KEY_REVOKED`).
+   - Corrupted or malformed key files/keyrings are handled safely without crashing.
+   - Strict zero-leakage contract: secrets and capability keys are never exposed in `__repr__`, `__str__`, `to_dict()`, JSON logs, or API payloads.
+3. **Gate 3: Artifact Integrity & Anti-Tampering Gate** (`TestArtifactIntegrityAndAntiTamperingGates`)
+   - Any payload byte modification, manifest file deletion, or unexpected extra file injection marks snapshots as `TAMPERED`.
+   - Path traversal (`..`) and symbolic links (directory or file) are rejected with `ValueError`.
+   - All 12 security-critical fields of `CaptureReceipt` Schema 2.0.0 are verified to be tamper-evident.
+   - Legacy snapshots lacking receipts load safely as `UNVERIFIED_LEGACY`.
+4. **Gate 4: Real-World C++ Cross-Process Acceptance Gate** (`TestRealWorldCppCrossProcessAcceptanceGate`)
+   - End-to-end positive control with compiled C++ PIE binary, live kernel capture with receipt issuance, inferior termination, and post-mortem offline verification in a clean session.
+   - Negative control ensuring that analysis sessions with mismatched keys fail closed when `require_capture_provenance=True`.
+
+---
+
+## 11. Trust-Boundary Security Matrix
+
+| # | Boundary Name | Ingress Point | Trusted Inputs | Attacker-Controlled Inputs | Required Security Checks | Failure Status / Outcome | Verifying Regression Tests |
+| :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **1** | **Native Capture Backend** | `ProcessVmCaptureBackend`, `ProcfsCaptureBackend` | Kernel syscall returns, `/proc/<pid>/stat` start time, ELF Build ID | Inferior memory contents, PID (reuse risk) | `CAP_SYS_PTRACE`, inferior stopped state (`T`/`t`), start time validation, atomic payload read | `INCONCLUSIVE`, `CAPTURE_ERROR`, `NON_ATOMIC` | `test_real_runtime_validation.py`, `test_capture_lifecycle_seam.py` |
+| **2** | **Receipt Issuance** | `issue_capture_receipt()` | Backend name, PID, start time, binary path, build ID, duration, completeness, consistency, manifest | Public constructor arguments if invoked externally | Active key lookup from `CaptureKeyStore`, HMAC-SHA256 signing over canonical Schema 2.0.0 payload | `ValueError` if required fields missing or key invalid | `test_phase10_ci_security_gates.py:test_gate_receipt_all_security_fields_tamper_evident` |
+| **3** | **Snapshot Save & Load** | `RawRuntimeSnapshot.save()`, `load()` | Internal metadata, memory buffers | Directory paths, files on disk, injected symlinks, extra scripts | Reject `..` in path segments, reject directory and file symlinks recursively, verify receipt HMAC, recompute manifest digests | `ValueError` (traversal/symlink), `TAMPERED` (byte tampering / extra files), `UNVERIFIED_LEGACY` | `test_phase10_ci_security_gates.py:TestArtifactIntegrityAndAntiTamperingGates` (5 tests) |
+| **4** | **Cross-Process Receipt Verification** | `verify_capture_provenance()`, `CaptureReceipt.verify_with_status()` | Configured `CaptureKeyStore` (env, key file, keyring) | Serialized `capture_receipt.json`, disk payload, foreign `key_id` | Key existence, revocation check, constant-time HMAC comparison, manifest matching | `VERIFICATION_KEY_UNAVAILABLE`, `KEY_REVOKED`, `SIGNATURE_MISMATCH`, `TAMPERED` | `test_phase10_ci_security_gates.py:TestKeyLifecycleAndConcurrencyGates`, `test_phase9_cross_process_offline_exchange_scenarios` |
+| **5** | **Investigation Creation & Corpus Registration** | `InvestigationManager.start_investigation()` | Ephemeral session secret, UUID session ID | `goal`, `memory_snapshot_path`, `debug_image`, metadata dicts | Path traversal and symlink rejection, snapshot receipt verification, isolated ledger initialization | `ValueError`, `FileNotFoundError` | `test_investigation_hypothesis.py`, `test_causal_validation_hardening.py:test_phase5_case_d` |
+| **6** | **REST API Ingress** | `WebApiAdapter` (`evaluate_hypothesis`, `add_evidence`) | Runtime manager instance, active sessions | JSON HTTP body: `deterministic_transition_verified`, forged tokens, caller claims | Strip unverified attestation tokens, mark evidence `source="unverified_caller"`, disarm attribution booleans, cap hypothesis at `SUPPORTED` | `INVALID_PARAM`, disarmed evaluation without promotion | `test_phase10_ci_security_gates.py:test_gate_rest_arp_caller_boolean_disarmed`, `test_case_k_api_and_arp_injection_fails_safely` |
+| **7** | **Autonomous Reasoner Pipeline (ARP)** | `AgentRuntime.dispatch_action()` | Internal runtime state, session ledger | `AgentAction` parameters, action type, candidate function flags | Enforce action permission, require authentic ledger proof record (`proof_evidence_id`), disarm caller-supplied flags | Action rejected or disarmed; `unverified_claim_rejected=True` | `test_investigation_hypothesis.py`, `test_phase5_case_m_rest_and_arp_payloads_cannot_inject_trusted_receipts` |
+| **8** | **Evidence Ledger Attestation** | `EvidenceLedger.attest_causal_proof()` | Internal `CausalVerificationCapability`, session ID | Caller `EvidenceRecord` fields, external provenance dicts | Capability HMAC matches `_capability_key`, capability not consumed, exact scope match (investigation, evidence, fn, field), reject unverified caller claims | `ValueError` ("invalid capability", "already consumed", "scope-mismatched") | `test_phase10_ci_security_gates.py:test_gate_capability_scope_and_reuse_enforcement` |
+| **9** | **Controlled Execution Verification** | `TrustedCausalVerifier.verify_execution_and_attest()` | Session secret, resolved snapshot artifacts, diff engine | Target function, field path, claimed before/after values, caller provenance | Reject caller-supplied execution dictionaries, resolve snapshots without symlinks, verify diff matches values, check control baseline stability, verify complete & atomic capture quality | `ValueError` ("Fabricated execution values", "Degraded capture quality", "Control baseline drifted") | `test_phase10_ci_security_gates.py:test_gate_single_writer_baseline_drift_rejection`, `test_gate_degraded_capture_quality_caps_hypothesis` |
+| **10** | **Causal Attestation & Hypothesis Promotion** | `HypothesisValidator.evaluate()`, `InvestigationManager.evaluate_hypothesis()` | Ledger records, verifier attestation in proof record | `deterministic_transition_verified` flag, `proof_evidence_id`, candidate nominations | Require authentic verifier attestation with valid HMAC signature, verify `STATE_TRANSITION_VERIFIED`, promote function to `VALIDATED_CAUSAL_FUNCTION` (`confirmed_root_cause=True`) ONLY with verified attribution (single-writer or trace). Static DWARF candidates never promoted without runtime proof. | Hypothesis capped at `SUPPORTED`; candidate capped at `EVIDENCE_SUPPORTED` / `STATIC` with `confirmed_root_cause=False` | `test_phase10_ci_security_gates.py:test_gate_static_dwarf_candidate_never_promoted_without_instrumentation`, `test_gate_cpp_compiled_process_offline_verification_e2e` |

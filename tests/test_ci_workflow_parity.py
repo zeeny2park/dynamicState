@@ -118,6 +118,8 @@ class TestCIWorkflowParity(unittest.TestCase):
             "Run Process Lifecycle and Seam Invariants Tests",
             "Run Real Runtime Validation Tests",
             "Run End-to-End C++ Investigation Pipeline Tests",
+            "Run Causal Validation and Evidence Authenticity Tests",
+            "Run Security Gates and Independent Trust Verification Tests",
             "Run All Remaining Tests",
             "Run CI Workflow Parity Tests",
             "Run Performance Benchmark Smoke Test",
@@ -131,6 +133,8 @@ class TestCIWorkflowParity(unittest.TestCase):
         self.assertIn("python3 -m unittest tests/test_capture_lifecycle_seam.py", all_run_commands)
         self.assertIn("python3 -m unittest tests/test_real_runtime_validation.py", all_run_commands)
         self.assertIn("python3 -m unittest tests/test_cpp_e2e_investigation.py", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_causal_validation_hardening.py", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_phase10_ci_security_gates.py", all_run_commands)
         self.assertIn("python3 -m unittest discover tests", all_run_commands)
         self.assertIn("python3 -m unittest tests/test_ci_workflow_parity.py", all_run_commands)
         self.assertIn("python3 -m benchmarks.capture_benchmark --smoke", all_run_commands)

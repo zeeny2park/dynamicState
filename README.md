@@ -1,10 +1,11 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `DYNAMICSTATE_INVESTIGATION_WORKFLOW_AND_EVIDENCE_LEDGER_COMPLETE`** — Agent-First Investigation Workflow Inspired by REA Complete  
-> Verified with 321 Unit/Integration Tests (Full Discovery), Multithread Branch Isolation Suite, Real GDB 9.2 Containerized Multithread Suite, Subprocess Lifecycle Integration Suite, Native C99 Target Collector Suite (with mapping race & process starttime validation), Web API Security Suite, and Real C++ PIE Binary Investigation E2E Fixture.
+> **Status: `DYNAMICSTATE_PHASE10_CI_SECURITY_GATES_AND_CAUSAL_VALIDATION_COMPLETE`** — Independent Trust Verification & CI Acceptance Gates Complete  
+> Verified with 400+ Unit/Integration/Security Tests (Full Discovery), 83 Causal Validation & Evidence Authenticity Tests, 16 Phase 10 Independent CI Security Gate Tests, Real C++ PIE ASLR Positive & Negative Controls, Multithread Branch Isolation Suite, Subprocess Lifecycle Integration Suite, Native C99 Target Collector Suite, CI Workflow Parity Suite, and Capture Performance Smoke Benchmark.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
+
 
 나아가 실제 CI/CD 및 프로덕션 환경의 **Stripped Production Binary**와 **External Debug Image** 환경 위에서, 자율 코딩 에이전트(Autonomous Coding Agent)가 GDB 명령어나 원시 메모리 주소를 직접 다루지 않고 오직 고수준 의미론적 개념(Object, Field, State, MutationCandidate, Transition, Exploration, Evidence, Invariant)만을 사용하여 런타임 상태를 관찰하고 탐색할 수 있는 **Agent Runtime Protocol (ARP)** 과 참조 구현체 `AgentRuntime`을 제공합니다.
 
@@ -99,6 +100,12 @@ Recursive Semantic Reachability Traversal
   (실행 중 프로세스의 중단 시간을 10ms 미만(실측 0.99~4.27ms)으로 최소화하는 고속 런타임 캡처 아키텍처: 중단 중 DWARF traversal 및 포인터 탐색을 완전히 배제하고 `process_vm_readv` 원시 메모리 캡처 즉시 프로세스를 재개(`SIGCONT`), 오프라인 의미론적 상태 엔진(`OfflineSemanticEngine`)을 통한 DWARF/객체 그래프/계층적 경로(`Session.worker.state.counter`) 복원, 불변 논리 스냅샷 복사 기반 State Laboratory(`StateLaboratory`, `SnapshotMutator`, `compute_semantic_diff`), 다중 스레드 동시성 환경에서의 스레드 영향 분석기(`ThreadImpactAnalyzer` - 직접 참조 스레드와 구조적 도달 가능 스레드 분리), 실시간 프로세스 읽기 검증 기반 Replay(`StateReplayer`), 그리고 7번째 탭 🔬 State Laboratory UI 제공)
 - **Phase 7 (Complete)**: *"Agent-First Investigation Workflow & Evidence Ledger (Inspired by REA)"*  
   (REA(Reverse Engineer Anything)의 체계적 조사 흐름과 코드 연결 정적 분석 철학을 계승하여 dynamicState를 자연어 요청 기반의 증거 중심 조사(Evidence-First Investigation) 워크플로로 확장: 버전화된 기계 판독 가능 증거 원장(`EvidenceLedger` v1.0.0), 엄격한 사실(Facts)·가설(Hypotheses)·불명(Unknowns) 삼원 분류, 타깃/빌드 ID 일치성 검증, DWARF 기반 정적-동적 코드 연결(`StaticAnalysisProvider`), 고수준 조사 API(`start_investigation`, `compare_observations`, `follow_evidence`, `get_next_steps`), 읽기 전용 기본 안전 정책, 그리고 엔지니어가 원시 주소 없이도 직관적으로 파악할 수 있는 `0. 🔍 Investigation Overview` UI 탭 제공)
+- **Phase 8 (Complete)**: *"Runtime Evidence Authenticity and Independent Function Attribution"*  
+  (스냅샷 바이트 무결성, 캡처 출처, 타깃 프로세스 ID, 상태 전이 검증, 함수 인과 귀속 검증 5개 신뢰 계층 분리; `CaptureReceipt` 및 `compute_snapshot_artifact_hash()` 통한 결정론적 매니페스트 해싱; 단일 작성자 격리 및 실행 추적 기반 함수 귀속 분리; REST/ARP 비신뢰 호출자 플래그 무장해제; DWARF 정적 후보(`STATIC_CANDIDATE`)의 런타임 독립 검증 없는 승격 원천 차단)
+- **Phase 9 (Complete)**: *"Cross-Process Evidence Trust, Key Lifecycle & Real-World Causal Validation"*  
+  (`CaptureKeyStore` 통한 키 수명주기(등록, 회전, 폐기, 프로세스 로컬 임시 키 폴백) 관리; Schema 2.0.0 HMAC-SHA256 기반 프로세스 간 오프라인 영속 스냅샷 상호검증; 폐기/미확인 키 Fail-Closed 보장; 비밀값 비노출(Zero Secret Leakage) 원칙 확립; PID 재활용 방지(`/proc/<pid>/stat` 시작 시간 검증); 실 컴파일 C++ PIE 바이너리 포지티브/네거티브 컨트롤 검증)
+- **Phase 10 (Complete)**: *"Independent Trust Verification & CI Acceptance Gates"*  
+  (전체 10대 신뢰 경계(Capture Backend, Receipt Issuance, Save/Load, Cross-Process, Investigation, REST, ARP, EvidenceLedger, Controlled Execution, Causal Attestation) 신뢰 행렬(Trust-Boundary Matrix) 명세화; 4대 CI 보안 수락 게이트(`TestTrustBoundaryIngressGates`, `TestKeyLifecycleAndConcurrencyGates`, `TestArtifactIntegrityAndAntiTamperingGates`, `TestRealWorldCppCrossProcessAcceptanceGate`) 및 16개 회귀 테스트 구축; `ci/workflows/test.yml` 및 `run_all_tests.sh` 내 보안 게이트 강제 통합)
 
 ---
 
@@ -1154,10 +1161,16 @@ python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 테스트 (321 unit/integration tests across all modules, including Phase 7 Investigation & Evidence Ledger suite)
+# 1. 단위 및 통합 전체 테스트 (577 unit/integration tests across all modules, including Phase 8-10 suites)
 python3 -m unittest discover -s tests -v
 
-# 2. Phase 7 조사 워크플로 및 증거 원장 전용 테스트 스위트 (29개 테스트)
+# 2. Phase 8 & 9 런타임 증거 진위성 및 인과 검증 하드닝 스위트 (83개 테스트)
+python3 -m unittest tests/test_causal_validation_hardening.py -v
+
+# 3. Phase 10 독립 신뢰 검증 및 CI 보안 수락 게이트 스위트 (16개 테스트)
+python3 -m unittest tests/test_phase10_ci_security_gates.py -v
+
+# 4. Phase 7 조사 워크플로 및 증거 원장 전용 테스트 스위트 (29개 테스트)
 python3 -m unittest tests/test_evidence_schema.py -v
 python3 -m unittest tests/test_investigation_identity_and_static.py -v
 python3 -m unittest tests/test_investigation_comparison.py -v

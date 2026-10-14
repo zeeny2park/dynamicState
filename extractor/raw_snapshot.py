@@ -450,10 +450,14 @@ class RawRuntimeSnapshot:
     def load(cls, output_dir: str) -> "RawRuntimeSnapshot":
         # Security invariant: Reject path traversal and symlinks at the root
         norm = os.path.normpath(output_dir)
-        if ".." in norm.split(os.path.sep):
+        if ".." in output_dir.replace("\\", "/").split("/") or ".." in norm.split(os.path.sep):
             raise ValueError(f"Path traversal detected in snapshot path: '{output_dir}'")
         if os.path.islink(output_dir):
             raise ValueError(f"Snapshot directory '{output_dir}' is a symbolic link; symlinks are rejected")
+        if not os.path.exists(output_dir):
+            raise FileNotFoundError(f"Snapshot directory '{output_dir}' does not exist")
+        if not os.path.isdir(output_dir):
+            raise ValueError(f"Snapshot path '{output_dir}' is not a directory")
 
         # Recursive symlink check throughout snapshot directory
         for root, dirs, files in os.walk(output_dir):

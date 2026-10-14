@@ -1451,10 +1451,10 @@ class InvestigationManager:
                     rcpt_data = data.get("capture_receipt")
                     if rcpt_data and isinstance(rcpt_data, dict):
                         from .capture_backend import CaptureReceipt
-                        rcpt = CaptureReceipt.from_dict(rcpt_data)
-                        if rcpt.verify_signature():
+                        sig_ok, sig_reason, _ = rcpt.verify_with_status()
+                        if sig_ok:
                             return True, rcpt, "Embedded capture receipt verified"
-                        return False, None, "Embedded capture receipt signature verification failed (tampering detected)"
+                        return False, rcpt, f"Embedded capture receipt signature verification failed: {sig_reason}"
                 except Exception:
                     pass
                 return False, None, "Snapshot file lacks an authentic CaptureReceipt"

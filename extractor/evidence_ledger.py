@@ -231,6 +231,16 @@ class CausalVerificationCapability:
     def verified_claims(self) -> Tuple[str, ...]:
         return self._verified_claims
 
+    def __repr__(self) -> str:
+        return (
+            f"<CausalVerificationCapability inv={self._investigation_id!r} "
+            f"ev={self._evidence_id!r} fn={self._target_function!r} "
+            f"field={self._field_path!r} consumed={self._consumed}>"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
 
 def normalize_path_tokens(path: str) -> List[str]:
     """Tokenize dot-separated or bracket-indexed paths into canonical lowercase segments."""
