@@ -460,6 +460,8 @@ class TestHypothesisValidator(unittest.TestCase):
             hypothesis_id="hypo_valid",
             evidence_id="ev_det_1",
             backend_type="synthetic_adversarial_fixture",
+            function_attribution_verified=True,
+            attribution_basis="call_stack_observation",
         )
         sig = compute_receipt_signature(self.ledger.session_secret, rcpt_temp)
         rcpt = ControlledExecutionResult(
@@ -474,6 +476,8 @@ class TestHypothesisValidator(unittest.TestCase):
             hypothesis_id=rcpt_temp.hypothesis_id,
             evidence_id=rcpt_temp.evidence_id,
             backend_type=rcpt_temp.backend_type,
+            function_attribution_verified=True,
+            attribution_basis="call_stack_observation",
             receipt_signature=sig,
         )
         cap = self.ledger.issue_verification_capability("ev_det_1", target_function="mutate_state", hypothesis_id="hypo_valid", execution_result=rcpt)

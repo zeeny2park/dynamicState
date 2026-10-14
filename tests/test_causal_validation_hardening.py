@@ -39,6 +39,11 @@ from extractor.evidence_ledger import (
     compute_evidence_fingerprint,
     compute_receipt_signature,
     is_exact_semantic_path_match,
+    find_matching_diff_changes,
+    ATTRIBUTION_BASIS_CALL_STACK,
+    ATTRIBUTION_BASIS_EXECUTION_TRACE,
+    ATTRIBUTION_BASIS_SINGLE_WRITER,
+    VALID_ATTRIBUTION_BASES,
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
@@ -1746,6 +1751,8 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             backend_type="synthetic_adversarial_fixture",
             evidence_id="ev_pos_n",
             hypothesis_id=hypo_id,
+            function_attribution_verified=True,
+            attribution_basis=ATTRIBUTION_BASIS_CALL_STACK,
         )
         att_ok = verifier.verify_execution_and_attest(
             evidence_id="ev_pos_n",
@@ -2908,6 +2915,481 @@ class TestVerifiableRuntimeProvenancePhase5(unittest.TestCase):
             )
         self.assertEqual(sum(1 for r in session.ledger._records if (r.details or {}).get("verified_causal_proof")), 0)
         self.assertEqual(sum(1 for r in session.ledger._records if (r.provenance or {}).get("verifier_attestation")), 0)
+
+
+class TestPhase7FunctionAttributionAndIdentityHardening(unittest.TestCase):
+    """Test suite specifically verifying Phase 7 function-attribution and identity hardening requirements."""
+
+    def test_item1_default_attribution_is_false_when_no_independent_evidence(self):
+        """Phase 7 Item 1: Default attribution is false when no independent attribution evidence exists."""
+        res = ControlledExecutionResult(
+            execution_id="exec_default",
+            investigation_id="inv_test",
+            target_function="mutate_state",
+            field_path="State.counter",
+            before_value=1,
+            after_value=2,
+            execution_status="REPRODUCED",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        self.assertFalse(res.function_attribution_verified)
+        self.assertFalse(res.is_function_attribution_verified)
+
+    def test_item2_target_function_presence_cannot_prove_attribution(self):
+        """Phase 7 Item 2: target_function presence alone cannot prove attribution."""
+        temp_dir = tempfile.mkdtemp(prefix="phase7_item2_")
+        try:
+            snap_a_file = os.path.join(temp_dir, "snap_a.json")
+            snap_b_file = os.path.join(temp_dir, "snap_b.json")
+            with open(snap_a_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:00Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 1}]}]}
+                }, f)
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 2}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            inv_id = mgr.start_investigation(goal="Phase 7 Item 2")["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_it2",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="observer",
+                session_id=inv_id,
+                observation="Obs",
+                details={"target_function": "worker_fn", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_it2",
+                investigation_id=inv_id,
+                title="Hypo Item 2",
+                claim="Claim Item 2",
+                proposed_mechanism="Mech Item 2",
+                supporting_evidence_ids=["ev_it2"],
+                candidate_fields=["State.counter"],
+                function_candidates=[{"function_name": "worker_fn", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            # verify_live_reproduction_and_attest specifies target_function='worker_fn', but no attribution evidence
+            att_ok = mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="hypo_it2",
+                evidence_id="ev_it2",
+                snapshot_a_path=snap_a_file,
+                snapshot_b_path=snap_b_file,
+                target_function="worker_fn",
+                field_path="State.counter",
+            )
+            self.assertTrue(att_ok)
+
+            att = session.ledger.get_record("ev_it2").provenance["verifier_attestation"]
+            self.assertFalse(att["function_attribution_verified"])
+
+            res = mgr.evaluate_hypothesis(inv_id, "hypo_it2", proof_evidence_id="ev_it2", deterministic_transition_verified=True)
+            self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+
+            h_after = mgr.get_hypothesis(inv_id, "hypo_it2")
+            fc = h_after["function_candidates"][0]
+            self.assertEqual(fc["candidate_tier"], FUNCTION_TIER_EVIDENCE_SUPPORTED)
+            self.assertFalse(fc["confirmed_root_cause"])
+            self.assertIn("function attribution was not independently verified", fc["tier_limitation"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_item3_caller_supplied_attribution_booleans_and_labels_cannot_authorize(self):
+        """Phase 7 Item 3: Caller-supplied attribution booleans and labels cannot authorize function promotion."""
+        temp_dir = tempfile.mkdtemp(prefix="phase7_item3_")
+        try:
+            snap_a_file = os.path.join(temp_dir, "snap_a.json")
+            snap_b_file = os.path.join(temp_dir, "snap_b.json")
+            with open(snap_a_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:00Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 1}]}]}
+                }, f)
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 2}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            inv_id = mgr.start_investigation(goal="Phase 7 Item 3")["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_it3",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="observer",
+                session_id=inv_id,
+                observation="Obs",
+                details={"target_function": "worker_fn", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_it3",
+                investigation_id=inv_id,
+                title="Hypo Item 3",
+                claim="Claim Item 3",
+                proposed_mechanism="Mech Item 3",
+                supporting_evidence_ids=["ev_it3"],
+                candidate_fields=["State.counter"],
+                function_candidates=[{"function_name": "worker_fn", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            # Caller injects attribution_evidence with function_attribution_verified=True and custom label
+            att_ok = mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="hypo_it3",
+                evidence_id="ev_it3",
+                snapshot_a_path=snap_a_file,
+                snapshot_b_path=snap_b_file,
+                target_function="worker_fn",
+                field_path="State.counter",
+                attribution_evidence={"function_attribution_verified": True, "attribution_basis": "caller_trusted_label"},
+            )
+            self.assertTrue(att_ok)
+
+            att = session.ledger.get_record("ev_it3").provenance["verifier_attestation"]
+            self.assertFalse(att["function_attribution_verified"])
+
+            res = mgr.evaluate_hypothesis(inv_id, "hypo_it3", proof_evidence_id="ev_it3", deterministic_transition_verified=True)
+            self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+            h_after = mgr.get_hypothesis(inv_id, "hypo_it3")
+            fc = h_after["function_candidates"][0]
+            self.assertFalse(fc["confirmed_root_cause"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_item10_exact_semantic_path_matching_prevents_unrelated_field_collisions(self):
+        """Phase 7 Item 10: Terminal field names in unrelated objects do not collide."""
+        # Unrelated objects
+        self.assertFalse(is_exact_semantic_path_match("ThreadCounter", "counter", "State.counter"))
+        self.assertFalse(is_exact_semantic_path_match("ThreadCounter.counter", "counter", "State.counter"))
+        self.assertTrue(is_exact_semantic_path_match("State", "counter", "State.counter"))
+        self.assertTrue(is_exact_semantic_path_match("Worker.state", "counter", "State.counter"))
+
+        # Arrays
+        self.assertTrue(is_exact_semantic_path_match("items[0]", "value", "items[0].value"))
+        self.assertFalse(is_exact_semantic_path_match("items[1]", "value", "items[0].value"))
+
+        # Target object ID disambiguation
+        self.assertFalse(is_exact_semantic_path_match("counter", "counter", "counter", obj_id="obj_2", target_obj_id="obj_1"))
+        self.assertTrue(is_exact_semantic_path_match("counter", "counter", "counter", obj_id="obj_1", target_obj_id="obj_1"))
+
+    def test_item11_ambiguous_object_correspondence_raises_explicit_error(self):
+        """Phase 7 Item 11: Ambiguous object correspondence raises explicit error instead of silent pick."""
+        changes = [
+            {"path": "State.counter", "field": "counter", "object_id": "state_1", "type": "State", "before": 1, "after": 2},
+            {"path": "State.counter", "field": "counter", "object_id": "state_2", "type": "State", "before": 10, "after": 20},
+        ]
+        matches, err_msg = find_matching_diff_changes(changes, "State.counter")
+        self.assertIsNotNone(err_msg)
+        self.assertIn("Ambiguous field path match", err_msg)
+        self.assertIn("specify object ID to disambiguate", err_msg)
+
+        # Providing target_obj_id disambiguates
+        matches, err_msg = find_matching_diff_changes(changes, "State.counter", target_obj_id="state_1")
+        self.assertIsNone(err_msg)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["object_id"], "state_1")
+
+    def test_item16_missing_identity_pid_reuse_and_deleted_artifact_fail_safely(self):
+        """Phase 7 Item 16: Missing process identity, PID reuse, and deleted artifact fail safely."""
+        temp_dir = tempfile.mkdtemp(prefix="phase7_item16_")
+        try:
+            snap_a1 = os.path.join(temp_dir, "snap_a1.json")
+            snap_b1 = os.path.join(temp_dir, "snap_b1.json")
+            # Snapshot A has build_id; Snapshot B has missing build_id
+            with open(snap_a1, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a1",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "build_1"},
+                    "timestamp": "2026-10-14T00:00:00Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 1}]}]}
+                }, f)
+            with open(snap_b1, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b1",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": None},
+                    "timestamp": "2026-10-14T00:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 2}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            inv_id = mgr.start_investigation(goal="Phase 7 Item 16")["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_it16",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="observer",
+                session_id=inv_id,
+                observation="Obs",
+                details={"target_function": "worker_fn", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_dummy",
+                investigation_id=inv_id,
+                title="Hypo Dummy",
+                claim="Claim",
+                proposed_mechanism="Mech",
+                supporting_evidence_ids=["ev_it16"],
+                candidate_fields=["State.counter"],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            # Asymmetric build_id fails
+            with self.assertRaises(ValueError) as ctx:
+                mgr.verify_live_reproduction_and_attest(
+                    investigation_id=inv_id,
+                    hypothesis_id="hypo_dummy",
+                    evidence_id="ev_it16",
+                    snapshot_a_path=snap_a1,
+                    snapshot_b_path=snap_b1,
+                    target_function="worker_fn",
+                    field_path="State.counter",
+                )
+            self.assertIn("Target build ID present on one snapshot but missing on the other", str(ctx.exception))
+
+            # PID reuse via mismatched start_time
+            snap_a2 = os.path.join(temp_dir, "snap_a2.json")
+            snap_b2 = os.path.join(temp_dir, "snap_b2.json")
+            with open(snap_a2, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a2",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1", "start_time": 1000},
+                    "timestamp": "2026-10-14T00:00:00Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 1}]}]}
+                }, f)
+            with open(snap_b2, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b2",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1", "start_time": 2000},
+                    "timestamp": "2026-10-14T00:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 2}]}]}
+                }, f)
+
+            with self.assertRaises(ValueError) as ctx:
+                mgr.verify_live_reproduction_and_attest(
+                    investigation_id=inv_id,
+                    hypothesis_id="hypo_dummy",
+                    evidence_id="ev_it16",
+                    snapshot_a_path=snap_a2,
+                    snapshot_b_path=snap_b2,
+                    target_function="worker_fn",
+                    field_path="State.counter",
+                )
+            self.assertIn("potential PID reuse detected", str(ctx.exception))
+
+            # Deleted artifact post-receipt
+            verifier = TrustedCausalVerifier(session)
+            receipt = verifier.record_controlled_execution(
+                target_function="worker_fn",
+                field_path="State.counter",
+                before_value=1,
+                after_value=2,
+                execution_status="REPRODUCED",
+                before_snapshot_ref=snap_a2,
+                after_snapshot_ref=snap_b2,
+                backend_type="live_process_snapshot_diff",
+            )
+            # Delete snapshot file
+            os.remove(snap_a2)
+            with self.assertRaises(ValueError) as ctx:
+                verifier.verify_execution_and_attest(
+                    evidence_id="ev_it16",
+                    hypothesis_id="hypo_dummy",
+                    execution_result=receipt,
+                )
+            self.assertIn("missing after receipt issuance", str(ctx.exception))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_item14_supported_genuine_attribution_mechanisms(self):
+        """Phase 7 Item 14: Supported genuine attribution mechanisms promote candidate."""
+        temp_dir = tempfile.mkdtemp(prefix="phase7_item14_")
+        try:
+            snap_a_file = os.path.join(temp_dir, "snap_a.json")
+            snap_b_file = os.path.join(temp_dir, "snap_b.json")
+            with open(snap_a_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:00Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 1}]}]}
+                }, f)
+            with open(snap_b_file, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "thread_metadata": [
+                        {"thread_id": 1, "function": "worker_fn", "call_stack": ["main", "worker_fn"]}
+                    ],
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 2}]}]}
+                }, f)
+
+            mgr = InvestigationManager()
+            inv_id = mgr.start_investigation(goal="Phase 7 Item 14")["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            rec = EvidenceRecord(
+                evidence_id="ev_it14",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="observer",
+                session_id=inv_id,
+                observation="Obs",
+                details={"target_function": "worker_fn", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_it14",
+                investigation_id=inv_id,
+                title="Hypo Item 14",
+                claim="Claim Item 14",
+                proposed_mechanism="Mech Item 14",
+                supporting_evidence_ids=["ev_it14"],
+                candidate_fields=["State.counter"],
+                function_candidates=[{"function_name": "worker_fn", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            # Mechanism 1: Call stack observation in thread metadata
+            att_ok = mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="hypo_it14",
+                evidence_id="ev_it14",
+                snapshot_a_path=snap_a_file,
+                snapshot_b_path=snap_b_file,
+                target_function="worker_fn",
+                field_path="State.counter",
+            )
+            self.assertTrue(att_ok)
+            att = session.ledger.get_record("ev_it14").provenance["verifier_attestation"]
+            self.assertTrue(att["function_attribution_verified"])
+            self.assertEqual(att["attribution_basis"], ATTRIBUTION_BASIS_CALL_STACK)
+
+            res = mgr.evaluate_hypothesis(inv_id, "hypo_it14", proof_evidence_id="ev_it14", deterministic_transition_verified=True)
+            self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+            h_after = mgr.get_hypothesis(inv_id, "hypo_it14")
+            fc = h_after["function_candidates"][0]
+            self.assertEqual(fc["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+            self.assertTrue(fc["confirmed_root_cause"])
+
+            # Mechanism 2: Single-writer isolation experiment
+            rec2 = EvidenceRecord(
+                evidence_id="ev_it14_sw",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="observer",
+                session_id=inv_id,
+                observation="Obs SW",
+                details={"target_function": "worker_fn", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec2)
+            hypo2 = InvestigationHypothesis(
+                hypothesis_id="hypo_it14_sw",
+                investigation_id=inv_id,
+                title="Hypo Item 14 SW",
+                claim="Claim Item 14 SW",
+                proposed_mechanism="Mech Item 14 SW",
+                supporting_evidence_ids=["ev_it14_sw"],
+                candidate_fields=["State.counter"],
+                function_candidates=[{"function_name": "worker_fn", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo2)
+
+            # Snapshots without thread metadata
+            snap_b_notm = os.path.join(temp_dir, "snap_b_notm.json")
+            with open(snap_b_notm, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b_notm",
+                    "process": {"pid": 1001, "binary": "/bin/app", "executable_build_id": "b1"},
+                    "timestamp": "2026-10-14T00:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 2}]}]}
+                }, f)
+
+            att_ok2 = mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="hypo_it14_sw",
+                evidence_id="ev_it14_sw",
+                snapshot_a_path=snap_a_file,
+                snapshot_b_path=snap_b_notm,
+                target_function="worker_fn",
+                field_path="State.counter",
+                attribution_evidence={
+                    "attribution_basis": ATTRIBUTION_BASIS_SINGLE_WRITER,
+                    "single_writer_verified": True,
+                    "active_writer_function": "worker_fn",
+                },
+            )
+            self.assertTrue(att_ok2)
+            att2 = session.ledger.get_record("ev_it14_sw").provenance["verifier_attestation"]
+            self.assertTrue(att2["function_attribution_verified"])
+            self.assertEqual(att2["attribution_basis"], ATTRIBUTION_BASIS_SINGLE_WRITER)
+
+            res2 = mgr.evaluate_hypothesis(inv_id, "hypo_it14_sw", proof_evidence_id="ev_it14_sw", deterministic_transition_verified=True)
+            self.assertEqual(res2["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+            h_after2 = mgr.get_hypothesis(inv_id, "hypo_it14_sw")
+            fc2 = h_after2["function_candidates"][0]
+            self.assertEqual(fc2["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+            self.assertTrue(fc2["confirmed_root_cause"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class TestFalsePositiveEvaluationHarness(unittest.TestCase):

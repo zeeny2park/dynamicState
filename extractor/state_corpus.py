@@ -90,6 +90,14 @@ class StateCorpus:
             record = self.states[state_id]
             if snapshot_id not in record.setdefault("observations", []):
                 record["observations"].append(snapshot_id)
+            if "thread_metadata" in snap_dict or "execution" in snap_dict:
+                existing_snap = self.get(state_id) or {}
+                if "thread_metadata" not in existing_snap or "execution" not in existing_snap:
+                    existing_snap.update(snap_dict)
+                    state_path = os.path.join(self.states_dir, state_id)
+                    with open(os.path.join(state_path, "snapshot.json"), "w", encoding="utf-8") as f:
+                        json.dump(existing_snap, f, indent=2, ensure_ascii=False)
+                        f.write("\n")
             self.save()
             return state_id, False
 

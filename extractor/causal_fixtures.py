@@ -173,6 +173,13 @@ class CausalDefectFixtures:
             "timestamp": "2026-10-13T10:00:05Z",
             "completeness": "COMPLETE",
             "consistency": {"level": "STOPPED"},
+            "thread_metadata": [
+                {
+                    "thread_id": 1001,
+                    "function": "mutate_worker_state",
+                    "call_stack": ["main", "worker_loop", "mutate_worker_state"],
+                }
+            ],
             "persistent": {
                 "objects": [
                     {
@@ -347,6 +354,13 @@ class CausalDefectFixtures:
             "timestamp": "2026-10-13T10:00:05Z",
             "completeness": "COMPLETE",
             "consistency": {"level": "STOPPED"},
+            "thread_metadata": [
+                {
+                    "thread_id": 2002,
+                    "function": "update_flags",
+                    "call_stack": ["main", "process_events", "update_flags"],
+                }
+            ],
             "persistent": {
                 "objects": [
                     {

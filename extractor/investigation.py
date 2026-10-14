@@ -42,6 +42,11 @@ from .evidence_ledger import (
     compute_receipt_signature,
     is_atomic_or_stopped_consistency,
     is_exact_semantic_path_match,
+    find_matching_diff_changes,
+    ATTRIBUTION_BASIS_CALL_STACK,
+    ATTRIBUTION_BASIS_EXECUTION_TRACE,
+    ATTRIBUTION_BASIS_SINGLE_WRITER,
+    VALID_ATTRIBUTION_BASES,
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
@@ -378,12 +383,16 @@ class TrustedCausalVerifier:
 
     def _resolve_snapshot_for_verifier(self, snap_ref: Any) -> Optional[Any]:
         """Resolve snapshot artifact for internal verification."""
-        if isinstance(snap_ref, dict):
-            return snap_ref
-        if hasattr(snap_ref, "to_dict"):
-            return snap_ref
         if not isinstance(snap_ref, str):
+            if isinstance(snap_ref, dict) or hasattr(snap_ref, "to_dict"):
+                return snap_ref
             return None
+
+        norm = os.path.normpath(snap_ref)
+        if ".." in norm.split(os.path.sep):
+            raise ValueError(f"Path traversal detected in snapshot path: '{snap_ref}'")
+        if os.path.islink(snap_ref):
+            raise ValueError(f"Snapshot path '{snap_ref}' is a symbolic link; symlinks are rejected for security")
         if self._session and hasattr(self._session, "corpus") and self._session.corpus:
             snap_data = self._session.corpus.get(snap_ref)
             if snap_data:
@@ -455,10 +464,18 @@ class TrustedCausalVerifier:
         eff_prov_class = provenance_class or PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
 
         if function_attribution_verified is not None:
-            eff_attr_ver = function_attribution_verified
+            eff_attr_ver = bool(function_attribution_verified)
         else:
-            eff_attr_ver = bool(target_function and backend_type != "live_process_snapshot_diff")
-        eff_attr_basis = attribution_basis or ("controlled_execution" if eff_attr_ver else "")
+            eff_attr_ver = False
+
+        if eff_attr_ver:
+            if attribution_basis and attribution_basis in VALID_ATTRIBUTION_BASES:
+                eff_attr_basis = attribution_basis
+            else:
+                eff_attr_ver = False
+                eff_attr_basis = "unsupported_attribution_basis"
+        else:
+            eff_attr_basis = attribution_basis or "state_transition_only"
 
         hash_a = None
         hash_b = None
@@ -473,17 +490,17 @@ class TrustedCausalVerifier:
             hash_a = compute_snapshot_artifact_hash(before_snapshot_ref, self._session)
             hash_b = compute_snapshot_artifact_hash(after_snapshot_ref, self._session)
             diff_res = StateDiffEngine().diff(snap_a, snap_b)
+            matching_changes, err_msg = find_matching_diff_changes(diff_res.changes, field_path)
+            if err_msg:
+                raise ValueError(err_msg)
             found = False
-            for chg in diff_res.changes:
-                p = chg.get("path") or ""
-                f = chg.get("field") or ""
-                if is_exact_semantic_path_match(p, f, field_path):
-                    if before_value is not None and chg.get("before") != before_value:
-                        continue
-                    if after_value is not None and chg.get("after") != after_value:
-                        continue
-                    found = True
-                    break
+            for chg in matching_changes:
+                if before_value is not None and chg.get("before") != before_value:
+                    continue
+                if after_value is not None and chg.get("after") != after_value:
+                    continue
+                found = True
+                break
             if not found:
                 raise ValueError(
                     f"Fabricated execution values: field '{field_path}' transition "
@@ -609,12 +626,18 @@ class TrustedCausalVerifier:
                 raise ValueError(f"Target PID mismatch: session ({sess_tid['pid']}) != receipt ({rec_tid['pid']})")
 
         # 9. Verify snapshot tamper detection post-issuance
-        if execution_result.before_snapshot_ref and execution_result.before_snapshot_hash and os.path.exists(execution_result.before_snapshot_ref):
-            curr_hash_a = compute_snapshot_artifact_hash(execution_result.before_snapshot_ref, self._session)
+        if execution_result.before_snapshot_ref and execution_result.before_snapshot_hash:
+            ref_a = execution_result.before_snapshot_ref
+            if (os.path.isabs(ref_a) or ref_a.endswith(".json") or os.path.sep in ref_a) and not os.path.exists(ref_a):
+                raise ValueError(f"Before-snapshot artifact '{ref_a}' is missing after receipt issuance")
+            curr_hash_a = compute_snapshot_artifact_hash(ref_a, self._session)
             if curr_hash_a != execution_result.before_snapshot_hash:
                 raise ValueError("Before-snapshot artifact tampered or modified after receipt issuance")
-        if execution_result.after_snapshot_ref and execution_result.after_snapshot_hash and os.path.exists(execution_result.after_snapshot_ref):
-            curr_hash_b = compute_snapshot_artifact_hash(execution_result.after_snapshot_ref, self._session)
+        if execution_result.after_snapshot_ref and execution_result.after_snapshot_hash:
+            ref_b = execution_result.after_snapshot_ref
+            if (os.path.isabs(ref_b) or ref_b.endswith(".json") or os.path.sep in ref_b) and not os.path.exists(ref_b):
+                raise ValueError(f"After-snapshot artifact '{ref_b}' is missing after receipt issuance")
+            curr_hash_b = compute_snapshot_artifact_hash(ref_b, self._session)
             if curr_hash_b != execution_result.after_snapshot_hash:
                 raise ValueError("After-snapshot artifact tampered or modified after receipt issuance")
 
@@ -1512,7 +1535,18 @@ class InvestigationManager:
                 or prov.get("executable_build_id")
                 or (prov.get("executable_identity") or {}).get("build_id")
             )
-            if disk_path and (pid is None or not binary or not build_id):
+            start_time = (
+                getattr(snap, "start_time", None)
+                or getattr(snap, "process_start_time", None)
+                or getattr(snap, "pid_start_time", None)
+                or d.get("start_time")
+                or d.get("process_start_time")
+                or proc.get("start_time")
+                or proc.get("process_start_time")
+                or prov.get("start_time")
+                or prov.get("process_start_time")
+            )
+            if disk_path and (pid is None or not binary or not build_id or not start_time):
                 meta_file = os.path.join(disk_path, "snapshot_metadata.json") if os.path.isdir(disk_path) else (disk_path if str(disk_path).endswith(".json") else None)
                 if meta_file and os.path.exists(meta_file):
                     try:
@@ -1524,9 +1558,11 @@ class InvestigationManager:
                                 binary = disk_meta.get("executable") or disk_meta.get("binary") or (disk_meta.get("process") or {}).get("binary") or (disk_meta.get("process") or {}).get("executable")
                             if not build_id:
                                 build_id = disk_meta.get("executable_build_id") or (disk_meta.get("process") or {}).get("executable_build_id")
+                            if not start_time:
+                                start_time = disk_meta.get("start_time") or disk_meta.get("process_start_time") or (disk_meta.get("process") or {}).get("start_time")
                     except Exception:
                         pass
-            return {"pid": pid, "binary": binary, "build_id": build_id}
+            return {"pid": pid, "binary": binary, "build_id": build_id, "start_time": start_time}
 
         id_a = _get_snapshot_identity(snap_a, disk_a)
         id_b = _get_snapshot_identity(snap_b, disk_b)
@@ -1535,10 +1571,19 @@ class InvestigationManager:
             raise ValueError("Snapshot missing required target PID identity")
         if id_a["pid"] != id_b["pid"]:
             raise ValueError(f"Target PID mismatch between snapshots: {id_a['pid']} != {id_b['pid']}")
+
+        if (id_a["binary"] is None) != (id_b["binary"] is None):
+            raise ValueError("Target binary identity present on one snapshot but missing on the other")
         if id_a["binary"] and id_b["binary"] and os.path.basename(str(id_a["binary"])) != os.path.basename(str(id_b["binary"])):
             raise ValueError(f"Target binary mismatch between snapshots: {id_a['binary']} != {id_b['binary']}")
+
+        if (id_a["build_id"] is None) != (id_b["build_id"] is None):
+            raise ValueError("Target build ID present on one snapshot but missing on the other")
         if id_a["build_id"] and id_b["build_id"] and id_a["build_id"] != id_b["build_id"]:
             raise ValueError(f"Target build ID mismatch between snapshots: {id_a['build_id']} != {id_b['build_id']}")
+
+        if id_a.get("start_time") and id_b.get("start_time") and id_a["start_time"] != id_b["start_time"]:
+            raise ValueError(f"Target process start time mismatch: {id_a['start_time']} != {id_b['start_time']} (potential PID reuse detected)")
 
         # Verify against session target
         sess_tid = session.target_ref.get("target_identity") or {}
@@ -1567,51 +1612,57 @@ class InvestigationManager:
         hash_a = compute_snapshot_artifact_hash(snapshot_a_path, session)
         hash_b = compute_snapshot_artifact_hash(snapshot_b_path, session)
 
-        # 9. Compute and verify diff using exact semantic path matching
+        # 9. Compute and verify diff using exact semantic path matching with ambiguity detection
         diff_engine = StateDiffEngine()
         diff_res = diff_engine.diff(snap_a, snap_b)
         diff_trust = getattr(diff_res, "trust_classification", "TRUSTED")
         if diff_trust not in ("TRUSTED", "CONFIRMED"):
             raise ValueError(f"Live reproduction rejected: snapshot comparison trust classification is {diff_trust}")
 
-        found_change = None
-        for chg in diff_res.changes:
-            p = chg.get("path") or ""
-            f = chg.get("field") or ""
-            if is_exact_semantic_path_match(p, f, field_path):
-                found_change = chg
-                break
-        if not found_change:
+        matching_changes, err_msg = find_matching_diff_changes(diff_res.changes, field_path)
+        if err_msg:
+            raise ValueError(err_msg)
+        if not matching_changes:
             raise ValueError(f"Live reproduction rejected: field '{field_path}' did not change between snapshots")
 
+        found_change = matching_changes[0]
         before_val = found_change.get("before")
         after_val = found_change.get("after")
 
         # 10. Verify function attribution evidence
+        th_meta = getattr(snap_b, "thread_metadata", None)
+        if th_meta is None and hasattr(snap_b, "to_dict"):
+            th_meta = snap_b.to_dict().get("thread_metadata")
+        elif th_meta is None and isinstance(snap_b, dict):
+            th_meta = snap_b.get("thread_metadata")
+
+        observed_in_stack = False
+        if th_meta and isinstance(th_meta, list):
+            for t in th_meta:
+                if isinstance(t, dict):
+                    fn = t.get("function") or t.get("name")
+                    frames = t.get("call_stack") or t.get("frames") or []
+                    if fn == target_function or any(target_function in str(fr) for fr in frames):
+                        observed_in_stack = True
+                        break
+
         func_attr_ver = False
         attr_basis = "state_transition_only"
 
-        if attribution_evidence and isinstance(attribution_evidence, dict):
-            if attribution_evidence.get("function_attribution_verified") is True:
-                attr_fn = attribution_evidence.get("function_name") or attribution_evidence.get("target_function")
-                if not attr_fn or attr_fn == target_function:
+        if observed_in_stack:
+            func_attr_ver = True
+            attr_basis = ATTRIBUTION_BASIS_CALL_STACK
+        elif attribution_evidence and isinstance(attribution_evidence, dict):
+            basis = attribution_evidence.get("attribution_basis")
+            if basis == ATTRIBUTION_BASIS_EXECUTION_TRACE and attribution_evidence.get("execution_trace"):
+                trace = attribution_evidence.get("execution_trace", [])
+                if any(isinstance(tr, dict) and tr.get("function") == target_function for tr in trace):
                     func_attr_ver = True
-                    attr_basis = attribution_evidence.get("attribution_basis") or "runtime_execution_instrumentation"
-        else:
-            th_meta = getattr(snap_b, "thread_metadata", None)
-            if th_meta is None and hasattr(snap_b, "to_dict"):
-                th_meta = snap_b.to_dict().get("thread_metadata")
-            elif th_meta is None and isinstance(snap_b, dict):
-                th_meta = snap_b.get("thread_metadata")
-            if th_meta and isinstance(th_meta, list):
-                for t in th_meta:
-                    if isinstance(t, dict):
-                        fn = t.get("function") or t.get("name")
-                        frames = t.get("call_stack") or t.get("frames") or []
-                        if fn == target_function or any(target_function in str(fr) for fr in frames):
-                            func_attr_ver = True
-                            attr_basis = "thread_call_frame_observation"
-                            break
+                    attr_basis = ATTRIBUTION_BASIS_EXECUTION_TRACE
+            elif basis == ATTRIBUTION_BASIS_SINGLE_WRITER and attribution_evidence.get("single_writer_verified") is True:
+                if attribution_evidence.get("active_writer_function") == target_function:
+                    func_attr_ver = True
+                    attr_basis = ATTRIBUTION_BASIS_SINGLE_WRITER
 
         # 11. Mint ControlledExecutionResult
         verifier = TrustedCausalVerifier(session)
@@ -1681,10 +1732,14 @@ class InvestigationManager:
             new_details["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
             new_prov.pop("verifier_attestation", None)
             new_prov.pop("execution_provenance", None)
+            new_prov.pop("function_attribution_verified", None)
+            new_prov.pop("attribution_basis", None)
 
             # Any caller-supplied causal claims are marked as unverified caller claims
             new_details["caller_submitted"] = True
             new_details.pop("execution_provenance", None)
+            new_details.pop("function_attribution_verified", None)
+            new_details.pop("attribution_basis", None)
             if (
                 new_details.get("verified_transition") is True
                 or new_details.get("causal_proof") is True
@@ -3009,13 +3064,16 @@ class InvestigationManager:
 
     def _resolve_snapshot(self, snap_ref: Any, session: InvestigationSession) -> Optional[Any]:
         """Resolve snapshot by dict, object, State ID, Snapshot ID, or file path."""
-        if isinstance(snap_ref, dict):
-            return snap_ref
-        if hasattr(snap_ref, "to_dict"):
-            return snap_ref
-
         if not isinstance(snap_ref, str):
+            if isinstance(snap_ref, dict) or hasattr(snap_ref, "to_dict"):
+                return snap_ref
             return None
+
+        norm = os.path.normpath(snap_ref)
+        if ".." in norm.split(os.path.sep):
+            raise ValueError(f"Path traversal detected in snapshot path: '{snap_ref}'")
+        if os.path.islink(snap_ref):
+            raise ValueError(f"Snapshot path '{snap_ref}' is a symbolic link; symlinks are rejected for security")
 
         # 1. Direct state_id in corpus
         snap_data = self.corpus.get(snap_ref)

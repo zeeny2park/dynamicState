@@ -10,8 +10,9 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import re
 import uuid
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 
 PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE = "LIVE_RUNTIME_CAPTURE"
@@ -22,6 +23,17 @@ PROVENANCE_CLASS_IMPORTED_UNVERIFIED = "IMPORTED_UNVERIFIED"
 TRUSTED_PROVENANCE_CLASSES = {
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+}
+
+# Genuine supported function attribution mechanisms
+ATTRIBUTION_BASIS_CALL_STACK = "call_stack_observation"
+ATTRIBUTION_BASIS_EXECUTION_TRACE = "runtime_execution_trace"
+ATTRIBUTION_BASIS_SINGLE_WRITER = "controlled_single_writer_isolation"
+
+VALID_ATTRIBUTION_BASES = {
+    ATTRIBUTION_BASIS_CALL_STACK,
+    ATTRIBUTION_BASIS_EXECUTION_TRACE,
+    ATTRIBUTION_BASIS_SINGLE_WRITER,
 }
 
 
@@ -45,7 +57,7 @@ class ControlledExecutionResult:
     target_identity: Optional[Dict[str, Any]] = None
     backend_type: str = "controlled_runtime"
     provenance_class: str = PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
-    function_attribution_verified: Optional[bool] = None
+    function_attribution_verified: bool = False
     attribution_basis: str = ""
     executed_at: str = ""
     receipt_signature: str = ""
@@ -54,7 +66,7 @@ class ControlledExecutionResult:
     def is_function_attribution_verified(self) -> bool:
         if self.function_attribution_verified is not None:
             return bool(self.function_attribution_verified)
-        return bool(self.target_function and self.backend_type != "live_process_snapshot_diff")
+        return False
 
     def verify_authenticity(self, session_secret: str) -> bool:
         """Verify the cryptographic authenticity of this execution receipt against session secret."""
@@ -185,14 +197,34 @@ class CausalVerificationCapability:
         return self._attribution_basis
 
 
-def is_exact_semantic_path_match(diff_path: str, diff_field: str, target_path: str) -> bool:
+def normalize_path_tokens(path: str) -> List[str]:
+    """Tokenize dot-separated or bracket-indexed paths into canonical lowercase segments."""
+    if not path:
+        return []
+    s = re.sub(r"\[(\d+)\]", r".\1", path.strip())
+    return [p.lower() for p in s.split(".") if p]
+
+
+def is_exact_semantic_path_match(
+    diff_path: str,
+    diff_field: str,
+    target_path: str,
+    obj_id: Optional[str] = None,
+    target_obj_id: Optional[str] = None,
+    obj_type: Optional[str] = None,
+) -> bool:
     """Compare intended field path using exact semantic path matching on dot boundaries.
 
     Prevents loose substring and suffix cross-object collisions
     (e.g., 'ThreadCounter.counter' matching 'State.counter').
+    Supports object identity disambiguation and array index normalization.
     """
     if not target_path:
         return False
+
+    if target_obj_id and obj_id and target_obj_id != obj_id:
+        return False
+
     dp = (diff_path or "").strip()
     df = (diff_field or "").strip()
     tp = target_path.strip()
@@ -205,22 +237,73 @@ def is_exact_semantic_path_match(diff_path: str, diff_field: str, target_path: s
         full_candidates.append(f"{dp}.{df}")
     if df and df != dp:
         full_candidates.append(df)
+    if obj_id:
+        if df:
+            full_candidates.append(f"{obj_id}.{df}")
+        if dp:
+            full_candidates.append(f"{obj_id}.{dp}")
+    if obj_type and df:
+        full_candidates.append(f"{obj_type}.{df}")
 
-    t_parts = [p.lower() for p in tp.split(".") if p]
-    if not t_parts:
+    t_tokens = normalize_path_tokens(tp)
+    if not t_tokens:
         return False
 
     for cand in full_candidates:
-        c_parts = [p.lower() for p in cand.split(".") if p]
-        if not c_parts:
+        c_tokens = normalize_path_tokens(cand)
+        if not c_tokens:
             continue
-        if len(t_parts) > 1:
-            if len(c_parts) >= len(t_parts) and c_parts[-len(t_parts):] == t_parts:
+        if len(t_tokens) > 1:
+            if len(c_tokens) >= len(t_tokens) and c_tokens[-len(t_tokens):] == t_tokens:
                 return True
         else:
-            if c_parts[-1] == t_parts[0]:
+            if c_tokens[-1] == t_tokens[0]:
                 return True
     return False
+
+
+def find_matching_diff_changes(
+    changes: List[Dict[str, Any]],
+    target_field_path: str,
+    target_obj_id: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Find changes matching target_field_path, detecting cross-object ambiguity.
+
+    Returns: (matching_changes, ambiguity_error_message)
+    """
+    matches = []
+    for chg in changes:
+        p = chg.get("path") or ""
+        f = chg.get("field") or ""
+        oid = chg.get("object_id")
+        otype = chg.get("type")
+        if is_exact_semantic_path_match(
+            diff_path=p,
+            diff_field=f,
+            target_path=target_field_path,
+            obj_id=oid,
+            target_obj_id=target_obj_id,
+            obj_type=otype,
+        ):
+            matches.append(chg)
+
+    if not matches:
+        return [], None
+
+    # Check for ambiguity: multiple changes across distinct object instances
+    distinct_objects = set()
+    for m in matches:
+        key = m.get("object_id") or m.get("address") or m.get("type") or id(m)
+        distinct_objects.add(key)
+
+    if len(distinct_objects) > 1 and not target_obj_id:
+        obj_names = sorted(str(k) for k in distinct_objects)
+        return matches, (
+            f"Ambiguous field path match: multiple changes match '{target_field_path}' "
+            f"across {len(distinct_objects)} distinct objects ({obj_names}); specify object ID to disambiguate"
+        )
+
+    return matches, None
 
 
 def compute_evidence_fingerprint(
@@ -763,8 +846,12 @@ class EvidenceLedger:
         ):
             if record.provenance:
                 record.provenance["verifier_attestation"] = None
+                record.provenance.pop("function_attribution_verified", None)
+                record.provenance.pop("attribution_basis", None)
             if record.details:
                 record.details.pop("execution_provenance", None)
+                record.details.pop("function_attribution_verified", None)
+                record.details.pop("attribution_basis", None)
 
     def get_record(self, evidence_id: str) -> Optional[EvidenceRecord]:
         """Look up record by unique ID."""

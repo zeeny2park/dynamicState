@@ -1118,14 +1118,14 @@ class HypothesisValidator:
                     reason = f"Deterministic transition verified causal relationship via evidence {proof_rec.evidence_id}; all criteria satisfied."
 
                     # Upgrade function candidate if present (Invariant 1 & 2: STATIC_CANDIDATE never promoted!)
-                    target_fn = (proof_rec.details or {}).get("target_function") or (proof_rec.details or {}).get("writer_function") or (proof_rec.details or {}).get("executing_function")
-                    func_attr_ver = bool(proof_att.get("function_attribution_verified", (proof_rec.details or {}).get("function_attribution_verified", False)))
+                    target_fn = proof_att.get("target_function") or (proof_rec.details or {}).get("target_function")
+                    func_attr_ver = bool(proof_att.get("function_attribution_verified", False))
 
                     for fc in hypothesis.function_candidates:
                         tier = fc.get("candidate_tier")
                         fn_name = fc.get("function_name")
                         if tier == FUNCTION_TIER_EVIDENCE_SUPPORTED:
-                            if not target_fn or fn_name == target_fn:
+                            if target_fn and fn_name == target_fn:
                                 if func_attr_ver:
                                     fc["candidate_tier"] = FUNCTION_TIER_VALIDATED_CAUSAL
                                     fc["confirmed_root_cause"] = True
@@ -1135,7 +1135,7 @@ class HypothesisValidator:
                                     fc["tier_limitation"] = f"State transition verified in runtime, but function attribution was not independently verified by execution instrumentation."
                             else:
                                 fc["confirmed_root_cause"] = False
-                                fc["tier_limitation"] = f"Observed in execution, but causal proof evidence identifies {target_fn} as the causal writer."
+                                fc["tier_limitation"] = f"Observed in execution, but causal proof evidence identifies {target_fn or 'another function'} as the causal writer."
                         elif tier == FUNCTION_TIER_STATIC_CANDIDATE:
                             # Invariant 1: static candidates remain static candidates
                             fc["confirmed_root_cause"] = False
