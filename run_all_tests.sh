@@ -84,6 +84,14 @@ run_step "Phase 11 Real-Target Validation & Release Readiness Suite" \
 run_step "Phase 12 Evidence-Driven Investigation Loop & Conversational Validation Suite" \
     python3 -m unittest tests/test_phase12_investigation_loop.py
 
+# 11. Phase 13 End-to-End Operational Acceptance Suite
+run_step "Phase 13 End-to-End Operational Acceptance Suite" \
+    python3 -m unittest tests/test_phase13_operational_acceptance.py
+
+# 12. Phase 13 Operational Acceptance Demonstration Script
+run_step "Phase 13 Operational Acceptance Demonstration Script" \
+    python3 scripts/run_e2e_operational_acceptance.py
+
 # 11. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests

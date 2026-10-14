@@ -1480,6 +1480,18 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": res.error.code if res.error else "OBSERVATION_ERROR",
                                             "message": res.error.message if res.error else "Failed to execute observation"}}
 
+    def cancel_observation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        obs_id = params.get("observation_id")
+        reason = params.get("reason")
+        if not inv_id or not obs_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id and observation_id are required"}}
+        res = self.runtime.cancel_observation(inv_id, obs_id, reason=reason)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "CANCEL_ERROR",
+                                            "message": res.error.message if res.error else "Failed to cancel observation"}}
+
     def get_investigation_timeline(self, investigation_id: Optional[str]) -> Dict[str, Any]:
         if not investigation_id:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
@@ -1957,8 +1969,12 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.evaluate_hypothesis(body))
                 return
 
-            if path == "/api/investigation/observe":
+            if path in ("/api/investigation/observe", "/api/investigation/observations/execute"):
                 self._send_json(adapter.execute_observation(body))
+                return
+
+            if path in ("/api/investigation/cancel-observation", "/api/investigation/observations/cancel"):
+                self._send_json(adapter.cancel_observation(body))
                 return
 
             if path in ("/api/investigation/cycle", "/api/investigation/run-cycle"):

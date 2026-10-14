@@ -29,6 +29,10 @@ class BinaryIdentity:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    @property
+    def is_stripped(self) -> bool:
+        return self.stripped
+
 
 @dataclass
 class CompatibilityResult:

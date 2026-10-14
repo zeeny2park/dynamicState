@@ -1,8 +1,8 @@
 # Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
 
 > [!NOTE]
-> **Status: `DYNAMICSTATE_PHASE12_EVIDENCE_DRIVEN_ROOT_CAUSE_INVESTIGATION_AND_CONVERSATIONAL_VALIDATION_COMPLETE`** — Evidence-Driven Root Cause Investigation & Conversational Validation Complete  
-> Verified with 605+ Unit/Integration/Security Tests (Full Discovery), 11 Phase 12 Conversational Investigation Loop Tests, 83 Causal Validation & Evidence Authenticity Tests, 16 Phase 10 Independent CI Security Gate Tests, 17 Phase 11 Real-Target Matrix & Concurrency Tests, 20 Pipeline Steps in `run_all_tests.sh`, Real C++ PIE ASLR Controls, Multithread Branch Isolation, CI Workflow Parity, and Non-Atomic Capture Degraded Trust Gates.
+> **Status: `DYNAMICSTATE_PHASE13_END_TO_END_OPERATIONAL_ACCEPTANCE_COMPLETE`** — End-to-End Operational Acceptance, Investigation Quality, and Release Readiness Complete  
+> Verified with 621+ Unit/Integration/Security Tests (Full Discovery), 16 Phase 13 Real C++ Operational Acceptance & Security Gate Tests, 14-Step Automated Acceptance Pipeline (`scripts/run_e2e_operational_acceptance.py`), 22 Pipeline Steps in `run_all_tests.sh`, 11 Phase 12 Conversational Investigation Loop Tests, 83 Causal Validation & Evidence Authenticity Tests, 16 Phase 10 Independent CI Security Gate Tests, 17 Phase 11 Real-Target Matrix & Concurrency Tests, Real C++ PIE ASLR Controls, Multithread Branch Isolation, CI Workflow Parity, and Non-Atomic Capture Degraded Trust Gates.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
@@ -110,6 +110,8 @@ Recursive Semantic Reachability Traversal
   (재현 가능한 C++ PIE DWARF/Stripped 9대 매트릭스 검증; 단일 작성자 포지티브/네거티브 컨트롤, 동시성 스레드 루프, 실행 추적 인증을 통한 함수 귀속 분리; 100% 바이트 회계 및 `SIGCONT` fail-open 재개 보장; 정지 시간 SLA 초과(`STOP_BUDGET_EXCEEDED`) 시 정합성 강등; 로컬 19단계 파이프라인(`run_all_tests.sh`) 100% 통과 및 원격 GitHub Actions 실행 현황 명시)
 - **Phase 12 (Complete)**: *"Evidence-Driven Root Cause Investigation & Conversational Validation"*  
   (실제 C/C++ 런타임 결함 조사를 위한 대화형 증거 검증 루프: 관측 사실 -> 가설 생성 -> 차별적 후속 관측 -> 검증 시도 -> 상태 갱신 -> 다음 조치; DWARF 선언/LLM 설명의 정적 후보(`STATIC_CANDIDATE`) 독립 검증 전 승격 차단 원칙; 외부 LLM 의존성 없는 `DeterministicHypothesisGenerator`; 차별적 식별력과 기대 결과를 갖춘 관측 계획기; 관측 사실 드릴다운 인스펙터; 감사 추적 가능한 순차 타임라인(`session.timeline`); 위변조 방지 세션 영속화 및 원장 기반 재검증; Web UI Launchpad 자동/단계별 사이클 제어 및 실시간 타임라인 시각화 제공)
+- **Phase 13 (Complete)**: *"End-to-End Operational Acceptance, Investigation Quality, and Release Readiness"*  
+  (실제 컴파일된 C++ 타깃 프로그램 기반 10대 운영 수락 시나리오 전수 검증: 통제된 상태 전이, 음성 대조군(Negative Control) 베이스라인 안정성 검증, 경쟁 작성자 함수 간 인과 식별, 런타임 추적 부재 시 가설 불확실성 보존, 독립 신뢰 증명 기반 인과 함수 승격(`VALIDATED_CAUSAL_FUNCTION`), Stripped 바이너리 + 분리 DWARF 기호 해석, 불일치 빌드 ID의 안전한 거부(Fail-Closed), 다중 스레드 동시성 환경에서의 인과 과잉주장 차단, 비원자적(NON_ATOMIC) 캡처 및 프로세스 종료 시 정합성 강등, 세션 영속화/재개 시 원장 암호학적 재검증; 신뢰 경계 보안 게이트 회귀 방지; 웹 UI/ARP/CLI 14단계 완전 자동화 종단간 파이프라인(`scripts/run_e2e_operational_acceptance.py`) 및 운영 런북(`docs/operational_acceptance_guide.md`) 완비)
 
 ---
 
@@ -1165,16 +1167,26 @@ python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
 
 ```bash
-# 1. 단위 및 통합 전체 테스트 (577 unit/integration tests across all modules, including Phase 8-10 suites)
+# 0. Phase 13 종단간 운영 수락 파이프라인 및 회귀 보안 게이트 (16개 테스트 + 14개 자동화 파이프라인 스텝)
+python3 -m unittest tests/test_phase13_operational_acceptance.py -v
+python3 scripts/run_e2e_operational_acceptance.py
+
+# 1. Phase 12 대화형 증거 기반 조사 루프 테스트 (11개 테스트)
+python3 -m unittest tests/test_phase12_conversational_investigation.py -v
+
+# 2. 단위 및 통합 전체 테스트 (621+ unit/integration tests across all modules, including Phase 8-13 suites)
 python3 -m unittest discover -s tests -v
 
-# 2. Phase 8 & 9 런타임 증거 진위성 및 인과 검증 하드닝 스위트 (83개 테스트)
+# 3. Phase 8 & 9 런타임 증거 진위성 및 인과 검증 하드닝 스위트 (83개 테스트)
 python3 -m unittest tests/test_causal_validation_hardening.py -v
 
-# 3. Phase 10 독립 신뢰 검증 및 CI 보안 수락 게이트 스위트 (16개 테스트)
+# 4. Phase 10 독립 신뢰 검증 및 CI 보안 수락 게이트 스위트 (16개 테스트)
 python3 -m unittest tests/test_phase10_ci_security_gates.py -v
 
-# 4. Phase 7 조사 워크플로 및 증거 원장 전용 테스트 스위트 (29개 테스트)
+# 5. Phase 11 실 타깃 매트릭스 및 동시성 검증 스위트 (17개 테스트)
+python3 -m unittest tests/test_phase11_real_target_matrix.py -v
+
+# 6. Phase 7 조사 워크플로 및 증거 원장 전용 테스트 스위트 (29개 테스트)
 python3 -m unittest tests/test_evidence_schema.py -v
 python3 -m unittest tests/test_investigation_identity_and_static.py -v
 python3 -m unittest tests/test_investigation_comparison.py -v
@@ -1308,6 +1320,10 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 | **Branch-Safe State Exploration** | Complete | Checkpoint-restore, crash isolation (SIGSEGV) | **INTEGRATION TESTED** | Verified multi-branch exploration |
 | **Workflow Parity & Drift Prevention** | Complete | 7 unit tests, PyYAML validation, isolated directory repair | **REAL TARGET VALIDATED** | Byte-for-byte parity between ci/workflows and .github/workflows |
 | **Capture Performance & Acceptance Gates** | Complete | 12 unit tests, ELF verification, byte accounting, SLA checks | **REAL TARGET VALIDATED** | 20-run benchmark across process_vm_readv & procfs |
+| **Conversational Investigation Loop (Phase 12)** | Complete | 11 loop tests, observation planner, drilldown | **INTEGRATION TESTED** | Validates deterministic hypotheses, observation outcomes, timeline |
+| **Phase 13 Operational Acceptance** | Complete | 16 E2E scenario & security tests, 14-step automated pipeline | **REAL TARGET VALIDATED** | Verified on live compiled C++ inferior, ASLR PIE, single-writer & concurrency |
+| **Trusted Causal Verification Engine** | Complete | Attestation proof verification, negative control baseline checks | **INTEGRATION TESTED** | Rejects unverified attribution, forged proofs, and conflated state transitions |
+| **Observation Plan Lifecycle** | Complete | State transitions (PROPOSED->EXECUTED->VERIFIED/FAILED/CANCELED) | **INTEGRATION TESTED** | Prevents duplicate execution, tracks cancellation, UI interactive controls |
 
 ---
 
@@ -1361,7 +1377,13 @@ dynamicState includes an automated benchmark harness measuring process suspensio
    # End-to-end C++ investigation pipeline scenarios A-E (5 tests)
    python3 -m unittest tests/test_cpp_e2e_investigation.py -v
 
-   # Full test discovery suite (464 tests)
+   # Phase 13 Real C++ Operational Acceptance & Security Gates (16 tests)
+   python3 -m unittest tests/test_phase13_operational_acceptance.py -v
+
+   # Phase 13 Automated 14-Step Acceptance Pipeline
+   python3 scripts/run_e2e_operational_acceptance.py
+
+   # Full test discovery suite (621+ tests)
    python3 -m unittest discover -s tests -v
    ```
 

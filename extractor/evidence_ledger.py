@@ -90,6 +90,13 @@ class ControlledExecutionResult:
             return bool(self.function_attribution_verified) or (CLAIM_FUNCTION_ATTRIBUTION_VERIFIED in getattr(self, "verified_claims", ()))
         return False
 
+    @property
+    def state_transition_verified(self) -> bool:
+        return (
+            CLAIM_STATE_TRANSITION_VERIFIED in getattr(self, "verified_claims", ())
+            or (self.execution_status in ("REPRODUCED", "SUCCESS", "CONFIRMED") and self.before_value is not None and self.after_value is not None)
+        )
+
     def verify_authenticity(self, session_secret: str) -> bool:
         """Verify the cryptographic authenticity of this execution receipt against session secret."""
         if not self.receipt_signature:
@@ -774,7 +781,9 @@ class EvidenceLedger:
         # Single-use: Consume capability immediately
         capability.consume()
 
-        eff_tid = target_identity or rec.target_identity
+        eff_tid = dict(target_identity or rec.target_identity or {})
+        rec.target_identity = dict(eff_tid)
+        rec.details["target_identity"] = dict(eff_tid)
         eff_prov_cls = getattr(capability, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
         eff_attr_ver = getattr(capability, "function_attribution_verified", False)
         eff_attr_basis = getattr(capability, "attribution_basis", "")

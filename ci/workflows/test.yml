@@ -61,6 +61,14 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase12_investigation_loop.py
 
+      - name: Run Phase 13 End-to-End Operational Acceptance Tests
+        run: |
+          python3 -m unittest tests/test_phase13_operational_acceptance.py
+
+      - name: Run Phase 13 Operational Acceptance Demonstration Script
+        run: |
+          python3 scripts/run_e2e_operational_acceptance.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

@@ -249,6 +249,10 @@ class AgentRuntime:
                 if not action.investigation_id or not action.observation_id:
                     return self._error("INVALID_FIELD", "investigation_id and observation_id are required", act, t0)
                 return self.execute_observation(action.investigation_id, action.observation_id, result_data=action.result_data)
+            elif act == "CANCEL_OBSERVATION":
+                if not action.investigation_id or not action.observation_id:
+                    return self._error("INVALID_FIELD", "investigation_id and observation_id are required", act, t0)
+                return self.cancel_observation(action.investigation_id, action.observation_id, reason=action.reason)
             elif act == "GET_INVESTIGATION_TIMELINE":
                 if not action.investigation_id:
                     return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
@@ -288,6 +292,9 @@ class AgentRuntime:
                 return self._error("CAPABILITY_UNSUPPORTED", f"Action '{act}' is not supported by ARP", act, t0)
         except Exception as exc:
             return self._error("RUNTIME_ERROR", str(exc), act, t0)
+
+    execute = dispatch_action
+    dispatch = dispatch_action
 
     # -------------------------------------------------------------------------
     # Observation & Snapshot Operations
@@ -1972,6 +1979,19 @@ class AgentRuntime:
         return AgentActionResult(
             success=True,
             action="LOAD_INVESTIGATION_SESSION",
+            data=res,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def cancel_observation(self, investigation_id: str, observation_id: str, reason: Optional[str] = None) -> AgentActionResult:
+        """Cancel a proposed or pending follow-up observation."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.cancel_observation(investigation_id, observation_id, reason=reason)
+        if not res.get("success", False):
+            return self._error("CANCEL_ERROR", res.get("error", "Failed to cancel observation"), "CANCEL_OBSERVATION", t0)
+        return AgentActionResult(
+            success=True,
+            action="CANCEL_OBSERVATION",
             data=res,
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
         )

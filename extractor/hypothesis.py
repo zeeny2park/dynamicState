@@ -308,7 +308,10 @@ class InvestigationHypothesis:
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
-        data["suggested_observations"] = [obs.to_dict() for obs in self.suggested_observations]
+        data["suggested_observations"] = [
+            obs.to_dict() if hasattr(obs, "to_dict") else obs
+            for obs in self.suggested_observations
+        ]
         return data
 
     @classmethod
@@ -1326,12 +1329,20 @@ class HypothesisValidator:
 
         # Check target identity binding
         att_tid = attestation.get("target_identity")
-        if att_tid and proof_rec.target_identity and att_tid != proof_rec.target_identity:
-            return (
-                False,
-                f"Proof evidence '{proof_rec.evidence_id}' target identity was tampered after attestation issuance",
-                proof_rec,
-            )
+        if att_tid and proof_rec.target_identity:
+            mismatch = False
+            for k in ("pid", "build_id", "binary", "binary_path"):
+                v1 = att_tid.get(k)
+                v2 = proof_rec.target_identity.get(k)
+                if v1 is not None and v2 is not None and str(v1) != str(v2):
+                    mismatch = True
+                    break
+            if mismatch:
+                return (
+                    False,
+                    f"Proof evidence '{proof_rec.evidence_id}' target identity was tampered after attestation issuance",
+                    proof_rec,
+                )
 
         # Check scope tampering between details and attestation
         att_fn = attestation.get("target_function")

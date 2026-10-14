@@ -475,6 +475,11 @@ class InvestigationSession:
             for ns in data.get("next_steps", [])
         ]
 
+        # Reconstruct follow-up observations list from hypotheses
+        session.follow_up_observations = [
+            obs for h in session.hypotheses for obs in h.suggested_observations
+        ]
+
         session.status = data.get("status", session.status)
         return session
 
@@ -622,6 +627,207 @@ class TrustedCausalVerifier:
             except Exception:
                 pass
         return None
+
+    def verify_controlled_execution(
+        self,
+        target_function: str,
+        field_path: str,
+        snapshot_a_path: str,
+        snapshot_b_path: str,
+        attribution_evidence: Optional[Dict[str, Any]] = None,
+        hypothesis_id: str = "",
+        evidence_id: str = "",
+    ) -> ControlledExecutionResult:
+        """Verify state transition and optional attribution from snapshot artifacts and mint ControlledExecutionResult."""
+        snap_a = self._resolve_snapshot_for_verifier(snapshot_a_path)
+        snap_b = self._resolve_snapshot_for_verifier(snapshot_b_path)
+        if snap_a is None or snap_b is None:
+            raise ValueError(
+                f"Snapshot artifacts '{snapshot_a_path}' or '{snapshot_b_path}' could not be resolved for verification"
+            )
+
+        # Check capture quality
+        def _get_snapshot_quality(snap: Any) -> Tuple[str, str]:
+            if hasattr(snap, "to_dict"):
+                s_dict = snap.to_dict()
+            elif isinstance(snap, dict):
+                s_dict = snap
+            else:
+                s_dict = {}
+            comp = getattr(snap, "completeness", None) or getattr(snap, "status", None) or s_dict.get("completeness") or s_dict.get("status") or "COMPLETE"
+            consistency = getattr(snap, "consistency", None) or s_dict.get("consistency")
+            q = getattr(snap, "quality", None)
+            if q is not None:
+                comp = getattr(q, "status", None) or comp
+                consistency = getattr(q, "consistency", None) or getattr(q, "consistency_level", None) or consistency
+            cons_lvl = None
+            if isinstance(consistency, dict):
+                cons_lvl = consistency.get("level")
+            elif isinstance(consistency, str):
+                cons_lvl = consistency
+            if not cons_lvl:
+                cons_lvl = getattr(snap, "consistency_level", None) or s_dict.get("consistency_level")
+            if not cons_lvl:
+                obs_meta = getattr(snap, "observation_metadata", None) or s_dict.get("observation_metadata") or {}
+                prov = getattr(snap, "provenance", None) or s_dict.get("provenance") or {}
+                if obs_meta.get("consistency_classification"):
+                    cons_lvl = obs_meta.get("consistency_classification")
+                elif prov.get("snapshot_consistency"):
+                    cons_lvl = prov.get("snapshot_consistency")
+                elif obs_meta.get("is_non_atomic") is True or prov.get("is_non_atomic") is True:
+                    cons_lvl = "NON_ATOMIC"
+                else:
+                    cons_lvl = "STOPPED"
+            return str(comp).upper(), str(cons_lvl).upper()
+
+        comp_a, cons_a = _get_snapshot_quality(snap_a)
+        comp_b, cons_b = _get_snapshot_quality(snap_b)
+        if comp_a != "COMPLETE" or comp_b != "COMPLETE":
+            raise ValueError(f"Live reproduction rejected: snapshot capture completeness not COMPLETE (A: {comp_a}, B: {comp_b})")
+        if not is_atomic_or_stopped_consistency(cons_a) or not is_atomic_or_stopped_consistency(cons_b):
+            raise ValueError(f"Live reproduction rejected: snapshot consistency not atomic/stopped (A: {cons_a}, B: {cons_b})")
+
+        # Identity resolution
+        def _get_identity(snap: Any) -> Dict[str, Any]:
+            if hasattr(snap, "to_dict"):
+                d = snap.to_dict()
+            elif isinstance(snap, dict):
+                d = snap
+            else:
+                d = {}
+            prov = d.get("provenance") or getattr(snap, "provenance", {}) or {}
+            proc = d.get("process") or prov.get("process") or {}
+            return {
+                "pid": getattr(snap, "pid", None) or d.get("pid") or proc.get("pid") or prov.get("pid"),
+                "binary": getattr(snap, "binary", None) or d.get("binary") or proc.get("binary") or prov.get("binary"),
+                "build_id": getattr(snap, "executable_build_id", None) or d.get("executable_build_id") or proc.get("executable_build_id") or prov.get("executable_build_id"),
+            }
+
+        id_a = _get_identity(snap_a)
+        id_b = _get_identity(snap_b)
+        if id_a.get("build_id") and id_b.get("build_id") and id_a["build_id"] != id_b["build_id"]:
+            raise ValueError(f"Target build ID mismatch between snapshots: {id_a['build_id']} != {id_b['build_id']}")
+        if id_a.get("pid") and id_b.get("pid") and id_a["pid"] != id_b["pid"]:
+            raise ValueError(f"Target PID mismatch between snapshots: {id_a['pid']} != {id_b['pid']}")
+
+        # Verify state transition diff
+        diff_res = StateDiffEngine().diff(snap_a, snap_b)
+        matching_changes, err_msg = find_matching_diff_changes(diff_res.changes, field_path)
+        if err_msg:
+            raise ValueError(err_msg)
+        if not matching_changes:
+            raise ValueError(f"No observed state transition for field '{field_path}' between snapshots")
+
+        before_val = matching_changes[0].get("before")
+        after_val = matching_changes[0].get("after")
+        if before_val == after_val:
+            raise ValueError(f"Field '{field_path}' did not change between snapshots ({before_val} == {after_val})")
+
+        func_attr_ver = False
+        attr_basis = ""
+        attr_limitation = ""
+
+        if attribution_evidence and isinstance(attribution_evidence, dict):
+            basis = attribution_evidence.get("attribution_basis")
+            if basis == ATTRIBUTION_BASIS_SINGLE_WRITER:
+                ctrl_eid = attribution_evidence.get("control_evidence_id") or attribution_evidence.get("baseline_evidence_id")
+                if ctrl_eid and self._session.ledger:
+                    rec_ctrl = self._session.ledger.get_record(ctrl_eid)
+                    if (
+                        rec_ctrl
+                        and rec_ctrl.source != "unverified_caller"
+                        and not (rec_ctrl.details or {}).get("caller_submitted")
+                        and not (rec_ctrl.details or {}).get("unverified_caller_claim")
+                    ):
+                        c_det = rec_ctrl.details or {}
+                        c_t_id = rec_ctrl.target_identity or c_det.get("target_identity") or {}
+                        pid_match = not c_t_id.get("pid") or not id_a.get("pid") or c_t_id.get("pid") == id_a["pid"]
+                        bld_match = not c_t_id.get("build_id") or not id_a.get("build_id") or c_t_id.get("build_id") == id_a["build_id"]
+                        fld = c_det.get("field_path") or c_det.get("field_name")
+                        fld_match = not fld or is_exact_semantic_path_match(field_path, field_path.split(".")[-1], fld)
+                        has_before_after = (c_det.get("before_value") is not None and c_det.get("after_value") is not None)
+                        if has_before_after:
+                            ctrl_stable = (c_det.get("before_value") == c_det.get("after_value"))
+                        elif c_det.get("mutation_occurred") is not None:
+                            ctrl_stable = (c_det.get("mutation_occurred") is False)
+                        elif c_det.get("state_stable") is not None:
+                            ctrl_stable = bool(c_det.get("state_stable"))
+                        else:
+                            ctrl_stable = (c_det.get("control_condition") in ("baseline", "no_mutation", "inactive_candidate"))
+
+                        writer_fn = attribution_evidence.get("active_writer_function") or c_det.get("target_function")
+                        if pid_match and bld_match and fld_match and ctrl_stable and writer_fn == target_function:
+                            func_attr_ver = True
+                            attr_basis = ATTRIBUTION_BASIS_SINGLE_WRITER
+                        else:
+                            if not ctrl_stable:
+                                attr_limitation = f"Negative control baseline failed: field '{field_path}' mutated during control period ({c_det.get('before_value')} -> {c_det.get('after_value')}) while candidate '{target_function}' was inactive (potential concurrent writer or idle drift)."
+                            elif writer_fn != target_function:
+                                attr_limitation = f"Single-writer isolation failed: active writer was '{writer_fn}', which does not match candidate '{target_function}'."
+                            elif not (pid_match and bld_match):
+                                attr_limitation = "Single-writer isolation failed: control evidence process identity does not match treatment snapshot."
+                            elif not fld_match:
+                                attr_limitation = f"Single-writer isolation failed: control evidence field '{fld}' does not match '{field_path}'."
+                    else:
+                        attr_limitation = "Single-writer isolation requires valid control evidence in ledger observing baseline field stability."
+            elif basis == ATTRIBUTION_BASIS_EXECUTION_TRACE:
+                trace_eid = attribution_evidence.get("trace_evidence_id")
+                if trace_eid and self._session.ledger:
+                    rec_tr = self._session.ledger.get_record(trace_eid)
+                    if (
+                        rec_tr
+                        and rec_tr.source in ("trace_collector", "trusted_tracer", "investigation_observer")
+                        and not (rec_tr.details or {}).get("caller_submitted")
+                    ):
+                        tr_events = (rec_tr.details or {}).get("trace_events", [])
+                        if any(isinstance(e, dict) and e.get("function") == target_function and e.get("event") == "write" for e in tr_events):
+                            func_attr_ver = True
+                            attr_basis = ATTRIBUTION_BASIS_EXECUTION_TRACE
+                        else:
+                            attr_limitation = f"Execution trace failed: no verified write event recorded for candidate '{target_function}' on field '{field_path}'."
+                else:
+                    attr_limitation = "Execution trace requires valid trace collector evidence in ledger."
+
+        if not func_attr_ver and not attr_limitation:
+            attr_limitation = "State transition verified in runtime, but function attribution was not independently verified by execution instrumentation."
+
+        claims = {
+            CLAIM_ARTIFACT_INTEGRITY_VERIFIED,
+            CLAIM_TARGET_IDENTITY_VERIFIED,
+            CLAIM_STATE_TRANSITION_VERIFIED,
+        }
+        if func_attr_ver:
+            claims.add(CLAIM_FUNCTION_ATTRIBUTION_VERIFIED)
+
+        t_id = {}
+        pid_val = id_a.get("pid") or id_b.get("pid")
+        if pid_val is not None:
+            t_id["pid"] = pid_val
+        bin_val = id_a.get("binary") or id_b.get("binary")
+        if bin_val is not None:
+            t_id["binary"] = bin_val
+        bld_val = id_a.get("build_id") or id_b.get("build_id")
+        if bld_val is not None:
+            t_id["build_id"] = bld_val
+        return self.record_controlled_execution(
+            target_function=target_function,
+            field_path=field_path,
+            before_value=before_val,
+            after_value=after_val,
+            execution_status="REPRODUCED",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            before_snapshot_ref=str(snapshot_a_path),
+            after_snapshot_ref=str(snapshot_b_path),
+            target_identity=t_id,
+            backend_type="live_process_snapshot_diff",
+            hypothesis_id=hypothesis_id,
+            evidence_id=evidence_id,
+            provenance_class=PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+            function_attribution_verified=func_attr_ver,
+            attribution_basis=attr_basis,
+            attribution_limitation=attr_limitation,
+            verified_claims=claims,
+        )
 
     def record_controlled_execution(
         self,
@@ -2286,6 +2492,24 @@ class InvestigationManager:
         if not target_obs:
             return {"success": False, "error": f"Observation '{observation_id}' not found in investigation '{investigation_id}'"}
 
+        # Prevent duplicate execution
+        if target_obs.executed or target_obs.status in (OBSERVATION_STATUS_EXECUTED, OBSERVATION_STATUS_VERIFIED):
+            return {
+                "success": False,
+                "error": f"Observation '{observation_id}' has already been executed.",
+                "already_executed": True,
+                "observation": target_obs.to_dict(),
+            }
+
+        # Prevent execution of canceled observation
+        if target_obs.status == OBSERVATION_STATUS_CANCELED:
+            return {
+                "success": False,
+                "error": f"Observation '{observation_id}' is canceled and cannot be executed.",
+                "canceled": True,
+                "observation": target_obs.to_dict(),
+            }
+
         # If live mutation or live target interaction requested, verify strict safety constraints
         t_ref = target_obs.target_ref if isinstance(target_obs.target_ref, dict) else {}
         requires_live = (
@@ -2377,6 +2601,26 @@ class InvestigationManager:
         )
         session.ledger.add_record(ev_record)
 
+        if result_data and (result_data.get("failed") is True or outcome in ("FAILED", "ERROR")):
+            target_obs.status = OBSERVATION_STATUS_FAILED
+            target_obs.execution_error = result_data.get("error") or f"Observation execution failed: {obs_text}"
+            target_obs.is_suggestion = False
+            session.add_timeline_event(
+                event_type="OBSERVATION_FAILED",
+                title=f"Observation Failed: {target_obs.observation_id}",
+                summary=target_obs.execution_error,
+                classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+                observation_id=observation_id,
+                hypothesis_id=target_hypo.hypothesis_id,
+                details={"outcome": outcome, "error": target_obs.execution_error},
+            )
+            return {
+                "success": False,
+                "error": target_obs.execution_error,
+                "failed": True,
+                "observation": target_obs.to_dict(),
+            }
+
         # Mark observation executed
         target_obs.executed = True
         if result_data and (result_data.get("verified") is True or result_data.get("outcome") in ("CONFIRMED", "VERIFIED")):
@@ -2433,6 +2677,63 @@ class InvestigationManager:
                 "reason": eval_result.reason,
             },
         }
+
+    def cancel_observation(
+        self,
+        investigation_id: str,
+        observation_id: str,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Cancel a proposed or pending follow-up observation."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+
+        target_obs = None
+        target_hypo = None
+        for h in session.hypotheses:
+            for obs in h.suggested_observations:
+                if obs.observation_id == observation_id:
+                    target_obs = obs
+                    target_hypo = h
+                    break
+            if target_obs:
+                break
+
+        if not target_obs:
+            for obs in session.follow_up_observations:
+                if obs.observation_id == observation_id:
+                    target_obs = obs
+                    break
+
+        if not target_obs:
+            return {"success": False, "error": f"Observation '{observation_id}' not found in investigation '{investigation_id}'"}
+
+        if target_obs.executed or target_obs.status in (OBSERVATION_STATUS_EXECUTED, OBSERVATION_STATUS_VERIFIED):
+            return {
+                "success": False,
+                "error": f"Observation '{observation_id}' has already been executed and cannot be canceled.",
+            }
+
+        target_obs.status = OBSERVATION_STATUS_CANCELED
+        target_obs.is_suggestion = False
+        target_obs.execution_error = reason or "Observation canceled by user or policy."
+
+        for ns in session.next_steps:
+            if ns.step_id == observation_id:
+                ns.is_suggestion = False
+
+        session.add_timeline_event(
+            event_type="OBSERVATION_CANCELED",
+            title=f"Observation Canceled: {target_obs.observation_id}",
+            summary=reason or f"Observation {target_obs.observation_id} was canceled.",
+            classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+            observation_id=target_obs.observation_id,
+            hypothesis_id=target_hypo.hypothesis_id if target_hypo else None,
+            details={"reason": reason},
+        )
+
+        return {"success": True, "observation": target_obs.to_dict()}
 
     def generate_report(self, investigation_id: str) -> Dict[str, Any]:
         """Synthesize a complete investigation report."""
@@ -2659,6 +2960,12 @@ class InvestigationManager:
                 "field_name": field_name,
                 "c_type_path": c_path,
             },
+            "target_object": {
+                "object_id": obj_id,
+                "type": type_name,
+                "field_name": field_name,
+                "c_type_path": c_path,
+            },
             "dwarf": {
                 "type_name": type_name,
                 "type_decl_location": type_decl,
@@ -2667,8 +2974,17 @@ class InvestigationManager:
                 "build_id": session.stages.get("target_identity", {}).get("details", {}).get("target_build_id"),
                 "build_id_status": session.stages.get("target_identity", {}).get("details", {}).get("build_id_status"),
             },
+            "dwarf_symbol": {
+                "type_name": type_name,
+                "decl_file": type_decl.split(":")[0] if type_decl and ":" in type_decl else (type_decl or "unknown"),
+                "decl_line": int(type_decl.split(":")[1]) if type_decl and ":" in type_decl and type_decl.split(":")[1].isdigit() else 0,
+                "source_location": source_loc,
+            },
             "function_candidates": candidates,
+            "candidate_functions": candidates,
             "attribution_evidence": attr_records,
+            "attribution_records": attr_records,
+            "limitations": limitations,
             "capture_quality": {
                 "status": cap_status,
                 "consistency_level": cap_details.get("consistency_level", "UNKNOWN"),

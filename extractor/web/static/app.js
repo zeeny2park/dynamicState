@@ -5460,11 +5460,38 @@
             <div style="margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--border-color);">
               <div style="font-weight: 600; font-size: 0.8rem; margin-bottom: 4px; color: var(--text-secondary);">Follow-Up Observation Plans:</div>
               ${observations.map(obs => {
-                const isExec = obs.is_executed;
-                const obsBadge = isExec ? '<span class="badge badge-success text-xs">EXECUTED</span>' : '<span class="badge badge-neutral text-xs">SUGGESTED</span>';
+                const isExec = obs.executed || obs.status === 'executed' || obs.status === 'verified';
+                const obsStatus = (obs.status || (isExec ? 'executed' : 'proposed')).toUpperCase();
+                let obsBadge = '<span class="badge badge-neutral text-xs">PROPOSED</span>';
+                if (obsStatus === 'VERIFIED') obsBadge = '<span class="badge badge-success text-xs">VERIFIED</span>';
+                else if (obsStatus === 'EXECUTED') obsBadge = '<span class="badge badge-info text-xs">EXECUTED</span>';
+                else if (obsStatus === 'FAILED') obsBadge = '<span class="badge badge-danger text-xs">FAILED</span>';
+                else if (obsStatus === 'CANCELED') obsBadge = '<span class="badge badge-neutral text-xs" style="text-decoration: line-through;">CANCELED</span>';
+
                 const disc = obs.discriminating_criteria ? `<div class="text-xs text-muted" style="margin-top: 2px;"><strong>Discriminating Criteria:</strong> ${escapeHtml(obs.discriminating_criteria)}</div>` : '';
-                const safety = (obs.safety_constraints && obs.safety_constraints.length > 0) ? `<div class="text-xs text-muted" style="margin-top: 2px;"><strong>Safety Constraints:</strong> ${escapeHtml(obs.safety_constraints.join(', '))}</div>` : '';
-                const execBtn = (!isExec && inv.investigation_id) ? `<button type="button" class="btn btn-xs btn-outline mt-1" onclick="window.__executeObservation('${escapeHtml(inv.investigation_id)}', '${escapeHtml(obs.observation_id)}')">Execute Observation</button>` : '';
+                
+                let outcomesHtml = '';
+                if (obs.expected_outcomes && Object.keys(obs.expected_outcomes).length > 0) {
+                  outcomesHtml = `
+                    <div class="text-xs text-muted" style="margin-top: 2px;">
+                      <strong>Expected Distinguishing Outcomes:</strong>
+                      ${Object.entries(obs.expected_outcomes).map(([outcomeKey, val]) => `
+                        <span style="display: inline-block; margin-right: 6px;"><code style="font-size: 0.7rem;">${escapeHtml(outcomeKey)}</code> &rarr; <strong>${escapeHtml(String(val))}</strong></span>
+                      `).join('')}
+                    </div>
+                  `;
+                }
+
+                const safety = (obs.safety_constraints && obs.safety_constraints.length > 0) ? `<div class="text-xs text-muted" style="margin-top: 2px;"><strong>Safety Constraints:</strong> ${escapeHtml(obs.safety_constraints.join(', '))} <span class="mono" style="font-size: 0.7rem;">(Risk: ${escapeHtml(obs.risk_level || 'READ_ONLY')})</span></div>` : '';
+                const prereqs = (obs.prerequisites && obs.prerequisites.length > 0) ? `<div class="text-xs text-muted" style="margin-top: 1px;"><strong>Prerequisites:</strong> ${escapeHtml(obs.prerequisites.join(', '))}</div>` : '';
+                const errorHtml = obs.execution_error ? `<div class="text-xs" style="color: var(--danger); margin-top: 2px;">⚠️ ${escapeHtml(obs.execution_error)}</div>` : '';
+
+                const canExecute = (!isExec && obsStatus !== 'CANCELED' && obsStatus !== 'FAILED' && inv.investigation_id);
+                const canCancel = (!isExec && obsStatus === 'PROPOSED' && inv.investigation_id);
+
+                const execBtn = canExecute ? `<button type="button" class="btn btn-xs btn-outline mt-1" onclick="window.__executeObservation('${escapeHtml(inv.investigation_id)}', '${escapeHtml(obs.observation_id)}')">Execute Observation</button>` : '';
+                const cancelBtn = canCancel ? `<button type="button" class="btn btn-xs btn-outline mt-1" style="color: var(--danger); border-color: var(--danger); margin-left: 4px;" onclick="window.__cancelObservation('${escapeHtml(inv.investigation_id)}', '${escapeHtml(obs.observation_id)}')">Cancel</button>` : '';
+
                 return `
                   <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); padding: 6px 8px; border-radius: 4px; margin-bottom: 6px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -5472,8 +5499,11 @@
                       ${obsBadge}
                     </div>
                     ${disc}
+                    ${outcomesHtml}
                     ${safety}
-                    ${execBtn}
+                    ${prereqs}
+                    ${errorHtml}
+                    <div style="display: flex; gap: 4px;">${execBtn}${cancelBtn}</div>
                   </div>
                 `;
               }).join('')}
@@ -5838,6 +5868,27 @@
     }
   };
 
+  // Global helper for canceling follow-up observation
+  window.__cancelObservation = async function (invId, obsId) {
+    if (!invId || !obsId) return;
+    try {
+      showToast(`Canceling observation ${obsId}...`, 'info');
+      const res = await apiPost('/api/investigation/cancel-observation', {
+        investigation_id: invId,
+        observation_id: obsId,
+        reason: 'Observation canceled by user.',
+      });
+      if (res.success) {
+        showToast(`Observation canceled: ${obsId}`, 'success');
+        await loadActiveInvestigation(invId);
+      } else {
+        showToast(`Failed to cancel: ${res.error?.message || 'Error'}`, 'error');
+      }
+    } catch (e) {
+      showToast(`Cancel error: ${String(e)}`, 'error');
+    }
+  };
+
   function renderTimeline(timeline) {
     if (!el.invTimelineContainer) return;
     const countEl = el.invTimelineCount;
@@ -5892,37 +5943,50 @@
       return;
     }
     const finding = drill.finding || {};
-    const obj = drill.target_object || {};
-    const dwarf = drill.dwarf_symbol || {};
-    const candidates = drill.candidate_functions || [];
-    const attrRecords = drill.attribution_records || [];
-    const limitations = drill.limitations || [];
+    const obj = drill.target_object || drill.path || {};
+    const dwarf = drill.dwarf_symbol || drill.dwarf || {};
+    const candidates = drill.candidate_functions || drill.function_candidates || [];
+    const attrRecords = drill.attribution_records || drill.attribution_evidence || [];
+    const limitations = drill.limitations || drill.capture_quality?.limitations || [];
+
+    const typeStr = obj.type || dwarf.type_name || finding.type_name || 'N/A';
+    const declStr = dwarf.type_decl_location || (dwarf.decl_file ? `${dwarf.decl_file}:${dwarf.decl_line || 0}` : 'unknown');
+    const pathStr = finding.c_type_path || finding.field_path || obj.c_type_path || (obj.object_id && obj.field_name ? `${obj.object_id}.${obj.field_name}` : 'N/A');
 
     el.invDrilldownContent.innerHTML = `
       <div style="display: flex; flex-direction: column; gap: 8px;">
         <div style="background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
-          <strong>Finding:</strong> <span class="mono">${escapeHtml(finding.finding_id || '')}</span> - ${escapeHtml(finding.title || '')}
-          <div class="text-muted" style="margin-top: 2px;">Path: <span class="mono">${escapeHtml(finding.c_type_path || finding.field_path || 'N/A')}</span> | Class: <span class="badge badge-info text-xs">${escapeHtml(finding.classification || 'FACT')}</span></div>
+          <strong>Finding:</strong> <span class="mono">${escapeHtml(finding.finding_id || drill.finding_id || '')}</span> - ${escapeHtml(finding.title || drill.title || '')}
+          <div class="text-muted" style="margin-top: 2px;">Path: <span class="mono">${escapeHtml(pathStr)}</span> | Class: <span class="badge badge-info text-xs">${escapeHtml(finding.classification || drill.classification || 'FACT')}</span></div>
+          ${finding.before_value !== undefined || finding.after_value !== undefined ? `
+            <div class="text-muted text-xs mono" style="margin-top: 2px;">Transition: ${escapeHtml(String(finding.before_value))} &rarr; ${escapeHtml(String(finding.after_value))}</div>
+          ` : ''}
         </div>
         <div style="background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
           <strong>Target Object & DWARF:</strong>
-          <div>Type: <span class="mono">${escapeHtml(obj.type || dwarf.type_name || 'N/A')}</span></div>
-          <div>Decl: <span class="mono">${escapeHtml(dwarf.decl_file || 'unknown')}:${escapeHtml(String(dwarf.decl_line || 0))}</span></div>
+          <div>Type: <span class="mono">${escapeHtml(typeStr)}</span></div>
+          <div>Decl: <span class="mono">${escapeHtml(declStr)}</span></div>
+          ${dwarf.source_location ? `<div>Source: <span class="mono">${escapeHtml(dwarf.source_location)}</span></div>` : ''}
+          ${dwarf.build_id ? `<div>Build ID: <span class="mono text-muted">${escapeHtml(dwarf.build_id)}</span></div>` : ''}
         </div>
         <div style="background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
           <strong>Candidate Functions (${candidates.length}):</strong>
-          ${candidates.length > 0 ? candidates.map(c => `
+          ${candidates.length > 0 ? candidates.map(c => {
+            const loc = c.source_location || (c.source_file ? `${c.source_file}:${c.source_line || 0}` : 'unknown');
+            return `
             <div style="margin-top: 4px; padding-left: 6px; border-left: 2px solid var(--accent);">
               <span class="mono font-semibold" style="color: var(--accent);">${escapeHtml(c.function_name || c.name || '')}</span>
-              <span class="badge badge-neutral text-xs">${escapeHtml(c.candidate_tier || 'STATIC_CANDIDATE')}</span>
-              <div class="text-muted text-xs">Source: ${escapeHtml(c.source_file || 'unknown')}:${escapeHtml(String(c.source_line || 0))}</div>
+              <span class="badge badge-neutral text-xs">${escapeHtml(c.candidate_tier || (c.confirmed_root_cause ? 'VALIDATED_CAUSAL_FUNCTION' : 'STATIC_CANDIDATE'))}</span>
+              <div class="text-muted text-xs">Source: <span class="mono">${escapeHtml(loc)}</span></div>
+              ${c.tier_limitation ? `<div class="text-muted" style="font-size: 0.7rem;">${escapeHtml(c.tier_limitation)}</div>` : ''}
             </div>
-          `).join('') : '<div class="text-muted">No candidate functions linked via DWARF/static analysis.</div>'}
+            `;
+          }).join('') : '<div class="text-muted">No candidate functions linked via DWARF/static analysis.</div>'}
         </div>
         ${attrRecords.length > 0 ? `
           <div style="background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
-            <strong>Attribution Verification Records:</strong>
-            ${attrRecords.map(r => `<div>&bull; <span class="mono">${escapeHtml(r.evidence_id || '')}</span>: ${escapeHtml(r.summary || '')}</div>`).join('')}
+            <strong>Attribution Verification Records (${attrRecords.length}):</strong>
+            ${attrRecords.map(r => `<div>&bull; <span class="mono">${escapeHtml(r.evidence_id || '')}</span>: ${escapeHtml(r.observation || r.summary || '')} ${r.function_attribution_verified ? '<span class="badge badge-success text-xs">ATTRIBUTION VERIFIED</span>' : '<span class="badge badge-neutral text-xs">UNVERIFIED ATTRIBUTION</span>'}</div>`).join('')}
           </div>
         ` : ''}
         ${limitations.length > 0 ? `

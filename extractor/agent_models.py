@@ -133,6 +133,7 @@ class AgentAction(_SubscriptableModel):
     stop_on_contradiction: bool = False
     file_path: Optional[str] = None
     session_data: Optional[Dict[str, Any]] = None
+    reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -183,6 +184,7 @@ class AgentAction(_SubscriptableModel):
             stop_on_contradiction=bool(data.get("stop_on_contradiction", False)),
             file_path=data.get("file_path"),
             session_data=data.get("session_data"),
+            reason=data.get("reason"),
         )
 
 

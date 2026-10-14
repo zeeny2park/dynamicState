@@ -122,6 +122,8 @@ class TestCIWorkflowParity(unittest.TestCase):
             "Run Security Gates and Independent Trust Verification Tests",
             "Run Real-Target Validation and Release Readiness Tests",
             "Run Evidence-Driven Investigation Loop and Conversational Validation Tests",
+            "Run Phase 13 End-to-End Operational Acceptance Tests",
+            "Run Phase 13 Operational Acceptance Demonstration Script",
             "Run All Remaining Tests",
             "Run CI Workflow Parity Tests",
             "Run Performance Benchmark Smoke Test",
@@ -139,6 +141,8 @@ class TestCIWorkflowParity(unittest.TestCase):
         self.assertIn("python3 -m unittest tests/test_phase10_ci_security_gates.py", all_run_commands)
         self.assertIn("python3 -m unittest tests/test_phase11_real_target_release_readiness.py", all_run_commands)
         self.assertIn("python3 -m unittest tests/test_phase12_investigation_loop.py", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_phase13_operational_acceptance.py", all_run_commands)
+        self.assertIn("python3 scripts/run_e2e_operational_acceptance.py", all_run_commands)
         self.assertIn("python3 -m unittest discover tests", all_run_commands)
         self.assertIn("python3 -m unittest tests/test_ci_workflow_parity.py", all_run_commands)
         self.assertIn("python3 -m benchmarks.capture_benchmark --smoke", all_run_commands)
