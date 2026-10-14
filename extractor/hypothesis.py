@@ -1137,9 +1137,14 @@ class HypothesisValidator:
                                 fc["confirmed_root_cause"] = False
                                 fc["tier_limitation"] = f"Observed in execution, but causal proof evidence identifies {target_fn or 'another function'} as the causal writer."
                         elif tier == FUNCTION_TIER_STATIC_CANDIDATE:
-                            # Invariant 1: static candidates remain static candidates
-                            fc["confirmed_root_cause"] = False
-                            fc["tier_limitation"] = "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
+                            if target_fn and fn_name == target_fn and func_attr_ver:
+                                fc["candidate_tier"] = FUNCTION_TIER_VALIDATED_CAUSAL
+                                fc["confirmed_root_cause"] = True
+                                fc["tier_limitation"] = f"Causal role verified via deterministic reproduction and verified function attribution in evidence {proof_rec.evidence_id}."
+                            else:
+                                # Invariant 1: static candidates remain static candidates without verified attribution
+                                fc["confirmed_root_cause"] = False
+                                fc["tier_limitation"] = "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
             else:
                 # Causal proof was not established
                 if proof_rec and (proof_rec.capture_quality or {}).get("completeness") in ("FAILED", "INVALID", "UNTRUSTED"):

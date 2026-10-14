@@ -6,6 +6,7 @@ for heavy semantic traversal.
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import struct
@@ -61,6 +62,7 @@ class RawRuntimeSnapshot:
     observation_metadata: Dict[str, Any] = field(default_factory=dict)
     completeness: str = "COMPLETE"
     provenance: Dict[str, Any] = field(default_factory=dict)
+    capture_receipt: Optional[Any] = None
 
     # In-memory buffer mappings for fast offline reading: (start, end) -> bytes
     _buffers: Dict[Tuple[int, int], bytes] = field(default_factory=dict, repr=False)
@@ -185,6 +187,7 @@ class RawRuntimeSnapshot:
             "observation_metadata": self.observation_metadata,
             "completeness": self.completeness,
             "provenance": self.provenance,
+            "capture_receipt": self.capture_receipt.to_dict() if hasattr(self.capture_receipt, "to_dict") else self.capture_receipt,
         }
 
     @classmethod
@@ -371,6 +374,15 @@ class RawRuntimeSnapshot:
             captured_ranges=ranges,
         )
 
+        rcpt_raw = data.get("capture_receipt")
+        rcpt = None
+        if isinstance(rcpt_raw, dict):
+            try:
+                from .capture_backend import CaptureReceipt
+                rcpt = CaptureReceipt.from_dict(rcpt_raw)
+            except Exception:
+                pass
+
         return cls(
             snapshot_id=data["snapshot_id"],
             pid=data.get("pid", 0),
@@ -387,6 +399,7 @@ class RawRuntimeSnapshot:
             observation_metadata=obs_meta,
             completeness=completeness,
             provenance=prov,
+            capture_receipt=rcpt,
         )
 
     def save(self, output_dir: str):
@@ -401,6 +414,37 @@ class RawRuntimeSnapshot:
             fn = f"range_{idx:05d}_0x{start:x}_0x{end:x}.bin"
             with open(os.path.join(mem_dir, fn), "wb") as f:
                 f.write(buf)
+
+        # Build disk manifest of all written files
+        disk_manifest = {}
+        with open(meta_path, "rb") as f:
+            disk_manifest["snapshot_metadata.json"] = hashlib.sha256(f.read()).hexdigest()
+
+        if os.path.exists(mem_dir):
+            for fn in sorted(os.listdir(mem_dir)):
+                if fn.endswith(".bin"):
+                    rel = os.path.join("memory", fn)
+                    with open(os.path.join(mem_dir, fn), "rb") as f:
+                        disk_manifest[rel] = hashlib.sha256(f.read()).hexdigest()
+
+        if self.capture_receipt:
+            from .capture_backend import issue_capture_receipt
+            start_time = getattr(self.capture_receipt, "process_start_time", str(self.provenance.get("start_time") or "0"))
+            disk_receipt = issue_capture_receipt(
+                backend_name=getattr(self.capture_receipt, "backend_name", self.capture_backend),
+                pid=self.pid,
+                process_start_time=start_time,
+                executable_path=self.executable,
+                executable_build_id=self.executable_build_id,
+                capture_time=self.timestamp,
+                capture_duration_us=self.capture_duration_us,
+                completeness=self.completeness,
+                consistency_level=self.provenance.get("snapshot_consistency") or "STOPPED",
+                artifact_manifest=disk_manifest,
+            )
+            with open(os.path.join(output_dir, "capture_receipt.json"), "w", encoding="utf-8") as f:
+                json.dump(disk_receipt.to_dict(), f, indent=2)
+            self.capture_receipt = disk_receipt
 
     @classmethod
     def load(cls, output_dir: str) -> "RawRuntimeSnapshot":
@@ -418,4 +462,44 @@ class RawRuntimeSnapshot:
                         end = int(parts[3], 16)
                         with open(os.path.join(mem_dir, fn), "rb") as f:
                             snap.register_buffer(start, f.read())
+
+        # Verify CaptureReceipt on load if present
+        rcpt_path = os.path.join(output_dir, "capture_receipt.json")
+        if os.path.exists(rcpt_path) and not os.path.islink(rcpt_path):
+            try:
+                with open(rcpt_path, "r", encoding="utf-8") as f:
+                    rcpt_data = json.load(f)
+                from .capture_backend import CaptureReceipt
+                rcpt = CaptureReceipt.from_dict(rcpt_data)
+                if rcpt.verify_signature():
+                    manifest_ok = True
+                    for rel_p, exp_h in rcpt.artifact_manifest.items():
+                        full_p = os.path.join(output_dir, rel_p)
+                        if not os.path.exists(full_p) or os.path.islink(full_p):
+                            manifest_ok = False
+                            break
+                        with open(full_p, "rb") as f:
+                            act_h = hashlib.sha256(f.read()).hexdigest()
+                        if act_h != exp_h:
+                            manifest_ok = False
+                            break
+                    if os.path.exists(mem_dir):
+                        for fn in os.listdir(mem_dir):
+                            rel = os.path.join("memory", fn)
+                            if rel not in rcpt.artifact_manifest:
+                                manifest_ok = False
+                                break
+                    if manifest_ok and rcpt.pid == snap.pid and rcpt.executable_build_id == snap.executable_build_id:
+                        snap.capture_receipt = rcpt
+                        snap.provenance["is_authenticated_capture"] = True
+                        snap.provenance["capture_receipt"] = rcpt.to_dict()
+                    else:
+                        snap.capture_receipt = None
+                        snap.provenance["is_authenticated_capture"] = False
+                else:
+                    snap.capture_receipt = None
+                    snap.provenance["is_authenticated_capture"] = False
+            except Exception:
+                snap.capture_receipt = None
+                snap.provenance["is_authenticated_capture"] = False
         return snap

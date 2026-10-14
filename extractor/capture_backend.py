@@ -13,14 +13,161 @@ import ctypes
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import errno
+import hashlib
+import hmac
+import json
 import os
 import platform
 import signal
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+import uuid
 
 from .capture_plan import CaptureMode, CapturePlan
 from .raw_snapshot import RawMemoryRegion, RawRuntimeSnapshot
+
+
+_CAPTURE_AUTHENTICATION_SECRET = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET") or (
+    "dynamicstate_trusted_capture_internal_key_" + os.urandom(16).hex()
+)
+
+
+@dataclass(frozen=True)
+class CaptureReceipt:
+    """Authentic cryptographic receipt issued exclusively by a RuntimeCaptureBackend.
+
+    Proves that physical state was captured from an identified running process by an
+    authenticated capture backend with deterministic artifact hashing.
+    """
+    receipt_id: str
+    backend_name: str
+    pid: int
+    process_start_time: str
+    executable_path: str
+    executable_build_id: Optional[str]
+    capture_time: str
+    capture_duration_us: float
+    completeness: str
+    consistency_level: str
+    artifact_manifest: Dict[str, str]  # relative_path/range_key -> sha256
+    signature: str = ""
+
+    def verify_signature(self, secret: Optional[str] = None) -> bool:
+        """Verify HMAC signature using capture authentication secret."""
+        if not self.signature:
+            return False
+        sec = secret or _CAPTURE_AUTHENTICATION_SECRET
+        expected = compute_capture_receipt_signature(
+            backend_name=self.backend_name,
+            pid=self.pid,
+            process_start_time=self.process_start_time,
+            executable_path=self.executable_path,
+            executable_build_id=self.executable_build_id,
+            capture_time=self.capture_time,
+            completeness=self.completeness,
+            consistency_level=self.consistency_level,
+            artifact_manifest=self.artifact_manifest,
+            secret=sec,
+        )
+        return hmac.compare_digest(self.signature, expected)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "backend_name": self.backend_name,
+            "pid": self.pid,
+            "process_start_time": self.process_start_time,
+            "executable_path": self.executable_path,
+            "executable_build_id": self.executable_build_id,
+            "capture_time": self.capture_time,
+            "capture_duration_us": self.capture_duration_us,
+            "completeness": self.completeness,
+            "consistency_level": self.consistency_level,
+            "artifact_manifest": dict(self.artifact_manifest),
+            "signature": self.signature,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CaptureReceipt":
+        return cls(
+            receipt_id=str(data.get("receipt_id", "")),
+            backend_name=str(data.get("backend_name", "")),
+            pid=int(data.get("pid", 0)),
+            process_start_time=str(data.get("process_start_time", "")),
+            executable_path=str(data.get("executable_path", "")),
+            executable_build_id=data.get("executable_build_id"),
+            capture_time=str(data.get("capture_time", "")),
+            capture_duration_us=float(data.get("capture_duration_us", 0.0)),
+            completeness=str(data.get("completeness", "")),
+            consistency_level=str(data.get("consistency_level", "")),
+            artifact_manifest=dict(data.get("artifact_manifest", {})),
+            signature=str(data.get("signature", "")),
+        )
+
+
+def compute_capture_receipt_signature(
+    backend_name: str,
+    pid: int,
+    process_start_time: str,
+    executable_path: str,
+    executable_build_id: Optional[str],
+    capture_time: str,
+    completeness: str,
+    consistency_level: str,
+    artifact_manifest: Dict[str, str],
+    secret: Optional[str] = None,
+) -> str:
+    sec = secret or _CAPTURE_AUTHENTICATION_SECRET
+    manifest_str = json.dumps(artifact_manifest, sort_keys=True)
+    raw = (
+        f"{backend_name}|{pid}|{process_start_time}|{executable_path}|"
+        f"{executable_build_id or ''}|{capture_time}|{completeness}|"
+        f"{consistency_level}|{manifest_str}"
+    )
+    return hmac.new(sec.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def issue_capture_receipt(
+    backend_name: str,
+    pid: int,
+    process_start_time: str,
+    executable_path: str,
+    executable_build_id: Optional[str],
+    capture_time: str,
+    capture_duration_us: float,
+    completeness: str,
+    consistency_level: str,
+    artifact_manifest: Dict[str, str],
+    secret: Optional[str] = None,
+) -> CaptureReceipt:
+    sec = secret or _CAPTURE_AUTHENTICATION_SECRET
+    sig = compute_capture_receipt_signature(
+        backend_name=backend_name,
+        pid=pid,
+        process_start_time=process_start_time,
+        executable_path=executable_path,
+        executable_build_id=executable_build_id,
+        capture_time=capture_time,
+        completeness=completeness,
+        consistency_level=consistency_level,
+        artifact_manifest=artifact_manifest,
+        secret=sec,
+    )
+    rcpt_id = f"cap_rcpt_{uuid.uuid4().hex[:12]}"
+    return CaptureReceipt(
+        receipt_id=rcpt_id,
+        backend_name=backend_name,
+        pid=pid,
+        process_start_time=process_start_time,
+        executable_path=executable_path,
+        executable_build_id=executable_build_id,
+        capture_time=capture_time,
+        capture_duration_us=capture_duration_us,
+        completeness=completeness,
+        consistency_level=consistency_level,
+        artifact_manifest=artifact_manifest,
+        signature=sig,
+    )
 
 
 @dataclass
@@ -2120,6 +2267,33 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             "thread_enumeration": thread_metadata.to_dict() if hasattr(thread_metadata, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if thread_metadata else "FAILED", "is_synthetic": False},
         }
 
+        start_time = str(
+            (handle.pre_signal_identity or {}).get("starttime")
+            or (handle.initial_identity or {}).get("starttime")
+            or _get_process_state(pid).get("starttime")
+            or "0"
+        )
+        mem_manifest = {
+            f"range_0x{s:x}_0x{e:x}": hashlib.sha256(b).hexdigest()
+            for (s, e), b in buffers.items()
+        }
+        cap_receipt = issue_capture_receipt(
+            backend_name=self.name,
+            pid=pid,
+            process_start_time=start_time,
+            executable_path=exe_path,
+            executable_build_id=build_id,
+            capture_time=wall_clock_start,
+            capture_duration_us=round(total_capture_time_us, 1),
+            completeness=completeness,
+            consistency_level=snapshot_consistency,
+            artifact_manifest=mem_manifest,
+        )
+        provenance["capture_receipt"] = cap_receipt.to_dict()
+        provenance["is_authenticated_capture"] = True
+        provenance["start_time"] = start_time
+        provenance["process_start_time"] = start_time
+
         raw_snap = RawRuntimeSnapshot(
             snapshot_id=sid,
             pid=pid,
@@ -2137,6 +2311,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             completeness=completeness,
             provenance=provenance,
             _buffers=buffers,
+            capture_receipt=cap_receipt,
         )
 
         return raw_snap
@@ -3133,6 +3308,33 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             "thread_enumeration": thread_metadata.to_dict() if hasattr(thread_metadata, "to_dict") else {"status": "SUCCESS_WITH_RESULTS" if thread_metadata else "FAILED", "is_synthetic": False},
         }
 
+        start_time = str(
+            (handle.pre_signal_identity or {}).get("starttime")
+            or (handle.initial_identity or {}).get("starttime")
+            or _get_process_state(pid).get("starttime")
+            or "0"
+        )
+        mem_manifest = {
+            f"range_0x{s:x}_0x{e:x}": hashlib.sha256(b).hexdigest()
+            for (s, e), b in buffers.items()
+        }
+        cap_receipt = issue_capture_receipt(
+            backend_name=self.name,
+            pid=pid,
+            process_start_time=start_time,
+            executable_path=exe_path,
+            executable_build_id=build_id,
+            capture_time=wall_clock_start,
+            capture_duration_us=round(total_capture_time_us, 1),
+            completeness=completeness,
+            consistency_level=snapshot_consistency,
+            artifact_manifest=mem_manifest,
+        )
+        provenance["capture_receipt"] = cap_receipt.to_dict()
+        provenance["is_authenticated_capture"] = True
+        provenance["start_time"] = start_time
+        provenance["process_start_time"] = start_time
+
         return RawRuntimeSnapshot(
             snapshot_id=sid,
             pid=pid,
@@ -3150,6 +3352,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             completeness=completeness,
             provenance=provenance,
             _buffers=buffers,
+            capture_receipt=cap_receipt,
         )
 
 

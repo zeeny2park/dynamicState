@@ -25,7 +25,9 @@ from .evidence_ledger import (
     EvidenceRecord,
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
+    ATTRIBUTION_BASIS_SINGLE_WRITER,
 )
+from .capture_backend import issue_capture_receipt
 from .hypothesis import (
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
@@ -144,6 +146,32 @@ class CausalDefectFixtures:
         )
         session.ledger.add_record(rec_proof)
 
+        # Baseline negative control evidence record demonstrating field stability prior to candidate intervention
+        rec_ctrl = EvidenceRecord(
+            evidence_id="ev_a_ctrl",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="investigation_observer",
+            session_id=inv_id,
+            observation="Baseline negative control: counter remained stable at 42 prior to mutation",
+            parent_evidence_ids=["ev_a_diff"],
+            details={
+                "target_function": "mutate_worker_state",
+                "field_path": "WorkerState.counter",
+                "before_value": 42,
+                "after_value": 42,
+                "state_stable": True,
+                "control_condition": "baseline",
+            },
+            target_identity={
+                "pid": 1001,
+                "binary": "/bin/worker",
+                "build_id": "build_scen_a_v1",
+            },
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec_ctrl)
+
         # Register verified snapshot artifacts and execute live reproduction verification
         session.target_ref["target_identity"] = {
             "pid": 1001,
@@ -167,6 +195,20 @@ class CausalDefectFixtures:
                 ]
             },
         }
+        rcpt_a1 = issue_capture_receipt(
+            backend_name="process_vm_readv",
+            pid=1001,
+            process_start_time="1000",
+            executable_path="/bin/worker",
+            executable_build_id="build_scen_a_v1",
+            capture_time="2026-10-13T10:00:00Z",
+            capture_duration_us=100,
+            completeness="COMPLETE",
+            consistency_level="STOPPED",
+            artifact_manifest={"snapshot.json": "manifest_a1_placeholder"},
+        )
+        snap_a1["capture_receipt"] = rcpt_a1.to_dict()
+
         snap_a2 = {
             "snapshot_id": f"snap_a2_{inv_id}",
             "process": {"pid": 1001, "binary": "/bin/worker", "executable_build_id": "build_scen_a_v1"},
@@ -191,6 +233,20 @@ class CausalDefectFixtures:
                 ]
             },
         }
+        rcpt_a2 = issue_capture_receipt(
+            backend_name="process_vm_readv",
+            pid=1001,
+            process_start_time="1000",
+            executable_path="/bin/worker",
+            executable_build_id="build_scen_a_v1",
+            capture_time="2026-10-13T10:00:05Z",
+            capture_duration_us=110,
+            completeness="COMPLETE",
+            consistency_level="STOPPED",
+            artifact_manifest={"snapshot.json": "manifest_a2_placeholder"},
+        )
+        snap_a2["capture_receipt"] = rcpt_a2.to_dict()
+
         mgr.corpus.add(snap_a1)
         mgr.corpus.add(snap_a2)
 
@@ -202,7 +258,11 @@ class CausalDefectFixtures:
             snapshot_b_path=snap_a2["snapshot_id"],
             target_function="mutate_worker_state",
             field_path="WorkerState.counter",
-            attribution_evidence={"function_attribution_verified": True, "attribution_basis": "call_stack_observation"},
+            attribution_evidence={
+                "attribution_basis": ATTRIBUTION_BASIS_SINGLE_WRITER,
+                "control_evidence_id": "ev_a_ctrl",
+                "active_writer_function": "mutate_worker_state",
+            },
         )
 
         return mgr, inv_id, hypo.hypothesis_id
@@ -325,6 +385,32 @@ class CausalDefectFixtures:
         )
         session.ledger.add_record(rec_proof)
 
+        # Baseline negative control evidence record for flags
+        rec_c_ctrl = EvidenceRecord(
+            evidence_id="ev_c_ctrl",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="investigation_observer",
+            session_id=inv_id,
+            observation="Baseline negative control: flags remained stable at 7 prior to update_flags execution",
+            parent_evidence_ids=["ev_c_diff"],
+            details={
+                "target_function": "update_flags",
+                "field_path": "State.flags",
+                "before_value": 7,
+                "after_value": 7,
+                "state_stable": True,
+                "control_condition": "baseline",
+            },
+            target_identity={
+                "pid": 2002,
+                "binary": "/bin/flags_updater",
+                "build_id": "build_scen_c_v1",
+            },
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+        )
+        session.ledger.add_record(rec_c_ctrl)
+
         # Register verified snapshot artifacts and execute live reproduction verification
         session.target_ref["target_identity"] = {
             "pid": 2002,
@@ -348,6 +434,20 @@ class CausalDefectFixtures:
                 ]
             },
         }
+        rcpt_c1 = issue_capture_receipt(
+            backend_name="process_vm_readv",
+            pid=2002,
+            process_start_time="2000",
+            executable_path="/bin/flags_updater",
+            executable_build_id="build_scen_c_v1",
+            capture_time="2026-10-13T10:00:00Z",
+            capture_duration_us=100,
+            completeness="COMPLETE",
+            consistency_level="STOPPED",
+            artifact_manifest={"snapshot.json": "manifest_c1_placeholder"},
+        )
+        snap_c1["capture_receipt"] = rcpt_c1.to_dict()
+
         snap_c2 = {
             "snapshot_id": f"snap_c2_{inv_id}",
             "process": {"pid": 2002, "binary": "/bin/flags_updater", "executable_build_id": "build_scen_c_v1"},
@@ -372,6 +472,20 @@ class CausalDefectFixtures:
                 ]
             },
         }
+        rcpt_c2 = issue_capture_receipt(
+            backend_name="process_vm_readv",
+            pid=2002,
+            process_start_time="2000",
+            executable_path="/bin/flags_updater",
+            executable_build_id="build_scen_c_v1",
+            capture_time="2026-10-13T10:00:05Z",
+            capture_duration_us=110,
+            completeness="COMPLETE",
+            consistency_level="STOPPED",
+            artifact_manifest={"snapshot.json": "manifest_c2_placeholder"},
+        )
+        snap_c2["capture_receipt"] = rcpt_c2.to_dict()
+
         mgr.corpus.add(snap_c1)
         mgr.corpus.add(snap_c2)
 
@@ -383,7 +497,11 @@ class CausalDefectFixtures:
             snapshot_b_path=snap_c2["snapshot_id"],
             target_function="update_flags",
             field_path="State.flags",
-            attribution_evidence={"function_attribution_verified": True, "attribution_basis": "call_stack_observation"},
+            attribution_evidence={
+                "attribution_basis": ATTRIBUTION_BASIS_SINGLE_WRITER,
+                "control_evidence_id": "ev_c_ctrl",
+                "active_writer_function": "update_flags",
+            },
         )
 
         return mgr, inv_id, hypo.hypothesis_id

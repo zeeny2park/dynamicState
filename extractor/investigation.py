@@ -52,6 +52,12 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
     TRUSTED_PROVENANCE_CLASSES,
+    CLAIM_ARTIFACT_INTEGRITY_VERIFIED,
+    CLAIM_CAPTURE_PROVENANCE_VERIFIED,
+    CLAIM_TARGET_IDENTITY_VERIFIED,
+    CLAIM_STATE_TRANSITION_VERIFIED,
+    CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
+    ALL_TRUST_CLAIMS,
 )
 from .hypothesis import (
     CONFIDENCE_HIGH,
@@ -221,6 +227,11 @@ class InvestigationSession:
         self.static_provider: StaticAnalysisProvider = NullStaticAnalysisProvider()
         self.summary: Dict[str, Any] = {}
         self.persistence: str = "EPHEMERAL_PROCESS_LOCAL"
+
+    @property
+    def session_secret(self) -> str:
+        """Internal session secret for signing and authenticity validation."""
+        return self._session_secret
 
     def issue_verification_capability(
         self,
@@ -446,6 +457,7 @@ class TrustedCausalVerifier:
         provenance_class: Optional[str] = None,
         function_attribution_verified: Optional[bool] = None,
         attribution_basis: str = "",
+        verified_claims: Optional[Union[Tuple[str, ...], List[str], Set[str]]] = None,
     ) -> ControlledExecutionResult:
         """Record an authentic execution receipt signed with the session secret.
 
@@ -519,6 +531,8 @@ class TrustedCausalVerifier:
         t_id = target_identity or self._session.target_ref.get("target_identity") or {}
         now_ts = datetime.now(timezone.utc).isoformat()
 
+        claims_tuple = tuple(sorted(verified_claims or ()))
+
         res_temp = ControlledExecutionResult(
             execution_id=exec_id,
             investigation_id=self._session.investigation_id,
@@ -539,6 +553,7 @@ class TrustedCausalVerifier:
             provenance_class=eff_prov_class,
             function_attribution_verified=eff_attr_ver,
             attribution_basis=eff_attr_basis,
+            verified_claims=claims_tuple,
             executed_at=now_ts,
             receipt_signature="",
         )
@@ -564,6 +579,7 @@ class TrustedCausalVerifier:
             provenance_class=eff_prov_class,
             function_attribution_verified=eff_attr_ver,
             attribution_basis=eff_attr_basis,
+            verified_claims=claims_tuple,
             executed_at=now_ts,
             receipt_signature=sig,
         )
@@ -1351,6 +1367,97 @@ class InvestigationManager:
             target_identity=target_identity,
         )
 
+    def verify_capture_provenance(
+        self,
+        snap_path: str,
+        session: Optional[InvestigationSession] = None,
+    ) -> Tuple[bool, Optional[Any], str]:
+        """Verify the authentic capture receipt and artifact integrity for a snapshot on disk."""
+        try:
+            if not isinstance(snap_path, str):
+                return False, None, f"Snapshot path must be a string, got {type(snap_path).__name__}"
+            norm = os.path.normpath(snap_path)
+            if ".." in norm.split(os.path.sep):
+                return False, None, f"Path traversal detected in snapshot path: '{snap_path}'"
+            if os.path.islink(snap_path):
+                return False, None, f"Snapshot path '{snap_path}' is a symbolic link; symlinks are rejected"
+
+            cand = snap_path if os.path.exists(snap_path) else os.path.join(self.corpus_dir, "memory_snapshots", snap_path)
+            if not os.path.exists(cand):
+                found_dir = None
+                if session and hasattr(session, "corpus") and session.corpus:
+                    for s_id, s_meta in session.corpus.states.items():
+                        if s_meta.get("snapshot_id") == snap_path or s_id == snap_path or snap_path in s_meta.get("observations", []):
+                            s_dir = os.path.join(session.corpus.states_dir, s_id)
+                            if os.path.exists(s_dir):
+                                found_dir = s_dir
+                                break
+                if found_dir:
+                    cand = found_dir
+                else:
+                    return False, None, f"Snapshot artifact '{snap_path}' does not exist on disk"
+
+            if os.path.isdir(cand):
+                for root, dirs, files in os.walk(cand):
+                    for d in dirs:
+                        if os.path.islink(os.path.join(root, d)):
+                            return False, None, f"Snapshot directory contains a symlink directory: {d}"
+                    for f in files:
+                        if os.path.islink(os.path.join(root, f)):
+                            return False, None, f"Snapshot directory contains a symlink file: {f}"
+
+                rcpt_path = os.path.join(cand, "capture_receipt.json")
+                if not os.path.exists(rcpt_path):
+                    return False, None, "Snapshot directory lacks capture_receipt.json"
+
+                with open(rcpt_path, "r", encoding="utf-8") as f:
+                    rcpt_data = json.load(f)
+
+                from .capture_backend import CaptureReceipt
+                rcpt = CaptureReceipt.from_dict(rcpt_data)
+                if not rcpt.verify_signature():
+                    return False, None, "Capture receipt signature verification failed (tampering detected)"
+
+                # Verify artifact manifest digests
+                if not rcpt.artifact_manifest:
+                    return False, None, "Capture receipt artifact manifest is empty"
+
+                for rel_path, exp_hash in rcpt.artifact_manifest.items():
+                    full_p = os.path.join(cand, rel_path)
+                    if not os.path.exists(full_p) or os.path.islink(full_p):
+                        return False, None, f"Manifest artifact '{rel_path}' is missing or a symlink (tampering detected)"
+                    with open(full_p, "rb") as f:
+                        act_h = hashlib.sha256(f.read()).hexdigest()
+                    if act_h != exp_hash:
+                        return False, None, f"Manifest artifact '{rel_path}' hash mismatch (tampering detected)"
+
+                # Check for extra unexpected files
+                allowed_files = set(rcpt.artifact_manifest.keys()) | {"capture_receipt.json"}
+                for root, _, files in os.walk(cand):
+                    for fn in files:
+                        rel = os.path.relpath(os.path.join(root, fn), cand)
+                        if rel not in allowed_files and not fn.startswith("."):
+                            return False, None, f"Extra unexpected file in snapshot directory: {rel}"
+
+                return True, rcpt, "Capture receipt and artifact manifest verified"
+            elif os.path.isfile(cand):
+                try:
+                    with open(cand, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    rcpt_data = data.get("capture_receipt")
+                    if rcpt_data and isinstance(rcpt_data, dict):
+                        from .capture_backend import CaptureReceipt
+                        rcpt = CaptureReceipt.from_dict(rcpt_data)
+                        if rcpt.verify_signature():
+                            return True, rcpt, "Embedded capture receipt verified"
+                        return False, None, "Embedded capture receipt signature verification failed (tampering detected)"
+                except Exception:
+                    pass
+                return False, None, "Snapshot file lacks an authentic CaptureReceipt"
+            return False, None, "Snapshot path is neither a file nor directory"
+        except Exception as exc:
+            return False, None, f"Capture provenance check error: {exc}"
+
     def verify_live_reproduction_and_attest(
         self,
         investigation_id: str,
@@ -1362,6 +1469,7 @@ class InvestigationManager:
         field_path: str,
         verification_type: str = "deterministic_reproduction",
         attribution_evidence: Optional[Dict[str, Any]] = None,
+        require_capture_provenance: bool = False,
     ) -> bool:
         """Verify genuine live reproduction from two snapshots, verify real diff, and attest causal proof."""
         session = self.sessions.get(investigation_id)
@@ -1395,10 +1503,35 @@ class InvestigationManager:
                         f"Snapshot artifact '{snap_path}' does not exist on disk; "
                         "in-memory dictionaries or unregistered states cannot prove live runtime execution"
                     )
+            if os.path.isdir(cand):
+                for root, dirs, files in os.walk(cand):
+                    for d in dirs:
+                        p = os.path.join(root, d)
+                        if os.path.islink(p):
+                            raise ValueError(f"Snapshot directory contains symlink directory '{p}'; symlinks are rejected for security")
+                    for f in files:
+                        p = os.path.join(root, f)
+                        if os.path.islink(p):
+                            raise ValueError(f"Snapshot directory contains symlink file '{p}'; symlinks are rejected for security")
             return cand
 
         disk_a = _resolve_and_verify_disk_artifact(snapshot_a_path)
         disk_b = _resolve_and_verify_disk_artifact(snapshot_b_path)
+
+        # Verify capture provenance receipts and manifests
+        ok_a, rcpt_a, reason_a = self.verify_capture_provenance(snapshot_a_path, session)
+        ok_b, rcpt_b, reason_b = self.verify_capture_provenance(snapshot_b_path, session)
+
+        if "tamper" in reason_a.lower() or "signature verification failed" in reason_a.lower() or "symlink" in reason_a.lower():
+            raise ValueError(f"Capture provenance verification failed for snapshot A: {reason_a}")
+        if "tamper" in reason_b.lower() or "signature verification failed" in reason_b.lower() or "symlink" in reason_b.lower():
+            raise ValueError(f"Capture provenance verification failed for snapshot B: {reason_b}")
+
+        if require_capture_provenance:
+            if not ok_a:
+                raise ValueError(f"Capture provenance verification failed for snapshot A: {reason_a}")
+            if not ok_b:
+                raise ValueError(f"Capture provenance verification failed for snapshot B: {reason_b}")
 
         # 2. Verify hypothesis scope
         target_hypo = None
@@ -1593,6 +1726,29 @@ class InvestigationManager:
         if sess_tid.get("build_id") and id_a["build_id"] and sess_tid["build_id"] != id_a["build_id"]:
             raise ValueError(f"Snapshot build ID does not match session target build ID")
 
+        # Check OS process start time from /proc/<pid>/stat when target PID is running on Linux
+        target_pid = id_a.get("pid")
+        if target_pid and isinstance(target_pid, int) and target_pid > 0:
+            proc_stat_path = f"/proc/{target_pid}/stat"
+            if os.path.exists(proc_stat_path):
+                try:
+                    with open(proc_stat_path, "r", encoding="utf-8") as f:
+                        stat_content = f.read()
+                    rparen = stat_content.rfind(")")
+                    if rparen != -1:
+                        fields = stat_content[rparen + 1:].strip().split()
+                        # Field 22 (index 19 after rparen) is starttime in jiffies
+                        if len(fields) >= 20:
+                            live_starttime = fields[19]
+                            snap_starttime = id_a.get("start_time")
+                            if snap_starttime and str(snap_starttime).isdigit():
+                                if str(live_starttime) != str(snap_starttime):
+                                    raise ValueError(f"Target process start time mismatch: live PID {target_pid} ({live_starttime}) != snapshot ({snap_starttime}); PID was reused or replaced")
+                except ValueError:
+                    raise
+                except Exception:
+                    pass
+
         # 7. Check temporal consistency
         def _get_timestamp(snap: Any) -> Any:
             if hasattr(snap, "to_dict"):
@@ -1630,6 +1786,10 @@ class InvestigationManager:
         after_val = found_change.get("after")
 
         # 10. Verify function attribution evidence
+        func_attr_ver = False
+        attr_basis = "state_transition_only"
+
+        # Check stack observation in snap_b
         th_meta = getattr(snap_b, "thread_metadata", None)
         if th_meta is None and hasattr(snap_b, "to_dict"):
             th_meta = snap_b.to_dict().get("thread_metadata")
@@ -1637,6 +1797,7 @@ class InvestigationManager:
             th_meta = snap_b.get("thread_metadata")
 
         observed_in_stack = False
+        # Do not accept caller-created thread_metadata in unverified snapshots as authenticated observation
         if th_meta and isinstance(th_meta, list):
             for t in th_meta:
                 if isinstance(t, dict):
@@ -1646,25 +1807,75 @@ class InvestigationManager:
                         observed_in_stack = True
                         break
 
-        func_attr_ver = False
-        attr_basis = "state_transition_only"
-
         if observed_in_stack:
-            func_attr_ver = True
+            # Stack presence alone establishes correlation, not write causality!
             attr_basis = ATTRIBUTION_BASIS_CALL_STACK
-        elif attribution_evidence and isinstance(attribution_evidence, dict):
-            basis = attribution_evidence.get("attribution_basis")
-            if basis == ATTRIBUTION_BASIS_EXECUTION_TRACE and attribution_evidence.get("execution_trace"):
-                trace = attribution_evidence.get("execution_trace", [])
-                if any(isinstance(tr, dict) and tr.get("function") == target_function for tr in trace):
-                    func_attr_ver = True
-                    attr_basis = ATTRIBUTION_BASIS_EXECUTION_TRACE
-            elif basis == ATTRIBUTION_BASIS_SINGLE_WRITER and attribution_evidence.get("single_writer_verified") is True:
-                if attribution_evidence.get("active_writer_function") == target_function:
-                    func_attr_ver = True
-                    attr_basis = ATTRIBUTION_BASIS_SINGLE_WRITER
+            func_attr_ver = False
 
-        # 11. Mint ControlledExecutionResult
+        # Independent Attribution Verification
+        if attribution_evidence and isinstance(attribution_evidence, dict):
+            basis = attribution_evidence.get("attribution_basis")
+
+            # Mechanism A: Controlled Single-Writer Isolation Experiment
+            # Require recorded, independently checkable intervention results with controlled conditions and before/after observations.
+            # Do not trust a boolean supplied by the experiment caller ('single_writer_verified' == True by itself is rejected).
+            if basis == ATTRIBUTION_BASIS_SINGLE_WRITER:
+                ctrl_eid = attribution_evidence.get("control_evidence_id") or attribution_evidence.get("baseline_evidence_id")
+                if ctrl_eid and session.ledger:
+                    rec_ctrl = session.ledger.get_record(ctrl_eid)
+                    if (
+                        rec_ctrl
+                        and rec_ctrl.source != "unverified_caller"
+                        and not (rec_ctrl.details or {}).get("caller_submitted")
+                        and not (rec_ctrl.details or {}).get("unverified_caller_claim")
+                    ):
+                        c_det = rec_ctrl.details or {}
+                        c_t_id = rec_ctrl.target_identity or c_det.get("target_identity") or {}
+                        # Validate bound to same process instance & build
+                        pid_match = not c_t_id.get("pid") or c_t_id.get("pid") == id_a["pid"]
+                        bld_match = not c_t_id.get("build_id") or c_t_id.get("build_id") == id_a["build_id"]
+
+                        # Validate field path or object
+                        fld = c_det.get("field_path") or c_det.get("field_name")
+                        fld_match = not fld or is_exact_semantic_path_match(field_path, field_path.split(".")[-1], fld)
+
+                        # Validate controlled condition: field remained stable without candidate mutation
+                        ctrl_stable = (
+                            c_det.get("before_value") is not None and c_det.get("after_value") is not None and c_det.get("before_value") == c_det.get("after_value")
+                        ) or c_det.get("mutation_occurred") is False or c_det.get("state_stable") is True or c_det.get("control_condition") in ("baseline", "no_mutation", "inactive_candidate")
+
+                        writer_fn = attribution_evidence.get("active_writer_function") or c_det.get("target_function")
+                        if pid_match and bld_match and fld_match and ctrl_stable and writer_fn == target_function:
+                            func_attr_ver = True
+                            attr_basis = ATTRIBUTION_BASIS_SINGLE_WRITER
+
+            # Mechanism B: Execution Trace
+            # Arbitrary caller trace list rejected. Must reference recorded trace collector evidence in ledger.
+            elif basis == ATTRIBUTION_BASIS_EXECUTION_TRACE:
+                trace_eid = attribution_evidence.get("trace_evidence_id")
+                if trace_eid and session.ledger:
+                    rec_tr = session.ledger.get_record(trace_eid)
+                    if (
+                        rec_tr
+                        and rec_tr.source in ("trace_collector", "trusted_tracer", "investigation_observer")
+                        and not (rec_tr.details or {}).get("caller_submitted")
+                    ):
+                        tr_events = (rec_tr.details or {}).get("trace_events", [])
+                        if any(isinstance(e, dict) and e.get("function") == target_function and e.get("event") == "write" for e in tr_events):
+                            func_attr_ver = True
+                            attr_basis = ATTRIBUTION_BASIS_EXECUTION_TRACE
+
+        # 11. Assemble explicit claims
+        claims = set()
+        claims.add(CLAIM_ARTIFACT_INTEGRITY_VERIFIED)
+        claims.add(CLAIM_TARGET_IDENTITY_VERIFIED)
+        claims.add(CLAIM_STATE_TRANSITION_VERIFIED)
+        if ok_a and ok_b:
+            claims.add(CLAIM_CAPTURE_PROVENANCE_VERIFIED)
+        if func_attr_ver:
+            claims.add(CLAIM_FUNCTION_ATTRIBUTION_VERIFIED)
+
+        # 12. Mint ControlledExecutionResult
         verifier = TrustedCausalVerifier(session)
         t_id = {
             "pid": id_a["pid"] or id_b["pid"],
@@ -1687,6 +1898,7 @@ class InvestigationManager:
             provenance_class=PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
             function_attribution_verified=func_attr_ver,
             attribution_basis=attr_basis,
+            verified_claims=claims,
         )
 
         return verifier.verify_execution_and_attest(

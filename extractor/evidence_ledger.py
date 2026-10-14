@@ -37,6 +37,22 @@ VALID_ATTRIBUTION_BASES = {
 }
 
 
+# Explicit evidence trust levels
+CLAIM_ARTIFACT_INTEGRITY_VERIFIED = "ARTIFACT_INTEGRITY_VERIFIED"
+CLAIM_CAPTURE_PROVENANCE_VERIFIED = "CAPTURE_PROVENANCE_VERIFIED"
+CLAIM_TARGET_IDENTITY_VERIFIED = "TARGET_IDENTITY_VERIFIED"
+CLAIM_STATE_TRANSITION_VERIFIED = "STATE_TRANSITION_VERIFIED"
+CLAIM_FUNCTION_ATTRIBUTION_VERIFIED = "FUNCTION_ATTRIBUTION_VERIFIED"
+
+ALL_TRUST_CLAIMS = {
+    CLAIM_ARTIFACT_INTEGRITY_VERIFIED,
+    CLAIM_CAPTURE_PROVENANCE_VERIFIED,
+    CLAIM_TARGET_IDENTITY_VERIFIED,
+    CLAIM_STATE_TRANSITION_VERIFIED,
+    CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
+}
+
+
 @dataclass(frozen=True)
 class ControlledExecutionResult:
     """Authentic execution receipt produced by a verified runtime execution or controlled reproduction."""
@@ -59,13 +75,18 @@ class ControlledExecutionResult:
     provenance_class: str = PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
     function_attribution_verified: bool = False
     attribution_basis: str = ""
+    verified_claims: Tuple[str, ...] = ()
     executed_at: str = ""
     receipt_signature: str = ""
+
+    def __post_init__(self):
+        if not isinstance(self.verified_claims, tuple):
+            object.__setattr__(self, "verified_claims", tuple(sorted(self.verified_claims or ())))
 
     @property
     def is_function_attribution_verified(self) -> bool:
         if self.function_attribution_verified is not None:
-            return bool(self.function_attribution_verified)
+            return bool(self.function_attribution_verified) or (CLAIM_FUNCTION_ATTRIBUTION_VERIFIED in getattr(self, "verified_claims", ()))
         return False
 
     def verify_authenticity(self, session_secret: str) -> bool:
@@ -83,11 +104,12 @@ def compute_receipt_signature(session_secret: str, result: "ControlledExecutionR
     prov_cls = getattr(result, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
     attr_ver = getattr(result, "is_function_attribution_verified", getattr(result, "function_attribution_verified", False))
     attr_basis = getattr(result, "attribution_basis", "")
+    claims_str = ",".join(sorted(getattr(result, "verified_claims", ()) or ()))
     raw = (
         f"{result.execution_id}|{result.investigation_id}|{result.hypothesis_id}|"
         f"{result.evidence_id}|{result.target_function}|{result.field_path}|"
         f"{result.before_value}|{result.after_value}|{result.execution_status}|"
-        f"{result.backend_type}|{prov_cls}|{attr_ver}|{attr_basis}|"
+        f"{result.backend_type}|{prov_cls}|{attr_ver}|{attr_basis}|{claims_str}|"
         f"{result.before_snapshot_ref}|{result.after_snapshot_ref}|"
         f"{result.before_snapshot_hash}|{result.after_snapshot_hash}|"
         f"{tid_str}|{cq_str}|{result.executed_at}"
@@ -123,6 +145,7 @@ class CausalVerificationCapability:
         provenance_class: str = PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
         function_attribution_verified: bool = False,
         attribution_basis: str = "",
+        verified_claims: Tuple[str, ...] = (),
     ):
         self._investigation_id = investigation_id
         self._capability_key = capability_key
@@ -133,6 +156,7 @@ class CausalVerificationCapability:
         self._provenance_class = provenance_class
         self._function_attribution_verified = function_attribution_verified
         self._attribution_basis = attribution_basis
+        self._verified_claims = tuple(sorted(verified_claims or ()))
         self._consumed = False
 
     def is_valid_for(
@@ -195,6 +219,10 @@ class CausalVerificationCapability:
     @property
     def attribution_basis(self) -> str:
         return self._attribution_basis
+
+    @property
+    def verified_claims(self) -> Tuple[str, ...]:
+        return self._verified_claims
 
 
 def normalize_path_tokens(path: str) -> List[str]:
@@ -315,6 +343,7 @@ def compute_evidence_fingerprint(
     provenance_class: Optional[str] = None,
     function_attribution_verified: Optional[bool] = None,
     attribution_basis: Optional[str] = None,
+    verified_claims: Optional[Union[Tuple[str, ...], List[str], Set[str]]] = None,
 ) -> str:
     """Compute a deterministic SHA256 digest sealing content, scope, hypothesis, target identity, quality, and ancestry."""
     p_details = record.details or {}
@@ -345,10 +374,15 @@ def compute_evidence_fingerprint(
     else:
         attr_basis = str(att.get("attribution_basis", p_details.get("attribution_basis", "")))
 
+    if verified_claims is not None:
+        claims_str = ",".join(sorted(verified_claims))
+    else:
+        claims_str = ",".join(sorted(att.get("verified_claims", p_details.get("verified_claims", []))))
+
     raw = (
         f"{record.evidence_id}|{record.observation}|{fld}|{fn}|"
         f"{hypo}|{t_id_str}|{rec_t_id_str}|{snap_str}|"
-        f"{parents_str}|{cq_str}|{prov_cls}|{attr_ver}|{attr_basis}|{record.session_id}"
+        f"{parents_str}|{cq_str}|{prov_cls}|{attr_ver}|{attr_basis}|{claims_str}|{record.session_id}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -637,6 +671,7 @@ class EvidenceLedger:
             provenance_class=getattr(execution_result, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION),
             function_attribution_verified=getattr(execution_result, "is_function_attribution_verified", getattr(execution_result, "function_attribution_verified", False)),
             attribution_basis=getattr(execution_result, "attribution_basis", ""),
+            verified_claims=getattr(execution_result, "verified_claims", ()),
         )
 
     def attest_causal_proof(
@@ -708,6 +743,7 @@ class EvidenceLedger:
         eff_prov_cls = getattr(capability, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
         eff_attr_ver = getattr(capability, "function_attribution_verified", False)
         eff_attr_basis = getattr(capability, "attribution_basis", "")
+        eff_claims = getattr(capability, "verified_claims", ())
 
         # Compute tamper-evident fingerprint and HMAC signature
         fingerprint = compute_evidence_fingerprint(
@@ -719,6 +755,7 @@ class EvidenceLedger:
             provenance_class=eff_prov_cls,
             function_attribution_verified=eff_attr_ver,
             attribution_basis=eff_attr_basis,
+            verified_claims=eff_claims,
         )
         token_sig = compute_attestation_signature(self.session_secret, rec.evidence_id, fingerprint, self.session_id)
 
@@ -735,6 +772,7 @@ class EvidenceLedger:
             "provenance_class": eff_prov_cls,
             "function_attribution_verified": eff_attr_ver,
             "attribution_basis": eff_attr_basis,
+            "verified_claims": list(eff_claims),
             "verification_type": verification_type,
             "attested_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -742,6 +780,7 @@ class EvidenceLedger:
         rec.details["provenance_class"] = eff_prov_cls
         rec.details["function_attribution_verified"] = eff_attr_ver
         rec.details["attribution_basis"] = eff_attr_basis
+        rec.details["verified_claims"] = list(eff_claims)
         rec.details["verified_transition"] = True
         rec.details["causal_proof"] = True
         if execution_provenance and isinstance(execution_provenance, dict):
