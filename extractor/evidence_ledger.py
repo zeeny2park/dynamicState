@@ -75,6 +75,7 @@ class ControlledExecutionResult:
     provenance_class: str = PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
     function_attribution_verified: bool = False
     attribution_basis: str = ""
+    attribution_limitation: str = ""
     verified_claims: Tuple[str, ...] = ()
     executed_at: str = ""
     receipt_signature: str = ""
@@ -146,6 +147,7 @@ class CausalVerificationCapability:
         function_attribution_verified: bool = False,
         attribution_basis: str = "",
         verified_claims: Tuple[str, ...] = (),
+        attribution_limitation: str = "",
     ):
         self._investigation_id = investigation_id
         self._capability_key = capability_key
@@ -157,6 +159,7 @@ class CausalVerificationCapability:
         self._function_attribution_verified = function_attribution_verified
         self._attribution_basis = attribution_basis
         self._verified_claims = tuple(sorted(verified_claims or ()))
+        self._attribution_limitation = attribution_limitation
         self._consumed = False
 
     def is_valid_for(
@@ -199,6 +202,10 @@ class CausalVerificationCapability:
     @property
     def target_function(self) -> str:
         return self._target_function
+
+    @property
+    def attribution_limitation(self) -> str:
+        return self._attribution_limitation
 
     @property
     def field_path(self) -> str:
@@ -672,6 +679,7 @@ class EvidenceLedger:
             function_attribution_verified=getattr(execution_result, "is_function_attribution_verified", getattr(execution_result, "function_attribution_verified", False)),
             attribution_basis=getattr(execution_result, "attribution_basis", ""),
             verified_claims=getattr(execution_result, "verified_claims", ()),
+            attribution_limitation=getattr(execution_result, "attribution_limitation", ""),
         )
 
     def attest_causal_proof(
@@ -772,6 +780,7 @@ class EvidenceLedger:
             "provenance_class": eff_prov_cls,
             "function_attribution_verified": eff_attr_ver,
             "attribution_basis": eff_attr_basis,
+            "attribution_limitation": getattr(capability, "attribution_limitation", ""),
             "verified_claims": list(eff_claims),
             "verification_type": verification_type,
             "attested_at": datetime.now(timezone.utc).isoformat(),
@@ -780,6 +789,7 @@ class EvidenceLedger:
         rec.details["provenance_class"] = eff_prov_cls
         rec.details["function_attribution_verified"] = eff_attr_ver
         rec.details["attribution_basis"] = eff_attr_basis
+        rec.details["attribution_limitation"] = getattr(capability, "attribution_limitation", "")
         rec.details["verified_claims"] = list(eff_claims)
         rec.details["verified_transition"] = True
         rec.details["causal_proof"] = True

@@ -24,11 +24,16 @@ import unittest
 from unittest.mock import MagicMock
 
 from extractor.capture_backend import (
+    CaptureKeyStore,
     CaptureReceipt,
     ProcessVmCaptureBackend,
     ProcfsCaptureBackend,
+    compute_capture_receipt_signature,
+    get_default_key_store,
     issue_capture_receipt,
+    set_default_key_store,
 )
+from extractor.raw_snapshot import RawRuntimeSnapshot
 from extractor.causal_fixtures import CausalDefectFixtures
 from extractor.evaluation import CausalValidationEvaluator
 from extractor.evidence_ledger import (
@@ -4601,5 +4606,605 @@ class TestPhase8RuntimeEvidenceAuthenticity(unittest.TestCase):
         self.assertIn("Execution receipt signature / authenticity verification failed", str(ctx_cross.exception))
 
 
+class TestPhase9CrossProcessEvidenceTrust(unittest.TestCase):
+    """Phase 9 Test Suite: Cross-Process Evidence Trust, Key Lifecycle & Real-World Causal Validation."""
+
+    @staticmethod
+    def _compile_fixture(work_dir: str) -> Optional[str]:
+        if shutil.which("g++") is None:
+            return None
+        src = os.path.abspath("tests/fixtures/real_runtime/main.cpp")
+        if not os.path.exists(src):
+            return None
+        bin_path = os.path.join(work_dir, "phase9_app.elf")
+        res = subprocess.run(
+            [
+                "g++", "-fPIE", "-pie", "-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer",
+                "-Wl,--build-id=sha1", src, "-o", bin_path, "-lpthread"
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and os.path.exists(bin_path):
+            return bin_path
+        return None
+
+    @staticmethod
+    def _start_target_process(bin_path: str) -> subprocess.Popen:
+        proc = subprocess.Popen(
+            [bin_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        ready_line = proc.stdout.readline().strip()
+        assert ready_line == "READY", f"Process did not emit READY: {ready_line}"
+        return proc
+
+    def test_phase9_key_lifecycle_configuration_rotation_and_revocation(self):
+        """1. Key lifecycle: configured keys, rotation, revocation, unconfigured fallback, and secret non-leakage."""
+        ks_ephemeral = CaptureKeyStore()
+        saved_env = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
+        saved_id = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_ID")
+        if "DYNAMICSTATE_CAPTURE_SECRET" in os.environ:
+            del os.environ["DYNAMICSTATE_CAPTURE_SECRET"]
+        if "DYNAMICSTATE_CAPTURE_KEY_ID" in os.environ:
+            del os.environ["DYNAMICSTATE_CAPTURE_KEY_ID"]
+        try:
+            ks_ephemeral.reload_from_environment()
+            self.assertFalse(ks_ephemeral.is_explicitly_configured)
+            kid, ephemeral_sec = ks_ephemeral.get_active_signing_key()
+            self.assertEqual(kid, "ephemeral")
+            self.assertTrue(ephemeral_sec.startswith("dynamicstate_ephemeral_key_"))
+
+            foreign_rcpt = issue_capture_receipt(
+                backend_name="procfs",
+                pid=9999,
+                process_start_time="100",
+                executable_path="/bin/app",
+                executable_build_id="build_p9",
+                capture_time="2026-10-14T00:00:00Z",
+                capture_duration_us=500.0,
+                completeness="COMPLETE",
+                consistency_level="STOPPED",
+                artifact_manifest={"memory/range_1.bin": "hash1"},
+                secret="some_foreign_secret",
+                key_id="prod_key",
+            )
+            valid, reason, _ = ks_ephemeral.verify_receipt(foreign_rcpt)
+            self.assertFalse(valid)
+            self.assertIn("VERIFICATION_KEY_UNAVAILABLE", reason)
+
+            ks_prod = CaptureKeyStore()
+            ks_prod.register_key("key_2026_q1", "secret_q1_alpha", is_active=True)
+            self.assertTrue(ks_prod.is_explicitly_configured)
+            self.assertEqual(ks_prod.get_active_signing_key(), ("key_2026_q1", "secret_q1_alpha"))
+
+            rcpt_q1 = issue_capture_receipt(
+                backend_name="process_vm_readv",
+                pid=1234,
+                process_start_time="200",
+                executable_path="/bin/srv",
+                executable_build_id="bld_q1",
+                capture_time="2026-10-14T00:00:00Z",
+                capture_duration_us=1200.0,
+                completeness="COMPLETE",
+                consistency_level="STOPPED",
+                artifact_manifest={"memory/heap.bin": "hash_heap"},
+                secret="secret_q1_alpha",
+                key_id="key_2026_q1",
+            )
+            valid_q1, reason_q1, verified_kid = ks_prod.verify_receipt(rcpt_q1)
+            self.assertTrue(valid_q1)
+            self.assertEqual(verified_kid, "key_2026_q1")
+
+            ks_prod.rotate_key("key_2026_q2", "secret_q2_beta")
+            self.assertEqual(ks_prod.get_active_signing_key(), ("key_2026_q2", "secret_q2_beta"))
+
+            rcpt_q2 = issue_capture_receipt(
+                backend_name="process_vm_readv",
+                pid=1234,
+                process_start_time="200",
+                executable_path="/bin/srv",
+                executable_build_id="bld_q1",
+                capture_time="2026-10-14T00:01:00Z",
+                capture_duration_us=1100.0,
+                completeness="COMPLETE",
+                consistency_level="STOPPED",
+                artifact_manifest={"memory/heap.bin": "hash_heap2"},
+                secret="secret_q2_beta",
+                key_id="key_2026_q2",
+            )
+            valid_q2, _, verified_kid_q2 = ks_prod.verify_receipt(rcpt_q2)
+            self.assertTrue(valid_q2)
+            self.assertEqual(verified_kid_q2, "key_2026_q2")
+
+            valid_old, _, verified_old_kid = ks_prod.verify_receipt(rcpt_q1)
+            self.assertTrue(valid_old)
+            self.assertEqual(verified_old_kid, "key_2026_q1")
+
+            ks_prod.revoke_key("key_2026_q1")
+            valid_revoked, reason_revoked, _ = ks_prod.verify_receipt(rcpt_q1)
+            self.assertFalse(valid_revoked)
+            self.assertIn("KEY_REVOKED", reason_revoked)
+
+            d = rcpt_q2.to_dict()
+            s = json.dumps(d)
+            self.assertNotIn("secret_q2_beta", s)
+            self.assertNotIn("secret_q2_beta", str(rcpt_q2))
+            self.assertNotIn("secret_q2_beta", repr(rcpt_q2))
+        finally:
+            if saved_env:
+                os.environ["DYNAMICSTATE_CAPTURE_SECRET"] = saved_env
+            if saved_id:
+                os.environ["DYNAMICSTATE_CAPTURE_KEY_ID"] = saved_id
+
+    def test_phase9_canonical_manifest_and_strict_tamper_detection(self):
+        """2. Receipt and canonical manifest binding: signature covers all security fields and manifest canonicalization."""
+        secret = "hardened_hmac_secret_456"
+        manifest = {
+            "./memory/range_0x1000.bin": "hash_a",
+            "memory/range_0x2000.bin": "hash_b",
+            "snapshot_metadata.json": "hash_meta",
+        }
+        rcpt = issue_capture_receipt(
+            backend_name="process_vm_readv",
+            pid=4000,
+            process_start_time="55555",
+            executable_path="/usr/bin/service",
+            executable_build_id="build_777",
+            capture_time="2026-10-14T01:00:00Z",
+            capture_duration_us=450.5,
+            completeness="COMPLETE",
+            consistency_level="STOPPED",
+            artifact_manifest=manifest,
+            secret=secret,
+            key_id="k_test",
+            receipt_id="rcpt_canonical_01",
+        )
+        self.assertTrue(rcpt.matches_secret(secret))
+
+        # Tampering with receipt_id must invalidate signature
+        tampered_rcpt_id = CaptureReceipt.from_dict({**rcpt.to_dict(), "receipt_id": "rcpt_canonical_02"})
+        self.assertFalse(tampered_rcpt_id.matches_secret(secret))
+
+        # Tampering with capture_duration_us must invalidate signature
+        tampered_duration = CaptureReceipt.from_dict({**rcpt.to_dict(), "capture_duration_us": 999.0})
+        self.assertFalse(tampered_duration.matches_secret(secret))
+
+        # Tampering with key_id must invalidate signature
+        tampered_kid = CaptureReceipt.from_dict({**rcpt.to_dict(), "key_id": "k_other"})
+        self.assertFalse(tampered_kid.matches_secret(secret))
+
+        # Tampering with process_start_time must invalidate signature
+        tampered_st = CaptureReceipt.from_dict({**rcpt.to_dict(), "process_start_time": "99999"})
+        self.assertFalse(tampered_st.matches_secret(secret))
+
+        # Tampering with artifact_manifest hash must invalidate signature
+        bad_manifest = dict(manifest)
+        bad_manifest["snapshot_metadata.json"] = "forged_hash"
+        tampered_manifest = CaptureReceipt.from_dict({**rcpt.to_dict(), "artifact_manifest": bad_manifest})
+        self.assertFalse(tampered_manifest.matches_secret(secret))
+
+    def test_phase9_snapshot_disk_load_validation_and_tampering(self):
+        """3. Snapshot save/load validation: rejects modified payload, extra files, symlinks, and marks legacy snapshots."""
+        temp_dir = tempfile.mkdtemp(prefix="phase9_snap_")
+        secret = "secret_snap_load_789"
+        ks = CaptureKeyStore()
+        ks.register_key("snap_key", secret, is_active=True)
+        orig_ks = get_default_key_store()
+        set_default_key_store(ks)
+        try:
+            snap = RawRuntimeSnapshot(
+                snapshot_id="snap_p9_valid",
+                pid=5000,
+                executable="/bin/daemon",
+                executable_build_id="build_daemon_1",
+                timestamp="2026-10-14T02:00:00Z",
+                completeness="COMPLETE",
+                capture_backend="process_vm_readv",
+                capture_duration_us=300.0,
+            )
+            snap.register_buffer(0x1000, b"AAAA" * 100)
+            snap.register_buffer(0x2000, b"BBBB" * 100)
+            valid_dir = os.path.join(temp_dir, "valid_snap")
+            snap.save(valid_dir)
+
+            loaded = RawRuntimeSnapshot.load(valid_dir)
+            self.assertEqual(loaded.provenance.get("verification_status"), "VERIFIED")
+            self.assertTrue(loaded.provenance.get("is_authenticated_capture"))
+
+            # Tamper 1: modify memory payload bytes
+            tampered_mem_dir = os.path.join(temp_dir, "tampered_mem")
+            shutil.copytree(valid_dir, tampered_mem_dir)
+            mem_file = os.path.join(tampered_mem_dir, "memory", os.listdir(os.path.join(tampered_mem_dir, "memory"))[0])
+            with open(mem_file, "r+b") as f:
+                f.write(b"CORRUPT")
+            loaded_tampered = RawRuntimeSnapshot.load(tampered_mem_dir)
+            self.assertEqual(loaded_tampered.provenance.get("verification_status"), "TAMPERED")
+            self.assertIn("digest mismatch", loaded_tampered.provenance.get("verification_error", ""))
+
+            # Tamper 2: extra rogue file in memory/
+            extra_mem_dir = os.path.join(temp_dir, "extra_mem")
+            shutil.copytree(valid_dir, extra_mem_dir)
+            with open(os.path.join(extra_mem_dir, "memory", "range_0x9999_0xaaaa.bin"), "wb") as f:
+                f.write(b"INJECTED")
+            loaded_extra = RawRuntimeSnapshot.load(extra_mem_dir)
+            self.assertEqual(loaded_extra.provenance.get("verification_status"), "TAMPERED")
+            self.assertIn("Extra unexpected memory file", loaded_extra.provenance.get("verification_error", ""))
+
+            # Tamper 3: extra rogue file in root
+            extra_root_dir = os.path.join(temp_dir, "extra_root")
+            shutil.copytree(valid_dir, extra_root_dir)
+            with open(os.path.join(extra_root_dir, "payload.sh"), "wb") as f:
+                f.write(b"echo pwn")
+            loaded_root = RawRuntimeSnapshot.load(extra_root_dir)
+            self.assertEqual(loaded_root.provenance.get("verification_status"), "TAMPERED")
+            self.assertIn("Extra unexpected root artifact", loaded_root.provenance.get("verification_error", ""))
+
+            # Tamper 4: symlink directory rejected
+            sym_dir = os.path.join(temp_dir, "sym_dir")
+            os.symlink(valid_dir, sym_dir)
+            with self.assertRaises(ValueError) as ctx_sym:
+                RawRuntimeSnapshot.load(sym_dir)
+            self.assertIn("symlinks are rejected", str(ctx_sym.exception))
+
+            # Legacy snapshot: lacks capture_receipt.json
+            legacy_dir = os.path.join(temp_dir, "legacy_snap")
+            shutil.copytree(valid_dir, legacy_dir)
+            os.remove(os.path.join(legacy_dir, "capture_receipt.json"))
+            loaded_legacy = RawRuntimeSnapshot.load(legacy_dir)
+            self.assertEqual(loaded_legacy.provenance.get("verification_status"), "UNVERIFIED_LEGACY")
+            self.assertFalse(loaded_legacy.provenance.get("is_authenticated_capture"))
+        finally:
+            set_default_key_store(orig_ks)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase9_cross_process_offline_exchange_scenarios(self):
+        """4. Cross-process offline exchange: verified with matching secret, rejected with wrong/missing secret."""
+        temp_dir = tempfile.mkdtemp(prefix="phase9_cross_")
+        shared_secret = "vault_shared_secret_abc123"
+        orig_ks = get_default_key_store()
+        try:
+            # Process A (Capture): writes snapshot with shared_secret
+            ks_a = CaptureKeyStore()
+            ks_a.register_key("vault_key", shared_secret, is_active=True)
+            set_default_key_store(ks_a)
+
+            snap_dir = os.path.join(temp_dir, "proc_a_snap")
+            snap = RawRuntimeSnapshot(
+                snapshot_id="snap_proc_a",
+                pid=7000,
+                executable="/opt/bin/app",
+                executable_build_id="build_proc_a",
+                timestamp="2026-10-14T03:00:00Z",
+                completeness="COMPLETE",
+                capture_backend="process_vm_readv",
+                capture_duration_us=250.0,
+            )
+            snap.register_buffer(0x10000, b"DATA" * 50)
+            snap.save(snap_dir)
+
+            # Process B, Subscenario 1: Analysis session has matching secret
+            ks_b1 = CaptureKeyStore()
+            ks_b1.register_key("vault_key", shared_secret, is_active=True)
+            set_default_key_store(ks_b1)
+
+            mgr1 = InvestigationManager()
+            ok1, rcpt1, reason1 = mgr1.verify_capture_provenance(snap_dir)
+            self.assertTrue(ok1)
+            self.assertEqual(reason1, "Capture receipt and artifact manifest verified")
+
+            # Process B, Subscenario 2: Analysis session has wrong secret
+            ks_b2 = CaptureKeyStore()
+            ks_b2.register_key("vault_key", "wrong_secret_xyz", is_active=True)
+            set_default_key_store(ks_b2)
+
+            mgr2 = InvestigationManager()
+            ok2, rcpt2, reason2 = mgr2.verify_capture_provenance(snap_dir)
+            self.assertFalse(ok2)
+            self.assertIn("Capture receipt signature verification failed", reason2)
+
+            # Process B, Subscenario 3: Analysis session has NO secret (ephemeral random)
+            ks_b3 = CaptureKeyStore()
+            set_default_key_store(ks_b3)
+
+            mgr3 = InvestigationManager()
+            ok3, rcpt3, reason3 = mgr3.verify_capture_provenance(snap_dir)
+            self.assertFalse(ok3)
+            self.assertIn("VERIFICATION_KEY_UNAVAILABLE", reason3)
+        finally:
+            set_default_key_store(orig_ks)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase9_single_writer_negative_controls_prevent_false_attribution(self):
+        """5. Function attribution negative controls: concurrent mutation or active writer mismatch blocks candidate promotion."""
+        temp_dir = tempfile.mkdtemp(prefix="phase9_neg_")
+        try:
+            mgr = InvestigationManager()
+            inv_id = mgr.start_investigation(goal="Phase 9 Negative Controls")["investigation_id"]
+            session = mgr.sessions[inv_id]
+
+            snap_a = os.path.join(temp_dir, "snap_a.json")
+            snap_b = os.path.join(temp_dir, "snap_b.json")
+            with open(snap_a, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_a",
+                    "process": {"pid": 8000, "binary": "/bin/target", "executable_build_id": "b_neg"},
+                    "timestamp": "2026-10-14T04:00:00Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 10}]}]}
+                }, f)
+            with open(snap_b, "w") as f:
+                json.dump({
+                    "snapshot_id": "snap_b",
+                    "process": {"pid": 8000, "binary": "/bin/target", "executable_build_id": "b_neg"},
+                    "timestamp": "2026-10-14T04:00:05Z",
+                    "completeness": "COMPLETE",
+                    "consistency": {"level": "STOPPED"},
+                    "persistent": {"objects": [{"object_id": "o1", "type": "State", "fields": [{"name": "counter", "value": 20}]}]}
+                }, f)
+
+            rec = EvidenceRecord(
+                evidence_id="ev_neg",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="observer",
+                session_id=inv_id,
+                observation="Obs Neg",
+                details={"target_function": "suspect_fn", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec)
+            hypo = InvestigationHypothesis(
+                hypothesis_id="hypo_neg",
+                investigation_id=inv_id,
+                title="Hypo Neg",
+                claim="Claim Neg",
+                proposed_mechanism="Mech Neg",
+                supporting_evidence_ids=["ev_neg"],
+                candidate_fields=["State.counter"],
+                function_candidates=[{"function_name": "suspect_fn", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
+                validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            )
+            session.hypotheses.append(hypo)
+
+            # Negative Control A: Baseline control mutated while candidate was inactive!
+            rec_ctrl_leaked = EvidenceRecord(
+                evidence_id="ev_ctrl_drift",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="observer",
+                session_id=inv_id,
+                observation="Baseline control showed mutation without candidate invocation",
+                details={
+                    "target_function": "suspect_fn",
+                    "field_path": "State.counter",
+                    "before_value": 10,
+                    "after_value": 15,
+                    "mutation_occurred": True,
+                    "control_condition": "baseline",
+                },
+                target_identity={"pid": 8000, "binary": "/bin/target", "build_id": "b_neg"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec_ctrl_leaked)
+
+            att_ok = mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id="hypo_neg",
+                evidence_id="ev_neg",
+                snapshot_a_path=snap_a,
+                snapshot_b_path=snap_b,
+                target_function="suspect_fn",
+                field_path="State.counter",
+                attribution_evidence={
+                    "attribution_basis": ATTRIBUTION_BASIS_SINGLE_WRITER,
+                    "control_evidence_id": "ev_ctrl_drift",
+                    "active_writer_function": "suspect_fn",
+                },
+            )
+            self.assertTrue(att_ok)
+            att = session.ledger.get_record("ev_neg").provenance["verifier_attestation"]
+            self.assertFalse(att["function_attribution_verified"])
+            self.assertIn("Negative control baseline failed", att["attribution_limitation"])
+            self.assertIn("potential concurrent writer or idle drift", att["attribution_limitation"])
+
+            res = mgr.evaluate_hypothesis(inv_id, "hypo_neg", proof_evidence_id="ev_neg", deterministic_transition_verified=True)
+            self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+            fc = mgr.get_hypothesis(inv_id, "hypo_neg")["function_candidates"][0]
+            self.assertFalse(fc["confirmed_root_cause"])
+            self.assertEqual(fc["candidate_tier"], FUNCTION_TIER_EVIDENCE_SUPPORTED)
+            self.assertIn("Negative control baseline failed", fc["tier_limitation"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_phase9_cpp_real_process_e2e_positive_and_negative_control(self):
+        """6. Real compiled C++ cross-process end-to-end positive and negative control with external verification."""
+        temp_dir = tempfile.mkdtemp(prefix="phase9_cpp_")
+        proc = None
+        orig_ks = get_default_key_store()
+        try:
+            bin_path = self._compile_fixture(temp_dir)
+            if not bin_path:
+                self.skipTest("g++ compiler or main.cpp fixture unavailable in current environment")
+
+            shared_secret = "cpp_e2e_cross_process_secret_999"
+            ks_capture = CaptureKeyStore()
+            ks_capture.register_key("cpp_key", shared_secret, is_active=True)
+            set_default_key_store(ks_capture)
+
+            proc = self._start_target_process(bin_path)
+
+            backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
+            if not backend.is_available(proc.pid):
+                self.skipTest("No available capture backend for live process")
+
+            # Capture baseline snapshot
+            snap1 = backend.capture(pid=proc.pid)
+            snap1_dir = os.path.join(temp_dir, "snap1")
+            snap1.save(snap1_dir)
+
+            # Record baseline control
+            rec_ctrl = EvidenceRecord(
+                evidence_id="ev_p9_ctrl",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="investigation_observer",
+                session_id="inv_p9",
+                observation="Baseline control stable",
+                details={
+                    "target_function": "mutate_worker_state",
+                    "field_path": "State.counter",
+                    "before_value": 42,
+                    "after_value": 42,
+                    "state_stable": True,
+                    "control_condition": "baseline",
+                },
+                target_identity={
+                    "pid": proc.pid,
+                    "binary": bin_path,
+                    "build_id": snap1.executable_build_id,
+                },
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+
+            # Mutate via stdin
+            proc.stdin.write("MUTATE\n")
+            proc.stdin.flush()
+            mut_line = proc.stdout.readline().strip()
+            self.assertEqual(mut_line, "MUTATED")
+
+            # Capture treatment snapshot
+            snap2 = backend.capture(pid=proc.pid)
+            snap2_dir = os.path.join(temp_dir, "snap2")
+            snap2.save(snap2_dir)
+
+            # Terminate target process to prove offline / post-mortem analysis
+            try:
+                proc.stdin.write("STOP\n")
+                proc.stdin.flush()
+            except Exception:
+                pass
+            proc.terminate()
+            proc.wait(timeout=2)
+            proc = None
+
+            # Sub-case A: Fresh analysis session with MATCHING secret -> Positive control succeeds
+            ks_analysis = CaptureKeyStore()
+            ks_analysis.register_key("cpp_key", shared_secret, is_active=True)
+            set_default_key_store(ks_analysis)
+
+            mgr = InvestigationManager(corpus_dir=os.path.join(temp_dir, "corpus"))
+            inv_info = mgr.start_investigation(
+                goal="Phase 9 C++ E2E Positive Control",
+                memory_snapshot_path=snap1_dir,
+                debug_image=bin_path,
+                authorize_target=False,
+            )
+            inv_id = inv_info["investigation_id"]
+            session = mgr.sessions[inv_id]
+            rec_ctrl.session_id = inv_id
+            session.ledger.add_record(rec_ctrl)
+
+            cmp_res = mgr.compare_observations(inv_id, snap1_dir, snap2_dir)
+            self.assertNotIn("error", cmp_res)
+            mgr._execute_stage_synthesis(session)
+            hypos = mgr.get_hypotheses(inv_id)
+            counter_hypo = next((h for h in hypos if "counter" in h["title"].lower() or "counter" in h["claim"].lower()), hypos[0])
+            h_id = counter_hypo["hypothesis_id"]
+
+            rec_proof = EvidenceRecord(
+                evidence_id="ev_p9_proof",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="investigation_observer",
+                session_id=inv_id,
+                observation="C++ reproduction: counter 42 -> 100 via mutate_worker_state",
+                details={
+                    "target_function": "mutate_worker_state",
+                    "field_path": "State.counter",
+                },
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            session.ledger.add_record(rec_proof)
+
+            att_ok = mgr.verify_live_reproduction_and_attest(
+                investigation_id=inv_id,
+                hypothesis_id=h_id,
+                evidence_id="ev_p9_proof",
+                snapshot_a_path=snap1_dir,
+                snapshot_b_path=snap2_dir,
+                target_function="mutate_worker_state",
+                field_path="State.counter",
+                attribution_evidence={
+                    "attribution_basis": ATTRIBUTION_BASIS_SINGLE_WRITER,
+                    "control_evidence_id": "ev_p9_ctrl",
+                    "active_writer_function": "mutate_worker_state",
+                },
+                require_capture_provenance=True,
+            )
+            self.assertTrue(att_ok)
+
+            eval_res = mgr.evaluate_hypothesis(inv_id, h_id, proof_evidence_id="ev_p9_proof", deterministic_transition_verified=True)
+            self.assertEqual(eval_res["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
+            fc = next((c for c in mgr.get_hypothesis(inv_id, h_id)["function_candidates"] if c.get("function_name") == "mutate_worker_state"), None)
+            self.assertIsNotNone(fc)
+            self.assertEqual(fc["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
+            self.assertTrue(fc["confirmed_root_cause"])
+
+            # Sub-case B: Negative control with WRONG secret in analysis session -> require_capture_provenance rejects
+            ks_wrong = CaptureKeyStore()
+            ks_wrong.register_key("cpp_key", "completely_wrong_key", is_active=True)
+            set_default_key_store(ks_wrong)
+
+            mgr_wrong = InvestigationManager(corpus_dir=os.path.join(temp_dir, "corpus_wrong"))
+            inv_wrong = mgr_wrong.start_investigation(
+                goal="Phase 9 C++ Negative Control with Wrong Key",
+                memory_snapshot_path=snap1_dir,
+                debug_image=bin_path,
+                authorize_target=False,
+            )
+            inv_w_id = inv_wrong["investigation_id"]
+            sess_w = mgr_wrong.sessions[inv_w_id]
+            rec_w = EvidenceRecord(
+                evidence_id="ev_w_proof",
+                evidence_type=EVIDENCE_TYPE_COMPARISON,
+                nature=NATURE_OBSERVATION,
+                source="investigation_observer",
+                session_id=inv_w_id,
+                observation="Proof with wrong key",
+                details={"target_function": "mutate_worker_state", "field_path": "State.counter"},
+                capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            )
+            sess_w.ledger.add_record(rec_w)
+            with self.assertRaises(ValueError) as ctx_wrong:
+                mgr_wrong.verify_live_reproduction_and_attest(
+                    investigation_id=inv_w_id,
+                    hypothesis_id=h_id,
+                    evidence_id="ev_w_proof",
+                    snapshot_a_path=snap1_dir,
+                    snapshot_b_path=snap2_dir,
+                    target_function="mutate_worker_state",
+                    field_path="State.counter",
+                    require_capture_provenance=True,
+                )
+            self.assertIn("Capture provenance verification failed", str(ctx_wrong.exception))
+        finally:
+            set_default_key_store(orig_ks)
+            if proc:
+                try:
+                    proc.stdin.write("STOP\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                proc.terminate()
+                proc.wait(timeout=2)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+

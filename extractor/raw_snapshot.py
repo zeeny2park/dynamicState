@@ -427,11 +427,11 @@ class RawRuntimeSnapshot:
                     with open(os.path.join(mem_dir, fn), "rb") as f:
                         disk_manifest[rel] = hashlib.sha256(f.read()).hexdigest()
 
-        if self.capture_receipt:
+        if self.capture_receipt or (self.capture_backend and self.capture_backend != "unknown"):
             from .capture_backend import issue_capture_receipt
-            start_time = getattr(self.capture_receipt, "process_start_time", str(self.provenance.get("start_time") or "0"))
+            start_time = getattr(self.capture_receipt, "process_start_time", str(self.provenance.get("start_time") or "0")) if self.capture_receipt else str(self.provenance.get("start_time") or "0")
             disk_receipt = issue_capture_receipt(
-                backend_name=getattr(self.capture_receipt, "backend_name", self.capture_backend),
+                backend_name=getattr(self.capture_receipt, "backend_name", self.capture_backend) if self.capture_receipt else self.capture_backend,
                 pid=self.pid,
                 process_start_time=start_time,
                 executable_path=self.executable,
@@ -448,13 +448,29 @@ class RawRuntimeSnapshot:
 
     @classmethod
     def load(cls, output_dir: str) -> "RawRuntimeSnapshot":
+        # Security invariant: Reject path traversal and symlinks at the root
+        norm = os.path.normpath(output_dir)
+        if ".." in norm.split(os.path.sep):
+            raise ValueError(f"Path traversal detected in snapshot path: '{output_dir}'")
+        if os.path.islink(output_dir):
+            raise ValueError(f"Snapshot directory '{output_dir}' is a symbolic link; symlinks are rejected")
+
+        # Recursive symlink check throughout snapshot directory
+        for root, dirs, files in os.walk(output_dir):
+            for d in dirs:
+                if os.path.islink(os.path.join(root, d)):
+                    raise ValueError(f"Snapshot directory contains a symlinked subdirectory: '{d}'")
+            for f in files:
+                if os.path.islink(os.path.join(root, f)):
+                    raise ValueError(f"Snapshot directory contains a symlinked file: '{f}'")
+
         meta_path = os.path.join(output_dir, "snapshot_metadata.json")
         with open(meta_path, "r", encoding="utf-8") as f:
             snap = cls.from_dict(json.load(f))
 
         mem_dir = os.path.join(output_dir, "memory")
         if os.path.exists(mem_dir):
-            for fn in os.listdir(mem_dir):
+            for fn in sorted(os.listdir(mem_dir)):
                 if fn.startswith("range_") and fn.endswith(".bin"):
                     parts = fn[:-4].split("_")
                     if len(parts) >= 4:
@@ -465,41 +481,98 @@ class RawRuntimeSnapshot:
 
         # Verify CaptureReceipt on load if present
         rcpt_path = os.path.join(output_dir, "capture_receipt.json")
-        if os.path.exists(rcpt_path) and not os.path.islink(rcpt_path):
-            try:
-                with open(rcpt_path, "r", encoding="utf-8") as f:
-                    rcpt_data = json.load(f)
-                from .capture_backend import CaptureReceipt
-                rcpt = CaptureReceipt.from_dict(rcpt_data)
-                if rcpt.verify_signature():
-                    manifest_ok = True
-                    for rel_p, exp_h in rcpt.artifact_manifest.items():
-                        full_p = os.path.join(output_dir, rel_p)
-                        if not os.path.exists(full_p) or os.path.islink(full_p):
-                            manifest_ok = False
-                            break
-                        with open(full_p, "rb") as f:
-                            act_h = hashlib.sha256(f.read()).hexdigest()
-                        if act_h != exp_h:
-                            manifest_ok = False
-                            break
-                    if os.path.exists(mem_dir):
-                        for fn in os.listdir(mem_dir):
-                            rel = os.path.join("memory", fn)
-                            if rel not in rcpt.artifact_manifest:
-                                manifest_ok = False
-                                break
-                    if manifest_ok and rcpt.pid == snap.pid and rcpt.executable_build_id == snap.executable_build_id:
-                        snap.capture_receipt = rcpt
-                        snap.provenance["is_authenticated_capture"] = True
-                        snap.provenance["capture_receipt"] = rcpt.to_dict()
-                    else:
-                        snap.capture_receipt = None
-                        snap.provenance["is_authenticated_capture"] = False
-                else:
-                    snap.capture_receipt = None
-                    snap.provenance["is_authenticated_capture"] = False
-            except Exception:
+        if not os.path.exists(rcpt_path):
+            # Legacy snapshot without capture receipt
+            snap.capture_receipt = None
+            snap.provenance["is_authenticated_capture"] = False
+            snap.provenance["verification_status"] = "UNVERIFIED_LEGACY"
+            snap.provenance["verification_error"] = "NO_CAPTURE_RECEIPT: Legacy snapshot lacks verifiable cryptographic capture receipt"
+            return snap
+
+        if os.path.islink(rcpt_path):
+            snap.capture_receipt = None
+            snap.provenance["is_authenticated_capture"] = False
+            snap.provenance["verification_status"] = "TAMPERED"
+            snap.provenance["verification_error"] = "SYMLINK_REJECTED: capture_receipt.json is a symbolic link"
+            return snap
+
+        try:
+            with open(rcpt_path, "r", encoding="utf-8") as f:
+                rcpt_data = json.load(f)
+            from .capture_backend import CaptureReceipt, get_default_key_store
+            rcpt = CaptureReceipt.from_dict(rcpt_data)
+            sig_ok, sig_reason, verified_kid = rcpt.verify_with_status()
+            if not sig_ok:
                 snap.capture_receipt = None
                 snap.provenance["is_authenticated_capture"] = False
+                snap.provenance["verification_status"] = "UNVERIFIED"
+                snap.provenance["verification_error"] = sig_reason
+                return snap
+
+            # Verify manifest digests and reject missing, modified, or extra files
+            manifest_ok = True
+            err_msg = ""
+            for rel_p, exp_h in rcpt.artifact_manifest.items():
+                full_p = os.path.join(output_dir, rel_p)
+                if not os.path.exists(full_p) or os.path.islink(full_p):
+                    manifest_ok = False
+                    err_msg = f"Manifest artifact '{rel_p}' is missing or a symlink"
+                    break
+                with open(full_p, "rb") as f:
+                    act_h = hashlib.sha256(f.read()).hexdigest()
+                if act_h != exp_h:
+                    manifest_ok = False
+                    err_msg = f"Artifact '{rel_p}' digest mismatch: expected {exp_h[:12]}, got {act_h[:12]}"
+                    break
+
+            # Check for extra files in memory/
+            if manifest_ok and os.path.exists(mem_dir):
+                for fn in os.listdir(mem_dir):
+                    rel = os.path.join("memory", fn)
+                    if rel not in rcpt.artifact_manifest:
+                        manifest_ok = False
+                        err_msg = f"Extra unexpected memory file detected: '{rel}'"
+                        break
+
+            # Check for extra files in output_dir root
+            if manifest_ok:
+                for fn in os.listdir(output_dir):
+                    full_p = os.path.join(output_dir, fn)
+                    if os.path.isfile(full_p):
+                        if fn != "capture_receipt.json" and fn not in rcpt.artifact_manifest:
+                            manifest_ok = False
+                            err_msg = f"Extra unexpected root artifact file detected: '{fn}'"
+                            break
+
+            if not manifest_ok:
+                snap.capture_receipt = None
+                snap.provenance["is_authenticated_capture"] = False
+                snap.provenance["verification_status"] = "TAMPERED"
+                snap.provenance["verification_error"] = err_msg or "Manifest verification failed"
+                return snap
+
+            # Validate process binding
+            if rcpt.pid != snap.pid or rcpt.executable_build_id != snap.executable_build_id:
+                snap.capture_receipt = None
+                snap.provenance["is_authenticated_capture"] = False
+                snap.provenance["verification_status"] = "IDENTITY_MISMATCH"
+                snap.provenance["verification_error"] = (
+                    f"Receipt target identity (PID {rcpt.pid}, Build ID {rcpt.executable_build_id}) "
+                    f"mismatches snapshot (PID {snap.pid}, Build ID {snap.executable_build_id})"
+                )
+                return snap
+
+            # Successfully verified
+            snap.capture_receipt = rcpt
+            snap.provenance["is_authenticated_capture"] = True
+            snap.provenance["verification_status"] = "VERIFIED"
+            snap.provenance["verified_key_id"] = verified_kid
+            snap.provenance["capture_receipt"] = rcpt.to_dict()
+
+        except Exception as exc:
+            snap.capture_receipt = None
+            snap.provenance["is_authenticated_capture"] = False
+            snap.provenance["verification_status"] = "ERROR"
+            snap.provenance["verification_error"] = f"Failed to verify capture receipt: {exc}"
+
         return snap

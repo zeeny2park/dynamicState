@@ -458,6 +458,7 @@ class TrustedCausalVerifier:
         function_attribution_verified: Optional[bool] = None,
         attribution_basis: str = "",
         verified_claims: Optional[Union[Tuple[str, ...], List[str], Set[str]]] = None,
+        attribution_limitation: str = "",
     ) -> ControlledExecutionResult:
         """Record an authentic execution receipt signed with the session secret.
 
@@ -553,6 +554,7 @@ class TrustedCausalVerifier:
             provenance_class=eff_prov_class,
             function_attribution_verified=eff_attr_ver,
             attribution_basis=eff_attr_basis,
+            attribution_limitation=attribution_limitation,
             verified_claims=claims_tuple,
             executed_at=now_ts,
             receipt_signature="",
@@ -579,6 +581,7 @@ class TrustedCausalVerifier:
             provenance_class=eff_prov_class,
             function_attribution_verified=eff_attr_ver,
             attribution_basis=eff_attr_basis,
+            attribution_limitation=attribution_limitation,
             verified_claims=claims_tuple,
             executed_at=now_ts,
             receipt_signature=sig,
@@ -1415,8 +1418,9 @@ class InvestigationManager:
 
                 from .capture_backend import CaptureReceipt
                 rcpt = CaptureReceipt.from_dict(rcpt_data)
-                if not rcpt.verify_signature():
-                    return False, None, "Capture receipt signature verification failed (tampering detected)"
+                sig_ok, sig_reason, _ = rcpt.verify_with_status()
+                if not sig_ok:
+                    return False, rcpt, f"Capture receipt signature verification failed: {sig_reason}"
 
                 # Verify artifact manifest digests
                 if not rcpt.artifact_manifest:
@@ -1788,6 +1792,7 @@ class InvestigationManager:
         # 10. Verify function attribution evidence
         func_attr_ver = False
         attr_basis = "state_transition_only"
+        attr_limitation = ""
 
         # Check stack observation in snap_b
         th_meta = getattr(snap_b, "thread_metadata", None)
@@ -1840,14 +1845,31 @@ class InvestigationManager:
                         fld_match = not fld or is_exact_semantic_path_match(field_path, field_path.split(".")[-1], fld)
 
                         # Validate controlled condition: field remained stable without candidate mutation
-                        ctrl_stable = (
-                            c_det.get("before_value") is not None and c_det.get("after_value") is not None and c_det.get("before_value") == c_det.get("after_value")
-                        ) or c_det.get("mutation_occurred") is False or c_det.get("state_stable") is True or c_det.get("control_condition") in ("baseline", "no_mutation", "inactive_candidate")
+                        has_before_after = (c_det.get("before_value") is not None and c_det.get("after_value") is not None)
+                        if has_before_after:
+                            ctrl_stable = (c_det.get("before_value") == c_det.get("after_value"))
+                        elif c_det.get("mutation_occurred") is not None:
+                            ctrl_stable = (c_det.get("mutation_occurred") is False)
+                        elif c_det.get("state_stable") is not None:
+                            ctrl_stable = bool(c_det.get("state_stable"))
+                        else:
+                            ctrl_stable = (c_det.get("control_condition") in ("baseline", "no_mutation", "inactive_candidate"))
 
                         writer_fn = attribution_evidence.get("active_writer_function") or c_det.get("target_function")
                         if pid_match and bld_match and fld_match and ctrl_stable and writer_fn == target_function:
                             func_attr_ver = True
                             attr_basis = ATTRIBUTION_BASIS_SINGLE_WRITER
+                        else:
+                            if not ctrl_stable:
+                                attr_limitation = f"Negative control baseline failed: field '{field_path}' mutated during control period ({c_det.get('before_value')} -> {c_det.get('after_value')}) while candidate '{target_function}' was inactive (potential concurrent writer or idle drift)."
+                            elif writer_fn != target_function:
+                                attr_limitation = f"Single-writer isolation failed: active writer was '{writer_fn}', which does not match candidate '{target_function}'."
+                            elif not (pid_match and bld_match):
+                                attr_limitation = f"Single-writer isolation failed: control evidence process identity does not match treatment snapshot."
+                            elif not fld_match:
+                                attr_limitation = f"Single-writer isolation failed: control evidence field '{fld}' does not match '{field_path}'."
+                else:
+                    attr_limitation = "Single-writer isolation requires valid control evidence in ledger observing baseline field stability."
 
             # Mechanism B: Execution Trace
             # Arbitrary caller trace list rejected. Must reference recorded trace collector evidence in ledger.
@@ -1864,6 +1886,12 @@ class InvestigationManager:
                         if any(isinstance(e, dict) and e.get("function") == target_function and e.get("event") == "write" for e in tr_events):
                             func_attr_ver = True
                             attr_basis = ATTRIBUTION_BASIS_EXECUTION_TRACE
+                        else:
+                            attr_limitation = f"Execution trace failed: no verified write event recorded for candidate '{target_function}' on field '{field_path}'."
+                else:
+                    attr_limitation = "Execution trace requires valid trace collector evidence in ledger."
+        elif not func_attr_ver and not attr_limitation:
+            attr_limitation = "State transition verified in runtime, but function attribution was not independently verified by execution instrumentation."
 
         # 11. Assemble explicit claims
         claims = set()
@@ -1898,6 +1926,7 @@ class InvestigationManager:
             provenance_class=PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
             function_attribution_verified=func_attr_ver,
             attribution_basis=attr_basis,
+            attribution_limitation=attr_limitation,
             verified_claims=claims,
         )
 

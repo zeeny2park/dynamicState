@@ -27,9 +27,181 @@ from .capture_plan import CaptureMode, CapturePlan
 from .raw_snapshot import RawMemoryRegion, RawRuntimeSnapshot
 
 
-_CAPTURE_AUTHENTICATION_SECRET = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET") or (
-    "dynamicstate_trusted_capture_internal_key_" + os.urandom(16).hex()
-)
+class CaptureKeyStore:
+    """Manages capture authentication key lifecycle, rotation, revocation, and resolution."""
+
+    def __init__(self):
+        self._keys: Dict[str, str] = {}
+        self._active_key_id: str = "default"
+        self._revoked_keys: Set[str] = set()
+        self._is_explicitly_configured: bool = False
+        self._ephemeral_fallback: Optional[str] = None
+        self.reload_from_environment()
+
+    def reload_from_environment(self) -> None:
+        """Load keys from environment variables or key files."""
+        self._keys.clear()
+        self._revoked_keys.clear()
+        self._is_explicitly_configured = False
+        self._ephemeral_fallback = None
+
+        # 1. Check DYNAMICSTATE_CAPTURE_SECRET
+        env_secret = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
+        key_id = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_ID", "default")
+        if env_secret:
+            self._keys[key_id] = env_secret
+            self._active_key_id = key_id
+            self._is_explicitly_configured = True
+
+        # 2. Check DYNAMICSTATE_CAPTURE_KEY_FILE
+        key_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
+        if key_file and os.path.exists(key_file):
+            try:
+                with open(key_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content.startswith("{"):
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        for k, v in data.items():
+                            if isinstance(k, str) and isinstance(v, str):
+                                self._keys[k] = v
+                        self._is_explicitly_configured = True
+                elif content:
+                    self._keys["file_default"] = content
+                    if not env_secret:
+                        self._active_key_id = "file_default"
+                    self._is_explicitly_configured = True
+            except Exception:
+                pass
+
+        # 3. Check DYNAMICSTATE_CAPTURE_KEYRING (JSON string or file path)
+        keyring_spec = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
+        if keyring_spec:
+            try:
+                if os.path.exists(keyring_spec):
+                    with open(keyring_spec, "r", encoding="utf-8") as f:
+                        keyring_data = json.load(f)
+                else:
+                    keyring_data = json.loads(keyring_spec)
+                if isinstance(keyring_data, dict):
+                    for k, v in keyring_data.items():
+                        if isinstance(k, str) and isinstance(v, str):
+                            self._keys[k] = v
+                    self._is_explicitly_configured = True
+            except Exception:
+                pass
+
+        # 4. If not configured, initialize process-local ephemeral key
+        if not self._keys:
+            self._ephemeral_fallback = "dynamicstate_ephemeral_key_" + os.urandom(16).hex()
+            self._keys["ephemeral"] = self._ephemeral_fallback
+            self._active_key_id = "ephemeral"
+            self._is_explicitly_configured = False
+
+    @property
+    def is_explicitly_configured(self) -> bool:
+        """Returns True if a key was provided via env/file/programmatic API rather than ephemeral random."""
+        return self._is_explicitly_configured
+
+    def register_key(self, key_id: str, secret: str, is_active: bool = False) -> None:
+        """Register a key for signing or verification."""
+        if not key_id or not secret:
+            raise ValueError("key_id and secret must be non-empty strings")
+        self._keys[key_id] = secret
+        self._revoked_keys.discard(key_id)
+        self._is_explicitly_configured = True
+        if is_active or len(self._keys) == 1:
+            self._active_key_id = key_id
+
+    def rotate_key(self, new_key_id: str, new_secret: str) -> None:
+        """Rotate the active signing key while keeping older keys available for verification."""
+        self.register_key(new_key_id, new_secret, is_active=True)
+
+    def revoke_key(self, key_id: str) -> None:
+        """Revoke a key so it will no longer verify any receipts."""
+        self._revoked_keys.add(key_id)
+        if self._active_key_id == key_id:
+            available = [k for k in self._keys.keys() if k not in self._revoked_keys]
+            self._active_key_id = available[0] if available else ""
+
+    def get_active_signing_key(self) -> Tuple[str, str]:
+        """Return (key_id, secret) for signing new receipts."""
+        if self._active_key_id in self._revoked_keys or self._active_key_id not in self._keys:
+            available = [k for k in self._keys.keys() if k not in self._revoked_keys]
+            if not available:
+                raise ValueError("No active, non-revoked capture key available for signing")
+            self._active_key_id = available[0]
+        return self._active_key_id, self._keys[self._active_key_id]
+
+    def verify_receipt(
+        self,
+        receipt: "CaptureReceipt",
+        explicit_secret: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[str]]:
+        """Verify HMAC signature of a CaptureReceipt with explicit lifecycle outcomes.
+
+        Returns (is_valid: bool, status_reason: str, verified_key_id: Optional[str]).
+        """
+        if not receipt.signature:
+            return False, "UNSIGNED_RECEIPT: Capture receipt has no HMAC signature", None
+
+        # If explicit secret supplied, test directly
+        if explicit_secret:
+            if receipt.matches_secret(explicit_secret):
+                return True, "VERIFIED", getattr(receipt, "key_id", "explicit")
+            return False, "SIGNATURE_VERIFICATION_FAILED: Signature mismatch with supplied secret", None
+
+        # Check key revocation
+        rcpt_kid = getattr(receipt, "key_id", "default") or "default"
+        if rcpt_kid in self._revoked_keys:
+            return False, f"KEY_REVOKED: Key ID '{rcpt_kid}' has been revoked", None
+
+        # In cross-process mode: if the current key store was not explicitly configured (only ephemeral random),
+        # and the receipt specifies a key_id that is NOT our ephemeral key, fail closed with KEY_UNAVAILABLE!
+        if not self._is_explicitly_configured:
+            if rcpt_kid != "ephemeral" or not receipt.matches_secret(self._keys.get("ephemeral", "")):
+                return (
+                    False,
+                    "VERIFICATION_KEY_UNAVAILABLE: No capture authentication key configured in environment "
+                    "(DYNAMICSTATE_CAPTURE_SECRET, DYNAMICSTATE_CAPTURE_KEYRING, or DYNAMICSTATE_CAPTURE_KEY_FILE)",
+                    None,
+                )
+
+        # Check candidate keys in keyring
+        # 1. Try receipt's specific key_id first
+        if rcpt_kid in self._keys and rcpt_kid not in self._revoked_keys:
+            if receipt.matches_secret(self._keys[rcpt_kid]):
+                return True, "VERIFIED", rcpt_kid
+
+        # 2. Try default / other non-revoked keys in keyring
+        for kid, sec in self._keys.items():
+            if kid != rcpt_kid and kid not in self._revoked_keys:
+                if receipt.matches_secret(sec):
+                    return True, "VERIFIED", kid
+
+        if rcpt_kid in self._keys:
+            return False, f"SIGNATURE_VERIFICATION_FAILED: Signature mismatch for Key ID '{rcpt_kid}'", None
+        return False, f"KEY_NOT_FOUND: Key ID '{rcpt_kid}' not found in key store", None
+
+
+_DEFAULT_KEY_STORE = CaptureKeyStore()
+
+
+def get_default_key_store() -> CaptureKeyStore:
+    return _DEFAULT_KEY_STORE
+
+
+def set_default_key_store(ks: CaptureKeyStore) -> None:
+    global _DEFAULT_KEY_STORE
+    _DEFAULT_KEY_STORE = ks
+
+
+# Preserved for backward compatibility
+def _get_capture_secret() -> str:
+    return _DEFAULT_KEY_STORE.get_active_signing_key()[1]
+
+
+_CAPTURE_AUTHENTICATION_SECRET = _get_capture_secret()
 
 
 @dataclass(frozen=True)
@@ -37,7 +209,7 @@ class CaptureReceipt:
     """Authentic cryptographic receipt issued exclusively by a RuntimeCaptureBackend.
 
     Proves that physical state was captured from an identified running process by an
-    authenticated capture backend with deterministic artifact hashing.
+    authenticated capture backend with deterministic artifact hashing and key lifecycle binding.
     """
     receipt_id: str
     backend_name: str
@@ -51,13 +223,16 @@ class CaptureReceipt:
     consistency_level: str
     artifact_manifest: Dict[str, str]  # relative_path/range_key -> sha256
     signature: str = ""
+    key_id: str = "default"
+    schema_version: str = "2.0.0"
 
-    def verify_signature(self, secret: Optional[str] = None) -> bool:
-        """Verify HMAC signature using capture authentication secret."""
-        if not self.signature:
+    def matches_secret(self, secret: str) -> bool:
+        """Check if signature matches secret under v2 canonical or v1 backward-compatible format."""
+        if not self.signature or not secret:
             return False
-        sec = secret or _CAPTURE_AUTHENTICATION_SECRET
-        expected = compute_capture_receipt_signature(
+
+        # Try v2 canonical signature first
+        expected_v2 = compute_capture_receipt_signature(
             backend_name=self.backend_name,
             pid=self.pid,
             process_start_time=self.process_start_time,
@@ -67,9 +242,39 @@ class CaptureReceipt:
             completeness=self.completeness,
             consistency_level=self.consistency_level,
             artifact_manifest=self.artifact_manifest,
-            secret=sec,
+            secret=secret,
+            receipt_id=self.receipt_id,
+            capture_duration_us=self.capture_duration_us,
+            key_id=self.key_id,
+            schema_version="2.0.0",
         )
-        return hmac.compare_digest(self.signature, expected)
+        if hmac.compare_digest(self.signature, expected_v2):
+            return True
+
+        # Fallback to v1 legacy format (Phase 8 backward compatibility)
+        expected_v1 = compute_capture_receipt_signature(
+            backend_name=self.backend_name,
+            pid=self.pid,
+            process_start_time=self.process_start_time,
+            executable_path=self.executable_path,
+            executable_build_id=self.executable_build_id,
+            capture_time=self.capture_time,
+            completeness=self.completeness,
+            consistency_level=self.consistency_level,
+            artifact_manifest=self.artifact_manifest,
+            secret=secret,
+            schema_version="1.0.0",
+        )
+        return hmac.compare_digest(self.signature, expected_v1)
+
+    def verify_signature(self, secret: Optional[str] = None) -> bool:
+        """Verify HMAC signature using capture authentication secret or key store."""
+        ok, _, _ = get_default_key_store().verify_receipt(self, explicit_secret=secret)
+        return ok
+
+    def verify_with_status(self, secret: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
+        """Verify HMAC signature returning (is_valid, status_reason, key_id)."""
+        return get_default_key_store().verify_receipt(self, explicit_secret=secret)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -85,6 +290,8 @@ class CaptureReceipt:
             "consistency_level": self.consistency_level,
             "artifact_manifest": dict(self.artifact_manifest),
             "signature": self.signature,
+            "key_id": self.key_id,
+            "schema_version": self.schema_version,
         }
 
     @classmethod
@@ -102,6 +309,8 @@ class CaptureReceipt:
             consistency_level=str(data.get("consistency_level", "")),
             artifact_manifest=dict(data.get("artifact_manifest", {})),
             signature=str(data.get("signature", "")),
+            key_id=str(data.get("key_id", "default")),
+            schema_version=str(data.get("schema_version", "1.0.0")),
         )
 
 
@@ -116,14 +325,35 @@ def compute_capture_receipt_signature(
     consistency_level: str,
     artifact_manifest: Dict[str, str],
     secret: Optional[str] = None,
+    receipt_id: Optional[str] = None,
+    capture_duration_us: float = 0.0,
+    key_id: str = "default",
+    schema_version: str = "2.0.0",
 ) -> str:
-    sec = secret or _CAPTURE_AUTHENTICATION_SECRET
-    manifest_str = json.dumps(artifact_manifest, sort_keys=True)
-    raw = (
-        f"{backend_name}|{pid}|{process_start_time}|{executable_path}|"
-        f"{executable_build_id or ''}|{capture_time}|{completeness}|"
-        f"{consistency_level}|{manifest_str}"
-    )
+    if secret:
+        sec = secret
+    else:
+        _, sec = get_default_key_store().get_active_signing_key()
+
+    # Canonicalize artifact manifest: sorted keys, normalized relative paths, compact json
+    clean_manifest = {str(k).lstrip("./"): str(v) for k, v in sorted(artifact_manifest.items())}
+    manifest_str = json.dumps(clean_manifest, sort_keys=True, separators=(',', ':'))
+
+    if schema_version == "1.0.0":
+        # Phase 8 legacy signature format for backward compatibility
+        raw = (
+            f"{backend_name}|{pid}|{process_start_time}|{executable_path}|"
+            f"{executable_build_id or ''}|{capture_time}|{completeness}|"
+            f"{consistency_level}|{json.dumps(artifact_manifest, sort_keys=True)}"
+        )
+    else:
+        # Phase 9 v2 canonical signature binding receipt_id, capture_duration_us, key_id, and schema_version
+        raw = (
+            f"v2|{receipt_id or ''}|{backend_name}|{pid}|{process_start_time}|"
+            f"{executable_path}|{executable_build_id or ''}|{capture_time}|"
+            f"{capture_duration_us:.6f}|{completeness}|{consistency_level}|"
+            f"{key_id}|{manifest_str}"
+        )
     return hmac.new(sec.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -139,8 +369,22 @@ def issue_capture_receipt(
     consistency_level: str,
     artifact_manifest: Dict[str, str],
     secret: Optional[str] = None,
+    key_id: Optional[str] = None,
+    receipt_id: Optional[str] = None,
+    schema_version: str = "2.0.0",
 ) -> CaptureReceipt:
-    sec = secret or _CAPTURE_AUTHENTICATION_SECRET
+    ks = get_default_key_store()
+    if secret:
+        eff_sec = secret
+        eff_kid = key_id or "default"
+    else:
+        eff_kid, eff_sec = ks.get_active_signing_key()
+        if key_id:
+            eff_kid = key_id
+            if key_id in ks._keys:
+                eff_sec = ks._keys[key_id]
+
+    rcpt_id = receipt_id or f"cap_rcpt_{uuid.uuid4().hex[:12]}"
     sig = compute_capture_receipt_signature(
         backend_name=backend_name,
         pid=pid,
@@ -151,9 +395,12 @@ def issue_capture_receipt(
         completeness=completeness,
         consistency_level=consistency_level,
         artifact_manifest=artifact_manifest,
-        secret=sec,
+        secret=eff_sec,
+        receipt_id=rcpt_id,
+        capture_duration_us=capture_duration_us,
+        key_id=eff_kid,
+        schema_version=schema_version,
     )
-    rcpt_id = f"cap_rcpt_{uuid.uuid4().hex[:12]}"
     return CaptureReceipt(
         receipt_id=rcpt_id,
         backend_name=backend_name,
@@ -165,8 +412,10 @@ def issue_capture_receipt(
         capture_duration_us=capture_duration_us,
         completeness=completeness,
         consistency_level=consistency_level,
-        artifact_manifest=artifact_manifest,
+        artifact_manifest=dict(artifact_manifest),
         signature=sig,
+        key_id=eff_kid,
+        schema_version=schema_version,
     )
 
 

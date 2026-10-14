@@ -73,22 +73,30 @@ Phase 8 establishes five distinct, non-conflated trust claims across the evidenc
 
 ---
 
-## 5. Capture Backend Authentication & `CaptureReceipt`
+## 5. Capture Backend Authentication, Key Lifecycle & `CaptureReceipt`
 
 To guarantee that snapshot artifacts originate from authenticated kernel captures rather than imported files or fabricated JSON:
 
 1. **Internal Minting**: `CaptureReceipt` is minted directly inside trusted capture backends (`ProcessVmCaptureBackend`, `ProcfsCaptureBackend`) immediately following memory extraction.
-2. **Cryptographic Binding**: The receipt binds:
+2. **Cryptographic Binding (Schema 2.0.0)**: The receipt binds:
+   - Receipt unique identifier (`receipt_id`) and capture duration (`capture_duration_us`).
    - Target process PID and start time (epoch ticks from `/proc/<pid>/stat`).
    - Executable build ID and binary path.
    - Capture backend type and capture timestamp.
    - Completeness (`COMPLETE`) and consistency level (`STOPPED`).
-   - Artifact manifest digest (`compute_snapshot_artifact_hash()`).
-   - HMAC-SHA256 signature using the internal session secret.
-3. **Storage & Verification**: When serialized to disk via `RawRuntimeSnapshot.save()`, `capture_receipt.json` is generated. Upon loading or live verification:
-   - The HMAC signature is verified against the session secret.
-   - The artifact manifest is recomputed across all metadata and memory `.bin` files; extra, missing, or altered files are detected.
+   - Active Key ID (`key_id`) from the key store.
+   - Deterministic artifact manifest (`compute_capture_receipt_signature()` with canonicalized sorted paths and compact JSON).
+   - HMAC-SHA256 signature using the active signing key from `CaptureKeyStore`.
+3. **Key Lifecycle Architecture (`CaptureKeyStore`)**:
+   - **Configured vs. Ephemeral Fallback**: When `DYNAMICSTATE_CAPTURE_SECRET`, `DYNAMICSTATE_CAPTURE_KEY_FILE`, or `DYNAMICSTATE_CAPTURE_KEYRING` is set, explicit keys are registered and marked as configured. In local unconfigured runs, a process-local ephemeral key is used; cross-process receipt verification against an unconfigured store fails closed with `VERIFICATION_KEY_UNAVAILABLE`.
+   - **Key Rotation**: New signing keys can be rotated in via `rotate_key(new_key_id, new_secret)` without invalidating existing receipts signed with older keys in the keyring.
+   - **Key Revocation**: Compromised or retired keys can be revoked via `revoke_key(key_id)`; receipts signed with revoked keys immediately evaluate to `KEY_REVOKED`.
+   - **Secret Non-Leakage**: Secrets are never serialized into receipts, snapshot metadata, JSON files, API responses, or exception messages.
+4. **Storage & Verification**: When serialized to disk via `RawRuntimeSnapshot.save()`, `capture_receipt.json` is generated. Upon loading or live verification:
+   - The HMAC signature is verified against the key store (`verify_with_status()`).
+   - The artifact manifest is recomputed across all metadata and memory `.bin` files; extra, missing, or altered files are detected and marked `TAMPERED`.
    - Any symbolic link in the snapshot hierarchy is strictly rejected to prevent symlink redirection attacks.
+   - Snapshots lacking a receipt are cleanly loaded and marked `UNVERIFIED_LEGACY`.
    - For live processes, process start time is cross-checked against `/proc/<pid>/stat` to defeat PID recycling.
 
 ---
@@ -141,7 +149,7 @@ To eliminate loose substring or suffix collisions, comparisons use object-aware 
 
 Test suites are categorized into distinct operational tiers:
 
-- **Category A (Unit Tests & Synthetic Adversarial Fixtures)**: 77 tests in `tests/test_causal_validation_hardening.py` verifying attestation security, HMAC signatures, tamper detection, capability consumption, Phase 8 trust levels (Tests A–L), and adversarial ingress hardening.
+- **Category A (Unit Tests & Synthetic Adversarial Fixtures)**: 83 tests in `tests/test_causal_validation_hardening.py` verifying attestation security, HMAC signatures, tamper detection, capability consumption, Phase 8 trust levels (Tests A–L), Phase 9 cross-process evidence trust and key lifecycle suites, and adversarial ingress hardening.
 - **Category B (Artifact Integrity & Manifest Hashing)**: Recursive directory payload hashing, file addition/deletion/modification detection, and path traversal/symlink rejection.
 - **Category C (Offline Reconstruction Tests)**: DWARF type recovery, layout mutation caveats, and offline object graph decoders (`test_offline_analyzer.py`, `test_dwarf_semantic_reconstruction.py`).
 - **Category D (Real Local C++ Process Tests)**: 5 end-to-end integration scenarios in `tests/test_cpp_e2e_investigation.py` and positive control in `test_causal_validation_hardening.py` running live compiled binaries with `g++`, stdin/stdout synchronization, thread workers, and kernel capture backends.

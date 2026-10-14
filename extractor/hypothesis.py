@@ -37,6 +37,11 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
     TRUSTED_PROVENANCE_CLASSES,
+    CLAIM_ARTIFACT_INTEGRITY_VERIFIED,
+    CLAIM_CAPTURE_PROVENANCE_VERIFIED,
+    CLAIM_TARGET_IDENTITY_VERIFIED,
+    CLAIM_STATE_TRANSITION_VERIFIED,
+    CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
 )
 
 # -----------------------------------------------------------------------------
@@ -1120,6 +1125,7 @@ class HypothesisValidator:
                     # Upgrade function candidate if present (Invariant 1 & 2: STATIC_CANDIDATE never promoted!)
                     target_fn = proof_att.get("target_function") or (proof_rec.details or {}).get("target_function")
                     func_attr_ver = bool(proof_att.get("function_attribution_verified", False))
+                    attr_lim = proof_att.get("attribution_limitation")
 
                     for fc in hypothesis.function_candidates:
                         tier = fc.get("candidate_tier")
@@ -1132,7 +1138,7 @@ class HypothesisValidator:
                                     fc["tier_limitation"] = f"Causal role verified via deterministic reproduction and verified function attribution in evidence {proof_rec.evidence_id}."
                                 else:
                                     fc["confirmed_root_cause"] = False
-                                    fc["tier_limitation"] = f"State transition verified in runtime, but function attribution was not independently verified by execution instrumentation."
+                                    fc["tier_limitation"] = attr_lim or f"State transition verified in runtime, but function attribution was not independently verified by execution instrumentation."
                             else:
                                 fc["confirmed_root_cause"] = False
                                 fc["tier_limitation"] = f"Observed in execution, but causal proof evidence identifies {target_fn or 'another function'} as the causal writer."
@@ -1144,7 +1150,7 @@ class HypothesisValidator:
                             else:
                                 # Invariant 1: static candidates remain static candidates without verified attribution
                                 fc["confirmed_root_cause"] = False
-                                fc["tier_limitation"] = "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
+                                fc["tier_limitation"] = attr_lim or "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
             else:
                 # Causal proof was not established
                 if proof_rec and (proof_rec.capture_quality or {}).get("completeness") in ("FAILED", "INVALID", "UNTRUSTED"):
