@@ -69,6 +69,14 @@ jobs:
         run: |
           python3 scripts/run_e2e_operational_acceptance.py
 
+      - name: Run Phase 14 Production Pilot and Release Qualification Tests
+        run: |
+          python3 -m unittest tests/test_phase14_production_pilot.py
+
+      - name: Run Phase 14 Production Pilot Demonstration Script
+        run: |
+          python3 scripts/run_production_pilot.py --smoke
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests
@@ -80,5 +88,6 @@ jobs:
       - name: Run Performance Benchmark Smoke Test
         run: |
           python3 -m benchmarks.capture_benchmark --smoke
+
 
 

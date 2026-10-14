@@ -92,27 +92,35 @@ run_step "Phase 13 End-to-End Operational Acceptance Suite" \
 run_step "Phase 13 Operational Acceptance Demonstration Script" \
     python3 scripts/run_e2e_operational_acceptance.py
 
-# 11. Discover and run all remaining unit and integration tests
+# 13. Phase 14 Production Pilot & Release Qualification Suite
+run_step "Phase 14 Production Pilot & Release Qualification Suite" \
+    python3 -m unittest tests/test_phase14_production_pilot.py
+
+# 14. Phase 14 Production Pilot Demonstration Script
+run_step "Phase 14 Production Pilot Demonstration Script" \
+    python3 scripts/run_production_pilot.py --smoke
+
+# 15. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 
-# 12. Multithread determinism & branch isolation specific tests
+# 16. Multithread determinism & branch isolation specific tests
 run_step "Multithread Restart Determinism & Branch Isolation Suite" \
     python3 -m unittest tests/test_multithread_exploration.py
 
-# 13. Web API & UI Lifecycle Suite
+# 17. Web API & UI Lifecycle Suite
 run_step "Web API & Server Lifecycle Tests" \
     python3 -m unittest tests/test_web_api.py tests/test_web_server_lifecycle.py
 
-# 14. CI Workflow Parity & Discoverability Suite
+# 18. CI Workflow Parity & Discoverability Suite
 run_step "CI Workflow Parity & Discoverability Suite" \
     python3 -m unittest tests/test_ci_workflow_parity.py
 
-# 15. Performance Benchmark Integrity & Unit Suite
+# 19. Performance Benchmark Integrity & Unit Suite
 run_step "Capture Benchmark Integrity & Schema Suite" \
     python3 -m unittest tests/test_capture_benchmark.py
 
-# 16. Performance Benchmark Smoke Test
+# 20. Performance Benchmark Smoke Test
 run_step "Capture Performance Benchmark Smoke Test" \
     python3 -m benchmarks.capture_benchmark --smoke
 

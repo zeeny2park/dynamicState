@@ -19,6 +19,10 @@ tmp_*
 corpus/
 build/
 
-# Snapshot outputs (preserve directory with .gitkeep)
+# Snapshot and pilot report outputs
 snapshots/*.json
 !snapshots/.gitkeep
+reports/
+*.raw
+*.bin
+

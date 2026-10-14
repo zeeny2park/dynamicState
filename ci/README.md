@@ -8,7 +8,7 @@ This directory contains the automated CI workflows for dynamicState.
    - Runs on Ubuntu 22.04.
    - Installs system dependencies (`gdb`, `gcc`, `g++`, `make`).
    - Compiles the native C99 target collector (`target/collector`) and real runtime C++ fixtures.
-   - Executes the full test suite (430 unit and integration tests including multithread exploration, memory snapshot, and lifecycle tests, plus end-to-end C++ investigation pipeline scenarios A-E).
+   - Executes the full test suite (634+ unit and integration tests across all modules, including Phase 10-14 security gates, operational acceptance, and production pilot).
 
 2. **`ci/workflows/gdb92.yml`**:
    - Runs on Ubuntu 22.04 with Docker.
@@ -31,7 +31,7 @@ To prevent drift between `ci/workflows/` and `.github/workflows/`, all changes t
 
 ### Local Test Matrix & Verification Commands
 
-Because remote workflow pushes require the `workflow` OAuth token scope which is currently absent, the complete regression and benchmark suite can be executed locally with identical coverage:
+Because remote workflow pushes require the `workflow` OAuth token scope which is currently absent, the complete regression, operational acceptance, and production pilot suite can be executed locally with identical coverage:
 
 ```bash
 # 1. Benchmark harness and acceptance gates (12 tests)
@@ -46,13 +46,30 @@ python3 -m unittest tests/test_real_runtime_validation.py -v
 # 4. End-to-end C++ investigation pipeline scenarios A-E (5 tests)
 python3 -m unittest tests/test_cpp_e2e_investigation.py -v
 
-# 5. Capture benchmark smoke run (schema, byte accounting, SLA checks)
+# 5. Phase 10 CI Security Gates & Trust Boundaries (16 tests)
+python3 -m unittest tests/test_phase10_ci_security_gates.py -v
+
+# 6. Phase 11 Real-Target Release Readiness (17 tests)
+python3 -m unittest tests/test_phase11_real_target_release_readiness.py -v
+
+# 7. Phase 12 Conversational Investigation Loop (11 tests)
+python3 -m unittest tests/test_phase12_investigation_loop.py -v
+
+# 8. Phase 13 End-to-End Operational Acceptance (16 tests)
+python3 -m unittest tests/test_phase13_operational_acceptance.py -v
+python3 scripts/run_e2e_operational_acceptance.py
+
+# 9. Phase 14 Embedded Linux Production Pilot & Security Gates (13 tests)
+python3 -m unittest tests/test_phase14_production_pilot.py -v
+python3 scripts/run_production_pilot.py --smoke
+
+# 10. Capture benchmark smoke run (schema, byte accounting, SLA checks)
 python3 -m benchmarks.capture_benchmark --smoke
 
-# 6. Capture benchmark 20-iteration acceptance run
+# 11. Capture benchmark 20-iteration acceptance run
 python3 -m benchmarks.capture_benchmark --iterations 20 --acceptance --output benchmarks/latest_results.json
 
-# 7. Full test discovery suite (464 tests)
+# 12. Full test discovery suite (634+ tests)
 python3 -m unittest discover -s tests -v
 ```
 
