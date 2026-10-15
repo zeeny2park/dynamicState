@@ -37,13 +37,18 @@
         <span class="pill-label" data-i18n="hdr_lbl_investigation">Investigation:</span>
         <span class="badge badge-neutral" id="hdr-badge-investigation-state">NOT_STARTED</span>
       </div>
+      <!-- LLM Provider Status -->
+      <div class="status-pill status-llm" id="pill-llm-status" title="Conversational LLM Provider connection state" data-i18n-title="pill_llm_status_title">
+        <span class="pill-label">LLM:</span>
+        <span class="badge badge-neutral" id="hdr-badge-llm-status">CHECKING</span>
+      </div>
     </div>
 
     <div class="header-actions">
-      <!-- Human-Centric Basic vs Advanced Mode Toggle -->
+      <!-- Human-Centric Basic vs Expert Mode Toggle -->
       <div class="mode-toggle-group" id="group-mode-toggle" title="Switch between human-friendly Basic view and technical Advanced view" data-i18n-title="title_mode_toggle">
         <button type="button" class="btn btn-sm btn-mode active" id="btn-mode-basic" data-i18n="btn_mode_basic">👤 Basic</button>
-        <button type="button" class="btn btn-sm btn-mode" id="btn-mode-advanced" data-i18n="btn_mode_advanced">⚙️ Advanced</button>
+        <button type="button" class="btn btn-sm btn-mode" id="btn-mode-advanced" data-i18n="btn_mode_advanced">⚙️ Expert Mode</button>
       </div>
 
       <!-- Language Toggle Group (English / 한국어) -->
@@ -146,15 +151,15 @@
   </div>
 
   <!-- Main Navigation Tabs (8 Functional Views) -->
-  <nav class="app-nav">
-    <button class="nav-tab active" data-tab="tab-investigation-overview" id="nav-tab-investigation" data-i18n="nav_tab_0">0. 🔍 Investigation Overview</button>
-    <button class="nav-tab" data-tab="tab-object-explorer" data-i18n="nav_tab_1">1. 📦 Object Explorer</button>
-    <button class="nav-tab" data-tab="tab-thread-explorer" data-i18n="nav_tab_2">2. 🧵 Thread Explorer</button>
-    <button class="nav-tab" data-tab="tab-memory-snapshot" data-i18n="nav_tab_3">3. 🧠 Memory Snapshot</button>
-    <button class="nav-tab" data-tab="tab-history-diff" data-i18n="nav_tab_4">4. 📜 State DAG & Diff</button>
-    <button class="nav-tab" data-tab="tab-advanced-explore" data-i18n="nav_tab_5">5. ⚡ Autonomous Loop</button>
-    <button class="nav-tab" data-tab="tab-system-provenance" data-i18n="nav_tab_6">6. 🛠️ System / Modules</button>
-    <button class="nav-tab" data-tab="tab-state-lab" id="nav-tab-state-lab" data-i18n="nav_tab_7">7. 🔬 State Laboratory</button>
+  <nav class="app-nav" id="app-nav-tabs">
+    <button class="nav-tab active" data-tab="tab-investigation-overview" id="nav-tab-investigation" data-i18n="nav_tab_0">0. 🔍 Investigation Workspace</button>
+    <button class="nav-tab advanced-only" data-tab="tab-object-explorer" data-i18n="nav_tab_1">1. 📦 Object Explorer</button>
+    <button class="nav-tab advanced-only" data-tab="tab-thread-explorer" data-i18n="nav_tab_2">2. 🧵 Thread Explorer</button>
+    <button class="nav-tab advanced-only" data-tab="tab-memory-snapshot" data-i18n="nav_tab_3">3. 🧠 Memory Snapshot</button>
+    <button class="nav-tab advanced-only" data-tab="tab-history-diff" data-i18n="nav_tab_4">4. 📜 State DAG & Diff</button>
+    <button class="nav-tab advanced-only" data-tab="tab-advanced-explore" data-i18n="nav_tab_5">5. ⚡ Autonomous Loop</button>
+    <button class="nav-tab advanced-only" data-tab="tab-system-provenance" data-i18n="nav_tab_6">6. 🛠️ System / Modules</button>
+    <button class="nav-tab advanced-only" data-tab="tab-state-lab" id="nav-tab-state-lab" data-i18n="nav_tab_7">7. 🔬 State Laboratory</button>
   </nav>
 
   <!-- Banner for low-impact observation mode -->
@@ -292,8 +297,164 @@
           <span id="inv-alert-message" class="text-xs"></span>
         </div>
 
+        <!-- Phase 15: Simplified Investigation Workspace & Conversational LLM -->
+        <div class="inv-card inv-chat-workspace mb-3" id="inv-chat-workspace">
+          <div class="inv-card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="inv-card-title" data-i18n="title_conversational_analysis">💬 대화형 시스템 조사 (Conversational Investigation)</span>
+              <span class="badge" id="badge-llm-provider-status" title="LLM Provider Status">🤖 LLM 확인 중...</span>
+            </div>
+            <div class="text-xs text-muted" id="txt-llm-provider-meta">
+              <span id="txt-llm-model-name">...</span>
+            </div>
+          </div>
+
+          <!-- Problem Description Input & Quick Prompt Chips -->
+          <div class="inv-chat-input-section" style="padding: 12px 16px;">
+            <label for="inv-chat-textarea" class="text-xs" style="font-weight: 600; display: block; margin-bottom: 6px;" data-i18n="lbl_chat_problem">
+              🔍 조사할 문제나 증상을 설명하세요 (Describe Problem in Natural Language):
+            </label>
+            <div style="position: relative;">
+              <textarea id="inv-chat-textarea" class="form-input" rows="3" style="width: 100%; resize: vertical; font-size: 0.85rem;"
+                        placeholder="예: 변수 state 값이 1에서 2로 비정상 변경되었습니다. 원인 함수 후보와 경쟁 상태 가능성을 분석해주세요."
+                        data-i18n-placeholder="ph_chat_problem"></textarea>
+            </div>
+
+            <!-- Korean Quick Prompt Chips -->
+            <div class="quick-prompts-bar" style="margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center;">
+              <span class="text-xs text-muted" style="font-weight: 600;" data-i18n="lbl_quick_prompts">추천 질의:</span>
+              <button type="button" class="btn btn-xs btn-outline quick-prompt-btn" data-prompt="변수 값이 예상과 다르게 변경되었습니다. DWARF 및 정적 분석을 통해 원인 함수 후보를 분석해주세요.">
+                🎯 변수 변경 원인 분석
+              </button>
+              <button type="button" class="btn btn-xs btn-outline quick-prompt-btn" data-prompt="경쟁 쓰레드(Data Race) 또는 동시 쓰기로 인한 비원자적(NON_ATOMIC) 캡처 왜곡 가능성을 점검해주세요.">
+                ⚡ 경쟁 쓰레드 / 레이스 점검
+              </button>
+              <button type="button" class="btn btn-xs btn-outline quick-prompt-btn" data-prompt="현재 가설들을 검증하기 위해 가장 효과적인 차별화 관측(읽기 전용 필드 비교 또는 스냅샷 대조)을 추천해주세요.">
+                📋 가설 검증 및 관측 추천
+              </button>
+            </div>
+
+            <!-- Action Buttons & 4-Stage Progress Stepper -->
+            <div style="margin-top: 12px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <button type="button" id="btn-chat-analyze" class="btn btn-primary btn-lg" style="font-weight: 700; padding: 10px 24px;">
+                  <span>🔍</span> <span data-i18n="btn_chat_analyze">분석 시작 (Analyze)</span>
+                </button>
+                <button type="button" id="btn-chat-cancel" class="btn btn-outline btn-sm" style="display: none; color: var(--danger); border-color: var(--danger);">
+                  <span>🛑</span> <span data-i18n="btn_chat_cancel">취소 (Cancel)</span>
+                </button>
+              </div>
+
+              <!-- 4-Stage Progress Stepper -->
+              <div id="inv-chat-stepper" class="chat-progress-stepper" style="display: none;">
+                <span class="chat-step" id="step-gather">1. 컨텍스트 수집</span>
+                <span class="chat-step-arrow">&rarr;</span>
+                <span class="chat-step" id="step-llm">2. LLM 추론</span>
+                <span class="chat-step-arrow">&rarr;</span>
+                <span class="chat-step" id="step-validate">3. 증거 검증</span>
+                <span class="chat-step-arrow">&rarr;</span>
+                <span class="chat-step" id="step-done">4. 완료</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Structured Analysis Results (4 Clear Sections) -->
+          <div id="inv-chat-results" style="display: none; padding: 0 16px 16px 16px;">
+            <div class="banner banner-info mb-3" id="inv-chat-summary-banner" style="display: flex; align-items: flex-start; gap: 10px;">
+              <span style="font-size: 1.2rem;">💡</span>
+              <div style="flex: 1;">
+                <strong id="inv-chat-summary-title">진단 요약 (Diagnostic Summary)</strong>
+                <p id="inv-chat-summary-text" class="text-xs" style="margin: 4px 0 0 0; line-height: 1.5;"></p>
+                <div id="inv-chat-disarmed-notice" class="text-xs" style="margin-top: 6px; color: #f59e0b; display: none;"></div>
+              </div>
+            </div>
+
+            <div class="chat-sections-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px;">
+              <!-- Section 1: Facts -->
+              <div class="chat-section-card facts-card">
+                <div class="chat-section-header">
+                  <span>🟢 확인된 사실 (Observed Facts)</span>
+                  <span class="badge badge-success text-xs" id="badge-chat-facts-count">0</span>
+                </div>
+                <div id="chat-section-facts-list" class="chat-section-body text-xs">
+                  <div class="text-muted p-2">관측된 사실이 없습니다.</div>
+                </div>
+              </div>
+
+              <!-- Section 2: Hypotheses & Candidate Functions -->
+              <div class="chat-section-card hypotheses-card">
+                <div class="chat-section-header">
+                  <span>🟡 가설 및 함수 후보 (Hypotheses &amp; Candidates)</span>
+                  <span class="badge badge-warning text-xs" id="badge-chat-hypo-count">0</span>
+                </div>
+                <div id="chat-section-hypo-list" class="chat-section-body text-xs">
+                  <div class="text-muted p-2">제안된 가설이 없습니다.</div>
+                </div>
+              </div>
+
+              <!-- Section 3: Unknowns -->
+              <div class="chat-section-card unknowns-card">
+                <div class="chat-section-header">
+                  <span>⚪ 미확인 사항 (Unknowns &amp; Uncertainties)</span>
+                  <span class="badge badge-neutral text-xs" id="badge-chat-unknown-count">0</span>
+                </div>
+                <div id="chat-section-unknown-list" class="chat-section-body text-xs">
+                  <div class="text-muted p-2">미확인 사항이 없습니다.</div>
+                </div>
+              </div>
+
+              <!-- Section 4: Recommended Next Steps with Approve & Observe -->
+              <div class="chat-section-card nextsteps-card">
+                <div class="chat-section-header">
+                  <span>📋 추천 후속 조치 (Recommended Next Steps)</span>
+                  <span class="badge badge-info text-xs" id="badge-chat-steps-count">0</span>
+                </div>
+                <div id="chat-section-steps-list" class="chat-section-body text-xs">
+                  <div class="text-muted p-2">추천 단계가 없습니다.</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Follow-up Conversational Turns & Continuous Chat -->
+            <div class="inv-followup-chat mt-3" style="border-top: 1px solid var(--border-color); padding-top: 14px;">
+              <div style="font-weight: 600; font-size: 0.85rem; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
+                <span>💬 후속 질의 및 대화 이력 (Follow-up Discussion)</span>
+                <button type="button" class="btn btn-xs btn-outline" id="btn-clear-chat-history">이력 초기화</button>
+              </div>
+              <div id="chat-conversation-stream" style="max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 6px 0;">
+                <!-- Chat bubbles rendered here -->
+              </div>
+              <div style="display: flex; gap: 8px; margin-top: 8px;">
+                <input type="text" id="inv-chat-followup-input" class="form-input text-xs" style="flex: 1;"
+                       placeholder="후속 질문을 입력하세요 (예: 이 함수가 호출된 다른 증거가 있나요?)..."
+                       data-i18n-placeholder="ph_chat_followup">
+                <button type="button" id="btn-chat-followup-send" class="btn btn-secondary btn-sm">전송 (Send)</button>
+              </div>
+            </div>
+
+            <!-- Progressive Disclosure Details Drawer -->
+            <div class="mt-3">
+              <details class="inv-progressive-details" id="inv-progressive-details">
+                <summary style="cursor: pointer; font-size: 0.8rem; font-weight: 600; color: var(--accent); padding: 6px 0;">
+                  🔍 세부 기술 데이터 및 증거 원장 펼치기 (Expand Technical Evidence &amp; Audit Ledger)
+                </summary>
+                <div class="details-content mt-2 p-3" style="background: var(--bg-card); border-radius: 6px; border: 1px solid var(--border-color);">
+                  <div class="text-xs mb-2">
+                    <strong>컨텍스트 핑거프린트:</strong> <span class="mono" id="txt-chat-context-fingerprint">N/A</span> &bull;
+                    <strong>검증 상태:</strong> <span class="badge badge-info" id="badge-chat-validation-status">VALIDATED_CLEAN</span> &bull;
+                    <strong>처리 시간:</strong> <span id="txt-chat-duration">0 ms</span>
+                  </div>
+                  <div class="text-xs text-muted mb-2">
+                    참조된 증거 ID: <span class="mono" id="txt-chat-evidence-refs">None</span>
+                  </div>
+                </div>
+              </details>
+            </div>
+          </div>
+        </div>
+
         <!-- 2-Column Overview Dashboard Grid -->
-        <div class="inv-dashboard-grid">
+        <div class="inv-dashboard-grid advanced-only">
           
           <!-- LEFT COLUMN: Identity, Quality, Comparisons, Next Steps -->
           <div style="display: flex; flex-direction: column; gap: 16px;">

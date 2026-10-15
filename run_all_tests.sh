@@ -100,7 +100,11 @@ run_step "Phase 14 Production Pilot & Release Qualification Suite" \
 run_step "Phase 14 Production Pilot Demonstration Script" \
     python3 scripts/run_production_pilot.py --smoke
 
-# 15. Discover and run all remaining unit and integration tests
+# 15. Phase 15 Conversational LLM & Simplified Investigation UX Suite
+run_step "Phase 15 Conversational LLM & Simplified Investigation UX Suite" \
+    python3 -m unittest tests/test_phase15_conversational_llm.py
+
+# 16. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

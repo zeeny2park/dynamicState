@@ -134,6 +134,9 @@ class AgentAction(_SubscriptableModel):
     file_path: Optional[str] = None
     session_data: Optional[Dict[str, Any]] = None
     reason: Optional[str] = None
+    message: Optional[str] = None
+    request_id: Optional[str] = None
+    provider_override: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -185,6 +188,9 @@ class AgentAction(_SubscriptableModel):
             file_path=data.get("file_path"),
             session_data=data.get("session_data"),
             reason=data.get("reason"),
+            message=data.get("message") or data.get("user_message"),
+            request_id=data.get("request_id"),
+            provider_override=data.get("provider_override"),
         )
 
 

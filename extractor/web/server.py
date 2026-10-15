@@ -1567,6 +1567,31 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": res.error.code if res.error else "LOAD_ERROR",
                                             "message": res.error.message if res.error else "Failed to load session"}}
 
+    def analyze_investigation_chat(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        inv_id = params.get("investigation_id")
+        if not inv_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        msg = params.get("message") or params.get("user_message") or "Analyze the observed state changes and propose evidence-grounded hypotheses."
+        req_id = params.get("request_id")
+        provider_override = params.get("provider_override")
+        res = self.runtime.analyze_investigation_chat(
+            investigation_id=inv_id,
+            message=msg,
+            request_id=req_id,
+            provider_override=provider_override,
+        )
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "CONVERSATIONAL_ANALYSIS_ERROR",
+                                            "message": res.error.message if res.error else "Failed to analyze chat"}}
+
+    def get_llm_status(self) -> Dict[str, Any]:
+        res = self.runtime.get_llm_status()
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "RUNTIME_ERROR",
+                                            "message": res.error.message if res.error else "Failed to get LLM status"}}
+
 
 WebRuntimeAdapter = WebApiAdapter
 
@@ -1879,6 +1904,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.list_investigations())
                 return
 
+            # GET /api/llm/status and /api/investigation/llm-status
+            if path in ("/api/llm/status", "/api/investigation/llm-status", "/api/investigation/chat/status"):
+                self._send_json(adapter.get_llm_status())
+                return
+
             # Unrecognized API endpoint
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
                             status=404)
@@ -1995,6 +2025,10 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
             if path == "/api/investigation/load":
                 self._send_json(adapter.load_investigation(body))
+                return
+
+            if path in ("/api/investigation/chat", "/api/investigation/analyze-chat"):
+                self._send_json(adapter.analyze_investigation_chat(body))
                 return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},

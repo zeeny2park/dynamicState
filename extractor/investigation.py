@@ -264,6 +264,7 @@ class InvestigationSession:
         self.summary: Dict[str, Any] = {}
         self.persistence: str = "EPHEMERAL_PROCESS_LOCAL"
         self.timeline: List[Dict[str, Any]] = []
+        self.chat_history: List[Dict[str, Any]] = []
 
     @property
     def session_secret(self) -> str:
@@ -401,6 +402,7 @@ class InvestigationSession:
             "timeline": list(self.timeline),
             "timeline_count": len(self.timeline),
             "evidence_ledger": self.ledger.to_dict(),
+            "chat_history": list(getattr(self, "chat_history", [])),
         }
 
     @classmethod
@@ -424,6 +426,7 @@ class InvestigationSession:
         session.comparison_results = list(data.get("comparison_results", []))
         session.summary = dict(data.get("summary", {}))
         session.timeline = list(data.get("timeline", []))
+        session.chat_history = list(data.get("chat_history", []))
 
         # Reconstruct ledger if present
         ledger_data = data.get("evidence_ledger")
@@ -3215,6 +3218,37 @@ class InvestigationManager:
         session = InvestigationSession.from_dict(data, corpus=self.corpus)
         self.sessions[session.investigation_id] = session
         return {"success": True, "investigation_id": session.investigation_id, "session": session.to_dict()}
+
+    def analyze_chat(
+        self,
+        investigation_id: str,
+        message: str,
+        request_id: Optional[str] = None,
+        provider_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute conversational analysis for the investigation session using configured LLM or honest fallback."""
+        session = self.sessions.get(investigation_id)
+        if not session:
+            return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
+
+        from extractor.conversational_investigation import ConversationalAnalysisService
+        service = ConversationalAnalysisService()
+        result = service.analyze_investigation(
+            session=session,
+            user_message=message,
+            request_id=request_id,
+            provider_override=provider_override,
+        )
+        return {
+            "success": True,
+            "investigation_id": investigation_id,
+            "result": result.to_dict(),
+        }
+
+    def get_llm_status(self) -> Dict[str, Any]:
+        """Return safe status of LLM provider without secrets."""
+        from extractor.llm_provider import LLMProviderManager
+        return LLMProviderManager.get_instance().get_status()
 
     # -------------------------------------------------------------------------
     # Stage Execution Internals

@@ -288,6 +288,18 @@ class AgentRuntime:
                 if not data_or_path:
                     return self._error("INVALID_FIELD", "file_path or session_data is required", act, t0)
                 return self.load_investigation_session(data_or_path)
+            elif act in ("ANALYZE_INVESTIGATION_CHAT", "INVESTIGATION_CHAT", "CHAT_INVESTIGATION"):
+                if not action.investigation_id:
+                    return self._error("INVALID_FIELD", "investigation_id is required", act, t0)
+                msg = action.message or "Analyze the observed state changes and propose evidence-grounded hypotheses."
+                return self.analyze_investigation_chat(
+                    action.investigation_id,
+                    msg,
+                    request_id=action.request_id,
+                    provider_override=action.provider_override,
+                )
+            elif act == "GET_LLM_STATUS":
+                return self.get_llm_status()
             else:
                 return self._error("CAPABILITY_UNSUPPORTED", f"Action '{act}' is not supported by ARP", act, t0)
         except Exception as exc:
@@ -1995,5 +2007,41 @@ class AgentRuntime:
             data=res,
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
         )
+
+    def analyze_investigation_chat(
+        self,
+        investigation_id: str,
+        message: str,
+        request_id: Optional[str] = None,
+        provider_override: Optional[str] = None,
+    ) -> AgentActionResult:
+        """Execute conversational analysis grounded strictly in investigation session evidence."""
+        t0 = time.monotonic()
+        res = self.investigation_manager.analyze_chat(
+            investigation_id=investigation_id,
+            message=message,
+            request_id=request_id,
+            provider_override=provider_override,
+        )
+        if not res.get("success", False):
+            return self._error("CONVERSATIONAL_ANALYSIS_ERROR", res.get("error", "Failed to analyze chat"), "ANALYZE_INVESTIGATION_CHAT", t0)
+        return AgentActionResult(
+            success=True,
+            action="ANALYZE_INVESTIGATION_CHAT",
+            data=res.get("result"),
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def get_llm_status(self) -> AgentActionResult:
+        """Return safe status of LLM provider without secrets."""
+        t0 = time.monotonic()
+        status = self.investigation_manager.get_llm_status()
+        return AgentActionResult(
+            success=True,
+            action="GET_LLM_STATUS",
+            data=status,
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
 
 

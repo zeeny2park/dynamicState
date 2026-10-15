@@ -42,6 +42,9 @@
     selectedFieldName: null,
     candidateTierFilter: 'all',
     showingRawJson: false,
+    llmStatus: null,
+    conversationalHistory: [],
+    isAnalyzingChat: false,
   };
 
   // DOM Elements Cache
@@ -50,6 +53,43 @@
     groupLangToggle: document.getElementById('group-lang-toggle'),
     btnLangEn: document.getElementById('btn-lang-en'),
     btnLangKo: document.getElementById('btn-lang-ko'),
+
+    // Phase 15: Conversational LLM & Simplified Investigation Workspace
+    hdrBadgeLlmStatus: document.getElementById('hdr-badge-llm-status'),
+    invChatWorkspace: document.getElementById('inv-chat-workspace'),
+    badgeLlmProviderStatus: document.getElementById('badge-llm-provider-status'),
+    txtLlmProviderMeta: document.getElementById('txt-llm-provider-meta'),
+    txtLlmModelName: document.getElementById('txt-llm-model-name'),
+    invChatTextarea: document.getElementById('inv-chat-textarea'),
+    btnChatAnalyze: document.getElementById('btn-chat-analyze'),
+    btnChatCancel: document.getElementById('btn-chat-cancel'),
+    invChatStepper: document.getElementById('inv-chat-stepper'),
+    stepGather: document.getElementById('step-gather'),
+    stepLlm: document.getElementById('step-llm'),
+    stepValidate: document.getElementById('step-validate'),
+    stepDone: document.getElementById('step-done'),
+    invChatResults: document.getElementById('inv-chat-results'),
+    invChatSummaryBanner: document.getElementById('inv-chat-summary-banner'),
+    invChatSummaryTitle: document.getElementById('inv-chat-summary-title'),
+    invChatSummaryText: document.getElementById('inv-chat-summary-text'),
+    invChatDisarmedNotice: document.getElementById('inv-chat-disarmed-notice'),
+    chatSectionFactsList: document.getElementById('chat-section-facts-list'),
+    badgeChatFactsCount: document.getElementById('badge-chat-facts-count'),
+    chatSectionHypoList: document.getElementById('chat-section-hypo-list'),
+    badgeChatHypoCount: document.getElementById('badge-chat-hypo-count'),
+    chatSectionUnknownList: document.getElementById('chat-section-unknown-list'),
+    badgeChatUnknownCount: document.getElementById('badge-chat-unknown-count'),
+    chatSectionStepsList: document.getElementById('chat-section-steps-list'),
+    badgeChatStepsCount: document.getElementById('badge-chat-steps-count'),
+    chatConversationStream: document.getElementById('chat-conversation-stream'),
+    invChatFollowupInput: document.getElementById('inv-chat-followup-input'),
+    btnChatFollowupSend: document.getElementById('btn-chat-followup-send'),
+    btnClearChatHistory: document.getElementById('btn-clear-chat-history'),
+    invProgressiveDetails: document.getElementById('inv-progressive-details'),
+    txtChatContextFingerprint: document.getElementById('txt-chat-context-fingerprint'),
+    badgeChatValidationStatus: document.getElementById('badge-chat-validation-status'),
+    txtChatDuration: document.getElementById('txt-chat-duration'),
+    txtChatEvidenceRefs: document.getElementById('txt-chat-evidence-refs'),
 
     // TAB 0: Investigation Overview
     invInputGoal: document.getElementById('inv-input-goal'),
@@ -864,6 +904,15 @@
       title_card_static_links: '📜 Resolved Static-Code References',
       empty_static_links_init: 'No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.',
 
+      // Phase 15: Conversational Investigation
+      title_conversational_analysis: '💬 Conversational Investigation',
+      lbl_chat_problem: '🔍 Describe Problem in Natural Language:',
+      ph_chat_problem: 'e.g. Variable state unexpectedly changed from 1 to 2. Analyze candidate writer functions and race condition risks.',
+      lbl_quick_prompts: 'Quick Prompts:',
+      btn_chat_analyze: 'Analyze',
+      btn_chat_cancel: 'Cancel',
+      ph_chat_followup: 'Ask a follow-up question (e.g. Is there evidence that function X was executed?)...',
+
       summary_advanced_details: '⚙️ Advanced Details & Raw Evidence Ledger (Expand)',
       th_evidence_id: 'Evidence ID',
       th_type: 'Type',
@@ -1138,6 +1187,17 @@
 
       title_card_static_links: '📜 확인된 정적 코드 참조',
       empty_static_links_init: '해결된 정적 코드 링크가 없습니다. 런타임 객체와 소스 심볼을 연결하려면 유효한 디버그 이미지를 제공하세요.',
+
+      // Phase 15: Conversational Investigation
+      btn_mode_basic: '👤 기본 조사',
+      btn_mode_advanced: '⚙️ 전문가 모드',
+      title_conversational_analysis: '💬 대화형 시스템 조사 (Conversational Investigation)',
+      lbl_chat_problem: '🔍 조사할 문제나 증상을 설명하세요:',
+      ph_chat_problem: '예: 변수 state 값이 1에서 2로 비정상 변경되었습니다. 원인 함수 후보와 경쟁 상태 가능성을 분석해주세요.',
+      lbl_quick_prompts: '추천 질의:',
+      btn_chat_analyze: '분석 시작',
+      btn_chat_cancel: '취소',
+      ph_chat_followup: '후속 질문을 입력하세요 (예: 특정 함수가 호출된 다른 증거가 있나요?)...',
 
       summary_advanced_details: '⚙️ 고급 상세 정보 및 원시 증거 원장 (펼치기)',
       th_evidence_id: '증거 ID',
@@ -4656,6 +4716,404 @@
   // Investigation Overview (Phase C)
   // --------------------------------------------------------------------------
 
+  // ==========================================================================
+  // Phase 15: Conversational Investigation & LLM Provider Status
+  // ==========================================================================
+
+  async function checkLLMProviderStatus() {
+    try {
+      const res = await apiGet('/api/llm/status');
+      if (res && res.success && res.data) {
+        state.llmStatus = res.data;
+        renderLLMStatusBadge(res.data);
+      } else {
+        renderLLMStatusBadge({ configured: false, reachable: false, is_fallback: true });
+      }
+    } catch (err) {
+      console.warn('Failed to probe LLM status:', err);
+      renderLLMStatusBadge({ configured: false, reachable: false, is_fallback: true, error: String(err) });
+    }
+  }
+
+  function renderLLMStatusBadge(data) {
+    const isFallback = data.is_fallback || !data.reachable || data.provider_type === 'none';
+    const model = data.model || 'deterministic-engine';
+    const provider = data.provider_type || 'none';
+    const latency = data.latency_ms ? ` (${data.latency_ms}ms)` : '';
+
+    if (el.hdrBadgeLlmStatus) {
+      if (isFallback) {
+        el.hdrBadgeLlmStatus.textContent = '⚙️ DETERMINISTIC';
+        el.hdrBadgeLlmStatus.className = 'badge badge-neutral';
+        el.hdrBadgeLlmStatus.title = 'No external LLM configured. Operating under deterministic hypothesis rules.';
+      } else {
+        el.hdrBadgeLlmStatus.textContent = `🤖 ${model}`;
+        el.hdrBadgeLlmStatus.className = 'badge badge-info';
+        el.hdrBadgeLlmStatus.title = `LLM Active: ${provider} at ${data.base_url || ''}${latency}`;
+      }
+    }
+
+    if (el.badgeLlmProviderStatus) {
+      if (isFallback) {
+        el.badgeLlmProviderStatus.textContent = '⚙️ 결정론적 분석 (Deterministic)';
+        el.badgeLlmProviderStatus.className = 'badge badge-neutral';
+      } else {
+        el.badgeLlmProviderStatus.textContent = `🤖 ${provider.toUpperCase()}: ${model}`;
+        el.badgeLlmProviderStatus.className = 'badge badge-success';
+      }
+    }
+
+    if (el.txtLlmProviderMeta) {
+      if (isFallback) {
+        el.txtLlmProviderMeta.textContent = '외부 LLM 미설정 (결정론적 가설 규칙으로 동작)';
+      } else {
+        el.txtLlmProviderMeta.textContent = `모델: ${model} | 지연시간: ${data.latency_ms || 0}ms`;
+      }
+    }
+  }
+
+  function initConversationalInvestigation() {
+    // Quick prompt buttons
+    document.querySelectorAll('.quick-prompt-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const promptText = btn.getAttribute('data-prompt') || '';
+        if (el.invChatTextarea) {
+          el.invChatTextarea.value = promptText;
+          el.invChatTextarea.focus();
+        }
+      });
+    });
+
+    // Analyze button
+    if (el.btnChatAnalyze) {
+      el.btnChatAnalyze.addEventListener('click', () => {
+        executeConversationalAnalysis();
+      });
+    }
+
+    // Follow-up chat send
+    if (el.btnChatFollowupSend) {
+      el.btnChatFollowupSend.addEventListener('click', () => {
+        const msg = el.invChatFollowupInput ? el.invChatFollowupInput.value.trim() : '';
+        if (msg) {
+          if (el.invChatFollowupInput) el.invChatFollowupInput.value = '';
+          executeConversationalAnalysis(msg);
+        }
+      });
+    }
+
+    if (el.invChatFollowupInput) {
+      el.invChatFollowupInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          const msg = el.invChatFollowupInput.value.trim();
+          if (msg) {
+            el.invChatFollowupInput.value = '';
+            executeConversationalAnalysis(msg);
+          }
+        }
+      });
+    }
+
+    // Clear history
+    if (el.btnClearChatHistory) {
+      el.btnClearChatHistory.addEventListener('click', () => {
+        state.conversationalHistory = [];
+        if (el.chatConversationStream) el.chatConversationStream.innerHTML = '';
+        showToast('대화 이력이 초기화되었습니다.', 'info');
+      });
+    }
+
+    // Stepper reset
+    setChatStepperStage(0);
+  }
+
+  function setChatStepperStage(stage) {
+    // 0: hidden, 1: gather, 2: llm, 3: validate, 4: done
+    if (!el.invChatStepper) return;
+    if (stage === 0) {
+      el.invChatStepper.style.display = 'none';
+      return;
+    }
+    el.invChatStepper.style.display = 'flex';
+    const steps = [
+      { el: el.stepGather, num: 1 },
+      { el: el.stepLlm, num: 2 },
+      { el: el.stepValidate, num: 3 },
+      { el: el.stepDone, num: 4 },
+    ];
+    steps.forEach(({ el: sEl, num }) => {
+      if (!sEl) return;
+      sEl.classList.toggle('active', num === stage);
+      sEl.classList.toggle('completed', num < stage);
+    });
+  }
+
+  async function executeConversationalAnalysis(customMessage) {
+    if (state.isAnalyzingChat) return;
+
+    const message = customMessage || (el.invChatTextarea ? el.invChatTextarea.value.trim() : '');
+    if (!message) {
+      showToast('조사할 문제나 증상을 입력해주세요.', 'warning');
+      if (el.invChatTextarea) el.invChatTextarea.focus();
+      return;
+    }
+
+    state.isAnalyzingChat = true;
+    if (el.btnChatAnalyze) el.btnChatAnalyze.disabled = true;
+
+    // Step 1: Ensure active investigation session exists
+    setChatStepperStage(1);
+    let invId = state.selectedInvestigationId || (state.activeInvestigation && state.activeInvestigation.investigation_id);
+
+    if (!invId) {
+      showToast('조사 세션을 시작합니다...', 'info');
+      await runInvestigation();
+      invId = state.selectedInvestigationId || (state.activeInvestigation && state.activeInvestigation.investigation_id);
+      if (!invId) {
+        showToast('조사 세션을 생성할 수 없습니다. 대상을 확인하세요.', 'error');
+        setChatStepperStage(0);
+        state.isAnalyzingChat = false;
+        if (el.btnChatAnalyze) el.btnChatAnalyze.disabled = false;
+        return;
+      }
+    }
+
+    // Step 2: Query conversational LLM service
+    setChatStepperStage(2);
+    const reqId = `chat_req_${Date.now()}`;
+
+    // Append user question to conversational stream
+    appendChatBubble('user', message);
+
+    try {
+      // Step 3: Call POST /api/investigation/chat
+      const res = await apiPost('/api/investigation/chat', {
+        investigation_id: invId,
+        message: message,
+        request_id: reqId,
+      });
+
+      setChatStepperStage(3);
+
+      if (res.success && res.data) {
+        const result = res.data;
+        // Step 4: Render results
+        setChatStepperStage(4);
+        renderConversationalAnalysisResults(result, invId);
+
+        // Append assistant response to conversational stream
+        appendChatBubble('assistant', result.summary);
+
+        showToast('대화형 분석이 완료되었습니다.', 'success');
+
+        // Refresh underlying investigation session to reflect added hypotheses/observations
+        await loadActiveInvestigation(invId);
+      } else {
+        const errMsg = (res.error && res.error.message) || '대화형 분석 요청에 실패했습니다.';
+        showToast(`분석 실패: ${errMsg}`, 'error');
+        appendChatBubble('assistant', `⚠️ 분석 오류 발생: ${errMsg}`);
+      }
+    } catch (err) {
+      console.error('Conversational analysis failed:', err);
+      showToast(`통신 오류: ${String(err)}`, 'error');
+      appendChatBubble('assistant', `⚠️ 네트워크 오류: ${String(err)}`);
+    } finally {
+      state.isAnalyzingChat = false;
+      if (el.btnChatAnalyze) el.btnChatAnalyze.disabled = false;
+      setTimeout(() => {
+        if (!state.isAnalyzingChat) setChatStepperStage(0);
+      }, 4000);
+    }
+  }
+
+  function appendChatBubble(role, content) {
+    if (!el.chatConversationStream) return;
+    const bubble = document.createElement('div');
+    bubble.className = role === 'user' ? 'chat-bubble-user' : 'chat-bubble-assistant';
+    bubble.innerHTML = `
+      <div style="font-weight: 600; font-size: 0.72rem; color: var(--text-muted); margin-bottom: 2px;">
+        ${role === 'user' ? '👤 Operator' : '🤖 dynamicState Assistant'}
+      </div>
+      <div>${escapeHtml(content)}</div>
+    `;
+    el.chatConversationStream.appendChild(bubble);
+    el.chatConversationStream.scrollTop = el.chatConversationStream.scrollHeight;
+  }
+
+  function renderConversationalAnalysisResults(res, invId) {
+    if (!el.invChatResults) return;
+    el.invChatResults.style.display = 'block';
+
+    // 1. Diagnostic Summary Banner
+    if (el.invChatSummaryText) {
+      el.invChatSummaryText.textContent = res.summary || '분석이 완료되었습니다.';
+    }
+    if (el.invChatDisarmedNotice) {
+      const disarmed = res.unverified_claims_disarmed || [];
+      if (disarmed.length > 0) {
+        el.invChatDisarmedNotice.style.display = 'block';
+        el.invChatDisarmedNotice.innerHTML = `⚠️ <strong>보안 검증 알림:</strong> ${disarmed.map(d => escapeHtml(d)).join('; ')}`;
+      } else {
+        el.invChatDisarmedNotice.style.display = 'none';
+      }
+    }
+
+    // 2. Section 1: Facts
+    const facts = res.observed_facts || [];
+    if (el.badgeChatFactsCount) el.badgeChatFactsCount.textContent = String(facts.length);
+    if (el.chatSectionFactsList) {
+      if (facts.length === 0) {
+        el.chatSectionFactsList.innerHTML = '<div class="text-muted p-2">관측된 사실이 없습니다.</div>';
+      } else {
+        el.chatSectionFactsList.innerHTML = facts.map(f => {
+          const desc = f.fact || f.title || f.field_path || 'Verified fact';
+          const field = f.field_path ? `<span class="mono text-accent">[${escapeHtml(f.field_path)}]</span> ` : '';
+          const valChange = (f.before_value !== undefined && f.after_value !== undefined)
+            ? ` (${escapeHtml(String(f.before_value))} &rarr; <strong class="text-accent">${escapeHtml(String(f.after_value))}</strong>)`
+            : '';
+          return `
+            <div style="background: rgba(34, 197, 94, 0.08); border-left: 3px solid #22c55e; padding: 6px 8px; border-radius: 4px;">
+              <span class="badge badge-success text-xs">FACT</span>
+              ${field}${escapeHtml(desc)}${valChange}
+            </div>
+          `;
+        }).join('');
+      }
+    }
+
+    // 3. Section 2: Hypotheses & Candidate Functions
+    const hypos = res.hypotheses || [];
+    if (el.badgeChatHypoCount) el.badgeChatHypoCount.textContent = String(hypos.length);
+    if (el.chatSectionHypoList) {
+      if (hypos.length === 0) {
+        el.chatSectionHypoList.innerHTML = '<div class="text-muted p-2">제안된 가설이 없습니다.</div>';
+      } else {
+        el.chatSectionHypoList.innerHTML = hypos.map(h => {
+          const title = h.title || 'Hypothesis';
+          const claim = h.claim || '';
+          const candidates = h.function_candidates || [];
+
+          let candBadges = '';
+          if (candidates.length > 0) {
+            candBadges = '<div style="margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px;">' + candidates.map(c => {
+              const fnName = c.function_name || c.name || 'func';
+              const tier = c.candidate_tier || 'STATIC_CANDIDATE';
+              let badgeCls = 'badge-static-candidate';
+              let tierLabel = '정적 후보 (Static)';
+              if (tier === 'VALIDATED_CAUSAL_FUNCTION') {
+                badgeCls = 'badge-validated-causal';
+                tierLabel = '입증된 인과 함수 (Validated)';
+              } else if (tier === 'EVIDENCE_SUPPORTED_CANDIDATE' || tier === 'EVIDENCE_SUPPORTED') {
+                badgeCls = 'badge-evidence-supported';
+                tierLabel = '증거 뒷받침 (Supported)';
+              }
+              return `<span class="${badgeCls}" title="${escapeHtml(tier)}">${escapeHtml(fnName)} &bull; ${tierLabel}</span>`;
+            }).join('') + '</div>';
+          }
+
+          return `
+            <div style="background: rgba(245, 158, 11, 0.08); border-left: 3px solid #f59e0b; padding: 6px 8px; border-radius: 4px;">
+              <div style="font-weight: 600;">${escapeHtml(title)}</div>
+              <div class="text-muted" style="margin-top: 2px;">${escapeHtml(claim)}</div>
+              ${candBadges}
+            </div>
+          `;
+        }).join('');
+      }
+    }
+
+    // 4. Section 3: Unknowns
+    const unknowns = res.unknowns || [];
+    if (el.badgeChatUnknownCount) el.badgeChatUnknownCount.textContent = String(unknowns.length);
+    if (el.chatSectionUnknownList) {
+      if (unknowns.length === 0) {
+        el.chatSectionUnknownList.innerHTML = '<div class="text-muted p-2">미확인 사항이 없습니다.</div>';
+      } else {
+        el.chatSectionUnknownList.innerHTML = unknowns.map(u => `
+          <div style="background: rgba(148, 163, 184, 0.08); border-left: 3px solid #94a3b8; padding: 6px 8px; border-radius: 4px;">
+            <span class="badge badge-neutral text-xs">UNKNOWN</span>
+            <span>${escapeHtml(u)}</span>
+          </div>
+        `).join('');
+      }
+    }
+
+    // 5. Section 4: Recommended Next Steps
+    const steps = res.proposed_observations || [];
+    const nextTextSteps = res.next_steps || [];
+    const totalSteps = steps.length + nextTextSteps.length;
+    if (el.badgeChatStepsCount) el.badgeChatStepsCount.textContent = String(totalSteps);
+
+    if (el.chatSectionStepsList) {
+      if (totalSteps === 0) {
+        el.chatSectionStepsList.innerHTML = '<div class="text-muted p-2">추천 후속 조치가 없습니다.</div>';
+      } else {
+        let html = '';
+        steps.forEach((obs, idx) => {
+          const obsId = obs.observation_id || `obs_${idx}`;
+          const q = obs.question || 'Inspect target';
+          const kind = obs.target_kind || 'FIELD';
+          const isExecuted = obs.executed || false;
+          html += `
+            <div style="background: rgba(56, 189, 248, 0.08); border-left: 3px solid var(--accent); padding: 8px; border-radius: 4px;">
+              <div style="font-weight: 600;">${escapeHtml(q)}</div>
+              <div class="text-muted" style="font-size: 0.7rem; margin-top: 2px;">유형: ${escapeHtml(kind)}</div>
+              ${!isExecuted ? `
+                <button type="button" class="approve-observe-btn" onclick="window.__approveObservation('${escapeHtml(invId)}', '${escapeHtml(obsId)}')">
+                  ✅ 승인 및 관측 실행 (Approve &amp; Observe)
+                </button>
+              ` : '<span class="badge badge-success text-xs mt-1">실행 완료</span>'}
+            </div>
+          `;
+        });
+        nextTextSteps.forEach(s => {
+          html += `
+            <div style="background: rgba(255, 255, 255, 0.03); border-left: 3px solid var(--border-color); padding: 6px 8px; border-radius: 4px;">
+              <span>${escapeHtml(s)}</span>
+            </div>
+          `;
+        });
+        el.chatSectionStepsList.innerHTML = html;
+      }
+    }
+
+    // 6. Technical Details Drawer
+    const meta = res.provider_metadata || {};
+    if (el.txtChatContextFingerprint) {
+      el.txtChatContextFingerprint.textContent = meta.context_fingerprint ? meta.context_fingerprint.substring(0, 16) + '...' : 'N/A';
+    }
+    if (el.badgeChatValidationStatus) {
+      el.badgeChatValidationStatus.textContent = res.validation_status || 'VALIDATED_CLEAN';
+    }
+    if (el.txtChatDuration) {
+      el.txtChatDuration.textContent = `${meta.duration_ms || 0} ms`;
+    }
+    if (el.txtChatEvidenceRefs) {
+      const refs = res.evidence_refs || [];
+      el.txtChatEvidenceRefs.textContent = refs.length > 0 ? refs.join(', ') : 'None';
+    }
+  }
+
+  window.__approveObservation = async function (invId, obsId) {
+    if (!invId || !obsId) return;
+    try {
+      showToast('후속 관측을 실행합니다...', 'info');
+      const res = await apiPost('/api/investigation/observe', {
+        investigation_id: invId,
+        observation_id: obsId,
+        authorize: true,
+      });
+      if (res.success) {
+        showToast('관측이 성공적으로 실행되었습니다.', 'success');
+        await loadActiveInvestigation(invId);
+      } else {
+        showToast(`관측 실행 실패: ${(res.error && res.error.message) || 'Unknown error'}`, 'error');
+      }
+    } catch (err) {
+      showToast(`관측 오류: ${String(err)}`, 'error');
+    }
+  };
+
   // --------------------------------------------------------------------------
   // Investigation Overview (Modernized Investigation-First Workspace)
   // --------------------------------------------------------------------------
@@ -6064,8 +6522,10 @@
     initSnapshotMutateModal();
     initLabBranchAndReplay();
     initInvestigationOverview();
+    initConversationalInvestigation();
     bindEvents();
 
+    await checkLLMProviderStatus();
     await loadRuntimeOverview();
     await loadStatesAndGraph();
     await loadStateLabTree();
