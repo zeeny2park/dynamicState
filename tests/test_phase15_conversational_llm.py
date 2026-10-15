@@ -507,7 +507,13 @@ class TestCLILLMProviders(unittest.TestCase):
             self.assertIn("--output-format", cmd)
             self.assertIn("text", cmd)
             self.assertIn("--disable-slash-commands", cmd)
-            self.assertIn("--dangerously-skip-permissions", cmd)
+            # Safe by default: no permission bypass
+            self.assertNotIn("--dangerously-skip-permissions", cmd)
+
+            # Opt-in permits permission bypass flag
+            cfg_opt_in = LLMProviderConfig(provider_type="gemini", allow_dangerous_permissions=True)
+            cmd_opt_in = GeminiCLIProvider(cfg_opt_in).build_command("Test prompt", timeout=30.0)
+            self.assertIn("--dangerously-skip-permissions", cmd_opt_in)
 
     def test_gemini_acp_provider_resolution_and_handshake(self):
         cfg = LLMProviderConfig(provider_type="acp")

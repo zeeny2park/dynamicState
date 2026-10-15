@@ -28,15 +28,33 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import ssl
 import subprocess
+import tempfile
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
 
 logger = logging.getLogger("dynamicstate.llm_provider")
+
+
+class ProviderError(RuntimeError):
+    """Base exception for all LLM and CLI provider failures."""
+    pass
+
+
+class ProviderUnavailableError(ProviderError):
+    """Raised when a requested provider is not installed, unconfigured, or unreachable."""
+    pass
+
+
+class ProviderExecutionError(ProviderError):
+    """Raised when an active provider fails during command execution or response generation."""
+    pass
 
 
 @dataclass
@@ -51,6 +69,9 @@ class LLMProviderConfig:
     temperature: float = 0.2
     cli_command: Optional[str] = None  # Custom CLI command, binary path, or template
     cli_args: Optional[List[str]] = None  # Extra arguments forwarded to CLI
+    allow_dangerous_permissions: bool = False  # Explicit opt-in required for CLI permission bypass
+    max_output_bytes: int = 10 * 1024 * 1024  # Max stdout/stderr bytes captured from child CLI processes
+    safe_working_dir: Optional[str] = None  # Restricted working directory for child processes
 
     def __repr__(self) -> str:
         key_str = "[REDACTED]" if self.api_key else "None"
@@ -58,7 +79,8 @@ class LLMProviderConfig:
         return (
             f"LLMProviderConfig(provider_type='{self.provider_type}', "
             f"base_url='{self.base_url}', api_key={key_str}, "
-            f"model='{self.model}', cli_command='{cmd_str}', timeout={self.timeout_seconds}s)"
+            f"model='{self.model}', cli_command='{cmd_str}', timeout={self.timeout_seconds}s, "
+            f"allow_dangerous_permissions={self.allow_dangerous_permissions})"
         )
 
     def _safe_cli_command(self) -> Optional[str]:
@@ -89,6 +111,9 @@ class LLMProviderConfig:
             "temperature": self.temperature,
             "cli_command": self._safe_cli_command(),
             "cli_args": self.cli_args or [],
+            "allow_dangerous_permissions": self.allow_dangerous_permissions,
+            "max_output_bytes": self.max_output_bytes,
+            "safe_working_dir": self.safe_working_dir,
             "is_cli": self.provider_type in ("gemini", "cline", "cli", "agy", "acp", "gemini-acp"),
         }
 
@@ -99,6 +124,12 @@ class LLMProviderConfig:
         cli_cmd = os.environ.get("DYNAMICSTATE_LLM_CLI_CMD", "").strip() or None
         cli_args_raw = os.environ.get("DYNAMICSTATE_LLM_CLI_ARGS", "").strip()
         cli_args = shlex.split(cli_args_raw) if cli_args_raw else None
+        allow_dangerous = os.environ.get("DYNAMICSTATE_ALLOW_CLI_PERMISSION_BYPASS", "").strip().lower() in ("1", "true", "yes")
+        try:
+            max_output_bytes = int(os.environ.get("DYNAMICSTATE_CLI_MAX_OUTPUT_BYTES", str(10 * 1024 * 1024)))
+        except (ValueError, TypeError):
+            max_output_bytes = 10 * 1024 * 1024
+        safe_working_dir = os.environ.get("DYNAMICSTATE_CLI_SAFE_WORKING_DIR", "").strip() or None
 
         base_url = (
             os.environ.get("DYNAMICSTATE_LLM_BASE_URL")
@@ -188,6 +219,9 @@ class LLMProviderConfig:
             timeout_seconds=timeout,
             cli_command=cli_cmd,
             cli_args=cli_args,
+            allow_dangerous_permissions=allow_dangerous,
+            max_output_bytes=max_output_bytes,
+            safe_working_dir=safe_working_dir,
         )
 
 
@@ -199,6 +233,8 @@ class LLMProviderStatus:
     model: str
     base_url: str
     reachable: bool
+    binary_available: bool = False
+    availability_status: str = "UNKNOWN"
     latency_ms: Optional[float] = None
     error: Optional[str] = None
     active_requests: int = 0
@@ -227,6 +263,7 @@ class BaseLLMProvider(ABC):
         messages: List[Dict[str, str]],
         json_mode: bool = True,
         timeout: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         """Execute chat completion and return the assistant response string."""
         pass
@@ -265,6 +302,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                         model=self.config.model,
                         base_url=self.config.to_safe_dict()["base_url"],
                         reachable=True,
+                        binary_available=False,
+                        availability_status="ENDPOINT_RESPONSIVE",
                         latency_ms=elapsed_ms,
                         is_fallback=False,
                     )
@@ -275,6 +314,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                         model=self.config.model,
                         base_url=self.config.to_safe_dict()["base_url"],
                         reachable=False,
+                        binary_available=False,
+                        availability_status="UNAVAILABLE",
                         error=f"HTTP status {resp.status}",
                         is_fallback=False,
                     )
@@ -288,6 +329,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 model=self.config.model,
                 base_url=self.config.to_safe_dict()["base_url"],
                 reachable=False,
+                binary_available=False,
+                availability_status="UNAVAILABLE",
                 error=safe_msg,
                 is_fallback=False,
             )
@@ -297,6 +340,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         messages: List[Dict[str, str]],
         json_mode: bool = True,
         timeout: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         req_timeout = timeout or self.config.timeout_seconds
         url = f"{self.config.base_url}/chat/completions"
@@ -364,12 +408,15 @@ class OllamaProvider(BaseLLMProvider):
             req = urllib.request.Request(url, headers={"User-Agent": "dynamicState-Health/1.0"}, method="GET")
             with urllib.request.urlopen(req, timeout=min(3.0, self.config.timeout_seconds)) as resp:
                 elapsed_ms = round((time.time() - start_time) * 1000.0, 2)
+                reachable = (resp.status == 200)
                 return LLMProviderStatus(
                     configured=True,
                     provider_type="ollama",
                     model=self.config.model,
                     base_url=self.config.to_safe_dict()["base_url"],
-                    reachable=resp.status == 200,
+                    reachable=reachable,
+                    binary_available=False,
+                    availability_status="ENDPOINT_RESPONSIVE" if reachable else "UNAVAILABLE",
                     latency_ms=elapsed_ms,
                     is_fallback=False,
                 )
@@ -380,6 +427,8 @@ class OllamaProvider(BaseLLMProvider):
                 model=self.config.model,
                 base_url=self.config.to_safe_dict()["base_url"],
                 reachable=False,
+                binary_available=False,
+                availability_status="UNAVAILABLE",
                 error=str(exc),
                 is_fallback=False,
             )
@@ -389,6 +438,7 @@ class OllamaProvider(BaseLLMProvider):
         messages: List[Dict[str, str]],
         json_mode: bool = True,
         timeout: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         req_timeout = timeout or self.config.timeout_seconds
         url = f"{self.config.base_url}/api/chat"
@@ -412,7 +462,68 @@ class OllamaProvider(BaseLLMProvider):
 
 
 class BaseCLIProvider(BaseLLMProvider):
-    """Abstract base adapter for local CLI-based LLMs."""
+    """Abstract base adapter for local CLI-based LLMs with process control and isolation."""
+
+    _active_subprocesses: Dict[str, subprocess.Popen] = {}
+    _subproc_lock: threading.Lock = threading.Lock()
+
+    @classmethod
+    def register_process(cls, request_id: str, proc: subprocess.Popen) -> None:
+        if request_id:
+            with cls._subproc_lock:
+                cls._active_subprocesses[request_id] = proc
+
+    @classmethod
+    def unregister_process(cls, request_id: str) -> None:
+        if request_id:
+            with cls._subproc_lock:
+                cls._active_subprocesses.pop(request_id, None)
+
+    @classmethod
+    def cancel_process(cls, request_id: str) -> bool:
+        """Cancel and terminate the active child process and process group for request_id."""
+        with cls._subproc_lock:
+            proc = cls._active_subprocesses.get(request_id)
+        if not proc:
+            return False
+
+        try:
+            if proc.poll() is None:
+                curr_pgid = os.getpgrp() if hasattr(os, "getpgrp") else None
+                child_pgid = None
+                if os.name == "posix":
+                    try:
+                        child_pgid = os.getpgid(proc.pid)
+                    except Exception:
+                        child_pgid = None
+
+                if child_pgid and child_pgid != curr_pgid:
+                    try:
+                        os.killpg(child_pgid, signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+                else:
+                    proc.terminate()
+
+                # Verify actual termination within a bounded grace window
+                try:
+                    proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    if child_pgid and child_pgid != curr_pgid:
+                        try:
+                            os.killpg(child_pgid, signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
+                    else:
+                        proc.kill()
+                    proc.wait(timeout=1.0)
+            return True
+        except Exception as exc:
+            logger.warning("Error cancelling process for request %s: %s", request_id, exc)
+            return False
+        finally:
+            with cls._subproc_lock:
+                cls._active_subprocesses.pop(request_id, None)
 
     def _redact_secrets(self, text: str) -> str:
         if not text:
@@ -423,6 +534,100 @@ class BaseCLIProvider(BaseLLMProvider):
         redacted = re.sub(r"(AIza[0-9A-Za-z-_]{15,})", "[REDACTED_GEMINI_KEY]", redacted)
         redacted = re.sub(r"(sk-[a-zA-Z0-9]{15,})", "[REDACTED_API_KEY]", redacted)
         return redacted
+
+    def _build_safe_env(self) -> Dict[str, str]:
+        """Construct sanitized environment with minimal required system variables and no leaked secrets."""
+        allowed_keys = {
+            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL",
+            "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "TERM", "SYSTEMROOT",
+            "LD_LIBRARY_PATH", "PYTHONPATH",
+        }
+        # Selective provider-specific variables
+        p_type = (self.config.provider_type or "").lower()
+        if p_type in ("gemini", "agy"):
+            allowed_keys.update({"GEMINI_API_KEY", "GOOGLE_API_KEY"})
+        elif p_type in ("cline", "paseo"):
+            allowed_keys.update({"CLINE_API_KEY", "PASEO_API_KEY"})
+        elif p_type == "ollama":
+            allowed_keys.add("OLLAMA_HOST")
+
+        clean_env: Dict[str, str] = {}
+        for k, v in os.environ.items():
+            # Never leak internal dynamicState secrets or unrelated API keys
+            if k in allowed_keys and not k.startswith("DYNAMICSTATE_"):
+                clean_env[k] = v
+
+        return clean_env
+
+    def _run_controlled_process(
+        self,
+        cmd: List[str],
+        timeout: float,
+        request_id: Optional[str] = None,
+    ) -> Tuple[int, str, str]:
+        """Execute command in a safe directory with bounded output and clean termination."""
+        safe_cwd = self.config.safe_working_dir
+        if not safe_cwd or not os.path.isdir(safe_cwd):
+            safe_cwd = tempfile.gettempdir()
+
+        clean_env = self._build_safe_env()
+        max_bytes = self.config.max_output_bytes or (10 * 1024 * 1024)
+
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=safe_cwd,
+                env=clean_env,
+                start_new_session=True if os.name == "posix" else False,
+            )
+            if request_id:
+                self.register_process(request_id, proc)
+
+            try:
+                stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                curr_pgid = os.getpgrp() if hasattr(os, "getpgrp") else None
+                child_pgid = None
+                if os.name == "posix":
+                    try:
+                        child_pgid = os.getpgid(proc.pid)
+                    except Exception:
+                        child_pgid = None
+
+                if child_pgid and child_pgid != curr_pgid:
+                    try:
+                        os.killpg(child_pgid, signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
+                else:
+                    proc.kill()
+                proc.wait(timeout=2.0)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+
+            # Bounded output capture to prevent memory exhaustion
+            if len(stdout_raw) > max_bytes:
+                stdout_raw = stdout_raw[:max_bytes]
+                logger.warning("CLI output exceeded %d bytes; truncated safely.", max_bytes)
+            if len(stderr_raw) > max_bytes:
+                stderr_raw = stderr_raw[:max_bytes]
+
+            stdout_str = stdout_raw.decode("utf-8", errors="replace").strip()
+            stderr_str = stderr_raw.decode("utf-8", errors="replace").strip()
+
+            return proc.returncode, stdout_str, stderr_str
+        finally:
+            if request_id:
+                self.unregister_process(request_id)
+            if proc and proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
 
     @abstractmethod
     def resolve_binary(self) -> Optional[str]:
@@ -443,6 +648,8 @@ class BaseCLIProvider(BaseLLMProvider):
                 model=self.config.model,
                 base_url=f"cli://{self.config.provider_type}",
                 reachable=False,
+                binary_available=False,
+                availability_status="UNAVAILABLE",
                 error=f"Executable for '{self.config.provider_type}' was not found on PATH or default locations.",
                 is_fallback=False,
                 is_cli=True,
@@ -450,21 +657,21 @@ class BaseCLIProvider(BaseLLMProvider):
 
         start = time.time()
         try:
-            probe = subprocess.run(
+            retcode, stdout_str, stderr_str = self._run_controlled_process(
                 [binary, "--version"],
-                capture_output=True,
-                text=True,
                 timeout=min(3.0, self.config.timeout_seconds),
             )
             elapsed_ms = round((time.time() - start) * 1000.0, 2)
-            if probe.returncode == 0:
-                ver = probe.stdout.strip().splitlines()[0] if probe.stdout else "unknown"
+            if retcode == 0:
+                ver = stdout_str.splitlines()[0] if stdout_str else "unknown"
                 return LLMProviderStatus(
                     configured=True,
                     provider_type=self.config.provider_type,
                     model=self.config.model or ver,
                     base_url=f"cli://{binary}",
                     reachable=True,
+                    binary_available=True,
+                    availability_status="BINARY_AVAILABLE",
                     latency_ms=elapsed_ms,
                     is_fallback=False,
                     is_cli=True,
@@ -477,7 +684,9 @@ class BaseCLIProvider(BaseLLMProvider):
                     model=self.config.model,
                     base_url=f"cli://{binary}",
                     reachable=False,
-                    error=self._redact_secrets(probe.stderr.strip()[:200] or f"Exit {probe.returncode}"),
+                    binary_available=True,
+                    availability_status="UNAVAILABLE",
+                    error=self._redact_secrets(stderr_str[:200] or f"Exit {retcode}"),
                     is_fallback=False,
                     is_cli=True,
                     cli_binary=binary,
@@ -489,6 +698,8 @@ class BaseCLIProvider(BaseLLMProvider):
                 model=self.config.model,
                 base_url=f"cli://{binary}",
                 reachable=False,
+                binary_available=False,
+                availability_status="UNAVAILABLE",
                 error=self._redact_secrets(str(exc)),
                 is_fallback=False,
                 is_cli=True,
@@ -547,7 +758,7 @@ class GeminiCLIProvider(BaseCLIProvider):
     def build_command(self, prompt: str, timeout: float) -> List[str]:
         binary = self.resolve_binary()
         if not binary:
-            raise RuntimeError("Gemini/agy CLI executable not found on PATH or ~/.local/bin/agy")
+            raise ProviderUnavailableError("Gemini/agy CLI executable not found on PATH or ~/.local/bin/agy")
 
         base_name = os.path.basename(binary).lower()
         if "agy" in base_name:
@@ -558,8 +769,12 @@ class GeminiCLIProvider(BaseCLIProvider):
                 "--output-format",
                 "text",
                 "--disable-slash-commands",
-                "--dangerously-skip-permissions",
             ]
+            # Dangerous permission bypass is strictly opt-in and disabled by default
+            if getattr(self.config, "allow_dangerous_permissions", False):
+                logger.warning("SECURITY WARNING: Antigravity/Gemini CLI running with permission bypass enabled via server configuration!")
+                cmd.append("--dangerously-skip-permissions")
+
             if (
                 self.config.model
                 and self.config.model not in ("default", "deterministic-engine")
@@ -589,31 +804,30 @@ class GeminiCLIProvider(BaseCLIProvider):
         messages: List[Dict[str, str]],
         json_mode: bool = True,
         timeout: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         req_timeout = timeout if timeout is not None else max(self.config.timeout_seconds, 60.0)
         prompt = self._format_messages_to_prompt(messages)
         cmd = self.build_command(prompt, req_timeout)
 
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=req_timeout,
-            )
-            if proc.returncode != 0:
-                err = self._redact_secrets(proc.stderr.strip()[:300] or f"Exit {proc.returncode}")
-                raise RuntimeError(f"Gemini CLI error (code {proc.returncode}): {err}")
+            retcode, stdout_str, stderr_str = self._run_controlled_process(cmd, timeout=req_timeout, request_id=request_id)
+            if retcode != 0:
+                err = self._redact_secrets(stderr_str[:300] or f"Exit {retcode}")
+                raise ProviderExecutionError(f"Gemini CLI error (code {retcode}): {err}")
 
-            output = proc.stdout.strip()
-            if not output and proc.stderr:
-                err = self._redact_secrets(proc.stderr.strip()[:300])
-                raise RuntimeError(f"Gemini CLI produced no output: {err}")
-            return output
+            if not stdout_str and stderr_str:
+                err = self._redact_secrets(stderr_str[:300])
+                raise ProviderExecutionError(f"Gemini CLI produced no output: {err}")
+            if not stdout_str:
+                raise ProviderExecutionError("Gemini CLI returned empty output")
+            return stdout_str
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Gemini CLI invocation timed out after {req_timeout}s")
+            raise ProviderExecutionError(f"Gemini CLI invocation timed out after {req_timeout}s")
+        except ProviderError:
+            raise
         except Exception as exc:
-            raise RuntimeError(f"Gemini CLI execution failure: {self._redact_secrets(str(exc))}")
+            raise ProviderExecutionError(f"Gemini CLI execution failure: {self._redact_secrets(str(exc))}")
 
 
 class GeminiACPProvider(BaseLLMProvider):
@@ -641,6 +855,8 @@ class GeminiACPProvider(BaseLLMProvider):
                 model=self.config.model,
                 base_url="acp://stdio",
                 reachable=False,
+                binary_available=False,
+                availability_status="UNAVAILABLE",
                 error="agy-acp binary not found at ~/.gemini/antigravity/agy-acp/dist/ or on PATH.",
                 is_fallback=False,
                 is_cli=True,
@@ -671,6 +887,8 @@ class GeminiACPProvider(BaseLLMProvider):
                         model=self.config.model or agent_name,
                         base_url=f"acp://{binary}",
                         reachable=True,
+                        binary_available=True,
+                        availability_status="BINARY_AVAILABLE",
                         latency_ms=elapsed_ms,
                         is_fallback=False,
                         is_cli=True,
@@ -682,6 +900,8 @@ class GeminiACPProvider(BaseLLMProvider):
                 model=self.config.model,
                 base_url=f"acp://{binary}",
                 reachable=False,
+                binary_available=True,
+                availability_status="UNAVAILABLE",
                 error="ACP server returned unexpected initialization response.",
                 is_fallback=False,
                 is_cli=True,
@@ -694,6 +914,8 @@ class GeminiACPProvider(BaseLLMProvider):
                 model=self.config.model,
                 base_url=f"acp://{binary}",
                 reachable=False,
+                binary_available=False,
+                availability_status="UNAVAILABLE",
                 error=str(exc),
                 is_fallback=False,
                 is_cli=True,
@@ -718,18 +940,19 @@ class GeminiACPProvider(BaseLLMProvider):
         messages: List[Dict[str, str]],
         json_mode: bool = True,
         timeout: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         # agy-acp drives the official agy binary. For direct conversational completion,
         # we delegate to the underlying GeminiCLIProvider.
         agy_provider = GeminiCLIProvider(self.config)
         if agy_provider.resolve_binary():
-            return agy_provider.chat_completion(messages, json_mode=json_mode, timeout=timeout)
+            return agy_provider.chat_completion(messages, json_mode=json_mode, timeout=timeout, request_id=request_id)
         else:
-            raise RuntimeError("Underlying agy binary not found for ACP execution.")
+            raise ProviderUnavailableError("Underlying agy binary not found for ACP execution.")
 
 
 class ClineCLIProvider(BaseCLIProvider):
-    """Adapter for Cline or Paseo agent runner CLI."""
+    """Adapter for Cline or Paseo agent runner CLI with sandboxing and output bounding."""
 
     def resolve_binary(self) -> Optional[str]:
         if self.config.cli_command and os.path.exists(self.config.cli_command):
@@ -753,7 +976,7 @@ class ClineCLIProvider(BaseCLIProvider):
     def build_command(self, prompt: str, timeout: float) -> List[str]:
         binary = self.resolve_binary()
         if not binary:
-            raise RuntimeError("Cline or Paseo CLI executable not found on PATH.")
+            raise ProviderUnavailableError("Cline or Paseo CLI executable not found on PATH.")
 
         base_name = os.path.basename(binary).lower()
         if "paseo" in base_name:
@@ -783,29 +1006,25 @@ class ClineCLIProvider(BaseCLIProvider):
         messages: List[Dict[str, str]],
         json_mode: bool = True,
         timeout: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         req_timeout = timeout or self.config.timeout_seconds
         prompt = self._format_messages_to_prompt(messages)
         binary = self.resolve_binary()
         if not binary:
-            raise RuntimeError("Cline or Paseo CLI executable not found on PATH.")
+            raise ProviderUnavailableError("Cline or Paseo CLI executable not found on PATH.")
 
         cmd = self.build_command(prompt, req_timeout)
         base_name = os.path.basename(binary).lower()
 
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=req_timeout,
-            )
-            if proc.returncode != 0:
-                err = self._redact_secrets(proc.stderr.strip()[:300] or f"Exit {proc.returncode}")
-                raise RuntimeError(f"Cline/Paseo CLI error: {err}")
+            retcode, stdout_str, stderr_str = self._run_controlled_process(cmd, timeout=req_timeout, request_id=request_id)
+            if retcode != 0:
+                err = self._redact_secrets(stderr_str[:300] or f"Exit {retcode}")
+                raise ProviderExecutionError(f"Cline/Paseo CLI error: {err}")
 
             if "paseo" in base_name:
-                out = proc.stdout.strip()
+                out = stdout_str
                 agent_id = None
                 try:
                     meta = json.loads(out)
@@ -816,24 +1035,21 @@ class ClineCLIProvider(BaseCLIProvider):
                         agent_id = m.group(0)
 
                 if agent_id:
-                    logs_proc = subprocess.run(
-                        [binary, "logs", agent_id],
-                        capture_output=True,
-                        text=True,
-                        timeout=10.0,
-                    )
-                    return logs_proc.stdout.strip() or out
+                    ret_logs, logs_out, _ = self._run_controlled_process([binary, "logs", agent_id], timeout=10.0)
+                    return logs_out or out
                 return out
             else:
-                return proc.stdout.strip()
+                return stdout_str
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Cline CLI invocation timed out after {req_timeout}s")
+            raise ProviderExecutionError(f"Cline CLI invocation timed out after {req_timeout}s")
+        except ProviderError:
+            raise
         except Exception as exc:
-            raise RuntimeError(f"Cline CLI execution failure: {self._redact_secrets(str(exc))}")
+            raise ProviderExecutionError(f"Cline CLI execution failure: {self._redact_secrets(str(exc))}")
 
 
 class GenericCLIProvider(BaseCLIProvider):
-    """Adapter for custom, user-specified CLI commands."""
+    """Adapter for custom, user-specified CLI commands with strict argument safety and sandboxing."""
 
     def resolve_binary(self) -> Optional[str]:
         if not self.config.cli_command:
@@ -848,13 +1064,28 @@ class GenericCLIProvider(BaseCLIProvider):
 
     def build_command(self, prompt: str, timeout: float) -> List[str]:
         if not self.config.cli_command:
-            raise RuntimeError("No CLI command specified for generic CLI provider.")
-        cmd_str = self.config.cli_command
+            raise ProviderUnavailableError("No CLI command specified for generic CLI provider.")
+        cmd_str = self.config.cli_command.strip()
+        parts = shlex.split(cmd_str)
+        if not parts:
+            raise ProviderExecutionError("Invalid empty CLI command template.")
+
+        # Reject dangerous shell metacharacters in command definition
+        forbidden = [";", "&&", "||", "|", "`", "$(", "<", ">"]
+        for p in parts:
+            for f in forbidden:
+                if f in p:
+                    raise ProviderExecutionError(f"Unsafe shell metacharacter '{f}' detected in generic CLI command template.")
+
         if "{prompt}" in cmd_str:
-            parts = shlex.split(cmd_str.replace("{prompt}", "__DS_PROMPT_SENTINEL__"))
-            return [p.replace("__DS_PROMPT_SENTINEL__", prompt) for p in parts]
+            res: List[str] = []
+            for p in parts:
+                if "{prompt}" in p:
+                    res.append(p.replace("{prompt}", prompt))
+                else:
+                    res.append(p)
+            return res
         else:
-            parts = shlex.split(cmd_str)
             parts.append(prompt)
             return parts
 
@@ -863,26 +1094,27 @@ class GenericCLIProvider(BaseCLIProvider):
         messages: List[Dict[str, str]],
         json_mode: bool = True,
         timeout: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         req_timeout = timeout or self.config.timeout_seconds
         prompt = self._format_messages_to_prompt(messages)
         cmd = self.build_command(prompt, req_timeout)
 
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=req_timeout,
-            )
-            if proc.returncode != 0:
-                err = self._redact_secrets(proc.stderr.strip()[:300] or f"Exit {proc.returncode}")
-                raise RuntimeError(f"CLI command error (code {proc.returncode}): {err}")
-            return proc.stdout.strip()
+            retcode, stdout_str, stderr_str = self._run_controlled_process(cmd, timeout=req_timeout, request_id=request_id)
+            if retcode != 0:
+                err = self._redact_secrets(stderr_str[:300] or f"Exit {retcode}")
+                raise ProviderExecutionError(f"CLI command error (code {retcode}): {err}")
+            if not stdout_str and stderr_str:
+                err = self._redact_secrets(stderr_str[:300])
+                raise ProviderExecutionError(f"CLI command produced no output: {err}")
+            return stdout_str
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"CLI command timed out after {req_timeout}s")
+            raise ProviderExecutionError(f"CLI command timed out after {req_timeout}s")
+        except ProviderError:
+            raise
         except Exception as exc:
-            raise RuntimeError(f"CLI execution failure: {self._redact_secrets(str(exc))}")
+            raise ProviderExecutionError(f"CLI execution failure: {self._redact_secrets(str(exc))}")
 
 
 class DeterministicFallbackProvider(BaseLLMProvider):
@@ -899,6 +1131,8 @@ class DeterministicFallbackProvider(BaseLLMProvider):
             model="deterministic-engine",
             base_url="local://internal",
             reachable=True,
+            binary_available=False,
+            availability_status="DETERMINISTIC_RULES",
             latency_ms=0.0,
             is_fallback=True,
             is_cli=False,
@@ -909,6 +1143,7 @@ class DeterministicFallbackProvider(BaseLLMProvider):
         messages: List[Dict[str, str]],
         json_mode: bool = True,
         timeout: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         response_dict = {
             "summary": "Deterministic analysis executed. No external LLM was configured or contacted.",
@@ -944,6 +1179,10 @@ class LLMProviderManager:
     """Thread-safe lifecycle manager for LLM provider adapters."""
 
     _instance: Optional["LLMProviderManager"] = None
+    ALLOWED_PROVIDERS: Set[str] = {
+        "auto", "openai", "ollama", "gemini", "agy", "acp", "gemini-acp",
+        "cline", "paseo", "cli", "custom", "none",
+    }
 
     def __init__(self, config: Optional[LLMProviderConfig] = None):
         self.config = config or LLMProviderConfig.from_env()
@@ -983,12 +1222,20 @@ class LLMProviderManager:
         self._provider = self._create_provider(self.config.provider_type, self.config)
 
     def get_provider(self, override_type: Optional[str] = None) -> BaseLLMProvider:
-        if override_type and override_type.lower().strip() != self.config.provider_type.lower().strip():
-            p_type = override_type.lower().strip()
+        if override_type:
+            clean_override = override_type.lower().strip()
+            if clean_override not in self.ALLOWED_PROVIDERS:
+                logger.warning("Rejecting unrecognized provider override '%s'; falling back to configured default", override_type)
+                clean_override = self.config.provider_type
+        else:
+            clean_override = self.config.provider_type
+
+        if clean_override and clean_override != self.config.provider_type.lower().strip():
+            p_type = clean_override
             target_model = self.config.model
-            if p_type in ("gemini", "acp"):
+            if p_type in ("gemini", "acp", "agy", "gemini-acp"):
                 target_model = os.environ.get("DYNAMICSTATE_GEMINI_MODEL") or ("default" if "/" in (self.config.model or "") or (self.config.model or "").endswith(".gguf") else self.config.model)
-            elif p_type == "cline":
+            elif p_type in ("cline", "paseo"):
                 target_model = os.environ.get("DYNAMICSTATE_CLINE_MODEL") or ("default" if "/" in (self.config.model or "") or (self.config.model or "").endswith(".gguf") else self.config.model)
             elif p_type == "ollama":
                 target_model = os.environ.get("DYNAMICSTATE_OLLAMA_MODEL") or ("llama3" if "/" in (self.config.model or "") else self.config.model)
@@ -1003,11 +1250,34 @@ class LLMProviderManager:
                 timeout_seconds=self.config.timeout_seconds,
                 max_tokens=self.config.max_tokens,
                 temperature=self.config.temperature,
-                cli_command=self.config.cli_command,
-                cli_args=self.config.cli_args,
+                cli_command=self.config.cli_command,  # ONLY server-side configured
+                cli_args=self.config.cli_args,        # ONLY server-side configured
+                allow_dangerous_permissions=self.config.allow_dangerous_permissions,
+                max_output_bytes=self.config.max_output_bytes,
+                safe_working_dir=self.config.safe_working_dir,
             )
             return self._create_provider(p_type, cfg)
         return self._provider or DeterministicFallbackProvider(self.config)
+
+    def get_available_providers(self) -> Dict[str, Dict[str, Any]]:
+        """Return truthful health and availability for each supported provider type."""
+        res: Dict[str, Dict[str, Any]] = {}
+        for p_name in ("openai", "gemini", "acp", "cline", "ollama", "none"):
+            prov = self.get_provider(p_name)
+            st = prov.check_health()
+            res[p_name] = {
+                "available": st.reachable,
+                "binary_available": getattr(st, "binary_available", False),
+                "availability_status": getattr(st, "availability_status", "UNKNOWN"),
+                "is_cli": st.is_cli,
+                "model": st.model,
+                "error": st.error,
+            }
+        return res
+
+    def cancel_request(self, request_id: str) -> bool:
+        """Cancel any running CLI child process associated with request_id."""
+        return BaseCLIProvider.cancel_process(request_id)
 
     def get_status(self) -> Dict[str, Any]:
         """Check health and return safe status dictionary without credentials."""
@@ -1015,7 +1285,9 @@ class LLMProviderManager:
         status = provider.check_health()
         status.active_requests = self._active_requests
         d = status.to_dict()
+        d["configured_default_provider"] = self.config.provider_type
         d["config"] = self.config.to_safe_dict()
+        d["available_providers"] = self.get_available_providers()
         return d
 
     def track_request_start(self) -> None:

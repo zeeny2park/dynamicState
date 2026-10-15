@@ -3225,6 +3225,7 @@ class InvestigationManager:
         message: str,
         request_id: Optional[str] = None,
         provider_override: Optional[str] = None,
+        allow_fallback: bool = False,
     ) -> Dict[str, Any]:
         """Execute conversational analysis for the investigation session using configured LLM or honest fallback."""
         session = self.sessions.get(investigation_id)
@@ -3232,18 +3233,60 @@ class InvestigationManager:
             return {"success": False, "error": f"Investigation '{investigation_id}' not found"}
 
         from extractor.conversational_investigation import ConversationalAnalysisService
+        from extractor.llm_provider import ProviderError, ProviderUnavailableError, ProviderExecutionError
         service = ConversationalAnalysisService()
-        result = service.analyze_investigation(
-            session=session,
-            user_message=message,
-            request_id=request_id,
-            provider_override=provider_override,
-        )
-        return {
-            "success": True,
-            "investigation_id": investigation_id,
-            "result": result.to_dict(),
-        }
+        try:
+            result = service.analyze_investigation(
+                session=session,
+                user_message=message,
+                request_id=request_id,
+                provider_override=provider_override,
+                allow_fallback=allow_fallback,
+            )
+            return {
+                "success": True,
+                "investigation_id": investigation_id,
+                "result": result.to_dict(),
+            }
+        except ProviderUnavailableError as e:
+            return {
+                "success": False,
+                "error_code": "PROVIDER_UNAVAILABLE",
+                "error": str(e),
+                "investigation_id": investigation_id,
+                "request_id": request_id,
+            }
+        except ProviderExecutionError as e:
+            return {
+                "success": False,
+                "error_code": "PROVIDER_EXECUTION_FAILED",
+                "error": str(e),
+                "investigation_id": investigation_id,
+                "request_id": request_id,
+            }
+        except ProviderError as e:
+            return {
+                "success": False,
+                "error_code": "PROVIDER_ERROR",
+                "error": str(e),
+                "investigation_id": investigation_id,
+                "request_id": request_id,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error_code": "INTERNAL_ERROR",
+                "error": str(e),
+                "investigation_id": investigation_id,
+                "request_id": request_id,
+            }
+
+    def cancel_chat(self, request_id: str) -> Dict[str, Any]:
+        """Cancel an in-flight conversational analysis request and kill any child processes."""
+        from extractor.conversational_investigation import ConversationalAnalysisService
+        service = ConversationalAnalysisService()
+        canceled = service.cancel_analysis(request_id)
+        return {"success": True, "request_id": request_id, "canceled": canceled}
 
     def get_llm_status(self) -> Dict[str, Any]:
         """Return safe status of LLM provider without secrets."""

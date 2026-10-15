@@ -343,17 +343,22 @@
                 <button type="button" id="btn-chat-cancel" class="btn btn-outline btn-sm" style="display: none; color: var(--danger); border-color: var(--danger);">
                   <span>🛑</span> <span data-i18n="btn_chat_cancel">취소 (Cancel)</span>
                 </button>
-                <div class="inv-chat-provider-wrap" style="display: flex; align-items: center; gap: 6px;">
-                  <label for="inv-chat-provider-select" class="text-xs text-muted" style="font-weight: 600;" data-i18n="lbl_llm_provider">LLM 엔진:</label>
-                  <select id="inv-chat-provider-select" class="form-select form-select-sm text-xs" style="width: auto; padding: 4px 8px; border-radius: 4px;">
-                    <option value="auto" data-i18n="opt_provider_auto">🤖 자동 선택 (Auto-detect)</option>
-                    <option value="gemini" data-i18n="opt_provider_gemini">✨ Gemini CLI (agy)</option>
-                    <option value="acp" data-i18n="opt_provider_acp">⚡ Gemini ACP (agy-acp)</option>
-                    <option value="cline" data-i18n="opt_provider_cline">🔧 Cline / Paseo CLI</option>
-                    <option value="openai" data-i18n="opt_provider_openai">🌐 OpenAI / llama.cpp (HTTP)</option>
-                    <option value="ollama" data-i18n="opt_provider_ollama">🦙 Ollama (HTTP)</option>
-                    <option value="none" data-i18n="opt_provider_none">⚙️ 결정론적 규칙 엔진 (Fallback)</option>
-                  </select>
+                <div class="inv-chat-provider-wrap" style="display: flex; flex-direction: column; gap: 2px;">
+                  <div style="display: flex; align-items: center; gap: 6px;">
+                    <label for="inv-chat-provider-select" class="text-xs text-muted" style="font-weight: 600;" data-i18n="lbl_llm_provider">LLM 엔진:</label>
+                    <select id="inv-chat-provider-select" class="form-select form-select-sm text-xs" style="width: auto; padding: 4px 8px; border-radius: 4px;">
+                      <option value="auto" data-i18n="opt_provider_auto">🤖 자동 선택 (Auto-detect)</option>
+                      <option value="gemini" data-i18n="opt_provider_gemini">✨ Gemini CLI (agy)</option>
+                      <option value="acp" data-i18n="opt_provider_acp">⚡ Gemini ACP (agy-acp)</option>
+                      <option value="cline" data-i18n="opt_provider_cline">🔧 Cline / Paseo CLI</option>
+                      <option value="openai" data-i18n="opt_provider_openai">🌐 OpenAI / llama.cpp (HTTP)</option>
+                      <option value="ollama" data-i18n="opt_provider_ollama">🦙 Ollama (HTTP)</option>
+                      <option value="none" data-i18n="opt_provider_none">⚙️ 결정론적 규칙 엔진 (Fallback)</option>
+                    </select>
+                  </div>
+                  <div id="txt-chat-provider-hint" class="text-xs text-muted" style="font-size: 0.72rem; margin-top: 2px;">
+                    선택한 엔진의 가용성을 확인합니다.
+                  </div>
                 </div>
               </div>
 
@@ -370,12 +375,31 @@
             </div>
           </div>
 
+          <!-- Provider Error & Retry Banner -->
+          <div id="inv-chat-error-alert" class="banner banner-danger mb-3" style="display: none; margin: 12px 16px 0 16px;">
+            <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;">
+              <div style="flex: 1;">
+                <strong id="inv-chat-error-title">⚠️ 엔진 실행 오류 (Execution Error)</strong>
+                <p id="inv-chat-error-msg" class="text-xs" style="margin: 4px 0 0 0; line-height: 1.4;"></p>
+              </div>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <button type="button" id="btn-chat-retry-fallback" class="btn btn-warning btn-xs" style="font-weight: 600;">
+                  ⚙️ 규칙 기반 엔진으로 재시도
+                </button>
+                <button type="button" id="btn-chat-dismiss-error" class="btn btn-outline btn-xs">닫기</button>
+              </div>
+            </div>
+          </div>
+
           <!-- Structured Analysis Results (4 Clear Sections) -->
           <div id="inv-chat-results" style="display: none; padding: 0 16px 16px 16px;">
             <div class="banner banner-info mb-3" id="inv-chat-summary-banner" style="display: flex; align-items: flex-start; gap: 10px;">
               <span style="font-size: 1.2rem;">💡</span>
               <div style="flex: 1;">
-                <strong id="inv-chat-summary-title">진단 요약 (Diagnostic Summary)</strong>
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px;">
+                  <strong id="inv-chat-summary-title">진단 요약 (Diagnostic Summary)</strong>
+                  <span id="badge-chat-execution-engine" class="badge text-xs" style="font-weight: 600;"></span>
+                </div>
                 <p id="inv-chat-summary-text" class="text-xs" style="margin: 4px 0 0 0; line-height: 1.5;"></p>
                 <div id="inv-chat-disarmed-notice" class="text-xs" style="margin-top: 6px; color: #f59e0b; display: none;"></div>
               </div>

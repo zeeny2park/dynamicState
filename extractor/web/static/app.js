@@ -62,6 +62,12 @@
     txtLlmModelName: document.getElementById('txt-llm-model-name'),
     invChatTextarea: document.getElementById('inv-chat-textarea'),
     invChatProviderSelect: document.getElementById('inv-chat-provider-select'),
+    txtChatProviderHint: document.getElementById('txt-chat-provider-hint'),
+    invChatErrorAlert: document.getElementById('inv-chat-error-alert'),
+    invChatErrorMsg: document.getElementById('inv-chat-error-msg'),
+    btnChatRetryFallback: document.getElementById('btn-chat-retry-fallback'),
+    btnChatDismissError: document.getElementById('btn-chat-dismiss-error'),
+    badgeChatExecutionEngine: document.getElementById('badge-chat-execution-engine'),
     btnChatAnalyze: document.getElementById('btn-chat-analyze'),
     btnChatCancel: document.getElementById('btn-chat-cancel'),
     invChatStepper: document.getElementById('inv-chat-stepper'),
@@ -573,15 +579,22 @@
     }
   }
 
-  async function apiPost(endpoint, body = {}) {
+  async function apiPost(endpoint, body = {}, options = {}) {
     try {
-      const res = await fetch(getApiUrl(endpoint), {
+      const fetchOpts = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      });
+      };
+      if (options && options.signal) {
+        fetchOpts.signal = options.signal;
+      }
+      const res = await fetch(getApiUrl(endpoint), fetchOpts);
       return await res.json();
     } catch (err) {
+      if (err.name === 'AbortError') {
+        throw err;
+      }
       console.error(`API POST ${endpoint} error:`, err);
       return { success: false, error: { code: 'NETWORK_ERROR', message: String(err) } };
     }
@@ -4794,10 +4807,75 @@
       });
     });
 
+    // Provider Selector Hint & Descriptions
+    function updateChatProviderHint() {
+      if (!el.txtChatProviderHint || !el.invChatProviderSelect) return;
+      const val = el.invChatProviderSelect.value;
+      const hints = {
+        auto: '서버에 구성된 기본 제공자를 사용하며 필요 시 결정론적 규칙으로 대체합니다.',
+        gemini: '로컬 Antigravity / Gemini CLI (agy)를 호출합니다. (안전 비대화형 모드, 권한 우회 플래그 미사용)',
+        acp: 'Gemini ACP (agy-acp) 에이전트 제어 프로토콜 핸드셰이크를 사용합니다.',
+        cline: '로컬 Cline / Paseo CLI를 안전한 비대화형 서브프로세스로 실행합니다.',
+        openai: 'OpenAI 호환 HTTP 엔드포인트(llama.cpp, vLLM, 호스트 서비스 등)를 호출합니다.',
+        ollama: '로컬 Ollama HTTP 엔드포인트를 호출합니다.',
+        none: 'LLM을 호출하지 않고 순수 결정론적 규칙 기반 분석만 정직하게 수행합니다.',
+      };
+      el.txtChatProviderHint.textContent = hints[val] || '선택한 엔진의 가용성을 확인합니다.';
+    }
+
+    if (el.invChatProviderSelect) {
+      el.invChatProviderSelect.addEventListener('change', updateChatProviderHint);
+      updateChatProviderHint();
+    }
+
     // Analyze button
     if (el.btnChatAnalyze) {
       el.btnChatAnalyze.addEventListener('click', () => {
         executeConversationalAnalysis();
+      });
+    }
+
+    // Cancel button
+    if (el.btnChatCancel) {
+      el.btnChatCancel.addEventListener('click', async () => {
+        const reqId = state.currentChatRequestId;
+        if (!reqId) return;
+        try {
+          showToast('분석 중단을 요청합니다...', 'info');
+          await apiPost('/api/investigation/chat/cancel', { request_id: reqId });
+          if (state.currentChatAbortController) {
+            state.currentChatAbortController.abort();
+          }
+          showToast('분석이 취소되었습니다.', 'warning');
+          appendChatBubble('assistant', '🛑 분석이 사용자에 의해 취소되었습니다.');
+        } catch (cErr) {
+          console.warn('Cancel failed:', cErr);
+        } finally {
+          state.isAnalyzingChat = false;
+          state.currentChatRequestId = null;
+          state.currentChatAbortController = null;
+          if (el.btnChatCancel) el.btnChatCancel.style.display = 'none';
+          if (el.btnChatAnalyze) el.btnChatAnalyze.disabled = false;
+          setChatStepperStage(0);
+        }
+      });
+    }
+
+    // Error Alert & Retry Buttons
+    if (el.btnChatRetryFallback) {
+      el.btnChatRetryFallback.addEventListener('click', () => {
+        if (el.invChatErrorAlert) el.invChatErrorAlert.style.display = 'none';
+        if (el.invChatProviderSelect) {
+          el.invChatProviderSelect.value = 'none';
+          updateChatProviderHint();
+        }
+        executeConversationalAnalysis(null, true);
+      });
+    }
+
+    if (el.btnChatDismissError) {
+      el.btnChatDismissError.addEventListener('click', () => {
+        if (el.invChatErrorAlert) el.invChatErrorAlert.style.display = 'none';
       });
     }
 
@@ -4858,8 +4936,10 @@
     });
   }
 
-  async function executeConversationalAnalysis(customMessage) {
+  async function executeConversationalAnalysis(customMessage, forceFallback = false) {
     if (state.isAnalyzingChat) return;
+
+    if (el.invChatErrorAlert) el.invChatErrorAlert.style.display = 'none';
 
     const message = customMessage || (el.invChatTextarea ? el.invChatTextarea.value.trim() : '');
     if (!message) {
@@ -4869,7 +4949,12 @@
     }
 
     state.isAnalyzingChat = true;
+    const reqId = `chat_req_${Date.now()}`;
+    state.currentChatRequestId = reqId;
+    state.currentChatAbortController = new AbortController();
+
     if (el.btnChatAnalyze) el.btnChatAnalyze.disabled = true;
+    if (el.btnChatCancel) el.btnChatCancel.style.display = 'inline-flex';
 
     // Step 1: Ensure active investigation session exists
     setChatStepperStage(1);
@@ -4883,34 +4968,41 @@
         showToast('조사 세션을 생성할 수 없습니다. 대상을 확인하세요.', 'error');
         setChatStepperStage(0);
         state.isAnalyzingChat = false;
+        state.currentChatRequestId = null;
+        state.currentChatAbortController = null;
         if (el.btnChatAnalyze) el.btnChatAnalyze.disabled = false;
+        if (el.btnChatCancel) el.btnChatCancel.style.display = 'none';
         return;
       }
     }
 
     // Step 2: Query conversational LLM service
     setChatStepperStage(2);
-    const reqId = `chat_req_${Date.now()}`;
 
     // Append user question to conversational stream
     appendChatBubble('user', message);
 
     try {
-      // Step 3: Call POST /api/investigation/chat with optional provider_override
-      const providerOverride = (el.invChatProviderSelect && el.invChatProviderSelect.value !== 'auto')
-        ? el.invChatProviderSelect.value
-        : null;
+      let providerOverride = null;
+      if (forceFallback) {
+        providerOverride = 'none';
+      } else if (el.invChatProviderSelect && el.invChatProviderSelect.value !== 'auto') {
+        providerOverride = el.invChatProviderSelect.value;
+      }
 
       const chatPayload = {
         investigation_id: invId,
         message: message,
         request_id: reqId,
+        allow_fallback: forceFallback || (providerOverride === null),
       };
       if (providerOverride) {
         chatPayload.provider_override = providerOverride;
       }
 
-      const res = await apiPost('/api/investigation/chat', chatPayload);
+      const res = await apiPost('/api/investigation/chat', chatPayload, {
+        signal: state.currentChatAbortController ? state.currentChatAbortController.signal : undefined
+      });
 
       setChatStepperStage(3);
 
@@ -4928,17 +5020,31 @@
         // Refresh underlying investigation session to reflect added hypotheses/observations
         await loadActiveInvestigation(invId);
       } else {
+        const errCode = (res.error && res.error.code) || 'CONVERSATIONAL_ANALYSIS_ERROR';
         const errMsg = (res.error && res.error.message) || '대화형 분석 요청에 실패했습니다.';
+
+        if (el.invChatErrorAlert && el.invChatErrorMsg) {
+          el.invChatErrorAlert.style.display = 'block';
+          el.invChatErrorMsg.textContent = `[${errCode}] ${errMsg}`;
+        }
+
         showToast(`분석 실패: ${errMsg}`, 'error');
-        appendChatBubble('assistant', `⚠️ 분석 오류 발생: ${errMsg}`);
+        appendChatBubble('assistant', `⚠️ 분석 오류 발생: [${errCode}] ${errMsg}`);
       }
     } catch (err) {
-      console.error('Conversational analysis failed:', err);
-      showToast(`통신 오류: ${String(err)}`, 'error');
-      appendChatBubble('assistant', `⚠️ 네트워크 오류: ${String(err)}`);
+      if (err.name === 'AbortError') {
+        console.log('Chat analysis aborted by user.');
+      } else {
+        console.error('Conversational analysis failed:', err);
+        showToast(`통신 오류: ${String(err)}`, 'error');
+        appendChatBubble('assistant', `⚠️ 네트워크 오류: ${String(err)}`);
+      }
     } finally {
       state.isAnalyzingChat = false;
+      state.currentChatRequestId = null;
+      state.currentChatAbortController = null;
       if (el.btnChatAnalyze) el.btnChatAnalyze.disabled = false;
+      if (el.btnChatCancel) el.btnChatCancel.style.display = 'none';
       setTimeout(() => {
         if (!state.isAnalyzingChat) setChatStepperStage(0);
       }, 4000);
@@ -4974,6 +5080,23 @@
         el.invChatDisarmedNotice.innerHTML = `⚠️ <strong>보안 검증 알림:</strong> ${disarmed.map(d => escapeHtml(d)).join('; ')}`;
       } else {
         el.invChatDisarmedNotice.style.display = 'none';
+      }
+    }
+
+    // Render Execution Engine Badge
+    if (el.badgeChatExecutionEngine) {
+      const meta = res.provider_metadata || {};
+      const isFallback = meta.is_fallback || false;
+      const invoked = meta.invoked_provider || meta.provider || 'unknown';
+      if (isFallback || invoked === 'deterministic_fallback' || invoked === 'none') {
+        el.badgeChatExecutionEngine.className = 'badge badge-warning text-xs';
+        el.badgeChatExecutionEngine.textContent = '⚙️ 결정론적 규칙 엔진 (LLM 미호출)';
+        el.badgeChatExecutionEngine.title = meta.fallback_reason ? `대체 사유: ${meta.fallback_reason}` : '사전 정의된 규칙 기반 분석';
+      } else {
+        el.badgeChatExecutionEngine.className = 'badge badge-success text-xs';
+        const modelStr = meta.model ? ` (${meta.model})` : '';
+        el.badgeChatExecutionEngine.textContent = `🤖 LLM 추론: ${invoked}${modelStr}`;
+        el.badgeChatExecutionEngine.title = `실행 엔진: ${invoked}, 소요 시간: ${meta.duration_ms || 0}ms`;
       }
     }
 

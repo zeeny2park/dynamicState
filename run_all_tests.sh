@@ -104,7 +104,11 @@ run_step "Phase 14 Production Pilot Demonstration Script" \
 run_step "Phase 15 Conversational LLM & Simplified Investigation UX Suite" \
     python3 -m unittest tests/test_phase15_conversational_llm.py
 
-# 16. Discover and run all remaining unit and integration tests
+# 16. Phase 16 CLI Provider Security, Process Control & Truthfulness Suite
+run_step "Phase 16 CLI Provider Security, Process Control & Truthfulness Suite" \
+    python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py
+
+# 17. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

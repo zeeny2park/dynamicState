@@ -42,6 +42,9 @@ from extractor.llm_provider import (
     BaseLLMProvider,
     DeterministicFallbackProvider,
     LLMProviderManager,
+    ProviderError,
+    ProviderExecutionError,
+    ProviderUnavailableError,
 )
 
 logger = logging.getLogger("dynamicstate.conversational_investigation")
@@ -375,12 +378,17 @@ class ConversationalAnalysisService:
 
         return validated_dict, disarmed_claims
 
+    def cancel_analysis(self, request_id: str) -> bool:
+        """Cancel an in-flight analysis request and terminate its child process."""
+        return self.provider_manager.cancel_request(request_id)
+
     def analyze_investigation(
         self,
         session: Any,
         user_message: str,
         request_id: Optional[str] = None,
         provider_override: Optional[str] = None,
+        allow_fallback: bool = False,
     ) -> StructuredAnalysisResult:
         """Execute end-to-end conversational analysis for an investigation session."""
         req_id = request_id or f"req_{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -393,28 +401,96 @@ class ConversationalAnalysisService:
             fingerprint = context["context_fingerprint"]
             valid_evidence_ids = context.get("evidence_ledger_ids", [])
 
-            # Step 2: Resolve provider
-            provider = self.provider_manager.get_provider(provider_override)
-            health = provider.check_health()
+            # Step 2: Resolve provider & truthful selection
+            configured_default = self.provider_manager.config.provider_type
+            clean_override = (provider_override or "").lower().strip()
 
-            is_fallback = health.is_fallback or not health.reachable
-            actual_provider = provider if not is_fallback else DeterministicFallbackProvider()
-            provider_type = "deterministic_fallback" if is_fallback else health.provider_type
-            model_name = "deterministic-engine" if is_fallback else health.model
+            if clean_override and clean_override not in ("auto", ""):
+                selected_provider = clean_override
+                is_explicit_selection = (clean_override != "none")
+            else:
+                selected_provider = configured_default if configured_default != "auto" else "none"
+                is_explicit_selection = False
+
+            provider = self.provider_manager.get_provider(clean_override or None)
+            health = provider.check_health()
 
             # Step 3: Format Prompt
             chat_history = getattr(session, "chat_history", []) or []
             messages = self.format_prompt(context, chat_history)
 
-            # Step 4: Execute Call
-            try:
-                raw_response = actual_provider.chat_completion(messages, json_mode=True)
-            except Exception as exc:
-                logger.warning("LLM provider execution failed: %s; falling back to deterministic reasoning", exc)
+            # Step 4: Execute Call with Truthful Handling
+            is_fallback = False
+            invoked_provider = selected_provider
+            model_name = health.model
+            execution_status = "SUCCESS"
+            fallback_reason = None
+
+            if is_explicit_selection:
+                # User explicitly selected an LLM provider: must not silently fall back
+                if not health.reachable:
+                    if not allow_fallback:
+                        err_msg = health.error or f"Provider '{selected_provider}' is not reachable or binary was not found"
+                        raise ProviderUnavailableError(
+                            f"Selected provider '{selected_provider}' is unavailable: {err_msg}. "
+                            "Please verify provider configuration or select '결정론적 규칙 엔진 (Fallback)'."
+                        )
+                    logger.warning("Selected provider %s is unreachable; falling back to deterministic reasoning", selected_provider)
+                    is_fallback = True
+                    invoked_provider = "deterministic_fallback"
+                    model_name = "deterministic-engine"
+                    execution_status = "FALLBACK"
+                    fallback_reason = health.error or f"Provider '{selected_provider}' unreachable"
+                    raw_response = DeterministicFallbackProvider().chat_completion(messages, json_mode=True, request_id=req_id)
+                else:
+                    try:
+                        raw_response = provider.chat_completion(messages, json_mode=True, request_id=req_id)
+                        invoked_provider = health.provider_type
+                        model_name = health.model
+                        execution_status = "SUCCESS"
+                    except Exception as exc:
+                        if not allow_fallback:
+                            raise ProviderExecutionError(
+                                f"Selected provider '{selected_provider}' execution failed: {exc}. "
+                                "Please check logs or select '결정론적 규칙 엔진 (Fallback)'."
+                            )
+                        logger.warning("Selected provider %s failed: %s; falling back to deterministic reasoning", selected_provider, exc)
+                        is_fallback = True
+                        invoked_provider = "deterministic_fallback"
+                        model_name = "deterministic-engine"
+                        execution_status = "FALLBACK"
+                        fallback_reason = str(exc)
+                        raw_response = DeterministicFallbackProvider().chat_completion(messages, json_mode=True, request_id=req_id)
+            elif selected_provider == "none":
+                # Deterministic fallback directly requested
                 is_fallback = True
-                provider_type = "deterministic_fallback"
+                invoked_provider = "deterministic_fallback"
                 model_name = "deterministic-engine"
-                raw_response = DeterministicFallbackProvider().chat_completion(messages, json_mode=True)
+                execution_status = "FALLBACK"
+                raw_response = DeterministicFallbackProvider().chat_completion(messages, json_mode=True, request_id=req_id)
+            else:
+                # Auto-detect or configured default
+                if health.reachable and not health.is_fallback:
+                    try:
+                        raw_response = provider.chat_completion(messages, json_mode=True, request_id=req_id)
+                        invoked_provider = health.provider_type
+                        model_name = health.model
+                        execution_status = "SUCCESS"
+                    except Exception as exc:
+                        logger.warning("Default provider %s failed: %s; falling back to deterministic reasoning", health.provider_type, exc)
+                        is_fallback = True
+                        invoked_provider = "deterministic_fallback"
+                        model_name = "deterministic-engine"
+                        execution_status = "FALLBACK"
+                        fallback_reason = str(exc)
+                        raw_response = DeterministicFallbackProvider().chat_completion(messages, json_mode=True, request_id=req_id)
+                else:
+                    is_fallback = True
+                    invoked_provider = "deterministic_fallback"
+                    model_name = "deterministic-engine"
+                    execution_status = "FALLBACK"
+                    fallback_reason = health.error or "No responsive LLM provider configured"
+                    raw_response = DeterministicFallbackProvider().chat_completion(messages, json_mode=True, request_id=req_id)
 
             # Step 5: Validate and Sanitize Response
             validated_data, disarmed = self.parse_and_validate_response(
@@ -427,11 +503,16 @@ class ConversationalAnalysisService:
 
             meta = {
                 "request_id": req_id,
-                "provider": provider_type,
+                "configured_default_provider": configured_default,
+                "selected_provider": selected_provider,
+                "invoked_provider": invoked_provider,
+                "provider": invoked_provider,
                 "model": model_name,
                 "duration_ms": duration_ms,
                 "is_fallback": is_fallback,
-                "is_cli": provider_type in ("gemini", "cline", "cli", "agy", "acp", "gemini-acp"),
+                "is_cli": invoked_provider in ("gemini", "cline", "cli", "agy", "acp", "gemini-acp"),
+                "execution_status": execution_status,
+                "fallback_reason": fallback_reason,
                 "context_fingerprint": fingerprint,
                 "timestamp": time.time(),
             }
@@ -492,10 +573,15 @@ class ConversationalAnalysisService:
                     classification=EVIDENCE_CLASSIFICATION_INFERENCE,
                     details={
                         "request_id": req_id,
-                        "provider": provider_type,
+                        "configured_default_provider": configured_default,
+                        "selected_provider": selected_provider,
+                        "invoked_provider": invoked_provider,
+                        "provider": invoked_provider,
                         "model": model_name,
                         "is_fallback": is_fallback,
                         "is_cli": meta.get("is_cli", False),
+                        "execution_status": execution_status,
+                        "fallback_reason": fallback_reason,
                         "context_fingerprint": fingerprint,
                         "validation_status": validation_status,
                         "disarmed_claims_count": len(disarmed),

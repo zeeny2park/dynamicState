@@ -297,7 +297,10 @@ class AgentRuntime:
                     msg,
                     request_id=action.request_id,
                     provider_override=action.provider_override,
+                    allow_fallback=getattr(action, "allow_fallback", False),
                 )
+            elif act in ("CANCEL_INVESTIGATION_CHAT", "CANCEL_CHAT"):
+                return self.cancel_investigation_chat(action.request_id)
             elif act == "GET_LLM_STATUS":
                 return self.get_llm_status()
             else:
@@ -2014,6 +2017,7 @@ class AgentRuntime:
         message: str,
         request_id: Optional[str] = None,
         provider_override: Optional[str] = None,
+        allow_fallback: bool = False,
     ) -> AgentActionResult:
         """Execute conversational analysis grounded strictly in investigation session evidence."""
         t0 = time.monotonic()
@@ -2022,13 +2026,28 @@ class AgentRuntime:
             message=message,
             request_id=request_id,
             provider_override=provider_override,
+            allow_fallback=allow_fallback,
         )
         if not res.get("success", False):
-            return self._error("CONVERSATIONAL_ANALYSIS_ERROR", res.get("error", "Failed to analyze chat"), "ANALYZE_INVESTIGATION_CHAT", t0)
+            err_code = res.get("error_code") or "CONVERSATIONAL_ANALYSIS_ERROR"
+            return self._error(err_code, res.get("error", "Failed to analyze chat"), "ANALYZE_INVESTIGATION_CHAT", t0)
         return AgentActionResult(
             success=True,
             action="ANALYZE_INVESTIGATION_CHAT",
             data=res.get("result"),
+            performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def cancel_investigation_chat(self, request_id: Optional[str] = None) -> AgentActionResult:
+        """Cancel an in-flight conversational analysis request and terminate child processes."""
+        t0 = time.monotonic()
+        if not request_id:
+            return self._error("INVALID_FIELD", "request_id is required to cancel chat", "CANCEL_INVESTIGATION_CHAT", t0)
+        res = self.investigation_manager.cancel_chat(request_id)
+        return AgentActionResult(
+            success=res.get("success", True),
+            action="CANCEL_INVESTIGATION_CHAT",
+            data=res,
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
         )
 

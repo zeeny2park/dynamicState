@@ -137,6 +137,7 @@ class AgentAction(_SubscriptableModel):
     message: Optional[str] = None
     request_id: Optional[str] = None
     provider_override: Optional[str] = None
+    allow_fallback: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -191,6 +192,7 @@ class AgentAction(_SubscriptableModel):
             message=data.get("message") or data.get("user_message"),
             request_id=data.get("request_id"),
             provider_override=data.get("provider_override"),
+            allow_fallback=bool(data.get("allow_fallback", False)),
         )
 
 

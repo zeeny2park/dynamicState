@@ -1574,16 +1574,28 @@ class WebApiAdapter:
         msg = params.get("message") or params.get("user_message") or "Analyze the observed state changes and propose evidence-grounded hypotheses."
         req_id = params.get("request_id")
         provider_override = params.get("provider_override")
+        allow_fallback = bool(params.get("allow_fallback", False))
         res = self.runtime.analyze_investigation_chat(
             investigation_id=inv_id,
             message=msg,
             request_id=req_id,
             provider_override=provider_override,
+            allow_fallback=allow_fallback,
         )
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
         return {"success": False, "error": {"code": res.error.code if res.error else "CONVERSATIONAL_ANALYSIS_ERROR",
                                             "message": res.error.message if res.error else "Failed to analyze chat"}}
+
+    def cancel_investigation_chat(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        req_id = params.get("request_id")
+        if not req_id:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "request_id is required"}}
+        res = self.runtime.cancel_investigation_chat(req_id)
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {"success": False, "error": {"code": res.error.code if res.error else "CANCEL_ERROR",
+                                            "message": res.error.message if res.error else "Failed to cancel chat"}}
 
     def get_llm_status(self) -> Dict[str, Any]:
         res = self.runtime.get_llm_status()
@@ -2029,6 +2041,10 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
             if path in ("/api/investigation/chat", "/api/investigation/analyze-chat"):
                 self._send_json(adapter.analyze_investigation_chat(body))
+                return
+
+            if path in ("/api/investigation/chat/cancel", "/api/investigation/cancel-chat"):
+                self._send_json(adapter.cancel_investigation_chat(body))
                 return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
