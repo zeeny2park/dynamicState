@@ -334,15 +334,27 @@
               </button>
             </div>
 
-            <!-- Action Buttons & 4-Stage Progress Stepper -->
+            <!-- Action Buttons, Provider Selector & 4-Stage Progress Stepper -->
             <div style="margin-top: 12px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
-              <div style="display: flex; gap: 8px; align-items: center;">
+              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
                 <button type="button" id="btn-chat-analyze" class="btn btn-primary btn-lg" style="font-weight: 700; padding: 10px 24px;">
                   <span>🔍</span> <span data-i18n="btn_chat_analyze">분석 시작 (Analyze)</span>
                 </button>
                 <button type="button" id="btn-chat-cancel" class="btn btn-outline btn-sm" style="display: none; color: var(--danger); border-color: var(--danger);">
                   <span>🛑</span> <span data-i18n="btn_chat_cancel">취소 (Cancel)</span>
                 </button>
+                <div class="inv-chat-provider-wrap" style="display: flex; align-items: center; gap: 6px;">
+                  <label for="inv-chat-provider-select" class="text-xs text-muted" style="font-weight: 600;" data-i18n="lbl_llm_provider">LLM 엔진:</label>
+                  <select id="inv-chat-provider-select" class="form-select form-select-sm text-xs" style="width: auto; padding: 4px 8px; border-radius: 4px;">
+                    <option value="auto" data-i18n="opt_provider_auto">🤖 자동 선택 (Auto-detect)</option>
+                    <option value="gemini" data-i18n="opt_provider_gemini">✨ Gemini CLI (agy)</option>
+                    <option value="acp" data-i18n="opt_provider_acp">⚡ Gemini ACP (agy-acp)</option>
+                    <option value="cline" data-i18n="opt_provider_cline">🔧 Cline / Paseo CLI</option>
+                    <option value="openai" data-i18n="opt_provider_openai">🌐 OpenAI / llama.cpp (HTTP)</option>
+                    <option value="ollama" data-i18n="opt_provider_ollama">🦙 Ollama (HTTP)</option>
+                    <option value="none" data-i18n="opt_provider_none">⚙️ 결정론적 규칙 엔진 (Fallback)</option>
+                  </select>
+                </div>
               </div>
 
               <!-- 4-Stage Progress Stepper -->

@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status: `DYNAMICSTATE_PHASE15_SIMPLIFIED_UX_AND_REAL_CONVERSATIONAL_LLM_COMPLETE`** — Simplified Investigation UX and Real Conversational LLM Integration Complete  
-> Verified with 649+ Unit/Integration/Security Tests (Full Discovery), 15 Phase 15 Conversational LLM & Simplified Investigation UX Tests, 25 Pipeline Steps in `run_all_tests.sh`, 13 Phase 14 Embedded Linux Production Pilot & Security Gate Tests, Standalone Production Pilot Demonstration Script (`scripts/run_production_pilot.py`), 16 Phase 13 Real C++ Operational Acceptance & Security Gate Tests, 14-Step Automated Acceptance Pipeline (`scripts/run_e2e_operational_acceptance.py`), 11 Phase 12 Conversational Investigation Loop Tests, 83 Causal Validation & Evidence Authenticity Tests, 16 Phase 10 Independent CI Security Gate Tests, 17 Phase 11 Real-Target Release Readiness Tests, Real C++ PIE ASLR Controls, Multithread Branch Isolation, CI Workflow Parity, Machine-Readable Pilot Qualification Schema with Tamper-Evident SHA-256 Signatures, and Non-Atomic Capture Degraded Trust Gates.
+> Verified with 656+ Unit/Integration/Security Tests (Full Discovery), 22 Phase 15 Conversational LLM & Simplified Investigation UX Tests, 25 Pipeline Steps in `run_all_tests.sh`, 13 Phase 14 Embedded Linux Production Pilot & Security Gate Tests, Standalone Production Pilot Demonstration Script (`scripts/run_production_pilot.py`), 16 Phase 13 Real C++ Operational Acceptance & Security Gate Tests, 14-Step Automated Acceptance Pipeline (`scripts/run_e2e_operational_acceptance.py`), 11 Phase 12 Conversational Investigation Loop Tests, 83 Causal Validation & Evidence Authenticity Tests, 16 Phase 10 Independent CI Security Gate Tests, 17 Phase 11 Real-Target Release Readiness Tests, Real C++ PIE ASLR Controls, Multithread Branch Isolation, CI Workflow Parity, Machine-Readable Pilot Qualification Schema with Tamper-Evident SHA-256 Signatures, and Non-Atomic Capture Degraded Trust Gates.
 
 GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
 
@@ -115,7 +115,7 @@ Recursive Semantic Reachability Traversal
 - **Phase 14 (Complete)**: *"Production Pilot and Release Qualification"*  
   (대표 임베디드 리눅스 C/C++ IoT 텔레메트리 타깃(`phase14_embedded_telemetry_fixture.cpp`) 대상 프로덕션 파일럿 및 릴리스 검증: Stripped PIE 바이너리 + 분리 컴패니언 DWARF 심볼, ASLR 환경 하 `process_vm_readv` 비침습적 정지/재개 캡처, 통계적 지연 시간 및 처리량 분포 산출(p50/p95/max), 음성 대조군 및 단일 작성자 격리 기반 인과 함수 승격, 상태 전이 검증과 함수 귀속 검증의 엄격한 분리, 경쟁 스레드 활성화 시 인과 주장 거절, 기계 판독 가능 파일럿 검증 보고서(`reports/pilot_qualification_report.json`)의 SHA-256 암호학적 위변조 방지 봉인, 시뮬레이션 타깃과 실 하드웨어 간 명시적 투명 공개(`real_hardware_validated=False`), 단독 실행 파일럿 검증 스크립트(`scripts/run_production_pilot.py`) 및 운영 런북(`docs/production_pilot_runbook.md`) 완비)
 - **Phase 15 (Complete)**: *"Simplified Investigation UX and Real Conversational LLM Integration"*  
-  (단일 조사 워크스페이스 중심의 UX 단순화 및 실제 Conversational LLM 연동: 8개 기술 탭을 전문가 모드(Expert Mode) 뒤로 점진적 공개(Progressive Disclosure) 처리하고 기본 뷰를 [대상 선택 -> 자연어 문제 기술 -> 분석 시작 -> 사실/가설/미확인/추천 조치 확인 -> 승인 및 관측 실행] 흐름으로 재편; OpenAI 호환 REST 엔드포인트(표준 라이브러리 urllib 기반, llama.cpp / vLLM / OpenAI) 및 로컬 Ollama 어댑터, 외부 LLM 미설정 시 정직한 결정론적 폴백(Deterministic Fallback) 지원; API 키의 클라이언트/HTML/로그/세션 노출 원천 차단(GET /api/llm/status) 및 비밀 마스킹; 원시 메모리 블록을 배제한 DWARF/차이점/함수후보/원장ID 중심의 컴팩트 컨텍스트 구축 및 SHA-256 핑거프린트 서명; 서버 측 스키마 검증 및 방어적 디스암(원장에 없는 위조 증거 ID 제거, LLM의 VALIDATED 인과 주장 PROPOSED 격하, 후보 함수 STATIC_CANDIDATE 상한 제한); 4단계 진행 표시기([1/4] 컨텍스트 수집 -> [2/4] LLM 분석 -> [3/4] 증거 검증 -> [4/4] 완료), 한국어 추천 질의 칩, 후속 연속 대화 스트림, 추천 관측 원클릭 승인 실행 연동 완비)
+  (단일 조사 워크스페이스 중심의 UX 단순화 및 실제 Conversational LLM 연동: 8개 기술 탭을 전문가 모드(Expert Mode) 뒤로 점진적 공개(Progressive Disclosure) 처리하고 기본 뷰를 [대상 선택 -> 자연어 문제 기술 -> 분석 시작 -> 사실/가설/미확인/추천 조치 확인 -> 승인 및 관측 실행] 흐름으로 재편; OpenAI 호환 REST 엔드포인트(표준 라이브러리 urllib 기반, llama.cpp / vLLM / OpenAI), 로컬 Ollama 어댑터, 로컬 설치 CLI 도구(Gemini `agy`/`gemini`, Gemini ACP `agy-acp` stdio JSON-RPC, Cline/Paseo `cline`/`paseo`, 범용 CLI 템플릿 지원), 외부 LLM 미설정 시 정직한 결정론적 폴백(Deterministic Fallback) 지원; UI 프로바이더 선택 드롭다운 연동; API 키/토큰의 클라이언트/HTML/로그/세션 노출 원천 차단(GET /api/llm/status) 및 비밀 마스킹; 원시 메모리 블록을 배제한 DWARF/차이점/함수후보/원장ID 중심의 컴팩트 컨텍스트 구축 및 SHA-256 핑거프린트 서명; 서버 측 스키마 검증 및 방어적 디스암(원장에 없는 위조 증거 ID 제거, LLM의 VALIDATED 인과 주장 PROPOSED 격하, 후보 함수 STATIC_CANDIDATE 상한 제한); 4단계 진행 표시기([1/4] 컨텍스트 수집 -> [2/4] LLM 분석 -> [3/4] 증거 검증 -> [4/4] 완료), 한국어 추천 질의 칩, 후속 연속 대화 스트림, 추천 관측 원클릭 승인 실행 연동 완비)
 
 ---
 
@@ -1334,7 +1334,7 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 | **Machine-Readable Pilot Report & SHA-256 Seal** | Complete | Tamper-evident schema, SHA-256 payload integrity hash | **INTEGRATION TESTED** | `reports/pilot_qualification_report.json`, strict hardware disclosures |
 | **Trusted Causal Verification Engine** | Complete | Attestation proof verification, negative control baseline checks | **INTEGRATION TESTED** | Rejects unverified attribution, forged proofs, and conflated state transitions |
 | **Observation Plan Lifecycle** | Complete | State transitions (PROPOSED->EXECUTED->VERIFIED/FAILED/CANCELED) | **INTEGRATION TESTED** | Prevents duplicate execution, tracks cancellation, UI interactive controls |
-| **Phase 15 Conversational LLM & Simplified UX** | Complete | 15 conversational tests, local LLM & fallback | **REAL TARGET VALIDATED** | Single-pane workspace, OpenAI/llama.cpp integration, evidence claim disarming, secret redaction |
+| **Phase 15 Conversational LLM & Simplified UX** | Complete | 22 conversational tests, local CLI/REST LLM & fallback | **REAL TARGET VALIDATED** | Single-pane workspace, OpenAI/Ollama/Gemini/ACP/Cline CLI integration, evidence claim disarming, secret redaction |
 
 ---
 
@@ -1400,10 +1400,10 @@ dynamicState includes an automated benchmark harness measuring process suspensio
    # Phase 14 Production Pilot Demonstration Script
    python3 scripts/run_production_pilot.py --smoke
 
-   # Phase 15 Conversational LLM & Simplified Investigation UX (15 tests)
+   # Phase 15 Conversational LLM & Simplified Investigation UX (22 tests)
    python3 -m unittest tests/test_phase15_conversational_llm.py -v
 
-   # Full test discovery suite (649+ tests)
+   # Full test discovery suite (656+ tests)
    python3 -m unittest discover -s tests -v
    ```
 

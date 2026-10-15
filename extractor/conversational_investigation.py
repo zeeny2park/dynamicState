@@ -431,6 +431,7 @@ class ConversationalAnalysisService:
                 "model": model_name,
                 "duration_ms": duration_ms,
                 "is_fallback": is_fallback,
+                "is_cli": provider_type in ("gemini", "cline", "cli", "agy", "acp", "gemini-acp"),
                 "context_fingerprint": fingerprint,
                 "timestamp": time.time(),
             }
@@ -494,6 +495,7 @@ class ConversationalAnalysisService:
                         "provider": provider_type,
                         "model": model_name,
                         "is_fallback": is_fallback,
+                        "is_cli": meta.get("is_cli", False),
                         "context_fingerprint": fingerprint,
                         "validation_status": validation_status,
                         "disarmed_claims_count": len(disarmed),
@@ -501,10 +503,20 @@ class ConversationalAnalysisService:
                 )
 
             # Record turn in chat history
-            if not hasattr(session, "chat_history"):
-                session.chat_history = []
-            session.chat_history.append({"role": "user", "content": user_message})
-            session.chat_history.append({"role": "assistant", "content": json.dumps(result.to_dict())})
+            if isinstance(session, dict):
+                if "chat_history" not in session:
+                    session["chat_history"] = []
+                session["chat_history"].append({"role": "user", "content": user_message})
+                session["chat_history"].append({"role": "assistant", "content": json.dumps(result.to_dict())})
+            elif hasattr(session, "chat_history"):
+                if getattr(session, "chat_history") is None:
+                    session.chat_history = []
+                session.chat_history.append({"role": "user", "content": user_message})
+                session.chat_history.append({"role": "assistant", "content": json.dumps(result.to_dict())})
+            elif hasattr(session, "__dict__"):
+                session.chat_history = getattr(session, "chat_history", None) or []
+                session.chat_history.append({"role": "user", "content": user_message})
+                session.chat_history.append({"role": "assistant", "content": json.dumps(result.to_dict())})
 
             return result
 

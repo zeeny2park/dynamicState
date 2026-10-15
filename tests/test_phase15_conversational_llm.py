@@ -39,8 +39,13 @@ from extractor.hypothesis import (
 )
 from extractor.investigation import InvestigationManager, InvestigationSession
 from extractor.llm_provider import (
+    BaseCLIProvider,
     BaseLLMProvider,
+    ClineCLIProvider,
     DeterministicFallbackProvider,
+    GeminiACPProvider,
+    GeminiCLIProvider,
+    GenericCLIProvider,
     LLMProviderConfig,
     LLMProviderManager,
     LLMProviderStatus,
@@ -482,6 +487,164 @@ class TestWebAPIAndRuntimeDispatch(unittest.TestCase):
         self.assertTrue(status_res.success)
         self.assertEqual(status_res.action, "GET_LLM_STATUS")
         self.assertIn("provider_type", status_res.data)
+
+
+class TestCLILLMProviders(unittest.TestCase):
+    """Test suite for local CLI-based LLM adapters (Gemini, Gemini ACP, Cline, and generic CLI)."""
+
+    def test_gemini_cli_provider_resolution_and_command_builder(self):
+        cfg = LLMProviderConfig(provider_type="gemini", model="gemini-2.5-pro")
+        prov = GeminiCLIProvider(cfg)
+        bin_path = prov.resolve_binary()
+        self.assertIsNotNone(bin_path, "Gemini or agy binary should resolve")
+        self.assertTrue(os.path.exists(bin_path))
+
+        cmd = prov.build_command("Test prompt", timeout=30.0)
+        self.assertEqual(cmd[0], bin_path)
+        self.assertIn("-p", cmd)
+        self.assertIn("Test prompt", cmd)
+        if "agy" in os.path.basename(bin_path).lower():
+            self.assertIn("--output-format", cmd)
+            self.assertIn("text", cmd)
+            self.assertIn("--disable-slash-commands", cmd)
+            self.assertIn("--dangerously-skip-permissions", cmd)
+
+    def test_gemini_acp_provider_resolution_and_handshake(self):
+        cfg = LLMProviderConfig(provider_type="acp")
+        prov = GeminiACPProvider(cfg)
+        bin_path = prov.resolve_binary()
+        self.assertIsNotNone(bin_path, "agy-acp binary should resolve at ~/.gemini/antigravity/agy-acp/dist/")
+        self.assertTrue(os.path.exists(bin_path))
+
+        status = prov.check_health()
+        self.assertTrue(status.configured)
+        self.assertTrue(status.reachable)
+        self.assertTrue(status.is_cli)
+        self.assertIn("acp://", status.base_url)
+        self.assertIsNotNone(status.latency_ms)
+
+    def test_cline_cli_provider_resolution_and_command_builder(self):
+        cfg = LLMProviderConfig(provider_type="cline")
+        prov = ClineCLIProvider(cfg)
+        bin_path = prov.resolve_binary()
+        self.assertIsNotNone(bin_path, "Cline or paseo binary should resolve")
+        self.assertTrue(os.path.exists(bin_path))
+
+        cmd = prov.build_command("Inspect state", timeout=25.0)
+        self.assertEqual(cmd[0], bin_path)
+        if "paseo" in os.path.basename(bin_path).lower():
+            self.assertIn("run", cmd)
+            self.assertIn("Inspect state", cmd)
+            self.assertIn("--provider", cmd)
+            self.assertIn("--json", cmd)
+
+    def test_generic_cli_provider_template_substitution_and_secrets(self):
+        secret = "sk-super-secret-token-777"
+        cfg = LLMProviderConfig(
+            provider_type="cli",
+            cli_command="echo 'Echoed: {prompt}'",
+            api_key=secret,
+        )
+        prov = GenericCLIProvider(cfg)
+        cmd = prov.build_command("Hello world", timeout=10.0)
+        self.assertEqual(cmd, ["echo", "Echoed: Hello world"])
+
+        # Test secret redaction on error
+        err_msg = prov._redact_secrets(f"Failed with token {secret} and AIzaSyD1234567890abcdefghijklmnopqrst")
+        self.assertNotIn(secret, err_msg)
+        self.assertIn("[REDACTED]", err_msg)
+        self.assertIn("[REDACTED_GEMINI_KEY]", err_msg)
+
+    def test_cli_provider_missing_binary_fails_safely(self):
+        cfg = LLMProviderConfig(
+            provider_type="cli",
+            cli_command="/usr/bin/nonexistent_llm_cli_99999",
+        )
+        prov = GenericCLIProvider(cfg)
+        self.assertIsNone(prov.resolve_binary())
+
+        status = prov.check_health()
+        self.assertTrue(status.configured)
+        self.assertFalse(status.reachable)
+        self.assertTrue(status.is_cli)
+        self.assertIn("not found", status.error)
+
+        cfg_empty = LLMProviderConfig(provider_type="cli", cli_command="")
+        prov_empty = GenericCLIProvider(cfg_empty)
+        with self.assertRaises(RuntimeError):
+            prov_empty.chat_completion([{"role": "user", "content": "hi"}])
+
+    def test_conversational_analysis_with_gemini_cli_provider(self):
+        session = InvestigationSession(
+            investigation_id="inv_gemini_cli_test",
+            goal="CLI Investigation Test",
+        )
+
+        mock_gemini_output = json.dumps({
+            "summary": "State analysis produced by Gemini CLI adapter.",
+            "observed_facts": [{"fact": "Worker status changed"}],
+            "hypotheses": [
+                {
+                    "title": "Worker Mutator",
+                    "claim": "update_worker mutated state",
+                    "status": "VALIDATED",
+                }
+            ],
+            "unknowns": ["No trace evidence available."],
+            "evidence_refs": ["fabricated_ev_999"],
+            "alternative_explanations": [],
+            "proposed_observations": [
+                {
+                    "question": "Run read-only observation?",
+                    "target_kind": "FIELD",
+                }
+            ],
+            "safety_notes": ["Safe read only."],
+            "next_steps": ["Observe next state."]
+        })
+
+        prov_mgr = LLMProviderManager.get_instance()
+        with patch.object(GeminiCLIProvider, "chat_completion", return_value=mock_gemini_output):
+            service = ConversationalAnalysisService(provider_manager=prov_mgr)
+            result = service.analyze_investigation(
+                session=session,
+                user_message="Analyze state with Gemini CLI",
+                provider_override="gemini",
+            )
+
+            self.assertEqual(result.summary, "State analysis produced by Gemini CLI adapter.")
+            self.assertTrue(result.provider_metadata.get("is_cli"))
+            self.assertEqual(result.provider_metadata.get("provider"), "gemini")
+
+            # Defensive disarming checks
+            self.assertNotIn("fabricated_ev_999", result.evidence_refs)
+            for h in result.hypotheses:
+                self.assertNotEqual(h.get("status"), "VALIDATED")
+                self.assertEqual(h.get("status"), "PROPOSED")
+
+            events = [e for e in session.timeline if e.get("event_type") == "CONVERSATIONAL_ANALYSIS_COMPLETED"]
+            self.assertEqual(len(events), 1)
+            self.assertTrue(events[0]["details"].get("is_cli"))
+            self.assertEqual(events[0]["details"].get("provider"), "gemini")
+
+    def test_llm_provider_manager_override_cli_types(self):
+        cfg = LLMProviderConfig(provider_type="none")
+        mgr = LLMProviderManager(config=cfg)
+
+        p_gemini = mgr.get_provider("gemini")
+        self.assertIsInstance(p_gemini, GeminiCLIProvider)
+
+        p_acp = mgr.get_provider("acp")
+        self.assertIsInstance(p_acp, GeminiACPProvider)
+
+        p_cline = mgr.get_provider("cline")
+        self.assertIsInstance(p_cline, ClineCLIProvider)
+
+        p_cli = mgr.get_provider("cli")
+        self.assertIsInstance(p_cli, GenericCLIProvider)
+
+        p_fallback = mgr.get_provider("none")
+        self.assertIsInstance(p_fallback, DeterministicFallbackProvider)
 
 
 if __name__ == "__main__":

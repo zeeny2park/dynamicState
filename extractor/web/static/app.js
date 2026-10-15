@@ -61,6 +61,7 @@
     txtLlmProviderMeta: document.getElementById('txt-llm-provider-meta'),
     txtLlmModelName: document.getElementById('txt-llm-model-name'),
     invChatTextarea: document.getElementById('inv-chat-textarea'),
+    invChatProviderSelect: document.getElementById('inv-chat-provider-select'),
     btnChatAnalyze: document.getElementById('btn-chat-analyze'),
     btnChatCancel: document.getElementById('btn-chat-cancel'),
     invChatStepper: document.getElementById('inv-chat-stepper'),
@@ -4738,8 +4739,16 @@
   function renderLLMStatusBadge(data) {
     const isFallback = data.is_fallback || !data.reachable || data.provider_type === 'none';
     const model = data.model || 'deterministic-engine';
-    const provider = data.provider_type || 'none';
+    const provider = (data.provider_type || 'none').toLowerCase();
+    const isCli = !!data.is_cli;
     const latency = data.latency_ms ? ` (${data.latency_ms}ms)` : '';
+
+    let providerLabel = provider.toUpperCase();
+    if (provider === 'gemini' || provider === 'agy') providerLabel = '✨ Gemini CLI (agy)';
+    else if (provider === 'acp' || provider === 'gemini-acp') providerLabel = '⚡ Gemini ACP';
+    else if (provider === 'cline' || provider === 'paseo') providerLabel = '🔧 Cline / Paseo';
+    else if (provider === 'openai') providerLabel = '🌐 llama.cpp / OpenAI';
+    else if (provider === 'ollama') providerLabel = '🦙 Ollama';
 
     if (el.hdrBadgeLlmStatus) {
       if (isFallback) {
@@ -4747,9 +4756,9 @@
         el.hdrBadgeLlmStatus.className = 'badge badge-neutral';
         el.hdrBadgeLlmStatus.title = 'No external LLM configured. Operating under deterministic hypothesis rules.';
       } else {
-        el.hdrBadgeLlmStatus.textContent = `🤖 ${model}`;
+        el.hdrBadgeLlmStatus.textContent = isCli ? providerLabel : `🤖 ${model}`;
         el.hdrBadgeLlmStatus.className = 'badge badge-info';
-        el.hdrBadgeLlmStatus.title = `LLM Active: ${provider} at ${data.base_url || ''}${latency}`;
+        el.hdrBadgeLlmStatus.title = `LLM Active: ${providerLabel} (${data.base_url || ''})${latency}`;
       }
     }
 
@@ -4758,7 +4767,7 @@
         el.badgeLlmProviderStatus.textContent = '⚙️ 결정론적 분석 (Deterministic)';
         el.badgeLlmProviderStatus.className = 'badge badge-neutral';
       } else {
-        el.badgeLlmProviderStatus.textContent = `🤖 ${provider.toUpperCase()}: ${model}`;
+        el.badgeLlmProviderStatus.textContent = `${providerLabel}: ${model}`;
         el.badgeLlmProviderStatus.className = 'badge badge-success';
       }
     }
@@ -4767,7 +4776,8 @@
       if (isFallback) {
         el.txtLlmProviderMeta.textContent = '외부 LLM 미설정 (결정론적 가설 규칙으로 동작)';
       } else {
-        el.txtLlmProviderMeta.textContent = `모델: ${model} | 지연시간: ${data.latency_ms || 0}ms`;
+        const engineType = isCli ? '로컬 CLI' : 'HTTP REST';
+        el.txtLlmProviderMeta.textContent = `엔진: ${providerLabel} (${engineType}) | 지연시간: ${data.latency_ms || 0}ms`;
       }
     }
   }
@@ -4886,12 +4896,21 @@
     appendChatBubble('user', message);
 
     try {
-      // Step 3: Call POST /api/investigation/chat
-      const res = await apiPost('/api/investigation/chat', {
+      // Step 3: Call POST /api/investigation/chat with optional provider_override
+      const providerOverride = (el.invChatProviderSelect && el.invChatProviderSelect.value !== 'auto')
+        ? el.invChatProviderSelect.value
+        : null;
+
+      const chatPayload = {
         investigation_id: invId,
         message: message,
         request_id: reqId,
-      });
+      };
+      if (providerOverride) {
+        chatPayload.provider_override = providerOverride;
+      }
+
+      const res = await apiPost('/api/investigation/chat', chatPayload);
 
       setChatStepperStage(3);
 
