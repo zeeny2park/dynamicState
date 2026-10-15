@@ -85,6 +85,18 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py
 
+      - name: Run Phase 17 CLI Process Isolation Hardening and Regression Tests
+        run: |
+          python3 -m unittest tests/test_phase17_process_isolation_regression.py
+
+      - name: Run Phase 17 Investigation Quality Benchmark Tests
+        run: |
+          python3 -m unittest tests/test_investigation_quality_benchmark.py
+
+      - name: Run Phase 17 Investigation Quality Benchmark Demonstration Script
+        run: |
+          python3 benchmarks/investigation_quality/run_benchmark.py --smoke
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

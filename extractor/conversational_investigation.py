@@ -42,8 +42,11 @@ from extractor.llm_provider import (
     BaseLLMProvider,
     DeterministicFallbackProvider,
     LLMProviderManager,
+    ProviderCancelledError,
     ProviderError,
     ProviderExecutionError,
+    ProviderOutputLimitExceededError,
+    ProviderTimeoutError,
     ProviderUnavailableError,
 )
 
@@ -396,6 +399,9 @@ class ConversationalAnalysisService:
         self.provider_manager.track_request_start()
 
         try:
+            if req_id and self.provider_manager.is_cancelled(req_id):
+                raise ProviderCancelledError(f"Request {req_id} was cancelled before starting")
+
             # Step 1: Gather compact context
             context = self.build_compact_context(session, user_message)
             fingerprint = context["context_fingerprint"]
@@ -423,8 +429,11 @@ class ConversationalAnalysisService:
             is_fallback = False
             invoked_provider = selected_provider
             model_name = health.model
-            execution_status = "SUCCESS"
+            execution_status = "MODEL_ROUNDTRIP_VERIFIED"
             fallback_reason = None
+
+            if req_id and self.provider_manager.is_cancelled(req_id):
+                raise ProviderCancelledError(f"Request {req_id} was cancelled before provider invocation")
 
             if is_explicit_selection:
                 # User explicitly selected an LLM provider: must not silently fall back
@@ -447,7 +456,9 @@ class ConversationalAnalysisService:
                         raw_response = provider.chat_completion(messages, json_mode=True, request_id=req_id)
                         invoked_provider = health.provider_type
                         model_name = health.model
-                        execution_status = "SUCCESS"
+                        execution_status = "MODEL_ROUNDTRIP_VERIFIED"
+                    except ProviderCancelledError:
+                        raise
                     except Exception as exc:
                         if not allow_fallback:
                             raise ProviderExecutionError(
@@ -466,7 +477,7 @@ class ConversationalAnalysisService:
                 is_fallback = True
                 invoked_provider = "deterministic_fallback"
                 model_name = "deterministic-engine"
-                execution_status = "FALLBACK"
+                execution_status = "DETERMINISTIC_RULES"
                 raw_response = DeterministicFallbackProvider().chat_completion(messages, json_mode=True, request_id=req_id)
             else:
                 # Auto-detect or configured default
@@ -475,7 +486,9 @@ class ConversationalAnalysisService:
                         raw_response = provider.chat_completion(messages, json_mode=True, request_id=req_id)
                         invoked_provider = health.provider_type
                         model_name = health.model
-                        execution_status = "SUCCESS"
+                        execution_status = "MODEL_ROUNDTRIP_VERIFIED"
+                    except ProviderCancelledError:
+                        raise
                     except Exception as exc:
                         logger.warning("Default provider %s failed: %s; falling back to deterministic reasoning", health.provider_type, exc)
                         is_fallback = True
@@ -488,9 +501,12 @@ class ConversationalAnalysisService:
                     is_fallback = True
                     invoked_provider = "deterministic_fallback"
                     model_name = "deterministic-engine"
-                    execution_status = "FALLBACK"
+                    execution_status = "DETERMINISTIC_RULES" if selected_provider == "none" else "FALLBACK"
                     fallback_reason = health.error or "No responsive LLM provider configured"
                     raw_response = DeterministicFallbackProvider().chat_completion(messages, json_mode=True, request_id=req_id)
+
+            if req_id and self.provider_manager.is_cancelled(req_id):
+                raise ProviderCancelledError(f"Request {req_id} was cancelled before response parsing")
 
             # Step 5: Validate and Sanitize Response
             validated_data, disarmed = self.parse_and_validate_response(
@@ -498,6 +514,9 @@ class ConversationalAnalysisService:
                 valid_evidence_ids=valid_evidence_ids,
                 ledger=getattr(session, "ledger", None),
             )
+
+            if req_id and self.provider_manager.is_cancelled(req_id):
+                raise ProviderCancelledError(f"Request {req_id} was cancelled; session state unmutated")
 
             duration_ms = round((time.time() - start_time) * 1000.0, 2)
 

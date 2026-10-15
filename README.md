@@ -116,6 +116,10 @@ Recursive Semantic Reachability Traversal
   (대표 임베디드 리눅스 C/C++ IoT 텔레메트리 타깃(`phase14_embedded_telemetry_fixture.cpp`) 대상 프로덕션 파일럿 및 릴리스 검증: Stripped PIE 바이너리 + 분리 컴패니언 DWARF 심볼, ASLR 환경 하 `process_vm_readv` 비침습적 정지/재개 캡처, 통계적 지연 시간 및 처리량 분포 산출(p50/p95/max), 음성 대조군 및 단일 작성자 격리 기반 인과 함수 승격, 상태 전이 검증과 함수 귀속 검증의 엄격한 분리, 경쟁 스레드 활성화 시 인과 주장 거절, 기계 판독 가능 파일럿 검증 보고서(`reports/pilot_qualification_report.json`)의 SHA-256 암호학적 위변조 방지 봉인, 시뮬레이션 타깃과 실 하드웨어 간 명시적 투명 공개(`real_hardware_validated=False`), 단독 실행 파일럿 검증 스크립트(`scripts/run_production_pilot.py`) 및 운영 런북(`docs/production_pilot_runbook.md`) 완비)
 - **Phase 15 (Complete)**: *"Simplified Investigation UX and Real Conversational LLM Integration"*  
   (단일 조사 워크스페이스 중심의 UX 단순화 및 실제 Conversational LLM 연동: 8개 기술 탭을 전문가 모드(Expert Mode) 뒤로 점진적 공개(Progressive Disclosure) 처리하고 기본 뷰를 [대상 선택 -> 자연어 문제 기술 -> 분석 시작 -> 사실/가설/미확인/추천 조치 확인 -> 승인 및 관측 실행] 흐름으로 재편; OpenAI 호환 REST 엔드포인트(표준 라이브러리 urllib 기반, llama.cpp / vLLM / OpenAI), 로컬 Ollama 어댑터, 로컬 설치 CLI 도구(Gemini `agy`/`gemini`, Gemini ACP `agy-acp` stdio JSON-RPC, Cline/Paseo `cline`/`paseo`, 범용 CLI 템플릿 지원), 외부 LLM 미설정 시 정직한 결정론적 폴백(Deterministic Fallback) 지원; UI 프로바이더 선택 드롭다운 연동; API 키/토큰의 클라이언트/HTML/로그/세션 노출 원천 차단(GET /api/llm/status) 및 비밀 마스킹; 원시 메모리 블록을 배제한 DWARF/차이점/함수후보/원장ID 중심의 컴팩트 컨텍스트 구축 및 SHA-256 핑거프린트 서명; 서버 측 스키마 검증 및 방어적 디스암(원장에 없는 위조 증거 ID 제거, LLM의 VALIDATED 인과 주장 PROPOSED 격하, 후보 함수 STATIC_CANDIDATE 상한 제한); 4단계 진행 표시기([1/4] 컨텍스트 수집 -> [2/4] LLM 분석 -> [3/4] 증거 검증 -> [4/4] 완료), 한국어 추천 질의 칩, 후속 연속 대화 스트림, 추천 관측 원클릭 승인 실행 연동 완비)
+- **Phase 16 (Complete)**: *"CLI Provider Security, Runtime Truthfulness & Process Control"*  
+  (로컬 CLI 실행 보안 강화 및 진실된 런타임 제공자 보고: `--dangerously-skip-permissions` 플래그 제거 및 서버 측 명시적 opt-in 설정으로 제한, 셸 주입 방지를 위한 인자 벡터화 및 셸 메타문자 차단, 최소 권한 프로세스 환경 정제(Secret Scrubbing) 및 안전 작업 디렉터리 격리, 사용자 선택과 실제 호출 제공자 간 일치 보장 및 비침습적 진실된 폴백 감사 추적, 브라우저-API-서브프로세스 간 취소 전파)
+- **Phase 17 (Complete)**: *"CLI Process Isolation Hardening & Investigation Quality Benchmark"*  
+  (진정한 스트리밍 논블로킹 프로세스 격리 및 조사 품질 벤치마크 기반 구축: `selectors` 기반 동시 stdout/stderr 읽기를 통한 파이프 버퍼 데드락 원천 방지, `max_output_bytes` 한도 초과 즉시 자식 및 손자 프로세스 그룹 강제 종료(`SIGTERM`+`SIGKILL`) 및 `ProviderOutputLimitExceededError` 발생(미완성 모델 출력의 침묵 파싱 배제), 파이프 핸들을 상속한 자식/손자 프로세스 누수 및 타임아웃 방지, Gemini ACP stdio 핸드셰이크의 논블로킹 타임아웃 및 기술자 누수 차단, 브라우저 클라이언트의 실행 파일 경로/인자/권한우회 주입 차단(`PRIVILEGED_CONFIG_FORBIDDEN`), 취소 요청 시 세션/원장/타임라인에 대한 늦은 커밋 경합 차단; 6대 정형 C++ 결함 시나리오(유효 전이, 불일치 캐시 필드, 범위 외 열거형 값, 널 포인터 결함, 크로스스레드 비원자성 경쟁, 인과 함수 부재 음성 대조군) 대상 조사 품질 벤치마크 하네스(`benchmarks/investigation_quality/run_benchmark.py`), 사실 정확도 100%, 증거 정밀도/재현율 100%, 미검증 주장률 0%, 불확실성 보정률 100%, 다음 관측 유용성 100%, **인과 함수 오탐율(False-Positive Causal Rate) 엄격한 0.0% SLA 충족**, 기계 판독 JSON(`benchmark_results.json`) 및 인간 판독 Markdown(`BENCHMARK_REPORT.md`) 보고서 자동 생성 완비)
 
 ---
 
@@ -1171,6 +1175,17 @@ python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
 
 ```bash
+# Phase 17 CLI 프로세스 격리 강화 및 조사 품질 벤치마크 (12개 테스트 + 6개 C++ 시나리오 하네스)
+python3 -m unittest tests/test_phase17_process_isolation_regression.py -v
+python3 benchmarks/investigation_quality/run_benchmark.py
+python3 -m unittest tests/test_investigation_quality_benchmark.py -v
+
+# Phase 16 CLI 프로바이더 보안, 런타임 진실성 및 E2E 검증 (14개 테스트)
+python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py -v
+
+# Phase 15 대화형 LLM 및 단순화 조사 워크스페이스 (22개 테스트)
+python3 -m unittest tests/test_phase15_conversational_llm.py -v
+
 # 0. Phase 14 임베디드 리눅스 프로덕션 파일럿 및 릴리스 검증 (13개 테스트 + 단독 실행 파일럿 스크립트)
 python3 -m unittest tests/test_phase14_production_pilot.py -v
 python3 scripts/run_production_pilot.py --smoke
@@ -1335,6 +1350,8 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 | **Trusted Causal Verification Engine** | Complete | Attestation proof verification, negative control baseline checks | **INTEGRATION TESTED** | Rejects unverified attribution, forged proofs, and conflated state transitions |
 | **Observation Plan Lifecycle** | Complete | State transitions (PROPOSED->EXECUTED->VERIFIED/FAILED/CANCELED) | **INTEGRATION TESTED** | Prevents duplicate execution, tracks cancellation, UI interactive controls |
 | **Phase 15 Conversational LLM & Simplified UX** | Complete | 22 conversational tests, local CLI/REST LLM & fallback | **REAL TARGET VALIDATED** | Single-pane workspace, OpenAI/Ollama/Gemini/ACP/Cline CLI integration, evidence claim disarming, secret redaction |
+| **Phase 16 CLI Provider Security & Truthfulness** | Complete | 14 security & lifecycle tests, privilege drop | **INTEGRATION TESTED** | Safe argument vectors, bounded execution, secret redaction, server-side template validation |
+| **Phase 17 CLI Process Isolation & Benchmark** | Complete | 12 isolation & benchmark tests, 6 C++ scenarios | **REAL TARGET VALIDATED** | Non-blocking streaming I/O, process group termination, 0% FP causal SLA, quality report |
 
 ---
 
@@ -1403,7 +1420,17 @@ dynamicState includes an automated benchmark harness measuring process suspensio
    # Phase 15 Conversational LLM & Simplified Investigation UX (22 tests)
    python3 -m unittest tests/test_phase15_conversational_llm.py -v
 
-   # Full test discovery suite (656+ tests)
+   # Phase 16 CLI Provider Security & Truthfulness (14 tests)
+   python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py -v
+
+   # Phase 17 CLI Process Isolation Hardening (10 tests)
+   python3 -m unittest tests/test_phase17_process_isolation_regression.py -v
+
+   # Phase 17 Investigation Quality Benchmark (2 tests + 6-scenario C++ harness)
+   python3 -m unittest tests/test_investigation_quality_benchmark.py -v
+   python3 benchmarks/investigation_quality/run_benchmark.py
+
+   # Full test discovery suite (692+ tests)
    python3 -m unittest discover -s tests -v
    ```
 

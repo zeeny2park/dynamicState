@@ -3257,9 +3257,10 @@ class InvestigationManager:
                 "request_id": request_id,
             }
         except ProviderExecutionError as e:
+            err_code = getattr(e, "error_code", "PROVIDER_EXECUTION_FAILED")
             return {
                 "success": False,
-                "error_code": "PROVIDER_EXECUTION_FAILED",
+                "error_code": err_code,
                 "error": str(e),
                 "investigation_id": investigation_id,
                 "request_id": request_id,

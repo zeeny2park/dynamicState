@@ -56,6 +56,7 @@ from extractor.llm_provider import (
     LLMProviderStatus,
     ProviderError,
     ProviderExecutionError,
+    ProviderOutputLimitExceededError,
     ProviderUnavailableError,
 )
 from extractor.web.server import run_server
@@ -184,7 +185,7 @@ class TestProcessIsolationAndControl(unittest.TestCase):
         self.assertEqual(out.strip(), os.path.realpath(safe_dir))
 
     def test_bounded_output_capture_prevents_memory_exhaustion(self):
-        """Process output exceeding max_output_bytes must be capped cleanly."""
+        """Process output exceeding max_output_bytes must terminate cleanly and raise ProviderOutputLimitExceededError."""
         max_bytes = 1024  # 1 KB limit
         cfg = LLMProviderConfig(
             provider_type="cli",
@@ -195,9 +196,11 @@ class TestProcessIsolationAndControl(unittest.TestCase):
 
         # Python command outputting 100 KB
         cmd = [sys.executable, "-c", "import sys; sys.stdout.write('A' * 102400)"]
-        retcode, out, _ = prov._run_controlled_process(cmd, timeout=5.0)
+        with self.assertRaises((ProviderOutputLimitExceededError, ProviderExecutionError)):
+            prov._run_controlled_process(cmd, timeout=5.0)
 
-        self.assertEqual(retcode, 0)
+        # Also test non-raising mode if explicitly requested
+        retcode, out, _ = prov._run_controlled_process(cmd, timeout=5.0, raise_on_limit=False)
         self.assertLessEqual(len(out.encode("utf-8")), max_bytes)
 
     def test_non_zero_exit_code_raises_execution_error(self):

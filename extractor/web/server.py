@@ -1568,12 +1568,39 @@ class WebApiAdapter:
                                             "message": res.error.message if res.error else "Failed to load session"}}
 
     def analyze_investigation_chat(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        # Privileged configuration protection: reject any attempts to supply execution configuration from client
+        privileged_keys = {
+            "cli_command", "cli_args", "executable", "allow_dangerous_permissions",
+            "safe_working_dir", "max_output_bytes", "command", "binary_path", "shell",
+        }
+        for pk in privileged_keys:
+            if pk in params:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PRIVILEGED_CONFIG_FORBIDDEN",
+                        "message": f"Parameter '{pk}' is privileged server-side configuration and cannot be specified in client requests."
+                    }
+                }
+
         inv_id = params.get("investigation_id")
-        if not inv_id:
-            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        if not inv_id or not isinstance(inv_id, str):
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required and must be a string"}}
+
+        provider_override = params.get("provider_override")
+        if provider_override is not None:
+            from extractor.llm_provider import LLMProviderManager
+            if not isinstance(provider_override, str) or provider_override.lower().strip() not in LLMProviderManager.ALLOWED_PROVIDERS:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PARAM",
+                        "message": f"Invalid provider_override '{provider_override}'. Allowed providers: {sorted(LLMProviderManager.ALLOWED_PROVIDERS)}"
+                    }
+                }
+
         msg = params.get("message") or params.get("user_message") or "Analyze the observed state changes and propose evidence-grounded hypotheses."
         req_id = params.get("request_id")
-        provider_override = params.get("provider_override")
         allow_fallback = bool(params.get("allow_fallback", False))
         res = self.runtime.analyze_investigation_chat(
             investigation_id=inv_id,

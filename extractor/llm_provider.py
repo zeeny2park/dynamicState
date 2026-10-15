@@ -26,6 +26,8 @@ import json
 import logging
 import os
 import re
+import select
+import selectors
 import shlex
 import shutil
 import signal
@@ -54,7 +56,27 @@ class ProviderUnavailableError(ProviderError):
 
 class ProviderExecutionError(ProviderError):
     """Raised when an active provider fails during command execution or response generation."""
-    pass
+    def __init__(self, message: str, error_code: str = "PROVIDER_EXECUTION_FAILED"):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+class ProviderCancelledError(ProviderExecutionError):
+    """Raised when a provider request is cancelled before completion or session commit."""
+    def __init__(self, message: str = "Request was cancelled by user"):
+        super().__init__(message, error_code="CANCELLED")
+
+
+class ProviderOutputLimitExceededError(ProviderExecutionError):
+    """Raised when a CLI provider exceeds the maximum allowed output buffer limit."""
+    def __init__(self, message: str):
+        super().__init__(message, error_code="OUTPUT_LIMIT_EXCEEDED")
+
+
+class ProviderTimeoutError(ProviderExecutionError):
+    """Raised when a CLI provider or endpoint times out."""
+    def __init__(self, message: str):
+        super().__init__(message, error_code="TIMEOUT")
 
 
 @dataclass
@@ -466,6 +488,8 @@ class BaseCLIProvider(BaseLLMProvider):
 
     _active_subprocesses: Dict[str, subprocess.Popen] = {}
     _subproc_lock: threading.Lock = threading.Lock()
+    _cancelled_requests: Set[str] = set()
+    _cancelled_lock: threading.Lock = threading.Lock()
 
     @classmethod
     def register_process(cls, request_id: str, proc: subprocess.Popen) -> None:
@@ -480,50 +504,86 @@ class BaseCLIProvider(BaseLLMProvider):
                 cls._active_subprocesses.pop(request_id, None)
 
     @classmethod
+    def mark_cancelled(cls, request_id: str) -> None:
+        if not request_id:
+            return
+        with cls._cancelled_lock:
+            cls._cancelled_requests.add(request_id)
+            if len(cls._cancelled_requests) > 1000:
+                try:
+                    cls._cancelled_requests.pop()
+                except KeyError:
+                    pass
+
+    @classmethod
+    def is_cancelled(cls, request_id: Optional[str]) -> bool:
+        if not request_id:
+            return False
+        with cls._cancelled_lock:
+            return request_id in cls._cancelled_requests
+
+    @classmethod
+    def clear_cancelled(cls, request_id: Optional[str]) -> None:
+        if not request_id:
+            return
+        with cls._cancelled_lock:
+            cls._cancelled_requests.discard(request_id)
+
+    @classmethod
+    def _kill_process_group(cls, proc: Optional[subprocess.Popen]) -> None:
+        """Safely terminate child process group with SIGTERM then SIGKILL, guarding against self-termination."""
+        if proc is None:
+            return
+        curr_pgid = os.getpgrp() if (os.name == "posix" and hasattr(os, "getpgrp")) else None
+        child_pgid = None
+        if os.name == "posix":
+            try:
+                child_pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
+                child_pgid = None
+            except Exception:
+                child_pgid = None
+
+        if child_pgid is not None and child_pgid > 1 and child_pgid != curr_pgid:
+            try:
+                os.killpg(child_pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            except Exception as e:
+                logger.debug("killpg SIGTERM error: %s", e)
+
+            try:
+                proc.wait(timeout=0.5)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+
+            try:
+                os.killpg(child_pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            except Exception as e:
+                logger.debug("killpg SIGKILL error: %s", e)
+
+        # Fallback to direct process termination
+        try:
+            proc.kill()
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+    @classmethod
     def cancel_process(cls, request_id: str) -> bool:
         """Cancel and terminate the active child process and process group for request_id."""
+        cls.mark_cancelled(request_id)
         with cls._subproc_lock:
             proc = cls._active_subprocesses.get(request_id)
-        if not proc:
-            return False
-
-        try:
-            if proc.poll() is None:
-                curr_pgid = os.getpgrp() if hasattr(os, "getpgrp") else None
-                child_pgid = None
-                if os.name == "posix":
-                    try:
-                        child_pgid = os.getpgid(proc.pid)
-                    except Exception:
-                        child_pgid = None
-
-                if child_pgid and child_pgid != curr_pgid:
-                    try:
-                        os.killpg(child_pgid, signal.SIGTERM)
-                    except Exception:
-                        proc.terminate()
-                else:
-                    proc.terminate()
-
-                # Verify actual termination within a bounded grace window
-                try:
-                    proc.wait(timeout=1.5)
-                except subprocess.TimeoutExpired:
-                    if child_pgid and child_pgid != curr_pgid:
-                        try:
-                            os.killpg(child_pgid, signal.SIGKILL)
-                        except Exception:
-                            proc.kill()
-                    else:
-                        proc.kill()
-                    proc.wait(timeout=1.0)
-            return True
-        except Exception as exc:
-            logger.warning("Error cancelling process for request %s: %s", request_id, exc)
-            return False
-        finally:
+        if proc is not None:
+            cls._kill_process_group(proc)
             with cls._subproc_lock:
                 cls._active_subprocesses.pop(request_id, None)
+            return True
+        return True
 
     def _redact_secrets(self, text: str) -> str:
         if not text:
@@ -564,8 +624,9 @@ class BaseCLIProvider(BaseLLMProvider):
         cmd: List[str],
         timeout: float,
         request_id: Optional[str] = None,
+        raise_on_limit: bool = True,
     ) -> Tuple[int, str, str]:
-        """Execute command in a safe directory with bounded output and clean termination."""
+        """Execute command in a safe directory with streaming bounded output and clean termination."""
         safe_cwd = self.config.safe_working_dir
         if not safe_cwd or not os.path.isdir(safe_cwd):
             safe_cwd = tempfile.gettempdir()
@@ -574,7 +635,16 @@ class BaseCLIProvider(BaseLLMProvider):
         max_bytes = self.config.max_output_bytes or (10 * 1024 * 1024)
 
         proc = None
+        sel = None
+        stdout_chunks: List[bytes] = []
+        stderr_chunks: List[bytes] = []
+        total_stdout_bytes = 0
+        total_stderr_bytes = 0
+
         try:
+            if request_id and self.is_cancelled(request_id):
+                raise ProviderCancelledError(f"Request {request_id} was cancelled before process start")
+
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
@@ -587,47 +657,131 @@ class BaseCLIProvider(BaseLLMProvider):
             if request_id:
                 self.register_process(request_id, proc)
 
-            try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                curr_pgid = os.getpgrp() if hasattr(os, "getpgrp") else None
-                child_pgid = None
-                if os.name == "posix":
-                    try:
-                        child_pgid = os.getpgid(proc.pid)
-                    except Exception:
-                        child_pgid = None
+            start_time = time.monotonic()
+            deadline = start_time + timeout
 
-                if child_pgid and child_pgid != curr_pgid:
-                    try:
-                        os.killpg(child_pgid, signal.SIGKILL)
-                    except Exception:
-                        proc.kill()
-                else:
-                    proc.kill()
-                proc.wait(timeout=2.0)
-                raise subprocess.TimeoutExpired(cmd, timeout)
+            if os.name == "posix":
+                os.set_blocking(proc.stdout.fileno(), False)
+                os.set_blocking(proc.stderr.fileno(), False)
 
-            # Bounded output capture to prevent memory exhaustion
-            if len(stdout_raw) > max_bytes:
-                stdout_raw = stdout_raw[:max_bytes]
-                logger.warning("CLI output exceeded %d bytes; truncated safely.", max_bytes)
-            if len(stderr_raw) > max_bytes:
-                stderr_raw = stderr_raw[:max_bytes]
+                sel = selectors.DefaultSelector()
+                sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
+                sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
 
-            stdout_str = stdout_raw.decode("utf-8", errors="replace").strip()
-            stderr_str = stderr_raw.decode("utf-8", errors="replace").strip()
+                active_streams = 2
+                limit_breached = False
 
-            return proc.returncode, stdout_str, stderr_str
-        finally:
-            if request_id:
-                self.unregister_process(request_id)
-            if proc and proc.poll() is None:
+                while active_streams > 0:
+                    # Check cancellation
+                    if request_id and self.is_cancelled(request_id):
+                        self._kill_process_group(proc)
+                        raise ProviderCancelledError(f"Request {request_id} was cancelled")
+
+                    # Check timeout
+                    now = time.monotonic()
+                    if now >= deadline:
+                        self._kill_process_group(proc)
+                        raise ProviderTimeoutError(f"Command execution timed out after {timeout}s")
+
+                    # If child process has terminated, drain remaining data with small bounded window
+                    if proc.poll() is not None:
+                        remaining_wait = 0.1
+                    else:
+                        remaining_wait = min(0.2, max(0.01, deadline - now))
+
+                    events = sel.select(timeout=remaining_wait)
+                    if not events and proc.poll() is not None:
+                        # Process exited and no more data pending in pipes
+                        break
+
+                    for key, _ in events:
+                        stream_name = key.data
+                        fileobj = key.fileobj
+                        read_limit = min(65536, max(1, (max_bytes - (total_stdout_bytes + total_stderr_bytes)) + 1))
+                        try:
+                            chunk = os.read(fileobj.fileno(), read_limit)
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        except Exception:
+                            chunk = b""
+
+                        if not chunk:
+                            try:
+                                sel.unregister(fileobj)
+                            except Exception:
+                                pass
+                            active_streams -= 1
+                        else:
+                            if stream_name == "stdout":
+                                stdout_chunks.append(chunk)
+                                total_stdout_bytes += len(chunk)
+                            else:
+                                stderr_chunks.append(chunk)
+                                total_stderr_bytes += len(chunk)
+
+                            if (total_stdout_bytes + total_stderr_bytes) > max_bytes:
+                                limit_breached = True
+                                break
+
+                    if limit_breached:
+                        logger.warning(
+                            "CLI output exceeded maximum limit (%d > %d bytes); killing process group.",
+                            total_stdout_bytes + total_stderr_bytes,
+                            max_bytes,
+                        )
+                        self._kill_process_group(proc)
+                        if raise_on_limit:
+                            raise ProviderOutputLimitExceededError(
+                                f"CLI process output exceeded maximum allowed limit of {max_bytes} bytes"
+                            )
+                        else:
+                            break
+
+                # Ensure process is reaped
                 try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    self._kill_process_group(proc)
+                    proc.wait(timeout=1.0)
+            else:
+                try:
+                    stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=1.0)
+                    raise ProviderTimeoutError(f"Command execution timed out after {timeout}s")
+                if len(stdout_raw) + len(stderr_raw) > max_bytes:
+                    if raise_on_limit:
+                        raise ProviderOutputLimitExceededError(f"Output exceeded {max_bytes} bytes")
+                stdout_chunks = [stdout_raw[:max_bytes]]
+                stderr_chunks = [stderr_raw[:max_bytes]]
+
+            retcode = proc.returncode if proc.returncode is not None else 0
+            stdout_raw_joined = b"".join(stdout_chunks)[:max_bytes]
+            stderr_raw_joined = b"".join(stderr_chunks)[:max_bytes]
+            stdout_str = stdout_raw_joined.decode("utf-8", errors="replace").strip()
+            stderr_str = stderr_raw_joined.decode("utf-8", errors="replace").strip()
+
+            return retcode, stdout_str, stderr_str
+
+        finally:
+            if sel is not None:
+                try:
+                    sel.close()
                 except Exception:
                     pass
+            if request_id:
+                self.unregister_process(request_id)
+            if proc is not None:
+                try:
+                    if proc.stdout and not proc.stdout.closed:
+                        proc.stdout.close()
+                    if proc.stderr and not proc.stderr.closed:
+                        proc.stderr.close()
+                except Exception:
+                    pass
+                if proc.poll() is None:
+                    self._kill_process_group(proc)
 
     @abstractmethod
     def resolve_binary(self) -> Optional[str]:
@@ -830,7 +984,7 @@ class GeminiCLIProvider(BaseCLIProvider):
             raise ProviderExecutionError(f"Gemini CLI execution failure: {self._redact_secrets(str(exc))}")
 
 
-class GeminiACPProvider(BaseLLMProvider):
+class GeminiACPProvider(BaseCLIProvider):
     """Adapter for Google Antigravity ACP (Agent Client Protocol) server over stdio."""
 
     def resolve_binary(self) -> Optional[str]:
@@ -845,6 +999,12 @@ class GeminiACPProvider(BaseLLMProvider):
             if c and os.path.exists(c) and os.access(c, os.X_OK):
                 return c
         return None
+
+    def build_command(self, prompt: str, timeout: float) -> List[str]:
+        binary = self.resolve_binary()
+        if not binary:
+            raise ProviderUnavailableError("agy-acp binary not found on PATH or default locations.")
+        return [binary]
 
     def check_health(self) -> LLMProviderStatus:
         binary = self.resolve_binary()
@@ -863,6 +1023,8 @@ class GeminiACPProvider(BaseLLMProvider):
             )
 
         start = time.time()
+        safe_cwd = self.config.safe_working_dir or tempfile.gettempdir()
+        clean_env = self._build_safe_env()
         proc = None
         try:
             proc = subprocess.Popen(
@@ -870,30 +1032,62 @@ class GeminiACPProvider(BaseLLMProvider):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                cwd=safe_cwd,
+                env=clean_env,
+                start_new_session=True if os.name == "posix" else False,
                 text=True,
             )
             init_req = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}
-            proc.stdin.write(json.dumps(init_req) + "\n")
-            proc.stdin.flush()
-            line = proc.stdout.readline()
+            try:
+                proc.stdin.write(json.dumps(init_req) + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+
+            # Non-blocking / bounded read of the initialization response
+            line = ""
+            health_timeout = min(2.0, self.config.timeout_seconds)
+            if os.name == "posix":
+                rlist, _, _ = select.select([proc.stdout], [], [], health_timeout)
+                if rlist:
+                    line = proc.stdout.readline()
+            else:
+                line = proc.stdout.readline()
+
             elapsed_ms = round((time.time() - start) * 1000.0, 2)
             if line:
-                data = json.loads(line)
-                if "result" in data:
-                    agent_name = data["result"].get("agentInfo", {}).get("name", "Antigravity ACP")
+                try:
+                    data = json.loads(line)
+                    if "result" in data:
+                        agent_name = data["result"].get("agentInfo", {}).get("name", "Antigravity ACP")
+                        return LLMProviderStatus(
+                            configured=True,
+                            provider_type="gemini-acp",
+                            model=self.config.model or agent_name,
+                            base_url=f"acp://{binary}",
+                            reachable=True,
+                            binary_available=True,
+                            availability_status="BINARY_AVAILABLE",
+                            latency_ms=elapsed_ms,
+                            is_fallback=False,
+                            is_cli=True,
+                            cli_binary=binary,
+                        )
+                except (json.JSONDecodeError, TypeError, KeyError):
                     return LLMProviderStatus(
                         configured=True,
                         provider_type="gemini-acp",
-                        model=self.config.model or agent_name,
+                        model=self.config.model,
                         base_url=f"acp://{binary}",
-                        reachable=True,
+                        reachable=False,
                         binary_available=True,
-                        availability_status="BINARY_AVAILABLE",
-                        latency_ms=elapsed_ms,
+                        availability_status="UNAVAILABLE",
+                        error="Malformed JSON-RPC response from ACP server during initialization.",
                         is_fallback=False,
                         is_cli=True,
                         cli_binary=binary,
                     )
+
             return LLMProviderStatus(
                 configured=True,
                 provider_type="gemini-acp",
@@ -902,7 +1096,7 @@ class GeminiACPProvider(BaseLLMProvider):
                 reachable=False,
                 binary_available=True,
                 availability_status="UNAVAILABLE",
-                error="ACP server returned unexpected initialization response.",
+                error="ACP server initialization timed out or returned empty response.",
                 is_fallback=False,
                 is_cli=True,
                 cli_binary=binary,
@@ -916,24 +1110,23 @@ class GeminiACPProvider(BaseLLMProvider):
                 reachable=False,
                 binary_available=False,
                 availability_status="UNAVAILABLE",
-                error=str(exc),
+                error=self._redact_secrets(str(exc)),
                 is_fallback=False,
                 is_cli=True,
                 cli_binary=binary,
             )
         finally:
-            if proc:
+            if proc is not None:
                 try:
-                    if proc.stdin:
+                    if proc.stdin and not proc.stdin.closed:
                         proc.stdin.close()
-                    if proc.stdout:
+                    if proc.stdout and not proc.stdout.closed:
                         proc.stdout.close()
-                    if proc.stderr:
+                    if proc.stderr and not proc.stderr.closed:
                         proc.stderr.close()
-                    proc.terminate()
-                    proc.wait(timeout=1.0)
                 except Exception:
                     pass
+                self._kill_process_group(proc)
 
     def chat_completion(
         self,
@@ -1071,7 +1264,7 @@ class GenericCLIProvider(BaseCLIProvider):
             raise ProviderExecutionError("Invalid empty CLI command template.")
 
         # Reject dangerous shell metacharacters in command definition
-        forbidden = [";", "&&", "||", "|", "`", "$(", "<", ">"]
+        forbidden = [";", "&&", "||", "|", "`", "$(", "<", ">", "\n", "\r", "\0"]
         for p in parts:
             for f in forbidden:
                 if f in p:
@@ -1276,8 +1469,16 @@ class LLMProviderManager:
         return res
 
     def cancel_request(self, request_id: str) -> bool:
-        """Cancel any running CLI child process associated with request_id."""
+        """Cancel any running CLI child process associated with request_id and mark request cancelled."""
         return BaseCLIProvider.cancel_process(request_id)
+
+    def is_cancelled(self, request_id: Optional[str]) -> bool:
+        """Check if request_id has been cancelled."""
+        return BaseCLIProvider.is_cancelled(request_id)
+
+    def mark_cancelled(self, request_id: str) -> None:
+        """Explicitly record a request_id as cancelled."""
+        BaseCLIProvider.mark_cancelled(request_id)
 
     def get_status(self) -> Dict[str, Any]:
         """Check health and return safe status dictionary without credentials."""
