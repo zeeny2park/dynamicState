@@ -124,6 +124,8 @@ Recursive Semantic Reachability Traversal
   (독립적 조사 벤치마크 및 실제 C++ 스냅샷 평가 하네스 고도화: 시스템 출력과 완전 분리된 독립 버전형 기계 판독 가능 Ground Truth 말뭉치(Corpus v1.0.0, 6대 결함 시나리오: 유효 전이, 불일치 캐시 필드, 무효 열거형 값, 널/무효 포인터, 크로스 스레드 비원자성 경쟁, 인과 함수 부재 음성 대조군), 하드코딩된 상수 지표 배제 및 정직한 예측 기반 평가기(`InvestigationEvaluator`), GNU Build ID 기반 분리 심볼(companion DWARF) 검증 및 불일치 감지, 대화형 C++ 타깃 프로세스(PIE, ASLR, Debug Info) 대상 실제 런타임 메모리 캡처(`process_vm_readv`/`procfs`) 기반 조사 평가 트랙과 단위 픽스처 트랙의 분리 운영, 사실 정밀도/재현율/F1, 증거 정밀도/재현율, 미검증 주장 비율 및 디스암율, 불확실성 보정률(Brier 점수 및 2진 일치도), 판별 후속 관측 유용성 산출, **인과 함수 오탐율(False-Positive Causal Rate) 엄격한 0.0% SLA 충족**, 10개 전용 회귀 테스트 통과)
 - **Phase 19 (Complete)**: *"Benchmark Integrity, Real Causal Evidence Verification, and Reproducible Provider Evaluation"*  
   (벤치마크 진위성 및 독립적 인과 검증 아키텍처 완성: 평가기(Evaluator)와 피평가 시스템(SUT) 간 완벽한 경계 분리 및 그라운드 트루스 누출 차단(적대적 누출 회귀 테스트 통과), 평가기 자체 단위 테스트(`EVALUATOR_UNIT_TEST`)와 실제 프로덕션 런타임 파이프라인(`REAL_RUNTIME_PRODUCT_PIPELINE`)의 점수 분리, 런타임 추적 부재 시 인과 함수를 정적 후보(`STATIC_CANDIDATE`)로 유지하고 인과 검증을 `UNPROVEN`으로 정직하게 보고(조작된 DIAGNOSTIC 추적 제거, 위양성률 0.0% 엄격 유지), 6대 시나리오 전반의 변이 소스·불변식·기대 관측 상태 명세 및 시나리오 6 음성 대조군(Negative Control) 정합성 복원, 시나리오 5 크로스 스레드 경쟁의 무경합 수명주기 스레드 조인 보장, 파이프라인 전 과정(컴파일-빌드ID검증-스폰-스냅샷A-변이및ACK-스냅샷B-종료-DWARF비교-스테이지합성-대화형분석) 스테이지 출처(Provenance) 및 타임아웃 통제, 빈 데이터에 대한 공허한 1.0(vacuous 1.0) 점수 제거(`None` 처리), 반복 실행(`repeat=N`) 및 분산 추적, 다중 프로바이더 비교 매트릭스(`--providers`) 및 폴백/비가용 투명 보고)
+- **Phase 20 (Complete)**: *"Benchmark Execution Integrity and Trustworthy Results"*  
+  (벤치마크 실행 무결성 및 신뢰할 수 있는 결과 검증 체계 확립: 평가 트랙의 엄격한 분리(`REAL_RUNTIME_PRODUCT_PIPELINE` vs `EVALUATOR_UNIT_TEST`) 및 결합 SLA 계산 배제, 프로덕션 인과 오탐 SLA는 적격 완료된 실시간 런타임 시나리오만을 모수로 산출(적격 음성 대조군 부재 시 `0/0 (NOT_EVALUABLE)` 및 통과 불허), 자체 테스트 통과가 프로덕션 SLA에 영향을 미치지 않도록 차단, `evaluator_self_test` 모드 격리(컴파일 및 타깃 프로세스 스폰 원천 배제), 프로바이더 매트릭스 평가 범위 명시(`--provider-scenarios` 또는 스모크 서브셋), 결정론적 폴백 발생 시 `FALLBACK_OCCURRED` 명시 및 모델 성공률(0.0%) 배제, C++ 픽스처 `STATE` 대화형 명령어를 통한 변이 전/후 실시간 상태 독립 검증 및 정확한 변이 응답 일치 확인, 디스크 상의 구체적 산출물(`metadata.json` 및 크기 > 0인 `memory.bin`) 검증, 상위 스테이지 실패 시 하위 스테이지 `FAILED`/`NOT_RUN` 출처 전파, 독립적 다회차 실행(`repeat=N`) 시도/완료/실패 추적 및 JSON-Markdown 보고서 간 전수 일치 검증, 22개 전용 회귀 테스트 통과)
 
 ---
 
@@ -1179,6 +1181,11 @@ python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
 
 ```bash
+# Phase 20 벤치마크 실행 무결성 및 신뢰할 수 있는 결과 검증 (22개 테스트)
+python3 -m unittest tests/test_investigation_quality_benchmark.py -v
+python3 benchmarks/investigation_quality/run_benchmark.py --smoke
+python3 benchmarks/investigation_quality/run_benchmark.py --mode evaluator_self_test
+
 # Phase 19 벤치마크 무결성, 실 인과 증거 검증 및 재현 가능 프로바이더 평가 (14개 테스트)
 python3 -m unittest tests/test_investigation_quality_benchmark.py -v
 python3 benchmarks/investigation_quality/run_benchmark.py --mode real_runtime
@@ -1364,6 +1371,7 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 | **Phase 17 CLI Process Isolation & Benchmark** | Complete | 10 process isolation tests, child/grandchild cleanup | **REAL TARGET VALIDATED** | Non-blocking streaming I/O, process group termination, privileged config defense |
 | **Phase 18 Independent Benchmark & Real C++ Eval** | Complete | 10 evaluation tests, 6 real-runtime scenarios | **REAL TARGET VALIDATED** | Independent versioned corpus, honest metric derivation, GNU Build ID validation, 0% FP causal SLA |
 | **Phase 19 Benchmark Integrity & Real Causal Eval** | Complete | 14 regression & benchmark tests, 6 real-runtime scenarios | **REAL TARGET VALIDATED** | Zero ground-truth leakage, 0.0% FP causal SLA (0/5), stage provenance, multi-provider matrix, honest None on empty data |
+| **Phase 20 Benchmark Execution Integrity & Results** | Complete | 22 regression & benchmark tests, track segregation | **REAL TARGET VALIDATED** | Strict track decoupling, non-evaluable empty denominator, mode isolation, truthful fallback labeling, live STATE provenance |
 
 ---
 
@@ -1441,6 +1449,10 @@ dynamicState includes an automated benchmark harness measuring process suspensio
    # Phase 18 Independent Investigation Benchmark & Real C++ Snapshot Evaluation (10 tests)
    python3 -m unittest tests/test_investigation_quality_benchmark.py -v
    python3 benchmarks/investigation_quality/run_benchmark.py --mode all --smoke
+
+   # Phase 20 Benchmark Execution Integrity & Trustworthy Results (22 tests)
+   python3 -m unittest tests/test_investigation_quality_benchmark.py -v
+   python3 benchmarks/investigation_quality/run_benchmark.py --smoke
 
    # Phase 19 Benchmark Integrity & Real Causal Evidence Verification (14 tests)
    python3 -m unittest tests/test_investigation_quality_benchmark.py -v

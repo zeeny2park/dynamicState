@@ -108,10 +108,18 @@ class AggregateMetrics:
     false_causal_positives: int
     true_causal_negatives: int
     false_causal_negatives: int
-    false_positive_causal_rate: float
+    false_positive_causal_rate: Optional[float]
     false_positive_display: str
     causal_confusion_matrix: Dict[str, int]
     zero_false_positive_sla_met: bool
+    
+    # Phase 20 enhancements: strict denominators, exclusion provenance, micro/macro metrics
+    eligible_causal_negatives: int = 0
+    excluded_scenarios_count: int = 0
+    excluded_scenarios: List[Dict[str, str]] = field(default_factory=list)
+    sla_status: str = "NOT_EVALUABLE"  # 'PASSED', 'FAILED', 'NOT_EVALUABLE'
+    micro_fact_f1: Optional[float] = None
+    macro_fact_f1: Optional[float] = None
     
     scenarios: List[ScenarioEvaluationResult] = field(default_factory=list)
 
@@ -139,6 +147,8 @@ class BenchmarkSuiteResult:
     repeat_runs: List[Dict[str, Any]] = field(default_factory=list)
     repeat_variability: Dict[str, Any] = field(default_factory=dict)
     zero_false_positive_sla_met: bool = False
+    product_sla_status: str = "NOT_EVALUABLE"
+    product_sla_details: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def unit_fixture_metrics(self) -> Optional[AggregateMetrics]:
@@ -312,22 +322,41 @@ class InvestigationEvaluator:
                 if a_idx in used_actual:
                     continue
                 
-                af_field = af.get("field_name", "") or af.get("field_path", "") or af.get("title", "")
+                af_name = str(af.get("field_name") or "").strip()
+                af_path = str(af.get("c_type_path") or af.get("field_path") or "").strip()
+                af_title = str(af.get("title") or "").strip()
                 af_before = af.get("before_value")
                 af_after = af.get("after_value", af.get("observed_value"))
 
-                # Match if field name/path matches
-                name_match = (
-                    (ef_name and ef_name in str(af_field))
-                    or (ef_path and ef_path in str(af_field))
-                    or (ef_name and ef_name in str(af.get("description", "")))
-                )
+                # Match if field name/path matches (resistant to substring collisions)
+                name_match = False
+                if ef_name:
+                    if af_name == ef_name or af_path == ef_name:
+                        name_match = True
+                    elif af_path.endswith("." + ef_name):
+                        name_match = True
+                    elif af_title.startswith(ef_name + " ") or f" {ef_name} " in af_title or f": {ef_name} " in af_title:
+                        name_match = True
+
+                if not name_match and ef_path:
+                    if af_path == ef_path or af_name == ef_path:
+                        name_match = True
+                    elif af_path.endswith("." + ef_path):
+                        name_match = True
                 
+                # Strict value matching: reject missing required values
                 val_match = True
-                if ef_before is not None and af_before is not None:
-                    val_match = str(ef_before) == str(af_before)
-                if ef_after is not None and af_after is not None and val_match:
-                    val_match = str(ef_after) == str(af_after)
+                if ef_before is not None:
+                    if af_before is None:
+                        val_match = False
+                    elif str(ef_before) != str(af_before):
+                        val_match = False
+
+                if ef_after is not None and val_match:
+                    if af_after is None:
+                        val_match = False
+                    elif str(ef_after) != str(af_after):
+                        val_match = False
 
                 if name_match and val_match:
                     matched_facts += 1
@@ -504,27 +533,64 @@ class InvestigationEvaluator:
             tier = c.get("candidate_tier", "")
             fn = c.get("function_name", "")
             if tier in ("VALIDATED_CAUSAL_FUNCTION", "VALIDATED_CAUSAL"):
-                promoted_functions.append(fn)
+                if fn and fn not in promoted_functions:
+                    promoted_functions.append(fn)
                 highest_tier = "VALIDATED_CAUSAL_FUNCTION"
             elif tier in ("EVIDENCE_SUPPORTED", "EVIDENCE_SUPPORTED_CANDIDATE") and highest_tier != "VALIDATED_CAUSAL_FUNCTION":
                 highest_tier = "EVIDENCE_SUPPORTED"
 
+        # Also inspect if any hypothesis claims VALIDATED
+        for h in hypotheses:
+            h_status = str(h.get("status") or h.get("validation_status") or "").upper()
+            if h_status in ("VALIDATED", "CONFIRMED"):
+                for c in h.get("function_candidates", []):
+                    fn = c.get("function_name", "")
+                    if fn and fn not in promoted_functions:
+                        promoted_functions.append(fn)
+                highest_tier = "VALIDATED_CAUSAL_FUNCTION"
+
         causal_promoted = len(promoted_functions) > 0
-        
+
+        # Helper to check if a promoted function is supported by authentic attribution evidence
+        def _has_authentic_attribution_evidence(fn_name: str) -> bool:
+            for eid, rec in ledger_map.items():
+                ev_type = str(rec.get("evidence_type", ""))
+                ev_source = str(rec.get("source", ""))
+                details = rec.get("details", {}) or {}
+
+                # Unverified / synthetic evidence cannot prove causality
+                if ev_source in ("unverified_caller", "caller") or details.get("caller_submitted"):
+                    continue
+                if details.get("synthetic") or details.get("unverified"):
+                    continue
+
+                if ev_type in ("EXECUTION_TRACE", "ATTRIBUTION") or details.get("attribution_basis") == "execution_trace":
+                    rec_str = json.dumps(rec).lower()
+                    if fn_name.lower() in rec_str:
+                        return True
+            return False
+
         is_tp = False
         is_fp = False
         is_tn = False
         is_fn = False
 
         if causal_promoted:
+            has_authentic_evidence = any(_has_authentic_attribution_evidence(fn) for fn in promoted_functions)
+
             if ground_is_causal:
-                # Must match expected causal function
+                # Must match expected causal function AND (for real runtime) have authentic attribution evidence
                 if expected_fn and any(fn == expected_fn for fn in promoted_functions):
-                    is_tp = True
+                    if evaluation_mode == "evaluator_self_test" or has_authentic_evidence:
+                        is_tp = True
+                    else:
+                        # Promoted in real runtime without authentic attribution evidence
+                        is_fp = True
                 else:
-                    is_fp = True  # Promoted wrong function
+                    # Promoted wrong function
+                    is_fp = True
             else:
-                is_fp = True  # Promoted when not causal
+                is_fp = True  # Promoted when ground truth is negative
         else:
             if ground_is_causal:
                 is_fn = True  # Causal in truth, but unproven by pipeline
@@ -620,9 +686,38 @@ class InvestigationEvaluator:
         pos_ground = sum(1 for r in completed if r.ground_truth_is_causal)
         neg_ground = sum(1 for r in completed if not r.ground_truth_is_causal)
 
-        fp_rate = round(fp / neg_ground, 4) if neg_ground > 0 else 0.0
-        fp_display = f"{fp}/{neg_ground} ({fp_rate * 100:.1f}%)" if neg_ground > 0 else "N/A"
-        sla_met = (fp == 0) and (comp_count > 0)
+        # Micro fact metrics calculation
+        tot_matched = sum(r.facts_matched for r in completed)
+        tot_detected = sum(r.facts_detected for r in completed)
+        tot_expected = sum(r.facts_expected for r in completed)
+        micro_prec = round(tot_matched / tot_detected, 4) if tot_detected > 0 else None
+        micro_rec = round(tot_matched / tot_expected, 4) if tot_expected > 0 else None
+        micro_f1 = (
+            round((2 * micro_prec * micro_rec) / (micro_prec + micro_rec), 4)
+            if (micro_prec is not None and micro_rec is not None and (micro_prec + micro_rec) > 0)
+            else None
+        )
+
+        excluded_list = [
+            {"scenario_id": r.scenario_id, "status": r.status, "reason": r.skip_reason or r.notes or "Incomplete execution"}
+            for r in results if r.status != "COMPLETED"
+        ]
+
+        # An empty eligible denominator must produce NOT_EVALUABLE/None and must never pass the SLA
+        if neg_ground == 0:
+            fp_rate = None
+            fp_display = f"{fp}/0 (NOT_EVALUABLE)"
+            sla_status = "NOT_EVALUABLE"
+            sla_met = False
+        else:
+            fp_rate = round(fp / neg_ground, 4)
+            fp_display = f"{fp}/{neg_ground} ({fp_rate * 100:.1f}%)"
+            if fp == 0 and comp_count > 0:
+                sla_status = "PASSED"
+                sla_met = True
+            else:
+                sla_status = "FAILED"
+                sla_met = False
 
         track_label = "REAL_RUNTIME_PRODUCT_PIPELINE" if evaluation_mode == "real_runtime" else "EVALUATOR_UNIT_TEST"
 
@@ -654,5 +749,11 @@ class InvestigationEvaluator:
             false_positive_display=fp_display,
             causal_confusion_matrix={"TP": tp, "FP": fp, "TN": tn, "FN": fn},
             zero_false_positive_sla_met=sla_met,
+            eligible_causal_negatives=neg_ground,
+            excluded_scenarios_count=len(excluded_list),
+            excluded_scenarios=excluded_list,
+            sla_status=sla_status,
+            micro_fact_f1=micro_f1,
+            macro_fact_f1=mean_fact_f1,
             scenarios=results,
         )

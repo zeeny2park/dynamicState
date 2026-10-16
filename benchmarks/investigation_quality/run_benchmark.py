@@ -155,13 +155,22 @@ class RealRuntimeExecutionHarness:
         mutate_cmd: str,
         expected_ack: str,
         is_non_atomic: bool = False,
+        capture_work_dir: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
         """Launch interactive inferior, capture State A, apply mutation, capture State B, and stop."""
         stage_prov: Dict[str, Any] = {}
         if not self.compiled:
+            stage_prov["compile"] = {"status": "FAILED", "reason": "Target not compiled"}
             return False, "Target not compiled", None, None, stage_prov
 
         bin_path = self.stripped_bin if os.path.exists(self.stripped_bin) else self.debug_bin
+        if not os.path.exists(bin_path) or not os.access(bin_path, os.X_OK):
+            stage_prov["spawn"] = {"status": "FAILED", "reason": f"Binary missing or not executable: {bin_path}"}
+            return False, f"Binary not executable: {bin_path}", None, None, stage_prov
+
+        work_dir = capture_work_dir or self.work_dir
+        os.makedirs(work_dir, exist_ok=True)
+        bin_hash = compute_file_sha256(bin_path)
 
         try:
             proc = subprocess.Popen(
@@ -172,69 +181,147 @@ class RealRuntimeExecutionHarness:
                 text=True,
             )
         except Exception as exc:
+            stage_prov["spawn"] = {"status": "FAILED", "reason": str(exc)}
             return False, f"Failed to spawn binary: {exc}", None, None, stage_prov
 
         stage_prov["spawn"] = {
             "pid": proc.pid,
             "binary_path": bin_path,
-            "status": "SPAWNED",
+            "binary_hash": bin_hash,
+            "build_id": self.build_id,
+            "status": "SUCCESS",
         }
 
         try:
             # 1. Wait for READY signal with bounded timeout
             ready_line = _readline_with_timeout(proc.stdout, timeout_sec=5.0)
-            if "READY" not in ready_line:
+            if ready_line != "READY":
                 proc.kill()
-                stage_prov["handshake"] = {"status": "FAILED", "response": ready_line}
+                stage_prov["handshake"] = {"status": "FAILED", "response": ready_line, "expected": "READY"}
                 return False, f"Inferior failed to report READY (got: '{ready_line}')", None, None, stage_prov
 
             stage_prov["handshake"] = {"status": "SUCCESS", "response": ready_line}
 
-            # 2. Capture Snapshot A
+            # 2. Independent inspection of initial State A via STATE command
+            fixture_state_a: Dict[str, Any] = {}
+            try:
+                proc.stdin.write("STATE\n")
+                proc.stdin.flush()
+                state_line_a = _readline_with_timeout(proc.stdout, timeout_sec=5.0)
+                if state_line_a.startswith("STATE "):
+                    for part in state_line_a[6:].strip().split():
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            fixture_state_a[k] = v
+                stage_prov["inspect_state_a"] = {
+                    "status": "SUCCESS" if fixture_state_a else "DEGRADED",
+                    "raw": state_line_a,
+                    "state": fixture_state_a,
+                }
+            except Exception as exc:
+                stage_prov["inspect_state_a"] = {"status": "FAILED", "error": str(exc)}
+
+            # 3. Capture Snapshot A
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
             snap1 = backend.capture(pid=proc.pid)
-            snap1_dir = os.path.join(self.work_dir, f"snap_A_{int(time.time()*1000)}")
+            snap1_dir = os.path.join(work_dir, f"snap_A_{int(time.time()*1000)}")
             snap1.save(snap1_dir)
+
+            # Concrete output artifact verification for Snapshot A
+            meta_path1 = os.path.join(snap1_dir, "metadata.json")
+            if not os.path.exists(meta_path1):
+                snap_meta1 = os.path.join(snap1_dir, "snapshot_metadata.json")
+                if os.path.exists(snap_meta1):
+                    shutil.copyfile(snap_meta1, meta_path1)
+            mem_path1 = os.path.join(snap1_dir, "memory.bin")
+            if not os.path.exists(mem_path1):
+                with open(mem_path1, "wb") as f:
+                    for buf in snap1._buffers.values():
+                        f.write(buf)
+
+            if not os.path.exists(meta_path1) or not os.path.exists(mem_path1) or os.path.getsize(mem_path1) == 0:
+                proc.kill()
+                stage_prov["snapshot_a"] = {"status": "FAILED", "reason": "Artifact verification failed (empty or missing memory.bin)"}
+                return False, "Snapshot A artifacts invalid", None, None, stage_prov
+
             stage_prov["snapshot_a"] = {
                 "path": snap1_dir,
                 "bytes_read": snap1.provenance.get("captured_bytes", 0),
                 "completeness": snap1.completeness,
-                "status": "CAPTURED",
+                "status": "SUCCESS" if snap1.completeness == "COMPLETE" else "DEGRADED",
             }
 
-            # 3. Send mutation command and validate ack line with timeout
+            # 4. Send mutation command and validate EXACT ack line with timeout
             proc.stdin.write(f"{mutate_cmd}\n")
             proc.stdin.flush()
             mut_line = _readline_with_timeout(proc.stdout, timeout_sec=5.0)
 
-            if expected_ack not in mut_line and "MUTATED" not in mut_line:
+            # Exact mutation acknowledgement check (reject arbitrary lines containing MUTATED)
+            if mut_line != expected_ack:
                 proc.kill()
                 stage_prov["mutation"] = {"status": "FAILED", "got": mut_line, "expected": expected_ack}
                 return False, f"Inferior mutation ack validation failed (got: '{mut_line}', expected: '{expected_ack}')", None, None, stage_prov
 
-            stage_prov["mutation"] = {"status": "VERIFIED_ACK", "got": mut_line}
+            stage_prov["mutation"] = {"status": "SUCCESS", "got": mut_line, "expected": expected_ack}
 
-            # 4. Capture Snapshot B
+            # 5. Independent inspection of post-mutation State B via STATE command
+            fixture_state_b: Dict[str, Any] = {}
+            try:
+                proc.stdin.write("STATE\n")
+                proc.stdin.flush()
+                state_line_b = _readline_with_timeout(proc.stdout, timeout_sec=5.0)
+                if state_line_b.startswith("STATE "):
+                    for part in state_line_b[6:].strip().split():
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            fixture_state_b[k] = v
+                stage_prov["inspect_state_b"] = {
+                    "status": "SUCCESS" if fixture_state_b else "DEGRADED",
+                    "raw": state_line_b,
+                    "state": fixture_state_b,
+                }
+            except Exception as exc:
+                stage_prov["inspect_state_b"] = {"status": "FAILED", "error": str(exc)}
+
+            # 6. Capture Snapshot B
             snap2 = backend.capture(pid=proc.pid)
             if is_non_atomic:
                 snap2.provenance["consistency_classification"] = "NON_ATOMIC"
-            snap2_dir = os.path.join(self.work_dir, f"snap_B_{int(time.time()*1000)}")
+            snap2_dir = os.path.join(work_dir, f"snap_B_{int(time.time()*1000)}")
             snap2.save(snap2_dir)
+
+            # Concrete output artifact verification for Snapshot B
+            meta_path2 = os.path.join(snap2_dir, "metadata.json")
+            if not os.path.exists(meta_path2):
+                snap_meta2 = os.path.join(snap2_dir, "snapshot_metadata.json")
+                if os.path.exists(snap_meta2):
+                    shutil.copyfile(snap_meta2, meta_path2)
+            mem_path2 = os.path.join(snap2_dir, "memory.bin")
+            if not os.path.exists(mem_path2):
+                with open(mem_path2, "wb") as f:
+                    for buf in snap2._buffers.values():
+                        f.write(buf)
+
+            if not os.path.exists(meta_path2) or not os.path.exists(mem_path2) or os.path.getsize(mem_path2) == 0:
+                proc.kill()
+                stage_prov["snapshot_b"] = {"status": "FAILED", "reason": "Artifact verification failed (empty or missing memory.bin)"}
+                return False, "Snapshot B artifacts invalid", None, None, stage_prov
+
             stage_prov["snapshot_b"] = {
                 "path": snap2_dir,
                 "bytes_read": snap2.provenance.get("captured_bytes", 0),
                 "completeness": snap2.completeness,
                 "consistency": "NON_ATOMIC" if is_non_atomic else "STOPPED",
-                "status": "CAPTURED",
+                "status": "DEGRADED" if is_non_atomic else ("SUCCESS" if snap2.completeness == "COMPLETE" else "DEGRADED"),
             }
 
-            # 5. Stop inferior cleanly with bounded timeout
+            # 7. Stop inferior cleanly with bounded timeout
             try:
                 proc.stdin.write("STOP\n")
                 proc.stdin.flush()
-                _readline_with_timeout(proc.stdout, timeout_sec=3.0)
+                stop_line = _readline_with_timeout(proc.stdout, timeout_sec=3.0)
                 proc.wait(timeout=2)
-                stage_prov["shutdown"] = {"status": "CLEAN_STOP", "exit_code": proc.returncode}
+                stage_prov["shutdown"] = {"status": "SUCCESS", "exit_code": proc.returncode, "response": stop_line}
             except Exception:
                 proc.terminate()
                 try:
@@ -284,6 +371,7 @@ class InvestigationQualityBenchmark:
         mode: str = "all",
         provider: str = "none",
         providers: Optional[List[str]] = None,
+        provider_scenarios: Optional[List[str]] = None,
         smoke: bool = False,
         repeat: int = 1,
     ) -> BenchmarkSuiteResult:
@@ -292,28 +380,45 @@ class InvestigationQualityBenchmark:
         corpus_hash = compute_file_sha256(self.corpus_path)
         fixture_hash = compute_file_sha256(self.fixture_src)
 
-        # 1. Compile C++ target
-        compiled_ok, compile_err = self.runtime_harness.compile()
-        build_id = self.runtime_harness.build_id
-
         # Normalize mode
-        normalized_mode = "evaluator_self_test" if mode == "unit_fixture" else mode
+        normalized_mode = "evaluator_self_test" if mode in ("unit_fixture", "evaluator_self_test") else mode
+
+        # 1. Compile C++ target (only if real_runtime is required; evaluator_self_test never launches target)
+        if normalized_mode == "evaluator_self_test":
+            compiled_ok = False
+            compile_err = "Evaluator self-test mode (live C++ execution disabled)"
+            build_id = None
+        else:
+            compiled_ok, compile_err = self.runtime_harness.compile()
+            build_id = self.runtime_harness.build_id
 
         # Determine target provider list
         target_providers = providers if providers else [provider]
+
+        # Determine scenario scope
+        if smoke:
+            # Smoke mode evaluates both positive and negative representative scenarios
+            scenarios_to_run = [
+                next(sc for sc in self.corpus["scenarios"] if sc["scenario_id"] == "scenario_1"),
+                next(sc for sc in self.corpus["scenarios"] if sc["scenario_id"] == "scenario_6"),
+            ]
+        else:
+            scenarios_to_run = self.corpus["scenarios"]
 
         repeat_run_records: List[Dict[str, Any]] = []
         last_real_results: List[ScenarioEvaluationResult] = []
         last_self_test_results: List[ScenarioEvaluationResult] = []
 
-        # 2. Execute repeat iterations (actual independent executions)
+        # 2. Execute repeat iterations (fresh independent executions)
         for rep_idx in range(max(1, repeat)):
+            rep_dir = os.path.join(self.tmp_dir, f"rep_{rep_idx}_{int(time.time()*1000)}")
+            os.makedirs(rep_dir, exist_ok=True)
             rep_real: List[ScenarioEvaluationResult] = []
             rep_self_test: List[ScenarioEvaluationResult] = []
 
             # Real-Runtime Evaluation
             if normalized_mode in ("all", "real_runtime"):
-                for sc in self.corpus["scenarios"]:
+                for sc in scenarios_to_run:
                     if not compiled_ok:
                         res = ScenarioEvaluationResult(
                             scenario_id=sc["scenario_id"],
@@ -326,12 +431,12 @@ class InvestigationQualityBenchmark:
                             notes=f"Skipped: {compile_err}",
                         )
                     else:
-                        res = self._execute_real_runtime_scenario(sc, provider=provider)
+                        res = self._execute_real_runtime_scenario(sc, provider=provider, session_work_dir=rep_dir)
                     rep_real.append(res)
 
-            # Evaluator Self-Test Evaluation (clearly segregated)
+            # Evaluator Self-Test Evaluation (strictly segregated)
             if normalized_mode in ("all", "evaluator_self_test"):
-                for sc in self.corpus["scenarios"]:
+                for sc in scenarios_to_run:
                     res = self._execute_evaluator_self_test_scenario(sc, provider=provider)
                     rep_self_test.append(res)
 
@@ -341,76 +446,197 @@ class InvestigationQualityBenchmark:
             rep_agg_real = self.evaluator.aggregate_metrics(rep_real, "real_runtime") if rep_real else None
             rep_agg_self = self.evaluator.aggregate_metrics(rep_self_test, "evaluator_self_test") if rep_self_test else None
 
+            # Track full repetition outcomes with attempted/completed/failed/skipped counts
+            att_count = len(rep_real) if rep_real else len(rep_self_test)
+            comp_count = rep_agg_real.completed_scenarios if rep_agg_real else (rep_agg_self.completed_scenarios if rep_agg_self else 0)
+            fail_count = rep_agg_real.failed_scenarios if rep_agg_real else (rep_agg_self.failed_scenarios if rep_agg_self else 0)
+            skip_count = rep_agg_real.skipped_scenarios if rep_agg_real else (rep_agg_self.skipped_scenarios if rep_agg_self else 0)
+
             repeat_run_records.append({
                 "iteration": rep_idx + 1,
+                "attempted_scenarios": att_count,
+                "completed_scenarios": comp_count,
+                "failed_scenarios": fail_count,
+                "skipped_scenarios": skip_count,
                 "real_runtime_f1": rep_agg_real.mean_fact_f1 if rep_agg_real else None,
-                "real_runtime_fp_rate": rep_agg_real.false_positive_causal_rate if rep_agg_real else 0.0,
-                "real_runtime_sla_met": rep_agg_real.zero_false_positive_sla_met if rep_agg_real else True,
+                "real_runtime_fp_rate": rep_agg_real.false_positive_causal_rate if rep_agg_real else None,
+                "real_runtime_sla_met": rep_agg_real.zero_false_positive_sla_met if rep_agg_real else False,
                 "self_test_f1": rep_agg_self.mean_fact_f1 if rep_agg_self else None,
-                "self_test_fp_rate": rep_agg_self.false_positive_causal_rate if rep_agg_self else 0.0,
+                "self_test_fp_rate": rep_agg_self.false_positive_causal_rate if rep_agg_self else None,
             })
 
-        # Calculate repeat variability
+        # Calculate repeat variability only over valid completed runs
         repeat_variability: Dict[str, Any] = {}
         if len(repeat_run_records) > 1:
-            f1_vals = [r["real_runtime_f1"] for r in repeat_run_records if r["real_runtime_f1"] is not None]
-            if f1_vals:
-                mean_f1 = sum(f1_vals) / len(f1_vals)
-                var_f1 = sum((x - mean_f1) ** 2 for x in f1_vals) / len(f1_vals)
+            valid_f1s = [r["real_runtime_f1"] for r in repeat_run_records if r["real_runtime_f1"] is not None]
+            if valid_f1s:
+                mean_f1 = sum(valid_f1s) / len(valid_f1s)
+                var_f1 = sum((x - mean_f1) ** 2 for x in valid_f1s) / len(valid_f1s)
                 repeat_variability["real_runtime_f1_mean"] = round(mean_f1, 4)
                 repeat_variability["real_runtime_f1_std"] = round(math.sqrt(var_f1), 4)
 
         # 3. Multi-Provider Comparison Matrix
+        # Determine provider scope
+        if provider_scenarios:
+            prov_scope = [s for s in provider_scenarios if any(sc["scenario_id"] == s for sc in self.corpus["scenarios"])]
+        elif smoke:
+            prov_scope = ["scenario_1"]
+        else:
+            prov_scope = [sc["scenario_id"] for sc in self.corpus["scenarios"]]
+
         provider_comparisons: Dict[str, Any] = {}
         prov_mgr = LLMProviderManager()
         avail_providers = prov_mgr.get_available_providers()
+
         for p in target_providers:
             p_status = avail_providers.get(p) or {}
-            if not p_status.get("available") and p != "none":
+            p_available = p_status.get("available", False) or (p == "none")
+
+            if not p_available:
                 provider_comparisons[p] = {
                     "provider": p,
                     "model": p_status.get("model", "unknown"),
+                    "execution_mode": "evaluator_self_test" if normalized_mode == "evaluator_self_test" else "real_runtime",
                     "status": "UNAVAILABLE",
                     "reason": p_status.get("error") or "Provider binary or endpoint unreachable",
+                    "scenarios_evaluated": prov_scope,
+                    "attempted_count": len(prov_scope),
                     "completed_scenarios": 0,
-                    "zero_false_positive_sla_met": False,
-                    "false_positive_causal_rate": 0.0,
+                    "completed_model_responses": 0,
+                    "fallback_count": 0,
                     "fallback_occurred": False,
+                    "failed_count": 0,
+                    "model_success_rate": 0.0,
+                    "zero_false_positive_sla_met": False,
+                    "false_positive_causal_rate": None,
+                    "scenario_details": [],
                 }
             else:
-                # Run scenario 1 as representative provider evaluation
-                sc1 = self.corpus["scenarios"][0]
-                if compiled_ok:
-                    res_p = self._execute_real_runtime_scenario(sc1, provider=p)
-                    fb_occurred = res_p.artifacts.get("is_fallback", False)
-                    status_label = "FALLBACK_OCCURRED" if (fb_occurred and p != "none") else "COMPLETED_MODEL_RESPONSE"
-                    provider_comparisons[p] = {
-                        "provider": p,
-                        "model": res_p.artifacts.get("model_used") or ("deterministic-engine" if p == "none" else p),
-                        "status": status_label,
-                        "completed_scenarios": 1,
-                        "zero_false_positive_sla_met": not res_p.is_false_positive,
-                        "false_positive_causal_rate": 1.0 if res_p.is_false_positive else 0.0,
-                        "fallback_occurred": False if p == "none" else fb_occurred,
-                    }
+                scenario_details: List[Dict[str, Any]] = []
+                for sc_id in prov_scope:
+                    sc_def = next((sc for sc in self.corpus["scenarios"] if sc["scenario_id"] == sc_id), None)
+                    if not sc_def:
+                        continue
+
+                    # Mode isolation: evaluator-only mode never executes real runtime
+                    if normalized_mode == "evaluator_self_test":
+                        res_p = self._execute_evaluator_self_test_scenario(sc_def, provider=p)
+                    else:
+                        if not compiled_ok:
+                            res_p = ScenarioEvaluationResult(
+                                scenario_id=sc_id,
+                                scenario_name=sc_def["scenario_name"],
+                                category=sc_def["category"],
+                                evaluation_mode="real_runtime",
+                                status="SKIPPED",
+                                skip_reason=f"Compilation skipped: {compile_err}",
+                                ground_truth_is_causal=bool(sc_def["causal_attribution"]["causal_function_provable"]),
+                            )
+                        else:
+                            prov_work_dir = tempfile.mkdtemp(prefix=f"prov_{p}_{sc_id}_", dir=self.tmp_dir)
+                            res_p = self._execute_real_runtime_scenario(sc_def, provider=p, session_work_dir=prov_work_dir)
+
+                    is_fb = res_p.artifacts.get("is_fallback", False)
+                    if p != "none" and is_fb:
+                        sc_status = "FALLBACK_OCCURRED"
+                    elif res_p.status == "COMPLETED":
+                        sc_status = "COMPLETED_MODEL_RESPONSE"
+                    else:
+                        sc_status = res_p.status
+
+                    scenario_details.append({
+                        "scenario_id": sc_id,
+                        "status": sc_status,
+                        "is_fallback": is_fb,
+                        "model": res_p.artifacts.get("model_used", p),
+                        "latency_ms": res_p.artifacts.get("latency_ms", 0.0),
+                        "is_false_positive": res_p.is_false_positive,
+                        "candidate_tier": res_p.candidate_tier,
+                    })
+
+                completed_models = sum(1 for d in scenario_details if d["status"] == "COMPLETED_MODEL_RESPONSE")
+                fallbacks = sum(1 for d in scenario_details if d["is_fallback"] and p != "none")
+                failed_scs = sum(1 for d in scenario_details if d["status"] == "FAILED")
+                fps = sum(1 for d in scenario_details if d["is_false_positive"])
+                prov_model_success_rate = round(completed_models / len(scenario_details), 4) if scenario_details else 0.0
+
+                if p == "none":
+                    overall_status = "COMPLETED_MODEL_RESPONSE"
+                elif fallbacks == len(scenario_details) and len(scenario_details) > 0:
+                    overall_status = "FALLBACK_OCCURRED"
+                elif fallbacks > 0:
+                    overall_status = "PARTIAL_FALLBACK"
+                elif completed_models == len(scenario_details) and len(scenario_details) > 0:
+                    overall_status = "COMPLETED_MODEL_RESPONSE"
+                else:
+                    overall_status = "FAILED"
+
+                provider_comparisons[p] = {
+                    "provider": p,
+                    "model": "deterministic-engine" if p == "none" else p_status.get("model", p),
+                    "execution_mode": "evaluator_self_test" if normalized_mode == "evaluator_self_test" else "real_runtime",
+                    "status": overall_status,
+                    "reason": None if overall_status == "COMPLETED_MODEL_RESPONSE" else ("Deterministic fallback occurred" if fallbacks > 0 else None),
+                    "scenarios_evaluated": prov_scope,
+                    "attempted_count": len(scenario_details),
+                    "completed_scenarios": completed_models,
+                    "completed_model_responses": completed_models,
+                    "fallback_count": fallbacks,
+                    "fallback_occurred": (fallbacks > 0),
+                    "failed_count": failed_scs,
+                    "model_success_rate": prov_model_success_rate,
+                    "zero_false_positive_sla_met": (fps == 0) and (completed_models > 0 or p == "none"),
+                    "false_positive_causal_rate": 0.0 if (fps == 0 and len(scenario_details) > 0) else (1.0 if fps > 0 else None),
+                    "scenario_details": scenario_details,
+                }
 
         # 4. Aggregate Final Metrics
         real_agg = self.evaluator.aggregate_metrics(last_real_results, "real_runtime") if last_real_results else None
         self_test_agg = self.evaluator.aggregate_metrics(last_self_test_results, "evaluator_self_test") if last_self_test_results else None
 
-        # Safety gate: 0% FP causal across eligible completed cases
-        all_completed = [r for r in (last_real_results + last_self_test_results) if r.status == "COMPLETED"]
-        total_fps = sum(1 for r in all_completed if r.is_false_positive)
-        sla_met = (total_fps == 0) and (len(all_completed) > 0)
+        # Product Causal SLA Gate: Strictly calculated ONLY from eligible completed real-runtime scenarios!
+        # Evaluator self-tests NEVER influence product SLA!
+        if normalized_mode == "evaluator_self_test":
+            product_sla_met = False
+            product_sla_status = "NOT_EVALUABLE"
+            product_sla_details = {
+                "status": "NOT_EVALUABLE",
+                "reason": "Evaluator self-test mode executed; real-runtime product pipeline was not run.",
+                "numerator": 0,
+                "denominator": 0,
+                "excluded_scenarios": [s.scenario_id for s in last_self_test_results],
+                "exclusion_reasons": {"all": "Self-test mode"},
+            }
+        elif real_agg is not None and real_agg.causal_negatives_ground_truth > 0:
+            product_sla_met = (real_agg.false_causal_positives == 0) and (real_agg.completed_scenarios > 0)
+            product_sla_status = "PASSED" if product_sla_met else "FAILED"
+            product_sla_details = {
+                "status": product_sla_status,
+                "numerator": real_agg.false_causal_positives,
+                "denominator": real_agg.causal_negatives_ground_truth,
+                "excluded_scenarios": [s["scenario_id"] for s in real_agg.excluded_scenarios],
+                "exclusion_reasons": {s["scenario_id"]: s.get("reason", "") for s in real_agg.excluded_scenarios},
+            }
+        else:
+            product_sla_met = False
+            product_sla_status = "NOT_EVALUABLE"
+            product_sla_details = {
+                "status": "NOT_EVALUABLE",
+                "reason": "No eligible completed real-runtime negative scenarios to evaluate causal false positive rate.",
+                "numerator": 0,
+                "denominator": 0,
+                "excluded_scenarios": [s.scenario_id for s in last_real_results if s.status != "COMPLETED"],
+                "exclusion_reasons": {s.scenario_id: (s.skip_reason or "Incomplete") for s in last_real_results if s.status != "COMPLETED"},
+            }
 
         suite_result = BenchmarkSuiteResult(
-            schema_version="1.1.0",
+            schema_version="1.2.0",
             timestamp_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
             corpus_version=self.corpus.get("corpus_version", "1.1.0"),
             corpus_hash=corpus_hash,
             fixture_hash=fixture_hash,
             build_id=build_id,
-            analyzer_version="1.1.0",
+            analyzer_version="1.2.0",
             provider_identity=provider,
             model="deterministic-engine" if provider == "none" else provider,
             prompt_schema_version="1.0.0",
@@ -418,6 +644,7 @@ class InvestigationQualityBenchmark:
                 "mode": mode,
                 "provider": provider,
                 "providers": target_providers,
+                "provider_scenarios": prov_scope,
                 "smoke": smoke,
                 "repeat": repeat,
             },
@@ -426,7 +653,9 @@ class InvestigationQualityBenchmark:
             provider_comparisons=provider_comparisons,
             repeat_runs=repeat_run_records if repeat > 1 else [],
             repeat_variability=repeat_variability,
-            zero_false_positive_sla_met=sla_met,
+            zero_false_positive_sla_met=product_sla_met,
+            product_sla_status=product_sla_status,
+            product_sla_details=product_sla_details,
         )
 
         self._save_reports(suite_result)
@@ -436,11 +665,15 @@ class InvestigationQualityBenchmark:
         self,
         scenario_def: Dict[str, Any],
         provider: str = "none",
+        session_work_dir: Optional[str] = None,
     ) -> ScenarioEvaluationResult:
         """Run real C++ inferior execution, capture memory, diff, synthesize, and evaluate without GT leakage."""
         sc_id = scenario_def["scenario_id"]
         sc_num = sc_id.replace("scenario_", "")
         is_non_atomic = (sc_id == "scenario_5")
+
+        scenario_work_dir = session_work_dir or tempfile.mkdtemp(prefix=f"dynstate_real_{sc_id}_", dir=self.tmp_dir)
+        os.makedirs(scenario_work_dir, exist_ok=True)
 
         mutate_cmd = f"MUTATE {sc_num}"
         expected_ack = f"MUTATED {sc_num}"
@@ -448,9 +681,13 @@ class InvestigationQualityBenchmark:
             mutate_cmd=mutate_cmd,
             expected_ack=expected_ack,
             is_non_atomic=is_non_atomic,
+            capture_work_dir=scenario_work_dir,
         )
 
         if not ok:
+            stage_prov["dwarf_diff"] = {"status": "NOT_RUN", "reason": "Upstream capture failed"}
+            stage_prov["stage_synthesis"] = {"status": "NOT_RUN", "reason": "Upstream capture failed"}
+            stage_prov["conversational_analysis"] = {"status": "NOT_RUN", "reason": "Upstream capture failed"}
             return ScenarioEvaluationResult(
                 scenario_id=sc_id,
                 scenario_name=scenario_def["scenario_name"],
@@ -463,54 +700,143 @@ class InvestigationQualityBenchmark:
                 artifacts={"stage_provenance": stage_prov},
             )
 
-        # Run investigation pipeline on real snapshots
-        mgr = InvestigationManager(corpus_dir=self.tmp_dir)
+        # Verify debug companion image and Build ID compatibility
         debug_img = self.runtime_harness.debug_companion if os.path.exists(self.runtime_harness.debug_companion) else self.runtime_harness.debug_bin
-        s_info = mgr.start_investigation(
-            goal=f"Real runtime benchmark for {sc_id}",
-            memory_snapshot_path=snap1_dir,
-            debug_image=debug_img,
-        )
-        inv_id = s_info["investigation_id"]
-        mgr.compare_observations(inv_id, snap1_dir, snap2_dir)
-        session = mgr.sessions[inv_id]
-        mgr._execute_stage_synthesis(session)
+        if not os.path.exists(debug_img):
+            stage_prov["dwarf_diff"] = {"status": "FAILED", "reason": "Debug companion image missing"}
+            stage_prov["stage_synthesis"] = {"status": "NOT_RUN", "reason": "DWARF diff failed"}
+            stage_prov["conversational_analysis"] = {"status": "NOT_RUN", "reason": "DWARF diff failed"}
+            return ScenarioEvaluationResult(
+                scenario_id=sc_id,
+                scenario_name=scenario_def["scenario_name"],
+                category=scenario_def["category"],
+                evaluation_mode="real_runtime",
+                status="FAILED",
+                skip_reason="Debug companion image missing",
+                ground_truth_is_causal=bool(scenario_def["causal_attribution"]["causal_function_provable"]),
+                notes="Debug companion image missing",
+                artifacts={"stage_provenance": stage_prov},
+            )
 
-        # Stage provenance recording
-        stage_prov["dwarf_diff"] = {
-            "status": "COMPLETED",
-            "findings_count": len(session.findings),
-            "diff_trust": "CONFIRMED",
-        }
-        stage_prov["stage_synthesis"] = {
-            "status": "COMPLETED",
-            "hypotheses_count": len(session.hypotheses),
-            "ledger_count": len(session.ledger.query()),
-        }
+        companion_info = inspect_elf(debug_img)
+        if companion_info.build_id != self.runtime_harness.build_id:
+            stage_prov["dwarf_diff"] = {
+                "status": "FAILED",
+                "reason": f"Companion Build ID mismatch: {companion_info.build_id} != {self.runtime_harness.build_id}",
+            }
+            stage_prov["stage_synthesis"] = {"status": "NOT_RUN", "reason": "Build ID mismatch"}
+            stage_prov["conversational_analysis"] = {"status": "NOT_RUN", "reason": "Build ID mismatch"}
+            return ScenarioEvaluationResult(
+                scenario_id=sc_id,
+                scenario_name=scenario_def["scenario_name"],
+                category=scenario_def["category"],
+                evaluation_mode="real_runtime",
+                status="FAILED",
+                skip_reason="Companion Build ID mismatch",
+                ground_truth_is_causal=bool(scenario_def["causal_attribution"]["causal_function_provable"]),
+                notes=f"Build ID mismatch: {companion_info.build_id} != {self.runtime_harness.build_id}",
+                artifacts={"stage_provenance": stage_prov},
+            )
 
-        # Run conversational analysis service
-        service = ConversationalAnalysisService()
-        t0 = time.time()
-        conv_resp = service.analyze_investigation(
-            session=session,
-            user_message=f"Analyze defect for {sc_id}",
-            provider_override=provider,
-            allow_fallback=True,
-        )
-        latency_ms = round((time.time() - t0) * 1000, 2)
+        # Run investigation pipeline on real snapshots
+        try:
+            mgr = InvestigationManager(corpus_dir=scenario_work_dir)
+            s_info = mgr.start_investigation(
+                goal=f"Real runtime benchmark for {sc_id}",
+                memory_snapshot_path=snap1_dir,
+                debug_image=debug_img,
+            )
+            inv_id = s_info["investigation_id"]
+            mgr.compare_observations(inv_id, snap1_dir, snap2_dir)
+            session = mgr.sessions[inv_id]
 
-        meta = getattr(conv_resp, "provider_metadata", {}) or {}
-        p_used = meta.get("invoked_provider", provider)
-        is_fb = meta.get("is_fallback", False)
-        m_used = meta.get("model", "deterministic-engine" if provider == "none" else provider)
-        dur_ms = meta.get("duration_ms", latency_ms)
+            stage_prov["dwarf_diff"] = {
+                "status": "SUCCESS",
+                "findings_count": len(session.findings),
+                "diff_trust": "CONFIRMED",
+                "debug_image": debug_img,
+                "companion_build_id": companion_info.build_id,
+            }
+        except Exception as exc:
+            stage_prov["dwarf_diff"] = {"status": "FAILED", "error": str(exc)}
+            stage_prov["stage_synthesis"] = {"status": "NOT_RUN", "reason": "DWARF diff failed"}
+            stage_prov["conversational_analysis"] = {"status": "NOT_RUN", "reason": "DWARF diff failed"}
+            return ScenarioEvaluationResult(
+                scenario_id=sc_id,
+                scenario_name=scenario_def["scenario_name"],
+                category=scenario_def["category"],
+                evaluation_mode="real_runtime",
+                status="FAILED",
+                skip_reason=f"DWARF diff error: {exc}",
+                ground_truth_is_causal=bool(scenario_def["causal_attribution"]["causal_function_provable"]),
+                notes=f"DWARF diff error: {exc}",
+                artifacts={"stage_provenance": stage_prov},
+            )
 
-        stage_prov["conversational_analysis"] = {
-            "status": "COMPLETED",
-            "provider_used": p_used,
-            "is_fallback": is_fb,
-            "model_used": m_used,
-            "latency_ms": dur_ms,
+        # Execute stage synthesis
+        try:
+            mgr._execute_stage_synthesis(session)
+            stage_prov["stage_synthesis"] = {
+                "status": "SUCCESS",
+                "hypotheses_count": len(session.hypotheses),
+                "ledger_count": len(session.ledger.query()),
+            }
+        except Exception as exc:
+            stage_prov["stage_synthesis"] = {"status": "FAILED", "error": str(exc)}
+            stage_prov["conversational_analysis"] = {"status": "NOT_RUN", "reason": "Synthesis failed"}
+            return ScenarioEvaluationResult(
+                scenario_id=sc_id,
+                scenario_name=scenario_def["scenario_name"],
+                category=scenario_def["category"],
+                evaluation_mode="real_runtime",
+                status="FAILED",
+                skip_reason=f"Synthesis error: {exc}",
+                ground_truth_is_causal=bool(scenario_def["causal_attribution"]["causal_function_provable"]),
+                notes=f"Synthesis error: {exc}",
+                artifacts={"stage_provenance": stage_prov},
+            )
+
+        # Conversational analysis service
+        conv_resp = None
+        is_fb = False
+        m_used = "deterministic-engine" if provider == "none" else provider
+        dur_ms = 0.0
+        p_used = provider
+
+        try:
+            service = ConversationalAnalysisService()
+            t0 = time.time()
+            conv_resp = service.analyze_investigation(
+                session=session,
+                user_message=f"Analyze defect for {sc_id}",
+                provider_override=provider,
+                allow_fallback=True,
+            )
+            latency_ms = round((time.time() - t0) * 1000, 2)
+            meta = getattr(conv_resp, "provider_metadata", {}) or {}
+            p_used = meta.get("invoked_provider", provider)
+            is_fb = meta.get("is_fallback", False)
+            m_used = meta.get("model", "deterministic-engine" if provider == "none" else provider)
+            dur_ms = meta.get("duration_ms", latency_ms)
+
+            status_label = "FALLBACK_OCCURRED" if (is_fb and provider != "none") else "COMPLETED_MODEL_RESPONSE"
+            stage_prov["conversational_analysis"] = {
+                "status": status_label,
+                "provider_used": p_used,
+                "is_fallback": is_fb,
+                "model_used": m_used,
+                "latency_ms": dur_ms,
+            }
+        except Exception as exc:
+            stage_prov["conversational_analysis"] = {"status": "FAILED", "error": str(exc)}
+
+        # Independent fixture state verification
+        state_a = stage_prov.get("inspect_state_a", {}).get("state", {})
+        state_b = stage_prov.get("inspect_state_b", {}).get("state", {})
+        stage_prov["fixture_state_verification"] = {
+            "status": "VERIFIED" if (state_a and state_b) else "UNAVAILABLE",
+            "state_a": state_a,
+            "state_b": state_b,
         }
 
         # Prioritize state mutation findings from snapshot comparison
@@ -524,7 +850,7 @@ class InvestigationQualityBenchmark:
             "evidence_ledger": [rec.to_dict() for rec in session.ledger.query()],
             "hypotheses": [h.to_dict() for h in session.hypotheses],
             "follow_up_observations": [obs.to_dict() for obs in session.follow_up_observations],
-            "conversational_response": conv_resp.to_dict(),
+            "conversational_response": conv_resp.to_dict() if conv_resp else {},
             "stage_provenance": stage_prov,
             "execution_metadata": {
                 "build_id": self.runtime_harness.build_id,
@@ -540,6 +866,7 @@ class InvestigationQualityBenchmark:
         eval_res.artifacts["is_fallback"] = is_fb
         eval_res.artifacts["model_used"] = m_used
         eval_res.artifacts["latency_ms"] = dur_ms
+        eval_res.artifacts["stage_provenance"] = stage_prov
         return eval_res
 
     def _execute_evaluator_self_test_scenario(
@@ -555,7 +882,6 @@ class InvestigationQualityBenchmark:
             corpus_dir=self.tmp_dir,
         )
 
-        # Set up findings and evidence records derived from scenario definition for evaluator self-test
         for ef in scenario_def.get("expected_facts", []):
             field_p = ef.get("field_path", "")
             f_name = ef.get("field_name", field_p.split(".")[-1])
@@ -587,7 +913,6 @@ class InvestigationQualityBenchmark:
                 evidence_ids=[ev.evidence_id],
             )
 
-            # Assign candidate tiers for self-test coverage
             if sc_id == "scenario_1":
                 f.function_candidates = [{
                     "function_name": "transition_worker_state",
@@ -630,6 +955,10 @@ class InvestigationQualityBenchmark:
             "follow_up_observations": [obs.to_dict() for obs in session.follow_up_observations],
             "conversational_response": conv_resp.to_dict(),
             "execution_metadata": {"provider": provider},
+            "stage_provenance": {
+                "track": "EVALUATOR_UNIT_TEST",
+                "status": "SELF_TEST",
+            },
         }
 
         return self.evaluator.evaluate_scenario(
@@ -659,12 +988,18 @@ class InvestigationQualityBenchmark:
             f.write(md_content)
 
     def _generate_markdown_report(self, res: BenchmarkSuiteResult) -> str:
-        sla_badge = "✅ PASSED (0.0% FP)" if res.zero_false_positive_sla_met else "❌ FAILED"
+        if res.product_sla_status == "PASSED":
+            sla_badge = "✅ PASSED (0.0% FP)"
+        elif res.product_sla_status == "NOT_EVALUABLE":
+            sla_badge = "⚠️ NOT_EVALUABLE (Empty Eligible Denominator)"
+        else:
+            sla_badge = "❌ FAILED"
+
         lines = [
-            "# Phase 19 Investigation Quality Benchmark Report",
+            "# Phase 20 Investigation Quality Benchmark Report",
             "",
             f"**Evaluation Timestamp (UTC):** `{res.timestamp_utc}`  ",
-            f"**Causal False-Positive SLA:** `{sla_badge}`  ",
+            f"**Product Causal False-Positive SLA:** `{sla_badge}`  ",
             f"**Corpus Version:** `{res.corpus_version}` (`{res.corpus_hash[:12]}`)  ",
             f"**Fixture SHA-256:** `{res.fixture_hash[:12]}`  ",
             f"**Target GNU Build ID:** `{res.build_id or 'N/A'}`  ",
@@ -672,7 +1007,7 @@ class InvestigationQualityBenchmark:
             "",
             "## Headline Product Investigation Quality (REAL_RUNTIME_PRODUCT_PIPELINE)",
             "",
-            "| Evaluation Track | Scenarios | Fact F1 | Evidence P/R | Unsupp. Claims | Disarm Rate | Uncertainty Cal. | Next Obs. Useful | Causal FP Rate | SLA Status |",
+            "| Evaluation Track | Scenarios (Comp/Total) | Fact F1 (Micro/Macro) | Evidence P/R | Unsupp. Claims | Disarm Rate | Uncertainty Cal. | Next Obs. Useful | Causal FP Rate | SLA Status |",
             "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
 
@@ -683,17 +1018,44 @@ class InvestigationQualityBenchmark:
 
         for track_name, m in tracks:
             if m:
-                fact_f1 = f"{m.mean_fact_f1 * 100:.1f}%" if m.mean_fact_f1 is not None else "N/A"
+                if m.micro_fact_f1 is not None and m.macro_fact_f1 is not None:
+                    fact_f1 = f"{m.micro_fact_f1 * 100:.1f}% / {m.macro_fact_f1 * 100:.1f}%"
+                elif m.mean_fact_f1 is not None:
+                    fact_f1 = f"{m.mean_fact_f1 * 100:.1f}%"
+                else:
+                    fact_f1 = "N/A"
+
                 ev_pr = f"{m.mean_evidence_precision * 100:.1f}% / {m.mean_evidence_recall * 100:.1f}%" if m.mean_evidence_precision is not None and m.mean_evidence_recall is not None else "N/A"
                 unsupp = f"{m.overall_unsupported_claim_rate * 100:.1f}%" if m.overall_unsupported_claim_rate is not None else "0.0%"
                 disarm = f"{m.overall_disarm_rate * 100:.1f}%" if m.overall_disarm_rate is not None else "N/A"
                 cal = f"{m.uncertainty_calibration_rate * 100:.1f}%" if m.uncertainty_calibration_rate is not None else "N/A"
                 obs_u = f"{m.mean_next_observation_usefulness * 100:.1f}%" if m.mean_next_observation_usefulness is not None else "N/A"
                 fp_display = f"`{m.false_positive_display}`"
-                sla = "✅ PASS" if m.zero_false_positive_sla_met else "❌ FAIL"
+                if m.sla_status == "PASSED":
+                    sla = "✅ PASS"
+                elif m.sla_status == "NOT_EVALUABLE":
+                    sla = "⚠️ NOT_EVALUABLE"
+                else:
+                    sla = "❌ FAIL"
+
                 lines.append(
                     f"| **{track_name}** | {m.completed_scenarios}/{m.total_scenarios} | {fact_f1} | {ev_pr} | {unsupp} | {disarm} | {cal} | {obs_u} | {fp_display} | {sla} |"
                 )
+
+        # Excluded Scenarios Table if applicable
+        all_excluded: List[Dict[str, str]] = []
+        if res.real_runtime_metrics and res.real_runtime_metrics.excluded_scenarios:
+            all_excluded.extend(res.real_runtime_metrics.excluded_scenarios)
+        if all_excluded:
+            lines.extend([
+                "",
+                "### Excluded Scenarios",
+                "",
+                "| Scenario ID | Status | Reason |",
+                "| :--- | :--- | :--- |",
+            ])
+            for exc in all_excluded:
+                lines.append(f"| `{exc.get('scenario_id')}` | `{exc.get('status')}` | {exc.get('reason')} |")
 
         # Real-Runtime Detailed Table
         if res.real_runtime_metrics and res.real_runtime_metrics.scenarios:
@@ -723,16 +1085,19 @@ class InvestigationQualityBenchmark:
                 "",
                 "## Provider Evaluation Matrix",
                 "",
-                "| Provider | Resolved Model | Status | Fallback Occurred | Scenarios | Causal FP Rate | SLA Met |",
-                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+                "| Provider | Mode | Resolved Model | Status | Fallback Count | Scenarios Evaluated | Model Success Rate | Causal FP Rate | SLA Met |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ])
             for p_name, p_info in res.provider_comparisons.items():
                 p_status = p_info.get("status", "UNKNOWN")
-                fb_str = "⚠️ Yes" if p_info.get("fallback_occurred") else "No"
-                fp_str = f"{p_info.get('false_positive_causal_rate', 0.0) * 100:.1f}%"
+                p_mode = p_info.get("execution_mode", "real_runtime")
+                fb_str = f"{p_info.get('fallback_count', 0)} / {p_info.get('attempted_count', 0)}"
+                sc_str = f"{len(p_info.get('scenarios_evaluated', []))}"
+                success_rate_str = f"{p_info.get('model_success_rate', 0.0) * 100:.1f}%"
+                fp_str = f"{p_info.get('false_positive_causal_rate') * 100:.1f}%" if p_info.get('false_positive_causal_rate') is not None else "N/A"
                 sla_str = "✅ PASS" if p_info.get("zero_false_positive_sla_met") else "❌ FAIL"
                 lines.append(
-                    f"| `{p_name}` | `{p_info.get('model')}` | `{p_status}` | {fb_str} | {p_info.get('completed_scenarios')} | {fp_str} | {sla_str} |"
+                    f"| `{p_name}` | `{p_mode}` | `{p_info.get('model')}` | `{p_status}` | {fb_str} | {sc_str} | {success_rate_str} | {fp_str} | {sla_str} |"
                 )
 
         # Repeat Execution Variability
@@ -747,15 +1112,16 @@ class InvestigationQualityBenchmark:
                 lines.append(f"**Mean Fact F1:** `{res.repeat_variability.get('real_runtime_f1_mean')}` (± `{res.repeat_variability.get('real_runtime_f1_std')}`)  ")
             lines.extend([
                 "",
-                "| Iteration | Real Fact F1 | Real Causal FP Rate | Real SLA Met | Self-Test Fact F1 |",
-                "| :--- | :--- | :--- | :--- | :--- |",
+                "| Iteration | Attempted | Completed | Failed | Real Fact F1 | Real Causal FP Rate | Real SLA Status | Self-Test Fact F1 |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ])
             for r in res.repeat_runs:
                 real_f1_str = f"{r['real_runtime_f1'] * 100:.1f}%" if r.get('real_runtime_f1') is not None else "N/A"
                 real_fp_str = f"{r['real_runtime_fp_rate'] * 100:.1f}%" if r.get('real_runtime_fp_rate') is not None else "N/A"
                 self_f1_str = f"{r['self_test_f1'] * 100:.1f}%" if r.get('self_test_f1') is not None else "N/A"
+                sla_badge_r = "✅" if r.get('real_runtime_sla_met') else "❌"
                 lines.append(
-                    f"| Run {r['iteration']} | {real_f1_str} | {real_fp_str} | {'✅' if r['real_runtime_sla_met'] else '❌'} | {self_f1_str} |"
+                    f"| Run {r['iteration']} | {r.get('attempted_scenarios', 0)} | {r.get('completed_scenarios', 0)} | {r.get('failed_scenarios', 0)} | {real_f1_str} | {real_fp_str} | {sla_badge_r} | {self_f1_str} |"
                 )
 
         # Limitations & Calibration Note
@@ -765,23 +1131,26 @@ class InvestigationQualityBenchmark:
             "- **Zero Fabricated Traces**: Real-runtime captures produce STATIC_CANDIDATE or EVIDENCE_SUPPORTED_CANDIDATE. VALIDATED_CAUSAL_FUNCTION is never awarded without authentic runtime execution traces; absence of trace produces FN rather than fabricated TP.",
             "- **Strict Causal Safety Gate**: False positive causal promotion is evaluated over eligible completed negative scenarios (0/5) and strictly enforced at 0.0% FP.",
             "- **Track Isolation**: Real-runtime product pipeline results and evaluator self-tests are kept strictly isolated with distinct provenance and denominators.",
+            "- **Empty Denominator Safety**: An empty eligible negative denominator produces NOT_EVALUABLE and cannot pass the SLA.",
         ])
 
         return "\n".join(lines) + "\n"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Phase 19 Investigation Quality Benchmark.")
+    parser = argparse.ArgumentParser(description="Run Phase 20 Investigation Quality Benchmark.")
     parser.add_argument("--smoke", action="store_true", help="Run in fast smoke mode")
     parser.add_argument("--mode", choices=["all", "real_runtime", "unit_fixture", "evaluator_self_test"], default="all", help="Evaluation track")
     parser.add_argument("--provider", default="none", help="LLM provider override (default: none)")
     parser.add_argument("--providers", default=None, help="Comma-separated list of providers to evaluate")
+    parser.add_argument("--provider-scenarios", default=None, help="Comma-separated list of scenario IDs for provider evaluation")
     parser.add_argument("--output", default=None, help="Output directory for reports")
     parser.add_argument("--repeat", type=int, default=1, help="Number of repetitions")
 
     args = parser.parse_args()
 
     prov_list = [p.strip() for p in args.providers.split(",")] if args.providers else None
+    prov_scenarios = [s.strip() for s in args.provider_scenarios.split(",")] if args.provider_scenarios else None
 
     bench = InvestigationQualityBenchmark(output_dir=args.output)
     try:
@@ -789,11 +1158,17 @@ def main():
             mode=args.mode,
             provider=args.provider,
             providers=prov_list,
+            provider_scenarios=prov_scenarios,
             smoke=args.smoke,
             repeat=args.repeat,
         )
-        print(f"Benchmark finished: SLA met={res.zero_false_positive_sla_met}")
-        sys.exit(0 if res.zero_false_positive_sla_met else 1)
+        if args.mode == "evaluator_self_test":
+            self_met = bool(res.evaluator_self_test_metrics and res.evaluator_self_test_metrics.zero_false_positive_sla_met)
+            print(f"Benchmark finished: Evaluator self-test SLA met={self_met} (Product SLA={res.product_sla_status})")
+            sys.exit(0 if self_met else 1)
+        else:
+            print(f"Benchmark finished: Product SLA met={res.zero_false_positive_sla_met} (status={res.product_sla_status})")
+            sys.exit(0 if res.zero_false_positive_sla_met else 1)
     finally:
         bench.cleanup()
 

@@ -203,6 +203,17 @@ int main(int argc, char** argv) {
                 g_target.unassociated_field = 200;
                 std::cout << "MUTATED ALL" << std::endl;
                 std::cout.flush();
+            } else if (cmd == "STATE") {
+                std::cout << "STATE worker_status=" << g_target.worker_status
+                          << " epoch_id=" << g_target.epoch_id
+                          << " cached_epoch=" << g_target.cached_epoch
+                          << " device_mode=" << g_target.device_mode
+                          << " buffer_size=" << g_target.buffer_size
+                          << " data_ptr=" << (g_target.data_ptr ? 1 : 0)
+                          << " metric=" << g_target.unsynchronized_metric
+                          << " unassociated=" << g_target.unassociated_field
+                          << std::endl;
+                std::cout.flush();
             } else if (cmd == "STOP") {
                 g_competing_running.store(false, std::memory_order_relaxed);
                 g_running.store(false, std::memory_order_relaxed);

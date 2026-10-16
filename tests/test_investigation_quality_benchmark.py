@@ -539,14 +539,14 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
             with open(json_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.assertTrue(data["zero_false_positive_sla_met"])
-            self.assertEqual(data["schema_version"], "1.1.0")
+            self.assertEqual(data["schema_version"], "1.2.0")
 
             # Check Markdown report
             md_file = os.path.join(self.tmp_dir, "BENCHMARK_REPORT.md")
             self.assertTrue(os.path.exists(md_file))
             with open(md_file, "r", encoding="utf-8") as f:
                 md_text = f.read()
-            self.assertIn("Phase 19 Investigation Quality Benchmark Report", md_text)
+            self.assertIn("Phase 20 Investigation Quality Benchmark Report", md_text)
             self.assertIn("0.0% FP", md_text)
             self.assertIn("REAL_RUNTIME_PRODUCT_PIPELINE", md_text)
 
@@ -560,6 +560,168 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
                 self.assertEqual(res.evaluator_self_test_metrics.false_causal_positives, 0)
                 self.assertEqual(res.evaluator_self_test_metrics.false_positive_causal_rate, 0.0)
 
+        finally:
+            bench.cleanup()
+
+    def test_track_segregation_and_self_test_cannot_pass_product_sla(self):
+        """Passing evaluator self-tests must NEVER promote a failed or unevaluable real-runtime product SLA."""
+        bench = InvestigationQualityBenchmark(output_dir=self.tmp_dir)
+        try:
+            # Evaluator self-test mode has self-tests passing, but product SLA must be NOT_EVALUABLE and False
+            res = bench.run_all(mode="evaluator_self_test", provider="none", smoke=True)
+            self.assertIsNotNone(res.evaluator_self_test_metrics)
+            self.assertTrue(res.evaluator_self_test_metrics.zero_false_positive_sla_met)
+            self.assertEqual(res.evaluator_self_test_metrics.sla_status, "PASSED")
+
+            # Product SLA must remain NOT_EVALUABLE and False!
+            self.assertFalse(res.zero_false_positive_sla_met)
+            self.assertEqual(res.product_sla_status, "NOT_EVALUABLE")
+            self.assertEqual(res.product_sla_details["status"], "NOT_EVALUABLE")
+        finally:
+            bench.cleanup()
+
+    def test_empty_eligible_negative_denominator_yields_not_evaluable(self):
+        """An empty eligible negative denominator must yield NOT_EVALUABLE / None and never pass the SLA."""
+        # Scenario 1 is causal positive, no negative control included
+        sc1 = self.corpus["scenarios"][0]
+        output_sc1 = {
+            "status": "COMPLETED",
+            "observed_facts": [{"field_name": "worker_status", "before_value": 1, "after_value": 2}],
+            "evidence_ledger": [],
+            "hypotheses": [],
+            "follow_up_observations": [],
+        }
+        res1 = self.evaluator.evaluate_scenario(sc1, output_sc1, "evaluator_self_test")
+        agg = self.evaluator.aggregate_metrics([res1], "evaluator_self_test")
+
+        self.assertEqual(agg.causal_negatives_ground_truth, 0)
+        self.assertEqual(agg.eligible_causal_negatives, 0)
+        self.assertIsNone(agg.false_positive_causal_rate)
+        self.assertEqual(agg.sla_status, "NOT_EVALUABLE")
+        self.assertFalse(agg.zero_false_positive_sla_met)
+        self.assertIn("NOT_EVALUABLE", agg.false_positive_display)
+
+    def test_mode_isolation_evaluator_self_test_does_not_spawn_inferior(self):
+        """Mode isolation: evaluator-only mode must not compile target or launch live process."""
+        bench = InvestigationQualityBenchmark(output_dir=self.tmp_dir)
+        try:
+            # Point runtime harness to invalid compiler to guarantee it would fail if invoked
+            bench.runtime_harness.compiler = "/bin/nonexistent_compiler_xyz"
+            res = bench.run_all(mode="evaluator_self_test", provider="none", smoke=True)
+            self.assertIsNone(res.real_runtime_metrics)
+            self.assertEqual(res.product_sla_status, "NOT_EVALUABLE")
+            self.assertFalse(res.zero_false_positive_sla_met)
+            self.assertIsNotNone(res.evaluator_self_test_metrics)
+        finally:
+            bench.cleanup()
+
+    def test_provider_matrix_scope_and_fallback_labeling(self):
+        """Provider comparison respects scenario scope and explicitly labels fallback as FALLBACK_OCCURRED."""
+        bench = InvestigationQualityBenchmark(output_dir=self.tmp_dir)
+        try:
+            res = bench.run_all(
+                mode="evaluator_self_test",
+                provider="none",
+                providers=["none"],
+                provider_scenarios=["scenario_1", "scenario_6"],
+                smoke=False,
+            )
+            self.assertIn("none", res.provider_comparisons)
+            p_info = res.provider_comparisons["none"]
+            self.assertEqual(p_info["scenarios_evaluated"], ["scenario_1", "scenario_6"])
+            self.assertEqual(p_info["attempted_count"], 2)
+            self.assertEqual(p_info["completed_model_responses"], 2)
+            self.assertEqual(p_info["fallback_count"], 0)
+            self.assertEqual(p_info["model_success_rate"], 1.0)
+        finally:
+            bench.cleanup()
+
+    def test_fact_matching_substring_collision_and_missing_values(self):
+        """Fact matching resists substring collisions and rejects missing required before/after values."""
+        sc1 = self.corpus["scenarios"][0]  # expects worker_status, before=1, after=2
+
+        # 1. Substring collision: worker_status_extended must not match worker_status
+        collision_output = {
+            "status": "COMPLETED",
+            "observed_facts": [
+                {"field_name": "worker_status_extended", "before_value": 1, "after_value": 2}
+            ],
+            "evidence_ledger": [],
+            "hypotheses": [],
+            "follow_up_observations": [],
+        }
+        res_col = self.evaluator.evaluate_scenario(sc1, collision_output, "evaluator_self_test")
+        self.assertEqual(res_col.facts_matched, 0)
+        self.assertEqual(res_col.facts_f1, 0.0)
+
+        # 2. Missing required value: before_value is None
+        missing_val_output = {
+            "status": "COMPLETED",
+            "observed_facts": [
+                {"field_name": "worker_status", "before_value": None, "after_value": 2}
+            ],
+            "evidence_ledger": [],
+            "hypotheses": [],
+            "follow_up_observations": [],
+        }
+        res_mv = self.evaluator.evaluate_scenario(sc1, missing_val_output, "evaluator_self_test")
+        self.assertEqual(res_mv.facts_matched, 0)
+        self.assertEqual(res_mv.facts_f1, 0.0)
+
+        # 3. Exact match succeeds
+        exact_output = {
+            "status": "COMPLETED",
+            "observed_facts": [
+                {"field_name": "worker_status", "before_value": 1, "after_value": 2}
+            ],
+            "evidence_ledger": [],
+            "hypotheses": [],
+            "follow_up_observations": [],
+        }
+        res_ex = self.evaluator.evaluate_scenario(sc1, exact_output, "evaluator_self_test")
+        self.assertEqual(res_ex.facts_matched, 1)
+
+    def test_stage_provenance_failure_propagation(self):
+        """Upstream capture failures leave downstream stages marked as NOT_RUN or FAILED with clean provenance."""
+        harness = RealRuntimeExecutionHarness(self.tmp_dir)
+        ok, err, s1, s2, stage_prov = harness.spawn_and_capture("MUTATE 1", "MUTATED 1")
+        self.assertFalse(ok)
+        self.assertEqual(stage_prov.get("compile", {}).get("status"), "FAILED")
+
+    def test_interactive_state_inspection_provenance(self):
+        """Inferior fixture target executes STATE command and records live state before and after mutation."""
+        harness = RealRuntimeExecutionHarness(self.tmp_dir)
+        compiled, _ = harness.compile()
+        self.assertTrue(compiled)
+        ok, err, s1, s2, stage_prov = harness.spawn_and_capture("MUTATE 1", "MUTATED 1")
+        self.assertTrue(ok, f"spawn_and_capture failed: {err}")
+        self.assertIn("inspect_state_a", stage_prov)
+        self.assertEqual(stage_prov["inspect_state_a"]["status"], "SUCCESS")
+        self.assertEqual(stage_prov["inspect_state_a"]["state"].get("worker_status"), "1")
+        self.assertIn("inspect_state_b", stage_prov)
+        self.assertEqual(stage_prov["inspect_state_b"]["status"], "SUCCESS")
+        self.assertEqual(stage_prov["inspect_state_b"]["state"].get("worker_status"), "2")
+
+    def test_json_and_markdown_report_consistency(self):
+        """JSON and Markdown reports must maintain full metric, track, and SLA consistency."""
+        bench = InvestigationQualityBenchmark(output_dir=self.tmp_dir)
+        try:
+            res = bench.run_all(mode="all", provider="none", smoke=True)
+            json_file = os.path.join(self.tmp_dir, "benchmark_results.json")
+            md_file = os.path.join(self.tmp_dir, "BENCHMARK_REPORT.md")
+
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            with open(md_file, "r", encoding="utf-8") as f:
+                md_text = f.read()
+
+            self.assertEqual(data["product_sla_status"], res.product_sla_status)
+            self.assertEqual(data["zero_false_positive_sla_met"], res.zero_false_positive_sla_met)
+            if res.zero_false_positive_sla_met:
+                self.assertIn("✅ PASS", md_text)
+            self.assertIn("Phase 20 Investigation Quality Benchmark Report", md_text)
+            self.assertIn("Fact F1 (Micro/Macro)", md_text)
+            self.assertIn("Provider Evaluation Matrix", md_text)
         finally:
             bench.cleanup()
 
