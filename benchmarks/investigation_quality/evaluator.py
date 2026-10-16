@@ -1,12 +1,13 @@
-"""Independent, read-only investigation evaluator and metric computer for Phase 18.
+"""Independent, read-only investigation evaluator and metric computer for Phase 19.
 
 Evaluates system investigation outputs against independent ground truth.
 Guarantees:
 1. No metric is hardcoded or assigned as a constant.
 2. Evaluator is strictly read-only with respect to system findings, evidence ledger, and causal attestation.
 3. Causal confusion matrix is computed from actual predictions; 0% FP causal SLA is enforced as a safety gate.
-4. Real-runtime metrics and unit-fixture metrics are kept completely separate.
-5. All metric denominators are explicitly tracked; missing data yields None (null), never silent 0% or 100%.
+4. Real-runtime metrics (REAL_RUNTIME_PRODUCT_PIPELINE) and evaluator self-test metrics (EVALUATOR_UNIT_TEST)
+   are kept completely separate and never combined into one headline product score.
+5. All metric denominators are explicitly tracked; undefined metrics yield None (null), never vacuous 1.0 or 0.0.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -26,7 +27,7 @@ class ScenarioEvaluationResult:
     scenario_id: str
     scenario_name: str
     category: str
-    evaluation_mode: str  # 'real_runtime' or 'unit_fixture'
+    evaluation_mode: str  # 'real_runtime' or 'evaluator_self_test' / 'unit_fixture'
     status: str           # 'COMPLETED', 'SKIPPED', 'FAILED'
     skip_reason: Optional[str] = None
     
@@ -51,14 +52,14 @@ class ScenarioEvaluationResult:
     disarm_rate: Optional[float] = None
     
     # Uncertainty calibration
-    confidence_score: float = 0.0
-    uncertainty_calibrated: bool = False
-    brier_score_component: float = 0.0
+    confidence_score: Optional[float] = None
+    uncertainty_calibrated: Optional[bool] = None
+    brier_score_component: Optional[float] = None
     
     # Next observation usefulness
     proposed_observations_count: int = 0
     useful_observations_count: int = 0
-    next_observation_useful: bool = False
+    next_observation_useful: Optional[bool] = None
     next_observation_usefulness_rate: Optional[float] = None
     
     # Causal attribution & confusion matrix
@@ -80,6 +81,7 @@ class ScenarioEvaluationResult:
 @dataclass
 class AggregateMetrics:
     evaluation_mode: str
+    track_label: str
     total_scenarios: int
     completed_scenarios: int
     skipped_scenarios: int
@@ -97,7 +99,7 @@ class AggregateMetrics:
     overall_unsupported_claim_rate: Optional[float]
     overall_disarm_rate: Optional[float]
     
-    uncertainty_calibration_rate: float
+    uncertainty_calibration_rate: Optional[float]
     mean_next_observation_usefulness: Optional[float]
     
     causal_positives_ground_truth: int
@@ -107,6 +109,8 @@ class AggregateMetrics:
     true_causal_negatives: int
     false_causal_negatives: int
     false_positive_causal_rate: float
+    false_positive_display: str
+    causal_confusion_matrix: Dict[str, int]
     zero_false_positive_sla_met: bool
     
     scenarios: List[ScenarioEvaluationResult] = field(default_factory=list)
@@ -130,12 +134,26 @@ class BenchmarkSuiteResult:
     run_configuration: Dict[str, Any]
     
     real_runtime_metrics: Optional[AggregateMetrics] = None
-    unit_fixture_metrics: Optional[AggregateMetrics] = None
+    evaluator_self_test_metrics: Optional[AggregateMetrics] = None
     provider_comparisons: Dict[str, Any] = field(default_factory=dict)
+    repeat_runs: List[Dict[str, Any]] = field(default_factory=list)
+    repeat_variability: Dict[str, Any] = field(default_factory=dict)
     zero_false_positive_sla_met: bool = False
 
+    @property
+    def unit_fixture_metrics(self) -> Optional[AggregateMetrics]:
+        """Backwards-compatible alias for evaluator self-test metrics."""
+        return self.evaluator_self_test_metrics
+
+    @unit_fixture_metrics.setter
+    def unit_fixture_metrics(self, value: Optional[AggregateMetrics]) -> None:
+        self.evaluator_self_test_metrics = value
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # Include legacy unit_fixture_metrics alias for backward compatibility
+        d["unit_fixture_metrics"] = self.evaluator_self_test_metrics.to_dict() if self.evaluator_self_test_metrics else None
+        return d
 
 
 class CorpusSchemaValidator:
@@ -144,6 +162,8 @@ class CorpusSchemaValidator:
     REQUIRED_TOP_LEVEL = ["$schema", "corpus_version", "corpus_id", "scenarios"]
     REQUIRED_SCENARIO_KEYS = [
         "scenario_id", "scenario_name", "category", "description",
+        "field_invariant", "exact_mutation_source", "expected_observable_state",
+        "causal_ground_truth", "sufficient_evidence_for_attribution",
         "expected_facts", "valid_evidence_rules", "expected_uncertainty",
         "plausible_hypotheses", "discriminating_criteria", "causal_attribution"
     ]
@@ -174,6 +194,15 @@ class CorpusSchemaValidator:
             if sc_id in seen_ids:
                 raise CorpusValidationError(f"Duplicate scenario_id '{sc_id}' found in corpus")
             seen_ids.add(sc_id)
+
+            # Validate documented domain contract fields
+            for doc_key in [
+                "field_invariant", "exact_mutation_source", "expected_observable_state",
+                "causal_ground_truth", "sufficient_evidence_for_attribution"
+            ]:
+                val = sc.get(doc_key)
+                if not isinstance(val, str) or not val.strip():
+                    raise CorpusValidationError(f"Scenario '{sc_id}' required contract field '{doc_key}' must be a non-empty string")
 
             # Validate expected_facts
             facts = sc.get("expected_facts")
@@ -231,7 +260,7 @@ class InvestigationEvaluator:
         self,
         scenario_def: Dict[str, Any],
         system_output: Dict[str, Any],
-        evaluation_mode: str = "unit_fixture",
+        evaluation_mode: str = "evaluator_self_test",
     ) -> ScenarioEvaluationResult:
         """Evaluate a single scenario output against ground truth. Strictly read-only."""
         sc_id = scenario_def["scenario_id"]
@@ -272,7 +301,7 @@ class InvestigationEvaluator:
         actual_facts = system_output.get("observed_facts", [])
         
         matched_facts = 0
-        used_actual = set()
+        used_actual: Set[int] = set()
         for ef in expected_facts:
             ef_path = ef.get("field_path", "")
             ef_name = ef.get("field_name", "")
@@ -308,9 +337,23 @@ class InvestigationEvaluator:
         num_expected_facts = len(expected_facts)
         num_detected_facts = len(actual_facts)
         
-        facts_prec = (matched_facts / num_detected_facts) if num_detected_facts > 0 else (1.0 if num_expected_facts == 0 else 0.0)
-        facts_rec = (matched_facts / num_expected_facts) if num_expected_facts > 0 else 1.0
-        facts_f1 = (2 * facts_prec * facts_rec / (facts_prec + facts_rec)) if (facts_prec + facts_rec) > 0 else 0.0
+        # Proper metrics: if no detected facts, precision is None (undefined), not 1.0 or 0.0
+        if num_detected_facts == 0:
+            facts_prec = None
+        else:
+            facts_prec = matched_facts / num_detected_facts
+
+        if num_expected_facts == 0:
+            facts_rec = None
+        else:
+            facts_rec = matched_facts / num_expected_facts
+
+        if facts_prec is None or facts_rec is None:
+            facts_f1 = None
+        elif (facts_prec + facts_rec) > 0:
+            facts_f1 = (2 * facts_prec * facts_rec) / (facts_prec + facts_rec)
+        else:
+            facts_f1 = 0.0
 
         # 2. Evaluate Evidence References
         evidence_ledger = system_output.get("evidence_ledger", [])
@@ -352,8 +395,9 @@ class InvestigationEvaluator:
                     valid_cited += 1
 
         total_cited = len(cited_evidence_ids)
-        ev_prec = (valid_cited / total_cited) if total_cited > 0 else 1.0
-        ev_rec = (len(rules_covered) / len(rules)) if rules else 1.0
+        # Vacuous score fix: if no evidence was cited, precision is None, NOT 1.0!
+        ev_prec = (valid_cited / total_cited) if total_cited > 0 else None
+        ev_rec = (len(rules_covered) / len(rules)) if rules else None
 
         # 3. Evaluate Unsupported Claims & Disarming
         unsupported_count = 0
@@ -381,8 +425,9 @@ class InvestigationEvaluator:
                     disarmed_count += 1
 
         total_claims = len(hypotheses)
-        unsupported_claim_rate = (unsupported_count / total_claims) if total_claims > 0 else 0.0
-        disarm_rate = (disarmed_count / unsupported_count) if unsupported_count > 0 else 1.0
+        unsupported_claim_rate = (unsupported_count / total_claims) if total_claims > 0 else (0.0 if not hypotheses else None)
+        # Vacuous score fix: if no unsupported claims exist, disarm rate is None, NOT 1.0!
+        disarm_rate = (disarmed_count / unsupported_count) if unsupported_count > 0 else None
 
         # 4. Uncertainty Calibration
         conf_str = resp.get("confidence")
@@ -396,29 +441,33 @@ class InvestigationEvaluator:
                     if any(ef.get("field_name", "") in str(f).lower() for ef in expected_facts):
                         conf_str = f.get("confidence")
                         break
-        conf_str = conf_str or "medium"
 
-        conf_val = 0.8
-        if isinstance(conf_str, (int, float)):
-            conf_val = float(conf_str)
+        # Honest calibration: if confidence was never reported, calibration is None
+        if conf_str is None:
+            conf_val = None
+            calibrated = None
+            brier_comp = None
         else:
-            conf_map = {"high": 0.9, "medium": 0.6, "low": 0.3}
-            conf_val = conf_map.get(str(conf_str).lower(), 0.6)
+            if isinstance(conf_str, (int, float)):
+                conf_val = float(conf_str)
+            else:
+                conf_map = {"high": 0.9, "medium": 0.6, "low": 0.3}
+                conf_val = conf_map.get(str(conf_str).lower(), 0.6)
 
-        expected_unc = scenario_def.get("expected_uncertainty", {})
-        should_be_inconclusive = expected_unc.get("should_be_inconclusive", False)
-        min_conf = expected_unc.get("min_confidence", 0.0)
-        max_conf = expected_unc.get("max_confidence", 1.0)
+            expected_unc = scenario_def.get("expected_uncertainty", {})
+            should_be_inconclusive = expected_unc.get("should_be_inconclusive", False)
+            min_conf = expected_unc.get("min_confidence", 0.0)
+            max_conf = expected_unc.get("max_confidence", 1.0)
 
-        calibrated = True
-        if should_be_inconclusive:
-            if conf_val > 0.6:
-                calibrated = False
-        else:
-            if conf_val < min_conf or conf_val > max_conf:
-                calibrated = False
+            calibrated = True
+            if should_be_inconclusive:
+                if conf_val > 0.6:
+                    calibrated = False
+            else:
+                if conf_val < min_conf or conf_val > max_conf:
+                    calibrated = False
 
-        brier_comp = (conf_val - (1.0 if not should_be_inconclusive else 0.0)) ** 2
+            brier_comp = round((conf_val - (1.0 if not should_be_inconclusive else 0.0)) ** 2, 4)
 
         # 5. Next Observation Usefulness
         proposed_obs = list(system_output.get("follow_up_observations", []))
@@ -435,11 +484,14 @@ class InvestigationEvaluator:
                 useful_obs_count += 1
 
         total_proposed = len(proposed_obs)
-        next_obs_useful = (useful_obs_count > 0)
-        usefulness_rate = (useful_obs_count / total_proposed) if total_proposed > 0 else None
+        if total_proposed == 0:
+            next_obs_useful = None
+            usefulness_rate = None
+        else:
+            next_obs_useful = (useful_obs_count > 0)
+            usefulness_rate = useful_obs_count / total_proposed
 
         # 6. Causal Promotion & Confusion Matrix
-        # Inspect candidates across findings and hypotheses
         all_candidates = list(system_output.get("function_candidates", []))
         for f in actual_facts:
             all_candidates.extend(f.get("function_candidates", []))
@@ -459,7 +511,6 @@ class InvestigationEvaluator:
 
         causal_promoted = len(promoted_functions) > 0
         
-        # Determine confusion matrix cell
         is_tp = False
         is_fp = False
         is_tn = False
@@ -476,9 +527,9 @@ class InvestigationEvaluator:
                 is_fp = True  # Promoted when not causal
         else:
             if ground_is_causal:
-                is_fn = True  # Causal in truth, but not validated
+                is_fn = True  # Causal in truth, but unproven by pipeline
             else:
-                is_tn = True  # Not causal, correctly not validated
+                is_tn = True  # Not causal, correctly unpromoted
 
         return ScenarioEvaluationResult(
             scenario_id=sc_id,
@@ -486,9 +537,9 @@ class InvestigationEvaluator:
             category=sc_cat,
             evaluation_mode=evaluation_mode,
             status="COMPLETED",
-            facts_precision=round(facts_prec, 4),
-            facts_recall=round(facts_rec, 4),
-            facts_f1=round(facts_f1, 4),
+            facts_precision=round(facts_prec, 4) if facts_prec is not None else None,
+            facts_recall=round(facts_rec, 4) if facts_rec is not None else None,
+            facts_f1=round(facts_f1, 4) if facts_f1 is not None else None,
             facts_detected=num_detected_facts,
             facts_expected=num_expected_facts,
             facts_matched=matched_facts,
@@ -498,11 +549,11 @@ class InvestigationEvaluator:
             valid_cited_evidence=valid_cited,
             unsupported_claims_count=unsupported_count,
             unsupported_claims_disarmed=disarmed_count,
-            unsupported_claim_rate=round(unsupported_claim_rate, 4),
+            unsupported_claim_rate=round(unsupported_claim_rate, 4) if unsupported_claim_rate is not None else None,
             disarm_rate=round(disarm_rate, 4) if disarm_rate is not None else None,
-            confidence_score=round(conf_val, 4),
+            confidence_score=round(conf_val, 4) if conf_val is not None else None,
             uncertainty_calibrated=calibrated,
-            brier_score_component=round(brier_comp, 4),
+            brier_score_component=brier_comp,
             proposed_observations_count=total_proposed,
             useful_observations_count=useful_obs_count,
             next_observation_useful=next_obs_useful,
@@ -518,6 +569,7 @@ class InvestigationEvaluator:
             artifacts={
                 "matched_facts_count": matched_facts,
                 "promoted_functions": promoted_functions,
+                "stage_provenance": system_output.get("stage_provenance", {}),
             }
         )
 
@@ -549,10 +601,14 @@ class InvestigationEvaluator:
         all_claims = sum(len(r.artifacts.get("hypotheses", [])) for r in completed)
         
         overall_unsupp_rate = round(total_unsupported / all_claims, 4) if all_claims > 0 else (0.0 if comp_count > 0 else None)
-        overall_disarm_rate = round(total_disarmed / total_unsupported, 4) if total_unsupported > 0 else (1.0 if comp_count > 0 else None)
+        overall_disarm_rate = round(total_disarmed / total_unsupported, 4) if total_unsupported > 0 else None
 
-        calib_count = sum(1 for r in completed if r.uncertainty_calibrated)
-        calib_rate = round(calib_count / comp_count, 4) if comp_count > 0 else 0.0
+        calib_eligible = [r for r in completed if r.uncertainty_calibrated is not None]
+        if calib_eligible:
+            calib_count = sum(1 for r in calib_eligible if r.uncertainty_calibrated is True)
+            calib_rate = round(calib_count / len(calib_eligible), 4)
+        else:
+            calib_rate = None
 
         mean_obs_useful = _mean_metric(lambda r: r.next_observation_usefulness_rate)
 
@@ -565,10 +621,14 @@ class InvestigationEvaluator:
         neg_ground = sum(1 for r in completed if not r.ground_truth_is_causal)
 
         fp_rate = round(fp / neg_ground, 4) if neg_ground > 0 else 0.0
+        fp_display = f"{fp}/{neg_ground} ({fp_rate * 100:.1f}%)" if neg_ground > 0 else "N/A"
         sla_met = (fp == 0) and (comp_count > 0)
+
+        track_label = "REAL_RUNTIME_PRODUCT_PIPELINE" if evaluation_mode == "real_runtime" else "EVALUATOR_UNIT_TEST"
 
         return AggregateMetrics(
             evaluation_mode=evaluation_mode,
+            track_label=track_label,
             total_scenarios=total,
             completed_scenarios=comp_count,
             skipped_scenarios=len(skipped),
@@ -591,6 +651,8 @@ class InvestigationEvaluator:
             true_causal_negatives=tn,
             false_causal_negatives=fn,
             false_positive_causal_rate=fp_rate,
+            false_positive_display=fp_display,
+            causal_confusion_matrix={"TP": tp, "FP": fp, "TN": tn, "FN": fn},
             zero_false_positive_sla_met=sla_met,
             scenarios=results,
         )

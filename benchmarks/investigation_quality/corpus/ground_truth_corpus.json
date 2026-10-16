@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "corpus_version": "1.0.0",
+  "corpus_version": "1.1.0",
   "corpus_id": "investigation_quality_v1",
-  "created_at_utc": "2026-10-15T00:00:00Z",
+  "created_at_utc": "2026-10-16T00:00:00Z",
   "description": "Independent ground-truth corpus for dynamicState C++ runtime investigation quality evaluation",
   "scenarios": [
     {
@@ -10,6 +10,11 @@
       "scenario_name": "Valid Transition",
       "category": "valid_transition",
       "description": "Clean deterministic state transition via verified causal writer transition_worker_state",
+      "field_invariant": "worker_status must follow valid WorkerStatus enum transitions (STATUS_INITIALIZING=1 -> STATUS_RUNNING=2)",
+      "exact_mutation_source": "transition_worker_state(STATUS_RUNNING) in fixture_target.cpp",
+      "expected_observable_state": "g_target.worker_status changes from 1 to 2",
+      "causal_ground_truth": "transition_worker_state is the authentic causal writer function in the binary",
+      "sufficient_evidence_for_attribution": "Authentic runtime execution trace or controlled single-writer isolation proving transition_worker_state executed and wrote worker_status; snapshot diff and static symbol existence alone are insufficient",
       "expected_facts": [
         {
           "field_path": "g_target.worker_status",
@@ -51,6 +56,11 @@
       "scenario_name": "Stale / Inconsistent Field",
       "category": "stale_inconsistent_field",
       "description": "epoch_id updated without corresponding cached_epoch update creating invariant drift",
+      "field_invariant": "epoch_id must equal cached_epoch in synchronized state; divergence indicates stale cache",
+      "exact_mutation_source": "update_epoch_partial(10) in fixture_target.cpp updates epoch_id but omits cached_epoch",
+      "expected_observable_state": "g_target.epoch_id changes from 1 to 10 while g_target.cached_epoch remains 1",
+      "causal_ground_truth": "update_epoch_partial is the partial writer causing invariant drift, but cached_epoch has no writer",
+      "sufficient_evidence_for_attribution": "Independent execution trace showing update_epoch_partial wrote epoch_id but omitted cached_epoch",
       "expected_facts": [
         {
           "field_path": "g_target.epoch_id",
@@ -93,6 +103,11 @@
       "scenario_name": "Invalid Enum / State",
       "category": "invalid_enum_state",
       "description": "device_mode set to undefined enum value 999 outside defined range [0, 2]",
+      "field_invariant": "device_mode must be one of MODE_IDLE (0), MODE_ACTIVE (1), MODE_STANDBY (2)",
+      "exact_mutation_source": "set_illegal_device_mode(999) in fixture_target.cpp writes illegal integer 999",
+      "expected_observable_state": "g_target.device_mode changes from 0 to out-of-range value 999",
+      "causal_ground_truth": "set_illegal_device_mode is the causal function writing illegal value",
+      "sufficient_evidence_for_attribution": "Execution trace attributing write of illegal value 999 to set_illegal_device_mode",
       "expected_facts": [
         {
           "field_path": "g_target.device_mode",
@@ -135,6 +150,11 @@
       "scenario_name": "Null / Invalid Pointer",
       "category": "null_invalid_pointer",
       "description": "Non-zero buffer_size (4096) with null data_ptr (0x0)",
+      "field_invariant": "When buffer_size > 0, data_ptr must be a valid non-null memory address",
+      "exact_mutation_source": "allocate_invalid_buffer(4096) in fixture_target.cpp sets buffer_size without allocating data_ptr",
+      "expected_observable_state": "g_target.buffer_size changes from 0 to 4096 while g_target.data_ptr remains null (0x0)",
+      "causal_ground_truth": "allocate_invalid_buffer is the causal function setting size without allocation",
+      "sufficient_evidence_for_attribution": "Execution trace attributing buffer_size write without pointer allocation to allocate_invalid_buffer",
       "expected_facts": [
         {
           "field_path": "g_target.buffer_size",
@@ -177,6 +197,11 @@
       "scenario_name": "Cross-Thread Non-Atomic Ambiguity",
       "category": "cross_thread_non_atomic",
       "description": "Competing unsynchronized thread writers without atomicity guarantee; causal promotion must be blocked",
+      "field_invariant": "unsynchronized_metric writes must be serialized; concurrent unsynchronized writes create non-atomic race",
+      "exact_mutation_source": "Concurrent competing threads running competing_writer_a and competing_writer_b in fixture_target.cpp",
+      "expected_observable_state": "g_target.unsynchronized_metric mutates continuously between non-atomic captures",
+      "causal_ground_truth": "Ambiguous multi-writer race; neither writer can be singled out as sole causal writer",
+      "sufficient_evidence_for_attribution": "Cannot be validated as single causal function; capture quality is NON_ATOMIC which strictly blocks causal promotion",
       "expected_facts": [
         {
           "field_path": "g_target.unsynchronized_metric",
@@ -217,9 +242,14 @@
     },
     {
       "scenario_id": "scenario_6",
-      "scenario_name": "Negative Control (No Causal Function)",
+      "scenario_name": "Negative Control (Unproven Causal Attribution)",
       "category": "negative_control",
-      "description": "State changed externally; static candidate in binary has no causal connection and must NOT be promoted",
+      "description": "Field mutated via harness command dispatcher; no dedicated domain causal function in binary and candidate unrelated_helper_function has no causal relationship",
+      "field_invariant": "unassociated_field must not be attributed to unrelated domain functions",
+      "exact_mutation_source": "Harness command dispatcher modifying unassociated_field; candidate unrelated_helper_function never writes it",
+      "expected_observable_state": "g_target.unassociated_field changes from 100 to 200",
+      "causal_ground_truth": "No candidate domain function in binary caused this state change; unrelated_helper_function is strictly non-causal",
+      "sufficient_evidence_for_attribution": "Requires verified trace or single-writer isolation which cannot exist for unrelated_helper_function",
       "expected_facts": [
         {
           "field_path": "g_target.unassociated_field",

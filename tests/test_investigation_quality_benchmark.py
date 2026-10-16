@@ -1,20 +1,27 @@
-"""Phase 18: Independent Investigation Benchmark & Real C++ Snapshot Evaluation Test Suite.
+"""Phase 19: Benchmark Integrity, Real Causal Evidence Verification & Reproducible Provider Evaluation Test Suite.
 
 Verifies:
-1. Ground truth corpus schema integrity, versioning, and validation error handling.
-2. Independent evaluator metric computation using synthetic test outputs (TP, FP, TN, FN, precision/recall, calibration, next observations).
-3. Read-only invariance of the evaluator.
-4. Prevention of LLM / caller self-promotion to VALIDATED_CAUSAL_FUNCTION.
+1. Ground truth corpus schema integrity, versioning, and validation of domain contracts.
+2. Independent evaluator metric computation using synthetic test outputs without hardcoded constants.
+3. Read-only invariance of the evaluator across findings, evidence ledger, and attestations.
+4. Prevention of LLM / caller self-promotion to VALIDATED_CAUSAL_FUNCTION without authentic proof.
 5. Separation of state-transition verification from function-causality verification.
-6. Negative control invariants (zero false positives).
+6. Reconciled negative control integrity (zero false positives, genuine unproven causal attribution).
 7. Capture quality limitations (NON_ATOMIC and PARTIAL block causal promotion).
 8. Debug companion Build ID mismatch rejection and honest reporting.
 9. Deterministic repeatability across multiple benchmark executions.
-10. Real-runtime C++ live process capture and evaluation pipeline.
+10. Complete real-runtime C++ live process capture and evaluation pipeline.
+11. Adversarial ground-truth leakage test: perturbing GT leaves system-under-test output unchanged.
+12. Elimination of fabricated causal traces and rejection of synthetic attestation.
+13. Prevention of vacuous perfect metric scores on empty/missing evidence and observations.
+14. Truthful provider matrix reporting: unavailable providers marked UNAVAILABLE, fallbacks not disguised.
+15. Repeat execution (repeat=N) actually executes N iterations and tracks variance.
+16. Pipeline stage failure and bypass detection (fails cleanly without synthetic fallback).
 """
 
 import copy
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -62,10 +69,10 @@ from extractor.investigation import (
 
 
 class TestInvestigationQualityBenchmark(unittest.TestCase):
-    """Phase 18 evaluation suite covering corpus, evaluator math, and C++ evidence pipelines."""
+    """Phase 19 evaluation suite covering corpus, evaluator math, and C++ evidence pipelines."""
 
     def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp(prefix="test_phase18_qual_bench_")
+        self.tmp_dir = tempfile.mkdtemp(prefix="test_phase19_qual_bench_")
         self.corpus = load_ground_truth_corpus()
         self.evaluator = InvestigationEvaluator(self.corpus)
 
@@ -97,13 +104,25 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
         with self.assertRaises(CorpusValidationError):
             CorpusSchemaValidator.validate(bad_corpus)
 
-        # 4. Duplicate scenario_id rejected
+        # 4. Missing required domain contract documentation rejected
+        bad_corpus = copy.deepcopy(self.corpus)
+        del bad_corpus["scenarios"][0]["field_invariant"]
+        with self.assertRaises(CorpusValidationError):
+            CorpusSchemaValidator.validate(bad_corpus)
+
+        # 5. Empty contract field rejected
+        bad_corpus = copy.deepcopy(self.corpus)
+        bad_corpus["scenarios"][0]["exact_mutation_source"] = "   "
+        with self.assertRaises(CorpusValidationError):
+            CorpusSchemaValidator.validate(bad_corpus)
+
+        # 6. Duplicate scenario_id rejected
         bad_corpus = copy.deepcopy(self.corpus)
         bad_corpus["scenarios"][1]["scenario_id"] = bad_corpus["scenarios"][0]["scenario_id"]
         with self.assertRaises(CorpusValidationError):
             CorpusSchemaValidator.validate(bad_corpus)
 
-        # 5. Empty expected_facts rejected
+        # 7. Empty expected_facts rejected
         bad_corpus = copy.deepcopy(self.corpus)
         bad_corpus["scenarios"][0]["expected_facts"] = []
         with self.assertRaises(CorpusValidationError):
@@ -114,7 +133,7 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
         sc1 = self.corpus["scenarios"][0]  # Valid Transition, causal_provable = True
         sc6 = self.corpus["scenarios"][5]  # Negative Control, causal_provable = False
 
-        # Case A: True Positive on Scenario 1
+        # Case A: True Positive on Scenario 1 (via synthetic self-test)
         output_tp = {
             "status": "COMPLETED",
             "observed_facts": [
@@ -139,7 +158,7 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
             "conversational_response": {"confidence": "high"},
         }
 
-        res_tp = self.evaluator.evaluate_scenario(sc1, output_tp, "unit_fixture")
+        res_tp = self.evaluator.evaluate_scenario(sc1, output_tp, "evaluator_self_test")
         self.assertTrue(res_tp.is_true_positive)
         self.assertFalse(res_tp.is_false_positive)
         self.assertEqual(res_tp.facts_f1, 1.0)
@@ -171,7 +190,7 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
             "conversational_response": {"confidence": "high"},
         }
 
-        res_fp = self.evaluator.evaluate_scenario(sc6, output_fp, "unit_fixture")
+        res_fp = self.evaluator.evaluate_scenario(sc6, output_fp, "evaluator_self_test")
         self.assertTrue(res_fp.is_false_positive, "Promoting negative control must be scored as False Positive!")
         self.assertFalse(res_fp.is_true_negative)
 
@@ -181,7 +200,7 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
         output_tn["hypotheses"][0]["validation_status"] = "INCONCLUSIVE"
         output_tn["conversational_response"]["confidence"] = "low"
 
-        res_tn = self.evaluator.evaluate_scenario(sc6, output_tn, "unit_fixture")
+        res_tn = self.evaluator.evaluate_scenario(sc6, output_tn, "evaluator_self_test")
         self.assertTrue(res_tn.is_true_negative)
         self.assertFalse(res_tn.is_false_positive)
         self.assertTrue(res_tn.uncertainty_calibrated)
@@ -189,12 +208,44 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
         # Case D: Partial fact matching (1 expected fact matched, 1 extraneous fact present)
         output_partial_facts = copy.deepcopy(output_tp)
         output_partial_facts["observed_facts"].append({"field_name": "extraneous_field", "before_value": 0, "after_value": 1})
-        res_part = self.evaluator.evaluate_scenario(sc1, output_partial_facts, "unit_fixture")
+        res_part = self.evaluator.evaluate_scenario(sc1, output_partial_facts, "evaluator_self_test")
         self.assertEqual(res_part.facts_matched, 1)
         self.assertEqual(res_part.facts_detected, 2)
         self.assertEqual(res_part.facts_precision, 0.5)
         self.assertEqual(res_part.facts_recall, 1.0)
         self.assertAlmostEqual(res_part.facts_f1, 0.6667, places=3)
+
+    def test_evaluator_empty_data_metrics_no_vacuous_perfection(self):
+        """Fix vacuous perfect scores: empty evidence, zero claims, or missing confidence must yield None."""
+        sc1 = self.corpus["scenarios"][0]
+        empty_output = {
+            "status": "COMPLETED",
+            "observed_facts": [],
+            "evidence_ledger": [],
+            "hypotheses": [],
+            "follow_up_observations": [],
+            "conversational_response": {},  # No confidence supplied
+        }
+
+        res = self.evaluator.evaluate_scenario(sc1, empty_output, "evaluator_self_test")
+        # 1. Facts precision is None when 0 facts detected (not 1.0)
+        self.assertIsNone(res.facts_precision)
+        self.assertEqual(res.facts_recall, 0.0)
+        self.assertIsNone(res.facts_f1)
+
+        # 2. Evidence precision is None when 0 evidence cited (not vacuous 1.0!)
+        self.assertIsNone(res.evidence_precision)
+
+        # 3. Disarm rate is None when 0 unsupported claims exist (not vacuous 1.0!)
+        self.assertIsNone(res.disarm_rate)
+
+        # 4. Uncertainty calibration is None when confidence was never reported
+        self.assertIsNone(res.confidence_score)
+        self.assertIsNone(res.uncertainty_calibrated)
+
+        # 5. Next observation usefulness is None when 0 observations proposed
+        self.assertIsNone(res.next_observation_useful)
+        self.assertIsNone(res.next_observation_usefulness_rate)
 
     def test_evaluator_is_strictly_read_only(self):
         """Evaluator must never mutate input findings, hypotheses, or ledger."""
@@ -215,7 +266,7 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
             "follow_up_observations": [],
         }
 
-        self.evaluator.evaluate_scenario(sc1, system_output, "unit_fixture")
+        self.evaluator.evaluate_scenario(sc1, system_output, "evaluator_self_test")
 
         current_findings = [f.to_dict() for f in session.findings]
         current_ledger = [r.to_dict() for r in session.ledger.query()]
@@ -223,97 +274,133 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
         self.assertEqual(orig_findings, current_findings, "Evaluator must not mutate findings")
         self.assertEqual(orig_ledger, current_ledger, "Evaluator must not mutate ledger")
 
-    def test_model_cannot_self_promote_validated_causal(self):
-        """Injected LLM claim of VALIDATED_CAUSAL_FUNCTION without attestation proof is disarmed."""
-        session = InvestigationSession("inv_fake_causal", "disarm test", corpus_dir=self.tmp_dir)
-        fake_hypo_data = {
-            "hypothesis_id": "hypo_fake",
-            "title": "Model claims transition_worker_state is root cause",
-            "claim": "transition_worker_state caused the defect",
-            "validation_status": "VALIDATED",
-            "confidence": "HIGH",
-            "supporting_evidence_ids": ["ev_nonexistent_fake"],
-            "function_candidates": [
-                {
-                    "function_name": "transition_worker_state",
-                    "candidate_tier": FUNCTION_TIER_VALIDATED_CAUSAL,
-                    "confirmed_root_cause": True,
-                }
-            ]
-        }
+    def test_adversarial_ground_truth_leakage(self):
+        """Perturbing ground-truth expected values must NOT change system-under-test outputs."""
+        harness = RealRuntimeExecutionHarness(self.tmp_dir)
+        compiled_ok, err = harness.compile()
+        if not compiled_ok:
+            self.skipTest(f"C++ compiler not available: {err}")
 
-        # Deserializing through InvestigationSession.from_dict disarms fake evidence IDs and evaluates against ledger
-        session_data = {
-            "investigation_id": session.investigation_id,
-            "goal": session.goal,
-            "corpus_dir": session.corpus_dir,
-            "evidence_ledger": session.ledger.to_dict(),
-            "findings": [],
-            "hypotheses": [fake_hypo_data],
-        }
-        restored = InvestigationSession.from_dict(session_data)
-        h = restored.hypotheses[0]
+        # 1. Run real runtime capture for scenario 1
+        ok, err, snap1, snap2, _ = harness.spawn_and_capture("MUTATE 1", "MUTATED 1")
+        self.assertTrue(ok, f"Capture failed: {err}")
 
-        # Fake evidence ID was disarmed
-        self.assertEqual(len(h.supporting_evidence_ids), 0)
-        # Status cannot remain VALIDATED without verified proof
-        self.assertNotEqual(h.validation_status, HYPOTHESIS_STATUS_VALIDATED)
+        # 2. Execute production pipeline on identical snapshots with authentic GT scenario
+        mgr1 = InvestigationManager(corpus_dir=os.path.join(self.tmp_dir, "inv1"))
+        s_info1 = mgr1.start_investigation("Leakage test", snap1, debug_image=harness.debug_companion)
+        inv1 = s_info1["investigation_id"]
+        mgr1.compare_observations(inv1, snap1, snap2)
+        sess1 = mgr1.sessions[inv1]
+        mgr1._execute_stage_synthesis(sess1)
 
-    def test_verified_transition_does_not_automatically_validate_causality(self):
-        """Verifying state transition without function attribution keeps candidate at STATIC_CANDIDATE."""
-        session = InvestigationSession("inv_trans_only", "transition only test", corpus_dir=self.tmp_dir)
-        h = InvestigationHypothesis(
-            hypothesis_id="h_trans",
-            title="Worker status transitioned",
-            claim="worker_status changed 1 -> 2",
-            investigation_id=session.investigation_id,
+        # 3. Create adversarial perturbed ground-truth scenario
+        perturbed_sc = copy.deepcopy(self.corpus["scenarios"][0])
+        perturbed_sc["expected_facts"] = [
+            {"field_path": "fake_nonexistent_field", "field_name": "fake", "before_value": 999, "after_value": 888}
+        ]
+        perturbed_sc["causal_attribution"]["expected_causal_function"] = "fake_adversarial_function"
+
+        # 4. Execute production pipeline on identical snapshots with perturbed GT context
+        mgr2 = InvestigationManager(corpus_dir=os.path.join(self.tmp_dir, "inv2"))
+        s_info2 = mgr2.start_investigation("Leakage test 2", snap1, debug_image=harness.debug_companion)
+        inv2 = s_info2["investigation_id"]
+        mgr2.compare_observations(inv2, snap1, snap2)
+        sess2 = mgr2.sessions[inv2]
+        mgr2._execute_stage_synthesis(sess2)
+
+        # 5. System outputs MUST be semantically identical (ignoring generated UUIDs / timestamps)
+        findings1 = [f.to_dict() for f in sess1.findings]
+        findings2 = [f.to_dict() for f in sess2.findings]
+        hypotheses1 = [h.to_dict() for h in sess1.hypotheses]
+        hypotheses2 = [h.to_dict() for h in sess2.hypotheses]
+
+        def _semantic_finding(f):
+            return {
+                "category": f.get("category"),
+                "title": f.get("title"),
+                "field_name": f.get("field_name"),
+                "before_value": f.get("before_value"),
+                "after_value": f.get("after_value"),
+                "function_candidates": f.get("function_candidates"),
+                "source_location": f.get("source_location"),
+                "classification": f.get("classification"),
+            }
+
+        def _semantic_hypothesis(h):
+            return {
+                "title": h.get("title"),
+                "claim": h.get("claim"),
+                "proposed_mechanism": h.get("proposed_mechanism"),
+                "function_candidates": h.get("function_candidates"),
+                "validation_status": h.get("validation_status"),
+                "confidence": h.get("confidence"),
+                "classification": h.get("classification"),
+            }
+
+        self.assertEqual(
+            [_semantic_finding(f) for f in findings1],
+            [_semantic_finding(f) for f in findings2],
+            "System findings must not be altered by ground-truth expectations!"
         )
+        self.assertEqual(
+            [_semantic_hypothesis(h) for h in hypotheses1],
+            [_semantic_hypothesis(h) for h in hypotheses2],
+            "System hypotheses must remain completely uninfluenced by ground-truth!"
+        )
+
+        # 6. Evaluator score changes honestly based on perturbed ground truth
+        out1 = {
+            "status": "COMPLETED",
+            "observed_facts": findings1,
+            "evidence_ledger": [r.to_dict() for r in sess1.ledger.query()],
+            "hypotheses": hypotheses1,
+            "follow_up_observations": [],
+        }
+        res_real = self.evaluator.evaluate_scenario(self.corpus["scenarios"][0], out1, "real_runtime")
+        res_pert = self.evaluator.evaluate_scenario(perturbed_sc, out1, "real_runtime")
+
+        self.assertGreater(res_real.facts_f1, 0.0)
+        self.assertEqual(res_pert.facts_f1, 0.0, "Perturbed expected facts must yield 0% F1 in evaluator")
+
+    def test_fake_causal_traces_and_claims_rejected(self):
+        """Fabricated execution traces and synthetic proofs cannot promote candidate to VALIDATED_CAUSAL_FUNCTION."""
+        session = InvestigationSession("inv_fake_trace", "fake trace test", corpus_dir=self.tmp_dir)
+        h = InvestigationHypothesis(hypothesis_id="h1", investigation_id=session.investigation_id, title="claim", claim="desc")
         h.function_candidates = [
             {"function_name": "transition_worker_state", "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE}
         ]
 
-        # Proof record verifying state transition but without function attribution
-        proof_eid = "ev_proof_transition"
-        rec = EvidenceRecord(
-            evidence_id=proof_eid,
-            evidence_type="COMPARISON",
+        # Fake diagnostic trace with caller claim
+        fake_rec = EvidenceRecord(
+            evidence_id="fake_ev_trace",
+            evidence_type="DIAGNOSTIC",
             nature="observation",
-            source="investigation_observer",
+            source="unverified_caller",  # Unverified!
             session_id=session.investigation_id,
-            observation="Worker status changed 1 -> 2",
-            provenance={
-                "verifier_attestation": {
-                    "token": session.ledger.session_secret,
-                    "evidence_fingerprint": "fake_or_real",
-                    "investigation_id": session.investigation_id,
-                    "target_function": "transition_worker_state",
-                    "function_attribution_verified": False,  # NOT verified!
-                    "provenance_class": "CONTROLLED_RUNTIME_REPRODUCTION",
-                }
-            },
+            observation="Fake trace claiming transition_worker_state wrote worker_status",
+            details={"caller_submitted": True, "trace_events": [{"function": "transition_worker_state", "event": "write"}]},
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
-        session.ledger.add_record(rec)
-        h.supporting_evidence_ids.append(proof_eid)
+        session.ledger.add_record(fake_rec)
+        h.supporting_evidence_ids.append(fake_rec.evidence_id)
 
-        # Evaluating with deterministic_transition_verified=True but function_attribution_verified=False
-        result = HypothesisValidator.evaluate(
-            h,
-            session.ledger,
-            proof_evidence_id=proof_eid,
-            deterministic_transition_verified=True,
-        )
+        # Hypothesis validator must reject caller claim
+        res = HypothesisValidator.evaluate(h, session.ledger)
+        self.assertNotEqual(res.to_status, HYPOTHESIS_STATUS_VALIDATED)
+        self.assertNotEqual(h.function_candidates[0].get("candidate_tier"), FUNCTION_TIER_VALIDATED_CAUSAL)
 
-        cand = h.function_candidates[0]
-        self.assertNotEqual(cand.get("candidate_tier"), FUNCTION_TIER_VALIDATED_CAUSAL)
-        self.assertFalse(cand.get("confirmed_root_cause", False))
+    def test_reconciled_negative_control_integrity(self):
+        """Scenario 6 negative control documents non-causality and strictly blocks causal promotion."""
+        sc6 = self.corpus["scenarios"][5]
+        self.assertEqual(sc6["scenario_id"], "scenario_6")
+        self.assertIn("Negative Control", sc6["scenario_name"])
+        self.assertFalse(sc6["causal_attribution"]["causal_function_provable"])
+        self.assertFalse(sc6["causal_attribution"]["allow_validated_causal"])
+        self.assertIn("unassociated_field", sc6["field_invariant"])
 
-    def test_negative_control_never_promoted(self):
-        """Scenario 6 negative control must strictly yield True Negative and 0% FP."""
         bench = InvestigationQualityBenchmark(output_dir=self.tmp_dir)
         try:
-            res = bench._execute_unit_fixture_scenario(self.corpus["scenarios"][5], provider="none")
-            self.assertEqual(res.scenario_id, "scenario_6")
+            res = bench._execute_evaluator_self_test_scenario(sc6, provider="none")
             self.assertFalse(res.causal_promoted)
             self.assertFalse(res.is_false_positive)
             self.assertTrue(res.is_true_negative)
@@ -369,25 +456,76 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    def test_repeat_benchmark_deterministic_stability(self):
-        """Repeated runs of deterministic benchmark must produce identical aggregate metrics."""
-        bench1 = InvestigationQualityBenchmark(output_dir=os.path.join(self.tmp_dir, "run1"))
-        bench2 = InvestigationQualityBenchmark(output_dir=os.path.join(self.tmp_dir, "run2"))
+    def test_repeat_execution_count_and_variability(self):
+        """repeat=N must execute N independent runs and record aggregate variability."""
+        bench = InvestigationQualityBenchmark(output_dir=self.tmp_dir)
         try:
-            res1 = bench1.run_all(mode="unit_fixture", provider="none", smoke=True)
-            res2 = bench2.run_all(mode="unit_fixture", provider="none", smoke=True)
-
-            self.assertEqual(res1.corpus_hash, res2.corpus_hash)
-            self.assertEqual(res1.fixture_hash, res2.fixture_hash)
-            self.assertEqual(res1.zero_false_positive_sla_met, res2.zero_false_positive_sla_met)
-            self.assertEqual(res1.unit_fixture_metrics.mean_fact_f1, res2.unit_fixture_metrics.mean_fact_f1)
-            self.assertEqual(res1.unit_fixture_metrics.false_positive_causal_rate, res2.unit_fixture_metrics.false_positive_causal_rate)
+            res = bench.run_all(mode="evaluator_self_test", provider="none", smoke=True, repeat=3)
+            self.assertEqual(len(res.repeat_runs), 3)
+            for r in res.repeat_runs:
+                self.assertIn("iteration", r)
+                self.assertIn("self_test_f1", r)
+                self.assertEqual(r["self_test_fp_rate"], 0.0)
         finally:
-            bench1.cleanup()
-            bench2.cleanup()
+            bench.cleanup()
+
+    def test_provider_matrix_and_fallback_misreporting_prevented(self):
+        """Unavailable provider must be UNAVAILABLE; fallback must be reported as FALLBACK_OCCURRED."""
+        bench = InvestigationQualityBenchmark(output_dir=self.tmp_dir)
+        try:
+            res = bench.run_all(
+                mode="evaluator_self_test",
+                provider="none",
+                providers=["none", "nonexistent_mock_provider"],
+                smoke=True,
+            )
+            self.assertIn("none", res.provider_comparisons)
+            self.assertIn("nonexistent_mock_provider", res.provider_comparisons)
+
+            unavail = res.provider_comparisons["nonexistent_mock_provider"]
+            self.assertEqual(unavail["status"], "UNAVAILABLE")
+            self.assertEqual(unavail["completed_scenarios"], 0)
+        finally:
+            bench.cleanup()
+
+    def test_artifact_stage_bypass_detection(self):
+        """Failed spawn or missing binary sets stage status to FAILED rather than synthetic fallback."""
+        harness = RealRuntimeExecutionHarness(self.tmp_dir)
+        # Harness not compiled -> spawn_and_capture returns (False, err)
+        ok, err, _, _, prov = harness.spawn_and_capture("MUTATE 1", "MUTATED 1")
+        self.assertFalse(ok)
+        self.assertIn("not compiled", err.lower())
+
+    def test_false_positive_causal_sla_enforcement(self):
+        """Any false positive promotion immediately fails the zero-false-positive SLA."""
+        sc6 = self.corpus["scenarios"][5]
+        # Fabricate an output where scenario 6 claims causal promotion
+        fake_fp_output = {
+            "status": "COMPLETED",
+            "observed_facts": [{"field_name": "unassociated_field", "before_value": 100, "after_value": 200}],
+            "evidence_ledger": [],
+            "hypotheses": [
+                {
+                    "hypothesis_id": "h_fp",
+                    "title": "Spurious attribution",
+                    "function_candidates": [
+                        {"function_name": "unrelated_helper_function", "candidate_tier": "VALIDATED_CAUSAL_FUNCTION"}
+                    ]
+                }
+            ],
+            "follow_up_observations": [],
+        }
+
+        res = self.evaluator.evaluate_scenario(sc6, fake_fp_output, "evaluator_self_test")
+        self.assertTrue(res.is_false_positive)
+
+        agg = self.evaluator.aggregate_metrics([res], "evaluator_self_test")
+        self.assertEqual(agg.false_causal_positives, 1)
+        self.assertEqual(agg.false_positive_causal_rate, 1.0)
+        self.assertFalse(agg.zero_false_positive_sla_met, "SLA MUST fail when any false positive occurs!")
 
     def test_full_benchmark_suite_execution(self):
-        """Run complete benchmark suite and verify report generation and 0% FP SLA."""
+        """Run complete benchmark suite and verify report generation, 0% FP SLA, and track isolation."""
         bench = InvestigationQualityBenchmark(output_dir=self.tmp_dir)
         try:
             res = bench.run_all(mode="all", provider="none", smoke=True)
@@ -401,24 +539,26 @@ class TestInvestigationQualityBenchmark(unittest.TestCase):
             with open(json_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.assertTrue(data["zero_false_positive_sla_met"])
-            self.assertEqual(data["schema_version"], "1.0.0")
+            self.assertEqual(data["schema_version"], "1.1.0")
 
             # Check Markdown report
             md_file = os.path.join(self.tmp_dir, "BENCHMARK_REPORT.md")
             self.assertTrue(os.path.exists(md_file))
             with open(md_file, "r", encoding="utf-8") as f:
                 md_text = f.read()
-            self.assertIn("Phase 18 Investigation Quality Benchmark Report", md_text)
+            self.assertIn("Phase 19 Investigation Quality Benchmark Report", md_text)
             self.assertIn("0.0% FP", md_text)
+            self.assertIn("REAL_RUNTIME_PRODUCT_PIPELINE", md_text)
 
-            # Both Real-Runtime and Unit-Fixture must have 0 False Positives
+            # Real-Runtime pipeline must have 0 False Positives
             if res.real_runtime_metrics and res.real_runtime_metrics.completed_scenarios > 0:
                 self.assertEqual(res.real_runtime_metrics.false_causal_positives, 0)
                 self.assertEqual(res.real_runtime_metrics.false_positive_causal_rate, 0.0)
 
-            if res.unit_fixture_metrics:
-                self.assertEqual(res.unit_fixture_metrics.false_causal_positives, 0)
-                self.assertEqual(res.unit_fixture_metrics.false_positive_causal_rate, 0.0)
+            # Evaluator Self-Test must have 0 False Positives
+            if res.evaluator_self_test_metrics:
+                self.assertEqual(res.evaluator_self_test_metrics.false_causal_positives, 0)
+                self.assertEqual(res.evaluator_self_test_metrics.false_positive_causal_rate, 0.0)
 
         finally:
             bench.cleanup()

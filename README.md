@@ -122,6 +122,8 @@ Recursive Semantic Reachability Traversal
   (진정한 스트리밍 논블로킹 프로세스 격리 및 조사 품질 벤치마크 기반 구축: `selectors` 기반 동시 stdout/stderr 읽기를 통한 파이프 버퍼 데드락 원천 방지, `max_output_bytes` 한도 초과 즉시 자식 및 손자 프로세스 그룹 강제 종료(`SIGTERM`+`SIGKILL`) 및 `ProviderOutputLimitExceededError` 발생(미완성 모델 출력의 침묵 파싱 배제), 파이프 핸들을 상속한 자식/손자 프로세스 누수 및 타임아웃 방지, Gemini ACP stdio 핸드셰이크의 논블로킹 타임아웃 및 기술자 누수 차단, 브라우저 클라이언트의 실행 파일 경로/인자/권한우회 주입 차단(`PRIVILEGED_CONFIG_FORBIDDEN`), 취소 요청 시 세션/원장/타임라인에 대한 늦은 커밋 경합 차단; 6대 정형 C++ 결함 시나리오 대상 조사 품질 벤치마크 하네스 기반 구축)
 - **Phase 18 (Complete)**: *"Independent Investigation Benchmark & Real C++ Snapshot Evaluation"*  
   (독립적 조사 벤치마크 및 실제 C++ 스냅샷 평가 하네스 고도화: 시스템 출력과 완전 분리된 독립 버전형 기계 판독 가능 Ground Truth 말뭉치(Corpus v1.0.0, 6대 결함 시나리오: 유효 전이, 불일치 캐시 필드, 무효 열거형 값, 널/무효 포인터, 크로스 스레드 비원자성 경쟁, 인과 함수 부재 음성 대조군), 하드코딩된 상수 지표 배제 및 정직한 예측 기반 평가기(`InvestigationEvaluator`), GNU Build ID 기반 분리 심볼(companion DWARF) 검증 및 불일치 감지, 대화형 C++ 타깃 프로세스(PIE, ASLR, Debug Info) 대상 실제 런타임 메모리 캡처(`process_vm_readv`/`procfs`) 기반 조사 평가 트랙과 단위 픽스처 트랙의 분리 운영, 사실 정밀도/재현율/F1, 증거 정밀도/재현율, 미검증 주장 비율 및 디스암율, 불확실성 보정률(Brier 점수 및 2진 일치도), 판별 후속 관측 유용성 산출, **인과 함수 오탐율(False-Positive Causal Rate) 엄격한 0.0% SLA 충족**, 10개 전용 회귀 테스트 통과)
+- **Phase 19 (Complete)**: *"Benchmark Integrity, Real Causal Evidence Verification, and Reproducible Provider Evaluation"*  
+  (벤치마크 진위성 및 독립적 인과 검증 아키텍처 완성: 평가기(Evaluator)와 피평가 시스템(SUT) 간 완벽한 경계 분리 및 그라운드 트루스 누출 차단(적대적 누출 회귀 테스트 통과), 평가기 자체 단위 테스트(`EVALUATOR_UNIT_TEST`)와 실제 프로덕션 런타임 파이프라인(`REAL_RUNTIME_PRODUCT_PIPELINE`)의 점수 분리, 런타임 추적 부재 시 인과 함수를 정적 후보(`STATIC_CANDIDATE`)로 유지하고 인과 검증을 `UNPROVEN`으로 정직하게 보고(조작된 DIAGNOSTIC 추적 제거, 위양성률 0.0% 엄격 유지), 6대 시나리오 전반의 변이 소스·불변식·기대 관측 상태 명세 및 시나리오 6 음성 대조군(Negative Control) 정합성 복원, 시나리오 5 크로스 스레드 경쟁의 무경합 수명주기 스레드 조인 보장, 파이프라인 전 과정(컴파일-빌드ID검증-스폰-스냅샷A-변이및ACK-스냅샷B-종료-DWARF비교-스테이지합성-대화형분석) 스테이지 출처(Provenance) 및 타임아웃 통제, 빈 데이터에 대한 공허한 1.0(vacuous 1.0) 점수 제거(`None` 처리), 반복 실행(`repeat=N`) 및 분산 추적, 다중 프로바이더 비교 매트릭스(`--providers`) 및 폴백/비가용 투명 보고)
 
 ---
 
@@ -1177,6 +1179,10 @@ python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
 
 ```bash
+# Phase 19 벤치마크 무결성, 실 인과 증거 검증 및 재현 가능 프로바이더 평가 (14개 테스트)
+python3 -m unittest tests/test_investigation_quality_benchmark.py -v
+python3 benchmarks/investigation_quality/run_benchmark.py --mode real_runtime
+
 # Phase 18 독립적 조사 벤치마크 및 실제 C++ 스냅샷 평가 (10개 테스트 + 실 런타임/단위 하네스)
 python3 -m unittest tests/test_investigation_quality_benchmark.py -v
 python3 benchmarks/investigation_quality/run_benchmark.py --mode all --smoke
@@ -1357,6 +1363,7 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 | **Phase 16 CLI Provider Security & Truthfulness** | Complete | 14 security & lifecycle tests, privilege drop | **INTEGRATION TESTED** | Safe argument vectors, bounded execution, secret redaction, server-side template validation |
 | **Phase 17 CLI Process Isolation & Benchmark** | Complete | 10 process isolation tests, child/grandchild cleanup | **REAL TARGET VALIDATED** | Non-blocking streaming I/O, process group termination, privileged config defense |
 | **Phase 18 Independent Benchmark & Real C++ Eval** | Complete | 10 evaluation tests, 6 real-runtime scenarios | **REAL TARGET VALIDATED** | Independent versioned corpus, honest metric derivation, GNU Build ID validation, 0% FP causal SLA |
+| **Phase 19 Benchmark Integrity & Real Causal Eval** | Complete | 14 regression & benchmark tests, 6 real-runtime scenarios | **REAL TARGET VALIDATED** | Zero ground-truth leakage, 0.0% FP causal SLA (0/5), stage provenance, multi-provider matrix, honest None on empty data |
 
 ---
 
@@ -1434,6 +1441,10 @@ dynamicState includes an automated benchmark harness measuring process suspensio
    # Phase 18 Independent Investigation Benchmark & Real C++ Snapshot Evaluation (10 tests)
    python3 -m unittest tests/test_investigation_quality_benchmark.py -v
    python3 benchmarks/investigation_quality/run_benchmark.py --mode all --smoke
+
+   # Phase 19 Benchmark Integrity & Real Causal Evidence Verification (14 tests)
+   python3 -m unittest tests/test_investigation_quality_benchmark.py -v
+   python3 benchmarks/investigation_quality/run_benchmark.py --mode real_runtime
 
    # Full test discovery suite (702+ tests)
    python3 -m unittest discover -s tests -v

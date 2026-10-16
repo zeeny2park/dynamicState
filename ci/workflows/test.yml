@@ -89,11 +89,11 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase17_process_isolation_regression.py
 
-      - name: Run Phase 18 Independent Investigation Benchmark Tests
+      - name: Run Phase 19 Benchmark Integrity and Causal Evidence Verification Tests
         run: |
           python3 -m unittest tests/test_investigation_quality_benchmark.py
 
-      - name: Run Phase 18 Independent Investigation Benchmark Demonstration Script
+      - name: Run Phase 19 Benchmark Demonstration Script
         run: |
           python3 benchmarks/investigation_quality/run_benchmark.py --smoke
 

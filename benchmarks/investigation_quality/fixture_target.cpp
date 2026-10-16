@@ -180,13 +180,18 @@ int main(int argc, char** argv) {
                 std::cout << "MUTATED 4" << std::endl;
                 std::cout.flush();
             } else if (cmd == "MUTATE 5" || cmd == "MUTATE thread_race") {
+                if (t1 || t2) {
+                    g_competing_running.store(false, std::memory_order_relaxed);
+                    if (t1 && t1->joinable()) { t1->join(); delete t1; t1 = nullptr; }
+                    if (t2 && t2->joinable()) { t2->join(); delete t2; t2 = nullptr; }
+                }
                 g_competing_running.store(true, std::memory_order_relaxed);
                 t1 = new std::thread(competing_writer_a);
                 t2 = new std::thread(competing_writer_b);
                 std::cout << "MUTATED 5" << std::endl;
                 std::cout.flush();
             } else if (cmd == "MUTATE 6" || cmd == "MUTATE negative_control") {
-                // External unassociated mutation
+                // External unassociated mutation via harness dispatcher
                 g_target.unassociated_field = 200;
                 std::cout << "MUTATED 6" << std::endl;
                 std::cout.flush();
@@ -199,8 +204,10 @@ int main(int argc, char** argv) {
                 std::cout << "MUTATED ALL" << std::endl;
                 std::cout.flush();
             } else if (cmd == "STOP") {
-                g_running.store(false, std::memory_order_relaxed);
                 g_competing_running.store(false, std::memory_order_relaxed);
+                g_running.store(false, std::memory_order_relaxed);
+                if (t1 && t1->joinable()) { t1->join(); delete t1; t1 = nullptr; }
+                if (t2 && t2->joinable()) { t2->join(); delete t2; t2 = nullptr; }
                 std::cout << "STOPPED" << std::endl;
                 std::cout.flush();
                 break;
@@ -224,10 +231,12 @@ int main(int argc, char** argv) {
     if (t1) {
         if (t1->joinable()) t1->join();
         delete t1;
+        t1 = nullptr;
     }
     if (t2) {
         if (t2->joinable()) t2->join();
         delete t2;
+        t2 = nullptr;
     }
 
     return 0;

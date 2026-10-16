@@ -112,12 +112,12 @@ run_step "Phase 16 CLI Provider Security, Process Control & Truthfulness Suite" 
 run_step "Phase 17 CLI Process Isolation Hardening & Regression Suite" \
     python3 -m unittest tests/test_phase17_process_isolation_regression.py
 
-# 18. Phase 18 Independent Investigation Benchmark Suite
-run_step "Phase 18 Independent Investigation Benchmark Suite" \
+# 18. Phase 19 Benchmark Integrity and Causal Evidence Verification Suite
+run_step "Phase 19 Benchmark Integrity and Causal Evidence Verification Suite" \
     python3 -m unittest tests/test_investigation_quality_benchmark.py
 
-# 19. Phase 18 Independent Investigation Benchmark Demonstration Script
-run_step "Phase 18 Independent Investigation Benchmark Demonstration Script" \
+# 19. Phase 19 Benchmark Demonstration Script
+run_step "Phase 19 Benchmark Demonstration Script" \
     python3 benchmarks/investigation_quality/run_benchmark.py --smoke
 
 # 20. Discover and run all remaining unit and integration tests

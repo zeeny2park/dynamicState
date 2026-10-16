@@ -1,22 +1,26 @@
 {
-  "schema_version": "1.0.0",
-  "timestamp_utc": "2026-10-15T23:26:37.785601+00:00",
-  "corpus_version": "1.0.0",
-  "corpus_hash": "4420d5089980f0c353bc19d8adb880117828baea157385870883ee87405416c8",
-  "fixture_hash": "af1671068a61f69c5291186536c775f5472478acfd10de6ad0f2b885287d3170",
-  "build_id": "3617f02cd67911ffa65c17ada5af4e89516ac27c",
-  "analyzer_version": "1.0.0",
+  "schema_version": "1.1.0",
+  "timestamp_utc": "2026-10-16T06:34:43.680488+00:00",
+  "corpus_version": "1.1.0",
+  "corpus_hash": "cfb50179bbc1c95d9b4ec02aee7f4fae295db4609872d5713774a1c109a942c2",
+  "fixture_hash": "b39c383e093ecadf104ef585414204ea764a08fa0dc1add6fe3ed531a8526008",
+  "build_id": "33d119106ac2184acc68abda6f471cc3535bf86f",
+  "analyzer_version": "1.1.0",
   "provider_identity": "none",
   "model": "deterministic-engine",
   "prompt_schema_version": "1.0.0",
   "run_configuration": {
     "mode": "all",
     "provider": "none",
+    "providers": [
+      "none"
+    ],
     "smoke": true,
     "repeat": 1
   },
   "real_runtime_metrics": {
     "evaluation_mode": "real_runtime",
+    "track_label": "REAL_RUNTIME_PRODUCT_PIPELINE",
     "total_scenarios": 6,
     "completed_scenarios": 6,
     "skipped_scenarios": 0,
@@ -30,15 +34,22 @@
     "total_disarmed_claims": 6,
     "overall_unsupported_claim_rate": 0.0,
     "overall_disarm_rate": 1.0,
-    "uncertainty_calibration_rate": 0.5,
+    "uncertainty_calibration_rate": 0.3333,
     "mean_next_observation_usefulness": 0.4643,
     "causal_positives_ground_truth": 1,
     "causal_negatives_ground_truth": 5,
-    "true_causal_positives": 1,
+    "true_causal_positives": 0,
     "false_causal_positives": 0,
     "true_causal_negatives": 5,
-    "false_causal_negatives": 0,
+    "false_causal_negatives": 1,
     "false_positive_causal_rate": 0.0,
+    "false_positive_display": "0/5 (0.0%)",
+    "causal_confusion_matrix": {
+      "TP": 0,
+      "FP": 0,
+      "TN": 5,
+      "FN": 1
+    },
     "zero_false_positive_sla_met": true,
     "scenarios": [
       {
@@ -62,26 +73,76 @@
         "unsupported_claims_disarmed": 1,
         "unsupported_claim_rate": 0.1667,
         "disarm_rate": 1.0,
-        "confidence_score": 0.9,
-        "uncertainty_calibrated": true,
-        "brier_score_component": 0.01,
+        "confidence_score": 0.6,
+        "uncertainty_calibrated": false,
+        "brier_score_component": 0.16,
         "proposed_observations_count": 7,
         "useful_observations_count": 7,
         "next_observation_useful": true,
         "next_observation_usefulness_rate": 1.0,
-        "candidate_tier": "VALIDATED_CAUSAL_FUNCTION",
-        "causal_promoted": true,
+        "candidate_tier": "STATIC_CANDIDATE",
+        "causal_promoted": false,
         "ground_truth_is_causal": true,
-        "is_true_positive": true,
+        "is_true_positive": false,
         "is_false_positive": false,
         "is_true_negative": false,
-        "is_false_negative": false,
-        "notes": "Outcome: TP",
+        "is_false_negative": true,
+        "notes": "Outcome: FN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": [
-            "transition_worker_state"
-          ]
+          "promoted_functions": [],
+          "stage_provenance": {
+            "spawn": {
+              "pid": 500865,
+              "binary_path": "/tmp/dynstate_phase19_bench_jxo9cuxy/fixture_target.stripped",
+              "status": "SPAWNED"
+            },
+            "handshake": {
+              "status": "SUCCESS",
+              "response": "READY"
+            },
+            "snapshot_a": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_A_1792132480487",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "status": "CAPTURED"
+            },
+            "mutation": {
+              "status": "VERIFIED_ACK",
+              "got": "MUTATED 1"
+            },
+            "snapshot_b": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_B_1792132480514",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "consistency": "STOPPED",
+              "status": "CAPTURED"
+            },
+            "shutdown": {
+              "status": "CLEAN_STOP",
+              "exit_code": 0
+            },
+            "dwarf_diff": {
+              "status": "COMPLETED",
+              "findings_count": 23,
+              "diff_trust": "CONFIRMED"
+            },
+            "stage_synthesis": {
+              "status": "COMPLETED",
+              "hypotheses_count": 5,
+              "ledger_count": 35
+            },
+            "conversational_analysis": {
+              "status": "COMPLETED",
+              "provider_used": "deterministic_fallback",
+              "is_fallback": true,
+              "model_used": "deterministic-engine",
+              "latency_ms": 1.77
+            }
+          },
+          "is_fallback": true,
+          "model_used": "deterministic-engine",
+          "latency_ms": 1.77
         }
       },
       {
@@ -122,7 +183,59 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {
+            "spawn": {
+              "pid": 500936,
+              "binary_path": "/tmp/dynstate_phase19_bench_jxo9cuxy/fixture_target.stripped",
+              "status": "SPAWNED"
+            },
+            "handshake": {
+              "status": "SUCCESS",
+              "response": "READY"
+            },
+            "snapshot_a": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_A_1792132480934",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "status": "CAPTURED"
+            },
+            "mutation": {
+              "status": "VERIFIED_ACK",
+              "got": "MUTATED 2"
+            },
+            "snapshot_b": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_B_1792132480958",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "consistency": "STOPPED",
+              "status": "CAPTURED"
+            },
+            "shutdown": {
+              "status": "CLEAN_STOP",
+              "exit_code": 0
+            },
+            "dwarf_diff": {
+              "status": "COMPLETED",
+              "findings_count": 23,
+              "diff_trust": "CONFIRMED"
+            },
+            "stage_synthesis": {
+              "status": "COMPLETED",
+              "hypotheses_count": 5,
+              "ledger_count": 35
+            },
+            "conversational_analysis": {
+              "status": "COMPLETED",
+              "provider_used": "deterministic_fallback",
+              "is_fallback": true,
+              "model_used": "deterministic-engine",
+              "latency_ms": 1.63
+            }
+          },
+          "is_fallback": true,
+          "model_used": "deterministic-engine",
+          "latency_ms": 1.63
         }
       },
       {
@@ -163,7 +276,59 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {
+            "spawn": {
+              "pid": 501006,
+              "binary_path": "/tmp/dynstate_phase19_bench_jxo9cuxy/fixture_target.stripped",
+              "status": "SPAWNED"
+            },
+            "handshake": {
+              "status": "SUCCESS",
+              "response": "READY"
+            },
+            "snapshot_a": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_A_1792132481244",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "status": "CAPTURED"
+            },
+            "mutation": {
+              "status": "VERIFIED_ACK",
+              "got": "MUTATED 3"
+            },
+            "snapshot_b": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_B_1792132481269",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "consistency": "STOPPED",
+              "status": "CAPTURED"
+            },
+            "shutdown": {
+              "status": "CLEAN_STOP",
+              "exit_code": 0
+            },
+            "dwarf_diff": {
+              "status": "COMPLETED",
+              "findings_count": 23,
+              "diff_trust": "CONFIRMED"
+            },
+            "stage_synthesis": {
+              "status": "COMPLETED",
+              "hypotheses_count": 5,
+              "ledger_count": 35
+            },
+            "conversational_analysis": {
+              "status": "COMPLETED",
+              "provider_used": "deterministic_fallback",
+              "is_fallback": true,
+              "model_used": "deterministic-engine",
+              "latency_ms": 1.62
+            }
+          },
+          "is_fallback": true,
+          "model_used": "deterministic-engine",
+          "latency_ms": 1.62
         }
       },
       {
@@ -204,7 +369,59 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {
+            "spawn": {
+              "pid": 501075,
+              "binary_path": "/tmp/dynstate_phase19_bench_jxo9cuxy/fixture_target.stripped",
+              "status": "SPAWNED"
+            },
+            "handshake": {
+              "status": "SUCCESS",
+              "response": "READY"
+            },
+            "snapshot_a": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_A_1792132481557",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "status": "CAPTURED"
+            },
+            "mutation": {
+              "status": "VERIFIED_ACK",
+              "got": "MUTATED 4"
+            },
+            "snapshot_b": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_B_1792132481581",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "consistency": "STOPPED",
+              "status": "CAPTURED"
+            },
+            "shutdown": {
+              "status": "CLEAN_STOP",
+              "exit_code": 0
+            },
+            "dwarf_diff": {
+              "status": "COMPLETED",
+              "findings_count": 25,
+              "diff_trust": "CONFIRMED"
+            },
+            "stage_synthesis": {
+              "status": "COMPLETED",
+              "hypotheses_count": 7,
+              "ledger_count": 37
+            },
+            "conversational_analysis": {
+              "status": "COMPLETED",
+              "provider_used": "deterministic_fallback",
+              "is_fallback": true,
+              "model_used": "deterministic-engine",
+              "latency_ms": 1.95
+            }
+          },
+          "is_fallback": true,
+          "model_used": "deterministic-engine",
+          "latency_ms": 1.95
         }
       },
       {
@@ -245,12 +462,64 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {
+            "spawn": {
+              "pid": 501145,
+              "binary_path": "/tmp/dynstate_phase19_bench_jxo9cuxy/fixture_target.stripped",
+              "status": "SPAWNED"
+            },
+            "handshake": {
+              "status": "SUCCESS",
+              "response": "READY"
+            },
+            "snapshot_a": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_A_1792132481870",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "status": "CAPTURED"
+            },
+            "mutation": {
+              "status": "VERIFIED_ACK",
+              "got": "MUTATED 5"
+            },
+            "snapshot_b": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_B_1792132481918",
+              "bytes_read": 25706496,
+              "completeness": "COMPLETE",
+              "consistency": "NON_ATOMIC",
+              "status": "CAPTURED"
+            },
+            "shutdown": {
+              "status": "CLEAN_STOP",
+              "exit_code": 0
+            },
+            "dwarf_diff": {
+              "status": "COMPLETED",
+              "findings_count": 28,
+              "diff_trust": "CONFIRMED"
+            },
+            "stage_synthesis": {
+              "status": "COMPLETED",
+              "hypotheses_count": 9,
+              "ledger_count": 39
+            },
+            "conversational_analysis": {
+              "status": "COMPLETED",
+              "provider_used": "deterministic_fallback",
+              "is_fallback": true,
+              "model_used": "deterministic-engine",
+              "latency_ms": 2.16
+            }
+          },
+          "is_fallback": true,
+          "model_used": "deterministic-engine",
+          "latency_ms": 2.16
         }
       },
       {
         "scenario_id": "scenario_6",
-        "scenario_name": "Negative Control (No Causal Function)",
+        "scenario_name": "Negative Control (Unproven Causal Attribution)",
         "category": "negative_control",
         "evaluation_mode": "real_runtime",
         "status": "COMPLETED",
@@ -286,13 +555,66 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {
+            "spawn": {
+              "pid": 501220,
+              "binary_path": "/tmp/dynstate_phase19_bench_jxo9cuxy/fixture_target.stripped",
+              "status": "SPAWNED"
+            },
+            "handshake": {
+              "status": "SUCCESS",
+              "response": "READY"
+            },
+            "snapshot_a": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_A_1792132482253",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "status": "CAPTURED"
+            },
+            "mutation": {
+              "status": "VERIFIED_ACK",
+              "got": "MUTATED 6"
+            },
+            "snapshot_b": {
+              "path": "/tmp/dynstate_phase19_bench_jxo9cuxy/snap_B_1792132482277",
+              "bytes_read": 8929280,
+              "completeness": "COMPLETE",
+              "consistency": "STOPPED",
+              "status": "CAPTURED"
+            },
+            "shutdown": {
+              "status": "CLEAN_STOP",
+              "exit_code": 0
+            },
+            "dwarf_diff": {
+              "status": "COMPLETED",
+              "findings_count": 23,
+              "diff_trust": "CONFIRMED"
+            },
+            "stage_synthesis": {
+              "status": "COMPLETED",
+              "hypotheses_count": 5,
+              "ledger_count": 35
+            },
+            "conversational_analysis": {
+              "status": "COMPLETED",
+              "provider_used": "deterministic_fallback",
+              "is_fallback": true,
+              "model_used": "deterministic-engine",
+              "latency_ms": 1.59
+            }
+          },
+          "is_fallback": true,
+          "model_used": "deterministic-engine",
+          "latency_ms": 1.59
         }
       }
     ]
   },
-  "unit_fixture_metrics": {
-    "evaluation_mode": "unit_fixture",
+  "evaluator_self_test_metrics": {
+    "evaluation_mode": "evaluator_self_test",
+    "track_label": "EVALUATOR_UNIT_TEST",
     "total_scenarios": 6,
     "completed_scenarios": 6,
     "skipped_scenarios": 0,
@@ -310,18 +632,25 @@
     "mean_next_observation_usefulness": 0.3333,
     "causal_positives_ground_truth": 1,
     "causal_negatives_ground_truth": 5,
-    "true_causal_positives": 1,
+    "true_causal_positives": 0,
     "false_causal_positives": 0,
     "true_causal_negatives": 5,
-    "false_causal_negatives": 0,
+    "false_causal_negatives": 1,
     "false_positive_causal_rate": 0.0,
+    "false_positive_display": "0/5 (0.0%)",
+    "causal_confusion_matrix": {
+      "TP": 0,
+      "FP": 0,
+      "TN": 5,
+      "FN": 1
+    },
     "zero_false_positive_sla_met": true,
     "scenarios": [
       {
         "scenario_id": "scenario_1",
         "scenario_name": "Valid Transition",
         "category": "valid_transition",
-        "evaluation_mode": "unit_fixture",
+        "evaluation_mode": "evaluator_self_test",
         "status": "COMPLETED",
         "skip_reason": null,
         "facts_precision": 1.0,
@@ -345,26 +674,25 @@
         "useful_observations_count": 1,
         "next_observation_useful": true,
         "next_observation_usefulness_rate": 1.0,
-        "candidate_tier": "VALIDATED_CAUSAL_FUNCTION",
-        "causal_promoted": true,
+        "candidate_tier": "STATIC_CANDIDATE",
+        "causal_promoted": false,
         "ground_truth_is_causal": true,
-        "is_true_positive": true,
+        "is_true_positive": false,
         "is_false_positive": false,
         "is_true_negative": false,
-        "is_false_negative": false,
-        "notes": "Outcome: TP",
+        "is_false_negative": true,
+        "notes": "Outcome: FN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": [
-            "transition_worker_state"
-          ]
+          "promoted_functions": [],
+          "stage_provenance": {}
         }
       },
       {
         "scenario_id": "scenario_2",
         "scenario_name": "Stale / Inconsistent Field",
         "category": "stale_inconsistent_field",
-        "evaluation_mode": "unit_fixture",
+        "evaluation_mode": "evaluator_self_test",
         "status": "COMPLETED",
         "skip_reason": null,
         "facts_precision": 1.0,
@@ -398,14 +726,15 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {}
         }
       },
       {
         "scenario_id": "scenario_3",
         "scenario_name": "Invalid Enum / State",
         "category": "invalid_enum_state",
-        "evaluation_mode": "unit_fixture",
+        "evaluation_mode": "evaluator_self_test",
         "status": "COMPLETED",
         "skip_reason": null,
         "facts_precision": 1.0,
@@ -439,14 +768,15 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {}
         }
       },
       {
         "scenario_id": "scenario_4",
         "scenario_name": "Null / Invalid Pointer",
         "category": "null_invalid_pointer",
-        "evaluation_mode": "unit_fixture",
+        "evaluation_mode": "evaluator_self_test",
         "status": "COMPLETED",
         "skip_reason": null,
         "facts_precision": 1.0,
@@ -480,14 +810,15 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {}
         }
       },
       {
         "scenario_id": "scenario_5",
         "scenario_name": "Cross-Thread Non-Atomic Ambiguity",
         "category": "cross_thread_non_atomic",
-        "evaluation_mode": "unit_fixture",
+        "evaluation_mode": "evaluator_self_test",
         "status": "COMPLETED",
         "skip_reason": null,
         "facts_precision": 1.0,
@@ -521,14 +852,15 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {}
         }
       },
       {
         "scenario_id": "scenario_6",
-        "scenario_name": "Negative Control (No Causal Function)",
+        "scenario_name": "Negative Control (Unproven Causal Attribution)",
         "category": "negative_control",
-        "evaluation_mode": "unit_fixture",
+        "evaluation_mode": "evaluator_self_test",
         "status": "COMPLETED",
         "skip_reason": null,
         "facts_precision": 1.0,
@@ -562,7 +894,8 @@
         "notes": "Outcome: TN",
         "artifacts": {
           "matched_facts_count": 1,
-          "promoted_functions": []
+          "promoted_functions": [],
+          "stage_provenance": {}
         }
       }
     ]
@@ -571,10 +904,302 @@
     "none": {
       "provider": "none",
       "model": "deterministic-engine",
-      "completed_scenarios": 12,
+      "status": "COMPLETED_MODEL_RESPONSE",
+      "completed_scenarios": 1,
       "zero_false_positive_sla_met": true,
-      "false_positive_causal_rate": 0.0
+      "false_positive_causal_rate": 0.0,
+      "fallback_occurred": false
     }
   },
-  "zero_false_positive_sla_met": true
+  "repeat_runs": [],
+  "repeat_variability": {},
+  "zero_false_positive_sla_met": true,
+  "unit_fixture_metrics": {
+    "evaluation_mode": "evaluator_self_test",
+    "track_label": "EVALUATOR_UNIT_TEST",
+    "total_scenarios": 6,
+    "completed_scenarios": 6,
+    "skipped_scenarios": 0,
+    "failed_scenarios": 0,
+    "mean_fact_precision": 1.0,
+    "mean_fact_recall": 1.0,
+    "mean_fact_f1": 1.0,
+    "mean_evidence_precision": 1.0,
+    "mean_evidence_recall": 1.0,
+    "total_unsupported_claims": 6,
+    "total_disarmed_claims": 6,
+    "overall_unsupported_claim_rate": 0.0,
+    "overall_disarm_rate": 1.0,
+    "uncertainty_calibration_rate": 1.0,
+    "mean_next_observation_usefulness": 0.3333,
+    "causal_positives_ground_truth": 1,
+    "causal_negatives_ground_truth": 5,
+    "true_causal_positives": 0,
+    "false_causal_positives": 0,
+    "true_causal_negatives": 5,
+    "false_causal_negatives": 1,
+    "false_positive_causal_rate": 0.0,
+    "false_positive_display": "0/5 (0.0%)",
+    "causal_confusion_matrix": {
+      "TP": 0,
+      "FP": 0,
+      "TN": 5,
+      "FN": 1
+    },
+    "zero_false_positive_sla_met": true,
+    "scenarios": [
+      {
+        "scenario_id": "scenario_1",
+        "scenario_name": "Valid Transition",
+        "category": "valid_transition",
+        "evaluation_mode": "evaluator_self_test",
+        "status": "COMPLETED",
+        "skip_reason": null,
+        "facts_precision": 1.0,
+        "facts_recall": 1.0,
+        "facts_f1": 1.0,
+        "facts_detected": 1,
+        "facts_expected": 1,
+        "facts_matched": 1,
+        "evidence_precision": 1.0,
+        "evidence_recall": 1.0,
+        "total_cited_evidence": 1,
+        "valid_cited_evidence": 1,
+        "unsupported_claims_count": 1,
+        "unsupported_claims_disarmed": 1,
+        "unsupported_claim_rate": 1.0,
+        "disarm_rate": 1.0,
+        "confidence_score": 0.9,
+        "uncertainty_calibrated": true,
+        "brier_score_component": 0.01,
+        "proposed_observations_count": 1,
+        "useful_observations_count": 1,
+        "next_observation_useful": true,
+        "next_observation_usefulness_rate": 1.0,
+        "candidate_tier": "STATIC_CANDIDATE",
+        "causal_promoted": false,
+        "ground_truth_is_causal": true,
+        "is_true_positive": false,
+        "is_false_positive": false,
+        "is_true_negative": false,
+        "is_false_negative": true,
+        "notes": "Outcome: FN",
+        "artifacts": {
+          "matched_facts_count": 1,
+          "promoted_functions": [],
+          "stage_provenance": {}
+        }
+      },
+      {
+        "scenario_id": "scenario_2",
+        "scenario_name": "Stale / Inconsistent Field",
+        "category": "stale_inconsistent_field",
+        "evaluation_mode": "evaluator_self_test",
+        "status": "COMPLETED",
+        "skip_reason": null,
+        "facts_precision": 1.0,
+        "facts_recall": 1.0,
+        "facts_f1": 1.0,
+        "facts_detected": 1,
+        "facts_expected": 1,
+        "facts_matched": 1,
+        "evidence_precision": 1.0,
+        "evidence_recall": 1.0,
+        "total_cited_evidence": 1,
+        "valid_cited_evidence": 1,
+        "unsupported_claims_count": 1,
+        "unsupported_claims_disarmed": 1,
+        "unsupported_claim_rate": 1.0,
+        "disarm_rate": 1.0,
+        "confidence_score": 0.9,
+        "uncertainty_calibrated": true,
+        "brier_score_component": 0.01,
+        "proposed_observations_count": 1,
+        "useful_observations_count": 0,
+        "next_observation_useful": false,
+        "next_observation_usefulness_rate": 0.0,
+        "candidate_tier": "STATIC_CANDIDATE",
+        "causal_promoted": false,
+        "ground_truth_is_causal": false,
+        "is_true_positive": false,
+        "is_false_positive": false,
+        "is_true_negative": true,
+        "is_false_negative": false,
+        "notes": "Outcome: TN",
+        "artifacts": {
+          "matched_facts_count": 1,
+          "promoted_functions": [],
+          "stage_provenance": {}
+        }
+      },
+      {
+        "scenario_id": "scenario_3",
+        "scenario_name": "Invalid Enum / State",
+        "category": "invalid_enum_state",
+        "evaluation_mode": "evaluator_self_test",
+        "status": "COMPLETED",
+        "skip_reason": null,
+        "facts_precision": 1.0,
+        "facts_recall": 1.0,
+        "facts_f1": 1.0,
+        "facts_detected": 1,
+        "facts_expected": 1,
+        "facts_matched": 1,
+        "evidence_precision": 1.0,
+        "evidence_recall": 1.0,
+        "total_cited_evidence": 1,
+        "valid_cited_evidence": 1,
+        "unsupported_claims_count": 1,
+        "unsupported_claims_disarmed": 1,
+        "unsupported_claim_rate": 1.0,
+        "disarm_rate": 1.0,
+        "confidence_score": 0.9,
+        "uncertainty_calibrated": true,
+        "brier_score_component": 0.01,
+        "proposed_observations_count": 1,
+        "useful_observations_count": 0,
+        "next_observation_useful": false,
+        "next_observation_usefulness_rate": 0.0,
+        "candidate_tier": "STATIC_CANDIDATE",
+        "causal_promoted": false,
+        "ground_truth_is_causal": false,
+        "is_true_positive": false,
+        "is_false_positive": false,
+        "is_true_negative": true,
+        "is_false_negative": false,
+        "notes": "Outcome: TN",
+        "artifacts": {
+          "matched_facts_count": 1,
+          "promoted_functions": [],
+          "stage_provenance": {}
+        }
+      },
+      {
+        "scenario_id": "scenario_4",
+        "scenario_name": "Null / Invalid Pointer",
+        "category": "null_invalid_pointer",
+        "evaluation_mode": "evaluator_self_test",
+        "status": "COMPLETED",
+        "skip_reason": null,
+        "facts_precision": 1.0,
+        "facts_recall": 1.0,
+        "facts_f1": 1.0,
+        "facts_detected": 1,
+        "facts_expected": 1,
+        "facts_matched": 1,
+        "evidence_precision": 1.0,
+        "evidence_recall": 1.0,
+        "total_cited_evidence": 1,
+        "valid_cited_evidence": 1,
+        "unsupported_claims_count": 1,
+        "unsupported_claims_disarmed": 1,
+        "unsupported_claim_rate": 1.0,
+        "disarm_rate": 1.0,
+        "confidence_score": 0.9,
+        "uncertainty_calibrated": true,
+        "brier_score_component": 0.01,
+        "proposed_observations_count": 1,
+        "useful_observations_count": 1,
+        "next_observation_useful": true,
+        "next_observation_usefulness_rate": 1.0,
+        "candidate_tier": "STATIC_CANDIDATE",
+        "causal_promoted": false,
+        "ground_truth_is_causal": false,
+        "is_true_positive": false,
+        "is_false_positive": false,
+        "is_true_negative": true,
+        "is_false_negative": false,
+        "notes": "Outcome: TN",
+        "artifacts": {
+          "matched_facts_count": 1,
+          "promoted_functions": [],
+          "stage_provenance": {}
+        }
+      },
+      {
+        "scenario_id": "scenario_5",
+        "scenario_name": "Cross-Thread Non-Atomic Ambiguity",
+        "category": "cross_thread_non_atomic",
+        "evaluation_mode": "evaluator_self_test",
+        "status": "COMPLETED",
+        "skip_reason": null,
+        "facts_precision": 1.0,
+        "facts_recall": 1.0,
+        "facts_f1": 1.0,
+        "facts_detected": 1,
+        "facts_expected": 1,
+        "facts_matched": 1,
+        "evidence_precision": 1.0,
+        "evidence_recall": 1.0,
+        "total_cited_evidence": 1,
+        "valid_cited_evidence": 1,
+        "unsupported_claims_count": 1,
+        "unsupported_claims_disarmed": 1,
+        "unsupported_claim_rate": 1.0,
+        "disarm_rate": 1.0,
+        "confidence_score": 0.3,
+        "uncertainty_calibrated": true,
+        "brier_score_component": 0.09,
+        "proposed_observations_count": 1,
+        "useful_observations_count": 0,
+        "next_observation_useful": false,
+        "next_observation_usefulness_rate": 0.0,
+        "candidate_tier": "STATIC_CANDIDATE",
+        "causal_promoted": false,
+        "ground_truth_is_causal": false,
+        "is_true_positive": false,
+        "is_false_positive": false,
+        "is_true_negative": true,
+        "is_false_negative": false,
+        "notes": "Outcome: TN",
+        "artifacts": {
+          "matched_facts_count": 1,
+          "promoted_functions": [],
+          "stage_provenance": {}
+        }
+      },
+      {
+        "scenario_id": "scenario_6",
+        "scenario_name": "Negative Control (Unproven Causal Attribution)",
+        "category": "negative_control",
+        "evaluation_mode": "evaluator_self_test",
+        "status": "COMPLETED",
+        "skip_reason": null,
+        "facts_precision": 1.0,
+        "facts_recall": 1.0,
+        "facts_f1": 1.0,
+        "facts_detected": 1,
+        "facts_expected": 1,
+        "facts_matched": 1,
+        "evidence_precision": 1.0,
+        "evidence_recall": 1.0,
+        "total_cited_evidence": 1,
+        "valid_cited_evidence": 1,
+        "unsupported_claims_count": 1,
+        "unsupported_claims_disarmed": 1,
+        "unsupported_claim_rate": 1.0,
+        "disarm_rate": 1.0,
+        "confidence_score": 0.3,
+        "uncertainty_calibrated": true,
+        "brier_score_component": 0.09,
+        "proposed_observations_count": 1,
+        "useful_observations_count": 0,
+        "next_observation_useful": false,
+        "next_observation_usefulness_rate": 0.0,
+        "candidate_tier": "STATIC_CANDIDATE",
+        "causal_promoted": false,
+        "ground_truth_is_causal": false,
+        "is_true_positive": false,
+        "is_false_positive": false,
+        "is_true_negative": true,
+        "is_false_negative": false,
+        "notes": "Outcome: TN",
+        "artifacts": {
+          "matched_facts_count": 1,
+          "promoted_functions": [],
+          "stage_provenance": {}
+        }
+      }
+    ]
+  }
 }
