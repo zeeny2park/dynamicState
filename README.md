@@ -1485,6 +1485,43 @@ dynamicState supports both `process_vm_readv` (direct syscall) and `procfs` (`/p
 - **Baseline Protection**: The canonical reference baseline at `benchmarks/baseline_results.json` is protected against accidental overwriting. Neither `--smoke` runs nor failed `--acceptance` runs can overwrite the baseline.
 - **Failure Reproduction**: Running with `--acceptance` enforces non-zero exit codes upon any byte accounting violations, missing required metrics/samples, payload corruptions, or quality downgrades. Detailed diagnostic messages are emitted directly to stderr and recorded in the JSON output.
 
+### Phase 21: Persistent Watch Session & Temporal Memory Explorer Foundation
+Phase 21 builds the end-to-end foundation for temporal memory observation and interactive state replay:
+- **Versioned Observation Data Contracts (`extractor/watch_session.py`)**:
+  - `ObservationSession` (schema 1.0.0): Target PID, binary Build ID, companion debug ELF, start/end times, interval, status (`RUNNING` / `STOPPED`), watch items, and provenance.
+  - `WatchItem`: Stable item ID, scope (`global`, `heap`, `thread`, `address_range`), virtual memory address, DWARF type name, size, and source location.
+  - `Observation`: Monotonic sequence (`seq`), nanosecond monotonic timestamp (`monotonic_ns`), wall-clock ISO-8601 timestamp, decoded values, raw hex bytes, and observation status (`OBSERVED`, `PARTIAL`, `UNAVAILABLE`, `DECODE_ERROR`).
+  - `CaptureGap`: Timestamped tracking of sampling discontinuities (`SAMPLING_OVERRUN`, `PROCESS_SLEEPING`, `MAPPING_CHANGED`).
+  - `AllocationEvent`: Strict schema contract for heap alloc/free events.
+- **Five Primary Explorer Views**:
+  - **Area A: Target & Watch Session Controls**: Connects to target PID, validates GNU Build ID between companion ELF and running process, configures interval (100ms–2000ms), and exposes zero-stop capture controls.
+  - **Area B: Thread and Memory Map Explorer**: Inspects `/proc/<pid>/task` threads, parses `/proc/<pid>/maps` regions with category filtering (Code, Data/BSS, Heap, Stack, Anonymous), and indexes discoverable DWARF global/static variables with PIE/DYN runtime address relocation.
+  - **Area C: Active Watch List**: Allows adding variables directly from DWARF or specifying raw memory address ranges with read-safety bounds checking. Selection persists durably to disk across browser refreshes and restarts.
+  - **Area D: Temporal State Table & Replay Navigation**: Non-destructive replay over immutable recorded observations. Features playback controls (Play/Pause, Prev, Next, Home, End), timeline scrubbing slider, keyboard shortcuts (Arrow keys, Home, End, Spacebar with input-focus guards), changed-value highlighting (`.val-changed`), delta computation, and recent observations time-series matrix.
+  - **Area E: Allocation Events (Truthful Capability Display)**: Truthfully reports `ALLOCATION_TRACING_UNAVAILABLE` when running without an active heap tracer probe. Documents sampling limits and specifies the future allocator recorder adapter contract without producing fabricated events.
+- **Capture Semantics, Overhead & Limitations**:
+  - **Stop Duration**: 0.00 ms (Zero-Stop, `process_vm_readv` reads target virtual memory without suspending inferior execution).
+  - **Latency**: Sub-millisecond tick latency recorded per observation (`capture_latency_us`).
+  - **No Fabrication**: Unmapped or inaccessible memory returns `UNAVAILABLE` or `PARTIAL`; values are never interpolated or defaulted to zero.
+
+### Phase 22: Zero-Configuration Live Capture, Language-Aligned LLM & Simplified UX
+Phase 22 transforms dynamicState from a technical runtime inspection dashboard into an intuitive investigation product:
+- **Two-Input Live Capture**: The basic workflow requires only two fields:
+  1. Target PID (`pid`)
+  2. Matching unstripped ELF / debug image path (`debug_image`)
+- **Automated Discovery & Pre-Validation (`POST /api/investigation/validate-target`)**:
+  - Automatically inspects `/proc/<pid>/exe`, checks GNU Build ID parity, verifies DWARF `.debug_info` presence, and tests zero-stop memory read backend accessibility (`process_vm_readv` / `procfs`).
+  - Reports actionable, localized diagnostic guidance for errors (ESRCH, EPERM, missing DWARF, Build ID mismatch).
+- **Language-Aligned LLM (`locale: 'ko' | 'en'`)**:
+  - The UI locale (`currentLang`) authoritatively drives LLM prompts, requiring natural-language explanations in the selected language.
+  - **Technical Symbol Protection**: C/C++ symbols, function names, source paths, memory addresses, and JSON schema keys are strictly preserved in their original form without translation or corruption.
+  - Offline CI and deterministic fallback provider (`DeterministicFallbackProvider`) automatically return localized responses matching the active locale.
+- **Radical Default UX Simplification**:
+  - **Area 1: TARGET**: Two-input connection form when disconnected; clean PID, binary, Build ID, and capture quality summary when connected.
+  - **Area 2: INVESTIGATION RESULT**: Concise diagnostic summary, NON_ATOMIC snapshot warnings, and three prioritized sections (Confirmed facts, Possible causes, What to do next) with progressive disclosure toggles.
+  - **Area 3: ASK A QUESTION**: Conversational natural language interface for interactive problem diagnosis.
+  - **Expert Mode**: Preserves all 8 deep-dive navigation tabs, low-level metrics bars, mutation labs, and raw evidence ledgers without regression.
+
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]
 > **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.

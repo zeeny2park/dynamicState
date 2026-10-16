@@ -44,6 +44,7 @@ from .impact_analyzer import ThreadImpactAnalyzer
 from .state_replayer import StateReplayer
 from .investigation import InvestigationManager
 from .static_analyzer import StaticAnalysisProvider
+from .watch_session import WatchSessionManager
 
 
 class AgentRuntime:
@@ -81,6 +82,9 @@ class AgentRuntime:
 
         # Evidence-first Investigation Workflow
         self.investigation_manager: InvestigationManager = InvestigationManager(corpus_dir=self.corpus_dir)
+
+        # Phase 21 Persistent Watch Session Manager
+        self.watch_session_manager: WatchSessionManager = WatchSessionManager(corpus_dir=self.corpus_dir)
 
     # -------------------------------------------------------------------------
     # Protocol Action Dispatcher
@@ -298,6 +302,7 @@ class AgentRuntime:
                     request_id=action.request_id,
                     provider_override=action.provider_override,
                     allow_fallback=getattr(action, "allow_fallback", False),
+                    locale=getattr(action, "locale", "en") or "en",
                 )
             elif act in ("CANCEL_INVESTIGATION_CHAT", "CANCEL_CHAT"):
                 return self.cancel_investigation_chat(action.request_id)
@@ -2018,6 +2023,7 @@ class AgentRuntime:
         request_id: Optional[str] = None,
         provider_override: Optional[str] = None,
         allow_fallback: bool = False,
+        locale: str = "en",
     ) -> AgentActionResult:
         """Execute conversational analysis grounded strictly in investigation session evidence."""
         t0 = time.monotonic()
@@ -2027,6 +2033,7 @@ class AgentRuntime:
             request_id=request_id,
             provider_override=provider_override,
             allow_fallback=allow_fallback,
+            locale=locale,
         )
         if not res.get("success", False):
             err_code = res.get("error_code") or "CONVERSATIONAL_ANALYSIS_ERROR"

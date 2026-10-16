@@ -45,6 +45,9 @@
     llmStatus: null,
     conversationalHistory: [],
     isAnalyzingChat: false,
+    basicTargetConnected: false,
+    basicStep: 0,
+    basicExpandedSections: { facts: false, causes: false, next: false },
   };
 
   // DOM Elements Cache
@@ -53,6 +56,47 @@
     groupLangToggle: document.getElementById('group-lang-toggle'),
     btnLangEn: document.getElementById('btn-lang-en'),
     btnLangKo: document.getElementById('btn-lang-ko'),
+
+    // Phase 22: Basic Mode Elements
+    basicInvestigationView: document.getElementById('basic-investigation-view'),
+    basicTargetArea: document.getElementById('basic-target-area'),
+    basicTargetForm: document.getElementById('basic-target-form'),
+    basicTargetPid: document.getElementById('basic-target-pid'),
+    basicDebugImage: document.getElementById('basic-debug-image'),
+    btnBasicConnectAnalyze: document.getElementById('btn-basic-connect-analyze'),
+    basicProgressSequence: document.getElementById('basic-progress-sequence'),
+    stepConnecting: document.getElementById('step-connecting'),
+    stepValidating: document.getElementById('step-validating'),
+    stepCapturing: document.getElementById('step-capturing'),
+    stepAnalyzing: document.getElementById('step-analyzing'),
+    stepResults: document.getElementById('step-results'),
+    basicTargetError: document.getElementById('basic-target-error'),
+    basicTargetErrorMsg: document.getElementById('basic-target-error-msg'),
+    basicTargetNextAction: document.getElementById('basic-target-next-action'),
+    basicTargetConnectedSummary: document.getElementById('basic-target-connected-summary'),
+    basicTxtPid: document.getElementById('basic-txt-pid'),
+    basicTxtExe: document.getElementById('basic-txt-exe'),
+    basicBadgeBuildId: document.getElementById('basic-badge-build-id'),
+    basicBadgeQuality: document.getElementById('basic-badge-quality'),
+    btnBasicDisconnect: document.getElementById('btn-basic-disconnect'),
+    basicResultsArea: document.getElementById('basic-results-area'),
+    basicResultSummary: document.getElementById('basic-result-summary'),
+    basicBadgeInvStatus: document.getElementById('basic-badge-inv-status'),
+    basicQualityWarning: document.getElementById('basic-quality-warning'),
+    basicQualityWarningText: document.getElementById('basic-quality-warning-text'),
+    basicFactsList: document.getElementById('basic-facts-list'),
+    basicFactsCount: document.getElementById('basic-facts-count'),
+    btnMoreFacts: document.getElementById('btn-more-facts'),
+    basicCausesList: document.getElementById('basic-causes-list'),
+    basicCausesCount: document.getElementById('basic-causes-count'),
+    btnMoreCauses: document.getElementById('btn-more-causes'),
+    basicNextList: document.getElementById('basic-next-list'),
+    basicNextCount: document.getElementById('basic-next-count'),
+    btnMoreNext: document.getElementById('btn-more-next'),
+    basicQuestionArea: document.getElementById('basic-question-area'),
+    basicQuestionInput: document.getElementById('basic-question-input'),
+    btnBasicAsk: document.getElementById('btn-basic-ask'),
+    basicChatHistory: document.getElementById('basic-chat-history'),
 
     // Phase 15: Conversational LLM & Simplified Investigation Workspace
     hdrBadgeLlmStatus: document.getElementById('hdr-badge-llm-status'),
@@ -727,6 +771,8 @@
       if (state.selectedLabSnapshotId) {
         selectLabSnapshot(state.selectedLabSnapshotId);
       }
+    } else if (tabId === 'tab-temporal-explorer') {
+      loadTemporalExplorerView();
     }
   }
 
@@ -1072,6 +1118,36 @@
       toast_investigation_started: 'Investigation started...',
       toast_investigation_completed: 'Investigation completed',
       toast_investigation_refreshed: 'Investigation data refreshed',
+
+      // Phase 22: Basic 3-Area Workflow
+      title_basic_target: '🎯 Target Process',
+      subtitle_basic_target: 'Provide the running target PID and its matching unstripped ELF/debug binary.',
+      lbl_basic_target_pid: 'Target PID',
+      ph_basic_target_pid: 'e.g. 12345',
+      lbl_basic_debug_image: 'Matching Nostrip/Debug ELF',
+      ph_basic_debug_image: '/path/to/target.debug or unstripped binary',
+      btn_basic_connect_analyze: 'Connect & Analyze',
+      lbl_step_connecting: '1. Connecting',
+      lbl_step_validating: '2. Validating debug image',
+      lbl_step_capturing: '3. Capturing state',
+      lbl_step_analyzing: '4. Analyzing',
+      lbl_step_results: '5. Results',
+      btn_basic_disconnect: '🔄 Disconnect / New Target',
+      title_basic_results: '📊 Investigation Result',
+      title_facts_section: 'Confirmed Facts (Observed)',
+      title_causes_section: 'Possible Causes (Candidate Explanations)',
+      title_next_section: 'What to Do Next (Recommended)',
+      notice_hypo_candidate_only: 'Candidate functions are static hypotheses; they are not confirmed root causes until proven by authentic execution tracing.',
+      msg_no_facts: 'No invariant violations observed in examined state.',
+      msg_no_causes: 'No competing causal hypotheses generated.',
+      msg_no_next: 'All automated verification steps completed.',
+      warning_non_atomic_snapshot: '⚠️ NON_ATOMIC Snapshot: Process was inspected while running without stopping threads. Observed values may reflect torn reads or concurrent execution.',
+      title_basic_questions: '💬 Ask a Question',
+      ph_basic_question: 'Describe the problem or ask a question (e.g. "Why did worker_status change?")...',
+      btn_basic_ask: 'Ask',
+      btn_show_more: 'Show more',
+      btn_show_less: 'Show less',
+      btn_details: 'Details / Evidence',
     },
     ko: {
       // Header & Navigation
@@ -1358,6 +1434,36 @@
       toast_investigation_started: '조사가 시작되었습니다...',
       toast_investigation_completed: '조사가 완료되었습니다',
       toast_investigation_refreshed: '조사 데이터가 새로고침되었습니다',
+
+      // Phase 22: Basic 3-Area Workflow
+      title_basic_target: '🎯 대상 프로세스',
+      subtitle_basic_target: '실행 중인 대상 PID와 일치하는 non-stripped ELF/디버그 바이너리 경로를 입력하세요.',
+      lbl_basic_target_pid: '대상 PID',
+      ph_basic_target_pid: '예: 12345',
+      lbl_basic_debug_image: '매칭 디버그/비스트립 ELF',
+      ph_basic_debug_image: '/path/to/target.debug 또는 비스트립 바이너리',
+      btn_basic_connect_analyze: '연결 및 분석',
+      lbl_step_connecting: '1. 연결 중',
+      lbl_step_validating: '2. 디버그 이미지 검증',
+      lbl_step_capturing: '3. 상태 캡처',
+      lbl_step_analyzing: '4. 분석 중',
+      lbl_step_results: '5. 결과 완료',
+      btn_basic_disconnect: '🔄 연결 해제 / 새 대상',
+      title_basic_results: '📊 조사 결과',
+      title_facts_section: '확인된 관측 사실',
+      title_causes_section: '가능한 원인 (후보 가설)',
+      title_next_section: '다음 조치 사항 (권장)',
+      notice_hypo_candidate_only: '후보 함수는 정적 가설일 뿐이며, 독립적인 실행 추적으로 입증되기 전까지는 확인된 근본 원인이 아닙니다.',
+      msg_no_facts: '검사된 상태에서 불변식 위반이 관찰되지 않았습니다.',
+      msg_no_causes: '경쟁 인과 가설이 생성되지 않았습니다.',
+      msg_no_next: '모든 자동 검증 단계가 완료되었습니다.',
+      warning_non_atomic_snapshot: '⚠️ 비원자적(NON_ATOMIC) 스냅샷: 프로세스 스레드를 중단하지 않고 실행 중에 메모리를 읽었습니다. 관찰된 값에 동시 실행 또는 분할 읽기(torn read)가 포함될 수 있습니다.',
+      title_basic_questions: '💬 질문하기',
+      ph_basic_question: '문제나 증상을 질문하세요 (예: "worker_status가 왜 변경되었나요?")...',
+      btn_basic_ask: '질문하기',
+      btn_show_more: '더 보기',
+      btn_show_less: '접기',
+      btn_details: '세부정보 / 증거',
     }
   };
 
@@ -4995,6 +5101,7 @@
         message: message,
         request_id: reqId,
         allow_fallback: forceFallback || (providerOverride === null),
+        locale: state.currentLang || 'en',
       };
       if (providerOverride) {
         chatPayload.provider_override = providerOverride;
@@ -5646,6 +5753,7 @@
       el.invStaticLinksList.innerHTML = `<div class="empty-state text-xs p-3">${t('empty_static_links_init', 'No static code links resolved yet. Provide a valid debug image to correlate runtime objects to source symbols.')}</div>`;
     }
     populateInvestigationSnapshots();
+    renderBasicInvestigationView();
   }
 
   function populateInvestigationSnapshots() {
@@ -5902,6 +6010,9 @@
 
     // 8. Render Audit Timeline
     renderTimeline(inv.timeline || []);
+
+    // 9. Render Phase 22 Basic Investigation View
+    renderBasicInvestigationView();
   }
 
   function renderFindings() {
@@ -6650,6 +6761,1257 @@
   window.__showFindingDrilldown = loadDrilldown;
 
   // --------------------------------------------------------------------------
+  // Phase 22: Basic 3-Area Workflow Handlers
+  // --------------------------------------------------------------------------
+
+  function setBasicStep(stepId, status) {
+    const stepEl = el[stepId];
+    if (!stepEl) return;
+    stepEl.classList.remove('active', 'completed', 'failed');
+    if (status && status !== 'pending') {
+      stepEl.classList.add(status);
+    }
+  }
+
+  function resetBasicSteps() {
+    ['stepConnecting', 'stepValidating', 'stepCapturing', 'stepAnalyzing', 'stepResults'].forEach(s => {
+      setBasicStep(s, 'pending');
+    });
+  }
+
+  function showBasicError(message, nextAction) {
+    if (el.basicTargetError) el.basicTargetError.style.display = 'flex';
+    if (el.basicTargetErrorMsg) el.basicTargetErrorMsg.textContent = message || 'Validation failed';
+    if (el.basicTargetNextAction) {
+      if (nextAction) {
+        el.basicTargetNextAction.textContent = nextAction;
+        el.basicTargetNextAction.style.display = 'block';
+      } else {
+        el.basicTargetNextAction.style.display = 'none';
+      }
+    }
+  }
+
+  function hideBasicError() {
+    if (el.basicTargetError) el.basicTargetError.style.display = 'none';
+  }
+
+  async function handleBasicConnectAndAnalyze() {
+    if (state.isBasicConnecting) return;
+    hideBasicError();
+
+    const rawPid = (el.basicTargetPid && el.basicTargetPid.value.trim()) || '';
+    const debugImage = (el.basicDebugImage && el.basicDebugImage.value.trim()) || '';
+
+    if (!rawPid) {
+      showBasicError(
+        state.currentLang === 'ko' ? '대상 PID를 입력해주세요.' : 'Please enter a target PID.',
+        state.currentLang === 'ko' ? '실행 중인 프로세스의 PID를 확인하세요 (예: pgrep <process_name>).' : 'Check the running process PID (e.g. pgrep <process_name>).'
+      );
+      if (el.basicTargetPid) el.basicTargetPid.focus();
+      return;
+    }
+
+    if (!/^\d+$/.test(rawPid)) {
+      showBasicError(
+        state.currentLang === 'ko' ? `잘못된 PID 형식입니다: "${rawPid}"` : `Invalid PID format: "${rawPid}"`,
+        state.currentLang === 'ko' ? '양의 10진수 정수 PID를 입력하세요.' : 'Enter a positive decimal integer PID.'
+      );
+      return;
+    }
+
+    const pid = parseInt(rawPid, 10);
+    if (isNaN(pid) || pid <= 0 || pid > 2147483647) {
+      showBasicError(
+        state.currentLang === 'ko' ? `PID ${rawPid}가 유효 범위를 벗어났습니다.` : `PID ${rawPid} is out of range.`,
+        state.currentLang === 'ko' ? '1에서 2147483647 사이의 PID를 입력하세요.' : 'Enter a valid PID between 1 and 2147483647.'
+      );
+      return;
+    }
+
+    if (!debugImage) {
+      showBasicError(
+        state.currentLang === 'ko' ? '디버그 ELF/바이너리 경로를 입력해주세요.' : 'Please enter matching nostrip/debug ELF path.',
+        state.currentLang === 'ko' ? 'non-stripped 바이너리 또는 별도 .debug 심볼 파일 경로를 제공하세요.' : 'Provide the path to the unstripped binary or separate .debug symbols.'
+      );
+      if (el.basicDebugImage) el.basicDebugImage.focus();
+      return;
+    }
+
+    state.isBasicConnecting = true;
+    if (el.btnBasicConnectAnalyze) {
+      el.btnBasicConnectAnalyze.disabled = true;
+      el.btnBasicConnectAnalyze.textContent = state.currentLang === 'ko' ? '⏳ 연결 및 분석 중...' : '⏳ Connecting & Analyzing...';
+    }
+    if (el.basicProgressSequence) {
+      el.basicProgressSequence.style.display = 'flex';
+    }
+    resetBasicSteps();
+
+    try {
+      // Step 1: Connecting
+      setBasicStep('stepConnecting', 'active');
+      await new Promise(r => setTimeout(r, 60));
+      setBasicStep('stepConnecting', 'completed');
+
+      // Step 2: Validating debug image
+      setBasicStep('stepValidating', 'active');
+      const valRes = await apiPost('/api/investigation/validate-target', {
+        pid: pid,
+        debug_image: debugImage,
+        locale: state.currentLang || 'en'
+      });
+
+      if (!valRes.success || !valRes.data?.valid) {
+        setBasicStep('stepValidating', 'failed');
+        const errMsg = valRes.data?.message || valRes.error?.message || (state.currentLang === 'ko' ? '디버그 이미지 검증 실패' : 'Debug image validation failed');
+        const nextAct = valRes.data?.next_action || (valRes.error && valRes.error.next_action);
+        showBasicError(errMsg, nextAct);
+        return;
+      }
+      setBasicStep('stepValidating', 'completed');
+
+      // Step 3: Capturing state
+      setBasicStep('stepCapturing', 'active');
+      const startPayload = {
+        goal: state.currentLang === 'ko' ? '실시간 런타임 제로 설정 자동 조사' : 'Zero-configuration live runtime investigation',
+        pid: pid,
+        debug_image: debugImage,
+        authorize_target: true,
+      };
+
+      const startRes = await apiPost('/api/investigation/start', startPayload);
+      if (!startRes.success || !startRes.data) {
+        setBasicStep('stepCapturing', 'failed');
+        const errMsg = startRes.error?.message || (state.currentLang === 'ko' ? '상태 캡처 실패' : 'State capture failed');
+        showBasicError(errMsg, state.currentLang === 'ko' ? '프로세스가 종료되었거나 접근 권한이 부족합니다.' : 'Target process may have exited or permissions are insufficient.');
+        return;
+      }
+      setBasicStep('stepCapturing', 'completed');
+
+      // Step 4: Analyzing
+      setBasicStep('stepAnalyzing', 'active');
+      const invData = startRes.data;
+      state.activeInvestigation = invData;
+      state.selectedInvestigationId = invData.investigation_id;
+      try { sessionStorage.setItem('dynamicstate_selected_inv_id', invData.investigation_id); } catch (_) {}
+      
+      await loadActiveInvestigation(invData.investigation_id);
+      setBasicStep('stepAnalyzing', 'completed');
+
+      // Step 5: Results
+      setBasicStep('stepResults', 'completed');
+      state.basicTargetConnected = true;
+      renderBasicInvestigationView();
+      showToast(state.currentLang === 'ko' ? '연결 및 조사가 완료되었습니다.' : 'Connect & analysis completed.', 'success');
+
+    } catch (err) {
+      console.error('Basic Connect & Analyze failed:', err);
+      showBasicError(String(err));
+    } finally {
+      state.isBasicConnecting = false;
+      if (el.btnBasicConnectAnalyze) {
+        el.btnBasicConnectAnalyze.disabled = false;
+        el.btnBasicConnectAnalyze.textContent = t('btn_basic_connect_analyze', 'Connect & Analyze');
+      }
+    }
+  }
+
+  function handleBasicDisconnect() {
+    state.basicTargetConnected = false;
+    resetBasicSteps();
+    if (el.basicProgressSequence) el.basicProgressSequence.style.display = 'none';
+    hideBasicError();
+    renderBasicInvestigationView();
+  }
+
+  function renderBasicInvestigationView() {
+    const inv = state.activeInvestigation;
+    const isConnected = state.basicTargetConnected || !!(inv && (inv.target_identity?.pid || inv.target_ref?.pid));
+
+    // Area 1: Target Process
+    if (el.basicTargetForm && el.basicTargetConnectedSummary) {
+      if (isConnected && inv) {
+        el.basicTargetForm.style.display = 'none';
+        el.basicTargetConnectedSummary.style.display = 'flex';
+        const idInfo = inv.target_identity || inv.stages?.target_identity?.details || inv.target_ref || {};
+        const qInfo = inv.capture_quality || inv.stages?.capture_quality?.details || {};
+        if (el.basicTxtPid) el.basicTxtPid.textContent = String(idInfo.pid || state.runtime?.pid || '-');
+        if (el.basicTxtExe) el.basicTxtExe.textContent = idInfo.executable || idInfo.exe || '-';
+        if (el.basicBadgeBuildId) {
+          const bId = idInfo.build_id || '';
+          el.basicBadgeBuildId.textContent = bId ? `Build ID: ${bId.slice(0, 10)}...` : 'MATCHED';
+        }
+        if (el.basicBadgeQuality) {
+          const cons = qInfo.consistency_level || 'CONSISTENT';
+          el.basicBadgeQuality.textContent = cons;
+          el.basicBadgeQuality.className = `badge text-xs ${cons === 'CONSISTENT' ? 'badge-success' : 'badge-warning'}`;
+        }
+      } else {
+        el.basicTargetForm.style.display = 'block';
+        el.basicTargetConnectedSummary.style.display = 'none';
+      }
+    }
+
+    // Area 2: Investigation Result
+    if (!inv) {
+      if (el.basicResultSummary) {
+        el.basicResultSummary.textContent = t('ph_basic_target_pid', 'No target investigated yet. Enter PID and debug image above, then click "Connect & Analyze".');
+      }
+      if (el.basicBadgeInvStatus) {
+        el.basicBadgeInvStatus.textContent = 'READY';
+        el.basicBadgeInvStatus.className = 'badge badge-neutral text-xs';
+      }
+      if (el.basicQualityWarning) el.basicQualityWarning.style.display = 'none';
+      if (el.basicFactsList) {
+        el.basicFactsList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_facts', 'No invariant violations observed in examined state.')}</div>`;
+      }
+      if (el.basicFactsCount) el.basicFactsCount.textContent = '(0)';
+      if (el.btnMoreFacts) el.btnMoreFacts.style.display = 'none';
+      if (el.basicCausesList) {
+        el.basicCausesList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_causes', 'No competing causal hypotheses generated.')}</div>`;
+      }
+      if (el.basicCausesCount) el.basicCausesCount.textContent = '(0)';
+      if (el.btnMoreCauses) el.btnMoreCauses.style.display = 'none';
+      if (el.basicNextList) {
+        el.basicNextList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_next', 'All automated verification steps completed.')}</div>`;
+      }
+      if (el.basicNextCount) el.basicNextCount.textContent = '(0)';
+      if (el.btnMoreNext) el.btnMoreNext.style.display = 'none';
+      return;
+    }
+
+    const st = inv.status || 'UNKNOWN';
+    if (el.basicBadgeInvStatus) {
+      el.basicBadgeInvStatus.textContent = st;
+      el.basicBadgeInvStatus.className = `badge text-xs ${st === 'COMPLETED' ? 'badge-success' : (st === 'PARTIAL' ? 'badge-warning' : 'badge-danger')}`;
+    }
+
+    let summaryText = inv.summary?.overview || inv.summary?.text || inv.goal || '';
+    if (!summaryText && inv.findings) {
+      summaryText = st === 'COMPLETED'
+        ? (state.currentLang === 'ko' ? '대상 프로세스 조사가 성공적으로 완료되었습니다.' : 'Target process investigation completed successfully.')
+        : (state.currentLang === 'ko' ? `조사 상태: ${st}` : `Investigation status: ${st}`);
+    }
+    if (el.basicResultSummary) el.basicResultSummary.textContent = summaryText;
+
+    // Quality warning
+    const qInfo = inv.capture_quality || inv.stages?.capture_quality?.details || {};
+    const isNonAtomic = (qInfo.consistency_level === 'NON_ATOMIC') || (qInfo.partial_reads && qInfo.partial_reads > 0);
+    if (el.basicQualityWarning) {
+      el.basicQualityWarning.style.display = isNonAtomic ? 'flex' : 'none';
+    }
+
+    // Extract findings
+    let facts = [];
+    let causes = [];
+    if (inv.findings && typeof inv.findings === 'object' && !Array.isArray(inv.findings)) {
+      facts = inv.findings.observed_facts || [];
+      causes = inv.findings.hypotheses || [];
+    } else if (Array.isArray(inv.findings)) {
+      facts = inv.findings.filter(f => f.category === 'fact');
+      causes = inv.findings.filter(f => f.category === 'hypothesis');
+    }
+
+    const nextSteps = inv.recommended_next_steps || inv.next_steps || [];
+    const LIMIT = 3;
+
+    // 2A: Confirmed Facts
+    if (el.basicFactsCount) el.basicFactsCount.textContent = `(${facts.length})`;
+    if (el.basicFactsList) {
+      if (facts.length === 0) {
+        el.basicFactsList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_facts', 'No invariant violations observed in examined state.')}</div>`;
+        if (el.btnMoreFacts) el.btnMoreFacts.style.display = 'none';
+      } else {
+        const visibleFacts = state.basicExpandedSections.facts ? facts : facts.slice(0, LIMIT);
+        el.basicFactsList.innerHTML = visibleFacts.map(f => {
+          const title = f.title || f.finding_id || f.c_type_path || 'Invariant Violation';
+          const desc = f.description || '';
+          const path = f.c_type_path ? `<span class="badge badge-neutral text-xs mono">${escapeHtml(f.c_type_path)}</span>` : '';
+          const valInfo = (f.current_value !== undefined && f.expected_value !== undefined)
+            ? `<div class="text-xs mono mt-1" style="color: var(--danger);">current: ${escapeHtml(String(f.current_value))} != expected: ${escapeHtml(String(f.expected_value))}</div>`
+            : '';
+          return `
+            <div class="basic-item-card">
+              <div class="basic-item-top">
+                <span class="basic-item-title">${escapeHtml(title)}</span>
+                ${path}
+              </div>
+              ${desc ? `<div class="basic-item-desc">${escapeHtml(desc)}</div>` : ''}
+              ${valInfo}
+            </div>
+          `;
+        }).join('');
+        if (el.btnMoreFacts) {
+          if (facts.length > LIMIT) {
+            el.btnMoreFacts.style.display = 'inline-block';
+            el.btnMoreFacts.textContent = state.basicExpandedSections.facts
+              ? t('btn_show_less', 'Show less')
+              : `${t('btn_show_more', 'Show more')} (${facts.length - LIMIT})`;
+          } else {
+            el.btnMoreFacts.style.display = 'none';
+          }
+        }
+      }
+    }
+
+    // 2B: Causes / Hypotheses
+    if (el.basicCausesCount) el.basicCausesCount.textContent = `(${causes.length})`;
+    if (el.basicCausesList) {
+      if (causes.length === 0) {
+        el.basicCausesList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_causes', 'No competing causal hypotheses generated.')}</div>`;
+        if (el.btnMoreCauses) el.btnMoreCauses.style.display = 'none';
+      } else {
+        const visibleCauses = state.basicExpandedSections.causes ? causes : causes.slice(0, LIMIT);
+        el.basicCausesList.innerHTML = visibleCauses.map(h => {
+          const title = h.title || h.function_name || h.description || h.hypothesis_id || 'Candidate Function';
+          const desc = h.description || '';
+          const plaus = h.plausibility || h.status || 'PROPOSED';
+          const fnName = h.function_name ? `<span class="mono text-xs" style="color: var(--accent);">${escapeHtml(h.function_name)}()</span>` : '';
+          const badgeClass = plaus === 'VALIDATED_CAUSAL_FUNCTION' ? 'badge-success' : 'badge-warning';
+          return `
+            <div class="basic-item-card">
+              <div class="basic-item-top">
+                <span class="basic-item-title">${escapeHtml(title)}</span>
+                <span class="badge ${badgeClass} text-xs">${escapeHtml(plaus)}</span>
+              </div>
+              ${fnName ? `<div class="mt-1">${fnName}</div>` : ''}
+              ${desc ? `<div class="basic-item-desc">${escapeHtml(desc)}</div>` : ''}
+            </div>
+          `;
+        }).join('');
+        if (el.btnMoreCauses) {
+          if (causes.length > LIMIT) {
+            el.btnMoreCauses.style.display = 'inline-block';
+            el.btnMoreCauses.textContent = state.basicExpandedSections.causes
+              ? t('btn_show_less', 'Show less')
+              : `${t('btn_show_more', 'Show more')} (${causes.length - LIMIT})`;
+          } else {
+            el.btnMoreCauses.style.display = 'none';
+          }
+        }
+      }
+    }
+
+    // 2C: Next steps
+    if (el.basicNextCount) el.basicNextCount.textContent = `(${nextSteps.length})`;
+    if (el.basicNextList) {
+      if (nextSteps.length === 0) {
+        el.basicNextList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_next', 'All automated verification steps completed.')}</div>`;
+        if (el.btnMoreNext) el.btnMoreNext.style.display = 'none';
+      } else {
+        const visibleNext = state.basicExpandedSections.next ? nextSteps : nextSteps.slice(0, LIMIT);
+        el.basicNextList.innerHTML = visibleNext.map((s, idx) => {
+          const act = s.action || s.title || (typeof s === 'string' ? s : JSON.stringify(s));
+          const rationale = s.rationale || s.description || '';
+          return `
+            <div class="basic-item-card">
+              <div class="basic-item-top">
+                <span class="basic-item-title">${idx + 1}. ${escapeHtml(act)}</span>
+              </div>
+              ${rationale ? `<div class="basic-item-desc">${escapeHtml(rationale)}</div>` : ''}
+            </div>
+          `;
+        }).join('');
+        if (el.btnMoreNext) {
+          if (nextSteps.length > LIMIT) {
+            el.btnMoreNext.style.display = 'inline-block';
+            el.btnMoreNext.textContent = state.basicExpandedSections.next
+              ? t('btn_show_less', 'Show less')
+              : `${t('btn_show_more', 'Show more')} (${nextSteps.length - LIMIT})`;
+          } else {
+            el.btnMoreNext.style.display = 'none';
+          }
+        }
+      }
+    }
+  }
+
+  function appendBasicChatBubble(role, content) {
+    if (!el.basicChatHistory) return;
+    const bubble = document.createElement('div');
+    bubble.className = role === 'user' ? 'chat-bubble-user' : 'chat-bubble-assistant';
+    bubble.innerHTML = `
+      <div style="font-weight: 600; font-size: 0.72rem; color: var(--text-muted); margin-bottom: 2px;">
+        ${role === 'user' ? (state.currentLang === 'ko' ? '👤 사용자' : '👤 Operator') : (state.currentLang === 'ko' ? '🤖 dynamicState 분석기' : '🤖 dynamicState Assistant')}
+      </div>
+      <div>${escapeHtml(content)}</div>
+    `;
+    el.basicChatHistory.appendChild(bubble);
+    el.basicChatHistory.scrollTop = el.basicChatHistory.scrollHeight;
+  }
+
+  async function handleBasicAskQuestion() {
+    if (!el.basicQuestionInput) return;
+    const message = el.basicQuestionInput.value.trim();
+    if (!message) return;
+
+    const invId = state.selectedInvestigationId || (state.activeInvestigation && state.activeInvestigation.investigation_id);
+    if (!invId) {
+      showToast(state.currentLang === 'ko' ? '먼저 대상을 연결하고 분석해주세요.' : 'Please connect and analyze a target first.', 'warning');
+      return;
+    }
+
+    appendBasicChatBubble('user', message);
+    el.basicQuestionInput.value = '';
+
+    if (el.btnBasicAsk) {
+      el.btnBasicAsk.disabled = true;
+      el.btnBasicAsk.textContent = '...';
+    }
+
+    const loadingBubble = document.createElement('div');
+    loadingBubble.className = 'chat-bubble-assistant';
+    loadingBubble.id = 'basic-chat-loading';
+    loadingBubble.innerHTML = `<span class="spinner-inline"></span> ${state.currentLang === 'ko' ? '분석 중...' : 'Analyzing...'}`;
+    if (el.basicChatHistory) {
+      el.basicChatHistory.appendChild(loadingBubble);
+      el.basicChatHistory.scrollTop = el.basicChatHistory.scrollHeight;
+    }
+
+    try {
+      const res = await apiPost('/api/investigation/chat', {
+        investigation_id: invId,
+        message: message,
+        request_id: `basic_chat_${Date.now()}`,
+        allow_fallback: true,
+        locale: state.currentLang || 'en',
+      });
+
+      if (loadingBubble.parentNode) {
+        loadingBubble.parentNode.removeChild(loadingBubble);
+      }
+
+      if (res.success && res.data) {
+        appendBasicChatBubble('assistant', res.data.summary || (state.currentLang === 'ko' ? '분석이 완료되었습니다.' : 'Analysis completed.'));
+        await loadActiveInvestigation(invId);
+      } else {
+        const errMsg = res.error?.message || (state.currentLang === 'ko' ? '분석 실패' : 'Analysis failed');
+        appendBasicChatBubble('assistant', `⚠️ ${errMsg}`);
+      }
+    } catch (err) {
+      if (loadingBubble.parentNode) {
+        loadingBubble.parentNode.removeChild(loadingBubble);
+      }
+      appendBasicChatBubble('assistant', `⚠️ ${String(err)}`);
+    } finally {
+      if (el.btnBasicAsk) {
+        el.btnBasicAsk.disabled = false;
+        el.btnBasicAsk.textContent = t('btn_basic_ask', 'Ask');
+      }
+    }
+  }
+
+  function initBasicModeHandlers() {
+    if (el.btnBasicConnectAnalyze) {
+      el.btnBasicConnectAnalyze.addEventListener('click', handleBasicConnectAndAnalyze);
+    }
+    if (el.basicTargetPid) {
+      el.basicTargetPid.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (el.basicDebugImage && !el.basicDebugImage.value) {
+            el.basicDebugImage.focus();
+          } else {
+            handleBasicConnectAndAnalyze();
+          }
+        }
+      });
+    }
+    if (el.basicDebugImage) {
+      el.basicDebugImage.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          handleBasicConnectAndAnalyze();
+        }
+      });
+    }
+    if (el.btnBasicDisconnect) {
+      el.btnBasicDisconnect.addEventListener('click', handleBasicDisconnect);
+    }
+    if (el.btnMoreFacts) {
+      el.btnMoreFacts.addEventListener('click', () => {
+        state.basicExpandedSections.facts = !state.basicExpandedSections.facts;
+        renderBasicInvestigationView();
+      });
+    }
+    if (el.btnMoreCauses) {
+      el.btnMoreCauses.addEventListener('click', () => {
+        state.basicExpandedSections.causes = !state.basicExpandedSections.causes;
+        renderBasicInvestigationView();
+      });
+    }
+    if (el.btnMoreNext) {
+      el.btnMoreNext.addEventListener('click', () => {
+        state.basicExpandedSections.next = !state.basicExpandedSections.next;
+        renderBasicInvestigationView();
+      });
+    }
+    if (el.btnBasicAsk) {
+      el.btnBasicAsk.addEventListener('click', handleBasicAskQuestion);
+    }
+    if (el.basicQuestionInput) {
+      el.basicQuestionInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          handleBasicAskQuestion();
+        }
+      });
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Phase 21: Temporal Memory Explorer & Replay State & Logic
+  // --------------------------------------------------------------------------
+
+  const teState = {
+    sessionId: null,
+    targetPid: null,
+    companionElf: '',
+    status: 'STOPPED',
+    intervalMs: 500,
+    maxSamples: 1000,
+    mappings: [],
+    threads: [],
+    discoverableVars: [],
+    watchItems: [],
+    observations: [],
+    gaps: [],
+    currentIndex: 0,
+    isPlaying: false,
+    playIntervalId: null,
+    pollIntervalId: null,
+    mapFilter: 'all',
+  };
+
+  function initTemporalExplorerHandlers() {
+    const btnStart = document.getElementById('btn-te-start-session');
+    const btnStop = document.getElementById('btn-te-stop-session');
+    const btnRefreshMap = document.getElementById('btn-te-refresh-map');
+    const btnToggleCustom = document.getElementById('btn-te-toggle-add-custom');
+    const btnSubmitCustom = document.getElementById('btn-te-submit-custom-watch');
+
+    const btnHome = document.getElementById('btn-te-replay-home');
+    const btnPrev = document.getElementById('btn-te-replay-prev');
+    const btnPlay = document.getElementById('btn-te-replay-play');
+    const btnNext = document.getElementById('btn-te-replay-next');
+    const btnEnd = document.getElementById('btn-te-replay-end');
+    const slider = document.getElementById('te-replay-slider');
+
+    const inputVarSearch = document.getElementById('te-var-search');
+    const filterBtns = document.querySelectorAll('.te-map-filter');
+
+    if (btnStart) btnStart.addEventListener('click', handleTeStartSession);
+    if (btnStop) btnStop.addEventListener('click', handleTeStopSession);
+    if (btnRefreshMap) btnRefreshMap.addEventListener('click', () => loadTemporalMemoryMap(true));
+    if (btnToggleCustom) {
+      btnToggleCustom.addEventListener('click', () => {
+        const p = document.getElementById('te-custom-add-panel');
+        if (p) p.style.display = p.style.display === 'none' ? 'block' : 'none';
+      });
+    }
+    if (btnSubmitCustom) btnSubmitCustom.addEventListener('click', handleTeSubmitCustomWatch);
+
+    // Replay controls
+    if (btnHome) btnHome.addEventListener('click', () => seekTemporalReplay(0));
+    if (btnPrev) btnPrev.addEventListener('click', () => stepTemporalReplay(-1));
+    if (btnPlay) btnPlay.addEventListener('click', toggleTemporalPlayback);
+    if (btnNext) btnNext.addEventListener('click', () => stepTemporalReplay(1));
+    if (btnEnd) btnEnd.addEventListener('click', () => seekTemporalReplay(-1));
+    if (slider) {
+      slider.addEventListener('input', (e) => {
+        seekTemporalReplay(parseInt(e.target.value, 10));
+      });
+    }
+
+    // Mapping filters
+    filterBtns.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        filterBtns.forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        teState.mapFilter = btn.getAttribute('data-filter') || 'all';
+        renderTeMappings();
+      });
+    });
+
+    // Variable search filter
+    if (inputVarSearch) {
+      inputVarSearch.addEventListener('input', () => {
+        renderTeDiscoverableVars();
+      });
+    }
+
+    // Global keyboard listener (strictly guarded against input/textarea typing)
+    window.addEventListener('keydown', (e) => {
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'SELECT' || activeEl.isContentEditable)) {
+        return;
+      }
+      if (state.activeTab !== 'tab-temporal-explorer') {
+        return;
+      }
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        stepTemporalReplay(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        stepTemporalReplay(1);
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        seekTemporalReplay(0);
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        seekTemporalReplay(-1);
+      } else if (e.key === ' ' || e.code === 'Space') {
+        e.preventDefault();
+        toggleTemporalPlayback();
+      }
+    });
+  }
+
+  function loadTemporalExplorerView() {
+    const inputPid = document.getElementById('te-target-pid');
+    const inputElf = document.getElementById('te-companion-elf');
+
+    // Auto-fill from active target or basic inputs if available
+    const basicPid = document.getElementById('basic-target-pid');
+    const basicElf = document.getElementById('basic-debug-image');
+    if (inputPid && !inputPid.value && basicPid && basicPid.value) {
+      inputPid.value = basicPid.value;
+    }
+    if (inputElf && !inputElf.value && basicElf && basicElf.value) {
+      inputElf.value = basicElf.value;
+    }
+
+    if (inputPid && inputPid.value && (!teState.mappings || teState.mappings.length === 0)) {
+      loadTemporalMemoryMap(false);
+    }
+
+    renderTeWatchList();
+    renderTemporalCurrentSnapshot();
+    renderTemporalMatrix();
+  }
+
+  async function loadTemporalMemoryMap(showToast = false) {
+    const inputPid = document.getElementById('te-target-pid');
+    const inputElf = document.getElementById('te-companion-elf');
+    const pidVal = inputPid ? inputPid.value.trim() : '';
+    if (!pidVal) {
+      if (showToast) showToastNotification('Please enter a target PID to inspect memory mappings', 'warning');
+      return;
+    }
+
+    const elfVal = inputElf ? inputElf.value.trim() : '';
+    let url = `/api/watch/memory-map?pid=${encodeURIComponent(pidVal)}`;
+    if (elfVal) {
+      url += `&companion_elf=${encodeURIComponent(elfVal)}`;
+    }
+
+    const res = await apiGet(url);
+    if (res.success && res.data) {
+      teState.targetPid = res.data.pid;
+      teState.mappings = res.data.mappings || [];
+      teState.threads = res.data.threads || [];
+      teState.discoverableVars = res.data.discoverable_variables || [];
+
+      renderTeThreads();
+      renderTeMappings();
+      renderTeDiscoverableVars();
+
+      if (showToast) showToastNotification(`Memory map & ${teState.discoverableVars.length} variables loaded`, 'success');
+    } else {
+      if (showToast) showToastNotification(res.error?.message || 'Failed to inspect memory map', 'error');
+    }
+  }
+
+  function renderTeThreads() {
+    const tbody = document.getElementById('te-threads-tbody');
+    const countEl = document.getElementById('te-threads-count');
+    if (!tbody) return;
+
+    if (countEl) countEl.textContent = `${teState.threads.length} threads`;
+
+    if (teState.threads.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted py-3">No active threads discovered</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = teState.threads.map((t) => {
+      const stateBadge = t.state === 'R'
+        ? '<span class="badge badge-success">Running (R)</span>'
+        : (t.state === 'S' ? '<span class="badge badge-neutral">Sleeping (S)</span>' : `<span class="badge">${escapeHtml(t.state)}</span>`);
+      return `<tr>
+        <td class="mono font-bold">${t.tid}</td>
+        <td>${escapeHtml(t.name)}</td>
+        <td>${stateBadge}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderTeMappings() {
+    const tbody = document.getElementById('te-mappings-tbody');
+    if (!tbody) return;
+
+    let filtered = teState.mappings;
+    if (teState.mapFilter !== 'all') {
+      filtered = filtered.filter((m) => {
+        if (teState.mapFilter === 'data') return m.category === 'data' || m.permissions.includes('w');
+        if (teState.mapFilter === 'heap') return m.category === 'heap';
+        if (teState.mapFilter === 'stack') return m.category === 'stack';
+        return true;
+      });
+    }
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">No mappings match filter</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = filtered.map((m) => {
+      const catBadgeClass = m.category === 'heap' ? 'badge-warning' : (m.category === 'stack' ? 'badge-info' : (m.category === 'code' ? 'badge-success' : 'badge-neutral'));
+      const sizeKb = Math.round(m.size / 1024);
+      return `<tr>
+        <td class="mono">${escapeHtml(m.start)} - ${escapeHtml(m.end)}</td>
+        <td class="mono">${sizeKb} KB</td>
+        <td class="mono font-semibold">${escapeHtml(m.permissions)}</td>
+        <td><span class="badge ${catBadgeClass}">${escapeHtml(m.category)}</span></td>
+        <td class="mono text-muted text-xs truncate" title="${escapeHtml(m.pathname)}">${escapeHtml(m.pathname || '[anonymous]')}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderTeDiscoverableVars() {
+    const tbody = document.getElementById('te-vars-tbody');
+    const inputSearch = document.getElementById('te-var-search');
+    if (!tbody) return;
+
+    const query = inputSearch ? inputSearch.value.trim().toLowerCase() : '';
+    let filtered = teState.discoverableVars;
+    if (query) {
+      filtered = filtered.filter((v) =>
+        (v.name && v.name.toLowerCase().includes(query)) ||
+        (v.type_name && v.type_name.toLowerCase().includes(query)) ||
+        (v.source_location && v.source_location.toLowerCase().includes(query))
+      );
+    }
+
+    if (filtered.length === 0) {
+      const msg = teState.discoverableVars.length === 0
+        ? 'Load companion ELF with DWARF to discover variables'
+        : 'No variables match search query';
+      tbody.innerHTML = `<tr><td colspan="6" class="text-center text-muted py-3">${escapeHtml(msg)}</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = filtered.map((v, idx) => {
+      const isAlreadyWatched = teState.watchItems.some((w) => w.name === v.name || w.address === v.runtime_address);
+      const btnAction = isAlreadyWatched
+        ? '<span class="badge badge-success">✓ Watching</span>'
+        : `<button type="button" class="btn btn-xs btn-outline" onclick="window.__addTeWatchFromVar(${idx})">➕ Watch</button>`;
+
+      return `<tr>
+        <td class="mono font-bold text-accent">${escapeHtml(v.name)}</td>
+        <td class="mono">${escapeHtml(v.type_name)}</td>
+        <td class="mono">${escapeHtml(v.runtime_address)}</td>
+        <td class="mono">${v.size} bytes</td>
+        <td class="text-muted text-xs">${escapeHtml(v.source_location || 'unknown')}</td>
+        <td>${btnAction}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  window.__addTeWatchFromVar = function (varIdx) {
+    const v = teState.discoverableVars[varIdx];
+    if (!v) return;
+
+    addWatchItem({
+      name: v.name,
+      scope: 'global',
+      address: v.runtime_address,
+      type_name: v.type_name,
+      size: v.size,
+      source_location: v.source_location,
+    });
+  };
+
+  async function handleTeSubmitCustomWatch() {
+    const inputName = document.getElementById('te-custom-name');
+    const inputAddr = document.getElementById('te-custom-address');
+    const inputType = document.getElementById('te-custom-type');
+    const inputSize = document.getElementById('te-custom-size');
+
+    const name = inputName ? inputName.value.trim() : '';
+    const addr = inputAddr ? inputAddr.value.trim() : '';
+    const type_name = inputType ? inputType.value : 'raw_bytes';
+    const size = inputSize ? parseInt(inputSize.value, 10) : 4;
+
+    if (!addr) {
+      showToastNotification('Hex memory address is required (e.g. 0x7ffe...)', 'warning');
+      return;
+    }
+
+    await addWatchItem({
+      name: name || `range_${addr}`,
+      scope: 'address_range',
+      address: addr,
+      type_name: type_name,
+      size: size,
+    });
+
+    if (inputAddr) inputAddr.value = '';
+    if (inputName) inputName.value = '';
+  }
+
+  async function addWatchItem(itemObj) {
+    if (teState.sessionId) {
+      // Session is active: dispatch via REST API
+      const res = await apiPost(`/api/watch/session/${teState.sessionId}/watch`, {
+        action: 'add',
+        item: itemObj,
+      });
+      if (res.success && res.data) {
+        // Refresh session
+        await refreshTeSessionState();
+        showToastNotification(`Added watch item '${itemObj.name}'`, 'success');
+      } else {
+        showToastNotification(res.error?.message || 'Failed to add watch item', 'error');
+      }
+    } else {
+      // Local addition before session start
+      const addrInt = typeof itemObj.address === 'string' && itemObj.address.startsWith('0x')
+        ? parseInt(itemObj.address, 16)
+        : parseInt(itemObj.address, 10);
+      const itemId = `watch_${itemObj.name}_${Math.floor(Math.random() * 10000)}`;
+
+      teState.watchItems.push({
+        item_id: itemId,
+        name: itemObj.name,
+        scope: itemObj.scope || 'global',
+        address: typeof itemObj.address === 'string' ? itemObj.address : `0x${addrInt.toString(16)}`,
+        address_int: addrInt,
+        type_name: itemObj.type_name || 'raw_bytes',
+        size: itemObj.size || 4,
+        source_location: itemObj.source_location,
+        status: 'ACTIVE',
+      });
+
+      renderTeWatchList();
+      renderTeDiscoverableVars();
+      showToastNotification(`Added watch item '${itemObj.name}'`, 'success');
+    }
+  }
+
+  window.__removeTeWatchItem = async function (itemId) {
+    if (teState.sessionId) {
+      const res = await apiPost(`/api/watch/session/${teState.sessionId}/watch`, {
+        action: 'remove',
+        item_id: itemId,
+      });
+      if (res.success) {
+        await refreshTeSessionState();
+        showToastNotification('Watch item removed', 'info');
+      } else {
+        showToastNotification(res.error?.message || 'Failed to remove watch item', 'error');
+      }
+    } else {
+      teState.watchItems = teState.watchItems.filter((w) => w.item_id !== itemId);
+      renderTeWatchList();
+      renderTeDiscoverableVars();
+      showToastNotification('Watch item removed', 'info');
+    }
+  };
+
+  function renderTeWatchList() {
+    const tbody = document.getElementById('te-watchlist-tbody');
+    if (!tbody) return;
+
+    if (teState.watchItems.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-3">No watch items selected. Pick from variables above or add a custom range.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = teState.watchItems.map((w) => {
+      const stBadgeClass = w.status === 'ACTIVE' ? 'badge-success' : 'badge-neutral';
+      return `<tr>
+        <td class="mono text-xs text-muted">${escapeHtml(w.item_id)}</td>
+        <td class="mono font-bold text-accent">${escapeHtml(w.name)}</td>
+        <td><span class="badge badge-secondary">${escapeHtml(w.scope)}</span></td>
+        <td class="mono">${escapeHtml(w.type_name)}</td>
+        <td class="mono">${escapeHtml(w.address)}</td>
+        <td class="mono">${w.size}B</td>
+        <td><span class="badge ${stBadgeClass}">${escapeHtml(w.status)}</span></td>
+        <td>
+          <button type="button" class="btn btn-xs btn-outline" onclick="window.__removeTeWatchItem('${escapeHtml(w.item_id)}')">🗑️ Remove</button>
+        </td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function handleTeStartSession() {
+    const inputPid = document.getElementById('te-target-pid');
+    const inputElf = document.getElementById('te-companion-elf');
+    const selectInterval = document.getElementById('te-select-interval');
+    const inputMaxSamples = document.getElementById('te-input-max-samples');
+
+    const pid = inputPid ? parseInt(inputPid.value, 10) : 0;
+    if (!pid || isNaN(pid) || pid <= 0) {
+      showToastNotification('Please enter a valid target process PID', 'error');
+      return;
+    }
+
+    const companionElf = inputElf ? inputElf.value.trim() : '';
+    const intervalMs = selectInterval ? parseInt(selectInterval.value, 10) : 500;
+    const maxSamples = inputMaxSamples ? parseInt(inputMaxSamples.value, 10) : 1000;
+
+    const btnStart = document.getElementById('btn-te-start-session');
+    if (btnStart) btnStart.disabled = true;
+
+    try {
+      const payload = {
+        pid: pid,
+        companion_elf: companionElf,
+        interval_ms: intervalMs,
+        max_samples: maxSamples,
+        watch_items: teState.watchItems,
+      };
+
+      const res = await apiPost('/api/watch/session/create', payload);
+      if (res.success && res.data) {
+        teState.sessionId = res.data.session_id;
+        teState.status = res.data.status;
+        teState.targetPid = pid;
+        teState.companionElf = companionElf;
+        teState.watchItems = res.data.watch_items || [];
+        teState.observations = res.data.observations || [];
+        teState.gaps = res.data.gaps || [];
+
+        // Update UI Badges & Telemetry
+        const badgeStatus = document.getElementById('te-badge-session-status');
+        const badgeBuildId = document.getElementById('te-badge-buildid');
+        const statSessId = document.getElementById('te-stat-session-id');
+        const btnStop = document.getElementById('btn-te-stop-session');
+
+        if (badgeStatus) {
+          badgeStatus.textContent = 'RUNNING';
+          badgeStatus.className = 'badge badge-success';
+        }
+        if (badgeBuildId) {
+          badgeBuildId.textContent = 'BUILD ID: MATCHED';
+          badgeBuildId.className = 'badge badge-success';
+        }
+        if (statSessId) statSessId.textContent = teState.sessionId;
+        if (btnStop) btnStop.disabled = false;
+
+        renderTeWatchList();
+        startTePolling();
+        showToastNotification(`Watch Session '${teState.sessionId}' started (interval: ${intervalMs}ms)`, 'success');
+      } else {
+        const badgeBuildId = document.getElementById('te-badge-buildid');
+        if (badgeBuildId && res.error?.code === 'BUILD_ID_MISMATCH') {
+          badgeBuildId.textContent = 'BUILD ID: MISMATCH';
+          badgeBuildId.className = 'badge badge-danger';
+        }
+        if (btnStart) btnStart.disabled = false;
+        showToastNotification(res.error?.message || 'Failed to start watch session', 'error');
+      }
+    } catch (err) {
+      if (btnStart) btnStart.disabled = false;
+      showToastNotification(`Error starting session: ${err}`, 'error');
+    }
+  }
+
+  async function handleTeStopSession() {
+    if (!teState.sessionId) return;
+    const res = await apiPost(`/api/watch/session/${teState.sessionId}/stop`);
+    stopTePolling();
+
+    const badgeStatus = document.getElementById('te-badge-session-status');
+    const btnStart = document.getElementById('btn-te-start-session');
+    const btnStop = document.getElementById('btn-te-stop-session');
+
+    if (badgeStatus) {
+      badgeStatus.textContent = 'STOPPED';
+      badgeStatus.className = 'badge badge-neutral';
+    }
+    if (btnStart) btnStart.disabled = false;
+    if (btnStop) btnStop.disabled = true;
+
+    if (res.success && res.data) {
+      teState.status = 'STOPPED';
+      teState.observations = res.data.observations || teState.observations;
+      teState.gaps = res.data.gaps || teState.gaps;
+      renderTemporalCurrentSnapshot();
+      renderTemporalMatrix();
+      showToastNotification('Watch session stopped', 'info');
+    }
+  }
+
+  function startTePolling() {
+    stopTePolling();
+    teState.pollIntervalId = setInterval(async () => {
+      if (!teState.sessionId) return;
+      await refreshTeSessionState();
+    }, 1000);
+  }
+
+  function stopTePolling() {
+    if (teState.pollIntervalId) {
+      clearInterval(teState.pollIntervalId);
+      teState.pollIntervalId = null;
+    }
+  }
+
+  async function refreshTeSessionState() {
+    if (!teState.sessionId) return;
+    const res = await apiGet(`/api/watch/session/${teState.sessionId}/observations`);
+    if (res.success && res.data) {
+      const prevCount = teState.observations.length;
+      teState.observations = res.data.observations || [];
+      teState.gaps = res.data.gaps || [];
+      teState.status = res.data.status;
+      if (res.data.watch_items) {
+        teState.watchItems = res.data.watch_items;
+        renderTeWatchList();
+      }
+
+      // Update counters
+      const statSamples = document.getElementById('te-stat-samples');
+      const statGaps = document.getElementById('te-stat-gaps');
+      const statLatency = document.getElementById('te-stat-latency');
+      if (statSamples) statSamples.textContent = teState.observations.length;
+      if (statGaps) statGaps.textContent = teState.gaps.length;
+
+      if (teState.observations.length > 0) {
+        const latest = teState.observations[teState.observations.length - 1];
+        if (statLatency && latest.capture_latency_us !== undefined) {
+          statLatency.textContent = `${latest.capture_latency_us} µs`;
+        }
+
+        // Auto-advance scrubber if user was at previous latest sample
+        if (teState.currentIndex >= prevCount - 1 || teState.currentIndex === 0) {
+          teState.currentIndex = teState.observations.length - 1;
+        }
+
+        // Update slider range
+        const slider = document.getElementById('te-replay-slider');
+        if (slider) {
+          slider.disabled = false;
+          slider.min = '0';
+          slider.max = String(Math.max(0, teState.observations.length - 1));
+          slider.value = String(teState.currentIndex);
+        }
+      }
+
+      // Check if session terminated
+      if (teState.status === 'STOPPED') {
+        stopTePolling();
+        const badgeStatus = document.getElementById('te-badge-session-status');
+        const btnStart = document.getElementById('btn-te-start-session');
+        const btnStop = document.getElementById('btn-te-stop-session');
+        if (badgeStatus) {
+          badgeStatus.textContent = 'STOPPED';
+          badgeStatus.className = 'badge badge-neutral';
+        }
+        if (btnStart) btnStart.disabled = false;
+        if (btnStop) btnStop.disabled = true;
+      }
+
+      renderTemporalCurrentSnapshot();
+      renderTemporalMatrix();
+    }
+  }
+
+  function renderTemporalCurrentSnapshot() {
+    const tbody = document.getElementById('te-temporal-tbody');
+    const infoEl = document.getElementById('te-replay-info');
+    const gapAlert = document.getElementById('te-gap-alert');
+    const slider = document.getElementById('te-replay-slider');
+
+    if (!tbody) return;
+
+    if (teState.observations.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-4">Start session and record observations to explore temporal state</td></tr>';
+      if (infoEl) infoEl.textContent = 'No observations recorded';
+      if (slider) slider.disabled = true;
+      if (gapAlert) gapAlert.style.display = 'none';
+      return;
+    }
+
+    if (slider) {
+      slider.disabled = false;
+      slider.value = String(teState.currentIndex);
+    }
+
+    const obs = teState.observations[teState.currentIndex];
+    const prevObs = teState.currentIndex > 0 ? teState.observations[teState.currentIndex - 1] : null;
+
+    if (infoEl && obs) {
+      const monoSec = (obs.monotonic_ns / 1_000_000_000).toFixed(3);
+      infoEl.textContent = `Sample ${obs.seq} / ${teState.observations.length} • Monotonic: ${monoSec}s • ${obs.timestamp}`;
+    }
+
+    // Check if this sample followed a gap
+    if (gapAlert) {
+      const hasRecentGap = teState.gaps.some((g) => obs && g.timestamp && g.timestamp <= obs.timestamp);
+      gapAlert.style.display = hasRecentGap ? 'flex' : 'none';
+    }
+
+    if (!obs || !obs.values) {
+      tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">No values recorded for this snapshot</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = teState.watchItems.map((item) => {
+      const itemVal = obs.values[item.item_id] || {};
+      const prevVal = prevObs && prevObs.values ? (prevObs.values[item.item_id] || {}) : null;
+
+      const currV = itemVal.value;
+      const prevV = prevVal ? prevVal.value : null;
+
+      const isChanged = prevVal && currV !== prevV && currV !== undefined && prevV !== undefined;
+      const valClass = isChanged ? 'val-changed' : '';
+
+      // Format value
+      let valDisplay = '<span class="text-muted">None</span>';
+      if (currV !== null && currV !== undefined) {
+        if (typeof currV === 'number') {
+          valDisplay = `<span class="${valClass} mono font-bold">${currV}</span>`;
+        } else {
+          valDisplay = `<span class="${valClass} mono">${escapeHtml(String(currV))}</span>`;
+        }
+      }
+
+      // Format delta / change
+      let deltaDisplay = '<span class="text-muted">&mdash;</span>';
+      if (isChanged) {
+        if (typeof currV === 'number' && typeof prevV === 'number') {
+          const diff = currV - prevV;
+          const diffStr = diff > 0 ? `+${diff}` : `${diff}`;
+          const diffClass = diff > 0 ? 'te-delta-up' : 'te-delta-down';
+          deltaDisplay = `<span class="${diffClass} mono">${diffStr}</span> <span class="text-muted text-xs">(from ${prevV})</span>`;
+        } else {
+          deltaDisplay = `<span class="val-changed text-xs">changed (was ${escapeHtml(String(prevV))})</span>`;
+        }
+      }
+
+      // Status Badge
+      const st = itemVal.status || 'UNAVAILABLE';
+      let stBadge = '<span class="badge te-status-unavailable">UNAVAILABLE</span>';
+      if (st === 'OBSERVED') stBadge = '<span class="badge te-status-observed">OBSERVED</span>';
+      else if (st === 'PARTIAL') stBadge = '<span class="badge te-status-partial">PARTIAL</span>';
+      else if (st === 'DECODE_ERROR') stBadge = '<span class="badge te-status-error">DECODE_ERROR</span>';
+
+      const hexStr = itemVal.raw_hex ? `0x${itemVal.raw_hex}` : '&mdash;';
+
+      return `<tr>
+        <td class="mono font-bold text-accent">${escapeHtml(item.name)}</td>
+        <td class="mono text-muted text-xs">${escapeHtml(item.type_name)} @ ${escapeHtml(item.address)}</td>
+        <td>${valDisplay}</td>
+        <td>${deltaDisplay}</td>
+        <td class="mono text-muted text-xs">${hexStr}</td>
+        <td>${stBadge}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderTemporalMatrix() {
+    const thead = document.getElementById('te-matrix-thead');
+    const tbody = document.getElementById('te-matrix-tbody');
+    const summary = document.getElementById('te-matrix-summary');
+    if (!thead || !tbody) return;
+
+    if (summary) summary.textContent = `${teState.observations.length} total samples`;
+
+    if (teState.observations.length === 0 || teState.watchItems.length === 0) {
+      thead.innerHTML = '<tr><th>Item</th></tr>';
+      tbody.innerHTML = '<tr><td class="text-center text-muted py-2">No time series data yet</td></tr>';
+      return;
+    }
+
+    // Show last 8 observations
+    const sliceCount = Math.min(8, teState.observations.length);
+    const startIdx = Math.max(0, teState.observations.length - sliceCount);
+    const windowObs = teState.observations.slice(startIdx);
+
+    // Build headers
+    thead.innerHTML = '<tr><th>Item</th>' + windowObs.map((o) => {
+      const isSelected = (o.seq === (teState.observations[teState.currentIndex]?.seq));
+      const selStyle = isSelected ? 'style="color: var(--accent); font-weight: bold;"' : '';
+      return `<th ${selStyle}>#${o.seq}</th>`;
+    }).join('') + '</tr>';
+
+    // Build rows
+    tbody.innerHTML = teState.watchItems.map((item) => {
+      let cells = `<td class="font-bold text-accent">${escapeHtml(item.name)}</td>`;
+      windowObs.forEach((o, oIdx) => {
+        const valObj = o.values ? (o.values[item.item_id] || {}) : {};
+        const val = valObj.value !== undefined && valObj.value !== null ? valObj.value : '-';
+
+        // Check if value changed from previous
+        let isChg = false;
+        if (oIdx > 0) {
+          const prevO = windowObs[oIdx - 1];
+          const prevVal = prevO.values ? prevO.values[item.item_id]?.value : null;
+          if (prevVal !== undefined && prevVal !== null && val !== '-' && val !== prevVal) {
+            isChg = true;
+          }
+        }
+        const chgClass = isChg ? 'val-changed' : '';
+        cells += `<td><span class="${chgClass}">${escapeHtml(String(val))}</span></td>`;
+      });
+      return `<tr>${cells}</tr>`;
+    }).join('');
+  }
+
+  function stepTemporalReplay(delta) {
+    if (teState.observations.length === 0) return;
+    const newIdx = Math.max(0, Math.min(teState.observations.length - 1, teState.currentIndex + delta));
+    teState.currentIndex = newIdx;
+    renderTemporalCurrentSnapshot();
+  }
+
+  function seekTemporalReplay(targetIdx) {
+    if (teState.observations.length === 0) return;
+    if (targetIdx === -1) {
+      targetIdx = teState.observations.length - 1;
+    }
+    teState.currentIndex = Math.max(0, Math.min(teState.observations.length - 1, targetIdx));
+    renderTemporalCurrentSnapshot();
+  }
+
+  function toggleTemporalPlayback() {
+    if (teState.observations.length === 0) return;
+    const btnPlay = document.getElementById('btn-te-replay-play');
+
+    if (teState.isPlaying) {
+      if (teState.playIntervalId) clearInterval(teState.playIntervalId);
+      teState.isPlaying = false;
+      if (btnPlay) {
+        btnPlay.textContent = '⏯️ Play';
+        btnPlay.className = 'btn btn-sm btn-primary';
+      }
+    } else {
+      if (teState.currentIndex >= teState.observations.length - 1) {
+        teState.currentIndex = 0;
+      }
+      teState.isPlaying = true;
+      if (btnPlay) {
+        btnPlay.textContent = '⏸️ Pause';
+        btnPlay.className = 'btn btn-sm btn-warning';
+      }
+
+      teState.playIntervalId = setInterval(() => {
+        if (teState.currentIndex >= teState.observations.length - 1) {
+          toggleTemporalPlayback();
+          return;
+        }
+        stepTemporalReplay(1);
+      }, 400);
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // Application Bootstrap
   // --------------------------------------------------------------------------
 
@@ -6665,6 +8027,8 @@
     initLabBranchAndReplay();
     initInvestigationOverview();
     initConversationalInvestigation();
+    initBasicModeHandlers();
+    initTemporalExplorerHandlers();
     bindEvents();
 
     await checkLLMProviderStatus();

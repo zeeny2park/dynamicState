@@ -1,6 +1,6 @@
 {
   "schema_version": "1.2.0",
-  "timestamp_utc": "2026-10-16T10:08:33.455448+00:00",
+  "timestamp_utc": "2026-10-16T14:54:00.253366+00:00",
   "corpus_version": "1.1.0",
   "corpus_hash": "cfb50179bbc1c95d9b4ec02aee7f4fae295db4609872d5713774a1c109a942c2",
   "fixture_hash": "cb7f5b191a787d7927d3a746caa7643130e62df45b0182c0c64a4a3d6268ad4d",
@@ -102,8 +102,8 @@
           "promoted_functions": [],
           "stage_provenance": {
             "spawn": {
-              "pid": 663881,
-              "binary_path": "/tmp/dynstate_phase19_bench_5sxwu5g9/fixture_target.stripped",
+              "pid": 873669,
+              "binary_path": "/tmp/dynstate_phase19_bench_v7c1lzmw/fixture_target.stripped",
               "binary_hash": "f9c2552def449cffda26e8c0a92076b04d36692703bfc06b3d76b80083956092",
               "build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567",
               "status": "SUCCESS"
@@ -127,7 +127,7 @@
               }
             },
             "snapshot_a": {
-              "path": "/tmp/dynstate_phase19_bench_5sxwu5g9/rep_0_1792145311553/snap_A_1792145311569",
+              "path": "/tmp/dynstate_phase19_bench_v7c1lzmw/rep_0_1792162438367/snap_A_1792162438384",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "status": "SUCCESS"
@@ -152,7 +152,7 @@
               }
             },
             "snapshot_b": {
-              "path": "/tmp/dynstate_phase19_bench_5sxwu5g9/rep_0_1792145311553/snap_B_1792145311597",
+              "path": "/tmp/dynstate_phase19_bench_v7c1lzmw/rep_0_1792162438367/snap_B_1792162438414",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "consistency": "STOPPED",
@@ -167,7 +167,7 @@
               "status": "SUCCESS",
               "findings_count": 20,
               "diff_trust": "CONFIRMED",
-              "debug_image": "/tmp/dynstate_phase19_bench_5sxwu5g9/fixture_target.debug",
+              "debug_image": "/tmp/dynstate_phase19_bench_v7c1lzmw/fixture_target.debug",
               "companion_build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567"
             },
             "stage_synthesis": {
@@ -252,8 +252,8 @@
           "promoted_functions": [],
           "stage_provenance": {
             "spawn": {
-              "pid": 663965,
-              "binary_path": "/tmp/dynstate_phase19_bench_5sxwu5g9/fixture_target.stripped",
+              "pid": 873740,
+              "binary_path": "/tmp/dynstate_phase19_bench_v7c1lzmw/fixture_target.stripped",
               "binary_hash": "f9c2552def449cffda26e8c0a92076b04d36692703bfc06b3d76b80083956092",
               "build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567",
               "status": "SUCCESS"
@@ -277,7 +277,7 @@
               }
             },
             "snapshot_a": {
-              "path": "/tmp/dynstate_phase19_bench_5sxwu5g9/rep_0_1792145311553/snap_A_1792145312019",
+              "path": "/tmp/dynstate_phase19_bench_v7c1lzmw/rep_0_1792162438367/snap_A_1792162438826",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "status": "SUCCESS"
@@ -302,7 +302,7 @@
               }
             },
             "snapshot_b": {
-              "path": "/tmp/dynstate_phase19_bench_5sxwu5g9/rep_0_1792145311553/snap_B_1792145312047",
+              "path": "/tmp/dynstate_phase19_bench_v7c1lzmw/rep_0_1792162438367/snap_B_1792162438855",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "consistency": "STOPPED",
@@ -317,7 +317,7 @@
               "status": "SUCCESS",
               "findings_count": 20,
               "diff_trust": "CONFIRMED",
-              "debug_image": "/tmp/dynstate_phase19_bench_5sxwu5g9/fixture_target.debug",
+              "debug_image": "/tmp/dynstate_phase19_bench_v7c1lzmw/fixture_target.debug",
               "companion_build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567"
             },
             "stage_synthesis": {
@@ -330,7 +330,7 @@
               "provider_used": "deterministic_fallback",
               "is_fallback": true,
               "model_used": "deterministic-engine",
-              "latency_ms": 1.63
+              "latency_ms": 1.7
             },
             "fixture_state_verification": {
               "status": "VERIFIED",
@@ -358,7 +358,7 @@
           },
           "is_fallback": true,
           "model_used": "deterministic-engine",
-          "latency_ms": 1.63
+          "latency_ms": 1.7
         }
       }
     ]
@@ -520,7 +520,7 @@
           "status": "COMPLETED_MODEL_RESPONSE",
           "is_fallback": true,
           "model": "deterministic-engine",
-          "latency_ms": 1.69,
+          "latency_ms": 1.68,
           "is_false_positive": false,
           "candidate_tier": "STATIC_CANDIDATE"
         }

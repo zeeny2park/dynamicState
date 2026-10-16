@@ -1,6 +1,6 @@
 # Phase 20 Investigation Quality Benchmark Report
 
-**Evaluation Timestamp (UTC):** `2026-10-16T10:08:33.455448+00:00`  
+**Evaluation Timestamp (UTC):** `2026-10-16T14:54:00.253366+00:00`  
 **Product Causal False-Positive SLA:** `✅ PASSED (0.0% FP)`  
 **Corpus Version:** `1.1.0` (`cfb50179bbc1`)  
 **Fixture SHA-256:** `cb7f5b191a78`  

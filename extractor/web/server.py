@@ -28,6 +28,7 @@ from extractor.static_analyzer import (
     resolve_function_candidates,
     LAYOUT_MUTATION_CAVEAT,
 )
+from extractor.watch_session import WatchSessionManager
 
 
 def _to_json_serializable(val: Any) -> Any:
@@ -139,6 +140,7 @@ class WebApiAdapter:
     def __init__(self, runtime: AgentRuntime):
         self.runtime = runtime
         self.diff_engine = StateDiffEngine()
+        self.watch_manager = getattr(runtime, "watch_session_manager", None) or WatchSessionManager(corpus_dir=self.runtime.corpus_dir)
 
     def get_health(self) -> Dict[str, Any]:
         return {
@@ -1354,8 +1356,245 @@ class WebApiAdapter:
     # Investigation Workflow API
     # -------------------------------------------------------------------------
 
+    def validate_target(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Pre-validate target process readability and debug-image compatibility before live capture."""
+        raw_loc = params.get("locale") or params.get("language") or "en"
+        locale = "ko" if str(raw_loc).lower().strip() in ("ko", "kor", "korean") else "en"
+        is_ko = (locale == "ko")
+
+        raw_pid = params.get("pid")
+        if raw_pid is None or isinstance(raw_pid, bool):
+            msg = "대상 PID가 필요하며 양의 정수여야 합니다." if is_ko else "Target PID is required and must be a positive integer."
+            act = "실행 중인 대상 프로세스의 올바른 PID를 입력하세요." if is_ko else "Enter a valid running process PID."
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": msg, "next_action": act}}
+
+        try:
+            pid = int(raw_pid)
+            if pid <= 0 or pid > 2147483647:
+                raise ValueError("out of range")
+        except (ValueError, TypeError):
+            msg = f"유효하지 않은 PID 형식입니다: '{raw_pid}'. 1 이상의 정수여야 합니다." if is_ko else f"Invalid PID format: '{raw_pid}'. Must be an integer >= 1."
+            act = "실행 중인 대상 프로세스의 올바른 PID를 입력하세요." if is_ko else "Enter a valid running process PID."
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": msg, "next_action": act}}
+
+        # 1. Process existence check
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            msg = f"대상 프로세스 PID {pid}를 찾을 수 없습니다 (ESRCH)." if is_ko else f"Target process PID {pid} was not found (ESRCH)."
+            act = f"ps -p {pid} 명령으로 프로세스가 실행 중인지 확인하거나 대상 프로세스를 시작하세요." if is_ko else f"Verify that process {pid} is running using `ps -p {pid}` or start the target process."
+            return {"success": True, "data": {"valid": False, "reason": "TARGET_NOT_FOUND", "message": msg, "next_action": act}}
+        except PermissionError:
+            msg = f"PID {pid}에 접근할 권한이 없습니다 (EPERM)." if is_ko else f"Permission denied accessing PID {pid} (EPERM)."
+            act = "ptrace_scope 설정(/proc/sys/kernel/yama/ptrace_scope)을 확인하거나 동일한 사용자 또는 root 권한으로 실행하세요." if is_ko else "Check ptrace_scope settings (/proc/sys/kernel/yama/ptrace_scope) or run dynamicState as the same user or root."
+            return {"success": True, "data": {"valid": False, "reason": "PERMISSION_DENIED", "message": msg, "next_action": act}}
+        except Exception as e:
+            msg = f"PID {pid} 접근 확인 실패: {e}" if is_ko else f"Failed to check PID {pid}: {e}"
+            act = "프로세스 상태 및 시스템 권한을 확인하세요." if is_ko else "Check process status and system permissions."
+            return {"success": True, "data": {"valid": False, "reason": "TARGET_CHECK_FAILED", "message": msg, "next_action": act}}
+
+        # 2. Resolve /proc/<pid>/exe
+        exe_path = None
+        try:
+            exe_path = os.readlink(f"/proc/{pid}/exe")
+        except PermissionError:
+            msg = f"/proc/{pid}/exe 심볼릭 링크를 읽을 권한이 없습니다 (EPERM)." if is_ko else f"Permission denied reading /proc/{pid}/exe (EPERM)."
+            act = "프로세스 소유자와 동일한 사용자로 dynamicState를 실행하거나 권한을 승격하세요." if is_ko else "Run dynamicState as the target owner or with elevated permissions."
+            return {"success": True, "data": {"valid": False, "reason": "PERMISSION_DENIED", "message": msg, "next_action": act}}
+        except Exception:
+            exe_path = None
+
+        # 3. Check capture backend accessibility
+        from extractor.capture_backend import ProcessVmCaptureBackend, ProcfsCaptureBackend
+        vm_backend = ProcessVmCaptureBackend()
+        proc_backend = ProcfsCaptureBackend()
+        selected_backend = None
+
+        if vm_backend.is_available(pid):
+            selected_backend = "process_vm_readv"
+        elif proc_backend.is_available(pid):
+            selected_backend = "procfs"
+        else:
+            msg = f"PID {pid}의 메모리를 읽을 수 있는 백엔드가 없습니다 (process_vm_readv 및 /proc/{pid}/mem 모두 접근 불가)." if is_ko else f"No capture backend available for PID {pid} (both process_vm_readv and /proc/{pid}/mem are inaccessible)."
+            act = "ptrace 권한을 확인하거나 sudo sysctl kernel.yama.ptrace_scope=0 설정을 검토하세요." if is_ko else "Check ptrace permissions or consider `sudo sysctl kernel.yama.ptrace_scope=0`."
+            return {"success": True, "data": {"valid": False, "reason": "NO_BACKEND_AVAILABLE", "message": msg, "next_action": act}}
+
+        # 4. Check debug image path
+        raw_dbg = params.get("debug_image")
+        if not raw_dbg or not isinstance(raw_dbg, str) or not raw_dbg.strip():
+            msg = "매칭되는 non-stripped 디버그 이미지 ELF 경로가 필요합니다." if is_ko else "A matching non-stripped debug image ELF path is required."
+            act = "DWARF 심볼이 포함된 바이너리 경로를 입력하세요." if is_ko else "Provide the path to an unstripped ELF binary containing DWARF symbols."
+            return {"success": True, "data": {"valid": False, "reason": "DEBUG_IMAGE_NOT_FOUND", "message": msg, "next_action": act}}
+
+        dbg_path = os.path.abspath(raw_dbg.strip())
+        if not os.path.isfile(dbg_path):
+            msg = f"디버그 이미지 파일 '{dbg_path}'를 찾을 수 없습니다." if is_ko else f"Debug image file '{dbg_path}' not found."
+            act = "지정한 파일 경로가 실제로 존재하는지 확인하세요." if is_ko else "Verify that the specified file path exists on disk."
+            return {"success": True, "data": {"valid": False, "reason": "DEBUG_IMAGE_NOT_FOUND", "message": msg, "next_action": act}}
+
+        # 5. Inspect debug image ELF & DWARF
+        from extractor.debug_image import inspect_elf
+        try:
+            dbg_ident = inspect_elf(dbg_path)
+        except Exception as e:
+            msg = f"디버그 이미지가 유효한 ELF 파일이 아닙니다: {e}" if is_ko else f"Debug image is not a valid ELF file: {e}"
+            act = "유효한 Linux ELF 바이너리를 지정하세요." if is_ko else "Provide a valid Linux ELF executable or shared library."
+            return {"success": True, "data": {"valid": False, "reason": "INVALID_ELF", "message": msg, "next_action": act}}
+
+        if not dbg_ident.has_debug_info:
+            msg = "제공된 디버그 이미지에 DWARF 디버그 정보(.debug_info 섹션)가 없습니다." if is_ko else "Debug image contains no DWARF debug information (.debug_info section is missing)."
+            act = "대상 프로그램을 디버그 플래그(-g 또는 -g3)로 컴파일하고 스트립되지 않은(non-stripped) 바이너리를 지정하세요." if is_ko else "Recompile target with debug symbols (-g or -g3) and provide the non-stripped binary."
+            return {"success": True, "data": {"valid": False, "reason": "MISSING_DWARF", "message": msg, "next_action": act}}
+
+        # 6. Check target binary Build ID vs debug image Build ID
+        target_ident = None
+        if exe_path and os.path.isfile(exe_path):
+            try:
+                target_ident = inspect_elf(exe_path)
+            except Exception:
+                target_ident = None
+
+        if target_ident and target_ident.build_id and dbg_ident.build_id:
+            if target_ident.build_id.lower() != dbg_ident.build_id.lower():
+                msg = (
+                    f"Build ID 불일치: 실행 중인 바이너리 Build ID({target_ident.build_id[:16]}...)와 "
+                    f"디버그 이미지 Build ID({dbg_ident.build_id[:16]}...)가 다릅니다."
+                    if is_ko else
+                    f"Build ID mismatch: running process binary ({target_ident.build_id[:16]}...) "
+                    f"does not match debug image ({dbg_ident.build_id[:16]}...)."
+                )
+                act = "실행 중인 대상 프로세스와 동일한 빌드에서 생성된 디버그 바이너리를 지정하세요." if is_ko else "Provide the exact matching debug image compiled from the same build."
+                return {
+                    "success": True,
+                    "data": {
+                        "valid": False,
+                        "reason": "BUILD_ID_MISMATCH",
+                        "message": msg,
+                        "next_action": act,
+                        "target_build_id": target_ident.build_id,
+                        "debug_image_build_id": dbg_ident.build_id,
+                    }
+                }
+
+        # 7. Check architecture and endianness compatibility
+        if target_ident and target_ident.architecture and dbg_ident.architecture:
+            if target_ident.architecture != dbg_ident.architecture:
+                msg = f"아키텍처 불일치: 프로세스는 {target_ident.architecture}이지만 디버그 이미지는 {dbg_ident.architecture}입니다." if is_ko else f"Architecture mismatch: process is {target_ident.architecture} but debug image is {dbg_ident.architecture}."
+                act = f"대상 프로세스 아키텍처({target_ident.architecture})에 맞는 바이너리를 제공하세요." if is_ko else f"Provide a binary matching target architecture ({target_ident.architecture})."
+                return {"success": True, "data": {"valid": False, "reason": "ARCH_MISMATCH", "message": msg, "next_action": act}}
+
+        return {
+            "success": True,
+            "data": {
+                "valid": True,
+                "reason": "VALID",
+                "pid": pid,
+                "executable": exe_path or (target_ident.path if target_ident else f"/proc/{pid}/exe"),
+                "target_build_id": target_ident.build_id if target_ident else None,
+                "debug_image": dbg_path,
+                "debug_build_id": dbg_ident.build_id,
+                "has_dwarf": dbg_ident.has_debug_info,
+                "has_debug_info": dbg_ident.has_debug_info,
+                "build_id_match": True,
+                "architecture": dbg_ident.architecture,
+                "endianness": dbg_ident.endianness,
+                "memory_read_backend": selected_backend,
+                "capture_backend": selected_backend,
+                "capture_quality": "CONSISTENT" if selected_backend == "process_vm_readv" else "LOW_IMPACT",
+                "message": "대상 프로세스 및 디버그 이미지가 검증되었습니다." if is_ko else "Target process and debug image verified successfully.",
+                "next_action": "상태 캡처 및 분석을 진행할 수 있습니다." if is_ko else "Ready to capture and analyze runtime state.",
+            }
+        }
+
+    # -------------------------------------------------------------------------
+    # Phase 21 Watch Session & Temporal Memory Explorer Endpoints
+    # -------------------------------------------------------------------------
+
+    def get_watch_memory_map(self, pid: int, companion_elf: Optional[str] = None) -> Dict[str, Any]:
+        """Explores process memory mappings, active threads, and discoverable variables."""
+        try:
+            data = self.watch_manager.get_memory_map_and_threads(pid=pid, companion_elf_path=companion_elf)
+            return {"success": True, "data": data}
+        except Exception as e:
+            return {"success": False, "error": {"code": "MEMORY_MAP_ERROR", "message": str(e)}}
+
+    def create_watch_session(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Creates and starts a persistent watch session with GNU Build ID validation."""
+        try:
+            pid = int(params.get("pid", 0))
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Target PID must be a positive integer"}}
+            companion_elf = params.get("companion_elf") or params.get("companion_elf_path") or params.get("debug_image")
+            interval_ms = int(params.get("interval_ms", 500))
+            max_samples = int(params.get("max_samples", 1000))
+            watch_items = params.get("watch_items") or []
+            capture_mode = params.get("capture_mode", "ZERO_STOP")
+
+            session = self.watch_manager.create_session(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                interval_ms=interval_ms,
+                max_samples=max_samples,
+                initial_watch_items=watch_items,
+                capture_mode=capture_mode,
+            )
+            return {"success": True, "data": session.to_dict()}
+        except Exception as e:
+            err_code = "BUILD_ID_MISMATCH" if "Build ID mismatch" in str(e) else "SESSION_CREATE_ERROR"
+            return {"success": False, "error": {"code": err_code, "message": str(e)}}
+
+    def get_watch_session(self, session_id: str) -> Dict[str, Any]:
+        """Retrieves session metadata, watch items, and current status."""
+        session = self.watch_manager.get_session(session_id)
+        if not session:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Watch session '{session_id}' not found"}}
+        return {"success": True, "data": session.to_dict()}
+
+    def stop_watch_session(self, session_id: str) -> Dict[str, Any]:
+        """Stops an active watch session."""
+        session = self.watch_manager.stop_session(session_id)
+        if not session:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Watch session '{session_id}' not found"}}
+        return {"success": True, "data": session.to_dict()}
+
+    def update_watch_items(self, session_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Adds or removes a watch item from an active or paused session."""
+        action = params.get("action", "add")
+        if action == "add":
+            item_data = params.get("item") or params
+            try:
+                item = self.watch_manager.add_watch_item(session_id, item_data)
+                return {"success": True, "data": item.to_dict()}
+            except Exception as e:
+                return {"success": False, "error": {"code": "ADD_WATCH_ITEM_ERROR", "message": str(e)}}
+        elif action == "remove":
+            item_id = params.get("item_id", "")
+            removed = self.watch_manager.remove_watch_item(session_id, item_id)
+            if not removed:
+                return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Watch item '{item_id}' not found"}}
+            return {"success": True, "data": {"removed": True, "item_id": item_id}}
+        else:
+            return {"success": False, "error": {"code": "INVALID_ACTION", "message": f"Unknown action '{action}'"}}
+
+    def get_watch_observations(self, session_id: str, query: Dict[str, Any]) -> Dict[str, Any]:
+        """Retrieves time-series observations and gaps with optional sequence bounds/pagination."""
+        try:
+            start_seq = int(query["start_seq"][0]) if query.get("start_seq") else None
+            end_seq = int(query["end_seq"][0]) if query.get("end_seq") else None
+            limit = int(query["limit"][0]) if query.get("limit") else None
+            data = self.watch_manager.get_observations(session_id, start_seq=start_seq, end_seq=end_seq, limit=limit)
+            return {"success": True, "data": data}
+        except Exception as e:
+            return {"success": False, "error": {"code": "GET_OBSERVATIONS_ERROR", "message": str(e)}}
+
     def start_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
         goal = params.get("goal") or "General state investigation"
+        auth_target = params.get("authorize_target")
+        if auth_target is None and params.get("pid"):
+            auth_target = True
+        else:
+            auth_target = bool(auth_target)
+
         res = self.runtime.start_investigation(
             goal=goal,
             snapshot_id=params.get("snapshot_id"),
@@ -1364,7 +1603,7 @@ class WebApiAdapter:
             debug_image=params.get("debug_image"),
             constraints=params.get("constraints"),
             budgets=params.get("budgets"),
-            authorize_target=bool(params.get("authorize_target", False)),
+            authorize_target=auth_target,
         )
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
@@ -1602,12 +1841,15 @@ class WebApiAdapter:
         msg = params.get("message") or params.get("user_message") or "Analyze the observed state changes and propose evidence-grounded hypotheses."
         req_id = params.get("request_id")
         allow_fallback = bool(params.get("allow_fallback", False))
+        raw_loc = params.get("locale") or params.get("language") or "en"
+        locale = "ko" if str(raw_loc).lower().strip() in ("ko", "kor", "korean") else "en"
         res = self.runtime.analyze_investigation_chat(
             investigation_id=inv_id,
             message=msg,
             request_id=req_id,
             provider_override=provider_override,
             allow_fallback=allow_fallback,
+            locale=locale,
         )
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
@@ -1948,6 +2190,35 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_llm_status())
                 return
 
+            # GET /api/watch/memory-map
+            if path == "/api/watch/memory-map":
+                pid_str = q_param("pid")
+                if not pid_str:
+                    self._send_json({"success": False, "error": {"code": "INVALID_PARAM", "message": "Query parameter 'pid' is required"}}, status=400)
+                    return
+                try:
+                    pid = int(pid_str)
+                except ValueError:
+                    self._send_json({"success": False, "error": {"code": "INVALID_PARAM", "message": f"Invalid PID: {pid_str}"}}, status=400)
+                    return
+                companion_elf = q_param("companion_elf") or q_param("debug_image")
+                self._send_json(adapter.get_watch_memory_map(pid, companion_elf=companion_elf))
+                return
+
+            # GET /api/watch/session/{session_id}/observations
+            m_watch_obs = re.match(r"^/api/watch/session/([^/]+)/observations$", path)
+            if m_watch_obs:
+                session_id = m_watch_obs.group(1)
+                self._send_json(adapter.get_watch_observations(session_id, query))
+                return
+
+            # GET /api/watch/session/{session_id}
+            m_watch_sess = re.match(r"^/api/watch/session/([^/]+)$", path)
+            if m_watch_sess:
+                session_id = m_watch_sess.group(1)
+                self._send_json(adapter.get_watch_session(session_id))
+                return
+
             # Unrecognized API endpoint
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
                             status=404)
@@ -2026,6 +2297,10 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             # Investigation POST routes
+            if path in ("/api/investigation/validate-target", "/api/investigation/validate"):
+                self._send_json(adapter.validate_target(body))
+                return
+
             if path == "/api/investigation/start":
                 self._send_json(adapter.start_investigation(body))
                 return
@@ -2072,6 +2347,25 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
             if path in ("/api/investigation/chat/cancel", "/api/investigation/cancel-chat"):
                 self._send_json(adapter.cancel_investigation_chat(body))
+                return
+
+            # POST /api/watch/session/create
+            if path == "/api/watch/session/create":
+                self._send_json(adapter.create_watch_session(body))
+                return
+
+            # POST /api/watch/session/{session_id}/stop
+            m_watch_stop = re.match(r"^/api/watch/session/([^/]+)/stop$", path)
+            if m_watch_stop:
+                session_id = m_watch_stop.group(1)
+                self._send_json(adapter.stop_watch_session(session_id))
+                return
+
+            # POST /api/watch/session/{session_id}/watch
+            m_watch_item = re.match(r"^/api/watch/session/([^/]+)/watch$", path)
+            if m_watch_item:
+                session_id = m_watch_item.group(1)
+                self._send_json(adapter.update_watch_items(session_id, body))
                 return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},

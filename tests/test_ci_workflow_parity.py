@@ -131,6 +131,8 @@ class TestCIWorkflowParity(unittest.TestCase):
             "Run Phase 17 CLI Process Isolation Hardening and Regression Tests",
             "Run Phase 20 Benchmark Execution Integrity and Trustworthy Results Tests",
             "Run Phase 20 Benchmark Demonstration Script",
+            "Run Phase 21 Watch Session and Temporal Memory Explorer Foundation Tests",
+            "Run Phase 22 Zero-Configuration Live Capture and UX Tests",
             "Run All Remaining Tests",
             "Run CI Workflow Parity Tests",
             "Run Performance Benchmark Smoke Test",
@@ -157,6 +159,8 @@ class TestCIWorkflowParity(unittest.TestCase):
         self.assertIn("python3 -m unittest tests/test_phase17_process_isolation_regression.py", all_run_commands)
         self.assertIn("python3 -m unittest tests/test_investigation_quality_benchmark.py", all_run_commands)
         self.assertIn("python3 benchmarks/investigation_quality/run_benchmark.py --smoke", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_phase21_watch_session.py", all_run_commands)
+        self.assertIn("python3 -m unittest tests/test_phase22_zero_config_live_capture.py", all_run_commands)
         self.assertIn("python3 -m unittest discover tests", all_run_commands)
         self.assertIn("python3 -m unittest tests/test_ci_workflow_parity.py", all_run_commands)
         self.assertIn("python3 -m benchmarks.capture_benchmark --smoke", all_run_commands)

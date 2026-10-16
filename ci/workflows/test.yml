@@ -97,6 +97,14 @@ jobs:
         run: |
           python3 benchmarks/investigation_quality/run_benchmark.py --smoke
 
+      - name: Run Phase 21 Watch Session and Temporal Memory Explorer Foundation Tests
+        run: |
+          python3 -m unittest tests/test_phase21_watch_session.py
+
+      - name: Run Phase 22 Zero-Configuration Live Capture and UX Tests
+        run: |
+          python3 -m unittest tests/test_phase22_zero_config_live_capture.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

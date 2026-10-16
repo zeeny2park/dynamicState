@@ -3469,5 +3469,425 @@ body.advanced-mode .runtime-summary-bar {
   background-color: rgba(34, 197, 94, 0.3);
 }
 
+/* ========================================================================== */
+/* Phase 22: Radical UX Simplification & Basic Mode 3-Area Workflow          */
+/* ========================================================================== */
 
+#basic-investigation-view {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 8px 0 32px 0;
+}
 
+.basic-card {
+  background-color: var(--bg-card, #131b2e);
+  border: 1px solid var(--border-color, #232f48);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  margin-bottom: 20px;
+}
+
+.basic-card-header {
+  padding: 14px 18px;
+  background-color: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--border-color, #232f48);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.basic-card-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text-primary, #f1f5f9);
+}
+
+.basic-card-body {
+  padding: 18px;
+}
+
+.basic-form-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.basic-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 160px;
+}
+
+.basic-flex-2 {
+  flex: 2.2;
+  min-width: 240px;
+}
+
+.basic-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-secondary, #94a3b8);
+}
+
+.required-star {
+  color: #ef4444;
+  margin-left: 2px;
+}
+
+.basic-form-action {
+  padding-bottom: 1px;
+}
+
+/* Compact Progress Sequence */
+.basic-progress-sequence {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background-color: rgba(15, 23, 42, 0.6);
+  border: 1px solid var(--border-color, #232f48);
+  border-radius: 6px;
+  padding: 10px 16px;
+  margin-top: 14px;
+  overflow-x: auto;
+}
+
+.basic-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78rem;
+  color: var(--text-muted, #64748b);
+  white-space: nowrap;
+}
+
+.step-num {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background-color: rgba(100, 116, 139, 0.2);
+  color: var(--text-muted, #64748b);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.7rem;
+}
+
+.step-connector {
+  flex: 1;
+  height: 2px;
+  background-color: rgba(100, 116, 139, 0.2);
+  margin: 0 10px;
+  min-width: 12px;
+}
+
+.basic-step.active {
+  color: var(--accent, #38bdf8);
+  font-weight: 700;
+}
+
+.basic-step.active .step-num {
+  background-color: var(--accent, #38bdf8);
+  color: #0b0f19;
+  animation: pulse 1.5s infinite;
+}
+
+.basic-step.completed {
+  color: #22c55e;
+}
+
+.basic-step.completed .step-num {
+  background-color: #22c55e;
+  color: #ffffff;
+}
+
+.basic-step.failed {
+  color: #ef4444;
+}
+
+.basic-step.failed .step-num {
+  background-color: #ef4444;
+  color: #ffffff;
+}
+
+/* Connected Summary */
+.basic-connected-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 10px 14px;
+  background-color: rgba(34, 197, 94, 0.05);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+  border-radius: 6px;
+}
+
+.basic-target-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 0.82rem;
+}
+
+.basic-target-meta .meta-item {
+  color: var(--text-secondary, #94a3b8);
+}
+
+.basic-target-meta .meta-item strong {
+  color: var(--text-primary, #f1f5f9);
+}
+
+/* Results Area */
+.basic-summary-box {
+  background-color: rgba(15, 23, 42, 0.5);
+  border: 1px solid var(--border-color, #232f48);
+  border-radius: 6px;
+  line-height: 1.5;
+  font-size: 0.88rem;
+  color: var(--text-primary, #f1f5f9);
+}
+
+.basic-sub-section {
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  padding-top: 14px;
+}
+
+.basic-sub-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.basic-sub-header .sub-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+
+.basic-items-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.basic-item-card {
+  background-color: rgba(15, 23, 42, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 0.82rem;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  transition: border-color 0.15s ease;
+}
+
+.basic-item-card:hover {
+  border-color: rgba(56, 189, 248, 0.3);
+}
+
+.basic-item-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.basic-item-title {
+  font-weight: 600;
+  color: var(--text-primary, #f1f5f9);
+}
+
+.basic-item-desc {
+  color: var(--text-secondary, #94a3b8);
+  line-height: 1.4;
+}
+
+.basic-item-evidence-toggle {
+  font-size: 0.72rem;
+  color: var(--accent, #38bdf8);
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  margin-top: 4px;
+  text-align: left;
+}
+
+.basic-item-evidence-toggle:hover {
+  text-decoration: underline;
+}
+
+.basic-item-evidence-body {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background-color: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  font-size: 0.75rem;
+  color: var(--text-muted, #94a3b8);
+}
+
+/* Question Area */
+.basic-chat-history {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.basic-question-input-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.basic-question-textarea {
+  flex: 1;
+  resize: vertical;
+  font-size: 0.85rem;
+}
+
+.basic-ask-btn {
+  padding: 10px 20px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  .basic-form-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .basic-form-action button {
+    width: 100%;
+  }
+  .basic-progress-sequence {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .step-connector {
+    display: none;
+  }
+  .basic-question-input-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .basic-ask-btn {
+    width: 100%;
+  }
+}
+
+/* ========================================================================== */
+/* Phase 21: Temporal Memory Explorer & Replay Styles                         */
+/* ========================================================================== */
+
+.temporal-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.te-controls-grid {
+  display: grid;
+  grid-template-columns: 140px 1fr 160px 120px auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.te-telemetry-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--bg-input);
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+}
+
+.te-metric-box {
+  display: flex;
+  flex-direction: column;
+  min-width: 110px;
+}
+
+.te-replay-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.te-slider {
+  accent-color: var(--accent);
+  cursor: pointer;
+  height: 6px;
+  border-radius: 3px;
+}
+
+.val-changed {
+  background-color: rgba(245, 158, 11, 0.22) !important;
+  color: #fbbf24 !important;
+  font-weight: 600;
+  border-radius: 3px;
+  padding: 2px 6px;
+  display: inline-block;
+}
+
+.te-delta-up {
+  color: #10b981;
+  font-weight: 600;
+}
+
+.te-delta-down {
+  color: #ef4444;
+  font-weight: 600;
+}
+
+.te-status-observed {
+  background: rgba(16, 185, 129, 0.2);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.te-status-partial {
+  background: rgba(245, 158, 11, 0.2);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.te-status-unavailable {
+  background: rgba(107, 114, 128, 0.2);
+  color: #9ca3af;
+  border: 1px solid rgba(107, 114, 128, 0.4);
+}
+
+.te-status-error {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+#te-matrix-table th,
+#te-matrix-table td {
+  white-space: nowrap;
+}

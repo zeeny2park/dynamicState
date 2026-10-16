@@ -120,7 +120,15 @@ run_step "Phase 20 Benchmark Execution Integrity and Trustworthy Results Suite" 
 run_step "Phase 20 Benchmark Demonstration Script" \
     python3 benchmarks/investigation_quality/run_benchmark.py --smoke
 
-# 20. Discover and run all remaining unit and integration tests
+# 20. Phase 21 Watch Session & Temporal Memory Explorer Foundation Suite
+run_step "Phase 21 Watch Session & Temporal Memory Explorer Foundation Suite" \
+    python3 -m unittest tests/test_phase21_watch_session.py
+
+# 21. Phase 22 Zero-Configuration Live Capture & UX Simplification Suite
+run_step "Phase 22 Zero-Configuration Live Capture & UX Simplification Suite" \
+    python3 -m unittest tests/test_phase22_zero_config_live_capture.py
+
+# 21. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

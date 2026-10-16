@@ -403,6 +403,8 @@ class InvestigationSession:
             "timeline_count": len(self.timeline),
             "evidence_ledger": self.ledger.to_dict(),
             "chat_history": list(getattr(self, "chat_history", [])),
+            "target_identity": self.stages.get("target_identity", {}).get("details", self.target_ref),
+            "capture_quality": self.stages.get("capture_quality", {}).get("details", {}),
         }
 
     @classmethod
@@ -3226,6 +3228,7 @@ class InvestigationManager:
         request_id: Optional[str] = None,
         provider_override: Optional[str] = None,
         allow_fallback: bool = False,
+        locale: str = "en",
     ) -> Dict[str, Any]:
         """Execute conversational analysis for the investigation session using configured LLM or honest fallback."""
         session = self.sessions.get(investigation_id)
@@ -3242,6 +3245,7 @@ class InvestigationManager:
                 request_id=request_id,
                 provider_override=provider_override,
                 allow_fallback=allow_fallback,
+                locale=locale,
             )
             return {
                 "success": True,

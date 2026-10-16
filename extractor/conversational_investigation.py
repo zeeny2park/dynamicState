@@ -202,8 +202,37 @@ class ConversationalAnalysisService:
         self,
         context: Dict[str, Any],
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        locale: str = "en",
     ) -> List[Dict[str, str]]:
         """Format system and user messages directing the LLM to return strict evidence-grounded JSON."""
+        # Sanitize locale: support 'ko' and 'en'
+        clean_locale = "ko" if str(locale).lower().strip() in ("ko", "kor", "korean") else "en"
+
+        lang_instruction = ""
+        if clean_locale == "ko":
+            lang_instruction = (
+                "\n\nLANGUAGE INSTRUCTION (MANDATORY):\n"
+                "The user's active UI locale is Korean ('ko').\n"
+                "You MUST write ALL natural-language text in fluent, professional Korean (한국어).\n"
+                "This includes: 'summary', descriptions in 'observed_facts', hypothesis 'title' and 'claim', "
+                "'unknowns', 'alternative_explanations', questions in 'proposed_observations', 'safety_notes', "
+                "and 'next_steps'.\n"
+                "TECHNICAL INTEGRITY RULES:\n"
+                "- Do NOT translate C/C++ symbol names, function names, variable names, or struct/field paths "
+                "(e.g., keep worker_status, transition_worker_state, counter, ptr literal in their original form).\n"
+                "- Do NOT translate source file paths, line numbers, memory addresses (e.g. 0x...), or DWARF type names.\n"
+                "- Do NOT translate evidence IDs (e.g. ev_...).\n"
+                "- Keep all JSON keys exactly as defined in the schema.\n"
+                "- Keep machine-readable status strings (e.g. PROPOSED, STATIC_CANDIDATE, READ_ONLY) in English."
+            )
+        else:
+            lang_instruction = (
+                "\n\nLANGUAGE INSTRUCTION:\n"
+                "The user's active UI locale is English ('en').\n"
+                "Write all natural-language summaries, claims, unknowns, and next steps in English.\n"
+                "Preserve technical symbols, field paths, addresses, and JSON keys in their literal form."
+            )
+
         system_prompt = (
             "You are an expert C/C++ systems debugger and root-cause investigator working with dynamicState.\n"
             "Your task is to analyze runtime evidence from process memory snapshots, DWARF debug information, "
@@ -242,6 +271,7 @@ class ConversationalAnalysisService:
             '  "safety_notes": ["Safety prerequisites or live process warnings"],\n'
             '  "next_steps": ["Concrete recommended next action for the operator"]\n'
             "}"
+            + lang_instruction
         )
 
         user_content = (
@@ -392,9 +422,11 @@ class ConversationalAnalysisService:
         request_id: Optional[str] = None,
         provider_override: Optional[str] = None,
         allow_fallback: bool = False,
+        locale: str = "en",
     ) -> StructuredAnalysisResult:
         """Execute end-to-end conversational analysis for an investigation session."""
         req_id = request_id or f"req_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        clean_locale = "ko" if str(locale).lower().strip() in ("ko", "kor", "korean") else "en"
         start_time = time.time()
         self.provider_manager.track_request_start()
 
@@ -423,7 +455,7 @@ class ConversationalAnalysisService:
 
             # Step 3: Format Prompt
             chat_history = getattr(session, "chat_history", []) or []
-            messages = self.format_prompt(context, chat_history)
+            messages = self.format_prompt(context, chat_history, locale=clean_locale)
 
             # Step 4: Execute Call with Truthful Handling
             is_fallback = False
@@ -522,6 +554,7 @@ class ConversationalAnalysisService:
 
             meta = {
                 "request_id": req_id,
+                "locale": clean_locale,
                 "configured_default_provider": configured_default,
                 "selected_provider": selected_provider,
                 "invoked_provider": invoked_provider,
@@ -592,6 +625,7 @@ class ConversationalAnalysisService:
                     classification=EVIDENCE_CLASSIFICATION_INFERENCE,
                     details={
                         "request_id": req_id,
+                        "locale": clean_locale,
                         "configured_default_provider": configured_default,
                         "selected_provider": selected_provider,
                         "invoked_provider": invoked_provider,

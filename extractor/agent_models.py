@@ -138,6 +138,7 @@ class AgentAction(_SubscriptableModel):
     request_id: Optional[str] = None
     provider_override: Optional[str] = None
     allow_fallback: bool = False
+    locale: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}

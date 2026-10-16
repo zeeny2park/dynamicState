@@ -57,17 +57,17 @@
         <button type="button" class="btn btn-sm btn-lang" id="btn-lang-ko" data-lang="ko">한국어</button>
       </div>
 
-      <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-tech-details" title="Toggle technical hardware, ELF, and backend details" data-i18n="btn_tech_details" data-i18n-title="btn_tech_details_title">
+      <button type="button" class="btn btn-outline btn-sm advanced-only" id="btn-toggle-tech-details" title="Toggle technical hardware, ELF, and backend details" data-i18n="btn_tech_details" data-i18n-title="btn_tech_details_title">
         ⚙️ Technical Details
       </button>
 
-      <button class="btn btn-secondary btn-sm" id="btn-refresh" title="Refresh runtime data" data-i18n-title="btn_refresh_title">
+      <button class="btn btn-secondary btn-sm advanced-only" id="btn-refresh" title="Refresh runtime data" data-i18n-title="btn_refresh_title">
         <span class="icon">⟳</span> <span data-i18n="btn_refresh">Refresh</span>
       </button>
-      <button class="btn btn-success btn-sm" id="btn-fast-capture" title="Fast runtime state capture with minimal stop time" data-i18n-title="btn_fast_capture_title">
+      <button class="btn btn-success btn-sm advanced-only" id="btn-fast-capture" title="Fast runtime state capture with minimal stop time" data-i18n-title="btn_fast_capture_title">
         <span>⚡</span> <span data-i18n="btn_fast_capture">Capture State</span>
       </button>
-      <button class="btn btn-primary btn-sm" id="btn-observe-dialog">
+      <button class="btn btn-primary btn-sm advanced-only" id="btn-observe-dialog">
         <span>👁</span> <span data-i18n="btn_observe">Observe</span>
       </button>
     </div>
@@ -76,7 +76,7 @@
   <!-- ===================================================================== -->
   <!-- Level 2: Secondary Technical Details Bar (Collapsible / Advanced)     -->
   <!-- ===================================================================== -->
-  <div class="runtime-summary-bar" id="runtime-summary-bar">
+  <div class="runtime-summary-bar advanced-only" id="runtime-summary-bar">
     <div class="tech-badge-group">
       <span class="meta-tag" id="tag-pid">PID: N/A</span>
       <span class="meta-tag" id="tag-arch">Arch: UNKNOWN</span>
@@ -151,7 +151,7 @@
   </div>
 
   <!-- Main Navigation Tabs (8 Functional Views) -->
-  <nav class="app-nav" id="app-nav-tabs">
+  <nav class="app-nav advanced-only" id="app-nav-tabs">
     <button class="nav-tab active" data-tab="tab-investigation-overview" id="nav-tab-investigation" data-i18n="nav_tab_0">0. 🔍 Investigation Workspace</button>
     <button class="nav-tab advanced-only" data-tab="tab-object-explorer" data-i18n="nav_tab_1">1. 📦 Object Explorer</button>
     <button class="nav-tab advanced-only" data-tab="tab-thread-explorer" data-i18n="nav_tab_2">2. 🧵 Thread Explorer</button>
@@ -160,6 +160,7 @@
     <button class="nav-tab advanced-only" data-tab="tab-advanced-explore" data-i18n="nav_tab_5">5. ⚡ Autonomous Loop</button>
     <button class="nav-tab advanced-only" data-tab="tab-system-provenance" data-i18n="nav_tab_6">6. 🛠️ System / Modules</button>
     <button class="nav-tab advanced-only" data-tab="tab-state-lab" id="nav-tab-state-lab" data-i18n="nav_tab_7">7. 🔬 State Laboratory</button>
+    <button class="nav-tab advanced-only" data-tab="tab-temporal-explorer" id="nav-tab-temporal-explorer" data-i18n="nav_tab_8">8. ⏱️ Temporal Explorer</button>
   </nav>
 
   <!-- Banner for low-impact observation mode -->
@@ -182,6 +183,222 @@
     <section id="tab-investigation-overview" class="tab-pane active">
       <div class="inv-container">
         
+        <!-- ===================================================================== -->
+        <!-- BASIC MODE: Three Primary Areas (TARGET, RESULT, QUESTION)            -->
+        <!-- ===================================================================== -->
+        <div id="basic-investigation-view" class="basic-only">
+
+          <!-- AREA 1: TARGET -->
+          <div class="basic-card basic-target-card mb-4" id="basic-target-area">
+            <div class="basic-card-header">
+              <div class="basic-card-title" data-i18n="title_basic_target">🎯 Target Process</div>
+              <div class="basic-card-subtitle text-xs text-muted" data-i18n="subtitle_basic_target">
+                Provide the running target PID and its matching unstripped ELF/debug binary.
+              </div>
+            </div>
+            <div class="basic-card-body">
+              <!-- 1A: Disconnected State (Two-Input Form) -->
+              <div id="basic-target-form" class="basic-target-form">
+                <div class="basic-form-row">
+                  <div class="basic-form-field">
+                    <label for="basic-target-pid" class="basic-label">
+                      <span data-i18n="lbl_basic_target_pid">Target PID</span>
+                      <span class="required-star">*</span>
+                    </label>
+                    <input type="number" id="basic-target-pid" class="form-input" 
+                           placeholder="e.g. 12345" min="1" step="1" required
+                           data-i18n-placeholder="ph_basic_target_pid">
+                  </div>
+                  <div class="basic-form-field basic-flex-2">
+                    <label for="basic-debug-image" class="basic-label">
+                      <span data-i18n="lbl_basic_debug_image">Matching Nostrip/Debug ELF</span>
+                      <span class="required-star">*</span>
+                    </label>
+                    <input type="text" id="basic-debug-image" class="form-input mono" 
+                           placeholder="/path/to/target.debug or unstripped binary" required
+                           data-i18n-placeholder="ph_basic_debug_image">
+                  </div>
+                  <div class="basic-form-action">
+                    <button type="button" id="btn-basic-connect-analyze" class="btn btn-primary btn-lg">
+                      <span class="btn-icon">⚡</span>
+                      <span data-i18n="btn_basic_connect_analyze">Connect &amp; Analyze</span>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Compact Progress Sequence -->
+                <div id="basic-progress-sequence" class="basic-progress-sequence" style="display: none;">
+                  <div class="basic-step" id="step-connecting">
+                    <span class="step-num">1</span>
+                    <span class="step-label" data-i18n="lbl_step_connecting">Connecting</span>
+                  </div>
+                  <div class="step-connector"></div>
+                  <div class="basic-step" id="step-validating">
+                    <span class="step-num">2</span>
+                    <span class="step-label" data-i18n="lbl_step_validating">Validating debug image</span>
+                  </div>
+                  <div class="step-connector"></div>
+                  <div class="basic-step" id="step-capturing">
+                    <span class="step-num">3</span>
+                    <span class="step-label" data-i18n="lbl_step_capturing">Capturing state</span>
+                  </div>
+                  <div class="step-connector"></div>
+                  <div class="basic-step" id="step-analyzing">
+                    <span class="step-num">4</span>
+                    <span class="step-label" data-i18n="lbl_step_analyzing">Analyzing</span>
+                  </div>
+                  <div class="step-connector"></div>
+                  <div class="basic-step" id="step-results">
+                    <span class="step-num">5</span>
+                    <span class="step-label" data-i18n="lbl_step_results">Results</span>
+                  </div>
+                </div>
+
+                <!-- Error Banner with concrete Next Action -->
+                <div id="basic-target-error" class="banner banner-danger mt-3" style="display: none;">
+                  <div class="banner-icon">🛑</div>
+                  <div class="banner-body">
+                    <div id="basic-target-error-msg" class="font-bold"></div>
+                    <div id="basic-target-next-action" class="text-xs mt-1 text-muted"></div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 1B: Connected Summary State -->
+              <div id="basic-target-connected-summary" class="basic-connected-summary" style="display: none;">
+                <div class="basic-connected-info">
+                  <div class="basic-target-meta">
+                    <span class="badge badge-success text-xs" id="basic-badge-connected">CONNECTED</span>
+                    <span class="meta-item">
+                      <strong>PID:</strong> <span class="mono" id="basic-txt-pid">--</span>
+                    </span>
+                    <span class="meta-item">
+                      <strong>Executable:</strong> <span class="mono" id="basic-txt-exe">--</span>
+                    </span>
+                    <span class="meta-item">
+                      <strong>Build ID:</strong> <span class="badge badge-info text-xs mono" id="basic-badge-build-id">MATCHED</span>
+                    </span>
+                    <span class="meta-item">
+                      <strong>Quality:</strong> <span class="badge badge-neutral text-xs" id="basic-badge-quality">CONSISTENT</span>
+                    </span>
+                  </div>
+                </div>
+                <div class="basic-connected-actions">
+                  <button type="button" id="btn-basic-disconnect" class="btn btn-secondary btn-sm" data-i18n="btn_basic_disconnect">
+                    🔄 Disconnect / New Target
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- AREA 2: INVESTIGATION RESULT -->
+          <div class="basic-card basic-results-card mb-4" id="basic-results-area">
+            <div class="basic-card-header">
+              <div class="basic-card-title" data-i18n="title_basic_results">📊 Investigation Result</div>
+              <div id="basic-badge-inv-status" class="badge badge-neutral text-xs">READY</div>
+            </div>
+            <div class="basic-card-body">
+              <!-- Short Diagnostic Summary -->
+              <div class="basic-summary-box p-3 mb-3" id="basic-summary-box">
+                <div id="basic-result-summary" class="basic-result-summary-text">
+                  No target investigated yet. Enter PID and debug image above, then click "Connect &amp; Analyze".
+                </div>
+              </div>
+
+              <!-- Capture-quality warning (shown only if non-atomic or partial) -->
+              <div id="basic-quality-warning" class="banner banner-warning mb-3" style="display: none;">
+                <span class="banner-icon">⚠️</span>
+                <span class="banner-text text-xs" id="basic-quality-warning-text" data-i18n="warning_non_atomic_snapshot">
+                  NON_ATOMIC Snapshot: Process was inspected while running. Observed values may reflect torn reads or concurrent execution.
+                </span>
+              </div>
+
+              <!-- Section 2A: Confirmed Facts -->
+              <div class="basic-sub-section mb-3" id="basic-sub-facts">
+                <div class="basic-sub-header">
+                  <span class="sub-title">
+                    <span class="badge badge-info text-xs">FACT</span>
+                    <span data-i18n="title_facts_section">Confirmed Facts (Observed)</span>
+                  </span>
+                  <span class="text-xs text-muted" id="basic-facts-count">(0)</span>
+                </div>
+                <div class="basic-items-list" id="basic-facts-list">
+                  <div class="text-xs text-muted p-2" data-i18n="msg_no_facts">No invariant violations observed in examined state.</div>
+                </div>
+                <button type="button" class="btn btn-xs btn-outline mt-2 show-more-toggle" id="btn-more-facts" style="display: none;">
+                  Show more
+                </button>
+              </div>
+
+              <!-- Section 2B: Possible Causes -->
+              <div class="basic-sub-section mb-3" id="basic-sub-causes">
+                <div class="basic-sub-header">
+                  <span class="sub-title">
+                    <span class="badge badge-warning text-xs">HYPOTHESIS</span>
+                    <span data-i18n="title_causes_section">Possible Causes (Candidate Explanations)</span>
+                  </span>
+                  <span class="text-xs text-muted" id="basic-causes-count">(0)</span>
+                </div>
+                <div class="text-xs text-muted mb-2 fst-italic" data-i18n="notice_hypo_candidate_only">
+                  Candidate functions are static hypotheses; they are not confirmed root causes until proven by authentic execution tracing.
+                </div>
+                <div class="basic-items-list" id="basic-causes-list">
+                  <div class="text-xs text-muted p-2" data-i18n="msg_no_causes">No competing causal hypotheses generated.</div>
+                </div>
+                <button type="button" class="btn btn-xs btn-outline mt-2 show-more-toggle" id="btn-more-causes" style="display: none;">
+                  Show more
+                </button>
+              </div>
+
+              <!-- Section 2C: What to Do Next -->
+              <div class="basic-sub-section" id="basic-sub-next">
+                <div class="basic-sub-header">
+                  <span class="sub-title">
+                    <span class="badge badge-success text-xs">ACTION</span>
+                    <span data-i18n="title_next_section">What to Do Next (Recommended)</span>
+                  </span>
+                  <span class="text-xs text-muted" id="basic-next-count">(0)</span>
+                </div>
+                <div class="basic-items-list" id="basic-next-list">
+                  <div class="text-xs text-muted p-2" data-i18n="msg_no_next">All automated verification steps completed.</div>
+                </div>
+                <button type="button" class="btn btn-xs btn-outline mt-2 show-more-toggle" id="btn-more-next" style="display: none;">
+                  Show more
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- AREA 3: ASK A QUESTION -->
+          <div class="basic-card basic-question-card" id="basic-question-area">
+            <div class="basic-card-header">
+              <div class="basic-card-title" data-i18n="title_basic_questions">💬 Ask a Question</div>
+              <div class="text-xs text-muted" id="basic-llm-status-pill">🤖 Ready</div>
+            </div>
+            <div class="basic-card-body">
+              <!-- Conversation Stream -->
+              <div id="basic-chat-history" class="basic-chat-history mb-3"></div>
+
+              <!-- Input Row -->
+              <div class="basic-question-input-row">
+                <textarea id="basic-question-input" class="form-input basic-question-textarea" rows="2"
+                          placeholder="Describe the problem or ask a question (e.g. 'Why did worker_status change?')..."
+                          data-i18n-placeholder="ph_basic_question"></textarea>
+                <button type="button" id="btn-basic-ask" class="btn btn-primary basic-ask-btn">
+                  <span data-i18n="btn_basic_ask">Ask</span> ➔
+                </button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ===================================================================== -->
+        <!-- EXPERT MODE: Full Advanced Investigation Workspace (All Tools)         -->
+        <!-- ===================================================================== -->
+        <div id="advanced-investigation-view" class="advanced-only">
+
         <!-- Investigation Entry Launchpad (Two clear paths: Snapshot vs Live) -->
         <div class="inv-launchpad">
           <div class="inv-launchpad-header">
@@ -669,7 +886,9 @@
 
         </div>
 
-      </div>
+        </div><!-- /#advanced-investigation-view -->
+
+      </div><!-- /.inv-container -->
     </section>
 
     <!-- ===================================================================== -->
@@ -1883,6 +2102,368 @@
             </button>
           </div>
         </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 8: ⏱️ Temporal Memory Explorer (Phase 21 Foundation)                -->
+    <!-- ===================================================================== -->
+    <section id="tab-temporal-explorer" class="tab-pane">
+      <div class="temporal-container">
+        
+        <!-- AREA A: Target / Session Controls -->
+        <div class="card mb-4">
+          <div class="card-header flex justify-between items-center">
+            <div>
+              <h2 class="text-base font-bold flex items-center gap-2">
+                <span>⏱️</span>
+                <span data-i18n="te_title_target_session">Area A: Target &amp; Watch Session Controls</span>
+              </h2>
+              <div class="text-xs text-muted" data-i18n="te_sub_target_session">
+                Connect to embedded/local Linux target, validate DWARF GNU Build ID, and configure non-intrusive periodic sampling.
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="badge badge-neutral" id="te-badge-session-status">STOPPED</span>
+              <span class="badge badge-neutral" id="te-badge-buildid">BUILD ID: UNCHECKED</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="te-controls-grid">
+              <div class="form-group">
+                <label for="te-target-pid" class="form-label text-xs">Target Process PID *</label>
+                <input type="number" id="te-target-pid" class="form-input form-input-sm mono" placeholder="e.g. 12345" min="1" step="1">
+              </div>
+              <div class="form-group flex-2">
+                <label for="te-companion-elf" class="form-label text-xs">Matching Companion Nostrip/Debug ELF *</label>
+                <input type="text" id="te-companion-elf" class="form-input form-input-sm mono" placeholder="/path/to/binary_debug.elf (with DWARF)">
+              </div>
+              <div class="form-group">
+                <label for="te-select-interval" class="form-label text-xs">Sampling Interval</label>
+                <select id="te-select-interval" class="input-select input-select-sm">
+                  <option value="100">100 ms (Fast)</option>
+                  <option value="250">250 ms</option>
+                  <option value="500" selected>500 ms (Standard)</option>
+                  <option value="1000">1000 ms (1s)</option>
+                  <option value="2000">2000 ms (2s)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="te-input-max-samples" class="form-label text-xs">Max Samples</label>
+                <input type="number" id="te-input-max-samples" class="form-input form-input-sm" value="1000" min="10" max="50000" step="50">
+              </div>
+              <div class="form-group flex items-end gap-2">
+                <button type="button" class="btn btn-primary btn-sm" id="btn-te-start-session">
+                  <span>▶️</span> <span data-i18n="btn_te_start">Start Session</span>
+                </button>
+                <button type="button" class="btn btn-secondary btn-sm" id="btn-te-stop-session" disabled>
+                  <span>⏹️</span> <span data-i18n="btn_te_stop">Stop</span>
+                </button>
+                <button type="button" class="btn btn-outline btn-sm" id="btn-te-refresh-map" title="Refresh memory map &amp; threads">
+                  <span>⟳</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Overhead & Performance Telemetry Row -->
+            <div class="te-telemetry-row mt-3">
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Backend</span>
+                <span class="font-mono text-xs font-bold text-accent" id="te-stat-backend">process_vm_readv</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Target Stop Time</span>
+                <span class="font-mono text-xs font-bold text-success" id="te-stat-stoptime">0.00 ms (Zero-Stop)</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Last Tick Latency</span>
+                <span class="font-mono text-xs" id="te-stat-latency">N/A</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Recorded Observations</span>
+                <span class="font-mono text-xs font-bold" id="te-stat-samples">0</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Capture Gaps</span>
+                <span class="font-mono text-xs" id="te-stat-gaps">0</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Session ID</span>
+                <span class="font-mono text-xs text-muted" id="te-stat-session-id">None</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AREA B: Thread and Memory Map Explorer -->
+        <div class="grid grid-cols-2 gap-4 mb-4" id="te-area-b">
+          <!-- Column 1: Active Threads -->
+          <div class="card">
+            <div class="card-header flex justify-between items-center">
+              <h3 class="text-sm font-bold flex items-center gap-2">
+                <span>🧵</span>
+                <span data-i18n="te_title_threads">Area B1: Active Threads</span>
+              </h3>
+              <span class="text-xs text-muted" id="te-threads-count">0 threads</span>
+            </div>
+            <div class="card-body p-0 table-scrollable" style="max-height: 240px; overflow-y: auto;">
+              <table class="data-table w-full text-xs" id="te-threads-table">
+                <thead>
+                  <tr>
+                    <th>TID</th>
+                    <th>Name</th>
+                    <th>State</th>
+                  </tr>
+                </thead>
+                <tbody id="te-threads-tbody">
+                  <tr><td colspan="3" class="text-center text-muted py-3">No target process loaded</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Column 2: Memory Mappings & Variables -->
+          <div class="card">
+            <div class="card-header flex justify-between items-center">
+              <h3 class="text-sm font-bold flex items-center gap-2">
+                <span>🗺️</span>
+                <span data-i18n="te_title_memory_map">Area B2: Memory Mappings &amp; DWARF Globals</span>
+              </h3>
+              <div class="flex items-center gap-1">
+                <button type="button" class="btn btn-xs btn-outline te-map-filter active" data-filter="all">All</button>
+                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="data">Data/BSS</button>
+                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="heap">Heap</button>
+                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="stack">Stack</button>
+              </div>
+            </div>
+            <div class="card-body p-0 table-scrollable" style="max-height: 240px; overflow-y: auto;">
+              <table class="data-table w-full text-xs" id="te-mappings-table">
+                <thead>
+                  <tr>
+                    <th>Address Range</th>
+                    <th>Size</th>
+                    <th>Perms</th>
+                    <th>Category</th>
+                    <th>Pathname</th>
+                  </tr>
+                </thead>
+                <tbody id="te-mappings-tbody">
+                  <tr><td colspan="5" class="text-center text-muted py-3">No memory map available</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- DWARF Discoverable Variables Picker (Sub-panel of Area B) -->
+        <div class="card mb-4" id="te-discoverable-vars-card">
+          <div class="card-header flex justify-between items-center">
+            <h3 class="text-sm font-bold flex items-center gap-2">
+              <span>🔍</span>
+              <span data-i18n="te_title_discovered_vars">DWARF Discoverable Global &amp; Static Variables</span>
+            </h3>
+            <input type="text" id="te-var-search" class="form-input form-input-xs" placeholder="Search variables (e.g. counter, session)..." style="width: 260px;">
+          </div>
+          <div class="card-body p-0 table-scrollable" style="max-height: 180px; overflow-y: auto;">
+            <table class="data-table w-full text-xs" id="te-vars-table">
+              <thead>
+                <tr>
+                  <th>Variable Name</th>
+                  <th>Type</th>
+                  <th>Runtime Virtual Address</th>
+                  <th>Size</th>
+                  <th>Location</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="te-vars-tbody">
+                <tr><td colspan="6" class="text-center text-muted py-3">Load companion ELF with DWARF to discover variables</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- AREA C: Active Watch List -->
+        <div class="card mb-4" id="te-area-c">
+          <div class="card-header flex justify-between items-center">
+            <h3 class="text-sm font-bold flex items-center gap-2">
+              <span>📋</span>
+              <span data-i18n="te_title_watchlist">Area C: Active Watch List</span>
+            </h3>
+            <button type="button" class="btn btn-xs btn-secondary" id="btn-te-toggle-add-custom">
+              <span>➕</span> Add Custom Address Range
+            </button>
+          </div>
+          
+          <!-- Collapsible Custom Add Form -->
+          <div class="card-body border-b border-color py-3" id="te-custom-add-panel" style="display: none; background: var(--bg-input);">
+            <div class="grid grid-cols-5 gap-2 items-end">
+              <div>
+                <label class="form-label text-xs">Name</label>
+                <input type="text" id="te-custom-name" class="form-input form-input-xs" placeholder="e.g. heap_ptr">
+              </div>
+              <div>
+                <label class="form-label text-xs">Hex Address *</label>
+                <input type="text" id="te-custom-address" class="form-input form-input-xs mono" placeholder="0x7ffe...">
+              </div>
+              <div>
+                <label class="form-label text-xs">Type</label>
+                <select id="te-custom-type" class="input-select input-select-xs">
+                  <option value="int">int (32-bit)</option>
+                  <option value="uint32_t">uint32_t (32-bit)</option>
+                  <option value="int64_t">int64_t (64-bit)</option>
+                  <option value="uint64_t">uint64_t (64-bit)</option>
+                  <option value="float">float (32-bit)</option>
+                  <option value="double">double (64-bit)</option>
+                  <option value="pointer">pointer (void*)</option>
+                  <option value="raw_bytes" selected>raw_bytes (hex)</option>
+                </select>
+              </div>
+              <div>
+                <label class="form-label text-xs">Size (bytes)</label>
+                <input type="number" id="te-custom-size" class="form-input form-input-xs" value="4" min="1" max="65536">
+              </div>
+              <div>
+                <button type="button" class="btn btn-xs btn-primary w-full" id="btn-te-submit-custom-watch">Add to Watch</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card-body p-0 table-scrollable" style="max-height: 200px; overflow-y: auto;">
+            <table class="data-table w-full text-xs" id="te-watchlist-table">
+              <thead>
+                <tr>
+                  <th>Item ID</th>
+                  <th>Name</th>
+                  <th>Scope</th>
+                  <th>Type</th>
+                  <th>Address</th>
+                  <th>Size</th>
+                  <th>Status</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="te-watchlist-tbody">
+                <tr><td colspan="8" class="text-center text-muted py-3">No watch items selected. Pick from variables above or add a custom range.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- AREA D: Temporal Table & Timeline Replay -->
+        <div class="card mb-4" id="te-area-d">
+          <div class="card-header flex justify-between items-center">
+            <h3 class="text-sm font-bold flex items-center gap-2">
+              <span>📊</span>
+              <span data-i18n="te_title_temporal_table">Area D: Temporal State Table &amp; Replay Navigation</span>
+            </h3>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-muted" id="te-replay-keyboard-hint">⌨️ Shortcuts: [←] Prev, [→] Next, [Home] First, [End] Last, [Space] Play/Pause</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <!-- Replay Scrubber & Control Bar -->
+            <div class="te-replay-bar mb-3">
+              <div class="flex items-center gap-2">
+                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-home" title="Jump to First Observation (Home)">⏮️</button>
+                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-prev" title="Step Backward (Left Arrow)">◀️</button>
+                <button type="button" class="btn btn-sm btn-primary" id="btn-te-replay-play" title="Play/Pause Replay (Space)">⏯️ Play</button>
+                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-next" title="Step Forward (Right Arrow)">▶️</button>
+                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-end" title="Jump to Latest Observation (End)">⏭️</button>
+              </div>
+              <div class="flex-1 px-3">
+                <input type="range" id="te-replay-slider" min="0" max="0" value="0" class="w-full te-slider" disabled>
+              </div>
+              <div class="text-xs font-mono" id="te-replay-info">
+                No observations recorded
+              </div>
+            </div>
+
+            <!-- Gap Alert Banner if sample followed a gap -->
+            <div id="te-gap-alert" class="banner banner-warning mb-3 py-1 px-3 text-xs" style="display: none;">
+              <span>⚠️</span>
+              <span id="te-gap-alert-text">Discontinuity detected: sampling overrun between observations</span>
+            </div>
+
+            <!-- Temporal Snapshot Table -->
+            <div class="table-scrollable" style="max-height: 280px; overflow-y: auto;">
+              <table class="data-table w-full text-xs" id="te-temporal-table">
+                <thead>
+                  <tr>
+                    <th>Watch Item</th>
+                    <th>Type &amp; Address</th>
+                    <th>Observed Value</th>
+                    <th>Delta / Change</th>
+                    <th>Raw Bytes (Hex)</th>
+                    <th>Observation Status</th>
+                  </tr>
+                </thead>
+                <tbody id="te-temporal-tbody">
+                  <tr><td colspan="6" class="text-center text-muted py-4">Start session and record observations to explore temporal state</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <!-- Historical Multi-Column Matrix Preview (Collapsible) -->
+            <div class="mt-4 pt-3 border-t border-color">
+              <div class="flex justify-between items-center mb-2">
+                <span class="text-xs font-bold text-muted uppercase">Recent Observations Matrix (Time Series Overview)</span>
+                <span class="text-xs text-muted" id="te-matrix-summary">0 samples</span>
+              </div>
+              <div class="table-scrollable" style="max-height: 200px; overflow-x: auto;">
+                <table class="data-table w-full text-xs mono" id="te-matrix-table">
+                  <thead id="te-matrix-thead">
+                    <tr><th>Item</th></tr>
+                  </thead>
+                  <tbody id="te-matrix-tbody">
+                    <tr><td class="text-center text-muted py-2">No time series data yet</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AREA E: Allocation Events (Truthful Capability Display) -->
+        <div class="card mb-4" id="te-area-e">
+          <div class="card-header flex justify-between items-center">
+            <h3 class="text-sm font-bold flex items-center gap-2">
+              <span>🧱</span>
+              <span data-i18n="te_title_alloc_events">Area E: Heap Allocation &amp; Free Event Stream</span>
+            </h3>
+            <span class="badge badge-warning" id="te-badge-alloc-cap">ALLOCATION_TRACING_UNAVAILABLE</span>
+          </div>
+          <div class="card-body">
+            <!-- Truthful capability banner -->
+            <div class="banner banner-info mb-3">
+              <span class="banner-icon">ℹ️</span>
+              <div class="banner-text text-xs leading-relaxed">
+                <strong>Truthful Backend Capability Notice:</strong> Allocation/free tracing requires an active heap hook 
+                (such as an <code>LD_PRELOAD</code> allocator wrapper, eBPF uretprobe on <code>malloc/free</code>, or GDB heap watchpoint). 
+                The current observation backend (<code>process_vm_readv</code>) operates strictly non-intrusively without pausing the process or intercepting allocator syscalls.
+                Per project truthfulness rules, no synthetic or fabricated allocation events are produced.
+              </div>
+            </div>
+
+            <div class="text-xs text-muted mb-2 font-semibold">Future Allocator Recorder Adapter Interface Contract:</div>
+            <pre class="bg-card p-3 rounded text-xs font-mono overflow-x-auto text-muted" style="border: 1px solid var(--border-color);">{
+  "schema_version": "1.0.0",
+  "event": "AllocationEvent",
+  "fields": {
+    "seq": "uint64 (strictly monotonic sequence)",
+    "timestamp": "ISO-8601 wall clock",
+    "thread_id": "uint32 (calling thread)",
+    "operation": "ALLOC | FREE | REALLOC",
+    "address": "uint64 (pointer)",
+    "size": "uint64 (allocated byte length)",
+    "allocation_generation": "uint64 (optional)",
+    "caller_pc": "uint64 (program counter)",
+    "provenance": { "hook_source": "ebpf_uprobe | ld_preload | gdb_watchpoint" }
+  }
+}</pre>
+          </div>
+        </div>
+
       </div>
     </section>
 

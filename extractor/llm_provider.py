@@ -1338,33 +1338,76 @@ class DeterministicFallbackProvider(BaseLLMProvider):
         timeout: Optional[float] = None,
         request_id: Optional[str] = None,
     ) -> str:
-        response_dict = {
-            "summary": "Deterministic analysis executed. No external LLM was configured or contacted.",
-            "observed_facts": [
-                {"fact": "System operating under deterministic hypothesis validation rules."}
-            ],
-            "hypotheses": [
-                {
-                    "title": "Deterministic Rule Evaluation",
-                    "claim": "Observed state transitions evaluated against deterministic invariants and DWARF linkage.",
-                    "status": "PROPOSED"
-                }
-            ],
-            "unknowns": [
-                "External conversational reasoning was not requested or provider is unconfigured."
-            ],
-            "evidence_refs": [],
-            "alternative_explanations": [],
-            "proposed_observations": [
-                {
-                    "question": "Execute safe comparison observation between initial and mutated states?",
-                    "target_kind": "COMPARISON",
-                    "status": "PROPOSED"
-                }
-            ],
-            "safety_notes": ["Zero external network requests performed."],
-            "next_steps": ["Inspect evidence ledger or configure OPENAI_BASE_URL to enable conversational LLM analysis."]
-        }
+        # Check messages for Korean language instruction or locale indication
+        is_ko = False
+        for msg in messages:
+            content = msg.get("content", "")
+            if (
+                "locale is Korean" in content
+                or "Korean ('ko')" in content
+                or "한국어" in content
+                or '"locale": "ko"' in content
+                or "'locale': 'ko'" in content
+            ):
+                is_ko = True
+                break
+
+        if is_ko:
+            response_dict = {
+                "summary": "결정론적 규칙 분석이 실행되었습니다. 외부 LLM이 설정되지 않았거나 호출되지 않았습니다.",
+                "observed_facts": [
+                    {"fact": "시스템이 결정론적 가설 검증 규칙 하에서 정상 동작 중입니다."}
+                ],
+                "hypotheses": [
+                    {
+                        "title": "결정론적 규칙 평가",
+                        "claim": "관찰된 상태 전이가 결정론적 불변식 및 DWARF 링키지를 기반으로 평가되었습니다.",
+                        "status": "PROPOSED"
+                    }
+                ],
+                "unknowns": [
+                    "외부 대화형 추론이 요청되지 않았거나 공급자가 구성되지 않았습니다."
+                ],
+                "evidence_refs": [],
+                "alternative_explanations": [],
+                "proposed_observations": [
+                    {
+                        "question": "초기 상태와 변경된 상태 간의 안전한 비교 관찰을 실행하시겠습니까?",
+                        "target_kind": "COMPARISON",
+                        "status": "PROPOSED"
+                    }
+                ],
+                "safety_notes": ["외부 네트워크 요청이 전혀 수행되지 않았습니다."],
+                "next_steps": ["증거 원장을 검토하거나 대화형 LLM 분석을 활성화하기 위해 OPENAI_BASE_URL을 구성하세요."]
+            }
+        else:
+            response_dict = {
+                "summary": "Deterministic analysis executed. No external LLM was configured or contacted.",
+                "observed_facts": [
+                    {"fact": "System operating under deterministic hypothesis validation rules."}
+                ],
+                "hypotheses": [
+                    {
+                        "title": "Deterministic Rule Evaluation",
+                        "claim": "Observed state transitions evaluated against deterministic invariants and DWARF linkage.",
+                        "status": "PROPOSED"
+                    }
+                ],
+                "unknowns": [
+                    "External conversational reasoning was not requested or provider is unconfigured."
+                ],
+                "evidence_refs": [],
+                "alternative_explanations": [],
+                "proposed_observations": [
+                    {
+                        "question": "Execute safe comparison observation between initial and mutated states?",
+                        "target_kind": "COMPARISON",
+                        "status": "PROPOSED"
+                    }
+                ],
+                "safety_notes": ["Zero external network requests performed."],
+                "next_steps": ["Inspect evidence ledger or configure OPENAI_BASE_URL to enable conversational LLM analysis."]
+            }
         return json.dumps(response_dict, indent=2)
 
 
