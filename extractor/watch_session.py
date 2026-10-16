@@ -27,6 +27,7 @@ import ctypes
 
 from .debug_image import BinaryIdentity, inspect_elf
 from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
+from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
 
 
 # -----------------------------------------------------------------------------
@@ -390,7 +391,7 @@ class AllocationEvent:
 class ObservationSession:
     """Persistent observation session holding metadata, watch items, and recorded observations."""
     session_id: str
-    schema_version: str = "1.0.0"
+    schema_version: str = "1.1.0"
     pid: int = 0
     target_identity: Dict[str, Any] = field(default_factory=dict)
     binary_build_id: Optional[str] = None
@@ -406,9 +407,10 @@ class ObservationSession:
     gaps: List[CaptureGap] = field(default_factory=list)
     allocation_events: List[AllocationEvent] = field(default_factory=list)
     capabilities: Dict[str, Any] = field(default_factory=dict)
+    total_observations: int = 0
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, include_observations: bool = True) -> Dict[str, Any]:
+        d = {
             "session_id": self.session_id,
             "schema_version": self.schema_version,
             "pid": self.pid,
@@ -422,17 +424,39 @@ class ObservationSession:
             "configuration": self.configuration,
             "provenance": self.provenance,
             "watch_items": [w.to_dict() for w in self.watch_items],
-            "observations": [o.to_dict() for o in self.observations],
             "gaps": [g.to_dict() for g in self.gaps],
             "allocation_events": [a.to_dict() for a in self.allocation_events],
             "capabilities": self.capabilities,
+            "total_observations": self.total_observations or len(self.observations),
+        }
+        if include_observations:
+            d["observations"] = [o.to_dict() for o in self.observations]
+        return d
+
+    def to_summary_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "pid": self.pid,
+            "status": self.status,
+            "is_remote": self.provenance.get("is_remote", False),
+            "target_host": self.provenance.get("host", "localhost"),
+            "binary_build_id": self.binary_build_id,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "total_observations": self.total_observations or len(self.observations),
+            "watch_items_count": len(self.watch_items),
+            "gaps_count": len(self.gaps),
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ObservationSession":
+        obs_list = [Observation.from_dict(o) for o in d.get("observations", [])]
+        tot = d.get("total_observations")
+        if tot is None:
+            tot = len(obs_list)
         return cls(
             session_id=d["session_id"],
-            schema_version=d.get("schema_version", "1.0.0"),
+            schema_version=d.get("schema_version", "1.1.0"),
             pid=d.get("pid", 0),
             target_identity=d.get("target_identity", {}),
             binary_build_id=d.get("binary_build_id"),
@@ -444,11 +468,125 @@ class ObservationSession:
             configuration=d.get("configuration", {}),
             provenance=d.get("provenance", {}),
             watch_items=[WatchItem.from_dict(w) for w in d.get("watch_items", [])],
-            observations=[Observation.from_dict(o) for o in d.get("observations", [])],
+            observations=obs_list,
             gaps=[CaptureGap.from_dict(g) for g in d.get("gaps", [])],
             allocation_events=[AllocationEvent.from_dict(a) for a in d.get("allocation_events", [])],
             capabilities=d.get("capabilities", {}),
+            total_observations=tot,
         )
+
+
+# -----------------------------------------------------------------------------
+# Address Correctness: ELF PT_LOAD Relocation and Load Bias
+# -----------------------------------------------------------------------------
+
+def calculate_load_bias(
+    companion_identity: Optional[BinaryIdentity],
+    runtime_identity: Optional[Union[BinaryIdentity, Dict[str, Any]]],
+    mappings: List[Dict[str, Any]],
+    page_size: int = 4096,
+) -> Dict[str, Any]:
+    """Calculates ELF load bias and validates relocation addresses for PIE/DYN and non-PIE binaries.
+    
+    Relocation semantics:
+    - ET_EXEC: fixed link-time address mapping, load_bias is 0.
+    - ET_DYN (PIE / Shared Library): kernel maps PT_LOAD segments with dynamic base.
+      load_bias = mapping_start - (p_vaddr & ~(page_size - 1))
+      Runtime address = link_time_address + load_bias.
+    """
+    is_dyn = False
+    elf_type = "unknown"
+    if companion_identity and companion_identity.elf_type:
+        elf_type = companion_identity.elf_type
+    elif runtime_identity:
+        if isinstance(runtime_identity, dict):
+            elf_type = runtime_identity.get("elf_type", "unknown")
+        else:
+            elf_type = runtime_identity.elf_type or "unknown"
+
+    if elf_type == "ET_DYN":
+        is_dyn = True
+    elif elf_type == "ET_EXEC":
+        is_dyn = False
+    else:
+        # If unknown, check if any mapping has high address or PIE
+        is_dyn = True
+
+    if not is_dyn:
+        return {
+            "load_bias": 0,
+            "load_bias_hex": "0x0",
+            "is_dyn": False,
+            "is_ambiguous": False,
+            "ambiguity_reason": None,
+            "verified_segments": 1,
+        }
+
+    # Extract PT_LOAD segments
+    pt_loads: List[Dict[str, Any]] = []
+    if companion_identity and companion_identity.pt_loads:
+        pt_loads = companion_identity.pt_loads
+    elif runtime_identity:
+        if isinstance(runtime_identity, dict):
+            pt_loads = runtime_identity.get("pt_loads", [])
+        else:
+            pt_loads = getattr(runtime_identity, "pt_loads", [])
+
+    if not pt_loads:
+        first_exec = next((m for m in mappings if m.get("is_executable")), None)
+        bias = first_exec["start_int"] if first_exec else (mappings[0]["start_int"] if mappings else 0)
+        return {
+            "load_bias": bias,
+            "load_bias_hex": f"0x{bias:x}",
+            "is_dyn": True,
+            "is_ambiguous": first_exec is None,
+            "ambiguity_reason": "No PT_LOAD segments found; used fallback mapping" if first_exec is None else None,
+            "verified_segments": 0,
+        }
+
+    sorted_loads = sorted(pt_loads, key=lambda p: p.get("p_offset", 0))
+    seg0 = sorted_loads[0]
+    seg0_off_page = seg0.get("p_offset", 0) - (seg0.get("p_offset", 0) % page_size)
+
+    candidates = [m for m in mappings if m.get("offset_int", 0) == seg0_off_page]
+    if not candidates:
+        candidates = [m for m in mappings if m.get("offset_int", 0) == 0]
+    if not candidates:
+        candidates = mappings[:1]
+
+    if not candidates:
+        return {
+            "load_bias": 0,
+            "load_bias_hex": "0x0",
+            "is_dyn": True,
+            "is_ambiguous": True,
+            "ambiguity_reason": "No memory mappings available to determine load bias",
+            "verified_segments": 0,
+        }
+
+    best = next((c for c in candidates if c.get("is_executable") or c.get("category") == "code"), candidates[0])
+    seg0_vaddr_page = seg0.get("p_vaddr", 0) - (seg0.get("p_vaddr", 0) % page_size)
+    load_bias = best["start_int"] - seg0_vaddr_page
+
+    verified = 1
+    ambiguous = False
+    ambiguity_reason = None
+    for s in sorted_loads[1:]:
+        exp_vaddr = s.get("p_vaddr", 0) + load_bias
+        if any(m["start_int"] <= exp_vaddr < m["end_int"] for m in mappings):
+            verified += 1
+        else:
+            # Segment not mapped in known regions
+            pass
+
+    return {
+        "load_bias": load_bias,
+        "load_bias_hex": f"0x{load_bias:x}",
+        "is_dyn": True,
+        "is_ambiguous": ambiguous,
+        "ambiguity_reason": ambiguity_reason,
+        "verified_segments": verified,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -467,131 +605,154 @@ class WatchSessionManager:
         self._sessions: Dict[str, ObservationSession] = {}
         self._threads: Dict[str, threading.Thread] = {}
         self._stop_events: Dict[str, threading.Event] = {}
+        self._adapters: Dict[str, TargetExecutionAdapter] = {}
+
+    def _get_session_dir(self, session_id: str) -> str:
+        d = os.path.join(self.sessions_dir, session_id)
+        os.makedirs(d, exist_ok=True)
+        return d
 
     def _get_session_file(self, session_id: str) -> str:
-        return os.path.join(self.sessions_dir, f"{session_id}.json")
+        # Primary session file in directory
+        return os.path.join(self._get_session_dir(session_id), "session.json")
+
+    def _get_observations_file(self, session_id: str) -> str:
+        return os.path.join(self._get_session_dir(session_id), "observations.jsonl")
 
     def _persist_session(self, session: ObservationSession) -> None:
-        """Atomically persists session to disk."""
+        """Atomically persists session metadata and watch configuration to disk."""
         target_path = self._get_session_file(session.session_id)
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=self.sessions_dir, prefix="sess_", suffix=".tmp")
+        parent_dir = os.path.dirname(target_path)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix="sess_", suffix=".tmp")
         try:
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                json.dump(session.to_dict(), f, indent=2, ensure_ascii=False)
+                json.dump(session.to_dict(include_observations=False), f, indent=2, ensure_ascii=False)
             os.replace(tmp_path, target_path)
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise
 
-    def get_memory_map_and_threads(self, pid: int, companion_elf_path: Optional[str] = None) -> Dict[str, Any]:
-        """Explores process memory mappings, threads, and discoverable variables."""
-        try:
-            os.kill(pid, 0)
-        except Exception as e:
-            raise RuntimeError(f"Target process PID {pid} is not accessible: {e}")
-
-        # 1. Parse /proc/<pid>/maps
-        mappings: List[Dict[str, Any]] = []
-        maps_path = f"/proc/{pid}/maps"
-        base_address = 0
-        exe_real = ""
-        try:
-            exe_real = os.path.realpath(f"/proc/{pid}/exe")
-        except Exception:
-            pass
-
-        if os.path.exists(maps_path):
-            with open(maps_path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    parts = line.strip().split(maxsplit=5)
-                    if len(parts) >= 5:
-                        addr_range = parts[0]
-                        perms = parts[1]
-                        offset = parts[2]
-                        pathname = parts[5] if len(parts) >= 6 else ""
-
-                        start_hex, end_hex = addr_range.split("-")
-                        s_int = int(start_hex, 16)
-                        e_int = int(end_hex, 16)
-
-                        category = "anonymous"
-                        if pathname == "[heap]":
-                            category = "heap"
-                        elif pathname.startswith("[stack"):
-                            category = "stack"
-                        elif pathname:
-                            if "x" in perms:
-                                category = "code"
-                            elif "w" in perms:
-                                category = "data"
-                            else:
-                                category = "file"
-
-                        # Determine base address for main executable
-                        if exe_real and pathname == exe_real and base_address == 0:
-                            base_address = s_int
-
-                        mappings.append({
-                            "start": f"0x{s_int:x}",
-                            "end": f"0x{e_int:x}",
-                            "start_int": s_int,
-                            "end_int": e_int,
-                            "size": e_int - s_int,
-                            "permissions": perms,
-                            "offset": offset,
-                            "category": category,
-                            "pathname": pathname,
-                            "is_readable": "r" in perms,
-                            "is_writable": "w" in perms,
-                            "is_executable": "x" in perms,
-                        })
-
-        # 2. Parse /proc/<pid>/task
-        threads: List[Dict[str, Any]] = []
-        task_dir = f"/proc/{pid}/task"
-        if os.path.exists(task_dir):
+        # Also maintain legacy file format for full backward compatibility if it exists
+        legacy_path = os.path.join(self.sessions_dir, f"{session.session_id}.json")
+        if os.path.exists(legacy_path):
             try:
-                for tid_entry in os.listdir(task_dir):
-                    if tid_entry.isdigit():
-                        tid = int(tid_entry)
-                        comm = "unknown"
-                        state = "UNKNOWN"
-                        comm_file = os.path.join(task_dir, tid_entry, "comm")
-                        if os.path.exists(comm_file):
-                            try:
-                                with open(comm_file, "r") as cf:
-                                    comm = cf.read().strip()
-                            except Exception:
-                                pass
-                        stat_file = os.path.join(task_dir, tid_entry, "stat")
-                        if os.path.exists(stat_file):
-                            try:
-                                with open(stat_file, "r") as sf:
-                                    tokens = sf.read().strip().split()
-                                    if len(tokens) >= 3:
-                                        state = tokens[2]
-                            except Exception:
-                                pass
-                        threads.append({
-                            "tid": tid,
-                            "name": comm,
-                            "state": state,
-                        })
+                tmp_fd2, tmp_path2 = tempfile.mkstemp(dir=self.sessions_dir, prefix="legacy_", suffix=".tmp")
+                with os.fdopen(tmp_fd2, "w", encoding="utf-8") as f2:
+                    json.dump(session.to_dict(include_observations=True), f2, indent=2, ensure_ascii=False)
+                os.replace(tmp_path2, legacy_path)
             except Exception:
-                pass
-        threads.sort(key=lambda t: t["tid"])
+                if os.path.exists(tmp_path2):
+                    os.remove(tmp_path2)
 
-        # 3. Discoverable variables from companion ELF DWARF
+    def _append_observation_to_file(self, session_id: str, observation: Observation) -> None:
+        """Appends a single observation to the durable JSONL log."""
+        jsonl_path = self._get_observations_file(session_id)
+        line = json.dumps(observation.to_dict(), ensure_ascii=False) + "\n"
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+
+    def _resolve_adapter(
+        self,
+        pid: int,
+        remote_host: Optional[str] = None,
+        ssh_user: Optional[str] = None,
+        ssh_port: int = 22,
+        ssh_key: Optional[str] = None,
+        ssh_proxy_jump: Optional[str] = None,
+        ssh_proxy_command: Optional[str] = None,
+        adapter: Optional[TargetExecutionAdapter] = None,
+    ) -> TargetExecutionAdapter:
+        if adapter is not None:
+            return adapter
+        if remote_host:
+            return RemoteSshTargetAdapter(
+                host=remote_host,
+                user=ssh_user,
+                port=ssh_port,
+                key_file=ssh_key,
+                proxy_jump=ssh_proxy_jump,
+                proxy_command=ssh_proxy_command,
+            )
+        return LocalTargetAdapter()
+
+    def get_memory_map_and_threads(
+        self,
+        pid: int,
+        companion_elf_path: Optional[str] = None,
+        remote_host: Optional[str] = None,
+        ssh_user: Optional[str] = None,
+        ssh_port: int = 22,
+        ssh_key: Optional[str] = None,
+        ssh_proxy_jump: Optional[str] = None,
+        ssh_proxy_command: Optional[str] = None,
+        adapter: Optional[TargetExecutionAdapter] = None,
+    ) -> Dict[str, Any]:
+        """Explores process memory mappings, threads, and discoverable variables across local or remote target."""
+        target_adapter = self._resolve_adapter(
+            pid=pid,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+            ssh_proxy_command=ssh_proxy_command,
+            adapter=adapter,
+        )
+
+        alive, live_err = target_adapter.check_liveness(pid)
+        if not alive:
+            raise RuntimeError(f"Target process PID {pid} is not accessible on {target_adapter.target_host()}: {live_err}")
+
+        # 1. Parse maps and threads from adapter
+        mappings = target_adapter.get_proc_maps(pid)
+        threads = target_adapter.get_threads(pid)
+        runtime_ident = target_adapter.get_process_identity(pid)
+
+        # 2. Inspect companion ELF (DWARF stays host-side)
+        companion_identity: Optional[BinaryIdentity] = None
+        if companion_elf_path:
+            if not os.path.exists(companion_elf_path):
+                raise FileNotFoundError(f"Companion ELF binary not found: '{companion_elf_path}'")
+            try:
+                companion_identity = inspect_elf(companion_elf_path)
+            except Exception as e:
+                raise ValueError(f"Invalid ELF image '{companion_elf_path}': {e}")
+
+            if not companion_identity.has_debug_info:
+                raise ValueError(f"Companion ELF '{companion_elf_path}' contains no DWARF debug information")
+
+            # Validate Build ID
+            if runtime_ident.get("build_id") and companion_identity.build_id:
+                if runtime_ident["build_id"] != companion_identity.build_id:
+                    raise ValueError(
+                        f"Build ID mismatch: runtime process {pid} on {target_adapter.target_host()} has build-id "
+                        f"'{runtime_ident['build_id']}', but companion image '{companion_elf_path}' "
+                        f"has build-id '{companion_identity.build_id}'. Mismatched symbols rejected."
+                    )
+
+            # Validate Architecture
+            if runtime_ident.get("architecture") and companion_identity.architecture:
+                if runtime_ident["architecture"] != companion_identity.architecture and runtime_ident["architecture"] != "unknown":
+                    raise ValueError(
+                        f"Architecture mismatch: runtime process is '{runtime_ident['architecture']}', "
+                        f"companion ELF is '{companion_identity.architecture}'"
+                    )
+
+        # 3. Calculate ELF load bias
+        bias_info = calculate_load_bias(companion_identity, runtime_ident, mappings)
+        load_bias = bias_info["load_bias"]
+        is_dyn = bias_info["is_dyn"]
+
+        # 4. Discoverable variables from companion ELF DWARF
         discoverable_variables: List[Dict[str, Any]] = []
         if companion_elf_path and os.path.exists(companion_elf_path):
             try:
-                elf_ident = inspect_elf(companion_elf_path)
-                is_dyn = (elf_ident.elf_type == "ET_DYN")
                 idx = DwarfIndexer.get_index(companion_elf_path)
                 for var in idx.variables:
                     if var.link_time_address is not None:
-                        runtime_addr = (base_address + var.link_time_address) if is_dyn else var.link_time_address
+                        runtime_addr = (load_bias + var.link_time_address) if is_dyn else var.link_time_address
                         t_name = idx.get_type_name(var.type_offset)
                         t_die = idx.types_by_die.get(var.type_offset)
                         size = t_die.byte_size if t_die and t_die.byte_size else 4
@@ -615,13 +776,18 @@ class WatchSessionManager:
                             "memory_category": matching_cat,
                             "is_global": True,
                         })
-            except Exception as e:
+            except Exception:
                 pass
 
         return {
             "pid": pid,
-            "base_address": f"0x{base_address:x}",
-            "base_address_int": base_address,
+            "is_remote": target_adapter.is_remote(),
+            "target_host": target_adapter.target_host(),
+            "base_address": f"0x{load_bias:x}",
+            "base_address_int": load_bias,
+            "load_bias": f"0x{load_bias:x}",
+            "load_bias_ambiguous": bias_info["is_ambiguous"],
+            "load_bias_reason": bias_info.get("ambiguity_reason"),
             "mappings": mappings,
             "threads": threads,
             "discoverable_variables": discoverable_variables,
@@ -635,30 +801,39 @@ class WatchSessionManager:
         max_samples: int = 1000,
         initial_watch_items: Optional[List[Dict[str, Any]]] = None,
         capture_mode: str = "ZERO_STOP",
+        remote_host: Optional[str] = None,
+        ssh_user: Optional[str] = None,
+        ssh_port: int = 22,
+        ssh_key: Optional[str] = None,
+        ssh_proxy_jump: Optional[str] = None,
+        ssh_proxy_command: Optional[str] = None,
+        adapter: Optional[TargetExecutionAdapter] = None,
+        max_storage_bytes: int = 52428800,
+        max_duration_sec: int = 3600,
     ) -> ObservationSession:
         """Validates target and companion ELF, creates a durable session, and begins periodic capture."""
         with self._lock:
+            target_adapter = self._resolve_adapter(
+                pid=pid,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
+                ssh_proxy_command=ssh_proxy_command,
+                adapter=adapter,
+            )
+
             # 1. Target process liveness check
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                raise ValueError(f"Target PID {pid} was not found (ESRCH)")
-            except PermissionError:
-                raise PermissionError(f"Permission denied accessing target PID {pid} (EPERM)")
+            alive, live_err = target_adapter.check_liveness(pid)
+            if not alive:
+                err_msg = live_err or f"Target PID {pid} was not found"
+                if "Permission" in err_msg or "EPERM" in err_msg:
+                    raise PermissionError(err_msg)
+                raise ValueError(err_msg)
 
             # 2. Inspect runtime executable
-            runtime_exe = ""
-            try:
-                runtime_exe = os.path.realpath(f"/proc/{pid}/exe")
-            except Exception:
-                pass
-
-            runtime_identity: Optional[BinaryIdentity] = None
-            if runtime_exe and os.path.exists(runtime_exe):
-                try:
-                    runtime_identity = inspect_elf(runtime_exe)
-                except Exception:
-                    pass
+            runtime_ident = target_adapter.get_process_identity(pid)
 
             # 3. Validate companion ELF if supplied
             companion_identity: Optional[BinaryIdentity] = None
@@ -674,30 +849,30 @@ class WatchSessionManager:
                     raise ValueError(f"Companion ELF '{companion_elf_path}' contains no DWARF debug information")
 
                 # Verify GNU Build ID compatibility
-                if runtime_identity and runtime_identity.build_id and companion_identity.build_id:
-                    if runtime_identity.build_id != companion_identity.build_id:
+                if runtime_ident.get("build_id") and companion_identity.build_id:
+                    if runtime_ident["build_id"] != companion_identity.build_id:
                         raise ValueError(
                             f"Build ID mismatch: runtime process {pid} build-id is "
-                            f"'{runtime_identity.build_id}', but companion image '{companion_elf_path}' "
+                            f"'{runtime_ident['build_id']}', but companion image '{companion_elf_path}' "
                             f"has build-id '{companion_identity.build_id}'. Mismatched symbols rejected."
                         )
 
                 # Verify Architecture compatibility
-                if runtime_identity and runtime_identity.architecture and companion_identity.architecture:
-                    if runtime_identity.architecture != companion_identity.architecture:
+                if runtime_ident.get("architecture") and companion_identity.architecture:
+                    if runtime_ident["architecture"] != companion_identity.architecture and runtime_ident["architecture"] != "unknown":
                         raise ValueError(
-                            f"Architecture mismatch: runtime process is '{runtime_identity.architecture}', "
+                            f"Architecture mismatch: runtime process is '{runtime_ident['architecture']}', "
                             f"companion ELF is '{companion_identity.architecture}'"
                         )
 
-            # 4. Resolve base address for PIE/DYN binaries
-            map_data = self.get_memory_map_and_threads(pid, companion_elf_path)
+            # 4. Resolve memory map and load bias
+            map_data = self.get_memory_map_and_threads(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                adapter=target_adapter,
+            )
             base_address = map_data.get("base_address_int", 0)
-            is_dyn = False
-            if companion_identity and companion_identity.elf_type == "ET_DYN":
-                is_dyn = True
-            elif runtime_identity and runtime_identity.elf_type == "ET_DYN":
-                is_dyn = True
+            is_dyn = (companion_identity and companion_identity.elf_type == "ET_DYN") or (runtime_ident.get("elf_type") == "ET_DYN")
 
             # 5. Process watch items
             watch_items: List[WatchItem] = []
@@ -734,26 +909,30 @@ class WatchSessionManager:
             session_id = f"watch_{pid}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
             target_ident = {
                 "pid": pid,
-                "executable": runtime_exe,
-                "architecture": runtime_identity.architecture if runtime_identity else "unknown",
-                "elf_type": runtime_identity.elf_type if runtime_identity else "unknown",
+                "executable": runtime_ident.get("executable", ""),
+                "architecture": runtime_ident.get("architecture", "unknown"),
+                "elf_type": runtime_ident.get("elf_type", "unknown"),
             }
+            backend_name = "remote_proc_mem" if target_adapter.is_remote() else "process_vm_readv"
+            transport_name = "ssh_proxy" if target_adapter.is_remote() else "local"
+
             capabilities = {
-                "capture_backend": "process_vm_readv",
+                "capture_backend": backend_name,
                 "zero_stop_supported": True,
+                "is_remote": target_adapter.is_remote(),
                 "allocation_tracking": {
                     "supported": False,
                     "status": "UNSUPPORTED_ON_BACKEND",
-                    "reason": "Heap allocation/free event recording requires an active heap hook (LD_PRELOAD / eBPF uretprobe). ProcessVmCaptureBackend does not trace allocations.",
+                    "reason": "Heap allocation/free event recording requires an active heap hook (LD_PRELOAD / eBPF uretprobe). Neither ProcessVmCaptureBackend nor RemoteSshAdapter traces allocations without a tracer.",
                 },
             }
 
             session = ObservationSession(
                 session_id=session_id,
-                schema_version="1.0.0",
+                schema_version="1.1.0",
                 pid=pid,
                 target_identity=target_ident,
-                binary_build_id=runtime_identity.build_id if runtime_identity else (companion_identity.build_id if companion_identity else None),
+                binary_build_id=runtime_ident.get("build_id") or (companion_identity.build_id if companion_identity else None),
                 companion_elf_path=companion_elf_path,
                 start_time=datetime.now(timezone.utc).isoformat(),
                 status="RUNNING",
@@ -761,29 +940,37 @@ class WatchSessionManager:
                 configuration={
                     "interval_ms": max(50, min(interval_ms, 60000)),
                     "max_samples": max(1, min(max_samples, 50000)),
+                    "max_storage_bytes": max_storage_bytes,
+                    "max_duration_sec": max_duration_sec,
                     "base_address": f"0x{base_address:x}",
+                    "load_bias": f"0x{base_address:x}",
+                    "load_bias_ambiguous": map_data.get("load_bias_ambiguous", False),
                 },
                 provenance={
-                    "transport": "local",
-                    "backend": "process_vm_readv",
-                    "host": os.uname().nodename,
+                    "transport": transport_name,
+                    "backend": backend_name,
+                    "host": target_adapter.target_host(),
+                    "is_remote": target_adapter.is_remote(),
+                    "remote_pid": pid if target_adapter.is_remote() else None,
                 },
                 watch_items=watch_items,
                 observations=[],
                 gaps=[],
                 allocation_events=[],
                 capabilities=capabilities,
+                total_observations=0,
             )
 
             self._persist_session(session)
             self._sessions[session_id] = session
+            self._adapters[session_id] = target_adapter
 
             # 7. Start background capture thread
             stop_evt = threading.Event()
             self._stop_events[session_id] = stop_evt
             th = threading.Thread(
                 target=self._capture_worker,
-                args=(session_id, stop_evt),
+                args=(session_id, stop_evt, target_adapter),
                 name=f"WatchSessionWorker-{session_id}",
                 daemon=True,
             )
@@ -798,23 +985,126 @@ class WatchSessionManager:
             if session_id in self._sessions:
                 return self._sessions[session_id]
 
-            # Try loading from disk
-            sess_path = self._get_session_file(session_id)
-            if os.path.exists(sess_path):
+            # 1. Try loading from directory structure: corpus/watch_sessions/{session_id}/session.json
+            dir_sess_path = self._get_session_file(session_id)
+            data = None
+            if os.path.exists(dir_sess_path):
                 try:
-                    with open(sess_path, "r", encoding="utf-8") as f:
+                    with open(dir_sess_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
+                except Exception:
+                    data = None
+
+            # 2. Try loading from legacy single file: corpus/watch_sessions/{session_id}.json
+            if data is None:
+                legacy_path = os.path.join(self.sessions_dir, f"{session_id}.json")
+                if os.path.exists(legacy_path):
+                    try:
+                        with open(legacy_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    except Exception:
+                        data = None
+
+            if data:
+                try:
                     session = ObservationSession.from_dict(data)
+
+                    # Load observations from JSONL if observations list was not loaded from monolithic JSON
+                    jsonl_path = self._get_observations_file(session_id)
+                    if os.path.exists(jsonl_path) and not session.observations:
+                        loaded_obs = []
+                        with open(jsonl_path, "r", encoding="utf-8") as jf:
+                            for line in jf:
+                                if line.strip():
+                                    try:
+                                        loaded_obs.append(Observation.from_dict(json.loads(line)))
+                                    except Exception:
+                                        pass
+                        session.observations = loaded_obs
+                        session.total_observations = len(loaded_obs)
+
                     # If loaded from disk and marked RUNNING without an active worker, mark STOPPED
                     if session.status == "RUNNING" and session_id not in self._threads:
                         session.status = "STOPPED"
                         session.end_time = session.end_time or datetime.now(timezone.utc).isoformat()
+                        session.gaps.append(CaptureGap(
+                            gap_id=f"gap_restart_{uuid.uuid4().hex[:6]}",
+                            start_ns=0,
+                            end_ns=0,
+                            duration_ms=0.0,
+                            reason="SERVER_RESTARTED_CAPTURE_ABORTED",
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                        ))
                         self._persist_session(session)
+
                     self._sessions[session_id] = session
                     return session
                 except Exception:
                     return None
             return None
+
+    def list_sessions(self, include_stopped: bool = True) -> List[Dict[str, Any]]:
+        """Lists metadata summaries of all persisted and active watch sessions."""
+        with self._lock:
+            results: List[Dict[str, Any]] = []
+            seen_ids = set()
+
+            # Active in-memory sessions
+            for sid, s in self._sessions.items():
+                seen_ids.add(sid)
+                if include_stopped or s.status == "RUNNING":
+                    results.append(s.to_summary_dict())
+
+            # Disk-discovered sessions
+            if os.path.exists(self.sessions_dir):
+                for entry in os.listdir(self.sessions_dir):
+                    entry_path = os.path.join(self.sessions_dir, entry)
+                    sid = None
+                    if os.path.isdir(entry_path):
+                        meta_file = os.path.join(entry_path, "session.json")
+                        if os.path.exists(meta_file):
+                            sid = entry
+                    elif entry.endswith(".json") and not entry.endswith(".tmp"):
+                        sid = entry[:-5]
+
+                    if sid and sid not in seen_ids:
+                        s = self.get_session(sid)
+                        if s:
+                            seen_ids.add(sid)
+                            if include_stopped or s.status == "RUNNING":
+                                results.append(s.to_summary_dict())
+
+            results.sort(key=lambda s: s.get("start_time", ""), reverse=True)
+            return results
+
+    def get_session_status(self, session_id: str) -> Dict[str, Any]:
+        """Fast status query without loading all historical observations into memory."""
+        session = self.get_session(session_id)
+        if not session:
+            return {"session_id": session_id, "found": False, "status": "NOT_FOUND"}
+
+        last_obs_seq = None
+        last_obs_time = None
+        if session.observations:
+            last_obs = session.observations[-1]
+            last_obs_seq = last_obs.seq
+            last_obs_time = last_obs.timestamp
+
+        return {
+            "session_id": session.session_id,
+            "found": True,
+            "status": session.status,
+            "pid": session.pid,
+            "is_remote": session.provenance.get("is_remote", False),
+            "target_host": session.provenance.get("host", "localhost"),
+            "total_observations": session.total_observations or len(session.observations),
+            "last_observation_seq": last_obs_seq,
+            "last_observation_timestamp": last_obs_time,
+            "watch_items_count": len(session.watch_items),
+            "gaps_count": len(session.gaps),
+            "health": "HEALTHY" if session.status == "RUNNING" else "STOPPED",
+            "capabilities": session.capabilities,
+        }
 
     def stop_session(self, session_id: str) -> Optional[ObservationSession]:
         """Stops an active watch session and flushes state."""
@@ -829,11 +1119,19 @@ class WatchSessionManager:
 
             th = self._threads.get(session_id)
             if th and th.is_alive() and th != threading.current_thread():
-                th.join(timeout=1.0)
+                th.join(timeout=2.0)
 
             session.status = "STOPPED"
             session.end_time = datetime.now(timezone.utc).isoformat()
             self._persist_session(session)
+
+            adapter = self._adapters.get(session_id)
+            if adapter:
+                try:
+                    adapter.close()
+                except Exception:
+                    pass
+
             return session
 
     def add_watch_item(self, session_id: str, item_dict: Dict[str, Any]) -> WatchItem:
@@ -849,8 +1147,9 @@ class WatchSessionManager:
             if size <= 0 or size > 65536:
                 raise ValueError(f"Invalid size {size}: must be between 1 and 65536 bytes")
 
-            # Validate against current mappings
-            map_data = self.get_memory_map_and_threads(session.pid, session.companion_elf_path)
+            # Validate against target mappings
+            adapter = self._adapters.get(session_id)
+            map_data = self.get_memory_map_and_threads(session.pid, session.companion_elf_path, adapter=adapter)
             readable = any(
                 m["start_int"] <= addr_int < m["end_int"] and m["is_readable"]
                 for m in map_data["mappings"]
@@ -911,58 +1210,137 @@ class WatchSessionManager:
         session_id: str,
         start_seq: Optional[int] = None,
         end_seq: Optional[int] = None,
-        limit: Optional[int] = None,
+        limit: Optional[int] = 50,
+        offset: int = 0,
     ) -> Dict[str, Any]:
-        """Returns ordered observations and gaps with pagination/filtering."""
+        """Returns ordered observations and gaps with streaming pagination and bounds."""
         with self._lock:
             session = self.get_session(session_id)
             if not session:
                 raise ValueError(f"Session '{session_id}' not found")
 
-            obs = session.observations
-            if start_seq is not None:
-                obs = [o for o in obs if o.seq >= start_seq]
-            if end_seq is not None:
-                obs = [o for o in obs if o.seq <= end_seq]
-            if limit is not None and limit > 0:
-                obs = obs[-limit:]
+            jsonl_path = self._get_observations_file(session_id)
+            results: List[Dict[str, Any]] = []
+            total_count = 0
+
+            # Stream from append-friendly JSONL file if available
+            if os.path.exists(jsonl_path):
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            d = json.loads(line)
+                            seq = d.get("seq", 0)
+                            if start_seq is not None and seq < start_seq:
+                                continue
+                            if end_seq is not None and seq > end_seq:
+                                continue
+
+                            total_count += 1
+                            if total_count > offset:
+                                if limit is None or len(results) < limit:
+                                    results.append(d)
+                        except Exception:
+                            pass
+            else:
+                # In-memory / legacy list fallback
+                obs = session.observations
+                if start_seq is not None:
+                    obs = [o for o in obs if o.seq >= start_seq]
+                if end_seq is not None:
+                    obs = [o for o in obs if o.seq <= end_seq]
+                total_count = len(obs)
+                page = obs[offset:offset + limit] if limit else obs[offset:]
+                results = [o.to_dict() for o in page]
 
             return {
                 "session_id": session.session_id,
                 "status": session.status,
-                "total_observations": len(session.observations),
-                "returned_count": len(obs),
-                "observations": [o.to_dict() for o in obs],
+                "total_observations": total_count,
+                "returned_count": len(results),
+                "offset": offset,
+                "limit": limit,
+                "observations": results,
                 "gaps": [g.to_dict() for g in session.gaps],
                 "watch_items": [w.to_dict() for w in session.watch_items],
             }
 
-    def _capture_worker(self, session_id: str, stop_evt: threading.Event) -> None:
-        """Periodic background sampling loop."""
+    def _capture_worker(
+        self,
+        session_id: str,
+        stop_evt: threading.Event,
+        adapter: TargetExecutionAdapter,
+    ) -> None:
+        """Periodic background sampling loop using TargetExecutionAdapter."""
         session = self.get_session(session_id)
         if not session:
             return
 
         interval_s = float(session.configuration.get("interval_ms", 500)) / 1000.0
         max_samples = int(session.configuration.get("max_samples", 1000))
+        max_storage_bytes = int(session.configuration.get("max_storage_bytes", 52428800))
+        max_duration_sec = float(session.configuration.get("max_duration_sec", 3600))
+
+        start_epoch = time.time()
         last_tick_end_ns = time.monotonic_ns()
+        jsonl_path = self._get_observations_file(session_id)
 
         while not stop_evt.is_set():
             t_start_ns = time.monotonic_ns()
 
-            # Liveness check
-            try:
-                os.kill(session.pid, 0)
-            except (ProcessLookupError, PermissionError):
+            # Bound 1: Duration bound
+            if (time.time() - start_epoch) >= max_duration_sec:
                 with self._lock:
                     session.status = "STOPPED"
                     session.end_time = datetime.now(timezone.utc).isoformat()
+                    session.gaps.append(CaptureGap(
+                        gap_id=f"gap_{uuid.uuid4().hex[:6]}",
+                        start_ns=t_start_ns,
+                        end_ns=t_start_ns,
+                        duration_ms=0.0,
+                        reason="DURATION_LIMIT_EXCEEDED",
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    ))
+                    self._persist_session(session)
+                break
+
+            # Bound 2: Storage bytes bound
+            if os.path.exists(jsonl_path) and os.path.getsize(jsonl_path) >= max_storage_bytes:
+                with self._lock:
+                    session.status = "STOPPED"
+                    session.end_time = datetime.now(timezone.utc).isoformat()
+                    session.gaps.append(CaptureGap(
+                        gap_id=f"gap_{uuid.uuid4().hex[:6]}",
+                        start_ns=t_start_ns,
+                        end_ns=t_start_ns,
+                        duration_ms=0.0,
+                        reason="STORAGE_LIMIT_EXCEEDED",
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    ))
+                    self._persist_session(session)
+                break
+
+            # Liveness check via adapter
+            alive, live_err = adapter.check_liveness(session.pid)
+            if not alive:
+                with self._lock:
+                    session.status = "STOPPED"
+                    session.end_time = datetime.now(timezone.utc).isoformat()
+                    session.gaps.append(CaptureGap(
+                        gap_id=f"gap_{uuid.uuid4().hex[:6]}",
+                        start_ns=t_start_ns,
+                        end_ns=t_start_ns,
+                        duration_ms=0.0,
+                        reason="TARGET_TERMINATED",
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    ))
                     self._persist_session(session)
                 break
 
             # Gap detection: if elapsed time > 1.8x expected interval, record gap
             elapsed_since_last_ms = (t_start_ns - last_tick_end_ns) / 1_000_000.0
-            if len(session.observations) > 0 and elapsed_since_last_ms > (interval_s * 1000.0 * 1.8):
+            if (session.total_observations or len(session.observations)) > 0 and elapsed_since_last_ms > (interval_s * 1000.0 * 1.8):
                 gap = CaptureGap(
                     gap_id=f"gap_{uuid.uuid4().hex[:6]}",
                     start_ns=last_tick_end_ns,
@@ -974,13 +1352,13 @@ class WatchSessionManager:
                 session.gaps.append(gap)
 
             # Sample each watch item
-            seq = len(session.observations) + 1
+            seq = (session.total_observations or len(session.observations)) + 1
             wall_clock = datetime.now(timezone.utc).isoformat()
             values: Dict[str, Dict[str, Any]] = {}
             obs_completeness = "COMPLETE"
 
             for item in list(session.watch_items):
-                raw_bytes, read_st, read_err = read_process_memory_slice(session.pid, item.address, item.size)
+                raw_bytes, read_st, read_err = adapter.read_memory(session.pid, item.address, item.size)
                 if read_st == "OBSERVED" and raw_bytes is not None:
                     decoded_val, dec_err = decode_value_from_bytes(raw_bytes, item.type_name)
                     st = "OBSERVED" if dec_err is None else "DECODE_ERROR"
@@ -1021,12 +1399,19 @@ class WatchSessionManager:
                 capture_latency_us=latency_us,
             )
 
+            # Durable append-only write
+            self._append_observation_to_file(session.session_id, observation)
+
             with self._lock:
                 session.observations.append(observation)
-                # Persist to disk periodically (every sample or when stopping)
-                self._persist_session(session)
+                session.total_observations = len(session.observations)
 
-                if len(session.observations) >= max_samples:
+                # Persist metadata periodically (every 10 samples)
+                if session.total_observations % 10 == 0:
+                    self._persist_session(session)
+
+                # Bound 3: Max samples bound
+                if session.total_observations >= max_samples:
                     session.status = "STOPPED"
                     session.end_time = datetime.now(timezone.utc).isoformat()
                     self._persist_session(session)
@@ -1036,3 +1421,10 @@ class WatchSessionManager:
             spent_s = (time.monotonic_ns() - t_start_ns) / 1_000_000_000.0
             sleep_s = max(0.01, interval_s - spent_s)
             stop_evt.wait(timeout=sleep_s)
+
+        # Final flush on worker exit
+        with self._lock:
+            if session.status == "RUNNING":
+                session.status = "STOPPED"
+                session.end_time = datetime.now(timezone.utc).isoformat()
+            self._persist_session(session)

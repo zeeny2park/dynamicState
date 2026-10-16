@@ -128,7 +128,11 @@ run_step "Phase 21 Watch Session & Temporal Memory Explorer Foundation Suite" \
 run_step "Phase 22 Zero-Configuration Live Capture & UX Simplification Suite" \
     python3 -m unittest tests/test_phase22_zero_config_live_capture.py
 
-# 21. Discover and run all remaining unit and integration tests
+# 22. Phase 23 Remote Watch Sessions and MCP Integration Suite
+run_step "Phase 23 Remote Watch Sessions and MCP Integration Suite" \
+    python3 -m unittest tests/test_phase23_remote_watch_session.py
+
+# 23. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

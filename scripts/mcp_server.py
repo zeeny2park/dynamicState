@@ -8,7 +8,7 @@ live memory capture, and C++ semantic investigation.
 import json
 import os
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -241,6 +241,302 @@ def runtime_get_capabilities() -> str:
         "action": "GET_CAPABILITIES"
     })
     return _format_result(res)
+
+
+# -----------------------------------------------------------------------------
+# Phase 23: Watch Session and Temporal Explorer MCP Tools
+# -----------------------------------------------------------------------------
+
+def _format_watch_result(data: Any) -> str:
+    """Format Watch Session result into clean JSON string."""
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+@server.tool()
+def runtime_watch_session_create(
+    pid: int,
+    companion_elf: Optional[str] = None,
+    interval_ms: int = 500,
+    max_samples: int = 1000,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+    watch_items: Optional[List[Dict[str, Any]]] = None,
+    capture_mode: str = "ZERO_STOP",
+) -> str:
+    """Create and start a persistent observation session for a local or remote target.
+    
+    Args:
+        pid: Target process PID (interpreted in target host namespace).
+        companion_elf: Local path to non-stripped companion ELF with DWARF symbols.
+        interval_ms: Sampling interval in milliseconds (default: 500ms, clamped 50..60000).
+        max_samples: Maximum observations to capture before stopping (default: 1000).
+        remote_host: Optional SSH remote host/IP for embedded target observation.
+        ssh_user: Optional SSH username.
+        ssh_port: SSH port (default: 22).
+        ssh_key: Optional path to SSH private key.
+        ssh_proxy_jump: Optional SSH jump host / proxy chain (e.g. 'jump.example.com').
+        watch_items: Optional initial list of watch items [{'name', 'address', 'size', 'type_name'}].
+        capture_mode: Capture mode ('ZERO_STOP' default).
+    """
+    try:
+        if pid <= 0:
+            return _format_watch_result({"success": False, "error": f"Invalid PID {pid}", "error_code": "INVALID_PID"})
+        session = runtime.watch_session_manager.create_session(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            interval_ms=interval_ms,
+            max_samples=max_samples,
+            initial_watch_items=watch_items,
+            capture_mode=capture_mode,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({
+            "success": True,
+            "session_id": session.session_id,
+            "status": session.status,
+            "pid": session.pid,
+            "target_host": session.provenance.get("host", "localhost"),
+            "is_remote": session.provenance.get("is_remote", False),
+            "watch_items_count": len(session.watch_items),
+            "binary_build_id": session.binary_build_id,
+            "configuration": session.configuration,
+            "capabilities": session.capabilities,
+        })
+    except Exception as e:
+        return _format_watch_result({
+            "success": False,
+            "error": str(e),
+            "error_code": type(e).__name__,
+        })
+
+
+@server.tool()
+def runtime_watch_session_status(session_id: str) -> str:
+    """Get fast compact status of a watch session without loading full observation history.
+    
+    Args:
+        session_id: Target session identifier.
+    """
+    try:
+        st = runtime.watch_session_manager.get_session_status(session_id)
+        if not st.get("found"):
+            return _format_watch_result({"success": False, "error": f"Session '{session_id}' not found", "error_code": "SESSION_NOT_FOUND"})
+        return _format_watch_result({"success": True, **st})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_watch_session_get(session_id: str) -> str:
+    """Retrieve full configuration, provenance, capabilities, and watch items for a session.
+    
+    Args:
+        session_id: Target session identifier.
+    """
+    try:
+        session = runtime.watch_session_manager.get_session(session_id)
+        if not session:
+            return _format_watch_result({"success": False, "error": f"Session '{session_id}' not found", "error_code": "SESSION_NOT_FOUND"})
+        return _format_watch_result({
+            "success": True,
+            **session.to_dict(include_observations=False),
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_watch_session_list(include_stopped: bool = True) -> str:
+    """List metadata summaries of active and persisted watch sessions.
+    
+    Args:
+        include_stopped: If True, include completed/stopped sessions (default: True).
+    """
+    try:
+        sessions = runtime.watch_session_manager.list_sessions(include_stopped=include_stopped)
+        return _format_watch_result({
+            "success": True,
+            "total_sessions": len(sessions),
+            "sessions": sessions,
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_watch_inspect_target(
+    pid: int,
+    companion_elf: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Inspect memory mappings, threads, and discoverable variables for a local or remote target.
+    
+    Args:
+        pid: Target process PID.
+        companion_elf: Local path to non-stripped companion ELF with DWARF symbols.
+        remote_host: Optional SSH remote host/IP.
+        ssh_user: Optional SSH username.
+        ssh_port: SSH port (default: 22).
+        ssh_key: Optional path to SSH private key.
+        ssh_proxy_jump: Optional SSH jump host.
+    """
+    try:
+        data = runtime.watch_session_manager.get_memory_map_and_threads(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({
+            "success": True,
+            "pid": data["pid"],
+            "target_host": data.get("target_host", "localhost"),
+            "is_remote": data.get("is_remote", False),
+            "base_address": data.get("base_address", "0x0"),
+            "load_bias": data.get("load_bias", "0x0"),
+            "load_bias_ambiguous": data.get("load_bias_ambiguous", False),
+            "mappings_count": len(data.get("mappings", [])),
+            "threads_count": len(data.get("threads", [])),
+            "discoverable_variables_count": len(data.get("discoverable_variables", [])),
+            "mappings": data.get("mappings", []),
+            "threads": data.get("threads", []),
+            "discoverable_variables": data.get("discoverable_variables", []),
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_watch_item_add(
+    session_id: str,
+    name: str,
+    address: Union[int, str],
+    size: int = 4,
+    type_name: str = "raw_bytes",
+    scope: str = "global",
+    source_location: Optional[str] = None,
+    expression: Optional[str] = None,
+) -> str:
+    """Add a variable or memory address range to a watch session's observation list.
+    
+    Args:
+        session_id: Active session identifier.
+        name: Identifier or variable name.
+        address: Runtime virtual memory address (int or hex string e.g. '0x5555...').
+        size: Bytes to sample (1..65536, default: 4).
+        type_name: Data type for decoding (int, uint, float, double, pointer, string, raw_bytes).
+        scope: Scope category (global, heap, thread, object).
+        source_location: Optional file:line source reference.
+        expression: Optional high-level expression.
+    """
+    try:
+        item = runtime.watch_session_manager.add_watch_item(session_id, {
+            "name": name,
+            "address": address,
+            "size": size,
+            "type_name": type_name,
+            "scope": scope,
+            "source_location": source_location,
+            "expression": expression,
+        })
+        return _format_watch_result({
+            "success": True,
+            "session_id": session_id,
+            "watch_item": item.to_dict(),
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_watch_item_remove(session_id: str, item_id: str) -> str:
+    """Remove an item from the watch list while preserving recorded observation history.
+    
+    Args:
+        session_id: Session identifier.
+        item_id: Watch item ID to remove.
+    """
+    try:
+        removed = runtime.watch_session_manager.remove_watch_item(session_id, item_id)
+        if not removed:
+            return _format_watch_result({"success": False, "error": f"Item '{item_id}' not found in session '{session_id}'", "error_code": "ITEM_NOT_FOUND"})
+        return _format_watch_result({
+            "success": True,
+            "session_id": session_id,
+            "removed_item_id": item_id,
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_watch_session_observations(
+    session_id: str,
+    start_seq: Optional[int] = None,
+    end_seq: Optional[int] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Retrieve paginated recorded observations and sampling gaps for a session.
+    
+    Args:
+        session_id: Session identifier.
+        start_seq: Optional lower bound sequence number (inclusive).
+        end_seq: Optional upper bound sequence number (inclusive).
+        limit: Maximum observations to return per page (default: 50, max: 500).
+        offset: Pagination offset (default: 0).
+    """
+    try:
+        clamped_limit = max(1, min(limit, 500))
+        data = runtime.watch_session_manager.get_observations(
+            session_id=session_id,
+            start_seq=start_seq,
+            end_seq=end_seq,
+            limit=clamped_limit,
+            offset=max(0, offset),
+        )
+        return _format_watch_result({
+            "success": True,
+            **data,
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_watch_session_stop(session_id: str) -> str:
+    """Stop active sampling for a watch session and persist final state.
+    
+    Args:
+        session_id: Session identifier to stop.
+    """
+    try:
+        stopped = runtime.watch_session_manager.stop_session(session_id)
+        if not stopped:
+            return _format_watch_result({"success": False, "error": f"Session '{session_id}' not found", "error_code": "SESSION_NOT_FOUND"})
+        return _format_watch_result({
+            "success": True,
+            "session_id": stopped.session_id,
+            "status": stopped.status,
+            "end_time": stopped.end_time,
+            "total_observations": stopped.total_observations or len(stopped.observations),
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 if __name__ == "__main__":

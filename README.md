@@ -1522,6 +1522,40 @@ Phase 22 transforms dynamicState from a technical runtime inspection dashboard i
   - **Area 3: ASK A QUESTION**: Conversational natural language interface for interactive problem diagnosis.
   - **Expert Mode**: Preserves all 8 deep-dive navigation tabs, low-level metrics bars, mutation labs, and raw evidence ledgers without regression.
 
+### Phase 23: Remote Watch Sessions and MCP Integration
+Phase 23 connects the Watch Session and Temporal Memory Explorer to embedded Linux targets across multi-hop SSH/SSH Proxy environments, exposing complete session lifecycle and streaming observation exploration through both MCP tools and the Web UI:
+- **Target Execution Adapter (`extractor/target_adapter.py`)**:
+  - `TargetExecutionAdapter`: Unified abstraction separating target operations from host inspection.
+  - `LocalTargetAdapter`: Zero-stop memory reads via `process_vm_readv` (fallback `/proc/<pid>/mem`) and local `/proc` introspection.
+  - `RemoteSshTargetAdapter`: High-efficiency transport over SSH, supporting multi-hop jump hosts (`proxy_jump`), proxy commands (`proxy_command`), custom ports, and keys.
+  - **Strict Target Namespace Separation**: PIDs are interpreted exclusively in the target host's namespace; local `/proc` is never touched or inspected for remote targets.
+  - **Zero Python on Target**: Operates without Python or debugger dependencies on the embedded device. Reads remote `/proc/<pid>/maps`, threads from `/proc/<pid>/task`, and memory slices via `dd | base64`. Companion unstripped ELF with DWARF stays on developer host.
+  - GNU Build ID and architecture are verified by reading remote ELF header bytes and parsing them with host-side tools.
+- **Address Correctness & PT_LOAD Load-Bias Relocation**:
+  - `calculate_load_bias`: Accurately computes load bias by matching ELF `PT_LOAD` segments against `/proc/<pid>/maps` file offsets and virtual address ranges, rather than relying on naive first-mapping heuristics.
+  - Correctly relocates PIE/DYN (`ET_DYN`) binaries, keeps non-PIE (`ET_EXEC`) load bias at 0, handles split mappings (code, rodata, data/bss), and explicitly flags ambiguous relocation states.
+- **Append-Friendly Durable Observation Store**:
+  - Eliminates monolithic JSON re-serialization overhead by logging observations to append-only `observations.jsonl` while persisting metadata in `session.json`.
+  - Supports streaming pagination (`limit`, `offset`, `start_seq`, `end_seq`) to query observation intervals without loading entire datasets into memory.
+  - Enforces resource bounds: `max_samples`, storage byte limits (`max_storage_bytes`), and session duration limits (`max_duration_sec`).
+  - Graceful restart recovery: upon restart, sessions without active workers are safely marked `STOPPED` with an explicit `SERVER_RESTARTED_CAPTURE_ABORTED` gap. Full backward compatibility with legacy monolithic session files is maintained.
+- **Model Context Protocol (MCP) Tools (`scripts/mcp_server.py`)**:
+  - Exposes 9 validated MCP tools:
+    - `runtime_watch_session_create`: Start a persistent watch session for local or remote PID.
+    - `runtime_watch_session_status`: Fast compact status query (health, sample counts, latency).
+    - `runtime_watch_session_get`: Session metadata, configuration, watch items, and capabilities.
+    - `runtime_watch_session_list`: List active and persisted watch sessions.
+    - `runtime_watch_inspect_target`: Explore threads, memory maps, and discoverable variables.
+    - `runtime_watch_item_add`: Add a variable or raw memory address to active watch list.
+    - `runtime_watch_item_remove`: Remove a watch item without deleting observation history.
+    - `runtime_watch_session_observations`: Paginated retrieval of recorded observations and gaps.
+    - `runtime_watch_session_stop`: Gracefully stop sampling and flush session state.
+- **UI and MCP Consistency**:
+  - MCP-created sessions immediately appear in the Web UI session switcher dropdown (`GET /api/watch/sessions`).
+  - Watch list modifications made via Web API or MCP are bidirectionally visible and preserved.
+  - Truthful capability reporting: allocation events remain strictly reported as `UNSUPPORTED_ON_BACKEND` unless a real allocation tracer probe is attached.
+  - Simple default UX is preserved (local PID + companion ELF) with an optional expandable remote SSH drawer for embedded targets.
+
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]
 > **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.

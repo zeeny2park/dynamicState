@@ -2152,6 +2152,12 @@
                 <label for="te-input-max-samples" class="form-label text-xs">Max Samples</label>
                 <input type="number" id="te-input-max-samples" class="form-input form-input-sm" value="1000" min="10" max="50000" step="50">
               </div>
+              <div class="form-group">
+                <label for="te-select-session" class="form-label text-xs">Active / MCP Session</label>
+                <select id="te-select-session" class="input-select input-select-sm mono">
+                  <option value="">-- New Session --</option>
+                </select>
+              </div>
               <div class="form-group flex items-end gap-2">
                 <button type="button" class="btn btn-primary btn-sm" id="btn-te-start-session">
                   <span>▶️</span> <span data-i18n="btn_te_start">Start Session</span>
@@ -2164,6 +2170,29 @@
                 </button>
               </div>
             </div>
+
+            <!-- Remote Target Configuration (Collapsible) -->
+            <details class="mt-2 text-xs text-muted" id="te-remote-details">
+              <summary class="cursor-pointer font-bold">🌐 Remote SSH Target Configuration (Embedded Targets / Multi-Hop Proxy)</summary>
+              <div class="te-controls-grid mt-2">
+                <div class="form-group">
+                  <label for="te-remote-host" class="form-label text-xs">Remote Host / IP</label>
+                  <input type="text" id="te-remote-host" class="form-input form-input-sm mono" placeholder="e.g. 192.168.1.50">
+                </div>
+                <div class="form-group">
+                  <label for="te-remote-user" class="form-label text-xs">SSH User</label>
+                  <input type="text" id="te-remote-user" class="form-input form-input-sm mono" placeholder="root">
+                </div>
+                <div class="form-group">
+                  <label for="te-remote-port" class="form-label text-xs">SSH Port</label>
+                  <input type="number" id="te-remote-port" class="form-input form-input-sm mono" value="22">
+                </div>
+                <div class="form-group flex-2">
+                  <label for="te-remote-jump" class="form-label text-xs">SSH Proxy / Jump Host (Optional)</label>
+                  <input type="text" id="te-remote-jump" class="form-input form-input-sm mono" placeholder="jump.host.example.com">
+                </div>
+              </div>
+            </details>
 
             <!-- Overhead & Performance Telemetry Row -->
             <div class="te-telemetry-row mt-3">

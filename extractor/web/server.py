@@ -1507,13 +1507,52 @@ class WebApiAdapter:
         }
 
     # -------------------------------------------------------------------------
-    # Phase 21 Watch Session & Temporal Memory Explorer Endpoints
+    # Phase 21 & Phase 23 Watch Session & Temporal Memory Explorer Endpoints
     # -------------------------------------------------------------------------
 
-    def get_watch_memory_map(self, pid: int, companion_elf: Optional[str] = None) -> Dict[str, Any]:
-        """Explores process memory mappings, active threads, and discoverable variables."""
+    def list_watch_sessions(self, query: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Lists metadata summaries of all watch sessions."""
         try:
-            data = self.watch_manager.get_memory_map_and_threads(pid=pid, companion_elf_path=companion_elf)
+            include_stopped = True
+            if query and query.get("include_stopped"):
+                val = str(query["include_stopped"][0]).lower()
+                include_stopped = (val in ("true", "1", "yes"))
+            sessions = self.watch_manager.list_sessions(include_stopped=include_stopped)
+            return {"success": True, "data": {"total": len(sessions), "sessions": sessions}}
+        except Exception as e:
+            return {"success": False, "error": {"code": "LIST_SESSIONS_ERROR", "message": str(e)}}
+
+    def get_watch_session_status(self, session_id: str) -> Dict[str, Any]:
+        """Retrieves compact health and observation count for a session."""
+        try:
+            st = self.watch_manager.get_session_status(session_id)
+            if not st.get("found"):
+                return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Watch session '{session_id}' not found"}}
+            return {"success": True, "data": st}
+        except Exception as e:
+            return {"success": False, "error": {"code": "GET_STATUS_ERROR", "message": str(e)}}
+
+    def get_watch_memory_map(
+        self,
+        pid: int,
+        companion_elf: Optional[str] = None,
+        remote_host: Optional[str] = None,
+        ssh_user: Optional[str] = None,
+        ssh_port: int = 22,
+        ssh_key: Optional[str] = None,
+        ssh_proxy_jump: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Explores process memory mappings, active threads, and discoverable variables across local or remote target."""
+        try:
+            data = self.watch_manager.get_memory_map_and_threads(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
+            )
             return {"success": True, "data": data}
         except Exception as e:
             return {"success": False, "error": {"code": "MEMORY_MAP_ERROR", "message": str(e)}}
@@ -1529,6 +1568,11 @@ class WebApiAdapter:
             max_samples = int(params.get("max_samples", 1000))
             watch_items = params.get("watch_items") or []
             capture_mode = params.get("capture_mode", "ZERO_STOP")
+            remote_host = params.get("remote_host")
+            ssh_user = params.get("ssh_user")
+            ssh_port = int(params.get("ssh_port", 22))
+            ssh_key = params.get("ssh_key")
+            ssh_proxy_jump = params.get("ssh_proxy_jump")
 
             session = self.watch_manager.create_session(
                 pid=pid,
@@ -1537,6 +1581,11 @@ class WebApiAdapter:
                 max_samples=max_samples,
                 initial_watch_items=watch_items,
                 capture_mode=capture_mode,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
             )
             return {"success": True, "data": session.to_dict()}
         except Exception as e:
@@ -1582,7 +1631,8 @@ class WebApiAdapter:
             start_seq = int(query["start_seq"][0]) if query.get("start_seq") else None
             end_seq = int(query["end_seq"][0]) if query.get("end_seq") else None
             limit = int(query["limit"][0]) if query.get("limit") else None
-            data = self.watch_manager.get_observations(session_id, start_seq=start_seq, end_seq=end_seq, limit=limit)
+            offset = int(query["offset"][0]) if query.get("offset") else 0
+            data = self.watch_manager.get_observations(session_id, start_seq=start_seq, end_seq=end_seq, limit=limit, offset=offset)
             return {"success": True, "data": data}
         except Exception as e:
             return {"success": False, "error": {"code": "GET_OBSERVATIONS_ERROR", "message": str(e)}}
@@ -2190,6 +2240,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_llm_status())
                 return
 
+            # GET /api/watch/sessions
+            if path == "/api/watch/sessions":
+                self._send_json(adapter.list_watch_sessions(query))
+                return
+
             # GET /api/watch/memory-map
             if path == "/api/watch/memory-map":
                 pid_str = q_param("pid")
@@ -2202,7 +2257,27 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                     self._send_json({"success": False, "error": {"code": "INVALID_PARAM", "message": f"Invalid PID: {pid_str}"}}, status=400)
                     return
                 companion_elf = q_param("companion_elf") or q_param("debug_image")
-                self._send_json(adapter.get_watch_memory_map(pid, companion_elf=companion_elf))
+                remote_host = q_param("remote_host")
+                ssh_user = q_param("ssh_user")
+                ssh_port = int(q_param("ssh_port") or 22)
+                ssh_key = q_param("ssh_key")
+                ssh_proxy_jump = q_param("ssh_proxy_jump")
+                self._send_json(adapter.get_watch_memory_map(
+                    pid,
+                    companion_elf=companion_elf,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                ))
+                return
+
+            # GET /api/watch/session/{session_id}/status
+            m_watch_status = re.match(r"^/api/watch/session/([^/]+)/status$", path)
+            if m_watch_status:
+                session_id = m_watch_status.group(1)
+                self._send_json(adapter.get_watch_session_status(session_id))
                 return
 
             # GET /api/watch/session/{session_id}/observations

@@ -7312,6 +7312,16 @@
     }
     if (btnSubmitCustom) btnSubmitCustom.addEventListener('click', handleTeSubmitCustomWatch);
 
+    const selectSession = document.getElementById('te-select-session');
+    if (selectSession) {
+      selectSession.addEventListener('change', (e) => {
+        const sid = e.target.value;
+        if (sid) {
+          loadExistingTemporalSession(sid);
+        }
+      });
+    }
+
     // Replay controls
     if (btnHome) btnHome.addEventListener('click', () => seekTemporalReplay(0));
     if (btnPrev) btnPrev.addEventListener('click', () => stepTemporalReplay(-1));
@@ -7384,6 +7394,9 @@
       inputElf.value = basicElf.value;
     }
 
+    // Refresh available sessions (UI and MCP)
+    loadTemporalSessionsList();
+
     if (inputPid && inputPid.value && (!teState.mappings || teState.mappings.length === 0)) {
       loadTemporalMemoryMap(false);
     }
@@ -7391,6 +7404,76 @@
     renderTeWatchList();
     renderTemporalCurrentSnapshot();
     renderTemporalMatrix();
+  }
+
+  async function loadTemporalSessionsList() {
+    const selectSession = document.getElementById('te-select-session');
+    if (!selectSession) return;
+    try {
+      const res = await apiGet('/api/watch/sessions');
+      if (res.success && res.data && res.data.sessions) {
+        const currentVal = selectSession.value;
+        const opts = ['<option value="">-- Start New Session / Select Existing --</option>'];
+        res.data.sessions.forEach((s) => {
+          const isSel = (s.session_id === teState.sessionId || s.session_id === currentVal) ? 'selected' : '';
+          const hostStr = s.is_remote ? ` [${s.target_host}]` : '';
+          opts.push(`<option value="${s.session_id}" ${isSel}>[${s.status}] ${s.session_id} (PID ${s.pid}${hostStr}, ${s.total_observations} obs)</option>`);
+        });
+        selectSession.innerHTML = opts.join('');
+      }
+    } catch (e) {
+      console.warn('Failed to load watch sessions list:', e);
+    }
+  }
+
+  async function loadExistingTemporalSession(sessionId) {
+    if (!sessionId) return;
+    try {
+      stopTePolling();
+      const res = await apiGet(`/api/watch/session/${sessionId}`);
+      if (res.success && res.data) {
+        const sess = res.data;
+        teState.sessionId = sess.session_id;
+        teState.status = sess.status;
+        teState.targetPid = sess.pid;
+        teState.companionElf = sess.companion_elf_path || '';
+        teState.watchItems = sess.watch_items || [];
+        teState.gaps = sess.gaps || [];
+
+        const inputPid = document.getElementById('te-target-pid');
+        const inputElf = document.getElementById('te-companion-elf');
+        if (inputPid) inputPid.value = sess.pid;
+        if (inputElf) inputElf.value = sess.companion_elf_path || '';
+
+        const badgeStatus = document.getElementById('te-badge-session-status');
+        const statSessId = document.getElementById('te-stat-session-id');
+        const statHost = document.getElementById('te-stat-host');
+        const btnStart = document.getElementById('btn-te-start-session');
+        const btnStop = document.getElementById('btn-te-stop-session');
+
+        if (badgeStatus) {
+          badgeStatus.textContent = sess.status;
+          badgeStatus.className = `badge badge-${sess.status === 'RUNNING' ? 'success' : 'neutral'}`;
+        }
+        if (statSessId) statSessId.textContent = sess.session_id;
+        if (statHost) statHost.textContent = sess.provenance?.host || 'localhost';
+        if (btnStart) btnStart.disabled = (sess.status === 'RUNNING');
+        if (btnStop) btnStop.disabled = (sess.status !== 'RUNNING');
+
+        // Fetch recorded observations
+        await pollTemporalObservations();
+        renderTeWatchList();
+        renderTemporalCurrentSnapshot();
+        renderTemporalMatrix();
+
+        if (sess.status === 'RUNNING') {
+          startTePolling();
+        }
+        showToastNotification(`Loaded watch session '${sessionId}'`, 'info');
+      }
+    } catch (err) {
+      showToastNotification(`Failed to load session '${sessionId}': ${err}`, 'error');
+    }
   }
 
   async function loadTemporalMemoryMap(showToast = false) {
@@ -7406,6 +7489,18 @@
     let url = `/api/watch/memory-map?pid=${encodeURIComponent(pidVal)}`;
     if (elfVal) {
       url += `&companion_elf=${encodeURIComponent(elfVal)}`;
+    }
+
+    const remHostEl = document.getElementById('te-remote-host');
+    const remUserEl = document.getElementById('te-remote-user');
+    const remPortEl = document.getElementById('te-remote-port');
+    const remJumpEl = document.getElementById('te-remote-jump');
+
+    if (remHostEl && remHostEl.value.trim()) {
+      url += `&remote_host=${encodeURIComponent(remHostEl.value.trim())}`;
+      if (remUserEl && remUserEl.value.trim()) url += `&ssh_user=${encodeURIComponent(remUserEl.value.trim())}`;
+      if (remPortEl && remPortEl.value.trim()) url += `&ssh_port=${encodeURIComponent(remPortEl.value.trim())}`;
+      if (remJumpEl && remJumpEl.value.trim()) url += `&ssh_proxy_jump=${encodeURIComponent(remJumpEl.value.trim())}`;
     }
 
     const res = await apiGet(url);
@@ -7676,6 +7771,18 @@
         watch_items: teState.watchItems,
       };
 
+      const remHostEl = document.getElementById('te-remote-host');
+      const remUserEl = document.getElementById('te-remote-user');
+      const remPortEl = document.getElementById('te-remote-port');
+      const remJumpEl = document.getElementById('te-remote-jump');
+
+      if (remHostEl && remHostEl.value.trim()) {
+        payload.remote_host = remHostEl.value.trim();
+        if (remUserEl && remUserEl.value.trim()) payload.ssh_user = remUserEl.value.trim();
+        if (remPortEl && remPortEl.value.trim()) payload.ssh_port = parseInt(remPortEl.value.trim(), 10) || 22;
+        if (remJumpEl && remJumpEl.value.trim()) payload.ssh_proxy_jump = remJumpEl.value.trim();
+      }
+
       const res = await apiPost('/api/watch/session/create', payload);
       if (res.success && res.data) {
         teState.sessionId = res.data.session_id;
@@ -7690,6 +7797,7 @@
         const badgeStatus = document.getElementById('te-badge-session-status');
         const badgeBuildId = document.getElementById('te-badge-buildid');
         const statSessId = document.getElementById('te-stat-session-id');
+        const statHost = document.getElementById('te-stat-host');
         const btnStop = document.getElementById('btn-te-stop-session');
 
         if (badgeStatus) {
@@ -7701,10 +7809,12 @@
           badgeBuildId.className = 'badge badge-success';
         }
         if (statSessId) statSessId.textContent = teState.sessionId;
+        if (statHost) statHost.textContent = res.data.provenance?.host || 'localhost';
         if (btnStop) btnStop.disabled = false;
 
         renderTeWatchList();
         startTePolling();
+        loadTemporalSessionsList();
         showToastNotification(`Watch Session '${teState.sessionId}' started (interval: ${intervalMs}ms)`, 'success');
       } else {
         const badgeBuildId = document.getElementById('te-badge-buildid');
@@ -7725,6 +7835,7 @@
     if (!teState.sessionId) return;
     const res = await apiPost(`/api/watch/session/${teState.sessionId}/stop`);
     stopTePolling();
+    loadTemporalSessionsList();
 
     const badgeStatus = document.getElementById('te-badge-session-status');
     const btnStart = document.getElementById('btn-te-start-session');

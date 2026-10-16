@@ -259,6 +259,7 @@ class RunningFixture:
         if line != "READY":
             self.proc.kill()
             raise RuntimeError(f"Fixture failed to report READY (got '{line}')")
+        time.sleep(0.05)
         return self.proc.pid
 
     def __exit__(self, exc_type, exc_val, exc_tb):
