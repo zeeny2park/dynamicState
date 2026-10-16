@@ -132,7 +132,11 @@ run_step "Phase 22 Zero-Configuration Live Capture & UX Simplification Suite" \
 run_step "Phase 23 Remote Watch Sessions and MCP Integration Suite" \
     python3 -m unittest tests/test_phase23_remote_watch_session.py
 
-# 23. Discover and run all remaining unit and integration tests
+# 23. Phase 24 Evidence-First Temporal Investigation Workflow Suite
+run_step "Phase 24 Evidence-First Temporal Investigation Workflow Suite" \
+    python3 -m unittest tests/test_phase24_temporal_investigation.py
+
+# 24. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

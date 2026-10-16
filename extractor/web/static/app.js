@@ -57,8 +57,15 @@
     btnLangEn: document.getElementById('btn-lang-en'),
     btnLangKo: document.getElementById('btn-lang-ko'),
 
-    // Phase 22: Basic Mode Elements
+    // Phase 22 & Phase 24: Basic Mode Elements
     basicInvestigationView: document.getElementById('basic-investigation-view'),
+    basicInvestigationGoal: document.getElementById('basic-investigation-goal'),
+    radioSourcePid: document.getElementById('radio-source-pid'),
+    radioSourceWatch: document.getElementById('radio-source-watch'),
+    basicLiveFields: document.getElementById('basic-live-fields'),
+    basicWatchFields: document.getElementById('basic-watch-fields'),
+    basicSelectWatchSession: document.getElementById('basic-select-watch-session'),
+    basicWatchDuration: document.getElementById('basic-watch-duration'),
     basicTargetArea: document.getElementById('basic-target-area'),
     basicTargetForm: document.getElementById('basic-target-form'),
     basicTargetPid: document.getElementById('basic-target-pid'),
@@ -97,6 +104,13 @@
     basicQuestionInput: document.getElementById('basic-question-input'),
     btnBasicAsk: document.getElementById('btn-basic-ask'),
     basicChatHistory: document.getElementById('basic-chat-history'),
+    // Phase 24 Finding Drilldown Modal Elements
+    modalFindingDrilldown: document.getElementById('modal-finding-drilldown'),
+    drilldownModalTitle: document.getElementById('drilldown-modal-title'),
+    drilldownModalLoading: document.getElementById('drilldown-modal-loading'),
+    drilldownModalContent: document.getElementById('drilldown-modal-content'),
+    btnCloseModalDrilldown: document.getElementById('btn-close-modal-drilldown'),
+    btnDismissModalDrilldown: document.getElementById('btn-dismiss-modal-drilldown'),
 
     // Phase 15: Conversational LLM & Simplified Investigation Workspace
     hdrBadgeLlmStatus: document.getElementById('hdr-badge-llm-status'),
@@ -1121,7 +1135,16 @@
 
       // Phase 22: Basic 3-Area Workflow
       title_basic_target: '🎯 Target Process',
-      subtitle_basic_target: 'Provide the running target PID and its matching unstripped ELF/debug binary.',
+      subtitle_basic_target: 'Provide a natural language goal and select a running target PID or existing observation session.',
+      lbl_basic_goal: 'Investigation Goal / Question',
+      ph_basic_goal: 'e.g. 특정 Buffer memory pool을 10초간 모니터링하면서 memory guard 근처까지 접근하는 변수가 무엇인지 알아봐줘',
+      lbl_source_live_pid: '⚡ Live Target Process (PID)',
+      lbl_source_watch_session: '⏱️ Observation Session (Watch / MCP)',
+      lbl_select_watch_session: 'Select Active or Persisted Session',
+      lbl_watch_duration: 'Window (seconds)',
+      opt_no_watch_sessions: 'No active sessions found',
+      loading_drilldown: 'Loading grounded evidence...',
+      btn_close: 'Close',
       lbl_basic_target_pid: 'Target PID',
       ph_basic_target_pid: 'e.g. 12345',
       lbl_basic_debug_image: 'Matching Nostrip/Debug ELF',
@@ -1437,7 +1460,16 @@
 
       // Phase 22: Basic 3-Area Workflow
       title_basic_target: '🎯 대상 프로세스',
-      subtitle_basic_target: '실행 중인 대상 PID와 일치하는 non-stripped ELF/디버그 바이너리 경로를 입력하세요.',
+      subtitle_basic_target: '자연어 조사 목표를 입력하고 실행 중인 대상 PID 또는 기존 관측 세션을 선택하세요.',
+      lbl_basic_goal: '조사 목표 / 질문',
+      ph_basic_goal: '예: 특정 Buffer memory pool을 10초간 모니터링하면서 memory guard 근처까지 접근하는 변수가 무엇인지 알아봐줘',
+      lbl_source_live_pid: '⚡ 실시간 대상 프로세스 (PID)',
+      lbl_source_watch_session: '⏱️ 관측 세션 (Watch / MCP)',
+      lbl_select_watch_session: '활성 또는 저장된 관측 세션 선택',
+      lbl_watch_duration: '관측 구간 (초)',
+      opt_no_watch_sessions: '활성 세션 없음',
+      loading_drilldown: '근거 증거 로딩 중...',
+      btn_close: '닫기',
       lbl_basic_target_pid: '대상 PID',
       ph_basic_target_pid: '예: 12345',
       lbl_basic_debug_image: '매칭 디버그/비스트립 ELF',
@@ -6800,6 +6832,96 @@
     if (state.isBasicConnecting) return;
     hideBasicError();
 
+    const isWatchSource = !!(el.radioSourceWatch && el.radioSourceWatch.checked);
+    const goalText = (el.basicInvestigationGoal && el.basicInvestigationGoal.value.trim()) || '';
+
+    if (isWatchSource) {
+      const watchSessionId = (el.basicSelectWatchSession && el.basicSelectWatchSession.value.trim()) || '';
+      if (!watchSessionId) {
+        showBasicError(
+          state.currentLang === 'ko' ? '분석할 관측 세션을 선택해주세요.' : 'Please select an observation session to investigate.',
+          state.currentLang === 'ko' ? 'Temporal Memory Explorer에서 생성된 세션을 선택하세요.' : 'Select an existing session created in Temporal Memory Explorer.'
+        );
+        if (el.basicSelectWatchSession) el.basicSelectWatchSession.focus();
+        return;
+      }
+
+      const durationSec = parseInt((el.basicWatchDuration && el.basicWatchDuration.value) || '10', 10) || 10;
+
+      state.isBasicConnecting = true;
+      if (el.btnBasicConnectAnalyze) {
+        el.btnBasicConnectAnalyze.disabled = true;
+        el.btnBasicConnectAnalyze.textContent = state.currentLang === 'ko' ? '⏳ 관측 데이터 분석 중...' : '⏳ Analyzing Observations...';
+      }
+      if (el.basicProgressSequence) {
+        el.basicProgressSequence.style.display = 'flex';
+      }
+      resetBasicSteps();
+
+      try {
+        // Step 1: Connecting to watch session
+        setBasicStep('stepConnecting', 'active');
+        await new Promise(r => setTimeout(r, 60));
+        setBasicStep('stepConnecting', 'completed');
+
+        // Step 2: Validating target identity & Build ID
+        setBasicStep('stepValidating', 'active');
+        await new Promise(r => setTimeout(r, 60));
+        setBasicStep('stepValidating', 'completed');
+
+        // Step 3: Stream & Paginate temporal observations
+        setBasicStep('stepCapturing', 'active');
+        const defaultGoal = state.currentLang === 'ko'
+          ? '특정 Buffer memory pool을 10초간 모니터링하면서 memory guard 근처까지 접근하는 변수가 무엇인지 알아봐줘'
+          : 'Investigate temporal state and buffer guard proximity over observation window';
+        const effectiveGoal = goalText || defaultGoal;
+
+        const analyzePayload = {
+          goal: effectiveGoal,
+          watch_session_id: watchSessionId,
+          observation_window: {
+            duration_sec: durationSec
+          },
+          locale: state.currentLang || 'en'
+        };
+
+        const res = await apiPost('/api/investigation/temporal-analyze', analyzePayload);
+        if (!res.success || !res.data) {
+          setBasicStep('stepCapturing', 'failed');
+          const errMsg = res.error?.message || (state.currentLang === 'ko' ? '관측 세션 분석 실패' : 'Temporal session analysis failed');
+          showBasicError(errMsg, state.currentLang === 'ko' ? '세션 데이터 및 디버그 심볼 일치 여부를 확인하세요.' : 'Check session data and matching debug symbols.');
+          return;
+        }
+        setBasicStep('stepCapturing', 'completed');
+
+        // Step 4: Analyzing findings & hypotheses
+        setBasicStep('stepAnalyzing', 'active');
+        const invData = res.data;
+        state.activeInvestigation = invData;
+        state.selectedInvestigationId = invData.investigation_id;
+        try { sessionStorage.setItem('dynamicstate_selected_inv_id', invData.investigation_id); } catch (_) {}
+
+        await loadActiveInvestigation(invData.investigation_id);
+        setBasicStep('stepAnalyzing', 'completed');
+
+        // Step 5: Results
+        setBasicStep('stepResults', 'completed');
+        state.basicTargetConnected = true;
+        renderBasicInvestigationView();
+        showToast(state.currentLang === 'ko' ? '시계열 관측 조사가 완료되었습니다.' : 'Temporal observation investigation completed.', 'success');
+      } catch (err) {
+        console.error('Temporal analysis failed:', err);
+        showBasicError(String(err));
+      } finally {
+        state.isBasicConnecting = false;
+        if (el.btnBasicConnectAnalyze) {
+          el.btnBasicConnectAnalyze.disabled = false;
+          el.btnBasicConnectAnalyze.textContent = t('btn_basic_connect_analyze', 'Connect & Analyze');
+        }
+      }
+      return;
+    }
+
     const rawPid = (el.basicTargetPid && el.basicTargetPid.value.trim()) || '';
     const debugImage = (el.basicDebugImage && el.basicDebugImage.value.trim()) || '';
 
@@ -6873,8 +6995,9 @@
 
       // Step 3: Capturing state
       setBasicStep('stepCapturing', 'active');
+      const defaultLiveGoal = state.currentLang === 'ko' ? '실시간 런타임 제로 설정 자동 조사' : 'Zero-configuration live runtime investigation';
       const startPayload = {
-        goal: state.currentLang === 'ko' ? '실시간 런타임 제로 설정 자동 조사' : 'Zero-configuration live runtime investigation',
+        goal: goalText || defaultLiveGoal,
         pid: pid,
         debug_image: debugImage,
         authorize_target: true,
@@ -7025,20 +7148,29 @@
       } else {
         const visibleFacts = state.basicExpandedSections.facts ? facts : facts.slice(0, LIMIT);
         el.basicFactsList.innerHTML = visibleFacts.map(f => {
+          const fid = f.finding_id || '';
           const title = f.title || f.finding_id || f.c_type_path || 'Invariant Violation';
           const desc = f.description || '';
           const path = f.c_type_path ? `<span class="badge badge-neutral text-xs mono">${escapeHtml(f.c_type_path)}</span>` : '';
           const valInfo = (f.current_value !== undefined && f.expected_value !== undefined)
             ? `<div class="text-xs mono mt-1" style="color: var(--danger);">current: ${escapeHtml(String(f.current_value))} != expected: ${escapeHtml(String(f.expected_value))}</div>`
             : '';
+          const prov = f.temporal_provenance || {};
+          const seqBadge = (prov.observation_sequence !== undefined)
+            ? `<span class="badge badge-neutral text-xs mono">Seq #${prov.observation_sequence}</span>`
+            : '';
           return `
-            <div class="basic-item-card">
+            <div class="basic-item-card" data-finding-id="${escapeHtml(fid)}" style="cursor: pointer;" title="${state.currentLang === 'ko' ? '클릭하여 상세 근거 드릴다운' : 'Click to inspect grounded evidence'}">
               <div class="basic-item-top">
                 <span class="basic-item-title">${escapeHtml(title)}</span>
-                ${path}
+                <div class="d-flex align-items-center gap-1">${seqBadge}${path}</div>
               </div>
               ${desc ? `<div class="basic-item-desc">${escapeHtml(desc)}</div>` : ''}
               ${valInfo}
+              <div class="mt-2 d-flex justify-content-between align-items-center text-xs" style="color: var(--accent);">
+                <span>🔍 ${state.currentLang === 'ko' ? '상세 증거 드릴다운' : 'Evidence Drill-down'} &rarr;</span>
+                ${prov.capture_quality ? `<span class="badge badge-neutral text-xs">${escapeHtml(prov.capture_quality)}</span>` : ''}
+              </div>
             </div>
           `;
         }).join('');
@@ -7064,19 +7196,23 @@
       } else {
         const visibleCauses = state.basicExpandedSections.causes ? causes : causes.slice(0, LIMIT);
         el.basicCausesList.innerHTML = visibleCauses.map(h => {
+          const hid = h.finding_id || h.hypothesis_id || '';
           const title = h.title || h.function_name || h.description || h.hypothesis_id || 'Candidate Function';
           const desc = h.description || '';
           const plaus = h.plausibility || h.status || 'PROPOSED';
           const fnName = h.function_name ? `<span class="mono text-xs" style="color: var(--accent);">${escapeHtml(h.function_name)}()</span>` : '';
           const badgeClass = plaus === 'VALIDATED_CAUSAL_FUNCTION' ? 'badge-success' : 'badge-warning';
           return `
-            <div class="basic-item-card">
+            <div class="basic-item-card" data-finding-id="${escapeHtml(hid)}" style="cursor: pointer;" title="${state.currentLang === 'ko' ? '클릭하여 상세 근거 드릴다운' : 'Click to inspect grounded evidence'}">
               <div class="basic-item-top">
                 <span class="basic-item-title">${escapeHtml(title)}</span>
                 <span class="badge ${badgeClass} text-xs">${escapeHtml(plaus)}</span>
               </div>
               ${fnName ? `<div class="mt-1">${fnName}</div>` : ''}
               ${desc ? `<div class="basic-item-desc">${escapeHtml(desc)}</div>` : ''}
+              <div class="mt-2 d-flex justify-content-between align-items-center text-xs" style="color: var(--accent);">
+                <span>🔍 ${state.currentLang === 'ko' ? '상세 증거 드릴다운' : 'Evidence Drill-down'} &rarr;</span>
+              </div>
             </div>
           `;
         }).join('');
@@ -7125,6 +7261,176 @@
         }
       }
     }
+  }
+
+  // Phase 24: Finding Evidence Drill-down Modal
+  async function openBasicFindingDrilldown(findingId) {
+    if (!findingId) return;
+    const invId = state.selectedInvestigationId || (state.activeInvestigation && state.activeInvestigation.investigation_id);
+    if (!invId) return;
+
+    if (el.modalFindingDrilldown) el.modalFindingDrilldown.style.display = 'flex';
+    if (el.drilldownModalLoading) el.drilldownModalLoading.style.display = 'block';
+    if (el.drilldownModalContent) {
+      el.drilldownModalContent.style.display = 'none';
+      el.drilldownModalContent.innerHTML = '';
+    }
+    if (el.drilldownModalTitle) {
+      el.drilldownModalTitle.textContent = `${state.currentLang === 'ko' ? '증거 기반 드릴다운' : 'Finding Evidence Drill-Down'}: ${findingId}`;
+    }
+
+    try {
+      const res = await apiGet(`/api/investigation/drilldown?investigation_id=${encodeURIComponent(invId)}&finding_id=${encodeURIComponent(findingId)}`);
+      if (el.drilldownModalLoading) el.drilldownModalLoading.style.display = 'none';
+      if (!res.success || !res.data) {
+        if (el.drilldownModalContent) {
+          el.drilldownModalContent.style.display = 'block';
+          el.drilldownModalContent.innerHTML = `<div class="banner banner-danger">${escapeHtml(res.error?.message || 'Failed to load drilldown evidence')}</div>`;
+        }
+        return;
+      }
+
+      renderBasicDrilldownContent(res.data);
+    } catch (err) {
+      if (el.drilldownModalLoading) el.drilldownModalLoading.style.display = 'none';
+      if (el.drilldownModalContent) {
+        el.drilldownModalContent.style.display = 'block';
+        el.drilldownModalContent.innerHTML = `<div class="banner banner-danger">${escapeHtml(String(err))}</div>`;
+      }
+    }
+  }
+
+  function closeBasicFindingDrilldown() {
+    if (el.modalFindingDrilldown) el.modalFindingDrilldown.style.display = 'none';
+  }
+
+  function renderBasicDrilldownContent(data) {
+    if (!el.drilldownModalContent) return;
+    el.drilldownModalContent.style.display = 'block';
+
+    const f = data.finding || data;
+    const provenance = f.temporal_provenance || data.temporal_provenance || {};
+    const dwarf = data.dwarf_source || f.dwarf_source || {};
+    const functions = data.related_functions || f.related_functions || [];
+    const evidence = data.evidence_records || f.evidence_records || [];
+    const uncertainty = data.uncertainty || f.uncertainty || null;
+    const nextSteps = data.next_steps || f.next_steps || [];
+
+    const isKo = state.currentLang === 'ko';
+
+    let html = `
+      <div style="display: flex; flex-direction: column; gap: 12px;">
+        <!-- Card 1: Finding Overview & Provenance -->
+        <div style="background: rgba(0,0,0,0.2); padding: 10px; border-radius: 6px; border-left: 3px solid var(--accent);">
+          <div class="d-flex justify-content-between align-items-center">
+            <h4 style="margin: 0; font-size: 0.95rem;">${escapeHtml(f.title || f.finding_id || 'Observation Finding')}</h4>
+            <span class="badge ${f.category === 'fact' ? 'badge-success' : 'badge-warning'} text-xs">${escapeHtml((f.category || 'FACT').toUpperCase())}</span>
+          </div>
+          ${f.description ? `<div class="text-xs text-muted mt-1">${escapeHtml(f.description)}</div>` : ''}
+          ${f.c_type_path ? `<div class="text-xs mono mt-1"><strong>Path:</strong> ${escapeHtml(f.c_type_path)}</div>` : ''}
+          ${(f.current_value !== undefined && f.expected_value !== undefined) ? `
+            <div class="text-xs mono mt-1" style="color: var(--danger);">current: ${escapeHtml(String(f.current_value))} != expected: ${escapeHtml(String(f.expected_value))}</div>
+          ` : ''}
+          ${f.observed_value !== undefined ? `
+            <div class="text-xs mono mt-1"><strong>Observed:</strong> ${escapeHtml(String(f.observed_value))}</div>
+          ` : ''}
+        </div>
+
+        <!-- Card 2: Temporal Observation Provenance -->
+        <div style="background: rgba(0,0,0,0.15); padding: 10px; border-radius: 6px;">
+          <h5 style="margin: 0 0 6px 0; font-size: 0.82rem; color: var(--text-muted); text-transform: uppercase;">
+            ${isKo ? '⏱️ 시계열 관측 출처 (Temporal Provenance)' : '⏱️ Temporal Observation Provenance'}
+          </h5>
+          <div class="d-flex flex-wrap gap-2 text-xs mono">
+            ${provenance.session_id ? `<div><span class="text-muted">Session:</span> ${escapeHtml(provenance.session_id)}</div>` : ''}
+            ${provenance.observation_sequence !== undefined ? `<div><span class="text-muted">Seq:</span> #${escapeHtml(String(provenance.observation_sequence))}</div>` : ''}
+            ${provenance.observation_timestamp ? `<div><span class="text-muted">Time:</span> ${escapeHtml(String(provenance.observation_timestamp))}</div>` : ''}
+            ${provenance.capture_quality ? `<div><span class="text-muted">Quality:</span> <span class="badge badge-neutral text-xs">${escapeHtml(provenance.capture_quality)}</span></div>` : ''}
+            ${provenance.address ? `<div><span class="text-muted">Address:</span> ${escapeHtml(provenance.address)}</div>` : ''}
+          </div>
+          ${provenance.provenance ? `<div class="text-xs text-muted mt-1">${escapeHtml(provenance.provenance)}</div>` : ''}
+        </div>
+
+        <!-- Card 3: DWARF Type & Source Location -->
+        <div style="background: rgba(0,0,0,0.15); padding: 10px; border-radius: 6px;">
+          <h5 style="margin: 0 0 6px 0; font-size: 0.82rem; color: var(--text-muted); text-transform: uppercase;">
+            ${isKo ? '🏷️ DWARF 심볼 및 소스 위치' : '🏷️ DWARF Symbol & Source Location'}
+          </h5>
+          <div class="text-xs mono">
+            ${(dwarf.file || dwarf.line) ? `<div><strong>Source:</strong> ${escapeHtml(dwarf.file || 'unknown')}:${escapeHtml(String(dwarf.line || 0))}</div>` : ''}
+            ${dwarf.symbol_name ? `<div><strong>Symbol:</strong> ${escapeHtml(dwarf.symbol_name)}</div>` : ''}
+            ${dwarf.type_name ? `<div><strong>Type:</strong> ${escapeHtml(dwarf.type_name)}</div>` : ''}
+            ${dwarf.build_id ? `<div><strong>Build ID:</strong> ${escapeHtml(dwarf.build_id)}</div>` : ''}
+          </div>
+          ${(!dwarf.file && !dwarf.type_name && !dwarf.symbol_name) ? `<div class="text-xs text-muted">${isKo ? 'DWARF 정보가 제공되지 않았거나 companion ELF 심볼이 누락되었습니다.' : 'No DWARF symbol information available for this finding.'}</div>` : ''}
+        </div>
+
+        <!-- Card 4: Related Function Candidates (Grounding & Safety Tier) -->
+        <div style="background: rgba(0,0,0,0.15); padding: 10px; border-radius: 6px;">
+          <h5 style="margin: 0 0 6px 0; font-size: 0.82rem; color: var(--text-muted); text-transform: uppercase;">
+            ${isKo ? '🧩 관련 함수 후보 (Function Candidates)' : '🧩 Related Function Candidates'}
+          </h5>
+          ${functions.length > 0 ? functions.map(fn => {
+            const fnName = fn.function_name || fn.name || 'candidate';
+            const tier = fn.plausibility || fn.candidate_tier || 'STATIC_CANDIDATE';
+            const isCausal = tier === 'VALIDATED_CAUSAL_FUNCTION';
+            const badgeClass = isCausal ? 'badge-success' : 'badge-warning';
+            return `
+              <div style="margin-top: 6px; padding: 6px; background: rgba(0,0,0,0.2); border-radius: 4px; border-left: 2px solid ${isCausal ? 'var(--success)' : 'var(--warning)'};">
+                <div class="d-flex justify-content-between align-items-center">
+                  <span class="mono font-bold" style="color: var(--accent); font-size: 0.85rem;">${escapeHtml(fnName)}()</span>
+                  <span class="badge ${badgeClass} text-xs">${escapeHtml(tier)}</span>
+                </div>
+                ${fn.source_location ? `<div class="text-xs mono text-muted mt-1">Source: ${escapeHtml(fn.source_location)}</div>` : ''}
+                ${fn.rationale ? `<div class="text-xs mt-1">${escapeHtml(fn.rationale)}</div>` : ''}
+                ${fn.caveats ? `<div class="text-xs text-muted mt-1" style="font-style: italic;">⚠️ ${escapeHtml(fn.caveats)}</div>` : ''}
+              </div>
+            `;
+          }).join('') : `<div class="text-xs text-muted">${isKo ? '연결된 함수 후보가 없습니다.' : 'No related function candidates found.'}</div>`}
+        </div>
+
+        <!-- Card 5: Canonical Evidence Ledger Records -->
+        <div style="background: rgba(0,0,0,0.15); padding: 10px; border-radius: 6px;">
+          <h5 style="margin: 0 0 6px 0; font-size: 0.82rem; color: var(--text-muted); text-transform: uppercase;">
+            ${isKo ? '📜 근거 원장 기록 (Evidence Ledger Records)' : '📜 Canonical Evidence Ledger Records'}
+          </h5>
+          ${evidence.length > 0 ? `
+            <div style="max-height: 180px; overflow-y: auto;">
+              ${evidence.map(ev => `
+                <div class="text-xs p-1 mb-1 border-bottom mono d-flex justify-content-between">
+                  <span class="text-accent">${escapeHtml(ev.evidence_id || '-')}</span>
+                  <span class="badge badge-neutral text-xs">${escapeHtml(ev.source_type || 'OBSERVATION')}</span>
+                  <span class="text-muted">Seq #${escapeHtml(String(ev.observation_sequence || '-'))}</span>
+                </div>
+              `).join('')}
+            </div>
+          ` : `<div class="text-xs text-muted">${isKo ? '연결된 원장 기록이 없습니다.' : 'No supporting evidence ledger records found.'}</div>`}
+        </div>
+
+        <!-- Card 6: Uncertainty & Next Recommended Steps -->
+        ${uncertainty ? `
+          <div class="banner banner-warning text-xs">
+            <strong>⚠️ ${isKo ? '불확실성 및 한계 고지' : 'Uncertainty & Observation Limitations'}:</strong> ${escapeHtml(uncertainty)}
+          </div>
+        ` : ''}
+
+        ${nextSteps.length > 0 ? `
+          <div style="background: rgba(0,0,0,0.15); padding: 10px; border-radius: 6px;">
+            <h5 style="margin: 0 0 6px 0; font-size: 0.82rem; color: var(--text-muted); text-transform: uppercase;">
+              ${isKo ? '🎯 권장 후속 관측/검증 단계' : '🎯 Recommended Next Steps'}
+            </h5>
+            ${nextSteps.map((st, i) => `
+              <div class="text-xs mt-1">
+                <strong>${i + 1}.</strong> ${escapeHtml(st.action || st.title || (typeof st === 'string' ? st : JSON.stringify(st)))}
+                ${st.rationale ? `<div class="text-muted" style="margin-left: 14px;">${escapeHtml(st.rationale)}</div>` : ''}
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
+      </div>
+    `;
+
+    el.drilldownModalContent.innerHTML = html;
   }
 
   function appendBasicChatBubble(role, content) {
@@ -7206,6 +7512,59 @@
     if (el.btnBasicConnectAnalyze) {
       el.btnBasicConnectAnalyze.addEventListener('click', handleBasicConnectAndAnalyze);
     }
+
+    // Target source toggle
+    if (el.radioSourcePid) {
+      el.radioSourcePid.addEventListener('change', () => {
+        if (el.radioSourcePid.checked) {
+          if (el.basicLiveFields) el.basicLiveFields.style.display = 'flex';
+          if (el.basicWatchFields) el.basicWatchFields.style.display = 'none';
+        }
+      });
+    }
+    if (el.radioSourceWatch) {
+      el.radioSourceWatch.addEventListener('change', () => {
+        if (el.radioSourceWatch.checked) {
+          if (el.basicLiveFields) el.basicLiveFields.style.display = 'none';
+          if (el.basicWatchFields) el.basicWatchFields.style.display = 'flex';
+          loadTemporalSessionsList();
+        }
+      });
+    }
+
+    // Modal finding drilldown handlers
+    if (el.btnCloseModalDrilldown) {
+      el.btnCloseModalDrilldown.addEventListener('click', closeBasicFindingDrilldown);
+    }
+    if (el.btnDismissModalDrilldown) {
+      el.btnDismissModalDrilldown.addEventListener('click', closeBasicFindingDrilldown);
+    }
+    if (el.modalFindingDrilldown) {
+      el.modalFindingDrilldown.addEventListener('click', (e) => {
+        if (e.target === el.modalFindingDrilldown) {
+          closeBasicFindingDrilldown();
+        }
+      });
+    }
+
+    // Finding card click delegation
+    if (el.basicFactsList) {
+      el.basicFactsList.addEventListener('click', (e) => {
+        const card = e.target.closest('.basic-item-card');
+        if (card && card.dataset.findingId) {
+          openBasicFindingDrilldown(card.dataset.findingId);
+        }
+      });
+    }
+    if (el.basicCausesList) {
+      el.basicCausesList.addEventListener('click', (e) => {
+        const card = e.target.closest('.basic-item-card');
+        if (card && card.dataset.findingId) {
+          openBasicFindingDrilldown(card.dataset.findingId);
+        }
+      });
+    }
+
     if (el.basicTargetPid) {
       el.basicTargetPid.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
@@ -7408,18 +7767,31 @@
 
   async function loadTemporalSessionsList() {
     const selectSession = document.getElementById('te-select-session');
-    if (!selectSession) return;
+    const selectBasic = el.basicSelectWatchSession || document.getElementById('basic-select-watch-session');
+    if (!selectSession && !selectBasic) return;
     try {
       const res = await apiGet('/api/watch/sessions');
       if (res.success && res.data && res.data.sessions) {
-        const currentVal = selectSession.value;
-        const opts = ['<option value="">-- Start New Session / Select Existing --</option>'];
-        res.data.sessions.forEach((s) => {
-          const isSel = (s.session_id === teState.sessionId || s.session_id === currentVal) ? 'selected' : '';
-          const hostStr = s.is_remote ? ` [${s.target_host}]` : '';
-          opts.push(`<option value="${s.session_id}" ${isSel}>[${s.status}] ${s.session_id} (PID ${s.pid}${hostStr}, ${s.total_observations} obs)</option>`);
-        });
-        selectSession.innerHTML = opts.join('');
+        if (selectSession) {
+          const currentVal = selectSession.value;
+          const opts = ['<option value="">-- Start New Session / Select Existing --</option>'];
+          res.data.sessions.forEach((s) => {
+            const isSel = (s.session_id === teState.sessionId || s.session_id === currentVal) ? 'selected' : '';
+            const hostStr = s.is_remote ? ` [${s.target_host}]` : '';
+            opts.push(`<option value="${s.session_id}" ${isSel}>[${s.status}] ${s.session_id} (PID ${s.pid}${hostStr}, ${s.total_observations} obs)</option>`);
+          });
+          selectSession.innerHTML = opts.join('');
+        }
+        if (selectBasic) {
+          const currentBasicVal = selectBasic.value;
+          const basicOpts = ['<option value="">-- Select Observation Session --</option>'];
+          res.data.sessions.forEach((s) => {
+            const isSel = (s.session_id === currentBasicVal) ? 'selected' : '';
+            const hostStr = s.is_remote ? ` [${s.target_host}]` : '';
+            basicOpts.push(`<option value="${s.session_id}" ${isSel}>[${s.status}] ${s.session_id} (PID ${s.pid}${hostStr}, ${s.total_observations} obs)</option>`);
+          });
+          selectBasic.innerHTML = basicOpts.join('');
+        }
       }
     } catch (e) {
       console.warn('Failed to load watch sessions list:', e);

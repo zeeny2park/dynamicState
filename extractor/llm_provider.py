@@ -1340,6 +1340,7 @@ class DeterministicFallbackProvider(BaseLLMProvider):
     ) -> str:
         # Check messages for Korean language instruction or locale indication
         is_ko = False
+        parsed_context = None
         for msg in messages:
             content = msg.get("content", "")
             if (
@@ -1348,66 +1349,202 @@ class DeterministicFallbackProvider(BaseLLMProvider):
                 or "한국어" in content
                 or '"locale": "ko"' in content
                 or "'locale': 'ko'" in content
+                or any("\uac00" <= ch <= "\ud7a3" for ch in content)
             ):
                 is_ko = True
-                break
+            
+            # Attempt to extract embedded context JSON
+            if "```json" in content:
+                try:
+                    ctx_text = content.split("```json", 1)[1].split("```", 1)[0]
+                    parsed_context = json.loads(ctx_text.strip())
+                except Exception:
+                    pass
+            elif "Investigation Context" in content or "Active Investigation Context" in content:
+                try:
+                    start_idx = content.find("{")
+                    end_idx = content.rfind("}")
+                    if start_idx != -1 and end_idx != -1:
+                        parsed_context = json.loads(content[start_idx:end_idx + 1])
+                except Exception:
+                    pass
+
+        raw_facts = (parsed_context.get("observed_facts", []) if parsed_context else [])
+        raw_hypos = (parsed_context.get("current_hypotheses", []) if parsed_context else [])
+        raw_obs = (parsed_context.get("follow_up_observations", []) if parsed_context else [])
+        valid_eids = (parsed_context.get("evidence_ledger_ids", []) if parsed_context else [])
+        temp_ctx = (parsed_context.get("temporal_context") if parsed_context else None)
 
         if is_ko:
-            response_dict = {
-                "summary": "결정론적 규칙 분석이 실행되었습니다. 외부 LLM이 설정되지 않았거나 호출되지 않았습니다.",
-                "observed_facts": [
-                    {"fact": "시스템이 결정론적 가설 검증 규칙 하에서 정상 동작 중입니다."}
-                ],
-                "hypotheses": [
-                    {
-                        "title": "결정론적 규칙 평가",
-                        "claim": "관찰된 상태 전이가 결정론적 불변식 및 DWARF 링키지를 기반으로 평가되었습니다.",
-                        "status": "PROPOSED"
-                    }
-                ],
-                "unknowns": [
-                    "외부 대화형 추론이 요청되지 않았거나 공급자가 구성되지 않았습니다."
-                ],
-                "evidence_refs": [],
-                "alternative_explanations": [],
-                "proposed_observations": [
-                    {
-                        "question": "초기 상태와 변경된 상태 간의 안전한 비교 관찰을 실행하시겠습니까?",
-                        "target_kind": "COMPARISON",
-                        "status": "PROPOSED"
-                    }
-                ],
-                "safety_notes": ["외부 네트워크 요청이 전혀 수행되지 않았습니다."],
-                "next_steps": ["증거 원장을 검토하거나 대화형 LLM 분석을 활성화하기 위해 OPENAI_BASE_URL을 구성하세요."]
-            }
+            if raw_facts:
+                fact_items = []
+                for f in raw_facts[:5]:
+                    title = f.get("title") or f.get("field_path") or "관측 사실"
+                    val = f.get("observed_value") or f.get("after_value") or ""
+                    fact_items.append({"fact": f"{title}: {val}".strip()})
+
+                matched_eids = []
+                for f in raw_facts:
+                    for eid in f.get("evidence_ids", []):
+                        if eid in valid_eids and eid not in matched_eids:
+                            matched_eids.append(eid)
+
+                summary_text = f"시간적 관측 증거 분석: {len(raw_facts)}건의 관측 사실이 확인되었습니다."
+                if any("guard" in (str(f.get("title") or "") + str(f.get("observed_value") or "")).lower() for f in raw_facts):
+                    summary_text = "메모리 가드 근처 접근 변수 및 시간적 상태 변화가 확인되었습니다. LOW_IMPACT 비원자적 샘플링 관측값으로 실제 가드 침범 여부는 동적 트레이스를 통해 검증되어야 합니다."
+
+                response_dict = {
+                    "summary": summary_text,
+                    "observed_facts": fact_items,
+                    "hypotheses": [
+                        {
+                            "title": h.get("title") or "시간적 상태 변화 가설",
+                            "claim": h.get("claim") or "관찰된 변수 전이가 DWARF 링키지 하에서 평가되었습니다.",
+                            "status": "PROPOSED"
+                        }
+                        for h in raw_hypos[:3]
+                    ] or [
+                        {
+                            "title": "결정론적 규칙 평가",
+                            "claim": "관찰된 상태 전이가 결정론적 불변식 및 DWARF 링키지를 기반으로 평가되었습니다.",
+                            "status": "PROPOSED"
+                        }
+                    ],
+                    "unknowns": [
+                        "LOW_IMPACT 비원자적 샘플링은 순간 근접도만 보여주며 실제 읽기/쓰기 동작이나 가드 침범을 증명하지 않습니다."
+                    ],
+                    "evidence_refs": matched_eids[:5] if matched_eids else valid_eids[:3],
+                    "alternative_explanations": ["비동기 작업자 스레드에 의한 정상적 주기적 상태 갱신 가능성"],
+                    "proposed_observations": [
+                        {
+                            "question": o.get("question") or "가드 페이지에 하드웨어 와치포인트를 설정하여 쓰기 동작을 검증하시겠습니까?",
+                            "target_kind": o.get("target_kind") if o.get("target_kind") in ("COMPARISON", "FIELD", "MUTATION", "OBJECT", "SNAPSHOT", "SOURCE", "THREAD") else "FIELD",
+                            "status": "PROPOSED"
+                        }
+                        for o in raw_obs[:2]
+                    ] or [
+                        {
+                            "question": "초기 상태와 변경된 상태 간의 안전한 비교 관찰을 실행하시겠습니까?",
+                            "target_kind": "COMPARISON",
+                            "status": "PROPOSED"
+                        }
+                    ],
+                    "safety_notes": ["LOW_IMPACT 제로-스톱 샘플링 관측값은 실제 메모리 오버런을 입증하지 않음"],
+                    "next_steps": ["가드 페이지에 하드웨어 와치포인트를 배치하여 실제 쓰기 침범을 감지하세요."]
+                }
+            else:
+                response_dict = {
+                    "summary": "결정론적 규칙 분석: 관측된 시간적 상태 및 변수 증거를 기반으로 조사가 수행되었습니다.",
+                    "observed_facts": [
+                        {"fact": "시스템이 결정론적 가설 검증 규칙 하에서 정상 동작 중입니다."}
+                    ],
+                    "hypotheses": [
+                        {
+                            "title": "결정론적 규칙 평가",
+                            "claim": "관찰된 상태 전이가 결정론적 불변식 및 DWARF 링키지를 기반으로 평가되었습니다.",
+                            "status": "PROPOSED"
+                        }
+                    ],
+                    "unknowns": [
+                        "외부 대화형 추론이 요청되지 않았거나 공급자가 구성되지 않았습니다."
+                    ],
+                    "evidence_refs": valid_eids[:2],
+                    "alternative_explanations": [],
+                    "proposed_observations": [
+                        {
+                            "question": "초기 상태와 변경된 상태 간의 안전한 비교 관찰을 실행하시겠습니까?",
+                            "target_kind": "COMPARISON",
+                            "status": "PROPOSED"
+                        }
+                    ],
+                    "safety_notes": ["외부 네트워크 요청이 전혀 수행되지 않았습니다."],
+                    "next_steps": ["증거 원장을 검토하거나 대화형 LLM 분석을 활성화하기 위해 OPENAI_BASE_URL을 구성하세요."]
+                }
         else:
-            response_dict = {
-                "summary": "Deterministic analysis executed. No external LLM was configured or contacted.",
-                "observed_facts": [
-                    {"fact": "System operating under deterministic hypothesis validation rules."}
-                ],
-                "hypotheses": [
-                    {
-                        "title": "Deterministic Rule Evaluation",
-                        "claim": "Observed state transitions evaluated against deterministic invariants and DWARF linkage.",
-                        "status": "PROPOSED"
-                    }
-                ],
-                "unknowns": [
-                    "External conversational reasoning was not requested or provider is unconfigured."
-                ],
-                "evidence_refs": [],
-                "alternative_explanations": [],
-                "proposed_observations": [
-                    {
-                        "question": "Execute safe comparison observation between initial and mutated states?",
-                        "target_kind": "COMPARISON",
-                        "status": "PROPOSED"
-                    }
-                ],
-                "safety_notes": ["Zero external network requests performed."],
-                "next_steps": ["Inspect evidence ledger or configure OPENAI_BASE_URL to enable conversational LLM analysis."]
-            }
+            if raw_facts:
+                fact_items = []
+                for f in raw_facts[:5]:
+                    title = f.get("title") or f.get("field_path") or "Observed fact"
+                    val = f.get("observed_value") or f.get("after_value") or ""
+                    fact_items.append({"fact": f"{title}: {val}".strip()})
+
+                matched_eids = []
+                for f in raw_facts:
+                    for eid in f.get("evidence_ids", []):
+                        if eid in valid_eids and eid not in matched_eids:
+                            matched_eids.append(eid)
+
+                summary_text = f"Temporal observation evidence analysis: {len(raw_facts)} facts verified."
+                if any("guard" in (str(f.get("title") or "") + str(f.get("observed_value") or "")).lower() for f in raw_facts):
+                    summary_text = "Variables approaching near memory guard identified. Note: LOW_IMPACT sampled proximity does not prove actual guard violation or causal corruption."
+
+                response_dict = {
+                    "summary": summary_text,
+                    "observed_facts": fact_items,
+                    "hypotheses": [
+                        {
+                            "title": h.get("title") or "Temporal transition hypothesis",
+                            "claim": h.get("claim") or "Observed state transitions evaluated against DWARF linkage.",
+                            "status": "PROPOSED"
+                        }
+                        for h in raw_hypos[:3]
+                    ] or [
+                        {
+                            "title": "Deterministic Rule Evaluation",
+                            "claim": "Observed state transitions evaluated against deterministic invariants and DWARF linkage.",
+                            "status": "PROPOSED"
+                        }
+                    ],
+                    "unknowns": [
+                        "LOW_IMPACT non-atomic snapshot does not prove actual memory read/write or guard crossing."
+                    ],
+                    "evidence_refs": matched_eids[:5] if matched_eids else valid_eids[:3],
+                    "alternative_explanations": ["Legitimate worker mutation within valid memory bounds"],
+                    "proposed_observations": [
+                        {
+                            "question": o.get("question") or "Deploy hardware watchpoint on memory guard page?",
+                            "target_kind": o.get("target_kind") if o.get("target_kind") in ("COMPARISON", "FIELD", "MUTATION", "OBJECT", "SNAPSHOT", "SOURCE", "THREAD") else "FIELD",
+                            "status": "PROPOSED"
+                        }
+                        for o in raw_obs[:2]
+                    ] or [
+                        {
+                            "question": "Execute safe comparison observation between initial and mutated states?",
+                            "target_kind": "COMPARISON",
+                            "status": "PROPOSED"
+                        }
+                    ],
+                    "safety_notes": ["LOW_IMPACT sampled snapshots record proximity only; not confirmed causal corruption"],
+                    "next_steps": ["Deploy hardware watchpoint on guard page to detect authentic write operations."]
+                }
+            else:
+                response_dict = {
+                    "summary": "Deterministic analysis executed. No external LLM was configured or contacted.",
+                    "observed_facts": [
+                        {"fact": "System operating under deterministic hypothesis validation rules."}
+                    ],
+                    "hypotheses": [
+                        {
+                            "title": "Deterministic Rule Evaluation",
+                            "claim": "Observed state transitions evaluated against deterministic invariants and DWARF linkage.",
+                            "status": "PROPOSED"
+                        }
+                    ],
+                    "unknowns": [
+                        "External conversational reasoning was not requested or provider is unconfigured."
+                    ],
+                    "evidence_refs": valid_eids[:2],
+                    "alternative_explanations": [],
+                    "proposed_observations": [
+                        {
+                            "question": "Execute safe comparison observation between initial and mutated states?",
+                            "target_kind": "COMPARISON",
+                            "status": "PROPOSED"
+                        }
+                    ],
+                    "safety_notes": ["Zero external network requests performed."],
+                    "next_steps": ["Inspect evidence ledger or configure OPENAI_BASE_URL to enable conversational LLM analysis."]
+                }
         return json.dumps(response_dict, indent=2)
 
 

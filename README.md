@@ -1556,6 +1556,33 @@ Phase 23 connects the Watch Session and Temporal Memory Explorer to embedded Lin
   - Truthful capability reporting: allocation events remain strictly reported as `UNSUPPORTED_ON_BACKEND` unless a real allocation tracer probe is attached.
   - Simple default UX is preserved (local PID + companion ELF) with an optional expandable remote SSH drawer for embedded targets.
 
+### Phase 24: Evidence-First Temporal Investigation Workflow
+Phase 24 connects Watch Sessions and the Temporal Memory Explorer to the conversational investigation workflow, canonical EvidenceLedger, static code analysis, and object-centric drilldown:
+- **Natural-Language Temporal Orchestration**:
+  - Translates user goals (English and Korean) into bounded temporal observation plans (`TemporalInvestigationPlan`).
+  - Supports intuitive goal understanding (e.g., *"특정 Buffer memory pool을 10초간 모니터링하면서 memory guard 근처까지 접근하는 변수가 무엇인지 알아봐줘"*).
+  - Automatically parses memory addresses, observation windows, buffer bounds, and guard proximity parameters.
+- **Evidence Provenance & Canonical Ledger**:
+  - Reuses canonical `EvidenceRecord` entries linking session ID, observation sequence/time, capture quality, target identity, Build ID, address/range, type/field path, DWARF source location, and static candidate functions.
+  - Distinguishes observed facts, inferred hypotheses, unknowns, and candidate causal functions.
+  - Candidate functions remain strictly in `STATIC_CANDIDATE` or `EVIDENCE_SUPPORTED` tiers and are never promoted to validated causality without independent execution tracing.
+- **Streaming & Memory-Bounded Observation Comparison**:
+  - Evaluates temporal observations through streaming pagination chunks without loading unbounded JSONL histories into memory.
+  - Distinctly classifies watch item states:
+    - `CHANGED`: Values transitioning across sequences.
+    - `UNCHANGED`: Values remaining steady across the requested window.
+    - `PARTIAL`: Partially read structures or memory reads.
+    - `MISSING`: Unrecorded or unavailable samples (never silently treated as unchanged).
+- **Buffer & Memory Guard Proximity Safety**:
+  - Evaluates byte distance between pointer variables and guard page boundaries.
+  - Strictly enforces `LOW_IMPACT` honest capture semantics: snapshot proximity alone does NOT prove actual memory reads, writes, buffer overruns, or guard crossings.
+  - Recommends non-invasive follow-up actions (hardware watchpoints or dynamic probes on guard pages).
+- **Object-Centric Evidence Drill-Down (`GET_FINDING_DRILLDOWN`)**:
+  - Provides drill-down navigation: Finding &rarr; C++ object/field &rarr; pointer/size/guard distance &rarr; DWARF type/source location &rarr; candidate functions &rarr; evidence ledger records &rarr; uncertainty notices.
+- **Simplified Investigation Workspace**:
+  - Enhances Basic Investigation Mode with a Target Source toggle (Live PID vs. Observation Session), watch session selector, observation window duration input, and a Finding Evidence Drilldown Modal (`#modal-finding-drilldown`).
+  - Strict secret redaction preserves confidentiality of API tokens, keys, and raw memory dumps across all views.
+
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]
 > **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.

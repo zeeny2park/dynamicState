@@ -141,15 +141,19 @@ def runtime_start_investigation(
     goal: str,
     pid: Optional[int] = None,
     debug_image: Optional[str] = None,
-    memory_snapshot_path: Optional[str] = None
+    memory_snapshot_path: Optional[str] = None,
+    watch_session_id: Optional[str] = None,
+    observation_window: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Launch an evidence-first investigation session against a live PID or offline snapshot.
+    """Launch an evidence-first investigation session against a live PID, offline snapshot, or persistent watch session.
     
     Args:
-        goal: Natural language investigation goal (e.g. 'Investigate worker counter mismatch').
+        goal: Natural language investigation goal (e.g. 'Investigate worker counter mismatch' or Korean equivalent).
         pid: Target process PID for live capture.
         debug_image: Path to external debug ELF binary with DWARF symbols.
         memory_snapshot_path: Path to offline raw memory snapshot directory.
+        watch_session_id: Optional persistent watch session ID (e.g. from runtime_watch_session_create).
+        observation_window: Optional dict with start_seq, end_seq, duration_sec, guard_address, etc.
     """
     res = runtime.dispatch_action({
         "action": "START_INVESTIGATION",
@@ -157,6 +161,8 @@ def runtime_start_investigation(
         "pid": pid,
         "debug_image": debug_image,
         "memory_snapshot_path": memory_snapshot_path,
+        "watch_session_id": watch_session_id,
+        "observation_window": observation_window,
         "authorize_target": True
     })
     return _format_result(res)

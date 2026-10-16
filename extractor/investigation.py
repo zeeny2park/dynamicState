@@ -158,6 +158,7 @@ class InvestigationFinding:
     unavailable_reason: Optional[str] = None
     classification: Optional[str] = None
     supporting_evidence_ids: Optional[List[str]] = None
+    temporal_provenance: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.supporting_evidence_ids and not self.evidence_ids:
@@ -397,6 +398,7 @@ class InvestigationSession:
             "hypotheses": [h.to_dict() for h in self.hypotheses],
             "evidence_count": len(self.ledger._records),
             "next_steps": [s.to_dict() for s in self.next_steps],
+            "recommended_next_steps": [s.to_dict() for s in self.next_steps],
             "comparison_results": self.comparison_results,
             "summary": self.summary,
             "timeline": list(self.timeline),
@@ -1160,6 +1162,9 @@ class InvestigationManager:
         budgets: Optional[Dict[str, Any]] = None,
         authorize_target: bool = False,
         static_provider: Optional[StaticAnalysisProvider] = None,
+        watch_session_id: Optional[str] = None,
+        observation_window: Optional[Dict[str, Any]] = None,
+        watch_manager: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Start an investigation from an existing offline snapshot or authorized target.
 
@@ -1190,7 +1195,30 @@ class InvestigationManager:
             "pid": pid,
             "debug_image": debug_image,
             "constraints": constraints or {},
+            "watch_session_id": watch_session_id,
+            "observation_window": observation_window or {},
         }
+
+        # Check for temporal investigation routing (Phase 24)
+        is_temporal_request = (
+            watch_session_id is not None
+            or (observation_window is not None and bool(observation_window.get("session_id")))
+        )
+        if is_temporal_request:
+            from extractor.temporal_investigation import TemporalInvestigationService
+            from extractor.watch_session import WatchSessionManager
+            wm = watch_manager or WatchSessionManager(corpus_dir=self.corpus_dir)
+            ws_id = watch_session_id or (observation_window.get("session_id") if observation_window else None)
+            ws = wm.get_session(ws_id) if ws_id else None
+            svc = TemporalInvestigationService(watch_manager=wm)
+            return svc.analyze_temporal_session(
+                investigation_session=session,
+                watch_session=ws,
+                watch_manager=wm,
+                observation_window=observation_window,
+                goal=goal,
+                static_provider=static_provider,
+            )
 
         # Target parameter validation and live PID processing
         parsed_pid = None
@@ -2995,6 +3023,25 @@ class InvestigationManager:
                 "consistency_level": cap_details.get("consistency_level", "UNKNOWN"),
                 "limitations": limitations,
             },
+            "uncertainty": target_finding.uncertainty,
+            "temporal_provenance": target_finding.temporal_provenance or next(
+                (
+                    {
+                        "session_id": (ev.provenance or {}).get("watch_session_id"),
+                        "watch_session_id": (ev.provenance or {}).get("watch_session_id"),
+                        "watch_item_id": (ev.provenance or {}).get("watch_item_id"),
+                        "comparison": ev.comparison_observation,
+                        "field_observation": ev.field_observation,
+                    }
+                    for ev in session.ledger._records
+                    if ev.evidence_id in target_finding.evidence_ids and (ev.comparison_observation or ev.field_observation)
+                ),
+                {}
+            ),
+            "evidence_records": [
+                ev.to_dict() for ev in session.ledger._records
+                if ev.evidence_id in target_finding.evidence_ids
+            ],
         }
         return {"success": True, "drilldown": drilldown}
 

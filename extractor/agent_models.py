@@ -139,6 +139,8 @@ class AgentAction(_SubscriptableModel):
     provider_override: Optional[str] = None
     allow_fallback: bool = False
     locale: Optional[str] = None
+    watch_session_id: Optional[str] = None
+    observation_window: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -194,6 +196,9 @@ class AgentAction(_SubscriptableModel):
             request_id=data.get("request_id"),
             provider_override=data.get("provider_override"),
             allow_fallback=bool(data.get("allow_fallback", False)),
+            locale=data.get("locale"),
+            watch_session_id=data.get("watch_session_id"),
+            observation_window=data.get("observation_window"),
         )
 
 

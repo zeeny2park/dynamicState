@@ -193,20 +193,47 @@
             <div class="basic-card-header">
               <div class="basic-card-title" data-i18n="title_basic_target">🎯 Target Process</div>
               <div class="basic-card-subtitle text-xs text-muted" data-i18n="subtitle_basic_target">
-                Provide the running target PID and its matching unstripped ELF/debug binary.
+                Provide a natural language goal and select a running target PID or existing observation session.
               </div>
             </div>
             <div class="basic-card-body">
-              <!-- 1A: Disconnected State (Two-Input Form) -->
+              <!-- 1A: Disconnected State (Target & Goal Form) -->
               <div id="basic-target-form" class="basic-target-form">
-                <div class="basic-form-row">
+                <!-- Goal Input Row -->
+                <div class="basic-form-row mb-3">
+                  <div class="basic-form-field w-full">
+                    <label for="basic-investigation-goal" class="basic-label">
+                      <span data-i18n="lbl_basic_goal">Investigation Goal / Question</span>
+                    </label>
+                    <input type="text" id="basic-investigation-goal" class="form-input" 
+                           placeholder="e.g. 특정 Buffer memory pool을 10초간 모니터링하면서 memory guard 근처까지 접근하는 변수가 무엇인지 알아봐줘"
+                           data-i18n-placeholder="ph_basic_goal">
+                  </div>
+                </div>
+
+                <!-- Source Selector Toggle -->
+                <div class="basic-form-row mb-3">
+                  <div class="basic-source-selector d-flex align-items-center">
+                    <label class="radio-label me-4 cursor-pointer">
+                      <input type="radio" name="basic-target-source" id="radio-source-pid" value="pid" checked>
+                      <span data-i18n="lbl_source_live_pid">⚡ Live Target Process (PID)</span>
+                    </label>
+                    <label class="radio-label cursor-pointer">
+                      <input type="radio" name="basic-target-source" id="radio-source-watch" value="watch">
+                      <span data-i18n="lbl_source_watch_session">⏱️ Observation Session (Watch / MCP)</span>
+                    </label>
+                  </div>
+                </div>
+
+                <!-- Live PID Fields -->
+                <div class="basic-form-row" id="basic-live-fields">
                   <div class="basic-form-field">
                     <label for="basic-target-pid" class="basic-label">
                       <span data-i18n="lbl_basic_target_pid">Target PID</span>
                       <span class="required-star">*</span>
                     </label>
                     <input type="number" id="basic-target-pid" class="form-input" 
-                           placeholder="e.g. 12345" min="1" step="1" required
+                           placeholder="e.g. 12345" min="1" step="1"
                            data-i18n-placeholder="ph_basic_target_pid">
                   </div>
                   <div class="basic-form-field basic-flex-2">
@@ -215,10 +242,33 @@
                       <span class="required-star">*</span>
                     </label>
                     <input type="text" id="basic-debug-image" class="form-input mono" 
-                           placeholder="/path/to/target.debug or unstripped binary" required
+                           placeholder="/path/to/target.debug or unstripped binary"
                            data-i18n-placeholder="ph_basic_debug_image">
                   </div>
-                  <div class="basic-form-action">
+                </div>
+
+                <!-- Watch Session Fields (collapsible/toggleable) -->
+                <div class="basic-form-row mb-3" id="basic-watch-fields" style="display: none;">
+                  <div class="basic-form-field basic-flex-2">
+                    <label for="basic-select-watch-session" class="basic-label">
+                      <span data-i18n="lbl_select_watch_session">Select Active or Persisted Session</span>
+                      <span class="required-star">*</span>
+                    </label>
+                    <select id="basic-select-watch-session" class="form-input mono">
+                      <option value="" data-i18n="opt_no_watch_sessions">No active sessions found</option>
+                    </select>
+                  </div>
+                  <div class="basic-form-field">
+                    <label for="basic-watch-duration" class="basic-label">
+                      <span data-i18n="lbl_watch_duration">Window (seconds)</span>
+                    </label>
+                    <input type="number" id="basic-watch-duration" class="form-input" value="10" min="1" step="1">
+                  </div>
+                </div>
+
+                <!-- Primary Connect & Analyze Action Button -->
+                <div class="basic-form-row mt-3">
+                  <div class="basic-form-action w-full d-flex justify-content-end">
                     <button type="button" id="btn-basic-connect-analyze" class="btn btn-primary btn-lg">
                       <span class="btn-icon">⚡</span>
                       <span data-i18n="btn_basic_connect_analyze">Connect &amp; Analyze</span>
@@ -388,6 +438,25 @@
                 <button type="button" id="btn-basic-ask" class="btn btn-primary basic-ask-btn">
                   <span data-i18n="btn_basic_ask">Ask</span> ➔
                 </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Finding Evidence Drilldown Modal -->
+          <div id="modal-finding-drilldown" class="modal-backdrop" style="display: none;">
+            <div class="modal-dialog modal-lg">
+              <div class="modal-header d-flex justify-content-between align-items-center">
+                <div class="modal-title font-bold" id="drilldown-modal-title">Finding Evidence Drill-Down</div>
+                <button type="button" class="btn btn-sm btn-outline" id="btn-close-modal-drilldown">✕</button>
+              </div>
+              <div class="modal-body" id="drilldown-modal-body">
+                <div id="drilldown-modal-loading" class="text-center p-4">
+                  <span class="spinner-inline"></span> <span data-i18n="loading_drilldown">Loading grounded evidence...</span>
+                </div>
+                <div id="drilldown-modal-content" style="display: none;"></div>
+              </div>
+              <div class="modal-footer d-flex justify-content-end p-2 border-top">
+                <button type="button" class="btn btn-secondary btn-sm" id="btn-dismiss-modal-drilldown" data-i18n="btn_close">Close</button>
               </div>
             </div>
           </div>

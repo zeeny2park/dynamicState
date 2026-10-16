@@ -1654,6 +1654,8 @@ class WebApiAdapter:
             constraints=params.get("constraints"),
             budgets=params.get("budgets"),
             authorize_target=auth_target,
+            watch_session_id=params.get("watch_session_id"),
+            observation_window=params.get("observation_window"),
         )
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
@@ -1663,6 +1665,34 @@ class WebApiAdapter:
             "error": {
                 "code": res.error.code if res.error else "INVESTIGATION_FAILED",
                 "message": res.error.message if res.error else "Investigation failed"
+            }
+        }
+
+    def analyze_temporal_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Phase 24: Evidence-first temporal investigation workflow endpoint."""
+        goal = params.get("goal") or "Temporal state investigation"
+        watch_session_id = params.get("watch_session_id") or params.get("session_id")
+        obs_window = dict(params.get("observation_window") or {})
+        for k in ("duration_sec", "guard_address", "buffer_address", "guard_threshold", "start_seq", "end_seq", "limit"):
+            if k in params and k not in obs_window:
+                obs_window[k] = params[k]
+
+        res = self.runtime.start_investigation(
+            goal=goal,
+            watch_session_id=watch_session_id,
+            observation_window=obs_window,
+            debug_image=params.get("debug_image"),
+            constraints=params.get("constraints"),
+            authorize_target=True,
+        )
+        if res.success:
+            return {"success": True, "data": _to_json_serializable(res.data)}
+        return {
+            "success": False,
+            "data": _to_json_serializable(res.data) if res.data else None,
+            "error": {
+                "code": res.error.code if res.error else "TEMPORAL_INVESTIGATION_FAILED",
+                "message": res.error.message if res.error else "Temporal investigation failed"
             }
         }
 
@@ -2378,6 +2408,10 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
             if path == "/api/investigation/start":
                 self._send_json(adapter.start_investigation(body))
+                return
+
+            if path in ("/api/investigation/temporal-analyze", "/api/investigation/temporal-plan"):
+                self._send_json(adapter.analyze_temporal_investigation(body))
                 return
 
             if path == "/api/investigation/compare":

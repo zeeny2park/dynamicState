@@ -125,9 +125,12 @@ class ConversationalAnalysisService:
                 "field_path": f_dict.get("field_name") or f_dict.get("field_path"),
                 "before_value": f_dict.get("before_value"),
                 "after_value": f_dict.get("after_value"),
+                "observed_value": f_dict.get("observed_value"),
+                "uncertainty": f_dict.get("uncertainty"),
                 "dwarf_type": code_nav.get("type_name") or f_dict.get("type_name"),
                 "source_location": code_nav.get("source_location") or f_dict.get("source_location"),
                 "confidence": f_dict.get("confidence", "high"),
+                "evidence_ids": f_dict.get("evidence_ids", []),
             })
 
         # 4. Current Candidate Functions
@@ -178,6 +181,16 @@ class ConversationalAnalysisService:
                 "executed": o_dict.get("executed", False),
             })
 
+        temporal_summary = t_ref.get("temporal_summary")
+        temporal_plan = t_ref.get("temporal_plan")
+        temporal_ctx = None
+        if temporal_summary or temporal_plan:
+            temporal_ctx = {
+                "plan": temporal_plan,
+                "summary": temporal_summary,
+                "capture_limitations": "Captured via LOW_IMPACT zero-stop. Snapshot proximity does NOT prove actual read, write, or guard violation.",
+            }
+
         context = {
             "investigation_id": getattr(session, "investigation_id", "inv_unknown"),
             "goal": getattr(session, "goal", "State inspection"),
@@ -188,6 +201,7 @@ class ConversationalAnalysisService:
             "current_hypotheses": hypotheses_summary,
             "evidence_ledger_ids": valid_evidence_ids,
             "follow_up_observations": observations_summary,
+            "temporal_context": temporal_ctx,
             "user_query": user_message,
         }
 

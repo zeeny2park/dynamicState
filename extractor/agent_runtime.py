@@ -209,7 +209,9 @@ class AgentRuntime:
                     debug_image=action.debug_image,
                     constraints=action.constraints,
                     budgets=action.budgets,
-                    authorize_target=action.authorize_target
+                    authorize_target=action.authorize_target,
+                    watch_session_id=action.watch_session_id,
+                    observation_window=action.observation_window,
                 )
             elif act == "GET_INVESTIGATION_STATUS":
                 if not action.investigation_id:
@@ -1710,6 +1712,8 @@ class AgentRuntime:
         constraints: Optional[Dict[str, Any]] = None,
         budgets: Optional[Dict[str, Any]] = None,
         authorize_target: bool = False,
+        watch_session_id: Optional[str] = None,
+        observation_window: Optional[Dict[str, Any]] = None,
     ) -> AgentActionResult:
         """Start an evidence-first investigation wrapping existing capabilities."""
         t0 = time.monotonic()
@@ -1723,6 +1727,9 @@ class AgentRuntime:
                 constraints=constraints,
                 budgets=budgets,
                 authorize_target=authorize_target,
+                watch_session_id=watch_session_id,
+                observation_window=observation_window,
+                watch_manager=self.watch_session_manager,
             )
             status = res.get("status")
             err_msg = res.get("summary", {}).get("error", "Investigation failed")
@@ -1735,6 +1742,8 @@ class AgentRuntime:
                 err_code = "TARGET_NOT_FOUND"
             elif "Permission denied" in err_msg:
                 err_code = "PERMISSION_DENIED"
+            elif "Build ID mismatch" in err_msg or "BUILD_ID_MISMATCH" in err_msg:
+                err_code = "BUILD_ID_MISMATCH"
 
             return AgentActionResult(
                 success=status in ("COMPLETED", "PARTIAL", "RUNNING", "BLOCKED"),
@@ -2043,6 +2052,26 @@ class AgentRuntime:
             action="ANALYZE_INVESTIGATION_CHAT",
             data=res.get("result"),
             performance={"total_ms": round((time.monotonic() - t0) * 1000, 3)},
+        )
+
+    def chat_investigation(
+        self,
+        investigation_id: str,
+        message: str,
+        request_id: Optional[str] = None,
+        provider_override: Optional[str] = None,
+        allow_fallback: bool = True,
+        locale: Optional[str] = None,
+    ) -> AgentActionResult:
+        """Convenience alias for conversational investigation chat supporting automatic locale and fallback."""
+        eff_locale = locale or ("ko" if any("\uac00" <= ch <= "\ud7a3" for ch in message) else "en")
+        return self.analyze_investigation_chat(
+            investigation_id=investigation_id,
+            message=message,
+            request_id=request_id,
+            provider_override=provider_override,
+            allow_fallback=allow_fallback,
+            locale=eff_locale,
         )
 
     def cancel_investigation_chat(self, request_id: Optional[str] = None) -> AgentActionResult:
