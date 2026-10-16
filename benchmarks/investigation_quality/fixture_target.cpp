@@ -1,5 +1,5 @@
 /**
- * Phase 17 Investigation Quality Benchmark C++ Target Fixture.
+ * Phase 18 Investigation Quality Benchmark C++ Target Fixture.
  *
  * Implements 6 distinct, deterministic state-space scenarios:
  * 1. Valid Transition: Clean deterministic state transition via known causal writer.
@@ -8,10 +8,14 @@
  * 4. Null / Invalid Pointer: Non-zero buffer size accompanied by null data pointer.
  * 5. Cross-Thread Non-Atomic Ambiguity: Competing unsynchronized thread writers.
  * 6. Negative Control: External / unassociated state change with no causal writer in binary.
+ *
+ * Supports both non-interactive execution (--mutate-all) and interactive execution
+ * via stdin (READY -> MUTATE <id> -> MUTATED <id> -> STOP -> STOPPED) for real live captures.
  */
 
 #include <iostream>
 #include <cstdint>
+#include <string>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -113,27 +117,118 @@ void init_state() {
     g_target.unassociated_field = 100;
 }
 
+std::atomic<bool> g_running{true};
+volatile uint64_t g_heartbeat = 0;
+
+void handle_signal(int) {
+    g_running.store(false, std::memory_order_relaxed);
+    g_competing_running.store(false, std::memory_order_relaxed);
+}
+
 int main(int argc, char** argv) {
+    signal(SIGTERM, handle_signal);
+    signal(SIGINT, handle_signal);
+
     init_state();
 
     if (argc > 1 && strcmp(argv[1], "--mutate-all") == 0) {
-        // Apply all 6 scenario mutations
+        // Non-interactive batch mutation mode
         transition_worker_state(STATUS_RUNNING);
         update_epoch_partial(10);
         set_illegal_device_mode(999);
         allocate_invalid_buffer(4096);
         g_target.unassociated_field = 200; // Simulated external change
+
+        std::cout << "READY worker_status=" << g_target.worker_status
+                  << " epoch_id=" << g_target.epoch_id
+                  << " cached_epoch=" << g_target.cached_epoch
+                  << " device_mode=" << g_target.device_mode
+                  << " buffer_size=" << g_target.buffer_size
+                  << " data_ptr=" << g_target.data_ptr
+                  << " metric=" << g_target.unsynchronized_metric
+                  << " unassociated=" << g_target.unassociated_field
+                  << std::endl;
+        return 0;
     }
 
-    std::cout << "READY worker_status=" << g_target.worker_status
-              << " epoch_id=" << g_target.epoch_id
-              << " cached_epoch=" << g_target.cached_epoch
-              << " device_mode=" << g_target.device_mode
-              << " buffer_size=" << g_target.buffer_size
-              << " data_ptr=" << g_target.data_ptr
-              << " metric=" << g_target.unsynchronized_metric
-              << " unassociated=" << g_target.unassociated_field
-              << std::endl;
+    // Interactive live process mode for real runtime memory capture
+    std::thread* t1 = nullptr;
+    std::thread* t2 = nullptr;
+
+    std::thread cmd_thread([&]() {
+        std::string line;
+        while (g_running.load(std::memory_order_relaxed) && std::getline(std::cin, line)) {
+            // Trim whitespace
+            size_t start = line.find_first_not_of(" \t\r\n");
+            size_t end = line.find_last_not_of(" \t\r\n");
+            std::string cmd = (start != std::string::npos) ? line.substr(start, end - start + 1) : "";
+
+            if (cmd == "MUTATE 1" || cmd == "MUTATE valid_transition") {
+                transition_worker_state(STATUS_RUNNING);
+                std::cout << "MUTATED 1" << std::endl;
+                std::cout.flush();
+            } else if (cmd == "MUTATE 2" || cmd == "MUTATE stale_inconsistent") {
+                update_epoch_partial(10);
+                std::cout << "MUTATED 2" << std::endl;
+                std::cout.flush();
+            } else if (cmd == "MUTATE 3" || cmd == "MUTATE invalid_enum") {
+                set_illegal_device_mode(999);
+                std::cout << "MUTATED 3" << std::endl;
+                std::cout.flush();
+            } else if (cmd == "MUTATE 4" || cmd == "MUTATE null_pointer") {
+                allocate_invalid_buffer(4096);
+                std::cout << "MUTATED 4" << std::endl;
+                std::cout.flush();
+            } else if (cmd == "MUTATE 5" || cmd == "MUTATE thread_race") {
+                g_competing_running.store(true, std::memory_order_relaxed);
+                t1 = new std::thread(competing_writer_a);
+                t2 = new std::thread(competing_writer_b);
+                std::cout << "MUTATED 5" << std::endl;
+                std::cout.flush();
+            } else if (cmd == "MUTATE 6" || cmd == "MUTATE negative_control") {
+                // External unassociated mutation
+                g_target.unassociated_field = 200;
+                std::cout << "MUTATED 6" << std::endl;
+                std::cout.flush();
+            } else if (cmd == "MUTATE ALL") {
+                transition_worker_state(STATUS_RUNNING);
+                update_epoch_partial(10);
+                set_illegal_device_mode(999);
+                allocate_invalid_buffer(4096);
+                g_target.unassociated_field = 200;
+                std::cout << "MUTATED ALL" << std::endl;
+                std::cout.flush();
+            } else if (cmd == "STOP") {
+                g_running.store(false, std::memory_order_relaxed);
+                g_competing_running.store(false, std::memory_order_relaxed);
+                std::cout << "STOPPED" << std::endl;
+                std::cout.flush();
+                break;
+            } else if (!cmd.empty()) {
+                std::cout << "UNKNOWN_CMD " << cmd << std::endl;
+                std::cout.flush();
+            }
+        }
+    });
+    cmd_thread.detach();
+
+    // Print READY to signal process is listening
+    std::cout << "READY" << std::endl;
+    std::cout.flush();
+
+    // Keep process active for snapshot capture without mutating unmonitored global state
+    while (g_running.load(std::memory_order_relaxed)) {
+        usleep(10000);
+    }
+
+    if (t1) {
+        if (t1->joinable()) t1->join();
+        delete t1;
+    }
+    if (t2) {
+        if (t2->joinable()) t2->join();
+        delete t2;
+    }
 
     return 0;
 }

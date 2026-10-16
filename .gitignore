@@ -17,6 +17,7 @@ target/collector/dynamicstate-collector
 state.json
 tmp_*
 corpus/
+!benchmarks/investigation_quality/corpus/
 build/
 
 # Snapshot and pilot report outputs

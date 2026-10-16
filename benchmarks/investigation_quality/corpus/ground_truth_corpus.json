@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "corpus_version": "1.0.0",
+  "corpus_id": "investigation_quality_v1",
+  "created_at_utc": "2026-10-15T00:00:00Z",
+  "description": "Independent ground-truth corpus for dynamicState C++ runtime investigation quality evaluation",
+  "scenarios": [
+    {
+      "scenario_id": "scenario_1",
+      "scenario_name": "Valid Transition",
+      "category": "valid_transition",
+      "description": "Clean deterministic state transition via verified causal writer transition_worker_state",
+      "expected_facts": [
+        {
+          "field_path": "g_target.worker_status",
+          "field_name": "worker_status",
+          "type_name": "int",
+          "before_value": 1,
+          "after_value": 2
+        }
+      ],
+      "valid_evidence_rules": [
+        {
+          "evidence_types": ["FIELD_OBSERVATION", "OBJECT_STATE", "COMPARISON", "DIAGNOSTIC"],
+          "required_substr": ["worker_status"]
+        }
+      ],
+      "expected_uncertainty": {
+        "should_be_inconclusive": false,
+        "min_confidence": 0.7,
+        "max_confidence": 1.0
+      },
+      "plausible_hypotheses": [
+        "worker_status",
+        "transition_worker_state",
+        "STATUS_RUNNING"
+      ],
+      "discriminating_criteria": [
+        "worker_status",
+        "transition_worker_state",
+        "status"
+      ],
+      "causal_attribution": {
+        "causal_function_provable": true,
+        "expected_causal_function": "transition_worker_state",
+        "allow_validated_causal": true
+      }
+    },
+    {
+      "scenario_id": "scenario_2",
+      "scenario_name": "Stale / Inconsistent Field",
+      "category": "stale_inconsistent_field",
+      "description": "epoch_id updated without corresponding cached_epoch update creating invariant drift",
+      "expected_facts": [
+        {
+          "field_path": "g_target.epoch_id",
+          "field_name": "epoch_id",
+          "type_name": "int",
+          "before_value": 1,
+          "after_value": 10
+        }
+      ],
+      "valid_evidence_rules": [
+        {
+          "evidence_types": ["FIELD_OBSERVATION", "OBJECT_STATE", "COMPARISON", "DIAGNOSTIC"],
+          "required_substr": ["epoch_id"]
+        }
+      ],
+      "expected_uncertainty": {
+        "should_be_inconclusive": false,
+        "min_confidence": 0.7,
+        "max_confidence": 1.0
+      },
+      "plausible_hypotheses": [
+        "epoch_id",
+        "cached_epoch",
+        "stale",
+        "drift"
+      ],
+      "discriminating_criteria": [
+        "cached_epoch",
+        "update_epoch_partial",
+        "cache"
+      ],
+      "causal_attribution": {
+        "causal_function_provable": false,
+        "expected_causal_function": null,
+        "allow_validated_causal": false
+      }
+    },
+    {
+      "scenario_id": "scenario_3",
+      "scenario_name": "Invalid Enum / State",
+      "category": "invalid_enum_state",
+      "description": "device_mode set to undefined enum value 999 outside defined range [0, 2]",
+      "expected_facts": [
+        {
+          "field_path": "g_target.device_mode",
+          "field_name": "device_mode",
+          "type_name": "int",
+          "before_value": 0,
+          "after_value": 999
+        }
+      ],
+      "valid_evidence_rules": [
+        {
+          "evidence_types": ["FIELD_OBSERVATION", "OBJECT_STATE", "COMPARISON", "DIAGNOSTIC"],
+          "required_substr": ["device_mode"]
+        }
+      ],
+      "expected_uncertainty": {
+        "should_be_inconclusive": false,
+        "min_confidence": 0.7,
+        "max_confidence": 1.0
+      },
+      "plausible_hypotheses": [
+        "device_mode",
+        "enum",
+        "999",
+        "out-of-range"
+      ],
+      "discriminating_criteria": [
+        "device_mode",
+        "set_illegal_device_mode",
+        "enum"
+      ],
+      "causal_attribution": {
+        "causal_function_provable": false,
+        "expected_causal_function": null,
+        "allow_validated_causal": false
+      }
+    },
+    {
+      "scenario_id": "scenario_4",
+      "scenario_name": "Null / Invalid Pointer",
+      "category": "null_invalid_pointer",
+      "description": "Non-zero buffer_size (4096) with null data_ptr (0x0)",
+      "expected_facts": [
+        {
+          "field_path": "g_target.buffer_size",
+          "field_name": "buffer_size",
+          "type_name": "uint64_t",
+          "before_value": 0,
+          "after_value": 4096
+        }
+      ],
+      "valid_evidence_rules": [
+        {
+          "evidence_types": ["FIELD_OBSERVATION", "OBJECT_STATE", "COMPARISON", "DIAGNOSTIC"],
+          "required_substr": ["buffer_size"]
+        }
+      ],
+      "expected_uncertainty": {
+        "should_be_inconclusive": false,
+        "min_confidence": 0.7,
+        "max_confidence": 1.0
+      },
+      "plausible_hypotheses": [
+        "buffer_size",
+        "data_ptr",
+        "null",
+        "pointer"
+      ],
+      "discriminating_criteria": [
+        "data_ptr",
+        "allocate_invalid_buffer",
+        "null"
+      ],
+      "causal_attribution": {
+        "causal_function_provable": false,
+        "expected_causal_function": null,
+        "allow_validated_causal": false
+      }
+    },
+    {
+      "scenario_id": "scenario_5",
+      "scenario_name": "Cross-Thread Non-Atomic Ambiguity",
+      "category": "cross_thread_non_atomic",
+      "description": "Competing unsynchronized thread writers without atomicity guarantee; causal promotion must be blocked",
+      "expected_facts": [
+        {
+          "field_path": "g_target.unsynchronized_metric",
+          "field_name": "unsynchronized_metric",
+          "type_name": "uint64_t",
+          "before_value": 100
+        }
+      ],
+      "valid_evidence_rules": [
+        {
+          "evidence_types": ["FIELD_OBSERVATION", "OBJECT_STATE", "COMPARISON", "DIAGNOSTIC"],
+          "required_substr": ["unsynchronized_metric", "competing", "thread", "non_atomic"]
+        }
+      ],
+      "expected_uncertainty": {
+        "should_be_inconclusive": true,
+        "min_confidence": 0.0,
+        "max_confidence": 0.6
+      },
+      "plausible_hypotheses": [
+        "competing_writer",
+        "thread",
+        "non-atomic",
+        "race"
+      ],
+      "discriminating_criteria": [
+        "thread",
+        "mutex",
+        "atomic",
+        "competing_writer_a",
+        "competing_writer_b"
+      ],
+      "causal_attribution": {
+        "causal_function_provable": false,
+        "expected_causal_function": null,
+        "allow_validated_causal": false
+      }
+    },
+    {
+      "scenario_id": "scenario_6",
+      "scenario_name": "Negative Control (No Causal Function)",
+      "category": "negative_control",
+      "description": "State changed externally; static candidate in binary has no causal connection and must NOT be promoted",
+      "expected_facts": [
+        {
+          "field_path": "g_target.unassociated_field",
+          "field_name": "unassociated_field",
+          "type_name": "uint64_t",
+          "before_value": 100,
+          "after_value": 200
+        }
+      ],
+      "valid_evidence_rules": [
+        {
+          "evidence_types": ["FIELD_OBSERVATION", "OBJECT_STATE", "COMPARISON", "DIAGNOSTIC"],
+          "required_substr": ["unassociated_field"]
+        }
+      ],
+      "expected_uncertainty": {
+        "should_be_inconclusive": true,
+        "min_confidence": 0.0,
+        "max_confidence": 0.5
+      },
+      "plausible_hypotheses": [
+        "external",
+        "unassociated",
+        "unknown writer"
+      ],
+      "discriminating_criteria": [
+        "external",
+        "unmapped",
+        "unrelated_helper_function"
+      ],
+      "causal_attribution": {
+        "causal_function_provable": false,
+        "expected_causal_function": null,
+        "allow_validated_causal": false
+      }
+    }
+  ]
+}

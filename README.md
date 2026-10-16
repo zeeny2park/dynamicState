@@ -119,7 +119,9 @@ Recursive Semantic Reachability Traversal
 - **Phase 16 (Complete)**: *"CLI Provider Security, Runtime Truthfulness & Process Control"*  
   (로컬 CLI 실행 보안 강화 및 진실된 런타임 제공자 보고: `--dangerously-skip-permissions` 플래그 제거 및 서버 측 명시적 opt-in 설정으로 제한, 셸 주입 방지를 위한 인자 벡터화 및 셸 메타문자 차단, 최소 권한 프로세스 환경 정제(Secret Scrubbing) 및 안전 작업 디렉터리 격리, 사용자 선택과 실제 호출 제공자 간 일치 보장 및 비침습적 진실된 폴백 감사 추적, 브라우저-API-서브프로세스 간 취소 전파)
 - **Phase 17 (Complete)**: *"CLI Process Isolation Hardening & Investigation Quality Benchmark"*  
-  (진정한 스트리밍 논블로킹 프로세스 격리 및 조사 품질 벤치마크 기반 구축: `selectors` 기반 동시 stdout/stderr 읽기를 통한 파이프 버퍼 데드락 원천 방지, `max_output_bytes` 한도 초과 즉시 자식 및 손자 프로세스 그룹 강제 종료(`SIGTERM`+`SIGKILL`) 및 `ProviderOutputLimitExceededError` 발생(미완성 모델 출력의 침묵 파싱 배제), 파이프 핸들을 상속한 자식/손자 프로세스 누수 및 타임아웃 방지, Gemini ACP stdio 핸드셰이크의 논블로킹 타임아웃 및 기술자 누수 차단, 브라우저 클라이언트의 실행 파일 경로/인자/권한우회 주입 차단(`PRIVILEGED_CONFIG_FORBIDDEN`), 취소 요청 시 세션/원장/타임라인에 대한 늦은 커밋 경합 차단; 6대 정형 C++ 결함 시나리오(유효 전이, 불일치 캐시 필드, 범위 외 열거형 값, 널 포인터 결함, 크로스스레드 비원자성 경쟁, 인과 함수 부재 음성 대조군) 대상 조사 품질 벤치마크 하네스(`benchmarks/investigation_quality/run_benchmark.py`), 사실 정확도 100%, 증거 정밀도/재현율 100%, 미검증 주장률 0%, 불확실성 보정률 100%, 다음 관측 유용성 100%, **인과 함수 오탐율(False-Positive Causal Rate) 엄격한 0.0% SLA 충족**, 기계 판독 JSON(`benchmark_results.json`) 및 인간 판독 Markdown(`BENCHMARK_REPORT.md`) 보고서 자동 생성 완비)
+  (진정한 스트리밍 논블로킹 프로세스 격리 및 조사 품질 벤치마크 기반 구축: `selectors` 기반 동시 stdout/stderr 읽기를 통한 파이프 버퍼 데드락 원천 방지, `max_output_bytes` 한도 초과 즉시 자식 및 손자 프로세스 그룹 강제 종료(`SIGTERM`+`SIGKILL`) 및 `ProviderOutputLimitExceededError` 발생(미완성 모델 출력의 침묵 파싱 배제), 파이프 핸들을 상속한 자식/손자 프로세스 누수 및 타임아웃 방지, Gemini ACP stdio 핸드셰이크의 논블로킹 타임아웃 및 기술자 누수 차단, 브라우저 클라이언트의 실행 파일 경로/인자/권한우회 주입 차단(`PRIVILEGED_CONFIG_FORBIDDEN`), 취소 요청 시 세션/원장/타임라인에 대한 늦은 커밋 경합 차단; 6대 정형 C++ 결함 시나리오 대상 조사 품질 벤치마크 하네스 기반 구축)
+- **Phase 18 (Complete)**: *"Independent Investigation Benchmark & Real C++ Snapshot Evaluation"*  
+  (독립적 조사 벤치마크 및 실제 C++ 스냅샷 평가 하네스 고도화: 시스템 출력과 완전 분리된 독립 버전형 기계 판독 가능 Ground Truth 말뭉치(Corpus v1.0.0, 6대 결함 시나리오: 유효 전이, 불일치 캐시 필드, 무효 열거형 값, 널/무효 포인터, 크로스 스레드 비원자성 경쟁, 인과 함수 부재 음성 대조군), 하드코딩된 상수 지표 배제 및 정직한 예측 기반 평가기(`InvestigationEvaluator`), GNU Build ID 기반 분리 심볼(companion DWARF) 검증 및 불일치 감지, 대화형 C++ 타깃 프로세스(PIE, ASLR, Debug Info) 대상 실제 런타임 메모리 캡처(`process_vm_readv`/`procfs`) 기반 조사 평가 트랙과 단위 픽스처 트랙의 분리 운영, 사실 정밀도/재현율/F1, 증거 정밀도/재현율, 미검증 주장 비율 및 디스암율, 불확실성 보정률(Brier 점수 및 2진 일치도), 판별 후속 관측 유용성 산출, **인과 함수 오탐율(False-Positive Causal Rate) 엄격한 0.0% SLA 충족**, 10개 전용 회귀 테스트 통과)
 
 ---
 
@@ -1175,10 +1177,12 @@ python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
 모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
 
 ```bash
-# Phase 17 CLI 프로세스 격리 강화 및 조사 품질 벤치마크 (12개 테스트 + 6개 C++ 시나리오 하네스)
-python3 -m unittest tests/test_phase17_process_isolation_regression.py -v
-python3 benchmarks/investigation_quality/run_benchmark.py
+# Phase 18 독립적 조사 벤치마크 및 실제 C++ 스냅샷 평가 (10개 테스트 + 실 런타임/단위 하네스)
 python3 -m unittest tests/test_investigation_quality_benchmark.py -v
+python3 benchmarks/investigation_quality/run_benchmark.py --mode all --smoke
+
+# Phase 17 CLI 프로세스 격리 강화 및 회귀 테스트 (10개 테스트)
+python3 -m unittest tests/test_phase17_process_isolation_regression.py -v
 
 # Phase 16 CLI 프로바이더 보안, 런타임 진실성 및 E2E 검증 (14개 테스트)
 python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py -v
@@ -1351,7 +1355,8 @@ To prevent overclaiming, every capability in dynamicState is categorized under s
 | **Observation Plan Lifecycle** | Complete | State transitions (PROPOSED->EXECUTED->VERIFIED/FAILED/CANCELED) | **INTEGRATION TESTED** | Prevents duplicate execution, tracks cancellation, UI interactive controls |
 | **Phase 15 Conversational LLM & Simplified UX** | Complete | 22 conversational tests, local CLI/REST LLM & fallback | **REAL TARGET VALIDATED** | Single-pane workspace, OpenAI/Ollama/Gemini/ACP/Cline CLI integration, evidence claim disarming, secret redaction |
 | **Phase 16 CLI Provider Security & Truthfulness** | Complete | 14 security & lifecycle tests, privilege drop | **INTEGRATION TESTED** | Safe argument vectors, bounded execution, secret redaction, server-side template validation |
-| **Phase 17 CLI Process Isolation & Benchmark** | Complete | 12 isolation & benchmark tests, 6 C++ scenarios | **REAL TARGET VALIDATED** | Non-blocking streaming I/O, process group termination, 0% FP causal SLA, quality report |
+| **Phase 17 CLI Process Isolation & Benchmark** | Complete | 10 process isolation tests, child/grandchild cleanup | **REAL TARGET VALIDATED** | Non-blocking streaming I/O, process group termination, privileged config defense |
+| **Phase 18 Independent Benchmark & Real C++ Eval** | Complete | 10 evaluation tests, 6 real-runtime scenarios | **REAL TARGET VALIDATED** | Independent versioned corpus, honest metric derivation, GNU Build ID validation, 0% FP causal SLA |
 
 ---
 
@@ -1426,11 +1431,11 @@ dynamicState includes an automated benchmark harness measuring process suspensio
    # Phase 17 CLI Process Isolation Hardening (10 tests)
    python3 -m unittest tests/test_phase17_process_isolation_regression.py -v
 
-   # Phase 17 Investigation Quality Benchmark (2 tests + 6-scenario C++ harness)
+   # Phase 18 Independent Investigation Benchmark & Real C++ Snapshot Evaluation (10 tests)
    python3 -m unittest tests/test_investigation_quality_benchmark.py -v
-   python3 benchmarks/investigation_quality/run_benchmark.py
+   python3 benchmarks/investigation_quality/run_benchmark.py --mode all --smoke
 
-   # Full test discovery suite (692+ tests)
+   # Full test discovery suite (702+ tests)
    python3 -m unittest discover -s tests -v
    ```
 

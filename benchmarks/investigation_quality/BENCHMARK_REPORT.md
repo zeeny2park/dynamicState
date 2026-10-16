@@ -1,40 +1,31 @@
-# Phase 17 Investigation Quality Benchmark Report
+# Phase 18 Investigation Quality Benchmark Report
 
-**Evaluation Timestamp (UTC):** `2026-10-15T22:08:27.742929+00:00`  
+**Evaluation Timestamp (UTC):** `2026-10-15T23:26:37.785601+00:00`  
 **Causal False-Positive SLA:** `✅ PASSED (0.0% FP)`  
-**Total Scenarios Evaluated:** `6`  
+**Corpus Version:** `1.0.0` (`4420d5089980`)  
+**Fixture SHA-256:** `af1671068a61`  
+**Target GNU Build ID:** `3617f02cd67911ffa65c17ada5af4e89516ac27c`  
+**Active Provider:** `none` (`deterministic-engine`)  
 
-## Summary Metrics
+## Aggregate Summary Metrics
 
-| Metric | Measured Value | Target / Requirement | Status |
-| :--- | :--- | :--- | :--- |
-| **Observed-Fact Correctness** | `100.0%` | ≥ 95.0% | ✅ |
-| **Mean Evidence Precision** | `100.0%` | 100.0% | ✅ |
-| **Mean Evidence Recall** | `100.0%` | 100.0% | ✅ |
-| **Unsupported Claim Rate** | `0.0%` | 0.0% unverified claims | ✅ |
-| **Uncertainty Calibration** | `100.0%` | 100.0% (calibrated across all 6) | ✅ |
-| **Next-Observation Usefulness** | `100.0%` | ≥ 90.0% | ✅ |
-| **False-Positive Causal Rate** | `0.0%` | **STRICTLY 0.0%** | ✅ |
+| Evaluation Track | Scenarios | Fact F1 | Evidence P/R | Unsupp. Claims | Disarm Rate | Uncertainty Cal. | Next Obs. Useful | Causal FP Rate | SLA Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Real-Runtime C++** | 6/6 | 94.4% | 44.4% / 100.0% | 0.0% | 100.0% | 50.0% | 46.4% | `0.0%` | ✅ PASS |
+| **Unit Fixture** | 6/6 | 100.0% | 100.0% / 100.0% | 0.0% | 100.0% | 100.0% | 33.3% | `0.0%` | ✅ PASS |
 
-## Detailed Scenario Results
+## Real-Runtime C++ Scenario Results
 
-| ID | Scenario | Category | Causal Truth | Validated? | Causal Outcome | FP Flag | Calibration |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `scenario_1` | **Valid Transition** | `valid_transition` | `True` | `True` | `TP` | `✅ 0 FP` | `✅ Calibrated` |
-| `scenario_2` | **Stale / Inconsistent Field** | `stale_inconsistent_field` | `False` | `False` | `TN` | `✅ 0 FP` | `✅ Calibrated` |
-| `scenario_3` | **Invalid Enum / State** | `invalid_enum_state` | `False` | `False` | `TN` | `✅ 0 FP` | `✅ Calibrated` |
-| `scenario_4` | **Null / Invalid Pointer** | `null_invalid_pointer` | `False` | `False` | `TN` | `✅ 0 FP` | `✅ Calibrated` |
-| `scenario_5` | **Cross-Thread Non-Atomic Ambiguity** | `cross_thread_non_atomic_ambiguity` | `False` | `False` | `TN` | `✅ 0 FP` | `✅ Calibrated` |
-| `scenario_6` | **Negative Control (No Causal Function)** | `negative_control` | `False` | `False` | `TN` | `✅ 0 FP` | `✅ Calibrated` |
+| ID | Scenario | Category | Ground Truth Causal | Fact F1 | Ev. Prec / Rec | Calibrated | Promoted? | Confusion Matrix | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `scenario_1` | Valid Transition | valid_transition | Yes | 100.0% | 67% / 100% | ✅ Yes | **VALIDATED_CAUSAL_FUNCTION** | **TP** | Outcome: TP |
+| `scenario_2` | Stale / Inconsistent Field | stale_inconsistent_field | No | 100.0% | 67% / 100% | ⚠️ No | STATIC_CANDIDATE | **TN** | Outcome: TN |
+| `scenario_3` | Invalid Enum / State | invalid_enum_state | No | 100.0% | 33% / 100% | ⚠️ No | STATIC_CANDIDATE | **TN** | Outcome: TN |
+| `scenario_4` | Null / Invalid Pointer | null_invalid_pointer | No | 100.0% | 33% / 100% | ⚠️ No | STATIC_CANDIDATE | **TN** | Outcome: TN |
+| `scenario_5` | Cross-Thread Non-Atomic Ambiguity | cross_thread_non_atomic | No | 66.7% | 33% / 100% | ✅ Yes | STATIC_CANDIDATE | **TN** | Outcome: TN |
+| `scenario_6` | Negative Control (No Causal Function) | negative_control | No | 100.0% | 33% / 100% | ✅ Yes | STATIC_CANDIDATE | **TN** | Outcome: TN |
 
-## Scenario Defect Characterization
-
-1. **Valid Transition (`scenario_1`)**: Verifies state transition from `STATUS_INITIALIZING` to `STATUS_RUNNING` via `transition_worker_state` with deterministic transition proof.
-2. **Stale / Inconsistent Field (`scenario_2`)**: Evaluates intra-struct invariant drift where `epoch_id` advanced while `cached_epoch` remained stale. Validates that static candidate is retained without unjustified promotion.
-3. **Invalid Enum / State (`scenario_3`)**: Detects field corruption where `device_mode` contains undefined integer representation `999`. Confirms safe disarming.
-4. **Null / Invalid Pointer (`scenario_4`)**: Flags inconsistent pointer state (`buffer_size > 0` with `data_ptr == nullptr`). Checks targeted observation generation.
-5. **Cross-Thread Non-Atomic Ambiguity (`scenario_5`)**: Ensures that competing unsynchronized writers under `NON_ATOMIC` consistency cannot trigger `VALIDATED_CAUSAL_FUNCTION` promotion.
-6. **Negative Control (`scenario_6`)**: Proves zero false positives when external state changes without a causal writer in the binary.
-
----
-*Report generated automatically by dynamicState Phase 17 Investigation Quality Benchmark Suite.*
+## Methodological Notes & Limitations
+- **Sample Size Calibration Note**: The canonical defect corpus consists of N=6 scenarios designed for deterministic coverage. This sample size is sufficient for binary calibration concordance but too small for a statistically granular 10-bin reliability curve.
+- **Strict Causal Safety Gate**: `FUNCTION_TIER_VALIDATED_CAUSAL` promotion requires verified runtime transition proofs and independent function attribution; ungrounded candidate names, caller booleans, and negative controls strictly yield zero promotions (0.0% FP).
+- **Track Isolation**: Real-runtime results and unit-fixture results are tracked independently with distinct denominators and provenance.
