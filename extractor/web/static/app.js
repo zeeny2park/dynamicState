@@ -1035,6 +1035,29 @@
       btn_watch: '➕ Watch',
       lbl_watching: '✓ Watching',
 
+      // Phase 31 Investigation-First Workflow
+      lbl_ptb_active_target: '🎯 Target:',
+      lbl_ptb_executable: 'Executable:',
+      lbl_ptb_status: 'Status:',
+      btn_ptb_switch_target: '🔄 Switch Target',
+      btn_step1_to_step2: '🧭 Proceed to Runtime Explorer (Step 2) →',
+      btn_step2_to_step3: '📋 Proceed to Watch List (Step 3) →',
+      lbl_step2_footer_title: 'Finished inspecting runtime structure?',
+      lbl_step2_footer_desc: 'Variables added to watch list will be monitored in Step 3.',
+      lbl_thread_details_title: 'Selected Thread Details',
+      lbl_var_details_title: 'Selected Variable Details',
+      btn_inspect_thread_stack: '🔬 Inspect Thread Stack in Memory Inspector',
+      btn_details_add_watch: '➕ Add to Watch List',
+      btn_details_inspect_mem: '🔬 Inspect in Hex Inspector',
+      lbl_step3_footer_title: 'Watch List Configured',
+      lbl_step3_footer_desc: 'Capture a baseline snapshot now, then proceed to Timeline to track mutations.',
+      btn_step3_to_step4: '⏱️ Proceed to Timeline & Compare (Step 4) →',
+      lbl_step4_footer_title: 'Timeline Analysis Complete?',
+      lbl_step4_footer_desc: 'Ask targeted, evidence-grounded questions scoped to these observations in Step 5.',
+      btn_step4_to_step5: '🔍 Proceed to Ask a Question (Step 5) →',
+      lbl_inv_context_title: '🔍 Active Investigation Scope:',
+      msg_no_observations_alert: '⚠️ No runtime observations recorded yet. Capture snapshots in Step 4 (Timeline) before asking questions requiring runtime memory state.',
+
       // Investigation Launchpad
       inv_launchpad_title: '🔍 Investigation Workspace',
       inv_launchpad_subtitle: 'Select an entry path to analyze runtime memory, reconstruct C++ object graphs, and verify evidence integrity.',
@@ -1461,6 +1484,29 @@
       btn_remove: '🗑️ 제거',
       btn_watch: '➕ 감시',
       lbl_watching: '✓ 감시 중',
+
+      // Phase 31 Investigation-First Workflow
+      lbl_ptb_active_target: '🎯 대상:',
+      lbl_ptb_executable: '실행 파일:',
+      lbl_ptb_status: '상태:',
+      btn_ptb_switch_target: '🔄 대상 변경',
+      btn_step1_to_step2: '🧭 런타임 탐색기(2단계)로 이동 →',
+      btn_step2_to_step3: '📋 감시 목록(3단계)으로 이동 →',
+      lbl_step2_footer_title: '런타임 구조 탐색을 완료하셨습니까?',
+      lbl_step2_footer_desc: '감시 목록에 추가된 변수는 3단계에서 모니터링됩니다.',
+      lbl_thread_details_title: '선택된 스레드 세부정보',
+      lbl_var_details_title: '선택된 변수 세부정보',
+      btn_inspect_thread_stack: '🔬 메모리 검사기에서 스레드 스택 검사',
+      btn_details_add_watch: '➕ 감시 목록에 추가',
+      btn_details_inspect_mem: '🔬 16진수 검사기에서 검사',
+      lbl_step3_footer_title: '감시 목록 구성 완료',
+      lbl_step3_footer_desc: '지금 기준선 스냅샷을 캡처한 후 타임라인으로 이동하여 변이를 추적하세요.',
+      btn_step3_to_step4: '⏱️ 타임라인 및 비교(4단계)로 이동 →',
+      lbl_step4_footer_title: '타임라인 분석 완료?',
+      lbl_step4_footer_desc: '5단계에서 이러한 관측치에 한정된 증거 기반 질문을 하세요.',
+      btn_step4_to_step5: '🔍 질문하기(5단계)로 이동 →',
+      lbl_inv_context_title: '🔍 활성 조사 범위:',
+      msg_no_observations_alert: '⚠️ 아직 기록된 런타임 관측치가 없습니다. 런타임 메모리 상태가 필요한 질문을 하기 전에 4단계(타임라인)에서 스냅샷을 캡처하세요.',
 
       // Investigation Launchpad
       inv_launchpad_title: '🔍 조사 워크스페이스',
@@ -7314,6 +7360,7 @@
   }
 
   function renderBasicInvestigationView() {
+    if (typeof updateInvestigationContext === 'function') updateInvestigationContext();
     const inv = state.activeInvestigation;
     const isConnected = state.basicTargetConnected || !!(inv && (inv.target_identity?.pid || inv.target_ref?.pid));
 
@@ -7974,9 +8021,16 @@
     const message = el.basicQuestionInput.value.trim();
     if (!message) return;
 
-    const invId = state.selectedInvestigationId || (state.activeInvestigation && state.activeInvestigation.investigation_id);
-    if (!invId) {
-      showToast(state.currentLang === 'ko' ? '먼저 대상을 연결하고 분석해주세요.' : 'Please connect and analyze a target first.', 'warning');
+    let invId = state.selectedInvestigationId || (state.activeInvestigation && state.activeInvestigation.investigation_id);
+    const hasObservations = (teState.observations && teState.observations.length > 0);
+
+    // If no observations have been recorded yet, prompt the user to capture before asking questions requiring runtime state
+    if (!hasObservations) {
+      appendBasicChatBubble('user', message);
+      el.basicQuestionInput.value = '';
+      appendBasicChatBubble('assistant', state.currentLang === 'ko'
+        ? '⚠️ 관측된 런타임 상태가 없습니다. 런타임 상태에 대한 질문을 하려면 먼저 4단계(타임라인)에서 스냅샷을 캡처해주세요.'
+        : '⚠️ No runtime observations recorded yet. Please capture snapshots in Step 4 (Timeline) before asking questions requiring runtime memory state.');
       return;
     }
 
@@ -7995,6 +8049,47 @@
     if (el.basicChatHistory) {
       el.basicChatHistory.appendChild(loadingBubble);
       el.basicChatHistory.scrollTop = el.basicChatHistory.scrollHeight;
+    }
+
+    // Auto-initialize temporal investigation if session has observations but no investigation session yet
+    if (!invId && hasObservations && teState.sessionId) {
+      try {
+        const analyzeRes = await apiPost('/api/investigation/temporal-analyze', {
+          goal: message,
+          watch_session_id: teState.sessionId,
+          observation_window: { duration_sec: 10 },
+          locale: state.currentLang || 'en'
+        });
+        if (loadingBubble.parentNode) loadingBubble.parentNode.removeChild(loadingBubble);
+        if (analyzeRes.success && analyzeRes.data) {
+          state.activeInvestigation = analyzeRes.data;
+          state.selectedInvestigationId = analyzeRes.data.investigation_id;
+          await loadActiveInvestigation(analyzeRes.data.investigation_id);
+          renderBasicInvestigationView();
+          appendBasicChatBubble('assistant', analyzeRes.data.summary?.narrative || analyzeRes.data.summary?.text || (state.currentLang === 'ko' ? '관측된 상태 분석이 완료되었습니다.' : 'Observed state analysis complete.'));
+        } else {
+          appendBasicChatBubble('assistant', `⚠️ ${analyzeRes.error?.message || 'Analysis failed'}`);
+        }
+      } catch (err) {
+        if (loadingBubble.parentNode) loadingBubble.parentNode.removeChild(loadingBubble);
+        appendBasicChatBubble('assistant', `⚠️ ${String(err)}`);
+      } finally {
+        if (el.btnBasicAsk) {
+          el.btnBasicAsk.disabled = false;
+          el.btnBasicAsk.textContent = t('btn_basic_ask', 'Ask');
+        }
+      }
+      return;
+    }
+
+    if (!invId) {
+      if (loadingBubble.parentNode) loadingBubble.parentNode.removeChild(loadingBubble);
+      if (el.btnBasicAsk) {
+        el.btnBasicAsk.disabled = false;
+        el.btnBasicAsk.textContent = t('btn_basic_ask', 'Ask');
+      }
+      showToast(state.currentLang === 'ko' ? '먼저 대상을 연결하고 분석해주세요.' : 'Please connect and analyze a target first.', 'warning');
+      return;
     }
 
     try {
@@ -8430,6 +8525,53 @@
     }
   }
 
+  let selectedThreadTid = null;
+  window.__onSelectThreadRow = function (idx) {
+    if (!teState.threads || !teState.threads[idx]) return;
+    const t = teState.threads[idx];
+    selectedThreadTid = t.tid;
+
+    const card = document.getElementById('te-thread-details-card');
+    const elTid = document.getElementById('td-val-tid');
+    const elName = document.getElementById('td-val-name');
+    const elState = document.getElementById('td-val-state');
+    const elStack = document.getElementById('td-val-stack');
+    const btnStack = document.getElementById('btn-inspect-thread-stack');
+
+    if (elTid) elTid.textContent = t.tid;
+    if (elName) elName.textContent = t.name || 'unnamed';
+    if (elState) {
+      elState.textContent = t.state === 'R' ? 'Running' : (t.state === 'S' ? 'Sleeping' : t.state);
+      elState.className = `badge badge-${t.state === 'R' ? 'success' : 'neutral'} text-xs`;
+    }
+
+    let stackRangeStr = 'Unavailable';
+    let stackStart = null;
+    if (t.stack_info && t.stack_info.status === 'AVAILABLE') {
+      stackStart = t.stack_info.start || t.stack_info.stack_start;
+      const stackEnd = t.stack_info.end || t.stack_info.stack_end;
+      const sizeKb = Math.round((t.stack_info.size || t.stack_info.stack_size || 0) / 1024);
+      stackRangeStr = `${stackStart} - ${stackEnd} (${sizeKb} KB)`;
+    }
+    if (elStack) elStack.textContent = stackRangeStr;
+
+    if (btnStack) {
+      btnStack.onclick = () => {
+        if (stackStart) {
+          const inputAddr = document.getElementById('input-inspect-address');
+          if (inputAddr) inputAddr.value = stackStart;
+          handleInspectMemoryRange(stackStart, 128);
+          document.getElementById('card-bounded-inspector')?.scrollIntoView({ behavior: 'smooth' });
+        } else {
+          showToastNotification('Thread stack memory range is unavailable', 'warning');
+        }
+      };
+    }
+
+    if (card) card.style.display = 'block';
+    renderTeThreads();
+  };
+
   function renderTeThreads() {
     const tbody = document.getElementById('te-threads-tbody');
     const countEl = document.getElementById('te-threads-count');
@@ -8445,21 +8587,24 @@
       return;
     }
 
-    tbody.innerHTML = teState.threads.map((t) => {
+    tbody.innerHTML = teState.threads.map((t, idx) => {
       const stateBadge = t.state === 'R'
         ? '<span class="badge badge-success">Running (R)</span>'
         : (t.state === 'S' ? '<span class="badge badge-neutral">Sleeping (S)</span>' : `<span class="badge">${escapeHtml(t.state)}</span>`);
 
       let stackStr = '<span class="badge badge-neutral text-xs">UNAVAILABLE</span>';
       if (t.stack_info && t.stack_info.status === 'AVAILABLE') {
-        const sizeKb = Math.round((t.stack_info.stack_size || 0) / 1024);
-        stackStr = `<span class="mono text-xs">${escapeHtml(t.stack_info.stack_start)} - ${escapeHtml(t.stack_info.stack_end)} (${sizeKb} KB)</span>`;
+        const stackStart = t.stack_info.start || t.stack_info.stack_start;
+        const stackEnd = t.stack_info.end || t.stack_info.stack_end;
+        const sizeKb = Math.round((t.stack_info.size || t.stack_info.stack_size || 0) / 1024);
+        stackStr = `<span class="mono text-xs">${escapeHtml(stackStart)} - ${escapeHtml(stackEnd)} (${sizeKb} KB)</span>`;
       }
 
       const localReason = t.local_variables?.reason || 'Stack frame inspection requires an active debugger backend (GDB/ptrace frame unwind).';
       const localBadge = `<span class="badge badge-neutral text-xs" title="${escapeHtml(localReason)}">UNSUPPORTED</span>`;
+      const isSelected = (selectedThreadTid === t.tid) ? 'selected-row' : '';
 
-      return `<tr>
+      return `<tr class="cursor-pointer hover-highlight ${isSelected}" onclick="window.__onSelectThreadRow(${idx})" title="Click to inspect thread stack & details">
         <td class="mono font-bold">${t.tid}</td>
         <td>${escapeHtml(t.name)}</td>
         <td>${stateBadge}</td>
@@ -8514,6 +8659,75 @@
     }
   };
 
+  let selectedVarItem = null;
+  window.__onSelectVarRow = function (idx) {
+    if (!teState.discoverableVars || !teState.discoverableVars[idx]) return;
+    const v = teState.discoverableVars[idx];
+    selectedVarItem = {
+      name: v.name,
+      source: 'global_variable',
+      scope: v.scope || 'global',
+      address: v.runtime_address,
+      type_name: v.type_name,
+      size: v.size,
+      source_location: v.source_location
+    };
+    populateVarDetailsCard(selectedVarItem);
+    renderTeDiscoverableVars();
+  };
+
+  window.__onSelectMemberRow = function (varName, mIdx) {
+    const v = teState.discoverableVars.find(x => x.name === varName);
+    if (!v || !v.members || !v.members[mIdx]) return;
+    const m = v.members[mIdx];
+    selectedVarItem = {
+      name: m.full_name,
+      source: 'struct_member',
+      scope: 'member',
+      address: m.runtime_address,
+      type_name: m.type_name,
+      size: m.size,
+      source_location: v.source_location
+    };
+    populateVarDetailsCard(selectedVarItem);
+    renderTeDiscoverableVars();
+  };
+
+  function populateVarDetailsCard(item) {
+    const card = document.getElementById('te-var-details-card');
+    const elName = document.getElementById('vd-val-name');
+    const elType = document.getElementById('vd-val-type');
+    const elAddr = document.getElementById('vd-val-addr');
+    const elSize = document.getElementById('vd-val-size');
+    const elLoc = document.getElementById('vd-val-loc');
+    const elScope = document.getElementById('vd-val-scope');
+    const btnWatch = document.getElementById('btn-details-add-watch');
+    const btnHex = document.getElementById('btn-details-inspect-memory');
+
+    if (elName) elName.textContent = item.name;
+    if (elType) elType.textContent = item.type_name;
+    if (elAddr) elAddr.textContent = item.address;
+    if (elSize) elSize.textContent = `${item.size} bytes`;
+    if (elLoc) elLoc.textContent = item.source_location || 'unknown';
+    if (elScope) elScope.textContent = item.scope || 'global';
+
+    if (btnWatch) {
+      btnWatch.onclick = async () => {
+        await addWatchItem(item);
+      };
+    }
+    if (btnHex) {
+      btnHex.onclick = () => {
+        const inputAddr = document.getElementById('input-inspect-address');
+        if (inputAddr) inputAddr.value = item.address;
+        handleInspectMemoryRange(item.address, Math.max(64, item.size || 64));
+        document.getElementById('card-bounded-inspector')?.scrollIntoView({ behavior: 'smooth' });
+      };
+    }
+
+    if (card) card.style.display = 'block';
+  }
+
   function renderTeDiscoverableVars() {
     const tbody = document.getElementById('te-vars-tbody');
     const inputSearch = document.getElementById('te-var-search');
@@ -8554,7 +8768,9 @@
         ? `<button type="button" class="btn btn-xs btn-outline me-1 btn-toggle-struct" onclick="window.__toggleVarExpand('${escapeHtml(v.name)}')" title="Expand / collapse struct member fields">${isExpanded ? '▼' : '▶'}</button>`
         : '';
 
-      rowsHtml += `<tr>
+      const isSelected = (selectedVarItem && selectedVarItem.name === v.name) ? 'selected-row' : '';
+
+      rowsHtml += `<tr class="cursor-pointer hover-highlight ${isSelected}" onclick="if (!event.target.closest('button')) window.__onSelectVarRow(${idx})" title="Click to view variable details">
         <td class="mono font-bold text-accent">${expandBtn}${escapeHtml(v.name)}</td>
         <td class="mono">${escapeHtml(v.type_name)}</td>
         <td class="mono">${escapeHtml(v.runtime_address)}</td>
@@ -8571,7 +8787,9 @@
             ? '<span class="badge badge-success">✓ Watching</span>'
             : `<button type="button" class="btn btn-xs btn-outline btn-add-member-watch" onclick="window.__addTeWatchFromMember('${escapeHtml(v.name)}', ${mIdx})">➕ Watch</button>`;
 
-          rowsHtml += `<tr class="te-member-row" style="background: rgba(255, 255, 255, 0.02);">
+          const isMSelected = (selectedVarItem && selectedVarItem.name === m.full_name) ? 'selected-row' : '';
+
+          rowsHtml += `<tr class="te-member-row cursor-pointer hover-highlight ${isMSelected}" style="background: rgba(255, 255, 255, 0.02);" onclick="if (!event.target.closest('button')) window.__onSelectMemberRow('${escapeHtml(v.name)}', ${mIdx})" title="Click to view member details">
             <td class="mono font-semibold" style="padding-left: 28px;">
               <span class="text-muted">↳</span> <span class="text-accent">${escapeHtml(m.name)}</span>
               <span class="text-muted text-xs ms-1">(${escapeHtml(m.full_name)})</span>
@@ -8739,11 +8957,14 @@
       const itemVal = latestObs && latestObs.values ? latestObs.values[w.item_id] : null;
 
       let latestDisplay = '<span class="text-muted">Not captured</span>';
+      let stBadge = `<span class="badge ${stBadgeClass}">${escapeHtml(w.status)}</span>`;
       if (itemVal) {
-        if (itemVal.status === 'UNREADABLE') {
-          latestDisplay = '<span class="badge badge-danger text-xs">UNREADABLE</span>';
+        if (itemVal.status === 'UNREADABLE' || itemVal.status === 'UNAVAILABLE' || itemVal.status === 'PERMISSION_DENIED' || itemVal.status === 'TARGET_TERMINATED') {
+          latestDisplay = `<span class="badge badge-danger text-xs" title="${escapeHtml(itemVal.error || 'Address unmapped, PROT_NONE guard page, or unreadable inferior memory')}">UNREADABLE</span><div class="text-xs text-danger mt-1">Unmapped / inaccessible</div>`;
+          stBadge = `<span class="badge badge-danger text-xs" title="Memory read failed (guard page or unmapped region)">UNREADABLE</span>`;
         } else if (itemVal.status === 'PARTIAL') {
           latestDisplay = '<span class="badge badge-warning text-xs">PARTIAL</span>';
+          stBadge = '<span class="badge badge-warning text-xs">PARTIAL</span>';
         } else if (itemVal.value !== undefined && itemVal.value !== null) {
           latestDisplay = `<span class="mono font-bold text-accent">${escapeHtml(String(itemVal.value))}</span>`;
         }
@@ -8757,7 +8978,7 @@
         <td class="mono">${escapeHtml(w.type_name)}</td>
         <td class="mono">${escapeHtml(w.address)}</td>
         <td class="mono">${w.size}B</td>
-        <td><span class="badge ${stBadgeClass}">${escapeHtml(w.status)}</span></td>
+        <td>${stBadge}</td>
         <td>${latestDisplay}</td>
         <td>
           <button type="button" class="btn btn-xs btn-outline" onclick="window.__removeTeWatchItem('${escapeHtml(w.item_id)}')">🗑️ Remove</button>
@@ -9167,8 +9388,74 @@
   }
 
   // --------------------------------------------------------------------------
-  // Phase 28: Runtime Memory Explorer & Step-by-Step Investigation Workflow
+  // Phase 28/31: Runtime Memory Explorer & Step-by-Step Investigation Workflow
   // --------------------------------------------------------------------------
+
+  function updatePersistentTargetBar(data = null) {
+    const ptbPid = document.getElementById('ptb-val-pid');
+    const ptbExe = document.getElementById('ptb-val-exe');
+    const ptbBuildId = document.getElementById('ptb-val-buildid');
+    const ptbStatus = document.getElementById('ptb-val-status');
+    const ptbBackend = document.getElementById('ptb-val-backend');
+
+    const pid = (data && data.pid) || teState.targetPid || (document.getElementById('te-target-pid')?.value.trim()) || '--';
+    const exe = (data && (data.executable_path || data.executable_name)) || teState.executableName || '--';
+    const isConn = !!((data && data.valid) || (teState.targetPid && document.getElementById('target-conn-badge')?.textContent.includes('CONNECTED')));
+
+    if (ptbPid) ptbPid.textContent = pid;
+    if (ptbExe) ptbExe.textContent = exe;
+    if (ptbStatus) {
+      ptbStatus.textContent = isConn ? 'CONNECTED' : (pid !== '--' && pid ? 'DISCONNECTED' : 'UNCONNECTED');
+      ptbStatus.className = `badge badge-${isConn ? 'success' : 'neutral'} text-xs`;
+    }
+    if (ptbBuildId) {
+      if (data && data.build_id_match === true) {
+        ptbBuildId.textContent = 'MATCHED';
+        ptbBuildId.className = 'badge badge-success text-xs mono';
+      } else if (data && data.build_id_match === false) {
+        ptbBuildId.textContent = 'MISMATCH';
+        ptbBuildId.className = 'badge badge-danger text-xs mono';
+      } else if (data && data.has_dwarf !== undefined) {
+        ptbBuildId.textContent = data.has_dwarf ? 'DWARF OK' : 'NO DWARF';
+        ptbBuildId.className = `badge badge-${data.has_dwarf ? 'info' : 'warning'} text-xs mono`;
+      }
+    }
+    if (ptbBackend && data && data.backend) {
+      ptbBackend.textContent = `${data.backend} (Zero-Stop)`;
+    }
+    updateInvestigationContext();
+  }
+
+  function updateInvestigationContext() {
+    const targetChip = document.getElementById('bic-target-chip');
+    const snapChip = document.getElementById('bic-snapshot-chip');
+    const watchChip = document.getElementById('bic-watch-chip');
+    const noObsAlert = document.getElementById('basic-no-observations-alert');
+
+    const pid = teState.targetPid || (document.getElementById('te-target-pid')?.value.trim());
+    if (targetChip) {
+      targetChip.textContent = pid ? `Target: PID ${pid}` : 'Target: None';
+    }
+
+    if (snapChip) {
+      if (lastComparisonResult && lastComparisonResult.seq_a && lastComparisonResult.seq_b) {
+        snapChip.textContent = `Comparing Snapshots: #${lastComparisonResult.seq_a} vs #${lastComparisonResult.seq_b}`;
+      } else if (teState.observations && teState.observations.length > 0) {
+        snapChip.textContent = `Snapshots: ${teState.observations.length} recorded`;
+      } else {
+        snapChip.textContent = 'Snapshots: 0 recorded';
+      }
+    }
+
+    if (watchChip) {
+      watchChip.textContent = `Watched: ${teState.watchItems ? teState.watchItems.length : 0} items`;
+    }
+
+    if (noObsAlert) {
+      const hasObs = (teState.observations && teState.observations.length > 0);
+      noObsAlert.style.display = hasObs ? 'none' : 'block';
+    }
+  }
 
   function syncTargetInputs() {
     const inputPid = document.getElementById('te-target-pid');
@@ -9206,6 +9493,7 @@
       if (basicElf && basicElf.value !== currentElf) basicElf.value = currentElf;
       try { sessionStorage.setItem('dynstate_companion_elf', currentElf); } catch (_) {}
     }
+    updatePersistentTargetBar();
   }
 
   async function handleValidateTarget() {
@@ -9285,6 +9573,7 @@
 
           // Preload mappings and threads in background
           loadTemporalMemoryMap(false);
+          updatePersistentTargetBar(d);
           showToastNotification('Target successfully validated and connected', 'success');
         } else {
           // Valid is false
@@ -9298,6 +9587,7 @@
             feedbackBanner.style.display = 'block';
             feedbackBanner.innerHTML = `<strong>⚠️ ${escapeHtml(d.reason || 'Validation Failed')}:</strong> ${escapeHtml(d.message || '')}<br><span class="text-muted">Next action: ${escapeHtml(d.next_action || '')}</span>`;
           }
+          updatePersistentTargetBar({ pid: pid, valid: false, message: d.message, build_id_match: d.build_id_match, has_dwarf: d.has_dwarf });
           showToastNotification(d.message || 'Validation failed', 'error');
         }
       } else {
@@ -9308,9 +9598,11 @@
           feedbackBanner.style.display = 'block';
           feedbackBanner.innerHTML = `<strong>⚠️ Error:</strong> ${escapeHtml(errMsg)}`;
         }
+        updatePersistentTargetBar({ pid: pid, valid: false, status: 'VALIDATION FAILED' });
       }
     } catch (err) {
       showToastNotification(`Target validation error: ${err}`, 'error');
+      updatePersistentTargetBar({ pid: pid, valid: false, status: 'VALIDATION FAILED' });
     } finally {
       if (btnVal) btnVal.disabled = false;
     }
@@ -9868,6 +10160,53 @@
     if (btnNavToInv) btnNavToInv.addEventListener('click', () => switchTab('tab-investigation-overview'));
     if (btnExecuteCompare) btnExecuteCompare.addEventListener('click', handleExecuteSnapshotCompare);
     if (btnSendDiff) btnSendDiff.addEventListener('click', handleSendDiffToInvestigation);
+
+    // Phase 31 Guided Journey Transition Buttons
+    const btnStep1To2 = document.getElementById('btn-step1-to-step2');
+    const btnStep2To3 = document.getElementById('btn-step2-to-step3');
+    const btnStep3Capture = document.getElementById('btn-step3-capture-now');
+    const btnStep3To4 = document.getElementById('btn-step3-to-step4');
+    const btnStep4To5 = document.getElementById('btn-step4-to-step5');
+    const btnPtbSwitch = document.getElementById('btn-ptb-switch-target');
+
+    if (btnStep1To2) {
+      btnStep1To2.addEventListener('click', () => {
+        loadTemporalMemoryMap(true);
+        switchTab('tab-runtime-explorer');
+      });
+    }
+    if (btnStep2To3) {
+      btnStep2To3.addEventListener('click', () => {
+        switchTab('tab-watch-list');
+      });
+    }
+    if (btnStep3Capture) {
+      btnStep3Capture.addEventListener('click', handleCaptureSnapshotNow);
+    }
+    if (btnStep3To4) {
+      btnStep3To4.addEventListener('click', () => {
+        switchTab('tab-timeline-compare');
+      });
+    }
+    if (btnStep4To5) {
+      btnStep4To5.addEventListener('click', () => {
+        if (lastComparisonResult) {
+          handleSendDiffToInvestigation();
+        } else {
+          switchTab('tab-investigation-overview');
+        }
+      });
+    }
+    if (btnPtbSwitch) {
+      btnPtbSwitch.addEventListener('click', () => {
+        switchTab('tab-target-setup');
+        const inputPid = document.getElementById('te-target-pid');
+        if (inputPid) {
+          inputPid.focus();
+          inputPid.select();
+        }
+      });
+    }
 
     // Provenance Drilldown Modal Close Listeners
     const btnCloseProv = document.getElementById('btn-close-modal-provenance');

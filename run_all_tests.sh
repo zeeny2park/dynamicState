@@ -160,7 +160,13 @@ if python3 -c "import playwright" >/dev/null 2>&1; then
         python3 -m unittest tests/test_phase30_real_capture_e2e.py
 fi
 
-# 29. Discover and run all remaining unit and integration tests
+# 29. Phase 31 Investigation-First Basic Mode UX Browser Acceptance Suite
+if python3 -c "import playwright" >/dev/null 2>&1; then
+    run_step "Phase 31 Investigation-First Basic Mode UX Suite" \
+        python3 -m unittest tests/test_phase31_basic_mode_ux.py
+fi
+
+# 30. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

@@ -2695,17 +2695,25 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except Exception as exc:
-            self.send_error(500, f"Error reading static file: {exc}")
+            try:
+                self.send_error(500, f"Error reading static file: {exc}")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def _send_json(self, data: Any, status: int = 200) -> None:
-        encoded = json.dumps(data, indent=2, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            encoded = json.dumps(data, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, format: str, *args: Any) -> None:
         # Keep server output quiet or structured unless debugging
@@ -2713,8 +2721,9 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             super().log_message(format, *args)
 
 
-class DynamicStateWebServer(http.server.HTTPServer):
+class DynamicStateWebServer(http.server.ThreadingHTTPServer):
     """HTTP Server for dynamicState Web UI."""
+    daemon_threads = True
 
     def __init__(self, server_address: Tuple[str, int], runtime: AgentRuntime, static_dir: str):
         super().__init__(server_address, DynamicStateRequestHandler)

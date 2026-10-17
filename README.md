@@ -1841,6 +1841,48 @@ Phase 30 hardens the primary investigation journey into a simple, reliable linea
   | Zero-Observation Speculation Guard | **Working** | Returns `status: PARTIAL` with action guidance; blocks hallucination |
   | Investigation & Ledger Integration | **Working** | Handoff into `EvidenceLedger` and Tab 5 Investigation goal |
 
+### Phase 31: Investigation-First Basic Mode UX
+
+Phase 31 redesigns the primary Basic Mode workflow into a guided, 6-stage investigation journey:
+`Connect target -> Explore runtime -> Select memory/variables -> Capture over time -> Compare changes -> Ask a question.`
+
+The interface guides users seamlessly through live runtime investigation with compact persistent state, clear stage transitions, contextual detail inspection, and anti-hallucination evidence grounding.
+
+- **Persistent Target Bar**:
+  - Compact `#basic-persistent-target-bar` anchored across all investigation tabs in Basic Mode.
+  - Live display of target PID, companion debug ELF, GNU Build ID status (`MATCHED`), connection badge (`CONNECTED`), and Zero-Stop backend badge (`process_vm_readv`).
+  - Integrated `[🔄 Switch Target]` button allowing instant retargeting without losing session continuity.
+  - Seamless English / 한국어 language switching preserving all active target and session metadata.
+
+- **Guided 6-Stage Investigation Flow**:
+  1. **Step 1: Connect Target**: Target PID & Companion ELF setup, GNU Build ID validation, and `#btn-step1-to-step2` transition footer.
+  2. **Step 2: Explore Runtime**: Primary entry points for Threads & Memory Maps. Contextual inspection cards (`#te-thread-details-card` with stack range and memory hex inspector link, `#te-var-details-card` with type, size, location, and 1-click watch addition), with `#btn-step2-to-step3` transition footer.
+  3. **Step 3: Watch List**: Compact monitored variables table with explicit add/remove actions, real-time item count badge (`#watchlist-count-badge`), clear explanation of unreadable/unmapped/guard page memory, immediate baseline capture (`#btn-step3-capture-now`), and `#btn-step3-to-step4` transition footer.
+  4. **Step 4: Timeline & Compare**: Snapshot sequence chips, zero process suspension (0.00 ms stop duration), side-by-side diff with strict pointer semantics (`POINTER_ADDRESS_CHANGED` vs `REFERENCED_MEMORY_CHANGED`), provenance modal, and `#btn-step4-to-step5` transition footer.
+  5. **Step 5: Ask About State**: Evidence-grounded conversational interface. Active investigation scope context chip (`#basic-investigation-context` showing PID, compared snapshot numbers, and watched items count). Zero-observation warning banner (`#basic-no-observations-alert`) and strict prevention of ungrounded LLM questions when 0 observations exist. Auto-binding of temporal session when observations are recorded.
+
+- **Browser Acceptance Test Suite**:
+  - `tests/test_phase31_basic_mode_ux.py`: 6 automated end-to-end Playwright browser tests:
+    1. `test_01_persistent_target_bar_and_navigation_persistence`: Validates Persistent Target Bar presence, PID & Build ID sync, tab navigation persistence, and switch target action.
+    2. `test_02_runtime_explorer_contextual_details_and_transitions`: Validates Thread details card with stack inspection link, Variable details card with struct member details, 1-click watch addition, and Step 2 to Step 3 footer transition.
+    3. `test_03_watchlist_and_unmapped_guard_memory_clarification`: Validates custom guard page watch item addition, capture execution, clear `UNREADABLE` status with "Unmapped / inaccessible" explanation, and Step 3 to Step 4 footer transition.
+    4. `test_04_timeline_compare_and_investigation_workflow_handoff`: Validates baseline and post-mutation captures, side-by-side diffing, diff handoff to investigation, active investigation scope context chip, and evidence-grounded follow-up question.
+    5. `test_05_zero_observations_prompt_and_hallucination_prevention`: Validates that asking questions with 0 captured observations displays warning alert, immediately prompts the user without hallucinating or making speculative LLM calls, and guides the user to Step 4.
+    6. `test_06_bilingual_i18n_verification`: Validates seamless English and Korean toggle across the Persistent Target Bar, journey buttons, detail cards, and active investigation scope chip.
+
+- **Phase 31 Capability Matrix**:
+  | Capability | Status | Implementation Details |
+  | :--- | :--- | :--- |
+  | Persistent Compact Target Bar | **Working** | `#basic-persistent-target-bar` with PID, ELF path, Build ID status, and Switch Target |
+  | Contextual Thread Inspector | **Working** | `#te-thread-details-card` with stack range and 1-click memory inspector handoff |
+  | Contextual Variable Inspector | **Working** | `#te-var-details-card` with type, size, source file:line, and 1-click watch list adding |
+  | Guided Journey Transition Footers | **Working** | Step 1 -> Step 2 -> Step 3 -> Step 4 -> Step 5 linear navigation |
+  | Guard Memory & Unmapped Clarification | **Working** | Unmapped / PROT_NONE pages explicitly marked `UNREADABLE` with explanation |
+  | Investigation Scope Context Chip | **Working** | `#basic-investigation-context` displays PID, compared snapshot numbers, and items count |
+  | Zero-Observation Hallucination Prevention | **Working** | Blocks ungrounded LLM questions when 0 observations exist; prompts user to Step 4 |
+  | Multi-Threaded HTTP Server | **Working** | `http.server.ThreadingHTTPServer` prevents client disconnections from blocking requests |
+  | Bilingual Support (EN / KO) | **Working** | Complete Korean and English translations across all Phase 31 workflow elements |
+
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]
 > **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.

@@ -162,6 +162,31 @@
     <button class="nav-tab advanced-only" data-tab="tab-state-lab" id="nav-tab-state-lab">🔬 Lab</button>
   </nav>
 
+  <!-- Phase 31: Persistent Target Bar for Basic Mode -->
+  <div id="basic-persistent-target-bar" class="basic-target-bar basic-only">
+    <div class="d-flex align-items-center gap-3">
+      <span class="font-bold text-xs" style="color: var(--text-muted);" data-i18n="lbl_ptb_active_target">🎯 Target:</span>
+      <span class="meta-item text-xs">
+        <strong>PID:</strong> <span class="mono font-bold text-accent" id="ptb-val-pid">--</span>
+      </span>
+      <span class="meta-item text-xs">
+        <strong data-i18n="lbl_ptb_executable">Executable:</strong> <span class="mono text-xs" id="ptb-val-exe">--</span>
+      </span>
+      <span class="meta-item text-xs">
+        <strong>Build ID:</strong> <span class="badge badge-neutral text-xs mono" id="ptb-val-buildid">UNCHECKED</span>
+      </span>
+      <span class="meta-item text-xs">
+        <strong data-i18n="lbl_ptb_status">Status:</strong> <span class="badge badge-neutral text-xs" id="ptb-val-status">DISCONNECTED</span>
+      </span>
+      <span class="badge badge-info text-xs" id="ptb-val-backend" title="process_vm_readv zero-stop capture">process_vm_readv (Zero-Stop)</span>
+    </div>
+    <div class="d-flex align-items-center gap-2">
+      <button type="button" class="btn btn-outline btn-xs" id="btn-ptb-switch-target" title="Return to Target Setup to connect or re-verify a target process" data-i18n="btn_ptb_switch_target">
+        🔄 Switch Target
+      </button>
+    </div>
+  </div>
+
   <!-- Banner for low-impact observation mode -->
   <div id="low-impact-banner" class="banner banner-warning" style="display: none;">
     <span class="banner-icon">⚠️</span>
@@ -259,13 +284,16 @@
             <div id="diag-feedback-banner" class="banner mb-3 text-xs" style="display: none;"></div>
 
             <!-- Workflow Action Buttons -->
-            <div style="background: rgba(0,0,0,0.2); padding: 14px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+            <div id="step1-next-action-card" style="background: rgba(0,0,0,0.2); padding: 14px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
               <div>
                 <span class="font-bold text-xs" style="color: var(--text-main);" data-i18n="lbl_choose_next_step">Choose Next Step:</span>
                 <span class="text-muted text-xs ms-2" data-i18n="desc_choose_next_step">Explore process memory layout first, or capture initial baseline state immediately.</span>
               </div>
               <div class="d-flex gap-2">
-                <button type="button" class="btn btn-primary btn-sm" id="btn-inspect-runtime">
+                <button type="button" class="btn btn-primary btn-sm font-bold" id="btn-step1-to-step2" data-i18n="btn_step1_to_step2">
+                  🧭 Proceed to Runtime Explorer (Step 2) →
+                </button>
+                <button type="button" class="btn btn-outline btn-sm" id="btn-inspect-runtime">
                   <span data-i18n="btn_inspect_runtime">🧭 Inspect Runtime Structure (Tab 2)</span>
                 </button>
                 <button type="button" class="btn btn-success btn-sm" id="btn-capture-baseline">
@@ -418,6 +446,69 @@
               </tbody>
             </table>
           </div>
+        </div>
+
+        <!-- Contextual Selection Details (Thread Details & Variable Details) -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;">
+          <!-- Selected Thread Detail Card -->
+          <div class="card p-3" id="te-thread-details-card" style="display: none;">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <h4 class="text-xs font-bold uppercase text-accent flex items-center gap-1" data-i18n="lbl_thread_details_title">
+                <span>🧵</span> Selected Thread Details
+              </h4>
+              <span class="badge badge-neutral text-xs" id="td-val-state">--</span>
+            </div>
+            <div class="text-xs mb-2">
+              <strong>TID:</strong> <span class="mono font-bold" id="td-val-tid">--</span> &bull; 
+              <strong>Name:</strong> <span class="mono" id="td-val-name">--</span>
+            </div>
+            <div class="text-xs mb-2">
+              <strong>Stack Range:</strong> <span class="mono" id="td-val-stack">--</span>
+            </div>
+            <div class="d-flex justify-content-end">
+              <button type="button" class="btn btn-outline btn-xs" id="btn-inspect-thread-stack" data-i18n="btn_inspect_thread_stack">
+                🔬 Inspect Thread Stack in Memory Inspector
+              </button>
+            </div>
+          </div>
+
+          <!-- Selected Variable Detail Card -->
+          <div class="card p-3" id="te-var-details-card" style="display: none;">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <h4 class="text-xs font-bold uppercase text-accent flex items-center gap-1" data-i18n="lbl_var_details_title">
+                <span>🔍</span> Selected Variable Details
+              </h4>
+              <span class="badge badge-secondary text-xs" id="vd-val-scope">global</span>
+            </div>
+            <div class="text-xs mb-1">
+              <strong>Name:</strong> <span class="mono font-bold text-accent" id="vd-val-name">--</span> &bull; 
+              <strong>Type:</strong> <span class="mono" id="vd-val-type">--</span>
+            </div>
+            <div class="text-xs mb-2">
+              <strong>Address:</strong> <span class="mono" id="vd-val-addr">--</span> &bull; 
+              <strong>Size:</strong> <span class="mono" id="vd-val-size">--</span> &bull; 
+              <strong>Location:</strong> <span class="text-muted" id="vd-val-loc">--</span>
+            </div>
+            <div class="d-flex justify-content-end gap-2">
+              <button type="button" class="btn btn-outline btn-xs" id="btn-details-inspect-memory" data-i18n="btn_details_inspect_mem">
+                🔬 Inspect in Hex Inspector
+              </button>
+              <button type="button" class="btn btn-primary btn-xs" id="btn-details-add-watch" data-i18n="btn_details_add_watch">
+                ➕ Add to Watch List
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Step 2 Footer Navigation -->
+        <div class="workflow-step-footer mt-3 d-flex justify-content-between align-items-center">
+          <div>
+            <span class="font-bold text-xs" data-i18n="lbl_step2_footer_title">Finished inspecting runtime structure?</span>
+            <span class="text-muted text-xs ms-2" data-i18n="lbl_step2_footer_desc">Variables added to watch list will be monitored in Step 3.</span>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm font-bold" id="btn-step2-to-step3" data-i18n="btn_step2_to_step3">
+            📋 Proceed to Watch List (Step 3) →
+          </button>
         </div>
       </div>
     </section>
@@ -578,6 +669,22 @@
             </div>
           </div>
         </div>
+
+        <!-- Step 3 Footer Navigation -->
+        <div class="workflow-step-footer mt-4 d-flex justify-content-between align-items-center">
+          <div>
+            <span class="font-bold text-xs" data-i18n="lbl_step3_footer_title">Watch List Configured</span>
+            <span class="text-muted text-xs ms-2" data-i18n="lbl_step3_footer_desc">Capture a baseline snapshot now, then proceed to Timeline to track mutations.</span>
+          </div>
+          <div class="d-flex gap-2">
+            <button type="button" class="btn btn-success btn-sm font-bold" id="btn-step3-capture-now" data-i18n="btn_capture_now">
+              ⚡ Capture Snapshot Now
+            </button>
+            <button type="button" class="btn btn-primary btn-sm font-bold" id="btn-step3-to-step4" data-i18n="btn_step3_to_step4">
+              ⏱️ Proceed to Timeline &amp; Compare (Step 4) →
+            </button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -732,6 +839,17 @@
             </table>
           </div>
         </div>
+
+        <!-- Step 4 Footer Navigation -->
+        <div class="workflow-step-footer mt-3 d-flex justify-content-between align-items-center">
+          <div>
+            <span class="font-bold text-xs" data-i18n="lbl_step4_footer_title">Timeline Analysis Complete?</span>
+            <span class="text-muted text-xs ms-2" data-i18n="lbl_step4_footer_desc">Ask targeted, evidence-grounded questions scoped to these observations in Step 5.</span>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm font-bold" id="btn-step4-to-step5" data-i18n="btn_step4_to_step5">
+            🔍 Proceed to Ask a Question (Step 5) →
+          </button>
+        </div>
       </div>
     </section>
 
@@ -745,6 +863,19 @@
         <!-- BASIC MODE: Three Primary Areas (TARGET, RESULT, QUESTION)            -->
         <!-- ===================================================================== -->
         <div id="basic-investigation-view" class="basic-only">
+
+          <!-- Investigation Scope & Context Chip (Phase 31) -->
+          <div class="card p-3 mb-4" id="basic-investigation-context" style="background: rgba(99, 102, 241, 0.05); border: 1px solid rgba(99, 102, 241, 0.25);">
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+              <div class="d-flex align-items-center gap-2 flex-wrap">
+                <span class="font-bold text-xs text-accent" data-i18n="lbl_inv_context_title">🔍 Active Investigation Scope:</span>
+                <span class="context-chip mono" id="bic-target-chip">Target: PID N/A</span>
+                <span class="context-chip mono" id="bic-snapshot-chip">Snapshots: None compared</span>
+                <span class="context-chip mono" id="bic-watch-chip">Watched: 0 items</span>
+              </div>
+              <span class="badge badge-neutral text-xs" id="bic-quality-badge">Zero-Stop (0.00 ms)</span>
+            </div>
+          </div>
 
           <!-- AREA 1: TARGET -->
           <div class="basic-card basic-target-card mb-4" id="basic-target-area">
@@ -1025,6 +1156,12 @@
               <div class="text-xs text-muted" id="basic-llm-status-pill">🤖 Ready</div>
             </div>
             <div class="basic-card-body">
+              <!-- 0-Observations Warning (Phase 31) -->
+              <div id="basic-no-observations-alert" class="banner banner-warning mb-3 text-xs" style="display: none;">
+                <span>⚠️</span>
+                <span data-i18n="msg_no_observations_alert">No runtime observations recorded yet. Capture snapshots in Step 4 (Timeline) before asking questions requiring runtime memory state.</span>
+              </div>
+
               <!-- Conversation Stream -->
               <div id="basic-chat-history" class="basic-chat-history mb-3"></div>
 
