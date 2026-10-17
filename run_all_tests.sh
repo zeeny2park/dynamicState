@@ -148,7 +148,13 @@ run_step "Phase 26 Real-Execution Quality Verification and Agent-First UX Suite"
 run_step "Phase 28 Runtime Memory Explorer and State Inspection UX Suite" \
     python3 -m unittest tests/test_phase28_memory_explorer_ux.py
 
-# 27. Discover and run all remaining unit and integration tests
+# 27. Phase 29 Browser-Based Runtime Investigation Workflow Suite (Playwright E2E)
+if python3 -c "import playwright" >/dev/null 2>&1; then
+    run_step "Phase 29 Browser-Based Runtime Investigation Workflow Suite" \
+        python3 -m unittest tests/test_phase29_browser_e2e.py
+fi
+
+# 28. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

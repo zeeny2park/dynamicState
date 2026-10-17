@@ -771,6 +771,26 @@ class WatchSessionManager:
                                 matching_cat = m["category"]
                                 break
 
+                        # Extract members if struct/class
+                        members = []
+                        if t_die and t_die.members:
+                            for mem in t_die.members:
+                                m_type_name = idx.get_type_name(mem.type_offset)
+                                mem_addr = runtime_addr + mem.offset
+                                m_die = idx.types_by_die.get(mem.type_offset)
+                                m_size = mem.byte_size if mem.byte_size else (m_die.byte_size if m_die and m_die.byte_size else 4)
+                                is_ptr = bool(m_type_name and ("*" in m_type_name or "pointer" in m_type_name.lower()))
+                                members.append({
+                                    "name": mem.name,
+                                    "full_name": f"{var.name}.{mem.name}",
+                                    "offset": mem.offset,
+                                    "size": m_size,
+                                    "type_name": m_type_name or "unknown",
+                                    "runtime_address": f"0x{mem_addr:x}",
+                                    "runtime_address_int": mem_addr,
+                                    "is_pointer": is_ptr,
+                                })
+
                         discoverable_variables.append({
                             "name": var.name,
                             "type_name": t_name,
@@ -781,6 +801,8 @@ class WatchSessionManager:
                             "source_location": loc,
                             "memory_category": matching_cat,
                             "is_global": True,
+                            "members": members,
+                            "has_members": len(members) > 0,
                         })
             except Exception:
                 pass
@@ -933,6 +955,8 @@ class WatchSessionManager:
                 },
             }
 
+            is_manual = (capture_mode == "MANUAL" or interval_ms <= 0)
+            status = "STOPPED" if is_manual else "RUNNING"
             session = ObservationSession(
                 session_id=session_id,
                 schema_version="1.1.0",
@@ -941,10 +965,10 @@ class WatchSessionManager:
                 binary_build_id=runtime_ident.get("build_id") or (companion_identity.build_id if companion_identity else None),
                 companion_elf_path=companion_elf_path,
                 start_time=datetime.now(timezone.utc).isoformat(),
-                status="RUNNING",
+                status=status,
                 capture_mode=capture_mode,
                 configuration={
-                    "interval_ms": max(50, min(interval_ms, 60000)),
+                    "interval_ms": 0 if is_manual else max(50, min(interval_ms, 60000)),
                     "max_samples": max(1, min(max_samples, 50000)),
                     "max_storage_bytes": max_storage_bytes,
                     "max_duration_sec": max_duration_sec,
@@ -971,17 +995,18 @@ class WatchSessionManager:
             self._sessions[session_id] = session
             self._adapters[session_id] = target_adapter
 
-            # 7. Start background capture thread
-            stop_evt = threading.Event()
-            self._stop_events[session_id] = stop_evt
-            th = threading.Thread(
-                target=self._capture_worker,
-                args=(session_id, stop_evt, target_adapter),
-                name=f"WatchSessionWorker-{session_id}",
-                daemon=True,
-            )
-            self._threads[session_id] = th
-            th.start()
+            # 7. Start background capture thread only if periodic capture requested
+            if status == "RUNNING":
+                stop_evt = threading.Event()
+                self._stop_events[session_id] = stop_evt
+                th = threading.Thread(
+                    target=self._capture_worker,
+                    args=(session_id, stop_evt, target_adapter),
+                    name=f"WatchSessionWorker-{session_id}",
+                    daemon=True,
+                )
+                self._threads[session_id] = th
+                th.start()
 
             return session
 
@@ -1387,7 +1412,11 @@ class WatchSessionManager:
 
             # Semantics:
             # Missing or failed reads must NEVER be interpreted as unchanged!
-            if st_a == "MISSING" or st_b == "MISSING":
+            if not val_a_entry and val_b_entry:
+                diff_state = "ADDED"
+            elif val_a_entry and not val_b_entry:
+                diff_state = "REMOVED"
+            elif st_a == "MISSING" or st_b == "MISSING":
                 diff_state = "MISSING"
             elif st_a in ("UNAVAILABLE", "ERROR") or st_b in ("UNAVAILABLE", "ERROR"):
                 diff_state = "UNREADABLE"
@@ -1399,6 +1428,15 @@ class WatchSessionManager:
                 diff_state = "CHANGED" if (val_a != val_b or raw_a != raw_b) else "UNCHANGED"
 
             is_pointer = (item.type_name in ("pointer", "void*") or item.type_name.endswith("*"))
+            pointer_change_type = "NONE"
+            if is_pointer:
+                if val_a != val_b:
+                    pointer_change_type = "POINTER_ADDRESS_CHANGED"
+                elif raw_a != raw_b:
+                    pointer_change_type = "REFERENCED_MEMORY_CHANGED"
+                else:
+                    pointer_change_type = "STABLE"
+
             diffs.append({
                 "item_id": item_id,
                 "name": item.name,
@@ -1411,10 +1449,13 @@ class WatchSessionManager:
                 "diff_state": diff_state,
                 "value_a": val_a,
                 "value_b": val_b,
+                "raw_hex_a": raw_a,
+                "raw_hex_b": raw_b,
                 "before": {"value": val_a, "raw_hex": raw_a, "status": st_a},
                 "after": {"value": val_b, "raw_hex": raw_b, "status": st_b},
                 "is_pointer": is_pointer,
                 "pointer_address_changed": is_pointer and (val_a != val_b),
+                "pointer_change_type": pointer_change_type,
             })
 
         return {
@@ -1434,12 +1475,16 @@ class WatchSessionManager:
                 "partial": sum(1 for d in diffs if d["state"] == "PARTIAL"),
                 "missing": sum(1 for d in diffs if d["state"] == "MISSING"),
                 "unknown": sum(1 for d in diffs if d["state"] == "UNKNOWN"),
+                "added": sum(1 for d in diffs if d["state"] == "ADDED"),
+                "removed": sum(1 for d in diffs if d["state"] == "REMOVED"),
                 "changed_count": sum(1 for d in diffs if d["state"] == "CHANGED"),
                 "unchanged_count": sum(1 for d in diffs if d["state"] == "UNCHANGED"),
                 "unreadable_count": sum(1 for d in diffs if d["state"] == "UNREADABLE"),
                 "partial_count": sum(1 for d in diffs if d["state"] == "PARTIAL"),
                 "missing_count": sum(1 for d in diffs if d["state"] == "MISSING"),
                 "unknown_count": sum(1 for d in diffs if d["state"] == "UNKNOWN"),
+                "added_count": sum(1 for d in diffs if d["state"] == "ADDED"),
+                "removed_count": sum(1 for d in diffs if d["state"] == "REMOVED"),
             }
         }
 

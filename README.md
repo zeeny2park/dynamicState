@@ -1751,6 +1751,43 @@ Phase 28 establishes an interactive, memory-centric inspection and temporal stat
        - Verify that `sequence` is labeled `CHANGED` with before/after values, while `status` is labeled `UNCHANGED`.
      - **Tab 5 (Investigation)**: Click **Send Diff to Investigation** to initiate a grounded investigation citing the exact observation sequences.
 
+### Phase 29: Complete and Validate the Browser-Based Runtime Investigation Workflow
+Phase 29 delivers a fully tested, end-to-end browser investigation experience verified through automated headless Chromium tests via Playwright against live running C++ processes (`tests/fixtures/real_runtime/scenario_target.cpp`).
+
+- **Target Connection & Validation (Step A — Tab 1)**:
+  - Form state persistence: Two-way binding between Tab 1 input forms (`#te-target-pid`, `#te-companion-elf`), Tab 5 forms, and `sessionStorage`. Values survive tab switching and browser refreshes.
+  - Complete internationalization (i18n): Dynamic real-time switching between English and Korean (`#btn-lang-en`, `#btn-lang-ko`) across all workflow tabs, badges, headers, and modal dialogues.
+  - Transparent Low-Impact Zero-Stop verification banner: Real-time report of zero process suspension time using `process_vm_readv` (latency < 100 μs).
+  - Explicit non-speculative state: Target connection does not trigger automated speculative investigation reports without explicit user intent.
+
+- **Runtime Explorer & DWARF Struct Expansion (Step B — Tab 2)**:
+  - Live OS Threads: Displays active thread IDs, execution states, and stack boundaries (`[stack_start, stack_end]`).
+  - Memory Mappings: Categorized memory ranges (Heap, Stack, Code, Data) with raw hex/ASCII slice inspect modal.
+  - DWARF Struct Member Unrolling: Expandable struct variables (e.g. `g_state` -> `sequence`, `status`, `buffer`, `active`) with inline toggle (`▶`/`▼`) and individual "Watch" action buttons per member.
+
+- **User-Selected Watch Items Management (Step C — Tab 3)**:
+  - Watch list table displays monitored symbols, source provenance (`global_variable`, `struct_member`, `memory_map`, `custom_range`), address, type, and status.
+  - Interactive "Add Custom Range" drawer and one-click item removal with instant UI synchronization.
+
+- **Timeline Navigation, Diffing & Provenance Drilldown (Step D — Tab 4)**:
+  - Repeated synchronous captures: Baseline Snapshot #1 and mutation Snapshot #2 captured via explicit user action (`#btn-manual-capture-now` / `#btn-timeline-capture-now`).
+  - Interactive scrubber slider and clickable snapshot sequence pills (`#1`, `#2`) to inspect temporal points in time.
+  - Side-by-side snapshot comparison distinguishing 8 diff states: `CHANGED`, `UNCHANGED`, `ADDED`, `REMOVED`, `UNREADABLE`, `PARTIAL`, `MISSING`, `UNKNOWN`.
+  - Pointer semantics breakdown (`POINTER_ADDRESS_CHANGED`, `REFERENCED_MEMORY_CHANGED`, `STABLE`).
+  - Provenance drilldown modal (`#modal-provenance-drilldown`): Inspects underlying kernel read backend (`process_vm_readv`), zero-stop pause duration (0.00 ms), raw hexadecimal bytes before/after, and byte provenance.
+
+- **Investigation Integration Handoff (Step E — Tab 5)**:
+  - "Investigate this Difference" button transfers mutated variable context, observation sequence numbers, and diff values directly into Tab 5 Investigation Goal input.
+  - Automatically switches target source to Watch Session mode and updates the active session dropdown.
+
+- **Automated Browser E2E Test Suite**:
+  - `tests/test_phase29_browser_e2e.py`: 5 automated real-browser Playwright test scenarios:
+    1. `test_01_target_setup_i18n_persistence_and_validation`: Target inputs, sessionStorage persistence, English/Korean toggles, validation diagnostics.
+    2. `test_02_runtime_explorer_threads_maps_and_struct_members`: Thread exploration, memory mappings, struct member unrolling, and individual watch item addition.
+    3. `test_03_watchlist_management_and_removal`: Watchlist items display, custom range addition, and item deletion.
+    4. `test_04_repeated_captures_mutation_timeline_diffs_and_provenance`: Inferior process state mutation via stdin (`SET sequence 9999`), repeated captures, timeline navigation, side-by-side diffing, and provenance drilldown modal.
+    5. `test_05_investigation_integration_handoff`: Handoff of diff context into Tab 5 Investigation Goal and watch session selection.
+
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]
 > **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.
