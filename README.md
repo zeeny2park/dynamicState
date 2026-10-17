@@ -1788,6 +1788,59 @@ Phase 29 delivers a fully tested, end-to-end browser investigation experience ve
     4. `test_04_repeated_captures_mutation_timeline_diffs_and_provenance`: Inferior process state mutation via stdin (`SET sequence 9999`), repeated captures, timeline navigation, side-by-side diffing, and provenance drilldown modal.
     5. `test_05_investigation_integration_handoff`: Handoff of diff context into Tab 5 Investigation Goal and watch session selection.
 
+### Phase 30: Runtime Investigation UX Hardening, Real-Capture Integrity, and Browser Acceptance
+Phase 30 hardens the primary investigation journey into a simple, reliable linear flow, establishes strict truthfulness for pointer vs. referenced memory mutations and unmapped/guard memory reads, guarantees tamper-proof provenance drilldown, and eliminates ungrounded speculation on sessions with 0 observations.
+
+- **Simplified Linear Journey in Basic Mode**:
+  `Target -> Explore -> Select variables -> Capture -> Compare -> Ask about changes`
+  - Single guided journey eliminating competing navigation dead-ends and unrequested automated reports.
+  - Clear progression states, action buttons, and descriptive empty states explaining next steps.
+  - Real-time synchronization of target PID, companion debug ELF, and selected watch session across all tabs and browser reloads.
+
+- **Strict Pointer Semantics**:
+  - Distinguishes pointer address reassignment (`POINTER_ADDRESS_CHANGED`) from changes within pointed-to memory buffers (`REFERENCED_MEMORY_CHANGED`).
+  - Sampling helper automatically inspects bounded slices (up to 64 bytes) of valid pointer targets via `process_vm_readv`.
+  - Side-by-side diffing and provenance modal clearly attribute whether the pointer itself was repointed or the buffer content was mutated.
+
+- **Truthful Guard & Unmapped Memory Handling**:
+  - Memory reads against unmapped regions or `PROT_NONE` guard pages are truthfully recorded as `UNREADABLE` / `UNAVAILABLE`.
+  - Zero fabrication: guard pages and inaccessible addresses are never replaced with dummy `0x00` bytes.
+
+- **Tamper-Proof Provenance Drilldown**:
+  - Every snapshot diff inspection displays verified target PID, companion ELF Build ID sha1/md5, kernel read backend (`process_vm_readv`), monotonic timestamps, before/after raw hex bytes, and observation status.
+  - Dedicated inspection section for pointer targets and referenced memory.
+
+- **Zero-Observation Speculation Guard**:
+  - Requesting an investigation question on a watch session with 0 observations immediately yields `status: PARTIAL` with a clear advisory finding and next action to capture snapshots first, completely preventing ungrounded LLM hallucinations.
+
+- **Negative Control & Error Resilience**:
+  - Verified error handling for invalid PIDs (`TARGET_NOT_FOUND`), target process exit mid-session (`ESRCH`), companion ELF Build ID mismatch (`BUILD_ID_MISMATCH`), and missing DWARF companion image (`MISSING_DWARF`).
+
+- **Automated Real-Capture E2E Acceptance Suite**:
+  - `tests/test_phase30_real_capture_e2e.py`: 4 automated real-browser Playwright test scenarios against a live C++ inferior (`scenario_target.cpp`):
+    1. `test_01_primary_journey_complete_linear_workflow`: Full linear journey from target connection, thread/map/DWARF exploration, variable selection (`sequence`, `status`, `active`), baseline & mutation snapshots, side-by-side diffing, provenance modal, and handoff to Tab 5 Investigation analysis.
+    2. `test_02_pointer_reassignment_vs_referenced_memory_mutation`: Strict verification distinguishing pointer target reassignment (`POINTER_ADDRESS_CHANGED`) from referenced memory mutation (`REFERENCED_MEMORY_CHANGED`).
+    3. `test_03_unmapped_guard_memory_truthfulness`: Guard page (`PROT_NONE`) unreadability verification ensuring honest `UNAVAILABLE` status without fabricated zeroes.
+    4. `test_04_negative_cases_and_error_handling`: Comprehensive negative tests covering invalid PID, process termination mid-capture, Build ID mismatch, missing DWARF companion image, and 0-observation safety.
+
+- **Phase 30 Capability Matrix**:
+  | Capability | Status | Implementation Details |
+  | :--- | :--- | :--- |
+  | Linear Basic Investigation Journey | **Working** | Step-by-step progress cards, automated handoff, no unsolicited reports |
+  | Target Connection & Build ID Validation | **Working** | Strict sha1/md5 Build ID matching; fails closed on `BUILD_ID_MISMATCH` |
+  | Process Exit & Liveness Verification | **Working** | `os.kill(pid, 0)` check; truthful `ESRCH` reporting on process termination |
+  | Thread Stack Boundaries | **Working** | `/proc/<pid>/task/<tid>/stat` & memory map matching |
+  | Thread Local Variable Unwinding | **Unsupported** | Truthfully reported as `UNSUPPORTED` without fabricated stack frames |
+  | Memory Map Navigation & Inspection | **Working** | Bounded slice inspection (up to 4096 bytes) with hex/ASCII view |
+  | DWARF Global & Struct Unrolling | **Working** | Recursive type & offset traversal for typed C/C++ structures |
+  | User Watch List Management | **Working** | Scope attribution, custom address range adding, instant removal |
+  | Zero-Stop On-Demand Capture | **Working** | `process_vm_readv` (latency < 100 μs, zero process suspension) |
+  | Pointer Address vs Dereference Diffing | **Working** | Distinguishes `POINTER_ADDRESS_CHANGED` from `REFERENCED_MEMORY_CHANGED` |
+  | Guard / Unmapped Memory Truthfulness | **Working** | Returns `UNREADABLE` / `UNAVAILABLE`; never fabricates `0x00` bytes |
+  | Provenance Drilldown Modal | **Working** | Verified PID, verified Build ID, backend, raw hex bytes, status |
+  | Zero-Observation Speculation Guard | **Working** | Returns `status: PARTIAL` with action guidance; blocks hallucination |
+  | Investigation & Ledger Integration | **Working** | Handoff into `EvidenceLedger` and Tab 5 Investigation goal |
+
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]
 > **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.

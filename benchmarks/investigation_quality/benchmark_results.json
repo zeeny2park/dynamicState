@@ -1,6 +1,6 @@
 {
   "schema_version": "1.2.0",
-  "timestamp_utc": "2026-10-17T02:23:13.262688+00:00",
+  "timestamp_utc": "2026-10-17T06:03:40.907814+00:00",
   "corpus_version": "1.1.0",
   "corpus_hash": "cfb50179bbc1c95d9b4ec02aee7f4fae295db4609872d5713774a1c109a942c2",
   "fixture_hash": "cb7f5b191a787d7927d3a746caa7643130e62df45b0182c0c64a4a3d6268ad4d",
@@ -102,8 +102,8 @@
           "promoted_functions": [],
           "stage_provenance": {
             "spawn": {
-              "pid": 1451736,
-              "binary_path": "/tmp/dynstate_phase19_bench_xab9bzyh/fixture_target.stripped",
+              "pid": 1658740,
+              "binary_path": "/tmp/dynstate_phase19_bench_rxif54u2/fixture_target.stripped",
               "binary_hash": "f9c2552def449cffda26e8c0a92076b04d36692703bfc06b3d76b80083956092",
               "build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567",
               "status": "SUCCESS"
@@ -127,7 +127,7 @@
               }
             },
             "snapshot_a": {
-              "path": "/tmp/dynstate_phase19_bench_xab9bzyh/rep_0_1792203791359/snap_A_1792203791375",
+              "path": "/tmp/dynstate_phase19_bench_rxif54u2/rep_0_1792217018984/snap_A_1792217019001",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "status": "SUCCESS"
@@ -152,7 +152,7 @@
               }
             },
             "snapshot_b": {
-              "path": "/tmp/dynstate_phase19_bench_xab9bzyh/rep_0_1792203791359/snap_B_1792203791404",
+              "path": "/tmp/dynstate_phase19_bench_rxif54u2/rep_0_1792217018984/snap_B_1792217019030",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "consistency": "STOPPED",
@@ -167,7 +167,7 @@
               "status": "SUCCESS",
               "findings_count": 20,
               "diff_trust": "CONFIRMED",
-              "debug_image": "/tmp/dynstate_phase19_bench_xab9bzyh/fixture_target.debug",
+              "debug_image": "/tmp/dynstate_phase19_bench_rxif54u2/fixture_target.debug",
               "companion_build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567"
             },
             "stage_synthesis": {
@@ -180,7 +180,7 @@
               "provider_used": "deterministic_fallback",
               "is_fallback": true,
               "model_used": "deterministic-engine",
-              "latency_ms": 4.02
+              "latency_ms": 3.99
             },
             "fixture_state_verification": {
               "status": "VERIFIED",
@@ -208,7 +208,7 @@
           },
           "is_fallback": true,
           "model_used": "deterministic-engine",
-          "latency_ms": 4.02
+          "latency_ms": 3.99
         }
       },
       {
@@ -252,8 +252,8 @@
           "promoted_functions": [],
           "stage_provenance": {
             "spawn": {
-              "pid": 1451810,
-              "binary_path": "/tmp/dynstate_phase19_bench_xab9bzyh/fixture_target.stripped",
+              "pid": 1658817,
+              "binary_path": "/tmp/dynstate_phase19_bench_rxif54u2/fixture_target.stripped",
               "binary_hash": "f9c2552def449cffda26e8c0a92076b04d36692703bfc06b3d76b80083956092",
               "build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567",
               "status": "SUCCESS"
@@ -277,7 +277,7 @@
               }
             },
             "snapshot_a": {
-              "path": "/tmp/dynstate_phase19_bench_xab9bzyh/rep_0_1792203791359/snap_A_1792203791826",
+              "path": "/tmp/dynstate_phase19_bench_rxif54u2/rep_0_1792217018984/snap_A_1792217019457",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "status": "SUCCESS"
@@ -302,7 +302,7 @@
               }
             },
             "snapshot_b": {
-              "path": "/tmp/dynstate_phase19_bench_xab9bzyh/rep_0_1792203791359/snap_B_1792203791852",
+              "path": "/tmp/dynstate_phase19_bench_rxif54u2/rep_0_1792217018984/snap_B_1792217019484",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "consistency": "STOPPED",
@@ -317,7 +317,7 @@
               "status": "SUCCESS",
               "findings_count": 20,
               "diff_trust": "CONFIRMED",
-              "debug_image": "/tmp/dynstate_phase19_bench_xab9bzyh/fixture_target.debug",
+              "debug_image": "/tmp/dynstate_phase19_bench_rxif54u2/fixture_target.debug",
               "companion_build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567"
             },
             "stage_synthesis": {
@@ -330,7 +330,7 @@
               "provider_used": "deterministic_fallback",
               "is_fallback": true,
               "model_used": "deterministic-engine",
-              "latency_ms": 3.49
+              "latency_ms": 3.38
             },
             "fixture_state_verification": {
               "status": "VERIFIED",
@@ -358,7 +358,7 @@
           },
           "is_fallback": true,
           "model_used": "deterministic-engine",
-          "latency_ms": 3.49
+          "latency_ms": 3.38
         }
       }
     ]
@@ -520,7 +520,7 @@
           "status": "COMPLETED_MODEL_RESPONSE",
           "is_fallback": true,
           "model": "deterministic-engine",
-          "latency_ms": 3.47,
+          "latency_ms": 3.38,
           "is_false_positive": false,
           "candidate_tier": "STATIC_CANDIDATE"
         }

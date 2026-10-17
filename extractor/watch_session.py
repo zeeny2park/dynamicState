@@ -1302,6 +1302,75 @@ class WatchSessionManager:
                 "watch_items": [w.to_dict() for w in session.watch_items],
             }
 
+    @staticmethod
+    def _sample_watch_item(adapter: TargetExecutionAdapter, pid: int, item: WatchItem) -> Tuple[Dict[str, Any], str]:
+        """Reads and decodes a watch item from the target process.
+
+        For pointer types (e.g. `Buffer*`, `void*`, `pointer`), this also samples a bounded
+        slice (up to 64 bytes) of the pointed-to memory so that referenced memory mutations
+        can be distinguished from pointer reassignments.
+        """
+        raw_bytes, read_st, read_err = adapter.read_memory(pid, item.address, item.size)
+        is_pointer = (item.type_name in ("pointer", "void*") or item.type_name.endswith("*"))
+
+        if read_st == "OBSERVED" and raw_bytes is not None:
+            decoded_val, dec_err = decode_value_from_bytes(raw_bytes, item.type_name)
+            st = "OBSERVED" if dec_err is None else "DECODE_ERROR"
+            entry: Dict[str, Any] = {
+                "value": decoded_val,
+                "raw_hex": raw_bytes.hex(),
+                "status": st,
+                "error": dec_err,
+                "is_pointer": is_pointer,
+            }
+
+            if is_pointer:
+                target_addr = None
+                if isinstance(decoded_val, str) and decoded_val.startswith("0x"):
+                    try:
+                        target_addr = int(decoded_val, 16)
+                    except ValueError:
+                        target_addr = None
+                elif isinstance(decoded_val, int):
+                    target_addr = decoded_val
+
+                if target_addr is not None and target_addr > 0:
+                    ref_bytes, ref_st, ref_err = adapter.read_memory(pid, target_addr, 64)
+                    entry["referenced_address"] = f"0x{target_addr:x}"
+                    entry["referenced_status"] = ref_st
+                    entry["referenced_raw_hex"] = ref_bytes.hex() if (ref_st == "OBSERVED" and ref_bytes) else ""
+                    if ref_err:
+                        entry["referenced_error"] = ref_err
+                elif target_addr == 0:
+                    entry["referenced_address"] = "0x0"
+                    entry["referenced_status"] = "NULL_POINTER"
+                    entry["referenced_raw_hex"] = ""
+                else:
+                    entry["referenced_address"] = "UNKNOWN"
+                    entry["referenced_status"] = "INVALID_POINTER"
+                    entry["referenced_raw_hex"] = ""
+
+            return entry, "COMPLETE" if st == "OBSERVED" else "PARTIAL"
+
+        elif read_st == "PARTIAL":
+            entry = {
+                "value": None,
+                "raw_hex": raw_bytes.hex() if raw_bytes else "",
+                "status": "PARTIAL",
+                "error": read_err or "Partial memory read",
+                "is_pointer": is_pointer,
+            }
+            return entry, "PARTIAL"
+        else:
+            entry = {
+                "value": None,
+                "raw_hex": "",
+                "status": read_st if read_st in ("UNAVAILABLE", "PERMISSION_DENIED", "TARGET_TERMINATED") else "UNAVAILABLE",
+                "error": read_err or "Memory read failed or unmapped",
+                "is_pointer": is_pointer,
+            }
+            return entry, "PARTIAL"
+
     def capture_once(self, session_id: str) -> Observation:
         """Executes a single synchronous capture of all watch items for a session."""
         with self._lock:
@@ -1325,32 +1394,10 @@ class WatchSessionManager:
                 raise RuntimeError(f"Target process PID {session.pid} is not accessible: {live_err}")
 
             for item in list(session.watch_items):
-                raw_bytes, read_st, read_err = adapter.read_memory(session.pid, item.address, item.size)
-                if read_st == "OBSERVED" and raw_bytes is not None:
-                    decoded_val, dec_err = decode_value_from_bytes(raw_bytes, item.type_name)
-                    st = "OBSERVED" if dec_err is None else "DECODE_ERROR"
-                    values[item.item_id] = {
-                        "value": decoded_val,
-                        "raw_hex": raw_bytes.hex(),
-                        "status": st,
-                        "error": dec_err,
-                    }
-                elif read_st == "PARTIAL":
+                item_entry, completeness = self._sample_watch_item(adapter, session.pid, item)
+                values[item.item_id] = item_entry
+                if completeness != "COMPLETE":
                     obs_completeness = "PARTIAL"
-                    values[item.item_id] = {
-                        "value": None,
-                        "raw_hex": raw_bytes.hex() if raw_bytes else "",
-                        "status": "PARTIAL",
-                        "error": read_err or "Partial memory read",
-                    }
-                else:
-                    obs_completeness = "PARTIAL"
-                    values[item.item_id] = {
-                        "value": None,
-                        "raw_hex": "",
-                        "status": "UNAVAILABLE",
-                        "error": read_err or "Memory read failed or unmapped",
-                    }
 
             t_end_ns = time.monotonic_ns()
             latency_us = round((t_end_ns - t_start_ns) / 1000.0, 2)
@@ -1410,6 +1457,14 @@ class WatchSessionManager:
             raw_a = val_a_entry.get("raw_hex", "") if val_a_entry else ""
             raw_b = val_b_entry.get("raw_hex", "") if val_b_entry else ""
 
+            is_pointer = (item.type_name in ("pointer", "void*") or item.type_name.endswith("*"))
+            ref_hex_a = val_a_entry.get("referenced_raw_hex", "") if val_a_entry else ""
+            ref_hex_b = val_b_entry.get("referenced_raw_hex", "") if val_b_entry else ""
+            ref_st_a = val_a_entry.get("referenced_status", "NONE") if val_a_entry else "NONE"
+            ref_st_b = val_b_entry.get("referenced_status", "NONE") if val_b_entry else "NONE"
+            ref_addr_a = val_a_entry.get("referenced_address", "") if val_a_entry else ""
+            ref_addr_b = val_b_entry.get("referenced_address", "") if val_b_entry else ""
+
             # Semantics:
             # Missing or failed reads must NEVER be interpreted as unchanged!
             if not val_a_entry and val_b_entry:
@@ -1418,30 +1473,36 @@ class WatchSessionManager:
                 diff_state = "REMOVED"
             elif st_a == "MISSING" or st_b == "MISSING":
                 diff_state = "MISSING"
-            elif st_a in ("UNAVAILABLE", "ERROR") or st_b in ("UNAVAILABLE", "ERROR"):
+            elif st_a in ("UNAVAILABLE", "ERROR", "PERMISSION_DENIED", "TARGET_TERMINATED") or st_b in ("UNAVAILABLE", "ERROR", "PERMISSION_DENIED", "TARGET_TERMINATED"):
                 diff_state = "UNREADABLE"
             elif st_a == "PARTIAL" or st_b == "PARTIAL":
                 diff_state = "PARTIAL"
             elif st_a == "DECODE_ERROR" or st_b == "DECODE_ERROR":
                 diff_state = "UNKNOWN"
             else:
-                diff_state = "CHANGED" if (val_a != val_b or raw_a != raw_b) else "UNCHANGED"
-
-            is_pointer = (item.type_name in ("pointer", "void*") or item.type_name.endswith("*"))
-            pointer_change_type = "NONE"
-            if is_pointer:
-                if val_a != val_b:
-                    pointer_change_type = "POINTER_ADDRESS_CHANGED"
-                elif raw_a != raw_b:
-                    pointer_change_type = "REFERENCED_MEMORY_CHANGED"
+                if is_pointer:
+                    if val_a != val_b:
+                        diff_state = "CHANGED"
+                        pointer_change_type = "POINTER_ADDRESS_CHANGED"
+                    elif ref_hex_a != ref_hex_b:
+                        diff_state = "CHANGED"
+                        pointer_change_type = "REFERENCED_MEMORY_CHANGED"
+                    else:
+                        diff_state = "UNCHANGED"
+                        pointer_change_type = "STABLE"
                 else:
-                    pointer_change_type = "STABLE"
+                    diff_state = "CHANGED" if (val_a != val_b or raw_a != raw_b) else "UNCHANGED"
+                    pointer_change_type = "NONE"
+
+            if not is_pointer:
+                pointer_change_type = "NONE"
 
             diffs.append({
                 "item_id": item_id,
                 "name": item.name,
                 "scope": item.scope,
                 "source": item.source,
+                "source_location": item.source_location,
                 "type_name": item.type_name,
                 "address": f"0x{item.address:x}",
                 "size": item.size,
@@ -1451,21 +1512,51 @@ class WatchSessionManager:
                 "value_b": val_b,
                 "raw_hex_a": raw_a,
                 "raw_hex_b": raw_b,
-                "before": {"value": val_a, "raw_hex": raw_a, "status": st_a},
-                "after": {"value": val_b, "raw_hex": raw_b, "status": st_b},
+                "status_a": st_a,
+                "status_b": st_b,
+                "before": {
+                    "value": val_a,
+                    "raw_hex": raw_a,
+                    "status": st_a,
+                    "referenced_address": ref_addr_a,
+                    "referenced_raw_hex": ref_hex_a,
+                    "referenced_status": ref_st_a,
+                },
+                "after": {
+                    "value": val_b,
+                    "raw_hex": raw_b,
+                    "status": st_b,
+                    "referenced_address": ref_addr_b,
+                    "referenced_raw_hex": ref_hex_b,
+                    "referenced_status": ref_st_b,
+                },
                 "is_pointer": is_pointer,
                 "pointer_address_changed": is_pointer and (val_a != val_b),
                 "pointer_change_type": pointer_change_type,
+                "referenced_raw_hex_a": ref_hex_a,
+                "referenced_raw_hex_b": ref_hex_b,
+                "referenced_status_a": ref_st_a,
+                "referenced_status_b": ref_st_b,
+                "pid": session.pid,
+                "binary_build_id": session.binary_build_id,
+                "capture_backend": session.capabilities.get("capture_backend", "process_vm_readv"),
+                "timestamp_a": obs_a.timestamp,
+                "timestamp_b": obs_b.timestamp,
             })
 
         return {
             "session_id": session_id,
+            "pid": session.pid,
+            "binary_build_id": session.binary_build_id,
+            "capture_backend": session.capabilities.get("capture_backend", "process_vm_readv"),
             "seq_a": seq_a,
             "seq_b": seq_b,
             "timestamp_a": obs_a.timestamp,
             "timestamp_b": obs_b.timestamp,
             "quality_a": obs_a.completeness,
             "quality_b": obs_b.completeness,
+            "snapshot_a": obs_a.to_dict(),
+            "snapshot_b": obs_b.to_dict(),
             "diffs": diffs,
             "summary": {
                 "total_items": len(diffs),
@@ -1580,32 +1671,10 @@ class WatchSessionManager:
             obs_completeness = "COMPLETE"
 
             for item in list(session.watch_items):
-                raw_bytes, read_st, read_err = adapter.read_memory(session.pid, item.address, item.size)
-                if read_st == "OBSERVED" and raw_bytes is not None:
-                    decoded_val, dec_err = decode_value_from_bytes(raw_bytes, item.type_name)
-                    st = "OBSERVED" if dec_err is None else "DECODE_ERROR"
-                    values[item.item_id] = {
-                        "value": decoded_val,
-                        "raw_hex": raw_bytes.hex(),
-                        "status": st,
-                        "error": dec_err,
-                    }
-                elif read_st == "PARTIAL":
+                item_entry, completeness = self._sample_watch_item(adapter, session.pid, item)
+                values[item.item_id] = item_entry
+                if completeness != "COMPLETE":
                     obs_completeness = "PARTIAL"
-                    values[item.item_id] = {
-                        "value": None,
-                        "raw_hex": raw_bytes.hex() if raw_bytes else "",
-                        "status": "PARTIAL",
-                        "error": read_err or "Partial memory read",
-                    }
-                else:
-                    obs_completeness = "PARTIAL"
-                    values[item.item_id] = {
-                        "value": None,
-                        "raw_hex": "",
-                        "status": "UNAVAILABLE",
-                        "error": read_err or "Memory read failed or unmapped",
-                    }
 
             t_end_ns = time.monotonic_ns()
             latency_us = round((t_end_ns - t_start_ns) / 1000.0, 2)

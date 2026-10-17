@@ -697,6 +697,45 @@ class TemporalInvestigationService:
         )
         obs_data_list = obs_resp.get("observations", [])
 
+        # Prevent ungrounded speculation if zero observations exist in watch session
+        if len(obs_data_list) == 0:
+            fnd_no_obs = InvestigationFinding(
+                finding_id=f"fnd_no_obs_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title="No Observations Recorded in Watch Session",
+                description=(
+                    f"Watch session '{sid}' contains 0 recorded observations. "
+                    "Cannot perform temporal diff or state mutation analysis without at least one captured observation snapshot."
+                ),
+                confidence="high",
+                status="UNRESOLVED",
+                evidence_ids=[ev_cap.evidence_id],
+                uncertainty="No temporal snapshot data available to evaluate.",
+                classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+            )
+            investigation_session.findings.append(fnd_no_obs)
+            investigation_session.next_steps.append(InvestigationNextStep(
+                step_id=f"step_capture_obs_{uuid.uuid4().hex[:6]}",
+                description="Capture baseline and subsequent observation snapshots using 'Capture Snapshot' or start periodic sampling.",
+                rationale="At least one observation snapshot is required to inspect runtime values or analyze state changes.",
+                risk_level="READ_ONLY",
+                action_type="CAPTURE",
+                required_inputs=["session_id"],
+            ))
+            investigation_session.status = "PARTIAL"
+            investigation_session.summary["status"] = "PARTIAL"
+            investigation_session.summary["findings_count"] = len(investigation_session.findings)
+            investigation_session.summary["hypotheses_count"] = 0
+            investigation_session.summary["next_steps_count"] = len(investigation_session.next_steps)
+            msg = f"Watch session '{sid}' has 0 observations. Capture snapshots before asking questions about runtime state changes."
+            if any(g.reason for g in watch_session.gaps):
+                reasons = ", ".join(g.reason for g in watch_session.gaps)
+                msg += f" (Recorded gaps: {reasons})"
+            investigation_session.summary["overview"] = msg
+            investigation_session.summary["text"] = msg
+            investigation_session.summary["error"] = "Zero observations recorded"
+            return investigation_session.to_dict()
+
         # If duration window specified, filter by duration if needed
         if plan.window_duration_sec and len(obs_data_list) > 1:
             first_mono = obs_data_list[0].get("monotonic_ns", 0)
@@ -806,6 +845,16 @@ class TemporalInvestigationService:
             last_val = redact_sensitive_content(item_vals[-1][2])
             distinct_vals = set(str(v[2]) for v in item_vals if v[3] in ("VALID", "OBSERVED"))
             changed = len(distinct_vals) > 1
+
+            is_pointer = (item.type_name in ("pointer", "void*") or item.type_name.endswith("*"))
+            if is_pointer:
+                distinct_refs = set(
+                    o.get("values", {}).get(item.item_id, {}).get("referenced_raw_hex", "")
+                    for o in obs_data_list
+                    if isinstance(o.get("values", {}).get(item.item_id), dict)
+                )
+                if len(distinct_refs) > 1:
+                    changed = True
 
             # Canonical Evidence for this watch item's temporal observations
             ev_timeline = investigation_session.ledger.add_record(EvidenceRecord(

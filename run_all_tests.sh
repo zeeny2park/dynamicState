@@ -154,7 +154,13 @@ if python3 -c "import playwright" >/dev/null 2>&1; then
         python3 -m unittest tests/test_phase29_browser_e2e.py
 fi
 
-# 28. Discover and run all remaining unit and integration tests
+# 28. Phase 30 Runtime Investigation UX Hardening, Real-Capture Integrity, and Browser Acceptance Suite
+if python3 -c "import playwright" >/dev/null 2>&1; then
+    run_step "Phase 30 Runtime Investigation UX Hardening, Real-Capture Integrity, and Browser Acceptance Suite" \
+        python3 -m unittest tests/test_phase30_real_capture_e2e.py
+fi
+
+# 29. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

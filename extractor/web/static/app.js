@@ -8318,14 +8318,17 @@
           selectSession.innerHTML = opts.join('');
         }
         if (selectBasic) {
-          const currentBasicVal = selectBasic.value;
+          const currentBasicVal = selectBasic.value || teState.sessionId || '';
           const basicOpts = ['<option value="">-- Select Observation Session --</option>'];
           res.data.sessions.forEach((s) => {
-            const isSel = (s.session_id === currentBasicVal) ? 'selected' : '';
+            const isSel = (s.session_id === teState.sessionId || s.session_id === currentBasicVal) ? 'selected' : '';
             const hostStr = s.is_remote ? ` [${s.target_host}]` : '';
             basicOpts.push(`<option value="${s.session_id}" ${isSel}>[${s.status}] ${s.session_id} (PID ${s.pid}${hostStr}, ${s.total_observations} obs)</option>`);
           });
           selectBasic.innerHTML = basicOpts.join('');
+          if (teState.sessionId || currentBasicVal) {
+            selectBasic.value = teState.sessionId || currentBasicVal;
+          }
         }
       }
     } catch (e) {
@@ -9554,6 +9557,11 @@
         renderSnapshotDiffs(res.data);
         showToastNotification(`Compared Snapshot #${seqA} and #${seqB}`, 'success');
       } else {
+        lastComparisonResult = null;
+        const sumRow = document.getElementById('compare-summary-row');
+        const tbody = document.getElementById('tbody-snapshot-diffs');
+        if (sumRow) sumRow.style.display = 'none';
+        if (tbody) tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted py-3">${escapeHtml(res.error?.message || 'Comparison failed')}</td></tr>`;
         showToastNotification(res.error?.message || 'Comparison failed', 'error');
       }
     } catch (err) {
@@ -9649,10 +9657,77 @@
 
     if (title) title.textContent = `Provenance Verification: ${d.name}`;
 
-    const snapATime = snapA.timestamp || `Snapshot #${lastComparisonResult.seq_a}`;
-    const snapBTime = snapB.timestamp || `Snapshot #${lastComparisonResult.seq_b}`;
+    const snapATime = snapA.timestamp || d.timestamp_a || `Snapshot #${lastComparisonResult.seq_a}`;
+    const snapBTime = snapB.timestamp || d.timestamp_b || `Snapshot #${lastComparisonResult.seq_b}`;
     const latencyA = snapA.capture_latency_us !== undefined ? `${snapA.capture_latency_us} µs` : 'N/A';
     const latencyB = snapB.capture_latency_us !== undefined ? `${snapB.capture_latency_us} µs` : 'N/A';
+    const backend = d.capture_backend || lastComparisonResult.capture_backend || 'process_vm_readv';
+    const verifiedPid = d.pid || lastComparisonResult.pid || teState.targetPid || 'N/A';
+    const verifiedBuildId = d.binary_build_id || lastComparisonResult.binary_build_id || 'N/A';
+
+    const stA = d.before?.status || d.status_a || 'UNKNOWN';
+    const stB = d.after?.status || d.status_b || 'UNKNOWN';
+
+    const badgeClassA = {
+      'OBSERVED': 'badge-success',
+      'UNAVAILABLE': 'badge-danger',
+      'UNREADABLE': 'badge-danger',
+      'PARTIAL': 'badge-warning',
+      'NOT_FOUND': 'badge-neutral',
+      'MISSING': 'badge-neutral',
+      'DECODE_ERROR': 'badge-danger'
+    }[stA] || 'badge-neutral';
+
+    const badgeClassB = {
+      'OBSERVED': 'badge-success',
+      'UNAVAILABLE': 'badge-danger',
+      'UNREADABLE': 'badge-danger',
+      'PARTIAL': 'badge-warning',
+      'NOT_FOUND': 'badge-neutral',
+      'MISSING': 'badge-neutral',
+      'DECODE_ERROR': 'badge-danger'
+    }[stB] || 'badge-neutral';
+
+    let pointerSection = '';
+    if (d.is_pointer) {
+      const refHexA = d.before?.referenced_raw_hex || d.referenced_raw_hex_a || '';
+      const refHexB = d.after?.referenced_raw_hex || d.referenced_raw_hex_b || '';
+      const refStA = d.before?.referenced_status || d.referenced_status_a || 'N/A';
+      const refStB = d.after?.referenced_status || d.referenced_status_b || 'N/A';
+      const refAddrA = d.before?.referenced_address || 'N/A';
+      const refAddrB = d.after?.referenced_address || 'N/A';
+
+      pointerSection = `
+        <h4 class="text-xs uppercase text-muted font-bold mb-2">Pointer Target &amp; Referenced Memory Inspection</h4>
+        <div style="background: var(--bg-input); padding: 12px; border-radius: 6px; border: 1px solid var(--border-color); margin-bottom: 16px;">
+          <div class="text-xs mb-1"><strong>Pointer Semantics Classification:</strong> <span class="badge ${d.pointer_change_type === 'REFERENCED_MEMORY_CHANGED' ? 'badge-info' : (d.pointer_change_type === 'POINTER_ADDRESS_CHANGED' ? 'badge-warning' : 'badge-neutral')}">${escapeHtml(d.pointer_change_type)}</span></div>
+          <table class="data-table w-full text-xs mono mt-2">
+            <thead>
+              <tr>
+                <th>Snapshot</th>
+                <th>Target Pointer Address</th>
+                <th>Pointed-to Bytes (Hex)</th>
+                <th>Target Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Snap A (#${lastComparisonResult.seq_a})</td>
+                <td>${escapeHtml(refAddrA)}</td>
+                <td class="break-all">${refHexA ? '0x' + escapeHtml(refHexA) : '<span class="text-muted">None</span>'}</td>
+                <td><span class="badge ${refStA === 'OBSERVED' ? 'badge-success' : 'badge-neutral'}">${escapeHtml(refStA)}</span></td>
+              </tr>
+              <tr>
+                <td>Snap B (#${lastComparisonResult.seq_b})</td>
+                <td>${escapeHtml(refAddrB)}</td>
+                <td class="break-all font-bold text-accent">${refHexB ? '0x' + escapeHtml(refHexB) : '<span class="text-muted">None</span>'}</td>
+                <td><span class="badge ${refStB === 'OBSERVED' ? 'badge-success' : 'badge-neutral'}">${escapeHtml(refStB)}</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
 
     content.innerHTML = `
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
@@ -9676,10 +9751,11 @@
 
       <h4 class="text-xs uppercase text-muted font-bold mb-2">Capture Quality & Transport Provenance</h4>
       <div style="background: var(--bg-input); padding: 12px; border-radius: 6px; border: 1px solid var(--border-color); margin-bottom: 16px;">
-        <div class="text-xs mb-1"><strong>Backend:</strong> <code>process_vm_readv</code> (Zero-Stop, 0.00 ms process pause time)</div>
+        <div class="text-xs mb-1"><strong>Verified PID:</strong> <code>${escapeHtml(String(verifiedPid))}</code> &bull; <strong>Verified Build ID:</strong> <code>${escapeHtml(String(verifiedBuildId))}</code></div>
+        <div class="text-xs mb-1"><strong>Backend:</strong> <code>${escapeHtml(backend)}</code> (Zero-Stop, 0.00 ms process pause time)</div>
         <div class="text-xs mb-1"><strong>Consistency Level:</strong> <span class="badge badge-success text-xs">CONSISTENT</span> (Kernel direct memory read)</div>
-        <div class="text-xs mb-1"><strong>Snapshot A (#${lastComparisonResult.seq_a}):</strong> Time: ${escapeHtml(snapATime)} • Stop duration: 0.00 ms • Latency: ${latencyA}</div>
-        <div class="text-xs mb-1"><strong>Snapshot B (#${lastComparisonResult.seq_b}):</strong> Time: ${escapeHtml(snapBTime)} • Stop duration: 0.00 ms • Latency: ${latencyB}</div>
+        <div class="text-xs mb-1"><strong>Snapshot A (#${lastComparisonResult.seq_a}):</strong> Time: ${escapeHtml(snapATime)} &bull; Latency: ${latencyA}</div>
+        <div class="text-xs mb-1"><strong>Snapshot B (#${lastComparisonResult.seq_b}):</strong> Time: ${escapeHtml(snapBTime)} &bull; Latency: ${latencyB}</div>
         <div class="text-xs"><strong>Source Location:</strong> <code>${escapeHtml(d.source_location || 'unknown')}</code></div>
       </div>
 
@@ -9697,17 +9773,18 @@
           <tr>
             <td>Snap A (#${lastComparisonResult.seq_a})</td>
             <td class="font-bold">${escapeHtml(String(d.value_a !== undefined && d.value_a !== null ? d.value_a : 'None'))}</td>
-            <td>0x${escapeHtml(d.raw_hex_a || '00')}</td>
-            <td><span class="badge badge-success">OBSERVED</span></td>
+            <td>${d.raw_hex_a ? '0x' + escapeHtml(d.raw_hex_a) : '<span class="text-muted">None</span>'}</td>
+            <td><span class="badge ${badgeClassA}">${escapeHtml(stA)}</span></td>
           </tr>
           <tr>
             <td>Snap B (#${lastComparisonResult.seq_b})</td>
             <td class="font-bold text-accent">${escapeHtml(String(d.value_b !== undefined && d.value_b !== null ? d.value_b : 'None'))}</td>
-            <td>0x${escapeHtml(d.raw_hex_b || '00')}</td>
-            <td><span class="badge badge-success">OBSERVED</span></td>
+            <td>${d.raw_hex_b ? '0x' + escapeHtml(d.raw_hex_b) : '<span class="text-muted">None</span>'}</td>
+            <td><span class="badge ${badgeClassB}">${escapeHtml(stB)}</span></td>
           </tr>
         </tbody>
       </table>
+      ${pointerSection}
     `;
 
     modal.style.display = 'flex';
@@ -9718,7 +9795,7 @@
     if (modal) modal.style.display = 'none';
   }
 
-  function handleSendDiffToInvestigation() {
+  async function handleSendDiffToInvestigation() {
     if (!lastComparisonResult) {
       showToastNotification('Perform a snapshot comparison first', 'warning');
       return;
@@ -9738,18 +9815,18 @@
     if (basicGoal) basicGoal.value = goal;
     if (invGoal) invGoal.value = goal;
 
-    // Set watch session selector
-    const basicWatch = document.getElementById('basic-select-watch-session');
-    if (basicWatch && teState.sessionId) {
-      basicWatch.value = teState.sessionId;
-    }
-
     const radioWatch = document.getElementById('radio-source-watch');
     if (radioWatch) {
       radioWatch.checked = true;
       if (el.basicLiveFields) el.basicLiveFields.style.display = 'none';
       if (el.basicWatchFields) el.basicWatchFields.style.display = 'flex';
-      loadTemporalSessionsList();
+      await loadTemporalSessionsList();
+    }
+
+    // Set watch session selector
+    const basicWatch = document.getElementById('basic-select-watch-session');
+    if (basicWatch && teState.sessionId) {
+      basicWatch.value = teState.sessionId;
     }
 
     // Switch to Investigation tab
