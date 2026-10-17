@@ -1,6 +1,6 @@
 {
   "schema_version": "1.2.0",
-  "timestamp_utc": "2026-10-16T14:54:00.253366+00:00",
+  "timestamp_utc": "2026-10-17T02:23:13.262688+00:00",
   "corpus_version": "1.1.0",
   "corpus_hash": "cfb50179bbc1c95d9b4ec02aee7f4fae295db4609872d5713774a1c109a942c2",
   "fixture_hash": "cb7f5b191a787d7927d3a746caa7643130e62df45b0182c0c64a4a3d6268ad4d",
@@ -33,8 +33,8 @@
     "mean_fact_f1": 1.0,
     "mean_evidence_precision": 0.5,
     "mean_evidence_recall": 1.0,
-    "total_unsupported_claims": 2,
-    "total_disarmed_claims": 2,
+    "total_unsupported_claims": 6,
+    "total_disarmed_claims": 6,
     "overall_unsupported_claim_rate": 0.0,
     "overall_disarm_rate": 1.0,
     "uncertainty_calibration_rate": 0.5,
@@ -78,9 +78,9 @@
         "evidence_recall": 1.0,
         "total_cited_evidence": 3,
         "valid_cited_evidence": 2,
-        "unsupported_claims_count": 1,
-        "unsupported_claims_disarmed": 1,
-        "unsupported_claim_rate": 0.1667,
+        "unsupported_claims_count": 3,
+        "unsupported_claims_disarmed": 3,
+        "unsupported_claim_rate": 0.375,
         "disarm_rate": 1.0,
         "confidence_score": 0.6,
         "uncertainty_calibrated": false,
@@ -102,8 +102,8 @@
           "promoted_functions": [],
           "stage_provenance": {
             "spawn": {
-              "pid": 873669,
-              "binary_path": "/tmp/dynstate_phase19_bench_v7c1lzmw/fixture_target.stripped",
+              "pid": 1451736,
+              "binary_path": "/tmp/dynstate_phase19_bench_xab9bzyh/fixture_target.stripped",
               "binary_hash": "f9c2552def449cffda26e8c0a92076b04d36692703bfc06b3d76b80083956092",
               "build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567",
               "status": "SUCCESS"
@@ -127,7 +127,7 @@
               }
             },
             "snapshot_a": {
-              "path": "/tmp/dynstate_phase19_bench_v7c1lzmw/rep_0_1792162438367/snap_A_1792162438384",
+              "path": "/tmp/dynstate_phase19_bench_xab9bzyh/rep_0_1792203791359/snap_A_1792203791375",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "status": "SUCCESS"
@@ -152,7 +152,7 @@
               }
             },
             "snapshot_b": {
-              "path": "/tmp/dynstate_phase19_bench_v7c1lzmw/rep_0_1792162438367/snap_B_1792162438414",
+              "path": "/tmp/dynstate_phase19_bench_xab9bzyh/rep_0_1792203791359/snap_B_1792203791404",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "consistency": "STOPPED",
@@ -167,7 +167,7 @@
               "status": "SUCCESS",
               "findings_count": 20,
               "diff_trust": "CONFIRMED",
-              "debug_image": "/tmp/dynstate_phase19_bench_v7c1lzmw/fixture_target.debug",
+              "debug_image": "/tmp/dynstate_phase19_bench_xab9bzyh/fixture_target.debug",
               "companion_build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567"
             },
             "stage_synthesis": {
@@ -180,7 +180,7 @@
               "provider_used": "deterministic_fallback",
               "is_fallback": true,
               "model_used": "deterministic-engine",
-              "latency_ms": 1.81
+              "latency_ms": 4.02
             },
             "fixture_state_verification": {
               "status": "VERIFIED",
@@ -208,7 +208,7 @@
           },
           "is_fallback": true,
           "model_used": "deterministic-engine",
-          "latency_ms": 1.81
+          "latency_ms": 4.02
         }
       },
       {
@@ -228,9 +228,9 @@
         "evidence_recall": 1.0,
         "total_cited_evidence": 3,
         "valid_cited_evidence": 1,
-        "unsupported_claims_count": 1,
-        "unsupported_claims_disarmed": 1,
-        "unsupported_claim_rate": 0.1667,
+        "unsupported_claims_count": 3,
+        "unsupported_claims_disarmed": 3,
+        "unsupported_claim_rate": 0.375,
         "disarm_rate": 1.0,
         "confidence_score": 0.6,
         "uncertainty_calibrated": true,
@@ -252,8 +252,8 @@
           "promoted_functions": [],
           "stage_provenance": {
             "spawn": {
-              "pid": 873740,
-              "binary_path": "/tmp/dynstate_phase19_bench_v7c1lzmw/fixture_target.stripped",
+              "pid": 1451810,
+              "binary_path": "/tmp/dynstate_phase19_bench_xab9bzyh/fixture_target.stripped",
               "binary_hash": "f9c2552def449cffda26e8c0a92076b04d36692703bfc06b3d76b80083956092",
               "build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567",
               "status": "SUCCESS"
@@ -277,7 +277,7 @@
               }
             },
             "snapshot_a": {
-              "path": "/tmp/dynstate_phase19_bench_v7c1lzmw/rep_0_1792162438367/snap_A_1792162438826",
+              "path": "/tmp/dynstate_phase19_bench_xab9bzyh/rep_0_1792203791359/snap_A_1792203791826",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "status": "SUCCESS"
@@ -302,7 +302,7 @@
               }
             },
             "snapshot_b": {
-              "path": "/tmp/dynstate_phase19_bench_v7c1lzmw/rep_0_1792162438367/snap_B_1792162438855",
+              "path": "/tmp/dynstate_phase19_bench_xab9bzyh/rep_0_1792203791359/snap_B_1792203791852",
               "bytes_read": 8929280,
               "completeness": "COMPLETE",
               "consistency": "STOPPED",
@@ -317,7 +317,7 @@
               "status": "SUCCESS",
               "findings_count": 20,
               "diff_trust": "CONFIRMED",
-              "debug_image": "/tmp/dynstate_phase19_bench_v7c1lzmw/fixture_target.debug",
+              "debug_image": "/tmp/dynstate_phase19_bench_xab9bzyh/fixture_target.debug",
               "companion_build_id": "4290a5f819f4e1232ac0dff7716f1e81dd83d567"
             },
             "stage_synthesis": {
@@ -330,7 +330,7 @@
               "provider_used": "deterministic_fallback",
               "is_fallback": true,
               "model_used": "deterministic-engine",
-              "latency_ms": 1.7
+              "latency_ms": 3.49
             },
             "fixture_state_verification": {
               "status": "VERIFIED",
@@ -358,7 +358,7 @@
           },
           "is_fallback": true,
           "model_used": "deterministic-engine",
-          "latency_ms": 1.7
+          "latency_ms": 3.49
         }
       }
     ]
@@ -520,7 +520,7 @@
           "status": "COMPLETED_MODEL_RESPONSE",
           "is_fallback": true,
           "model": "deterministic-engine",
-          "latency_ms": 1.68,
+          "latency_ms": 3.47,
           "is_false_positive": false,
           "candidate_tier": "STATIC_CANDIDATE"
         }
