@@ -221,12 +221,14 @@ class WatchItem:
     source_location: Optional[str] = None
     status: str = "ACTIVE"         # "ACTIVE", "OUT_OF_SCOPE", "UNRESOLVED"
     expression: Optional[str] = None
+    source: str = "custom_range"   # "global_variable", "memory_map", "thread_stack", "custom_range", "object_field"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "item_id": self.item_id,
             "name": self.name,
             "scope": self.scope,
+            "source": self.source,
             "address": f"0x{self.address:x}",
             "address_int": self.address,
             "type_name": self.type_name,
@@ -255,6 +257,7 @@ class WatchItem:
             source_location=d.get("source_location"),
             status=d.get("status", "ACTIVE"),
             expression=d.get("expression"),
+            source=d.get("source", "custom_range"),
         )
 
 
@@ -270,6 +273,7 @@ class Observation:
     source_snapshot_id: Optional[str] = None
     completeness: str = "COMPLETE" # "COMPLETE", "PARTIAL", "FAILED"
     capture_latency_us: Optional[float] = None
+    zero_stop: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -282,6 +286,7 @@ class Observation:
             "source_snapshot_id": self.source_snapshot_id,
             "completeness": self.completeness,
             "capture_latency_us": self.capture_latency_us,
+            "zero_stop": self.zero_stop,
         }
 
     @classmethod
@@ -296,6 +301,7 @@ class Observation:
             source_snapshot_id=d.get("source_snapshot_id"),
             completeness=d.get("completeness", "COMPLETE"),
             capture_latency_us=d.get("capture_latency_us"),
+            zero_stop=d.get("zero_stop", True),
         )
 
 
@@ -1134,8 +1140,10 @@ class WatchSessionManager:
 
             return session
 
-    def add_watch_item(self, session_id: str, item_dict: Dict[str, Any]) -> WatchItem:
+    def add_watch_item(self, session_id: str, item_dict: Union[Dict[str, Any], WatchItem]) -> WatchItem:
         """Adds a new watch item to an existing session."""
+        if hasattr(item_dict, "to_dict"):
+            item_dict = item_dict.to_dict()
         with self._lock:
             session = self.get_session(session_id)
             if not session:
@@ -1160,6 +1168,7 @@ class WatchSessionManager:
             item_id = item_dict.get("item_id") or f"watch_{name}_{uuid.uuid4().hex[:4]}"
 
             # Check for existing item with same item_id
+            source = item_dict.get("source", "custom_range")
             for idx, existing in enumerate(session.watch_items):
                 if existing.item_id == item_id:
                     session.watch_items[idx] = WatchItem(
@@ -1172,6 +1181,7 @@ class WatchSessionManager:
                         source_location=item_dict.get("source_location", existing.source_location),
                         status=status,
                         expression=item_dict.get("expression", existing.expression),
+                        source=source,
                     )
                     self._persist_session(session)
                     return session.watch_items[idx]
@@ -1186,6 +1196,7 @@ class WatchSessionManager:
                 source_location=item_dict.get("source_location"),
                 status=status,
                 expression=item_dict.get("expression"),
+                source=source,
             )
             session.watch_items.append(item)
             self._persist_session(session)
@@ -1265,6 +1276,172 @@ class WatchSessionManager:
                 "gaps": [g.to_dict() for g in session.gaps],
                 "watch_items": [w.to_dict() for w in session.watch_items],
             }
+
+    def capture_once(self, session_id: str) -> Observation:
+        """Executes a single synchronous capture of all watch items for a session."""
+        with self._lock:
+            session = self.get_session(session_id)
+            if not session:
+                raise ValueError(f"Session '{session_id}' not found")
+            adapter = self._adapters.get(session_id)
+            if not adapter:
+                adapter = self._resolve_adapter(pid=session.pid)
+                self._adapters[session_id] = adapter
+
+            t_start_ns = time.monotonic_ns()
+            wall_clock = datetime.now(timezone.utc).isoformat()
+            seq = (session.total_observations or len(session.observations)) + 1
+            values: Dict[str, Dict[str, Any]] = {}
+            obs_completeness = "COMPLETE"
+
+            # Check liveness
+            alive, live_err = adapter.check_liveness(session.pid)
+            if not alive:
+                raise RuntimeError(f"Target process PID {session.pid} is not accessible: {live_err}")
+
+            for item in list(session.watch_items):
+                raw_bytes, read_st, read_err = adapter.read_memory(session.pid, item.address, item.size)
+                if read_st == "OBSERVED" and raw_bytes is not None:
+                    decoded_val, dec_err = decode_value_from_bytes(raw_bytes, item.type_name)
+                    st = "OBSERVED" if dec_err is None else "DECODE_ERROR"
+                    values[item.item_id] = {
+                        "value": decoded_val,
+                        "raw_hex": raw_bytes.hex(),
+                        "status": st,
+                        "error": dec_err,
+                    }
+                elif read_st == "PARTIAL":
+                    obs_completeness = "PARTIAL"
+                    values[item.item_id] = {
+                        "value": None,
+                        "raw_hex": raw_bytes.hex() if raw_bytes else "",
+                        "status": "PARTIAL",
+                        "error": read_err or "Partial memory read",
+                    }
+                else:
+                    obs_completeness = "PARTIAL"
+                    values[item.item_id] = {
+                        "value": None,
+                        "raw_hex": "",
+                        "status": "UNAVAILABLE",
+                        "error": read_err or "Memory read failed or unmapped",
+                    }
+
+            t_end_ns = time.monotonic_ns()
+            latency_us = round((t_end_ns - t_start_ns) / 1000.0, 2)
+
+            obs = Observation(
+                session_id=session.session_id,
+                seq=seq,
+                monotonic_ns=t_start_ns,
+                timestamp=wall_clock,
+                values=values,
+                completeness=obs_completeness,
+                capture_latency_us=latency_us,
+            )
+
+            self._append_observation_to_file(session.session_id, obs)
+            session.observations.append(obs)
+            session.total_observations = len(session.observations)
+            self._persist_session(session)
+            return obs
+
+    def compare_observations(self, session_id: str, seq_a: int, seq_b: int) -> Dict[str, Any]:
+        """Compares two specific observation records within a session."""
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session '{session_id}' not found")
+
+        # Find observation A and B
+        obs_a = next((o for o in session.observations if o.seq == seq_a), None)
+        obs_b = next((o for o in session.observations if o.seq == seq_b), None)
+
+        if not obs_a or not obs_b:
+            all_obs = self.get_observations(session_id, limit=50000).get("observations", [])
+            if not obs_a:
+                for o in all_obs:
+                    if o.get("seq") == seq_a:
+                        obs_a = Observation.from_dict(o)
+                        break
+            if not obs_b:
+                for o in all_obs:
+                    if o.get("seq") == seq_b:
+                        obs_b = Observation.from_dict(o)
+                        break
+
+        if not obs_a or not obs_b:
+            raise ValueError(f"One or both observation sequences (#{seq_a}, #{seq_b}) not found in session '{session_id}'")
+
+        items_map = {w.item_id: w for w in session.watch_items}
+        diffs = []
+        for item_id, item in items_map.items():
+            val_a_entry = obs_a.values.get(item_id, {})
+            val_b_entry = obs_b.values.get(item_id, {})
+
+            st_a = val_a_entry.get("status", "MISSING") if val_a_entry else "MISSING"
+            st_b = val_b_entry.get("status", "MISSING") if val_b_entry else "MISSING"
+            val_a = val_a_entry.get("value") if val_a_entry else None
+            val_b = val_b_entry.get("value") if val_b_entry else None
+            raw_a = val_a_entry.get("raw_hex", "") if val_a_entry else ""
+            raw_b = val_b_entry.get("raw_hex", "") if val_b_entry else ""
+
+            # Semantics:
+            # Missing or failed reads must NEVER be interpreted as unchanged!
+            if st_a == "MISSING" or st_b == "MISSING":
+                diff_state = "MISSING"
+            elif st_a in ("UNAVAILABLE", "ERROR") or st_b in ("UNAVAILABLE", "ERROR"):
+                diff_state = "UNREADABLE"
+            elif st_a == "PARTIAL" or st_b == "PARTIAL":
+                diff_state = "PARTIAL"
+            elif st_a == "DECODE_ERROR" or st_b == "DECODE_ERROR":
+                diff_state = "UNKNOWN"
+            else:
+                diff_state = "CHANGED" if (val_a != val_b or raw_a != raw_b) else "UNCHANGED"
+
+            is_pointer = (item.type_name in ("pointer", "void*") or item.type_name.endswith("*"))
+            diffs.append({
+                "item_id": item_id,
+                "name": item.name,
+                "scope": item.scope,
+                "source": item.source,
+                "type_name": item.type_name,
+                "address": f"0x{item.address:x}",
+                "size": item.size,
+                "state": diff_state,
+                "diff_state": diff_state,
+                "value_a": val_a,
+                "value_b": val_b,
+                "before": {"value": val_a, "raw_hex": raw_a, "status": st_a},
+                "after": {"value": val_b, "raw_hex": raw_b, "status": st_b},
+                "is_pointer": is_pointer,
+                "pointer_address_changed": is_pointer and (val_a != val_b),
+            })
+
+        return {
+            "session_id": session_id,
+            "seq_a": seq_a,
+            "seq_b": seq_b,
+            "timestamp_a": obs_a.timestamp,
+            "timestamp_b": obs_b.timestamp,
+            "quality_a": obs_a.completeness,
+            "quality_b": obs_b.completeness,
+            "diffs": diffs,
+            "summary": {
+                "total_items": len(diffs),
+                "changed": sum(1 for d in diffs if d["state"] == "CHANGED"),
+                "unchanged": sum(1 for d in diffs if d["state"] == "UNCHANGED"),
+                "unreadable": sum(1 for d in diffs if d["state"] == "UNREADABLE"),
+                "partial": sum(1 for d in diffs if d["state"] == "PARTIAL"),
+                "missing": sum(1 for d in diffs if d["state"] == "MISSING"),
+                "unknown": sum(1 for d in diffs if d["state"] == "UNKNOWN"),
+                "changed_count": sum(1 for d in diffs if d["state"] == "CHANGED"),
+                "unchanged_count": sum(1 for d in diffs if d["state"] == "UNCHANGED"),
+                "unreadable_count": sum(1 for d in diffs if d["state"] == "UNREADABLE"),
+                "partial_count": sum(1 for d in diffs if d["state"] == "PARTIAL"),
+                "missing_count": sum(1 for d in diffs if d["state"] == "MISSING"),
+                "unknown_count": sum(1 for d in diffs if d["state"] == "UNKNOWN"),
+            }
+        }
 
     def _capture_worker(
         self,

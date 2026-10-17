@@ -150,17 +150,16 @@
     </div>
   </div>
 
-  <!-- Main Navigation Tabs (8 Functional Views) -->
-  <nav class="app-nav advanced-only" id="app-nav-tabs">
-    <button class="nav-tab active" data-tab="tab-investigation-overview" id="nav-tab-investigation" data-i18n="nav_tab_0">0. 🔍 Investigation Workspace</button>
-    <button class="nav-tab advanced-only" data-tab="tab-object-explorer" data-i18n="nav_tab_1">1. 📦 Object Explorer</button>
-    <button class="nav-tab advanced-only" data-tab="tab-thread-explorer" data-i18n="nav_tab_2">2. 🧵 Thread Explorer</button>
-    <button class="nav-tab advanced-only" data-tab="tab-memory-snapshot" data-i18n="nav_tab_3">3. 🧠 Memory Snapshot</button>
-    <button class="nav-tab advanced-only" data-tab="tab-history-diff" data-i18n="nav_tab_4">4. 📜 State DAG & Diff</button>
-    <button class="nav-tab advanced-only" data-tab="tab-advanced-explore" data-i18n="nav_tab_5">5. ⚡ Autonomous Loop</button>
-    <button class="nav-tab advanced-only" data-tab="tab-system-provenance" data-i18n="nav_tab_6">6. 🛠️ System / Modules</button>
-    <button class="nav-tab advanced-only" data-tab="tab-state-lab" id="nav-tab-state-lab" data-i18n="nav_tab_7">7. 🔬 State Laboratory</button>
-    <button class="nav-tab advanced-only" data-tab="tab-temporal-explorer" id="nav-tab-temporal-explorer" data-i18n="nav_tab_8">8. ⏱️ Temporal Explorer</button>
+  <!-- Main Navigation Tabs (Phase 28 Primary Workflow + Expert Extensions) -->
+  <nav class="app-nav" id="app-nav-tabs">
+    <button class="nav-tab active" data-tab="tab-target-setup" id="nav-tab-target">🎯 1. Target</button>
+    <button class="nav-tab" data-tab="tab-runtime-explorer" id="nav-tab-explorer">🧭 2. Runtime Explorer</button>
+    <button class="nav-tab" data-tab="tab-watch-list" id="nav-tab-watchlist">📋 3. Watch List</button>
+    <button class="nav-tab" data-tab="tab-timeline-compare" id="nav-tab-timeline">⏱️ 4. Timeline / Compare</button>
+    <button class="nav-tab" data-tab="tab-investigation-overview" id="nav-tab-investigation">🔍 5. Investigation</button>
+    <button class="nav-tab advanced-only" data-tab="tab-object-explorer">📦 Object Graph</button>
+    <button class="nav-tab advanced-only" data-tab="tab-history-diff">📜 State DAG</button>
+    <button class="nav-tab advanced-only" data-tab="tab-state-lab" id="nav-tab-state-lab">🔬 Lab</button>
   </nav>
 
   <!-- Banner for low-impact observation mode -->
@@ -178,9 +177,554 @@
   <main class="app-main">
 
     <!-- ===================================================================== -->
-    <!-- TAB 0: 🔍 Investigation Overview (Investigation-First Workflow)        -->
+    <!-- TAB 1: 🎯 Target Setup & Verification (Primary Entry Point)           -->
     <!-- ===================================================================== -->
-    <section id="tab-investigation-overview" class="tab-pane active">
+    <section id="tab-target-setup" class="tab-pane active">
+      <div class="inv-container" style="max-width: 1200px; margin: 0 auto;">
+        <div class="workflow-step-card">
+          <div class="d-flex justify-content-between align-items-center mb-3">
+            <div>
+              <h2 style="font-size: 1.15rem; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 8px;">
+                <span>🎯</span> Step 1: Target Process Connection &amp; Compatibility Verification
+              </h2>
+              <div class="text-xs text-muted mt-1">
+                Connect to a target Linux process, verify executable identity, GNU Build ID, and DWARF debug availability before state inspection.
+              </div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <span class="badge badge-neutral" id="target-conn-badge">DISCONNECTED</span>
+              <span class="badge badge-neutral" id="target-backend-badge">BACKEND: UNCHECKED</span>
+            </div>
+          </div>
+
+          <!-- Connection & Validation Form -->
+          <div style="background: var(--bg-input); padding: 16px; border-radius: 6px; border: 1px solid var(--border-color);">
+            <div style="display: grid; grid-template-columns: 160px 1fr 140px; gap: 12px; align-items: end;">
+              <div>
+                <label for="te-target-pid" class="form-label text-xs font-bold" style="display: block; margin-bottom: 4px;">Target PID *</label>
+                <input type="number" id="te-target-pid" class="form-input form-input-sm mono w-full" placeholder="e.g. 12345" min="1" step="1">
+              </div>
+              <div>
+                <label for="te-companion-elf" class="form-label text-xs font-bold" style="display: block; margin-bottom: 4px;">Matching Companion Nostrip / Debug ELF *</label>
+                <input type="text" id="te-companion-elf" class="form-input form-input-sm mono w-full" placeholder="/path/to/binary_debug.elf (with DWARF symbols)">
+              </div>
+              <div>
+                <button type="button" class="btn btn-primary btn-sm w-full" id="btn-validate-target" style="height: 32px;">
+                  <span>🔍</span> Validate Target
+                </button>
+              </div>
+            </div>
+
+            <!-- Clarification Banner -->
+            <div class="banner banner-info text-xs mt-3" style="background: rgba(56, 189, 248, 0.08); border-left: 3px solid var(--accent); padding: 8px 12px; border-radius: 4px;">
+              <strong>ℹ️ Operations &amp; Access Guarantees:</strong>
+              <div class="text-muted mt-1">
+                • <strong>Process Metadata &amp; Maps:</strong> Read non-intrusively from <code>/proc/&lt;pid&gt;/</code> without stopping target threads.<br>
+                • <strong>Memory Inspection &amp; Captures:</strong> Read via <code>process_vm_readv</code> (or procfs) with <strong>0.00 ms stop time (Zero-Stop)</strong>.<br>
+                • <strong>DWARF Resolution:</strong> Kept strictly host-side; no debug artifacts or LLM binaries injected into inferior.
+              </div>
+            </div>
+          </div>
+
+          <!-- Target Diagnostic Result Card (Populated after validation) -->
+          <div id="target-validation-results" class="mt-4" style="display: none;">
+            <h4 class="text-xs text-muted uppercase font-bold mb-2">Target Diagnostics &amp; Compatibility Report</h4>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 16px;">
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Executable Path</span>
+                <span class="mono text-xs font-bold text-accent break-all" id="diag-val-executable">--</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Target Build ID</span>
+                <span class="mono text-xs font-bold" id="diag-val-target-buildid">--</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Debug Image Build ID</span>
+                <span class="mono text-xs font-bold text-success" id="diag-val-debug-buildid">--</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Architecture / Endian</span>
+                <span class="mono text-xs" id="diag-val-arch">--</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">DWARF Status</span>
+                <span class="badge badge-success text-xs" id="diag-val-dwarf">VERIFIED</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Capture Backend</span>
+                <span class="mono text-xs font-bold text-accent" id="diag-val-backend">process_vm_readv</span>
+              </div>
+            </div>
+
+            <div id="diag-feedback-banner" class="banner mb-3 text-xs" style="display: none;"></div>
+
+            <!-- Workflow Action Buttons -->
+            <div style="background: rgba(0,0,0,0.2); padding: 14px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <span class="font-bold text-xs" style="color: var(--text-main);">Choose Next Step:</span>
+                <span class="text-muted text-xs ms-2">Explore process memory layout first, or capture initial baseline state immediately.</span>
+              </div>
+              <div class="d-flex gap-2">
+                <button type="button" class="btn btn-primary btn-sm" id="btn-inspect-runtime">
+                  <span>🧭</span> Inspect Runtime Structure (Tab 2)
+                </button>
+                <button type="button" class="btn btn-success btn-sm" id="btn-capture-baseline">
+                  <span>⚡</span> Capture Baseline Snapshot (Tab 3/4)
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 2: 🧭 Runtime Explorer (Threads, Maps, Objects)                    -->
+    <!-- ===================================================================== -->
+    <section id="tab-runtime-explorer" class="tab-pane">
+      <div class="inv-container" style="max-width: 1400px; margin: 0 auto;">
+        <div class="workflow-step-card mb-3">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <h2 style="font-size: 1.15rem; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 8px;">
+                <span>🧭</span> Step 2: Runtime Structure Explorer
+              </h2>
+              <div class="text-xs text-muted mt-1">
+                Inspect active thread execution states, memory layout segments, bounded memory slices, and DWARF-backed global objects.
+              </div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <span class="badge badge-neutral text-xs" id="re-txt-threads-summary">0 Threads</span>
+              <span class="badge badge-neutral text-xs" id="re-txt-maps-summary">0 Maps</span>
+              <span class="badge badge-neutral text-xs" id="re-txt-vars-summary">0 Variables</span>
+              <button type="button" class="btn btn-outline btn-sm" id="btn-re-refresh" title="Refresh runtime maps &amp; threads">⟳ Refresh</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2-Column Layout: Threads & Memory Maps -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;">
+          <!-- Active Threads Card -->
+          <div class="card p-0" style="overflow: hidden;">
+            <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+              <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+                <span>🧵</span> Active Threads
+              </h3>
+              <span class="text-xs text-muted" id="te-threads-count">0 threads</span>
+            </div>
+            <div class="table-scrollable" style="max-height: 240px; overflow-y: auto;">
+              <table class="data-table w-full text-xs" id="te-threads-table">
+                <thead>
+                  <tr>
+                    <th>TID</th>
+                    <th>Name</th>
+                    <th>State</th>
+                    <th>Stack Range</th>
+                    <th>Local Variables</th>
+                  </tr>
+                </thead>
+                <tbody id="te-threads-tbody">
+                  <tr><td colspan="5" class="text-center text-muted py-3">Validate target and click Inspect Runtime to load threads</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Memory Maps Card -->
+          <div class="card p-0" style="overflow: hidden;">
+            <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+              <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+                <span>🗺️</span> Memory Mappings
+              </h3>
+              <div class="flex items-center gap-1">
+                <button type="button" class="btn btn-xs btn-outline te-map-filter active" data-filter="all">All</button>
+                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="data">Data/BSS</button>
+                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="heap">Heap</button>
+                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="stack">Stack</button>
+              </div>
+            </div>
+            <div class="table-scrollable" style="max-height: 240px; overflow-y: auto;">
+              <table class="data-table w-full text-xs" id="te-mappings-table">
+                <thead>
+                  <tr>
+                    <th>Address Range</th>
+                    <th>Size</th>
+                    <th>Perms</th>
+                    <th>Category</th>
+                    <th>Pathname</th>
+                  </tr>
+                </thead>
+                <tbody id="te-mappings-tbody">
+                  <tr><td colspan="5" class="text-center text-muted py-3">Validate target and click Inspect Runtime to load maps</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Bounded Address Range Inspector -->
+        <div class="card mb-4" id="card-bounded-inspector">
+          <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+            <div>
+              <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+                <span>🔬</span> Bounded Memory Range Inspector
+              </h3>
+              <div class="text-xs text-muted">Select any memory mapping above or enter an address to inspect a bounded raw byte slice.</div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <input type="text" id="input-inspect-address" class="form-input form-input-xs mono" placeholder="0x..." style="width: 180px;">
+              <select id="select-inspect-size" class="input-select input-select-xs" style="width: 100px;">
+                <option value="64">64 bytes</option>
+                <option value="128" selected>128 bytes</option>
+                <option value="256">256 bytes</option>
+                <option value="512">512 bytes</option>
+                <option value="1024">1024 bytes</option>
+              </select>
+              <button type="button" class="btn btn-primary btn-xs" id="btn-do-inspect-range">Inspect</button>
+              <button type="button" class="btn btn-secondary btn-xs" id="btn-watch-inspected-range">➕ Watch Range</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div id="inspector-dwarf-match" class="banner banner-info text-xs mb-2" style="display: none;"></div>
+            <div class="hex-dump-panel" id="inspector-hex-dump">
+              <span class="text-muted">Click any memory map row or enter an address to inspect bounded memory contents.</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- DWARF Discoverable Variables Table -->
+        <div class="card mb-4" id="te-discoverable-vars-card">
+          <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+              <span>🔍</span> DWARF Discoverable Global &amp; Static Variables
+            </h3>
+            <input type="text" id="te-var-search" class="form-input form-input-xs" placeholder="Search variables (e.g. counter, buffer)..." style="width: 260px;">
+          </div>
+          <div class="table-scrollable" style="max-height: 220px; overflow-y: auto;">
+            <table class="data-table w-full text-xs" id="te-vars-table">
+              <thead>
+                <tr>
+                  <th>Variable Name</th>
+                  <th>Type</th>
+                  <th>Runtime Address</th>
+                  <th>Size</th>
+                  <th>Location</th>
+                  <th>Category</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="te-vars-tbody">
+                <tr><td colspan="7" class="text-center text-muted py-3">Load companion ELF with DWARF to discover variables</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 3: 📋 Watch List & Capture Controls                               -->
+    <!-- ===================================================================== -->
+    <section id="tab-watch-list" class="tab-pane">
+      <div class="inv-container" style="max-width: 1400px; margin: 0 auto;">
+        <div class="workflow-step-card mb-3">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <h2 style="font-size: 1.15rem; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 8px;">
+                <span>📋</span> Step 3: User-Selected Watch List &amp; Capture Controls
+              </h2>
+              <div class="text-xs text-muted mt-1">
+                Configure persistent variables and bounded memory ranges. Execute user-triggered baseline captures or periodic sampling.
+              </div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <button type="button" class="btn btn-success btn-sm font-bold" id="btn-manual-capture-now">
+                <span>⚡</span> Capture Snapshot Now
+              </button>
+              <button type="button" class="btn btn-outline btn-sm" id="btn-te-toggle-add-custom">
+                <span>➕</span> Add Custom Range
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Collapsible Custom Add Form -->
+        <div class="card-body border-b border-color py-3 mb-3" id="te-custom-add-panel" style="display: none; background: var(--bg-input); border-radius: 6px;">
+          <div class="grid grid-cols-5 gap-2 items-end">
+            <div>
+              <label class="form-label text-xs">Name</label>
+              <input type="text" id="te-custom-name" class="form-input form-input-xs" placeholder="e.g. heap_ptr">
+            </div>
+            <div>
+              <label class="form-label text-xs">Hex Address *</label>
+              <input type="text" id="te-custom-address" class="form-input form-input-xs mono" placeholder="0x7ffe...">
+            </div>
+            <div>
+              <label class="form-label text-xs">Type</label>
+              <select id="te-custom-type" class="input-select input-select-xs">
+                <option value="int">int (32-bit)</option>
+                <option value="uint32_t">uint32_t (32-bit)</option>
+                <option value="int64_t">int64_t (64-bit)</option>
+                <option value="uint64_t">uint64_t (64-bit)</option>
+                <option value="float">float (32-bit)</option>
+                <option value="double">double (64-bit)</option>
+                <option value="pointer">pointer (void*)</option>
+                <option value="raw_bytes" selected>raw_bytes (hex)</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label text-xs">Size (bytes)</label>
+              <input type="number" id="te-custom-size" class="form-input form-input-xs" value="4" min="1" max="65536">
+            </div>
+            <div>
+              <button type="button" class="btn btn-xs btn-primary w-full" id="btn-te-submit-custom-watch">Add to Watch</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Active Watch List Table -->
+        <div class="card mb-3 p-0" style="overflow: hidden;">
+          <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+              <span>📋</span> Active Watch Items
+            </h3>
+            <span class="badge badge-neutral text-xs" id="watchlist-count-badge">0 items</span>
+          </div>
+          <div class="table-scrollable" style="max-height: 280px; overflow-y: auto;">
+            <table class="data-table w-full text-xs" id="te-watchlist-table">
+              <thead>
+                <tr>
+                  <th>Item ID</th>
+                  <th>Name</th>
+                  <th>Source</th>
+                  <th>Scope</th>
+                  <th>Type</th>
+                  <th>Address</th>
+                  <th>Size</th>
+                  <th>Status</th>
+                  <th>Latest Value</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="te-watchlist-tbody">
+                <tr><td colspan="10" class="text-center text-muted py-3">No watch items selected. Pick from Runtime Explorer (Tab 2) or add custom range above.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Repeated Capture Controls & Telemetry -->
+        <div class="card mb-3">
+          <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+              <span>⏱️</span> Sampling Controls &amp; Performance Telemetry
+            </h3>
+            <div class="d-flex align-items-center gap-2">
+              <span class="badge badge-neutral" id="te-badge-session-status">STOPPED</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="d-flex align-items-center gap-3 mb-3">
+              <div class="d-flex align-items-center gap-2">
+                <label for="te-select-interval" class="form-label text-xs mb-0">Interval:</label>
+                <select id="te-select-interval" class="input-select input-select-sm" style="width: 140px;">
+                  <option value="100">100 ms (Fast)</option>
+                  <option value="250">250 ms</option>
+                  <option value="500" selected>500 ms (Standard)</option>
+                  <option value="1000">1000 ms (1s)</option>
+                  <option value="2000">2000 ms (2s)</option>
+                </select>
+              </div>
+              <div class="d-flex align-items-center gap-2">
+                <label for="te-input-max-samples" class="form-label text-xs mb-0">Max Samples:</label>
+                <input type="number" id="te-input-max-samples" class="form-input form-input-sm" value="1000" min="10" max="50000" step="50" style="width: 100px;">
+              </div>
+              <div class="d-flex gap-2 ms-auto">
+                <button type="button" class="btn btn-primary btn-sm" id="btn-te-start-session">
+                  <span>▶️</span> Start Periodic Capture
+                </button>
+                <button type="button" class="btn btn-secondary btn-sm" id="btn-te-stop-session" disabled>
+                  <span>⏹️</span> Stop
+                </button>
+              </div>
+            </div>
+
+            <!-- Telemetry Row -->
+            <div class="te-telemetry-row">
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Backend</span>
+                <span class="font-mono text-xs font-bold text-accent" id="te-stat-backend">process_vm_readv</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Stop Duration</span>
+                <span class="font-mono text-xs font-bold text-success" id="te-stat-stoptime">0.00 ms (Zero-Stop)</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Last Latency</span>
+                <span class="font-mono text-xs" id="te-stat-latency">N/A</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Recorded Samples</span>
+                <span class="font-mono text-xs font-bold" id="te-stat-samples">0</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Capture Gaps</span>
+                <span class="font-mono text-xs" id="te-stat-gaps">0</span>
+              </div>
+              <div class="te-metric-box">
+                <span class="text-xs text-muted">Session ID</span>
+                <span class="font-mono text-xs text-muted" id="te-stat-session-id">None</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 4: ⏱️ Timeline & Snapshot Comparison                             -->
+    <!-- ===================================================================== -->
+    <section id="tab-timeline-compare" class="tab-pane">
+      <div class="inv-container" style="max-width: 1400px; margin: 0 auto;">
+        <div class="workflow-step-card mb-3">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <h2 style="font-size: 1.15rem; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 8px;">
+                <span>⏱️</span> Step 4: Timeline Navigation &amp; Snapshot Comparison
+              </h2>
+              <div class="text-xs text-muted mt-1">
+                Scrutinize individual observations on the timeline and perform side-by-side snapshot diffing to pinpoint meaningful state mutations.
+              </div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <button type="button" class="btn btn-primary btn-sm font-bold" id="btn-nav-to-investigation">
+                <span>🔍</span> Investigate Results (Tab 5)
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Replay Scrubber Card -->
+        <div class="card mb-3">
+          <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+              <span>📊</span> Timeline Replay &amp; Observation Inspector
+            </h3>
+            <span class="text-xs text-muted" id="te-replay-keyboard-hint">⌨️ Shortcuts: [←] Prev, [→] Next, [Home] First, [End] Last, [Space] Play</span>
+          </div>
+          <div class="card-body">
+            <div class="te-replay-bar mb-3">
+              <div class="flex items-center gap-2">
+                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-home" title="Jump to First Observation (Home)">⏮️</button>
+                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-prev" title="Step Backward (Left Arrow)">◀️</button>
+                <button type="button" class="btn btn-sm btn-primary" id="btn-te-replay-play" title="Play/Pause Replay (Space)">⏯️ Play</button>
+                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-next" title="Step Forward (Right Arrow)">▶️</button>
+                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-end" title="Jump to Latest Observation (End)">⏭️</button>
+              </div>
+              <div class="flex-1 px-3">
+                <input type="range" id="te-replay-slider" min="0" max="0" value="0" class="w-full te-slider" disabled>
+              </div>
+              <div class="text-xs font-mono" id="te-replay-info">No observations recorded</div>
+            </div>
+
+            <div id="te-gap-alert" class="banner banner-warning mb-3 py-1 px-3 text-xs" style="display: none;">
+              <span>⚠️</span>
+              <span id="te-gap-alert-text">Discontinuity detected: sampling overrun between observations</span>
+            </div>
+
+            <!-- Single Observation Table -->
+            <div class="table-scrollable" style="max-height: 240px; overflow-y: auto;">
+              <table class="data-table w-full text-xs" id="te-temporal-table">
+                <thead>
+                  <tr>
+                    <th>Watch Item</th>
+                    <th>Type &amp; Address</th>
+                    <th>Observed Value</th>
+                    <th>Delta / Change</th>
+                    <th>Raw Bytes (Hex)</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="te-temporal-tbody">
+                  <tr><td colspan="6" class="text-center text-muted py-3">Capture snapshots to inspect timeline values</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Side-by-Side Snapshot Comparison Card -->
+        <div class="card mb-3" id="card-snapshot-compare">
+          <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+            <div>
+              <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+                <span>⚖️</span> Side-by-Side Snapshot Diffing
+              </h3>
+              <div class="text-xs text-muted">Select two snapshots to compare all watch items with strict state distinctions.</div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <label class="text-xs text-muted mb-0">Snap A:</label>
+              <select id="select-cmp-snap-a" class="input-select input-select-xs mono" style="width: 150px;"></select>
+              <label class="text-xs text-muted mb-0">Snap B:</label>
+              <select id="select-cmp-snap-b" class="input-select input-select-xs mono" style="width: 150px;"></select>
+              <button type="button" class="btn btn-primary btn-xs" id="btn-execute-compare">Compare</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <!-- Diff Summary Metrics -->
+            <div id="compare-summary-row" class="d-flex gap-2 mb-3" style="display: none;">
+              <span class="badge badge-diff-changed text-xs" id="cmp-badge-changed">0 Changed</span>
+              <span class="badge badge-diff-unchanged text-xs" id="cmp-badge-unchanged">0 Unchanged</span>
+              <span class="badge badge-diff-unreadable text-xs" id="cmp-badge-unreadable">0 Unreadable</span>
+              <span class="badge badge-diff-partial text-xs" id="cmp-badge-partial">0 Partial</span>
+              <span class="badge badge-diff-missing text-xs" id="cmp-badge-missing">0 Missing</span>
+              <span class="badge badge-diff-unknown text-xs" id="cmp-badge-unknown">0 Unknown</span>
+              <button type="button" class="btn btn-xs btn-outline ms-auto" id="btn-send-diff-to-inv">
+                <span>🔍</span> Investigate this Difference in Tab 5
+              </button>
+            </div>
+
+            <!-- Comparison Diffs Table -->
+            <div class="table-scrollable" style="max-height: 280px; overflow-y: auto;">
+              <table class="data-table w-full text-xs" id="table-snapshot-diffs">
+                <thead>
+                  <tr>
+                    <th>Watch Item</th>
+                    <th>Type &amp; Address</th>
+                    <th>Diff State</th>
+                    <th>Before (Snap A)</th>
+                    <th>After (Snap B)</th>
+                    <th>Pointer Semantics</th>
+                  </tr>
+                </thead>
+                <tbody id="tbody-snapshot-diffs">
+                  <tr><td colspan="6" class="text-center text-muted py-3">Select two snapshots above and click Compare to evaluate state changes.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Recent Observations Multi-column Matrix Preview -->
+        <div class="card mb-4">
+          <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-muted">Recent Observations Matrix (Time Series Overview)</h3>
+            <span class="text-xs text-muted" id="te-matrix-summary">0 samples</span>
+          </div>
+          <div class="card-body p-0 table-scrollable" style="max-height: 200px; overflow-x: auto; overflow-y: auto;">
+            <table class="data-table w-full text-xs mono" id="te-matrix-table">
+              <thead id="te-matrix-thead"><tr><th>Watch Item</th></tr></thead>
+              <tbody id="te-matrix-tbody"><tr><td class="text-center text-muted py-3">No observations yet</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 5: 🔍 Investigation Overview (Investigation-First Workflow)        -->
+    <!-- ===================================================================== -->
+    <section id="tab-investigation-overview" class="tab-pane">
       <div class="inv-container">
         
         <!-- ===================================================================== -->
@@ -2211,397 +2755,6 @@
             </button>
           </div>
         </div>
-      </div>
-    </section>
-
-    <!-- ===================================================================== -->
-    <!-- TAB 8: ⏱️ Temporal Memory Explorer (Phase 21 Foundation)                -->
-    <!-- ===================================================================== -->
-    <section id="tab-temporal-explorer" class="tab-pane">
-      <div class="temporal-container">
-        
-        <!-- AREA A: Target / Session Controls -->
-        <div class="card mb-4">
-          <div class="card-header flex justify-between items-center">
-            <div>
-              <h2 class="text-base font-bold flex items-center gap-2">
-                <span>⏱️</span>
-                <span data-i18n="te_title_target_session">Area A: Target &amp; Watch Session Controls</span>
-              </h2>
-              <div class="text-xs text-muted" data-i18n="te_sub_target_session">
-                Connect to embedded/local Linux target, validate DWARF GNU Build ID, and configure non-intrusive periodic sampling.
-              </div>
-            </div>
-            <div class="flex items-center gap-2">
-              <span class="badge badge-neutral" id="te-badge-session-status">STOPPED</span>
-              <span class="badge badge-neutral" id="te-badge-buildid">BUILD ID: UNCHECKED</span>
-            </div>
-          </div>
-          <div class="card-body">
-            <div class="te-controls-grid">
-              <div class="form-group">
-                <label for="te-target-pid" class="form-label text-xs">Target Process PID *</label>
-                <input type="number" id="te-target-pid" class="form-input form-input-sm mono" placeholder="e.g. 12345" min="1" step="1">
-              </div>
-              <div class="form-group flex-2">
-                <label for="te-companion-elf" class="form-label text-xs">Matching Companion Nostrip/Debug ELF *</label>
-                <input type="text" id="te-companion-elf" class="form-input form-input-sm mono" placeholder="/path/to/binary_debug.elf (with DWARF)">
-              </div>
-              <div class="form-group">
-                <label for="te-select-interval" class="form-label text-xs">Sampling Interval</label>
-                <select id="te-select-interval" class="input-select input-select-sm">
-                  <option value="100">100 ms (Fast)</option>
-                  <option value="250">250 ms</option>
-                  <option value="500" selected>500 ms (Standard)</option>
-                  <option value="1000">1000 ms (1s)</option>
-                  <option value="2000">2000 ms (2s)</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label for="te-input-max-samples" class="form-label text-xs">Max Samples</label>
-                <input type="number" id="te-input-max-samples" class="form-input form-input-sm" value="1000" min="10" max="50000" step="50">
-              </div>
-              <div class="form-group">
-                <label for="te-select-session" class="form-label text-xs">Active / MCP Session</label>
-                <select id="te-select-session" class="input-select input-select-sm mono">
-                  <option value="">-- New Session --</option>
-                </select>
-              </div>
-              <div class="form-group flex items-end gap-2">
-                <button type="button" class="btn btn-primary btn-sm" id="btn-te-start-session">
-                  <span>▶️</span> <span data-i18n="btn_te_start">Start Session</span>
-                </button>
-                <button type="button" class="btn btn-secondary btn-sm" id="btn-te-stop-session" disabled>
-                  <span>⏹️</span> <span data-i18n="btn_te_stop">Stop</span>
-                </button>
-                <button type="button" class="btn btn-outline btn-sm" id="btn-te-refresh-map" title="Refresh memory map &amp; threads">
-                  <span>⟳</span>
-                </button>
-              </div>
-            </div>
-
-            <!-- Remote Target Configuration (Collapsible) -->
-            <details class="mt-2 text-xs text-muted" id="te-remote-details">
-              <summary class="cursor-pointer font-bold">🌐 Remote SSH Target Configuration (Embedded Targets / Multi-Hop Proxy)</summary>
-              <div class="te-controls-grid mt-2">
-                <div class="form-group">
-                  <label for="te-remote-host" class="form-label text-xs">Remote Host / IP</label>
-                  <input type="text" id="te-remote-host" class="form-input form-input-sm mono" placeholder="e.g. 192.168.1.50">
-                </div>
-                <div class="form-group">
-                  <label for="te-remote-user" class="form-label text-xs">SSH User</label>
-                  <input type="text" id="te-remote-user" class="form-input form-input-sm mono" placeholder="root">
-                </div>
-                <div class="form-group">
-                  <label for="te-remote-port" class="form-label text-xs">SSH Port</label>
-                  <input type="number" id="te-remote-port" class="form-input form-input-sm mono" value="22">
-                </div>
-                <div class="form-group flex-2">
-                  <label for="te-remote-jump" class="form-label text-xs">SSH Proxy / Jump Host (Optional)</label>
-                  <input type="text" id="te-remote-jump" class="form-input form-input-sm mono" placeholder="jump.host.example.com">
-                </div>
-              </div>
-            </details>
-
-            <!-- Overhead & Performance Telemetry Row -->
-            <div class="te-telemetry-row mt-3">
-              <div class="te-metric-box">
-                <span class="text-xs text-muted">Backend</span>
-                <span class="font-mono text-xs font-bold text-accent" id="te-stat-backend">process_vm_readv</span>
-              </div>
-              <div class="te-metric-box">
-                <span class="text-xs text-muted">Target Stop Time</span>
-                <span class="font-mono text-xs font-bold text-success" id="te-stat-stoptime">0.00 ms (Zero-Stop)</span>
-              </div>
-              <div class="te-metric-box">
-                <span class="text-xs text-muted">Last Tick Latency</span>
-                <span class="font-mono text-xs" id="te-stat-latency">N/A</span>
-              </div>
-              <div class="te-metric-box">
-                <span class="text-xs text-muted">Recorded Observations</span>
-                <span class="font-mono text-xs font-bold" id="te-stat-samples">0</span>
-              </div>
-              <div class="te-metric-box">
-                <span class="text-xs text-muted">Capture Gaps</span>
-                <span class="font-mono text-xs" id="te-stat-gaps">0</span>
-              </div>
-              <div class="te-metric-box">
-                <span class="text-xs text-muted">Session ID</span>
-                <span class="font-mono text-xs text-muted" id="te-stat-session-id">None</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- AREA B: Thread and Memory Map Explorer -->
-        <div class="grid grid-cols-2 gap-4 mb-4" id="te-area-b">
-          <!-- Column 1: Active Threads -->
-          <div class="card">
-            <div class="card-header flex justify-between items-center">
-              <h3 class="text-sm font-bold flex items-center gap-2">
-                <span>🧵</span>
-                <span data-i18n="te_title_threads">Area B1: Active Threads</span>
-              </h3>
-              <span class="text-xs text-muted" id="te-threads-count">0 threads</span>
-            </div>
-            <div class="card-body p-0 table-scrollable" style="max-height: 240px; overflow-y: auto;">
-              <table class="data-table w-full text-xs" id="te-threads-table">
-                <thead>
-                  <tr>
-                    <th>TID</th>
-                    <th>Name</th>
-                    <th>State</th>
-                  </tr>
-                </thead>
-                <tbody id="te-threads-tbody">
-                  <tr><td colspan="3" class="text-center text-muted py-3">No target process loaded</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <!-- Column 2: Memory Mappings & Variables -->
-          <div class="card">
-            <div class="card-header flex justify-between items-center">
-              <h3 class="text-sm font-bold flex items-center gap-2">
-                <span>🗺️</span>
-                <span data-i18n="te_title_memory_map">Area B2: Memory Mappings &amp; DWARF Globals</span>
-              </h3>
-              <div class="flex items-center gap-1">
-                <button type="button" class="btn btn-xs btn-outline te-map-filter active" data-filter="all">All</button>
-                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="data">Data/BSS</button>
-                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="heap">Heap</button>
-                <button type="button" class="btn btn-xs btn-outline te-map-filter" data-filter="stack">Stack</button>
-              </div>
-            </div>
-            <div class="card-body p-0 table-scrollable" style="max-height: 240px; overflow-y: auto;">
-              <table class="data-table w-full text-xs" id="te-mappings-table">
-                <thead>
-                  <tr>
-                    <th>Address Range</th>
-                    <th>Size</th>
-                    <th>Perms</th>
-                    <th>Category</th>
-                    <th>Pathname</th>
-                  </tr>
-                </thead>
-                <tbody id="te-mappings-tbody">
-                  <tr><td colspan="5" class="text-center text-muted py-3">No memory map available</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <!-- DWARF Discoverable Variables Picker (Sub-panel of Area B) -->
-        <div class="card mb-4" id="te-discoverable-vars-card">
-          <div class="card-header flex justify-between items-center">
-            <h3 class="text-sm font-bold flex items-center gap-2">
-              <span>🔍</span>
-              <span data-i18n="te_title_discovered_vars">DWARF Discoverable Global &amp; Static Variables</span>
-            </h3>
-            <input type="text" id="te-var-search" class="form-input form-input-xs" placeholder="Search variables (e.g. counter, session)..." style="width: 260px;">
-          </div>
-          <div class="card-body p-0 table-scrollable" style="max-height: 180px; overflow-y: auto;">
-            <table class="data-table w-full text-xs" id="te-vars-table">
-              <thead>
-                <tr>
-                  <th>Variable Name</th>
-                  <th>Type</th>
-                  <th>Runtime Virtual Address</th>
-                  <th>Size</th>
-                  <th>Location</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody id="te-vars-tbody">
-                <tr><td colspan="6" class="text-center text-muted py-3">Load companion ELF with DWARF to discover variables</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        <!-- AREA C: Active Watch List -->
-        <div class="card mb-4" id="te-area-c">
-          <div class="card-header flex justify-between items-center">
-            <h3 class="text-sm font-bold flex items-center gap-2">
-              <span>📋</span>
-              <span data-i18n="te_title_watchlist">Area C: Active Watch List</span>
-            </h3>
-            <button type="button" class="btn btn-xs btn-secondary" id="btn-te-toggle-add-custom">
-              <span>➕</span> Add Custom Address Range
-            </button>
-          </div>
-          
-          <!-- Collapsible Custom Add Form -->
-          <div class="card-body border-b border-color py-3" id="te-custom-add-panel" style="display: none; background: var(--bg-input);">
-            <div class="grid grid-cols-5 gap-2 items-end">
-              <div>
-                <label class="form-label text-xs">Name</label>
-                <input type="text" id="te-custom-name" class="form-input form-input-xs" placeholder="e.g. heap_ptr">
-              </div>
-              <div>
-                <label class="form-label text-xs">Hex Address *</label>
-                <input type="text" id="te-custom-address" class="form-input form-input-xs mono" placeholder="0x7ffe...">
-              </div>
-              <div>
-                <label class="form-label text-xs">Type</label>
-                <select id="te-custom-type" class="input-select input-select-xs">
-                  <option value="int">int (32-bit)</option>
-                  <option value="uint32_t">uint32_t (32-bit)</option>
-                  <option value="int64_t">int64_t (64-bit)</option>
-                  <option value="uint64_t">uint64_t (64-bit)</option>
-                  <option value="float">float (32-bit)</option>
-                  <option value="double">double (64-bit)</option>
-                  <option value="pointer">pointer (void*)</option>
-                  <option value="raw_bytes" selected>raw_bytes (hex)</option>
-                </select>
-              </div>
-              <div>
-                <label class="form-label text-xs">Size (bytes)</label>
-                <input type="number" id="te-custom-size" class="form-input form-input-xs" value="4" min="1" max="65536">
-              </div>
-              <div>
-                <button type="button" class="btn btn-xs btn-primary w-full" id="btn-te-submit-custom-watch">Add to Watch</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="card-body p-0 table-scrollable" style="max-height: 200px; overflow-y: auto;">
-            <table class="data-table w-full text-xs" id="te-watchlist-table">
-              <thead>
-                <tr>
-                  <th>Item ID</th>
-                  <th>Name</th>
-                  <th>Scope</th>
-                  <th>Type</th>
-                  <th>Address</th>
-                  <th>Size</th>
-                  <th>Status</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody id="te-watchlist-tbody">
-                <tr><td colspan="8" class="text-center text-muted py-3">No watch items selected. Pick from variables above or add a custom range.</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        <!-- AREA D: Temporal Table & Timeline Replay -->
-        <div class="card mb-4" id="te-area-d">
-          <div class="card-header flex justify-between items-center">
-            <h3 class="text-sm font-bold flex items-center gap-2">
-              <span>📊</span>
-              <span data-i18n="te_title_temporal_table">Area D: Temporal State Table &amp; Replay Navigation</span>
-            </h3>
-            <div class="flex items-center gap-2">
-              <span class="text-xs text-muted" id="te-replay-keyboard-hint">⌨️ Shortcuts: [←] Prev, [→] Next, [Home] First, [End] Last, [Space] Play/Pause</span>
-            </div>
-          </div>
-          <div class="card-body">
-            <!-- Replay Scrubber & Control Bar -->
-            <div class="te-replay-bar mb-3">
-              <div class="flex items-center gap-2">
-                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-home" title="Jump to First Observation (Home)">⏮️</button>
-                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-prev" title="Step Backward (Left Arrow)">◀️</button>
-                <button type="button" class="btn btn-sm btn-primary" id="btn-te-replay-play" title="Play/Pause Replay (Space)">⏯️ Play</button>
-                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-next" title="Step Forward (Right Arrow)">▶️</button>
-                <button type="button" class="btn btn-sm btn-outline" id="btn-te-replay-end" title="Jump to Latest Observation (End)">⏭️</button>
-              </div>
-              <div class="flex-1 px-3">
-                <input type="range" id="te-replay-slider" min="0" max="0" value="0" class="w-full te-slider" disabled>
-              </div>
-              <div class="text-xs font-mono" id="te-replay-info">
-                No observations recorded
-              </div>
-            </div>
-
-            <!-- Gap Alert Banner if sample followed a gap -->
-            <div id="te-gap-alert" class="banner banner-warning mb-3 py-1 px-3 text-xs" style="display: none;">
-              <span>⚠️</span>
-              <span id="te-gap-alert-text">Discontinuity detected: sampling overrun between observations</span>
-            </div>
-
-            <!-- Temporal Snapshot Table -->
-            <div class="table-scrollable" style="max-height: 280px; overflow-y: auto;">
-              <table class="data-table w-full text-xs" id="te-temporal-table">
-                <thead>
-                  <tr>
-                    <th>Watch Item</th>
-                    <th>Type &amp; Address</th>
-                    <th>Observed Value</th>
-                    <th>Delta / Change</th>
-                    <th>Raw Bytes (Hex)</th>
-                    <th>Observation Status</th>
-                  </tr>
-                </thead>
-                <tbody id="te-temporal-tbody">
-                  <tr><td colspan="6" class="text-center text-muted py-4">Start session and record observations to explore temporal state</td></tr>
-                </tbody>
-              </table>
-            </div>
-
-            <!-- Historical Multi-Column Matrix Preview (Collapsible) -->
-            <div class="mt-4 pt-3 border-t border-color">
-              <div class="flex justify-between items-center mb-2">
-                <span class="text-xs font-bold text-muted uppercase">Recent Observations Matrix (Time Series Overview)</span>
-                <span class="text-xs text-muted" id="te-matrix-summary">0 samples</span>
-              </div>
-              <div class="table-scrollable" style="max-height: 200px; overflow-x: auto;">
-                <table class="data-table w-full text-xs mono" id="te-matrix-table">
-                  <thead id="te-matrix-thead">
-                    <tr><th>Item</th></tr>
-                  </thead>
-                  <tbody id="te-matrix-tbody">
-                    <tr><td class="text-center text-muted py-2">No time series data yet</td></tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- AREA E: Allocation Events (Truthful Capability Display) -->
-        <div class="card mb-4" id="te-area-e">
-          <div class="card-header flex justify-between items-center">
-            <h3 class="text-sm font-bold flex items-center gap-2">
-              <span>🧱</span>
-              <span data-i18n="te_title_alloc_events">Area E: Heap Allocation &amp; Free Event Stream</span>
-            </h3>
-            <span class="badge badge-warning" id="te-badge-alloc-cap">ALLOCATION_TRACING_UNAVAILABLE</span>
-          </div>
-          <div class="card-body">
-            <!-- Truthful capability banner -->
-            <div class="banner banner-info mb-3">
-              <span class="banner-icon">ℹ️</span>
-              <div class="banner-text text-xs leading-relaxed">
-                <strong>Truthful Backend Capability Notice:</strong> Allocation/free tracing requires an active heap hook 
-                (such as an <code>LD_PRELOAD</code> allocator wrapper, eBPF uretprobe on <code>malloc/free</code>, or GDB heap watchpoint). 
-                The current observation backend (<code>process_vm_readv</code>) operates strictly non-intrusively without pausing the process or intercepting allocator syscalls.
-                Per project truthfulness rules, no synthetic or fabricated allocation events are produced.
-              </div>
-            </div>
-
-            <div class="text-xs text-muted mb-2 font-semibold">Future Allocator Recorder Adapter Interface Contract:</div>
-            <pre class="bg-card p-3 rounded text-xs font-mono overflow-x-auto text-muted" style="border: 1px solid var(--border-color);">{
-  "schema_version": "1.0.0",
-  "event": "AllocationEvent",
-  "fields": {
-    "seq": "uint64 (strictly monotonic sequence)",
-    "timestamp": "ISO-8601 wall clock",
-    "thread_id": "uint32 (calling thread)",
-    "operation": "ALLOC | FREE | REALLOC",
-    "address": "uint64 (pointer)",
-    "size": "uint64 (allocated byte length)",
-    "allocation_generation": "uint64 (optional)",
-    "caller_pc": "uint64 (program counter)",
-    "provenance": { "hook_source": "ebpf_uprobe | ld_preload | gdb_watchpoint" }
-  }
-}</pre>
-          </div>
-        </div>
-
       </div>
     </section>
 

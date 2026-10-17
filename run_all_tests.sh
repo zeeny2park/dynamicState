@@ -144,7 +144,11 @@ run_step "Phase 25 Evidence-Grounded LLM Investigation and End-to-End Quality Va
 run_step "Phase 26 Real-Execution Quality Verification and Agent-First UX Suite" \
     python3 -m unittest tests/test_phase26_real_execution_quality.py
 
-# 26. Discover and run all remaining unit and integration tests
+# 26. Phase 28 Runtime Memory Explorer and State Inspection UX Suite
+run_step "Phase 28 Runtime Memory Explorer and State Inspection UX Suite" \
+    python3 -m unittest tests/test_phase28_memory_explorer_ux.py
+
+# 27. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

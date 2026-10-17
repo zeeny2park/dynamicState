@@ -3891,3 +3891,66 @@ body.advanced-mode .runtime-summary-bar {
 #te-matrix-table td {
   white-space: nowrap;
 }
+
+/* ========================================================================== */
+/* Phase 28: Runtime Memory Explorer & Inspection UX                          */
+/* ========================================================================== */
+
+.badge-diff-unchanged {
+  background: rgba(107, 114, 128, 0.2);
+  color: #9ca3af;
+  border: 1px solid rgba(107, 114, 128, 0.4);
+}
+
+.badge-diff-changed {
+  background: rgba(245, 158, 11, 0.2);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  font-weight: 600;
+}
+
+.badge-diff-unreadable {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  font-weight: 600;
+}
+
+.badge-diff-partial {
+  background: rgba(234, 179, 8, 0.2);
+  color: #eab308;
+  border: 1px solid rgba(234, 179, 8, 0.5);
+}
+
+.badge-diff-missing {
+  background: rgba(168, 85, 247, 0.2);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.5);
+}
+
+.badge-diff-unknown {
+  background: rgba(100, 116, 139, 0.2);
+  color: #94a3b8;
+  border: 1px solid rgba(100, 116, 139, 0.4);
+}
+
+.hex-dump-panel {
+  background: #090d16;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 12px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  max-height: 220px;
+  overflow-y: auto;
+  line-height: 1.6;
+}
+
+.workflow-step-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+

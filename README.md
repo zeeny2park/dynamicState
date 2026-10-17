@@ -1673,6 +1673,84 @@ Phase 26 closes the gap between synthetic assertions and trustworthy real-runtim
   - Preserved strict transport boundary: DynamicState does not duplicate multi-hop SSH, ProxyJump, or remote execution adapters (delegated to existing `xssh` tools).
   - Frozen ARP action types: no new ARP actions introduced; unsupported action requests safely return `CAPABILITY_UNSUPPORTED`.
 
+### Phase 28: Runtime Memory Explorer and Time-based State Inspection UX
+Phase 28 establishes an interactive, memory-centric inspection and temporal state-tracking workflow:
+`Target Connection -> Runtime Structure Exploration -> User-Selected Watch Items -> Repeated Captures -> Timeline & Diffs -> Evidence-Backed Investigation`.
+
+- **Target Connection & Compatibility Validation (Tab 1: Target Setup)**:
+  - Explicit PID and companion non-stripped debug ELF input fields.
+  - Verifies process liveness (`/proc/<pid>`), executable identity, architecture, and GNU Build ID matching.
+  - Inspects DWARF compilation units, global variables, and type tables before capture.
+  - Transparent error diagnostics when Build IDs mismatch or permissions are denied (`EPERM`).
+
+- **Runtime Structure Exploration (Tab 2: Runtime Explorer)**:
+  - **Threads View**: Lists OS thread IDs, thread names, execution status, and stack address ranges (`[stack_start, stack_end]`, size in KB). Truthfully reports local variables as `UNSUPPORTED` with clear explanation of debugger frame unwinding requirements.
+  - **Memory Maps View**: Lists virtual memory mappings with address ranges, sizes, permissions (`rwxp`), device/inode, and mapped file paths or classifications (`[heap]`, `[stack]`, `[anon]`).
+  - **Bounded Memory Range Inspector**: Safely reads up to 4096 bytes via `process_vm_readv` (zero process interruption). Formats canonical hexadecimal and ASCII dumps with offset markings. Correlates addresses against companion DWARF variables to highlight named symbols. Returns truthful statuses (`OBSERVED`, `PARTIAL`, `UNMAPPED`).
+  - **Object & Variable Tree**: Traverses DWARF type hierarchy for structs/classes, member fields, offsets, byte sizes, and pointer types without fabricating values.
+
+- **User-Selected Watch Items (Tab 3: Watch List)**:
+  - Operators select specific variables, fields, or bounded memory address ranges to track over time.
+  - Enforces bounded reads (1 to 65,536 bytes) and scope/source attribution (`global_variable`, `memory_map`, `thread_stack`, `custom_range`, `object_field`).
+  - Dynamic addition and removal of watch items with live address validation against target memory maps.
+
+- **Timeline & State Diffing (Tab 4: Timeline / Compare)**:
+  - **On-Demand Zero-Stop Snapshot Capture**: Trigger single synchronous capture snapshots (`POST /api/watch/session/{id}/capture`) with exact nanosecond timestamps and microsecond latency measurement.
+  - **Chronological Timeline**: Ordered historical observations with completeness status (`COMPLETE`, `PARTIAL`, `FAILED`).
+  - **State-Aware Diffing Engine**: Strict 6-state distinction:
+    - `CHANGED`: Values or raw bytes altered between captures.
+    - `UNCHANGED`: Validated identical values.
+    - `UNREADABLE`: Inaccessible memory or guard pages (`PROT_NONE`) — never falsely reported as unchanged.
+    - `PARTIAL`: Incomplete memory reads.
+    - `MISSING`: Watch item omitted from one observation.
+    - `UNKNOWN`: Decoding errors or type mismatches.
+  - **Pointer Semantics**: Distinguishes pointer address change (`pointer_address_changed`) vs. changes within dereferenced memory buffers.
+
+- **Evidence-Backed Investigation Handoff (Tab 5: Investigation)**:
+  - Direct one-click export of observed state diffs into `EvidenceLedger` and active investigation sessions.
+  - Full provenance preservation (`session_id`, `observation_seq`, `pid`, `address`, `byte_range`, `timestamp`).
+
+- **Capability Matrix**:
+  | Capability | Status | Implementation Details |
+  | :--- | :--- | :--- |
+  | Target Connection & Build ID Validation | **Working** | `debug_image.py`, `LocalTargetAdapter.check_liveness`, Build ID sha1/md5 check |
+  | Thread Stack Range Detection | **Working** | `/proc/<pid>/task/<tid>/stat` & `/proc/<pid>/maps` stack matching |
+  | Thread Local Variable Unwinding | **Unsupported** | Truthfully reported as `UNSUPPORTED` (requires DWARF CFI unwind engine / GDB frame) |
+  | Memory Map Navigation & Classification | **Working** | `LocalTargetAdapter.get_memory_mappings`, permission & path parsing |
+  | Bounded Memory Range Inspector | **Working** | `read_process_memory_slice`, hex+ASCII dump formatting (max 4096 bytes) |
+  | DWARF Global Variable Tree & Struct Decode | **Working** | `DwarfIndexer`, recursive member offset traversal, endian-aware unpack |
+  | User Watch List Management | **Working** | `WatchSessionManager.add_watch_item`, bounded size (1-65536 bytes), scope attribution |
+  | Zero-Stop On-Demand Snapshot Capture | **Working** | `WatchSessionManager.capture_once`, `process_vm_readv` (latency < 100 μs) |
+  | Multi-State Snapshot Diffing | **Working** | `WatchSessionManager.compare_observations`, strict UNREADABLE != UNCHANGED |
+  | Pointer vs Pointed-To Memory Diffing | **Working** | DWARF pointer type detection & pointer address transition tracking |
+  | Investigation & Ledger Handoff | **Working** | `EvidenceLedger.add_record`, `InvestigationManager.start_investigation` |
+  | Remote Multi-Hop Target Access | **Delegated** | Preserved transport boundary: delegated to registered external `xssh` tools |
+
+- **Manual Verification Guide**:
+  1. Compile and launch the real-runtime test fixture:
+     ```bash
+     g++ -fPIE -pie -g -O0 -fno-inline -fno-omit-frame-pointer -Wl,--build-id=sha1 tests/fixtures/real_runtime/scenario_target.cpp -o /tmp/target_debug.elf -lpthread
+     strip -s -o /tmp/target_prod.stripped /tmp/target_debug.elf
+     /tmp/target_prod.stripped
+     ```
+  2. Start the web UI server:
+     ```bash
+     python3 -m extractor.web.server --port 8080 --corpus corpus
+     ```
+  3. Open `http://localhost:8080/` in a browser:
+     - **Tab 1 (Target Setup)**: Enter the PID and companion debug ELF `/tmp/target_debug.elf`. Click **Inspect Runtime Target**. Verify target identity, Build ID compatibility, and memory map counts.
+     - **Tab 2 (Runtime Explorer)**:
+       - View threads and verify stack address ranges. Note that local variables are marked `UNSUPPORTED`.
+       - View memory maps. Click **Inspect Range** on an address (e.g. `g_state` or stack). Verify the hex/ASCII dump and matched DWARF symbol.
+     - **Tab 3 (Watch List)**: Select variables (e.g. `g_state.sequence`, `g_state.status`) and click **Add to Watch List**. Verify the items appear in the table with scope and address.
+     - **Tab 4 (Timeline / Compare)**:
+       - Click **Capture Snapshot Now** to record observation #1.
+       - Send a mutation command to the target process via stdin (e.g. `SET sequence 9999`).
+       - Click **Capture Snapshot Now** to record observation #2.
+       - Select Snapshot #1 and Snapshot #2 in the compare dropdowns and click **Compare Selected Snapshots**.
+       - Verify that `sequence` is labeled `CHANGED` with before/after values, while `status` is labeled `UNCHANGED`.
+     - **Tab 5 (Investigation)**: Click **Send Diff to Investigation** to initiate a grounded investigation citing the exact observation sequences.
+
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]
 > **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.

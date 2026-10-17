@@ -50,6 +50,10 @@ class TargetExecutionAdapter(ABC):
         """Reads /proc/<pid>/maps and returns structured memory mappings."""
         pass
 
+    def get_memory_mappings(self, pid: int) -> List[Dict[str, Any]]:
+        """Convenience alias for get_proc_maps."""
+        return self.get_proc_maps(pid)
+
     @abstractmethod
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         """Discovers active threads from /proc/<pid>/task."""
@@ -189,11 +193,17 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     })
         return mappings
 
+    get_memory_mappings = get_proc_maps
+
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         threads: List[Dict[str, Any]] = []
         task_dir = f"/proc/{pid}/task"
         if not os.path.exists(task_dir):
             return threads
+
+        # Pre-fetch proc maps to locate thread stacks
+        maps = self.get_proc_maps(pid)
+        stack_maps = [m for m in maps if m.get("category") == "stack" or m.get("pathname", "").startswith("[stack")]
 
         try:
             for tid_entry in os.listdir(task_dir):
@@ -201,6 +211,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     tid = int(tid_entry)
                     comm = "unknown"
                     state = "UNKNOWN"
+                    startstack = 0
                     comm_file = os.path.join(task_dir, tid_entry, "comm")
                     if os.path.exists(comm_file):
                         try:
@@ -212,15 +223,60 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     if os.path.exists(stat_file):
                         try:
                             with open(stat_file, "r") as sf:
-                                tokens = sf.read().strip().split()
-                                if len(tokens) >= 3:
-                                    state = tokens[2]
+                                raw_stat = sf.read().strip()
+                                rparen = raw_stat.rfind(")")
+                                if rparen != -1:
+                                    rest = raw_stat[rparen + 1:].strip().split()
+                                    if len(rest) >= 1:
+                                        state = rest[0]
+                                    if len(rest) >= 26:
+                                        try:
+                                            startstack = int(rest[25])
+                                        except (ValueError, IndexError):
+                                            pass
                         except Exception:
                             pass
+
+                    # Determine stack range
+                    stack_info: Dict[str, Any] = {"status": "UNAVAILABLE", "reason": "Thread stack mapping not identifiable in proc maps"}
+                    matched_map = None
+                    if tid == pid:
+                        # Main thread stack
+                        for m in stack_maps:
+                            if m.get("pathname") == "[stack]":
+                                matched_map = m
+                                break
+                    if not matched_map:
+                        for m in stack_maps:
+                            if m.get("pathname") == f"[stack:{tid}]":
+                                matched_map = m
+                                break
+                    if not matched_map and startstack > 0:
+                        for m in maps:
+                            if m["start_int"] <= startstack < m["end_int"]:
+                                matched_map = m
+                                break
+
+                    if matched_map:
+                        stack_info = {
+                            "status": "AVAILABLE",
+                            "start": matched_map["start"],
+                            "end": matched_map["end"],
+                            "start_int": matched_map["start_int"],
+                            "end_int": matched_map["end_int"],
+                            "size": matched_map["size"],
+                            "permissions": matched_map["permissions"],
+                        }
+
                     threads.append({
                         "tid": tid,
                         "name": comm,
                         "state": state,
+                        "stack_info": stack_info,
+                        "local_variables": {
+                            "status": "UNSUPPORTED",
+                            "reason": "Stack frame inspection requires an active debugger backend (GDB/ptrace frame unwind).",
+                        },
                     })
         except Exception:
             pass
@@ -465,6 +521,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     "tid": tid,
                     "name": comm,
                     "state": state,
+                    "stack_info": {
+                        "status": "UNAVAILABLE",
+                        "reason": "Remote thread stack mapping not inspected over lightweight ssh adapter",
+                    },
+                    "local_variables": {
+                        "status": "UNSUPPORTED",
+                        "reason": "Stack frame inspection requires an active debugger backend.",
+                    },
                 })
 
         threads.sort(key=lambda t: t["tid"])

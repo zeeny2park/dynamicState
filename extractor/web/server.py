@@ -1500,6 +1500,7 @@ class WebApiAdapter:
                 "endianness": dbg_ident.endianness,
                 "memory_read_backend": selected_backend,
                 "capture_backend": selected_backend,
+                "backend": selected_backend,
                 "capture_quality": "CONSISTENT" if selected_backend == "process_vm_readv" else "LOW_IMPACT",
                 "message": "대상 프로세스 및 디버그 이미지가 검증되었습니다." if is_ko else "Target process and debug image verified successfully.",
                 "next_action": "상태 캡처 및 분석을 진행할 수 있습니다." if is_ko else "Ready to capture and analyze runtime state.",
@@ -1636,6 +1637,125 @@ class WebApiAdapter:
             return {"success": True, "data": data}
         except Exception as e:
             return {"success": False, "error": {"code": "GET_OBSERVATIONS_ERROR", "message": str(e)}}
+
+    def inspect_memory_range(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Inspects a bounded slice of target process memory (max 4096 bytes)."""
+        from extractor.watch_session import read_process_memory_slice
+        try:
+            pid = int(params.get("pid", 0))
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Valid positive PID is required"}}
+            raw_addr = params.get("address", 0)
+            if isinstance(raw_addr, str) and raw_addr.startswith("0x"):
+                addr = int(raw_addr, 16)
+            else:
+                addr = int(raw_addr)
+            size = int(params.get("size", 64))
+            size = max(1, min(size, 4096))
+
+            # DWARF variable match lookup if companion_elf is provided
+            dwarf_match = None
+            companion_elf = params.get("companion_elf") or params.get("debug_image")
+            if companion_elf and os.path.isfile(companion_elf):
+                try:
+                    from extractor.dwarf_indexer import DwarfIndexer
+                    idx = DwarfIndexer.get_index(companion_elf)
+                    # Find load bias from target mappings
+                    from extractor.target_adapter import LocalTargetAdapter
+                    local_adapter = LocalTargetAdapter()
+                    maps = local_adapter.get_proc_maps(pid)
+                    load_bias = 0
+                    for m in maps:
+                        if m.get("category") == "code" or "r-x" in m.get("permissions", ""):
+                            load_bias = int(m.get("start", "0"), 16)
+                            break
+                    for var in idx.variables:
+                        if var.runtime_address is not None:
+                            var_addr = var.runtime_address + load_bias if var.runtime_address < 0x10000000 else var.runtime_address
+                            if var_addr == addr or (var_addr <= addr < var_addr + max(var.size or 4, 1)):
+                                dwarf_match = {
+                                    "name": var.name,
+                                    "type_name": var.type_name,
+                                    "runtime_address": f"0x{var_addr:x}",
+                                    "size": var.size or 4,
+                                }
+                                break
+                except Exception:
+                    dwarf_match = None
+
+            raw_bytes, read_st, read_err = read_process_memory_slice(pid, addr, size)
+            if read_st == "OBSERVED" and raw_bytes is not None:
+                ascii_repr = "".join((chr(b) if 32 <= b <= 126 else ".") for b in raw_bytes)
+                return {
+                    "success": True,
+                    "data": {
+                        "pid": pid,
+                        "address": f"0x{addr:x}",
+                        "address_int": addr,
+                        "size": len(raw_bytes),
+                        "bytes_read": len(raw_bytes),
+                        "bytes_hex": raw_bytes.hex(),
+                        "raw_hex": raw_bytes.hex(),
+                        "ascii": ascii_repr,
+                        "status": "OBSERVED",
+                        "dwarf_match": dwarf_match,
+                    }
+                }
+            elif read_st == "PARTIAL":
+                ascii_repr = "".join((chr(b) if 32 <= b <= 126 else ".") for b in raw_bytes) if raw_bytes else ""
+                return {
+                    "success": True,
+                    "data": {
+                        "pid": pid,
+                        "address": f"0x{addr:x}",
+                        "address_int": addr,
+                        "size": len(raw_bytes) if raw_bytes else 0,
+                        "bytes_read": len(raw_bytes) if raw_bytes else 0,
+                        "bytes_hex": raw_bytes.hex() if raw_bytes else "",
+                        "raw_hex": raw_bytes.hex() if raw_bytes else "",
+                        "ascii": ascii_repr,
+                        "status": "PARTIAL",
+                        "error": read_err or "Partial memory read",
+                        "dwarf_match": dwarf_match,
+                    }
+                }
+            else:
+                return {
+                    "success": True,
+                    "data": {
+                        "pid": pid,
+                        "address": f"0x{addr:x}",
+                        "address_int": addr,
+                        "size": 0,
+                        "bytes_read": 0,
+                        "bytes_hex": "",
+                        "raw_hex": "",
+                        "ascii": "",
+                        "status": "UNMAPPED",
+                        "error": read_err or f"Unable to read memory at 0x{addr:x}",
+                        "dwarf_match": None,
+                    }
+                }
+        except Exception as e:
+            return {"success": False, "error": {"code": "INSPECT_RANGE_ERROR", "message": str(e)}}
+
+    def capture_watch_session(self, session_id: str) -> Dict[str, Any]:
+        """Triggers an immediate synchronous capture of all watch items for a session."""
+        try:
+            obs = self.watch_manager.capture_once(session_id)
+            return {"success": True, "data": obs.to_dict()}
+        except Exception as e:
+            return {"success": False, "error": {"code": "CAPTURE_ERROR", "message": str(e)}}
+
+    def compare_watch_observations(self, session_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Compares two observation snapshots within a session."""
+        try:
+            seq_a = int(params.get("seq_a", 1))
+            seq_b = int(params.get("seq_b", 2))
+            res = self.watch_manager.compare_observations(session_id, seq_a, seq_b)
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "COMPARE_ERROR", "message": str(e)}}
 
     def start_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
         goal = params.get("goal") or "General state investigation"
@@ -2324,6 +2444,31 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_watch_session(session_id))
                 return
 
+            # GET /api/target/inspect-range
+            if path == "/api/target/inspect-range":
+                pid_str = q_param("pid")
+                addr_str = q_param("address")
+                size_str = q_param("size", "64")
+                if not pid_str or not addr_str:
+                    self._send_json({"success": False, "error": {"code": "INVALID_PARAM", "message": "Query parameters 'pid' and 'address' are required"}}, status=400)
+                    return
+                self._send_json(adapter.inspect_memory_range({
+                    "pid": pid_str,
+                    "address": addr_str,
+                    "size": size_str,
+                }))
+                return
+
+            # GET /api/watch/session/{session_id}/compare
+            m_watch_cmp = re.match(r"^/api/watch/session/([^/]+)/compare$", path)
+            if m_watch_cmp:
+                session_id = m_watch_cmp.group(1)
+                self._send_json(adapter.compare_watch_observations(session_id, {
+                    "seq_a": q_param("seq_a", "1"),
+                    "seq_b": q_param("seq_b", "2"),
+                }))
+                return
+
             # Unrecognized API endpoint
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
                             status=404)
@@ -2475,6 +2620,25 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if m_watch_item:
                 session_id = m_watch_item.group(1)
                 self._send_json(adapter.update_watch_items(session_id, body))
+                return
+
+            # POST /api/target/inspect-range
+            if path == "/api/target/inspect-range":
+                self._send_json(adapter.inspect_memory_range(body))
+                return
+
+            # POST /api/watch/session/{session_id}/capture
+            m_watch_cap = re.match(r"^/api/watch/session/([^/]+)/capture$", path)
+            if m_watch_cap:
+                session_id = m_watch_cap.group(1)
+                self._send_json(adapter.capture_watch_session(session_id))
+                return
+
+            # POST /api/watch/session/{session_id}/compare
+            m_watch_cmp_post = re.match(r"^/api/watch/session/([^/]+)/compare$", path)
+            if m_watch_cmp_post:
+                session_id = m_watch_cmp_post.group(1)
+                self._send_json(adapter.compare_watch_observations(session_id, body))
                 return
 
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},

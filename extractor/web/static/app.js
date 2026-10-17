@@ -21,7 +21,7 @@
     searchQuery: '',
     candidates: [],
     stateGraphData: { nodes: [], edges: [] },
-    activeTab: 'tab-investigation-overview',
+    activeTab: 'tab-target-setup',
     activeSubtab: 'subtab-dag',
     centerView: 'tree', // 'tree', 'table', 'graph'
     jsonViewerCache: {},
@@ -773,7 +773,22 @@
       p.classList.toggle('active', p.id === tabId);
     });
 
-    if (tabId === 'tab-investigation-overview') {
+    if (tabId === 'tab-target-setup') {
+      if (typeof syncTargetInputs === 'function') syncTargetInputs();
+    } else if (tabId === 'tab-runtime-explorer') {
+      if (teState && teState.targetPid && (!teState.mappings || teState.mappings.length === 0)) {
+        if (typeof loadTemporalMemoryMap === 'function') loadTemporalMemoryMap(false);
+      }
+      if (typeof renderTeThreads === 'function') renderTeThreads();
+      if (typeof renderTeMappings === 'function') renderTeMappings();
+      if (typeof renderTeDiscoverableVars === 'function') renderTeDiscoverableVars();
+    } else if (tabId === 'tab-watch-list') {
+      if (typeof renderTeWatchList === 'function') renderTeWatchList();
+    } else if (tabId === 'tab-timeline-compare') {
+      if (typeof populateCompareDropdowns === 'function') populateCompareDropdowns();
+      if (typeof renderTemporalCurrentSnapshot === 'function') renderTemporalCurrentSnapshot();
+      if (typeof renderTemporalMatrix === 'function') renderTemporalMatrix();
+    } else if (tabId === 'tab-investigation-overview') {
       renderInvestigationOverview();
     } else if (tabId === 'tab-object-explorer') {
       renderMemoryObjectsList();
@@ -8171,12 +8186,15 @@
   function renderTeThreads() {
     const tbody = document.getElementById('te-threads-tbody');
     const countEl = document.getElementById('te-threads-count');
+    const summaryEl = document.getElementById('re-txt-threads-summary');
     if (!tbody) return;
 
-    if (countEl) countEl.textContent = `${teState.threads.length} threads`;
+    const countText = `${teState.threads.length} threads`;
+    if (countEl) countEl.textContent = countText;
+    if (summaryEl) summaryEl.textContent = countText;
 
     if (teState.threads.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted py-3">No active threads discovered</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">No active threads discovered</td></tr>';
       return;
     }
 
@@ -8184,17 +8202,32 @@
       const stateBadge = t.state === 'R'
         ? '<span class="badge badge-success">Running (R)</span>'
         : (t.state === 'S' ? '<span class="badge badge-neutral">Sleeping (S)</span>' : `<span class="badge">${escapeHtml(t.state)}</span>`);
+
+      let stackStr = '<span class="badge badge-neutral text-xs">UNAVAILABLE</span>';
+      if (t.stack_info && t.stack_info.status === 'AVAILABLE') {
+        const sizeKb = Math.round((t.stack_info.stack_size || 0) / 1024);
+        stackStr = `<span class="mono text-xs">${escapeHtml(t.stack_info.stack_start)} - ${escapeHtml(t.stack_info.stack_end)} (${sizeKb} KB)</span>`;
+      }
+
+      const localReason = t.local_variables?.reason || 'Stack frame inspection requires an active debugger backend (GDB/ptrace frame unwind).';
+      const localBadge = `<span class="badge badge-neutral text-xs" title="${escapeHtml(localReason)}">UNSUPPORTED</span>`;
+
       return `<tr>
         <td class="mono font-bold">${t.tid}</td>
         <td>${escapeHtml(t.name)}</td>
         <td>${stateBadge}</td>
+        <td>${stackStr}</td>
+        <td>${localBadge}</td>
       </tr>`;
     }).join('');
   }
 
   function renderTeMappings() {
     const tbody = document.getElementById('te-mappings-tbody');
+    const summaryEl = document.getElementById('re-txt-maps-summary');
     if (!tbody) return;
+
+    if (summaryEl) summaryEl.textContent = `${teState.mappings.length} Maps`;
 
     let filtered = teState.mappings;
     if (teState.mapFilter !== 'all') {
@@ -8214,8 +8247,8 @@
     tbody.innerHTML = filtered.map((m) => {
       const catBadgeClass = m.category === 'heap' ? 'badge-warning' : (m.category === 'stack' ? 'badge-info' : (m.category === 'code' ? 'badge-success' : 'badge-neutral'));
       const sizeKb = Math.round(m.size / 1024);
-      return `<tr>
-        <td class="mono">${escapeHtml(m.start)} - ${escapeHtml(m.end)}</td>
+      return `<tr class="cursor-pointer hover-highlight" onclick="window.__onSelectMappingRow('${escapeHtml(m.start)}', ${Math.min(512, m.size)})" title="Click to inspect bounded memory slice">
+        <td class="mono text-accent font-semibold">${escapeHtml(m.start)} - ${escapeHtml(m.end)}</td>
         <td class="mono">${sizeKb} KB</td>
         <td class="mono font-semibold">${escapeHtml(m.permissions)}</td>
         <td><span class="badge ${catBadgeClass}">${escapeHtml(m.category)}</span></td>
@@ -8224,10 +8257,23 @@
     }).join('');
   }
 
+  window.__onSelectMappingRow = function (startAddr, size) {
+    const inputAddr = document.getElementById('input-inspect-address');
+    const selectSize = document.getElementById('select-inspect-size');
+    if (inputAddr) inputAddr.value = startAddr;
+    if (selectSize) selectSize.value = String(size >= 128 ? 128 : 64);
+    if (typeof handleInspectMemoryRange === 'function') {
+      handleInspectMemoryRange(startAddr, size >= 128 ? 128 : 64);
+    }
+  };
+
   function renderTeDiscoverableVars() {
     const tbody = document.getElementById('te-vars-tbody');
     const inputSearch = document.getElementById('te-var-search');
+    const summaryEl = document.getElementById('re-txt-vars-summary');
     if (!tbody) return;
+
+    if (summaryEl) summaryEl.textContent = `${teState.discoverableVars.length} Variables`;
 
     const query = inputSearch ? inputSearch.value.trim().toLowerCase() : '';
     let filtered = teState.discoverableVars;
@@ -8243,7 +8289,7 @@
       const msg = teState.discoverableVars.length === 0
         ? 'Load companion ELF with DWARF to discover variables'
         : 'No variables match search query';
-      tbody.innerHTML = `<tr><td colspan="6" class="text-center text-muted py-3">${escapeHtml(msg)}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted py-3">${escapeHtml(msg)}</td></tr>`;
       return;
     }
 
@@ -8251,7 +8297,7 @@
       const isAlreadyWatched = teState.watchItems.some((w) => w.name === v.name || w.address === v.runtime_address);
       const btnAction = isAlreadyWatched
         ? '<span class="badge badge-success">✓ Watching</span>'
-        : `<button type="button" class="btn btn-xs btn-outline" onclick="window.__addTeWatchFromVar(${idx})">➕ Watch</button>`;
+        : `<button type="button" class="btn btn-xs btn-outline btn-add-var-watch" onclick="window.__addTeWatchFromVar(${idx})">➕ Watch</button>`;
 
       return `<tr>
         <td class="mono font-bold text-accent">${escapeHtml(v.name)}</td>
@@ -8259,6 +8305,7 @@
         <td class="mono">${escapeHtml(v.runtime_address)}</td>
         <td class="mono">${v.size} bytes</td>
         <td class="text-muted text-xs">${escapeHtml(v.source_location || 'unknown')}</td>
+        <td><span class="badge badge-secondary text-xs">${escapeHtml(v.scope || 'global')}</span></td>
         <td>${btnAction}</td>
       </tr>`;
     }).join('');
@@ -8270,6 +8317,7 @@
 
     addWatchItem({
       name: v.name,
+      source: 'global_variable',
       scope: 'global',
       address: v.runtime_address,
       type_name: v.type_name,
@@ -8296,6 +8344,7 @@
 
     await addWatchItem({
       name: name || `range_${addr}`,
+      source: 'custom_range',
       scope: 'address_range',
       address: addr,
       type_name: type_name,
@@ -8307,11 +8356,12 @@
   }
 
   async function addWatchItem(itemObj) {
+    const source = itemObj.source || (itemObj.scope === 'address_range' ? 'custom_range' : 'global_variable');
     if (teState.sessionId) {
       // Session is active: dispatch via REST API
       const res = await apiPost(`/api/watch/session/${teState.sessionId}/watch`, {
         action: 'add',
-        item: itemObj,
+        item: { ...itemObj, source: source },
       });
       if (res.success && res.data) {
         // Refresh session
@@ -8330,6 +8380,7 @@
       teState.watchItems.push({
         item_id: itemId,
         name: itemObj.name,
+        source: source,
         scope: itemObj.scope || 'global',
         address: typeof itemObj.address === 'string' ? itemObj.address : `0x${addrInt.toString(16)}`,
         address_int: addrInt,
@@ -8367,23 +8418,43 @@
 
   function renderTeWatchList() {
     const tbody = document.getElementById('te-watchlist-tbody');
+    const countBadge = document.getElementById('watchlist-count-badge');
     if (!tbody) return;
 
+    if (countBadge) countBadge.textContent = `${teState.watchItems.length} items`;
+
     if (teState.watchItems.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-3">No watch items selected. Pick from variables above or add a custom range.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-3">No watch items selected. Pick from variables above or add a custom range.</td></tr>';
       return;
     }
 
+    const latestObs = teState.observations.length > 0 ? teState.observations[teState.observations.length - 1] : null;
+
     tbody.innerHTML = teState.watchItems.map((w) => {
       const stBadgeClass = w.status === 'ACTIVE' ? 'badge-success' : 'badge-neutral';
+      const itemVal = latestObs && latestObs.values ? latestObs.values[w.item_id] : null;
+
+      let latestDisplay = '<span class="text-muted">Not captured</span>';
+      if (itemVal) {
+        if (itemVal.status === 'UNREADABLE') {
+          latestDisplay = '<span class="badge badge-danger text-xs">UNREADABLE</span>';
+        } else if (itemVal.status === 'PARTIAL') {
+          latestDisplay = '<span class="badge badge-warning text-xs">PARTIAL</span>';
+        } else if (itemVal.value !== undefined && itemVal.value !== null) {
+          latestDisplay = `<span class="mono font-bold text-accent">${escapeHtml(String(itemVal.value))}</span>`;
+        }
+      }
+
       return `<tr>
         <td class="mono text-xs text-muted">${escapeHtml(w.item_id)}</td>
         <td class="mono font-bold text-accent">${escapeHtml(w.name)}</td>
-        <td><span class="badge badge-secondary">${escapeHtml(w.scope)}</span></td>
+        <td><span class="badge badge-neutral text-xs">${escapeHtml(w.source || 'global_variable')}</span></td>
+        <td><span class="badge badge-secondary text-xs">${escapeHtml(w.scope || 'global')}</span></td>
         <td class="mono">${escapeHtml(w.type_name)}</td>
         <td class="mono">${escapeHtml(w.address)}</td>
         <td class="mono">${w.size}B</td>
         <td><span class="badge ${stBadgeClass}">${escapeHtml(w.status)}</span></td>
+        <td>${latestDisplay}</td>
         <td>
           <button type="button" class="btn btn-xs btn-outline" onclick="window.__removeTeWatchItem('${escapeHtml(w.item_id)}')">🗑️ Remove</button>
         </td>
@@ -8771,6 +8842,512 @@
   }
 
   // --------------------------------------------------------------------------
+  // Phase 28: Runtime Memory Explorer & Step-by-Step Investigation Workflow
+  // --------------------------------------------------------------------------
+
+  function syncTargetInputs() {
+    const inputPid = document.getElementById('te-target-pid');
+    const inputElf = document.getElementById('te-companion-elf');
+    const basicPid = document.getElementById('basic-target-pid');
+    const basicElf = document.getElementById('basic-debug-image');
+
+    if (inputPid && !inputPid.value && basicPid && basicPid.value) {
+      inputPid.value = basicPid.value;
+    }
+    if (inputElf && !inputElf.value && basicElf && basicElf.value) {
+      inputElf.value = basicElf.value;
+    }
+  }
+
+  async function handleValidateTarget() {
+    const inputPid = document.getElementById('te-target-pid');
+    const inputElf = document.getElementById('te-companion-elf');
+    const pidVal = inputPid ? inputPid.value.trim() : '';
+    const elfVal = inputElf ? inputElf.value.trim() : '';
+
+    if (!pidVal) {
+      showToastNotification('Please enter a target PID', 'warning');
+      return;
+    }
+    const pid = parseInt(pidVal, 10);
+    if (isNaN(pid) || pid <= 0) {
+      showToastNotification('Target PID must be a positive integer', 'warning');
+      return;
+    }
+
+    const btnVal = document.getElementById('btn-validate-target');
+    if (btnVal) btnVal.disabled = true;
+
+    try {
+      const res = await apiPost('/api/investigation/validate-target', {
+        pid: pid,
+        debug_image: elfVal,
+        locale: state.currentLang || 'en'
+      });
+
+      const resDiv = document.getElementById('target-validation-results');
+      const badgeConn = document.getElementById('target-conn-badge');
+      const badgeBackend = document.getElementById('target-backend-badge');
+      const feedbackBanner = document.getElementById('diag-feedback-banner');
+
+      if (res.success && res.data) {
+        const d = res.data;
+        if (d.valid) {
+          teState.targetPid = d.pid;
+          teState.companionElf = d.debug_image_path || elfVal;
+          if (badgeConn) {
+            badgeConn.textContent = 'CONNECTED';
+            badgeConn.className = 'badge badge-success';
+          }
+          if (badgeBackend) {
+            badgeBackend.textContent = `BACKEND: ${d.backend || 'process_vm_readv'}`;
+            badgeBackend.className = 'badge badge-info';
+          }
+          if (resDiv) resDiv.style.display = 'block';
+
+          const elExe = document.getElementById('diag-val-executable');
+          const elTB = document.getElementById('diag-val-target-buildid');
+          const elDB = document.getElementById('diag-val-debug-buildid');
+          const elArch = document.getElementById('diag-val-arch');
+          const elDwarf = document.getElementById('diag-val-dwarf');
+          const elBackend = document.getElementById('diag-val-backend');
+
+          if (elExe) elExe.textContent = d.executable_path || `PID ${d.pid}`;
+          if (elTB) elTB.textContent = d.target_build_id ? d.target_build_id.slice(0, 16) + '...' : 'N/A';
+          if (elDB) elDB.textContent = d.debug_image_build_id ? d.debug_image_build_id.slice(0, 16) + '...' : 'N/A';
+          if (elArch) elArch.textContent = `${d.arch || 'x86_64'} (${d.endian || 'little'})`;
+          if (elDwarf) {
+            elDwarf.textContent = d.has_dwarf ? 'VERIFIED' : 'NONE';
+            elDwarf.className = `badge ${d.has_dwarf ? 'badge-success' : 'badge-danger'} text-xs`;
+          }
+          if (elBackend) elBackend.textContent = d.backend || 'process_vm_readv';
+
+          if (feedbackBanner) {
+            if (d.build_id_match === false) {
+              feedbackBanner.className = 'banner banner-danger mb-3 text-xs';
+              feedbackBanner.style.display = 'block';
+              feedbackBanner.innerHTML = '<strong>⚠️ Build ID Mismatch:</strong> Companion debug ELF Build ID does not match running binary. Addresses may be invalid.';
+            } else {
+              feedbackBanner.className = 'banner banner-success mb-3 text-xs';
+              feedbackBanner.style.display = 'block';
+              feedbackBanner.innerHTML = '<strong>✓ Validation Passed:</strong> Target readable via ' + (d.backend || 'process_vm_readv') + ' with verified DWARF symbols.';
+            }
+          }
+
+          // Preload mappings and threads in background
+          loadTemporalMemoryMap(false);
+          showToastNotification('Target successfully validated and connected', 'success');
+        } else {
+          // Valid is false
+          if (badgeConn) {
+            badgeConn.textContent = 'VALIDATION FAILED';
+            badgeConn.className = 'badge badge-danger';
+          }
+          if (resDiv) resDiv.style.display = 'block';
+          if (feedbackBanner) {
+            feedbackBanner.className = 'banner banner-danger mb-3 text-xs';
+            feedbackBanner.style.display = 'block';
+            feedbackBanner.innerHTML = `<strong>⚠️ ${escapeHtml(d.reason || 'Validation Failed')}:</strong> ${escapeHtml(d.message || '')}<br><span class="text-muted">Next action: ${escapeHtml(d.next_action || '')}</span>`;
+          }
+          showToastNotification(d.message || 'Validation failed', 'error');
+        }
+      } else {
+        const errMsg = res.error?.message || 'Target validation request failed';
+        showToastNotification(errMsg, 'error');
+        if (feedbackBanner) {
+          feedbackBanner.className = 'banner banner-danger mb-3 text-xs';
+          feedbackBanner.style.display = 'block';
+          feedbackBanner.innerHTML = `<strong>⚠️ Error:</strong> ${escapeHtml(errMsg)}`;
+        }
+      }
+    } catch (err) {
+      showToastNotification(`Target validation error: ${err}`, 'error');
+    } finally {
+      if (btnVal) btnVal.disabled = false;
+    }
+  }
+
+  let lastInspectedRange = null;
+
+  async function handleInspectMemoryRange(customAddr = null, customSize = null) {
+    const inputAddr = document.getElementById('input-inspect-address');
+    const selectSize = document.getElementById('select-inspect-size');
+    const addr = customAddr || (inputAddr ? inputAddr.value.trim() : '');
+    const size = customSize || (selectSize ? parseInt(selectSize.value, 10) : 128);
+
+    if (!addr) {
+      showToastNotification('Enter or click an address to inspect', 'warning');
+      return;
+    }
+    const pid = teState.targetPid || (document.getElementById('te-target-pid')?.value.trim());
+    if (!pid) {
+      showToastNotification('Target PID is required before memory inspection', 'warning');
+      return;
+    }
+
+    const hexDumpEl = document.getElementById('inspector-hex-dump');
+    const dwarfMatchEl = document.getElementById('inspector-dwarf-match');
+    if (hexDumpEl) hexDumpEl.innerHTML = '<span class="text-muted">Reading memory slice...</span>';
+
+    try {
+      const companionElf = teState.companionElf || (document.getElementById('te-companion-elf')?.value.trim());
+      let url = `/api/target/inspect-range?pid=${encodeURIComponent(pid)}&address=${encodeURIComponent(addr)}&size=${size}`;
+      if (companionElf) {
+        url += `&companion_elf=${encodeURIComponent(companionElf)}`;
+      }
+      const res = await apiGet(url);
+      if (res.success && res.data) {
+        lastInspectedRange = res.data;
+        const d = res.data;
+        if (dwarfMatchEl) {
+          if (d.dwarf_match) {
+            const dm = d.dwarf_match;
+            dwarfMatchEl.className = 'banner banner-info text-xs mb-2';
+            dwarfMatchEl.style.display = 'block';
+            dwarfMatchEl.innerHTML = `<span>🔍</span> <strong>Matches DWARF Variable:</strong> <code>${escapeHtml(dm.name)}</code> (${escapeHtml(dm.type_name)}, ${dm.size} bytes) @ <code>${escapeHtml(dm.runtime_address)}</code>`;
+          } else {
+            dwarfMatchEl.style.display = 'none';
+          }
+        }
+
+        if (hexDumpEl) {
+          if (d.status === 'UNMAPPED' || d.status === 'ERROR') {
+            hexDumpEl.innerHTML = `<span class="badge badge-danger">READ FAILED</span> <span class="text-danger">${escapeHtml(d.error || 'Address range unmapped or inaccessible')}</span>`;
+          } else {
+            const addrInt = typeof d.address === 'string' && d.address.startsWith('0x') ? parseInt(d.address, 16) : parseInt(d.address, 10);
+            const dumpText = formatHexDumpLines(addrInt, d.raw_hex || '');
+            const badgePart = d.status === 'PARTIAL' ? '<div class="mb-1"><span class="badge badge-warning">PARTIAL READ</span> Only ' + d.bytes_read + ' of ' + d.size + ' bytes accessible</div>' : '';
+            hexDumpEl.innerHTML = badgePart + `<pre class="mono" style="margin: 0; font-size: 11px;">${dumpText}</pre>`;
+          }
+        }
+      } else {
+        if (hexDumpEl) hexDumpEl.innerHTML = `<span class="badge badge-danger">ERROR</span> <span class="text-danger">${escapeHtml(res.error?.message || 'Failed to inspect range')}</span>`;
+      }
+    } catch (err) {
+      if (hexDumpEl) hexDumpEl.innerHTML = `<span class="badge badge-danger">ERROR</span> <span class="text-danger">${escapeHtml(String(err))}</span>`;
+    }
+  }
+
+  function formatHexDumpLines(startAddr, hexStr) {
+    if (!hexStr) return '(empty memory bytes)';
+    const bytes = [];
+    for (let i = 0; i < hexStr.length; i += 2) {
+      bytes.push(hexStr.substr(i, 2));
+    }
+    const lines = [];
+    const lineSize = 16;
+    for (let i = 0; i < bytes.length; i += lineSize) {
+      const slice = bytes.slice(i, i + lineSize);
+      const addrStr = '0x' + (startAddr + i).toString(16).padStart(12, '0');
+      const hexPart = slice.map((b) => b.toLowerCase()).join(' ');
+      const asciiPart = slice.map((b) => {
+        const code = parseInt(b, 16);
+        return (code >= 32 && code <= 126) ? String.fromCharCode(code) : '.';
+      }).join('');
+      lines.push(`${addrStr}:  ${hexPart.padEnd(48, ' ')}  |${asciiPart}|`);
+    }
+    return lines.join('\n');
+  }
+
+  function handleWatchInspectedRange() {
+    if (!lastInspectedRange || !lastInspectedRange.address) {
+      showToastNotification('Inspect a memory range first before watching', 'warning');
+      return;
+    }
+    const name = lastInspectedRange.dwarf_match ? lastInspectedRange.dwarf_match.name : `range_${lastInspectedRange.address}`;
+    addWatchItem({
+      name: name,
+      scope: 'address_range',
+      source: lastInspectedRange.dwarf_match ? 'global_variable' : 'memory_map',
+      address: lastInspectedRange.address,
+      type_name: lastInspectedRange.dwarf_match ? lastInspectedRange.dwarf_match.type_name : 'raw_bytes',
+      size: lastInspectedRange.size || 128
+    });
+  }
+
+  async function handleCaptureSnapshotNow() {
+    const inputPid = document.getElementById('te-target-pid');
+    const inputElf = document.getElementById('te-companion-elf');
+    const pidVal = teState.targetPid || (inputPid ? inputPid.value.trim() : '');
+    const elfVal = teState.companionElf || (inputElf ? inputElf.value.trim() : '');
+
+    if (!pidVal) {
+      showToastNotification('Please validate or specify a target PID first', 'warning');
+      return;
+    }
+    const pid = parseInt(pidVal, 10);
+
+    const btnCapture = document.getElementById('btn-manual-capture-now');
+    const btnBaseline = document.getElementById('btn-capture-baseline');
+    if (btnCapture) btnCapture.disabled = true;
+    if (btnBaseline) btnBaseline.disabled = true;
+
+    try {
+      // If no session exists, create one
+      if (!teState.sessionId) {
+        const createRes = await apiPost('/api/watch/session/create', {
+          pid: pid,
+          companion_elf: elfVal,
+          interval_ms: 1000,
+          max_samples: 1000,
+          watch_items: teState.watchItems
+        });
+        if (createRes.success && createRes.data) {
+          teState.sessionId = createRes.data.session_id;
+          teState.status = createRes.data.status || 'ACTIVE';
+          teState.watchItems = createRes.data.watch_items || teState.watchItems;
+        } else {
+          showToastNotification(createRes.error?.message || 'Failed to initialize session for capture', 'error');
+          return;
+        }
+      }
+
+      // Execute synchronous capture
+      const capRes = await apiPost(`/api/watch/session/${teState.sessionId}/capture`, {});
+      if (capRes.success && capRes.data) {
+        const obs = capRes.data;
+        teState.observations.push(obs);
+        teState.currentIndex = teState.observations.length - 1;
+
+        // Update stats
+        const statSamples = document.getElementById('te-stat-samples');
+        const statLatency = document.getElementById('te-stat-latency');
+        const statSessId = document.getElementById('te-stat-session-id');
+        if (statSamples) statSamples.textContent = teState.observations.length;
+        if (statLatency) statLatency.textContent = `${obs.capture_latency_us} µs`;
+        if (statSessId) statSessId.textContent = teState.sessionId;
+
+        // Refresh UI components
+        renderTeWatchList();
+        renderTemporalCurrentSnapshot();
+        renderTemporalMatrix();
+        populateCompareDropdowns();
+
+        showToastNotification(`Captured snapshot #${obs.seq} (${obs.capture_latency_us} µs, Zero-Stop)`, 'success');
+      } else {
+        showToastNotification(capRes.error?.message || 'Capture failed', 'error');
+      }
+    } catch (err) {
+      showToastNotification(`Error capturing snapshot: ${err}`, 'error');
+    } finally {
+      if (btnCapture) btnCapture.disabled = false;
+      if (btnBaseline) btnBaseline.disabled = false;
+    }
+  }
+
+  function populateCompareDropdowns() {
+    const selA = document.getElementById('select-cmp-snap-a');
+    const selB = document.getElementById('select-cmp-snap-b');
+    if (!selA || !selB) return;
+
+    const count = teState.observations.length;
+    if (count === 0) {
+      selA.innerHTML = '<option value="">(No snapshots)</option>';
+      selB.innerHTML = '<option value="">(No snapshots)</option>';
+      return;
+    }
+
+    const prevValA = selA.value;
+    const prevValB = selB.value;
+
+    const optsA = [];
+    const optsB = [];
+
+    teState.observations.forEach((o, idx) => {
+      const timeStr = o.timestamp ? o.timestamp.slice(11, 19) : String(idx);
+      const label = `#${o.seq} (${timeStr})`;
+      optsA.push(`<option value="${o.seq}">${label}</option>`);
+      optsB.push(`<option value="${o.seq}">${label}</option>`);
+    });
+
+    selA.innerHTML = optsA.join('');
+    selB.innerHTML = optsB.join('');
+
+    // Default: Snap A is second-to-last or first, Snap B is latest
+    if (count >= 2) {
+      selA.value = prevValA || teState.observations[count - 2].seq;
+      selB.value = prevValB || teState.observations[count - 1].seq;
+    } else {
+      selA.value = teState.observations[0].seq;
+      selB.value = teState.observations[0].seq;
+    }
+  }
+
+  let lastComparisonResult = null;
+
+  async function handleExecuteSnapshotCompare() {
+    const selA = document.getElementById('select-cmp-snap-a');
+    const selB = document.getElementById('select-cmp-snap-b');
+    if (!selA || !selB) return;
+
+    const seqA = parseInt(selA.value, 10);
+    const seqB = parseInt(selB.value, 10);
+
+    if (isNaN(seqA) || isNaN(seqB)) {
+      showToastNotification('Please select two snapshots to compare', 'warning');
+      return;
+    }
+
+    if (!teState.sessionId) {
+      showToastNotification('Active watch session required for comparison', 'warning');
+      return;
+    }
+
+    const btnCmp = document.getElementById('btn-execute-compare');
+    if (btnCmp) btnCmp.disabled = true;
+
+    try {
+      const res = await apiPost(`/api/watch/session/${teState.sessionId}/compare`, {
+        seq_a: seqA,
+        seq_b: seqB
+      });
+
+      if (res.success && res.data) {
+        lastComparisonResult = res.data;
+        renderSnapshotDiffs(res.data);
+        showToastNotification(`Compared Snapshot #${seqA} and #${seqB}`, 'success');
+      } else {
+        showToastNotification(res.error?.message || 'Comparison failed', 'error');
+      }
+    } catch (err) {
+      showToastNotification(`Comparison error: ${err}`, 'error');
+    } finally {
+      if (btnCmp) btnCmp.disabled = false;
+    }
+  }
+
+  function renderSnapshotDiffs(data) {
+    const sumRow = document.getElementById('compare-summary-row');
+    const tbody = document.getElementById('tbody-snapshot-diffs');
+    if (!tbody) return;
+
+    if (sumRow) {
+      sumRow.style.display = 'flex';
+      const s = data.summary || {};
+      const elChg = document.getElementById('cmp-badge-changed');
+      const elUnc = document.getElementById('cmp-badge-unchanged');
+      const elUnr = document.getElementById('cmp-badge-unreadable');
+      const elPart = document.getElementById('cmp-badge-partial');
+      const elMis = document.getElementById('cmp-badge-missing');
+      const elUnk = document.getElementById('cmp-badge-unknown');
+
+      if (elChg) elChg.textContent = `${s.changed_count || 0} Changed`;
+      if (elUnc) elUnc.textContent = `${s.unchanged_count || 0} Unchanged`;
+      if (elUnr) elUnr.textContent = `${s.unreadable_count || 0} Unreadable`;
+      if (elPart) elPart.textContent = `${s.partial_count || 0} Partial`;
+      if (elMis) elMis.textContent = `${s.missing_count || 0} Missing`;
+      if (elUnk) elUnk.textContent = `${s.unknown_count || 0} Unknown`;
+    }
+
+    const diffs = data.diffs || [];
+    if (diffs.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">No watch items compared</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = diffs.map((d) => {
+      const stateBadgeClass = {
+        'CHANGED': 'badge-diff-changed',
+        'UNCHANGED': 'badge-diff-unchanged',
+        'UNREADABLE': 'badge-diff-unreadable',
+        'PARTIAL': 'badge-diff-partial',
+        'MISSING': 'badge-diff-missing',
+        'UNKNOWN': 'badge-diff-unknown'
+      }[d.diff_state] || 'badge-diff-unknown';
+
+      const valAStr = d.value_a !== null && d.value_a !== undefined ? escapeHtml(String(d.value_a)) : '<span class="text-muted">None</span>';
+      const valBStr = d.value_b !== null && d.value_b !== undefined ? escapeHtml(String(d.value_b)) : '<span class="text-muted">None</span>';
+      const hexAStr = d.raw_hex_a ? `<div class="mono text-muted text-xs">0x${d.raw_hex_a}</div>` : '';
+      const hexBStr = d.raw_hex_b ? `<div class="mono text-muted text-xs">0x${d.raw_hex_b}</div>` : '';
+
+      let ptrSemantics = '<span class="text-muted">&mdash;</span>';
+      if (d.is_pointer) {
+        if (d.pointer_change_type === 'POINTER_ADDRESS_CHANGED') {
+          ptrSemantics = '<span class="badge badge-warning text-xs">Pointer Target Reassigned</span>';
+        } else if (d.pointer_change_type === 'REFERENCED_MEMORY_CHANGED') {
+          ptrSemantics = '<span class="badge badge-info text-xs">Referenced Memory Mutated</span>';
+        } else {
+          ptrSemantics = '<span class="text-muted text-xs">Pointer Target Stable</span>';
+        }
+      }
+
+      return `<tr>
+        <td class="mono font-bold text-accent">${escapeHtml(d.name)}</td>
+        <td class="mono text-muted text-xs">${escapeHtml(d.type_name)} @ ${escapeHtml(d.address)}</td>
+        <td><span class="badge ${stateBadgeClass}">${escapeHtml(d.diff_state)}</span></td>
+        <td><span class="mono">${valAStr}</span>${hexAStr}</td>
+        <td><span class="mono font-bold">${valBStr}</span>${hexBStr}</td>
+        <td>${ptrSemantics}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function handleSendDiffToInvestigation() {
+    if (!lastComparisonResult) {
+      showToastNotification('Perform a snapshot comparison first', 'warning');
+      return;
+    }
+
+    const c = lastComparisonResult;
+    const changed = (c.diffs || []).filter((d) => d.diff_state === 'CHANGED');
+    const changedNames = changed.map((d) => `${d.name} (${d.value_a} -> ${d.value_b})`).join(', ');
+
+    const goal = changed.length > 0
+      ? `Investigate state mutation between snapshot #${c.seq_a} and #${c.seq_b}: ${changedNames}`
+      : `Investigate state between snapshot #${c.seq_a} and #${c.seq_b} (${c.summary?.total_items || 0} watched items)`;
+
+    // Set goal input
+    const basicGoal = document.getElementById('basic-investigation-goal');
+    const invGoal = document.getElementById('inv-input-goal');
+    if (basicGoal) basicGoal.value = goal;
+    if (invGoal) invGoal.value = goal;
+
+    // Set watch session selector
+    const basicWatch = document.getElementById('basic-select-watch-session');
+    if (basicWatch && teState.sessionId) {
+      basicWatch.value = teState.sessionId;
+    }
+
+    // Switch to Investigation tab
+    switchTab('tab-investigation-overview');
+    showToastNotification('Transferred snapshot diff context to investigation goal', 'success');
+  }
+
+  function initPhase28Handlers() {
+    const btnVal = document.getElementById('btn-validate-target');
+    const btnInspect = document.getElementById('btn-inspect-runtime');
+    const btnBaseline = document.getElementById('btn-capture-baseline');
+    const btnReRefresh = document.getElementById('btn-re-refresh');
+    const btnDoInspectRange = document.getElementById('btn-do-inspect-range');
+    const btnWatchInspected = document.getElementById('btn-watch-inspected-range');
+    const btnManualCapture = document.getElementById('btn-manual-capture-now');
+    const btnNavToInv = document.getElementById('btn-nav-to-investigation');
+    const btnExecuteCompare = document.getElementById('btn-execute-compare');
+    const btnSendDiff = document.getElementById('btn-send-diff-to-inv');
+
+    if (btnVal) btnVal.addEventListener('click', handleValidateTarget);
+    if (btnInspect) {
+      btnInspect.addEventListener('click', () => {
+        loadTemporalMemoryMap(true);
+        switchTab('tab-runtime-explorer');
+      });
+    }
+    if (btnBaseline) {
+      btnBaseline.addEventListener('click', async () => {
+        await handleCaptureSnapshotNow();
+        switchTab('tab-timeline-compare');
+      });
+    }
+    if (btnReRefresh) btnReRefresh.addEventListener('click', () => loadTemporalMemoryMap(true));
+    if (btnDoInspectRange) btnDoInspectRange.addEventListener('click', () => handleInspectMemoryRange());
+    if (btnWatchInspected) btnWatchInspected.addEventListener('click', handleWatchInspectedRange);
+    if (btnManualCapture) btnManualCapture.addEventListener('click', handleCaptureSnapshotNow);
+    if (btnNavToInv) btnNavToInv.addEventListener('click', () => switchTab('tab-investigation-overview'));
+    if (btnExecuteCompare) btnExecuteCompare.addEventListener('click', handleExecuteSnapshotCompare);
+    if (btnSendDiff) btnSendDiff.addEventListener('click', handleSendDiffToInvestigation);
+  }
+
+  // --------------------------------------------------------------------------
   // Application Bootstrap
   // --------------------------------------------------------------------------
 
@@ -8788,6 +9365,7 @@
     initConversationalInvestigation();
     initBasicModeHandlers();
     initTemporalExplorerHandlers();
+    initPhase28Handlers();
     bindEvents();
 
     await checkLLMProviderStatus();
