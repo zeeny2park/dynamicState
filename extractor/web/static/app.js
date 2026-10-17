@@ -7470,7 +7470,7 @@
         return;
       }
 
-      renderBasicDrilldownContent(res.data);
+      renderBasicDrilldownContent(res.data?.drilldown || res.data);
     } catch (err) {
       if (el.drilldownModalLoading) el.drilldownModalLoading.style.display = 'none';
       if (el.drilldownModalContent) {
@@ -7488,31 +7488,71 @@
     if (!el.drilldownModalContent) return;
     el.drilldownModalContent.style.display = 'block';
 
-    const f = data.finding || data;
-    const provenance = f.temporal_provenance || data.temporal_provenance || {};
-    const dwarf = data.dwarf_source || f.dwarf_source || {};
-    const functions = data.related_functions || f.related_functions || [];
-    const evidence = data.evidence_records || f.evidence_records || [];
-    const uncertainty = data.uncertainty || f.uncertainty || null;
-    const nextSteps = data.next_steps || f.next_steps || [];
+    const drill = data?.drilldown || data || {};
+    const f = drill.finding || drill || {};
+    const obj = drill.target_object || drill.path || {};
+    const dwarf = drill.dwarf_symbol || drill.dwarf || drill.dwarf_source || f.dwarf_source || {};
+    const dwarfMeta = drill.dwarf || {};
+    const provenance = drill.temporal_provenance || f.temporal_provenance || {};
+    const functions = drill.function_candidates || drill.candidate_functions || drill.related_functions || f.function_candidates || f.related_functions || [];
+    const evidence = drill.evidence_records || drill.attribution_evidence || drill.attribution_records || f.evidence_records || [];
+    const uncertainty = drill.uncertainty || f.uncertainty || null;
+    const limitations = drill.limitations || (drill.capture_quality && drill.capture_quality.limitations) || [];
+    const nextSteps = drill.next_steps || f.next_steps || [];
 
     const isKo = state.currentLang === 'ko';
 
+    const firstEv = (evidence && evidence[0]) || {};
+    const firstEvDetails = firstEv.details || {};
+
+    const titleStr = f.title || drill.title || f.finding_id || drill.finding_id || 'Observation Finding';
+    const catStr = (f.category || drill.category || 'fact').toLowerCase();
+    const classStr = f.classification || drill.classification || (catStr === 'fact' ? 'OBSERVED_FACT' : (catStr === 'hypothesis' ? 'INFERRED_HYPOTHESIS' : 'FACT'));
+    const descStr = f.description || drill.description || '';
+    const pathStr = f.c_type_path || (obj.c_type_path && obj.c_type_path !== 'None.None' ? obj.c_type_path : null) || (f.field_name ? f.field_name : null);
+
+    const valObserved = f.observed_value !== undefined && f.observed_value !== null ? f.observed_value : (drill.values?.observed !== undefined ? drill.values.observed : null);
+    const beforeVal = f.before_value !== undefined && f.before_value !== null ? f.before_value : (drill.values?.before !== undefined ? drill.values.before : null);
+    const afterVal = f.after_value !== undefined && f.after_value !== null ? f.after_value : (drill.values?.after !== undefined ? drill.values.after : null);
+
+    // DWARF details
+    const srcLoc = dwarf.source_location || f.source_location || (dwarf.decl_file && dwarf.decl_file !== 'unknown' ? `${dwarf.decl_file}:${dwarf.decl_line || 0}` : null) || dwarfMeta.source_location || dwarfMeta.type_decl_location || f.type_decl_location;
+    const typeName = dwarf.type_name || dwarfMeta.type_name || f.type_name || obj.type;
+    const symbolName = dwarf.symbol_name || f.field_name || obj.field_name;
+    const buildId = dwarfMeta.build_id || dwarf.build_id || firstEvDetails.target_build_id || firstEvDetails.debug_build_id;
+    const debugImg = dwarfMeta.debug_image || dwarf.debug_image || firstEvDetails.debug_image || firstEvDetails.executable;
+    const buildIdStatus = dwarfMeta.build_id_status || dwarf.build_id_status || firstEvDetails.build_id_status;
+
+    // Temporal provenance details
+    const pSession = provenance.session_id || provenance.watch_session_id || firstEv.session_id;
+    const pSeq = provenance.observation_sequence !== undefined ? provenance.observation_sequence : (firstEvDetails.observation_sequence !== undefined ? firstEvDetails.observation_sequence : null);
+    const pTime = provenance.observation_timestamp || firstEv.timestamp;
+    const pQuality = provenance.capture_quality || firstEv.capture_quality || (firstEvDetails.build_id_status ? firstEvDetails.build_id_status : null);
+    const pAddr = provenance.address || firstEvDetails.address;
+    const pSource = provenance.provenance || firstEv.source || firstEvDetails.capture_source || firstEvDetails.capture_backend;
+    const fieldObs = provenance.field_observation;
+
+    const hasProv = Boolean(pSession || pSeq !== null || pTime || pQuality || pAddr || pSource || fieldObs);
+    const isIdentityFinding = String(f.finding_id || drill.finding_id || '').startsWith('fnd_id_') || titleStr.includes('Build ID');
+
     let html = `
       <div style="display: flex; flex-direction: column; gap: 12px;">
-        <!-- Card 1: Finding Overview & Provenance -->
+        <!-- Card 1: Finding Overview -->
         <div style="background: rgba(0,0,0,0.2); padding: 10px; border-radius: 6px; border-left: 3px solid var(--accent);">
           <div class="d-flex justify-content-between align-items-center">
-            <h4 style="margin: 0; font-size: 0.95rem;">${escapeHtml(f.title || f.finding_id || 'Observation Finding')}</h4>
-            <span class="badge ${f.category === 'fact' ? 'badge-success' : 'badge-warning'} text-xs">${escapeHtml((f.category || 'FACT').toUpperCase())}</span>
+            <h4 style="margin: 0; font-size: 0.95rem;">${escapeHtml(titleStr)}</h4>
+            <span class="badge ${catStr === 'fact' ? 'badge-success' : 'badge-warning'} text-xs">${escapeHtml(classStr)}</span>
           </div>
-          ${f.description ? `<div class="text-xs text-muted mt-1">${escapeHtml(f.description)}</div>` : ''}
-          ${f.c_type_path ? `<div class="text-xs mono mt-1"><strong>Path:</strong> ${escapeHtml(f.c_type_path)}</div>` : ''}
+          ${descStr ? `<div class="text-xs text-muted mt-1">${escapeHtml(descStr)}</div>` : ''}
+          ${pathStr ? `<div class="text-xs mono mt-1"><strong>Path:</strong> ${escapeHtml(pathStr)}</div>` : ''}
+          ${(beforeVal !== null && afterVal !== null) ? `
+            <div class="text-xs mono mt-1" style="color: var(--accent);">Transition: ${escapeHtml(String(beforeVal))} &rarr; ${escapeHtml(String(afterVal))}</div>
+          ` : ''}
           ${(f.current_value !== undefined && f.expected_value !== undefined) ? `
             <div class="text-xs mono mt-1" style="color: var(--danger);">current: ${escapeHtml(String(f.current_value))} != expected: ${escapeHtml(String(f.expected_value))}</div>
           ` : ''}
-          ${f.observed_value !== undefined ? `
-            <div class="text-xs mono mt-1"><strong>Observed:</strong> ${escapeHtml(String(f.observed_value))}</div>
+          ${valObserved !== null ? `
+            <div class="text-xs mono mt-1"><strong>Observed:</strong> ${escapeHtml(String(valObserved))}</div>
           ` : ''}
         </div>
 
@@ -7521,14 +7561,25 @@
           <h5 style="margin: 0 0 6px 0; font-size: 0.82rem; color: var(--text-muted); text-transform: uppercase;">
             ${isKo ? '⏱️ 시계열 관측 출처 (Temporal Provenance)' : '⏱️ Temporal Observation Provenance'}
           </h5>
-          <div class="d-flex flex-wrap gap-2 text-xs mono">
-            ${provenance.session_id ? `<div><span class="text-muted">Session:</span> ${escapeHtml(provenance.session_id)}</div>` : ''}
-            ${provenance.observation_sequence !== undefined ? `<div><span class="text-muted">Seq:</span> #${escapeHtml(String(provenance.observation_sequence))}</div>` : ''}
-            ${provenance.observation_timestamp ? `<div><span class="text-muted">Time:</span> ${escapeHtml(String(provenance.observation_timestamp))}</div>` : ''}
-            ${provenance.capture_quality ? `<div><span class="text-muted">Quality:</span> <span class="badge badge-neutral text-xs">${escapeHtml(provenance.capture_quality)}</span></div>` : ''}
-            ${provenance.address ? `<div><span class="text-muted">Address:</span> ${escapeHtml(provenance.address)}</div>` : ''}
-          </div>
-          ${provenance.provenance ? `<div class="text-xs text-muted mt-1">${escapeHtml(provenance.provenance)}</div>` : ''}
+          ${hasProv ? `
+            <div class="d-flex flex-wrap gap-2 text-xs mono">
+              ${pSession ? `<div><span class="text-muted">Session:</span> ${escapeHtml(pSession)}</div>` : ''}
+              ${pSeq !== null ? `<div><span class="text-muted">Seq:</span> #${escapeHtml(String(pSeq))}</div>` : ''}
+              ${pTime ? `<div><span class="text-muted">Time:</span> ${escapeHtml(String(pTime).replace('T', ' ').substring(0, 19))}</div>` : ''}
+              ${pQuality ? `<div><span class="text-muted">Quality:</span> <span class="badge badge-neutral text-xs">${escapeHtml(pQuality)}</span></div>` : ''}
+              ${pAddr ? `<div><span class="text-muted">Address:</span> ${escapeHtml(pAddr)}</div>` : ''}
+              ${pSource ? `<div><span class="text-muted">Source:</span> ${escapeHtml(pSource)}</div>` : ''}
+            </div>
+            ${fieldObs ? `
+              <div class="text-xs mono text-muted mt-1">
+                <strong>Observed Field:</strong> ${escapeHtml(fieldObs.path || fieldObs.field || '')} = ${escapeHtml(String(fieldObs.value))} (${escapeHtml(fieldObs.type || '')})
+              </div>
+            ` : ''}
+          ` : `
+            <div class="text-xs text-muted">
+              ${isKo ? '프로세스 스냅샷 기반 관측 항목입니다 (시계열 변경 추적 없음).' : 'Process snapshot observation (no temporal watch sequence required).'}
+            </div>
+          `}
         </div>
 
         <!-- Card 3: DWARF Type & Source Location -->
@@ -7537,12 +7588,18 @@
             ${isKo ? '🏷️ DWARF 심볼 및 소스 위치' : '🏷️ DWARF Symbol & Source Location'}
           </h5>
           <div class="text-xs mono">
-            ${(dwarf.file || dwarf.line) ? `<div><strong>Source:</strong> ${escapeHtml(dwarf.file || 'unknown')}:${escapeHtml(String(dwarf.line || 0))}</div>` : ''}
-            ${dwarf.symbol_name ? `<div><strong>Symbol:</strong> ${escapeHtml(dwarf.symbol_name)}</div>` : ''}
-            ${dwarf.type_name ? `<div><strong>Type:</strong> ${escapeHtml(dwarf.type_name)}</div>` : ''}
-            ${dwarf.build_id ? `<div><strong>Build ID:</strong> ${escapeHtml(dwarf.build_id)}</div>` : ''}
+            ${srcLoc ? `<div><strong>Source:</strong> ${escapeHtml(srcLoc)}</div>` : ''}
+            ${symbolName ? `<div><strong>Symbol:</strong> ${escapeHtml(symbolName)}</div>` : ''}
+            ${typeName ? `<div><strong>Type:</strong> ${escapeHtml(typeName)}</div>` : ''}
+            ${debugImg ? `<div><strong>Executable:</strong> ${escapeHtml(debugImg)}</div>` : ''}
+            ${buildId ? `<div><strong>Build ID:</strong> ${escapeHtml(buildId)} ${buildIdStatus ? `<span class="badge badge-success text-xs">${escapeHtml(buildIdStatus)}</span>` : ''}</div>` : ''}
           </div>
-          ${(!dwarf.file && !dwarf.type_name && !dwarf.symbol_name) ? `<div class="text-xs text-muted">${isKo ? 'DWARF 정보가 제공되지 않았거나 companion ELF 심볼이 누락되었습니다.' : 'No DWARF symbol information available for this finding.'}</div>` : ''}
+          ${(!srcLoc && !typeName && !symbolName && !buildId && !debugImg) ? `
+            <div class="text-xs text-muted">${isKo ? 'DWARF 정보가 제공되지 않았거나 companion ELF 심볼이 누락되었습니다.' : 'No DWARF symbol information available for this finding.'}</div>
+          ` : ''}
+          ${(isIdentityFinding && (buildId || debugImg)) ? `
+            <div class="text-xs text-muted mt-1">ℹ️ ${isKo ? '타깃 실행 파일 바이너리/Build ID 무결성 검증 심볼입니다.' : 'Binary image identity & Build ID integrity verification item.'}</div>
+          ` : ''}
         </div>
 
         <!-- Card 4: Related Function Candidates (Grounding & Safety Tier) -->
@@ -7552,21 +7609,24 @@
           </h5>
           ${functions.length > 0 ? functions.map(fn => {
             const fnName = fn.function_name || fn.name || 'candidate';
-            const tier = fn.plausibility || fn.candidate_tier || 'STATIC_CANDIDATE';
+            const tier = fn.candidate_tier || fn.plausibility || (fn.confirmed_root_cause ? 'VALIDATED_CAUSAL_FUNCTION' : 'STATIC_CANDIDATE');
             const isCausal = tier === 'VALIDATED_CAUSAL_FUNCTION';
             const badgeClass = isCausal ? 'badge-success' : 'badge-warning';
+            const fnSrc = fn.source_location || (fn.source_file ? `${fn.source_file}:${fn.source_line || 0}` : '');
+            const rationale = fn.reason || fn.rationale || fn.description || '';
+            const caveats = fn.limitations || fn.relationship_limitation || fn.tier_limitation || fn.caveats || '';
             return `
               <div style="margin-top: 6px; padding: 6px; background: rgba(0,0,0,0.2); border-radius: 4px; border-left: 2px solid ${isCausal ? 'var(--success)' : 'var(--warning)'};">
                 <div class="d-flex justify-content-between align-items-center">
                   <span class="mono font-bold" style="color: var(--accent); font-size: 0.85rem;">${escapeHtml(fnName)}()</span>
                   <span class="badge ${badgeClass} text-xs">${escapeHtml(tier)}</span>
                 </div>
-                ${fn.source_location ? `<div class="text-xs mono text-muted mt-1">Source: ${escapeHtml(fn.source_location)}</div>` : ''}
-                ${fn.rationale ? `<div class="text-xs mt-1">${escapeHtml(fn.rationale)}</div>` : ''}
-                ${fn.caveats ? `<div class="text-xs text-muted mt-1" style="font-style: italic;">⚠️ ${escapeHtml(fn.caveats)}</div>` : ''}
+                ${fnSrc ? `<div class="text-xs mono text-muted mt-1">Source: ${escapeHtml(fnSrc)}</div>` : ''}
+                ${rationale ? `<div class="text-xs mt-1">${escapeHtml(rationale)}</div>` : ''}
+                ${caveats ? `<div class="text-xs text-muted mt-1" style="font-style: italic;">⚠️ ${escapeHtml(caveats)}</div>` : ''}
               </div>
             `;
-          }).join('') : `<div class="text-xs text-muted">${isKo ? '연결된 함수 후보가 없습니다.' : 'No related function candidates found.'}</div>`}
+          }).join('') : `<div class="text-xs text-muted">${isIdentityFinding ? (isKo ? '바이너리 무결성/프로세스 진단 항목으로 연결된 변이 함수가 없습니다.' : 'Binary integrity item; no mutating function candidates.') : (isKo ? '연결된 함수 후보가 없습니다.' : 'No related function candidates found.')}</div>`}
         </div>
 
         <!-- Card 5: Canonical Evidence Ledger Records -->
@@ -7575,14 +7635,29 @@
             ${isKo ? '📜 근거 원장 기록 (Evidence Ledger Records)' : '📜 Canonical Evidence Ledger Records'}
           </h5>
           ${evidence.length > 0 ? `
-            <div style="max-height: 180px; overflow-y: auto;">
-              ${evidence.map(ev => `
-                <div class="text-xs p-1 mb-1 border-bottom mono d-flex justify-content-between">
-                  <span class="text-accent">${escapeHtml(ev.evidence_id || '-')}</span>
-                  <span class="badge badge-neutral text-xs">${escapeHtml(ev.source_type || 'OBSERVATION')}</span>
-                  <span class="text-muted">Seq #${escapeHtml(String(ev.observation_sequence || '-'))}</span>
-                </div>
-              `).join('')}
+            <div style="max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;">
+              ${evidence.map(ev => {
+                const evId = ev.evidence_id || '-';
+                const evType = ev.evidence_type || ev.source_type || ev.nature || 'OBSERVATION';
+                const evSeq = ev.observation_sequence !== undefined ? ev.observation_sequence : (ev.details && ev.details.observation_sequence);
+                const evObs = ev.observation || (ev.details && ev.details.build_id_reason) || '';
+                const evQuality = ev.capture_quality || (ev.details && ev.details.build_id_status);
+                const isAttVerified = ev.function_attribution_verified || ev.has_attestation;
+                return `
+                  <div class="text-xs p-2 mono" style="background: rgba(0,0,0,0.2); border-radius: 4px; border-left: 2px solid var(--accent);">
+                    <div class="d-flex justify-content-between align-items-center">
+                      <span class="text-accent font-bold">${escapeHtml(evId)}</span>
+                      <div class="d-flex align-items-center gap-1">
+                        <span class="badge badge-neutral text-xs">${escapeHtml(evType)}</span>
+                        ${evSeq !== undefined && evSeq !== null ? `<span class="text-muted text-xs">Seq #${escapeHtml(String(evSeq))}</span>` : ''}
+                        ${isAttVerified ? '<span class="badge badge-success text-xs">VERIFIED</span>' : ''}
+                        ${evQuality ? `<span class="badge badge-info text-xs">${escapeHtml(String(evQuality))}</span>` : ''}
+                      </div>
+                    </div>
+                    ${evObs ? `<div class="mt-1 text-muted" style="white-space: pre-wrap; font-family: inherit; font-size: 0.78rem;">${escapeHtml(evObs)}</div>` : ''}
+                  </div>
+                `;
+              }).join('')}
             </div>
           ` : `<div class="text-xs text-muted">${isKo ? '연결된 원장 기록이 없습니다.' : 'No supporting evidence ledger records found.'}</div>`}
         </div>
@@ -7591,6 +7666,15 @@
         ${uncertainty ? `
           <div class="banner banner-warning text-xs">
             <strong>⚠️ ${isKo ? '불확실성 및 한계 고지' : 'Uncertainty & Observation Limitations'}:</strong> ${escapeHtml(uncertainty)}
+          </div>
+        ` : ''}
+
+        ${limitations.length > 0 ? `
+          <div class="banner banner-warning text-xs">
+            <strong>⚠️ ${isKo ? '관측 환경 한계/제약' : 'Observation Limitations'}:</strong>
+            <ul style="margin: 4px 0 0 16px; padding: 0;">
+              ${limitations.map(l => `<li>${escapeHtml(l)}</li>`).join('')}
+            </ul>
           </div>
         ` : ''}
 

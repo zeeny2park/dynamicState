@@ -903,6 +903,60 @@ class TestPhase26RealExecutionQuality(unittest.TestCase):
         self.assertEqual(report.false_positive_causal_promotion_rate.numerator, 0)
         self.assertEqual(report.false_positive_causal_promotion_rate.denominator, 2)
 
+    # -------------------------------------------------------------------------
+    # Scenario 19: Finding Drilldown Grounding and Path Integrity
+    # -------------------------------------------------------------------------
+    def test_19_finding_drilldown_grounding_and_structure(self):
+        """Verify get_finding_drilldown returns properly structured DWARF and ledger data without 'None.None'."""
+        inv_manager = InvestigationManager(corpus_dir=self.corpus_dir)
+        session = InvestigationSession(
+            investigation_id="inv_test_drilldown",
+            goal="Test finding drilldown",
+            corpus_dir=self.corpus_dir,
+        )
+        session.target_ref = {"pid": 12345, "debug_image": "/tmp/app_debug.elf"}
+        inv_manager.sessions[session.investigation_id] = session
+
+        # 1. Identity finding without variable fields
+        id_finding = InvestigationFinding(
+            finding_id="fnd_id_test_01",
+            category="fact",
+            title="Debug Image Build ID Verified",
+            description="Target module and debug image Build IDs match.",
+            confidence="high",
+            status="VERIFIED",
+        )
+        session.findings.append(id_finding)
+
+        res = inv_manager.get_finding_drilldown(session.investigation_id, "fnd_id_test_01")
+        self.assertTrue(res.get("success"))
+        drill = res.get("drilldown", {})
+        self.assertEqual(drill.get("finding_id"), "fnd_id_test_01")
+        self.assertEqual(drill.get("title"), "Debug Image Build ID Verified")
+        self.assertIsNone(drill.get("path", {}).get("c_type_path"))
+        self.assertNotEqual(drill.get("path", {}).get("c_type_path"), "None.None")
+
+        # 2. Variable field finding
+        field_finding = InvestigationFinding(
+            finding_id="fnd_fld_test_02",
+            category="fact",
+            title="Observed Field: g_session.worker.state.counter",
+            description="Observed counter field in worker state",
+            c_type_path="g_session.worker.state.counter",
+            observed_value=42,
+            type_name="int",
+            source_location="tests/fixtures/real_runtime/main.cpp:10",
+        )
+        session.findings.append(field_finding)
+
+        res2 = inv_manager.get_finding_drilldown(session.investigation_id, "fnd_fld_test_02")
+        self.assertTrue(res2.get("success"))
+        drill2 = res2.get("drilldown", {})
+        self.assertEqual(drill2.get("path", {}).get("c_type_path"), "g_session.worker.state.counter")
+        self.assertEqual(drill2.get("target_object", {}).get("c_type_path"), "g_session.worker.state.counter")
+        self.assertEqual(drill2.get("dwarf", {}).get("source_location"), "tests/fixtures/real_runtime/main.cpp:10")
+
 
 if __name__ == "__main__":
     unittest.main()
+

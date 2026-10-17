@@ -2949,7 +2949,7 @@ class InvestigationManager:
 
         obj_id = target_finding.object_id
         field_name = target_finding.field_name or (target_finding.c_type_path.split(".")[-1] if target_finding.c_type_path else None)
-        c_path = target_finding.c_type_path or f"{obj_id}.{field_name}"
+        c_path = target_finding.c_type_path or (f"{obj_id}.{field_name}" if (obj_id and field_name) else None)
 
         # DWARF type / declaration
         type_name = target_finding.type_name
@@ -2970,8 +2970,8 @@ class InvestigationManager:
             ev_details = ev.details or {}
             ev_att = (ev.provenance or {}).get("verifier_attestation") or {}
             matches_field = (
-                ev_details.get("field_path") == c_path
-                or ev_att.get("field_path") == c_path
+                (c_path and ev_details.get("field_path") == c_path)
+                or (c_path and ev_att.get("field_path") == c_path)
                 or (field_name and field_name in str(ev.observation))
             )
             if matches_field:
