@@ -399,13 +399,26 @@ class TemporalInvestigationService:
         elif not isinstance(buf_size, int):
             buf_size = None
 
+        mmap_boundary = obs_win.get("memory_map_boundary") or obs_win.get("mapping_boundary") or constraints.get("memory_map_boundary")
+        if isinstance(mmap_boundary, str) and mmap_boundary.startswith("0x"):
+            mmap_boundary = int(mmap_boundary, 16)
+        elif isinstance(mmap_boundary, str) and mmap_boundary.isdigit():
+            mmap_boundary = int(mmap_boundary)
+        elif not isinstance(mmap_boundary, int):
+            mmap_boundary = None
+
         # Grounded boundary classification
+        # Note: A memory-map boundary is NEVER inferred to be a valid buffer boundary.
         boundary_kind = "UNKNOWN"
         if guard_addr is not None:
             boundary_kind = "CONFIGURED_GUARD_ADDRESS"
+            guard_addr = guard_addr & 0xFFFFFFFFFFFFFFFF
         elif buf_addr is not None and buf_size is not None:
-            guard_addr = buf_addr + buf_size
+            guard_addr = (buf_addr + buf_size) & 0xFFFFFFFFFFFFFFFF
             boundary_kind = "KNOWN_BUFFER_END"
+        elif mmap_boundary is not None:
+            guard_addr = mmap_boundary & 0xFFFFFFFFFFFFFFFF
+            boundary_kind = "MEMORY_MAP_BOUNDARY"
         else:
             boundary_kind = "UNKNOWN"
 
@@ -995,7 +1008,7 @@ class TemporalInvestigationService:
                     if ptr_num is not None:
                         ptr_num = ptr_num & 0xFFFFFFFFFFFFFFFF
                         # Skip null pointers and addresses outside user space
-                        if ptr_num == 0 or ptr_num > 0x00007FFFFFFFFFFF:
+                        if ptr_num == 0 or ptr_num > 0x7FFFFFFFFFFFFFFF:
                             continue
                         dist = abs(guard_target - ptr_num)
                         if closest_dist is None or dist < closest_dist:
@@ -1054,6 +1067,7 @@ class TemporalInvestigationService:
                             "capture_quality": "LOW_IMPACT",
                             "address": f"0x{closest_ptr_val:x}",
                             "guard_address": f"0x{guard_target:x}",
+                            "boundary_kind": plan.boundary_kind,
                             "distance_bytes": closest_dist,
                             "provenance": "LIVE_RUNTIME_CAPTURE",
                         },

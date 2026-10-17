@@ -126,6 +126,18 @@ Recursive Semantic Reachability Traversal
   (벤치마크 진위성 및 독립적 인과 검증 아키텍처 완성: 평가기(Evaluator)와 피평가 시스템(SUT) 간 완벽한 경계 분리 및 그라운드 트루스 누출 차단(적대적 누출 회귀 테스트 통과), 평가기 자체 단위 테스트(`EVALUATOR_UNIT_TEST`)와 실제 프로덕션 런타임 파이프라인(`REAL_RUNTIME_PRODUCT_PIPELINE`)의 점수 분리, 런타임 추적 부재 시 인과 함수를 정적 후보(`STATIC_CANDIDATE`)로 유지하고 인과 검증을 `UNPROVEN`으로 정직하게 보고(조작된 DIAGNOSTIC 추적 제거, 위양성률 0.0% 엄격 유지), 6대 시나리오 전반의 변이 소스·불변식·기대 관측 상태 명세 및 시나리오 6 음성 대조군(Negative Control) 정합성 복원, 시나리오 5 크로스 스레드 경쟁의 무경합 수명주기 스레드 조인 보장, 파이프라인 전 과정(컴파일-빌드ID검증-스폰-스냅샷A-변이및ACK-스냅샷B-종료-DWARF비교-스테이지합성-대화형분석) 스테이지 출처(Provenance) 및 타임아웃 통제, 빈 데이터에 대한 공허한 1.0(vacuous 1.0) 점수 제거(`None` 처리), 반복 실행(`repeat=N`) 및 분산 추적, 다중 프로바이더 비교 매트릭스(`--providers`) 및 폴백/비가용 투명 보고)
 - **Phase 20 (Complete)**: *"Benchmark Execution Integrity and Trustworthy Results"*  
   (벤치마크 실행 무결성 및 신뢰할 수 있는 결과 검증 체계 확립: 평가 트랙의 엄격한 분리(`REAL_RUNTIME_PRODUCT_PIPELINE` vs `EVALUATOR_UNIT_TEST`) 및 결합 SLA 계산 배제, 프로덕션 인과 오탐 SLA는 적격 완료된 실시간 런타임 시나리오만을 모수로 산출(적격 음성 대조군 부재 시 `0/0 (NOT_EVALUABLE)` 및 통과 불허), 자체 테스트 통과가 프로덕션 SLA에 영향을 미치지 않도록 차단, `evaluator_self_test` 모드 격리(컴파일 및 타깃 프로세스 스폰 원천 배제), 프로바이더 매트릭스 평가 범위 명시(`--provider-scenarios` 또는 스모크 서브셋), 결정론적 폴백 발생 시 `FALLBACK_OCCURRED` 명시 및 모델 성공률(0.0%) 배제, C++ 픽스처 `STATE` 대화형 명령어를 통한 변이 전/후 실시간 상태 독립 검증 및 정확한 변이 응답 일치 확인, 디스크 상의 구체적 산출물(`metadata.json` 및 크기 > 0인 `memory.bin`) 검증, 상위 스테이지 실패 시 하위 스테이지 `FAILED`/`NOT_RUN` 출처 전파, 독립적 다회차 실행(`repeat=N`) 시도/완료/실패 추적 및 JSON-Markdown 보고서 간 전수 일치 검증, 22개 전용 회귀 테스트 통과)
+- **Phase 21 (Complete)**: *"Watch Sessions and Non-Stop Temporal Observation"*  
+  (임베디드 및 실시간 프로세스를 중단시키지 않는 경량 주기적 관측 기반 Watch Session 및 Temporal Memory Explorer 구축)
+- **Phase 22 (Complete)**: *"Zero-Configuration Live Capture & UX Simplification"*  
+  (단일 PID 지정만으로 즉시 관측을 개시하는 Zero-Config 라이브 캡처 및 직관적 웹 UI 단순화)
+- **Phase 23 (Complete)**: *"Remote Watch Sessions and Multi-Context Agent Integration"*  
+  (다중 호스트 타깃 분리 관측, 프로세스 수명주기 댕글링 방지 및 MCP 기반 에이전트 도구 연동)
+- **Phase 24 (Complete)**: *"Evidence-First Temporal Investigation Workflow"*  
+  (자연어 기반 시간적 조사 오케스트레이션, 연속 관측 스트리밍 비교, 메모리 경계/가드 근접성 분석 및 객체 중심 증거 드릴다운)
+- **Phase 25 (Complete)**: *"Evidence-Grounded LLM Investigation & End-to-End Quality Validation"*  
+  (런타임 관측 및 표준 증거 원장 기반 사실 검증, 진실된 프로바이더 상태 보고, 가드/버퍼 경계 의미론 확립, 전용 C++ 픽스처 기반 17개 수락 시나리오 검증)
+- **Phase 26 (Complete)**: *"Real-Execution Quality Verification & Agent-First Investigation UX"*  
+  (하드코딩된 품질 지표 배제 및 명시적 모수/분자 기반 `QualityMetricsReport` 엔진(`NOT_EVALUABLE` 투명 보고), 격리된 실시간 C++ 픽스처 라이브 프로세스 실행 및 음성 대조군(Negative Control: 접근 없는 근접성) 검증, 부분 문자열 루프홀 제거 및 모순 값 거부, 컴패니언 DWARF 심볼 검증 및 미확인 심볼 `UNVERIFIED` 티어 강제, 64비트 가상 주소(5-level paging 포함) 안전 마스킹, 웹 UI 5대 독립 결과 섹션(사실, 가설, 함수 후보, 미확인/대안, 추천 조치) 분리 시각화, 원격 전송 독립성(multi-hop SSH/ProxyJump 중복 구현 배제) 및 ARP 액션 무증설 원칙 준수)
 
 ---
 
@@ -1623,6 +1635,43 @@ Phase 25 ensures that conversational temporal investigations produce conclusions
   - **Scenario Coverage**: 17 / 17 (100.0%)
   - **False-Positive Causal Promotion Rate**: 0.0%
   - **Unsupported Claim Rejection Rate**: 100.0%
+
+### Phase 26: Real-Execution Quality Verification & Agent-First Investigation UX
+Phase 26 closes the gap between synthetic assertions and trustworthy real-runtime investigation, establishing transparent quality metrics and an agent-first investigation workflow:
+- **Explicit Quality Metrics & Transparent Denominators (`QualityMetricsReport`)**:
+  - Replaced hardcoded constants, order-dependent mutable state, and unverified pass counts with explicit computed metrics.
+  - Transparently reports `NOT_EVALUABLE` when the denominator is zero rather than claiming 0.0% error or 100.0% success.
+  - Quality metrics engine (`extractor/investigation_quality.py`) outputs formatted markdown and CLI tables:
+    - **Scenario Execution & Pass Rate**: 17 / 17 (100.0%)
+    - **Unsupported Claim Rejection Rate**: 4 / 4 (100.0%)
+    - **Invalid Evidence Reference Rejection Rate**: 4 / 4 (100.0%)
+    - **False-Positive Causal Promotion Rate**: 0 / 2 (0.0% FP)
+- **Real-Runtime Fixture Verification & Negative Control**:
+  - Live execution of `tests/fixtures/real_runtime/guard_pool_fixture.cpp` in an isolated test harness (`test_01`).
+  - Verifies process spawning, handshake parsing (`PID`, `POOL`, `GUARD`), and memory layout.
+  - Proves the negative control: a pointer situated near a memory guard (`guard_addr - 16`, within the 64-byte threshold) without an actual invalid access event is correctly identified as near, but candidate functions are **never** promoted to `VALIDATED_CAUSAL_FUNCTION` or marked as root cause.
+  - Verifies clean shutdown via `SIGTERM` with exit code 0.
+- **Evidence-Grounded Semantic Trustworthiness**:
+  - Fails closed when session findings or evidence ledger records are empty: arbitrary asserted facts are rejected and disarmed.
+  - Eliminated substring matching loopholes (e.g. `'ptr'` matching `'g_guard_state.near_ptr'`, `'data'` matching `'dataset'`); only exact leaf identifiers or hierarchical path matches are accepted.
+  - Contradictory value rejection: asserted fact values contradicting confirmed finding values are rejected.
+  - Companion ELF symbol validation: non-existent symbols are flagged as `FABRICATED` and stripped; symbols in stripped binaries without companion DWARF are labeled `UNVERIFIED` tier.
+  - Irrelevant and fabricated evidence references (such as citing a `RUNTIME_IDENTITY` record for a memory corruption claim) are stripped.
+- **Temporal Semantics & Boundary Grounding**:
+  - Enforced 64-bit address masking (`& 0xFFFFFFFFFFFFFFFF`), null pointer skipping, and canonical user-space address bounds up to 5-level paging (`0x7FFFFFFFFFFFFFFF`).
+  - Distinct boundary classifications (`CONFIGURED_GUARD_ADDRESS`, `KNOWN_BUFFER_END`, `MEMORY_MAP_BOUNDARY`, `UNKNOWN`), ensuring memory map boundaries never falsely infer buffer capacity.
+  - Missing, partial, and gap states are strictly differentiated from `UNCHANGED`.
+- **Agent-First Investigation UX**:
+  - Web UI investigation results cleanly organized into 5 dedicated sections:
+    - **2A. Observed Facts**: Confirmed facts grounded against EvidenceLedger.
+    - **2B. Inferred Hypotheses**: Disarmed hypotheses with explicit confidence and uncertainty notes.
+    - **2C. Function Candidates**: Visual badges for `VALIDATED_CAUSAL`, `EVIDENCE_SUPPORTED`, `STATIC_CANDIDATE`, and `UNVERIFIED`.
+    - **2D. Unknowns & Alternative Explanations**: Highlighted open uncertainties, missing DWARF notices, and unverified symbols.
+    - **2E. Recommended Next Steps**: Prioritized follow-up actions with risk levels and rationale.
+  - Interactive show-more toggles and one-click evidence drilldown modal integration.
+- **Transport Independence & ARP Action Freeze**:
+  - Preserved strict transport boundary: DynamicState does not duplicate multi-hop SSH, ProxyJump, or remote execution adapters (delegated to existing `xssh` tools).
+  - Frozen ARP action types: no new ARP actions introduced; unsupported action requests safely return `CAPABILITY_UNSUPPORTED`.
 
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]

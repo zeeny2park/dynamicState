@@ -47,7 +47,7 @@
     isAnalyzingChat: false,
     basicTargetConnected: false,
     basicStep: 0,
-    basicExpandedSections: { facts: false, causes: false, next: false },
+    basicExpandedSections: { facts: false, causes: false, candidates: false, unknowns: false, next: false },
   };
 
   // DOM Elements Cache
@@ -98,6 +98,12 @@
     basicCausesList: document.getElementById('basic-causes-list'),
     basicCausesCount: document.getElementById('basic-causes-count'),
     btnMoreCauses: document.getElementById('btn-more-causes'),
+    basicCandidatesList: document.getElementById('basic-candidates-list'),
+    basicCandidatesCount: document.getElementById('basic-candidates-count'),
+    btnMoreCandidates: document.getElementById('btn-more-candidates'),
+    basicUnknownsList: document.getElementById('basic-unknowns-list'),
+    basicUnknownsCount: document.getElementById('basic-unknowns-count'),
+    btnMoreUnknowns: document.getElementById('btn-more-unknowns'),
     basicNextList: document.getElementById('basic-next-list'),
     basicNextCount: document.getElementById('basic-next-count'),
     btnMoreNext: document.getElementById('btn-more-next'),
@@ -7098,6 +7104,16 @@
       }
       if (el.basicCausesCount) el.basicCausesCount.textContent = '(0)';
       if (el.btnMoreCauses) el.btnMoreCauses.style.display = 'none';
+      if (el.basicCandidatesList) {
+        el.basicCandidatesList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_candidates', 'No candidate functions linked.')}</div>`;
+      }
+      if (el.basicCandidatesCount) el.basicCandidatesCount.textContent = '(0)';
+      if (el.btnMoreCandidates) el.btnMoreCandidates.style.display = 'none';
+      if (el.basicUnknownsList) {
+        el.basicUnknownsList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_unknowns', 'No unresolved uncertainties or missing observations.')}</div>`;
+      }
+      if (el.basicUnknownsCount) el.basicUnknownsCount.textContent = '(0)';
+      if (el.btnMoreUnknowns) el.btnMoreUnknowns.style.display = 'none';
       if (el.basicNextList) {
         el.basicNextList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_next', 'All automated verification steps completed.')}</div>`;
       }
@@ -7256,7 +7272,144 @@
       }
     }
 
-    // 2C: Next steps
+    // Extract function candidates from findings and hypotheses
+    const candidates = [];
+    const seenCandidateFns = new Set();
+    const allFindings = Array.isArray(inv.findings) ? inv.findings : [];
+    for (const f of allFindings) {
+      for (const fc of (f.function_candidates || [])) {
+        const fnName = fc.function_name || fc.name;
+        if (fnName && !seenCandidateFns.has(fnName)) {
+          seenCandidateFns.add(fnName);
+          candidates.push({
+            ...fc,
+            finding_id: f.finding_id,
+            source_file: fc.source_file || f.source_location,
+            reason: fc.reason || f.title,
+          });
+        }
+      }
+    }
+    for (const h of (inv.hypotheses || [])) {
+      for (const fc of (h.function_candidates || [])) {
+        const fnName = fc.function_name || fc.name;
+        if (fnName && !seenCandidateFns.has(fnName)) {
+          seenCandidateFns.add(fnName);
+          candidates.push({
+            ...fc,
+            finding_id: h.finding_id || h.hypothesis_id,
+            source_file: fc.source_file,
+            reason: fc.reason || h.title,
+          });
+        }
+      }
+    }
+
+    // 2C: Function Candidates
+    if (el.basicCandidatesCount) el.basicCandidatesCount.textContent = `(${candidates.length})`;
+    if (el.basicCandidatesList) {
+      if (candidates.length === 0) {
+        el.basicCandidatesList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_candidates', 'No candidate functions linked.')}</div>`;
+        if (el.btnMoreCandidates) el.btnMoreCandidates.style.display = 'none';
+      } else {
+        const visibleCandidates = state.basicExpandedSections.candidates ? candidates : candidates.slice(0, LIMIT);
+        el.basicCandidatesList.innerHTML = visibleCandidates.map(c => {
+          const fnName = c.function_name || c.name || 'unknown_fn';
+          const tier = c.candidate_tier || (c.confirmed_root_cause ? 'VALIDATED_CAUSAL_FUNCTION' : 'STATIC_CANDIDATE');
+          const tierBadgeClass = tier === 'VALIDATED_CAUSAL_FUNCTION' ? 'badge-success' : (tier === 'UNVERIFIED' ? 'badge-neutral' : 'badge-warning');
+          const srcLoc = c.source_file ? `<div class="text-xs mono text-muted mt-1">${escapeHtml(c.source_file)}${c.line ? `:${c.line}` : ''}</div>` : '';
+          const reason = c.reason || c.tier_limitation || (tier === 'UNVERIFIED' ? 'Companion debug symbols unavailable' : 'Static analysis candidate');
+          return `
+            <div class="basic-item-card" data-finding-id="${escapeHtml(c.finding_id || '')}" style="${c.finding_id ? 'cursor: pointer;' : ''}">
+              <div class="basic-item-top">
+                <span class="basic-item-title mono font-bold">${escapeHtml(fnName)}()</span>
+                <span class="badge ${tierBadgeClass} text-xs">${escapeHtml(tier)}</span>
+              </div>
+              ${srcLoc}
+              <div class="basic-item-desc mt-1">${escapeHtml(reason)}</div>
+              ${c.finding_id ? `
+                <div class="mt-2 text-xs" style="color: var(--accent);">
+                  <span>🔍 ${state.currentLang === 'ko' ? '상세 증거 드릴다운' : 'Evidence Drill-down'} &rarr;</span>
+                </div>
+              ` : ''}
+            </div>
+          `;
+        }).join('');
+        if (el.btnMoreCandidates) {
+          if (candidates.length > LIMIT) {
+            el.btnMoreCandidates.style.display = 'inline-block';
+            el.btnMoreCandidates.textContent = state.basicExpandedSections.candidates
+              ? t('btn_show_less', 'Show less')
+              : `${t('btn_show_more', 'Show more')} (${candidates.length - LIMIT})`;
+          } else {
+            el.btnMoreCandidates.style.display = 'none';
+          }
+        }
+      }
+    }
+
+    // Extract unknowns & alternative explanations
+    const unknowns = [];
+    for (const f of allFindings) {
+      if (f.category === 'unknown') {
+        unknowns.push({
+          finding_id: f.finding_id,
+          title: f.title || 'Uncertainty',
+          description: f.description || f.uncertainty || '',
+        });
+      }
+    }
+    for (const u of (inv.unknowns || [])) {
+      if (typeof u === 'string') {
+        unknowns.push({ title: state.currentLang === 'ko' ? '미관측 상태 / 한계' : 'Missing Observation / Limitation', description: u });
+      } else if (u && typeof u === 'object') {
+        unknowns.push(u);
+      }
+    }
+    for (const a of (inv.alternative_explanations || [])) {
+      if (typeof a === 'string') {
+        unknowns.push({ title: state.currentLang === 'ko' ? '대안 가설' : 'Alternative Explanation', description: a });
+      }
+    }
+
+    // 2D: Unknowns & Alternative Explanations
+    if (el.basicUnknownsCount) el.basicUnknownsCount.textContent = `(${unknowns.length})`;
+    if (el.basicUnknownsList) {
+      if (unknowns.length === 0) {
+        el.basicUnknownsList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_unknowns', 'No unresolved uncertainties or missing observations.')}</div>`;
+        if (el.btnMoreUnknowns) el.btnMoreUnknowns.style.display = 'none';
+      } else {
+        const visibleUnknowns = state.basicExpandedSections.unknowns ? unknowns : unknowns.slice(0, LIMIT);
+        el.basicUnknownsList.innerHTML = visibleUnknowns.map(u => {
+          return `
+            <div class="basic-item-card" data-finding-id="${escapeHtml(u.finding_id || '')}" style="${u.finding_id ? 'cursor: pointer;' : ''}">
+              <div class="basic-item-top">
+                <span class="basic-item-title">${escapeHtml(u.title || 'Unknown')}</span>
+                <span class="badge badge-neutral text-xs">UNKNOWN</span>
+              </div>
+              ${u.description ? `<div class="basic-item-desc mt-1">${escapeHtml(u.description)}</div>` : ''}
+              ${u.finding_id ? `
+                <div class="mt-2 text-xs" style="color: var(--accent);">
+                  <span>🔍 ${state.currentLang === 'ko' ? '상세 증거 드릴다운' : 'Evidence Drill-down'} &rarr;</span>
+                </div>
+              ` : ''}
+            </div>
+          `;
+        }).join('');
+        if (el.btnMoreUnknowns) {
+          if (unknowns.length > LIMIT) {
+            el.btnMoreUnknowns.style.display = 'inline-block';
+            el.btnMoreUnknowns.textContent = state.basicExpandedSections.unknowns
+              ? t('btn_show_less', 'Show less')
+              : `${t('btn_show_more', 'Show more')} (${unknowns.length - LIMIT})`;
+          } else {
+            el.btnMoreUnknowns.style.display = 'none';
+          }
+        }
+      }
+    }
+
+    // 2E: Next steps
     if (el.basicNextCount) el.basicNextCount.textContent = `(${nextSteps.length})`;
     if (el.basicNextList) {
       if (nextSteps.length === 0) {
@@ -7624,6 +7777,18 @@
     if (el.btnMoreCauses) {
       el.btnMoreCauses.addEventListener('click', () => {
         state.basicExpandedSections.causes = !state.basicExpandedSections.causes;
+        renderBasicInvestigationView();
+      });
+    }
+    if (el.btnMoreCandidates) {
+      el.btnMoreCandidates.addEventListener('click', () => {
+        state.basicExpandedSections.candidates = !state.basicExpandedSections.candidates;
+        renderBasicInvestigationView();
+      });
+    }
+    if (el.btnMoreUnknowns) {
+      el.btnMoreUnknowns.addEventListener('click', () => {
+        state.basicExpandedSections.unknowns = !state.basicExpandedSections.unknowns;
         renderBasicInvestigationView();
       });
     }

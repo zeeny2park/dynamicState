@@ -51,12 +51,14 @@ from .evidence_ledger import (
 # Evidence and Finding classifications
 EVIDENCE_CLASSIFICATION_FACT = "OBSERVED_FACT"
 EVIDENCE_CLASSIFICATION_INFERENCE = "INFERENCE"
+EVIDENCE_CLASSIFICATION_INFERRED_HYPOTHESIS = "INFERRED_HYPOTHESIS"
 EVIDENCE_CLASSIFICATION_UNKNOWN = "UNKNOWN"
 EVIDENCE_CLASSIFICATION_PROPOSED_ACTION = "PROPOSED_ACTION"
 
 VALID_EVIDENCE_CLASSIFICATIONS = {
     EVIDENCE_CLASSIFICATION_FACT,
     EVIDENCE_CLASSIFICATION_INFERENCE,
+    EVIDENCE_CLASSIFICATION_INFERRED_HYPOTHESIS,
     EVIDENCE_CLASSIFICATION_UNKNOWN,
     EVIDENCE_CLASSIFICATION_PROPOSED_ACTION,
 }
@@ -109,12 +111,14 @@ VALID_CONFIDENCE_LEVELS = {
 FUNCTION_TIER_STATIC_CANDIDATE = "STATIC_CANDIDATE"
 FUNCTION_TIER_EVIDENCE_SUPPORTED = "EVIDENCE_SUPPORTED_CANDIDATE"
 FUNCTION_TIER_VALIDATED_CAUSAL = "VALIDATED_CAUSAL_FUNCTION"
+FUNCTION_TIER_UNVERIFIED = "UNVERIFIED"
 FUNCTION_TIER_UNKNOWN = "UNKNOWN"
 
 VALID_FUNCTION_TIERS = {
     FUNCTION_TIER_STATIC_CANDIDATE,
     FUNCTION_TIER_EVIDENCE_SUPPORTED,
     FUNCTION_TIER_VALIDATED_CAUSAL,
+    FUNCTION_TIER_UNVERIFIED,
     FUNCTION_TIER_UNKNOWN,
 }
 
@@ -892,9 +896,15 @@ def sanitize_and_disarm_llm_hypothesis(
     disarmed_candidates: List[Dict[str, Any]] = []
     for cand in raw_candidates:
         c_copy = dict(cand)
-        c_copy["candidate_tier"] = FUNCTION_TIER_STATIC_CANDIDATE
-        c_copy["confirmed_root_cause"] = False
-        c_copy["tier_limitation"] = "Model/caller proposed candidate; unproven write causality without verified attestation."
+        current_tier = c_copy.get("candidate_tier")
+        if current_tier == FUNCTION_TIER_UNVERIFIED:
+            c_copy["candidate_tier"] = FUNCTION_TIER_UNVERIFIED
+            c_copy["confirmed_root_cause"] = False
+            c_copy["tier_limitation"] = "Companion ELF debug symbols unavailable or unverified; candidate cannot be validated as causal."
+        else:
+            c_copy["candidate_tier"] = FUNCTION_TIER_STATIC_CANDIDATE
+            c_copy["confirmed_root_cause"] = False
+            c_copy["tier_limitation"] = "Model/caller proposed candidate; unproven write causality without verified attestation."
         c_copy.pop("verifier_attestation", None)
         c_copy.pop("execution_provenance", None)
         c_copy.pop("function_attribution_verified", None)

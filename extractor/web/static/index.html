@@ -404,7 +404,44 @@
                 </button>
               </div>
 
-              <!-- Section 2C: What to Do Next -->
+              <!-- Section 2C: Function Candidates -->
+              <div class="basic-sub-section mb-3" id="basic-sub-candidates">
+                <div class="basic-sub-header">
+                  <span class="sub-title">
+                    <span class="badge badge-warning text-xs">CANDIDATE</span>
+                    <span data-i18n="title_candidates_section">Function Candidates (Static &amp; Symbol Analysis)</span>
+                  </span>
+                  <span class="text-xs text-muted" id="basic-candidates-count">(0)</span>
+                </div>
+                <div class="text-xs text-muted mb-2 fst-italic" data-i18n="notice_candidates_unvalidated">
+                  Candidate functions are derived from static analysis or companion symbols. They remain unproven static candidates until verified by independent execution traces.
+                </div>
+                <div class="basic-items-list" id="basic-candidates-list">
+                  <div class="text-xs text-muted p-2" data-i18n="msg_no_candidates">No candidate functions linked.</div>
+                </div>
+                <button type="button" class="btn btn-xs btn-outline mt-2 show-more-toggle" id="btn-more-candidates" style="display: none;">
+                  Show more
+                </button>
+              </div>
+
+              <!-- Section 2D: Unknowns & Alternative Explanations -->
+              <div class="basic-sub-section mb-3" id="basic-sub-unknowns">
+                <div class="basic-sub-header">
+                  <span class="sub-title">
+                    <span class="badge badge-neutral text-xs">UNKNOWN</span>
+                    <span data-i18n="title_unknowns_section">Unknowns &amp; Alternative Explanations</span>
+                  </span>
+                  <span class="text-xs text-muted" id="basic-unknowns-count">(0)</span>
+                </div>
+                <div class="basic-items-list" id="basic-unknowns-list">
+                  <div class="text-xs text-muted p-2" data-i18n="msg_no_unknowns">No unresolved uncertainties or missing observations.</div>
+                </div>
+                <button type="button" class="btn btn-xs btn-outline mt-2 show-more-toggle" id="btn-more-unknowns" style="display: none;">
+                  Show more
+                </button>
+              </div>
+
+              <!-- Section 2E: What to Do Next -->
               <div class="basic-sub-section" id="basic-sub-next">
                 <div class="basic-sub-header">
                   <span class="sub-title">

@@ -140,7 +140,11 @@ run_step "Phase 24 Evidence-First Temporal Investigation Workflow Suite" \
 run_step "Phase 25 Evidence-Grounded LLM Investigation and End-to-End Quality Validation Suite" \
     python3 -m unittest tests/test_phase25_grounded_investigation.py
 
-# 25. Discover and run all remaining unit and integration tests
+# 25. Phase 26 Real-Execution Quality Verification and Agent-First UX Suite
+run_step "Phase 26 Real-Execution Quality Verification and Agent-First UX Suite" \
+    python3 -m unittest tests/test_phase26_real_execution_quality.py
+
+# 26. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

@@ -117,6 +117,10 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase25_grounded_investigation.py
 
+      - name: Run Phase 26 Real-Execution Quality Verification and Agent-First UX Tests
+        run: |
+          python3 -m unittest tests/test_phase26_real_execution_quality.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

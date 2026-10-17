@@ -28,9 +28,11 @@ from extractor.temporal_investigation import redact_sensitive_content
 from extractor.hypothesis import (
     EVIDENCE_CLASSIFICATION_FACT,
     EVIDENCE_CLASSIFICATION_INFERENCE,
+    EVIDENCE_CLASSIFICATION_INFERRED_HYPOTHESIS,
     FUNCTION_TIER_STATIC_CANDIDATE,
     FUNCTION_TIER_EVIDENCE_SUPPORTED,
     FUNCTION_TIER_VALIDATED_CAUSAL,
+    FUNCTION_TIER_UNVERIFIED,
     HYPOTHESIS_STATUS_PROPOSED,
     HYPOTHESIS_STATUS_SUPPORTED,
     HYPOTHESIS_STATUS_VALIDATED,
@@ -309,55 +311,106 @@ class ConversationalAnalysisService:
         session: Optional[Any],
         ledger: Optional[EvidenceLedger],
     ) -> Tuple[bool, str]:
-        """Verify whether an asserted fact corresponds to verified session findings or ledger records."""
-        if not session:
-            return True, "no session context"
+        """Verify whether an asserted fact corresponds to verified session findings or ledger records.
+        
+        Strict Trust Invariants:
+        - Absence of session context, empty findings list, or empty ledger NEVER makes arbitrary claims trusted.
+        - Matching substrings or field-name overlaps do NOT establish ground truth.
+        - Asserted values must be consistent with observed runtime values.
+        """
+        if not session and not ledger:
+            return False, "no session or ledger context available to ground fact"
 
-        findings = getattr(session, "findings", []) or []
-        if not findings:
-            return True, "no session findings to contradict"
+        findings = getattr(session, "findings", []) or [] if session else []
+        ledger_records = []
+        if ledger and hasattr(ledger, "_records"):
+            ledger_records = getattr(ledger, "_records", [])
+        elif ledger and hasattr(ledger, "get_all_records"):
+            ledger_records = ledger.get_all_records()
+
+        if not findings and not ledger_records:
+            return False, "no session findings or ledger records available to ground fact"
 
         fact_text = (str(fact_item.get("fact") or "") + " " + str(fact_item.get("title") or "")).lower()
-        field_path = str(fact_item.get("field_path") or "").lower()
+        field_path = str(fact_item.get("field_path") or "").strip().lower()
 
-        # Check against session findings
-        for f in findings:
-            f_path = str(getattr(f, "c_type_path", "") or getattr(f, "field_name", "") or "").lower()
-            f_title = str(getattr(f, "title", "") or "").lower()
-            f_val = str(getattr(f, "observed_value", "") or getattr(f, "after_value", "") or "").lower()
+        def _match_path(target: str, cand: str) -> bool:
+            """Exact or strict struct-member dot/arrow match (rejects arbitrary substring overlap)."""
+            if not target or not cand:
+                return False
+            t = target.strip().lower()
+            c = cand.strip().lower()
+            if t == c:
+                return True
+            if c.endswith("." + t) or c.endswith("->" + t):
+                return True
+            if t.endswith("." + c) or t.endswith("->" + c):
+                return True
+            return False
 
-            if field_path and (field_path in f_path or f_path in field_path):
-                return True, "matched finding field"
-            if f_path and f_path in fact_text:
-                return True, "matched finding path in text"
-            if f_title and f_title in fact_text:
-                return True, "matched finding title"
-            if f_val and len(f_val) > 2 and f_val in fact_text:
-                return True, "matched finding value"
+        # If a specific field_path is asserted in the fact item
+        if field_path:
+            # Check findings
+            for f in findings:
+                f_path = str(getattr(f, "c_type_path", "") or getattr(f, "field_name", "") or "").strip().lower()
+                if _match_path(field_path, f_path):
+                    asserted_val = str(fact_item.get("observed_value") or fact_item.get("value") or fact_item.get("value_change") or "").strip().lower()
+                    if asserted_val:
+                        f_vals = [str(v).lower() for v in (getattr(f, "observed_value", None), getattr(f, "after_value", None), getattr(f, "current_value", None)) if v is not None]
+                        if f_vals and not any(asserted_val == v or asserted_val in v for v in f_vals):
+                            return False, f"asserted value '{asserted_val}' contradicts observed finding value {f_vals}"
+                    return True, f"matched verified finding field '{f_path}'"
 
-        # Check against EvidenceLedger records
-        if ledger and hasattr(ledger, "_records"):
-            for r in getattr(ledger, "_records", []):
-                obs_text = str(getattr(r, "observation", "")).lower()
-                if field_path and field_path in obs_text:
-                    return True, "matched ledger observation"
-                cmp_obs = getattr(r, "comparison_observation", {}) or {}
-                if cmp_obs:
-                    item_name = str(cmp_obs.get("item_name", "")).lower()
-                    if (field_path and item_name and (field_path in item_name or item_name in field_path)) or (item_name and item_name in fact_text):
-                        return True, "matched ledger comparison item"
+            # Check ledger records
+            for r in ledger_records:
                 fld_obs = getattr(r, "field_observation", {}) or {}
                 if fld_obs:
-                    var_name = str(fld_obs.get("variable_name", "")).lower()
-                    if (field_path and var_name and (field_path in var_name or var_name in field_path)) or (var_name and var_name in fact_text):
-                        return True, "matched ledger field variable"
+                    var_name = str(fld_obs.get("variable_name", "")).strip().lower()
+                    if _match_path(field_path, var_name):
+                        return True, f"matched ledger field variable '{var_name}'"
+                cmp_obs = getattr(r, "comparison_observation", {}) or {}
+                if cmp_obs:
+                    item_name = str(cmp_obs.get("item_name", "")).strip().lower()
+                    if _match_path(field_path, item_name):
+                        return True, f"matched ledger comparison item '{item_name}'"
+                details = getattr(r, "details", {}) or {}
+                det_path = str(details.get("field_path") or details.get("field") or "").strip().lower()
+                if _match_path(field_path, det_path):
+                    return True, f"matched ledger record details field '{det_path}'"
+
+            return False, f"field '{field_path}' does not match any observed session finding or ledger record"
+
+        # If no field_path is specified, fact must describe an observed finding or ledger event
+        for f in findings:
+            f_title = str(getattr(f, "title", "") or "").lower()
+            f_desc = str(getattr(f, "description", "") or "").lower()
+            f_path = str(getattr(f, "c_type_path", "") or getattr(f, "field_name", "") or "").lower()
+            if f_path and re.search(r"\b" + re.escape(f_path) + r"\b", fact_text):
+                return True, f"matched finding path '{f_path}' in fact statement"
+            if f_title:
+                keywords = [w for w in re.findall(r"\w+", f_title) if len(w) >= 4 and w not in ("with", "from", "that", "this", "were", "been", "during", "have")]
+                if keywords and all(kw in fact_text for kw in keywords[:3]):
+                    return True, f"matched finding title '{f.finding_id}'"
+
+        for r in ledger_records:
+            obs = str(getattr(r, "observation", "")).lower()
+            if obs:
+                keywords = [w for w in re.findall(r"\w+", obs) if len(w) >= 4 and w not in ("with", "from", "that", "this", "were", "been", "during", "have")]
+                if keywords and all(kw in fact_text for kw in keywords[:3]):
+                    return True, f"matched ledger record '{r.evidence_id}'"
 
         return False, "no corresponding runtime finding or ledger record"
 
-    def _validate_function_candidate(self, fn_name: str, session: Optional[Any]) -> Tuple[bool, str]:
-        """Validate whether proposed function candidate exists in companion ELF symbols or findings."""
-        if not session or not fn_name:
-            return True, "no session context"
+    def _validate_function_candidate(self, fn_name: str, session: Optional[Any]) -> Tuple[str, str]:
+        """Validate proposed function candidate against companion ELF symbols or findings.
+        
+        Returns:
+            Tuple of (status, reason) where status is 'VALID', 'FABRICATED', or 'UNVERIFIED'.
+        """
+        if not fn_name:
+            return "UNVERIFIED", "empty function name"
+        if not session:
+            return "STATIC", "no session context provided; retained as static candidate"
 
         clean_name = fn_name.split("(")[0].strip()
 
@@ -367,39 +420,64 @@ class ConversationalAnalysisService:
             for c in getattr(f, "function_candidates", []) or []:
                 c_name = c.get("function_name") if isinstance(c, dict) else getattr(c, "function_name", "")
                 if c_name and clean_name == c_name:
-                    return True, "matched finding candidate"
+                    return "VALID", "matched finding candidate"
 
         # Check debug image symbols
         t_ref = getattr(session, "target_ref", {}) or {}
         debug_elf = t_ref.get("companion_elf_path") or t_ref.get("debug_image")
-        if debug_elf and os.path.exists(debug_elf):
-            try:
-                from extractor.debug_image import inspect_elf
-                info = inspect_elf(debug_elf)
-                symbols = getattr(info, "symbols", {})
-                if symbols:
-                    if clean_name in symbols:
-                        return True, "matched ELF symbol"
-                    return False, f"function '{clean_name}' not found in companion ELF symbols"
-            except Exception:
-                pass
+        if not debug_elf or not os.path.exists(debug_elf):
+            return "UNVERIFIED", "companion debug ELF binary not available"
 
-        return True, "symbol unverified but plausible"
+        try:
+            from extractor.debug_image import inspect_elf
+            info = inspect_elf(debug_elf)
+            if info.is_stripped and not info.has_debug_info:
+                return "UNVERIFIED", "companion ELF is stripped of debug info and symbols"
+
+            import subprocess
+            cmd = ["nm", "-C", debug_elf]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                return "UNVERIFIED", "companion ELF has no readable symbol table"
+            lines = proc.stdout.splitlines()
+            symbols = set()
+            for line in lines:
+                parts = line.strip().split(maxsplit=2)
+                if len(parts) >= 3:
+                    symbols.add(parts[2].split("(")[0].strip())
+            if not symbols:
+                return "UNVERIFIED", "companion ELF symbol table empty"
+            if clean_name in symbols:
+                return "VALID", "matched companion ELF symbol"
+            return "FABRICATED", f"function '{clean_name}' not found in companion ELF symbols"
+        except Exception as e:
+            return "UNVERIFIED", f"could not inspect companion ELF symbols: {e}"
 
     def _record_is_relevant(self, record: EvidenceRecord, claim_text: str, context: Optional[Dict[str, Any]] = None) -> bool:
         """Verify whether cited EvidenceRecord actually relates to the claim subject."""
         ev_type = getattr(record, "evidence_type", "")
         claim_lower = claim_text.lower()
 
+        # 1. RUNTIME_IDENTITY cannot support memory corruption, write, or root-cause claims
         if ev_type == "RUNTIME_IDENTITY":
-            if any(kw in claim_lower for kw in ("mutate", "corrupt", "overrun", "overflow", "guard", "write", "access", "root cause", "changed from")):
+            if any(kw in claim_lower for kw in (
+                "mutate", "corrupt", "overrun", "overflow", "guard", "write", "access",
+                "root cause", "changed from", "transition", "pointer", "leak", "boundary"
+            )):
                 return False
             return True
 
+        # 2. CAPTURE_QUALITY cannot support root cause or boundary crossing claims
         if ev_type == "CAPTURE_QUALITY":
+            if any(kw in claim_lower for kw in ("root cause", "overrun", "overflow", "violation", "corrupt", "fault")):
+                return False
             if any(kw in claim_lower for kw in ("gap", "quality", "consistency", "non_atomic", "partial", "complete", "sampling")):
                 return True
-            if any(kw in claim_lower for kw in ("root cause", "overrun", "overflow", "violation")):
+            return True
+
+        # 3. STATIC_LINK cannot prove dynamic runtime access or validated execution
+        if ev_type == "STATIC_LINK":
+            if any(kw in claim_lower for kw in ("actually executed", "validated root cause", "occurred at runtime", "wrote to memory")):
                 return False
             return True
 
@@ -414,6 +492,11 @@ class ConversationalAnalysisService:
     ) -> Tuple[Dict[str, Any], List[str]]:
         """Parse JSON response, validate schema, and disarm unverified claims."""
         disarmed_claims: List[str] = []
+
+        if ledger is None and session and hasattr(session, "ledger"):
+            ledger = session.ledger
+        if not valid_evidence_ids and ledger:
+            valid_evidence_ids = list(ledger._by_id.keys()) if hasattr(ledger, "_by_id") else [r.evidence_id for r in ledger.get_all_records()]
 
         # 1. Clean markdown JSON formatting if present
         text = raw_response.strip()
@@ -430,7 +513,6 @@ class ConversationalAnalysisService:
         try:
             data = json.loads(text)
         except Exception:
-            # Fallback parsing attempt: find outermost JSON object
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1 and end > start:
@@ -469,6 +551,19 @@ class ConversationalAnalysisService:
             f_clean = {k: redact_sensitive_content(v) for k, v in f.items()}
             is_grounded, ground_reason = self._is_fact_grounded(f_clean, session, ledger)
             if is_grounded:
+                # Sanitize any fact-level evidence references
+                if "evidence_ids" in f_clean and isinstance(f_clean["evidence_ids"], list):
+                    valid_f_refs = []
+                    for fref in f_clean["evidence_ids"]:
+                        fref_str = str(fref).strip()
+                        if fref_str not in valid_evidence_ids:
+                            continue
+                        if ledger:
+                            f_rec = ledger.get_record(fref_str)
+                            if f_rec and not self._record_is_relevant(f_rec, f_clean.get("fact", "") + " " + f_clean.get("field_path", "")):
+                                continue
+                        valid_f_refs.append(fref_str)
+                    f_clean["evidence_ids"] = valid_f_refs
                 sanitized_facts.append(f_clean)
             else:
                 f_desc = f_clean.get("fact") or f_clean.get("title") or json.dumps(f_clean)
@@ -497,6 +592,7 @@ class ConversationalAnalysisService:
             h_copy = dict(h)
             h_copy["investigation_id"] = ""
             h_copy["hypothesis_id"] = h_copy.get("hypothesis_id") or f"hypo_chat_{uuid.uuid4().hex[:8]}"
+            h_claim = str(h_copy.get("claim") or h_copy.get("title") or "")
 
             # Disarm any claimed VALIDATED status
             claimed_status = h_copy.get("status")
@@ -504,17 +600,25 @@ class ConversationalAnalysisService:
                 disarmed_claims.append(f"Demoted claimed status VALIDATED to PROPOSED in hypothesis '{h_copy.get('title')}'")
             h_copy["status"] = HYPOTHESIS_STATUS_PROPOSED
 
-            # Handle candidate functions and validate against symbols
+            # Handle candidate functions and validate against companion symbols
             cand_fn = h_copy.get("candidate_function") or h_copy.get("function_name")
             if cand_fn:
                 cand_fn_str = str(cand_fn).strip()
-                is_valid_sym, sym_reason = self._validate_function_candidate(cand_fn_str, session)
-                if not is_valid_sym:
+                sym_status, sym_reason = self._validate_function_candidate(cand_fn_str, session)
+                if sym_status == "FABRICATED":
                     disarmed_claims.append(f"Stripped fabricated function candidate '{cand_fn_str}' ({sym_reason})")
                     h_copy.pop("candidate_function", None)
                     h_copy.pop("function_name", None)
                     h_copy["function_candidates"] = []
                     unknowns.append(f"Model proposed candidate function '{cand_fn_str}', but symbol was not found in companion ELF.")
+                elif sym_status == "UNVERIFIED":
+                    disarmed_claims.append(f"Labeled unverified function candidate '{cand_fn_str}' as UNVERIFIED ({sym_reason})")
+                    h_copy["function_candidates"] = [{
+                        "function_name": cand_fn_str,
+                        "candidate_tier": FUNCTION_TIER_UNVERIFIED,
+                        "confirmed_root_cause": False,
+                        "tier_limitation": "Companion ELF debug symbols unavailable or unverified; candidate cannot be validated as causal."
+                    }]
                 else:
                     h_copy["function_candidates"] = [{
                         "function_name": cand_fn_str,
@@ -522,6 +626,43 @@ class ConversationalAnalysisService:
                         "confirmed_root_cause": False,
                         "tier_limitation": "Proposed via conversational analysis; requires independent runtime execution verification."
                     }]
+            elif "function_candidates" in h_copy and isinstance(h_copy["function_candidates"], list):
+                sanitized_cands = []
+                for fc in h_copy["function_candidates"]:
+                    if not isinstance(fc, dict):
+                        continue
+                    fc_name = str(fc.get("function_name") or fc.get("name") or "").strip()
+                    if not fc_name:
+                        continue
+                    sym_status, sym_reason = self._validate_function_candidate(fc_name, session)
+                    if sym_status == "FABRICATED":
+                        disarmed_claims.append(f"Stripped fabricated function candidate '{fc_name}' ({sym_reason})")
+                        unknowns.append(f"Candidate function '{fc_name}' was not found in companion ELF symbols.")
+                        continue
+                    tier = FUNCTION_TIER_UNVERIFIED if sym_status == "UNVERIFIED" else FUNCTION_TIER_STATIC_CANDIDATE
+                    sanitized_cands.append({
+                        "function_name": fc_name,
+                        "candidate_tier": tier,
+                        "confirmed_root_cause": False,
+                        "tier_limitation": "Requires independent runtime execution verification." if tier != FUNCTION_TIER_UNVERIFIED else "Companion ELF debug symbols unavailable; unverified."
+                    })
+                h_copy["function_candidates"] = sanitized_cands
+
+            # Validate supporting evidence refs on the hypothesis
+            if "supporting_evidence_ids" in h_copy and isinstance(h_copy["supporting_evidence_ids"], list):
+                valid_hypo_refs = []
+                for href in h_copy["supporting_evidence_ids"]:
+                    href_str = str(href).strip()
+                    if href_str not in valid_evidence_ids:
+                        disarmed_claims.append(f"Stripped fabricated evidence reference '{href_str}' from hypothesis '{h_copy.get('title')}'")
+                        continue
+                    if ledger:
+                        h_rec = ledger.get_record(href_str)
+                        if h_rec and not self._record_is_relevant(h_rec, h_claim):
+                            disarmed_claims.append(f"Stripped unsupported evidence reference '{href_str}' from hypothesis '{h_copy.get('title')}'")
+                            continue
+                    valid_hypo_refs.append(href_str)
+                h_copy["supporting_evidence_ids"] = valid_hypo_refs
 
             # Redact sensitive content in hypothesis fields
             for k in ("title", "claim", "proposed_mechanism", "uncertainty"):
