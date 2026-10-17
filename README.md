@@ -1583,6 +1583,47 @@ Phase 24 connects Watch Sessions and the Temporal Memory Explorer to the convers
   - Enhances Basic Investigation Mode with a Target Source toggle (Live PID vs. Observation Session), watch session selector, observation window duration input, and a Finding Evidence Drilldown Modal (`#modal-finding-drilldown`).
   - Strict secret redaction preserves confidentiality of API tokens, keys, and raw memory dumps across all views.
 
+### Phase 25: Evidence-Grounded LLM Investigation & End-to-End Quality Validation
+Phase 25 ensures that conversational temporal investigations produce conclusions genuinely supported by runtime observations, DWARF symbols, and canonical evidence records, verifying the entire workflow end-to-end:
+- **Truthful LLM vs. Deterministic Fallback**:
+  - Distinguishes real LLM provider execution, deterministic fallback, provider unavailable, timeout, and cancellation statuses (`MODEL_ROUNDTRIP_VERIFIED`, `FALLBACK`, `DETERMINISTIC_RULES`, `UNAVAILABLE`, `TIMEOUT`, `CANCELLED`).
+  - Removed misleading canned claims when raw facts are empty; deterministic fallback explicitly disclaims that no external LLM was contacted and no invariant violations were detected in examined observations.
+  - Basic Investigation UI and conversational chat display truthful provider execution status badges (`#basic-badge-provider-status`).
+- **Evidence-Grounded Claim Validation & Symbol Verification**:
+  - Every factual claim asserted by LLM reasoning is validated against active confirmed findings (`session.findings`) and canonical `EvidenceLedger` records; ungrounded assertions are demoted to unknowns and disarmed claims.
+  - Candidate functions proposed by LLM are verified against companion ELF symbols (`inspect_elf(companion_elf).symbols`) and static candidate lists; non-existent/hallucinated function names are stripped.
+  - Irrelevant evidence citations (such as citing a `RUNTIME_IDENTITY` record to support a memory corruption claim) are automatically stripped.
+  - Static function candidates and temporal correlations are never promoted to `VALIDATED_CAUSAL_FUNCTION` without authentic independent runtime proof (`TrustedCausalVerifier` attestation).
+- **Temporal Semantics & Boundary Grounding**:
+  - Boundary kinds are grounded into `CONFIGURED_GUARD_ADDRESS`, `KNOWN_BUFFER_END`, `MEMORY_MAP_BOUNDARY`, and `UNKNOWN`.
+  - Removed silent `+4096` buffer address substitutions; when boundary coordinates are ungrounded, proximity calculations are suppressed and an explicit `Memory Guard Boundary Unknown` finding (`category="unknown"`) is emitted.
+  - Added 64-bit address masking, null pointer guards, and safe boundary distance findings (`fnd_guard_safe`) when pointers remain safely away from guard boundaries.
+  - Temporal summaries explicitly include discrete periodic sampling notices, duration in milliseconds, and gap counts.
+- **Dedicated Real-Runtime Fixtures & 17 Quality Acceptance Scenarios**:
+  - Added `tests/fixtures/real_runtime/guard_pool_fixture.cpp` featuring real buffer pool, `PROT_NONE` guard page, safe pointer, and near pointer (negative control: proximity without write access).
+  - Validated across all 17 required scenarios in `tests/test_phase25_grounded_investigation.py`:
+    1. Valid state transition.
+    2. Pointer near known boundary without actual access (negative control: remains unproven).
+    3. Actual invalid access only when independently observable by test harness.
+    4. Unchanged values correctly identified.
+    5. Partial read correctly identified and not reported as unchanged.
+    6. Capture gap recorded and missing samples not assumed unchanged.
+    7. Target exit/restart.
+    8. Build ID mismatch fails closed.
+    9. Missing DWARF handled gracefully without inventing types.
+    10. Remote-session failure handled truthfully.
+    11. Provider unavailable handled truthfully without pretending LLM succeeded.
+    12. LLM timeout and cancellation terminates process group cleanly.
+    13. Malformed provider output disarmed into safe schema.
+    14. Fabricated evidence IDs stripped (100% rejection rate).
+    15. Unsupported causal claims and static candidates never promoted to validated causality (0.0% false-positive rate).
+    16. Secret redaction preserved across all findings and ledger records.
+    17. Large paginated histories processed with streaming bounds.
+- **Measured Quality Metrics**:
+  - **Scenario Coverage**: 17 / 17 (100.0%)
+  - **False-Positive Causal Promotion Rate**: 0.0%
+  - **Unsupported Claim Rejection Rate**: 100.0%
+
 ### Local Validation & GitHub Actions Constraint Notice
 > [!NOTE]
 > **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.

@@ -1434,21 +1434,13 @@ class DeterministicFallbackProvider(BaseLLMProvider):
                 }
             else:
                 response_dict = {
-                    "summary": "결정론적 규칙 분석: 관측된 시간적 상태 및 변수 증거를 기반으로 조사가 수행되었습니다.",
-                    "observed_facts": [
-                        {"fact": "시스템이 결정론적 가설 검증 규칙 하에서 정상 동작 중입니다."}
-                    ],
-                    "hypotheses": [
-                        {
-                            "title": "결정론적 규칙 평가",
-                            "claim": "관찰된 상태 전이가 결정론적 불변식 및 DWARF 링키지를 기반으로 평가되었습니다.",
-                            "status": "PROPOSED"
-                        }
-                    ],
+                    "summary": "결정론적 분석 수행 완료: 외부 LLM이 구성되거나 호출되지 않았습니다. 조사된 관측 상태에서 변수 불변식 위반이나 상태 전이가 관찰되지 않았습니다.",
+                    "observed_facts": [],
+                    "hypotheses": [],
                     "unknowns": [
-                        "외부 대화형 추론이 요청되지 않았거나 공급자가 구성되지 않았습니다."
+                        "조사된 관측 범위 내에서 상태 전이 또는 불변식 위반이 감지되지 않았습니다."
                     ],
-                    "evidence_refs": valid_eids[:2],
+                    "evidence_refs": valid_eids[:2] if valid_eids else [],
                     "alternative_explanations": [],
                     "proposed_observations": [
                         {
@@ -1519,21 +1511,13 @@ class DeterministicFallbackProvider(BaseLLMProvider):
                 }
             else:
                 response_dict = {
-                    "summary": "Deterministic analysis executed. No external LLM was configured or contacted.",
-                    "observed_facts": [
-                        {"fact": "System operating under deterministic hypothesis validation rules."}
-                    ],
-                    "hypotheses": [
-                        {
-                            "title": "Deterministic Rule Evaluation",
-                            "claim": "Observed state transitions evaluated against deterministic invariants and DWARF linkage.",
-                            "status": "PROPOSED"
-                        }
-                    ],
+                    "summary": "Deterministic analysis executed. No external LLM was configured or contacted. No invariant violations or state transitions were observed in the examined runtime state.",
+                    "observed_facts": [],
+                    "hypotheses": [],
                     "unknowns": [
-                        "External conversational reasoning was not requested or provider is unconfigured."
+                        "No state transitions or invariant violations were detected in the examined observations."
                     ],
-                    "evidence_refs": valid_eids[:2],
+                    "evidence_refs": valid_eids[:2] if valid_eids else [],
                     "alternative_explanations": [],
                     "proposed_observations": [
                         {

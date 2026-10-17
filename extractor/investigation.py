@@ -2929,6 +2929,21 @@ class InvestigationManager:
                 target_finding = f
                 break
         if not target_finding:
+            for h in session.hypotheses:
+                if h.hypothesis_id == finding_id:
+                    target_finding = InvestigationFinding(
+                        finding_id=h.hypothesis_id,
+                        category="hypothesis",
+                        title=h.title or h.hypothesis_id,
+                        description=h.claim or h.proposed_mechanism or "",
+                        confidence="medium",
+                        status=h.status or "PROPOSED",
+                        classification=EVIDENCE_CLASSIFICATION_INFERENCE,
+                        function_candidates=h.function_candidates or [],
+                        evidence_ids=h.supporting_evidence_ids or [],
+                    )
+                    break
+        if not target_finding:
             return {"success": False, "error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'"}
 
         obj_id = target_finding.object_id

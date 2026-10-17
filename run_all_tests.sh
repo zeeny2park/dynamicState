@@ -136,7 +136,11 @@ run_step "Phase 23 Remote Watch Sessions and MCP Integration Suite" \
 run_step "Phase 24 Evidence-First Temporal Investigation Workflow Suite" \
     python3 -m unittest tests/test_phase24_temporal_investigation.py
 
-# 24. Discover and run all remaining unit and integration tests
+# 24. Phase 25 Evidence-Grounded LLM Investigation and End-to-End Quality Validation Suite
+run_step "Phase 25 Evidence-Grounded LLM Investigation and End-to-End Quality Validation Suite" \
+    python3 -m unittest tests/test_phase25_grounded_investigation.py
+
+# 25. Discover and run all remaining unit and integration tests
 run_step "Python Unit & Integration Test Suite (Full Discovery)" \
     python3 -m unittest discover tests
 

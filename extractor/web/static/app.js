@@ -89,6 +89,7 @@
     basicResultsArea: document.getElementById('basic-results-area'),
     basicResultSummary: document.getElementById('basic-result-summary'),
     basicBadgeInvStatus: document.getElementById('basic-badge-inv-status'),
+    basicBadgeProviderStatus: document.getElementById('basic-badge-provider-status'),
     basicQualityWarning: document.getElementById('basic-quality-warning'),
     basicQualityWarningText: document.getElementById('basic-quality-warning-text'),
     basicFactsList: document.getElementById('basic-facts-list'),
@@ -7085,6 +7086,7 @@
         el.basicBadgeInvStatus.textContent = 'READY';
         el.basicBadgeInvStatus.className = 'badge badge-neutral text-xs';
       }
+      if (el.basicBadgeProviderStatus) el.basicBadgeProviderStatus.style.display = 'none';
       if (el.basicQualityWarning) el.basicQualityWarning.style.display = 'none';
       if (el.basicFactsList) {
         el.basicFactsList.innerHTML = `<div class="text-xs text-muted p-2">${t('msg_no_facts', 'No invariant violations observed in examined state.')}</div>`;
@@ -7108,6 +7110,27 @@
     if (el.basicBadgeInvStatus) {
       el.basicBadgeInvStatus.textContent = st;
       el.basicBadgeInvStatus.className = `badge text-xs ${st === 'COMPLETED' ? 'badge-success' : (st === 'PARTIAL' ? 'badge-warning' : 'badge-danger')}`;
+    }
+
+    // Render LLM / Fallback execution engine badge
+    const pMeta = inv.provider_metadata || inv.stages?.conversational_analysis?.provider_metadata || (inv.target_ref && inv.target_ref.provider_metadata);
+    if (el.basicBadgeProviderStatus) {
+      if (pMeta) {
+        el.basicBadgeProviderStatus.style.display = 'inline-block';
+        const isFb = pMeta.is_fallback || pMeta.execution_status === 'FALLBACK' || pMeta.execution_status === 'DETERMINISTIC_RULES';
+        const execSt = pMeta.execution_status || (isFb ? 'FALLBACK' : 'VERIFIED');
+        if (isFb) {
+          el.basicBadgeProviderStatus.className = 'badge badge-warning text-xs';
+          el.basicBadgeProviderStatus.textContent = `⚙️ ${execSt}`;
+          el.basicBadgeProviderStatus.title = pMeta.fallback_reason || 'Deterministic fallback rules executed';
+        } else {
+          el.basicBadgeProviderStatus.className = 'badge badge-success text-xs';
+          el.basicBadgeProviderStatus.textContent = `🤖 ${pMeta.invoked_provider || 'LLM'} (${execSt})`;
+          el.basicBadgeProviderStatus.title = `Model: ${pMeta.model || 'default'}, Duration: ${pMeta.duration_ms || 0}ms`;
+        }
+      } else {
+        el.basicBadgeProviderStatus.style.display = 'none';
+      }
     }
 
     let summaryText = inv.summary?.overview || inv.summary?.text || inv.goal || '';
@@ -7134,6 +7157,9 @@
     } else if (Array.isArray(inv.findings)) {
       facts = inv.findings.filter(f => f.category === 'fact');
       causes = inv.findings.filter(f => f.category === 'hypothesis');
+    }
+    if (causes.length === 0 && inv.hypotheses && Array.isArray(inv.hypotheses) && inv.hypotheses.length > 0) {
+      causes = inv.hypotheses;
     }
 
     const nextSteps = inv.recommended_next_steps || inv.next_steps || [];
@@ -7198,9 +7224,10 @@
         el.basicCausesList.innerHTML = visibleCauses.map(h => {
           const hid = h.finding_id || h.hypothesis_id || '';
           const title = h.title || h.function_name || h.description || h.hypothesis_id || 'Candidate Function';
-          const desc = h.description || '';
+          const desc = h.description || h.claim || '';
           const plaus = h.plausibility || h.status || 'PROPOSED';
-          const fnName = h.function_name ? `<span class="mono text-xs" style="color: var(--accent);">${escapeHtml(h.function_name)}()</span>` : '';
+          const fnName = (h.function_name || (h.function_candidates && h.function_candidates[0]?.function_name))
+            ? `<span class="mono text-xs" style="color: var(--accent);">${escapeHtml(h.function_name || h.function_candidates[0].function_name)}()</span>` : '';
           const badgeClass = plaus === 'VALIDATED_CAUSAL_FUNCTION' ? 'badge-success' : 'badge-warning';
           return `
             <div class="basic-item-card" data-finding-id="${escapeHtml(hid)}" style="cursor: pointer;" title="${state.currentLang === 'ko' ? '클릭하여 상세 근거 드릴다운' : 'Click to inspect grounded evidence'}">

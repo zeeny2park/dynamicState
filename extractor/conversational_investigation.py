@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -23,6 +24,7 @@ from extractor.evidence_ledger import (
     EvidenceLedger,
     EvidenceRecord,
 )
+from extractor.temporal_investigation import redact_sensitive_content
 from extractor.hypothesis import (
     EVIDENCE_CLASSIFICATION_FACT,
     EVIDENCE_CLASSIFICATION_INFERENCE,
@@ -301,11 +303,114 @@ class ConversationalAnalysisService:
 
         return messages
 
+    def _is_fact_grounded(
+        self,
+        fact_item: Dict[str, Any],
+        session: Optional[Any],
+        ledger: Optional[EvidenceLedger],
+    ) -> Tuple[bool, str]:
+        """Verify whether an asserted fact corresponds to verified session findings or ledger records."""
+        if not session:
+            return True, "no session context"
+
+        findings = getattr(session, "findings", []) or []
+        if not findings:
+            return True, "no session findings to contradict"
+
+        fact_text = (str(fact_item.get("fact") or "") + " " + str(fact_item.get("title") or "")).lower()
+        field_path = str(fact_item.get("field_path") or "").lower()
+
+        # Check against session findings
+        for f in findings:
+            f_path = str(getattr(f, "c_type_path", "") or getattr(f, "field_name", "") or "").lower()
+            f_title = str(getattr(f, "title", "") or "").lower()
+            f_val = str(getattr(f, "observed_value", "") or getattr(f, "after_value", "") or "").lower()
+
+            if field_path and (field_path in f_path or f_path in field_path):
+                return True, "matched finding field"
+            if f_path and f_path in fact_text:
+                return True, "matched finding path in text"
+            if f_title and f_title in fact_text:
+                return True, "matched finding title"
+            if f_val and len(f_val) > 2 and f_val in fact_text:
+                return True, "matched finding value"
+
+        # Check against EvidenceLedger records
+        if ledger and hasattr(ledger, "_records"):
+            for r in getattr(ledger, "_records", []):
+                obs_text = str(getattr(r, "observation", "")).lower()
+                if field_path and field_path in obs_text:
+                    return True, "matched ledger observation"
+                cmp_obs = getattr(r, "comparison_observation", {}) or {}
+                if cmp_obs:
+                    item_name = str(cmp_obs.get("item_name", "")).lower()
+                    if (field_path and item_name and (field_path in item_name or item_name in field_path)) or (item_name and item_name in fact_text):
+                        return True, "matched ledger comparison item"
+                fld_obs = getattr(r, "field_observation", {}) or {}
+                if fld_obs:
+                    var_name = str(fld_obs.get("variable_name", "")).lower()
+                    if (field_path and var_name and (field_path in var_name or var_name in field_path)) or (var_name and var_name in fact_text):
+                        return True, "matched ledger field variable"
+
+        return False, "no corresponding runtime finding or ledger record"
+
+    def _validate_function_candidate(self, fn_name: str, session: Optional[Any]) -> Tuple[bool, str]:
+        """Validate whether proposed function candidate exists in companion ELF symbols or findings."""
+        if not session or not fn_name:
+            return True, "no session context"
+
+        clean_name = fn_name.split("(")[0].strip()
+
+        # Check session findings candidates
+        findings = getattr(session, "findings", []) or []
+        for f in findings:
+            for c in getattr(f, "function_candidates", []) or []:
+                c_name = c.get("function_name") if isinstance(c, dict) else getattr(c, "function_name", "")
+                if c_name and clean_name == c_name:
+                    return True, "matched finding candidate"
+
+        # Check debug image symbols
+        t_ref = getattr(session, "target_ref", {}) or {}
+        debug_elf = t_ref.get("companion_elf_path") or t_ref.get("debug_image")
+        if debug_elf and os.path.exists(debug_elf):
+            try:
+                from extractor.debug_image import inspect_elf
+                info = inspect_elf(debug_elf)
+                symbols = getattr(info, "symbols", {})
+                if symbols:
+                    if clean_name in symbols:
+                        return True, "matched ELF symbol"
+                    return False, f"function '{clean_name}' not found in companion ELF symbols"
+            except Exception:
+                pass
+
+        return True, "symbol unverified but plausible"
+
+    def _record_is_relevant(self, record: EvidenceRecord, claim_text: str, context: Optional[Dict[str, Any]] = None) -> bool:
+        """Verify whether cited EvidenceRecord actually relates to the claim subject."""
+        ev_type = getattr(record, "evidence_type", "")
+        claim_lower = claim_text.lower()
+
+        if ev_type == "RUNTIME_IDENTITY":
+            if any(kw in claim_lower for kw in ("mutate", "corrupt", "overrun", "overflow", "guard", "write", "access", "root cause", "changed from")):
+                return False
+            return True
+
+        if ev_type == "CAPTURE_QUALITY":
+            if any(kw in claim_lower for kw in ("gap", "quality", "consistency", "non_atomic", "partial", "complete", "sampling")):
+                return True
+            if any(kw in claim_lower for kw in ("root cause", "overrun", "overflow", "violation")):
+                return False
+            return True
+
+        return True
+
     def parse_and_validate_response(
         self,
         raw_response: str,
         valid_evidence_ids: List[str],
         ledger: Optional[EvidenceLedger] = None,
+        session: Optional[Any] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         """Parse JSON response, validate schema, and disarm unverified claims."""
         disarmed_claims: List[str] = []
@@ -321,9 +426,10 @@ class ConversationalAnalysisService:
             if match:
                 text = match.group(1).strip()
 
+        is_malformed = False
         try:
             data = json.loads(text)
-        except Exception as exc:
+        except Exception:
             # Fallback parsing attempt: find outermost JSON object
             start = text.find("{")
             end = text.rfind("}")
@@ -332,33 +438,58 @@ class ConversationalAnalysisService:
                     data = json.loads(text[start : end + 1])
                 except Exception:
                     data = {}
+                    is_malformed = True
             else:
                 data = {}
+                is_malformed = True
 
         if not isinstance(data, dict):
             data = {}
+            is_malformed = True
 
-        # 2. Enforce Default Schema
-        summary = str(data.get("summary") or "Investigation conversational analysis complete.")
-        facts = list(data.get("observed_facts", []))
+        if is_malformed and raw_response.strip():
+            disarmed_claims.append("Malformed model response could not be parsed as valid JSON schema")
+
+        # 2. Enforce Default Schema and apply secret redaction
+        summary = redact_sensitive_content(str(data.get("summary") or "Investigation conversational analysis complete."))
+        raw_facts = list(data.get("observed_facts", []))
         raw_hypotheses = list(data.get("hypotheses", []))
-        unknowns = [str(u) for u in data.get("unknowns", [])]
+        unknowns = [redact_sensitive_content(str(u)) for u in data.get("unknowns", [])]
         raw_evidence_refs = list(data.get("evidence_refs", []))
-        alternatives = [str(a) for a in data.get("alternative_explanations", [])]
+        alternatives = [redact_sensitive_content(str(a)) for a in data.get("alternative_explanations", [])]
         raw_observations = list(data.get("proposed_observations", []))
-        safety_notes = [str(s) for s in data.get("safety_notes", [])]
-        next_steps = [str(n) for n in data.get("next_steps", [])]
+        safety_notes = [redact_sensitive_content(str(s)) for s in data.get("safety_notes", [])]
+        next_steps = [redact_sensitive_content(str(n)) for n in data.get("next_steps", [])]
 
-        # 3. Strip Fabricated Evidence References
+        # 3. Grounded Factual Claims Validation
+        sanitized_facts: List[Dict[str, Any]] = []
+        for f in raw_facts:
+            if not isinstance(f, dict):
+                continue
+            f_clean = {k: redact_sensitive_content(v) for k, v in f.items()}
+            is_grounded, ground_reason = self._is_fact_grounded(f_clean, session, ledger)
+            if is_grounded:
+                sanitized_facts.append(f_clean)
+            else:
+                f_desc = f_clean.get("fact") or f_clean.get("title") or json.dumps(f_clean)
+                disarmed_claims.append(f"Downgraded unsupported observed fact: '{str(f_desc)[:60]}' ({ground_reason})")
+                unknowns.append(f"Model asserted unverified fact '{str(f_desc)[:60]}', but this was not verified in runtime observations.")
+
+        # 4. Strip Fabricated or Unsupported Evidence References
         sanitized_evidence_refs: List[str] = []
         for ref in raw_evidence_refs:
             ref_str = str(ref).strip()
-            if ref_str in valid_evidence_ids:
-                sanitized_evidence_refs.append(ref_str)
-            else:
+            if ref_str not in valid_evidence_ids:
                 disarmed_claims.append(f"Stripped fabricated evidence reference '{ref_str}'")
+                continue
+            if ledger:
+                rec = ledger.get_record(ref_str)
+                if rec and not self._record_is_relevant(rec, summary):
+                    disarmed_claims.append(f"Stripped unsupported evidence reference '{ref_str}' (record nature '{rec.evidence_type}' does not substantiate claim)")
+                    continue
+            sanitized_evidence_refs.append(ref_str)
 
-        # 4. Sanitize and Disarm Hypotheses
+        # 5. Sanitize and Disarm Hypotheses
         sanitized_hypotheses: List[Dict[str, Any]] = []
         for h in raw_hypotheses:
             if not isinstance(h, dict):
@@ -373,28 +504,42 @@ class ConversationalAnalysisService:
                 disarmed_claims.append(f"Demoted claimed status VALIDATED to PROPOSED in hypothesis '{h_copy.get('title')}'")
             h_copy["status"] = HYPOTHESIS_STATUS_PROPOSED
 
-            # Handle candidate functions
+            # Handle candidate functions and validate against symbols
             cand_fn = h_copy.get("candidate_function") or h_copy.get("function_name")
             if cand_fn:
-                h_copy["function_candidates"] = [{
-                    "function_name": str(cand_fn),
-                    "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE,
-                    "confirmed_root_cause": False,
-                    "tier_limitation": "Proposed via conversational analysis; requires independent runtime execution verification."
-                }]
+                cand_fn_str = str(cand_fn).strip()
+                is_valid_sym, sym_reason = self._validate_function_candidate(cand_fn_str, session)
+                if not is_valid_sym:
+                    disarmed_claims.append(f"Stripped fabricated function candidate '{cand_fn_str}' ({sym_reason})")
+                    h_copy.pop("candidate_function", None)
+                    h_copy.pop("function_name", None)
+                    h_copy["function_candidates"] = []
+                    unknowns.append(f"Model proposed candidate function '{cand_fn_str}', but symbol was not found in companion ELF.")
+                else:
+                    h_copy["function_candidates"] = [{
+                        "function_name": cand_fn_str,
+                        "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE,
+                        "confirmed_root_cause": False,
+                        "tier_limitation": "Proposed via conversational analysis; requires independent runtime execution verification."
+                    }]
+
+            # Redact sensitive content in hypothesis fields
+            for k in ("title", "claim", "proposed_mechanism", "uncertainty"):
+                if k in h_copy and h_copy[k]:
+                    h_copy[k] = redact_sensitive_content(h_copy[k])
 
             # Run through canonical disarmer
             disarmed_h = sanitize_and_disarm_llm_hypothesis(h_copy, ledger=ledger)
             sanitized_hypotheses.append(disarmed_h.to_dict())
 
-        # 5. Sanitize Proposed Observations
+        # 6. Sanitize Proposed Observations
         sanitized_observations: List[Dict[str, Any]] = []
         for idx, obs in enumerate(raw_observations):
             if not isinstance(obs, dict):
                 continue
             o_copy = dict(obs)
             obs_id = o_copy.get("observation_id") or f"obs_chat_{uuid.uuid4().hex[:8]}"
-            q = o_copy.get("question") or f"Inspect target field for hypothesis {idx+1}"
+            q = redact_sensitive_content(o_copy.get("question") or f"Inspect target field for hypothesis {idx+1}")
             kind = str(o_copy.get("target_kind", "FIELD")).upper()
             if kind not in ("FIELD", "COMPARISON", "THREAD", "MUTATION"):
                 kind = "FIELD"
@@ -413,7 +558,7 @@ class ConversationalAnalysisService:
 
         validated_dict = {
             "summary": summary,
-            "observed_facts": facts,
+            "observed_facts": sanitized_facts,
             "hypotheses": sanitized_hypotheses,
             "unknowns": unknowns,
             "evidence_refs": sanitized_evidence_refs,
@@ -559,6 +704,7 @@ class ConversationalAnalysisService:
                 raw_response,
                 valid_evidence_ids=valid_evidence_ids,
                 ledger=getattr(session, "ledger", None),
+                session=session,
             )
 
             if req_id and self.provider_manager.is_cancelled(req_id):

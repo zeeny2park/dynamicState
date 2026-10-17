@@ -128,17 +128,21 @@ class ObservationComparisonState:
     UNCHANGED = "UNCHANGED"
     PARTIAL = "PARTIAL"
     MISSING = "MISSING"
+    STALE = "STALE"
+    GAP_INTERRUPTED = "GAP_INTERRUPTED"
 
 
 @dataclass
 class ObservationComparisonResult:
     item_id: str
     item_name: str
-    state: str  # CHANGED, UNCHANGED, PARTIAL, MISSING
+    state: str  # CHANGED, UNCHANGED, PARTIAL, MISSING, STALE, GAP_INTERRUPTED
     initial_value: Any
     final_value: Any
     samples_count: int
     missing_count: int = 0
+    is_gap_interrupted: bool = False
+    is_stale: bool = False
 
 
 @dataclass
@@ -155,6 +159,8 @@ class TemporalInvestigationPlan:
     buffer_keywords_detected: bool = False
     guard_address: Optional[int] = None
     buffer_address: Optional[int] = None
+    buffer_size: Optional[int] = None
+    boundary_kind: str = "UNKNOWN"  # CONFIGURED_GUARD_ADDRESS, KNOWN_BUFFER_END, MEMORY_MAP_BOUNDARY, INFERRED_BOUNDARY, UNKNOWN
     guard_threshold: int = DEFAULT_GUARD_THRESHOLD_BYTES
     target_items: List[str] = field(default_factory=list)
     watch_session_id: Optional[str] = None
@@ -179,6 +185,9 @@ class TemporalInvestigationPlan:
             d["guard_address_hex"] = f"0x{self.guard_address:x}"
         if self.buffer_address is not None:
             d["buffer_address_hex"] = f"0x{self.buffer_address:x}"
+        d["boundary_kind"] = self.boundary_kind
+        if self.buffer_size is not None:
+            d["buffer_size"] = self.buffer_size
         return d
 
 
@@ -384,6 +393,22 @@ class TemporalInvestigationService:
 
         guard_thresh = int(obs_win.get("guard_threshold") or constraints.get("guard_threshold") or DEFAULT_GUARD_THRESHOLD_BYTES)
 
+        buf_size = obs_win.get("buffer_size") or constraints.get("buffer_size")
+        if isinstance(buf_size, str) and buf_size.isdigit():
+            buf_size = int(buf_size)
+        elif not isinstance(buf_size, int):
+            buf_size = None
+
+        # Grounded boundary classification
+        boundary_kind = "UNKNOWN"
+        if guard_addr is not None:
+            boundary_kind = "CONFIGURED_GUARD_ADDRESS"
+        elif buf_addr is not None and buf_size is not None:
+            guard_addr = buf_addr + buf_size
+            boundary_kind = "KNOWN_BUFFER_END"
+        else:
+            boundary_kind = "UNKNOWN"
+
         start_seq = obs_win.get("start_seq")
         end_seq = obs_win.get("end_seq")
         limit = min(int(obs_win.get("limit", 50)), MAX_PAGINATION_LIMIT)
@@ -408,6 +433,8 @@ class TemporalInvestigationService:
             buffer_keywords_detected=bool(buffer_re),
             guard_address=guard_addr,
             buffer_address=buf_addr,
+            buffer_size=buf_size,
+            boundary_kind=boundary_kind,
             guard_threshold=guard_thresh,
         )
 
@@ -663,18 +690,58 @@ class TemporalInvestigationService:
             max_mono = first_mono + int(plan.window_duration_sec * 1_000_000_000)
             obs_data_list = [o for o in obs_data_list if o.get("monotonic_ns", 0) <= max_mono]
 
+        start_ts = obs_data_list[0].get("timestamp") if obs_data_list else None
+        end_ts = obs_data_list[-1].get("timestamp") if obs_data_list else None
+        dur_ms = 0.0
+        if len(obs_data_list) > 1:
+            m0 = obs_data_list[0].get("monotonic_ns", 0)
+            m1 = obs_data_list[-1].get("monotonic_ns", 0)
+            dur_ms = max(0.0, (m1 - m0) / 1_000_000.0)
+
         investigation_session.target_ref["temporal_summary"] = {
             "total_observations_examined": len(obs_data_list),
             "start_seq": obs_data_list[0].get("seq") if obs_data_list else None,
             "end_seq": obs_data_list[-1].get("seq") if obs_data_list else None,
+            "start_timestamp": start_ts,
+            "end_timestamp": end_ts,
+            "duration_ms": round(dur_ms, 2),
             "watch_items_count": len(watch_session.watch_items),
+            "gaps_count": len(watch_session.gaps),
+            "discrete_sampling_notice": "Discrete periodic sampling; discrete snapshots do not imply continuous monitoring.",
         }
+
+        # Check if goal requested guard inspection but boundary is UNKNOWN
+        if plan.guard_keywords_detected and (plan.boundary_kind == "UNKNOWN" or plan.guard_address is None):
+            fnd_guard_unk = InvestigationFinding(
+                finding_id=f"fnd_guard_unk_{uuid.uuid4().hex[:8]}",
+                category="unknown",
+                title="Memory Guard Boundary Unknown",
+                description=(
+                    "Goal requested memory guard boundary inspection, but no grounded "
+                    "guard page address (guard_address), buffer capacity (buffer_size), or PROT_NONE mapping was supplied. "
+                    "Proximity calculation was suppressed to prevent false positive conclusions."
+                ),
+                confidence="high",
+                status="UNRESOLVED",
+                uncertainty="Guard boundary unknown; cannot calculate distance without grounded boundary coordinates.",
+                classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+            )
+            investigation_session.findings.append(fnd_guard_unk)
+            investigation_session.next_steps.append(InvestigationNextStep(
+                step_id=f"step_guard_addr_{uuid.uuid4().hex[:6]}",
+                description="Provide guard page address (guard_address), inspect /proc/<pid>/maps for PROT_NONE pages, or specify buffer capacity.",
+                rationale="Memory boundary proximity requires grounded address coordinates to prevent fabricated findings.",
+                risk_level="READ_ONLY",
+                action_type="INSPECT",
+                required_inputs=["guard_address"],
+            ))
 
         # Analyze watch item timelines
         for item in watch_session.watch_items:
             item_vals: List[Tuple[int, str, Any, str]] = []
             has_unavailable = False
             has_partial = False
+            has_terminated = False
             missing_count = 0
 
             for o in obs_data_list:
@@ -692,6 +759,9 @@ class TemporalInvestigationService:
                 else:
                     status = "VALID"
                     val = v_entry
+
+                if status == "TARGET_TERMINATED" or o.get("completeness") == "TERMINATED":
+                    has_terminated = True
 
                 if status in ("UNAVAILABLE", "ERROR") or (val is None and status != "PARTIAL" and not (isinstance(v_entry, dict) and v_entry.get("is_partial"))):
                     has_unavailable = True
@@ -760,6 +830,49 @@ class TemporalInvestigationService:
                 },
             ))
 
+            if has_terminated:
+                investigation_session.findings.append(InvestigationFinding(
+                    finding_id=f"fnd_term_{uuid.uuid4().hex[:8]}",
+                    category="unknown",
+                    title=f"Target Process Terminated during observation of {item.name}",
+                    description=f"Process terminated during observation of '{item.name}'. Further observation halted truthfully.",
+                    c_type_path=item.name,
+                    type_name=item.type_name,
+                    source_location=item.source_location,
+                    confidence="high",
+                    status="RESOLVED",
+                    evidence_ids=[ev_timeline.evidence_id],
+                    classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+                    temporal_provenance={
+                        "session_id": sid,
+                        "capture_quality": "TERMINATED",
+                        "address": f"0x{item.address:x}",
+                        "provenance": "LIVE_RUNTIME_CAPTURE",
+                    },
+                ))
+
+            if has_partial:
+                investigation_session.findings.append(InvestigationFinding(
+                    finding_id=f"fnd_part_read_{uuid.uuid4().hex[:8]}",
+                    category="unknown",
+                    title=f"Partial memory read in {item.name}",
+                    description=f"Field '{item.name}' encountered partial or torn reads during sampling. Never reported as unchanged.",
+                    c_type_path=item.name,
+                    type_name=item.type_name,
+                    source_location=item.source_location,
+                    confidence="medium",
+                    status="UNRESOLVED",
+                    evidence_ids=[ev_timeline.evidence_id],
+                    classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+                    temporal_provenance={
+                        "session_id": sid,
+                        "capture_quality": "PARTIAL",
+                        "transition_state": ObservationComparisonState.PARTIAL,
+                        "address": f"0x{item.address:x}",
+                        "provenance": "LIVE_RUNTIME_CAPTURE",
+                    },
+                ))
+
             if has_unavailable:
                 investigation_session.findings.append(InvestigationFinding(
                     finding_id=f"fnd_part_unavail_{uuid.uuid4().hex[:8]}",
@@ -773,6 +886,13 @@ class TemporalInvestigationService:
                     status="UNRESOLVED",
                     evidence_ids=[ev_timeline.evidence_id],
                     classification=EVIDENCE_CLASSIFICATION_UNKNOWN,
+                    temporal_provenance={
+                        "session_id": sid,
+                        "capture_quality": "LOW_IMPACT",
+                        "transition_state": ObservationComparisonState.MISSING,
+                        "address": f"0x{item.address:x}",
+                        "provenance": "LIVE_RUNTIME_CAPTURE",
+                    },
                 ))
 
             if changed:
@@ -799,13 +919,14 @@ class TemporalInvestigationService:
                         "observation_timestamp": item_vals[-1][1],
                         "capture_quality": "LOW_IMPACT",
                         "address": f"0x{item.address:x}",
+                        "transition_state": ObservationComparisonState.CHANGED,
                         "provenance": "LIVE_RUNTIME_CAPTURE",
                     },
                     classification=EVIDENCE_CLASSIFICATION_FACT,
                 )
                 self._link_candidate_functions(fnd_chg, item, static_provider, debug_elf)
                 investigation_session.findings.append(fnd_chg)
-            else:
+            elif not has_partial and not has_terminated:
                 fnd_unchg = InvestigationFinding(
                     finding_id=f"fnd_temp_unchg_{uuid.uuid4().hex[:8]}",
                     category="fact",
@@ -829,6 +950,7 @@ class TemporalInvestigationService:
                         "observation_timestamp": item_vals[-1][1],
                         "capture_quality": "LOW_IMPACT",
                         "address": f"0x{item.address:x}",
+                        "transition_state": ObservationComparisonState.UNCHANGED,
                         "provenance": "LIVE_RUNTIME_CAPTURE",
                     },
                     classification=EVIDENCE_CLASSIFICATION_FACT,
@@ -849,10 +971,6 @@ class TemporalInvestigationService:
                 or "buffer" in item.name.lower()
                 or "shared" in item.name.lower()
             )
-
-            # If a guard address is known (or inferred from buffer pool base + size)
-            if guard_target is None and plan.buffer_address is not None:
-                guard_target = plan.buffer_address + 4096  # default 4K page boundary guard
 
             if guard_target is not None and is_pointer_or_addr:
                 # Evaluate observed pointer values against guard boundary
@@ -875,6 +993,10 @@ class TemporalInvestigationService:
                         ptr_num = int(val)
 
                     if ptr_num is not None:
+                        ptr_num = ptr_num & 0xFFFFFFFFFFFFFFFF
+                        # Skip null pointers and addresses outside user space
+                        if ptr_num == 0 or ptr_num > 0x00007FFFFFFFFFFF:
+                            continue
                         dist = abs(guard_target - ptr_num)
                         if closest_dist is None or dist < closest_dist:
                             closest_dist = dist
@@ -993,6 +1115,36 @@ class TemporalInvestigationService:
                         action_type="INSPECT",
                         required_inputs=["guard_address"],
                     ))
+                elif closest_dist is not None and closest_dist > plan.guard_threshold:
+                    fnd_safe = InvestigationFinding(
+                        finding_id=f"fnd_guard_safe_{uuid.uuid4().hex[:8]}",
+                        category="fact",
+                        title=f"Variable '{item.name}' maintained safe boundary distance ({closest_dist} bytes away)",
+                        description=(
+                            f"Pointer '{item.name}' remained at least {closest_dist} bytes from memory guard ({plan.boundary_kind}) "
+                            f"at 0x{guard_target:x} (threshold: {plan.guard_threshold}B). No guard proximity event detected."
+                        ),
+                        c_type_path=item.name,
+                        type_name=item.type_name,
+                        source_location=item.source_location,
+                        observed_value=f"0x{closest_ptr_val:x} (distance to guard: {closest_dist} bytes)",
+                        confidence="high",
+                        status="CONFIRMED",
+                        evidence_ids=[ev_timeline.evidence_id],
+                        temporal_provenance={
+                            "session_id": sid,
+                            "observation_sequence": closest_seq,
+                            "capture_quality": "LOW_IMPACT",
+                            "address": f"0x{closest_ptr_val:x}",
+                            "guard_address": f"0x{guard_target:x}",
+                            "boundary_kind": plan.boundary_kind,
+                            "distance_bytes": closest_dist,
+                            "provenance": "LIVE_RUNTIME_CAPTURE",
+                        },
+                        classification=EVIDENCE_CLASSIFICATION_FACT,
+                    )
+                    self._link_candidate_functions(fnd_safe, item, static_provider, debug_elf)
+                    investigation_session.findings.append(fnd_safe)
 
         # Discriminating Next Steps if none were generated
         if not investigation_session.next_steps:
