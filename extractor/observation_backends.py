@@ -162,3 +162,70 @@ class LowImpactObservationBackend(ObservationBackend):
             "build_id_verification": True,
             "debuglink": True,
         }
+
+
+class EbpfObservationBackend(ObservationBackend):
+    """Optional userspace eBPF function tracing observation backend (Phase 1 PoC).
+
+    Truthful capabilities:
+    - Zero stop (inferior continues executing)
+    - Never uses ptrace, SIGSTOP, SIGCONT, or GDB
+    - Observations are isolated probe events (PROBE_POINT_EVENT) at function entry/return
+    - Never claimed as a consistent process-wide snapshot
+    - DWARF dynamic stack variable evaluation is deferred to Phase 2
+    """
+
+    def __init__(self, tracer: Optional[Any] = None):
+        from .ebpf_tracer import EbpfTracer
+        self.tracer = tracer or EbpfTracer()
+
+    @property
+    def mode(self) -> str:
+        return "EBPF_PROBE"
+
+    def observe(
+        self,
+        pid: Optional[int] = None,
+        binary: Optional[str] = None,
+        function: Optional[str] = None,
+        debug_image: Optional[str] = None,
+        duration_s: float = 3.0,
+        **kwargs,
+    ) -> Any:
+        if pid is None or pid <= 0:
+            raise ValueError(f"Valid PID required for eBPF observation; got {pid}")
+        if not binary:
+            raise ValueError("Target binary path is required for eBPF uprobe observation")
+        if not function:
+            raise ValueError("Target function name is required for eBPF uprobe observation")
+
+        return self.tracer.trace(
+            pid=pid,
+            binary_path=binary,
+            function_name=function,
+            debug_image=debug_image,
+            duration_s=duration_s,
+            **kwargs,
+        )
+
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "mode": "EBPF_PROBE",
+            "process_stop": False,
+            "ptrace": False,
+            "sigstop": False,
+            "sigcont": False,
+            "gdb_attached": False,
+            "typed_mutation": False,
+            "checkpoint_restore": False,
+            "branch_exploration": False,
+            "execution_context": True,
+            "consistency": "PROBE_POINT_EVENT",
+            "backend": "ebpf_uprobe",
+            "ebpf": True,
+            "function_entry_tracing": True,
+            "function_return_tracing": True,
+            "local_variable_dwarf_eval": False,
+            "dwarf_eval_status": "UNSUPPORTED_PHASE1",
+        }
+

@@ -126,7 +126,17 @@ def main():
     cmp_parser.add_argument("--debug-image", type=str, default=None, help="Optional external debug image")
     cmp_parser.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (default: corpus)")
     cmp_parser.add_argument("--output", type=str, default=None, help="Path to save comparison JSON")
-    cmp_parser.add_argument("--json", action="store_true", default=False, help="Print output in JSON format")
+    # 10. trace-function
+    trace_parser = subparsers.add_parser("trace-function", help="Trace function entry and return using eBPF uprobes (Phase 1 PoC)")
+    trace_parser.add_argument("--pid", type=int, required=True, help="Target process PID")
+    trace_parser.add_argument("--binary", type=str, required=True, help="Target binary ELF path")
+    trace_parser.add_argument("--function", type=str, required=True, help="Target function symbol name")
+    trace_parser.add_argument("--debug-image", type=str, default=None, help="Optional external debug image")
+    trace_parser.add_argument("--duration", type=float, default=3.0, help="Tracing duration in seconds (default: 3.0)")
+    trace_parser.add_argument("--entry-only", action="store_true", default=False, help="Trace function entry only (skip uretprobe)")
+    trace_parser.add_argument("--output", type=str, default=None, help="Optional output path to save JSON trace session")
+    trace_parser.add_argument("--json", action="store_true", default=False, help="Print trace results in JSON format")
+    trace_parser.add_argument("--no-verify-build-id", action="store_true", default=False, help="Skip build-id verification")
 
     args = parser.parse_args()
 
@@ -614,6 +624,53 @@ def main():
         except Exception as exc:
             print(f"ERROR: Comparison failed: {exc}", file=sys.stderr)
             sys.exit(1)
+
+    elif args.command in ("trace-function", "trace-ebpf"):
+        from .ebpf_tracer import EbpfTracer
+        tracer = EbpfTracer()
+        session = tracer.trace(
+            pid=args.pid,
+            binary_path=args.binary,
+            function_name=args.function,
+            debug_image=args.debug_image,
+            duration_s=args.duration,
+            entry_only=args.entry_only,
+            verify_build_id=not args.no_verify_build_id,
+        )
+        res_dict = session.to_dict()
+        if args.output:
+            out_p = os.path.abspath(args.output)
+            os.makedirs(os.path.dirname(out_p), exist_ok=True)
+            with open(out_p, "w", encoding="utf-8") as f:
+                json.dump(res_dict, f, indent=2)
+            print(f"Trace session saved to {out_p}")
+
+        if args.json:
+            print(json.dumps(res_dict, indent=2))
+        else:
+            print(f"eBPF Trace Session: {session.session_id} (Status: {session.status})")
+            print(f"Target PID: {session.target_pid} | Binary: {session.target_binary}")
+            print(f"Function: {session.function_name} | Consistency: {session.consistency_level}")
+            print(f"Events Captured: {session.total_events} | Lost: {session.lost_events} | Malformed: {session.malformed_records}")
+            if session.overhead_stats:
+                print(f"Overhead: {session.overhead_stats}")
+            if session.error_message:
+                print(f"Note/Error: {session.error_message}", file=sys.stderr if session.status == "FAILED" else sys.stdout)
+            for ev in session.events[:10]:
+                print(f"  [{ev.probe_type}] seq={ev.sequence} tid={ev.tid} time={ev.timestamp_ns}")
+                if ev.frame_metadata:
+                    sp_str = f"0x{ev.frame_metadata.stack_pointer:x}" if ev.frame_metadata.stack_pointer is not None else "None"
+                    pc_str = f"0x{ev.frame_metadata.instruction_pointer:x}" if ev.frame_metadata.instruction_pointer is not None else "None"
+                    print(f"    SP={sp_str} PC={pc_str}")
+                if ev.arguments:
+                    args_str = ", ".join(f"{k}={v.value}" for k, v in ev.arguments.items())
+                    print(f"    Args: {args_str}")
+                if ev.return_value:
+                    print(f"    Return: {ev.return_value.value}")
+        if session.status == "FAILED":
+            sys.exit(1)
+        sys.exit(0)
+
 
 
 if __name__ == "__main__":
