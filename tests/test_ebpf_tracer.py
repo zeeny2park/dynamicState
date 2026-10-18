@@ -26,7 +26,9 @@ import platform
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import unittest
 from unittest.mock import MagicMock, patch
@@ -2252,131 +2254,40 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
     def test_62_terminate_probe_process_modes(self):
         """Scenario 62: Unit test _terminate_probe_process across all execution modes and edge cases."""
-        # 1. proc is None -> returns CLEAN immediately
+        # 0. proc is None -> returns CLEAN immediately
         res_none = EbpfEnvironmentChecker._terminate_probe_process(None, [])
         self.assertTrue(res_none)
         self.assertEqual(res_none.status, "CLEAN")
         self.assertTrue(res_none.child_reaped)
         self.assertTrue(res_none.group_terminated)
 
-        # 2. proc is already terminated (poll() != None, mock/untracked pid) -> returns ALREADY_EXITED
-        mock_done = MagicMock()
-        mock_done.poll.return_value = 0
-        mock_done.pid = MagicMock()
-        res_done = EbpfEnvironmentChecker._terminate_probe_process(mock_done, [])
-        self.assertTrue(res_done)
-        self.assertEqual(res_done.status, "ALREADY_EXITED")
-        mock_done.kill.assert_not_called()
+        # 1. Direct child reaped but group state unverified (e.g. non-session leader)
+        mock_unverified = MagicMock()
+        mock_unverified.pid = 6611
+        mock_unverified.poll.side_effect = [None, 0]
+        res_unverified = EbpfEnvironmentChecker._terminate_probe_process(
+            mock_unverified, [], is_session_leader=False
+        )
+        self.assertFalse(res_unverified)
+        self.assertEqual(res_unverified.status, "UNCERTAIN")
+        self.assertTrue(res_unverified.child_reaped)
+        self.assertFalse(res_unverified.group_terminated)
+        self.assertIn("not a session leader", res_unverified.details)
 
-        # 3. proc already terminated with real integer pid -> verifies group with signal 0
-        mock_done_real = MagicMock()
-        mock_done_real.poll.return_value = 0
-        mock_done_real.pid = 4321
+        # 2. Direct child reaped and group verified absent (clean termination)
+        mock_clean = MagicMock()
+        mock_clean.pid = 4321
+        mock_clean.poll.side_effect = [None, 0]
         with patch("os.killpg") as mock_killpg:
-            mock_killpg.side_effect = ProcessLookupError("No such process")
-            res_done_real = EbpfEnvironmentChecker._terminate_probe_process(mock_done_real, [])
-            self.assertTrue(res_done_real)
-            self.assertEqual(res_done_real.status, "ALREADY_EXITED")
-            mock_killpg.assert_called_once_with(4321, 0)
-
-        # 4. proc running without sudo (cmd_prefix=[]) -> calls os.killpg SIGKILL then verifies with signal 0
-        mock_running_nosudo = MagicMock()
-        mock_running_nosudo.pid = 4321
-        mock_running_nosudo.poll.side_effect = [None, 0]
-        with patch("os.killpg") as mock_killpg:
-            mock_killpg.side_effect = [None, ProcessLookupError]
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_running_nosudo, [])
-            self.assertTrue(res)
-            self.assertEqual(res.status, "CLEAN")
-            self.assertTrue(res.child_reaped)
-            self.assertTrue(res.group_terminated)
+            mock_killpg.side_effect = [None, ProcessLookupError]  # SIGKILL then signal 0 ESRCH
+            res_clean = EbpfEnvironmentChecker._terminate_probe_process(mock_clean, [], is_session_leader=True)
+            self.assertTrue(res_clean)
+            self.assertEqual(res_clean.status, "CLEAN")
+            self.assertTrue(res_clean.child_reaped)
+            self.assertTrue(res_clean.group_terminated)
             self.assertEqual(mock_killpg.call_count, 2)
-            mock_running_nosudo.kill.assert_called_once()
-            mock_running_nosudo.communicate.assert_called_once()
 
-        # 5. proc running with sudo (cmd_prefix=["sudo", "-n"]) -> calls subprocess.run with kill -KILL then verifies with kill -0
-        mock_running_sudo = MagicMock()
-        mock_running_sudo.pid = 5432
-        mock_running_sudo.poll.side_effect = [None, 0]
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stderr="", stdout=""),
-                MagicMock(returncode=1, stderr="kill: (-5432): No such process", stdout=""),
-            ]
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_running_sudo, ["sudo", "-n"])
-            self.assertTrue(res)
-            self.assertEqual(res.status, "CLEAN")
-            self.assertTrue(res.child_reaped)
-            self.assertTrue(res.group_terminated)
-            self.assertEqual(mock_run.call_count, 2)
-            mock_running_sudo.kill.assert_called_once()
-            mock_running_sudo.communicate.assert_called_once()
-
-        # 6. Process fails to terminate (mock poll() remains None) -> REAP_FAILED
-        mock_stuck = MagicMock()
-        mock_stuck.pid = 9999
-        mock_stuck.poll.return_value = None
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_stuck, ["sudo", "-n"])
-            self.assertFalse(res, "Should return False when process remains un-reaped")
-            self.assertEqual(res.status, "REAP_FAILED")
-            self.assertFalse(res.child_reaped)
-
-        # 7. Sudo kill -KILL fails with error -> GROUP_KILL_FAILED
-        mock_kill_err = MagicMock()
-        mock_kill_err.pid = 6543
-        mock_kill_err.poll.side_effect = [None, 0]
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=1, stderr="kill: (-6543): Operation not permitted", stdout=""),
-                MagicMock(returncode=1, stderr="kill: (-6543): No such process", stdout=""),
-            ]
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_kill_err, ["sudo", "-n"])
-            self.assertFalse(res)
-            self.assertEqual(res.status, "GROUP_KILL_FAILED")
-            self.assertIn("Operation not permitted", res.details)
-
-        # 8. Sudo kill -0 returns 0 (processes lingering after SIGKILL) -> GROUP_KILL_FAILED
-        mock_linger = MagicMock()
-        mock_linger.pid = 7654
-        mock_linger.poll.side_effect = [None, 0]
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stderr="", stdout=""),
-                MagicMock(returncode=0, stderr="", stdout=""),
-            ]
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_linger, ["sudo", "-n"])
-            self.assertFalse(res)
-            self.assertEqual(res.status, "GROUP_KILL_FAILED")
-            self.assertIn("still contains active processes", res.details)
-
-        # 9. Group verification signal 0 encounters unexpected error -> UNCERTAIN
-        mock_uncertain = MagicMock()
-        mock_uncertain.pid = 8765
-        mock_uncertain.poll.side_effect = [None, 0]
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stderr="", stdout=""),
-                MagicMock(returncode=2, stderr="kill: invalid option", stdout=""),
-            ]
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_uncertain, ["sudo", "-n"])
-            self.assertFalse(res)
-            self.assertEqual(res.status, "UNCERTAIN")
-            self.assertIn("could not be verified", res.details)
-
-        # 10. Direct execution os.killpg(pid, 0) encounters PermissionError -> UNCERTAIN
-        mock_perm_nosudo = MagicMock()
-        mock_perm_nosudo.pid = 9876
-        mock_perm_nosudo.poll.side_effect = [None, 0]
-        with patch("os.killpg") as mock_killpg:
-            mock_killpg.side_effect = [None, PermissionError("Operation not permitted")]
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_perm_nosudo, [])
-            self.assertFalse(res)
-            self.assertEqual(res.status, "UNCERTAIN")
-            self.assertIn("could not be verified", res.details)
-
-        # 11. Child already exited, but descendants remain alive in process group
+        # 3. Direct child exited but descendants remain in group after kill attempt
         mock_exited_desc = MagicMock()
         mock_exited_desc.pid = 4455
         mock_exited_desc.poll.return_value = 0  # Child exited
@@ -2389,14 +2300,141 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 MagicMock(returncode=0, stderr="", stdout=""),
                 MagicMock(returncode=0, stderr="", stdout=""),
             ]
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_exited_desc, ["sudo", "-n"])
-            self.assertFalse(res)
-            self.assertEqual(res.status, "GROUP_KILL_FAILED")
-            self.assertFalse(res.group_terminated)
-            self.assertTrue(res.child_reaped)
-            self.assertIn("still contains active processes", res.details)
+            res_desc = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_exited_desc, ["sudo", "-n"], is_session_leader=True
+            )
+            self.assertFalse(res_desc)
+            self.assertEqual(res_desc.status, "GROUP_KILL_FAILED")
+            self.assertFalse(res_desc.group_terminated)
+            self.assertTrue(res_desc.child_reaped)
+            self.assertIn("still contains active processes", res_desc.details)
 
-        # 12. Race condition: child exits between poll and group-kill; group-kill reports ESRCH (no such process)
+        # 4. Session/group relationship cannot be established (is_session_leader is None, child already exited)
+        mock_no_session = MagicMock()
+        mock_no_session.pid = 5511
+        mock_no_session.poll.return_value = 0
+        with patch("os.killpg") as mock_killpg:
+            res_no_sess = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_no_session, [], is_session_leader=None
+            )
+            self.assertFalse(res_no_sess)
+            self.assertEqual(res_no_sess.status, "UNCERTAIN")
+            self.assertFalse(res_no_sess.group_terminated)
+            self.assertTrue(res_no_sess.child_reaped)
+            mock_killpg.assert_not_called()  # Refused to signal unverified group
+
+        # 5. Confirmed non-session-leader with surviving descendants (refuses to signal group)
+        mock_nonsession = MagicMock()
+        mock_nonsession.pid = 6677
+        mock_nonsession.poll.side_effect = [None, 0]
+        with patch("os.killpg") as mock_killpg:
+            res_nonsess = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_nonsession, [], is_session_leader=False
+            )
+            self.assertFalse(res_nonsess)
+            self.assertEqual(res_nonsess.status, "UNCERTAIN")
+            self.assertFalse(res_nonsess.group_terminated)
+            self.assertTrue(res_nonsess.child_reaped)
+            mock_killpg.assert_not_called()  # Did NOT signal parent process group
+            mock_nonsession.kill.assert_called_once()
+
+        # 6. Refusal to signal an unsafe or unrelated process group (caller PGID or caller PID)
+        mock_caller_group = MagicMock()
+        mock_caller_group.pid = os.getpgrp()
+        mock_caller_group.poll.return_value = 0
+        with patch("os.killpg") as mock_killpg:
+            res_caller = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_caller_group, [], is_session_leader=True
+            )
+            self.assertFalse(res_caller)
+            self.assertEqual(res_caller.status, "UNCERTAIN")
+            self.assertFalse(res_caller.group_terminated)
+            self.assertIn("Refusing to signal caller's own process or group", res_caller.details)
+            mock_killpg.assert_not_called()
+
+        # 7. Group kill succeeds and a subsequent check verifies absence
+        mock_running_sudo = MagicMock()
+        mock_running_sudo.pid = 5432
+        mock_running_sudo.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=1, stderr="kill: (-5432): No such process", stdout=""),
+            ]
+            res_sudo = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_running_sudo, ["sudo", "-n"], is_session_leader=True
+            )
+            self.assertTrue(res_sudo)
+            self.assertEqual(res_sudo.status, "CLEAN")
+            self.assertTrue(res_sudo.child_reaped)
+            self.assertTrue(res_sudo.group_terminated)
+            self.assertEqual(mock_run.call_count, 2)
+            mock_running_sudo.kill.assert_called_once()
+            mock_running_sudo.communicate.assert_called_once()
+
+        # 8. Group kill fails or returns ambiguous diagnostics -> GROUP_KILL_FAILED
+        mock_kill_err = MagicMock()
+        mock_kill_err.pid = 6543
+        mock_kill_err.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stderr="kill: (-6543): Operation not permitted", stdout=""),
+                MagicMock(returncode=1, stderr="kill: (-6543): No such process", stdout=""),
+            ]
+            res_kerr = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_kill_err, ["sudo", "-n"], is_session_leader=True
+            )
+            self.assertFalse(res_kerr)
+            self.assertEqual(res_kerr.status, "GROUP_KILL_FAILED")
+            self.assertIn("Operation not permitted", res_kerr.details)
+
+        # 9. Signal-0 permission failure and command timeout -> UNCERTAIN
+        mock_uncertain = MagicMock()
+        mock_uncertain.pid = 8765
+        mock_uncertain.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=2, stderr="kill: invalid option", stdout=""),
+            ]
+            res_unc = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_uncertain, ["sudo", "-n"], is_session_leader=True
+            )
+            self.assertFalse(res_unc)
+            self.assertEqual(res_unc.status, "UNCERTAIN")
+            self.assertIn("could not be verified", res_unc.details)
+
+        # Signal-0 timeout
+        mock_timeout = MagicMock()
+        mock_timeout.pid = 8766
+        mock_timeout.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stderr="", stdout=""),
+                subprocess.TimeoutExpired(cmd=["kill"], timeout=1.0),
+            ]
+            res_to = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_timeout, ["sudo", "-n"], is_session_leader=True
+            )
+            self.assertFalse(res_to)
+            self.assertEqual(res_to.status, "UNCERTAIN")
+            self.assertIn("Timeout", res_to.details)
+
+        # 10. Child reaping failure (poll remains None) -> REAP_FAILED
+        mock_stuck = MagicMock()
+        mock_stuck.pid = 9999
+        mock_stuck.poll.return_value = None
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            res_stuck = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_stuck, ["sudo", "-n"], is_session_leader=True
+            )
+            self.assertFalse(res_stuck)
+            self.assertEqual(res_stuck.status, "REAP_FAILED")
+            self.assertFalse(res_stuck.child_reaped)
+            self.assertFalse(res_stuck.group_terminated)
+
+        # 11. Races between poll, kill, wait, and group verification
         mock_race = MagicMock()
         mock_race.pid = 5566
         mock_race.poll.side_effect = [None, 0]
@@ -2407,33 +2445,39 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 MagicMock(returncode=1, stderr="kill: (-5566): No such process", stdout=""),
                 MagicMock(returncode=1, stderr="kill: (-5566): No such process", stdout=""),
             ]
-            res = EbpfEnvironmentChecker._terminate_probe_process(mock_race, ["sudo", "-n"])
-            self.assertTrue(res)
-            self.assertEqual(res.status, "CLEAN")
-            self.assertTrue(res.group_terminated)
-
-        # 13. Child process is NOT a session leader: avoids collateral group signaling
-        mock_nonsession = MagicMock()
-        mock_nonsession.pid = 6677
-        mock_nonsession.poll.side_effect = [None, 0]
-        with patch("os.killpg") as mock_killpg:
-            res = EbpfEnvironmentChecker._terminate_probe_process(
-                mock_nonsession, [], is_session_leader=False
+            res_race = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_race, ["sudo", "-n"], is_session_leader=True
             )
-            self.assertTrue(res)
-            self.assertEqual(res.status, "CLEAN")
-            mock_killpg.assert_not_called()  # Did NOT signal parent process group
-            mock_nonsession.kill.assert_called_once()
+            self.assertTrue(res_race)
+            self.assertEqual(res_race.status, "CLEAN")
+            self.assertTrue(res_race.group_terminated)
 
-        # 14. Invalid PIDs: None, string, negative, PID 1
+        # 12. Repeated cleanup calls and already-reaped processes (idempotency)
+        mock_idempotent = MagicMock()
+        mock_idempotent.pid = 4322
+        mock_idempotent.poll.return_value = 0
+        with patch("os.killpg") as mock_killpg:
+            mock_killpg.side_effect = ProcessLookupError("No such process")
+            # 1st call
+            r1 = EbpfEnvironmentChecker._terminate_probe_process(mock_idempotent, [], is_session_leader=True)
+            self.assertTrue(r1)
+            self.assertEqual(r1.status, "ALREADY_EXITED")
+            self.assertTrue(r1.group_terminated)
+            # 2nd call (identical outcome, completely idempotent)
+            r2 = EbpfEnvironmentChecker._terminate_probe_process(mock_idempotent, [], is_session_leader=True)
+            self.assertEqual(r1, r2)
+
+        # 13. Invalid/untracked PID behavior (None, string, negative, 0, 1)
         for invalid_pid in [None, "invalid_pid", -10, 0, 1]:
             mock_invalid = MagicMock()
             mock_invalid.pid = invalid_pid
             mock_invalid.poll.return_value = 0
             with patch("os.killpg") as mock_killpg:
-                res = EbpfEnvironmentChecker._terminate_probe_process(mock_invalid, [])
-                self.assertTrue(res)
-                self.assertEqual(res.status, "ALREADY_EXITED")
+                res_inv = EbpfEnvironmentChecker._terminate_probe_process(mock_invalid, [])
+                self.assertFalse(res_inv)
+                self.assertEqual(res_inv.status, "UNCERTAIN")
+                self.assertFalse(res_inv.group_terminated)
+                self.assertTrue(res_inv.child_reaped)
                 mock_killpg.assert_not_called()
 
     def test_63_cache_invalidation_stat_keys(self):
@@ -2741,32 +2785,85 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertNotEqual(r_success1, r_diff_details)
         self.assertNotEqual(r_success1, r_failed)
 
-        # 2. Boolean backward-compatibility comparisons
-        self.assertTrue(r_success1 == True)
-        self.assertTrue(True == r_success1)
+        # 2. Normal Python equality semantics (dataclass does NOT equal bool)
+        self.assertFalse(r_success1 == True)
         self.assertFalse(r_success1 == False)
-        self.assertFalse(False == r_success1)
-
-        self.assertTrue(r_failed == False)
-        self.assertTrue(False == r_failed)
+        self.assertFalse(r_failed == False)
         self.assertFalse(r_failed == True)
-        self.assertFalse(True == r_failed)
 
         # 3. Truthiness via __bool__
         self.assertTrue(bool(r_success1))
         self.assertFalse(bool(r_failed))
+        self.assertTrue(r_success1)
+        self.assertFalse(r_failed)
 
         # 4. Incompatible type comparison returns False without raising
         self.assertFalse(r_success1 == "arbitrary string")
         self.assertFalse(r_success1 == None)
         self.assertFalse(r_success1 == 42)
 
-        # 5. Serialization to dict
+        # 5. Hashability and set usage (frozen dataclass)
+        self.assertEqual(hash(r_success1), hash(r_success2))
+        self.assertEqual(len({r_success1, r_success2}), 1)
+
+        # 6. Serialization to dict
         d = r_success1.to_dict()
         self.assertEqual(d["status"], "CLEAN")
         self.assertTrue(d["success"])
         self.assertTrue(d["child_reaped"])
         self.assertTrue(d["group_terminated"])
+
+        # 7. Internal consistency invariant
+        # success=True MUST imply both child_reaped=True and group_terminated=True
+        results = [r_success1, r_success2, r_diff_details, r_failed]
+        for r in results:
+            if r.success:
+                self.assertTrue(r.child_reaped)
+                self.assertTrue(r.group_terminated)
+                self.assertIn(r.status, ("CLEAN", "ALREADY_EXITED"))
+            else:
+                self.assertIn(r.status, ("GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN"))
+
+    def test_68_real_process_group_lifecycle_and_cleanup(self):
+        """Scenario 68: Real operating-system process and process-group lifecycle cleanup test.
+
+        Spawns a real process with start_new_session=True (which spawns a real child in its group),
+        exercises _terminate_probe_process, and verifies that the entire process group is
+        terminated with no surviving or zombie processes.
+        """
+        if not sys.platform.startswith("linux"):
+            raise unittest.SkipTest("Requires Linux platform")
+
+        # Spawn a real process that owns its own process group/session and spawns a child
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); time.sleep(10)",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        time.sleep(0.15)  # Let subprocess spawn its child
+
+        # Verify child is running and pgid matches its PID
+        self.assertIsNone(proc.poll())
+        self.assertEqual(os.getpgid(pgid), pgid)
+
+        # Exercise real cleanup
+        cleanup_res = EbpfEnvironmentChecker._terminate_probe_process(proc, [], is_session_leader=True)
+
+        # Verify cleanup outcome
+        self.assertTrue(cleanup_res.success)
+        self.assertTrue(cleanup_res.child_reaped)
+        self.assertTrue(cleanup_res.group_terminated)
+        self.assertEqual(cleanup_res.status, "CLEAN")
+
+        # Verify on real OS that process group is completely dead (os.killpg raises ESRCH)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pgid, 0)
 
 
 if __name__ == "__main__":

@@ -702,6 +702,66 @@ DynamicState structures test validation into four truthful tiers:
   - Unit tests in `tests/test_ebpf_tracer.py` verify deterministic state transitions, race handling, and error branches using controlled mocks.
   - Real operating-system kernel capability is validated exclusively through Tier 4 live integration tests on real Linux hosts.
 
+---
+
+## 19. Phase 1.15 Cleanup State Integrity & Host-Portable Validation
+
+### 19.1 Precise Cleanup Result Semantics & Guarantees
+- **Semantics of `ProbeCleanupResult` Fields**:
+  - `child_reaped: bool`: The direct `subprocess.Popen` child process has been explicitly reaped (`proc.poll() is not None` and pipes drained). Guarantees the direct child is not a lingering zombie process.
+  - `group_terminated: bool`: The process group has been explicitly inspected with signal 0 and verified absent via positive ESRCH (`no such process`) evidence. It is `True` **if and only if** absence was positively verified. It is `False` whenever group termination failed or could not be established.
+  - `status: str`:
+    - `CLEAN`: Direct child reaped AND process group verified terminated (signal 0 returned ESRCH).
+    - `ALREADY_EXITED`: Direct child had already exited prior to termination AND process group verified absent (signal 0 returned ESRCH).
+    - `GROUP_KILL_FAILED`: Direct child reaped, but active processes were confirmed to remain in the process group after SIGKILL or group SIGKILL command failed.
+    - `REAP_FAILED`: The direct child handle could not be reaped within the bounded timeout.
+    - `UNCERTAIN`: The direct child was terminated or reaped, but the state of descendant processes in the group could not be verified (e.g. non-session leader, caller PID/PGID match, untracked PID, permission denied, command timeout, or ambiguous diagnostic).
+  - `success: bool`: `True` **if and only if** both `child_reaped == True` and `group_terminated == True` with status in `("CLEAN", "ALREADY_EXITED")`. Evaluates as `False` in all other states.
+  - `details: str`: Human-readable diagnostic explaining the exact verification outcome and any errors.
+  - **Dataclass Equality & Hashing**: `ProbeCleanupResult` is an immutable `@dataclass(frozen=True)` adhering strictly to standard Python equality (`r1 == r2` iff all fields match; `r == True` returns `False`) and standard hashing, while truthiness is evaluated via `__bool__`.
+
+### 19.2 Handling of Unverified and Non-Session-Leader Process Groups
+- **Collateral Damage Prevention**:
+  - If a process was not launched in its own session (`is_session_leader is not True`), signaling `-pid` could inadvertently signal the caller's process group or unrelated processes.
+  - In such cases, `_terminate_probe_process` safely terminates/reaps only the direct child and skips group-wide signaling.
+  - Because descendant processes were not verified, the cleanup state is explicitly classified as `status="UNCERTAIN"`, `group_terminated=False`, and `success=False`. The implementation **never** claims `group_terminated=True` merely because group signaling was bypassed.
+- **Unsafe and Untracked PID Guard**:
+  - If `pid` is invalid (mock, untracked, non-int, or `pid <= 1`), or if `pid` matches the caller's own PID or PGID, group-wide signaling is strictly refused.
+  - Direct child is reaped if present; group state is marked unverified (`group_terminated=False`, `status="UNCERTAIN"`, `success=False`).
+
+### 19.3 Classification of Errors: UNKNOWN vs UNCERTAIN
+- **Cleanup Status `UNCERTAIN`**:
+  - Triggered during process cleanup when verification of the process group cannot be definitively established due to:
+    - Non-session-leader execution (`is_session_leader is not True`).
+    - Inspection permission error (`kill -0` returns EPERM).
+    - sudo failure, usage error, or timeout during group inspection.
+    - Untracked or invalid process IDs.
+- **Capability Status `UNKNOWN`**:
+  - Triggered during capability probing when the active probe cannot conclusively establish whether the kernel/bpftrace supports offset probing due to:
+    - Probe execution timeout ($3.0$s / $4.0$s).
+    - Compiler or disassembler failure during probe fixture compilation.
+    - Permission error during probe attachment.
+    - Non-zero bpftrace exit code without specific unsupported-offset diagnostics.
+    - Probe exiting cleanly without emitting the expected `PROBE_OFFSET_HIT` event marker.
+- **Distinction from `UNSUPPORTED`**:
+  - `UNSUPPORTED` is strictly reserved for deterministic diagnostic evidence that the installed bpftrace binary lacks offset probing support (e.g. `compiled without (k|u)probe offset support` or `offset is not supported`).
+- **Distinction from `NOT_CHECKED`**:
+  - `NOT_CHECKED` indicates that active probing was declined due to missing prerequisites (non-Linux, unprivileged user without sudo, missing bpftrace) or because the caller requested a default non-probing query (`active_probe=False`).
+
+### 19.4 Host-Portable Integration Testing & Test Evidence Boundaries
+- **Prerequisites Verification**:
+  - `test_16` and `test_17` portably verify Linux platform, bpftrace availability, GCC compiler, objdump disassembler, and root or non-interactive sudo (`sudo -n`) before attempting privileged execution.
+  - If any prerequisite is absent, tests skip cleanly with an explicit reason (`unittest.SkipTest`) rather than producing false failures or manufacturing false negative capability claims.
+- **Evidence Verification Standards**:
+  - A probe is classified as `SUPPORTED` **if and only if** both target process execution succeeds (exit code 0) AND the explicit uniquely identifiable probe event marker (`TEST16_OFFSET_HIT`) is observed.
+  - Every probe execution path explicitly checks `ProbeCleanupResult`, asserting that `child_reaped == True` and `group_terminated == True`.
+- **Operating-System vs Mocked Evidence**:
+  - Mocked unit tests (`test_62`, `test_67`) verify the complete 15-branch contract of `_terminate_probe_process` and `ProbeCleanupResult` deterministically.
+  - Real OS process lifecycle test (`test_68`) exercises real kernel process-group creation (`start_new_session=True`) and group-wide SIGKILL teardown, independently verifying absence via `os.killpg(pgid, 0)` raising `ProcessLookupError`.
+  - Tier 4 integration tests validate real host eBPF kernel attachment and DWARF local variable evaluation.
+- **GDB Oracle Isolation**:
+  - GDB oracle evaluations run in dedicated, separate process invocations with separate binary copies, preventing ptrace conflicts with live eBPF tracing. Same-process dual-tracing parity is never claimed.
+
 
 
 

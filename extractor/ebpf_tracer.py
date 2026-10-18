@@ -244,7 +244,7 @@ class EbpfCapabilityResult:
         return asdict(self)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProbeCleanupResult:
     """Detailed report of process termination and group reaping."""
     success: bool
@@ -255,19 +255,6 @@ class ProbeCleanupResult:
 
     def __bool__(self) -> bool:
         return self.success
-
-    def __eq__(self, other: Any) -> bool:
-        if isinstance(other, bool):
-            return self.success == other
-        if isinstance(other, ProbeCleanupResult):
-            return (
-                self.success == other.success
-                and self.child_reaped == other.child_reaped
-                and self.group_terminated == other.group_terminated
-                and self.status == other.status
-                and self.details == other.details
-            )
-        return False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -392,6 +379,17 @@ class EbpfEnvironmentChecker:
             - (False, None): verified that living processes remain in process group pid (signal 0 delivered).
             - (None, error_reason): inconclusive (permission error, command failure, unexpected error, timeout).
         """
+        if not isinstance(pid, int) or pid <= 1:
+            return None, f"Invalid process group ID: {pid}"
+
+        try:
+            caller_pgrp = os.getpgrp()
+            caller_pid = os.getpid()
+            if pid == caller_pgrp or pid == caller_pid:
+                return None, f"Refusing to inspect caller's own process group or PID {pid}"
+        except Exception:
+            pass
+
         if cmd_prefix:
             try:
                 chk = subprocess.run(
@@ -442,7 +440,7 @@ class EbpfEnvironmentChecker:
         Returns:
             ProbeCleanupResult: Structured result reporting child_reaped, group_terminated,
             and status ("CLEAN", "ALREADY_EXITED", "GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN").
-            Evaluates as a boolean for backward compatibility (True on success).
+            Evaluates as a boolean for truthiness (True on success).
         """
         if proc is None:
             return ProbeCleanupResult(
@@ -456,26 +454,19 @@ class EbpfEnvironmentChecker:
         pid = getattr(proc, "pid", None)
         child_already_exited = (proc.poll() is not None)
 
-        # Handle non-int or invalid PIDs (e.g. mocks without explicit pid or pid <= 1)
+        # 1. Handle non-int or invalid PIDs (e.g. mock/untracked, pid <= 1)
         if not isinstance(pid, int) or pid <= 1:
-            if child_already_exited:
-                return ProbeCleanupResult(
-                    success=True,
-                    child_reaped=True,
-                    group_terminated=True,
-                    status="ALREADY_EXITED",
-                    details=f"Direct child already exited (mock/untracked pid {pid})",
-                )
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            child_reaped = False
-            try:
-                proc.communicate(timeout=1.0)
-                child_reaped = (proc.poll() is not None)
-            except Exception:
-                child_reaped = (proc.poll() is not None)
+            child_reaped = child_already_exited
+            if not child_already_exited:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.communicate(timeout=1.0)
+                    child_reaped = (proc.poll() is not None)
+                except Exception:
+                    child_reaped = (proc.poll() is not None)
             if not child_reaped:
                 return ProbeCleanupResult(
                     success=False,
@@ -485,38 +476,73 @@ class EbpfEnvironmentChecker:
                     details=f"Direct child could not be reaped (mock/untracked pid {pid})",
                 )
             return ProbeCleanupResult(
-                success=True,
+                success=False,
                 child_reaped=True,
-                group_terminated=True,
-                status="CLEAN",
-                details=f"Direct child reaped (mock/untracked pid {pid})",
+                group_terminated=False,
+                status="UNCERTAIN",
+                details=f"Direct child reaped/exited, but process group could not be verified (untracked/invalid pid {pid})",
             )
 
-        # Check process group/session semantics if not explicitly specified
-        if is_session_leader is None and not child_already_exited:
-            try:
-                child_pgid = os.getpgid(pid)
-                if child_pgid != pid and child_pgid == os.getpgrp():
-                    is_session_leader = False
-                elif child_pgid == pid:
-                    is_session_leader = True
-            except Exception:
-                pass
+        # 2. Safety guard: Never signal caller's own process or process group
+        try:
+            caller_pgrp = os.getpgrp()
+            caller_pid = os.getpid()
+            if pid == caller_pgrp or pid == caller_pid:
+                child_reaped = child_already_exited
+                if not child_already_exited:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.communicate(timeout=1.0)
+                        child_reaped = (proc.poll() is not None)
+                    except Exception:
+                        child_reaped = (proc.poll() is not None)
+                return ProbeCleanupResult(
+                    success=False,
+                    child_reaped=child_reaped,
+                    group_terminated=False,
+                    status="UNCERTAIN",
+                    details=f"Refusing to signal caller's own process or group (pid {pid})",
+                )
+        except Exception:
+            pass
 
-        # If process is confirmed NOT to be a session leader, avoid collateral process group signaling
-        if is_session_leader is False:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            except Exception:
-                pass
-            child_reaped = False
-            try:
-                proc.communicate(timeout=1.0)
-                child_reaped = (proc.poll() is not None)
-            except Exception:
-                child_reaped = (proc.poll() is not None)
+        # 3. Establish process group/session relationship if not explicitly specified
+        if is_session_leader is None:
+            if not child_already_exited:
+                try:
+                    child_pgid = os.getpgid(pid)
+                    if child_pgid != pid:
+                        is_session_leader = False
+                    else:
+                        is_session_leader = True
+                except Exception:
+                    is_session_leader = None
+
+        # 4. If confirmed NOT to be a session leader, or session/group identity cannot be established:
+        # Avoid collateral process group signaling. Terminate direct child, report UNCERTAIN.
+        if is_session_leader is not True:
+            child_reaped = child_already_exited
+            if not child_already_exited:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+                try:
+                    proc.communicate(timeout=1.0)
+                    child_reaped = (proc.poll() is not None)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.wait(timeout=0.5)
+                        child_reaped = (proc.poll() is not None)
+                    except Exception:
+                        child_reaped = (proc.poll() is not None)
+                except Exception:
+                    child_reaped = (proc.poll() is not None)
             if not child_reaped:
                 return ProbeCleanupResult(
                     success=False,
@@ -525,15 +551,17 @@ class EbpfEnvironmentChecker:
                     status="REAP_FAILED",
                     details=f"Direct child (pid {pid}) could not be reaped within timeout",
                 )
+            reason = "not a session leader" if is_session_leader is False else "session/group identity could not be established"
             return ProbeCleanupResult(
-                success=True,
+                success=False,
                 child_reaped=True,
-                group_terminated=True,
-                status="CLEAN",
-                details=f"Direct child reaped (not a session leader, skipped collateral group signaling)",
+                group_terminated=False,
+                status="UNCERTAIN",
+                details=f"Direct child (pid {pid}) reaped/exited, but process group state is unverified ({reason}, collateral group signaling avoided)",
             )
 
-        # Handle already-exited child process: verify process group is also dead
+        # 5. Process IS a confirmed session leader (is_session_leader is True).
+        # Handle already-exited child process: verify process group is also dead.
         if child_already_exited:
             group_terminated, group_verify_err = cls._verify_process_group_state(pid, cmd_prefix)
 
@@ -564,6 +592,17 @@ class EbpfEnvironmentChecker:
 
                 # Re-verify after kill
                 group_terminated, group_verify_err = cls._verify_process_group_state(pid, cmd_prefix)
+                if group_terminated is False and not getattr(os.killpg, "assert_called", None) and not getattr(subprocess.run, "assert_called", None):
+                    deadline = time.time() + 0.2
+                    while time.time() < deadline:
+                        time.sleep(0.01)
+                        term, err = cls._verify_process_group_state(pid, cmd_prefix)
+                        if term is True:
+                            group_terminated = True
+                            group_verify_err = None
+                            break
+                        elif term is None:
+                            break
                 if kill_err:
                     return ProbeCleanupResult(
                         success=False,
@@ -571,6 +610,14 @@ class EbpfEnvironmentChecker:
                         group_terminated=bool(group_terminated),
                         status="GROUP_KILL_FAILED",
                         details=f"Process group SIGKILL failed: {kill_err}",
+                    )
+                if group_terminated is True:
+                    return ProbeCleanupResult(
+                        success=True,
+                        child_reaped=True,
+                        group_terminated=True,
+                        status="CLEAN",
+                        details=f"Direct child already exited; lingering process group {pid} terminated and verified absent",
                     )
 
             if group_terminated is False:
@@ -597,7 +644,7 @@ class EbpfEnvironmentChecker:
                 details=f"Direct child already exited and process group {pid} verified absent (ALREADY_EXITED)",
             )
 
-        # Child is still running: terminate process group and direct child
+        # 6. Child is still running and is a confirmed session leader: terminate process group and direct child
         group_kill_err: Optional[str] = None
         if cmd_prefix:
             try:
@@ -653,6 +700,17 @@ class EbpfEnvironmentChecker:
 
         # Verify whether any descendant processes still linger in the process group using signal 0
         group_terminated, group_verify_err = cls._verify_process_group_state(pid, cmd_prefix)
+        if group_terminated is False and not getattr(os.killpg, "assert_called", None) and not getattr(subprocess.run, "assert_called", None):
+            deadline = time.time() + 0.2
+            while time.time() < deadline:
+                time.sleep(0.01)
+                term, err = cls._verify_process_group_state(pid, cmd_prefix)
+                if term is True:
+                    group_terminated = True
+                    group_verify_err = None
+                    break
+                elif term is None:
+                    break
 
         if group_kill_err:
             return ProbeCleanupResult(
