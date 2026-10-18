@@ -719,18 +719,20 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             self.skipTest("GDB executable not found in PATH; cannot execute GDB oracle parity validation for test_13")
 
         observed_op = op_val.value
+        oracle_bin_t13 = os.path.join(self.tmp_dir, "ebpf_fixture_opt_oracle_t13")
+        shutil.copy2(self.opt_bin, oracle_bin_t13)
         gdb_cmd = [
             "gdb", "-batch",
             "-ex", "set pagination off",
+            "-ex", f"file {oracle_bin_t13}",
             "-ex", f"break trace_target_function if op_code == {observed_op}",
             "-ex", "run --loop 30 --interval-ms 50",
             "-ex", 'printf "PARITY_VAR:op_code=%d\\n", op_code',
             "-ex", 'printf "PARITY_VAR:input_val=%lld\\n", (long long)input_val',
             "-ex", 'printf "PARITY_VAR:count=%u\\n", (unsigned int)count',
             "-ex", "quit",
-            self.opt_bin,
         ]
-        gdb_proc = subprocess.run(gdb_cmd, capture_output=True, text=True, errors="replace")
+        gdb_proc = subprocess.run(gdb_cmd, capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL)
         self.assertEqual(gdb_proc.returncode, 0, f"GDB execution failed: {gdb_proc.stderr}")
 
         validate_gdb_oracle_parity(
@@ -752,18 +754,20 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             raise unittest.SkipTest("GDB executable not found in PATH")
 
         # 1. Optimized build (-O2)
+        oracle_bin_opt = os.path.join(self.tmp_dir, "ebpf_fixture_opt_oracle_t14")
+        shutil.copy2(self.opt_bin, oracle_bin_opt)
         gdb_cmd_opt = [
             "gdb", "-batch",
             "-ex", "set pagination off",
+            "-ex", f"file {oracle_bin_opt}",
             "-ex", "break trace_target_function if op_code == 7",
             "-ex", "run --loop 20 --interval-ms 20",
             "-ex", 'printf "PARITY:op_code=%d\\n", op_code',
             "-ex", 'printf "PARITY:input_val=%lld\\n", (long long)input_val',
             "-ex", 'printf "PARITY:count=%u\\n", (unsigned int)count',
             "-ex", "quit",
-            self.opt_bin,
         ]
-        proc_opt = subprocess.run(gdb_cmd_opt, capture_output=True, text=True, errors="replace")
+        proc_opt = subprocess.run(gdb_cmd_opt, capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL)
         self.assertEqual(proc_opt.returncode, 0, f"GDB -O2 run failed: {proc_opt.stderr}")
 
         gdb_opt: Dict[str, int] = {}
