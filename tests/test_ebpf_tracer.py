@@ -974,6 +974,129 @@ class TestEbpfTracerUnit(unittest.TestCase):
         v_reg_u32, h_reg_u32 = unpack_scalar_from_register(0xffffffff, "uint32", byte_size=4)
         self.assertEqual(v_reg_u32, 4294967295)
 
+    def test_33_dwarf_evaluator_gdb_parity_value_assertions(self):
+        """Verify Phase 2 resolver value reconstruction against exact expected values and types."""
+        ident = BinaryIdentity(
+            path="/bin/dummy",
+            elf_class="ELF64",
+            architecture="x86_64",
+            endianness="little",
+            build_id="abcdef0123456789",
+            elf_type="ET_DYN",
+        )
+        fp = 0x7fffffffe000
+        var_addr = fp + 16 - 24
+        mem_store = {
+            var_addr: struct.pack("<i", -4242),
+        }
+
+        def mock_mem_reader(addr: int, sz: int) -> Optional[bytes]:
+            return mem_store.get(addr)
+
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="target_func",
+            low_pc=0x1000,
+            high_pc=0x1100,
+            frame_base="DW_OP_call_frame_cfa",
+            cfa_rules=[(0x1000, 0x1100, "fp", 16, True)],
+            variables=[
+                DwarfVariable(die_offset=0x20, name="local_int", type_offset=0x30, location_expr="DW_OP_fbreg -24"),
+            ],
+        )
+
+        mock_index = DwarfIndex(artifact_path="/bin/dummy")
+        mock_index.types_by_die[0x30] = DwarfType(die_offset=0x30, tag="DW_TAG_base_type", name="int", byte_size=4)
+
+        resolver = Phase2DwarfLocationResolver(
+            binary_identity=ident,
+            link_time_address=0x1020,
+            load_bias=0,
+            architecture="x86_64",
+            memory_reader=mock_mem_reader,
+        )
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_index):
+            tv = resolver.resolve_variable(
+                subprogram=subp,
+                variable_name="local_int",
+                registers={"rbp": fp, "rsp": fp - 32},
+                frame_metadata=FrameMetadata(frame_pointer=fp),
+            )
+            self.assertEqual(tv.status, STATUS_OBSERVED)
+            self.assertEqual(tv.value, -4242)
+            self.assertEqual(tv.value_hex, "0xffffef6e")
+            self.assertIn("stack:", tv.location)
+            self.assertIn("CFA", tv.location)
+
+    def test_34_phase2_resolver_companion_debug_artifact_and_cfi(self):
+        """Verify companion artifact rejection and unsupported CFI rule detection in Phase 2 resolver."""
+        ident = BinaryIdentity(
+            path="/bin/dummy",
+            elf_class="ELF64",
+            architecture="x86_64",
+            endianness="little",
+            build_id="1111222233334444",
+            elf_type="ET_DYN",
+        )
+        subp_unsupported = DwarfSubprogram(
+            die_offset=0x10,
+            name="complex_cfi_func",
+            low_pc=0x1000,
+            high_pc=0x1100,
+            has_unsupported_cfi=True,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="x", type_offset=0x30, location_expr="DW_OP_reg0"),
+            ],
+        )
+        mock_index = DwarfIndex(artifact_path="/bin/dummy")
+        mock_index.types_by_die[0x30] = DwarfType(die_offset=0x30, tag="DW_TAG_base_type", name="int", byte_size=4)
+
+        resolver = Phase2DwarfLocationResolver(
+            binary_identity=ident,
+            link_time_address=0x1020,
+            load_bias=0,
+            architecture="x86_64",
+        )
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_index):
+            tv = resolver.resolve_variable(
+                subprogram=subp_unsupported,
+                variable_name="x",
+                registers={"rax": 10},
+                frame_metadata=FrameMetadata(),
+            )
+            self.assertEqual(tv.status, EVAL_STATUS_UNSUPPORTED)
+            self.assertIn("DW_CFA_def_cfa_expression", tv.reason)
+
+        # Mismatched companion debug artifact
+        resolver_mismatch = Phase2DwarfLocationResolver(
+            binary_identity=ident,
+            link_time_address=0x1020,
+            load_bias=0,
+            architecture="x86_64",
+            debug_artifact_path="/bin/other_debug",
+        )
+        dbg_ident = BinaryIdentity(
+            path="/bin/other_debug",
+            elf_class="ELF64",
+            architecture="x86_64",
+            endianness="little",
+            build_id="9999888877776666",
+            elf_type="ET_DYN",
+        )
+
+        with patch("os.path.exists", return_value=True), \
+             patch("extractor.dwarf_evaluator.inspect_elf", return_value=dbg_ident):
+            tv_mismatch = resolver_mismatch.resolve_variable(
+                subprogram=DwarfSubprogram(die_offset=0x10, name="func", low_pc=0x1000),
+                variable_name="x",
+                registers={},
+                frame_metadata=FrameMetadata(),
+            )
+            self.assertEqual(tv_mismatch.status, EVAL_STATUS_ERROR)
+            self.assertIn("Build ID mismatch", tv_mismatch.reason)
+
 
 if __name__ == "__main__":
     unittest.main()

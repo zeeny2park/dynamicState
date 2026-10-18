@@ -90,6 +90,7 @@ class DwarfSubprogram:
     fp_offset_from_cfa: Optional[int] = None
     cfa_rules: List[Tuple[int, int, str, int, bool]] = field(default_factory=list)
     variables: List[DwarfVariable] = field(default_factory=list)
+    has_unsupported_cfi: bool = False
 
     def get_variable(self, var_name: str) -> Optional[DwarfVariable]:
         for v in self.variables:
@@ -182,13 +183,14 @@ class DwarfIndex:
         return f"type_0x{t.die_offset:x}"
 
 
-_CFI_CACHE: Dict[Tuple[str, float, int, Optional[str]], Dict[int, Dict[str, Any]]] = {}
+_CFI_CACHE: Dict[Tuple[str, int, int, Optional[str]], Dict[int, Dict[str, Any]]] = {}
+_CFI_ERROR: Dict[Tuple[str, int, int, Optional[str]], str] = {}
 
 
-def _get_cfi_cache_key(path: str) -> Tuple[str, float, int, Optional[str]]:
+def _get_cfi_cache_key(path: str) -> Tuple[str, int, int, Optional[str]]:
     abs_path = os.path.abspath(path)
     if not os.path.exists(abs_path):
-        return (abs_path, 0.0, 0, None)
+        return (abs_path, 0, 0, None)
     st = os.stat(abs_path)
     build_id = None
     try:
@@ -197,7 +199,7 @@ def _get_cfi_cache_key(path: str) -> Tuple[str, float, int, Optional[str]]:
         build_id = ident.build_id
     except Exception:
         pass
-    return (abs_path, st.st_mtime, st.st_size, build_id)
+    return (abs_path, st.st_mtime_ns, st.st_size, build_id)
 
 
 def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[str, Any]]:
@@ -210,104 +212,155 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
     try:
         cmd = ["readelf", "--debug-dump=frames", cache_key[0]]
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if res.returncode == 0:
-            fp_reg_names = ("r29", "x29") if arch in ("aarch64", "arm64") else ("r6", "rbp")
-            sp_reg_names = ("r31", "sp") if arch in ("aarch64", "arm64") else ("r7", "rsp")
+        if res.returncode != 0:
+            _CFI_ERROR[cache_key] = res.stderr.strip() or f"readelf exited with code {res.returncode}"
+            return {}
 
-            fde_re = re.compile(r"FDE\s+cie=[0-9a-fA-F]+\s+pc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)")
-            adv_re = re.compile(r"DW_CFA_advance_loc\w*:\s+\d+\s+to\s+([0-9a-fA-F]+)")
-            def_cfa_re = re.compile(r"DW_CFA_def_cfa:\s+(\w+)\s+ofs\s+(\d+)")
-            def_cfa_reg_re = re.compile(r"DW_CFA_def_cfa_register:\s+(\w+)")
-            def_cfa_off_re = re.compile(r"DW_CFA_def_cfa_offset:\s+(\d+)")
-            offset_fp_re = re.compile(r"DW_CFA_offset:\s+(?:r29|x29|r6|rbp)\b.*at cfa(-?\d+)")
-            restore_fp_re = re.compile(r"DW_CFA_restore:\s+(?:r29|x29|r6|rbp)\b")
+        fp_reg_names = ("r29", "x29") if arch in ("aarch64", "arm64") else ("r6", "rbp")
+        sp_reg_names = ("r31", "sp") if arch in ("aarch64", "arm64") else ("r7", "rsp")
 
-            curr_fde: Optional[Dict[str, Any]] = None
-            curr_pc: int = 0
-            curr_cfa_reg: str = "sp"
-            curr_cfa_off: int = 0 if arch in ("aarch64", "arm64") else 8
-            fp_established: bool = False
-            last_rule_pc: int = 0
-            state_stack: List[Tuple[str, int, bool]] = []
+        cie_re = re.compile(r"^\s*([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+CIE\b")
+        fde_re = re.compile(r"FDE\s+cie=([0-9a-fA-F]+)\s+pc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)")
+        adv_re = re.compile(r"(?:DW_CFA_advance_loc\w*:\s+\d+\s+to\s+|DW_CFA_set_loc:\s+)([0-9a-fA-F]+)")
+        def_cfa_re = re.compile(r"DW_CFA_def_cfa:\s+(\w+)\s+ofs\s+(\d+)")
+        def_cfa_reg_re = re.compile(r"DW_CFA_def_cfa_register:\s+(\w+)")
+        def_cfa_off_re = re.compile(r"DW_CFA_def_cfa_offset:\s+(\d+)")
+        offset_fp_re = re.compile(r"DW_CFA_offset:\s+(?:r29|x29|r6|rbp)\b.*at cfa(-?\d+)")
+        restore_fp_re = re.compile(r"DW_CFA_restore(?:_extended)?:\s+(?:r29|x29|r6|rbp|\b29\b|\b6\b)\b")
 
-            for line in res.stdout.splitlines():
-                m_fde = fde_re.search(line)
-                if m_fde:
-                    if curr_fde is not None:
-                        curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
-                    low_pc = int(m_fde.group(1), 16)
-                    high_pc = int(m_fde.group(2), 16)
-                    curr_fde = {
-                        "low_pc": low_pc,
-                        "high_pc": high_pc,
-                        "has_frame_pointer": False,
-                        "frame_established_pc": None,
-                        "frame_destroyed_pc": None,
-                        "fp_offset_from_cfa": None,
-                        "cfa_rules": [],
-                    }
-                    cfi_map[low_pc] = curr_fde
-                    curr_pc = low_pc
-                    curr_cfa_reg = "sp"
-                    curr_cfa_off = 0 if arch in ("aarch64", "arm64") else 8
-                    fp_established = False
-                    last_rule_pc = low_pc
-                    state_stack.clear()
-                    continue
+        cie_table: Dict[int, Dict[str, Any]] = {}
+        curr_cie_offset: Optional[int] = None
+        curr_fde: Optional[Dict[str, Any]] = None
+        curr_pc: int = 0
+        curr_cfa_reg: str = "sp"
+        curr_cfa_off: int = 0 if arch in ("aarch64", "arm64") else 8
+        fp_established: bool = False
+        last_rule_pc: int = 0
+        state_stack: List[Tuple[str, int, bool]] = []
 
-                if curr_fde is None:
-                    continue
-
-                # An FDE closes on encountering another CIE/FDE header (never on blank lines or nops)
-                if re.match(r"^[0-9a-fA-F]{4,16}\s+[0-9a-fA-F]{4,16}\s+[0-9a-fA-F]{4,16}\s+(?:FDE|CIE)", line) or re.search(r"\bCIE\b", line):
+        for line in res.stdout.splitlines():
+            # Check CIE header
+            m_cie = cie_re.match(line)
+            if m_cie:
+                if curr_fde is not None:
                     curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
                     curr_fde = None
-                    continue
+                curr_cie_offset = int(m_cie.group(1), 16)
+                cie_table[curr_cie_offset] = {
+                    "cfa_reg": "sp",
+                    "cfa_off": 0 if arch in ("aarch64", "arm64") else 8,
+                }
+                continue
 
-                m_adv = adv_re.search(line)
-                if m_adv:
-                    new_pc = int(m_adv.group(1), 16)
-                    curr_fde["cfa_rules"].append((last_rule_pc, new_pc, curr_cfa_reg, curr_cfa_off, fp_established))
-                    last_rule_pc = new_pc
-                    curr_pc = new_pc
+            # Check FDE header
+            m_fde = fde_re.search(line)
+            if m_fde:
+                if curr_fde is not None:
+                    curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
+                cie_off = int(m_fde.group(1), 16)
+                low_pc = int(m_fde.group(2), 16)
+                high_pc = int(m_fde.group(3), 16)
+                curr_fde = {
+                    "low_pc": low_pc,
+                    "high_pc": high_pc,
+                    "has_frame_pointer": False,
+                    "frame_established_pc": None,
+                    "frame_destroyed_pc": None,
+                    "fp_offset_from_cfa": None,
+                    "cfa_rules": [],
+                    "has_unsupported_cfi": False,
+                }
+                cfi_map[low_pc] = curr_fde
+                curr_pc = low_pc
+                # Inherit CIE initial rule if present
+                if cie_off in cie_table:
+                    curr_cfa_reg = cie_table[cie_off]["cfa_reg"]
+                    curr_cfa_off = cie_table[cie_off]["cfa_off"]
+                else:
+                    curr_cfa_reg = "sp"
+                    curr_cfa_off = 0 if arch in ("aarch64", "arm64") else 8
+                fp_established = False
+                last_rule_pc = low_pc
+                state_stack.clear()
+                curr_cie_offset = None
+                continue
 
-                if "DW_CFA_remember_state" in line:
-                    state_stack.append((curr_cfa_reg, curr_cfa_off, fp_established))
-                if "DW_CFA_restore_state" in line and state_stack:
-                    curr_cfa_reg, curr_cfa_off, fp_established = state_stack.pop()
-
+            # If inside CIE, parse initial CFA definition
+            if curr_cie_offset is not None:
                 m_cfa = def_cfa_re.search(line)
                 if m_cfa:
                     r = m_cfa.group(1).lower()
-                    curr_cfa_reg = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
-                    curr_cfa_off = int(m_cfa.group(2))
-
+                    r_canon = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
+                    cie_table[curr_cie_offset]["cfa_reg"] = r_canon
+                    cie_table[curr_cie_offset]["cfa_off"] = int(m_cfa.group(2))
                 m_cfa_r = def_cfa_reg_re.search(line)
                 if m_cfa_r:
                     r = m_cfa_r.group(1).lower()
-                    curr_cfa_reg = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
-
+                    cie_table[curr_cie_offset]["cfa_reg"] = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
                 m_cfa_o = def_cfa_off_re.search(line)
                 if m_cfa_o:
-                    curr_cfa_off = int(m_cfa_o.group(1))
+                    cie_table[curr_cie_offset]["cfa_off"] = int(m_cfa_o.group(1))
+                continue
 
-                m_off = offset_fp_re.search(line)
-                if m_off:
-                    curr_fde["has_frame_pointer"] = True
-                    fp_established = True
-                    curr_fde["fp_offset_from_cfa"] = int(m_off.group(1))
-                    if curr_fde["frame_established_pc"] is None:
-                        curr_fde["frame_established_pc"] = curr_pc
+            if curr_fde is None:
+                continue
 
-                if restore_fp_re.search(line):
-                    fp_established = False
-                    if curr_fde["frame_destroyed_pc"] is None:
-                        curr_fde["frame_destroyed_pc"] = curr_pc
-
-            if curr_fde is not None:
+            # An FDE closes on encountering another CIE/FDE header (never on blank lines or nops)
+            if re.match(r"^[0-9a-fA-F]{4,16}\s+[0-9a-fA-F]{4,16}\s+[0-9a-fA-F]{4,16}\s+(?:FDE|CIE)", line):
                 curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
-    except Exception:
-        pass
+                curr_fde = None
+                continue
+
+            # Detect unsupported complex CFA expressions
+            if "DW_CFA_def_cfa_expression" in line or "DW_CFA_expression" in line:
+                curr_fde["has_unsupported_cfi"] = True
+
+            m_adv = adv_re.search(line)
+            if m_adv:
+                new_pc = int(m_adv.group(1), 16)
+                curr_fde["cfa_rules"].append((last_rule_pc, new_pc, curr_cfa_reg, curr_cfa_off, fp_established))
+                last_rule_pc = new_pc
+                curr_pc = new_pc
+
+            if "DW_CFA_remember_state" in line:
+                state_stack.append((curr_cfa_reg, curr_cfa_off, fp_established))
+            if "DW_CFA_restore_state" in line and state_stack:
+                curr_cfa_reg, curr_cfa_off, fp_established = state_stack.pop()
+
+            m_cfa = def_cfa_re.search(line)
+            if m_cfa:
+                r = m_cfa.group(1).lower()
+                curr_cfa_reg = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
+                curr_cfa_off = int(m_cfa.group(2))
+
+            m_cfa_r = def_cfa_reg_re.search(line)
+            if m_cfa_r:
+                r = m_cfa_r.group(1).lower()
+                curr_cfa_reg = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
+
+            m_cfa_o = def_cfa_off_re.search(line)
+            if m_cfa_o:
+                curr_cfa_off = int(m_cfa_o.group(1))
+
+            m_off = offset_fp_re.search(line)
+            if m_off:
+                curr_fde["has_frame_pointer"] = True
+                fp_established = True
+                curr_fde["fp_offset_from_cfa"] = int(m_off.group(1))
+                if curr_fde["frame_established_pc"] is None:
+                    curr_fde["frame_established_pc"] = curr_pc
+
+            if restore_fp_re.search(line):
+                fp_established = False
+                if curr_fde["frame_destroyed_pc"] is None:
+                    curr_fde["frame_destroyed_pc"] = curr_pc
+
+        if curr_fde is not None:
+            curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
+
+    except Exception as e:
+        _CFI_ERROR[cache_key] = str(e)
+        return {}
 
     _CFI_CACHE[cache_key] = cfi_map
     return cfi_map
@@ -316,12 +369,13 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
 def clear_cfi_cache() -> None:
     """Clear cached CFI tables (used in test teardown)."""
     _CFI_CACHE.clear()
+    _CFI_ERROR.clear()
 
 
 class DwarfIndexer:
     """Thread-safe indexer and cache manager for DWARF debug images."""
 
-    _cache: Dict[Tuple[str, float, int, Optional[str]], DwarfIndex] = {}
+    _cache: Dict[Tuple[str, int, int, Optional[str]], DwarfIndex] = {}
     _lock = threading.Lock()
 
     @classmethod
@@ -331,7 +385,7 @@ class DwarfIndexer:
             raise FileNotFoundError(f"Debug artifact not found: {abs_path}")
 
         st = os.stat(abs_path)
-        mtime = st.st_mtime
+        mtime = st.st_mtime_ns
         size = st.st_size
 
         # Inspect ELF header for build ID and architecture
@@ -699,6 +753,7 @@ class DwarfIndexer:
                     subp_dest_pc = None
                     subp_fp_cfa_off = None
                     subp_cfa_rules = []
+                    subp_unsupported_cfi = False
                     if low_pc is not None and low_pc in cfi_table:
                         cfi_info = cfi_table[low_pc]
                         subp_has_fp = cfi_info.get("has_frame_pointer")
@@ -706,6 +761,7 @@ class DwarfIndexer:
                         subp_dest_pc = cfi_info.get("frame_destroyed_pc")
                         subp_fp_cfa_off = cfi_info.get("fp_offset_from_cfa")
                         subp_cfa_rules = cfi_info.get("cfa_rules", [])
+                        subp_unsupported_cfi = cfi_info.get("has_unsupported_cfi", False)
 
                     subp = DwarfSubprogram(
                         die_offset=d["offset"],
@@ -724,6 +780,7 @@ class DwarfIndexer:
                         frame_destroyed_pc=subp_dest_pc,
                         fp_offset_from_cfa=subp_fp_cfa_off,
                         cfa_rules=subp_cfa_rules,
+                        has_unsupported_cfi=subp_unsupported_cfi,
                     )
                     # Extract parameters and local variables in subprogram subtree
                     j = die_idx + 1

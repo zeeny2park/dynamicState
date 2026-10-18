@@ -915,7 +915,11 @@ class EbpfTracer:
         try:
             search_path = debug_image if (debug_image and os.path.exists(debug_image)) else abs_binary
             d_index = DwarfIndexer.get_index(search_path)
-            subps = d_index.subprograms_by_name.get(function_name, [])
+            subps = list(d_index.subprograms_by_name.get(function_name, []))
+            if not subps:
+                for sp in d_index.subprograms:
+                    if sp.name == function_name or sp.linkage_name == function_name:
+                        subps.append(sp)
             if subps:
                 target_subp = subps[0]
 
@@ -1210,7 +1214,11 @@ class EbpfTracer:
         subprograms: List[DwarfSubprogram] = []
         try:
             d_index = DwarfIndexer.get_index(search_path)
-            subprograms = d_index.subprograms_by_name.get(function_name, [])
+            subprograms = list(d_index.subprograms_by_name.get(function_name, []))
+            if not subprograms:
+                for sp in d_index.subprograms:
+                    if sp.name == function_name or sp.linkage_name == function_name:
+                        subprograms.append(sp)
         except Exception:
             pass
 

@@ -37,6 +37,7 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import unittest
+from unittest.mock import patch
 
 from extractor.debug_image import BinaryIdentity, inspect_elf
 from extractor.dwarf_evaluator import (
@@ -63,6 +64,7 @@ from extractor.dwarf_indexer import (
     DwarfType,
     DwarfVariable,
     _CFI_CACHE,
+    _CFI_ERROR,
     _get_cfi_cache_key,
     clear_cfi_cache,
     parse_cfi_table,
@@ -757,46 +759,65 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
         self.assertEqual(rule_entry[0], "sp", "Entry CFA rule must be based on stack pointer")
 
     def test_20_gdb_parity_clang_and_gcc(self):
-        """Verify parity against GDB 15.1 on both Clang and GCC for scalar parameters and locals."""
+        """Verify parity against GDB 15.1 on both Clang and GCC with genuine value-to-value comparisons."""
         if not self.has_gdb:
             raise unittest.SkipTest("GDB not available")
 
+        tested_any = False
         for label in ("gcc_o2", "clang_o2"):
             if label not in self.binaries:
                 continue
+            tested_any = True
             bin_path = self.binaries[label]
             idx = DwarfIndexer.get_index(bin_path)
             subp_list = idx.subprograms_by_name.get("test_all_scalars")
-            if not subp_list:
-                continue
+            self.assertTrue(subp_list, f"Subprogram test_all_scalars not found in {label}")
             subp = subp_list[0]
             ident = inspect_elf(bin_path)
 
             gdb_cmd = [
                 "gdb", "-batch",
                 "-ex", f"file {bin_path}",
-                "-ex", "break test_all_scalars",
+                "-ex", "break *test_all_scalars",
                 "-ex", "run --loop 1",
                 "-ex", "print i32",
                 "-ex", "print u32",
+                "-ex", "print i64",
+                "-ex", "print u64",
+                "-ex", "print flag",
                 "-ex", "info registers general",
             ]
             proc = subprocess.run(gdb_cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                continue
+            self.assertEqual(proc.returncode, 0, f"GDB failed on {label}: {proc.stderr}")
+
+            gdb_prints: Dict[str, Any] = {}
+            lines = proc.stdout.splitlines()
+            for line in lines:
+                m = re.match(r"^\$(\d+)\s*=\s*(.*)$", line.strip())
+                if m:
+                    idx_val = int(m.group(1))
+                    raw_val = m.group(2).strip()
+                    target_var = ["i32", "u32", "i64", "u64", "flag"][idx_val - 1]
+                    if "<optimized out>" in raw_val:
+                        gdb_prints[target_var] = "<optimized out>"
+                    elif target_var in ("i32", "u32", "i64", "u64"):
+                        num_m = re.search(r"(-?\d+)", raw_val)
+                        if num_m:
+                            gdb_prints[target_var] = int(num_m.group(1))
+                    elif target_var == "flag":
+                        gdb_prints[target_var] = "true" in raw_val
 
             regs: Dict[str, int] = {}
-            for line in proc.stdout.splitlines():
+            for line in lines:
                 parts = line.strip().split()
-                if len(parts) >= 2:
-                    r_name = parts[0].lower()
-                    if parts[1].startswith("0x"):
-                        try:
-                            regs[r_name] = int(parts[1], 16)
-                        except ValueError:
-                            pass
+                if len(parts) >= 2 and parts[1].startswith("0x"):
+                    try:
+                        regs[parts[0].lower()] = int(parts[1], 16)
+                    except ValueError:
+                        pass
 
-            for vname in ("i32", "u32"):
+            for vname in ("i32", "u32", "i64", "u64"):
+                self.assertIn(vname, gdb_prints, f"GDB did not print {vname}")
                 ctx = DwarfEvaluationContext(
                     binary_identity=ident,
                     subprogram=subp,
@@ -807,6 +828,313 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
                 )
                 res = DwarfEvaluator.evaluate(ctx)
                 self.assertEqual(res.status, EVAL_STATUS_OBSERVED, f"{label} {vname} failed: {res.reason}")
+                self.assertEqual(
+                    res.value,
+                    gdb_prints[vname],
+                    f"{label} {vname} value mismatch: DynamicState={res.value} vs GDB={gdb_prints[vname]}",
+                )
+
+            if "flag" in gdb_prints:
+                ctx_flag = DwarfEvaluationContext(
+                    binary_identity=ident,
+                    subprogram=subp,
+                    link_time_address=subp.low_pc,
+                    registers=regs,
+                    variable_name="flag",
+                    architecture=ident.architecture,
+                )
+                res_flag = DwarfEvaluator.evaluate(ctx_flag)
+                if gdb_prints["flag"] == "<optimized out>":
+                    self.assertIn(
+                        res_flag.status,
+                        (EVAL_STATUS_UNAVAILABLE, EVAL_STATUS_OPTIMIZED_OUT),
+                        f"Expected unavailable/optimized out for {label} flag, got {res_flag.status}",
+                    )
+
+        self.assertTrue(tested_any, "At least one compiler binary must be tested for GDB parity")
+
+    def test_21_gdb_parity_stack_memory_and_struct_fields(self):
+        """Verify stack variable values against live GDB process memory and register dump."""
+        if not self.has_gdb:
+            raise unittest.SkipTest("GDB not available")
+        if "gcc_o0" not in self.binaries:
+            raise unittest.SkipTest("gcc_o0 binary not available")
+
+        bin_path = self.binaries["gcc_o0"]
+        idx = DwarfIndexer.get_index(bin_path)
+        subp_list = idx.subprograms_by_name.get("trace_target_function")
+        self.assertTrue(subp_list, "trace_target_function not found")
+        subp = subp_list[0]
+        ident = inspect_elf(bin_path)
+
+        gdb_cmd = [
+            "gdb", "-batch",
+            "-ex", f"file {bin_path}",
+            "-ex", "break trace_target_function",
+            "-ex", "run --loop 1",
+            "-ex", "print op_code",
+            "-ex", "print input_val",
+            "-ex", "print count",
+            "-ex", "info registers general",
+            "-ex", "x/512bx $sp",
+        ]
+        proc = subprocess.run(gdb_cmd, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"GDB failed: {proc.stderr}")
+
+        # Parse GDB values
+        gdb_vals: Dict[str, int] = {}
+        for line in proc.stdout.splitlines():
+            m = re.match(r"^\$(\d+)\s*=\s*(-?\d+)", line.strip())
+            if m:
+                idx_val = int(m.group(1))
+                val = int(m.group(2))
+                if idx_val == 1:
+                    gdb_vals["op_code"] = val
+                elif idx_val == 2:
+                    gdb_vals["input_val"] = val
+                elif idx_val == 3:
+                    gdb_vals["count"] = val
+
+        self.assertEqual(len(gdb_vals), 3, f"Expected 3 printed values from GDB, got {gdb_vals}")
+
+        # Parse registers
+        regs: Dict[str, int] = {}
+        for line in proc.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1].startswith("0x"):
+                try:
+                    regs[parts[0].lower()] = int(parts[1], 16)
+                except ValueError:
+                    pass
+
+        # Parse memory
+        mem: Dict[int, int] = {}
+        for line in proc.stdout.splitlines():
+            m = re.match(r"^0x([0-9a-fA-F]+):\s+(.*)$", line.strip())
+            if m:
+                base_addr = int(m.group(1), 16)
+                bytes_str = m.group(2).split()
+                for i, b_hex in enumerate(bytes_str):
+                    if b_hex.startswith("0x"):
+                        mem[base_addr + i] = int(b_hex, 16)
+
+        def test_memory_reader(addr: int, size: int) -> Optional[bytes]:
+            bs = bytearray()
+            for a in range(addr, addr + size):
+                if a in mem:
+                    bs.append(mem[a])
+                else:
+                    return None
+            return bytes(bs)
+
+        pc_runtime = regs.get("pc", 0)
+        self.assertGreater(pc_runtime, 0, "GDB failed to report runtime PC")
+        load_bias = (pc_runtime & ~0xfff) - (subp.low_pc & ~0xfff)
+        link_time_pc = pc_runtime - load_bias
+        fp = regs.get("x29", regs.get("rbp", 0))
+        self.assertGreater(fp, 0, "GDB failed to report frame pointer (x29/rbp)")
+
+        for vname in ("op_code", "input_val", "count"):
+            ctx = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=link_time_pc,
+                load_bias=load_bias,
+                registers=regs,
+                frame_metadata=FrameMetadata(frame_pointer=fp),
+                variable_name=vname,
+                architecture=ident.architecture,
+                memory_reader=test_memory_reader,
+            )
+            res = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res.status, EVAL_STATUS_OBSERVED, f"{vname} failed: {res.reason}")
+            self.assertEqual(
+                res.value,
+                gdb_vals[vname],
+                f"{vname} mismatch: DynamicState={res.value} vs GDB={gdb_vals[vname]}",
+            )
+
+    def test_22_companion_debug_artifact_build_id_mismatch_rejected(self):
+        """Companion debug artifact with mismatched Build ID must be rejected with EVAL_STATUS_ERROR."""
+        if "gcc_o0" not in self.binaries or "gcc_o2" not in self.binaries:
+            raise unittest.SkipTest("Binaries not available")
+        bin1 = self.binaries["gcc_o0"]
+        bin2 = self.binaries["gcc_o2"]
+
+        ident1 = inspect_elf(bin1)
+        subp = DwarfIndexer.get_index(bin1).subprograms_by_name["trace_target_function"][0]
+
+        ctx = DwarfEvaluationContext(
+            binary_identity=ident1,
+            subprogram=subp,
+            link_time_address=subp.low_pc + 16,
+            variable_name="op_code",
+            architecture=ident1.architecture,
+            debug_artifact_path=bin2,
+        )
+        res = DwarfEvaluator.evaluate(ctx)
+        self.assertEqual(res.status, EVAL_STATUS_ERROR)
+        self.assertIn("Build ID mismatch", res.reason)
+
+    def test_23_companion_debug_artifact_not_found(self):
+        """Non-existent companion debug artifact must return EVAL_STATUS_ERROR with clear diagnostic."""
+        if "gcc_o0" not in self.binaries:
+            raise unittest.SkipTest("gcc_o0 binary not available")
+        bin1 = self.binaries["gcc_o0"]
+        ident1 = inspect_elf(bin1)
+        subp = DwarfIndexer.get_index(bin1).subprograms_by_name["trace_target_function"][0]
+
+        ctx = DwarfEvaluationContext(
+            binary_identity=ident1,
+            subprogram=subp,
+            link_time_address=subp.low_pc + 16,
+            variable_name="op_code",
+            architecture=ident1.architecture,
+            debug_artifact_path="/tmp/non_existent_debug_artifact_12345.debug",
+        )
+        res = DwarfEvaluator.evaluate(ctx)
+        self.assertEqual(res.status, EVAL_STATUS_ERROR)
+        self.assertIn("Companion debug artifact not found", res.reason)
+
+    def test_24_loc_cache_nanosecond_precision_and_no_cache_on_failure(self):
+        """Location list cache key must use nanosecond timestamps and must never cache failures."""
+        if "gcc_o0" not in self.binaries:
+            raise unittest.SkipTest("gcc_o0 binary not available")
+        bin1 = self.binaries["gcc_o0"]
+
+        key = _get_loc_cache_key(bin1)
+        self.assertIsInstance(key[1], int, "mtime must be an integer nanosecond timestamp")
+        self.assertGreater(key[1], 0)
+
+        with tempfile.NamedTemporaryFile(suffix=".corrupted", delete=False) as f:
+            f.write(b"NOT_AN_ELF_FILE_CORRUPTED_HEADER")
+            bad_path = f.name
+
+        try:
+            tbl = parse_debug_loc_table(bad_path)
+            self.assertEqual(tbl, {})
+            bad_key = _get_loc_cache_key(bad_path)
+            self.assertNotIn(bad_key, _LOC_CACHE, "Failed parse must never be cached in _LOC_CACHE")
+            self.assertIn(bad_key, _LOC_ERROR, "Failed parse must be recorded in _LOC_ERROR")
+        finally:
+            if os.path.exists(bad_path):
+                os.unlink(bad_path)
+
+    def test_25_cfi_cache_no_cache_on_failure(self):
+        """CFI cache must use nanosecond precision and never cache failed readelf parses."""
+        if "gcc_o0" not in self.binaries:
+            raise unittest.SkipTest("gcc_o0 binary not available")
+        bin1 = self.binaries["gcc_o0"]
+
+        key = _get_cfi_cache_key(bin1)
+        self.assertIsInstance(key[1], int, "mtime must be an integer nanosecond timestamp")
+        self.assertGreater(key[1], 0)
+
+        with tempfile.NamedTemporaryFile(suffix=".corrupted", delete=False) as f:
+            f.write(b"NOT_AN_ELF_FILE_CORRUPTED_HEADER")
+            bad_path = f.name
+
+        try:
+            cfi = parse_cfi_table(bad_path)
+            self.assertEqual(cfi, {})
+            bad_key = _get_cfi_cache_key(bad_path)
+            self.assertNotIn(bad_key, _CFI_CACHE, "Failed CFI parse must never be cached in _CFI_CACHE")
+            self.assertIn(bad_key, _CFI_ERROR, "Failed CFI parse must be recorded in _CFI_ERROR")
+        finally:
+            if os.path.exists(bad_path):
+                os.unlink(bad_path)
+
+    def test_26_location_list_boundary_inclusive_start_exclusive_end(self):
+        """Location list evaluation must treat range start_pc as inclusive and end_pc as exclusive."""
+        if "gcc_o0" not in self.binaries:
+            raise unittest.SkipTest("gcc_o0 binary not available")
+        bin_path = self.binaries["gcc_o0"]
+        ident = inspect_elf(bin_path)
+
+        subp = DwarfSubprogram(die_offset=0x10, name="boundary_func", low_pc=0x2000, high_pc=0x2100)
+        v = DwarfVariable(die_offset=0x20, name="bound_var", location_list_offset=0x100)
+        subp.variables.append(v)
+
+        mock_loc_table = {
+            0x100: [(0x2000, 0x2050, "DW_OP_reg0 (x0)")],
+        }
+
+        with patch("extractor.dwarf_evaluator.parse_debug_loc_table", return_value=mock_loc_table):
+            # 1. At start_pc (0x2000): INCLUSIVE -> OBSERVED
+            ctx_start = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=0x2000,
+                registers={"x0": 42, "r0": 42, "rax": 42},
+                variable_name="bound_var",
+                architecture=ident.architecture,
+            )
+            res_start = DwarfEvaluator.evaluate(ctx_start)
+            self.assertEqual(res_start.status, EVAL_STATUS_OBSERVED)
+            self.assertEqual(res_start.value, 42)
+
+            # 2. At end_pc - 1 (0x204f): INSIDE -> OBSERVED
+            ctx_mid = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=0x204f,
+                registers={"x0": 42, "r0": 42, "rax": 42},
+                variable_name="bound_var",
+                architecture=ident.architecture,
+            )
+            res_mid = DwarfEvaluator.evaluate(ctx_mid)
+            self.assertEqual(res_mid.status, EVAL_STATUS_OBSERVED)
+
+            # 3. At end_pc (0x2050): EXCLUSIVE -> UNAVAILABLE
+            ctx_end = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=0x2050,
+                registers={"x0": 42, "r0": 42, "rax": 42},
+                variable_name="bound_var",
+                architecture=ident.architecture,
+            )
+            res_end = DwarfEvaluator.evaluate(ctx_end)
+            self.assertEqual(res_end.status, EVAL_STATUS_UNAVAILABLE)
+            self.assertIn("outside variable live ranges", res_end.reason)
+
+            # 4. At start_pc - 1 (0x1fff): BEFORE -> UNAVAILABLE
+            ctx_before = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=0x1fff,
+                registers={"x0": 42, "r0": 42, "rax": 42},
+                variable_name="bound_var",
+                architecture=ident.architecture,
+            )
+            res_before = DwarfEvaluator.evaluate(ctx_before)
+            self.assertEqual(res_before.status, EVAL_STATUS_UNAVAILABLE)
+            self.assertIn("outside variable live ranges", res_before.reason)
+
+    def test_27_dwarf4_and_dwarf5_location_lists_real_compiler_output(self):
+        """Verify location list extraction from real compiler binaries (GCC DWARF 4 / Clang DWARF 5)."""
+        tested_formats = 0
+        for label in ("gcc_o2", "clang_o2"):
+            if label not in self.binaries:
+                continue
+            bin_path = self.binaries[label]
+            loc_table = parse_debug_loc_table(bin_path)
+            self.assertIsInstance(loc_table, dict)
+            self.assertGreater(len(loc_table), 0, f"Location table for {label} must not be empty")
+
+            for off, entries in loc_table.items():
+                self.assertIsInstance(off, int)
+                self.assertIsInstance(entries, list)
+                for entry in entries:
+                    self.assertEqual(len(entry), 3)
+                    start_pc, end_pc, expr = entry
+                    self.assertIsInstance(start_pc, int)
+                    self.assertIsInstance(end_pc, int)
+                    self.assertIsInstance(expr, str)
+                    self.assertLessEqual(start_pc, end_pc)
+            tested_formats += 1
+
+        self.assertGreater(tested_formats, 0, "At least one compiler output must be verified for location list parsing")
 
 
 if __name__ == "__main__":

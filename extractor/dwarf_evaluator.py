@@ -166,14 +166,14 @@ for i in range(8):
 # Location List Cache & Parser
 # -----------------------------------------------------------------------------
 
-_LOC_CACHE: Dict[Tuple[str, float, int, Optional[str]], Dict[int, List[Tuple[int, int, str]]]] = {}
-_LOC_ERROR: Dict[Tuple[str, float, int, Optional[str]], str] = {}
+_LOC_CACHE: Dict[Tuple[str, int, int, Optional[str]], Dict[int, List[Tuple[int, int, str]]]] = {}
+_LOC_ERROR: Dict[Tuple[str, int, int, Optional[str]], str] = {}
 
 
-def _get_loc_cache_key(path: str) -> Tuple[str, float, int, Optional[str]]:
+def _get_loc_cache_key(path: str) -> Tuple[str, int, int, Optional[str]]:
     abs_path = os.path.abspath(path)
     if not os.path.exists(abs_path):
-        return (abs_path, 0.0, 0, None)
+        return (abs_path, 0, 0, None)
     st = os.stat(abs_path)
     build_id = None
     try:
@@ -182,7 +182,7 @@ def _get_loc_cache_key(path: str) -> Tuple[str, float, int, Optional[str]]:
         build_id = ident.build_id
     except Exception:
         pass
-    return (abs_path, st.st_mtime, st.st_size, build_id)
+    return (abs_path, st.st_mtime_ns, st.st_size, build_id)
 
 
 def clear_loc_cache() -> None:
@@ -211,8 +211,7 @@ def parse_debug_loc_table(artifact_path: str) -> Dict[int, List[Tuple[int, int, 
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if res.returncode != 0:
             _LOC_ERROR[cache_key] = res.stderr.strip() or f"readelf exited with code {res.returncode}"
-            _LOC_CACHE[cache_key] = loc_table
-            return loc_table
+            return {}
 
         lines = res.stdout.splitlines()
         current_list_offset: Optional[int] = None
@@ -332,6 +331,7 @@ def parse_debug_loc_table(artifact_path: str) -> Dict[int, List[Tuple[int, int, 
 
     except Exception as e:
         _LOC_ERROR[cache_key] = str(e)
+        return {}
 
     _LOC_CACHE[cache_key] = loc_table
     return loc_table
@@ -547,6 +547,42 @@ class DwarfEvaluator:
                 variable_name=var_name,
                 status=EVAL_STATUS_ERROR,
                 reason="Subprogram context is missing or null",
+            )
+
+        # Companion debug artifact validation
+        if context.debug_artifact_path:
+            abs_dbg = os.path.abspath(context.debug_artifact_path)
+            if not os.path.exists(abs_dbg):
+                return DwarfLocationResult(
+                    variable_name=var_name,
+                    status=EVAL_STATUS_ERROR,
+                    reason=f"Companion debug artifact not found: {abs_dbg}",
+                )
+            try:
+                dbg_ident = inspect_elf(abs_dbg)
+                if context.binary_identity.build_id and dbg_ident.build_id:
+                    if context.binary_identity.build_id != dbg_ident.build_id:
+                        return DwarfLocationResult(
+                            variable_name=var_name,
+                            status=EVAL_STATUS_ERROR,
+                            reason=(
+                                f"Companion debug artifact Build ID mismatch: "
+                                f"expected {context.binary_identity.build_id}, "
+                                f"got {dbg_ident.build_id}"
+                            ),
+                        )
+            except Exception as e:
+                return DwarfLocationResult(
+                    variable_name=var_name,
+                    status=EVAL_STATUS_ERROR,
+                    reason=f"Failed to inspect companion debug artifact: {e}",
+                )
+
+        if getattr(context.subprogram, "has_unsupported_cfi", False):
+            return DwarfLocationResult(
+                variable_name=var_name,
+                status=EVAL_STATUS_UNSUPPORTED,
+                reason="Subprogram uses unsupported complex CFI rule (DW_CFA_def_cfa_expression)",
             )
 
         # 1. Find variable in subprogram
