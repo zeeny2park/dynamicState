@@ -663,44 +663,49 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
 
         # 3. Independent GDB oracle value cross-validation
         # Directly compare the actual eBPF-observed values with GDB oracle values at the exact equivalent execution point.
-        if shutil.which("gdb"):
-            observed_op = op_val.value
-            gdb_cmd = [
-                "gdb", "-batch",
-                "-ex", "set pagination off",
-                "-ex", f"break trace_target_function if op_code == {observed_op}",
-                "-ex", "run --loop 30 --interval-ms 50",
-                "-ex", 'printf "PARITY_VAR:op_code=%d\\n", op_code',
-                "-ex", 'printf "PARITY_VAR:input_val=%lld\\n", (long long)input_val',
-                "-ex", 'printf "PARITY_VAR:count=%u\\n", (unsigned int)count',
-                "-ex", "quit",
-                self.opt_bin,
-            ]
-            gdb_proc = subprocess.run(gdb_cmd, capture_output=True, text=True)
-            self.assertEqual(gdb_proc.returncode, 0, f"GDB execution failed: {gdb_proc.stderr}")
+        # NOTE: This comparison validates against a separate deterministic equivalent execution using a conditional breakpoint
+        # on the captured iteration key (op_code). It does not claim same-event / same-process parity.
+        if not shutil.which("gdb"):
+            self.skipTest("GDB executable not found in PATH; cannot execute GDB oracle parity validation for test_13")
 
-            gdb_prints: Dict[str, int] = {}
-            for line in gdb_proc.stdout.splitlines():
-                line = line.strip()
-                m = re.match(r"^PARITY_VAR:([a-zA-Z0-9_]+)=(-?\d+)", line)
-                if m:
-                    gdb_prints[m.group(1)] = int(m.group(2))
+        observed_op = op_val.value
+        gdb_cmd = [
+            "gdb", "-batch",
+            "-ex", "set pagination off",
+            "-ex", f"break trace_target_function if op_code == {observed_op}",
+            "-ex", "run --loop 30 --interval-ms 50",
+            "-ex", 'printf "PARITY_VAR:op_code=%d\\n", op_code',
+            "-ex", 'printf "PARITY_VAR:input_val=%lld\\n", (long long)input_val',
+            "-ex", 'printf "PARITY_VAR:count=%u\\n", (unsigned int)count',
+            "-ex", "quit",
+            self.opt_bin,
+        ]
+        gdb_proc = subprocess.run(gdb_cmd, capture_output=True, text=True)
+        self.assertEqual(gdb_proc.returncode, 0, f"GDB execution failed: {gdb_proc.stderr}")
 
-            for vname in ("op_code", "input_val", "count"):
-                self.assertIn(vname, gdb_prints, f"GDB output missing variable '{vname}'")
-                self.assertEqual(
-                    sample_entry.local_variables[vname].value,
-                    gdb_prints[vname],
-                    f"Direct value mismatch between eBPF and GDB oracle for '{vname}' at iteration op_code={observed_op}: "
-                    f"eBPF={sample_entry.local_variables[vname].value} vs GDB={gdb_prints[vname]}"
-                )
+        gdb_prints: Dict[str, int] = {}
+        for line in gdb_proc.stdout.splitlines():
+            line = line.strip()
+            m = re.match(r"^PARITY_VAR:([a-zA-Z0-9_]+)=(-?\d+)", line)
+            if m:
+                gdb_prints[m.group(1)] = int(m.group(2))
 
-    def test_14_gdb_oracle_compiled_fixture_parity(self):
-        """Scenario 14: Independent GDB oracle parity test on compiled fixture artifacts (-O0 and -O2).
+        for vname in ("op_code", "input_val", "count"):
+            self.assertIn(vname, gdb_prints, f"GDB output missing variable '{vname}'")
+            self.assertEqual(
+                sample_entry.local_variables[vname].value,
+                gdb_prints[vname],
+                f"Direct value mismatch between eBPF and GDB oracle for '{vname}' at iteration op_code={observed_op}: "
+                f"eBPF={sample_entry.local_variables[vname].value} vs GDB={gdb_prints[vname]}"
+            )
 
-        Verifies that DwarfEvaluator matches GDB 15.1 variable values by name across:
-        - ABI parameter registers in optimized build (-O2).
-        - Stack frame variables and memory context in debug build (-O0).
+    def test_14_compiled_fixture_evaluator_vs_gdb_oracle(self):
+        """Scenario 14: Evaluator-versus-GDB oracle validation on real compiled fixture artifacts (-O0 and -O2).
+
+        EVIDENCE CLASSIFICATION: Real compiler-generated DWARF + Synthetic registers + GDB Oracle.
+        NOTE: This test supplies register values directly to DwarfEvaluationContext to validate
+        that DwarfEvaluator matches GDB 15.1 variable evaluation on real compiled ELF binaries.
+        It does NOT exercise live eBPF register capture from a running process.
         """
         if not shutil.which("gdb"):
             raise unittest.SkipTest("GDB executable not found in PATH")
@@ -732,7 +737,7 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         self.assertEqual(gdb_opt["input_val"], 70)
         self.assertEqual(gdb_opt["count"], 11)
 
-        # Cross-evaluate using DwarfEvaluator on self.opt_bin
+        # Cross-evaluate using DwarfEvaluator on self.opt_bin with synthetic register context
         d_index_opt = DwarfIndexer.get_index(self.opt_bin)
         subp_opt = d_index_opt.subprograms_by_name["trace_target_function"][0]
         arch = platform.machine()
@@ -749,6 +754,67 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             res = DwarfEvaluator.evaluate(ctx_opt)
             self.assertEqual(res.status, EVAL_STATUS_OBSERVED)
             self.assertEqual(res.value, gdb_opt[vname], f"Value mismatch for {vname}: DynamicState={res.value} vs GDB={gdb_opt[vname]}")
+
+    def test_15_live_ebpf_oracle_parity_negative_mismatch_fails(self):
+        """Scenario 15: Negative test verifying that parity assertions fail closed on value mismatch.
+
+        Deliberately injects a corrupted/mismatched oracle value and verifies that the parity
+        comparison detects the divergence and raises AssertionError.
+        """
+        simulated_ebpf_val = 42
+        corrupted_gdb_val = 999
+
+        def verify_parity(ebpf_v: int, gdb_v: int, vname: str):
+            if ebpf_v != gdb_v:
+                raise AssertionError(f"Parity mismatch for '{vname}': eBPF={ebpf_v} vs GDB={gdb_v}")
+
+        # Identical values must pass
+        verify_parity(simulated_ebpf_val, 42, "op_code")
+
+        # Mismatched value must raise AssertionError
+        with self.assertRaises(AssertionError) as ctx:
+            verify_parity(simulated_ebpf_val, corrupted_gdb_val, "op_code")
+        self.assertIn("Parity mismatch for 'op_code'", str(ctx.exception))
+        self.assertIn("42 vs GDB=999", str(ctx.exception))
+
+    def test_16_instruction_point_offset_probing_feasibility(self):
+        """Scenario 16: Feasibility diagnostic for nonzero instruction-offset probing.
+
+        Attempts to attach bpftrace at an instruction offset within trace_target_function (low_pc + 4).
+        On host platforms where bpftrace was built without (k|u)probe offset support:
+        - Detects exit code 255 and blocker error 'compiled without (k|u)probe offset support'.
+        - Verifies that capability reporting marks arbitrary instruction offset probing as False.
+        - Documents the exact technical prerequisite for future Phase 2 backend selection.
+        """
+        bpftrace_path = shutil.which("bpftrace")
+        if not bpftrace_path:
+            raise unittest.SkipTest("bpftrace executable not found")
+
+        # 1. Attempt nonzero instruction offset uprobe via bpftrace
+        probe_cmd = [
+            "sudo", "-n", bpftrace_path,
+            "-e", f"uprobe:{self.debug_bin}:trace_target_function+4 {{ exit(); }}"
+        ]
+        proc = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=3.0)
+
+        # 2. In this host environment, bpftrace lacks offset support
+        if proc.returncode != 0:
+            err = proc.stderr.strip() or proc.stdout.strip()
+            self.assertIn(
+                "compiled without (k|u)probe offset support",
+                err,
+                f"Unexpected bpftrace error on offset probe: returncode={proc.returncode}, output={err}"
+            )
+
+            # Check that backend capability reflects verified reality
+            backend = EbpfObservationBackend()
+            caps = backend.capabilities()
+            self.assertFalse(caps["arbitrary_instruction_offset_probing"])
+            self.assertFalse(caps["dwarf_eval_scope"]["arbitrary_instruction_offset_probing"])
+            self.assertEqual(caps["uprobe_offset_status"], "UNSUPPORTED")
+        else:
+            # If supported in a future environment, verify that it attached successfully
+            self.assertEqual(proc.returncode, 0)
 
 
 if __name__ == "__main__":

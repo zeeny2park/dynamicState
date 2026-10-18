@@ -1108,7 +1108,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
             self.assertEqual(tv_mismatch.status, EVAL_STATUS_ERROR)
             self.assertIn("Build ID mismatch", tv_mismatch.reason)
 
-    def test_33_frame_metadata_link_time_address(self):
+    def test_35_frame_metadata_link_time_address(self):
         """Verify FrameMetadata includes link_time_address and serializes it in hex."""
         fm_none = FrameMetadata()
         self.assertIsNone(fm_none.link_time_address)
@@ -1118,7 +1118,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(fm_val.link_time_address, 0x123456)
         self.assertEqual(fm_val.to_dict()["link_time_address"], "0x123456")
 
-    def test_34_decoder_normalizes_canonical_registers(self):
+    def test_36_decoder_normalizes_canonical_registers(self):
         """Verify EbpfEventDecoder normalizes arguments and control registers to canonical names."""
         # AArch64
         dec_arm = EbpfEventDecoder(target_pid=100, architecture="aarch64", function_name="func")
@@ -1149,7 +1149,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(ev_x86.registers.get("rsp"), 0x6000)
         self.assertEqual(ev_x86.registers.get("rip"), 0x7000)
 
-    def test_35_return_probe_marks_local_variables_unavailable(self):
+    def test_37_return_probe_marks_local_variables_unavailable(self):
         """Verify return probes mark subprogram variables UNAVAILABLE due to frame destruction."""
         subp = DwarfSubprogram(
             die_offset=0x10,
@@ -1186,7 +1186,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(ev.local_variables["buffer"].status, STATUS_UNAVAILABLE)
         self.assertIn("destroyed", ev.local_variables["buffer"].reason)
 
-    def test_36_entry_probe_dwarf_variable_resolution(self):
+    def test_38_entry_probe_dwarf_variable_resolution(self):
         """Verify entry probes resolve local variables via configured DWARF location resolver."""
         subp = DwarfSubprogram(
             die_offset=0x10,
@@ -1228,7 +1228,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(ev.local_variables["arg_val"].status, STATUS_OBSERVED)
         self.assertEqual(ev.local_variables["arg_val"].value, 777)
 
-    def test_37_missing_runtime_pc_returns_unavailable_not_zero(self):
+    def test_39_missing_runtime_pc_returns_unavailable_not_zero(self):
         """Verify that when runtime PC is absent/null, link_time_address is None and evaluator returns UNAVAILABLE."""
         subp = DwarfSubprogram(
             die_offset=0x10,
@@ -1272,7 +1272,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(ev.local_variables["arg_val"].status, STATUS_UNAVAILABLE)
         self.assertIn("unavailable", ev.local_variables["arg_val"].reason.lower())
 
-    def test_38_subprogram_declaration_vs_definition_and_ambiguity(self):
+    def test_40_subprogram_declaration_vs_definition_and_ambiguity(self):
         """Verify declaration DIE vs definition DIE selection, and fail closed on ambiguous definitions."""
         tracer = EbpfTracer(use_sudo=False)
         ident = BinaryIdentity(
@@ -1347,7 +1347,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
             self.assertEqual(session_ambig.status, "FAILED")
             self.assertIn("Ambiguous", session_ambig.error_message)
 
-    def test_39_dwarf_indexer_cache_invalidation_on_binary_replacement(self):
+    def test_41_dwarf_indexer_cache_invalidation_on_binary_replacement(self):
         """Verify DwarfIndexer invalidates cached index when binary mtime or size changes."""
         with tempfile.NamedTemporaryFile(suffix=".elf") as tf:
             tf.write(b"\x7fELF" + b"\x00" * 100)
@@ -1369,14 +1369,14 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 idx2 = DwarfIndexer.get_index(path)
                 self.assertIsNot(idx2, idx1, "Modified mtime must invalidate cache and produce fresh index")
 
-    def test_40_proc_mem_reader_bounds_and_validity(self):
+    def test_42_proc_mem_reader_bounds_and_validity(self):
         """Verify proc_mem_reader rejects sizes <= 0, > 64KiB, and invalid pointer addresses."""
         # Test the memory reader logic directly
         def create_reader(pid):
             def proc_mem_reader(addr: int, size: int) -> Optional[bytes]:
                 if size <= 0 or size > 65536:
                     return None
-                if addr <= 0 or addr > 0x00007fffffffffff:
+                if addr <= 0 or addr >= 0x8000000000000000:
                     return None
                 try:
                     from extractor.watch_session import read_process_memory_slice
@@ -1398,9 +1398,9 @@ class TestEbpfTracerUnit(unittest.TestCase):
         # Address bounds
         self.assertIsNone(reader(0, 4), "Address 0 (NULL) must return None")
         self.assertIsNone(reader(-1, 4), "Negative address must return None")
-        self.assertIsNone(reader(0x800000000000, 4), "Address > 0x7fffffffffff must return None")
+        self.assertIsNone(reader(0x8000000000000000, 4), "Address >= 0x8000000000000000 must return None")
 
-    def test_41_proc_mem_reader_valid_zeros_vs_unreadable(self):
+    def test_43_proc_mem_reader_valid_zeros_vs_unreadable(self):
         """Verify proc_mem_reader distinguishes valid zero bytes from unreadable memory."""
         # Mock read_process_memory_slice returning valid zeros vs UNAVAILABLE
         with patch("extractor.watch_session.read_process_memory_slice") as mock_read:
@@ -1409,7 +1409,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
             from extractor.watch_session import read_process_memory_slice
 
             def reader(addr, size):
-                if size <= 0 or size > 65536 or addr <= 0 or addr > 0x00007fffffffffff:
+                if size <= 0 or size > 65536 or addr <= 0 or addr >= 0x8000000000000000:
                     return None
                 data, status, _ = read_process_memory_slice(100, addr, size)
                 return data if (status == "OBSERVED" and data is not None and len(data) == size) else None
@@ -1422,11 +1422,11 @@ class TestEbpfTracerUnit(unittest.TestCase):
             res_unavail = reader(0x2000, 4)
             self.assertIsNone(res_unavail, "Unreadable memory must return None, never fabricated zeros")
 
-    def test_42_proc_mem_reader_partial_read_and_process_exit(self):
+    def test_44_proc_mem_reader_partial_read_and_process_exit(self):
         """Verify proc_mem_reader returns None on partial reads or target process termination."""
         with patch("extractor.watch_session.read_process_memory_slice") as mock_read:
             def reader(addr, size):
-                if size <= 0 or size > 65536 or addr <= 0 or addr > 0x00007fffffffffff:
+                if size <= 0 or size > 65536 or addr <= 0 or addr >= 0x8000000000000000:
                     return None
                 from extractor.watch_session import read_process_memory_slice
                 data, status, _ = read_process_memory_slice(100, addr, size)
@@ -1442,7 +1442,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
             res_exit = reader(0x1000, 4)
             self.assertIsNone(res_exit, "Terminated process memory read must return None")
 
-    def test_43_load_bias_calculation_pie_and_nopie(self):
+    def test_45_load_bias_calculation_pie_and_nopie(self):
         """Verify load bias calculation and runtime-to-link-time PC translation."""
         # Non-PIE: load_bias = 0
         dec_nopie = EbpfEventDecoder(target_pid=100, architecture="x86_64", function_name="f", load_bias=0)
@@ -1460,7 +1460,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(ev_pie.frame_metadata.instruction_pointer, 0x555555555120)
         self.assertEqual(ev_pie.frame_metadata.link_time_address, 0x1120)
 
-    def test_44_missing_build_id_and_explicitly_unchecked_states(self):
+    def test_46_missing_build_id_and_explicitly_unchecked_states(self):
         """Verify truthful reporting of UNAVAILABLE and EXPLICITLY_UNCHECKED Build ID states."""
         tracer = EbpfTracer(use_sudo=False)
         ident_no_bid = BinaryIdentity(
@@ -1498,6 +1498,137 @@ class TestEbpfTracerUnit(unittest.TestCase):
             # 2. verify_build_id=False -> EXPLICITLY_UNCHECKED
             sess_unchecked = tracer.trace(pid=100, binary_path="/bin/no_bid", function_name="f", duration_s=0.01, verify_build_id=False)
             self.assertEqual(sess_unchecked.build_id_status, "EXPLICITLY_UNCHECKED")
+
+    def test_47_pc_bounds_and_malformed_values_handling(self):
+        """Verify malformed, non-numeric, 0, negative, and out-of-range PC values are treated as None."""
+        dec = EbpfEventDecoder(target_pid=100, architecture="x86_64", function_name="func")
+        for bad_pc in [0, -1, "null", "invalid", "0xG", 0x8000000000000000]:
+            line = json.dumps({"type": "ENTRY", "pid": 100, "tid": 100, "pc": bad_pc, "arg0": 123})
+            ev = dec.decode_line(line)
+            self.assertIsNotNone(ev)
+            self.assertIsNone(ev.frame_metadata.instruction_pointer, f"Expected None for bad PC: {bad_pc}")
+            self.assertIsNone(ev.frame_metadata.link_time_address, f"Expected None link_pc for bad PC: {bad_pc}")
+            self.assertNotIn("pc", ev.registers)
+            self.assertNotIn("rip", ev.registers)
+
+    def test_48_resolver_uses_frame_metadata_link_time_address_dynamically(self):
+        """Verify Phase2DwarfLocationResolver uses link_time_address from frame_metadata instead of stale entry address."""
+        ident = BinaryIdentity(
+            path="/bin/dummy", elf_class="ELF64", architecture="aarch64", endianness="little",
+            build_id="abcdef", stripped=False, has_debug_info=True,
+        )
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="target_func",
+            low_pc=0x1000,
+            high_pc=0x1200,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="dyn_var", type_offset=0x30, location_list_offset=0x500),
+            ],
+        )
+        mock_index = DwarfIndex(artifact_path="/bin/dummy")
+        mock_index.types_by_die[0x30] = DwarfType(die_offset=0x30, tag="DW_TAG_base_type", name="int", byte_size=4)
+
+        # Location table: [0x1000, 0x1050) -> x0, [0x1050, 0x1100) -> x1
+        mock_loc_table = {
+            0x500: [
+                (0x1000, 0x1050, "DW_OP_reg0 (x0)"),
+                (0x1050, 0x1100, "DW_OP_reg1 (x1)"),
+            ]
+        }
+
+        # Initialize resolver with low_pc (0x1000)
+        resolver = Phase2DwarfLocationResolver(
+            binary_identity=ident,
+            link_time_address=0x1000,
+            architecture="aarch64",
+        )
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_index), \
+             patch("extractor.dwarf_evaluator.parse_debug_loc_table", return_value=mock_loc_table):
+            # Pass frame_metadata with a DIFFERENT instruction address (0x1060)
+            fm = FrameMetadata(instruction_pointer=0x1060, link_time_address=0x1060)
+            tv = resolver.resolve_variable(
+                subprogram=subp,
+                variable_name="dyn_var",
+                registers={"x0": 11, "x1": 22},
+                frame_metadata=fm,
+            )
+            # Must evaluate at 0x1060 (x1 -> 22), NOT stale low_pc 0x1000 (x0 -> 11)
+            self.assertEqual(tv.status, STATUS_OBSERVED)
+            self.assertEqual(tv.value, 22)
+            self.assertEqual(tv.location, "register:x1")
+
+    def test_49_uprobe_offset_capability_detection(self):
+        """Verify runtime detection of uprobe offset support in EbpfEnvironmentChecker."""
+        # 1. Without bpftrace executable
+        res_no_bpf, reason_no_bpf = EbpfEnvironmentChecker.check_uprobe_offset_support(bpftrace_path="")
+        self.assertFalse(res_no_bpf)
+        self.assertIn("not found", reason_no_bpf)
+
+        # 2. Without privileges
+        res_no_priv, reason_no_priv = EbpfEnvironmentChecker.check_uprobe_offset_support(
+            bpftrace_path="/usr/bin/bpftrace", is_privileged=False
+        )
+        self.assertFalse(res_no_priv)
+        self.assertIn("Privileges", reason_no_priv)
+
+        # 3. Mock bpftrace returning exit code 255 with 'compiled without (k|u)probe offset support'
+        mock_proc_fail = MagicMock()
+        mock_proc_fail.returncode = 255
+        mock_proc_fail.stderr = "ERROR: Can't check if uprobe is in proper place (compiled without (k|u)probe offset support): /bin/ls:main+4"
+        mock_proc_fail.stdout = ""
+
+        def run_mock_fail(cmd, *args, **kwargs):
+            if cmd and "gcc" in cmd[0]:
+                m = MagicMock()
+                m.returncode = 0
+                return m
+            return mock_proc_fail
+
+        with patch("subprocess.run", side_effect=run_mock_fail):
+            res_fail, reason_fail = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+            )
+            self.assertFalse(res_fail)
+            self.assertIn("compiled without (k|u)probe offset support", reason_fail)
+
+        # 4. Mock bpftrace succeeding (returncode 0)
+        mock_proc_ok = MagicMock()
+        mock_proc_ok.returncode = 0
+        mock_proc_ok.stderr = ""
+        mock_proc_ok.stdout = "Attached"
+
+        def run_mock_ok(cmd, *args, **kwargs):
+            if cmd and "gcc" in cmd[0]:
+                m = MagicMock()
+                m.returncode = 0
+                return m
+            return mock_proc_ok
+
+        with patch("subprocess.run", side_effect=run_mock_ok):
+            res_ok, reason_ok = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+            )
+            self.assertTrue(res_ok)
+            self.assertIn("verified", reason_ok)
+
+    def test_50_observation_backend_capabilities_truthful_flags(self):
+        """Verify EbpfObservationBackend exposes explicit boolean capability flags at top-level and scope."""
+        backend = EbpfObservationBackend()
+        caps = backend.capabilities()
+        self.assertIn("arbitrary_instruction_offset_probing", caps)
+        self.assertFalse(caps["arbitrary_instruction_offset_probing"])
+        self.assertIn("stack_locals_readable_at_entry", caps)
+        self.assertFalse(caps["stack_locals_readable_at_entry"])
+        self.assertIn("locals_readable_at_return", caps)
+        self.assertFalse(caps["locals_readable_at_return"])
+        self.assertEqual(caps.get("uprobe_offset_status"), "UNSUPPORTED")
+
+        scope = caps["dwarf_eval_scope"]
+        self.assertFalse(scope["arbitrary_instruction_offset_probing"])
+        self.assertFalse(scope["stack_locals_readable_at_entry"])
+        self.assertFalse(scope["locals_readable_at_return"])
 
 
 if __name__ == "__main__":

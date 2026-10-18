@@ -383,3 +383,33 @@ The memory reader function `proc_mem_reader` adheres to strict contract bounds:
 ### 11.6 Artifact Replacement Cache Invalidation
 The quad-tuple cache key `(abs_path, mtime, size, build_id)` across `DwarfIndexer`, location-list, and CFI caches ensures that modifying or replacing an executable on disk immediately invalidates cached DWARF metadata, preventing stale variable evaluation.
 
+---
+
+## 12. Phase 1.8 Real-Path Validation & Instruction-Point Observability Readiness
+
+### 12.1 Five-Tier Test Evidence Hierarchy
+Phase 1.8 establishes an explicit, transparent boundary across test evidence tiers to prevent overstating what individual tests prove:
+1. **Mocked Unit Tests** (`tests/test_ebpf_tracer.py:test_01-test_07`, `test_11-test_20`): Exercise JSON/text event parsing, PID filtering, lost record accounting, and session status determination using mocked data payloads.
+2. **Synthetic Evaluator Unit Tests** (`tests/test_ebpf_tracer.py:test_28-test_34`): Exercise location-list range resolution, CFA rules, and scalar byte unpacking using synthetic DIE structures and mock registers/memory.
+3. **Compiled-Fixture DWARF Tests** (`tests/test_ebpf_integration.py:test_12`, `test_14`): Exercise real compiler-generated DWARF (`-O0` and `-O2`) from GCC 13 and Clang 18 against `DwarfEvaluator` with supplied register contexts. (Note: `test_14` validates evaluator-vs-GDB correctness on real DWARF, not live eBPF register capture).
+4. **Live eBPF Tracing Tests** (`tests/test_ebpf_integration.py:test_01-test_11`, `test_13`): Exercise the actual kernel uprobe/uretprobe pipeline via bpftrace on live running target processes, validating real register decoding and runtime-to-link-time PC translation.
+5. **GDB Oracle Cross-Validation** (`tests/test_ebpf_integration.py:test_13`, `test_14`): Cross-checks values against an independent GDB 15.1 oracle. `test_13` uses a conditional breakpoint on the observed iteration identifier (`op_code`) in a separate deterministic execution, ensuring verified parity without falsely claiming same-event/same-process observation.
+
+### 12.2 64-Bit Userspace Virtual Address Space Hardening
+- **Canonical Userspace Ceiling**: On 64-bit architectures (both x86-64 and AArch64), userspace virtual addresses span up to 48-bit or 52-bit VA (`0 < addr < 0x8000000000000000`, with bit 63 clear). The previous boundary check (`0x00007fffffffffff`, 47-bit) inadvertently rejected legitimate 48-bit userspace text addresses on Linux AArch64 (such as `0xc25695220d80`). Phase 1.8 hardens `decode_line()` and `proc_mem_reader` to canonical 64-bit userspace bounds (`0 < addr < 0x8000000000000000`), rejecting NULL (0), negative offsets, and kernel-space addresses (`>= 0x8000000000000000`) while seamlessly admitting all valid userspace instruction pointers.
+- **Dynamic Per-Event Resolver Instruction Address**: `Phase2DwarfLocationResolver.resolve_variable()` extracts the active `link_time_address` dynamically from each event's `FrameMetadata` rather than relying on a static or stale subprogram entry address.
+
+### 12.3 Instruction-Point Offset Probing Feasibility Diagnostic
+- **Runtime Capability Detection**: `EbpfEnvironmentChecker.check_uprobe_offset_support()` dynamically attempts an instruction-offset probe (`main+4`) against a compiled probe binary.
+- **Host Blocker Documentation**: In the host environment (Ubuntu 24.04 AArch64, bpftrace 0.20.2), bpftrace was built without `HAVE_BCC_UPROBE_OFFSET`, returning exit code 255:
+  ```text
+  ERROR: Can't check if uprobe is in proper place (compiled without (k|u)probe offset support): <binary>:main+4
+  ```
+- **Capability Truthfulness**: `EbpfObservationBackend.capabilities()` exposes:
+  - `arbitrary_instruction_offset_probing: False`
+  - `uprobe_offset_status: "UNSUPPORTED"`
+  - `stack_locals_readable_at_entry: False`
+  - `locals_readable_at_return: False`
+- **Technical Recommendation for Phase 2**: For in-function stack local variable observation at arbitrary instruction points, Phase 2 should transition from CLI bpftrace to a direct `libbpf` backend utilizing `bpf_program__attach_uprobe_opts()` with explicit function offset support, bypassing bpftrace build limitations.
+
+

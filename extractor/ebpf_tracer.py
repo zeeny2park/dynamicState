@@ -236,6 +236,9 @@ class EbpfCapabilityResult:
     bpftrace_path: Optional[str] = None
     clang_path: Optional[str] = None
     reasons: List[str] = field(default_factory=list)
+    supports_uprobe_offset: bool = False
+    uprobe_offset_status: str = "UNSUPPORTED"
+    uprobe_offset_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -243,6 +246,53 @@ class EbpfCapabilityResult:
 
 class EbpfEnvironmentChecker:
     """Verifies kernel, architecture, compilers, privileges, and dependency requirements."""
+
+    @classmethod
+    def check_uprobe_offset_support(
+        cls,
+        bpftrace_path: Optional[str] = None,
+        is_privileged: bool = False,
+    ) -> Tuple[bool, str]:
+        """Detect at runtime whether the installed bpftrace binary supports nonzero uprobe offsets."""
+        path = bpftrace_path if bpftrace_path is not None else shutil.which("bpftrace")
+        if not path:
+            return False, "bpftrace executable not found in PATH"
+        if not is_privileged:
+            return False, "Privileges (root or passwordless sudo) required to check probe capabilities"
+
+        cmd_prefix = [] if (hasattr(os, "geteuid") and os.geteuid() == 0) else ["sudo", "-n"]
+        test_bin = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
+                test_bin = tf.name
+            comp = subprocess.run(
+                ["gcc", "-O0", "-x", "c", "-", "-o", test_bin],
+                input=b"int main(){return 0;}\n",
+                capture_output=True,
+                timeout=5.0,
+            )
+            if comp.returncode != 0:
+                err_text = comp.stderr.decode("utf-8", errors="ignore") if isinstance(comp.stderr, bytes) else str(comp.stderr)
+                return False, f"Failed to build probe test binary: {err_text}"
+
+            probe_cmd = cmd_prefix + [path, "-e", f"uprobe:{test_bin}:main+4 {{ exit(); }}"]
+            proc = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=2.0)
+            if proc.returncode == 0:
+                return True, "uprobe offset support verified"
+            err = (proc.stderr.strip() or proc.stdout.strip())
+            if "compiled without (k|u)probe offset support" in err:
+                return False, f"bpftrace compiled without (k|u)probe offset support: {err}"
+            return False, f"bpftrace probe offset attachment failed (exit code {proc.returncode}): {err}"
+        except subprocess.TimeoutExpired:
+            return True, "uprobe offset support attached (timed out waiting for event)"
+        except Exception as e:
+            return False, f"Error detecting uprobe offset support: {e}"
+        finally:
+            if test_bin and os.path.exists(test_bin):
+                try:
+                    os.remove(test_bin)
+                except Exception:
+                    pass
 
     @classmethod
     def check_prerequisites(cls) -> EbpfCapabilityResult:
@@ -319,6 +369,16 @@ class EbpfEnvironmentChecker:
 
         supported = (len(reasons) == 0) and is_privileged and (backend == "bpftrace")
 
+        offset_supported = False
+        offset_status = "UNSUPPORTED"
+        offset_reason = None
+        if supported and backend == "bpftrace":
+            offset_supported, offset_reason = cls.check_uprobe_offset_support(
+                bpftrace_path=bpftrace_path,
+                is_privileged=is_privileged,
+            )
+            offset_status = "SUPPORTED" if offset_supported else "UNSUPPORTED"
+
         return EbpfCapabilityResult(
             supported=supported,
             backend=backend,
@@ -330,6 +390,9 @@ class EbpfEnvironmentChecker:
             bpftrace_path=bpftrace_path,
             clang_path=clang_path,
             reasons=reasons,
+            supports_uprobe_offset=offset_supported,
+            uprobe_offset_status=offset_status,
+            uprobe_offset_reason=offset_reason,
         )
 
 
@@ -536,15 +599,20 @@ class EbpfEventDecoder:
                 except ValueError:
                     pass
             if int_val is not None:
-                registers[k] = int_val
-                if k in ("sp", "rsp"):
-                    sp = int_val
-                elif k in ("fp", "bp", "rbp", "x29", "r29"):
-                    fp = int_val
-                elif k in ("pc", "ip", "rip"):
-                    pc = int_val
-                elif k in ("ra", "lr", "r30"):
-                    ra = int_val
+                if k in ("pc", "ip", "rip"):
+                    if 0 < int_val < 0x8000000000000000:
+                        registers[k] = int_val
+                        pc = int_val
+                    else:
+                        pc = None
+                else:
+                    registers[k] = int_val
+                    if k in ("sp", "rsp"):
+                        sp = int_val
+                    elif k in ("fp", "bp", "rbp", "x29", "r29"):
+                        fp = int_val
+                    elif k in ("ra", "lr", "r30"):
+                        ra = int_val
 
         # On x86_64, there is no link register; return address is passed on the stack ((%rsp)).
         # Never report a hardcoded 0x0 or fabricate a return address.
@@ -596,8 +664,10 @@ class EbpfEventDecoder:
                 registers.setdefault("pc", pc)
 
         link_pc: Optional[int] = None
-        if pc is not None:
-            link_pc = (pc - self.load_bias) if self.load_bias else pc
+        if pc is not None and pc > 0:
+            computed_link_pc = (pc - self.load_bias) if self.load_bias else pc
+            if 0 < computed_link_pc < 0x8000000000000000:
+                link_pc = computed_link_pc
 
         frame_meta = FrameMetadata(
             stack_pointer=sp,
@@ -1037,7 +1107,7 @@ class EbpfTracer:
             def proc_mem_reader(addr: int, size: int) -> Optional[bytes]:
                 if size <= 0 or size > 65536:
                     return None
-                if addr <= 0 or addr > 0x00007fffffffffff:
+                if addr <= 0 or addr >= 0x8000000000000000:
                     return None
                 try:
                     from .watch_session import read_process_memory_slice

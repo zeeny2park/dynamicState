@@ -227,6 +227,10 @@ class EbpfObservationBackend(ObservationBackend):
             "function_return_tracing": True,
             "local_variable_dwarf_eval": True,
             "dwarf_eval_status": "SUPPORTED_PROBE_POINT",
+            "arbitrary_instruction_offset_probing": False,
+            "stack_locals_readable_at_entry": False,
+            "locals_readable_at_return": False,
+            "uprobe_offset_status": "UNSUPPORTED",
             "dwarf_eval_scope": {
                 "supported_types": [
                     "int8", "int16", "int32", "int64",

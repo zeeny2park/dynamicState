@@ -1218,10 +1218,15 @@ class Phase2DwarfLocationResolver(DwarfLocationResolverInterface):
         registers: Dict[str, int],
         frame_metadata: FrameMetadata,
     ) -> TraceValue:
+        effective_link_pc = (
+            frame_metadata.link_time_address
+            if (frame_metadata and frame_metadata.link_time_address is not None)
+            else self.link_time_address
+        )
         context = DwarfEvaluationContext(
             binary_identity=self.binary_identity,
             subprogram=subprogram,
-            link_time_address=self.link_time_address,
+            link_time_address=effective_link_pc,
             load_bias=self.load_bias,
             registers=registers,
             frame_metadata=frame_metadata,
@@ -1232,3 +1237,4 @@ class Phase2DwarfLocationResolver(DwarfLocationResolverInterface):
         )
         res = DwarfEvaluator.evaluate(context)
         return res.to_trace_value()
+
