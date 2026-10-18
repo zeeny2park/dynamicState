@@ -41,6 +41,9 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfSubprogram
 
 STATUS_OBSERVED = "OBSERVED"
 STATUS_UNAVAILABLE = "UNAVAILABLE"
+STATUS_OPTIMIZED_OUT = "OPTIMIZED_OUT"
+STATUS_UNSUPPORTED = "UNSUPPORTED"
+STATUS_ERROR = "ERROR"
 STATUS_UNSUPPORTED_PHASE1 = "UNSUPPORTED_PHASE1"
 STATUS_LOST = "LOST"
 
@@ -77,6 +80,7 @@ class FrameMetadata:
     return_address: Optional[int] = None
     return_address_status: str = STATUS_OBSERVED
     return_address_reason: Optional[str] = None
+    link_time_address: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -86,6 +90,7 @@ class FrameMetadata:
             "return_address": f"0x{self.return_address:x}" if self.return_address is not None else None,
             "return_address_status": self.return_address_status,
             "return_address_reason": self.return_address_reason,
+            "link_time_address": f"0x{self.link_time_address:x}" if self.link_time_address is not None else None,
         }
 
 
@@ -556,6 +561,44 @@ class EbpfEventDecoder:
                 ra_status = STATUS_UNAVAILABLE
                 ra_reason = "Return address register not captured in probe payload"
 
+        # Populate canonical architecture registers from parsed values and arguments
+        if arch_norm in ("aarch64", "arm64"):
+            for i in range(8):
+                if f"arg{i}" in registers and f"x{i}" not in registers:
+                    registers[f"x{i}"] = registers[f"arg{i}"]
+            if fp is not None:
+                registers.setdefault("x29", fp)
+                registers.setdefault("r29", fp)
+                registers.setdefault("fp", fp)
+            if ra is not None:
+                registers.setdefault("x30", ra)
+                registers.setdefault("r30", ra)
+                registers.setdefault("lr", ra)
+                registers.setdefault("ra", ra)
+            if sp is not None:
+                registers.setdefault("sp", sp)
+            if pc is not None:
+                registers.setdefault("pc", pc)
+        elif arch_norm in ("x86_64", "amd64"):
+            x86_arg_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+            for i, r_name in enumerate(x86_arg_regs):
+                if f"arg{i}" in registers and r_name not in registers:
+                    registers[r_name] = registers[f"arg{i}"]
+            if fp is not None:
+                registers.setdefault("rbp", fp)
+                registers.setdefault("bp", fp)
+                registers.setdefault("fp", fp)
+            if sp is not None:
+                registers.setdefault("rsp", sp)
+                registers.setdefault("sp", sp)
+            if pc is not None:
+                registers.setdefault("rip", pc)
+                registers.setdefault("pc", pc)
+
+        link_pc: Optional[int] = None
+        if pc is not None:
+            link_pc = (pc - self.load_bias) if self.load_bias else pc
+
         frame_meta = FrameMetadata(
             stack_pointer=sp,
             frame_pointer=fp,
@@ -563,6 +606,7 @@ class EbpfEventDecoder:
             return_address=ra,
             return_address_status=ra_status,
             return_address_reason=ra_reason,
+            link_time_address=link_pc,
         )
 
         arguments: Dict[str, TraceValue] = {}
@@ -625,11 +669,18 @@ class EbpfEventDecoder:
             )
         }
         if self.subprogram and getattr(self.subprogram, "variables", None):
-            link_pc = (pc - self.load_bias) if (pc is not None and self.load_bias) else (pc if pc is not None else 0)
             if hasattr(self.resolver, "link_time_address"):
-                self.resolver.link_time_address = link_pc
-            for v in self.subprogram.variables:
-                local_vars[v.name] = self.resolver.resolve_variable(self.subprogram, v.name, registers, frame_meta)
+                self.resolver.link_time_address = link_pc if link_pc is not None else 0
+            if probe_type == "RETURN":
+                for v in self.subprogram.variables:
+                    local_vars[v.name] = TraceValue(
+                        name=v.name,
+                        status=STATUS_UNAVAILABLE,
+                        reason="Function execution completed (return probe); stack frame and register context are destroyed.",
+                    )
+            else:
+                for v in self.subprogram.variables:
+                    local_vars[v.name] = self.resolver.resolve_variable(self.subprogram, v.name, registers, frame_meta)
 
         return TraceEvent(
             sequence=self.sequence_counter,
@@ -945,10 +996,16 @@ class EbpfTracer:
                     pass
 
             def proc_mem_reader(addr: int, size: int) -> Optional[bytes]:
+                if size <= 0 or size > 65536:
+                    return None
+                if addr <= 0 or addr > 0x00007fffffffffff:
+                    return None
                 try:
-                    with open(f"/proc/{pid}/mem", "rb") as pf:
-                        pf.seek(addr)
-                        return pf.read(size)
+                    from .watch_session import read_process_memory_slice
+                    data, status, _ = read_process_memory_slice(pid, addr, size)
+                    if status == "OBSERVED" and data is not None and len(data) == size:
+                        return data
+                    return None
                 except Exception:
                     return None
 

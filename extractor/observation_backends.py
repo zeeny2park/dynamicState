@@ -225,7 +225,31 @@ class EbpfObservationBackend(ObservationBackend):
             "ebpf": True,
             "function_entry_tracing": True,
             "function_return_tracing": True,
-            "local_variable_dwarf_eval": False,
-            "dwarf_eval_status": "UNSUPPORTED_PHASE1",
+            "local_variable_dwarf_eval": True,
+            "dwarf_eval_status": "SUPPORTED_PROBE_POINT",
+            "dwarf_eval_scope": {
+                "supported_types": [
+                    "int8", "int16", "int32", "int64",
+                    "uint8", "uint16", "uint32", "uint64",
+                    "float", "double", "bool", "pointer",
+                ],
+                "supported_expressions": [
+                    "DW_OP_reg*", "DW_OP_regx",
+                    "DW_OP_fbreg", "DW_OP_breg*", "DW_OP_bregx",
+                    "DW_OP_entry_value", ".debug_loc/.debug_loclists ranges",
+                ],
+                "supported_architectures": ["x86_64", "aarch64"],
+                "available_probe_points": [
+                    "function_entry (uprobe)",
+                    "function_return (uretprobe)",
+                ],
+                "value_sources": ["registers", "process_memory"],
+                "notes": (
+                    "Stack-resident locals are UNAVAILABLE at function entry prior to prologue "
+                    "frame establishment. At function return, locals are UNAVAILABLE due to frame "
+                    "destruction. Arbitrary instruction offset probing depends on host bpftrace "
+                    "probe offset support."
+                ),
+            },
         }
 

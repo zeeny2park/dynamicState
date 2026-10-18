@@ -585,6 +585,13 @@ class DwarfEvaluator:
                 reason="Subprogram uses unsupported complex CFI rule (DW_CFA_def_cfa_expression)",
             )
 
+        if context.link_time_address is None:
+            return DwarfLocationResult(
+                variable_name=var_name,
+                status=EVAL_STATUS_UNAVAILABLE,
+                reason="Link-time instruction address is unavailable",
+            )
+
         # 1. Find variable in subprogram
         d_var = context.subprogram.get_variable(var_name)
         if not d_var:

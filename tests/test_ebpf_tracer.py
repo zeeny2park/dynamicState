@@ -486,7 +486,15 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertFalse(caps["ptrace"])
         self.assertTrue(caps["ebpf"])
         self.assertEqual(caps["consistency"], "PROBE_POINT_EVENT")
-        self.assertEqual(caps["dwarf_eval_status"], "UNSUPPORTED_PHASE1")
+        self.assertTrue(caps["local_variable_dwarf_eval"])
+        self.assertEqual(caps["dwarf_eval_status"], "SUPPORTED_PROBE_POINT")
+        self.assertIn("dwarf_eval_scope", caps)
+        scope = caps["dwarf_eval_scope"]
+        self.assertIn("supported_types", scope)
+        self.assertIn("supported_expressions", scope)
+        self.assertIn("supported_architectures", scope)
+        self.assertIn("available_probe_points", scope)
+        self.assertIn("value_sources", scope)
 
     def test_22_pure_python_elf_symbol_lookup(self):
         """Verify pure-Python symbol lookup finds symbols in unstripped ELF binaries."""
@@ -1096,6 +1104,126 @@ class TestEbpfTracerUnit(unittest.TestCase):
             )
             self.assertEqual(tv_mismatch.status, EVAL_STATUS_ERROR)
             self.assertIn("Build ID mismatch", tv_mismatch.reason)
+
+    def test_33_frame_metadata_link_time_address(self):
+        """Verify FrameMetadata includes link_time_address and serializes it in hex."""
+        fm_none = FrameMetadata()
+        self.assertIsNone(fm_none.link_time_address)
+        self.assertIsNone(fm_none.to_dict()["link_time_address"])
+
+        fm_val = FrameMetadata(link_time_address=0x123456)
+        self.assertEqual(fm_val.link_time_address, 0x123456)
+        self.assertEqual(fm_val.to_dict()["link_time_address"], "0x123456")
+
+    def test_34_decoder_normalizes_canonical_registers(self):
+        """Verify EbpfEventDecoder normalizes arguments and control registers to canonical names."""
+        # AArch64
+        dec_arm = EbpfEventDecoder(target_pid=100, architecture="aarch64", function_name="func")
+        line_arm = json.dumps({
+            "type": "ENTRY", "pid": 100, "tid": 100,
+            "arg0": 10, "arg1": 20, "fp": "0x2000", "ra": "0x3000", "sp": "0x4000", "pc": "0x1000",
+        })
+        ev_arm = dec_arm.decode_line(line_arm)
+        self.assertIsNotNone(ev_arm)
+        self.assertEqual(ev_arm.registers.get("x0"), 10)
+        self.assertEqual(ev_arm.registers.get("x1"), 20)
+        self.assertEqual(ev_arm.registers.get("x29"), 0x2000)
+        self.assertEqual(ev_arm.registers.get("x30"), 0x3000)
+        self.assertEqual(ev_arm.registers.get("sp"), 0x4000)
+        self.assertEqual(ev_arm.registers.get("pc"), 0x1000)
+
+        # x86_64
+        dec_x86 = EbpfEventDecoder(target_pid=100, architecture="x86_64", function_name="func")
+        line_x86 = json.dumps({
+            "type": "ENTRY", "pid": 100, "tid": 100,
+            "arg0": 42, "arg1": 84, "fp": "0x5000", "sp": "0x6000", "pc": "0x7000",
+        })
+        ev_x86 = dec_x86.decode_line(line_x86)
+        self.assertIsNotNone(ev_x86)
+        self.assertEqual(ev_x86.registers.get("rdi"), 42)
+        self.assertEqual(ev_x86.registers.get("rsi"), 84)
+        self.assertEqual(ev_x86.registers.get("rbp"), 0x5000)
+        self.assertEqual(ev_x86.registers.get("rsp"), 0x6000)
+        self.assertEqual(ev_x86.registers.get("rip"), 0x7000)
+
+    def test_35_return_probe_marks_local_variables_unavailable(self):
+        """Verify return probes mark subprogram variables UNAVAILABLE due to frame destruction."""
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="compute",
+            low_pc=0x1000,
+            high_pc=0x1100,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="count"),
+                DwarfVariable(die_offset=0x30, name="buffer"),
+            ],
+        )
+        dec = EbpfEventDecoder(
+            target_pid=200,
+            architecture="aarch64",
+            function_name="compute",
+            subprogram=subp,
+        )
+        ret_line = json.dumps({
+            "type": "RETURN", "pid": 200, "tid": 200,
+            "ret": 1234, "sp": "0x4000", "pc": "0x5000",
+        })
+        ev = dec.decode_line(ret_line)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.probe_type, "RETURN")
+        self.assertIsNotNone(ev.return_value)
+        self.assertEqual(ev.return_value.status, STATUS_OBSERVED)
+        self.assertEqual(ev.return_value.value, 1234)
+
+        self.assertIn("count", ev.local_variables)
+        self.assertEqual(ev.local_variables["count"].status, STATUS_UNAVAILABLE)
+        self.assertIn("destroyed", ev.local_variables["count"].reason)
+
+        self.assertIn("buffer", ev.local_variables)
+        self.assertEqual(ev.local_variables["buffer"].status, STATUS_UNAVAILABLE)
+        self.assertIn("destroyed", ev.local_variables["buffer"].reason)
+
+    def test_36_entry_probe_dwarf_variable_resolution(self):
+        """Verify entry probes resolve local variables via configured DWARF location resolver."""
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="target_func",
+            low_pc=0x2000,
+            high_pc=0x2100,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="arg_val"),
+            ],
+        )
+        mock_resolver = MagicMock()
+        mock_resolver.resolve_variable.return_value = TraceValue(
+            name="arg_val",
+            status=STATUS_OBSERVED,
+            value=777,
+            value_hex="0x00000309",
+            location="register:x0",
+        )
+
+        dec = EbpfEventDecoder(
+            target_pid=300,
+            architecture="aarch64",
+            function_name="target_func",
+            load_bias=0x1000,
+            subprogram=subp,
+            resolver=mock_resolver,
+        )
+
+        entry_line = json.dumps({
+            "type": "ENTRY", "pid": 300, "tid": 300,
+            "arg0": 777, "sp": "0x8000", "pc": "0x3000",
+        })
+        ev = dec.decode_line(entry_line)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.frame_metadata.link_time_address, 0x2000, "Link PC = runtime 0x3000 - load_bias 0x1000")
+        self.assertEqual(mock_resolver.link_time_address, 0x2000)
+        mock_resolver.resolve_variable.assert_called_once()
+        self.assertIn("arg_val", ev.local_variables)
+        self.assertEqual(ev.local_variables["arg_val"].status, STATUS_OBSERVED)
+        self.assertEqual(ev.local_variables["arg_val"].value, 777)
 
 
 if __name__ == "__main__":

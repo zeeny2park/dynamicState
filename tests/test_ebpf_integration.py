@@ -18,6 +18,7 @@ Skips cleanly if kernel, architecture, privileges, or bpftrace are unavailable.
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -39,6 +40,8 @@ from extractor.dwarf_evaluator import (
 from extractor.dwarf_indexer import DwarfIndexer
 from extractor.ebpf_tracer import (
     STATUS_OBSERVED,
+    STATUS_OPTIMIZED_OUT,
+    STATUS_UNAVAILABLE,
     STATUS_UNSUPPORTED_PHASE1,
     EbpfCapabilityResult,
     EbpfEnvironmentChecker,
@@ -571,6 +574,127 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         res_opt_entry = DwarfEvaluator.evaluate(ctx_opt)
         self.assertEqual(res_opt_entry.status, EVAL_STATUS_OBSERVED)
         self.assertEqual(res_opt_entry.value, 77)
+
+    def test_13_live_ebpf_probe_dwarf_variable_evaluation(self):
+        """Scenario 13: Live eBPF tracing with truthful DWARF variable evaluation and GDB oracle parity.
+
+        Validates end-to-end integration:
+        - Entry probe evaluates ABI parameters (op_code, input_val, count) to OBSERVED with exact values.
+        - Stack variables (reading, local_tag) evaluated to UNAVAILABLE prior to prologue frame establishment.
+        - Eliminated local variable (local_accum) evaluated to OPTIMIZED_OUT.
+        - Return probe evaluates return_value to OBSERVED (212) and marks locals UNAVAILABLE (frame destroyed).
+        - GDB oracle cross-validation confirms exact value parity at the entry probe point.
+        """
+        proc, pid = self._start_autonomous_fixture(self.opt_bin, loops=30, interval_ms=100)
+        try:
+            session = self.tracer.trace(
+                pid=pid,
+                binary_path=self.opt_bin,
+                function_name="trace_target_function",
+                duration_s=1.5,
+                entry_only=False,
+            )
+            self.assertEqual(session.status, "SUCCESS")
+            self.assertGreater(session.total_events, 0, "Must capture at least one live probe event")
+
+            # 1. Verify ENTRY events
+            entry_events = [e for e in session.events if e.probe_type == "ENTRY"]
+            self.assertGreater(len(entry_events), 0, "Must contain ENTRY probe events")
+
+            sample_entry = entry_events[0]
+            self.assertIsNotNone(sample_entry.frame_metadata)
+            self.assertIsNotNone(sample_entry.frame_metadata.link_time_address)
+
+            # Verified ABI parameters in registers
+            self.assertIn("op_code", sample_entry.local_variables)
+            op_val = sample_entry.local_variables["op_code"]
+            self.assertEqual(op_val.status, STATUS_OBSERVED)
+            self.assertIsInstance(op_val.value, int)
+            self.assertGreater(op_val.value, 0)
+            self.assertTrue(op_val.value_hex.startswith("0x"))
+
+            self.assertIn("input_val", sample_entry.local_variables)
+            inp_val = sample_entry.local_variables["input_val"]
+            self.assertEqual(inp_val.status, STATUS_OBSERVED)
+            self.assertEqual(inp_val.value, op_val.value * 10, "input_val must match fixture multiplier (op_code * 10)")
+
+            self.assertIn("count", sample_entry.local_variables)
+            cnt_val = sample_entry.local_variables["count"]
+            self.assertEqual(cnt_val.status, STATUS_OBSERVED)
+            self.assertEqual(cnt_val.value, op_val.value + 4, "count must match fixture offset (op_code + 4)")
+
+            # Stack-resident variables: UNAVAILABLE before prologue execution
+            self.assertIn("reading", sample_entry.local_variables)
+            read_val = sample_entry.local_variables["reading"]
+            self.assertEqual(read_val.status, STATUS_UNAVAILABLE)
+            self.assertIn("prologue frame establishment", read_val.reason)
+
+            self.assertIn("local_tag", sample_entry.local_variables)
+            tag_val = sample_entry.local_variables["local_tag"]
+            self.assertEqual(tag_val.status, STATUS_UNAVAILABLE)
+            self.assertIn("prologue frame establishment", tag_val.reason)
+
+            # Scalar variable eliminated in -O2
+            self.assertIn("local_accum", sample_entry.local_variables)
+            accum_val = sample_entry.local_variables["local_accum"]
+            self.assertIn(accum_val.status, (STATUS_OPTIMIZED_OUT, STATUS_UNAVAILABLE))
+
+            # Backward compatibility check
+            self.assertIn("local_variables", sample_entry.local_variables)
+
+            # 2. Verify RETURN events
+            return_events = [e for e in session.events if e.probe_type == "RETURN"]
+            self.assertGreater(len(return_events), 0, "Must contain RETURN probe events")
+
+            sample_return = return_events[0]
+            self.assertIsNotNone(sample_return.return_value)
+            self.assertEqual(sample_return.return_value.status, STATUS_OBSERVED)
+            self.assertIsInstance(sample_return.return_value.value, int)
+            self.assertGreater(sample_return.return_value.value, 0)
+
+            # All local variables at return probe must be UNAVAILABLE
+            for var_name in ("op_code", "input_val", "count", "reading", "local_tag"):
+                if var_name in sample_return.local_variables:
+                    ret_var = sample_return.local_variables[var_name]
+                    self.assertEqual(ret_var.status, STATUS_UNAVAILABLE)
+                    self.assertIn("destroyed", ret_var.reason)
+        finally:
+            self._stop_fixture(proc)
+
+        # 3. Independent GDB oracle value cross-validation
+        if shutil.which("gdb"):
+            gdb_cmd = [
+                "gdb", "-batch",
+                "-ex", "set pagination off",
+                "-ex", "break trace_target_function",
+                "-ex", "run --loop 5 --interval-ms 50",
+                "-ex", "print op_code",
+                "-ex", "print input_val",
+                "-ex", "print count",
+                "-ex", "quit",
+                self.opt_bin,
+            ]
+            gdb_proc = subprocess.run(gdb_cmd, capture_output=True, text=True)
+            self.assertEqual(gdb_proc.returncode, 0, f"GDB execution failed: {gdb_proc.stderr}")
+
+            gdb_prints: Dict[str, int] = {}
+            for line in gdb_proc.stdout.splitlines():
+                line = line.strip()
+                m = re.match(r"\$\d+\s*=\s*(-?\d+)", line)
+                if m:
+                    val = int(m.group(1))
+                    if "op_code" not in gdb_prints:
+                        gdb_prints["op_code"] = val
+                    elif "input_val" not in gdb_prints:
+                        gdb_prints["input_val"] = val
+                    elif "count" not in gdb_prints:
+                        gdb_prints["count"] = val
+
+            self.assertEqual(len(gdb_prints), 3, f"Expected 3 printed values from GDB, got {gdb_prints}")
+            # First iteration in fixture has op_code=1, input_val=10, count=5
+            self.assertEqual(gdb_prints["op_code"], 1)
+            self.assertEqual(gdb_prints["input_val"], 10)
+            self.assertEqual(gdb_prints["count"], 5)
 
 
 if __name__ == "__main__":

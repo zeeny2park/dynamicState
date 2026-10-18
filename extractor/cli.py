@@ -664,12 +664,21 @@ def main():
                     pc_str = f"0x{ev.frame_metadata.instruction_pointer:x}" if ev.frame_metadata.instruction_pointer is not None else "None"
                     fp_str = f"0x{ev.frame_metadata.frame_pointer:x}" if ev.frame_metadata.frame_pointer is not None else "None"
                     ra_str = f"0x{ev.frame_metadata.return_address:x}" if ev.frame_metadata.return_address is not None else "None"
-                    print(f"    SP={sp_str} PC={pc_str} FP={fp_str} RA={ra_str}")
+                    link_pc_str = f"0x{ev.frame_metadata.link_time_address:x}" if ev.frame_metadata.link_time_address is not None else "None"
+                    print(f"    SP={sp_str} PC={pc_str} FP={fp_str} RA={ra_str} LinkPC={link_pc_str}")
                 if ev.arguments:
                     args_str = ", ".join(f"{k}={v.value}" for k, v in ev.arguments.items())
                     print(f"    Args: {args_str}")
                 if ev.return_value:
                     print(f"    Return: {ev.return_value.value}")
+                if ev.local_variables:
+                    real_locals = {k: v for k, v in ev.local_variables.items() if k != "local_variables"}
+                    if real_locals:
+                        locs_str = ", ".join(
+                            f"{k}={v.value if v.status == 'OBSERVED' else v.status}"
+                            for k, v in real_locals.items()
+                        )
+                        print(f"    Locals: {locs_str}")
         if session.status in ("FAILED", "PERMISSION_DENIED", "UNSUPPORTED_ENVIRONMENT"):
             sys.exit(1)
         sys.exit(0)

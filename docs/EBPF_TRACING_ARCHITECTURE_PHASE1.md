@@ -312,3 +312,32 @@ The DWARF location list parser (`parse_debug_loc_table`) operates as a grammar-d
 DynamicState is tested against GDB 15.1 in automated cross-validation tests (`TestDwarfEvaluatorCorrectness`):
 - Scalar arguments (`int8_t` through `uint64_t`) and IEEE 754 floats (`float`, `double`) match GDB exactly.
 - Location list evaluation across GCC 13 and Clang 18 binaries matches GDB across active live ranges, prologue entry, epilogue teardown, and clobbered registers.
+
+---
+
+## 10. Phase 1.6 eBPF Probe Event & DWARF Variable Evaluation Pipeline Integration
+
+### 10.1 End-to-End Tracing Pipeline Architecture
+Phase 1.6 connects the runtime observation pipeline (`EbpfTracer`) directly to the DWARF evaluation engine (`DwarfEvaluator` via `Phase2DwarfLocationResolver`):
+1. **Probe Attachment**: `EbpfTracer` determines file-relative attachment offsets using PT_LOAD headers and attaches bounded `uprobe` (entry) and `uretprobe` (return) probes via `bpftrace`.
+2. **Streaming Event Parsing**: `EbpfEventDecoder` streams JSON payloads from `bpftrace`, filtering strictly by target PID and sequence.
+3. **Canonical Register Normalization**: Arguments `arg0`..`arg7` and frame registers are normalized into canonical architecture registers (`x0`..`x7`, `x29`, `x30`, `sp`, `pc` on aarch64; `rdi`..`r9`, `rbp`, `rsp`, `rip` on x86_64).
+4. **Link-Time PC Translation**: Runtime PC is translated to link-time PC using verified load bias ($\text{link\_pc} = \text{pc} - \text{load\_bias}$) and recorded in `FrameMetadata.link_time_address`.
+5. **Probe-Point DWARF Evaluation**:
+   - **At Function Entry (`uprobe`)**: ABI arguments residing in registers (`op_code`, `input_val`, `count`) are evaluated against active location lists and reported as `OBSERVED` with exact typed values and hex strings. Stack-resident variables are truthfully reported as `UNAVAILABLE` because observation occurs prior to prologue frame establishment. Eliminated constants are reported as `OPTIMIZED_OUT`.
+   - **At Function Return (`uretprobe`)**: `return_value` is reported as `OBSERVED`, while function local variables are reported as `UNAVAILABLE` because function execution completed and the stack frame is destroyed.
+6. **Safe Memory Reader**: A bounded memory reader delegates to `read_process_memory_slice`, enforcing `0 < size <= 65536` and `0 < addr <= 0x7fffffffffff`, distinguishing unreadable memory from valid zeros.
+
+### 10.2 Truthful Capability Descriptor
+`EbpfObservationBackend.capabilities()` reports:
+- `local_variable_dwarf_eval`: `True`
+- `dwarf_eval_status`: `"SUPPORTED_PROBE_POINT"`
+- `dwarf_eval_scope`:
+  - `supported_types`: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `double`, `bool`, `pointer`.
+  - `supported_expressions`: `DW_OP_reg*`, `DW_OP_regx`, `DW_OP_fbreg`, `DW_OP_breg*`, `DW_OP_bregx`, `DW_OP_entry_value`, `.debug_loc`/`.debug_loclists` ranges.
+  - `supported_architectures`: `x86_64`, `aarch64`.
+  - `available_probe_points`: `function_entry (uprobe)`, `function_return (uretprobe)`.
+  - `value_sources`: `registers`, `process_memory`.
+
+### 10.3 Host Environment & Probe Offset Limitation
+In the host test environment (Linux 6.17 aarch64 with `bpftrace` 0.20.2), `bpftrace` was built without kernel/uprobe offset support (`compiled without (k|u)probe offset support`), returning exit code 255 if an arbitrary instruction offset (`function+offset`) is targeted. Consequently, live eBPF tracing is strictly limited to function entry and return probe points. Instruction-point local-variable tracing at arbitrary locations within the function body remains blocked pending a bpftrace rebuild with offset support or a direct `libbpf` backend in Phase 2.
