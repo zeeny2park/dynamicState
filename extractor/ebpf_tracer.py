@@ -955,6 +955,7 @@ class EbpfTracer:
                 load_bias=load_bias,
                 architecture=arch,
                 memory_reader=proc_mem_reader,
+                debug_artifact_path=search_path,
             )
         except Exception:
             pass

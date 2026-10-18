@@ -286,3 +286,29 @@ dynamic-state trace-function \
 | **Local Variable Scope** | Calling args & return value only | In-function locals via DWARF expressions | Process-wide globals, heaps, thread stacks |
 | **Consistency Scope** | `PROBE_POINT_EVENT` (Ephemeral event) | Ephemeral probe-point evaluation | `NON_ATOMIC` (Low-Impact) / `STOPPED` (Consistent) |
 | **Overhead Mechanism** | Kernel trap / breakpoint (~1-3 µs/hit) | Kernel trap + BPF map lookup | OS syscall `process_vm_readv` (page batches) |
+
+---
+
+## 9. Phase 1.4 DWARF Parser & CFI Hardening Audit
+
+### 9.1 Grammar-Driven Location-List Parsing
+The DWARF location list parser (`parse_debug_loc_table`) operates as a grammar-driven state machine rather than an indentation heuristic:
+- **Disambiguation of Offsets vs Range Addresses**: In readelf `--debug-dump=loc`, column 1 section offsets have exactly 3 tokens before expression (`<offset> <begin> <end> (<expr>)`), whereas indented continuation ranges have 2 tokens (`<begin> <end> (<expr>)`). In non-PIE binaries, link-time addresses like `0x004015b0` are strictly categorized as range addresses and never registered as section list keys.
+- **Entry Offset Isolation**: In multi-entry location lists, only the list header offset (or location view pair offset) is registered as the dictionary lookup key. Internal entry offsets are not registered as independent list keys, preventing truncated range lists.
+- **Explicitly Empty Lists**: `<End of list>` entries with no preceding ranges are mapped to `[]` in the table, allowing the evaluator to distinguish `OPTIMIZED_OUT` (variable eliminated) from `ERROR` (offset missing / corrupted).
+- **Format Errors & Diagnostics**: Failures from readelf are recorded in `_LOC_ERROR` and returned in `DwarfLocationResult.reason` rather than silently swallowed.
+
+### 9.2 CFI Rule Intervals & Epilogue Teardown Protection
+- **Instruction-by-Instruction CFA Intervals**: `parse_cfi_table` parses CFI rules across `[start_pc, end_pc)` intervals, tracking `DW_CFA_advance_loc`, `DW_CFA_def_cfa`, `DW_CFA_def_cfa_register`, and `DW_CFA_def_cfa_offset`.
+- **FDE Lifetime Integrity**: An FDE is closed only on encountering the next FDE/CIE header; blank lines, nops, and state save/restore instructions do not cause premature FDE termination. State stacks handle `DW_CFA_remember_state` and `DW_CFA_restore_state`.
+- **Epilogue Frame Destruction**: When `DW_CFA_restore` restores the frame pointer (or CFA resets to SP), `frame_destroyed_pc` is recorded. Probes in the epilogue at or after `frame_destroyed_pc` return `UNAVAILABLE` ("is in function epilogue after frame destruction"), preventing reading caller stack frames.
+- **Omitted Frame Pointer Handling**: Functions compiled with `-fomit-frame-pointer` evaluate CFA via `SP + cfa_off` when the stack pointer is available, or return `UNAVAILABLE` when SP is absent.
+
+### 9.3 Invalidation & Debug Artifact Identity
+- **Quad-Tuple Cache Key**: `_LOC_CACHE`, `_CFI_CACHE`, and `DwarfIndexer._cache` key on `(abs_path, mtime, size, build_id)`. Rebuilding an ELF artifact in place at the same path immediately invalidates cached indexes and parses new symbols.
+- **Stripped Binary External Artifact**: `DwarfEvaluationContext` and `Phase2DwarfLocationResolver` support `debug_artifact_path`. When tracing stripped production binaries, DWARF location expressions, CFI tables, and location lists are resolved from the verified matching external debug ELF while memory is read from the target process.
+
+### 9.4 Automated GDB 15.1 Parity Matrix
+DynamicState is tested against GDB 15.1 in automated cross-validation tests (`TestDwarfEvaluatorCorrectness`):
+- Scalar arguments (`int8_t` through `uint64_t`) and IEEE 754 floats (`float`, `double`) match GDB exactly.
+- Location list evaluation across GCC 13 and Clang 18 binaries matches GDB across active live ranges, prologue entry, epilogue teardown, and clobbered registers.

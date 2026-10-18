@@ -61,6 +61,7 @@ class DwarfEvaluationContext:
     variable_name: str = ""
     architecture: str = "x86_64"             # "x86_64", "aarch64", "arm64"
     memory_reader: Optional[Callable[[int, int], Optional[bytes]]] = None  # (address, size) -> bytes
+    debug_artifact_path: Optional[str] = None  # Explicit companion debug ELF when binary is stripped
 
 
 @dataclass
@@ -165,77 +166,174 @@ for i in range(8):
 # Location List Cache & Parser
 # -----------------------------------------------------------------------------
 
-_LOC_CACHE: Dict[str, Dict[int, List[Tuple[int, int, str]]]] = {}
+_LOC_CACHE: Dict[Tuple[str, float, int, Optional[str]], Dict[int, List[Tuple[int, int, str]]]] = {}
+_LOC_ERROR: Dict[Tuple[str, float, int, Optional[str]], str] = {}
+
+
+def _get_loc_cache_key(path: str) -> Tuple[str, float, int, Optional[str]]:
+    abs_path = os.path.abspath(path)
+    if not os.path.exists(abs_path):
+        return (abs_path, 0.0, 0, None)
+    st = os.stat(abs_path)
+    build_id = None
+    try:
+        from .debug_image import inspect_elf
+        ident = inspect_elf(abs_path)
+        build_id = ident.build_id
+    except Exception:
+        pass
+    return (abs_path, st.st_mtime, st.st_size, build_id)
 
 
 def clear_loc_cache() -> None:
     """Clear cached location lists (used in test teardown)."""
     _LOC_CACHE.clear()
+    _LOC_ERROR.clear()
 
 
 def parse_debug_loc_table(artifact_path: str) -> Dict[int, List[Tuple[int, int, str]]]:
     """Parse .debug_loc (DWARF 4) or .debug_loclists (DWARF 5) section using readelf.
 
     Returns mapping from loc_offset to list of (start_pc, end_pc, expression).
+    Ensures that:
+    1. Each location-list offset maps only to its own entries.
+    2. Range start addresses are never mistakenly treated as list offsets.
+    3. Empty lists (<End of list>) map to empty lists.
+    4. Base-address selection entries and continuation lines are properly parsed.
     """
-    abs_path = os.path.abspath(artifact_path)
-    if abs_path in _LOC_CACHE:
-        return _LOC_CACHE[abs_path]
+    cache_key = _get_loc_cache_key(artifact_path)
+    if cache_key in _LOC_CACHE:
+        return _LOC_CACHE[cache_key]
 
     loc_table: Dict[int, List[Tuple[int, int, str]]] = {}
     try:
-        cmd = ["readelf", "--debug-dump=loc", abs_path]
+        cmd = ["readelf", "--debug-dump=loc", cache_key[0]]
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if res.returncode != 0:
+            _LOC_ERROR[cache_key] = res.stderr.strip() or f"readelf exited with code {res.returncode}"
+            _LOC_CACHE[cache_key] = loc_table
             return loc_table
 
-        current_offsets: List[int] = []
+        lines = res.stdout.splitlines()
+        current_list_offset: Optional[int] = None
+        current_view_offsets: List[int] = []
         current_entries: List[Tuple[int, int, str]] = []
 
-        # Matches column 1 section offset (e.g. "    0000000c ...", "    00000012 ...")
-        # In readelf, section offsets are printed in column 1 (2-6 leading spaces, 1-8 hex chars)
-        col1_re = re.compile(r"^\s{2,6}([0-9a-fA-F]{1,8})\s+(.*)$")
-        # Matches range entry: either on same line or indented continuation line
-        # e.g. "         00000000000015b0 00000000000015c4 (DW_OP_reg0 (x0))"
-        range_re = re.compile(r"(?:^|\s+)([0-9a-fA-F]{8,16})\s+([0-9a-fA-F]{8,16})\s+\((.*)\)\s*$")
-        end_re = re.compile(r"<End of list>")
+        # Grammar-driven regex patterns
+        # 1. End of list: starts with optional column 1 offset and <End of list>
+        end_re = re.compile(r"^\s*([0-9a-fA-F]{1,8})?\s*<End of list>")
+        # 2. View pair line: e.g. "    00000000 v000000000000000 v000000000000000 location view pair"
+        view_pair_re = re.compile(r"^\s{2,6}([0-9a-fA-F]{1,8})\s+v[0-9a-fA-F]+\s+v[0-9a-fA-F]+\s+location view pair")
+        # 3. View header line: e.g. "    00000006 v... views at 00000000 for:"
+        view_hdr_re = re.compile(r"^\s{2,6}([0-9a-fA-F]{1,8})\s+v[0-9a-fA-F]+\s+v[0-9a-fA-F]+\s+views at ([0-9a-fA-F]+) for:")
+        # 4. Base address line: e.g. "    00000012 0000000000001880 (base address)" or with .debug_addr index
+        base_addr_re = re.compile(r"^\s{2,6}([0-9a-fA-F]{1,8})\s+.*\(base address\)")
+        # 5. Range entry with column 1 offset: exactly 3 hex tokens before expression
+        #    e.g. "    00000000 0000000000001880 0000000000001894 (DW_OP_reg0 (x0))"
+        #    Must have 2-6 leading spaces, 1-8 hex digit offset, then start_pc, end_pc, and expression.
+        range_with_offset_re = re.compile(r"^\s{2,6}([0-9a-fA-F]{1,8})\s+([0-9a-fA-F]{8,16})\s+([0-9a-fA-F]{8,16})\s+\((.*)$")
+        # 6. Range entry without offset (indented continuation line, e.g. after view header or multi-range)
+        #    Must have >= 7 leading spaces, start_pc, end_pc, and expression.
+        range_no_offset_re = re.compile(r"^\s{7,}([0-9a-fA-F]{8,16})\s+([0-9a-fA-F]{8,16})\s+\((.*)$")
 
-        for line in res.stdout.splitlines():
-            if end_re.search(line):
-                m_col = col1_re.match(line)
-                if m_col:
-                    current_offsets.append(int(m_col.group(1), 16))
-                if current_offsets:
-                    for off in current_offsets:
-                        loc_table[off] = list(current_entries)
-                current_offsets = []
+        for line in lines:
+            sline = line.strip()
+            if not sline:
+                continue
+            if (
+                "Contents of the" in line
+                or "Table at Offset" in line
+                or "Offset Entries" in line
+                or re.match(r"^\s*\[\s*\d+\]", line)
+                or "Offset   Begin" in line
+                or "Address size:" in line
+                or "Length:" in line
+                or "DWARF version:" in line
+                or "Segment size:" in line
+            ):
+                continue
+
+            # Check End of list
+            m_end = end_re.match(line)
+            if m_end:
+                end_off = int(m_end.group(1), 16) if m_end.group(1) else None
+                if current_list_offset is not None:
+                    loc_table[current_list_offset] = list(current_entries)
+                    for voff in current_view_offsets:
+                        if voff not in loc_table:
+                            loc_table[voff] = list(current_entries)
+                elif end_off is not None:
+                    # Explicitly empty location list at this offset
+                    loc_table[end_off] = []
+                current_list_offset = None
+                current_view_offsets = []
                 current_entries = []
                 continue
 
-            m_col = col1_re.match(line)
-            if m_col:
-                off_val = int(m_col.group(1), 16)
-                current_offsets.append(off_val)
-                rest = m_col.group(2)
-            else:
-                rest = line.strip()
-
-            m_range = range_re.search(rest)
-            if m_range:
-                start_pc = int(m_range.group(1), 16)
-                end_pc = int(m_range.group(2), 16)
-                expr = m_range.group(3).strip()
-                current_entries.append((start_pc, end_pc, expr))
+            # Check View Pair (locviews metadata preceding list)
+            m_vp = view_pair_re.match(line)
+            if m_vp:
+                v_off = int(m_vp.group(1), 16)
+                current_view_offsets.append(v_off)
                 continue
 
-        if current_offsets:
-            for off in current_offsets:
-                loc_table[off] = list(current_entries)
+            # Check View Header for list
+            m_vh = view_hdr_re.match(line)
+            if m_vh:
+                off = int(m_vh.group(1), 16)
+                if current_list_offset is None:
+                    current_list_offset = off
+                continue
 
-    except Exception:
-        pass
+            # Check Base Address selection entry
+            m_base = base_addr_re.match(line)
+            if m_base:
+                off = int(m_base.group(1), 16)
+                if current_list_offset is None:
+                    current_list_offset = off
+                continue
 
-    _LOC_CACHE[abs_path] = loc_table
+            # Check Range Entry with Offset in column 1
+            m_ro = range_with_offset_re.match(line)
+            if m_ro:
+                off = int(m_ro.group(1), 16)
+                start_pc = int(m_ro.group(2), 16)
+                end_pc = int(m_ro.group(3), 16)
+                raw_expr = m_ro.group(4)
+                expr = raw_expr[:-1] if raw_expr.endswith(")") else raw_expr
+                if current_list_offset is None:
+                    current_list_offset = off
+                current_entries.append((start_pc, end_pc, expr.strip()))
+                continue
+
+            # Check Range Entry without Offset (indented continuation line)
+            m_rno = range_no_offset_re.match(line)
+            if m_rno:
+                start_pc = int(m_rno.group(1), 16)
+                end_pc = int(m_rno.group(2), 16)
+                raw_expr = m_rno.group(3)
+                expr = raw_expr[:-1] if raw_expr.endswith(")") else raw_expr
+                current_entries.append((start_pc, end_pc, expr.strip()))
+                continue
+
+            # Check Expression Continuation Line (multi-line opcode sequence)
+            if current_entries and (sline.startswith("DW_OP_") or sline.startswith(";")):
+                raw_cont = sline[:-1] if sline.endswith(")") else sline
+                prev_start, prev_end, prev_expr = current_entries[-1]
+                delim = "; " if not prev_expr.rstrip().endswith(";") and not raw_cont.startswith(";") else " "
+                current_entries[-1] = (prev_start, prev_end, (prev_expr + delim + raw_cont).strip())
+
+        # If file finished while inside a list
+        if current_list_offset is not None:
+            loc_table[current_list_offset] = list(current_entries)
+            for voff in current_view_offsets:
+                if voff not in loc_table:
+                    loc_table[voff] = list(current_entries)
+
+    except Exception as e:
+        _LOC_ERROR[cache_key] = str(e)
+
+    _LOC_CACHE[cache_key] = loc_table
     return loc_table
 
 
@@ -461,7 +559,8 @@ class DwarfEvaluator:
             )
 
         # Resolve type and byte size
-        d_index = DwarfIndexer.get_index(context.binary_identity.path)
+        artifact_path = context.debug_artifact_path or context.binary_identity.path
+        d_index = DwarfIndexer.get_index(artifact_path)
         d_type: Optional[DwarfType] = None
         type_name = "unknown"
         byte_size = 4
@@ -484,14 +583,19 @@ class DwarfEvaluator:
         # 3. Determine active location expression (handling location lists if present)
         loc_expr = d_var.location_expr
         if d_var.location_list_offset is not None:
-            loc_table = parse_debug_loc_table(context.binary_identity.path)
+            loc_table = parse_debug_loc_table(artifact_path)
             if d_var.location_list_offset not in loc_table:
+                cache_key = _get_loc_cache_key(artifact_path)
+                err_detail = _LOC_ERROR.get(cache_key)
+                reason_msg = f"Location list at offset 0x{d_var.location_list_offset:x} not found in debug data (table missing or corrupted)"
+                if err_detail:
+                    reason_msg += f": {err_detail}"
                 return DwarfLocationResult(
                     variable_name=var_name,
                     status=EVAL_STATUS_ERROR,
                     type_name=type_name,
                     byte_size=byte_size,
-                    reason=f"Location list at offset 0x{d_var.location_list_offset:x} not found in debug data (table missing or corrupted)",
+                    reason=reason_msg,
                 )
 
             entries = loc_table[d_var.location_list_offset]
@@ -821,39 +925,117 @@ class DwarfEvaluator:
                     ),
                 )
 
-        # 2. Determine frame base according to DW_AT_frame_base
+        # 2. Epilogue frame destruction check
+        if subp and subp.frame_destroyed_pc is not None and context.link_time_address >= subp.frame_destroyed_pc:
+            return DwarfLocationResult(
+                variable_name=var_name,
+                status=EVAL_STATUS_UNAVAILABLE,
+                location_type="stack_memory",
+                type_name=type_name,
+                byte_size=byte_size,
+                reason=(
+                    f"Stack variable not accessible: observation point (0x{context.link_time_address:x}) "
+                    f"is in function epilogue after frame destruction (0x{subp.frame_destroyed_pc:x})"
+                ),
+            )
+
+        # 3. Determine frame base according to DW_AT_frame_base
         frame_base_expr = subp.frame_base if subp else None
         base_addr: Optional[int] = None
         base_desc = "CFA"
 
         if frame_base_expr == "DW_OP_call_frame_cfa":
-            # Check if function was compiled with -fomit-frame-pointer (no frame pointer in CFI)
-            if subp and subp.has_frame_pointer is False:
-                return DwarfLocationResult(
-                    variable_name=var_name,
-                    status=EVAL_STATUS_UNAVAILABLE,
-                    location_type="stack_memory",
-                    type_name=type_name,
-                    byte_size=byte_size,
-                    reason=(
-                        "Cannot compute Canonical Frame Address (CFA): function compiled with "
-                        "-fomit-frame-pointer (no frame pointer rule in CFI) without DWARF unwind unwinding"
-                    ),
-                )
+            fp_val = None
+            if fm and fm.frame_pointer is not None and fm.frame_pointer != 0:
+                fp_val = fm.frame_pointer
+            else:
+                fp_reg_name = "x29" if arch in ("aarch64", "arm64") else "rbp"
+                fp_val = cls._lookup_register_value(context, fp_reg_name)
 
-            if not fm or fm.frame_pointer is None or fm.frame_pointer == 0:
-                return DwarfLocationResult(
-                    variable_name=var_name,
-                    status=EVAL_STATUS_UNAVAILABLE,
-                    location_type="stack_memory",
-                    type_name=type_name,
-                    byte_size=byte_size,
-                    reason="Frame pointer register not available in observation context",
-                )
+            sp_val = None
+            if fm and fm.stack_pointer is not None and fm.stack_pointer != 0:
+                sp_val = fm.stack_pointer
+            else:
+                sp_reg_name = "sp" if arch in ("aarch64", "arm64") else "rsp"
+                sp_val = cls._lookup_register_value(context, sp_reg_name)
 
-            # CFA = FP + 16 (on both x86_64 and AArch64 standard frame pointer prologues)
-            base_addr = fm.frame_pointer + 16
-            base_desc = "CFA"
+            cfa_rule = subp.get_cfa_rule_at(context.link_time_address) if subp else None
+            if cfa_rule:
+                cfa_reg, cfa_off, fp_est = cfa_rule
+                if cfa_reg == "sp":
+                    if sp_val is not None:
+                        base_addr = sp_val + cfa_off
+                        base_desc = f"CFA(SP+{cfa_off})"
+                    elif fp_val is not None and fp_est and subp and subp.fp_offset_from_cfa is not None:
+                        fp_delta = -subp.fp_offset_from_cfa
+                        base_addr = fp_val + fp_delta
+                        base_desc = f"CFA(FP+{fp_delta})"
+                    elif subp and subp.has_frame_pointer is False:
+                        return DwarfLocationResult(
+                            variable_name=var_name,
+                            status=EVAL_STATUS_UNAVAILABLE,
+                            location_type="stack_memory",
+                            type_name=type_name,
+                            byte_size=byte_size,
+                            reason=(
+                                "Cannot compute Canonical Frame Address (CFA): function compiled with "
+                                "-fomit-frame-pointer (no frame pointer rule in CFI) without DWARF unwind unwinding"
+                            ),
+                        )
+                    else:
+                        return DwarfLocationResult(
+                            variable_name=var_name,
+                            status=EVAL_STATUS_UNAVAILABLE,
+                            location_type="stack_memory",
+                            type_name=type_name,
+                            byte_size=byte_size,
+                            reason="Stack pointer register not available in observation context to compute CFA",
+                        )
+                elif cfa_reg == "fp":
+                    if fp_val is None:
+                        return DwarfLocationResult(
+                            variable_name=var_name,
+                            status=EVAL_STATUS_UNAVAILABLE,
+                            location_type="stack_memory",
+                            type_name=type_name,
+                            byte_size=byte_size,
+                            reason="Frame pointer register not available in observation context",
+                        )
+                    base_addr = fp_val + cfa_off
+                    base_desc = f"CFA(FP+{cfa_off})"
+                else:
+                    return DwarfLocationResult(
+                        variable_name=var_name,
+                        status=EVAL_STATUS_UNSUPPORTED,
+                        location_type="stack_memory",
+                        type_name=type_name,
+                        byte_size=byte_size,
+                        reason=f"Unsupported CFA base register '{cfa_reg}' in CFI rule",
+                    )
+            else:
+                if subp and subp.has_frame_pointer is False:
+                    return DwarfLocationResult(
+                        variable_name=var_name,
+                        status=EVAL_STATUS_UNAVAILABLE,
+                        location_type="stack_memory",
+                        type_name=type_name,
+                        byte_size=byte_size,
+                        reason=(
+                            "Cannot compute Canonical Frame Address (CFA): function compiled with "
+                            "-fomit-frame-pointer (no frame pointer rule in CFI) without DWARF unwind unwinding"
+                        ),
+                    )
+                if fp_val is None:
+                    return DwarfLocationResult(
+                        variable_name=var_name,
+                        status=EVAL_STATUS_UNAVAILABLE,
+                        location_type="stack_memory",
+                        type_name=type_name,
+                        byte_size=byte_size,
+                        reason="Frame pointer register not available in observation context",
+                    )
+                base_addr = fp_val + (16 if arch in ("aarch64", "arm64", "x86_64") else 8)
+                base_desc = "CFA"
 
         elif frame_base_expr in ("DW_OP_reg6", "DW_OP_reg29"):
             # Direct frame register
@@ -977,12 +1159,14 @@ class Phase2DwarfLocationResolver(DwarfLocationResolverInterface):
         load_bias: int = 0,
         architecture: str = "x86_64",
         memory_reader: Optional[Callable[[int, int], Optional[bytes]]] = None,
+        debug_artifact_path: Optional[str] = None,
     ):
         self.binary_identity = binary_identity
         self.link_time_address = link_time_address
         self.load_bias = load_bias
         self.architecture = architecture
         self.memory_reader = memory_reader
+        self.debug_artifact_path = debug_artifact_path
 
     def resolve_variable(
         self,
@@ -1001,6 +1185,7 @@ class Phase2DwarfLocationResolver(DwarfLocationResolverInterface):
             variable_name=variable_name,
             architecture=self.architecture,
             memory_reader=self.memory_reader,
+            debug_artifact_path=self.debug_artifact_path,
         )
         res = DwarfEvaluator.evaluate(context)
         return res.to_trace_value()
