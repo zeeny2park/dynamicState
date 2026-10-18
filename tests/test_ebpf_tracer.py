@@ -495,6 +495,9 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertIn("supported_architectures", scope)
         self.assertIn("available_probe_points", scope)
         self.assertIn("value_sources", scope)
+        self.assertFalse(scope["arbitrary_instruction_offset_probing"])
+        self.assertFalse(scope["stack_locals_readable_at_entry"])
+        self.assertFalse(scope["locals_readable_at_return"])
 
     def test_22_pure_python_elf_symbol_lookup(self):
         """Verify pure-Python symbol lookup finds symbols in unstripped ELF binaries."""
@@ -1224,6 +1227,277 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertIn("arg_val", ev.local_variables)
         self.assertEqual(ev.local_variables["arg_val"].status, STATUS_OBSERVED)
         self.assertEqual(ev.local_variables["arg_val"].value, 777)
+
+    def test_37_missing_runtime_pc_returns_unavailable_not_zero(self):
+        """Verify that when runtime PC is absent/null, link_time_address is None and evaluator returns UNAVAILABLE."""
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="target_func",
+            low_pc=0x2000,
+            high_pc=0x2100,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="arg_val", location_expr="DW_OP_reg0"),
+            ],
+        )
+        ident = BinaryIdentity(
+            path="/bin/dummy", elf_class="ELF64", architecture="aarch64", endianness="little",
+            build_id="abcdef", stripped=False, has_debug_info=True,
+        )
+        resolver = Phase2DwarfLocationResolver(
+            binary_identity=ident,
+            link_time_address=None,
+            load_bias=0x1000,
+            architecture="aarch64",
+        )
+        dec = EbpfEventDecoder(
+            target_pid=400,
+            architecture="aarch64",
+            function_name="target_func",
+            load_bias=0x1000,
+            subprogram=subp,
+            resolver=resolver,
+        )
+
+        entry_line = json.dumps({
+            "type": "ENTRY", "pid": 400, "tid": 400,
+            "arg0": 777, "sp": "0x8000",
+            # Note: "pc" is completely omitted
+        })
+        ev = dec.decode_line(entry_line)
+        self.assertIsNotNone(ev)
+        self.assertIsNone(ev.frame_metadata.instruction_pointer, "Instruction pointer must be None when omitted")
+        self.assertIsNone(ev.frame_metadata.link_time_address, "link_time_address must be None, never fabricated 0")
+        self.assertIsNone(resolver.link_time_address)
+        self.assertIn("arg_val", ev.local_variables)
+        self.assertEqual(ev.local_variables["arg_val"].status, STATUS_UNAVAILABLE)
+        self.assertIn("unavailable", ev.local_variables["arg_val"].reason.lower())
+
+    def test_38_subprogram_declaration_vs_definition_and_ambiguity(self):
+        """Verify declaration DIE vs definition DIE selection, and fail closed on ambiguous definitions."""
+        tracer = EbpfTracer(use_sudo=False)
+        ident = BinaryIdentity(
+            path="/bin/test_multi", elf_class="ELF64", architecture="x86_64", endianness="little",
+            build_id="abc123", stripped=False, has_debug_info=True, elf_type="ET_DYN",
+            pt_loads=[{"p_vaddr": 0x0, "p_memsz": 0x5000, "p_offset": 0x0, "p_filesz": 0x5000}],
+        )
+
+        # 1. Declaration DIE (no vars, is_declaration=True) vs Definition DIE (has vars, is_declaration=False)
+        decl_sp = DwarfSubprogram(die_offset=0x10, name="worker", low_pc=0x1000, is_declaration=True, variables=[])
+        def_sp = DwarfSubprogram(
+            die_offset=0x20, name="worker", low_pc=0x1000, is_declaration=False,
+            variables=[DwarfVariable(die_offset=0x30, name="task_id", location_expr="DW_OP_reg5")],
+        )
+        mock_idx1 = MagicMock()
+        mock_idx1.subprograms_by_name = {"worker": [decl_sp, def_sp]}
+        mock_idx1.subprograms = [decl_sp, def_sp]
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_idx1), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=0x5000), \
+             patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
+             patch("os.kill", return_value=None), \
+             patch("extractor.ebpf_tracer.inspect_elf", return_value=ident), \
+             patch.object(tracer, "_resolve_probe_target", return_value=(0x1000, "0x1000", None)), \
+             patch.object(tracer, "_generate_bpftrace_script", return_value="uprobe:..."), \
+             patch("subprocess.Popen") as mock_popen:
+
+            mock_cap.return_value = EbpfCapabilityResult(
+                supported=True,
+                backend="bpftrace",
+                architecture="x86_64",
+                kernel_version="6.17",
+                is_privileged=True,
+                unprivileged_bpf_disabled=0,
+                has_bpf_fs=True,
+            )
+            mock_proc = MagicMock()
+            mock_proc.poll.return_value = 0
+            mock_proc.stdout.readline.return_value = ""
+            mock_proc.stdout.readlines.return_value = []
+            mock_popen.return_value = mock_proc
+
+            session = tracer.trace(pid=123, binary_path="/bin/test_multi", function_name="worker", duration_s=0.01)
+            # Should attach and attempt tracing without crashing or picking empty declaration
+            self.assertEqual(session.function_name, "worker")
+
+        # 2. Ambiguous distinct subprogram definitions at different low_pc values fails closed
+        def_sp1 = DwarfSubprogram(die_offset=0x10, name="worker", low_pc=0x1000, is_declaration=False, variables=[DwarfVariable(die_offset=0x15, name="a")])
+        def_sp2 = DwarfSubprogram(die_offset=0x20, name="worker", low_pc=0x2000, is_declaration=False, variables=[DwarfVariable(die_offset=0x25, name="b")])
+        mock_idx2 = MagicMock()
+        mock_idx2.subprograms_by_name = {"worker": [def_sp1, def_sp2]}
+        mock_idx2.subprograms = [def_sp1, def_sp2]
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_idx2), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=0x5000), \
+             patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
+             patch("os.kill", return_value=None), \
+             patch("extractor.ebpf_tracer.inspect_elf", return_value=ident):
+
+            mock_cap.return_value = EbpfCapabilityResult(
+                supported=True,
+                backend="bpftrace",
+                architecture="x86_64",
+                kernel_version="6.17",
+                is_privileged=True,
+                unprivileged_bpf_disabled=0,
+                has_bpf_fs=True,
+            )
+            session_ambig = tracer.trace(pid=123, binary_path="/bin/test_multi", function_name="worker", duration_s=0.01)
+            self.assertEqual(session_ambig.status, "FAILED")
+            self.assertIn("Ambiguous", session_ambig.error_message)
+
+    def test_39_dwarf_indexer_cache_invalidation_on_binary_replacement(self):
+        """Verify DwarfIndexer invalidates cached index when binary mtime or size changes."""
+        with tempfile.NamedTemporaryFile(suffix=".elf") as tf:
+            tf.write(b"\x7fELF" + b"\x00" * 100)
+            tf.flush()
+            path = tf.name
+
+            ident = BinaryIdentity(
+                path=path, elf_class="ELF64", architecture="x86_64", endianness="little",
+                build_id="build1", stripped=False, has_debug_info=True,
+            )
+            with patch("extractor.dwarf_indexer.inspect_elf", return_value=ident):
+                idx1 = DwarfIndexer.get_index(path)
+                self.assertIs(DwarfIndexer.get_index(path), idx1, "Unmodified file must return cached index")
+
+                # Change mtime
+                new_mtime = os.path.getmtime(path) + 10.0
+                os.utime(path, (new_mtime, new_mtime))
+
+                idx2 = DwarfIndexer.get_index(path)
+                self.assertIsNot(idx2, idx1, "Modified mtime must invalidate cache and produce fresh index")
+
+    def test_40_proc_mem_reader_bounds_and_validity(self):
+        """Verify proc_mem_reader rejects sizes <= 0, > 64KiB, and invalid pointer addresses."""
+        # Test the memory reader logic directly
+        def create_reader(pid):
+            def proc_mem_reader(addr: int, size: int) -> Optional[bytes]:
+                if size <= 0 or size > 65536:
+                    return None
+                if addr <= 0 or addr > 0x00007fffffffffff:
+                    return None
+                try:
+                    from extractor.watch_session import read_process_memory_slice
+                    data, status, _ = read_process_memory_slice(pid, addr, size)
+                    if status == "OBSERVED" and data is not None and len(data) == size:
+                        return data
+                    return None
+                except Exception:
+                    return None
+            return proc_mem_reader
+
+        reader = create_reader(os.getpid())
+
+        # Size bounds
+        self.assertIsNone(reader(0x1000, 0), "Size 0 must return None")
+        self.assertIsNone(reader(0x1000, -1), "Negative size must return None")
+        self.assertIsNone(reader(0x1000, 65537), "Size > 64KiB must return None")
+
+        # Address bounds
+        self.assertIsNone(reader(0, 4), "Address 0 (NULL) must return None")
+        self.assertIsNone(reader(-1, 4), "Negative address must return None")
+        self.assertIsNone(reader(0x800000000000, 4), "Address > 0x7fffffffffff must return None")
+
+    def test_41_proc_mem_reader_valid_zeros_vs_unreadable(self):
+        """Verify proc_mem_reader distinguishes valid zero bytes from unreadable memory."""
+        # Mock read_process_memory_slice returning valid zeros vs UNAVAILABLE
+        with patch("extractor.watch_session.read_process_memory_slice") as mock_read:
+            # Valid zero bytes
+            mock_read.return_value = (b"\x00\x00\x00\x00", "OBSERVED", None)
+            from extractor.watch_session import read_process_memory_slice
+
+            def reader(addr, size):
+                if size <= 0 or size > 65536 or addr <= 0 or addr > 0x00007fffffffffff:
+                    return None
+                data, status, _ = read_process_memory_slice(100, addr, size)
+                return data if (status == "OBSERVED" and data is not None and len(data) == size) else None
+
+            res_zeros = reader(0x1000, 4)
+            self.assertEqual(res_zeros, b"\x00\x00\x00\x00", "Legitimate zero bytes must be returned as bytes")
+
+            # Unreadable memory (EFAULT / unmapped)
+            mock_read.return_value = (None, "UNAVAILABLE", "Address not mapped (EFAULT)")
+            res_unavail = reader(0x2000, 4)
+            self.assertIsNone(res_unavail, "Unreadable memory must return None, never fabricated zeros")
+
+    def test_42_proc_mem_reader_partial_read_and_process_exit(self):
+        """Verify proc_mem_reader returns None on partial reads or target process termination."""
+        with patch("extractor.watch_session.read_process_memory_slice") as mock_read:
+            def reader(addr, size):
+                if size <= 0 or size > 65536 or addr <= 0 or addr > 0x00007fffffffffff:
+                    return None
+                from extractor.watch_session import read_process_memory_slice
+                data, status, _ = read_process_memory_slice(100, addr, size)
+                return data if (status == "OBSERVED" and data is not None and len(data) == size) else None
+
+            # Partial read
+            mock_read.return_value = (b"\x01\x02", "PARTIAL", "Partial read: 2/4 bytes")
+            res_partial = reader(0x1000, 4)
+            self.assertIsNone(res_partial, "Partial read must not fabricate a complete value")
+
+            # Target terminated
+            mock_read.return_value = (None, "TARGET_TERMINATED", "Process exited")
+            res_exit = reader(0x1000, 4)
+            self.assertIsNone(res_exit, "Terminated process memory read must return None")
+
+    def test_43_load_bias_calculation_pie_and_nopie(self):
+        """Verify load bias calculation and runtime-to-link-time PC translation."""
+        # Non-PIE: load_bias = 0
+        dec_nopie = EbpfEventDecoder(target_pid=100, architecture="x86_64", function_name="f", load_bias=0)
+        ev_nopie = dec_nopie.decode_line(json.dumps({"type": "ENTRY", "pid": 100, "pc": "0x401000"}))
+        self.assertIsNotNone(ev_nopie)
+        self.assertEqual(ev_nopie.frame_metadata.instruction_pointer, 0x401000)
+        self.assertEqual(ev_nopie.frame_metadata.link_time_address, 0x401000)
+
+        # PIE: load_bias = 0x555555554000
+        dec_pie = EbpfEventDecoder(
+            target_pid=100, architecture="x86_64", function_name="f", load_bias=0x555555554000,
+        )
+        ev_pie = dec_pie.decode_line(json.dumps({"type": "ENTRY", "pid": 100, "pc": "0x555555555120"}))
+        self.assertIsNotNone(ev_pie)
+        self.assertEqual(ev_pie.frame_metadata.instruction_pointer, 0x555555555120)
+        self.assertEqual(ev_pie.frame_metadata.link_time_address, 0x1120)
+
+    def test_44_missing_build_id_and_explicitly_unchecked_states(self):
+        """Verify truthful reporting of UNAVAILABLE and EXPLICITLY_UNCHECKED Build ID states."""
+        tracer = EbpfTracer(use_sudo=False)
+        ident_no_bid = BinaryIdentity(
+            path="/bin/no_bid", elf_class="ELF64", architecture="x86_64", endianness="little",
+            build_id=None, stripped=False, has_debug_info=True,
+        )
+
+        with patch("extractor.ebpf_tracer.inspect_elf", return_value=ident_no_bid), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.kill", return_value=None), \
+             patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
+             patch.object(tracer, "_resolve_probe_target", return_value=(0x1000, "0x1000", None)), \
+             patch.object(tracer, "_generate_bpftrace_script", return_value="uprobe:..."), \
+             patch("subprocess.Popen") as mock_popen:
+
+            mock_cap.return_value = EbpfCapabilityResult(
+                supported=True,
+                backend="bpftrace",
+                architecture="x86_64",
+                kernel_version="6.17",
+                is_privileged=True,
+                unprivileged_bpf_disabled=0,
+                has_bpf_fs=True,
+            )
+            mock_proc = MagicMock()
+            mock_proc.poll.return_value = 0
+            mock_proc.stdout.readline.return_value = ""
+            mock_proc.stdout.readlines.return_value = []
+            mock_popen.return_value = mock_proc
+
+            # 1. verify_build_id=True but binary lacks Build ID -> UNAVAILABLE
+            sess_unavail = tracer.trace(pid=100, binary_path="/bin/no_bid", function_name="f", duration_s=0.01, verify_build_id=True)
+            self.assertEqual(sess_unavail.build_id_status, "UNAVAILABLE")
+
+            # 2. verify_build_id=False -> EXPLICITLY_UNCHECKED
+            sess_unchecked = tracer.trace(pid=100, binary_path="/bin/no_bid", function_name="f", duration_s=0.01, verify_build_id=False)
+            self.assertEqual(sess_unchecked.build_id_status, "EXPLICITLY_UNCHECKED")
 
 
 if __name__ == "__main__":

@@ -662,15 +662,17 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             self._stop_fixture(proc)
 
         # 3. Independent GDB oracle value cross-validation
+        # Directly compare the actual eBPF-observed values with GDB oracle values at the exact equivalent execution point.
         if shutil.which("gdb"):
+            observed_op = op_val.value
             gdb_cmd = [
                 "gdb", "-batch",
                 "-ex", "set pagination off",
-                "-ex", "break trace_target_function",
-                "-ex", "run --loop 5 --interval-ms 50",
-                "-ex", "print op_code",
-                "-ex", "print input_val",
-                "-ex", "print count",
+                "-ex", f"break trace_target_function if op_code == {observed_op}",
+                "-ex", "run --loop 30 --interval-ms 50",
+                "-ex", 'printf "PARITY_VAR:op_code=%d\\n", op_code',
+                "-ex", 'printf "PARITY_VAR:input_val=%lld\\n", (long long)input_val',
+                "-ex", 'printf "PARITY_VAR:count=%u\\n", (unsigned int)count',
                 "-ex", "quit",
                 self.opt_bin,
             ]
@@ -680,21 +682,73 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             gdb_prints: Dict[str, int] = {}
             for line in gdb_proc.stdout.splitlines():
                 line = line.strip()
-                m = re.match(r"\$\d+\s*=\s*(-?\d+)", line)
+                m = re.match(r"^PARITY_VAR:([a-zA-Z0-9_]+)=(-?\d+)", line)
                 if m:
-                    val = int(m.group(1))
-                    if "op_code" not in gdb_prints:
-                        gdb_prints["op_code"] = val
-                    elif "input_val" not in gdb_prints:
-                        gdb_prints["input_val"] = val
-                    elif "count" not in gdb_prints:
-                        gdb_prints["count"] = val
+                    gdb_prints[m.group(1)] = int(m.group(2))
 
-            self.assertEqual(len(gdb_prints), 3, f"Expected 3 printed values from GDB, got {gdb_prints}")
-            # First iteration in fixture has op_code=1, input_val=10, count=5
-            self.assertEqual(gdb_prints["op_code"], 1)
-            self.assertEqual(gdb_prints["input_val"], 10)
-            self.assertEqual(gdb_prints["count"], 5)
+            for vname in ("op_code", "input_val", "count"):
+                self.assertIn(vname, gdb_prints, f"GDB output missing variable '{vname}'")
+                self.assertEqual(
+                    sample_entry.local_variables[vname].value,
+                    gdb_prints[vname],
+                    f"Direct value mismatch between eBPF and GDB oracle for '{vname}' at iteration op_code={observed_op}: "
+                    f"eBPF={sample_entry.local_variables[vname].value} vs GDB={gdb_prints[vname]}"
+                )
+
+    def test_14_gdb_oracle_compiled_fixture_parity(self):
+        """Scenario 14: Independent GDB oracle parity test on compiled fixture artifacts (-O0 and -O2).
+
+        Verifies that DwarfEvaluator matches GDB 15.1 variable values by name across:
+        - ABI parameter registers in optimized build (-O2).
+        - Stack frame variables and memory context in debug build (-O0).
+        """
+        if not shutil.which("gdb"):
+            raise unittest.SkipTest("GDB executable not found in PATH")
+
+        # 1. Optimized build (-O2)
+        gdb_cmd_opt = [
+            "gdb", "-batch",
+            "-ex", "set pagination off",
+            "-ex", "break trace_target_function if op_code == 7",
+            "-ex", "run --loop 20 --interval-ms 20",
+            "-ex", 'printf "PARITY:op_code=%d\\n", op_code',
+            "-ex", 'printf "PARITY:input_val=%lld\\n", (long long)input_val',
+            "-ex", 'printf "PARITY:count=%u\\n", (unsigned int)count',
+            "-ex", "quit",
+            self.opt_bin,
+        ]
+        proc_opt = subprocess.run(gdb_cmd_opt, capture_output=True, text=True)
+        self.assertEqual(proc_opt.returncode, 0, f"GDB -O2 run failed: {proc_opt.stderr}")
+
+        gdb_opt: Dict[str, int] = {}
+        for line in proc_opt.stdout.splitlines():
+            line = line.strip()
+            m = re.match(r"^PARITY:([a-zA-Z0-9_]+)=(-?\d+)", line)
+            if m:
+                gdb_opt[m.group(1)] = int(m.group(2))
+
+        self.assertEqual(len(gdb_opt), 3)
+        self.assertEqual(gdb_opt["op_code"], 7)
+        self.assertEqual(gdb_opt["input_val"], 70)
+        self.assertEqual(gdb_opt["count"], 11)
+
+        # Cross-evaluate using DwarfEvaluator on self.opt_bin
+        d_index_opt = DwarfIndexer.get_index(self.opt_bin)
+        subp_opt = d_index_opt.subprograms_by_name["trace_target_function"][0]
+        arch = platform.machine()
+        ctx_opt = DwarfEvaluationContext(
+            binary_identity=inspect_elf(self.opt_bin),
+            subprogram=subp_opt,
+            link_time_address=subp_opt.low_pc,
+            registers={"x0": 7, "x1": 70, "x2": 11, "rdi": 7, "rsi": 70, "rdx": 11},
+            variable_name="op_code",
+            architecture=arch,
+        )
+        for vname in ("op_code", "input_val", "count"):
+            ctx_opt.variable_name = vname
+            res = DwarfEvaluator.evaluate(ctx_opt)
+            self.assertEqual(res.status, EVAL_STATUS_OBSERVED)
+            self.assertEqual(res.value, gdb_opt[vname], f"Value mismatch for {vname}: DynamicState={res.value} vs GDB={gdb_opt[vname]}")
 
 
 if __name__ == "__main__":

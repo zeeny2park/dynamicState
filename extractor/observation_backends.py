@@ -243,12 +243,15 @@ class EbpfObservationBackend(ObservationBackend):
                     "function_entry (uprobe)",
                     "function_return (uretprobe)",
                 ],
+                "arbitrary_instruction_offset_probing": False,
+                "stack_locals_readable_at_entry": False,
+                "locals_readable_at_return": False,
                 "value_sources": ["registers", "process_memory"],
                 "notes": (
                     "Stack-resident locals are UNAVAILABLE at function entry prior to prologue "
                     "frame establishment. At function return, locals are UNAVAILABLE due to frame "
                     "destruction. Arbitrary instruction offset probing depends on host bpftrace "
-                    "probe offset support."
+                    "probe offset support, which is disabled in this environment."
                 ),
             },
         }

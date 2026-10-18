@@ -670,7 +670,7 @@ class EbpfEventDecoder:
         }
         if self.subprogram and getattr(self.subprogram, "variables", None):
             if hasattr(self.resolver, "link_time_address"):
-                self.resolver.link_time_address = link_pc if link_pc is not None else 0
+                self.resolver.link_time_address = link_pc
             if probe_type == "RETURN":
                 for v in self.subprogram.variables:
                     local_vars[v.name] = TraceValue(
@@ -972,7 +972,46 @@ class EbpfTracer:
                     if sp.name == function_name or sp.linkage_name == function_name:
                         subps.append(sp)
             if subps:
-                target_subp = subps[0]
+                # 1. Match subprograms to file offset via PT_LOAD
+                matching_subps = []
+                for sp in subps:
+                    if sp.low_pc is not None:
+                        sp_fo = self._virt_to_file_offset(elf_info, abs_binary, sp.low_pc)
+                        if sp_fo == func_offset:
+                            matching_subps.append(sp)
+                candidates = matching_subps if matching_subps else [sp for sp in subps if sp.low_pc is not None]
+                if not candidates:
+                    candidates = subps
+
+                # 2. Check for multiple distinct definitions with different entry points
+                distinct_definitions = [
+                    sp for sp in candidates
+                    if getattr(sp, "variables", None) and not getattr(sp, "is_declaration", False)
+                ]
+                if len(distinct_definitions) > 1:
+                    distinct_pcs = {sp.low_pc for sp in distinct_definitions if sp.low_pc is not None}
+                    if len(distinct_pcs) > 1:
+                        addrs_str = ", ".join(f"0x{a:x}" for a in sorted(distinct_pcs))
+                        return TraceObservationSession(
+                            session_id=session_id,
+                            target_pid=pid,
+                            target_binary=abs_binary,
+                            target_build_id=target_build_id,
+                            build_id_status=build_id_status,
+                            function_name=function_name,
+                            probe_offset=probe_offset_str,
+                            architecture=arch,
+                            backend_name=cap.backend,
+                            start_time=t_start_iso,
+                            end_time=datetime.now(timezone.utc).isoformat(),
+                            status="FAILED",
+                            error_message=(
+                                f"Ambiguous DWARF subprograms for '{function_name}': matches multiple candidate "
+                                f"definitions at distinct locations ({addrs_str}). Disambiguate using linkage name or exact offset."
+                            ),
+                        )
+                # Prefer definition with variables over empty declaration DIE
+                target_subp = distinct_definitions[0] if distinct_definitions else candidates[0]
 
             # Calculate load bias for PIE binaries
             if elf_info.elf_type == "ET_DYN":
@@ -1012,7 +1051,7 @@ class EbpfTracer:
             from .dwarf_evaluator import Phase2DwarfLocationResolver
             resolver = Phase2DwarfLocationResolver(
                 binary_identity=elf_info,
-                link_time_address=target_subp.low_pc if target_subp and target_subp.low_pc is not None else 0,
+                link_time_address=target_subp.low_pc if target_subp and target_subp.low_pc is not None else None,
                 load_bias=load_bias,
                 architecture=arch,
                 memory_reader=proc_mem_reader,

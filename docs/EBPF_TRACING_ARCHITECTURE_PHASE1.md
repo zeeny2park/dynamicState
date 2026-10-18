@@ -341,3 +341,45 @@ Phase 1.6 connects the runtime observation pipeline (`EbpfTracer`) directly to t
 
 ### 10.3 Host Environment & Probe Offset Limitation
 In the host test environment (Linux 6.17 aarch64 with `bpftrace` 0.20.2), `bpftrace` was built without kernel/uprobe offset support (`compiled without (k|u)probe offset support`), returning exit code 255 if an arbitrary instruction offset (`function+offset`) is targeted. Consequently, live eBPF tracing is strictly limited to function entry and return probe points. Instruction-point local-variable tracing at arbitrary locations within the function body remains blocked pending a bpftrace rebuild with offset support or a direct `libbpf` backend in Phase 2.
+
+---
+
+## 11. Phase 1.7 End-to-End DWARF Value Parity, Correlation Protocol & Capability Truthfulness
+
+### 11.1 Deterministic GDB Oracle Value Parity Protocol
+To ensure that values reported as `OBSERVED` are truthful and not merely non-empty, Phase 1.7 establishes a direct, key-correlated GDB oracle validation framework:
+- **Keyed Variable Identification**: The test framework parses GDB output using variable-name keys (`PARITY_VAR:<var_name>=<val>`), eliminating positional/line-order heuristics that can misalign variables.
+- **Iteration Correlation via Conditional Breakpoints**: Because live eBPF probes and GDB runs are distinct processes, tests capture the runtime iteration identifier (e.g. `op_code`) from the live eBPF observation and set a conditional GDB breakpoint (`break trace_target_function if op_code == <observed_op_code>`). This guarantees value comparison at the exact equivalent point of execution.
+- **Strict Equivalence Assertions**: Tests assert typed equality (`val == gdb_val`) across signed integers, unsigned integers, floats, doubles, and pointers. Any mismatch, missing variable, or GDB invocation error fails the test closed rather than skipping.
+
+### 11.2 Explicit Backend Capability Booleans
+`EbpfObservationBackend.capabilities()` exposes explicit boolean capability flags reflecting actual engine boundaries:
+```python
+{
+    "local_variable_dwarf_eval": True,
+    "dwarf_eval_status": "SUPPORTED_PROBE_POINT",
+    "arbitrary_instruction_offset_probing": False,
+    "stack_locals_readable_at_entry": False,
+    "locals_readable_at_return": False,
+    ...
+}
+```
+Consumers can query these flags directly without relying on human-readable strings.
+
+### 11.3 Missing Context & PC Coercion Guard
+- **No Zero Coercion**: Missing runtime PC (`link_pc is None`) is preserved as `None` in `Phase2DwarfLocationResolver` and `DwarfEvaluationContext`, instead of defaulting to `0x0`.
+- **Truthful Evaluator Guard**: `DwarfEvaluator.evaluate()` checks `context.link_time_address is None` and immediately returns `EVAL_STATUS_UNAVAILABLE` ("Link-time instruction address is unavailable"), preventing inadvertent address 0 matching.
+
+### 11.4 Subprogram Disambiguation & Ambiguity Protection
+- **Declaration vs Definition DIE Disambiguation**: When an ELF contains both forward declaration DIEs (`is_declaration=True`, lacking local variables) and full definition DIEs for the same function name, `EbpfTracer.trace()` resolves the target subprogram to the definition DIE located at the probed `func_offset`.
+- **Fail-Closed Ambiguity**: If multiple definition DIEs match with conflicting `low_pc` values, the tracer terminates with `status="FAILED"` and an unambiguous error diagnostic rather than evaluating against the wrong function frame.
+
+### 11.5 Bounded Memory Reader Contract
+The memory reader function `proc_mem_reader` adheres to strict contract bounds:
+- **Bounds Checking**: Reads are restricted to `0 < size <= 65536` and `0 < addr <= 0x7fffffffffff`. Out-of-bounds or invalid addresses return `None`.
+- **Zero-Byte Preservation**: Valid zero bytes (`b"\x00" * size`) are preserved and distinguished from unreadable memory (`EFAULT`).
+- **Process Exit & Partial Read Safety**: Reader gracefully returns `None` on process termination or truncated pages, ensuring no partial or corrupted data is fed to the evaluator.
+
+### 11.6 Artifact Replacement Cache Invalidation
+The quad-tuple cache key `(abs_path, mtime, size, build_id)` across `DwarfIndexer`, location-list, and CFI caches ensures that modifying or replacing an executable on disk immediately invalidates cached DWARF metadata, preventing stale variable evaluation.
+

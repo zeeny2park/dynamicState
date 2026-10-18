@@ -54,7 +54,7 @@ class DwarfEvaluationContext:
     """Inputs for DWARF variable location evaluation at a specific observation point."""
     binary_identity: BinaryIdentity
     subprogram: Optional[DwarfSubprogram]
-    link_time_address: int                   # Link-time instruction pointer (PC) inside subprogram
+    link_time_address: Optional[int] = None  # Link-time instruction pointer (PC) inside subprogram
     load_bias: int = 0                       # Runtime load bias (runtime_pc - link_time_pc)
     registers: Dict[str, int] = field(default_factory=dict)
     frame_metadata: Optional[FrameMetadata] = None
@@ -1198,7 +1198,7 @@ class Phase2DwarfLocationResolver(DwarfLocationResolverInterface):
     def __init__(
         self,
         binary_identity: BinaryIdentity,
-        link_time_address: int,
+        link_time_address: Optional[int] = None,
         load_bias: int = 0,
         architecture: str = "x86_64",
         memory_reader: Optional[Callable[[int, int], Optional[bytes]]] = None,
