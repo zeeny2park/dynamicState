@@ -650,24 +650,27 @@ def main():
         else:
             print(f"eBPF Trace Session: {session.session_id} (Status: {session.status})")
             print(f"Target PID: {session.target_pid} | Binary: {session.target_binary}")
+            print(f"Build ID Status: {session.build_id_status} | Probe Offset: {session.probe_offset}")
             print(f"Function: {session.function_name} | Consistency: {session.consistency_level}")
             print(f"Events Captured: {session.total_events} | Lost: {session.lost_events} | Malformed: {session.malformed_records}")
             if session.overhead_stats:
                 print(f"Overhead: {session.overhead_stats}")
             if session.error_message:
-                print(f"Note/Error: {session.error_message}", file=sys.stderr if session.status == "FAILED" else sys.stdout)
+                print(f"Note/Error: {session.error_message}", file=sys.stderr if session.status in ("FAILED", "PERMISSION_DENIED", "UNSUPPORTED_ENVIRONMENT") else sys.stdout)
             for ev in session.events[:10]:
                 print(f"  [{ev.probe_type}] seq={ev.sequence} tid={ev.tid} time={ev.timestamp_ns}")
                 if ev.frame_metadata:
                     sp_str = f"0x{ev.frame_metadata.stack_pointer:x}" if ev.frame_metadata.stack_pointer is not None else "None"
                     pc_str = f"0x{ev.frame_metadata.instruction_pointer:x}" if ev.frame_metadata.instruction_pointer is not None else "None"
-                    print(f"    SP={sp_str} PC={pc_str}")
+                    fp_str = f"0x{ev.frame_metadata.frame_pointer:x}" if ev.frame_metadata.frame_pointer is not None else "None"
+                    ra_str = f"0x{ev.frame_metadata.return_address:x}" if ev.frame_metadata.return_address is not None else "None"
+                    print(f"    SP={sp_str} PC={pc_str} FP={fp_str} RA={ra_str}")
                 if ev.arguments:
                     args_str = ", ".join(f"{k}={v.value}" for k, v in ev.arguments.items())
                     print(f"    Args: {args_str}")
                 if ev.return_value:
                     print(f"    Return: {ev.return_value.value}")
-        if session.status == "FAILED":
+        if session.status in ("FAILED", "PERMISSION_DENIED", "UNSUPPORTED_ENVIRONMENT"):
             sys.exit(1)
         sys.exit(0)
 

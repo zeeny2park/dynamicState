@@ -1,14 +1,16 @@
-"""Phase 1 eBPF Stack-Variable & Function Tracing Proof of Concept.
+"""Phase 1 eBPF Stack-Variable & Function Tracing Proof of Concept (Hardened).
 
 Provides an isolated, optional eBPF-based userspace function tracing backend that:
-1. Attaches uprobe (function entry) and uretprobe (function return) to target binary.
-2. Filters strictly by target PID.
-3. Records monotonic/real timestamps, PID/TID, probe type, function identity,
+1. Validates target process existence, access, and executable identity (/proc/<pid>/exe, Build ID).
+2. Supports stripped production binaries using matching external debug ELFs and precise file offsets.
+3. Attaches uprobe (function entry) and uretprobe (function return) to target binary without pipe deadlock.
+4. Filters strictly by target PID.
+5. Records monotonic/real timestamps, PID/TID, probe type, function identity,
    architecture-supported argument and register values, and stack pointer / frame metadata.
-4. Distinguishes observed values, unavailable values, unsupported features, and lost events.
-5. Preserves existing CONSISTENT and LOW_IMPACT semantics: observations are explicitly
+6. Distinguishes observed values, unavailable values, unsupported features, and lost events.
+7. Preserves existing CONSISTENT and LOW_IMPACT semantics: observations are explicitly
    labeled as PROBE_POINT_EVENT and never misrepresented as consistent process-wide snapshots.
-6. Provides a clean interface (DwarfLocationResolverInterface) for future Phase 2 DWARF location evaluation.
+8. Provides a clean interface (DwarfLocationResolverInterface) for future Phase 2 DWARF location evaluation.
 """
 
 from abc import ABC, abstractmethod
@@ -20,6 +22,7 @@ import platform
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -123,11 +126,13 @@ class TraceObservationSession:
     session_id: str
     target_pid: int
     target_binary: str
-    target_build_id: Optional[str]
     function_name: str
     architecture: str
     backend_name: str
     start_time: str
+    target_build_id: Optional[str] = None
+    build_id_status: str = "VERIFIED"              # VERIFIED, MISMATCHED, UNAVAILABLE, EXPLICITLY_UNCHECKED
+    probe_offset: Optional[str] = None             # e.g., "0xc90"
     end_time: Optional[str] = None
     events: List[TraceEvent] = field(default_factory=list)
     total_events: int = 0
@@ -144,7 +149,9 @@ class TraceObservationSession:
             "target_pid": self.target_pid,
             "target_binary": self.target_binary,
             "target_build_id": self.target_build_id,
+            "build_id_status": self.build_id_status,
             "function_name": self.function_name,
+            "probe_offset": self.probe_offset,
             "architecture": self.architecture,
             "backend_name": self.backend_name,
             "start_time": self.start_time,
@@ -165,7 +172,7 @@ class TraceObservationSession:
 # -----------------------------------------------------------------------------
 
 class DwarfLocationResolverInterface(ABC):
-    """Abstract contract for dynamic DWARF location evaluation (e.g., DW_AT_location, registers, stack frame)."""
+    """Abstract contract for dynamic DWARF location evaluation."""
 
     @abstractmethod
     def resolve_variable(
@@ -255,7 +262,6 @@ class EbpfEnvironmentChecker:
         is_root = (euid == 0)
         has_sudo = False
         if not is_root:
-            # Check if passwordless sudo is available
             try:
                 res = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=1.0)
                 if res.returncode == 0:
@@ -286,16 +292,23 @@ class EbpfEnvironmentChecker:
 
         bpftrace_path = shutil.which("bpftrace")
         clang_path = shutil.which("clang")
+        has_libbpf_headers = os.path.exists("/usr/include/bpf/bpf.h")
 
-        backend = "none"
+        # Phase 1 only executes bpftrace.
+        # Report backend truthfully:
         if bpftrace_path:
             backend = "bpftrace"
-        elif clang_path and os.path.exists("/usr/include/bpf/bpf.h"):
+        elif clang_path and has_libbpf_headers:
             backend = "libbpf"
+            reasons.append(
+                "bpftrace executable not found in PATH. libbpf execution backend is not "
+                "implemented in Phase 1 (deferred to Phase 2)."
+            )
         else:
-            reasons.append("Neither 'bpftrace' nor 'clang + libbpf-dev' found in PATH/system.")
+            backend = "none"
+            reasons.append("bpftrace executable not found in PATH.")
 
-        supported = (len(reasons) == 0) and is_privileged and (backend != "none")
+        supported = (len(reasons) == 0) and is_privileged and (backend == "bpftrace")
 
         return EbpfCapabilityResult(
             supported=supported,
@@ -309,6 +322,97 @@ class EbpfEnvironmentChecker:
             clang_path=clang_path,
             reasons=reasons,
         )
+
+
+# -----------------------------------------------------------------------------
+# Pure-Python ELF Symbol Resolver (Fallback for binaries without DWARF)
+# -----------------------------------------------------------------------------
+
+def find_elf_symbols(path: str, sym_name: str) -> List[int]:
+    """Extract symbol virtual addresses from ELF .symtab or .dynsym sections."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "rb") as f:
+            ident = f.read(16)
+            if len(ident) < 16 or ident[:4] != b"\x7fELF":
+                return []
+            is_64 = ident[4] == 2
+            endian = "<" if ident[5] == 1 else ">"
+            f.seek(16)
+            if is_64:
+                hdr = f.read(48)
+                if len(hdr) < 48:
+                    return []
+                e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = struct.unpack(
+                    endian + "HHIQQQIHHHHHH", hdr
+                )
+            else:
+                hdr = f.read(36)
+                if len(hdr) < 36:
+                    return []
+                e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = struct.unpack(
+                    endian + "HHIIIIIHHHHHH", hdr
+                )
+
+            if e_shoff == 0 or e_shnum == 0 or e_shentsize == 0:
+                return []
+
+            f.seek(e_shoff)
+            sh_data = f.read(e_shentsize * e_shnum)
+            sections = []
+            for i in range(e_shnum):
+                chunk = sh_data[i * e_shentsize : (i + 1) * e_shentsize]
+                if len(chunk) < e_shentsize:
+                    break
+                if is_64:
+                    sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize = struct.unpack(
+                        endian + "IIQQQQIIQQ", chunk
+                    )
+                else:
+                    sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize = struct.unpack(
+                        endian + "IIIIIIIIII", chunk
+                    )
+                sections.append({
+                    "type": sh_type,
+                    "offset": sh_offset,
+                    "size": sh_size,
+                    "link": sh_link,
+                    "entsize": sh_entsize,
+                })
+
+            matches = []
+            # SHT_SYMTAB = 2, SHT_DYNSYM = 11
+            for s in sections:
+                if s["type"] in (2, 11) and s["entsize"] > 0 and 0 <= s["link"] < len(sections):
+                    strtab_sec = sections[s["link"]]
+                    f.seek(strtab_sec["offset"])
+                    strtab = f.read(strtab_sec["size"])
+
+                    f.seek(s["offset"])
+                    sym_data = f.read(s["size"])
+                    num_syms = s["size"] // s["entsize"]
+                    for j in range(num_syms):
+                        sym_chunk = sym_data[j * s["entsize"] : (j + 1) * s["entsize"]]
+                        if is_64:
+                            st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack(
+                                endian + "IBBHQQ", sym_chunk
+                            )
+                        else:
+                            st_name, st_value, st_size, st_info, st_other, st_shndx = struct.unpack(
+                                endian + "IIIBBH", sym_chunk
+                            )
+
+                        if st_name < len(strtab):
+                            end = strtab.find(b"\x00", st_name)
+                            if end == -1:
+                                end = len(strtab)
+                            cur_name = strtab[st_name:end].decode("latin1", errors="replace")
+                            if cur_name == sym_name:
+                                matches.append(st_value)
+            return matches
+    except Exception:
+        return []
 
 
 # -----------------------------------------------------------------------------
@@ -335,7 +439,19 @@ class EbpfEventDecoder:
     def decode_line(self, line: str) -> Optional[TraceEvent]:
         """Decode a single line of probe output. Returns None if ignored or malformed."""
         line = line.strip()
-        if not line or line.startswith("Attaching ") or line.startswith("READY "):
+        if not line:
+            return None
+
+        # Filter out informational / warning lines from bpftrace
+        if (
+            line.startswith("Attaching ")
+            or line.startswith("READY ")
+            or line.startswith("WARNING: ")
+            or line.startswith("INFO: ")
+            or line.startswith("Program ID: ")
+            or line.startswith("The verifier log:")
+            or line.startswith("processed ")
+        ):
             return None
 
         # Detect dropped event markers from bpftrace / kernel ringbuffer
@@ -364,7 +480,12 @@ class EbpfEventDecoder:
 
         # Filter strictly by PID
         pid = payload.get("pid")
-        if pid is None or int(pid) != self.target_pid:
+        if pid is None:
+            return None
+        try:
+            if int(pid) != self.target_pid:
+                return None
+        except (ValueError, TypeError):
             return None
 
         tid = int(payload.get("tid", pid))
@@ -378,6 +499,7 @@ class EbpfEventDecoder:
         sp: Optional[int] = None
         fp: Optional[int] = None
         pc: Optional[int] = None
+        ra: Optional[int] = None
 
         for k, v in payload.items():
             if k in ("type", "pid", "tid", "time"):
@@ -394,15 +516,18 @@ class EbpfEventDecoder:
                 registers[k] = int_val
                 if k in ("sp", "rsp"):
                     sp = int_val
-                elif k in ("fp", "bp", "rbp", "x29"):
+                elif k in ("fp", "bp", "rbp", "x29", "r29"):
                     fp = int_val
                 elif k in ("pc", "ip", "rip"):
                     pc = int_val
+                elif k in ("ra", "lr", "r30"):
+                    ra = int_val
 
         frame_meta = FrameMetadata(
             stack_pointer=sp,
             frame_pointer=fp,
             instruction_pointer=pc,
+            return_address=ra,
         )
 
         arguments: Dict[str, TraceValue] = {}
@@ -505,7 +630,47 @@ class EbpfTracer:
         t0 = time.monotonic()
         session_id = f"trace_ebpf_{uuid.uuid4().hex[:12]}"
 
-        # 1. Inspect target binary ELF & Build ID
+        # 1. Validate target process PID and accessibility
+        if pid <= 0:
+            return TraceObservationSession(
+                session_id=session_id,
+                target_pid=pid,
+                target_binary=binary_path,
+                target_build_id=None,
+                build_id_status="UNAVAILABLE",
+                function_name=function_name,
+                probe_offset=None,
+                architecture=platform.machine(),
+                backend_name="none",
+                start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(),
+                status="FAILED",
+                error_message=f"Invalid target PID: {pid}",
+            )
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return TraceObservationSession(
+                session_id=session_id,
+                target_pid=pid,
+                target_binary=binary_path,
+                target_build_id=None,
+                build_id_status="UNAVAILABLE",
+                function_name=function_name,
+                probe_offset=None,
+                architecture=platform.machine(),
+                backend_name="none",
+                start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(),
+                status="FAILED",
+                error_message=f"Target process PID {pid} does not exist",
+            )
+        except PermissionError:
+            # PID exists, but cannot signal without root/sudo
+            pass
+
+        # 2. Inspect target binary ELF & Build ID
         abs_binary = os.path.abspath(binary_path)
         if not os.path.exists(abs_binary):
             return TraceObservationSession(
@@ -513,7 +678,9 @@ class EbpfTracer:
                 target_pid=pid,
                 target_binary=abs_binary,
                 target_build_id=None,
+                build_id_status="UNAVAILABLE",
                 function_name=function_name,
+                probe_offset=None,
                 architecture=platform.machine(),
                 backend_name="none",
                 start_time=t_start_iso,
@@ -526,65 +693,166 @@ class EbpfTracer:
         target_build_id = elf_info.build_id
         arch = elf_info.architecture
 
-        # If external debug image specified, verify Build ID
-        if debug_image:
-            abs_dbg = os.path.abspath(debug_image)
-            if os.path.exists(abs_dbg):
+        # 3. Validate running process identity (/proc/<pid>/exe)
+        proc_exe_path = f"/proc/{pid}/exe"
+        if os.path.exists(proc_exe_path):
+            try:
+                proc_real = os.path.realpath(proc_exe_path)
+                req_real = os.path.realpath(abs_binary)
+                if proc_real != req_real:
+                    s_proc = os.stat(proc_exe_path)
+                    s_req = os.stat(abs_binary)
+                    if (s_proc.st_dev, s_proc.st_ino) != (s_req.st_dev, s_req.st_ino):
+                        proc_elf = inspect_elf(proc_exe_path)
+                        if not proc_elf.build_id or proc_elf.build_id != target_build_id:
+                            return TraceObservationSession(
+                                session_id=session_id,
+                                target_pid=pid,
+                                target_binary=abs_binary,
+                                target_build_id=target_build_id,
+                                build_id_status="MISMATCHED",
+                                function_name=function_name,
+                                probe_offset=None,
+                                architecture=arch,
+                                backend_name="none",
+                                start_time=t_start_iso,
+                                end_time=datetime.now(timezone.utc).isoformat(),
+                                status="FAILED",
+                                error_message=(
+                                    f"Target PID {pid} running executable '{proc_real}' does not match "
+                                    f"requested binary '{req_real}'"
+                                ),
+                            )
+            except (PermissionError, FileNotFoundError, OSError):
+                # Namespace / container visibility restriction
+                pass
+
+        # 4. Validate Build ID & external debug image
+        build_id_status = "UNAVAILABLE"
+        if not verify_build_id:
+            build_id_status = "EXPLICITLY_UNCHECKED"
+        else:
+            if debug_image:
+                abs_dbg = os.path.abspath(debug_image)
+                if not os.path.exists(abs_dbg):
+                    return TraceObservationSession(
+                        session_id=session_id,
+                        target_pid=pid,
+                        target_binary=abs_binary,
+                        target_build_id=target_build_id,
+                        build_id_status="UNAVAILABLE",
+                        function_name=function_name,
+                        probe_offset=None,
+                        architecture=arch,
+                        backend_name="none",
+                        start_time=t_start_iso,
+                        end_time=datetime.now(timezone.utc).isoformat(),
+                        status="FAILED",
+                        error_message=f"Debug image not found: {abs_dbg}",
+                    )
                 dbg_info = inspect_elf(abs_dbg)
-                if verify_build_id and target_build_id and dbg_info.build_id:
+                if dbg_info.architecture != elf_info.architecture:
+                    return TraceObservationSession(
+                        session_id=session_id,
+                        target_pid=pid,
+                        target_binary=abs_binary,
+                        target_build_id=target_build_id,
+                        build_id_status="MISMATCHED",
+                        function_name=function_name,
+                        probe_offset=None,
+                        architecture=arch,
+                        backend_name="none",
+                        start_time=t_start_iso,
+                        end_time=datetime.now(timezone.utc).isoformat(),
+                        status="FAILED",
+                        error_message=(
+                            f"Architecture mismatch: binary '{elf_info.architecture}' != debug image '{dbg_info.architecture}'"
+                        ),
+                    )
+                if target_build_id and dbg_info.build_id:
                     if target_build_id != dbg_info.build_id:
                         return TraceObservationSession(
                             session_id=session_id,
                             target_pid=pid,
                             target_binary=abs_binary,
                             target_build_id=target_build_id,
+                            build_id_status="MISMATCHED",
                             function_name=function_name,
+                            probe_offset=None,
                             architecture=arch,
                             backend_name="none",
                             start_time=t_start_iso,
                             end_time=datetime.now(timezone.utc).isoformat(),
                             status="FAILED",
-                            error_message=f"Build ID mismatch: binary '{target_build_id}' != debug image '{dbg_info.build_id}'",
+                            error_message=(
+                                f"Build ID mismatch: binary '{target_build_id}' != debug image '{dbg_info.build_id}'"
+                            ),
                         )
+                    build_id_status = "VERIFIED"
+                else:
+                    build_id_status = "UNAVAILABLE"
+            else:
+                if target_build_id:
+                    build_id_status = "VERIFIED"
+                else:
+                    build_id_status = "UNAVAILABLE"
 
-        # 2. Check environment prerequisites
+        # 5. Check environment prerequisites
         cap = EbpfEnvironmentChecker.check_prerequisites()
         if not cap.supported:
+            fail_status = "PERMISSION_DENIED" if not cap.is_privileged else "UNSUPPORTED_ENVIRONMENT"
             return TraceObservationSession(
                 session_id=session_id,
                 target_pid=pid,
                 target_binary=abs_binary,
                 target_build_id=target_build_id,
+                build_id_status=build_id_status,
                 function_name=function_name,
+                probe_offset=None,
                 architecture=arch,
                 backend_name=cap.backend,
                 start_time=t_start_iso,
                 end_time=datetime.now(timezone.utc).isoformat(),
-                status="UNSUPPORTED_ENVIRONMENT",
+                status=fail_status,
                 error_message="; ".join(cap.reasons),
             )
 
-        # 3. Resolve function offset / symbol
-        func_offset: Optional[int] = None
-        try:
-            indexer_path = debug_image if (debug_image and os.path.exists(debug_image)) else abs_binary
-            d_index = DwarfIndexer.get_index(indexer_path)
-            subps = d_index.subprograms_by_name.get(function_name, [])
-            if subps:
-                func_offset = subps[0].low_pc
-        except Exception:
-            pass
-
-        # 4. Generate probe script (bpftrace-based bounded format)
-        probe_script = self._generate_bpftrace_script(
+        # 6. Resolve probe target and file offset
+        func_offset, attach_spec, resolve_err = self._resolve_probe_target(
+            elf_info=elf_info,
             binary_path=abs_binary,
             function_name=function_name,
+            debug_image=debug_image,
+        )
+        probe_offset_str = f"0x{func_offset:x}" if func_offset is not None else None
+
+        if resolve_err or not attach_spec:
+            return TraceObservationSession(
+                session_id=session_id,
+                target_pid=pid,
+                target_binary=abs_binary,
+                target_build_id=target_build_id,
+                build_id_status=build_id_status,
+                function_name=function_name,
+                probe_offset=None,
+                architecture=arch,
+                backend_name=cap.backend,
+                start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(),
+                status="FAILED",
+                error_message=resolve_err or f"Failed to resolve probe target for '{function_name}'",
+            )
+
+        # 7. Generate probe script (bpftrace-based bounded format)
+        probe_script = self._generate_bpftrace_script(
+            binary_path=abs_binary,
+            attach_spec=attach_spec,
             target_pid=pid,
             arch=arch,
             entry_only=entry_only,
         )
 
-        # 5. Launch probe process with guaranteed cleanup
+        # 8. Launch probe process with guaranteed cleanup
         decoder = EbpfEventDecoder(
             target_pid=pid,
             architecture=arch,
@@ -596,6 +864,8 @@ class EbpfTracer:
         attach_latency_ms = 0.0
         script_file = None
         proc: Optional[subprocess.Popen] = None
+        stderr_lines: List[str] = []
+        target_alive = True
 
         try:
             with tempfile.NamedTemporaryFile("w", suffix=".bt", delete=False) as f:
@@ -605,7 +875,7 @@ class EbpfTracer:
             cmd = []
             if self.use_sudo and os.geteuid() != 0:
                 cmd.extend(["sudo", "-n"])
-            cmd.extend(["bpftrace", "-B", "none", script_file])
+            cmd.extend(["bpftrace", "--unsafe", "-B", "none", script_file])
 
             import select
             t_attach_start = time.monotonic()
@@ -615,65 +885,107 @@ class EbpfTracer:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                start_new_session=True,
             )
 
-            # Wait for attach confirmation ("Attaching ...")
+            # Wait for attach confirmation ("Attaching ...") while draining stderr to prevent deadlock
             timeout_attach = time.monotonic() + 5.0
             attached = False
             while time.monotonic() < timeout_attach:
                 if proc.poll() is not None:
                     break
-                rlist, _, _ = select.select([proc.stdout], [], [], 0.05)
-                if rlist:
-                    line = proc.stdout.readline()
-                    if "Attaching " in line:
-                        attached = True
-                        attach_latency_ms = round((time.monotonic() - t_attach_start) * 1000, 2)
-                        break
+                rlist, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.05)
+                for r in rlist:
+                    if r == proc.stdout:
+                        line = proc.stdout.readline()
+                        if "Attaching " in line:
+                            attached = True
+                            attach_latency_ms = round((time.monotonic() - t_attach_start) * 1000, 2)
+                            break
+                    elif r == proc.stderr:
+                        err_line = proc.stderr.readline()
+                        if err_line and len(stderr_lines) < 200:
+                            stderr_lines.append(err_line.strip())
+                if attached:
+                    break
 
             if not attached and proc.poll() is not None:
-                stderr_out = proc.stderr.read()
+                try:
+                    for l in proc.stderr.readlines():
+                        stderr_lines.append(l.strip())
+                except Exception:
+                    pass
+                err_msg = "\n".join(stderr_lines).strip()
                 return TraceObservationSession(
                     session_id=session_id,
                     target_pid=pid,
                     target_binary=abs_binary,
                     target_build_id=target_build_id,
+                    build_id_status=build_id_status,
                     function_name=function_name,
+                    probe_offset=probe_offset_str,
                     architecture=arch,
                     backend_name="bpftrace",
                     start_time=t_start_iso,
                     end_time=datetime.now(timezone.utc).isoformat(),
                     status="FAILED",
-                    error_message=f"bpftrace process terminated prematurely: {stderr_out.strip()}",
+                    error_message=f"bpftrace process terminated prematurely: {err_msg}",
                 )
 
             # Collect events for the specified duration
             end_deadline = time.monotonic() + duration_s
+            max_events = 10000
             while time.monotonic() < end_deadline:
                 if proc.poll() is not None:
                     break
-                rlist, _, _ = select.select([proc.stdout], [], [], 0.05)
-                if rlist:
-                    line = proc.stdout.readline()
-                    if line:
-                        ev = decoder.decode_line(line)
-                        if ev is not None:
-                            events.append(ev)
+                # Check target process liveness
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    target_alive = False
+                    break
+
+                rlist, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.05)
+                for r in rlist:
+                    if r == proc.stdout:
+                        line = proc.stdout.readline()
+                        if line:
+                            ev = decoder.decode_line(line)
+                            if ev is not None:
+                                events.append(ev)
+                                if len(events) >= max_events:
+                                    break
+                    elif r == proc.stderr:
+                        err_line = proc.stderr.readline()
+                        if err_line and len(stderr_lines) < 200:
+                            stderr_lines.append(err_line.strip())
+
+                if len(events) >= max_events:
+                    break
 
         finally:
             # Reliable attach/detach cleanup
             if proc:
                 try:
                     if proc.poll() is None:
-                        # Send SIGINT to allow bpftrace to detach probes and drain ring buffer
+                        # Send SIGINT to entire process group
                         if self.use_sudo and os.geteuid() != 0:
-                            subprocess.run(["sudo", "-n", "kill", "-INT", str(proc.pid)], check=False)
+                            subprocess.run(["sudo", "-n", "kill", "-INT", f"-{proc.pid}"], check=False)
                         else:
-                            proc.send_signal(signal.SIGINT)
+                            try:
+                                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                            except OSError:
+                                proc.send_signal(signal.SIGINT)
                         try:
                             proc.wait(timeout=2.0)
                         except subprocess.TimeoutExpired:
-                            proc.kill()
+                            if self.use_sudo and os.geteuid() != 0:
+                                subprocess.run(["sudo", "-n", "kill", "-KILL", f"-{proc.pid}"], check=False)
+                            else:
+                                try:
+                                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                                except OSError:
+                                    proc.kill()
                             proc.wait(timeout=1.0)
                     if proc.stdout:
                         try:
@@ -681,6 +993,15 @@ class EbpfTracer:
                                 ev = decoder.decode_line(rem)
                                 if ev is not None:
                                     events.append(ev)
+                        except Exception:
+                            pass
+                        try:
+                            proc.stdout.close()
+                        except Exception:
+                            pass
+                    if proc.stderr:
+                        try:
+                            proc.stderr.close()
                         except Exception:
                             pass
                 except Exception:
@@ -695,12 +1016,28 @@ class EbpfTracer:
         t_end = time.monotonic()
         total_duration_ms = round((t_end - t0) * 1000, 2)
 
+        status = "SUCCESS"
+        error_msg = None
+        if not target_alive:
+            if len(events) > 0:
+                status = "PARTIAL"
+                error_msg = f"Target process PID {pid} exited during trace; {len(events)} events captured"
+            else:
+                status = "FAILED"
+                error_msg = f"Target process PID {pid} exited before any events could be captured"
+        elif proc and proc.poll() is not None and proc.returncode != 0 and len(events) == 0:
+            status = "FAILED"
+            err_details = "\n".join(stderr_lines).strip()
+            error_msg = f"bpftrace exited with code {proc.returncode}: {err_details}"
+
         return TraceObservationSession(
             session_id=session_id,
             target_pid=pid,
             target_binary=abs_binary,
             target_build_id=target_build_id,
+            build_id_status=build_id_status,
             function_name=function_name,
+            probe_offset=probe_offset_str,
             architecture=arch,
             backend_name="bpftrace",
             start_time=t_start_iso,
@@ -715,31 +1052,150 @@ class EbpfTracer:
                 "sample_count": len(events),
             },
             consistency_level="PROBE_POINT_EVENT",
-            status="SUCCESS",
+            status=status,
+            error_message=error_msg,
         )
+
+    def _resolve_probe_target(
+        self,
+        elf_info: BinaryIdentity,
+        binary_path: str,
+        function_name: str,
+        debug_image: Optional[str] = None,
+    ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+        """Resolve function name or symbol to file-relative probe offset.
+
+        Returns (file_offset, attach_spec, error_message).
+        """
+        # If user passed an explicit hex offset (e.g. 0xd80)
+        if function_name.startswith("0x") or function_name.startswith("0X"):
+            try:
+                raw_val = int(function_name, 16)
+                # Check if raw_val is virtual address or file offset
+                fo = self._virt_to_file_offset(elf_info, binary_path, raw_val)
+                if fo is not None:
+                    return fo, f"0x{fo:x}", None
+                file_sz = os.path.getsize(binary_path)
+                if 0 <= raw_val < file_sz:
+                    return raw_val, f"0x{raw_val:x}", None
+                return None, None, f"Specified offset 0x{raw_val:x} is outside binary file size"
+            except ValueError:
+                pass
+
+        search_path = debug_image if (debug_image and os.path.exists(debug_image)) else binary_path
+
+        # 1. Search DWARF subprograms
+        subprograms: List[DwarfSubprogram] = []
+        try:
+            d_index = DwarfIndexer.get_index(search_path)
+            subprograms = d_index.subprograms_by_name.get(function_name, [])
+        except Exception:
+            pass
+
+        # 2. Search ELF symbols if not found in DWARF
+        symbols: List[int] = []
+        if not subprograms:
+            symbols = find_elf_symbols(search_path, function_name)
+            if not symbols and search_path != binary_path:
+                symbols = find_elf_symbols(binary_path, function_name)
+
+        if not subprograms and not symbols:
+            if elf_info.is_stripped and not debug_image:
+                return (
+                    None,
+                    None,
+                    f"Function '{function_name}' could not be resolved: binary is stripped and no "
+                    f"matching debug image was provided.",
+                )
+            return None, None, f"Function '{function_name}' not found in '{search_path}'"
+
+        # 3. Disambiguate overloaded or duplicate functions
+        if subprograms:
+            distinct_addrs = sorted(list(set(s.low_pc for s in subprograms if s.low_pc is not None)))
+            if len(distinct_addrs) > 1:
+                addrs_str = ", ".join(f"0x{a:x}" for a in distinct_addrs)
+                linkages = [s.linkage_name for s in subprograms if s.linkage_name and s.linkage_name != function_name]
+                link_hint = f" (e.g. '{linkages[0]}')" if linkages else ""
+                return (
+                    None,
+                    None,
+                    f"Ambiguous function name '{function_name}': matches {len(distinct_addrs)} distinct "
+                    f"subprogram locations ({addrs_str}). Disambiguate using mangled linkage name{link_hint} "
+                    f"or exact offset.",
+                )
+            virt_addr = distinct_addrs[0]
+        else:
+            distinct_addrs = sorted(list(set(symbols)))
+            if len(distinct_addrs) > 1:
+                addrs_str = ", ".join(f"0x{a:x}" for a in distinct_addrs)
+                return (
+                    None,
+                    None,
+                    f"Ambiguous symbol name '{function_name}': matches {len(distinct_addrs)} distinct "
+                    f"locations ({addrs_str}). Disambiguate using mangled linkage name or exact offset.",
+                )
+            virt_addr = distinct_addrs[0]
+
+        # 4. Map virtual address to file-relative offset in the target binary
+        file_offset = self._virt_to_file_offset(elf_info, binary_path, virt_addr)
+        if file_offset is None:
+            return (
+                None,
+                None,
+                f"Virtual address 0x{virt_addr:x} could not be mapped to any PT_LOAD segment in '{binary_path}'",
+            )
+
+        file_size = os.path.getsize(binary_path)
+        if file_offset < 0 or file_offset >= file_size:
+            return (
+                None,
+                None,
+                f"Computed file offset 0x{file_offset:x} exceeds file size ({file_size} bytes)",
+            )
+
+        attach_spec = f"0x{file_offset:x}"
+        return file_offset, attach_spec, None
+
+    def _virt_to_file_offset(self, elf_info: BinaryIdentity, binary_path: str, virt_addr: int) -> Optional[int]:
+        """Convert a virtual address (low_pc) to a file-relative offset using PT_LOAD segments."""
+        for seg in elf_info.pt_loads:
+            p_vaddr = seg["p_vaddr"]
+            p_memsz = seg["p_memsz"]
+            p_offset = seg["p_offset"]
+            p_filesz = seg["p_filesz"]
+            if p_vaddr <= virt_addr < p_vaddr + p_memsz:
+                if virt_addr - p_vaddr < p_filesz:
+                    return (virt_addr - p_vaddr) + p_offset
+        return None
 
     def _generate_bpftrace_script(
         self,
         binary_path: str,
-        function_name: str,
+        attach_spec: str,
         target_pid: int,
         arch: str,
         entry_only: bool,
     ) -> str:
         """Generate a minimal bpftrace script with bounded JSON formatting and PID filter."""
-        # Registers by architecture
-        # bpftrace provides reg("sp") and reg("pc") on both arm64 and x86_64,
-        # arg0..arg5 builtins, and retval for uretprobe
-        entry_probe = f"""uprobe:{binary_path}:{function_name}
+        # Architecture-specific register mappings
+        if arch in ("aarch64", "arm64"):
+            fp_expr = 'reg("r29")'
+            ra_expr = 'reg("r30")'
+        else:
+            # x86_64
+            fp_expr = 'reg("bp")'
+            ra_expr = '0'
+
+        entry_probe = f"""uprobe:{binary_path}:{attach_spec}
 /pid == {target_pid}/
 {{
-    printf("{{\\"type\\":\\"ENTRY\\",\\"pid\\":%d,\\"tid\\":%d,\\"time\\":%llu,\\"sp\\":\\"0x%lx\\",\\"pc\\":\\"0x%lx\\",\\"arg0\\":%ld,\\"arg1\\":%ld,\\"arg2\\":%ld,\\"arg3\\":%ld}}\\n",
-           pid, tid, nsecs, reg("sp"), reg("pc"), arg0, arg1, arg2, arg3);
+    printf("{{\\"type\\":\\"ENTRY\\",\\"pid\\":%d,\\"tid\\":%d,\\"time\\":%llu,\\"sp\\":\\"0x%lx\\",\\"pc\\":\\"0x%lx\\",\\"fp\\":\\"0x%lx\\",\\"ra\\":\\"0x%lx\\",\\"arg0\\":%ld,\\"arg1\\":%ld,\\"arg2\\":%ld,\\"arg3\\":%ld,\\"arg4\\":%ld,\\"arg5\\":%ld}}\\n",
+           pid, tid, nsecs, reg("sp"), reg("pc"), {fp_expr}, {ra_expr}, arg0, arg1, arg2, arg3, arg4, arg5);
 }}
 """
         return_probe = ""
         if not entry_only:
-            return_probe = f"""uretprobe:{binary_path}:{function_name}
+            return_probe = f"""uretprobe:{binary_path}:{attach_spec}
 /pid == {target_pid}/
 {{
     printf("{{\\"type\\":\\"RETURN\\",\\"pid\\":%d,\\"tid\\":%d,\\"time\\":%llu,\\"sp\\":\\"0x%lx\\",\\"pc\\":\\"0x%lx\\",\\"ret\\":%ld}}\\n",

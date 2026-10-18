@@ -36,6 +36,17 @@ int32_t compute_inner_metric(int32_t base, int32_t multiplier, const char* tag) 
     return (base * multiplier) + tag_len;
 }
 
+// Overloaded C++ functions for testing ambiguous function resolution
+__attribute__((noinline))
+int32_t overloaded_metric(int32_t a) {
+    return a * 2;
+}
+
+__attribute__((noinline))
+int32_t overloaded_metric(int32_t a, int32_t b) {
+    return a + b;
+}
+
 // 1, 2, 4. Non-inlined function with scalar args, stack-allocated struct, local buffer, local variables
 extern "C" __attribute__((noinline))
 int64_t trace_target_function(int32_t op_code, int64_t input_val, uint32_t count) {
@@ -101,7 +112,9 @@ int main(int argc, char* argv[]) {
         // Autonomous mode: invoke periodically
         for (int i = 0; i < loop_count && g_running; ++i) {
             int64_t res = trace_target_function(i + 1, (i + 1) * 10, i + 5);
-            printf("AUTO_CALL iter=%d res=%lld\n", i, static_cast<long long>(res));
+            int32_t ov1 = overloaded_metric(i + 1);
+            int32_t ov2 = overloaded_metric(i + 1, i + 2);
+            printf("AUTO_CALL iter=%d res=%lld ov1=%d ov2=%d\n", i, static_cast<long long>(res), ov1, ov2);
             fflush(stdout);
             std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
         }
@@ -129,6 +142,18 @@ int main(int argc, char* argv[]) {
             sscanf(line + 5, "%d %lld %u", &op, reinterpret_cast<long long*>(&val), &cnt);
             int64_t ret = trace_target_function(op, val, cnt);
             printf("RESULT ret=%lld\n", static_cast<long long>(ret));
+            fflush(stdout);
+        } else if (strncmp(line, "CALL_OV1 ", 9) == 0) {
+            int32_t a = 1;
+            sscanf(line + 9, "%d", &a);
+            int32_t ret = overloaded_metric(a);
+            printf("RESULT_OV1 ret=%d\n", ret);
+            fflush(stdout);
+        } else if (strncmp(line, "CALL_OV2 ", 9) == 0) {
+            int32_t a = 1, b = 2;
+            sscanf(line + 9, "%d %d", &a, &b);
+            int32_t ret = overloaded_metric(a, b);
+            printf("RESULT_OV2 ret=%d\n", ret);
             fflush(stdout);
         } else if (strcmp(line, "PING") == 0) {
             printf("PONG\n");

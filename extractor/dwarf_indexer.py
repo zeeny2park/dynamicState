@@ -523,6 +523,8 @@ class DwarfIndexer:
                     )
                     index.subprograms.append(subp)
                     index.subprograms_by_name.setdefault(name, []).append(subp)
+                    if linkage_name and linkage_name != name:
+                        index.subprograms_by_name.setdefault(linkage_name, []).append(subp)
 
         # Infer byte size for compound types that missed DW_AT_byte_size
         for d_type in index.types_by_die.values():
