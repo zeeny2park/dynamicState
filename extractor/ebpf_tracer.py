@@ -264,19 +264,38 @@ class ProbeCleanupResult:
                     f"Contradictory ProbeCleanupResult: success=True requires child_reaped=True, "
                     f"group_terminated=True, and status in ('CLEAN', 'ALREADY_EXITED'), got {self}"
                 )
-        # Invariant 2: NO_PROCESS requires success=False, child_reaped=False, group_terminated=False
+        # Invariant 2: status in ('CLEAN', 'ALREADY_EXITED') requires success=True, child_reaped=True, and group_terminated=True
+        if self.status in ("CLEAN", "ALREADY_EXITED"):
+            if not (self.success and self.child_reaped and self.group_terminated):
+                raise ValueError(
+                    f"Contradictory ProbeCleanupResult: status={self.status} requires success=True, "
+                    f"child_reaped=True, and group_terminated=True, got {self}"
+                )
+        # Invariant 3: NO_PROCESS requires success=False, child_reaped=False, group_terminated=False
         if self.status == "NO_PROCESS":
             if self.success or self.child_reaped or self.group_terminated:
                 raise ValueError(
                     f"Contradictory ProbeCleanupResult: NO_PROCESS requires success=False, "
                     f"child_reaped=False, group_terminated=False, got {self}"
                 )
-        # Invariant 3: UNCERTAIN and REAP_FAILED cannot claim group_terminated=True or success=True
+        # Invariant 4: UNCERTAIN and REAP_FAILED cannot claim group_terminated=True or success=True
         if self.status in ("UNCERTAIN", "REAP_FAILED"):
             if self.group_terminated or self.success:
                 raise ValueError(
                     f"Contradictory ProbeCleanupResult: status={self.status} cannot have "
                     f"group_terminated=True or success=True, got {self}"
+                )
+        # Invariant 5: REAP_FAILED requires child_reaped=False
+        if self.status == "REAP_FAILED":
+            if self.child_reaped:
+                raise ValueError(
+                    f"Contradictory ProbeCleanupResult: status=REAP_FAILED requires child_reaped=False, got {self}"
+                )
+        # Invariant 6: GROUP_KILL_FAILED cannot claim success=True
+        if self.status == "GROUP_KILL_FAILED":
+            if self.success:
+                raise ValueError(
+                    f"Contradictory ProbeCleanupResult: status=GROUP_KILL_FAILED cannot have success=True, got {self}"
                 )
 
     def __bool__(self) -> bool:
@@ -776,6 +795,57 @@ class EbpfEnvironmentChecker:
         )
 
     @classmethod
+    def _safe_remove_tempfile(
+        cls,
+        path: Optional[str],
+        cmd_prefix: List[str],
+    ) -> Tuple[bool, Optional[str]]:
+        """Safely remove a temporary file, verifying removal and diagnosing failures.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (success, error_detail)
+            - (True, None): file successfully removed or already absent.
+            - (False, error_detail): file could not be removed and residual file remains.
+        """
+        if not path:
+            return True, None
+        if not os.path.exists(path):
+            return True, None
+
+        # 1. Unprivileged removal attempt
+        try:
+            os.remove(path)
+            return True, None
+        except FileNotFoundError:
+            return True, None
+        except Exception as e1:
+            err_detail = str(e1)
+            # 2. Privileged fallback if cmd_prefix is configured (e.g. ['sudo', '-n'])
+            if cmd_prefix:
+                try:
+                    res = subprocess.run(
+                        cmd_prefix + ["rm", "-f", "--", path],
+                        capture_output=True,
+                        text=True,
+                        timeout=2.0,
+                    )
+                    if res.returncode == 0:
+                        if not os.path.exists(path):
+                            return True, None
+                        err_detail = "Privileged rm returned 0 but file still exists"
+                    else:
+                        stderr_msg = res.stderr.strip() or f"exit code {res.returncode}"
+                        err_detail = f"Privileged rm failed: {stderr_msg}"
+                except Exception as e2:
+                    err_detail = f"Privileged rm exception: {e2}"
+
+            if os.path.exists(path):
+                logger.warning("Failed to remove temporary file %s: %s", path, err_detail)
+                return False, f"file still present ({err_detail})"
+
+            return True, None
+
+    @classmethod
     def check_uprobe_offset_support(
         cls,
         bpftrace_path: Optional[str] = None,
@@ -817,6 +887,9 @@ class EbpfEnvironmentChecker:
         test_bin = None
         arch = platform.machine().lower()
         proc = None
+        cleanup_warnings: List[str] = []
+        cleanup_res: Optional[ProbeCleanupResult] = None
+        primary_res: Optional[Tuple[bool, str, str]] = None
 
         try:
             with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as tf:
@@ -840,79 +913,86 @@ class EbpfEnvironmentChecker:
             )
             if comp.returncode != 0:
                 err_text = comp.stderr.decode("utf-8", errors="ignore") if isinstance(comp.stderr, bytes) else str(comp.stderr)
-                return False, "UNKNOWN", f"Failed to build probe test binary: {err_text.strip()}"
-
-            offset, err_reason = cls._find_second_instruction_offset(test_bin, "probe_target", arch)
-            if offset is None:
-                return False, "UNKNOWN", f"Instruction offset determination failed: {err_reason}"
-
-            probe_script = f"uprobe:{test_bin}:probe_target+{offset} {{ printf(\"PROBE_OFFSET_HIT\\n\"); exit(); }}"
-            probe_cmd = cmd_prefix + [path, "-e", probe_script, "-c", test_bin]
-            try:
-                proc = subprocess.Popen(
-                    probe_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
-                )
-                stdout, stderr = proc.communicate(timeout=3.0)
-                err = (stderr.strip() or stdout.strip())
-
-                if proc.returncode == 0 and "PROBE_OFFSET_HIT" in stdout:
-                    res = (True, "SUPPORTED", f"uprobe offset support verified via active execution (offset +{offset})")
-                elif "compiled without (k|u)probe offset support" in err or "offset is not supported" in err.lower():
-                    res = (False, "UNSUPPORTED", f"bpftrace compiled without (k|u)probe offset support: {err}")
-                elif "permission denied" in err.lower() or "operation not permitted" in err.lower():
-                    res = (False, "UNKNOWN", f"bpftrace probe offset attachment failed with permission error: {err}")
-                elif proc.returncode != 0:
-                    res = (False, "UNKNOWN", f"bpftrace probe offset attachment failed (exit code {proc.returncode}): {err}")
+                primary_res = (False, "UNKNOWN", f"Failed to build probe test binary: {err_text.strip()}")
+            else:
+                offset, err_reason = cls._find_second_instruction_offset(test_bin, "probe_target", arch)
+                if offset is None:
+                    primary_res = (False, "UNKNOWN", f"Instruction offset determination failed: {err_reason}")
                 else:
-                    res = (False, "UNKNOWN", f"bpftrace exited without observing PROBE_OFFSET_HIT event: {stdout.strip()}")
+                    probe_script = f"uprobe:{test_bin}:probe_target+{offset} {{ printf(\"PROBE_OFFSET_HIT\\n\"); exit(); }}"
+                    probe_cmd = cmd_prefix + [path, "-e", probe_script, "-c", test_bin]
+                    try:
+                        proc = subprocess.Popen(
+                            probe_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            start_new_session=True,
+                        )
+                        stdout, stderr = proc.communicate(timeout=3.0)
+                        err = (stderr.strip() or stdout.strip())
 
-                cleanup_res = cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
-                proc = None  # prevent duplicate termination in finally
-                if not cleanup_res:
-                    res = (res[0], res[1], f"{res[2]} [cleanup warning: {cleanup_res.status} - {cleanup_res.details}]")
+                        if proc.returncode == 0 and "PROBE_OFFSET_HIT" in stdout:
+                            primary_res = (True, "SUPPORTED", f"uprobe offset support verified via active execution (offset +{offset})")
+                        elif "compiled without (k|u)probe offset support" in err or "offset is not supported" in err.lower():
+                            primary_res = (False, "UNSUPPORTED", f"bpftrace compiled without (k|u)probe offset support: {err}")
+                        elif "permission denied" in err.lower() or "operation not permitted" in err.lower():
+                            primary_res = (False, "UNKNOWN", f"bpftrace probe offset attachment failed with permission error: {err}")
+                        elif proc.returncode != 0:
+                            primary_res = (False, "UNKNOWN", f"bpftrace probe offset attachment failed (exit code {proc.returncode}): {err}")
+                        else:
+                            primary_res = (False, "UNKNOWN", f"bpftrace exited without observing PROBE_OFFSET_HIT event: {stdout.strip()}")
 
-                # Only cache definitive supported or unsupported results; do not cache inconclusive UNKNOWN outcomes
-                if cache_key and res[1] in ("SUPPORTED", "UNSUPPORTED"):
-                    cls._UPROBE_OFFSET_CACHE[cache_key] = res
-                return res
-
-            except subprocess.TimeoutExpired:
-                cleanup_res = cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
-                proc = None  # prevent duplicate termination in finally
-                return (
-                    False,
-                    "UNKNOWN",
-                    f"Probe execution check timed out after 3.0s without confirming event trigger (process reaped: {cleanup_res})",
-                )
+                    except subprocess.TimeoutExpired:
+                        primary_res = (
+                            False,
+                            "UNKNOWN",
+                            "Probe execution check timed out after 3.0s without confirming event trigger",
+                        )
 
         except Exception as e:
-            return False, "UNKNOWN", f"Error detecting uprobe offset support: {e}"
+            if primary_res is None:
+                primary_res = (False, "UNKNOWN", f"Error detecting uprobe offset support: {e}")
         finally:
+            # 1. Terminate and reap probe process if created
             if proc is not None:
-                cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
+                try:
+                    cleanup_res = cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
+                except Exception as term_err:
+                    cleanup_res = ProbeCleanupResult(
+                        success=False,
+                        child_reaped=False,
+                        group_terminated=False,
+                        status="UNCERTAIN",
+                        details=f"Unexpected cleanup exception: {term_err}",
+                    )
                 proc = None
-            if test_src and os.path.exists(test_src):
-                try:
-                    os.remove(test_src)
-                except Exception as e1:
+                if cleanup_res is not None and not cleanup_res.success:
+                    cleanup_warnings.append(f"[cleanup warning: {cleanup_res.status} - {cleanup_res.details}]")
+
+            # 2. Safely remove temporary files
+            for p_clean, label in [(test_src, "source"), (test_bin, "binary")]:
+                if p_clean:
                     try:
-                        if cmd_prefix:
-                            subprocess.run(cmd_prefix + ["rm", "-f", test_src], capture_output=True, timeout=1.0)
-                    except Exception as e2:
-                        logger.warning("Failed to remove probe test source file %s: %s / %s", test_src, e1, e2)
-            if test_bin and os.path.exists(test_bin):
-                try:
-                    os.remove(test_bin)
-                except Exception as e1:
-                    try:
-                        if cmd_prefix:
-                            subprocess.run(cmd_prefix + ["rm", "-f", test_bin], capture_output=True, timeout=1.0)
-                    except Exception as e2:
-                        logger.warning("Failed to remove probe test binary file %s: %s / %s", test_bin, e1, e2)
+                        ok_rm, rm_err = cls._safe_remove_tempfile(p_clean, cmd_prefix)
+                        if not ok_rm:
+                            cleanup_warnings.append(f"[tempfile warning: failed to remove {label}: {rm_err}]")
+                    except Exception as rm_exc:
+                        cleanup_warnings.append(f"[tempfile warning: exception removing {label}: {rm_exc}]")
+
+        if primary_res is None:
+            primary_res = (False, "UNKNOWN", "Probe capability determination incomplete")
+
+        is_supp, status, reason = primary_res
+        if cleanup_warnings:
+            reason = f"{reason} {' '.join(cleanup_warnings)}"
+        final_res = (is_supp, status, reason)
+
+        # Only cache definitive supported or unsupported results; do not cache inconclusive UNKNOWN outcomes
+        if cache_key and status in ("SUPPORTED", "UNSUPPORTED"):
+            cls._UPROBE_OFFSET_CACHE[cache_key] = final_res
+
+        return final_res
 
     @classmethod
     def check_prerequisites(

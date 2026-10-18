@@ -814,6 +814,58 @@ DynamicState structures test validation into four truthful tiers:
     2. Real cleanup terminates both the direct child and grandchild.
     3. `os.kill(gchild_pid, 0)` and `os.killpg(pgid, 0)` both raise `ProcessLookupError` (ESRCH), proving complete elimination of all lingering and zombie processes.
 
+---
+
+## 21. Phase 1.17 — End-to-End Cleanup Failure Propagation & Process Lifecycle Verification
+
+### 21.1 Complete and Unmasked Cleanup Outcome Propagation
+Phase 1.17 audits all control-flow paths in `EbpfEnvironmentChecker.check_uprobe_offset_support()` to guarantee that cleanup outcomes and diagnostics remain observable without distorting primary capability findings:
+1. **Separation of Concerns**:
+   - The primary capability determination (`(is_supported, status, primary_reason)`) is computed strictly from probe execution and event marker evidence (`PROBE_OFFSET_HIT`).
+   - A verified event marker is **never** reclassified or degraded to `UNSUPPORTED` or `UNKNOWN` because of subsequent process or temporary file cleanup warnings.
+2. **Observable Across Every Exit Path**:
+   - Compiler failure before process creation (`comp.returncode != 0`).
+   - Instruction-offset determination failure (`offset is None`).
+   - Process launch failure (`subprocess.Popen` exceptions).
+   - Normal completion with detected event marker (`SUPPORTED`).
+   - Diagnostic unsupported probe execution (`UNSUPPORTED`).
+   - Probe exit without event marker (`UNKNOWN`).
+   - Execution timeout (`subprocess.TimeoutExpired`).
+   - Unexpected exception during execution or result classification.
+   - Unexpected exception raised by cleanup itself.
+3. **Structured Non-Masking Diagnostics**:
+   - Process cleanup failures append: `[cleanup warning: {status} - {details}]`.
+   - Temporary file removal failures append: `[tempfile warning: failed to remove {label}: {error}]`.
+   - Cleanup exceptions are caught and surfaced as `UNCERTAIN` warnings, never escaping to abort execution or mask primary probe exceptions.
+
+### 21.2 Verified Temporary-File Cleanup (`_safe_remove_tempfile`)
+- **Inspection of Outcomes and Residual Files**:
+  - `_safe_remove_tempfile(path, cmd_prefix)` strictly verifies whether the temporary path still exists after removal attempts.
+  - Attempt 1: Standard unprivileged removal (`os.remove`). If the file is unlinked, returns `(True, None)` immediately.
+  - Attempt 2: Privileged fallback (`sudo -n rm -f -- {path}`) is executed only when unprivileged removal failed and `cmd_prefix` is non-empty.
+  - Return Code & Existence Inspection:
+    - Bounded execution timeout (`timeout=2.0`).
+    - Inspects command return code and error output.
+    - If privileged `rm` returns 0 but the file still exists (e.g. NFS cache anomaly or read-only mount), it flags: `file still present (Privileged rm returned 0 but file still exists)`.
+    - Never leaks environment secrets or sensitive host data in logs.
+
+### 21.3 Operating-System Process Lifecycle & Reaper/Zombie Adoption Model
+- **Process Group Absence vs Zombie Reaping**:
+  - In Linux, terminating a descendant process in a process group leaves a zombie entry in the process table until reaped by its parent or adopted by PID 1 / subreaper.
+  - `_terminate_probe_process()` signals the entire process group and reaps the direct child via standard wait APIs.
+  - Real OS test (`test_68`) verifies direct-child reaping separately from process-group state.
+  - Process group absence and descendant absence are asserted using bounded polling (up to $2.0$s) via `os.killpg(pgid, 0)` and `os.kill(gchild_pid, 0)` raising `ProcessLookupError` (ESRCH), avoiding races with asynchronous init/subreaper zombie harvesting.
+
+### 21.4 Strengthened `ProbeCleanupResult` State Invariants
+- `ProbeCleanupResult` enforces complete matrix invariants in `__post_init__`:
+  - `status in ("CLEAN", "ALREADY_EXITED")` strictly requires `success=True, child_reaped=True, group_terminated=True`.
+  - `status == "NO_PROCESS"` strictly requires `success=False, child_reaped=False, group_terminated=False`.
+  - `status == "REAP_FAILED"` strictly requires `success=False, child_reaped=False, group_terminated=False`.
+  - `status == "UNCERTAIN"` strictly requires `success=False, group_terminated=False`.
+  - `status == "GROUP_KILL_FAILED"` strictly requires `success=False`.
+  - Table-driven unit test `test_72` validates the entire matrix of valid and invalid state combinations.
+
+
 
 
 

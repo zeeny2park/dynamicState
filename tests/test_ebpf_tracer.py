@@ -2885,11 +2885,35 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertTrue(cleanup_res.group_terminated)
                 self.assertEqual(cleanup_res.status, "CLEAN")
 
-                # Verify on real OS that process group and grandchild are completely dead
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(gchild_pid, 0)
-                with self.assertRaises(ProcessLookupError):
-                    os.killpg(pgid, 0)
+                # Verify direct-child reaping separately from process-group state
+                self.assertIsNotNone(proc.poll(), "Direct child was not reaped")
+
+                # Verify on real OS that process group is completely dead (os.killpg raises ESRCH)
+                # Bounded polling accounts for asynchronous reaper (PID 1 / subreaper) zombie collection
+                group_dead = False
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    try:
+                        os.killpg(pgid, 0)
+                        time.sleep(0.01)
+                    except ProcessLookupError:
+                        group_dead = True
+                        break
+
+                self.assertTrue(group_dead, f"Process group {pgid} still detected via signal 0 after timeout")
+
+                # Verify descendant process is absent or reaped by reaper
+                gchild_dead = False
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    try:
+                        os.kill(gchild_pid, 0)
+                        time.sleep(0.01)
+                    except ProcessLookupError:
+                        gchild_dead = True
+                        break
+
+                self.assertTrue(gchild_dead, f"Grandchild PID {gchild_pid} still detected via signal 0 after timeout")
             finally:
                 # Guaranteed process cleanup in case of test failure
                 try:
@@ -3035,6 +3059,210 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertEqual(status, "SUPPORTED")
                 self.assertNotIn("cleanup warning", reason)
                 self.assertEqual(mock_term.call_count, 1)
+
+    def test_72_probe_cleanup_result_table_driven_validation(self):
+        """Scenario 72: Table-driven validation of ProbeCleanupResult valid and invalid state matrices."""
+        # Valid state combinations (must instantiate without error)
+        valid_cases = [
+            (True, True, True, "CLEAN", "Cleaned up"),
+            (True, True, True, "ALREADY_EXITED", "Already dead"),
+            (False, False, False, "NO_PROCESS", "No proc"),
+            (False, True, False, "UNCERTAIN", "Not leader"),
+            (False, False, False, "UNCERTAIN", "Untracked"),
+            (False, False, False, "REAP_FAILED", "Stuck child"),
+            (False, True, False, "GROUP_KILL_FAILED", "Kill failed, descendants alive"),
+            (False, True, True, "GROUP_KILL_FAILED", "Kill failed, but descendants absent"),
+        ]
+        for success, child_reaped, group_terminated, status, details in valid_cases:
+            res = ProbeCleanupResult(
+                success=success,
+                child_reaped=child_reaped,
+                group_terminated=group_terminated,
+                status=status,
+                details=details,
+            )
+            self.assertEqual(res.success, success)
+            self.assertEqual(res.child_reaped, child_reaped)
+            self.assertEqual(res.group_terminated, group_terminated)
+            self.assertEqual(res.status, status)
+            self.assertEqual(bool(res), success)
+            self.assertEqual(res.to_dict()["status"], status)
+
+        # Invalid state combinations (must raise ValueError)
+        invalid_cases = [
+            # success=True but child not reaped
+            (True, False, True, "CLEAN", "Invalid"),
+            # success=True but group not terminated
+            (True, True, False, "CLEAN", "Invalid"),
+            # success=True with failure status
+            (True, True, True, "GROUP_KILL_FAILED", "Invalid"),
+            (True, True, True, "REAP_FAILED", "Invalid"),
+            (True, True, True, "UNCERTAIN", "Invalid"),
+            (True, True, True, "NO_PROCESS", "Invalid"),
+            # CLEAN with success=False
+            (False, True, True, "CLEAN", "Invalid"),
+            # ALREADY_EXITED with success=False
+            (False, True, True, "ALREADY_EXITED", "Invalid"),
+            # NO_PROCESS claiming child reaped or group terminated
+            (False, True, False, "NO_PROCESS", "Invalid"),
+            (False, False, True, "NO_PROCESS", "Invalid"),
+            (True, False, False, "NO_PROCESS", "Invalid"),
+            # UNCERTAIN claiming group terminated
+            (False, True, True, "UNCERTAIN", "Invalid"),
+            # REAP_FAILED claiming child reaped or group terminated
+            (False, True, False, "REAP_FAILED", "Invalid"),
+            (False, False, True, "REAP_FAILED", "Invalid"),
+            # GROUP_KILL_FAILED claiming success
+            (True, True, True, "GROUP_KILL_FAILED", "Invalid"),
+        ]
+        for success, child_reaped, group_terminated, status, details in invalid_cases:
+            with self.assertRaises(ValueError):
+                ProbeCleanupResult(
+                    success=success,
+                    child_reaped=child_reaped,
+                    group_terminated=group_terminated,
+                    status=status,
+                    details=details,
+                )
+
+    def test_73_safe_remove_tempfile_all_scenarios(self):
+        """Scenario 73: Deterministic unit tests for _safe_remove_tempfile across all execution and fallback branches."""
+        # 1. Real filesystem-level test: unprivileged removal succeeds
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = os.path.join(tmpdir, "test_file.txt")
+            with open(fpath, "w") as f:
+                f.write("hello")
+            self.assertTrue(os.path.exists(fpath))
+            ok, err = EbpfEnvironmentChecker._safe_remove_tempfile(fpath, [])
+            self.assertTrue(ok)
+            self.assertIsNone(err)
+            self.assertFalse(os.path.exists(fpath))
+
+        # 2. None or nonexistent path returns True, None immediately
+        self.assertEqual(EbpfEnvironmentChecker._safe_remove_tempfile(None, []), (True, None))
+        self.assertEqual(EbpfEnvironmentChecker._safe_remove_tempfile("/tmp/nonexistent_1234567.tmp", []), (True, None))
+
+        # 3. os.remove fails with PermissionError, but privileged fallback succeeds
+        with patch("os.path.exists", side_effect=[True, True, False]), \
+             patch("os.remove", side_effect=PermissionError("Permission denied")), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            ok, err = EbpfEnvironmentChecker._safe_remove_tempfile("/tmp/fake_bin", ["sudo", "-n"])
+            self.assertTrue(ok)
+            self.assertIsNone(err)
+            mock_run.assert_called_once_with(
+                ["sudo", "-n", "rm", "-f", "--", "/tmp/fake_bin"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+
+        # 4. Privileged fallback returns nonzero exit code and file still exists
+        with patch("os.path.exists", return_value=True), \
+             patch("os.remove", side_effect=PermissionError("Permission denied")), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stderr="rm: cannot remove: Read-only file system", stdout="")
+            ok, err = EbpfEnvironmentChecker._safe_remove_tempfile("/tmp/readonly_bin", ["sudo", "-n"])
+            self.assertFalse(ok)
+            self.assertIn("Read-only file system", err)
+
+        # 5. Privileged fallback times out and file still exists
+        with patch("os.path.exists", return_value=True), \
+             patch("os.remove", side_effect=PermissionError("Permission denied")), \
+             patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["rm"], timeout=2.0)):
+            ok, err = EbpfEnvironmentChecker._safe_remove_tempfile("/tmp/stuck_bin", ["sudo", "-n"])
+            self.assertFalse(ok)
+            self.assertIn("Privileged rm exception", err)
+
+        # 6. Privileged fallback returns 0, but file still exists (nominal success anomaly)
+        with patch("os.path.exists", return_value=True), \
+             patch("os.remove", side_effect=PermissionError("Permission denied")), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            ok, err = EbpfEnvironmentChecker._safe_remove_tempfile("/tmp/ghost_bin", ["sudo", "-n"])
+            self.assertFalse(ok)
+            self.assertIn("returned 0 but file still exists", err)
+
+    def test_74_check_uprobe_offset_support_all_cleanup_failure_paths(self):
+        """Scenario 74: Verify all active-probe failure and cleanup warning propagation paths."""
+        with patch.object(EbpfEnvironmentChecker, "_find_second_instruction_offset", return_value=(4, None)), \
+             patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
+             patch("os.stat") as mock_stat:
+            mock_stat.return_value = MagicMock(st_mtime_ns=12345, st_size=6789)
+
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate.return_value = ("PROBE_OFFSET_HIT\n", "")
+
+            # 1. Active probe succeeds, but _terminate_probe_process raises unexpected exception
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="", stdout="")), \
+                 patch("subprocess.Popen", return_value=mock_proc), \
+                 patch.object(EbpfEnvironmentChecker, "_terminate_probe_process", side_effect=RuntimeError("killpg bug")) as mock_term:
+                supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                    bpftrace_path="/usr/bin/bpftrace",
+                    is_privileged=True,
+                    force_refresh=True,
+                )
+                self.assertTrue(supported)
+                self.assertEqual(status, "SUPPORTED")
+                self.assertIn("uprobe offset support verified via active execution (offset +4)", reason)
+                self.assertIn("[cleanup warning: UNCERTAIN - Unexpected cleanup exception: killpg bug]", reason)
+                self.assertEqual(mock_term.call_count, 1)
+
+            # 2. Active probe times out, and cleanup returns failure
+            cleanup_failed = ProbeCleanupResult(
+                success=False,
+                child_reaped=True,
+                group_terminated=False,
+                status="GROUP_KILL_FAILED",
+                details="Kill signal rejected",
+            )
+            mock_proc_to = MagicMock()
+            mock_proc_to.communicate.side_effect = subprocess.TimeoutExpired(cmd=["bpftrace"], timeout=3.0)
+            mock_proc_to.pid = 7711
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="", stdout="")), \
+                 patch("subprocess.Popen", return_value=mock_proc_to), \
+                 patch.object(EbpfEnvironmentChecker, "_terminate_probe_process", return_value=cleanup_failed):
+                supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                    bpftrace_path="/usr/bin/bpftrace",
+                    is_privileged=True,
+                    force_refresh=True,
+                )
+                self.assertFalse(supported)
+                self.assertEqual(status, "UNKNOWN")
+                self.assertIn("timed out after 3.0s", reason.lower())
+                self.assertIn("[cleanup warning: GROUP_KILL_FAILED - Kill signal rejected]", reason)
+
+            # 3. Compiler failure combined with temporary-file cleanup failure
+            mock_gcc_fail = MagicMock(returncode=1, stderr=b"gcc error", stdout="")
+            with patch("subprocess.run", return_value=mock_gcc_fail), \
+                 patch.object(EbpfEnvironmentChecker, "_safe_remove_tempfile", return_value=(False, "disk full")):
+                supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                    bpftrace_path="/usr/bin/bpftrace",
+                    is_privileged=True,
+                    force_refresh=True,
+                )
+                self.assertFalse(supported)
+                self.assertEqual(status, "UNKNOWN")
+                self.assertIn("Failed to build probe test binary", reason)
+                self.assertIn("[tempfile warning: failed to remove source: disk full]", reason)
+
+            # 4. Unexpected communicate exception combined with cleanup failure
+            mock_proc_err = MagicMock()
+            mock_proc_err.communicate.side_effect = OSError("Corrupted pipe descriptor")
+            mock_proc_err.pid = 8822
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="", stdout="")), \
+                 patch("subprocess.Popen", return_value=mock_proc_err), \
+                 patch.object(EbpfEnvironmentChecker, "_terminate_probe_process", return_value=cleanup_failed):
+                supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                    bpftrace_path="/usr/bin/bpftrace",
+                    is_privileged=True,
+                    force_refresh=True,
+                )
+                self.assertFalse(supported)
+                self.assertEqual(status, "UNKNOWN")
+                self.assertIn("Corrupted pipe descriptor", reason)
+                self.assertIn("[cleanup warning: GROUP_KILL_FAILED - Kill signal rejected]", reason)
 
 
 if __name__ == "__main__":
