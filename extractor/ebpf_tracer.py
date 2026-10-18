@@ -247,13 +247,53 @@ class EbpfCapabilityResult:
 class EbpfEnvironmentChecker:
     """Verifies kernel, architecture, compilers, privileges, and dependency requirements."""
 
+    _UPROBE_OFFSET_CACHE: Dict[Tuple[str, int, int, int], Tuple[bool, str, str]] = {}
+
+    @classmethod
+    def invalidate_uprobe_offset_cache(cls) -> None:
+        """Clear cached uprobe offset capability results."""
+        cls._UPROBE_OFFSET_CACHE.clear()
+
+    @classmethod
+    def _find_second_instruction_offset(cls, bin_path: str, sym_name: str, arch: str) -> int:
+        """Find a valid nonzero instruction boundary offset within sym_name."""
+        if arch in ("aarch64", "arm64"):
+            return 4
+        objdump = shutil.which("objdump")
+        if objdump:
+            try:
+                res = subprocess.run([objdump, "-d", bin_path], capture_output=True, text=True, timeout=2.0)
+                if res.returncode == 0:
+                    in_sym = False
+                    base_addr = None
+                    for line in res.stdout.splitlines():
+                        if f"<{sym_name}>:" in line:
+                            in_sym = True
+                            continue
+                        if in_sym:
+                            m = re.match(r"^\s*([0-9a-fA-F]+):", line)
+                            if m:
+                                addr = int(m.group(1), 16)
+                                if base_addr is None:
+                                    base_addr = addr
+                                elif addr > base_addr:
+                                    return addr - base_addr
+            except Exception:
+                pass
+        return 4 if arch in ("aarch64", "arm64") else 1
+
     @classmethod
     def check_uprobe_offset_support(
         cls,
         bpftrace_path: Optional[str] = None,
         is_privileged: bool = False,
+        force_refresh: bool = False,
     ) -> Tuple[bool, str, str]:
         """Detect at runtime whether the installed bpftrace binary supports nonzero uprobe offsets.
+
+        Actively compiles a deterministic test executable containing a dedicated probe target,
+        runs bpftrace with a probe at a nonzero instruction offset, and verifies that the probe
+        event is actually triggered and observed upon process execution.
 
         Returns:
             Tuple[bool, str, str]: (is_supported, status, reason)
@@ -265,26 +305,58 @@ class EbpfEnvironmentChecker:
         if not is_privileged:
             return False, "NOT_CHECKED", "Privileges (root or passwordless sudo) required to check probe capabilities"
 
+        euid = os.geteuid() if hasattr(os, "geteuid") else -1
+        cache_key = None
+        try:
+            st = os.stat(path)
+            cache_key = (path, st.st_mtime_ns, st.st_size, euid)
+            if not force_refresh and cache_key in cls._UPROBE_OFFSET_CACHE:
+                return cls._UPROBE_OFFSET_CACHE[cache_key]
+        except Exception:
+            pass
+
         gcc_path = shutil.which("gcc")
         if not gcc_path:
-            return False, "UNKNOWN", "Compiler 'gcc' not found in PATH to build probe test binary"
+            res = (False, "UNKNOWN", "Compiler 'gcc' not found in PATH to build probe test binary")
+            if cache_key:
+                cls._UPROBE_OFFSET_CACHE[cache_key] = res
+            return res
 
         cmd_prefix = [] if (hasattr(os, "geteuid") and os.geteuid() == 0) else ["sudo", "-n"]
+        test_src = None
         test_bin = None
+        arch = platform.machine().lower()
+
         try:
-            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
-                test_bin = tf.name
+            with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as tf:
+                tf.write(
+                    "#include <stdio.h>\n"
+                    "__attribute__((noinline)) int probe_target(void) {\n"
+                    "    __asm__ volatile(\"nop; nop; nop; nop;\");\n"
+                    "    return 42;\n"
+                    "}\n"
+                    "int main(void) {\n"
+                    "    return probe_target();\n"
+                    "}\n"
+                )
+                test_src = tf.name
+            test_bin = test_src + ".bin"
+
             comp = subprocess.run(
-                [gcc_path, "-O0", "-x", "c", "-", "-o", test_bin],
-                input=b"int main(){return 0;}\n",
+                [gcc_path, "-O0", "-g", "-fno-inline", "-fno-omit-frame-pointer", test_src, "-o", test_bin],
                 capture_output=True,
                 timeout=5.0,
             )
             if comp.returncode != 0:
                 err_text = comp.stderr.decode("utf-8", errors="ignore") if isinstance(comp.stderr, bytes) else str(comp.stderr)
-                return False, "UNKNOWN", f"Failed to build probe test binary: {err_text.strip()}"
+                res = (False, "UNKNOWN", f"Failed to build probe test binary: {err_text.strip()}")
+                if cache_key:
+                    cls._UPROBE_OFFSET_CACHE[cache_key] = res
+                return res
 
-            probe_cmd = cmd_prefix + [path, "-e", f"uprobe:{test_bin}:main+4 {{ exit(); }}"]
+            offset = cls._find_second_instruction_offset(test_bin, "probe_target", arch)
+            probe_script = f"uprobe:{test_bin}:probe_target+{offset} {{ printf(\"PROBE_OFFSET_HIT\\n\"); exit(); }}"
+            probe_cmd = cmd_prefix + [path, "-e", probe_script, "-c", test_bin]
             proc = None
             try:
                 proc = subprocess.Popen(
@@ -294,21 +366,31 @@ class EbpfEnvironmentChecker:
                     text=True,
                     start_new_session=True,
                 )
-                stdout, stderr = proc.communicate(timeout=2.0)
-                if proc.returncode == 0:
-                    return True, "SUPPORTED", "uprobe offset support verified"
+                stdout, stderr = proc.communicate(timeout=3.0)
                 err = (stderr.strip() or stdout.strip())
-                if "compiled without (k|u)probe offset support" in err:
-                    return False, "UNSUPPORTED", f"bpftrace compiled without (k|u)probe offset support: {err}"
-                if "permission denied" in err.lower() or "operation not permitted" in err.lower():
-                    return False, "UNKNOWN", f"bpftrace probe offset attachment failed with permission error: {err}"
-                return False, "UNKNOWN", f"bpftrace probe offset attachment failed (exit code {proc.returncode}): {err}"
+
+                if proc.returncode == 0 and "PROBE_OFFSET_HIT" in stdout:
+                    res = (True, "SUPPORTED", f"uprobe offset support verified via active execution (offset +{offset})")
+                elif "compiled without (k|u)probe offset support" in err:
+                    res = (False, "UNSUPPORTED", f"bpftrace compiled without (k|u)probe offset support: {err}")
+                elif "permission denied" in err.lower() or "operation not permitted" in err.lower():
+                    res = (False, "UNKNOWN", f"bpftrace probe offset attachment failed with permission error: {err}")
+                elif proc.returncode != 0:
+                    res = (False, "UNKNOWN", f"bpftrace probe offset attachment failed (exit code {proc.returncode}): {err}")
+                else:
+                    res = (False, "UNKNOWN", f"bpftrace exited without observing PROBE_OFFSET_HIT event: {stdout.strip()}")
+
+                if cache_key:
+                    cls._UPROBE_OFFSET_CACHE[cache_key] = res
+                return res
+
             except subprocess.TimeoutExpired:
                 if proc:
                     try:
                         if cmd_prefix:
-                            subprocess.run(cmd_prefix + ["kill", "-9", str(proc.pid)], capture_output=True, timeout=1.0)
-                        os.killpg(proc.pid, signal.SIGKILL)
+                            subprocess.run(cmd_prefix + ["kill", "-KILL", f"-{proc.pid}"], capture_output=True, timeout=1.0)
+                        else:
+                            os.killpg(proc.pid, signal.SIGKILL)
                     except Exception:
                         try:
                             proc.kill()
@@ -318,10 +400,19 @@ class EbpfEnvironmentChecker:
                         proc.communicate(timeout=0.5)
                     except Exception:
                         pass
-                return False, "UNKNOWN", "Probe attachment check timed out without confirming event trigger"
+                res = (False, "UNKNOWN", "Probe execution check timed out without confirming event trigger")
+                if cache_key:
+                    cls._UPROBE_OFFSET_CACHE[cache_key] = res
+                return res
+
         except Exception as e:
             return False, "UNKNOWN", f"Error detecting uprobe offset support: {e}"
         finally:
+            if test_src and os.path.exists(test_src):
+                try:
+                    os.remove(test_src)
+                except Exception:
+                    pass
             if test_bin and os.path.exists(test_bin):
                 try:
                     os.remove(test_bin)
@@ -329,7 +420,11 @@ class EbpfEnvironmentChecker:
                     pass
 
     @classmethod
-    def check_prerequisites(cls) -> EbpfCapabilityResult:
+    def check_prerequisites(
+        cls,
+        active_probe: bool = False,
+        force_refresh: bool = False,
+    ) -> EbpfCapabilityResult:
         reasons: List[str] = []
         is_linux = sys.platform.startswith("linux")
         if not is_linux:
@@ -406,11 +501,26 @@ class EbpfEnvironmentChecker:
         offset_supported = False
         offset_status = "NOT_CHECKED"
         offset_reason = None
+
         if supported and backend == "bpftrace":
-            offset_supported, offset_status, offset_reason = cls.check_uprobe_offset_support(
-                bpftrace_path=bpftrace_path,
-                is_privileged=is_privileged,
-            )
+            cache_key = None
+            if bpftrace_path:
+                try:
+                    st = os.stat(bpftrace_path)
+                    cache_key = (bpftrace_path, st.st_mtime_ns, st.st_size, euid)
+                except Exception:
+                    pass
+
+            if active_probe or (not force_refresh and cache_key and cache_key in cls._UPROBE_OFFSET_CACHE):
+                offset_supported, offset_status, offset_reason = cls.check_uprobe_offset_support(
+                    bpftrace_path=bpftrace_path,
+                    is_privileged=is_privileged,
+                    force_refresh=force_refresh,
+                )
+            else:
+                offset_status = "NOT_CHECKED"
+                offset_supported = False
+                offset_reason = "Active uprobe offset probe has not been run (call capabilities(active_probe=True) to test)"
         elif not is_privileged:
             offset_reason = "Privileges (root or passwordless sudo) required to check probe capabilities"
             offset_status = "NOT_CHECKED"
@@ -535,34 +645,60 @@ class AddressValidator:
 
     Linux Userspace Address Rules:
     - x86_64:
-      - 4-level paging canonical userspace: [0x1000, 0x00007fffffffffff]
-      - 5-level paging canonical userspace: [0x1000, 0x00ffffffffffffff]
-      - Addresses in kernel space (bit 63 set, or non-canonical high addresses) are invalid.
+      - 4-level paging canonical userspace: [0x1000, 0x00007fffffffffff] (48-bit canonical ceiling, default)
+      - 5-level paging canonical userspace: [0x1000, 0x00ffffffffffffff] (57-bit canonical ceiling, if explicitly configured)
+      - Addresses in kernel space (bit 63 set, or non-canonical high addresses) are strictly invalid.
       - Instruction pointer (PC) has 1-byte granularity (variable instruction length).
     - AArch64 (ARM64):
-      - 48-bit userspace VA: [0x1000, 0x0000ffffffffffff]
-      - 52-bit userspace VA: [0x1000, 0x000fffffffffffff]
-      - Instruction pointer (PC) MUST be 4-byte aligned (pc % 4 == 0) and cannot use TBI tags ((pc >> 56) == 0).
-      - Data pointers MAY use Top Byte Ignore (TBI) in user space: bits [63:56] contain tag bits.
-        Data addresses must be untagged before validation and memory access.
+      - 48-bit userspace VA: [0x1000, 0x0000ffffffffffff] (standard Linux AArch64 default)
+      - 52-bit userspace VA: [0x1000, 0x000fffffffffffff] (LVA extension, if explicitly configured)
+      - Instruction pointer (PC) MUST be 4-byte aligned (pc % 4 == 0) and CANNOT use TBI tags ((pc >> 56) == 0).
+        Hardware instruction fetch forbids TBI tags; tag bits cause a translation fault.
+      - Data pointers MAY use Top Byte Ignore (TBI) in userspace: bits [63:56] contain tag bits.
+        Data addresses must be normalized (untagged) before validation and memory access.
     - Low memory: addresses < 0x1000 (page 0 / NULL page) are strictly rejected for runtime execution/data.
+    - Architecture fail-closed policy: unsupported architectures are strictly rejected (return False / None).
     """
 
     PAGE_SIZE_MIN = 0x1000
+    X86_64_4LEVEL_MAX = 0x00007FFFFFFFFFFF     # 4-level paging userspace ceiling (48-bit canonical, default)
     X86_64_USER_MAX = 0x00FFFFFFFFFFFFFF       # 5-level paging userspace ceiling (57-bit)
-    X86_64_4LEVEL_MAX = 0x00007FFFFFFFFFFF     # 4-level paging userspace ceiling (48-bit canonical)
-    AARCH64_USER_MAX = 0x000FFFFFFFFFFFFF      # 52-bit userspace ceiling
-    AARCH64_48BIT_MAX = 0x0000FFFFFFFFFFFF     # 48-bit userspace ceiling
+    AARCH64_48BIT_MAX = 0x0000FFFFFFFFFFFF     # 48-bit userspace ceiling (standard Linux AArch64 default)
+    AARCH64_52BIT_MAX = 0x000FFFFFFFFFFFFF     # 52-bit userspace ceiling (LVA extension)
+    AARCH64_USER_MAX = AARCH64_52BIT_MAX       # Backward-compat alias
+
+    SUPPORTED_ARCHITECTURES = frozenset({"x86_64", "amd64", "aarch64", "arm64"})
 
     @classmethod
-    def untag_data_address(cls, addr: int, arch: str = "x86_64") -> int:
-        """Strip AArch64 Top Byte Ignore (TBI) tag bits [63:56] from data pointer."""
-        if not isinstance(addr, int):
-            return 0
+    def is_supported_architecture(cls, arch: Optional[str]) -> bool:
+        """Return True if the architecture is supported by userspace validation rules."""
+        if not arch or not isinstance(arch, str):
+            return False
+        return arch.lower() in cls.SUPPORTED_ARCHITECTURES
+
+    @classmethod
+    def normalize_data_address(cls, addr: Optional[int], arch: str = "x86_64") -> Optional[int]:
+        """Normalize data address by stripping AArch64 TBI tag bits [63:56].
+
+        Fails closed (returns None) for unsupported architectures, negative values, or invalid types.
+        Leaves x86_64 addresses unchanged.
+        """
+        if addr is None or not isinstance(addr, int):
+            return None
+        if not cls.is_supported_architecture(arch):
+            return None
+        if addr < 0:
+            return None
         norm = arch.lower()
         if norm in ("aarch64", "arm64"):
             return addr & 0x00FFFFFFFFFFFFFF
         return addr
+
+    @classmethod
+    def untag_data_address(cls, addr: int, arch: str = "x86_64") -> int:
+        """Strip AArch64 Top Byte Ignore (TBI) tag bits [63:56] from data pointer."""
+        res = cls.normalize_data_address(addr, arch)
+        return res if res is not None else 0
 
     @classmethod
     def is_valid_instruction_pointer(
@@ -571,9 +707,12 @@ class AddressValidator:
         arch: str = "x86_64",
         is_link_time: bool = False,
         five_level_paging: bool = False,
+        fifty_two_bit_va: bool = False,
     ) -> bool:
         """Validate userspace instruction pointer according to architecture rules."""
         if pc is None or not isinstance(pc, int):
+            return False
+        if not cls.is_supported_architecture(arch):
             return False
 
         min_bound = 0 if is_link_time else cls.PAGE_SIZE_MIN
@@ -582,14 +721,15 @@ class AddressValidator:
 
         norm = arch.lower()
         if norm in ("aarch64", "arm64"):
-            # 1. Reject if TBI tag is present (instruction fetch does not support TBI)
+            # 1. Reject if TBI tag is present (hardware instruction fetch does not support TBI)
             if (pc >> 56) != 0:
                 return False
             # 2. Must be 4-byte aligned
             if (pc % 4) != 0:
                 return False
-            # 3. Must be within AArch64 userspace ceiling (up to 52-bit VA)
-            return pc <= cls.AARCH64_USER_MAX
+            # 3. Must be within AArch64 userspace ceiling (default 48-bit VA, 52-bit if explicitly enabled)
+            limit = cls.AARCH64_52BIT_MAX if fifty_two_bit_va else cls.AARCH64_48BIT_MAX
+            return pc <= limit
         else:
             # x86_64: 4-level paging userspace limit is 0x00007fffffffffff; 5-level paging is 0x00ffffffffffffff
             limit = cls.X86_64_USER_MAX if five_level_paging else cls.X86_64_4LEVEL_MAX
@@ -602,24 +742,32 @@ class AddressValidator:
         size: int = 1,
         arch: str = "x86_64",
         five_level_paging: bool = False,
+        fifty_two_bit_va: bool = False,
     ) -> bool:
         """Validate userspace data memory address according to architecture rules."""
         if addr is None or not isinstance(addr, int) or not isinstance(size, int):
             return False
+        if not cls.is_supported_architecture(arch):
+            return False
         if size <= 0 or size > 65536:
             return False
 
-        norm = arch.lower()
-        untagged = cls.untag_data_address(addr, arch)
-        if untagged < cls.PAGE_SIZE_MIN:
+        norm_addr = cls.normalize_data_address(addr, arch)
+        if norm_addr is None or norm_addr < cls.PAGE_SIZE_MIN:
             return False
 
-        max_limit = cls.AARCH64_USER_MAX if norm in ("aarch64", "arm64") else (
-            cls.X86_64_USER_MAX if five_level_paging else cls.X86_64_4LEVEL_MAX
-        )
-        if (untagged + size - 1) > max_limit:
+        # Check for 64-bit integer overflow: norm_addr + size - 1 < norm_addr
+        end_addr = norm_addr + size - 1
+        if end_addr < norm_addr:
             return False
-        return True
+
+        norm = arch.lower()
+        if norm in ("aarch64", "arm64"):
+            max_limit = cls.AARCH64_52BIT_MAX if fifty_two_bit_va else cls.AARCH64_48BIT_MAX
+        else:
+            max_limit = cls.X86_64_USER_MAX if five_level_paging else cls.X86_64_4LEVEL_MAX
+
+        return end_addr <= max_limit
 
     @classmethod
     def compute_link_time_pc(
@@ -628,9 +776,14 @@ class AddressValidator:
         load_bias: int,
         arch: str = "x86_64",
         five_level_paging: bool = False,
+        fifty_two_bit_va: bool = False,
     ) -> Optional[int]:
         """Compute link-time PC from runtime PC and load bias with underflow detection."""
-        if not cls.is_valid_instruction_pointer(runtime_pc, arch, five_level_paging=five_level_paging):
+        if not cls.is_supported_architecture(arch):
+            return None
+        if not cls.is_valid_instruction_pointer(
+            runtime_pc, arch, five_level_paging=five_level_paging, fifty_two_bit_va=fifty_two_bit_va
+        ):
             return None
         if not isinstance(load_bias, int) or load_bias < 0:
             return None
@@ -640,7 +793,9 @@ class AddressValidator:
             return None
 
         link_pc = runtime_pc - load_bias
-        if not cls.is_valid_instruction_pointer(link_pc, arch, is_link_time=True, five_level_paging=five_level_paging):
+        if not cls.is_valid_instruction_pointer(
+            link_pc, arch, is_link_time=True, five_level_paging=five_level_paging, fifty_two_bit_va=fifty_two_bit_va
+        ):
             return None
 
         return link_pc
@@ -1264,12 +1419,12 @@ class EbpfTracer:
                     pass
 
             def proc_mem_reader(addr: int, size: int) -> Optional[bytes]:
-                if not AddressValidator.is_valid_memory_address(addr, size, arch):
+                norm_addr = AddressValidator.normalize_data_address(addr, arch)
+                if norm_addr is None or not AddressValidator.is_valid_memory_address(norm_addr, size, arch):
                     return None
-                untagged_addr = AddressValidator.untag_data_address(addr, arch)
                 try:
                     from .watch_session import read_process_memory_slice
-                    data, status, _ = read_process_memory_slice(pid, untagged_addr, size)
+                    data, status, _ = read_process_memory_slice(pid, norm_addr, size)
                     if status == "OBSERVED" and data is not None and len(data) == size:
                         return data
                     return None

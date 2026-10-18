@@ -879,13 +879,18 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
 
             # Check that backend capability reflects verified reality
             backend = EbpfObservationBackend()
-            caps = backend.capabilities()
+            caps = backend.capabilities(active_probe=True)
             self.assertFalse(caps["arbitrary_instruction_offset_probing"])
             self.assertFalse(caps["dwarf_eval_scope"]["arbitrary_instruction_offset_probing"])
             self.assertIn(caps["uprobe_offset_status"], ("UNSUPPORTED", "SUPPORTED", "UNKNOWN"))
             if "compiled without (k|u)probe offset support" in err:
                 self.assertEqual(caps["uprobe_offset_status"], "UNSUPPORTED")
                 self.assertFalse(caps["uprobe_offset_supported"])
+
+            # Verify that subsequent default query (active_probe=False) uses cached outcome
+            caps_cached = backend.capabilities(active_probe=False)
+            self.assertEqual(caps_cached["uprobe_offset_status"], caps["uprobe_offset_status"])
+            self.assertEqual(caps_cached["uprobe_offset_supported"], caps["uprobe_offset_supported"])
         else:
             self.assertEqual(proc.returncode, 0)
 

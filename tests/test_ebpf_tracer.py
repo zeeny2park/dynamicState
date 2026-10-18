@@ -1375,12 +1375,12 @@ class TestEbpfTracerUnit(unittest.TestCase):
         # Test the memory reader logic directly
         def create_reader(pid, arch="x86_64"):
             def proc_mem_reader(addr: int, size: int) -> Optional[bytes]:
-                if not AddressValidator.is_valid_memory_address(addr, size, arch):
+                norm_addr = AddressValidator.normalize_data_address(addr, arch)
+                if norm_addr is None or not AddressValidator.is_valid_memory_address(norm_addr, size, arch):
                     return None
-                untagged_addr = AddressValidator.untag_data_address(addr, arch)
                 try:
                     from extractor.watch_session import read_process_memory_slice
-                    data, status, _ = read_process_memory_slice(pid, untagged_addr, size)
+                    data, status, _ = read_process_memory_slice(pid, norm_addr, size)
                     if status == "OBSERVED" and data is not None and len(data) == size:
                         return data
                     return None
@@ -1518,21 +1518,22 @@ class TestEbpfTracerUnit(unittest.TestCase):
             self.assertNotIn("pc", ev.registers)
             self.assertNotIn("rip", ev.registers)
 
-        # On AArch64, 0xc25695220d80 is 4-byte aligned and in 48-bit userspace (valid)
+        # On AArch64, a genuine 4-byte aligned userspace text PC is valid
         dec_aarch64 = EbpfEventDecoder(target_pid=100, architecture="aarch64", function_name="func")
-        line_aarch64_valid = json.dumps({"type": "ENTRY", "pid": 100, "tid": 100, "pc": "0xc25695220d80", "arg0": 123})
+        line_aarch64_valid = json.dumps({"type": "ENTRY", "pid": 100, "tid": 100, "pc": "0xaaaaaaaa1230", "arg0": 123})
         ev_aarch64_valid = dec_aarch64.decode_line(line_aarch64_valid)
         self.assertIsNotNone(ev_aarch64_valid)
-        self.assertEqual(ev_aarch64_valid.frame_metadata.instruction_pointer, 0xc25695220d80)
+        self.assertEqual(ev_aarch64_valid.frame_metadata.instruction_pointer, 0xaaaaaaaa1230)
 
-        # On AArch64, unaligned PC (0xc25695220d81) must be rejected
-        line_aarch64_unaligned = json.dumps({"type": "ENTRY", "pid": 100, "tid": 100, "pc": "0xc25695220d81", "arg0": 123})
+        # On AArch64, unaligned PC (0xaaaaaaaa1231) must be rejected
+        line_aarch64_unaligned = json.dumps({"type": "ENTRY", "pid": 100, "tid": 100, "pc": "0xaaaaaaaa1231", "arg0": 123})
         ev_aarch64_unaligned = dec_aarch64.decode_line(line_aarch64_unaligned)
         self.assertIsNotNone(ev_aarch64_unaligned)
         self.assertIsNone(ev_aarch64_unaligned.frame_metadata.instruction_pointer)
 
-        # On AArch64, TBI tag on PC (0x9000c25695220d80) must be rejected
-        line_aarch64_tbi = json.dumps({"type": "ENTRY", "pid": 100, "tid": 100, "pc": "0x9000c25695220d80", "arg0": 123})
+        # On AArch64, hardware instruction fetch forbids TBI tags; nonzero top byte must be rejected
+        tagged_pc = (0xc2 << 56) | 0x5695220d80
+        line_aarch64_tbi = json.dumps({"type": "ENTRY", "pid": 100, "tid": 100, "pc": tagged_pc, "arg0": 123})
         ev_aarch64_tbi = dec_aarch64.decode_line(line_aarch64_tbi)
         self.assertIsNotNone(ev_aarch64_tbi)
         self.assertIsNone(ev_aarch64_tbi.frame_metadata.instruction_pointer)
@@ -1587,6 +1588,8 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
     def test_49_uprobe_offset_capability_detection(self):
         """Verify runtime detection of uprobe offset support in EbpfEnvironmentChecker across all 4 outcomes."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+
         # 1. Without bpftrace executable -> NOT_CHECKED
         res_no_bpf, status_no_bpf, reason_no_bpf = EbpfEnvironmentChecker.check_uprobe_offset_support(bpftrace_path="")
         self.assertFalse(res_no_bpf)
@@ -1602,9 +1605,12 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertIn("Privileges", reason_no_priv)
 
         # 3. Missing compiler -> UNKNOWN
-        with patch("shutil.which", side_effect=lambda name: "/usr/bin/bpftrace" if name == "bpftrace" else None):
+        with patch("shutil.which", side_effect=lambda name: "/usr/bin/bpftrace" if name == "bpftrace" else None), \
+             patch("os.stat") as mock_stat:
+            mock_stat.return_value.st_mtime_ns = 1000
+            mock_stat.return_value.st_size = 2000
             res_no_gcc, status_no_gcc, reason_no_gcc = EbpfEnvironmentChecker.check_uprobe_offset_support(
-                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
             )
             self.assertFalse(res_no_gcc)
             self.assertEqual(status_no_gcc, "UNKNOWN")
@@ -1615,9 +1621,12 @@ class TestEbpfTracerUnit(unittest.TestCase):
         mock_gcc_fail.returncode = 1
         mock_gcc_fail.stderr = b"gcc: internal compiler error"
         with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat") as mock_stat, \
              patch("subprocess.run", return_value=mock_gcc_fail):
+            mock_stat.return_value.st_mtime_ns = 1000
+            mock_stat.return_value.st_size = 2000
             res_gcc_err, status_gcc_err, reason_gcc_err = EbpfEnvironmentChecker.check_uprobe_offset_support(
-                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
             )
             self.assertFalse(res_gcc_err)
             self.assertEqual(status_gcc_err, "UNKNOWN")
@@ -1628,15 +1637,18 @@ class TestEbpfTracerUnit(unittest.TestCase):
         mock_gcc_ok.returncode = 0
         mock_gcc_ok.stderr = b""
         with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat") as mock_stat, \
              patch("subprocess.run", return_value=mock_gcc_ok), \
              patch("subprocess.Popen") as mock_popen:
+            mock_stat.return_value.st_mtime_ns = 1000
+            mock_stat.return_value.st_size = 2000
             mock_proc = MagicMock()
             mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["bpftrace"], timeout=2.0)
             mock_proc.pid = 9999
             mock_popen.return_value = mock_proc
             with patch("os.killpg"):
                 res_to, status_to, reason_to = EbpfEnvironmentChecker.check_uprobe_offset_support(
-                    bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+                    bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
                 )
                 self.assertFalse(res_to)
                 self.assertEqual(status_to, "UNKNOWN")
@@ -1644,31 +1656,37 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
         # 6. Mock bpftrace returning exit code 255 with 'compiled without (k|u)probe offset support' -> UNSUPPORTED
         with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat") as mock_stat, \
              patch("subprocess.run", return_value=mock_gcc_ok), \
              patch("subprocess.Popen") as mock_popen:
+            mock_stat.return_value.st_mtime_ns = 1000
+            mock_stat.return_value.st_size = 2000
             mock_proc = MagicMock()
             mock_proc.returncode = 255
             mock_proc.communicate.return_value = ("", "ERROR: Can't check if uprobe is in proper place (compiled without (k|u)probe offset support): /bin/ls:main+4")
             mock_proc.pid = 9999
             mock_popen.return_value = mock_proc
             res_fail, status_fail, reason_fail = EbpfEnvironmentChecker.check_uprobe_offset_support(
-                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
             )
             self.assertFalse(res_fail)
             self.assertEqual(status_fail, "UNSUPPORTED")
             self.assertIn("compiled without (k|u)probe offset support", reason_fail)
 
-        # 7. Mock bpftrace succeeding (returncode 0) -> SUPPORTED
+        # 7. Mock bpftrace succeeding (returncode 0 with PROBE_OFFSET_HIT in stdout) -> SUPPORTED
         with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat") as mock_stat, \
              patch("subprocess.run", return_value=mock_gcc_ok), \
              patch("subprocess.Popen") as mock_popen:
+            mock_stat.return_value.st_mtime_ns = 1000
+            mock_stat.return_value.st_size = 2000
             mock_proc = MagicMock()
             mock_proc.returncode = 0
-            mock_proc.communicate.return_value = ("Attached", "")
+            mock_proc.communicate.return_value = ("Attaching 1 probe...\nPROBE_OFFSET_HIT\n", "")
             mock_proc.pid = 9999
             mock_popen.return_value = mock_proc
             res_ok, status_ok, reason_ok = EbpfEnvironmentChecker.check_uprobe_offset_support(
-                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
             )
             self.assertTrue(res_ok)
             self.assertEqual(status_ok, "SUPPORTED")
@@ -1676,7 +1694,9 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
     def test_50_observation_backend_capabilities_truthful_flags(self):
         """Verify EbpfObservationBackend exposes explicit boolean capability flags at top-level and scope."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
         backend = EbpfObservationBackend()
+        # Default capabilities query is inexpensive (active_probe=False)
         caps = backend.capabilities()
         self.assertIn("arbitrary_instruction_offset_probing", caps)
         self.assertFalse(caps["arbitrary_instruction_offset_probing"])
@@ -1712,15 +1732,15 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertTrue(AddressValidator.is_valid_memory_address(0x401001, 1, "aarch64"))
 
         # 4. AArch64 Top Byte Ignore (TBI): forbidden for PC, allowed and untagged for data memory
-        tagged_ptr = 0x5a00000000002000
+        tagged_ptr = (0xc2 << 56) | 0x5695220d80
         self.assertFalse(AddressValidator.is_valid_instruction_pointer(tagged_ptr, "aarch64"))
         self.assertTrue(AddressValidator.is_valid_memory_address(tagged_ptr, 4, "aarch64"))
-        self.assertEqual(AddressValidator.untag_data_address(tagged_ptr, "aarch64"), 0x2000)
+        self.assertEqual(AddressValidator.normalize_data_address(tagged_ptr, "aarch64"), 0x5695220d80)
+        self.assertEqual(AddressValidator.untag_data_address(tagged_ptr, "aarch64"), 0x5695220d80)
 
         # 5. Resolving the 0xc25695220d80 address contradiction:
-        # 0xc25695220d80 is 48-bit (bit 47 is 1).
-        # On AArch64: fully valid text PC (4-byte aligned, 48-bit userspace)
-        self.assertTrue(AddressValidator.is_valid_instruction_pointer(0xc25695220d80, "aarch64"))
+        # As an untagged 48-bit address, 0xc25695220d80 has bit 47 set.
+        # On AArch64: within standard 48-bit userspace VA (<= 0x0000ffffffffffff)
         self.assertTrue(AddressValidator.is_valid_memory_address(0xc25695220d80, 4, "aarch64"))
         # On x86_64 4-level paging: non-canonical userspace address (> 0x00007fffffffffff), rejected!
         self.assertFalse(AddressValidator.is_valid_instruction_pointer(0xc25695220d80, "x86_64", five_level_paging=False))
@@ -1756,12 +1776,190 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertIsNone(AddressValidator.compute_link_time_pc(-1, 0, "x86_64"))
 
         # 6. AArch64 alignment check on link PC
-        # Aligned runtime PC and aligned load bias -> Aligned link PC
         self.assertEqual(AddressValidator.compute_link_time_pc(0x555555555120, 0x555555554000, "aarch64"), 0x1120)
-        # Unaligned runtime PC returns None
         self.assertIsNone(AddressValidator.compute_link_time_pc(0x555555555121, 0x555555554000, "aarch64"))
+
+    def test_53_uprobe_offset_detector_real_execution_and_hit_verification(self):
+        """Scenario 53: Verify active execution probe uses -c and verifies PROBE_OFFSET_HIT event."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"")
+
+        # 1. Probe executes fixture, outputs PROBE_OFFSET_HIT, exits 0 -> SUPPORTED
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat") as mock_stat, \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen") as mock_popen:
+            mock_stat.return_value.st_mtime_ns = 5000
+            mock_stat.return_value.st_size = 3000
+            mock_proc = MagicMock(returncode=0)
+            mock_proc.communicate.return_value = ("Attaching 1 probe...\nPROBE_OFFSET_HIT\n", "")
+            mock_proc.pid = 1234
+            mock_popen.return_value = mock_proc
+
+            supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
+            )
+            self.assertTrue(supported)
+            self.assertEqual(status, "SUPPORTED")
+            self.assertIn("verified via active execution", reason)
+
+            # Verify that -c was included in Popen args
+            popen_args = mock_popen.call_args[0][0]
+            self.assertIn("-c", popen_args)
+
+        # 2. Probe exits 0 without observing PROBE_OFFSET_HIT -> UNKNOWN
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat") as mock_stat, \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen") as mock_popen:
+            mock_stat.return_value.st_mtime_ns = 5000
+            mock_stat.return_value.st_size = 3000
+            mock_proc = MagicMock(returncode=0)
+            mock_proc.communicate.return_value = ("Attaching 1 probe...\n", "")
+            mock_proc.pid = 1234
+            mock_popen.return_value = mock_proc
+
+            supported_no_hit, status_no_hit, reason_no_hit = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
+            )
+            self.assertFalse(supported_no_hit)
+            self.assertEqual(status_no_hit, "UNKNOWN")
+            self.assertIn("without observing PROBE_OFFSET_HIT", reason_no_hit)
+
+    def test_54_capability_caching_and_invalidation(self):
+        """Scenario 54: Verify capability caching by binary stat and explicit cache invalidation."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"")
+
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat") as mock_stat, \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen") as mock_popen:
+            mock_stat.return_value.st_mtime_ns = 8000
+            mock_stat.return_value.st_size = 4000
+            mock_proc = MagicMock(returncode=0)
+            mock_proc.communicate.return_value = ("PROBE_OFFSET_HIT\n", "")
+            mock_proc.pid = 1234
+            mock_popen.return_value = mock_proc
+
+            # First invocation: runs probe and populates cache
+            res1 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+            )
+            self.assertTrue(res1[0])
+            self.assertEqual(mock_popen.call_count, 1)
+
+            # Second invocation with same stat: hits cache, does NOT invoke subprocess
+            res2 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+            )
+            self.assertEqual(res2, res1)
+            self.assertEqual(mock_popen.call_count, 1, "Cache hit must not invoke subprocess")
+
+            # Binary modified (mtime changes): invalidates cache and runs probe again
+            mock_stat.return_value.st_mtime_ns = 9000
+            res3 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True
+            )
+            self.assertEqual(mock_popen.call_count, 2, "Modified mtime must re-execute probe")
+
+            # Explicit cache invalidation
+            EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+            self.assertEqual(len(EbpfEnvironmentChecker._UPROBE_OFFSET_CACHE), 0)
+
+    def test_55_address_validator_fail_closed_unsupported_arch(self):
+        """Scenario 55: Verify AddressValidator strictly fails closed on unsupported architecture names."""
+        for bad_arch in ["riscv", "mips", "s390x", "ppc64", "sparc", "unknown", "", None]:
+            self.assertFalse(AddressValidator.is_supported_architecture(bad_arch))
+            self.assertFalse(AddressValidator.is_valid_instruction_pointer(0x401000, bad_arch))
+            self.assertFalse(AddressValidator.is_valid_memory_address(0x401000, 4, bad_arch))
+            self.assertIsNone(AddressValidator.normalize_data_address(0x401000, bad_arch))
+            self.assertEqual(AddressValidator.untag_data_address(0x401000, bad_arch), 0)
+            self.assertIsNone(AddressValidator.compute_link_time_pc(0x401000, 0, bad_arch))
+
+    def test_56_address_normalization_before_memory_read(self):
+        """Scenario 56: Verify DwarfEvaluator normalizes tagged data addresses before passing to memory_reader."""
+        ident = BinaryIdentity(
+            path="/bin/test", elf_class="ELF64", architecture="aarch64", endianness="little",
+            build_id="abc", stripped=False, has_debug_info=True,
+        )
+        subp = DwarfSubprogram(die_offset=0x10, name="func", low_pc=0x1000, frame_base="DW_OP_reg29")
+
+        # 1. Test breg evaluation with tagged pointer
+        read_addresses = []
+        def mock_reader(addr: int, sz: int) -> Optional[bytes]:
+            read_addresses.append(addr)
+            return struct.pack("<I", 12345)
+
+        tagged_base = (0xc2 << 56) | 0x00007fffffffe000
+        ctx_breg = DwarfEvaluationContext(
+            binary_identity=ident,
+            subprogram=subp,
+            link_time_address=0x1010,
+            registers={"x29": tagged_base},
+            variable_name="var_breg",
+            architecture="aarch64",
+            memory_reader=mock_reader,
+        )
+        res_breg = DwarfEvaluator._evaluate_breg_location(
+            ctx_breg, "var_breg", 29, 16, "int", 4, None
+        )
+        self.assertEqual(res_breg.status, EVAL_STATUS_OBSERVED)
+        self.assertEqual(res_breg.value, 12345)
+        # Verify the address passed to memory_reader was normalized (tag stripped)
+        self.assertEqual(len(read_addresses), 1)
+        expected_norm_addr = 0x00007fffffffe000 + 16
+        self.assertEqual(read_addresses[0], expected_norm_addr)
+        self.assertEqual(res_breg.evaluated_address, expected_norm_addr)
+
+        # 2. Test fbreg evaluation with tagged frame pointer
+        read_addresses.clear()
+        ctx_fbreg = DwarfEvaluationContext(
+            binary_identity=ident,
+            subprogram=subp,
+            link_time_address=0x1010,
+            frame_metadata=FrameMetadata(frame_pointer=tagged_base),
+            variable_name="var_fbreg",
+            architecture="aarch64",
+            memory_reader=mock_reader,
+        )
+        res_fbreg = DwarfEvaluator._evaluate_frame_base_location(
+            ctx_fbreg, "var_fbreg", -32, "int", 4, None
+        )
+        self.assertEqual(res_fbreg.status, EVAL_STATUS_OBSERVED)
+        self.assertEqual(res_fbreg.value, 12345)
+        self.assertEqual(len(read_addresses), 1)
+        expected_fbreg_addr = 0x00007fffffffe000 - 32
+        self.assertEqual(read_addresses[0], expected_fbreg_addr)
+        self.assertEqual(res_fbreg.evaluated_address, expected_fbreg_addr)
+
+    def test_57_address_validator_bounds_and_overflow(self):
+        """Scenario 57: Verify 64-bit integer overflow protection and page 0 bounds in AddressValidator."""
+        # 1. 64-bit overflow: addr + size - 1 wraps around
+        overflow_addr = 0xFFFFFFFFFFFFFFFF
+        self.assertFalse(AddressValidator.is_valid_memory_address(overflow_addr, 4, "x86_64"))
+        self.assertFalse(AddressValidator.is_valid_memory_address(overflow_addr, 4, "aarch64"))
+
+        # 2. Negative address or size <= 0
+        self.assertFalse(AddressValidator.is_valid_memory_address(-1, 4, "x86_64"))
+        self.assertFalse(AddressValidator.is_valid_memory_address(0x2000, 0, "x86_64"))
+        self.assertFalse(AddressValidator.is_valid_memory_address(0x2000, -4, "x86_64"))
+        self.assertFalse(AddressValidator.is_valid_memory_address(0x2000, 65537, "x86_64"))
+
+        # 3. Page 0 rejection (< 0x1000)
+        self.assertFalse(AddressValidator.is_valid_memory_address(0, 4, "x86_64"))
+        self.assertFalse(AddressValidator.is_valid_memory_address(0xFFF, 1, "x86_64"))
+        self.assertTrue(AddressValidator.is_valid_memory_address(0x1000, 1, "x86_64"))
+
+        # 4. AArch64 48-bit ceiling vs 52-bit ceiling
+        addr_48bit_max = 0x0000FFFFFFFFFFFF
+        addr_52bit_val = 0x0001000000000000  # > 48-bit, <= 52-bit
+        self.assertTrue(AddressValidator.is_valid_memory_address(addr_48bit_max - 3, 4, "aarch64", fifty_two_bit_va=False))
+        self.assertFalse(AddressValidator.is_valid_memory_address(addr_52bit_val, 4, "aarch64", fifty_two_bit_va=False))
+        self.assertTrue(AddressValidator.is_valid_memory_address(addr_52bit_val, 4, "aarch64", fifty_two_bit_va=True))
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

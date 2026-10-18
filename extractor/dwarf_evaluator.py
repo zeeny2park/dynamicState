@@ -868,8 +868,11 @@ class DwarfEvaluator:
 
         target_addr = reg_val + offset
         loc_desc = f"memory:0x{target_addr:x} ({reg_name}{'+' if offset >= 0 else ''}{offset})"
+        norm_target_addr = AddressValidator.normalize_data_address(target_addr, context.architecture)
 
-        if not AddressValidator.is_valid_memory_address(target_addr, byte_size, context.architecture):
+        if norm_target_addr is None or not AddressValidator.is_valid_memory_address(
+            norm_target_addr, byte_size, context.architecture
+        ):
             return DwarfLocationResult(
                 variable_name=var_name,
                 status=EVAL_STATUS_UNAVAILABLE,
@@ -883,7 +886,7 @@ class DwarfEvaluator:
 
         if context.memory_reader:
             try:
-                mem_bytes = context.memory_reader(target_addr, byte_size)
+                mem_bytes = context.memory_reader(norm_target_addr, byte_size)
                 if mem_bytes is not None and len(mem_bytes) >= byte_size:
                     endianness = context.binary_identity.endianness or "little"
                     val, val_hex = unpack_scalar_from_bytes(
@@ -898,7 +901,7 @@ class DwarfEvaluator:
                         status=EVAL_STATUS_OBSERVED,
                         location_type="memory",
                         location_description=loc_desc,
-                        evaluated_address=target_addr,
+                        evaluated_address=norm_target_addr,
                         value=val,
                         value_hex=val_hex,
                         type_name=type_name,
@@ -910,10 +913,10 @@ class DwarfEvaluator:
                         status=EVAL_STATUS_UNAVAILABLE,
                         location_type="memory",
                         location_description=loc_desc,
-                        evaluated_address=target_addr,
+                        evaluated_address=norm_target_addr,
                         type_name=type_name,
                         byte_size=byte_size,
-                        reason=f"Failed to read memory at 0x{target_addr:x} ({byte_size} bytes): memory unreadable",
+                        reason=f"Failed to read memory at 0x{norm_target_addr:x} ({byte_size} bytes): memory unreadable",
                     )
             except Exception as e:
                 return DwarfLocationResult(
@@ -921,10 +924,10 @@ class DwarfEvaluator:
                     status=EVAL_STATUS_UNAVAILABLE,
                     location_type="memory",
                     location_description=loc_desc,
-                    evaluated_address=target_addr,
+                    evaluated_address=norm_target_addr,
                     type_name=type_name,
                     byte_size=byte_size,
-                    reason=f"Failed to read memory at 0x{target_addr:x}: {e}",
+                    reason=f"Failed to read memory at 0x{norm_target_addr:x}: {e}",
                 )
 
         return DwarfLocationResult(
@@ -932,10 +935,10 @@ class DwarfEvaluator:
             status=EVAL_STATUS_UNAVAILABLE,
             location_type="memory",
             location_description=loc_desc,
-            evaluated_address=target_addr,
+            evaluated_address=norm_target_addr,
             type_name=type_name,
             byte_size=byte_size,
-            reason=f"Address 0x{target_addr:x} evaluated successfully, but memory reader is not configured",
+            reason=f"Address 0x{norm_target_addr:x} evaluated successfully, but memory reader is not configured",
         )
 
     @classmethod
@@ -1140,8 +1143,11 @@ class DwarfEvaluator:
 
         var_addr = base_addr + fb_offset
         loc_desc = f"stack:0x{var_addr:x} ({base_desc}{'+' if fb_offset >= 0 else ''}{fb_offset})"
+        norm_var_addr = AddressValidator.normalize_data_address(var_addr, context.architecture)
 
-        if not AddressValidator.is_valid_memory_address(var_addr, byte_size, context.architecture):
+        if norm_var_addr is None or not AddressValidator.is_valid_memory_address(
+            norm_var_addr, byte_size, context.architecture
+        ):
             return DwarfLocationResult(
                 variable_name=var_name,
                 status=EVAL_STATUS_UNAVAILABLE,
@@ -1156,7 +1162,7 @@ class DwarfEvaluator:
         # If a memory reader is provided, read and unpack the value
         if context.memory_reader:
             try:
-                mem_bytes = context.memory_reader(var_addr, byte_size)
+                mem_bytes = context.memory_reader(norm_var_addr, byte_size)
                 if mem_bytes is not None and len(mem_bytes) >= byte_size:
                     endianness = context.binary_identity.endianness or "little"
                     val, val_hex = unpack_scalar_from_bytes(
@@ -1171,7 +1177,7 @@ class DwarfEvaluator:
                         status=EVAL_STATUS_OBSERVED,
                         location_type="stack_memory",
                         location_description=loc_desc,
-                        evaluated_address=var_addr,
+                        evaluated_address=norm_var_addr,
                         value=val,
                         value_hex=val_hex,
                         type_name=type_name,
@@ -1183,10 +1189,10 @@ class DwarfEvaluator:
                         status=EVAL_STATUS_UNAVAILABLE,
                         location_type="stack_memory",
                         location_description=loc_desc,
-                        evaluated_address=var_addr,
+                        evaluated_address=norm_var_addr,
                         type_name=type_name,
                         byte_size=byte_size,
-                        reason=f"Failed to read stack memory at 0x{var_addr:x} ({byte_size} bytes): memory unreadable",
+                        reason=f"Failed to read stack memory at 0x{norm_var_addr:x} ({byte_size} bytes): memory unreadable",
                     )
             except Exception as e:
                 return DwarfLocationResult(
@@ -1194,10 +1200,10 @@ class DwarfEvaluator:
                     status=EVAL_STATUS_UNAVAILABLE,
                     location_type="stack_memory",
                     location_description=loc_desc,
-                    evaluated_address=var_addr,
+                    evaluated_address=norm_var_addr,
                     type_name=type_name,
                     byte_size=byte_size,
-                    reason=f"Failed to read stack memory at 0x{var_addr:x}: {e}",
+                    reason=f"Failed to read stack memory at 0x{norm_var_addr:x}: {e}",
                 )
 
         # Memory reader not available: truthful reporting of evaluated address without fabricating value
@@ -1206,10 +1212,10 @@ class DwarfEvaluator:
             status=EVAL_STATUS_UNAVAILABLE,
             location_type="stack_memory",
             location_description=loc_desc,
-            evaluated_address=var_addr,
+            evaluated_address=norm_var_addr,
             type_name=type_name,
             byte_size=byte_size,
-            reason=f"Stack address 0x{var_addr:x} evaluated successfully, but memory reader is not configured",
+            reason=f"Stack address 0x{norm_var_addr:x} evaluated successfully, but memory reader is not configured",
         )
 
 

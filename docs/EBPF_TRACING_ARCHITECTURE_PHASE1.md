@@ -457,5 +457,50 @@ Phase 1.9 resolves this contradiction by introducing `AddressValidator` with exp
   3. Detection of missing variables in observed local variable maps.
   4. Detection of malformed GDB output without parsed parity markers.
 
+---
+
+## 14. Phase 1.10 Capability Probe Reliability and Address-Validation Consistency
+
+### 14.1 Deterministic Active-Execution Uprobe Offset Probing
+- **Active Execution Model**: Previous capability checks attached to a binary without executing it, causing supported builds to wait indefinitely until timeout. Phase 1.10 compiles a dedicated non-inlined fixture binary containing a deterministic function:
+  ```c
+  __attribute__((noinline)) int probe_target(void) {
+      __asm__ volatile("nop; nop; nop; nop;");
+      return 42;
+  }
+  int main(void) {
+      return probe_target();
+  }
+  ```
+- **Verified Instruction Boundary**: Instruction offsets are determined according to target architecture: fixed 4-byte boundary on AArch64/ARM64, or parsed via `objdump -d` for the second instruction on x86-64.
+- **Probe Hit Verification**: bpftrace is launched with command execution (`-c <test_bin>`) and script `uprobe:<bin>:probe_target+<off> { printf("PROBE_OFFSET_HIT\n"); exit(); }`. Support is established (`SUPPORTED`) if and only if `PROBE_OFFSET_HIT` is observed in stdout and the process exits with code 0.
+- **Strict Classification**:
+  - `SUPPORTED`: `PROBE_OFFSET_HIT` observed and exit code 0.
+  - `UNSUPPORTED`: bpftrace reports `compiled without (k|u)probe offset support` (exit code 255).
+  - `UNKNOWN`: Subprocess timed out, missing compiler, compilation error, permission error, or exit without hit marker.
+  - `NOT_CHECKED`: bpftrace absent or unprivileged user without sudo.
+- **Guaranteed Process Group Cleanup**: On timeout, `os.killpg(proc.pid, signal.SIGKILL)` forcefully terminates the entire process group, reaps child processes, drains pipes, and deletes temporary source and binary files.
+
+### 14.2 Inexpensive Capability Queries and Binary Stat Caching
+- **Default Inexpensive Discovery**: `EbpfObservationBackend.capabilities()` defaults to `active_probe=False`, querying static system prerequisites without compiling test fixtures or spawning privileged subprocesses. Read-only callers (UI rendering, status polling) execute in sub-millisecond time.
+- **Cache Lifecycle and Invalidation**: Capability results are cached in `EbpfEnvironmentChecker._UPROBE_OFFSET_CACHE` keyed by `(bpftrace_path, mtime_ns, size, euid)`. Modifying or replacing the bpftrace binary automatically invalidates the cache. Callers can explicitly force a refresh via `force_refresh=True` or `EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()`.
+- **Feature Boundary Separation**: `arbitrary_instruction_offset_probing` remains strictly `False`, reflecting that while nonzero offset attachment may succeed on supported bpftrace builds, full arbitrary instruction-point DWARF stack variable observation is deferred to Phase 2.
+
+### 14.3 Resolution of the `0xc25695220d80` Address Contradiction & Normalization Contract
+- **Role Resolution**: An address with top byte `0xc2` (such as `(0xc2 << 56) | ...`) represents a tagged data pointer under AArch64 Top Byte Ignore (TBI), NOT an instruction pointer.
+  - **Instruction Pointers (PC)**: AArch64 hardware strictly forbids TBI tags during instruction fetch (`(pc >> 56) != 0` triggers a translation fault). Any instruction pointer with nonzero bits [63:56] is rejected.
+  - **Data Pointers**: Userspace data memory accesses permit TBI in bits [63:56]. However, DynamicState normalizes all data pointers via `AddressValidator.normalize_data_address(addr, arch)` (stripping bits [63:56]) before bounds validation and before passing to kernel memory readers.
+- **Single Normalization Contract**:
+  - `DwarfEvaluator._evaluate_breg_location` and `_evaluate_frame_base_location` normalize addresses before validation and pass the normalized address to `context.memory_reader()`.
+  - `proc_mem_reader` validates the normalized address and passes it to `read_process_memory_slice()`.
+  - Normalization is idempotent and prevents double-normalization anomalies.
+
+### 14.4 Fail-Closed Architecture Policy and Conservative Address Ceilings
+- **Fail-Closed Architecture Verification**: `AddressValidator.is_supported_architecture(arch)` restricts supported architectures strictly to `{"x86_64", "amd64", "aarch64", "arm64"}`. All validation and translation methods fail closed (`False` or `None`) on unsupported architectures (e.g. RISC-V, MIPS, or unknown).
+- **Conservative Ceiling Defaults**:
+  - **x86-64**: Default userspace ceiling is 4-level canonical `0x00007FFFFFFFFFFF` (48-bit). 5-level paging ceiling `0x00FFFFFFFFFFFFFF` (57-bit) is admitted only when `five_level_paging=True` is explicitly passed.
+  - **AArch64**: Default userspace ceiling is 48-bit VA `0x0000FFFFFFFFFFFF`. 52-bit VA ceiling `0x000FFFFFFFFFFFFF` (LVA) is admitted only when `fifty_two_bit_va=True` is explicitly passed.
+- **Arithmetic Overflow & Range Protection**: Memory reads validate that `addr + size - 1 >= addr` (no 64-bit integer wraparound), `size > 0 and size <= 65536`, and `addr >= 0x1000` (page 0 / NULL page protection). Negative load biases and underflow conditions (`runtime_pc < load_bias`) strictly return `None`.
+
 
 

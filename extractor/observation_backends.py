@@ -208,9 +208,9 @@ class EbpfObservationBackend(ObservationBackend):
             **kwargs,
         )
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self, active_probe: bool = False) -> Dict[str, Any]:
         from .ebpf_tracer import EbpfEnvironmentChecker
-        env = EbpfEnvironmentChecker.check_prerequisites()
+        env = EbpfEnvironmentChecker.check_prerequisites(active_probe=active_probe)
         return {
             "mode": "EBPF_PROBE",
             "process_stop": False,
@@ -265,4 +265,8 @@ class EbpfObservationBackend(ObservationBackend):
                 ),
             },
         }
+
+    def probe_uprobe_offset(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Actively test and cache uprobe offset support."""
+        return self.capabilities(active_probe=True)
 
