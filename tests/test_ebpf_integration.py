@@ -27,13 +27,23 @@ from typing import Any, Dict, List, Optional, Tuple
 import unittest
 from unittest.mock import patch
 
+import struct
 from extractor.debug_image import inspect_elf
+from extractor.dwarf_evaluator import (
+    EVAL_STATUS_OBSERVED,
+    EVAL_STATUS_OPTIMIZED_OUT,
+    EVAL_STATUS_UNAVAILABLE,
+    DwarfEvaluationContext,
+    DwarfEvaluator,
+)
+from extractor.dwarf_indexer import DwarfIndexer
 from extractor.ebpf_tracer import (
     STATUS_OBSERVED,
     STATUS_UNSUPPORTED_PHASE1,
     EbpfCapabilityResult,
     EbpfEnvironmentChecker,
     EbpfTracer,
+    FrameMetadata,
     TraceObservationSession,
 )
 from extractor.observation_backends import EbpfObservationBackend
@@ -457,6 +467,97 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         finally:
             self._stop_fixture(proc)
 
+    def test_11_zero_events_returns_partial_status(self):
+        """Scenario 11: Probe attached cleanly to live target without function invocation reports PARTIAL."""
+        # Start fixture in interactive mode (sits on stdin; trace_target_function is never called)
+        proc = subprocess.Popen(
+            [self.debug_bin],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        line = proc.stdout.readline()
+        self.assertIn("READY", line)
+        pid = int([tok.split("=")[1] for tok in line.split() if tok.startswith("pid=")][0])
+
+        try:
+            # Trace for 0.5s while function is never invoked
+            session = self.tracer.trace(
+                pid=pid,
+                binary_path=self.debug_bin,
+                function_name="trace_target_function",
+                duration_s=0.5,
+            )
+            self.assertEqual(session.status, "PARTIAL", "Zero events captured must report PARTIAL status")
+            self.assertEqual(session.total_events, 0)
+            self.assertEqual(session.lost_events, 0)
+            self.assertIn("0 events were captured", session.error_message)
+        finally:
+            self._stop_fixture(proc)
+
+    def test_12_real_fixture_dwarf_variable_evaluation(self):
+        """Scenario 12: Evaluate DWARF variables on real fixture builds (-O0 and -O2) cross-checked against ABI."""
+        # 1. Debug build (-O0)
+        d_index = DwarfIndexer.get_index(self.debug_bin)
+        subp = d_index.subprograms_by_name["trace_target_function"][0]
+        self.assertEqual(subp.frame_base, "DW_OP_call_frame_cfa")
+
+        op_var = subp.get_variable("op_code")
+        self.assertIsNotNone(op_var)
+        self.assertEqual(op_var.location_expr, "DW_OP_fbreg: -116")
+
+        tag_var = subp.get_variable("local_tag")
+        self.assertIsNotNone(tag_var)
+        self.assertEqual(tag_var.location_expr, "DW_OP_fbreg: -56")
+
+        reading_var = subp.get_variable("reading")
+        self.assertIsNotNone(reading_var)
+        self.assertEqual(reading_var.location_expr, "DW_OP_fbreg: -80")
+
+        # Evaluate op_code with simulated frame pointer
+        arch = platform.machine()
+        fp = 0x7fffffffe000
+        ctx_debug = DwarfEvaluationContext(
+            binary_identity=inspect_elf(self.debug_bin),
+            subprogram=subp,
+            link_time_address=subp.low_pc,
+            frame_metadata=FrameMetadata(frame_pointer=fp),
+            variable_name="op_code",
+            architecture=arch,
+        )
+        res_unavail = DwarfEvaluator.evaluate(ctx_debug)
+        self.assertEqual(res_unavail.status, EVAL_STATUS_UNAVAILABLE)
+        self.assertEqual(res_unavail.evaluated_address, fp + 16 - 116)
+
+        ctx_debug.memory_reader = lambda addr, sz: struct.pack("<i", 42)
+        res_obs = DwarfEvaluator.evaluate(ctx_debug)
+        self.assertEqual(res_obs.status, EVAL_STATUS_OBSERVED)
+        self.assertEqual(res_obs.value, 42)
+        self.assertEqual(res_obs.value_hex, "0x0000002a")
+
+        # 2. Optimized build (-O2)
+        d_index_opt = DwarfIndexer.get_index(self.opt_bin)
+        subp_opt = d_index_opt.subprograms_by_name["trace_target_function"][0]
+        op_opt = subp_opt.get_variable("op_code")
+        self.assertIsNotNone(op_opt)
+        self.assertIsNotNone(op_opt.location_list_offset, "op_code in -O2 must have a location list offset")
+
+        # At function entry (low_pc): matches first live range (x0 on aarch64, rdi on x86_64)
+        reg_map = {"x0": 77, "rdi": 77}
+        ctx_opt = DwarfEvaluationContext(
+            binary_identity=inspect_elf(self.opt_bin),
+            subprogram=subp_opt,
+            link_time_address=subp_opt.low_pc,
+            registers=reg_map,
+            variable_name="op_code",
+            architecture=arch,
+        )
+        res_opt_entry = DwarfEvaluator.evaluate(ctx_opt)
+        self.assertEqual(res_opt_entry.status, EVAL_STATUS_OBSERVED)
+        self.assertEqual(res_opt_entry.value, 77)
+
 
 if __name__ == "__main__":
     unittest.main()
+

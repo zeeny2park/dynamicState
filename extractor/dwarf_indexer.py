@@ -44,8 +44,11 @@ class DwarfVariable:
     linkage_name: Optional[str] = None
     type_offset: Optional[int] = None
     link_time_address: Optional[int] = None
+    location_expr: Optional[str] = None
+    location_list_offset: Optional[int] = None
     is_external: bool = False
     is_declaration: bool = False
+    is_parameter: bool = False
     specification_offset: Optional[int] = None
     decl_file: Optional[str] = None
     decl_line: Optional[int] = None
@@ -75,11 +78,19 @@ class DwarfSubprogram:
     linkage_name: Optional[str] = None
     low_pc: Optional[int] = None
     high_pc: Optional[int] = None
+    frame_base: Optional[str] = None
     decl_file: Optional[str] = None
     decl_line: Optional[int] = None
     is_external: bool = False
     is_declaration: bool = False
     specification_offset: Optional[int] = None
+    variables: List[DwarfVariable] = field(default_factory=list)
+
+    def get_variable(self, var_name: str) -> Optional[DwarfVariable]:
+        for v in self.variables:
+            if v.name == var_name:
+                return v
+        return None
 
 
 @dataclass
@@ -426,8 +437,8 @@ class DwarfIndexer:
 
             i += 1
 
-        # Second pass: parse variables
-        for d in dies:
+        # Second pass: parse variables and subprograms
+        for die_idx, d in enumerate(dies):
             if d["tag"] == "DW_TAG_variable":
                 attrs = d["attrs"]
                 name = cls._clean_str(attrs.get("DW_AT_name", ""))
@@ -489,6 +500,11 @@ class DwarfIndexer:
                 low_pc = cls._parse_int(attrs.get("DW_AT_low_pc", "0")) or None
                 high_pc_raw = cls._parse_int(attrs.get("DW_AT_high_pc", "0")) or None
                 high_pc = (low_pc + high_pc_raw) if (low_pc is not None and high_pc_raw is not None and high_pc_raw < low_pc) else high_pc_raw
+                frame_base_raw = attrs.get("DW_AT_frame_base", "")
+                frame_base = None
+                if frame_base_raw:
+                    m_fb = re.search(r"\((DW_OP_[^)]+)\)", frame_base_raw)
+                    frame_base = m_fb.group(1).strip() if m_fb else frame_base_raw.strip()
                 is_ext = attrs.get("DW_AT_external") == "1"
                 is_decl = attrs.get("DW_AT_declaration") == "1"
                 spec_offset = cls._parse_offset(attrs.get("DW_AT_specification", ""))
@@ -515,12 +531,49 @@ class DwarfIndexer:
                         linkage_name=linkage_name if linkage_name else None,
                         low_pc=low_pc,
                         high_pc=high_pc,
+                        frame_base=frame_base,
                         decl_file=sp_file,
                         decl_line=sp_line,
                         is_external=is_ext,
                         is_declaration=is_decl,
                         specification_offset=spec_offset,
                     )
+                    # Extract parameters and local variables in subprogram subtree
+                    j = die_idx + 1
+                    while j < len(dies) and dies[j]["depth"] > d["depth"]:
+                        child = dies[j]
+                        c_tag = child["tag"]
+                        if c_tag in ("DW_TAG_variable", "DW_TAG_formal_parameter"):
+                            c_attrs = child["attrs"]
+                            c_name = cls._clean_str(c_attrs.get("DW_AT_name", ""))
+                            c_type = cls._parse_offset(c_attrs.get("DW_AT_type", ""))
+                            c_loc_raw = c_attrs.get("DW_AT_location", "")
+                            c_loc_expr = None
+                            c_loc_list = None
+                            if c_loc_raw:
+                                if "(location list)" in c_loc_raw:
+                                    m_off = re.search(r"0x([0-9a-fA-F]+)", c_loc_raw)
+                                    if m_off:
+                                        c_loc_list = int(m_off.group(1), 16)
+                                else:
+                                    m_expr = re.search(r"\((DW_OP_[^)]+)\)", c_loc_raw)
+                                    c_loc_expr = m_expr.group(1).strip() if m_expr else c_loc_raw.strip()
+                            c_file_idx = cls._parse_int(c_attrs.get("DW_AT_decl_file", "0"))
+                            c_file = file_table.get(c_file_idx) or (cls._clean_str(c_attrs.get("DW_AT_decl_file", "")) if c_attrs.get("DW_AT_decl_file") else None)
+                            c_line = cls._parse_int(c_attrs.get("DW_AT_decl_line", "0")) or None
+                            if c_name:
+                                subp.variables.append(DwarfVariable(
+                                    die_offset=child["offset"],
+                                    name=c_name,
+                                    type_offset=c_type,
+                                    location_expr=c_loc_expr,
+                                    location_list_offset=c_loc_list,
+                                    is_parameter=(c_tag == "DW_TAG_formal_parameter"),
+                                    decl_file=c_file,
+                                    decl_line=c_line,
+                                ))
+                        j += 1
+
                     index.subprograms.append(subp)
                     index.subprograms_by_name.setdefault(name, []).append(subp)
                     if linkage_name and linkage_name != name:

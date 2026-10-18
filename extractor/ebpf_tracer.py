@@ -75,6 +75,8 @@ class FrameMetadata:
     frame_pointer: Optional[int] = None
     instruction_pointer: Optional[int] = None
     return_address: Optional[int] = None
+    return_address_status: str = STATUS_OBSERVED
+    return_address_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,6 +84,8 @@ class FrameMetadata:
             "frame_pointer": f"0x{self.frame_pointer:x}" if self.frame_pointer is not None else None,
             "instruction_pointer": f"0x{self.instruction_pointer:x}" if self.instruction_pointer is not None else None,
             "return_address": f"0x{self.return_address:x}" if self.return_address is not None else None,
+            "return_address_status": self.return_address_status,
+            "return_address_reason": self.return_address_reason,
         }
 
 
@@ -504,6 +508,9 @@ class EbpfEventDecoder:
         for k, v in payload.items():
             if k in ("type", "pid", "tid", "time"):
                 continue
+            if v is None:
+                # Explicitly unavailable / null register
+                continue
             int_val: Optional[int] = None
             if isinstance(v, int):
                 int_val = v
@@ -523,11 +530,28 @@ class EbpfEventDecoder:
                 elif k in ("ra", "lr", "r30"):
                     ra = int_val
 
+        # On x86_64, there is no link register; return address is passed on the stack ((%rsp)).
+        # Never report a hardcoded 0x0 or fabricate a return address.
+        arch_norm = self.architecture.lower()
+        ra_status = STATUS_OBSERVED
+        ra_reason = None
+        if arch_norm in ("x86_64", "amd64"):
+            if ra is None or ra == 0:
+                ra = None
+                ra_status = STATUS_UNAVAILABLE
+                ra_reason = "Return address register is not available on x86_64 (passed on stack via (%rsp))."
+        else:
+            if ra is None:
+                ra_status = STATUS_UNAVAILABLE
+                ra_reason = "Return address register not captured in probe payload"
+
         frame_meta = FrameMetadata(
             stack_pointer=sp,
             frame_pointer=fp,
             instruction_pointer=pc,
             return_address=ra,
+            return_address_status=ra_status,
+            return_address_reason=ra_reason,
         )
 
         arguments: Dict[str, TraceValue] = {}
@@ -537,15 +561,25 @@ class EbpfEventDecoder:
             # Map registers to standard calling convention arguments
             # x86_64: arg0=rdi, arg1=rsi, arg2=rdx, arg3=rcx, arg4=r8, arg5=r9
             # aarch64: arg0=x0, arg1=x1, arg2=x2, arg3=x3, arg4=x4, arg5=x5, arg6=x6, arg7=x7
-            for i in range(8):
+            max_args = 8 if arch_norm in ("aarch64", "arm64") else 6
+            for i in range(max_args):
                 arg_key = f"arg{i}"
                 if arg_key in registers:
+                    val = registers[arg_key]
+                    val_hex = f"0x{(val & 0xFFFFFFFFFFFFFFFF):x}"
                     arguments[f"param_{i}"] = TraceValue(
                         name=f"param_{i}",
                         status=STATUS_OBSERVED,
-                        value=registers[arg_key],
-                        value_hex=f"0x{registers[arg_key]:x}",
+                        value=val,
+                        value_hex=val_hex,
                         location=f"register:{arg_key}",
+                    )
+                elif arg_key in payload and payload[arg_key] is None:
+                    arguments[f"param_{i}"] = TraceValue(
+                        name=f"param_{i}",
+                        status=STATUS_UNAVAILABLE,
+                        location=f"register:{arg_key}",
+                        reason="Argument register is null in probe payload",
                     )
         elif probe_type == "RETURN":
             ret_val = payload.get("ret")
@@ -556,11 +590,12 @@ class EbpfEventDecoder:
                 except ValueError:
                     pass
                 if int_ret is not None:
+                    ret_hex = f"0x{(int_ret & 0xFFFFFFFFFFFFFFFF):x}"
                     return_value = TraceValue(
                         name="return_value",
                         status=STATUS_OBSERVED,
                         value=int_ret,
-                        value_hex=f"0x{int_ret:x}",
+                        value_hex=ret_hex,
                         location="register:retval",
                     )
                 else:
@@ -1025,10 +1060,20 @@ class EbpfTracer:
             else:
                 status = "FAILED"
                 error_msg = f"Target process PID {pid} exited before any events could be captured"
-        elif proc and proc.poll() is not None and proc.returncode != 0 and len(events) == 0:
-            status = "FAILED"
+        elif proc and proc.poll() is not None and proc.returncode != 0 and proc.returncode != -signal.SIGINT:
             err_details = "\n".join(stderr_lines).strip()
-            error_msg = f"bpftrace exited with code {proc.returncode}: {err_details}"
+            if len(events) > 0:
+                status = "PARTIAL"
+                error_msg = f"bpftrace terminated prematurely with code {proc.returncode} ({err_details}); {len(events)} events captured"
+            else:
+                status = "FAILED"
+                error_msg = f"bpftrace exited with code {proc.returncode}: {err_details}"
+        elif decoder.lost_count > 0:
+            status = "PARTIAL"
+            error_msg = f"Trace completed with {decoder.lost_count} lost event(s) due to buffer saturation; {len(events)} events captured"
+        elif len(events) == 0:
+            status = "PARTIAL"
+            error_msg = "Attached successfully, but 0 events were captured during trace duration (function was not invoked)"
 
         return TraceObservationSession(
             session_id=session_id,
@@ -1179,18 +1224,34 @@ class EbpfTracer:
         """Generate a minimal bpftrace script with bounded JSON formatting and PID filter."""
         # Architecture-specific register mappings
         if arch in ("aarch64", "arm64"):
-            fp_expr = 'reg("r29")'
-            ra_expr = 'reg("r30")'
+            entry_fmt = (
+                '{\\"type\\":\\"ENTRY\\",\\"pid\\":%d,\\"tid\\":%d,\\"time\\":%llu,'
+                '\\"sp\\":\\"0x%lx\\",\\"pc\\":\\"0x%lx\\",\\"fp\\":\\"0x%lx\\",\\"ra\\":\\"0x%lx\\",'
+                '\\"arg0\\":%ld,\\"arg1\\":%ld,\\"arg2\\":%ld,\\"arg3\\":%ld,'
+                '\\"arg4\\":%ld,\\"arg5\\":%ld,\\"arg6\\":%ld,\\"arg7\\":%ld}\\n'
+            )
+            entry_args = (
+                'pid, tid, nsecs, reg("sp"), reg("pc"), reg("r29"), reg("r30"), '
+                'arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7'
+            )
+        elif arch == "x86_64":
+            # x86_64 has no link register for return address (passed on stack via (%rsp)).
+            # Avoid reporting hardcoded 0x0; emit ra as null so it is marked UNAVAILABLE.
+            entry_fmt = (
+                '{\\"type\\":\\"ENTRY\\",\\"pid\\":%d,\\"tid\\":%d,\\"time\\":%llu,'
+                '\\"sp\\":\\"0x%lx\\",\\"pc\\":\\"0x%lx\\",\\"fp\\":\\"0x%lx\\",\\"ra\\":null,'
+                '\\"arg0\\":%ld,\\"arg1\\":%ld,\\"arg2\\":%ld,\\"arg3\\":%ld,'
+                '\\"arg4\\":%ld,\\"arg5\\":%ld}\\n'
+            )
+            entry_args = 'pid, tid, nsecs, reg("sp"), reg("pc"), reg("bp"), arg0, arg1, arg2, arg3, arg4, arg5'
         else:
-            # x86_64
-            fp_expr = 'reg("bp")'
-            ra_expr = '0'
+            raise ValueError(f"Architecture '{arch}' not supported for eBPF tracing.")
 
         entry_probe = f"""uprobe:{binary_path}:{attach_spec}
 /pid == {target_pid}/
 {{
-    printf("{{\\"type\\":\\"ENTRY\\",\\"pid\\":%d,\\"tid\\":%d,\\"time\\":%llu,\\"sp\\":\\"0x%lx\\",\\"pc\\":\\"0x%lx\\",\\"fp\\":\\"0x%lx\\",\\"ra\\":\\"0x%lx\\",\\"arg0\\":%ld,\\"arg1\\":%ld,\\"arg2\\":%ld,\\"arg3\\":%ld,\\"arg4\\":%ld,\\"arg5\\":%ld}}\\n",
-           pid, tid, nsecs, reg("sp"), reg("pc"), {fp_expr}, {ra_expr}, arg0, arg1, arg2, arg3, arg4, arg5);
+    printf("{entry_fmt}",
+           {entry_args});
 }}
 """
         return_probe = ""

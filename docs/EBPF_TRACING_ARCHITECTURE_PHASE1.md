@@ -88,32 +88,47 @@ When multiple subprograms share the same unqualified C++ function name (e.g., `i
 
 ---
 
-## 5. Event Schema, Register Capture, and Process Lifecycle
+## 5. Event Schema, Register Capture, and Session Lifecycle
 
-### 5.1 Architecture-Specific Register Semantics
+### 5.1 Architecture-Specific Register & Observation Semantics
 - **`aarch64` / `arm64`**:
   - Frame pointer: `reg("r29")`
-  - Return address: `reg("r30")` (Link Register `lr`)
+  - Return address: `reg("r30")` (Link Register `lr`, captured directly as `STATUS_OBSERVED`)
   - Stack pointer: `reg("sp")`
   - Instruction pointer: `reg("pc")`
-  - Function arguments: `param_0`..`param_5` from `arg0`..`arg5` (`x0`..`x5`)
+  - Function arguments: `param_0`..`param_7` from `arg0`..`arg7` (`x0`..`x7` AAPCS64 registers)
   - Return value: `return_value` from `retval` (`x0`)
 - **`x86_64`**:
   - Frame pointer: `reg("bp")`
   - Stack pointer: `reg("sp")`
   - Instruction pointer: `reg("pc")`
-  - Return address: not claimed or fabricated (`None`)
-  - Function arguments: `param_0`..`param_5` from `arg0`..`arg5` (`rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`)
+  - Return address: Passed on the stack via `(%rsp)`; never reported as hardcoded `0x0`. In probe output, `ra` is emitted as `null` and parsed as `None` with `return_address_status="UNAVAILABLE"` and `return_address_reason="Return address register is not available on x86_64 (passed on stack via (%rsp))."`.
+  - Function arguments: `param_0`..`param_5` from `arg0`..`arg5` (`rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` System V AMD64 ABI)
   - Return value: `return_value` from `retval` (`rax`)
 
-### 5.2 Prevention of Pipe Deadlocks
-`EbpfTracer` executes `bpftrace` with `stdout=subprocess.PIPE, stderr=subprocess.PIPE` and monitors both file descriptors concurrently using non-blocking `select.select([proc.stdout, proc.stderr], [], [], 0.05)`. `stderr` warnings (such as stripped binary boundary notices) are drained continuously into a bounded buffer, preventing OS pipe buffers (typically 64 KB) from saturating and deadlocking the tracing process.
+### 5.2 Truthful Observation Representation
+- **Register 0 vs UNAVAILABLE**: Legitimate 0 values (e.g. `arg0 == 0`) are recorded as `STATUS_OBSERVED` (`value=0, value_hex="0x0"`), whereas missing or null registers are recorded as `STATUS_UNAVAILABLE`.
+- **Signedness and Integer Width**: Decoder preserves signed integers (e.g. `-42`) in `value` and exact 64-bit hexadecimal register representation (e.g. `"0xffffffffffffffd6"`) in `value_hex`.
+- **No Unwarranted Inferences**: SP/FP alone are never used to synthesize frame chains or fabricate local variables without validated DWARF locations.
 
-### 5.3 Guaranteed Process Group Detach & Cleanup
-1. `bpftrace` is launched in its own process session (`start_new_session=True`).
-2. Upon detach, interruption, or timeout, `EbpfTracer` delivers `SIGINT` to the entire process group (`kill -INT -<pgid>`), ensuring both the `sudo` wrapper and child `bpftrace` process detach their probes from the kernel ring buffer and exit cleanly.
-3. If the process does not terminate within 2.0 s, `SIGKILL` is delivered to the process group (`kill -KILL -<pgid>`).
-4. `proc.stdout`, `proc.stderr`, and temporary `.bt` script files are unconditionally closed and unlinked in `finally:` blocks.
+### 5.3 Session Status Lifecycle
+Every trace session reports one of five strictly defined statuses:
+- `SUCCESS`: Attachment confirmed and trace completed with observed events (`total_events > 0`), zero event loss, target remained alive, and clean process termination.
+- `PARTIAL`: Attachment succeeded, but trace is incomplete or unverified:
+  - **Zero Events**: Probe attached cleanly, but the traced function was never invoked during the duration (`total_events == 0`). Never reported as `SUCCESS`.
+  - **Lost Events**: Kernel ring buffer saturated, dropping events (`lost_events > 0`).
+  - **Target Exit**: Target process exited mid-trace while events were recorded.
+  - **Premature Termination**: `bpftrace` terminated prematurely with partial events.
+- `FAILED`: Invalid target PID, non-existent process, binary not found, executable mismatch, Build ID mismatch, attach failure, or target exited before any events could be captured.
+- `PERMISSION_DENIED`: Insufficient privileges (CAP_BPF / CAP_SYS_ADMIN / passwordless sudo missing).
+- `UNSUPPORTED_ENVIRONMENT`: Unsupported OS (non-Linux), unmounted `/sys/fs/bpf`, or unsupported architecture.
+
+### 5.4 Prevention of Pipe Deadlocks & Guaranteed Process Cleanup
+- `EbpfTracer` executes `bpftrace` with `stdout=subprocess.PIPE, stderr=subprocess.PIPE` and monitors both file descriptors concurrently using non-blocking `select.select([proc.stdout, proc.stderr], [], [], 0.05)`. `stderr` warnings are continuously drained into a bounded ring buffer to prevent OS pipe deadlocks.
+- `bpftrace` is launched in its own process session (`start_new_session=True`).
+- Upon detach, interruption, or timeout, `EbpfTracer` delivers `SIGINT` to the entire process group (`kill -INT -<pgid>`), ensuring both the `sudo` wrapper and child `bpftrace` process detach their probes from the kernel ring buffer and exit cleanly.
+- If the process does not terminate within 2.0 s, `SIGKILL` is delivered (`kill -KILL -<pgid>`).
+- All pipes and temporary `.bt` script files are unconditionally closed and unlinked in `finally:` blocks.
 
 ---
 
@@ -127,7 +142,7 @@ When multiple subprograms share the same unqualified C++ function name (e.g., `i
 - **Compiler optimization barrier**: `asm volatile("" : : "r"(&reading), "r"(local_tag), "r"(final_metric) : "memory")`.
 - **Markers**: Emits `READY pid=%d target_func=%p inner_func=%p build_mode=%s\n` on stdout.
 
-### 6.2 Ten Required Integration Scenarios (`tests/test_ebpf_integration.py`)
+### 6.2 Twelve Integration Scenarios (`tests/test_ebpf_integration.py`)
 1. **Debug build (`-O0`)**: Verifies entry/return probes, arguments, return value, frame metadata (`SP`, `PC`, `FP`, `RA`).
 2. **Optimized build (`-O2`)**: Verifies probes and register values in presence of compiler optimizations.
 3. **Stripped binary with external debug ELF (`strip -s`)**: Verifies uprobe attachment to stripped binary via file-offset calculation.
@@ -138,10 +153,70 @@ When multiple subprograms share the same unqualified C++ function name (e.g., `i
 8. **Unsupported permissions / non-root**: Verifies `PERMISSION_DENIED` reporting.
 9. **Entry-only mode vs Entry+Return mode**: Verifies probe selectivity.
 10. **Interruption and process cleanup**: Verifies probe detachment and absence of orphaned processes.
+11. **Zero events session status**: Verifies that a probe attached to an idle target without function calls reports `PARTIAL` with 0 total events.
+12. **Real fixture DWARF variable evaluation**: Evaluates DWARF variables on real fixture builds (`-O0` and `-O2`) cross-checked against ABI.
 
 ---
 
-## 7. CLI Usage Reference
+## 7. Phase 2 DWARF Location-Evaluation Contract & Vertical Slice
+
+The Phase 2 location evaluator is implemented in `extractor/dwarf_evaluator.py`:
+
+### 7.1 Contract Definition
+```python
+@dataclass
+class DwarfEvaluationContext:
+    binary_identity: BinaryIdentity
+    subprogram: Optional[DwarfSubprogram]
+    link_time_address: int                   # Instruction address inside subprogram
+    load_bias: int = 0                       # Runtime load bias (runtime_pc - link_time_pc)
+    registers: Dict[str, int]                # Observation registers
+    frame_metadata: Optional[FrameMetadata]  # SP, FP, PC, RA
+    variable_name: str
+    architecture: str                        # "x86_64", "aarch64"
+    memory_reader: Optional[Callable[[int, int], Optional[bytes]]]
+
+@dataclass
+class DwarfLocationResult:
+    variable_name: str
+    status: str                              # OBSERVED, UNAVAILABLE, OPTIMIZED_OUT, UNSUPPORTED, ERROR
+    location_type: Optional[str]             # "register", "stack_memory", "memory", None
+    location_description: Optional[str]
+    evaluated_address: Optional[int]
+    register_name: Optional[str]
+    value: Optional[Union[int, float, str, bool]]
+    value_hex: Optional[str]
+    type_name: Optional[str]
+    byte_size: Optional[int]
+    reason: Optional[str]
+```
+
+### 7.2 Strict Non-Conflation Principle
+- `UNSUPPORTED`: DWARF opcode not implemented in the vertical slice (e.g. `DW_OP_piece`, complex expression trees). Never reported as `OPTIMIZED_OUT`.
+- `OPTIMIZED_OUT`: DWARF explicitly specifies variable has no location, was eliminated, or has `DW_OP_entry_value` outside its live register range. Never reported as `UNSUPPORTED`.
+- `UNAVAILABLE`: Location expression is valid, but variable is not accessible at current probe point (e.g. instruction address outside location-list range, register absent from payload, or memory reader unconfigured).
+
+### 7.3 Bounded Vertical Slice
+1. **Direct Registers (`DW_OP_reg*` / `DW_OP_regx`)**:
+   - Maps DWARF register numbers to architecture register names (`x0`..`x30`, `sp` on aarch64; `rax`, `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, `rbp`, `rsp` on x86_64).
+   - Unpacks values with integer width and sign extension.
+2. **Simple Frame-Base Relative (`DW_OP_fbreg <offset>`)**:
+   - Canonical Frame Address (CFA) calculation:
+     $$\text{CFA} = \text{frame\_pointer} + 16$$
+     (representing saved frame pointer and return address on standard ABI stack frames).
+   - Target variable address: $\text{addr} = \text{CFA} + \text{offset}$.
+   - Cross-checked with GDB: on `ebpf_stack_fixture.cpp` (`-O0`), GDB reported `&op_code == 0xffffffffcc0c` with `CFA == 0xffffffffcc80` (`0xffffffffcc80 - 116 == 0xffffffffcc0c`), exactly matching `DwarfEvaluator`.
+3. **Location-List Range Selection (`.debug_loc` / `.debug_loclists`)**:
+   - Parses location lists and selects active range for `link_time_address`:
+     - Inside active register range: evaluated as register location (`OBSERVED`).
+     - Inside `DW_OP_entry_value` range: evaluated as `OPTIMIZED_OUT`.
+     - Outside all ranges: evaluated as `UNAVAILABLE`.
+4. **Basic Scalar Types**:
+   - Supports `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `double`, `bool`, and `pointer`.
+
+---
+
+## 8. CLI Usage Reference
 
 ```bash
 # Trace function entry and return on running target:

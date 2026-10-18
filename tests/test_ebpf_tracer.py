@@ -26,11 +26,25 @@ import platform
 import struct
 import subprocess
 import tempfile
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import unittest
 from unittest.mock import MagicMock, patch
 
 from extractor.debug_image import BinaryIdentity, inspect_elf
-from extractor.dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfSubprogram
+from extractor.dwarf_evaluator import (
+    EVAL_STATUS_ERROR,
+    EVAL_STATUS_OBSERVED,
+    EVAL_STATUS_OPTIMIZED_OUT,
+    EVAL_STATUS_UNAVAILABLE,
+    EVAL_STATUS_UNSUPPORTED,
+    DwarfEvaluationContext,
+    DwarfEvaluator,
+    DwarfLocationResult,
+    Phase2DwarfLocationResolver,
+    unpack_scalar_from_bytes,
+    unpack_scalar_from_register,
+)
+from extractor.dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfSubprogram, DwarfType, DwarfVariable
 from extractor.ebpf_tracer import (
     STATUS_OBSERVED,
     STATUS_UNAVAILABLE,
@@ -480,6 +494,487 @@ class TestEbpfTracerUnit(unittest.TestCase):
         syms = find_elf_symbols("/bin/ls", "some_nonexistent_symbol_12345")
         self.assertEqual(syms, [])
 
+    def test_23_x86_64_return_address_null_not_hardcoded_zero(self):
+        """Verify that on x86_64, missing or null return address is reported as UNAVAILABLE, never 0x0."""
+        decoder_x86 = EbpfEventDecoder(
+            target_pid=self.target_pid,
+            architecture="x86_64",
+            function_name="target_func",
+        )
+
+        # 1. Payload with null ra
+        line_null_ra = json.dumps({
+            "type": "ENTRY",
+            "pid": self.target_pid,
+            "tid": self.target_pid,
+            "time": 1000,
+            "sp": "0x7fffffffe000",
+            "pc": "0x401200",
+            "fp": "0x7fffffffe020",
+            "ra": None,
+            "arg0": 1,
+        })
+        ev = decoder_x86.decode_line(line_null_ra)
+        self.assertIsNotNone(ev)
+        self.assertIsNone(ev.frame_metadata.return_address, "x86_64 return address must not be fabricated")
+        self.assertNotEqual(ev.frame_metadata.return_address, 0)
+        self.assertEqual(ev.frame_metadata.return_address_status, STATUS_UNAVAILABLE)
+        self.assertIn("stack", ev.frame_metadata.return_address_reason.lower())
+        self.assertIsNone(ev.frame_metadata.to_dict()["return_address"])
+
+        # 2. Payload with ra == 0 (must also be treated as unavailable, not a valid return address)
+        line_zero_ra = json.dumps({
+            "type": "ENTRY",
+            "pid": self.target_pid,
+            "tid": self.target_pid,
+            "time": 1000,
+            "sp": "0x7fffffffe000",
+            "pc": "0x401200",
+            "fp": "0x7fffffffe020",
+            "ra": 0,
+            "arg0": 1,
+        })
+        ev2 = decoder_x86.decode_line(line_zero_ra)
+        self.assertIsNotNone(ev2)
+        self.assertIsNone(ev2.frame_metadata.return_address)
+        self.assertEqual(ev2.frame_metadata.return_address_status, STATUS_UNAVAILABLE)
+
+        # 3. On AArch64, valid observed link register is preserved
+        decoder_arm = EbpfEventDecoder(
+            target_pid=self.target_pid,
+            architecture="aarch64",
+            function_name="target_func",
+        )
+        line_arm = json.dumps({
+            "type": "ENTRY",
+            "pid": self.target_pid,
+            "tid": self.target_pid,
+            "time": 1000,
+            "sp": "0x7fffffffe000",
+            "pc": "0x401200",
+            "fp": "0x7fffffffe020",
+            "ra": "0x401150",
+            "arg0": 1,
+        })
+        ev_arm = decoder_arm.decode_line(line_arm)
+        self.assertIsNotNone(ev_arm)
+        self.assertEqual(ev_arm.frame_metadata.return_address, 0x401150)
+        self.assertEqual(ev_arm.frame_metadata.return_address_status, STATUS_OBSERVED)
+
+    def test_24_distinguish_unavailable_registers_from_zero(self):
+        """Verify registers holding 0 are OBSERVED, while null or missing registers are UNAVAILABLE."""
+        line = json.dumps({
+            "type": "ENTRY",
+            "pid": self.target_pid,
+            "tid": self.target_pid,
+            "time": 1000,
+            "sp": "0x7fffffffe000",
+            "pc": "0x401200",
+            "arg0": 0,       # Valid 0 integer
+            "arg1": None,    # Explicit null
+        })
+        ev = self.decoder.decode_line(line)
+        self.assertIsNotNone(ev)
+
+        # param_0: observed 0
+        self.assertIn("param_0", ev.arguments)
+        self.assertEqual(ev.arguments["param_0"].status, STATUS_OBSERVED)
+        self.assertEqual(ev.arguments["param_0"].value, 0)
+        self.assertEqual(ev.arguments["param_0"].value_hex, "0x0")
+
+        # param_1: unavailable
+        self.assertIn("param_1", ev.arguments)
+        self.assertEqual(ev.arguments["param_1"].status, STATUS_UNAVAILABLE)
+        self.assertIsNone(ev.arguments["param_1"].value)
+
+        # param_2: absent
+        self.assertNotIn("param_2", ev.arguments)
+
+    def test_25_signedness_and_integer_width_preservation(self):
+        """Verify negative integers and 64-bit hexadecimal bit patterns are preserved."""
+        line_entry = json.dumps({
+            "type": "ENTRY",
+            "pid": self.target_pid,
+            "tid": self.target_pid,
+            "time": 1000,
+            "sp": "0x7fffffffe000",
+            "pc": "0x401200",
+            "arg0": -42,
+            "arg1": 42,
+        })
+        ev_entry = self.decoder.decode_line(line_entry)
+        self.assertEqual(ev_entry.arguments["param_0"].value, -42)
+        self.assertEqual(ev_entry.arguments["param_0"].value_hex, "0xffffffffffffffd6")
+        self.assertEqual(ev_entry.arguments["param_1"].value, 42)
+        self.assertEqual(ev_entry.arguments["param_1"].value_hex, "0x2a")
+
+        line_ret = json.dumps({
+            "type": "RETURN",
+            "pid": self.target_pid,
+            "tid": self.target_pid,
+            "time": 1005,
+            "sp": "0x7fffffffe000",
+            "pc": "0x401250",
+            "ret": -1,
+        })
+        ev_ret = self.decoder.decode_line(line_ret)
+        self.assertEqual(ev_ret.return_value.value, -1)
+        self.assertEqual(ev_ret.return_value.value_hex, "0xffffffffffffffff")
+
+    def test_26_session_status_zero_events_is_partial(self):
+        """Verify that attachment producing zero events reports PARTIAL rather than SUCCESS."""
+        tracer = EbpfTracer()
+
+        mock_ident = BinaryIdentity(
+            path="/bin/echo",
+            architecture="x86_64",
+            elf_class="ELF64",
+            endianness="little",
+            build_id="abcdef",
+            stripped=False,
+            pt_loads=[{"p_vaddr": 0x400000, "p_memsz": 0x1000, "p_offset": 0, "p_filesz": 0x1000}],
+        )
+
+        mock_proc = MagicMock()
+        poll_count_26 = 0
+        def mock_poll_26():
+            nonlocal poll_count_26
+            poll_count_26 += 1
+            return None if poll_count_26 < 5 else 0
+
+        mock_proc.poll = mock_poll_26
+        mock_proc.returncode = 0
+        mock_proc.stdout.readline.return_value = "Attaching 1 probe...\n"
+        mock_proc.stdout.readlines.return_value = []
+        mock_proc.stderr.readline.return_value = ""
+
+        with patch("extractor.ebpf_tracer.inspect_elf", return_value=mock_ident), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.kill", return_value=None), \
+             patch("select.select", return_value=([mock_proc.stdout], [], [])), \
+             patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
+             patch("subprocess.Popen", return_value=mock_proc):
+
+            mock_cap.return_value = EbpfCapabilityResult(
+                supported=True,
+                backend="bpftrace",
+                architecture="x86_64",
+                kernel_version="6.17",
+                is_privileged=True,
+                unprivileged_bpf_disabled=0,
+                has_bpf_fs=True,
+            )
+
+            session = tracer.trace(
+                pid=os.getpid(),
+                binary_path="/bin/echo",
+                function_name="0x400500",
+                duration_s=0.01,
+            )
+
+            self.assertEqual(session.status, "PARTIAL", "0 events must report PARTIAL, never SUCCESS")
+            self.assertEqual(session.total_events, 0)
+            self.assertIn("0 events were captured", session.error_message)
+
+    def test_27_session_status_lost_events_is_partial(self):
+        """Verify that a trace with lost events reports PARTIAL."""
+        tracer = EbpfTracer()
+
+        mock_ident = BinaryIdentity(
+            path="/bin/echo",
+            architecture="x86_64",
+            elf_class="ELF64",
+            endianness="little",
+            build_id="abcdef",
+            stripped=False,
+            pt_loads=[{"p_vaddr": 0x400000, "p_memsz": 0x1000, "p_offset": 0, "p_filesz": 0x1000}],
+        )
+
+        mock_proc = MagicMock()
+        poll_count_27 = 0
+        def mock_poll_27():
+            nonlocal poll_count_27
+            poll_count_27 += 1
+            return None if poll_count_27 < 5 else 0
+
+        mock_proc.poll = mock_poll_27
+        mock_proc.returncode = 0
+        # Yield attach notice, a lost event notice, a valid event, then empty
+        mock_proc.stdout.readline.side_effect = [
+            "Attaching 1 probe...\n",
+            json.dumps({"type": "ENTRY", "pid": os.getpid(), "tid": os.getpid(), "time": 100, "arg0": 1}) + "\n",
+            "Lost 3 events\n",
+            "",
+        ]
+        mock_proc.stdout.readlines.return_value = []
+        mock_proc.stderr.readline.return_value = ""
+
+        with patch("extractor.ebpf_tracer.inspect_elf", return_value=mock_ident), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.kill", return_value=None), \
+             patch("select.select", return_value=([mock_proc.stdout], [], [])), \
+             patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
+             patch("subprocess.Popen", return_value=mock_proc):
+
+            mock_cap.return_value = EbpfCapabilityResult(
+                supported=True,
+                backend="bpftrace",
+                architecture="x86_64",
+                kernel_version="6.17",
+                is_privileged=True,
+                unprivileged_bpf_disabled=0,
+                has_bpf_fs=True,
+            )
+
+            session = tracer.trace(
+                pid=os.getpid(),
+                binary_path="/bin/echo",
+                function_name="0x400500",
+                duration_s=0.01,
+            )
+
+            self.assertEqual(session.status, "PARTIAL")
+            self.assertEqual(session.lost_events, 3)
+            self.assertIn("lost", session.error_message.lower())
+
+    def test_28_dwarf_evaluator_direct_register(self):
+        """Verify DWARF evaluator direct register resolution (DW_OP_reg* / DW_OP_regx)."""
+        ident = BinaryIdentity(path="/bin/dummy", architecture="aarch64", elf_class="ELF64", endianness="little")
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="target_func",
+            low_pc=0x1000,
+            high_pc=0x1100,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="scalar_arg", type_offset=0x30, location_expr="DW_OP_reg0"),
+                DwarfVariable(die_offset=0x25, name="scalar_r5", type_offset=0x30, location_expr="DW_OP_reg5"),
+            ],
+        )
+
+        mock_index = DwarfIndex(artifact_path="/bin/dummy")
+        mock_index.types_by_die[0x30] = DwarfType(die_offset=0x30, tag="DW_TAG_base_type", name="int", byte_size=4)
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_index):
+            ctx = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=0x1020,
+                registers={"x0": 77, "x5": 128},
+                variable_name="scalar_arg",
+                architecture="aarch64",
+            )
+            res = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res.status, EVAL_STATUS_OBSERVED)
+            self.assertEqual(res.location_type, "register")
+            self.assertEqual(res.register_name, "x0")
+            self.assertEqual(res.value, 77)
+            self.assertEqual(res.value_hex, "0x0000004d")
+
+            ctx.variable_name = "scalar_r5"
+            res2 = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res2.status, EVAL_STATUS_OBSERVED)
+            self.assertEqual(res2.value, 128)
+
+            # Test unavailable register
+            ctx.registers = {}  # Empty registers
+            res_unavail = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res_unavail.status, EVAL_STATUS_UNAVAILABLE)
+            self.assertIn("not available", res_unavail.reason)
+
+    def test_29_dwarf_evaluator_frame_base_relative(self):
+        """Verify DWARF evaluator frame-base relative location (DW_OP_fbreg <offset>)."""
+        ident = BinaryIdentity(path="/bin/dummy", architecture="aarch64", elf_class="ELF64", endianness="little")
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="target_func",
+            frame_base="DW_OP_call_frame_cfa",
+            low_pc=0x1000,
+            high_pc=0x1100,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="local_val", type_offset=0x30, location_expr="DW_OP_fbreg: -116"),
+            ],
+        )
+
+        mock_index = DwarfIndex(artifact_path="/bin/dummy")
+        mock_index.types_by_die[0x30] = DwarfType(die_offset=0x30, tag="DW_TAG_base_type", name="int", byte_size=4)
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_index):
+            # Frame pointer = 0x7fffffffe000. On AArch64 with standard prologue, CFA = FP + 16 = 0x7fffffffe010
+            # Target address = CFA - 116 = 0x7fffffffe010 - 116 = 0x7fffffffdfe4
+            fm = FrameMetadata(frame_pointer=0x7fffffffe000)
+
+            # 1. Without memory reader: truthful address reporting without fabricated value
+            ctx = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=0x1020,
+                frame_metadata=fm,
+                variable_name="local_val",
+                architecture="aarch64",
+            )
+            res = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res.status, EVAL_STATUS_UNAVAILABLE)
+            self.assertEqual(res.location_type, "stack_memory")
+            self.assertEqual(res.evaluated_address, 0x7fffffffdf9c)
+            self.assertIn("0x7fffffffdf9c", res.reason)
+            self.assertIsNone(res.value)
+
+            # 2. With memory reader: unpacks memory cleanly
+            mem_data = {0x7fffffffdf9c: struct.pack("<i", 4242)}
+            def mock_reader(addr: int, sz: int) -> Optional[bytes]:
+                return mem_data.get(addr)
+
+            ctx.memory_reader = mock_reader
+            res_mem = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res_mem.status, EVAL_STATUS_OBSERVED)
+            self.assertEqual(res_mem.value, 4242)
+            self.assertEqual(res_mem.value_hex, "0x00001092")
+            self.assertEqual(res_mem.evaluated_address, 0x7fffffffdf9c)
+
+    def test_30_dwarf_evaluator_location_list_selection(self):
+        """Verify active range selection and instruction pointer filtering in location lists."""
+        ident = BinaryIdentity(path="/bin/dummy", architecture="aarch64", elf_class="ELF64", endianness="little")
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="target_func",
+            low_pc=0x1000,
+            high_pc=0x1200,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="opt_param", type_offset=0x30, location_list_offset=0x429),
+            ],
+        )
+
+        mock_index = DwarfIndex(artifact_path="/bin/dummy")
+        mock_index.types_by_die[0x30] = DwarfType(die_offset=0x30, tag="DW_TAG_base_type", name="int", byte_size=4)
+
+        mock_loc_table = {
+            0x429: [
+                (0x1000, 0x1050, "DW_OP_reg0 (x0)"),
+                (0x1050, 0x1080, "DW_OP_reg5 (x5)"),
+                (0x1080, 0x1100, "DW_OP_entry_value: (DW_OP_reg0 (x0)); DW_OP_stack_value"),
+            ]
+        }
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_index), \
+             patch("extractor.dwarf_evaluator.parse_debug_loc_table", return_value=mock_loc_table):
+
+            ctx = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=0x1020,
+                registers={"x0": 10, "x5": 20},
+                variable_name="opt_param",
+                architecture="aarch64",
+            )
+
+            # Link-time PC 0x1020 matches [0x1000, 0x1050) -> x0
+            res1 = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res1.status, EVAL_STATUS_OBSERVED)
+            self.assertEqual(res1.register_name, "x0")
+            self.assertEqual(res1.value, 10)
+
+            # Link-time PC 0x1060 matches [0x1050, 0x1080) -> x5
+            ctx.link_time_address = 0x1060
+            res2 = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res2.status, EVAL_STATUS_OBSERVED)
+            self.assertEqual(res2.register_name, "x5")
+            self.assertEqual(res2.value, 20)
+
+            # Link-time PC 0x1090 matches [0x1080, 0x1100) -> DW_OP_entry_value (OPTIMIZED_OUT)
+            ctx.link_time_address = 0x1090
+            res3 = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res3.status, EVAL_STATUS_OPTIMIZED_OUT)
+            self.assertIn("entry_value", res3.reason)
+
+            # Link-time PC 0x1150 is outside all ranges -> UNAVAILABLE
+            ctx.link_time_address = 0x1150
+            res4 = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res4.status, EVAL_STATUS_UNAVAILABLE)
+            self.assertIn("outside", res4.reason)
+
+    def test_31_dwarf_evaluator_unsupported_vs_optimized_out(self):
+        """Verify UNSUPPORTED opcodes are NEVER conflated with OPTIMIZED_OUT."""
+        ident = BinaryIdentity(path="/bin/dummy", architecture="aarch64", elf_class="ELF64", endianness="little")
+        subp = DwarfSubprogram(
+            die_offset=0x10,
+            name="target_func",
+            low_pc=0x1000,
+            high_pc=0x1100,
+            variables=[
+                DwarfVariable(die_offset=0x20, name="unsupported_var", type_offset=0x30, location_expr="DW_OP_piece 4"),
+                DwarfVariable(die_offset=0x25, name="optimized_var", type_offset=0x30, location_expr=None, location_list_offset=None),
+            ],
+        )
+
+        mock_index = DwarfIndex(artifact_path="/bin/dummy")
+        mock_index.types_by_die[0x30] = DwarfType(die_offset=0x30, tag="DW_TAG_base_type", name="int", byte_size=4)
+
+        with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_index):
+            ctx = DwarfEvaluationContext(
+                binary_identity=ident,
+                subprogram=subp,
+                link_time_address=0x1020,
+                variable_name="unsupported_var",
+                architecture="aarch64",
+            )
+            res_unsup = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res_unsup.status, EVAL_STATUS_UNSUPPORTED)
+            self.assertNotEqual(res_unsup.status, EVAL_STATUS_OPTIMIZED_OUT)
+
+            ctx.variable_name = "optimized_var"
+            res_opt = DwarfEvaluator.evaluate(ctx)
+            self.assertEqual(res_opt.status, EVAL_STATUS_OPTIMIZED_OUT)
+            self.assertNotEqual(res_opt.status, EVAL_STATUS_UNSUPPORTED)
+
+    def test_32_dwarf_evaluator_scalar_types(self):
+        """Verify unpacking of all supported scalar types from memory and registers."""
+        # 1. Unpack from bytes
+        v_i8, h_i8 = unpack_scalar_from_bytes(b"\xfb", "int8")
+        self.assertEqual(v_i8, -5)
+        self.assertEqual(h_i8, "0xfb")
+
+        v_u8, h_u8 = unpack_scalar_from_bytes(b"\xfb", "uint8")
+        self.assertEqual(v_u8, 251)
+        self.assertEqual(h_u8, "0xfb")
+
+        v_i16, h_i16 = unpack_scalar_from_bytes(struct.pack("<h", -300), "short")
+        self.assertEqual(v_i16, -300)
+        self.assertEqual(h_i16, "0xfed4")
+
+        v_i32, h_i32 = unpack_scalar_from_bytes(struct.pack("<i", -100000), "int")
+        self.assertEqual(v_i32, -100000)
+        self.assertEqual(h_i32, "0xfffe7960")
+
+        v_u32, h_u32 = unpack_scalar_from_bytes(struct.pack("<I", 100000), "unsigned int")
+        self.assertEqual(v_u32, 100000)
+        self.assertEqual(h_u32, "0x000186a0")
+
+        v_i64, h_i64 = unpack_scalar_from_bytes(struct.pack("<q", -5000000000), "int64_t")
+        self.assertEqual(v_i64, -5000000000)
+
+        v_flt, h_flt = unpack_scalar_from_bytes(struct.pack("<f", 3.14159), "float")
+        self.assertAlmostEqual(v_flt, 3.14159, places=4)
+
+        v_dbl, h_dbl = unpack_scalar_from_bytes(struct.pack("<d", 2.718281828), "double")
+        self.assertAlmostEqual(v_dbl, 2.718281828, places=6)
+
+        v_bool, h_bool = unpack_scalar_from_bytes(b"\x01", "bool")
+        self.assertEqual(v_bool, True)
+        self.assertEqual(h_bool, "0x1")
+
+        v_ptr, h_ptr = unpack_scalar_from_bytes(struct.pack("<Q", 0x7fffffffe100), "void*")
+        self.assertEqual(v_ptr, 0x7fffffffe100)
+        self.assertEqual(h_ptr, "0x7fffffffe100")
+
+        # 2. Unpack from register
+        v_reg_i32, h_reg_i32 = unpack_scalar_from_register(0xffffffff, "int32", byte_size=4)
+        self.assertEqual(v_reg_i32, -1)
+        self.assertEqual(h_reg_i32, "0xffffffff")
+
+        v_reg_u32, h_reg_u32 = unpack_scalar_from_register(0xffffffff, "uint32", byte_size=4)
+        self.assertEqual(v_reg_u32, 4294967295)
+
 
 if __name__ == "__main__":
     unittest.main()
+
