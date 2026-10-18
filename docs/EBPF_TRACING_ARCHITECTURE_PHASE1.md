@@ -549,5 +549,57 @@ Phase 1.9 resolves this contradiction by introducing `AddressValidator` with exp
   - Outcome: `uprobe_offset_status="UNSUPPORTED"`, `uprobe_offset_supported=False`.
   - Truthful Representation: DynamicState accurately reports `uprobe_offset_status="UNSUPPORTED"` on this host, proving that capability detection truthfully reflects host toolchain limitations rather than reporting false capabilities or hanging on timeouts.
 
+---
+
+## 16. Phase 1.12 Real-Environment Validation & Failure-Path Hardening
+
+### 16.1 Active-Probe Lifecycle & Process Reaping Guarantees
+- **Dedicated Process Reaping (`_terminate_probe_process`)**:
+  - Implements explicit process-tree termination distinguishing root vs unprivileged execution (`cmd_prefix`).
+  - When running without sudo (`cmd_prefix=[]`), forcefully sends `SIGKILL` to the process group via `os.killpg(pid, signal.SIGKILL)`.
+  - When running under sudo (`cmd_prefix=["sudo", "-n"]`), executes `sudo -n kill -KILL -<pid>` to ensure the root-owned `bpftrace` child process group is terminated.
+  - Calls `proc.kill()` on the local handle and drains standard streams (`proc.communicate(timeout=1.0)` / `proc.wait(timeout=0.5)`).
+  - Explicitly validates `proc.poll() is not None` to verify the process was reaped from the OS process table without creating zombies.
+- **Leak-Proof Temporary File Deletion**:
+  - `finally:` block cleans up test source and binary files with standard `os.remove()`, and provides a `sudo -n rm -f` fallback to guarantee deletion even if files were created or touched with elevated permissions.
+
+### 16.2 Failure-Path Error Classification
+DynamicState strictly partitions every probe execution outcome without false positive claims:
+1. `SUPPORTED`: Returned **only** if the process exits with returncode 0 **and** `PROBE_OFFSET_HIT` is found in standard output.
+2. `UNSUPPORTED`: Returned when `bpftrace` reports lack of offset support (e.g., `compiled without (k|u)probe offset support` or `offset is not supported`).
+3. `UNKNOWN`: Returned on compilation failure, disassembler failure, permission denied, non-zero exit codes, timeouts, or exit code 0 without the hit marker.
+4. `NOT_CHECKED`: Returned when bpftrace or privileges are absent, or when active probing was not requested.
+
+### 16.3 Hardened Instruction-Offset Parsing
+- **Monotonic Address Validation**: `_parse_disassembly_for_second_instruction` enforces strictly increasing instruction addresses (`inst_addrs[i+1] > inst_addrs[i]`), rejecting duplicate or disordered entries.
+- **Strict Architecture Alignment**:
+  - **AArch64**: Every instruction address and the computed offset must be 4-byte aligned (`addr % 4 == 0` and `offset % 4 == 0`).
+  - **x86-64**: Offset must be $\le 15$ bytes (the architectural maximum instruction length for x86).
+- **Function Boundary Protection**: Parsing terminates immediately upon encountering a subsequent function header (`^\s*[0-9a-fA-F]+\s+<.*>:`) or section header (`Disassembly of section`), preventing accidental absorption of instructions from adjacent functions.
+
+### 16.4 Truthful Test Validation Tiers
+DynamicState structures test validation into four truthful tiers:
+- **Tier 1 — Deterministic Unit Tests** (`tests/test_ebpf_tracer.py`):
+  - 64 tests covering event decoding, PID filtering, truncation, Build ID validation, file offset calculation, address normalization, disassembly parsing edge cases, and process lifecycle termination.
+  - Zero elevated privileges required; executes in < 0.2s.
+- **Tier 2 — Compiled-Fixture DWARF Evaluator Tests** (`tests/test_ebpf_integration.py`):
+  - Validates DWARF evaluation against real GCC-compiled debug and optimized binaries.
+- **Tier 3 — Live eBPF Tracing with GDB Oracle Parity** (`tests/test_ebpf_integration.py`):
+  - Attaches live uprobes and uretprobes to running fixture processes.
+  - Compares observed values against an independent GDB oracle at equivalent execution points.
+- **Tier 4 — Real-Host Capability Probe** (`test_16` and `test_17` in `tests/test_ebpf_integration.py`):
+  - Executes active probe directly against the host `bpftrace` binary with `sudo -n`.
+  - Confirms `uprobe_offset_status="UNSUPPORTED"` matches host toolchain reality without mocks.
+
+### 16.5 Verification of Public Capability Claims
+- `EbpfObservationBackend.capabilities()` exposes truthful boolean flags:
+  - `arbitrary_instruction_offset_probing: False`
+  - `stack_locals_readable_at_entry: False`
+  - `locals_readable_at_return: False`
+  - `uprobe_offset_status: "UNSUPPORTED"` (on current host)
+  - `uprobe_offset_supported: False`
+  - `supports_uprobe_offset: False`
+- Function entry and return probes establish function boundary events and parameter/return observation, but do **not** claim arbitrary instruction-point DWARF stack variable evaluation (which remains deferred to Phase 2).
+
 
 

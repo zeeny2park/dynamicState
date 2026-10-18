@@ -299,14 +299,17 @@ class EbpfEnvironmentChecker:
         in_sym = False
         inst_addrs: List[int] = []
         sym_re = re.compile(rf"<({re.escape(sym_name)})>:")
-        other_sym_re = re.compile(r"^[0-9a-fA-F]+\s+<.*>:")
+        other_sym_re = re.compile(r"^\s*[0-9a-fA-F]+\s+<.*>:")
         inst_re = re.compile(r"^\s*([0-9a-fA-F]+):")
 
         for line in lines:
+            line_str = line.strip()
+            if not line_str:
+                continue
             if sym_re.search(line):
                 in_sym = True
                 continue
-            elif in_sym and other_sym_re.search(line):
+            elif in_sym and (other_sym_re.search(line) or line.startswith("Disassembly of section")):
                 break
             elif in_sym:
                 m = inst_re.match(line)
@@ -317,6 +320,11 @@ class EbpfEnvironmentChecker:
             return None, f"Symbol '{sym_name}' not found in disassembly"
         if len(inst_addrs) < 2:
             return None, f"Symbol '{sym_name}' contains fewer than 2 instructions in disassembly"
+
+        # Check strictly monotonic increasing addresses
+        for i in range(len(inst_addrs) - 1):
+            if inst_addrs[i + 1] <= inst_addrs[i]:
+                return None, f"Non-increasing or duplicate instruction address at index {i + 1}: 0x{inst_addrs[i+1]:x} <= 0x{inst_addrs[i]:x}"
 
         base_addr = inst_addrs[0]
         second_addr = inst_addrs[1]
@@ -330,10 +338,64 @@ class EbpfEnvironmentChecker:
 
         norm_arch = arch.lower()
         if norm_arch in ("aarch64", "arm64"):
+            for addr in inst_addrs:
+                if addr % 4 != 0:
+                    return None, f"AArch64 instruction address 0x{addr:x} is not 4-byte aligned"
             if offset % 4 != 0:
                 return None, f"AArch64 instruction offset 0x{offset:x} is not 4-byte aligned"
+        elif norm_arch in ("x86_64", "amd64"):
+            if offset > 15:
+                return None, f"x86-64 instruction offset {offset} exceeds maximum x86 instruction length (15 bytes)"
 
         return offset, None
+
+    @classmethod
+    def _terminate_probe_process(cls, proc: Optional[subprocess.Popen], cmd_prefix: List[str]) -> bool:
+        """Safely terminate and reap a probe process and its process group.
+
+        Sends SIGKILL to the process group (using sudo -n kill if running under sudo),
+        calls proc.kill(), waits for the process to terminate, and verifies reap status.
+
+        Returns:
+            bool: True if process was successfully terminated and reaped (proc.poll() is not None).
+        """
+        if proc is None:
+            return True
+        if proc.poll() is not None:
+            return True
+
+        pid = proc.pid
+
+        # 1. Kill process group
+        try:
+            if cmd_prefix:
+                subprocess.run(
+                    cmd_prefix + ["kill", "-KILL", f"-{pid}"],
+                    capture_output=True,
+                    timeout=1.0,
+                )
+            else:
+                os.killpg(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+        # 2. Kill direct child process handle
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+        # 3. Wait and reap the child process (drain pipes to prevent deadlock/zombies)
+        try:
+            proc.communicate(timeout=1.0)
+        except Exception:
+            try:
+                proc.wait(timeout=0.5)
+            except Exception:
+                pass
+
+        # 4. Confirm process exit
+        return proc.poll() is not None
 
     @classmethod
     def check_uprobe_offset_support(
@@ -430,7 +492,7 @@ class EbpfEnvironmentChecker:
 
                 if proc.returncode == 0 and "PROBE_OFFSET_HIT" in stdout:
                     res = (True, "SUPPORTED", f"uprobe offset support verified via active execution (offset +{offset})")
-                elif "compiled without (k|u)probe offset support" in err:
+                elif "compiled without (k|u)probe offset support" in err or "offset is not supported" in err.lower():
                     res = (False, "UNSUPPORTED", f"bpftrace compiled without (k|u)probe offset support: {err}")
                 elif "permission denied" in err.lower() or "operation not permitted" in err.lower():
                     res = (False, "UNKNOWN", f"bpftrace probe offset attachment failed with permission error: {err}")
@@ -444,22 +506,12 @@ class EbpfEnvironmentChecker:
                 return res
 
             except subprocess.TimeoutExpired:
-                if proc:
-                    try:
-                        if cmd_prefix:
-                            subprocess.run(cmd_prefix + ["kill", "-KILL", f"-{proc.pid}"], capture_output=True, timeout=1.0)
-                        else:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                    except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                    try:
-                        proc.communicate(timeout=0.5)
-                    except Exception:
-                        pass
-                res = (False, "UNKNOWN", "Probe execution check timed out without confirming event trigger")
+                reaped = cls._terminate_probe_process(proc, cmd_prefix)
+                res = (
+                    False,
+                    "UNKNOWN",
+                    f"Probe execution check timed out after 3.0s without confirming event trigger (process reaped: {reaped})",
+                )
                 if cache_key:
                     cls._UPROBE_OFFSET_CACHE[cache_key] = res
                 return res
@@ -467,31 +519,25 @@ class EbpfEnvironmentChecker:
         except Exception as e:
             return False, "UNKNOWN", f"Error detecting uprobe offset support: {e}"
         finally:
-            if proc and proc.poll() is None:
-                try:
-                    if cmd_prefix:
-                        subprocess.run(cmd_prefix + ["kill", "-KILL", f"-{proc.pid}"], capture_output=True, timeout=1.0)
-                    else:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                try:
-                    proc.communicate(timeout=0.5)
-                except Exception:
-                    pass
+            cls._terminate_probe_process(proc, cmd_prefix)
             if test_src and os.path.exists(test_src):
                 try:
                     os.remove(test_src)
                 except Exception:
-                    pass
+                    try:
+                        if cmd_prefix:
+                            subprocess.run(cmd_prefix + ["rm", "-f", test_src], capture_output=True, timeout=1.0)
+                    except Exception:
+                        pass
             if test_bin and os.path.exists(test_bin):
                 try:
                     os.remove(test_bin)
                 except Exception:
-                    pass
+                    try:
+                        if cmd_prefix:
+                            subprocess.run(cmd_prefix + ["rm", "-f", test_bin], capture_output=True, timeout=1.0)
+                    except Exception:
+                        pass
 
     @classmethod
     def check_prerequisites(

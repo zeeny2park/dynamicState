@@ -234,6 +234,7 @@ class EbpfObservationBackend(ObservationBackend):
             "locals_readable_at_return": False,
             "uprobe_offset_status": env.uprobe_offset_status,
             "uprobe_offset_supported": env.supports_uprobe_offset,
+            "supports_uprobe_offset": env.supports_uprobe_offset,
             "uprobe_offset_reason": env.uprobe_offset_reason,
             "dwarf_eval_scope": {
                 "supported_types": [
@@ -256,6 +257,7 @@ class EbpfObservationBackend(ObservationBackend):
                 "locals_readable_at_return": False,
                 "uprobe_offset_status": env.uprobe_offset_status,
                 "uprobe_offset_supported": env.supports_uprobe_offset,
+                "supports_uprobe_offset": env.supports_uprobe_offset,
                 "value_sources": ["registers", "process_memory"],
                 "notes": (
                     "Stack-resident locals are UNAVAILABLE at function entry prior to prologue "

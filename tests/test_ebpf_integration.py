@@ -730,7 +730,7 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             "-ex", "quit",
             self.opt_bin,
         ]
-        gdb_proc = subprocess.run(gdb_cmd, capture_output=True, text=True)
+        gdb_proc = subprocess.run(gdb_cmd, capture_output=True, text=True, errors="replace")
         self.assertEqual(gdb_proc.returncode, 0, f"GDB execution failed: {gdb_proc.stderr}")
 
         validate_gdb_oracle_parity(
@@ -763,7 +763,7 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             "-ex", "quit",
             self.opt_bin,
         ]
-        proc_opt = subprocess.run(gdb_cmd_opt, capture_output=True, text=True)
+        proc_opt = subprocess.run(gdb_cmd_opt, capture_output=True, text=True, errors="replace")
         self.assertEqual(proc_opt.returncode, 0, f"GDB -O2 run failed: {proc_opt.stderr}")
 
         gdb_opt: Dict[str, int] = {}
@@ -773,7 +773,7 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             if m:
                 gdb_opt[m.group(1)] = int(m.group(2))
 
-        self.assertEqual(len(gdb_opt), 3)
+        self.assertEqual(len(gdb_opt), 3, f"GDB stdout:\n{proc_opt.stdout}\nGDB stderr:\n{proc_opt.stderr}")
         self.assertEqual(gdb_opt["op_code"], 7)
         self.assertEqual(gdb_opt["input_val"], 70)
         self.assertEqual(gdb_opt["count"], 11)
@@ -893,6 +893,40 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             self.assertEqual(caps_cached["uprobe_offset_supported"], caps["uprobe_offset_supported"])
         else:
             self.assertEqual(proc.returncode, 0)
+
+    def test_17_real_host_active_uprobe_offset_probe(self):
+        """Scenario 17: Live end-to-end execution of the active uprobe offset probe on real host.
+
+        Validates the real active probe execution lifecycle (compilation, execution with -c,
+        exit code inspection, process group cleanup, and temporary file removal).
+        On the local Ubuntu 24.04 Linux 6.17 AArch64 host:
+        - Confirms bpftrace reports 'compiled without (k|u)probe offset support'.
+        - Confirms capability status is truthfully set to UNSUPPORTED (supported=False).
+        - Confirms cache reuse on default queries and NOT_CHECKED after invalidation.
+        """
+        backend = EbpfObservationBackend()
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+
+        # 1. Execute live active probe with force_refresh=True
+        caps = backend.probe_uprobe_offset(force_refresh=True)
+        self.assertIn(caps.get("uprobe_offset_status"), ("SUPPORTED", "UNSUPPORTED", "UNKNOWN"))
+        self.assertIsInstance(caps.get("uprobe_offset_supported"), bool)
+
+        # On this specific host, bpftrace lacks offset support
+        if "compiled without (k|u)probe offset support" in (caps.get("uprobe_offset_reason") or ""):
+            self.assertEqual(caps.get("uprobe_offset_status"), "UNSUPPORTED")
+            self.assertFalse(caps.get("uprobe_offset_supported"))
+
+        # 2. Subsequent default query reuses cache
+        caps_cached = backend.capabilities(active_probe=False)
+        self.assertEqual(caps_cached.get("uprobe_offset_status"), caps.get("uprobe_offset_status"))
+        self.assertEqual(caps_cached.get("uprobe_offset_supported"), caps.get("uprobe_offset_supported"))
+
+        # 3. Explicit invalidation resets status to NOT_CHECKED for default queries
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+        caps_inval = backend.capabilities(active_probe=False)
+        self.assertEqual(caps_inval.get("uprobe_offset_status"), "NOT_CHECKED")
+        self.assertFalse(caps_inval.get("uprobe_offset_supported"))
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ NOTE: Ordinary unit tests NEVER require elevated privileges and run cleanly in a
 import json
 import os
 import platform
+import signal
 import struct
 import subprocess
 import tempfile
@@ -2058,13 +2059,20 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertIsNone(off)
         self.assertIn("fewer than 2 instructions", err)
 
-        # 4. Non-positive offset
-        bad_addrs = "00000500 <probe_target>:\n 500: nop\n 500: nop\n 504: ret\n"
+        # 4. Duplicate or non-increasing instruction addresses
+        dup_addrs = "00000500 <probe_target>:\n 500: nop\n 500: nop\n 504: ret\n"
         off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
-            bad_addrs, "probe_target", "x86_64"
+            dup_addrs, "probe_target", "x86_64"
         )
         self.assertIsNone(off)
-        self.assertIn("Non-positive instruction offset", err)
+        self.assertIn("Non-increasing or duplicate instruction address", err)
+
+        decreasing_addrs = "00000500 <probe_target>:\n 504: nop\n 500: nop\n 508: ret\n"
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            decreasing_addrs, "probe_target", "x86_64"
+        )
+        self.assertIsNone(off)
+        self.assertIn("Non-increasing or duplicate instruction address", err)
 
         # 5. Second instruction at or beyond function end (only 2 instructions total)
         two_inst_only = "00000500 <probe_target>:\n 500: nop\n 504: ret\n"
@@ -2074,20 +2082,74 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertIsNone(off)
         self.assertIn("at or beyond function end", err)
 
-        # 6. AArch64 not 4-byte aligned
-        unaligned_aarch64 = (
+        # 6. AArch64 not 4-byte aligned (offset or address)
+        unaligned_aarch64_off = (
             "00000500 <probe_target>:\n"
             " 500: nop\n"
             " 502: nop\n"
             " 508: ret\n"
         )
         off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
-            unaligned_aarch64, "probe_target", "aarch64"
+            unaligned_aarch64_off, "probe_target", "aarch64"
         )
         self.assertIsNone(off)
         self.assertIn("not 4-byte aligned", err)
 
-        # 7. Valid x86_64 disassembly (variable length instruction, e.g. 1-byte push)
+        unaligned_aarch64_addr = (
+            "00000500 <probe_target>:\n"
+            " 500: nop\n"
+            " 504: nop\n"
+            " 507: ret\n"
+        )
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            unaligned_aarch64_addr, "probe_target", "aarch64"
+        )
+        self.assertIsNone(off)
+        self.assertIn("not 4-byte aligned", err)
+
+        # 7. x86-64 offset exceeding maximum instruction length (15 bytes)
+        excessive_x86_off = (
+            "00000500 <probe_target>:\n"
+            " 500: nop\n"
+            " 520: mov %rsp,%rbp\n"
+            " 530: ret\n"
+        )
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            excessive_x86_off, "probe_target", "x86_64"
+        )
+        self.assertIsNone(off)
+        self.assertIn("exceeds maximum x86 instruction length", err)
+
+        # 8. Function boundary: ensure parser stops at next function header or section header
+        multi_func_disasm = (
+            "00000500 <probe_target>:\n"
+            " 500: 55 push %rbp\n"
+            " 501: 48 89 e5 mov %rsp,%rbp\n"
+            " 504: c3 ret\n"
+            "00000505 <next_function>:\n"
+            " 505: 90 nop\n"
+        )
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            multi_func_disasm, "probe_target", "x86_64"
+        )
+        self.assertEqual(off, 1)
+        self.assertIsNone(err)
+
+        section_disasm = (
+            "00000500 <probe_target>:\n"
+            " 500: 55 push %rbp\n"
+            " 501: 48 89 e5 mov %rsp,%rbp\n"
+            " 504: c3 ret\n"
+            "Disassembly of section .data:\n"
+            " 505: 90 nop\n"
+        )
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            section_disasm, "probe_target", "x86_64"
+        )
+        self.assertEqual(off, 1)
+        self.assertIsNone(err)
+
+        # 9. Valid x86_64 disassembly (variable length instruction, e.g. 1-byte push)
         valid_x86 = (
             "00000000000005fa <probe_target>:\n"
             " 5fa:\t55\tpush %rbp\n"
@@ -2100,7 +2162,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(off, 1)
         self.assertIsNone(err)
 
-        # 8. Valid AArch64 disassembly (4-byte instructions)
+        # 10. Valid AArch64 disassembly (4-byte instructions)
         valid_aarch64 = (
             "0000000000000500 <probe_target>:\n"
             " 500:\td503201f\tnop\n"
@@ -2113,13 +2175,13 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(off, 4)
         self.assertIsNone(err)
 
-        # 9. _find_second_instruction_offset with missing objdump
+        # 11. _find_second_instruction_offset with missing objdump
         with patch("shutil.which", return_value=None):
             off, err = EbpfEnvironmentChecker._find_second_instruction_offset("/bin/dummy", "sym", "x86_64")
             self.assertIsNone(off)
             self.assertIn("Disassembler 'objdump' not found", err)
 
-        # 10. _find_second_instruction_offset with objdump failure
+        # 12. _find_second_instruction_offset with objdump failure
         mock_objdump_fail = MagicMock(returncode=1, stderr="objdump: file format not recognized")
         with patch("shutil.which", return_value="/usr/bin/objdump"), \
              patch("subprocess.run", return_value=mock_objdump_fail):
@@ -2186,6 +2248,217 @@ class TestEbpfTracerUnit(unittest.TestCase):
             # Verify temporary files were cleaned up
             for fpath in created_files:
                 self.assertFalse(os.path.exists(fpath), f"Temporary file {fpath} was not cleaned up!")
+
+    def test_62_terminate_probe_process_modes(self):
+        """Scenario 62: Unit test _terminate_probe_process across all execution modes and edge cases."""
+        # 1. proc is None -> returns True immediately
+        self.assertTrue(EbpfEnvironmentChecker._terminate_probe_process(None, []))
+
+        # 2. proc is already terminated (poll() != None) -> returns True immediately
+        mock_done = MagicMock()
+        mock_done.poll.return_value = 0
+        self.assertTrue(EbpfEnvironmentChecker._terminate_probe_process(mock_done, []))
+        mock_done.kill.assert_not_called()
+
+        # 3. proc running without sudo (cmd_prefix=[]) -> calls os.killpg and proc.kill()
+        mock_running_nosudo = MagicMock()
+        mock_running_nosudo.pid = 4321
+        mock_running_nosudo.poll.side_effect = [None, 0]
+        with patch("os.killpg") as mock_killpg:
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_running_nosudo, [])
+            self.assertTrue(res)
+            mock_killpg.assert_called_once_with(4321, signal.SIGKILL)
+            mock_running_nosudo.kill.assert_called_once()
+            mock_running_nosudo.communicate.assert_called_once()
+
+        # 4. proc running with sudo (cmd_prefix=["sudo", "-n"]) -> calls subprocess.run with sudo -n kill
+        mock_running_sudo = MagicMock()
+        mock_running_sudo.pid = 5432
+        mock_running_sudo.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_running_sudo, ["sudo", "-n"])
+            self.assertTrue(res)
+            mock_run.assert_called_once_with(
+                ["sudo", "-n", "kill", "-KILL", "-5432"],
+                capture_output=True,
+                timeout=1.0,
+            )
+            mock_running_sudo.kill.assert_called_once()
+            mock_running_sudo.communicate.assert_called_once()
+
+        # 5. Process fails to terminate (mock poll() remains None) -> returns False
+        mock_stuck = MagicMock()
+        mock_stuck.pid = 9999
+        mock_stuck.poll.return_value = None
+        with patch("subprocess.run"):
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_stuck, ["sudo", "-n"])
+            self.assertFalse(res, "Should return False when process remains un-reaped")
+
+    def test_63_cache_invalidation_stat_keys(self):
+        """Scenario 63: Cache key comprehensively tracks path, mtime, size, and euid."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+        mock_disasm = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"", stdout=mock_disasm)
+
+        current_stat = {"mtime": 1000, "size": 2000}
+        current_euid = 1000
+
+        real_stat = os.stat
+        def dynamic_stat(p, *args, **kwargs):
+            if "bpftrace" in str(p):
+                m = MagicMock()
+                m.st_mtime_ns = current_stat["mtime"]
+                m.st_size = current_stat["size"]
+                return m
+            return real_stat(p, *args, **kwargs)
+
+        mock_proc = MagicMock(returncode=0)
+        mock_proc.communicate.return_value = ("PROBE_OFFSET_HIT\n", "")
+        mock_proc.pid = 1111
+
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat", side_effect=dynamic_stat), \
+             patch("os.geteuid", side_effect=lambda: current_euid), \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+
+            # 1. Initial probe: populates cache
+            res1 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=False
+            )
+            self.assertTrue(res1[0])
+            self.assertEqual(mock_popen.call_count, 1)
+
+            # 2. Identical stat and euid: reuses cache
+            res2 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=False
+            )
+            self.assertEqual(res2, res1)
+            self.assertEqual(mock_popen.call_count, 1)
+
+            # 3. mtime changes -> fresh probe
+            current_stat["mtime"] = 2000
+            res3 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=False
+            )
+            self.assertEqual(mock_popen.call_count, 2)
+
+            # 4. size changes -> fresh probe
+            current_stat["size"] = 3000
+            res4 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=False
+            )
+            self.assertEqual(mock_popen.call_count, 3)
+
+            # 5. euid changes -> fresh probe
+            current_euid = 0
+            res5 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=False
+            )
+            self.assertEqual(mock_popen.call_count, 4)
+
+            # 6. path changes -> fresh probe
+            res6 = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/local/bin/bpftrace", is_privileged=True, force_refresh=False
+            )
+            self.assertEqual(mock_popen.call_count, 5)
+
+            # 7. Invalidation clears cache
+            EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+            self.assertEqual(len(EbpfEnvironmentChecker._UPROBE_OFFSET_CACHE), 0)
+
+    def test_64_failure_path_error_classification_and_cleanup(self):
+        """Scenario 64: Verify truthful error classification across all failure branches without false positives."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+        mock_disasm = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"", stdout=mock_disasm)
+
+        real_stat = os.stat
+        def fake_stat(p, *args, **kwargs):
+            if "bpftrace" in str(p):
+                m = MagicMock()
+                m.st_mtime_ns = 9999
+                m.st_size = 8888
+                return m
+            return real_stat(p, *args, **kwargs)
+
+        # Branch A: bpftrace fails with permission error
+        mock_proc_perm = MagicMock(returncode=1)
+        mock_proc_perm.communicate.return_value = ("", "Operation not permitted")
+        mock_proc_perm.pid = 1111
+
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat", side_effect=fake_stat), \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen", return_value=mock_proc_perm):
+            res, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
+            )
+            self.assertFalse(res)
+            self.assertEqual(status, "UNKNOWN")
+            self.assertIn("permission error", reason.lower())
+
+        # Branch B: bpftrace exits 0 but PROBE_OFFSET_HIT was not observed
+        mock_proc_nohit = MagicMock(returncode=0)
+        mock_proc_nohit.communicate.return_value = ("Attaching 1 probe...\nProcess exited.\n", "")
+        mock_proc_nohit.pid = 2222
+
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat", side_effect=fake_stat), \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen", return_value=mock_proc_nohit):
+            res, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
+            )
+            self.assertFalse(res)
+            self.assertEqual(status, "UNKNOWN")
+            self.assertIn("without observing PROBE_OFFSET_HIT", reason)
+
+        # Branch C: bpftrace fails with generic non-zero exit code
+        mock_proc_err = MagicMock(returncode=127)
+        mock_proc_err.communicate.return_value = ("", "syntax error in probe specification")
+        mock_proc_err.pid = 3333
+
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat", side_effect=fake_stat), \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen", return_value=mock_proc_err):
+            res, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
+            )
+            self.assertFalse(res)
+            self.assertEqual(status, "UNKNOWN")
+            self.assertIn("exit code 127", reason)
+
+        # Branch D: bpftrace compiled without offset support
+        mock_proc_unsupp = MagicMock(returncode=255)
+        mock_proc_unsupp.communicate.return_value = ("", "compiled without (k|u)probe offset support")
+        mock_proc_unsupp.pid = 4444
+
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat", side_effect=fake_stat), \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen", return_value=mock_proc_unsupp):
+            res, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
+            )
+            self.assertFalse(res)
+            self.assertEqual(status, "UNSUPPORTED")
+            self.assertIn("compiled without (k|u)probe offset support", reason)
+
+        # Confirm that none of the failure outcomes were cached as SUPPORTED
+        for key, cached_val in EbpfEnvironmentChecker._UPROBE_OFFSET_CACHE.items():
+            self.assertFalse(cached_val[0], "Failure outcomes must never be cached as is_supported=True")
 
 
 if __name__ == "__main__":
