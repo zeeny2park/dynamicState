@@ -255,32 +255,85 @@ class EbpfEnvironmentChecker:
         cls._UPROBE_OFFSET_CACHE.clear()
 
     @classmethod
-    def _find_second_instruction_offset(cls, bin_path: str, sym_name: str, arch: str) -> int:
-        """Find a valid nonzero instruction boundary offset within sym_name."""
-        if arch in ("aarch64", "arm64"):
-            return 4
+    def _find_second_instruction_offset(
+        cls,
+        bin_path: str,
+        sym_name: str,
+        arch: str,
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Find a verified nonzero instruction boundary offset within sym_name.
+
+        Returns:
+            Tuple[Optional[int], Optional[str]]: (offset, error_reason)
+            If offset is None, capability detection must return UNKNOWN with error_reason.
+        """
+        if not AddressValidator.is_supported_architecture(arch):
+            return None, f"Unsupported architecture '{arch}' for instruction offset detection"
+
         objdump = shutil.which("objdump")
-        if objdump:
-            try:
-                res = subprocess.run([objdump, "-d", bin_path], capture_output=True, text=True, timeout=2.0)
-                if res.returncode == 0:
-                    in_sym = False
-                    base_addr = None
-                    for line in res.stdout.splitlines():
-                        if f"<{sym_name}>:" in line:
-                            in_sym = True
-                            continue
-                        if in_sym:
-                            m = re.match(r"^\s*([0-9a-fA-F]+):", line)
-                            if m:
-                                addr = int(m.group(1), 16)
-                                if base_addr is None:
-                                    base_addr = addr
-                                elif addr > base_addr:
-                                    return addr - base_addr
-            except Exception:
-                pass
-        return 4 if arch in ("aarch64", "arm64") else 1
+        if not objdump:
+            return None, "Disassembler 'objdump' not found in PATH to verify instruction boundaries"
+
+        try:
+            res = subprocess.run([objdump, "-d", bin_path], capture_output=True, text=True, timeout=2.0)
+            if res.returncode != 0:
+                err = res.stderr.strip() if res.stderr else f"exit code {res.returncode}"
+                return None, f"objdump failed while disassembling binary: {err}"
+        except Exception as e:
+            return None, f"Failed to execute objdump: {e}"
+
+        return cls._parse_disassembly_for_second_instruction(res.stdout, sym_name, arch)
+
+    @classmethod
+    def _parse_disassembly_for_second_instruction(
+        cls,
+        disasm_text: str,
+        sym_name: str,
+        arch: str,
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Parse objdump disassembly text to find the second instruction offset in sym_name."""
+        if not AddressValidator.is_supported_architecture(arch):
+            return None, f"Unsupported architecture '{arch}'"
+
+        lines = disasm_text.splitlines()
+        in_sym = False
+        inst_addrs: List[int] = []
+        sym_re = re.compile(rf"<({re.escape(sym_name)})>:")
+        other_sym_re = re.compile(r"^[0-9a-fA-F]+\s+<.*>:")
+        inst_re = re.compile(r"^\s*([0-9a-fA-F]+):")
+
+        for line in lines:
+            if sym_re.search(line):
+                in_sym = True
+                continue
+            elif in_sym and other_sym_re.search(line):
+                break
+            elif in_sym:
+                m = inst_re.match(line)
+                if m:
+                    inst_addrs.append(int(m.group(1), 16))
+
+        if not in_sym:
+            return None, f"Symbol '{sym_name}' not found in disassembly"
+        if len(inst_addrs) < 2:
+            return None, f"Symbol '{sym_name}' contains fewer than 2 instructions in disassembly"
+
+        base_addr = inst_addrs[0]
+        second_addr = inst_addrs[1]
+        max_addr = inst_addrs[-1]
+        offset = second_addr - base_addr
+
+        if offset <= 0:
+            return None, f"Non-positive instruction offset computed: {offset}"
+        if second_addr >= max_addr:
+            return None, f"Second instruction at offset 0x{offset:x} is at or beyond function end (max 0x{max_addr:x})"
+
+        norm_arch = arch.lower()
+        if norm_arch in ("aarch64", "arm64"):
+            if offset % 4 != 0:
+                return None, f"AArch64 instruction offset 0x{offset:x} is not 4-byte aligned"
+
+        return offset, None
 
     @classmethod
     def check_uprobe_offset_support(
@@ -326,6 +379,7 @@ class EbpfEnvironmentChecker:
         test_src = None
         test_bin = None
         arch = platform.machine().lower()
+        proc = None
 
         try:
             with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as tf:
@@ -354,10 +408,15 @@ class EbpfEnvironmentChecker:
                     cls._UPROBE_OFFSET_CACHE[cache_key] = res
                 return res
 
-            offset = cls._find_second_instruction_offset(test_bin, "probe_target", arch)
+            offset, err_reason = cls._find_second_instruction_offset(test_bin, "probe_target", arch)
+            if offset is None:
+                res = (False, "UNKNOWN", f"Instruction offset determination failed: {err_reason}")
+                if cache_key:
+                    cls._UPROBE_OFFSET_CACHE[cache_key] = res
+                return res
+
             probe_script = f"uprobe:{test_bin}:probe_target+{offset} {{ printf(\"PROBE_OFFSET_HIT\\n\"); exit(); }}"
             probe_cmd = cmd_prefix + [path, "-e", probe_script, "-c", test_bin]
-            proc = None
             try:
                 proc = subprocess.Popen(
                     probe_cmd,
@@ -408,6 +467,21 @@ class EbpfEnvironmentChecker:
         except Exception as e:
             return False, "UNKNOWN", f"Error detecting uprobe offset support: {e}"
         finally:
+            if proc and proc.poll() is None:
+                try:
+                    if cmd_prefix:
+                        subprocess.run(cmd_prefix + ["kill", "-KILL", f"-{proc.pid}"], capture_output=True, timeout=1.0)
+                    else:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.communicate(timeout=0.5)
+                except Exception:
+                    pass
             if test_src and os.path.exists(test_src):
                 try:
                     os.remove(test_src)
@@ -511,12 +585,14 @@ class EbpfEnvironmentChecker:
                 except Exception:
                     pass
 
-            if active_probe or (not force_refresh and cache_key and cache_key in cls._UPROBE_OFFSET_CACHE):
+            if active_probe:
                 offset_supported, offset_status, offset_reason = cls.check_uprobe_offset_support(
                     bpftrace_path=bpftrace_path,
                     is_privileged=is_privileged,
                     force_refresh=force_refresh,
                 )
+            elif not force_refresh and cache_key and cache_key in cls._UPROBE_OFFSET_CACHE:
+                offset_supported, offset_status, offset_reason = cls._UPROBE_OFFSET_CACHE[cache_key]
             else:
                 offset_status = "NOT_CHECKED"
                 offset_supported = False
@@ -655,9 +731,11 @@ class AddressValidator:
       - Instruction pointer (PC) MUST be 4-byte aligned (pc % 4 == 0) and CANNOT use TBI tags ((pc >> 56) == 0).
         Hardware instruction fetch forbids TBI tags; tag bits cause a translation fault.
       - Data pointers MAY use Top Byte Ignore (TBI) in userspace: bits [63:56] contain tag bits.
-        Data addresses must be normalized (untagged) before validation and memory access.
+        TBI is an architectural hardware capability of AArch64 (configured via TCR_EL1.TBI0 in the kernel),
+        not an assumption that every userspace process universally enables or generates tagged pointers.
+        When present, tagged data addresses are normalized (untagged) before range validation and process memory access.
     - Low memory: addresses < 0x1000 (page 0 / NULL page) are strictly rejected for runtime execution/data.
-    - Architecture fail-closed policy: unsupported architectures are strictly rejected (return False / None).
+    - Architecture fail-closed policy: unsupported architectures (e.g., riscv, mips, x86_32) are strictly rejected (return False / None).
     """
 
     PAGE_SIZE_MIN = 0x1000

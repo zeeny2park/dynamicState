@@ -1632,10 +1632,13 @@ class TestEbpfTracerUnit(unittest.TestCase):
             self.assertEqual(status_gcc_err, "UNKNOWN")
             self.assertIn("Failed to build probe test binary", reason_gcc_err)
 
-        # 5. Subprocess timeout -> UNKNOWN (never True)
-        mock_gcc_ok = MagicMock()
-        mock_gcc_ok.returncode = 0
-        mock_gcc_ok.stderr = b""
+        mock_disasm = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"", stdout=mock_disasm)
         with patch("shutil.which", return_value="/usr/bin/gcc"), \
              patch("os.stat") as mock_stat, \
              patch("subprocess.run", return_value=mock_gcc_ok), \
@@ -1782,7 +1785,13 @@ class TestEbpfTracerUnit(unittest.TestCase):
     def test_53_uprobe_offset_detector_real_execution_and_hit_verification(self):
         """Scenario 53: Verify active execution probe uses -c and verifies PROBE_OFFSET_HIT event."""
         EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
-        mock_gcc_ok = MagicMock(returncode=0, stderr=b"")
+        mock_disasm = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"", stdout=mock_disasm)
 
         # 1. Probe executes fixture, outputs PROBE_OFFSET_HIT, exits 0 -> SUPPORTED
         with patch("shutil.which", return_value="/usr/bin/gcc"), \
@@ -1829,7 +1838,13 @@ class TestEbpfTracerUnit(unittest.TestCase):
     def test_54_capability_caching_and_invalidation(self):
         """Scenario 54: Verify capability caching by binary stat and explicit cache invalidation."""
         EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
-        mock_gcc_ok = MagicMock(returncode=0, stderr=b"")
+        mock_disasm = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"", stdout=mock_disasm)
 
         with patch("shutil.which", return_value="/usr/bin/gcc"), \
              patch("os.stat") as mock_stat, \
@@ -1957,6 +1972,220 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertTrue(AddressValidator.is_valid_memory_address(addr_48bit_max - 3, 4, "aarch64", fifty_two_bit_va=False))
         self.assertFalse(AddressValidator.is_valid_memory_address(addr_52bit_val, 4, "aarch64", fifty_two_bit_va=False))
         self.assertTrue(AddressValidator.is_valid_memory_address(addr_52bit_val, 4, "aarch64", fifty_two_bit_va=True))
+
+    def test_58_capabilities_default_no_active_probe(self):
+        """Scenario 58: Default capabilities() call is inexpensive and does not compile fixtures or spawn probes."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+        backend = EbpfObservationBackend()
+        with patch.object(EbpfEnvironmentChecker, "check_uprobe_offset_support") as mock_active:
+            caps = backend.capabilities(active_probe=False)
+            mock_active.assert_not_called()
+            self.assertEqual(caps.get("uprobe_offset_status"), "NOT_CHECKED")
+            self.assertFalse(caps.get("uprobe_offset_supported"))
+
+    def test_59_force_refresh_propagation_and_cache_bypass(self):
+        """Scenario 59: probe_uprobe_offset propagates force_refresh and properly utilizes cache."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+        backend = EbpfObservationBackend()
+
+        mock_disasm = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"", stdout=mock_disasm)
+
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat") as mock_stat, \
+             patch("subprocess.run", return_value=mock_gcc_ok), \
+             patch("subprocess.Popen") as mock_popen:
+            mock_stat.return_value.st_mtime_ns = 5555
+            mock_stat.return_value.st_size = 4444
+            mock_proc = MagicMock(returncode=0)
+            mock_proc.communicate.return_value = ("PROBE_OFFSET_HIT\n", "")
+            mock_proc.pid = 4321
+            mock_popen.return_value = mock_proc
+
+            # 1. Initial active probe: executes and populates cache
+            res1 = backend.probe_uprobe_offset(force_refresh=False)
+            self.assertEqual(mock_popen.call_count, 1)
+            self.assertTrue(res1.get("uprobe_offset_supported"))
+            self.assertEqual(res1.get("uprobe_offset_status"), "SUPPORTED")
+
+            # 2. Subsequent default capabilities() query reuses cached result without active probe
+            caps = backend.capabilities(active_probe=False)
+            self.assertEqual(mock_popen.call_count, 1, "Default capabilities must reuse cache without executing probe")
+            self.assertTrue(caps.get("uprobe_offset_supported"))
+            self.assertEqual(caps.get("uprobe_offset_status"), "SUPPORTED")
+
+            # 3. probe_uprobe_offset(force_refresh=True) bypasses cache and re-runs probe
+            res2 = backend.probe_uprobe_offset(force_refresh=True)
+            self.assertEqual(mock_popen.call_count, 2, "force_refresh=True must re-run active probe")
+            self.assertTrue(res2.get("uprobe_offset_supported"))
+
+            # 4. invalidate_uprobe_offset_cache causes subsequent query to be NOT_CHECKED unless active_probe=True
+            EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+            caps_after_inval = backend.capabilities(active_probe=False)
+            self.assertEqual(caps_after_inval.get("uprobe_offset_status"), "NOT_CHECKED")
+            self.assertFalse(caps_after_inval.get("uprobe_offset_supported"))
+            self.assertEqual(mock_popen.call_count, 2, "Default capabilities after invalidation must not run probe")
+
+            # 5. Subsequent probe_uprobe_offset re-executes probe
+            res3 = backend.probe_uprobe_offset(force_refresh=False)
+            self.assertEqual(mock_popen.call_count, 3, "Active probe after invalidation must run probe")
+            self.assertTrue(res3.get("uprobe_offset_supported"))
+
+    def test_60_instruction_offset_selection_safe_fail_and_parsing(self):
+        """Scenario 60: Unit test instruction offset parsing and fail-safe boundaries without guessing."""
+        # 1. Unsupported architecture fails closed
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction("", "sym", "riscv")
+        self.assertIsNone(off)
+        self.assertIn("Unsupported architecture", err)
+
+        # 2. Missing symbol
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            "0000 <other_sym>:\n 0: nop\n", "probe_target", "x86_64"
+        )
+        self.assertIsNone(off)
+        self.assertIn("Symbol 'probe_target' not found", err)
+
+        # 3. Fewer than 2 instructions
+        single_inst = "00000500 <probe_target>:\n 500: c3 ret\n"
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            single_inst, "probe_target", "x86_64"
+        )
+        self.assertIsNone(off)
+        self.assertIn("fewer than 2 instructions", err)
+
+        # 4. Non-positive offset
+        bad_addrs = "00000500 <probe_target>:\n 500: nop\n 500: nop\n 504: ret\n"
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            bad_addrs, "probe_target", "x86_64"
+        )
+        self.assertIsNone(off)
+        self.assertIn("Non-positive instruction offset", err)
+
+        # 5. Second instruction at or beyond function end (only 2 instructions total)
+        two_inst_only = "00000500 <probe_target>:\n 500: nop\n 504: ret\n"
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            two_inst_only, "probe_target", "x86_64"
+        )
+        self.assertIsNone(off)
+        self.assertIn("at or beyond function end", err)
+
+        # 6. AArch64 not 4-byte aligned
+        unaligned_aarch64 = (
+            "00000500 <probe_target>:\n"
+            " 500: nop\n"
+            " 502: nop\n"
+            " 508: ret\n"
+        )
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            unaligned_aarch64, "probe_target", "aarch64"
+        )
+        self.assertIsNone(off)
+        self.assertIn("not 4-byte aligned", err)
+
+        # 7. Valid x86_64 disassembly (variable length instruction, e.g. 1-byte push)
+        valid_x86 = (
+            "00000000000005fa <probe_target>:\n"
+            " 5fa:\t55\tpush %rbp\n"
+            " 5fb:\t48 89 e5\tmov %rsp,%rbp\n"
+            " 5fe:\tc3\tret\n"
+        )
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            valid_x86, "probe_target", "x86_64"
+        )
+        self.assertEqual(off, 1)
+        self.assertIsNone(err)
+
+        # 8. Valid AArch64 disassembly (4-byte instructions)
+        valid_aarch64 = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        off, err = EbpfEnvironmentChecker._parse_disassembly_for_second_instruction(
+            valid_aarch64, "probe_target", "aarch64"
+        )
+        self.assertEqual(off, 4)
+        self.assertIsNone(err)
+
+        # 9. _find_second_instruction_offset with missing objdump
+        with patch("shutil.which", return_value=None):
+            off, err = EbpfEnvironmentChecker._find_second_instruction_offset("/bin/dummy", "sym", "x86_64")
+            self.assertIsNone(off)
+            self.assertIn("Disassembler 'objdump' not found", err)
+
+        # 10. _find_second_instruction_offset with objdump failure
+        mock_objdump_fail = MagicMock(returncode=1, stderr="objdump: file format not recognized")
+        with patch("shutil.which", return_value="/usr/bin/objdump"), \
+             patch("subprocess.run", return_value=mock_objdump_fail):
+            off, err = EbpfEnvironmentChecker._find_second_instruction_offset("/bin/dummy", "sym", "x86_64")
+            self.assertIsNone(off)
+            self.assertIn("objdump failed", err)
+
+    def test_61_subprocess_cleanup_and_tempfile_removal(self):
+        """Scenario 61: Subprocess lifecycle guarantees SIGKILL and tempfile cleanup on all exit paths."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+        mock_disasm = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"", stdout=mock_disasm)
+
+        created_files = []
+        real_named_temp_file = tempfile.NamedTemporaryFile
+
+        def tracking_tempfile(*args, **kwargs):
+            tf = real_named_temp_file(*args, **kwargs)
+            created_files.append(tf.name)
+            created_files.append(tf.name + ".bin")
+            return tf
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 9876
+        mock_proc.poll.return_value = None  # Process is still running when timeout occurs
+        mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["bpftrace"], timeout=2.0)
+
+        real_stat = os.stat
+        def fake_stat(p, *args, **kwargs):
+            if "bpftrace" in str(p):
+                mock_s = MagicMock()
+                mock_s.st_mtime_ns = 7777
+                mock_s.st_size = 1111
+                return mock_s
+            return real_stat(p, *args, **kwargs)
+
+        with patch("shutil.which", return_value="/usr/bin/gcc"), \
+             patch("os.stat", side_effect=fake_stat), \
+             patch("tempfile.NamedTemporaryFile", side_effect=tracking_tempfile), \
+             patch("subprocess.run", return_value=mock_gcc_ok) as mock_run, \
+             patch("subprocess.Popen", return_value=mock_proc), \
+             patch("os.killpg") as mock_killpg:
+
+            supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
+            )
+            self.assertFalse(supported)
+            self.assertEqual(status, "UNKNOWN")
+            self.assertIn("timed out", reason.lower())
+
+            # Verify process cleanup was triggered
+            kill_called = (
+                mock_killpg.called
+                or mock_proc.kill.called
+                or any("kill" in str(c) for c in mock_run.call_args_list)
+            )
+            self.assertTrue(kill_called, "Process termination was not triggered")
+
+            # Verify temporary files were cleaned up
+            for fpath in created_files:
+                self.assertFalse(os.path.exists(fpath), f"Temporary file {fpath} was not cleaned up!")
 
 
 if __name__ == "__main__":

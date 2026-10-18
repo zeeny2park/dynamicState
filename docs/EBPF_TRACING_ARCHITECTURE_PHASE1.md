@@ -500,7 +500,54 @@ Phase 1.9 resolves this contradiction by introducing `AddressValidator` with exp
 - **Conservative Ceiling Defaults**:
   - **x86-64**: Default userspace ceiling is 4-level canonical `0x00007FFFFFFFFFFF` (48-bit). 5-level paging ceiling `0x00FFFFFFFFFFFFFF` (57-bit) is admitted only when `five_level_paging=True` is explicitly passed.
   - **AArch64**: Default userspace ceiling is 48-bit VA `0x0000FFFFFFFFFFFF`. 52-bit VA ceiling `0x000FFFFFFFFFFFFF` (LVA) is admitted only when `fifty_two_bit_va=True` is explicitly passed.
-- **Arithmetic Overflow & Range Protection**: Memory reads validate that `addr + size - 1 >= addr` (no 64-bit integer wraparound), `size > 0 and size <= 65536`, and `addr >= 0x1000` (page 0 / NULL page protection). Negative load biases and underflow conditions (`runtime_pc < load_bias`) strictly return `None`.
+---
+
+## 15. Phase 1.11 Capability Probe Hardening, Safe Instruction Parsing, and Real-World Validation
+
+### 15.1 Complete `force_refresh` Propagation and Cache Lifecycle
+- **Propagated Call Chain**: `force_refresh: bool = False` is explicitly propagated across the entire capability discovery call chain:
+  `EbpfObservationBackend.probe_uprobe_offset(force_refresh=True)` $\rightarrow$
+  `EbpfObservationBackend.capabilities(active_probe=True, force_refresh=True)` $\rightarrow$
+  `EbpfEnvironmentChecker.check_prerequisites(active_probe=True, force_refresh=True)` $\rightarrow$
+  `EbpfEnvironmentChecker.check_uprobe_offset_support(force_refresh=True)`.
+- **Cache Invalidation Semantics**:
+  - `force_refresh=True` actively bypasses `_UPROBE_OFFSET_CACHE`, ensuring a fresh active probe executes and updates the cache.
+  - Default capability queries (`active_probe=False`) remain inexpensive (sub-millisecond) and never spawn compiler or probe subprocesses.
+  - When a cached probe result exists, `capabilities(active_probe=False)` reuses it without executing subprocesses.
+  - `EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()` explicitly purges cached probe results.
+
+### 15.2 Safe Instruction-Offset Selection Without Guesswork
+- **Pure Parser Helper**: `EbpfEnvironmentChecker._parse_disassembly_for_second_instruction` separates disassembly text parsing from command execution into a pure, unit-testable helper returning `Tuple[Optional[int], Optional[str]]`.
+- **Fail-Closed Verification**: Guessing arbitrary instruction offsets (e.g., `+1` on x86-64 or assuming +4 without validation) is eliminated. Offset determination strictly fails closed with status `UNKNOWN` if:
+  1. Target architecture is unsupported (`AddressValidator.is_supported_architecture(arch)` returns `False`).
+  2. Disassembler `objdump` is absent or fails execution.
+  3. The target symbol `probe_target` is not found in disassembly.
+  4. The fixture binary contains fewer than 2 instructions in `probe_target`.
+  5. The computed offset is $\le 0$ or the second instruction is at/beyond function end.
+  6. On AArch64/ARM64, the instruction offset is not 4-byte aligned (`offset % 4 != 0`).
+
+### 15.3 Guaranteed Subprocess Lifecycle and Resource Cleanup
+- **Process Group Termination & Reaping**:
+  - `Popen` runs with `start_new_session=True` (or under `sudo -n`).
+  - On timeout, error, or normal completion, the process group is reaped via `cmd_prefix + ["kill", "-KILL", f"-{proc.pid}"]` (or `os.killpg(proc.pid, signal.SIGKILL)`).
+  - Both `proc.kill()` fallback and `proc.communicate(timeout=0.5)` drain pipes and reap zombie processes.
+- **Guaranteed Temporary File Cleanup**:
+  - All temporary files (`.c` test sources and `.c.bin` compiled binaries) are registered and deleted in `finally:` blocks across all exit, exception, and timeout paths.
+
+### 15.4 Clarification of AArch64 TBI Architectural Capability vs Process Policy
+- **Architectural Policy**:
+  - AArch64 Top Byte Ignore (TBI) is an architectural hardware capability governed by kernel register `TCR_EL1.TBI0` (userspace translation control).
+  - TBI is not assumed to be universally active across all user processes. Rather, DynamicState defensively detects and normalizes tagged data pointers when tag bits [63:56] are present before range validation and before issuing `process_vm_readv` reads.
+  - Instruction pointers (PC) strictly forbid TBI tags because ARM64 hardware instruction fetch never ignores tag bits and raises a translation fault if tag bits are set.
+
+### 15.5 Real-Environment Host Verification Evidence
+- **Host Platform**: Linux 6.17.0-1014-oracle (Ubuntu 24.04 LTS), AArch64, Python 3.12, GCC 13.3.0, bpftrace v0.20.2.
+- **Active Probe Result on Host**:
+  - Command: `bpftrace -e 'uprobe:<bin>:probe_target+4 { printf("PROBE_OFFSET_HIT\n"); exit(); }' -c <bin>`
+  - Exit Code: `255`
+  - Diagnostic: `ERROR: Can't check if uprobe is in proper place (compiled without (k|u)probe offset support): <bin>:probe_target+4`
+  - Outcome: `uprobe_offset_status="UNSUPPORTED"`, `uprobe_offset_supported=False`.
+  - Truthful Representation: DynamicState accurately reports `uprobe_offset_status="UNSUPPORTED"` on this host, proving that capability detection truthfully reflects host toolchain limitations rather than reporting false capabilities or hanging on timeouts.
 
 
 
