@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
+import logging
 import os
 import platform
 import re
@@ -28,11 +29,13 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import uuid
 
 from .debug_image import BinaryIdentity, inspect_elf
 from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfSubprogram
+
+logger = logging.getLogger("dynamicstate.ebpf_tracer")
 
 
 # -----------------------------------------------------------------------------
@@ -250,8 +253,31 @@ class ProbeCleanupResult:
     success: bool
     child_reaped: bool
     group_terminated: bool
-    status: str                         # "CLEAN", "ALREADY_EXITED", "GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN"
+    status: str                         # "CLEAN", "ALREADY_EXITED", "GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN", "NO_PROCESS"
     details: str
+
+    def __post_init__(self) -> None:
+        # Invariant 1: success=True ONLY when child_reaped=True, group_terminated=True, and status is CLEAN or ALREADY_EXITED
+        if self.success:
+            if not (self.child_reaped and self.group_terminated and self.status in ("CLEAN", "ALREADY_EXITED")):
+                raise ValueError(
+                    f"Contradictory ProbeCleanupResult: success=True requires child_reaped=True, "
+                    f"group_terminated=True, and status in ('CLEAN', 'ALREADY_EXITED'), got {self}"
+                )
+        # Invariant 2: NO_PROCESS requires success=False, child_reaped=False, group_terminated=False
+        if self.status == "NO_PROCESS":
+            if self.success or self.child_reaped or self.group_terminated:
+                raise ValueError(
+                    f"Contradictory ProbeCleanupResult: NO_PROCESS requires success=False, "
+                    f"child_reaped=False, group_terminated=False, got {self}"
+                )
+        # Invariant 3: UNCERTAIN and REAP_FAILED cannot claim group_terminated=True or success=True
+        if self.status in ("UNCERTAIN", "REAP_FAILED"):
+            if self.group_terminated or self.success:
+                raise ValueError(
+                    f"Contradictory ProbeCleanupResult: status={self.status} cannot have "
+                    f"group_terminated=True or success=True, got {self}"
+                )
 
     def __bool__(self) -> bool:
         return self.success
@@ -429,6 +455,8 @@ class EbpfEnvironmentChecker:
         proc: Optional[subprocess.Popen],
         cmd_prefix: List[str],
         is_session_leader: Optional[bool] = None,
+        group_reap_timeout: float = 0.2,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> ProbeCleanupResult:
         """Safely terminate and reap a probe process and its entire process group.
 
@@ -439,15 +467,15 @@ class EbpfEnvironmentChecker:
 
         Returns:
             ProbeCleanupResult: Structured result reporting child_reaped, group_terminated,
-            and status ("CLEAN", "ALREADY_EXITED", "GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN").
+            and status ("CLEAN", "ALREADY_EXITED", "GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN", "NO_PROCESS").
             Evaluates as a boolean for truthiness (True on success).
         """
         if proc is None:
             return ProbeCleanupResult(
-                success=True,
-                child_reaped=True,
-                group_terminated=True,
-                status="CLEAN",
+                success=False,
+                child_reaped=False,
+                group_terminated=False,
+                status="NO_PROCESS",
                 details="No process to terminate",
             )
 
@@ -592,10 +620,10 @@ class EbpfEnvironmentChecker:
 
                 # Re-verify after kill
                 group_terminated, group_verify_err = cls._verify_process_group_state(pid, cmd_prefix)
-                if group_terminated is False and not getattr(os.killpg, "assert_called", None) and not getattr(subprocess.run, "assert_called", None):
-                    deadline = time.time() + 0.2
+                if group_terminated is False and group_reap_timeout > 0:
+                    deadline = time.time() + group_reap_timeout
                     while time.time() < deadline:
-                        time.sleep(0.01)
+                        sleep_fn(0.01)
                         term, err = cls._verify_process_group_state(pid, cmd_prefix)
                         if term is True:
                             group_terminated = True
@@ -700,10 +728,10 @@ class EbpfEnvironmentChecker:
 
         # Verify whether any descendant processes still linger in the process group using signal 0
         group_terminated, group_verify_err = cls._verify_process_group_state(pid, cmd_prefix)
-        if group_terminated is False and not getattr(os.killpg, "assert_called", None) and not getattr(subprocess.run, "assert_called", None):
-            deadline = time.time() + 0.2
+        if group_terminated is False and group_reap_timeout > 0:
+            deadline = time.time() + group_reap_timeout
             while time.time() < deadline:
-                time.sleep(0.01)
+                sleep_fn(0.01)
                 term, err = cls._verify_process_group_state(pid, cmd_prefix)
                 if term is True:
                     group_terminated = True
@@ -842,41 +870,49 @@ class EbpfEnvironmentChecker:
                 else:
                     res = (False, "UNKNOWN", f"bpftrace exited without observing PROBE_OFFSET_HIT event: {stdout.strip()}")
 
+                cleanup_res = cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
+                proc = None  # prevent duplicate termination in finally
+                if not cleanup_res:
+                    res = (res[0], res[1], f"{res[2]} [cleanup warning: {cleanup_res.status} - {cleanup_res.details}]")
+
                 # Only cache definitive supported or unsupported results; do not cache inconclusive UNKNOWN outcomes
                 if cache_key and res[1] in ("SUPPORTED", "UNSUPPORTED"):
                     cls._UPROBE_OFFSET_CACHE[cache_key] = res
                 return res
 
             except subprocess.TimeoutExpired:
-                reaped = cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
+                cleanup_res = cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
+                proc = None  # prevent duplicate termination in finally
                 return (
                     False,
                     "UNKNOWN",
-                    f"Probe execution check timed out after 3.0s without confirming event trigger (process reaped: {reaped})",
+                    f"Probe execution check timed out after 3.0s without confirming event trigger (process reaped: {cleanup_res})",
                 )
 
         except Exception as e:
             return False, "UNKNOWN", f"Error detecting uprobe offset support: {e}"
         finally:
-            cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
+            if proc is not None:
+                cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
+                proc = None
             if test_src and os.path.exists(test_src):
                 try:
                     os.remove(test_src)
-                except Exception:
+                except Exception as e1:
                     try:
                         if cmd_prefix:
                             subprocess.run(cmd_prefix + ["rm", "-f", test_src], capture_output=True, timeout=1.0)
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        logger.warning("Failed to remove probe test source file %s: %s / %s", test_src, e1, e2)
             if test_bin and os.path.exists(test_bin):
                 try:
                     os.remove(test_bin)
-                except Exception:
+                except Exception as e1:
                     try:
                         if cmd_prefix:
                             subprocess.run(cmd_prefix + ["rm", "-f", test_bin], capture_output=True, timeout=1.0)
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        logger.warning("Failed to remove probe test binary file %s: %s / %s", test_bin, e1, e2)
 
     @classmethod
     def check_prerequisites(

@@ -762,6 +762,59 @@ DynamicState structures test validation into four truthful tiers:
 - **GDB Oracle Isolation**:
   - GDB oracle evaluations run in dedicated, separate process invocations with separate binary copies, preventing ptrace conflicts with live eBPF tracing. Same-process dual-tracing parity is never claimed.
 
+---
+
+## 20. Phase 1.16 — Cleanup Contract Integrity & Production/Test Separation
+
+### 20.1 Invariant Integrity in `ProbeCleanupResult`
+`ProbeCleanupResult` is an immutable, frozen dataclass that enforces strict state-transition invariants at initialization time via `__post_init__`:
+1. **Success Requires Complete Termination**:
+   - `success=True` requires `child_reaped=True`, `group_terminated=True`, and `status in ("CLEAN", "ALREADY_EXITED")`.
+   - Any attempt to construct a `ProbeCleanupResult` with `success=True` while `child_reaped=False`, `group_terminated=False`, or an unverified/failure status (`UNCERTAIN`, `GROUP_KILL_FAILED`, `REAP_FAILED`, `NO_PROCESS`) immediately raises `ValueError`.
+2. **Dedicated Truthful `NO_PROCESS` Contract**:
+   - Calling cleanup functions when `proc is None` (e.g., when process creation failed or was skipped) previously returned `CLEAN` with `success=True` and `group_terminated=True`. This falsely claimed that a process group was verified terminated and absent from the operating system.
+   - Under Phase 1.16, `proc is None` strictly returns:
+     `ProbeCleanupResult(success=False, child_reaped=False, group_terminated=False, status="NO_PROCESS", details="No process to terminate")`.
+   - The invariant strictly enforces: if `status == "NO_PROCESS"`, then `success`, `child_reaped`, and `group_terminated` must all be `False`.
+3. **Uncertain and Reaping Failure Invariants**:
+   - If `status in ("UNCERTAIN", "REAP_FAILED")`, neither `group_terminated` nor `success` may be `True`.
+
+### 20.2 Complete Removal of Test-Framework Mock Introspection from Production Code
+- **Defect Identified**:
+  - Earlier iterations used `if not getattr(os.killpg, "assert_called", None) and not getattr(subprocess.run, "assert_called", None):` to bypass polling sleep loops during unit test mocking.
+  - This violated production-test separation by coupling core production logic to specific testing framework mocking internals (`unittest.mock.MagicMock.assert_called`).
+- **Clean Dependency Injection Solution**:
+  - All mock-specific attribute checks have been eliminated from `extractor/ebpf_tracer.py`.
+  - Replaced with narrow, deterministic dependency-injection parameters in `_terminate_probe_process`:
+    - `group_reap_timeout: float = 0.2`: specifies the polling duration for lingering descendants in the process group. Tests can set this to `0.0` for immediate evaluation without sleeping.
+    - `sleep_fn: Callable[[float], None] = time.sleep`: abstracts the time interval sleep, allowing deterministic test recording without wall-clock delays.
+  - Production code executes standard OS operations without inspecting whether functions are monkey-patched or wrapped.
+
+### 20.3 Truthful Cleanup Outcome Handling in Active Probing
+- **Preservation of Capability Truth**:
+  - `check_uprobe_offset_support()` evaluates kernel uprobe offset capability via active execution.
+  - If the probe executes and verifies `PROBE_OFFSET_HIT`, the kernel/toolchain capability is definitively confirmed (`is_supported=True, status="SUPPORTED"`).
+  - If subsequent process cleanup encounters an issue (e.g. `GROUP_KILL_FAILED`), the primary kernel capability is **not** falsified into `UNKNOWN` or `UNSUPPORTED`.
+  - Instead, the primary status is preserved while a structured cleanup warning is appended to the reason diagnostic:
+    `[cleanup warning: {status} - {details}]`.
+  - Callers receive accurate kernel capability facts while operations/monitoring systems are alerted to process lifecycle anomalies.
+- **Single-Termination Guarantee**:
+  - Once cleanup is executed in normal or timeout paths, `proc` is reset to `None`.
+  - The `finally:` block executes `_terminate_probe_process` only if `proc is not None`, preventing redundant cleanup invocations or spurious warnings.
+- **Robust Best-Effort Tempfile Removal**:
+  - Temporary C source and binary fixture files are deleted with standard `os.remove`, falling back to `sudo -n rm -f` if permissions require it.
+  - Failures to remove temporary files log a structured warning via `logger.warning` instead of crashing or masking the primary probe result.
+
+### 20.4 Deterministic Synchronization in Real OS Process Lifecycle Tests
+- **Elimination of Race Conditions**:
+  - `test_68` in `tests/test_ebpf_tracer.py` previously relied on an arbitrary `time.sleep(0.15)` to wait for descendant processes to spawn.
+  - In Phase 1.16, `test_68` uses a filesystem token (`gchild_ready.token` containing the grandchild PID) for deterministic inter-process synchronization.
+  - The test verifies:
+    1. Grandchild PID exists and shares the exact same process group: `os.getpgid(gchild_pid) == pgid`.
+    2. Real cleanup terminates both the direct child and grandchild.
+    3. `os.kill(gchild_pid, 0)` and `os.killpg(pgid, 0)` both raise `ProcessLookupError` (ESRCH), proving complete elimination of all lingering and zombie processes.
+
+
 
 
 

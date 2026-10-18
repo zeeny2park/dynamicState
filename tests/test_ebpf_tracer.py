@@ -2254,12 +2254,13 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
     def test_62_terminate_probe_process_modes(self):
         """Scenario 62: Unit test _terminate_probe_process across all execution modes and edge cases."""
-        # 0. proc is None -> returns CLEAN immediately
+        # 0. proc is None -> returns NO_PROCESS
         res_none = EbpfEnvironmentChecker._terminate_probe_process(None, [])
-        self.assertTrue(res_none)
-        self.assertEqual(res_none.status, "CLEAN")
-        self.assertTrue(res_none.child_reaped)
-        self.assertTrue(res_none.group_terminated)
+        self.assertFalse(res_none)
+        self.assertEqual(res_none.status, "NO_PROCESS")
+        self.assertFalse(res_none.child_reaped)
+        self.assertFalse(res_none.group_terminated)
+        self.assertIn("No process to terminate", res_none.details)
 
         # 1. Direct child reaped but group state unverified (e.g. non-session leader)
         mock_unverified = MagicMock()
@@ -2301,7 +2302,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 MagicMock(returncode=0, stderr="", stdout=""),
             ]
             res_desc = EbpfEnvironmentChecker._terminate_probe_process(
-                mock_exited_desc, ["sudo", "-n"], is_session_leader=True
+                mock_exited_desc, ["sudo", "-n"], is_session_leader=True, group_reap_timeout=0.0
             )
             self.assertFalse(res_desc)
             self.assertEqual(res_desc.status, "GROUP_KILL_FAILED")
@@ -2815,55 +2816,225 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
         # 7. Internal consistency invariant
         # success=True MUST imply both child_reaped=True and group_terminated=True
-        results = [r_success1, r_success2, r_diff_details, r_failed]
+        r_no_proc = ProbeCleanupResult(
+            success=False, child_reaped=False, group_terminated=False, status="NO_PROCESS", details="No process"
+        )
+        results = [r_success1, r_success2, r_diff_details, r_failed, r_no_proc]
         for r in results:
             if r.success:
                 self.assertTrue(r.child_reaped)
                 self.assertTrue(r.group_terminated)
                 self.assertIn(r.status, ("CLEAN", "ALREADY_EXITED"))
             else:
-                self.assertIn(r.status, ("GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN"))
+                self.assertIn(r.status, ("GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN", "NO_PROCESS"))
 
     def test_68_real_process_group_lifecycle_and_cleanup(self):
         """Scenario 68: Real operating-system process and process-group lifecycle cleanup test.
 
         Spawns a real process with start_new_session=True (which spawns a real child in its group),
+        uses a filesystem token for deterministic synchronization (avoiding sleep races),
         exercises _terminate_probe_process, and verifies that the entire process group is
         terminated with no surviving or zombie processes.
         """
         if not sys.platform.startswith("linux"):
             raise unittest.SkipTest("Requires Linux platform")
 
-        # Spawn a real process that owns its own process group/session and spawns a child
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); time.sleep(10)",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        pgid = proc.pid
-        time.sleep(0.15)  # Let subprocess spawn its child
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_file = os.path.join(tmpdir, "gchild_ready.token")
+            # Parent spawns grandchild that writes token_file containing its PID and sleeps
+            script = (
+                f"import os, subprocess, sys, time\n"
+                f"gchild = subprocess.Popen([sys.executable, '-c',\n"
+                f"    'import os, time; open(\"{token_file}\", \"w\").write(str(os.getpid())); time.sleep(30)'])\n"
+                f"time.sleep(30)\n"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            pgid = proc.pid
+            gchild_pid = None
+            try:
+                # Deterministic sync: wait for grandchild to write token file
+                deadline = time.time() + 4.0
+                while time.time() < deadline:
+                    if os.path.exists(token_file) and os.path.getsize(token_file) > 0:
+                        try:
+                            with open(token_file, "r") as f:
+                                gchild_pid = int(f.read().strip())
+                            break
+                        except Exception:
+                            pass
+                    time.sleep(0.01)
 
-        # Verify child is running and pgid matches its PID
-        self.assertIsNone(proc.poll())
-        self.assertEqual(os.getpgid(pgid), pgid)
+                self.assertIsNotNone(gchild_pid, "Grandchild did not signal readiness via token file")
 
-        # Exercise real cleanup
-        cleanup_res = EbpfEnvironmentChecker._terminate_probe_process(proc, [], is_session_leader=True)
+                # Verify child is running and pgid matches its PID, and grandchild shares the pgid
+                self.assertIsNone(proc.poll())
+                self.assertEqual(os.getpgid(pgid), pgid)
+                self.assertEqual(os.getpgid(gchild_pid), pgid)
 
-        # Verify cleanup outcome
-        self.assertTrue(cleanup_res.success)
-        self.assertTrue(cleanup_res.child_reaped)
-        self.assertTrue(cleanup_res.group_terminated)
-        self.assertEqual(cleanup_res.status, "CLEAN")
+                # Exercise real cleanup
+                cleanup_res = EbpfEnvironmentChecker._terminate_probe_process(proc, [], is_session_leader=True)
 
-        # Verify on real OS that process group is completely dead (os.killpg raises ESRCH)
-        with self.assertRaises(ProcessLookupError):
-            os.killpg(pgid, 0)
+                # Verify cleanup outcome
+                self.assertTrue(cleanup_res.success)
+                self.assertTrue(cleanup_res.child_reaped)
+                self.assertTrue(cleanup_res.group_terminated)
+                self.assertEqual(cleanup_res.status, "CLEAN")
+
+                # Verify on real OS that process group and grandchild are completely dead
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(gchild_pid, 0)
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(pgid, 0)
+            finally:
+                # Guaranteed process cleanup in case of test failure
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except Exception:
+                    pass
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
+
+    def test_69_no_mock_specific_branches_in_production(self):
+        """Scenario 69: Verify production code contains no test-framework-specific attributes or mocks."""
+        tracer_path = os.path.join(os.path.dirname(__file__), "..", "extractor", "ebpf_tracer.py")
+        with open(tracer_path, "r", encoding="utf-8") as f:
+            code = f.read()
+
+        # Production code must not introspect mock attributes like assert_called or import unittest.mock
+        self.assertNotIn("assert_called", code)
+        self.assertNotIn("unittest.mock", code)
+        self.assertNotIn("MagicMock", code)
+
+        # Test dependency injection for group_reap_timeout and sleep_fn
+        sleep_calls = []
+        mock_proc = MagicMock()
+        mock_proc.pid = 9911
+        mock_proc.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            # 1st call: kill -KILL -> 0
+            # 2nd call: kill -0 -> 0 (alive)
+            # (sleep_fn called)
+            # 3rd call: kill -0 -> 0 (still alive)
+            # (sleep_fn called)
+            # 4th call: kill -0 -> 1 (now gone ESRCH!)
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=1, stderr="kill: (-9911): No such process", stdout=""),
+            ]
+            res = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_proc,
+                ["sudo", "-n"],
+                is_session_leader=True,
+                group_reap_timeout=0.5,
+                sleep_fn=lambda dt: sleep_calls.append(dt),
+            )
+            self.assertTrue(res.success)
+            self.assertEqual(res.status, "CLEAN")
+            self.assertTrue(res.group_terminated)
+            self.assertEqual(len(sleep_calls), 2)
+            self.assertEqual(sleep_calls, [0.01, 0.01])
+
+    def test_70_probe_cleanup_result_invariant_enforcement(self):
+        """Scenario 70: Verify ProbeCleanupResult enforces all integrity invariants at construction time."""
+        # 1. success=True requires child_reaped=True
+        with self.assertRaises(ValueError) as ctx:
+            ProbeCleanupResult(success=True, child_reaped=False, group_terminated=True, status="CLEAN", details="")
+        self.assertIn("success=True requires child_reaped=True", str(ctx.exception))
+
+        # 2. success=True requires group_terminated=True
+        with self.assertRaises(ValueError) as ctx:
+            ProbeCleanupResult(success=True, child_reaped=True, group_terminated=False, status="CLEAN", details="")
+        self.assertIn("group_terminated=True", str(ctx.exception))
+
+        # 3. success=True requires status in ('CLEAN', 'ALREADY_EXITED')
+        for bad_status in ("GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN", "NO_PROCESS"):
+            with self.assertRaises(ValueError) as ctx:
+                ProbeCleanupResult(success=True, child_reaped=True, group_terminated=True, status=bad_status, details="")
+            self.assertIn("status in ('CLEAN', 'ALREADY_EXITED')", str(ctx.exception))
+
+        # 4. NO_PROCESS requires success=False, child_reaped=False, group_terminated=False
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=True, child_reaped=False, group_terminated=False, status="NO_PROCESS", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=False, child_reaped=True, group_terminated=False, status="NO_PROCESS", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=False, child_reaped=False, group_terminated=True, status="NO_PROCESS", details="")
+
+        # 5. UNCERTAIN and REAP_FAILED cannot have group_terminated=True or success=True
+        for invalid_status in ("UNCERTAIN", "REAP_FAILED"):
+            with self.assertRaises(ValueError):
+                ProbeCleanupResult(success=False, child_reaped=True, group_terminated=True, status=invalid_status, details="")
+            with self.assertRaises(ValueError):
+                ProbeCleanupResult(success=True, child_reaped=True, group_terminated=False, status=invalid_status, details="")
+
+    def test_71_cleanup_failure_propagation_in_offset_support(self):
+        """Scenario 71: Verify cleanup warnings are propagated without distorting kernel capability."""
+        # Mock successful probe compilation, execution, and event marker output
+        with patch.object(EbpfEnvironmentChecker, "_find_second_instruction_offset", return_value=(4, None)), \
+             patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
+             patch("os.stat") as mock_stat:
+            mock_stat.return_value = MagicMock(st_mtime_ns=12345, st_size=6789)
+
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate.return_value = ("PROBE_OFFSET_HIT\n", "")
+
+            # 1. When cleanup fails (e.g. GROUP_KILL_FAILED), primary capability is preserved with a warning
+            cleanup_failed = ProbeCleanupResult(
+                success=False,
+                child_reaped=True,
+                group_terminated=False,
+                status="GROUP_KILL_FAILED",
+                details="Failed to send SIGKILL to group",
+            )
+            with patch("subprocess.run") as mock_run, \
+                 patch("subprocess.Popen", return_value=mock_proc), \
+                 patch.object(EbpfEnvironmentChecker, "_terminate_probe_process", return_value=cleanup_failed) as mock_term:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+                supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                    bpftrace_path="/usr/bin/bpftrace",
+                    is_privileged=True,
+                    force_refresh=True,
+                )
+                self.assertTrue(supported)
+                self.assertEqual(status, "SUPPORTED")
+                self.assertIn("uprobe offset support verified via active execution (offset +4)", reason)
+                self.assertIn("[cleanup warning: GROUP_KILL_FAILED - Failed to send SIGKILL to group]", reason)
+                # Ensure _terminate_probe_process was called exactly once (no duplicate cleanup call in finally)
+                self.assertEqual(mock_term.call_count, 1)
+
+            # 2. When cleanup succeeds (CLEAN), no warning is appended
+            cleanup_clean = ProbeCleanupResult(
+                success=True,
+                child_reaped=True,
+                group_terminated=True,
+                status="CLEAN",
+                details="Process group terminated cleanly",
+            )
+            with patch("subprocess.run") as mock_run, \
+                 patch("subprocess.Popen", return_value=mock_proc), \
+                 patch.object(EbpfEnvironmentChecker, "_terminate_probe_process", return_value=cleanup_clean) as mock_term:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+                supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                    bpftrace_path="/usr/bin/bpftrace",
+                    is_privileged=True,
+                    force_refresh=True,
+                )
+                self.assertTrue(supported)
+                self.assertEqual(status, "SUPPORTED")
+                self.assertNotIn("cleanup warning", reason)
+                self.assertEqual(mock_term.call_count, 1)
 
 
 if __name__ == "__main__":
