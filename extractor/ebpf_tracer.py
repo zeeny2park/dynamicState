@@ -430,15 +430,26 @@ class EbpfEventDecoder:
     and isolates corrupted or truncated lines without raising exceptions.
     """
 
-    def __init__(self, target_pid: int, architecture: str, function_name: str, function_offset: Optional[int] = None):
+    def __init__(
+        self,
+        target_pid: int,
+        architecture: str,
+        function_name: str,
+        function_offset: Optional[int] = None,
+        load_bias: int = 0,
+        subprogram: Optional[Any] = None,
+        resolver: Optional[DwarfLocationResolverInterface] = None,
+    ):
         self.target_pid = target_pid
         self.architecture = architecture
         self.function_name = function_name
         self.function_offset = function_offset
+        self.load_bias = load_bias
+        self.subprogram = subprogram
         self.sequence_counter = 0
         self.malformed_count = 0
         self.lost_count = 0
-        self.resolver: DwarfLocationResolverInterface = Phase1DwarfLocationResolver()
+        self.resolver: DwarfLocationResolverInterface = resolver or Phase1DwarfLocationResolver()
 
     def decode_line(self, line: str) -> Optional[TraceEvent]:
         """Decode a single line of probe output. Returns None if ignored or malformed."""
@@ -605,10 +616,20 @@ class EbpfEventDecoder:
                         reason="Failed to parse return value",
                     )
 
-        # Local variables: explicitly mark as deferred in Phase 1
+        # Local variables: resolve via DWARF resolver if available
         local_vars: Dict[str, TraceValue] = {
-            "local_variables": self.resolver.resolve_variable(None, "locals", registers, frame_meta)
+            "local_variables": TraceValue(
+                name="local_variables",
+                status=STATUS_UNSUPPORTED_PHASE1,
+                reason="Arbitrary userspace local variable evaluation is deferred to Phase 2.",
+            )
         }
+        if self.subprogram and getattr(self.subprogram, "variables", None):
+            link_pc = (pc - self.load_bias) if (pc is not None and self.load_bias) else (pc if pc is not None else 0)
+            if hasattr(self.resolver, "link_time_address"):
+                self.resolver.link_time_address = link_pc
+            for v in self.subprogram.variables:
+                local_vars[v.name] = self.resolver.resolve_variable(self.subprogram, v.name, registers, frame_meta)
 
         return TraceEvent(
             sequence=self.sequence_counter,
@@ -887,12 +908,66 @@ class EbpfTracer:
             entry_only=entry_only,
         )
 
-        # 8. Launch probe process with guaranteed cleanup
+        # 8. Determine load bias and configure DWARF location resolver
+        load_bias = 0
+        target_subp = None
+        resolver: DwarfLocationResolverInterface = Phase1DwarfLocationResolver()
+        try:
+            search_path = debug_image if (debug_image and os.path.exists(debug_image)) else abs_binary
+            d_index = DwarfIndexer.get_index(search_path)
+            subps = d_index.subprograms_by_name.get(function_name, [])
+            if subps:
+                target_subp = subps[0]
+
+            # Calculate load bias for PIE binaries
+            if elf_info.elf_type == "ET_DYN":
+                try:
+                    with open(f"/proc/{pid}/maps", "r") as mf:
+                        for mline in mf:
+                            parts = mline.strip().split()
+                            if len(parts) >= 6 and (os.path.basename(abs_binary) in parts[5] or parts[5] == abs_binary):
+                                if parts[2] == "00000000" or "x" in parts[1]:
+                                    addr_range = parts[0]
+                                    start_vaddr = int(addr_range.split("-")[0], 16)
+                                    map_offset = int(parts[2], 16)
+                                    seg_vaddr = 0
+                                    for seg in elf_info.pt_loads:
+                                        if seg.get("p_offset") == map_offset:
+                                            seg_vaddr = seg.get("p_vaddr", 0)
+                                            break
+                                    load_bias = start_vaddr - seg_vaddr
+                                    break
+                except Exception:
+                    pass
+
+            def proc_mem_reader(addr: int, size: int) -> Optional[bytes]:
+                try:
+                    with open(f"/proc/{pid}/mem", "rb") as pf:
+                        pf.seek(addr)
+                        return pf.read(size)
+                except Exception:
+                    return None
+
+            from .dwarf_evaluator import Phase2DwarfLocationResolver
+            resolver = Phase2DwarfLocationResolver(
+                binary_identity=elf_info,
+                link_time_address=target_subp.low_pc if target_subp and target_subp.low_pc is not None else 0,
+                load_bias=load_bias,
+                architecture=arch,
+                memory_reader=proc_mem_reader,
+            )
+        except Exception:
+            pass
+
+        # 9. Launch probe process with guaranteed cleanup
         decoder = EbpfEventDecoder(
             target_pid=pid,
             architecture=arch,
             function_name=function_name,
             function_offset=func_offset,
+            load_bias=load_bias,
+            subprogram=target_subp,
+            resolver=resolver,
         )
 
         events: List[TraceEvent] = []
@@ -1095,6 +1170,7 @@ class EbpfTracer:
                 "attach_latency_ms": attach_latency_ms,
                 "total_trace_duration_ms": total_duration_ms,
                 "sample_count": len(events),
+                "load_bias": f"0x{load_bias:x}",
             },
             consistency_level="PROBE_POINT_EVENT",
             status=status,

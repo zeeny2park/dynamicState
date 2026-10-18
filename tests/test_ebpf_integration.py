@@ -518,7 +518,8 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         # Evaluate op_code with simulated frame pointer
         arch = platform.machine()
         fp = 0x7fffffffe000
-        ctx_debug = DwarfEvaluationContext(
+        # A. At function entry (low_pc): prologue not established -> UNAVAILABLE
+        ctx_entry = DwarfEvaluationContext(
             binary_identity=inspect_elf(self.debug_bin),
             subprogram=subp,
             link_time_address=subp.low_pc,
@@ -526,12 +527,26 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             variable_name="op_code",
             architecture=arch,
         )
-        res_unavail = DwarfEvaluator.evaluate(ctx_debug)
+        res_entry = DwarfEvaluator.evaluate(ctx_entry)
+        self.assertEqual(res_entry.status, EVAL_STATUS_UNAVAILABLE)
+        self.assertIn("entry", res_entry.reason.lower())
+
+        # B. Post-prologue (at frame_established_pc)
+        post_pc = subp.frame_established_pc or (subp.low_pc + 16)
+        ctx_post = DwarfEvaluationContext(
+            binary_identity=inspect_elf(self.debug_bin),
+            subprogram=subp,
+            link_time_address=post_pc,
+            frame_metadata=FrameMetadata(frame_pointer=fp),
+            variable_name="op_code",
+            architecture=arch,
+        )
+        res_unavail = DwarfEvaluator.evaluate(ctx_post)
         self.assertEqual(res_unavail.status, EVAL_STATUS_UNAVAILABLE)
         self.assertEqual(res_unavail.evaluated_address, fp + 16 - 116)
 
-        ctx_debug.memory_reader = lambda addr, sz: struct.pack("<i", 42)
-        res_obs = DwarfEvaluator.evaluate(ctx_debug)
+        ctx_post.memory_reader = lambda addr, sz: struct.pack("<i", 42)
+        res_obs = DwarfEvaluator.evaluate(ctx_post)
         self.assertEqual(res_obs.status, EVAL_STATUS_OBSERVED)
         self.assertEqual(res_obs.value, 42)
         self.assertEqual(res_obs.value_hex, "0x0000002a")

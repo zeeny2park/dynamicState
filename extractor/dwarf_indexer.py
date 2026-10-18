@@ -84,6 +84,8 @@ class DwarfSubprogram:
     is_external: bool = False
     is_declaration: bool = False
     specification_offset: Optional[int] = None
+    has_frame_pointer: Optional[bool] = None
+    frame_established_pc: Optional[int] = None
     variables: List[DwarfVariable] = field(default_factory=list)
 
     def get_variable(self, var_name: str) -> Optional[DwarfVariable]:
@@ -163,6 +165,80 @@ class DwarfIndex:
         return f"type_0x{t.die_offset:x}"
 
 
+_CFI_CACHE: Dict[str, Dict[int, Dict[str, Any]]] = {}
+
+
+def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[str, Any]]:
+    """Parse .eh_frame / .debug_frame CFI rules using readelf to detect frame pointer presence and establishment PC."""
+    abs_path = os.path.abspath(artifact_path)
+    if abs_path in _CFI_CACHE:
+        return _CFI_CACHE[abs_path]
+
+    cfi_map: Dict[int, Dict[str, Any]] = {}
+    try:
+        cmd = ["readelf", "--debug-dump=frames", abs_path]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            fp_reg_str = "r29" if arch in ("aarch64", "arm64") else "r6"
+            fde_re = re.compile(r"FDE\s+cie=[0-9a-fA-F]+\s+pc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)")
+            adv_re = re.compile(r"DW_CFA_advance_loc\w*:\s+\d+\s+to\s+([0-9a-fA-F]+)")
+            fp_rule_re = re.compile(rf"(?:DW_CFA_offset|DW_CFA_def_cfa_register):\s+{fp_reg_str}\b")
+
+            curr_low_pc: Optional[int] = None
+            curr_pc: Optional[int] = None
+            has_fp = False
+            est_pc: Optional[int] = None
+
+            for line in res.stdout.splitlines():
+                m_fde = fde_re.search(line)
+                if m_fde:
+                    if curr_low_pc is not None:
+                        cfi_map[curr_low_pc] = {
+                            "has_frame_pointer": has_fp,
+                            "frame_established_pc": est_pc,
+                        }
+                    curr_low_pc = int(m_fde.group(1), 16)
+                    curr_pc = curr_low_pc
+                    has_fp = False
+                    est_pc = None
+                    continue
+
+                if curr_low_pc is None:
+                    continue
+
+                if line.strip() == "" or "FDE" in line:
+                    cfi_map[curr_low_pc] = {
+                        "has_frame_pointer": has_fp,
+                        "frame_established_pc": est_pc,
+                    }
+                    curr_low_pc = None
+                    continue
+
+                m_adv = adv_re.search(line)
+                if m_adv:
+                    curr_pc = int(m_adv.group(1), 16)
+                if fp_rule_re.search(line):
+                    has_fp = True
+                    if est_pc is None:
+                        est_pc = curr_pc
+
+            if curr_low_pc is not None:
+                cfi_map[curr_low_pc] = {
+                    "has_frame_pointer": has_fp,
+                    "frame_established_pc": est_pc,
+                }
+    except Exception:
+        pass
+
+    _CFI_CACHE[abs_path] = cfi_map
+    return cfi_map
+
+
+def clear_cfi_cache() -> None:
+    """Clear cached CFI tables (used in test teardown)."""
+    _CFI_CACHE.clear()
+
+
 class DwarfIndexer:
     """Thread-safe indexer and cache manager for DWARF debug images."""
 
@@ -205,6 +281,8 @@ class DwarfIndexer:
 
     @classmethod
     def _parse_offset(cls, val: str) -> Optional[int]:
+        if "): " in val:
+            val = val.split("): ", 1)[1]
         m = re.search(r"<0?x?([0-9a-fA-F]+)>", val)
         if m:
             return int(m.group(1), 16)
@@ -215,6 +293,8 @@ class DwarfIndexer:
 
     @classmethod
     def _parse_addr(cls, val: str) -> Optional[int]:
+        if "): " in val:
+            val = val.split("): ", 1)[1]
         m = re.search(r"DW_OP_addr:\s*([0-9a-fA-F]+)", val)
         if m:
             return int(m.group(1), 16)
@@ -222,6 +302,8 @@ class DwarfIndexer:
 
     @classmethod
     def _parse_int(cls, val: str) -> int:
+        if "): " in val:
+            val = val.split("): ", 1)[1]
         m = re.search(r"DW_OP_plus_uconst\s*(\d+)", val)
         if m:
             return int(m.group(1))
@@ -438,6 +520,8 @@ class DwarfIndexer:
             i += 1
 
         # Second pass: parse variables and subprograms
+        cfi_table = parse_cfi_table(path, index.architecture)
+
         for die_idx, d in enumerate(dies):
             if d["tag"] == "DW_TAG_variable":
                 attrs = d["attrs"]
@@ -525,6 +609,12 @@ class DwarfIndexer:
                         sp_line = cls._parse_int(spec_die["attrs"].get("DW_AT_decl_line", "0")) or None
 
                 if name:
+                    subp_has_fp = None
+                    subp_est_pc = None
+                    if low_pc is not None and low_pc in cfi_table:
+                        subp_has_fp = cfi_table[low_pc].get("has_frame_pointer")
+                        subp_est_pc = cfi_table[low_pc].get("frame_established_pc")
+
                     subp = DwarfSubprogram(
                         die_offset=d["offset"],
                         name=name,
@@ -537,6 +627,8 @@ class DwarfIndexer:
                         is_external=is_ext,
                         is_declaration=is_decl,
                         specification_offset=spec_offset,
+                        has_frame_pointer=subp_has_fp,
+                        frame_established_pc=subp_est_pc,
                     )
                     # Extract parameters and local variables in subprogram subtree
                     j = die_idx + 1
@@ -552,7 +644,7 @@ class DwarfIndexer:
                             c_loc_list = None
                             if c_loc_raw:
                                 if "(location list)" in c_loc_raw:
-                                    m_off = re.search(r"0x([0-9a-fA-F]+)", c_loc_raw)
+                                    m_off = re.search(r"(?:^|:\s*|[\s(])(?:0x)?([0-9a-fA-F]+)\s+\(location list\)", c_loc_raw)
                                     if m_off:
                                         c_loc_list = int(m_off.group(1), 16)
                                 else:
