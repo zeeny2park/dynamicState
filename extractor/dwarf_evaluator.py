@@ -28,6 +28,7 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfSubprogram, DwarfType,
 from .ebpf_tracer import (
     STATUS_OBSERVED,
     STATUS_UNAVAILABLE,
+    AddressValidator,
     DwarfLocationResolverInterface,
     FrameMetadata,
     TraceValue,
@@ -585,7 +586,7 @@ class DwarfEvaluator:
                 reason="Subprogram uses unsupported complex CFI rule (DW_CFA_def_cfa_expression)",
             )
 
-        if context.link_time_address is None:
+        if context.link_time_address is None or context.link_time_address < 0:
             return DwarfLocationResult(
                 variable_name=var_name,
                 status=EVAL_STATUS_UNAVAILABLE,
@@ -868,6 +869,18 @@ class DwarfEvaluator:
         target_addr = reg_val + offset
         loc_desc = f"memory:0x{target_addr:x} ({reg_name}{'+' if offset >= 0 else ''}{offset})"
 
+        if not AddressValidator.is_valid_memory_address(target_addr, byte_size, context.architecture):
+            return DwarfLocationResult(
+                variable_name=var_name,
+                status=EVAL_STATUS_UNAVAILABLE,
+                location_type="memory",
+                location_description=loc_desc,
+                evaluated_address=target_addr,
+                type_name=type_name,
+                byte_size=byte_size,
+                reason=f"Target address 0x{target_addr:x} is outside valid userspace memory bounds",
+            )
+
         if context.memory_reader:
             try:
                 mem_bytes = context.memory_reader(target_addr, byte_size)
@@ -1127,6 +1140,18 @@ class DwarfEvaluator:
 
         var_addr = base_addr + fb_offset
         loc_desc = f"stack:0x{var_addr:x} ({base_desc}{'+' if fb_offset >= 0 else ''}{fb_offset})"
+
+        if not AddressValidator.is_valid_memory_address(var_addr, byte_size, context.architecture):
+            return DwarfLocationResult(
+                variable_name=var_name,
+                status=EVAL_STATUS_UNAVAILABLE,
+                location_type="stack_memory",
+                location_description=loc_desc,
+                evaluated_address=var_addr,
+                type_name=type_name,
+                byte_size=byte_size,
+                reason=f"Stack address 0x{var_addr:x} is outside valid userspace memory bounds",
+            )
 
         # If a memory reader is provided, read and unpack the value
         if context.memory_reader:

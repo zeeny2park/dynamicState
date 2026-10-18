@@ -209,6 +209,8 @@ class EbpfObservationBackend(ObservationBackend):
         )
 
     def capabilities(self) -> Dict[str, Any]:
+        from .ebpf_tracer import EbpfEnvironmentChecker
+        env = EbpfEnvironmentChecker.check_prerequisites()
         return {
             "mode": "EBPF_PROBE",
             "process_stop": False,
@@ -230,7 +232,9 @@ class EbpfObservationBackend(ObservationBackend):
             "arbitrary_instruction_offset_probing": False,
             "stack_locals_readable_at_entry": False,
             "locals_readable_at_return": False,
-            "uprobe_offset_status": "UNSUPPORTED",
+            "uprobe_offset_status": env.uprobe_offset_status,
+            "uprobe_offset_supported": env.supports_uprobe_offset,
+            "uprobe_offset_reason": env.uprobe_offset_reason,
             "dwarf_eval_scope": {
                 "supported_types": [
                     "int8", "int16", "int32", "int64",
@@ -250,12 +254,14 @@ class EbpfObservationBackend(ObservationBackend):
                 "arbitrary_instruction_offset_probing": False,
                 "stack_locals_readable_at_entry": False,
                 "locals_readable_at_return": False,
+                "uprobe_offset_status": env.uprobe_offset_status,
+                "uprobe_offset_supported": env.supports_uprobe_offset,
                 "value_sources": ["registers", "process_memory"],
                 "notes": (
                     "Stack-resident locals are UNAVAILABLE at function entry prior to prologue "
                     "frame establishment. At function return, locals are UNAVAILABLE due to frame "
-                    "destruction. Arbitrary instruction offset probing depends on host bpftrace "
-                    "probe offset support, which is disabled in this environment."
+                    f"destruction. Nonzero uprobe offset status: {env.uprobe_offset_status}. "
+                    "Arbitrary instruction-point local variable evaluation is deferred to Phase 2."
                 ),
             },
         }

@@ -24,7 +24,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import unittest
 from unittest.mock import patch
 
@@ -50,6 +50,56 @@ from extractor.ebpf_tracer import (
     TraceObservationSession,
 )
 from extractor.observation_backends import EbpfObservationBackend
+
+
+def validate_gdb_oracle_parity(
+    observed_locals: Dict[str, Any],
+    gdb_stdout: str,
+    required_vars: List[str],
+    iteration_key: Optional[Union[int, str]] = None,
+) -> Dict[str, int]:
+    """Parse GDB oracle output and strictly compare each variable's value against observed eBPF values.
+
+    Args:
+        observed_locals: Mapping of variable name to TraceValue (or int/float).
+        gdb_stdout: Raw stdout from GDB process containing PARITY_VAR:<var>=<val> lines.
+        required_vars: List of variable names required to be verified.
+        iteration_key: Optional iteration or correlation key for failure diagnostics.
+
+    Returns:
+        Dict[str, int]: Parsed GDB oracle values for each variable.
+
+    Raises:
+        AssertionError: If any required variable is missing in GDB output, if GDB output is malformed,
+                        or if any observed value fails to match the GDB oracle value.
+    """
+    gdb_values: Dict[str, int] = {}
+    for line in gdb_stdout.splitlines():
+        line = line.strip()
+        m = re.match(r"^PARITY_VAR:([a-zA-Z0-9_]+)=(-?\d+)", line)
+        if m:
+            gdb_values[m.group(1)] = int(m.group(2))
+
+    iter_desc = f" at iteration key {iteration_key}" if iteration_key is not None else ""
+
+    for vname in required_vars:
+        if vname not in gdb_values:
+            raise AssertionError(f"GDB oracle output missing required variable '{vname}'{iter_desc}")
+
+        if vname not in observed_locals:
+            raise AssertionError(f"Observed locals missing variable '{vname}'{iter_desc}")
+
+        obs_item = observed_locals[vname]
+        obs_val = getattr(obs_item, "value", obs_item)
+
+        gdb_val = gdb_values[vname]
+        if obs_val != gdb_val:
+            raise AssertionError(
+                f"Direct value mismatch between eBPF and GDB oracle for '{vname}'{iter_desc}: "
+                f"eBPF={obs_val} vs GDB={gdb_val}"
+            )
+
+    return gdb_values
 
 
 class TestEbpfFixtureIntegration(unittest.TestCase):
@@ -683,21 +733,12 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         gdb_proc = subprocess.run(gdb_cmd, capture_output=True, text=True)
         self.assertEqual(gdb_proc.returncode, 0, f"GDB execution failed: {gdb_proc.stderr}")
 
-        gdb_prints: Dict[str, int] = {}
-        for line in gdb_proc.stdout.splitlines():
-            line = line.strip()
-            m = re.match(r"^PARITY_VAR:([a-zA-Z0-9_]+)=(-?\d+)", line)
-            if m:
-                gdb_prints[m.group(1)] = int(m.group(2))
-
-        for vname in ("op_code", "input_val", "count"):
-            self.assertIn(vname, gdb_prints, f"GDB output missing variable '{vname}'")
-            self.assertEqual(
-                sample_entry.local_variables[vname].value,
-                gdb_prints[vname],
-                f"Direct value mismatch between eBPF and GDB oracle for '{vname}' at iteration op_code={observed_op}: "
-                f"eBPF={sample_entry.local_variables[vname].value} vs GDB={gdb_prints[vname]}"
-            )
+        validate_gdb_oracle_parity(
+            observed_locals=sample_entry.local_variables,
+            gdb_stdout=gdb_proc.stdout,
+            required_vars=["op_code", "input_val", "count"],
+            iteration_key=f"op_code={observed_op}",
+        )
 
     def test_14_compiled_fixture_evaluator_vs_gdb_oracle(self):
         """Scenario 14: Evaluator-versus-GDB oracle validation on real compiled fixture artifacts (-O0 and -O2).
@@ -756,26 +797,56 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             self.assertEqual(res.value, gdb_opt[vname], f"Value mismatch for {vname}: DynamicState={res.value} vs GDB={gdb_opt[vname]}")
 
     def test_15_live_ebpf_oracle_parity_negative_mismatch_fails(self):
-        """Scenario 15: Negative test verifying that parity assertions fail closed on value mismatch.
+        """Scenario 15: Negative test verifying that shared parity assertions fail closed on divergences.
 
-        Deliberately injects a corrupted/mismatched oracle value and verifies that the parity
-        comparison detects the divergence and raises AssertionError.
+        Verifies that validate_gdb_oracle_parity strictly detects:
+        1. Value mismatch between eBPF and GDB oracle.
+        2. Missing required variable in GDB output.
+        3. Missing variable in observed local variables map.
+        4. Malformed GDB output without PARITY_VAR tokens.
         """
-        simulated_ebpf_val = 42
-        corrupted_gdb_val = 999
+        # 1. Matching values pass
+        good_locals = {"op_code": 42, "input_val": 420, "count": 46}
+        good_gdb_stdout = (
+            "Breakpoint 1 at 0x1120\n"
+            "PARITY_VAR:op_code=42\n"
+            "PARITY_VAR:input_val=420\n"
+            "PARITY_VAR:count=46\n"
+        )
+        parsed = validate_gdb_oracle_parity(good_locals, good_gdb_stdout, ["op_code", "input_val", "count"])
+        self.assertEqual(parsed["op_code"], 42)
+        self.assertEqual(parsed["input_val"], 420)
+        self.assertEqual(parsed["count"], 46)
 
-        def verify_parity(ebpf_v: int, gdb_v: int, vname: str):
-            if ebpf_v != gdb_v:
-                raise AssertionError(f"Parity mismatch for '{vname}': eBPF={ebpf_v} vs GDB={gdb_v}")
-
-        # Identical values must pass
-        verify_parity(simulated_ebpf_val, 42, "op_code")
-
-        # Mismatched value must raise AssertionError
+        # 2. Value mismatch raises AssertionError
+        corrupted_gdb_stdout = (
+            "PARITY_VAR:op_code=999\n"
+            "PARITY_VAR:input_val=420\n"
+            "PARITY_VAR:count=46\n"
+        )
         with self.assertRaises(AssertionError) as ctx:
-            verify_parity(simulated_ebpf_val, corrupted_gdb_val, "op_code")
-        self.assertIn("Parity mismatch for 'op_code'", str(ctx.exception))
-        self.assertIn("42 vs GDB=999", str(ctx.exception))
+            validate_gdb_oracle_parity(good_locals, corrupted_gdb_stdout, ["op_code", "input_val", "count"], iteration_key="test_iter")
+        self.assertIn("Direct value mismatch between eBPF and GDB oracle for 'op_code'", str(ctx.exception))
+        self.assertIn("eBPF=42 vs GDB=999", str(ctx.exception))
+        self.assertIn("at iteration key test_iter", str(ctx.exception))
+
+        # 3. Missing variable in GDB output raises AssertionError
+        missing_var_gdb = "PARITY_VAR:op_code=42\n"
+        with self.assertRaises(AssertionError) as ctx_missing_gdb:
+            validate_gdb_oracle_parity(good_locals, missing_var_gdb, ["op_code", "input_val"])
+        self.assertIn("GDB oracle output missing required variable 'input_val'", str(ctx_missing_gdb.exception))
+
+        # 4. Missing variable in observed locals raises AssertionError
+        incomplete_locals = {"op_code": 42}
+        with self.assertRaises(AssertionError) as ctx_missing_local:
+            validate_gdb_oracle_parity(incomplete_locals, good_gdb_stdout, ["op_code", "input_val"])
+        self.assertIn("Observed locals missing variable 'input_val'", str(ctx_missing_local.exception))
+
+        # 5. Malformed GDB output raises AssertionError
+        malformed_gdb = "Program exited normally with code 0\nNo variables found."
+        with self.assertRaises(AssertionError) as ctx_malformed:
+            validate_gdb_oracle_parity(good_locals, malformed_gdb, ["op_code"])
+        self.assertIn("GDB oracle output missing required variable 'op_code'", str(ctx_malformed.exception))
 
     def test_16_instruction_point_offset_probing_feasibility(self):
         """Scenario 16: Feasibility diagnostic for nonzero instruction-offset probing.
@@ -811,9 +882,11 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             caps = backend.capabilities()
             self.assertFalse(caps["arbitrary_instruction_offset_probing"])
             self.assertFalse(caps["dwarf_eval_scope"]["arbitrary_instruction_offset_probing"])
-            self.assertEqual(caps["uprobe_offset_status"], "UNSUPPORTED")
+            self.assertIn(caps["uprobe_offset_status"], ("UNSUPPORTED", "SUPPORTED", "UNKNOWN"))
+            if "compiled without (k|u)probe offset support" in err:
+                self.assertEqual(caps["uprobe_offset_status"], "UNSUPPORTED")
+                self.assertFalse(caps["uprobe_offset_supported"])
         else:
-            # If supported in a future environment, verify that it attached successfully
             self.assertEqual(proc.returncode, 0)
 
 

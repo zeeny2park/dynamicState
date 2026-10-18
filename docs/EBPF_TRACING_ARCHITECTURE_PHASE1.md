@@ -412,4 +412,50 @@ Phase 1.8 establishes an explicit, transparent boundary across test evidence tie
   - `locals_readable_at_return: False`
 - **Technical Recommendation for Phase 2**: For in-function stack local variable observation at arbitrary instruction points, Phase 2 should transition from CLI bpftrace to a direct `libbpf` backend utilizing `bpf_program__attach_uprobe_opts()` with explicit function offset support, bypassing bpftrace build limitations.
 
+---
+
+## 13. Phase 1.9 eBPF Capability Truthfulness & Architecture-Correct Address Validation
+
+### 13.1 Resolution of the `0xc25695220d80` Contradiction & Code/Data Role Separation
+Phase 1.8 identified that the 47-bit ceiling `0x00007fffffffffff` rejected legitimate userspace instruction addresses on Linux AArch64 such as `0xc25695220d80`. However, the naive generic check `< 0x8000000000000000` introduced in Phase 1.8 was overly broad and architecturally flawed:
+1. It accepted unaligned instruction pointers on AArch64 (where all instructions must be 4-byte aligned).
+2. It accepted non-canonical addresses on x86-64 and invalid addresses with bits 48-62 set.
+3. It conflated code pointers (instruction pointers) with data pointers (memory access).
+
+Phase 1.9 resolves this contradiction by introducing `AddressValidator` with explicit architectural role separation:
+- **x86-64 vs AArch64 Userspace Conventions**:
+  - On **x86-64**, Linux userspace with 4-level paging spans `[0x1000, 0x00007fffffffffff]` (bit 47 is sign-extended; bit 47 must be 0 for user space). Under 5-level paging, userspace spans `[0x1000, 0x00ffffffffffffff]` (57-bit). Instruction alignment is 1-byte granular (variable-length x86 instructions).
+  - On **AArch64**, user and kernel spaces have independent base registers (TTBR0_EL1 and TTBR1_EL1). Standard 48-bit userspace spans `[0x1000, 0x0000ffffffffffff]`, and 52-bit userspace spans `[0x1000, 0x000fffffffffffff]`. The address `0xc25695220d80` (a 48-bit address with bit 47 set and ending in `0xd80`) is fully canonical, 4-byte aligned, and valid for AArch64 text, but invalid on 4-level paging x86-64.
+- **Instruction Pointer (PC) Validation**:
+  - On AArch64, `is_valid_instruction_pointer()` strictly enforces 4-byte alignment (`pc % 4 == 0`) and forbids Top Byte Ignore tags (`(pc >> 56) == 0`).
+  - Addresses `< 0x1000` (page 0 / NULL page) and kernel addresses (`>= 0x8000000000000000`) are rejected.
+- **Data / Memory Address Validation & Top Byte Ignore (TBI)**:
+  - On AArch64, Linux user space supports Top Byte Ignore (TBI) for data accesses (e.g. tagged pointers, HWASan, MTE). Bits [63:56] may contain metadata tags.
+  - `AddressValidator.untag_data_address()` strips bits [63:56] before bounds validation and passing to `process_vm_readv()`.
+  - Data memory addresses permit byte alignment for scalar variable dereference.
+
+### 13.2 Runtime-to-Link-Time PC Translation and Underflow Protection
+- **Underflow Detection**: `AddressValidator.compute_link_time_pc()` validates that `runtime_pc >= load_bias`. If `runtime_pc < load_bias`, underflow is detected and `None` is returned.
+- **Link-Time Range Validation**: Negative load biases or invalid runtime PCs immediately return `None`, propagating to `DwarfEvaluator` as `EVAL_STATUS_UNAVAILABLE` ("Link-time instruction address is unavailable") without evaluating against corrupted link addresses.
+- **PIE Offset Support**: Link-time instruction pointers for PIE binaries with low section offsets (`< 0x1000`, e.g. `0x720`) are accepted as valid link-time addresses (`is_link_time=True`), while runtime execution addresses strictly require `runtime_pc >= 0x1000`.
+
+### 13.3 Four-State Uprobe Offset Capability Detection & Process Group Safety
+- **Four Distinct States**: `EbpfEnvironmentChecker.check_uprobe_offset_support()` returns `(is_supported, status, reason)` distinguishing:
+  1. `SUPPORTED`: Probe attachment at `main+4` verified with return code 0.
+  2. `UNSUPPORTED`: Host bpftrace was compiled without `HAVE_BCC_UPROBE_OFFSET` (exit code 255).
+  3. `UNKNOWN`: Subprocess timed out, compiler missing, compilation error, or permission restriction.
+  4. `NOT_CHECKED`: bpftrace executable absent from PATH or privileges unavailable.
+- **Timeout Safety**: Timeouts never infer support. The child process group (`os.killpg`) is forcefully killed (`SIGKILL`) with guaranteed cleanup of temporary test binaries.
+- **Dynamic Backend Reporting**: `EbpfObservationBackend.capabilities()` queries `EbpfEnvironmentChecker` dynamically, reporting the actual verified host status rather than hardcoding `UNSUPPORTED`.
+- **Feature Separation**: Nonzero offset attachment capability (`uprobe_offset_status`) is kept strictly distinct from arbitrary instruction-point probing (`arbitrary_instruction_offset_probing: False`), ensuring DynamicState never falsely claims in-function local-variable observability.
+
+### 13.4 Unified GDB Oracle Parity Verification Protocol
+- **Shared Parity Function**: `tests/test_ebpf_integration.py` introduces `validate_gdb_oracle_parity()` as a shared verifier for both `test_13` (live eBPF vs GDB) and `test_15` (negative failure tests).
+- **Comprehensive Failure Modes**: The protocol strictly verifies:
+  1. Typed value parity between eBPF and GDB oracle (`eBPF == GDB`).
+  2. Detection of missing variables in GDB oracle output.
+  3. Detection of missing variables in observed local variable maps.
+  4. Detection of malformed GDB output without parsed parity markers.
+
+
 
