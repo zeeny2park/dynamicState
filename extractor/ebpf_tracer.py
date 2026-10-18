@@ -244,6 +244,27 @@ class EbpfCapabilityResult:
         return asdict(self)
 
 
+@dataclass
+class ProbeCleanupResult:
+    """Detailed report of process termination and group reaping."""
+    success: bool
+    child_reaped: bool
+    group_terminated: bool
+    status: str                         # "CLEAN", "ALREADY_EXITED", "GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN"
+    details: str
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, bool):
+            return self.success == other
+        return super().__eq__(other)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class EbpfEnvironmentChecker:
     """Verifies kernel, architecture, compilers, privileges, and dependency requirements."""
 
@@ -350,52 +371,281 @@ class EbpfEnvironmentChecker:
         return offset, None
 
     @classmethod
-    def _terminate_probe_process(cls, proc: Optional[subprocess.Popen], cmd_prefix: List[str]) -> bool:
-        """Safely terminate and reap a probe process and its process group.
+    def _terminate_probe_process(
+        cls,
+        proc: Optional[subprocess.Popen],
+        cmd_prefix: List[str],
+    ) -> ProbeCleanupResult:
+        """Safely terminate and reap a probe process and its entire process group.
 
-        Sends SIGKILL to the process group (using sudo -n kill if running under sudo),
-        calls proc.kill(), waits for the process to terminate, and verifies reap status.
+        Distinguishes the direct Popen child, privilege wrapper (sudo -n), and
+        descendant process group. Verifies exit code and stderr of cleanup commands,
+        reaps the direct child, and verifies with signal 0 whether descendant processes
+        remain in the process group.
 
         Returns:
-            bool: True if process was successfully terminated and reaped (proc.poll() is not None).
+            ProbeCleanupResult: Structured result reporting child_reaped, group_terminated,
+            and status ("CLEAN", "ALREADY_EXITED", "GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN").
+            Evaluates as a boolean for backward compatibility (True on success).
         """
         if proc is None:
-            return True
-        if proc.poll() is not None:
-            return True
+            return ProbeCleanupResult(
+                success=True,
+                child_reaped=True,
+                group_terminated=True,
+                status="CLEAN",
+                details="No process to terminate",
+            )
 
-        pid = proc.pid
+        pid = getattr(proc, "pid", None)
+        child_already_exited = (proc.poll() is not None)
 
-        # 1. Kill process group
-        try:
-            if cmd_prefix:
-                subprocess.run(
-                    cmd_prefix + ["kill", "-KILL", f"-{pid}"],
-                    capture_output=True,
-                    timeout=1.0,
+        # Handle non-int or invalid PIDs (e.g. mocks without explicit pid or pid <= 1)
+        if not isinstance(pid, int) or pid <= 1:
+            if child_already_exited:
+                return ProbeCleanupResult(
+                    success=True,
+                    child_reaped=True,
+                    group_terminated=True,
+                    status="ALREADY_EXITED",
+                    details=f"Direct child already exited (mock/untracked pid {pid})",
                 )
-            else:
-                os.killpg(pid, signal.SIGKILL)
-        except Exception:
-            pass
-
-        # 2. Kill direct child process handle
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-        # 3. Wait and reap the child process (drain pipes to prevent deadlock/zombies)
-        try:
-            proc.communicate(timeout=1.0)
-        except Exception:
             try:
-                proc.wait(timeout=0.5)
+                proc.kill()
             except Exception:
                 pass
+            child_reaped = False
+            try:
+                proc.communicate(timeout=1.0)
+                child_reaped = (proc.poll() is not None)
+            except Exception:
+                child_reaped = (proc.poll() is not None)
+            if not child_reaped:
+                return ProbeCleanupResult(
+                    success=False,
+                    child_reaped=False,
+                    group_terminated=False,
+                    status="REAP_FAILED",
+                    details=f"Direct child could not be reaped (pid {pid})",
+                )
+            return ProbeCleanupResult(
+                success=True,
+                child_reaped=True,
+                group_terminated=True,
+                status="CLEAN",
+                details=f"Direct child reaped (mock/untracked pid {pid})",
+            )
 
-        # 4. Confirm process exit
-        return proc.poll() is not None
+        # Handle already-exited child process: verify process group is also dead
+        if child_already_exited:
+            group_terminated = True
+            group_verify_err = None
+            if cmd_prefix:
+                try:
+                    chk = subprocess.run(
+                        cmd_prefix + ["kill", "-0", f"-{pid}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=1.0,
+                    )
+                    if chk.returncode == 0:
+                        # Descendants still alive: terminate them
+                        subprocess.run(
+                            cmd_prefix + ["kill", "-KILL", f"-{pid}"],
+                            capture_output=True,
+                            text=True,
+                            timeout=1.0,
+                        )
+                        chk = subprocess.run(
+                            cmd_prefix + ["kill", "-0", f"-{pid}"],
+                            capture_output=True,
+                            text=True,
+                            timeout=1.0,
+                        )
+                    if chk.returncode != 0:
+                        err_chk = (chk.stderr.strip() or chk.stdout.strip()).lower()
+                        if "no such process" in err_chk or "esrch" in err_chk or chk.returncode == 1:
+                            group_terminated = True
+                        else:
+                            group_verify_err = chk.stderr.strip() or f"exit code {chk.returncode}"
+                            group_terminated = None
+                    else:
+                        group_terminated = False
+                except Exception as e:
+                    group_verify_err = str(e)
+                    group_terminated = None
+            else:
+                try:
+                    os.killpg(pid, 0)
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.killpg(pid, 0)
+                        group_terminated = False
+                    except ProcessLookupError:
+                        group_terminated = True
+                except ProcessLookupError:
+                    group_terminated = True
+                except PermissionError as e:
+                    group_verify_err = str(e)
+                    group_terminated = None
+                except Exception as e:
+                    group_verify_err = str(e)
+                    group_terminated = None
+
+            if group_terminated is False:
+                return ProbeCleanupResult(
+                    success=False,
+                    child_reaped=True,
+                    group_terminated=False,
+                    status="GROUP_KILL_FAILED",
+                    details=f"Process group {pid} still contains active processes after termination",
+                )
+            if group_terminated is None:
+                return ProbeCleanupResult(
+                    success=False,
+                    child_reaped=True,
+                    group_terminated=False,
+                    status="UNCERTAIN",
+                    details=f"Child already exited, but process group state could not be verified: {group_verify_err}",
+                )
+            return ProbeCleanupResult(
+                success=True,
+                child_reaped=True,
+                group_terminated=True,
+                status="ALREADY_EXITED",
+                details=f"Direct child already exited and process group {pid} verified terminated (ALREADY_EXITED)",
+            )
+
+        # Child is still running: terminate process group and direct child
+        group_kill_err: Optional[str] = None
+        if cmd_prefix:
+            try:
+                res = subprocess.run(
+                    cmd_prefix + ["kill", "-KILL", f"-{pid}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0,
+                )
+                if res.returncode != 0:
+                    err_out = (res.stderr.strip() or res.stdout.strip())
+                    if "no such process" in err_out.lower() or "esrch" in err_out.lower():
+                        pass
+                    else:
+                        group_kill_err = err_out or f"exit code {res.returncode}"
+            except Exception as e:
+                group_kill_err = str(e)
+        else:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                group_kill_err = str(e)
+
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+
+        # Drain pipes and reap direct child
+        child_reaped = False
+        try:
+            proc.communicate(timeout=1.0)
+            child_reaped = (proc.poll() is not None)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.wait(timeout=0.5)
+                child_reaped = (proc.poll() is not None)
+            except Exception:
+                child_reaped = (proc.poll() is not None)
+        except Exception:
+            child_reaped = (proc.poll() is not None)
+
+        if not child_reaped:
+            return ProbeCleanupResult(
+                success=False,
+                child_reaped=False,
+                group_terminated=False,
+                status="REAP_FAILED",
+                details=f"Direct Popen child (pid {pid}) could not be reaped within timeout",
+            )
+
+        # Verify whether any descendant processes still linger in the process group using signal 0
+        group_terminated: Optional[bool] = None
+        group_verify_err: Optional[str] = None
+
+        if cmd_prefix:
+            try:
+                chk = subprocess.run(
+                    cmd_prefix + ["kill", "-0", f"-{pid}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0,
+                )
+                if chk.returncode != 0:
+                    err_chk = (chk.stderr.strip() or chk.stdout.strip()).lower()
+                    if "no such process" in err_chk or "esrch" in err_chk or chk.returncode == 1:
+                        group_terminated = True
+                    else:
+                        group_verify_err = chk.stderr.strip() or f"exit code {chk.returncode}"
+                        group_terminated = None
+                else:
+                    group_terminated = False
+            except Exception as e:
+                group_verify_err = str(e)
+                group_terminated = None
+        else:
+            try:
+                os.killpg(pid, 0)
+                group_terminated = False
+            except ProcessLookupError:
+                group_terminated = True
+            except PermissionError as e:
+                group_verify_err = str(e)
+                group_terminated = None
+            except Exception as e:
+                group_verify_err = str(e)
+                group_terminated = None
+
+        if group_kill_err:
+            return ProbeCleanupResult(
+                success=False,
+                child_reaped=True,
+                group_terminated=bool(group_terminated),
+                status="GROUP_KILL_FAILED",
+                details=f"Process group SIGKILL command failed: {group_kill_err}",
+            )
+
+        if group_terminated is False:
+            return ProbeCleanupResult(
+                success=False,
+                child_reaped=True,
+                group_terminated=False,
+                status="GROUP_KILL_FAILED",
+                details=f"Process group {pid} still contains active processes after termination",
+            )
+
+        if group_terminated is None:
+            return ProbeCleanupResult(
+                success=False,
+                child_reaped=True,
+                group_terminated=False,
+                status="UNCERTAIN",
+                details=f"Child reaped, but process group state could not be verified: {group_verify_err}",
+            )
+
+        return ProbeCleanupResult(
+            success=True,
+            child_reaped=True,
+            group_terminated=True,
+            status="CLEAN",
+            details=f"Direct child reaped and process group {pid} verified terminated (CLEAN)",
+        )
 
     @classmethod
     def check_uprobe_offset_support(

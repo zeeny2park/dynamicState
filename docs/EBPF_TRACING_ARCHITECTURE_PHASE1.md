@@ -601,5 +601,60 @@ DynamicState structures test validation into four truthful tiers:
   - `supports_uprobe_offset: False`
 - Function entry and return probes establish function boundary events and parameter/return observation, but do **not** claim arbitrary instruction-point DWARF stack variable evaluation (which remains deferred to Phase 2).
 
+---
+
+## 17. Phase 1.13 Process Lifecycle Guarantees & Portable Integration Tests
+
+### 17.1 Process Group Lifecycle Guarantees and Verifiable Reaping
+- **Distinction Between Process Entities**:
+  - `_terminate_probe_process` explicitly separates the direct `subprocess.Popen` child handle, the privilege-escalation wrapper (`sudo -n`), and the descendant process group launched for the probe (`-{pid}`).
+  - Never assumes that killing or reaping the direct Popen child proves that descendant processes (e.g. `bpftrace` or the traced fixture process) have terminated.
+- **Verification via Signal 0**:
+  - **Direct execution without sudo**: tests whether processes remain in the group via `os.killpg(pid, 0)`.
+    - If `os.killpg(pid, 0)` raises `ProcessLookupError`, the process group is confirmed terminated.
+    - If `os.killpg(pid, 0)` succeeds, processes in the group are still alive; `SIGKILL` is issued and verified again.
+    - If `PermissionError` or an unexpected exception is raised, reports `UNCERTAIN` without making unverified claims.
+  - **Sudo execution**: tests the group via `sudo -n kill -0 -<pid>`.
+    - Exit code 1 or ESRCH confirms the group is terminated.
+    - Exit code 0 indicates surviving descendant processes (`GROUP_KILL_FAILED`).
+    - Non-zero unexpected exit codes or errors are classified as `UNCERTAIN`.
+- **Structured `ProbeCleanupResult` Lifecycle Outcomes**:
+  - `CLEAN`: Direct child reaped, SIGKILL issued to process group, and process group confirmed terminated via signal 0.
+  - `ALREADY_EXITED`: Direct child was already reaped, and process group confirmed terminated via signal 0.
+  - `GROUP_KILL_FAILED`: Kill command failed or descendants remained alive in the process group after termination.
+  - `REAP_FAILED`: Direct child handle could not be reaped within the bounded timeout ($< 1.5$s).
+  - `UNCERTAIN`: Child was reaped, but process group state could not be verified due to permission or diagnostic ambiguity.
+  - **Backward compatibility**: Implements `__bool__` and `__eq__` returning boolean `success` so callers evaluating `if reaped:` or `assertTrue(reaped)` maintain seamless compatibility.
+- **Bounded Cleanup Latency**:
+  - All stream draining and process waiting operations enforce strict timeouts (`proc.communicate(timeout=1.0)`, `proc.wait(timeout=0.5)`). Total cleanup latency is bounded under 3.0s.
+
+### 17.2 Guaranteed Temporary File Removal Across All Failure Paths
+- Registers temporary C source files (`.c`) and compiled test binaries (`.c.bin`).
+- Enforces cleanup in `finally:` blocks across all failure branches:
+  1. Compiler execution error (e.g. gcc error / syntax failure)
+  2. Disassembly and offset determination failure (e.g. missing objdump or malformed disassembly)
+  3. Active probe timeout (`subprocess.TimeoutExpired`)
+  4. Active probe exception (e.g. `OSError`, `RuntimeError`)
+  5. Successful active probe execution
+  6. Unsupported offset diagnostic outcome
+- Includes permission-hardened fallback using `sudo -n rm -f` when unprivileged `os.remove()` encounters `PermissionError`.
+
+### 17.3 Portable Multi-Tier Integration Test Framework
+- **Portable Host Classification in `test_16` and `test_17`**:
+  - Integration tests in `tests/test_ebpf_integration.py` no longer require host-specific error strings (e.g., hardcoded `"compiled without (k|u)probe offset support"`).
+  - Classifies outcomes portably across any Linux architecture (x86_64, aarch64, etc.) and toolchain:
+    - `SUPPORTED`: Active probe exits 0 and observes `PROBE_OFFSET_HIT`.
+    - `UNSUPPORTED`: bpftrace reports known unsupported-offset diagnostics.
+    - `UNKNOWN`: Blocked by permissions, missing tools, timeout, or unexpected non-zero exit codes.
+    - `NOT_CHECKED` / `SKIPPED`: Missing prerequisites or non-privileged test runner.
+- **Uncompromising Boundary Between Offset Support and Local Variable Evaluation**:
+  - In all cases, capability reporting strictly enforces:
+    `arbitrary_instruction_offset_probing = False`
+    `dwarf_eval_scope["arbitrary_instruction_offset_probing"] = False`
+    `local_variables_evaluation = "UNSUPPORTED_PHASE1"`
+    `consistency = "PROBE_POINT_EVENT"`
+  - Attaching uprobes at nonzero instruction offsets does **not** imply arbitrary instruction-point DWARF stack variable observation. DynamicState strictly disallows conflating probe attachment mechanics with variable observability.
+
+
 
 

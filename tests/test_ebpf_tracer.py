@@ -62,6 +62,7 @@ from extractor.ebpf_tracer import (
     TraceEvent,
     TraceObservationSession,
     TraceValue,
+    ProbeCleanupResult,
     find_elf_symbols,
 )
 from extractor.observation_backends import EbpfObservationBackend, ObservationBackend
@@ -2251,48 +2252,129 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
     def test_62_terminate_probe_process_modes(self):
         """Scenario 62: Unit test _terminate_probe_process across all execution modes and edge cases."""
-        # 1. proc is None -> returns True immediately
-        self.assertTrue(EbpfEnvironmentChecker._terminate_probe_process(None, []))
+        # 1. proc is None -> returns CLEAN immediately
+        res_none = EbpfEnvironmentChecker._terminate_probe_process(None, [])
+        self.assertTrue(res_none)
+        self.assertEqual(res_none.status, "CLEAN")
+        self.assertTrue(res_none.child_reaped)
+        self.assertTrue(res_none.group_terminated)
 
-        # 2. proc is already terminated (poll() != None) -> returns True immediately
+        # 2. proc is already terminated (poll() != None, mock/untracked pid) -> returns ALREADY_EXITED
         mock_done = MagicMock()
         mock_done.poll.return_value = 0
-        self.assertTrue(EbpfEnvironmentChecker._terminate_probe_process(mock_done, []))
+        mock_done.pid = MagicMock()
+        res_done = EbpfEnvironmentChecker._terminate_probe_process(mock_done, [])
+        self.assertTrue(res_done)
+        self.assertEqual(res_done.status, "ALREADY_EXITED")
         mock_done.kill.assert_not_called()
 
-        # 3. proc running without sudo (cmd_prefix=[]) -> calls os.killpg and proc.kill()
+        # 3. proc already terminated with real integer pid -> verifies group with signal 0
+        mock_done_real = MagicMock()
+        mock_done_real.poll.return_value = 0
+        mock_done_real.pid = 4321
+        with patch("os.killpg") as mock_killpg:
+            mock_killpg.side_effect = ProcessLookupError("No such process")
+            res_done_real = EbpfEnvironmentChecker._terminate_probe_process(mock_done_real, [])
+            self.assertTrue(res_done_real)
+            self.assertEqual(res_done_real.status, "ALREADY_EXITED")
+            mock_killpg.assert_called_once_with(4321, 0)
+
+        # 4. proc running without sudo (cmd_prefix=[]) -> calls os.killpg SIGKILL then verifies with signal 0
         mock_running_nosudo = MagicMock()
         mock_running_nosudo.pid = 4321
         mock_running_nosudo.poll.side_effect = [None, 0]
         with patch("os.killpg") as mock_killpg:
+            mock_killpg.side_effect = [None, ProcessLookupError]
             res = EbpfEnvironmentChecker._terminate_probe_process(mock_running_nosudo, [])
             self.assertTrue(res)
-            mock_killpg.assert_called_once_with(4321, signal.SIGKILL)
+            self.assertEqual(res.status, "CLEAN")
+            self.assertTrue(res.child_reaped)
+            self.assertTrue(res.group_terminated)
+            self.assertEqual(mock_killpg.call_count, 2)
             mock_running_nosudo.kill.assert_called_once()
             mock_running_nosudo.communicate.assert_called_once()
 
-        # 4. proc running with sudo (cmd_prefix=["sudo", "-n"]) -> calls subprocess.run with sudo -n kill
+        # 5. proc running with sudo (cmd_prefix=["sudo", "-n"]) -> calls subprocess.run with kill -KILL then verifies with kill -0
         mock_running_sudo = MagicMock()
         mock_running_sudo.pid = 5432
         mock_running_sudo.poll.side_effect = [None, 0]
         with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=1, stderr="kill: (-5432): No such process", stdout=""),
+            ]
             res = EbpfEnvironmentChecker._terminate_probe_process(mock_running_sudo, ["sudo", "-n"])
             self.assertTrue(res)
-            mock_run.assert_called_once_with(
-                ["sudo", "-n", "kill", "-KILL", "-5432"],
-                capture_output=True,
-                timeout=1.0,
-            )
+            self.assertEqual(res.status, "CLEAN")
+            self.assertTrue(res.child_reaped)
+            self.assertTrue(res.group_terminated)
+            self.assertEqual(mock_run.call_count, 2)
             mock_running_sudo.kill.assert_called_once()
             mock_running_sudo.communicate.assert_called_once()
 
-        # 5. Process fails to terminate (mock poll() remains None) -> returns False
+        # 6. Process fails to terminate (mock poll() remains None) -> REAP_FAILED
         mock_stuck = MagicMock()
         mock_stuck.pid = 9999
         mock_stuck.poll.return_value = None
-        with patch("subprocess.run"):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
             res = EbpfEnvironmentChecker._terminate_probe_process(mock_stuck, ["sudo", "-n"])
             self.assertFalse(res, "Should return False when process remains un-reaped")
+            self.assertEqual(res.status, "REAP_FAILED")
+            self.assertFalse(res.child_reaped)
+
+        # 7. Sudo kill -KILL fails with error -> GROUP_KILL_FAILED
+        mock_kill_err = MagicMock()
+        mock_kill_err.pid = 6543
+        mock_kill_err.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stderr="kill: (-6543): Operation not permitted", stdout=""),
+                MagicMock(returncode=1, stderr="kill: (-6543): No such process", stdout=""),
+            ]
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_kill_err, ["sudo", "-n"])
+            self.assertFalse(res)
+            self.assertEqual(res.status, "GROUP_KILL_FAILED")
+            self.assertIn("Operation not permitted", res.details)
+
+        # 8. Sudo kill -0 returns 0 (processes lingering after SIGKILL) -> GROUP_KILL_FAILED
+        mock_linger = MagicMock()
+        mock_linger.pid = 7654
+        mock_linger.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=0, stderr="", stdout=""),
+            ]
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_linger, ["sudo", "-n"])
+            self.assertFalse(res)
+            self.assertEqual(res.status, "GROUP_KILL_FAILED")
+            self.assertIn("still contains active processes", res.details)
+
+        # 9. Group verification signal 0 encounters unexpected error -> UNCERTAIN
+        mock_uncertain = MagicMock()
+        mock_uncertain.pid = 8765
+        mock_uncertain.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=2, stderr="kill: invalid option", stdout=""),
+            ]
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_uncertain, ["sudo", "-n"])
+            self.assertFalse(res)
+            self.assertEqual(res.status, "UNCERTAIN")
+            self.assertIn("could not be verified", res.details)
+
+        # 10. Direct execution os.killpg(pid, 0) encounters PermissionError -> UNCERTAIN
+        mock_perm_nosudo = MagicMock()
+        mock_perm_nosudo.pid = 9876
+        mock_perm_nosudo.poll.side_effect = [None, 0]
+        with patch("os.killpg") as mock_killpg:
+            mock_killpg.side_effect = [None, PermissionError("Operation not permitted")]
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_perm_nosudo, [])
+            self.assertFalse(res)
+            self.assertEqual(res.status, "UNCERTAIN")
+            self.assertIn("could not be verified", res.details)
 
     def test_63_cache_invalidation_stat_keys(self):
         """Scenario 63: Cache key comprehensively tracks path, mtime, size, and euid."""
@@ -2459,6 +2541,125 @@ class TestEbpfTracerUnit(unittest.TestCase):
         # Confirm that none of the failure outcomes were cached as SUPPORTED
         for key, cached_val in EbpfEnvironmentChecker._UPROBE_OFFSET_CACHE.items():
             self.assertFalse(cached_val[0], "Failure outcomes must never be cached as is_supported=True")
+
+    def test_65_temporary_file_removal_all_branches(self):
+        """Scenario 65: Temporary C source and binary files are cleaned up across all execution and failure branches."""
+        mock_disasm = (
+            "0000000000000500 <probe_target>:\n"
+            " 500:\td503201f\tnop\n"
+            " 504:\td503201f\tnop\n"
+            " 508:\td65f03c0\tret\n"
+        )
+        mock_gcc_ok = MagicMock(returncode=0, stderr=b"", stdout=mock_disasm)
+        mock_gcc_err = MagicMock(returncode=1, stderr=b"gcc: fatal error: internal error", stdout="")
+
+        real_stat = os.stat
+        def fake_stat(p, *args, **kwargs):
+            if "bpftrace" in str(p):
+                m = MagicMock()
+                m.st_mtime_ns = 5555
+                m.st_size = 6666
+                return m
+            return real_stat(p, *args, **kwargs)
+
+        branches = [
+            # 1. Compiler error (gcc returncode != 0)
+            ("compiler_error", mock_gcc_err, None, None, "UNKNOWN"),
+            # 2. Disassembly / offset determination failure
+            ("disasm_failure", MagicMock(returncode=0, stderr=b"", stdout="no instructions"), None, None, "UNKNOWN"),
+            # 3. TimeoutExpired
+            ("timeout", mock_gcc_ok, subprocess.TimeoutExpired(cmd=["bpftrace"], timeout=2.0), None, "UNKNOWN"),
+            # 4. Probe exception (Popen raises exception)
+            ("exception", mock_gcc_ok, None, OSError("Exec format error"), "UNKNOWN"),
+            # 5. Normal success
+            ("success", mock_gcc_ok, ("PROBE_OFFSET_HIT\n", ""), None, "SUPPORTED"),
+            # 6. Unsupported diagnostic
+            ("unsupported", mock_gcc_ok, ("", "compiled without (k|u)probe offset support"), None, "UNSUPPORTED"),
+        ]
+
+        for branch_name, gcc_result, proc_comm, popen_exc, expected_status in branches:
+            EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+            created_files = []
+            real_named_temp_file = tempfile.NamedTemporaryFile
+
+            def tracking_tempfile(*args, **kwargs):
+                tf = real_named_temp_file(*args, **kwargs)
+                created_files.append(tf.name)
+                bin_name = tf.name + ".bin"
+                created_files.append(bin_name)
+                # Create the .bin file on disk so we can verify its deletion
+                with open(bin_name, "w") as bf:
+                    bf.write("ELF_TEST")
+                return tf
+
+            mock_proc = MagicMock()
+            mock_proc.pid = 9911
+            mock_proc.poll.return_value = 0
+            if isinstance(proc_comm, Exception):
+                mock_proc.communicate.side_effect = proc_comm
+            elif proc_comm is not None:
+                mock_proc.communicate.return_value = proc_comm
+                mock_proc.returncode = 0 if "PROBE_OFFSET_HIT" in proc_comm[0] else 255
+
+            def fake_popen(*args, **kwargs):
+                if popen_exc:
+                    raise popen_exc
+                return mock_proc
+
+            with patch("shutil.which", return_value="/usr/bin/gcc"), \
+                 patch("os.stat", side_effect=fake_stat), \
+                 patch("tempfile.NamedTemporaryFile", side_effect=tracking_tempfile), \
+                 patch("subprocess.run", return_value=gcc_result), \
+                 patch("subprocess.Popen", side_effect=fake_popen), \
+                 patch("os.killpg"):
+
+                supported, status, reason = EbpfEnvironmentChecker.check_uprobe_offset_support(
+                    bpftrace_path="/usr/bin/bpftrace", is_privileged=True, force_refresh=True
+                )
+                self.assertEqual(
+                    status,
+                    expected_status,
+                    f"Branch {branch_name} expected status {expected_status}, got {status} ({reason})",
+                )
+
+                # Verify all temporary files created on disk were cleaned up
+                self.assertGreater(len(created_files), 0, f"Branch {branch_name} created no tracked files")
+                for fpath in created_files:
+                    self.assertFalse(
+                        os.path.exists(fpath),
+                        f"Branch {branch_name} leaked temporary file {fpath}",
+                    )
+
+    def test_66_capabilities_offset_support_never_claims_arbitrary_instruction_probing(self):
+        """Scenario 66: Capability detection never conflates uprobe offset support with arbitrary instruction probing."""
+        EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
+
+        # Mock check_uprobe_offset_support to simulate a verified SUPPORTED environment
+        with patch.object(
+            EbpfEnvironmentChecker,
+            "check_uprobe_offset_support",
+            return_value=(True, "SUPPORTED", "uprobe offset support verified via active execution (offset +4)"),
+        ), patch("shutil.which", return_value="/usr/bin/bpftrace"), \
+           patch("os.geteuid", return_value=0), \
+           patch("platform.machine", return_value="aarch64"), \
+           patch("sys.platform", "linux"):
+
+            # 1. EbpfEnvironmentChecker.check_prerequisites
+            prereq = EbpfEnvironmentChecker.check_prerequisites(active_probe=True, force_refresh=True)
+            self.assertTrue(prereq.supports_uprobe_offset)
+            self.assertEqual(prereq.uprobe_offset_status, "SUPPORTED")
+
+            # 2. EbpfObservationBackend.capabilities
+            backend = EbpfObservationBackend()
+            caps = backend.capabilities(active_probe=True)
+            self.assertTrue(caps["uprobe_offset_supported"])
+            self.assertTrue(caps["supports_uprobe_offset"])
+            self.assertEqual(caps["uprobe_offset_status"], "SUPPORTED")
+            self.assertFalse(caps["arbitrary_instruction_offset_probing"])
+            self.assertFalse(caps["dwarf_eval_scope"]["arbitrary_instruction_offset_probing"])
+            self.assertFalse(caps["stack_locals_readable_at_entry"])
+            self.assertFalse(caps["locals_readable_at_return"])
+            self.assertEqual(caps["consistency"], "PROBE_POINT_EVENT")
 
 
 if __name__ == "__main__":

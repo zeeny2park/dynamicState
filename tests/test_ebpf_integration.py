@@ -856,10 +856,11 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         """Scenario 16: Feasibility diagnostic for nonzero instruction-offset probing.
 
         Attempts to attach bpftrace at an instruction offset within trace_target_function (low_pc + 4).
-        On host platforms where bpftrace was built without (k|u)probe offset support:
-        - Detects exit code 255 and blocker error 'compiled without (k|u)probe offset support'.
-        - Verifies that capability reporting marks arbitrary instruction offset probing as False.
-        - Documents the exact technical prerequisite for future Phase 2 backend selection.
+        Classifies evidence portably without assuming specific host build limitations:
+        - If exit code 0 and event triggered: SUPPORTED.
+        - If specific unsupported-offset error returned: UNSUPPORTED.
+        - If permission or unexpected error: UNKNOWN.
+        - Verifies that capability reporting never claims arbitrary instruction offset probing.
         """
         bpftrace_path = shutil.which("bpftrace")
         if not bpftrace_path:
@@ -872,59 +873,71 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         ]
         proc = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=3.0)
 
-        # 2. In this host environment, bpftrace lacks offset support
-        if proc.returncode != 0:
-            err = proc.stderr.strip() or proc.stdout.strip()
-            self.assertIn(
-                "compiled without (k|u)probe offset support",
-                err,
-                f"Unexpected bpftrace error on offset probe: returncode={proc.returncode}, output={err}"
-            )
+        # 2. Query capability backend with active probe
+        backend = EbpfObservationBackend()
+        caps = backend.capabilities(active_probe=True)
 
-            # Check that backend capability reflects verified reality
-            backend = EbpfObservationBackend()
-            caps = backend.capabilities(active_probe=True)
-            self.assertFalse(caps["arbitrary_instruction_offset_probing"])
-            self.assertFalse(caps["dwarf_eval_scope"]["arbitrary_instruction_offset_probing"])
-            self.assertIn(caps["uprobe_offset_status"], ("UNSUPPORTED", "SUPPORTED", "UNKNOWN"))
-            if "compiled without (k|u)probe offset support" in err:
+        # 3. In all cases, verify capability reporting never claims arbitrary instruction offset probing
+        self.assertFalse(caps["arbitrary_instruction_offset_probing"])
+        self.assertFalse(caps["dwarf_eval_scope"]["arbitrary_instruction_offset_probing"])
+        self.assertIn(caps["uprobe_offset_status"], ("SUPPORTED", "UNSUPPORTED", "UNKNOWN"))
+
+        # 4. Portable classification based on observed evidence
+        if proc.returncode == 0:
+            self.assertEqual(caps["uprobe_offset_status"], "SUPPORTED")
+            self.assertTrue(caps["uprobe_offset_supported"])
+        else:
+            err = (proc.stderr.strip() or proc.stdout.strip()).lower()
+            if "compiled without (k|u)probe offset support" in err or "offset is not supported" in err:
                 self.assertEqual(caps["uprobe_offset_status"], "UNSUPPORTED")
                 self.assertFalse(caps["uprobe_offset_supported"])
+            elif "permission" in err or "operation not permitted" in err:
+                self.assertEqual(caps["uprobe_offset_status"], "UNKNOWN")
+                self.assertFalse(caps["uprobe_offset_supported"])
+            else:
+                self.assertIn(caps["uprobe_offset_status"], ("UNSUPPORTED", "UNKNOWN"))
+                self.assertFalse(caps["uprobe_offset_supported"])
 
-            # Verify that subsequent default query (active_probe=False) uses cached outcome
-            caps_cached = backend.capabilities(active_probe=False)
-            self.assertEqual(caps_cached["uprobe_offset_status"], caps["uprobe_offset_status"])
-            self.assertEqual(caps_cached["uprobe_offset_supported"], caps["uprobe_offset_supported"])
-        else:
-            self.assertEqual(proc.returncode, 0)
+        # 5. Subsequent default query (active_probe=False) reuses cached outcome
+        caps_cached = backend.capabilities(active_probe=False)
+        self.assertEqual(caps_cached["uprobe_offset_status"], caps["uprobe_offset_status"])
+        self.assertEqual(caps_cached["uprobe_offset_supported"], caps["uprobe_offset_supported"])
 
     def test_17_real_host_active_uprobe_offset_probe(self):
         """Scenario 17: Live end-to-end execution of the active uprobe offset probe on real host.
 
         Validates the real active probe execution lifecycle (compilation, execution with -c,
         exit code inspection, process group cleanup, and temporary file removal).
-        On the local Ubuntu 24.04 Linux 6.17 AArch64 host:
-        - Confirms bpftrace reports 'compiled without (k|u)probe offset support'.
-        - Confirms capability status is truthfully set to UNSUPPORTED (supported=False).
-        - Confirms cache reuse on default queries and NOT_CHECKED after invalidation.
+        Classifies host evidence portably:
+        - Verifies truthful classification: SUPPORTED, UNSUPPORTED, or UNKNOWN with reason.
+        - Verifies that capability reporting never claims arbitrary instruction offset probing.
+        - Verifies cache reuse on default queries and NOT_CHECKED after invalidation.
         """
         backend = EbpfObservationBackend()
         EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
 
         # 1. Execute live active probe with force_refresh=True
         caps = backend.probe_uprobe_offset(force_refresh=True)
-        self.assertIn(caps.get("uprobe_offset_status"), ("SUPPORTED", "UNSUPPORTED", "UNKNOWN"))
-        self.assertIsInstance(caps.get("uprobe_offset_supported"), bool)
+        status = caps.get("uprobe_offset_status")
+        supported = caps.get("uprobe_offset_supported")
 
-        # On this specific host, bpftrace lacks offset support
-        if "compiled without (k|u)probe offset support" in (caps.get("uprobe_offset_reason") or ""):
-            self.assertEqual(caps.get("uprobe_offset_status"), "UNSUPPORTED")
-            self.assertFalse(caps.get("uprobe_offset_supported"))
+        self.assertIn(status, ("SUPPORTED", "UNSUPPORTED", "UNKNOWN"))
+        self.assertIsInstance(supported, bool)
+
+        # Consistent relationship between status and boolean flag
+        if status == "SUPPORTED":
+            self.assertTrue(supported)
+        else:
+            self.assertFalse(supported)
+
+        # Capability reporting never claims arbitrary instruction offset probing
+        self.assertFalse(caps.get("arbitrary_instruction_offset_probing"))
+        self.assertFalse(caps.get("dwarf_eval_scope", {}).get("arbitrary_instruction_offset_probing"))
 
         # 2. Subsequent default query reuses cache
         caps_cached = backend.capabilities(active_probe=False)
-        self.assertEqual(caps_cached.get("uprobe_offset_status"), caps.get("uprobe_offset_status"))
-        self.assertEqual(caps_cached.get("uprobe_offset_supported"), caps.get("uprobe_offset_supported"))
+        self.assertEqual(caps_cached.get("uprobe_offset_status"), status)
+        self.assertEqual(caps_cached.get("uprobe_offset_supported"), supported)
 
         # 3. Explicit invalidation resets status to NOT_CHECKED for default queries
         EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
