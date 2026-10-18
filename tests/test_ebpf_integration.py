@@ -855,23 +855,67 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
     def test_16_instruction_point_offset_probing_feasibility(self):
         """Scenario 16: Feasibility diagnostic for nonzero instruction-offset probing.
 
-        Attempts to attach bpftrace at an instruction offset within trace_target_function (low_pc + 4).
+        Attempts to attach bpftrace at a verified nonzero instruction offset within
+        trace_target_function and actually executes the fixture command.
+        Requires an explicit event marker (TEST16_OFFSET_HIT) and exit code 0 before
+        classifying the capability as SUPPORTED.
         Classifies evidence portably without assuming specific host build limitations:
-        - If exit code 0 and event triggered: SUPPORTED.
+        - If exit code 0 and event marker observed: SUPPORTED.
         - If specific unsupported-offset error returned: UNSUPPORTED.
-        - If permission or unexpected error: UNKNOWN.
+        - If permission, timeout, or unexpected error: UNKNOWN.
+        - Handles timeouts explicitly and verifies bounded process cleanup.
         - Verifies that capability reporting never claims arbitrary instruction offset probing.
         """
         bpftrace_path = shutil.which("bpftrace")
         if not bpftrace_path:
             raise unittest.SkipTest("bpftrace executable not found")
 
-        # 1. Attempt nonzero instruction offset uprobe via bpftrace
-        probe_cmd = [
-            "sudo", "-n", bpftrace_path,
-            "-e", f"uprobe:{self.debug_bin}:trace_target_function+4 {{ exit(); }}"
-        ]
-        proc = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=3.0)
+        arch = platform.machine().lower()
+        offset, err_reason = EbpfEnvironmentChecker._find_second_instruction_offset(
+            self.debug_bin, "trace_target_function", arch
+        )
+        if offset is None:
+            raise unittest.SkipTest(f"Instruction offset determination failed for trace_target_function: {err_reason}")
+
+        # 1. Start probe with dedicated event marker, executing the fixture command to actually trigger execution
+        probe_script = f"uprobe:{self.debug_bin}:trace_target_function+{offset} {{ printf(\"TEST16_OFFSET_HIT\\n\"); exit(); }}"
+        probe_cmd = ["sudo", "-n", bpftrace_path, "-e", probe_script, "-c", f"{self.debug_bin} --loop 1 --interval-ms 10"]
+
+        proc = None
+        evidence_status = "UNKNOWN"
+        evidence_reason = ""
+        try:
+            proc = subprocess.Popen(
+                probe_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            stdout, stderr = proc.communicate(timeout=4.0)
+            err = (stderr.strip() or stdout.strip())
+
+            # Require BOTH exit code 0 AND explicit uniquely identifiable event marker
+            if proc.returncode == 0 and "TEST16_OFFSET_HIT" in stdout:
+                evidence_status = "SUPPORTED"
+                evidence_reason = f"Active probe event marker TEST16_OFFSET_HIT observed at offset +{offset}"
+            elif "compiled without (k|u)probe offset support" in err.lower() or "offset is not supported" in err.lower():
+                evidence_status = "UNSUPPORTED"
+                evidence_reason = f"bpftrace reported offset probing unsupported: {err}"
+            elif "permission" in err.lower() or "operation not permitted" in err.lower():
+                evidence_status = "UNKNOWN"
+                evidence_reason = f"Permission error: {err}"
+            else:
+                evidence_status = "UNKNOWN"
+                evidence_reason = f"Execution failed without confirming probe event: code={proc.returncode}, output={err}"
+        except subprocess.TimeoutExpired:
+            # Handle timeout explicitly with bounded process cleanup
+            EbpfEnvironmentChecker._terminate_probe_process(proc, ["sudo", "-n"], is_session_leader=True)
+            evidence_status = "UNKNOWN"
+            evidence_reason = "Probe timed out after 4.0s without observing event marker"
+        finally:
+            if proc is not None:
+                EbpfEnvironmentChecker._terminate_probe_process(proc, ["sudo", "-n"], is_session_leader=True)
 
         # 2. Query capability backend with active probe
         backend = EbpfObservationBackend()
@@ -880,43 +924,39 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         # 3. In all cases, verify capability reporting never claims arbitrary instruction offset probing
         self.assertFalse(caps["arbitrary_instruction_offset_probing"])
         self.assertFalse(caps["dwarf_eval_scope"]["arbitrary_instruction_offset_probing"])
-        self.assertIn(caps["uprobe_offset_status"], ("SUPPORTED", "UNSUPPORTED", "UNKNOWN"))
+        self.assertEqual(caps["consistency"], "PROBE_POINT_EVENT")
 
-        # 4. Portable classification based on observed evidence
-        if proc.returncode == 0:
-            self.assertEqual(caps["uprobe_offset_status"], "SUPPORTED")
+        # 4. Independent execution evidence must agree with backend capability classification
+        self.assertEqual(
+            caps["uprobe_offset_status"],
+            evidence_status,
+            f"Backend reported status {caps['uprobe_offset_status']} does not match independent execution evidence {evidence_status} ({evidence_reason})",
+        )
+        if evidence_status == "SUPPORTED":
             self.assertTrue(caps["uprobe_offset_supported"])
         else:
-            err = (proc.stderr.strip() or proc.stdout.strip()).lower()
-            if "compiled without (k|u)probe offset support" in err or "offset is not supported" in err:
-                self.assertEqual(caps["uprobe_offset_status"], "UNSUPPORTED")
-                self.assertFalse(caps["uprobe_offset_supported"])
-            elif "permission" in err or "operation not permitted" in err:
-                self.assertEqual(caps["uprobe_offset_status"], "UNKNOWN")
-                self.assertFalse(caps["uprobe_offset_supported"])
-            else:
-                self.assertIn(caps["uprobe_offset_status"], ("UNSUPPORTED", "UNKNOWN"))
-                self.assertFalse(caps["uprobe_offset_supported"])
+            self.assertFalse(caps["uprobe_offset_supported"])
 
-        # 5. Subsequent default query (active_probe=False) reuses cached outcome
+        # 5. Subsequent default query (active_probe=False)
         caps_cached = backend.capabilities(active_probe=False)
-        self.assertEqual(caps_cached["uprobe_offset_status"], caps["uprobe_offset_status"])
-        self.assertEqual(caps_cached["uprobe_offset_supported"], caps["uprobe_offset_supported"])
+        if evidence_status in ("SUPPORTED", "UNSUPPORTED"):
+            self.assertEqual(caps_cached["uprobe_offset_status"], evidence_status)
+            self.assertEqual(caps_cached["uprobe_offset_supported"], caps["uprobe_offset_supported"])
+        else:
+            self.assertEqual(caps_cached["uprobe_offset_status"], "NOT_CHECKED")
+            self.assertFalse(caps_cached["uprobe_offset_supported"])
 
     def test_17_real_host_active_uprobe_offset_probe(self):
         """Scenario 17: Live end-to-end execution of the active uprobe offset probe on real host.
 
         Validates the real active probe execution lifecycle (compilation, execution with -c,
         exit code inspection, process group cleanup, and temporary file removal).
-        Classifies host evidence portably:
-        - Verifies truthful classification: SUPPORTED, UNSUPPORTED, or UNKNOWN with reason.
-        - Verifies that capability reporting never claims arbitrary instruction offset probing.
-        - Verifies cache reuse on default queries and NOT_CHECKED after invalidation.
+        Separates capability detection from cache assertions and invalidation.
         """
         backend = EbpfObservationBackend()
         EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
 
-        # 1. Execute live active probe with force_refresh=True
+        # Step 1: Execute live active probe with force_refresh=True
         caps = backend.probe_uprobe_offset(force_refresh=True)
         status = caps.get("uprobe_offset_status")
         supported = caps.get("uprobe_offset_supported")
@@ -927,6 +967,7 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         # Consistent relationship between status and boolean flag
         if status == "SUPPORTED":
             self.assertTrue(supported)
+            self.assertIn("verified via active execution", caps.get("uprobe_offset_reason", ""))
         else:
             self.assertFalse(supported)
 
@@ -934,12 +975,16 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
         self.assertFalse(caps.get("arbitrary_instruction_offset_probing"))
         self.assertFalse(caps.get("dwarf_eval_scope", {}).get("arbitrary_instruction_offset_probing"))
 
-        # 2. Subsequent default query reuses cache
+        # Step 2: Test cache reuse separately from initial detection
         caps_cached = backend.capabilities(active_probe=False)
-        self.assertEqual(caps_cached.get("uprobe_offset_status"), status)
-        self.assertEqual(caps_cached.get("uprobe_offset_supported"), supported)
+        if status in ("SUPPORTED", "UNSUPPORTED"):
+            self.assertEqual(caps_cached.get("uprobe_offset_status"), status)
+            self.assertEqual(caps_cached.get("uprobe_offset_supported"), supported)
+        else:
+            self.assertEqual(caps_cached.get("uprobe_offset_status"), "NOT_CHECKED")
+            self.assertFalse(caps_cached.get("uprobe_offset_supported"))
 
-        # 3. Explicit invalidation resets status to NOT_CHECKED for default queries
+        # Step 3: Test explicit cache invalidation separately
         EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
         caps_inval = backend.capabilities(active_probe=False)
         self.assertEqual(caps_inval.get("uprobe_offset_status"), "NOT_CHECKED")

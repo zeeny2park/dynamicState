@@ -2376,6 +2376,66 @@ class TestEbpfTracerUnit(unittest.TestCase):
             self.assertEqual(res.status, "UNCERTAIN")
             self.assertIn("could not be verified", res.details)
 
+        # 11. Child already exited, but descendants remain alive in process group
+        mock_exited_desc = MagicMock()
+        mock_exited_desc.pid = 4455
+        mock_exited_desc.poll.return_value = 0  # Child exited
+        with patch("subprocess.run") as mock_run:
+            # 1st call: kill -0 -> 0 (descendants alive)
+            # 2nd call: kill -KILL -> 0 (sent SIGKILL)
+            # 3rd call: kill -0 -> 0 (descendants STILL alive after SIGKILL)
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=0, stderr="", stdout=""),
+            ]
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_exited_desc, ["sudo", "-n"])
+            self.assertFalse(res)
+            self.assertEqual(res.status, "GROUP_KILL_FAILED")
+            self.assertFalse(res.group_terminated)
+            self.assertTrue(res.child_reaped)
+            self.assertIn("still contains active processes", res.details)
+
+        # 12. Race condition: child exits between poll and group-kill; group-kill reports ESRCH (no such process)
+        mock_race = MagicMock()
+        mock_race.pid = 5566
+        mock_race.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            # 1st call: kill -KILL -> returns ESRCH ("no such process")
+            # 2nd call: kill -0 -> returns ESRCH ("no such process")
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stderr="kill: (-5566): No such process", stdout=""),
+                MagicMock(returncode=1, stderr="kill: (-5566): No such process", stdout=""),
+            ]
+            res = EbpfEnvironmentChecker._terminate_probe_process(mock_race, ["sudo", "-n"])
+            self.assertTrue(res)
+            self.assertEqual(res.status, "CLEAN")
+            self.assertTrue(res.group_terminated)
+
+        # 13. Child process is NOT a session leader: avoids collateral group signaling
+        mock_nonsession = MagicMock()
+        mock_nonsession.pid = 6677
+        mock_nonsession.poll.side_effect = [None, 0]
+        with patch("os.killpg") as mock_killpg:
+            res = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_nonsession, [], is_session_leader=False
+            )
+            self.assertTrue(res)
+            self.assertEqual(res.status, "CLEAN")
+            mock_killpg.assert_not_called()  # Did NOT signal parent process group
+            mock_nonsession.kill.assert_called_once()
+
+        # 14. Invalid PIDs: None, string, negative, PID 1
+        for invalid_pid in [None, "invalid_pid", -10, 0, 1]:
+            mock_invalid = MagicMock()
+            mock_invalid.pid = invalid_pid
+            mock_invalid.poll.return_value = 0
+            with patch("os.killpg") as mock_killpg:
+                res = EbpfEnvironmentChecker._terminate_probe_process(mock_invalid, [])
+                self.assertTrue(res)
+                self.assertEqual(res.status, "ALREADY_EXITED")
+                mock_killpg.assert_not_called()
+
     def test_63_cache_invalidation_stat_keys(self):
         """Scenario 63: Cache key comprehensively tracks path, mtime, size, and euid."""
         EbpfEnvironmentChecker.invalidate_uprobe_offset_cache()
@@ -2660,6 +2720,53 @@ class TestEbpfTracerUnit(unittest.TestCase):
             self.assertFalse(caps["stack_locals_readable_at_entry"])
             self.assertFalse(caps["locals_readable_at_return"])
             self.assertEqual(caps["consistency"], "PROBE_POINT_EVENT")
+
+    def test_67_probe_cleanup_result_contract_and_equality(self):
+        """Scenario 67: Unit test ProbeCleanupResult equality, boolean contract, and serialization."""
+        r_success1 = ProbeCleanupResult(
+            success=True, child_reaped=True, group_terminated=True, status="CLEAN", details="all good"
+        )
+        r_success2 = ProbeCleanupResult(
+            success=True, child_reaped=True, group_terminated=True, status="CLEAN", details="all good"
+        )
+        r_diff_details = ProbeCleanupResult(
+            success=True, child_reaped=True, group_terminated=True, status="CLEAN", details="different"
+        )
+        r_failed = ProbeCleanupResult(
+            success=False, child_reaped=True, group_terminated=False, status="GROUP_KILL_FAILED", details="failed"
+        )
+
+        # 1. Instance equality (same fields -> True)
+        self.assertEqual(r_success1, r_success2)
+        self.assertNotEqual(r_success1, r_diff_details)
+        self.assertNotEqual(r_success1, r_failed)
+
+        # 2. Boolean backward-compatibility comparisons
+        self.assertTrue(r_success1 == True)
+        self.assertTrue(True == r_success1)
+        self.assertFalse(r_success1 == False)
+        self.assertFalse(False == r_success1)
+
+        self.assertTrue(r_failed == False)
+        self.assertTrue(False == r_failed)
+        self.assertFalse(r_failed == True)
+        self.assertFalse(True == r_failed)
+
+        # 3. Truthiness via __bool__
+        self.assertTrue(bool(r_success1))
+        self.assertFalse(bool(r_failed))
+
+        # 4. Incompatible type comparison returns False without raising
+        self.assertFalse(r_success1 == "arbitrary string")
+        self.assertFalse(r_success1 == None)
+        self.assertFalse(r_success1 == 42)
+
+        # 5. Serialization to dict
+        d = r_success1.to_dict()
+        self.assertEqual(d["status"], "CLEAN")
+        self.assertTrue(d["success"])
+        self.assertTrue(d["child_reaped"])
+        self.assertTrue(d["group_terminated"])
 
 
 if __name__ == "__main__":

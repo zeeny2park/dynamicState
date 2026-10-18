@@ -655,6 +655,54 @@ DynamicState structures test validation into four truthful tiers:
     `consistency = "PROBE_POINT_EVENT"`
   - Attaching uprobes at nonzero instruction offsets does **not** imply arbitrary instruction-point DWARF stack variable observation. DynamicState strictly disallows conflating probe attachment mechanics with variable observability.
 
+---
+
+## 18. Phase 1.14 Process Cleanup Correctness & Evidence-Based Integration Tests
+
+### 18.1 Verifiable Process Cleanup Guarantees & Non-Zero Ambiguity Elimination
+- **What Process Cleanup Success Guarantees**:
+  `ProbeCleanupResult.success` is strictly `True` only when all of the following conditions are simultaneously met:
+  1. The direct `subprocess.Popen` child process has been fully reaped (`child_reaped == True` and `proc.poll() is not None`), ensuring no zombie process remains.
+  2. The process group has been verified absent (`group_terminated == True`) via explicit signal 0 inspection returning ESRCH (`no such process`), ensuring no orphaned descendants linger.
+  3. No error occurred during process group SIGKILL issuance.
+  4. The cleanup status is verified as either `CLEAN` or `ALREADY_EXITED`.
+- **Elimination of False Generic Exit Code 1 Inferences**:
+  - A generic non-zero exit code from `sudo` or `kill -0` is **never** treated as proof of process termination.
+  - `_verify_process_group_state` requires verified ESRCH (`no such process`) diagnostics.
+  - If signal 0 returns `Operation not permitted` (EPERM), password required, command not found, timeout, or ambiguous text, status is classified as `UNCERTAIN` and `success` is `False`. The process group is never represented as terminated when verification is inconclusive.
+- **Session Leader and Process Group Safety**:
+  - `_terminate_probe_process` inspects process group semantics (`os.getpgid`).
+  - If a child process was not spawned in its own session (`is_session_leader == False` or sharing caller's PGID), collateral process group signaling (`-pid`) is bypassed to prevent signaling unrelated processes or the calling test runner.
+- **POSIX procps Argument Disambiguation (`--`)**:
+  - All process group commands explicitly include `--` before negative PGID arguments (e.g. `["kill", "-KILL", "--", f"-{pid}"]` and `["kill", "-0", "--", f"-{pid}"]`), preventing procps `kill` from misinterpreting negative process group IDs as unrecognized command-line options.
+
+### 18.2 Evidence-Based Uprobe Integration Testing
+- **Execution-Verified Probe Evidence**:
+  - `test_16` explicitly executes the target fixture binary (`-c "{debug_bin} --loop 1 --interval-ms 10"`) rather than attempting standalone probe attachment without target execution.
+  - A returncode of 0 alone is **not** accepted as proof of support. Both exit code 0 AND the explicit observation of the unique probe event marker (`TEST16_OFFSET_HIT`) emitted from `trace_target_function` are strictly required to classify the outcome as `SUPPORTED`.
+- **Explicit Timeout & Orphan Prevention**:
+  - All probe executions are bounded in time ($4.0$s) and wrapped in explicit `try ... except subprocess.TimeoutExpired ... finally` blocks.
+  - On timeout, `_terminate_probe_process(proc, ["sudo", "-n"], is_session_leader=True)` guarantees child reaping and process group termination. Timeouts are classified as `UNKNOWN`, never mislabeled as unsupported.
+
+### 18.3 Capability Cache Correctness & Inconclusive Isolation
+- **Non-Caching of Inconclusive Outcomes**:
+  - Only definitive outcomes (`SUPPORTED` and `UNSUPPORTED`) are stored in `_UPROBE_OFFSET_CACHE`.
+  - Inconclusive results (`UNKNOWN` from timeouts, missing compilers, or permission failures) are **never** cached. This ensures subsequent default queries report `NOT_CHECKED` rather than false negative capabilities, and subsequent active queries can retry cleanly.
+- **Separation of Cache Lifecycle Testing**:
+  - `test_17` separates live capability detection from cache verification:
+    1. Live active probe execution (`force_refresh=True`).
+    2. Cache reuse on subsequent default query (`active_probe=False`).
+    3. Explicit cache invalidation (`invalidate_uprobe_offset_cache()`) resetting status to `NOT_CHECKED`.
+
+### 18.4 Scope and Limits of Test Evidence
+- **GDB Oracle Parity Scope**:
+  - GDB oracle execution runs in an isolated, separate process invocation from live eBPF tracing to prevent ptrace single-stepping conflicts with kernel uprobes.
+  - This establishes semantic value equivalence across identical compiler builds and inputs, but does not represent concurrent dual-tracing of a single running process.
+- **Mocked vs Real-Host OS Evidence**:
+  - Unit tests in `tests/test_ebpf_tracer.py` verify deterministic state transitions, race handling, and error branches using controlled mocks.
+  - Real operating-system kernel capability is validated exclusively through Tier 4 live integration tests on real Linux hosts.
+
+
 
 
 

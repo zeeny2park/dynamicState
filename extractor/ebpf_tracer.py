@@ -259,7 +259,15 @@ class ProbeCleanupResult:
     def __eq__(self, other: Any) -> bool:
         if isinstance(other, bool):
             return self.success == other
-        return super().__eq__(other)
+        if isinstance(other, ProbeCleanupResult):
+            return (
+                self.success == other.success
+                and self.child_reaped == other.child_reaped
+                and self.group_terminated == other.group_terminated
+                and self.status == other.status
+                and self.details == other.details
+            )
+        return False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -371,10 +379,58 @@ class EbpfEnvironmentChecker:
         return offset, None
 
     @classmethod
+    def _verify_process_group_state(
+        cls,
+        pid: int,
+        cmd_prefix: List[str],
+    ) -> Tuple[Optional[bool], Optional[str]]:
+        """Verify whether any processes still linger in process group pid using signal 0.
+
+        Returns:
+            Tuple[Optional[bool], Optional[str]]:
+            - (True, None): verified that process group is absent (ESRCH / no such process).
+            - (False, None): verified that living processes remain in process group pid (signal 0 delivered).
+            - (None, error_reason): inconclusive (permission error, command failure, unexpected error, timeout).
+        """
+        if cmd_prefix:
+            try:
+                chk = subprocess.run(
+                    cmd_prefix + ["kill", "-0", "--", f"-{pid}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0,
+                )
+                if chk.returncode == 0:
+                    return False, None
+                err = (chk.stderr.strip() or chk.stdout.strip()).lower()
+                # Positively verify ESRCH / No such process
+                if "no such process" in err or "esrch" in err:
+                    return True, None
+                elif "operation not permitted" in err or "permission denied" in err:
+                    return None, f"Permission denied inspecting process group {pid}: {chk.stderr.strip()}"
+                else:
+                    return None, f"Ambiguous diagnostic inspecting process group {pid} (exit {chk.returncode}): {chk.stderr.strip() or chk.stdout.strip()}"
+            except subprocess.TimeoutExpired:
+                return None, f"Timeout verifying process group {pid}"
+            except Exception as e:
+                return None, f"Exception verifying process group {pid}: {e}"
+        else:
+            try:
+                os.killpg(pid, 0)
+                return False, None
+            except ProcessLookupError:
+                return True, None
+            except PermissionError as e:
+                return None, f"Permission denied inspecting process group {pid}: {e}"
+            except Exception as e:
+                return None, f"Exception verifying process group {pid}: {e}"
+
+    @classmethod
     def _terminate_probe_process(
         cls,
         proc: Optional[subprocess.Popen],
         cmd_prefix: List[str],
+        is_session_leader: Optional[bool] = None,
     ) -> ProbeCleanupResult:
         """Safely terminate and reap a probe process and its entire process group.
 
@@ -426,7 +482,7 @@ class EbpfEnvironmentChecker:
                     child_reaped=False,
                     group_terminated=False,
                     status="REAP_FAILED",
-                    details=f"Direct child could not be reaped (pid {pid})",
+                    details=f"Direct child could not be reaped (mock/untracked pid {pid})",
                 )
             return ProbeCleanupResult(
                 success=True,
@@ -436,64 +492,86 @@ class EbpfEnvironmentChecker:
                 details=f"Direct child reaped (mock/untracked pid {pid})",
             )
 
+        # Check process group/session semantics if not explicitly specified
+        if is_session_leader is None and not child_already_exited:
+            try:
+                child_pgid = os.getpgid(pid)
+                if child_pgid != pid and child_pgid == os.getpgrp():
+                    is_session_leader = False
+                elif child_pgid == pid:
+                    is_session_leader = True
+            except Exception:
+                pass
+
+        # If process is confirmed NOT to be a session leader, avoid collateral process group signaling
+        if is_session_leader is False:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            child_reaped = False
+            try:
+                proc.communicate(timeout=1.0)
+                child_reaped = (proc.poll() is not None)
+            except Exception:
+                child_reaped = (proc.poll() is not None)
+            if not child_reaped:
+                return ProbeCleanupResult(
+                    success=False,
+                    child_reaped=False,
+                    group_terminated=False,
+                    status="REAP_FAILED",
+                    details=f"Direct child (pid {pid}) could not be reaped within timeout",
+                )
+            return ProbeCleanupResult(
+                success=True,
+                child_reaped=True,
+                group_terminated=True,
+                status="CLEAN",
+                details=f"Direct child reaped (not a session leader, skipped collateral group signaling)",
+            )
+
         # Handle already-exited child process: verify process group is also dead
         if child_already_exited:
-            group_terminated = True
-            group_verify_err = None
-            if cmd_prefix:
-                try:
-                    chk = subprocess.run(
-                        cmd_prefix + ["kill", "-0", f"-{pid}"],
-                        capture_output=True,
-                        text=True,
-                        timeout=1.0,
-                    )
-                    if chk.returncode == 0:
-                        # Descendants still alive: terminate them
-                        subprocess.run(
-                            cmd_prefix + ["kill", "-KILL", f"-{pid}"],
+            group_terminated, group_verify_err = cls._verify_process_group_state(pid, cmd_prefix)
+
+            # If descendants are still running in the group, terminate them
+            if group_terminated is False:
+                kill_err = None
+                if cmd_prefix:
+                    try:
+                        chk_kill = subprocess.run(
+                            cmd_prefix + ["kill", "-KILL", "--", f"-{pid}"],
                             capture_output=True,
                             text=True,
                             timeout=1.0,
                         )
-                        chk = subprocess.run(
-                            cmd_prefix + ["kill", "-0", f"-{pid}"],
-                            capture_output=True,
-                            text=True,
-                            timeout=1.0,
-                        )
-                    if chk.returncode != 0:
-                        err_chk = (chk.stderr.strip() or chk.stdout.strip()).lower()
-                        if "no such process" in err_chk or "esrch" in err_chk or chk.returncode == 1:
-                            group_terminated = True
-                        else:
-                            group_verify_err = chk.stderr.strip() or f"exit code {chk.returncode}"
-                            group_terminated = None
-                    else:
-                        group_terminated = False
-                except Exception as e:
-                    group_verify_err = str(e)
-                    group_terminated = None
-            else:
-                try:
-                    os.killpg(pid, 0)
+                        if chk_kill.returncode != 0:
+                            err_k = (chk_kill.stderr.strip() or chk_kill.stdout.strip()).lower()
+                            if not ("no such process" in err_k or "esrch" in err_k):
+                                kill_err = chk_kill.stderr.strip() or f"exit code {chk_kill.returncode}"
+                    except Exception as e:
+                        kill_err = str(e)
+                else:
                     try:
                         os.killpg(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    try:
-                        os.killpg(pid, 0)
-                        group_terminated = False
-                    except ProcessLookupError:
-                        group_terminated = True
-                except ProcessLookupError:
-                    group_terminated = True
-                except PermissionError as e:
-                    group_verify_err = str(e)
-                    group_terminated = None
-                except Exception as e:
-                    group_verify_err = str(e)
-                    group_terminated = None
+                    except Exception as e:
+                        kill_err = str(e)
+
+                # Re-verify after kill
+                group_terminated, group_verify_err = cls._verify_process_group_state(pid, cmd_prefix)
+                if kill_err:
+                    return ProbeCleanupResult(
+                        success=False,
+                        child_reaped=True,
+                        group_terminated=bool(group_terminated),
+                        status="GROUP_KILL_FAILED",
+                        details=f"Process group SIGKILL failed: {kill_err}",
+                    )
 
             if group_terminated is False:
                 return ProbeCleanupResult(
@@ -516,7 +594,7 @@ class EbpfEnvironmentChecker:
                 child_reaped=True,
                 group_terminated=True,
                 status="ALREADY_EXITED",
-                details=f"Direct child already exited and process group {pid} verified terminated (ALREADY_EXITED)",
+                details=f"Direct child already exited and process group {pid} verified absent (ALREADY_EXITED)",
             )
 
         # Child is still running: terminate process group and direct child
@@ -524,16 +602,14 @@ class EbpfEnvironmentChecker:
         if cmd_prefix:
             try:
                 res = subprocess.run(
-                    cmd_prefix + ["kill", "-KILL", f"-{pid}"],
+                    cmd_prefix + ["kill", "-KILL", "--", f"-{pid}"],
                     capture_output=True,
                     text=True,
                     timeout=1.0,
                 )
                 if res.returncode != 0:
                     err_out = (res.stderr.strip() or res.stdout.strip())
-                    if "no such process" in err_out.lower() or "esrch" in err_out.lower():
-                        pass
-                    else:
+                    if not ("no such process" in err_out.lower() or "esrch" in err_out.lower()):
                         group_kill_err = err_out or f"exit code {res.returncode}"
             except Exception as e:
                 group_kill_err = str(e)
@@ -576,41 +652,7 @@ class EbpfEnvironmentChecker:
             )
 
         # Verify whether any descendant processes still linger in the process group using signal 0
-        group_terminated: Optional[bool] = None
-        group_verify_err: Optional[str] = None
-
-        if cmd_prefix:
-            try:
-                chk = subprocess.run(
-                    cmd_prefix + ["kill", "-0", f"-{pid}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=1.0,
-                )
-                if chk.returncode != 0:
-                    err_chk = (chk.stderr.strip() or chk.stdout.strip()).lower()
-                    if "no such process" in err_chk or "esrch" in err_chk or chk.returncode == 1:
-                        group_terminated = True
-                    else:
-                        group_verify_err = chk.stderr.strip() or f"exit code {chk.returncode}"
-                        group_terminated = None
-                else:
-                    group_terminated = False
-            except Exception as e:
-                group_verify_err = str(e)
-                group_terminated = None
-        else:
-            try:
-                os.killpg(pid, 0)
-                group_terminated = False
-            except ProcessLookupError:
-                group_terminated = True
-            except PermissionError as e:
-                group_verify_err = str(e)
-                group_terminated = None
-            except Exception as e:
-                group_verify_err = str(e)
-                group_terminated = None
+        group_terminated, group_verify_err = cls._verify_process_group_state(pid, cmd_prefix)
 
         if group_kill_err:
             return ProbeCleanupResult(
@@ -682,10 +724,7 @@ class EbpfEnvironmentChecker:
 
         gcc_path = shutil.which("gcc")
         if not gcc_path:
-            res = (False, "UNKNOWN", "Compiler 'gcc' not found in PATH to build probe test binary")
-            if cache_key:
-                cls._UPROBE_OFFSET_CACHE[cache_key] = res
-            return res
+            return False, "UNKNOWN", "Compiler 'gcc' not found in PATH to build probe test binary"
 
         cmd_prefix = [] if (hasattr(os, "geteuid") and os.geteuid() == 0) else ["sudo", "-n"]
         test_src = None
@@ -715,17 +754,11 @@ class EbpfEnvironmentChecker:
             )
             if comp.returncode != 0:
                 err_text = comp.stderr.decode("utf-8", errors="ignore") if isinstance(comp.stderr, bytes) else str(comp.stderr)
-                res = (False, "UNKNOWN", f"Failed to build probe test binary: {err_text.strip()}")
-                if cache_key:
-                    cls._UPROBE_OFFSET_CACHE[cache_key] = res
-                return res
+                return False, "UNKNOWN", f"Failed to build probe test binary: {err_text.strip()}"
 
             offset, err_reason = cls._find_second_instruction_offset(test_bin, "probe_target", arch)
             if offset is None:
-                res = (False, "UNKNOWN", f"Instruction offset determination failed: {err_reason}")
-                if cache_key:
-                    cls._UPROBE_OFFSET_CACHE[cache_key] = res
-                return res
+                return False, "UNKNOWN", f"Instruction offset determination failed: {err_reason}"
 
             probe_script = f"uprobe:{test_bin}:probe_target+{offset} {{ printf(\"PROBE_OFFSET_HIT\\n\"); exit(); }}"
             probe_cmd = cmd_prefix + [path, "-e", probe_script, "-c", test_bin]
@@ -751,25 +784,23 @@ class EbpfEnvironmentChecker:
                 else:
                     res = (False, "UNKNOWN", f"bpftrace exited without observing PROBE_OFFSET_HIT event: {stdout.strip()}")
 
-                if cache_key:
+                # Only cache definitive supported or unsupported results; do not cache inconclusive UNKNOWN outcomes
+                if cache_key and res[1] in ("SUPPORTED", "UNSUPPORTED"):
                     cls._UPROBE_OFFSET_CACHE[cache_key] = res
                 return res
 
             except subprocess.TimeoutExpired:
-                reaped = cls._terminate_probe_process(proc, cmd_prefix)
-                res = (
+                reaped = cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
+                return (
                     False,
                     "UNKNOWN",
                     f"Probe execution check timed out after 3.0s without confirming event trigger (process reaped: {reaped})",
                 )
-                if cache_key:
-                    cls._UPROBE_OFFSET_CACHE[cache_key] = res
-                return res
 
         except Exception as e:
             return False, "UNKNOWN", f"Error detecting uprobe offset support: {e}"
         finally:
-            cls._terminate_probe_process(proc, cmd_prefix)
+            cls._terminate_probe_process(proc, cmd_prefix, is_session_leader=True)
             if test_src and os.path.exists(test_src):
                 try:
                     os.remove(test_src)
