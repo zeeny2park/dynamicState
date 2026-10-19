@@ -229,10 +229,19 @@ class TestEbpfTracerUnit(unittest.TestCase):
             ProcessInspection: (status, detail, info) where status is in
             {"ACTIVE", "ZOMBIE", "ABSENT", "UNKNOWN"}.
         """
+        # 0. Defensive validation of requested target PID before any syscalls or signal operations
+        try:
+            target_pid = int(p)
+        except (ValueError, TypeError):
+            return ProcessInspection("UNKNOWN", f"Invalid non-integer requested PID '{p}'")
+
+        if target_pid <= 0:
+            return ProcessInspection("UNKNOWN", f"Invalid non-positive requested PID {target_pid}")
+
         # 1. If kill_fn is explicitly provided, verify signal 0 first (allows mock testing of signal errors)
         if kill_fn is not None:
             try:
-                kill_fn(p, 0)
+                kill_fn(target_pid, 0)
             except ProcessLookupError:
                 return ProcessInspection("ABSENT", "ProcessLookupError (ESRCH)")
             except PermissionError as e:
@@ -243,16 +252,16 @@ class TestEbpfTracerUnit(unittest.TestCase):
         # 2. Inspect /proc/<p>/stat for definitive execution state
         try:
             if stat_reader is not None:
-                content = stat_reader(p).strip()
+                content = stat_reader(target_pid).strip()
             else:
-                stat_path = os.path.join(proc_dir, str(p), "stat")
+                stat_path = os.path.join(proc_dir, str(target_pid), "stat")
                 with open(stat_path, "r", encoding="utf-8") as f:
                     content = f.read().strip()
         except (FileNotFoundError, ProcessLookupError):
             # Process does not exist in /proc (or reaped)
             return ProcessInspection("ABSENT", "Stat file absent (process reaped)")
         except PermissionError as e:
-            return ProcessInspection("UNKNOWN", f"PermissionError reading /proc/{p}/stat: {e}")
+            return ProcessInspection("UNKNOWN", f"PermissionError reading /proc/{target_pid}/stat: {e}")
         except Exception as e:
             return ProcessInspection("UNKNOWN", f"Stat read error: {e}")
 
@@ -262,7 +271,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         if lparen == -1 or rparen == -1 or rparen <= lparen:
             return ProcessInspection(
                 "UNKNOWN",
-                f"Malformed parentheses in /proc/{p}/stat: {content[:80]}"
+                f"Malformed parentheses in /proc/{target_pid}/stat: {content[:80]}"
             )
 
         # 1. Parse and validate leading PID (Field 1) before opening parenthesis of comm (Field 2)
@@ -270,26 +279,26 @@ class TestEbpfTracerUnit(unittest.TestCase):
         if not leading_token:
             return ProcessInspection(
                 "UNKNOWN",
-                f"Missing leading PID before comm in /proc/{p}/stat: {content[:80]}"
+                f"Missing leading PID before comm in /proc/{target_pid}/stat: {content[:80]}"
             )
         try:
             stat_pid = int(leading_token)
         except ValueError:
             return ProcessInspection(
                 "UNKNOWN",
-                f"Malformed non-numeric leading PID '{leading_token}' in /proc/{p}/stat: {content[:80]}"
+                f"Malformed non-numeric leading PID '{leading_token}' in /proc/{target_pid}/stat: {content[:80]}"
             )
 
         if stat_pid <= 0:
             return ProcessInspection(
                 "UNKNOWN",
-                f"Invalid non-positive PID {stat_pid} in /proc/{p}/stat"
+                f"Invalid non-positive PID {stat_pid} in /proc/{target_pid}/stat"
             )
 
-        if stat_pid != p:
+        if stat_pid != target_pid:
             return ProcessInspection(
                 "UNKNOWN",
-                f"Mismatched PID in /proc/{p}/stat: stat PID {stat_pid} != requested PID {p}"
+                f"Mismatched PID in /proc/{target_pid}/stat: stat PID {stat_pid} != requested PID {target_pid}"
             )
 
         comm = content[lparen + 1:rparen]
@@ -424,6 +433,18 @@ class TestEbpfTracerUnit(unittest.TestCase):
           invalidate completeness.
         - Returns a structured GroupProcessEnumeration result that callers must verify for completeness.
         """
+        if not isinstance(target_pgid, int) or target_pgid <= 0:
+            err_msg = f"Invalid target_pgid '{target_pgid}': must be positive integer"
+            return GroupProcessEnumeration(
+                target_pgid=target_pgid,
+                members={},
+                complete=False,
+                unknown_candidates={},
+                scan_error=err_msg,
+                transient_exits=[],
+                diagnostics=[err_msg],
+            )
+
         _listdir = listdir_fn or os.listdir
         members: Dict[int, ProcessInspection] = {}
         unknown_candidates: Dict[int, ProcessInspection] = {}
@@ -4633,9 +4654,294 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertFalse(enum_act.is_clean())
         self.assertFalse(enum_act.is_empty())
 
+    def test_79_adversarial_proc_stat_input_matrix(self):
+        """Scenario 79: Comprehensive adversarial /proc/<pid>/stat parsing and classification matrix."""
+        # 1. Invalid requested PID types and values (tested before stat file read or signal check)
+        invalid_requested_pids = [
+            ("string_pid", "not_a_pid", "Invalid non-integer requested PID"),
+            ("none_pid", None, "Invalid non-integer requested PID"),
+            ("zero_pid", 0, "Invalid non-positive requested PID 0"),
+            ("negative_pid", -42, "Invalid non-positive requested PID -42"),
+        ]
+        for name, req_p, expected_diag in invalid_requested_pids:
+            with self.subTest(req_pid_case=name):
+                kill_called = []
+                insp = self._inspect_process(
+                    req_p,
+                    kill_fn=lambda p, s: kill_called.append((p, s)),
+                )
+                self.assertEqual(insp.status, "UNKNOWN")
+                self.assertNotEqual(insp.status, "ABSENT")
+                self.assertNotEqual(insp.status, "ACTIVE")
+                self.assertIn(expected_diag, insp.detail)
+                self.assertEqual(kill_called, [], "kill_fn must never be invoked for invalid requested PID")
+
+        # 2. Table-driven adversarial stat line matrix
+        # Each entry: (case_name, req_pid, stat_line, exp_pgrp, exp_stime, expected_status, expected_detail_sub, is_err)
+        stat_cases = [
+            # 2a. Leading PID defects
+            ("pid_mismatch", 7001, "9999 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Mismatched PID", True),
+            ("missing_leading_pid", 7001, "(task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Missing leading PID", True),
+            ("whitespace_leading_pid", 7001, "   (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Missing leading PID", True),
+            ("string_leading_pid", 7001, "not_numeric (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Malformed non-numeric leading PID", True),
+            ("float_leading_pid", 7001, "7001.5 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Malformed non-numeric leading PID", True),
+            ("multi_token_leading_pid", 7001, "7001 7002 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Malformed non-numeric leading PID", True),
+            ("zero_leading_pid", 7001, "0 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Invalid non-positive PID", True),
+            ("negative_leading_pid", 7001, "-7001 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Invalid non-positive PID", True),
+
+            # 2b. Parentheses and comm defects
+            ("unclosed_comm", 7001, "7001 (unclosed_comm S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Malformed parentheses", True),
+            ("unopened_comm", 7001, "7001 unopened_comm) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Malformed parentheses", True),
+            ("inverted_parens", 7001, "7001 )inverted( S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Malformed parentheses", True),
+            ("no_parens", 7001, "7001 no_parens S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Malformed parentheses", True),
+            ("empty_comm", 7001, "7001 () S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "ACTIVE", "S", False),
+            ("nested_comm_parens", 7001, "7001 (task (sub) [deep (nested)]) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "ACTIVE", "S", False),
+            ("sequential_comm_parens", 7001, "7001 (a) (b) (c) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "ACTIVE", "S", False),
+
+            # 2c. Field counts (< 20 fields after comm)
+            ("no_fields_after_comm", 7001, "7001 (task)", None, None, "UNKNOWN", "Insufficient fields", True),
+            ("three_fields_after_comm", 7001, "7001 (task) S 100 1234", None, None, "UNKNOWN", "Insufficient fields", True),
+            ("nineteen_fields_after_comm", 7001, "7001 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0", None, None, "UNKNOWN", "Insufficient fields", True),
+
+            # 2d. State token defects
+            ("multi_char_state", 7001, "7001 (task) RUNNING 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Invalid multi-character state token", True),
+            ("unrecognized_state_symbol", 7001, "7001 (task) ? 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Unrecognized kernel process state", True),
+            ("digit_state_token", 7001, "7001 (task) 7 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Unrecognized kernel process state", True),
+            ("valid_lowercase_state", 7001, "7001 (task) t 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "ACTIVE", "t", False),
+            ("valid_zombie_state", 7001, "7001 (task) Z 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "ZOMBIE", "Z", False),
+
+            # 2e. Numeric identity field defects
+            ("non_int_ppid", 7001, "7001 (task) S not_ppid 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Non-integer field", True),
+            ("negative_ppid", 7001, "7001 (task) S -1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Invalid negative ppid", True),
+            ("non_int_pgrp", 7001, "7001 (task) S 100 not_pgrp 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Non-integer field", True),
+            ("negative_pgrp", 7001, "7001 (task) S 100 -500 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", None, None, "UNKNOWN", "Invalid negative pgrp", True),
+            ("non_int_starttime", 7001, "7001 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 not_time", None, None, "UNKNOWN", "Non-integer field", True),
+            ("negative_starttime", 7001, "7001 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 -100", None, None, "UNKNOWN", "Invalid negative starttime", True),
+
+            # 2f. PID reuse detection
+            ("reuse_pgrp_mismatch", 7001, "7001 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", 9999, None, "ABSENT", "pgrp 1234 != expected 9999", False),
+            ("reuse_stime_mismatch", 7001, "7001 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", 1234, 99999, "ABSENT", "starttime 50000 != expected 99999", False),
+            ("reuse_both_match", 7001, "7001 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000", 1234, 50000, "ACTIVE", "S", False),
+        ]
+
+        for case_name, req_pid, stat_line, exp_pg, exp_st, exp_status, exp_diag, is_err in stat_cases:
+            with self.subTest(stat_matrix_case=case_name):
+                insp = self._inspect_process(
+                    req_pid,
+                    expected_pgrp=exp_pg,
+                    expected_starttime=exp_st,
+                    stat_reader=lambda p, sl=stat_line: sl,
+                )
+                self.assertEqual(insp.status, exp_status)
+                self.assertIn(exp_diag, insp.detail)
+                if is_err:
+                    # Invariant: input validation failure must NEVER return ACTIVE, ZOMBIE, or ABSENT
+                    self.assertNotIn(insp.status, ("ACTIVE", "ZOMBIE", "ABSENT"))
+                    if case_name in ("multi_char_state", "unrecognized_state_symbol", "digit_state_token"):
+                        # Readable PGID is retained in info so candidate in target PGID is recorded as UNKNOWN member
+                        self.assertEqual(insp.info.get("pgrp"), 1234)
+                    else:
+                        self.assertIsNone(insp.info.get("pgrp"), f"Corrupted record in {case_name} must not have valid pgrp")
+
+        # 3. Genuine process absence: FileNotFoundError and ProcessLookupError
+        def mock_fnf(p):
+            raise FileNotFoundError(2, "No such file or directory")
+        insp_fnf = self._inspect_process(7001, stat_reader=mock_fnf)
+        self.assertEqual(insp_fnf.status, "ABSENT")
+        self.assertIn("Stat file absent", insp_fnf.detail)
+
+        def mock_esrch(p, s):
+            raise ProcessLookupError(3, "No such process")
+        insp_esrch = self._inspect_process(7001, kill_fn=mock_esrch)
+        self.assertEqual(insp_esrch.status, "ABSENT")
+        self.assertIn("ESRCH", insp_esrch.detail)
+
+        # 4. Invalidation of group enumeration for invalid target_pgid
+        for bad_pgid in [0, -1, -999, "not_int", None]:
+            with self.subTest(bad_pgid_case=bad_pgid):
+                enum_bad = self._get_group_processes(bad_pgid)
+                self.assertFalse(enum_bad.complete)
+                self.assertEqual(enum_bad.members, {})
+                self.assertFalse(enum_bad.is_clean())
+                self.assertFalse(enum_bad.is_empty())
+                with self.assertRaises(RuntimeError):
+                    len(enum_bad)
+                with self.assertRaises(RuntimeError):
+                    bool(enum_bad)
+
+    def test_80_real_signal_safety_and_adversarial_cleanup(self):
+        """Scenario 80: Real OS process group signal safety, bystander isolation, and bounded cleanup."""
+        if not sys.platform.startswith("linux"):
+            raise unittest.SkipTest("Requires Linux platform")
+
+        caller_pid = os.getpid()
+        caller_pgrp = os.getpgrp()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_ready_token = os.path.join(tmpdir, "target_ready.token")
+            bystander_ready_token = os.path.join(tmpdir, "bystander_ready.token")
+
+            # 1. Target process group: parent launches grandchild in new session and both sleep
+            target_script = (
+                f"import os, subprocess, sys, time\n"
+                f"gchild = subprocess.Popen([sys.executable, '-c',\n"
+                f"    'import os, time; open(\"{target_ready_token}\", \"w\").write(str(os.getpid())); time.sleep(30)'])\n"
+                f"time.sleep(30)\n"
+            )
+            target_proc = subprocess.Popen(
+                [sys.executable, "-c", target_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            target_pgid = target_proc.pid
+
+            # 2. Bystander process in an independent process group
+            bystander_script = (
+                f"import os, time\n"
+                f"open(\"{bystander_ready_token}\", \"w\").write(str(os.getpid()))\n"
+                f"time.sleep(30)\n"
+            )
+            bystander_proc = subprocess.Popen(
+                [sys.executable, "-c", bystander_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            bystander_pgid = bystander_proc.pid
+            bystander_pid = bystander_proc.pid
+
+            target_gchild_pid = None
+            try:
+                # Wait for both processes to report ready
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline:
+                    if target_gchild_pid is None and os.path.exists(target_ready_token) and os.path.getsize(target_ready_token) > 0:
+                        try:
+                            with open(target_ready_token, "r") as f:
+                                target_gchild_pid = int(f.read().strip())
+                        except Exception:
+                            pass
+                    if os.path.exists(bystander_ready_token) and os.path.getsize(bystander_ready_token) > 0:
+                        pass
+                    if target_gchild_pid is not None and os.path.exists(bystander_ready_token):
+                        break
+                    time.sleep(0.01)
+
+                self.assertIsNotNone(target_gchild_pid, "Target grandchild failed to signal readiness")
+                self.assertTrue(os.path.exists(bystander_ready_token), "Bystander failed to signal readiness")
+
+                # Verify distinct process groups: target_pgid != bystander_pgid != caller_pgrp
+                self.assertNotEqual(target_pgid, bystander_pgid)
+                self.assertNotEqual(target_pgid, caller_pgrp)
+                self.assertNotEqual(bystander_pgid, caller_pgrp)
+
+                # Record pre-cleanup identity and starttimes
+                insp_target_p = self._inspect_process(target_pgid, expected_pgrp=target_pgid)
+                insp_target_g = self._inspect_process(target_gchild_pid, expected_pgrp=target_pgid)
+                insp_bystander = self._inspect_process(bystander_pid, expected_pgrp=bystander_pgid)
+
+                self.assertEqual(insp_target_p.status, "ACTIVE")
+                self.assertEqual(insp_target_g.status, "ACTIVE")
+                self.assertEqual(insp_bystander.status, "ACTIVE")
+
+                target_p_stime = insp_target_p.info.get("starttime")
+                target_g_stime = insp_target_g.info.get("starttime")
+                bystander_stime = insp_bystander.info.get("starttime")
+
+                self.assertIsInstance(bystander_stime, int)
+
+                # 3. Perform cleanup on target_proc
+                cleanup_res = EbpfEnvironmentChecker._terminate_probe_process(
+                    target_proc, [], is_session_leader=True
+                )
+                self.assertTrue(cleanup_res.success)
+                self.assertEqual(cleanup_res.status, "CLEAN")
+
+                # 4. Verify target group was terminated
+                self.assertIsNotNone(target_proc.poll())
+                insp_post_target_p = self._inspect_process(target_pgid, expected_starttime=target_p_stime)
+                self.assertEqual(insp_post_target_p.status, "ABSENT")
+
+                insp_post_target_g = self._inspect_process(
+                    target_gchild_pid, expected_pgrp=target_pgid, expected_starttime=target_g_stime
+                )
+                self.assertNotEqual(insp_post_target_g.status, "ACTIVE")
+
+                # 5. Direct verification: bystander process was NOT signaled and remains ACTIVE
+                self.assertIsNone(bystander_proc.poll(), "Bystander process was mistakenly reaped or killed!")
+                insp_bystander_post = self._inspect_process(
+                    bystander_pid, expected_pgrp=bystander_pgid, expected_starttime=bystander_stime
+                )
+                self.assertEqual(
+                    insp_bystander_post.status, "ACTIVE",
+                    f"Bystander process in separate PGID {bystander_pgid} was disrupted: {insp_bystander_post}"
+                )
+                self.assertEqual(
+                    insp_bystander_post.info["starttime"], bystander_stime,
+                    "Bystander starttime changed (PID was recycled)!"
+                )
+
+                # 6. Direct verification: caller process and group were NOT signaled
+                self.assertEqual(os.getpid(), caller_pid)
+                self.assertEqual(os.getpgrp(), caller_pgrp)
+
+                # 7. Unverified / non-session-leader protection:
+                # Real child spawned in caller's session (start_new_session=False).
+                # _terminate_probe_process MUST reap direct child but MUST NOT send os.killpg.
+                non_leader_proc = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=False,
+                )
+                try:
+                    self.assertEqual(os.getpgid(non_leader_proc.pid), caller_pgrp)
+                    with patch("os.killpg") as mock_killpg:
+                        res_non_leader = EbpfEnvironmentChecker._terminate_probe_process(
+                            non_leader_proc, [], is_session_leader=False
+                        )
+                        self.assertFalse(res_non_leader.success)
+                        self.assertTrue(res_non_leader.child_reaped)
+                        self.assertFalse(res_non_leader.group_terminated)
+                        self.assertEqual(res_non_leader.status, "UNCERTAIN")
+                        self.assertIn("not a session leader", res_non_leader.details)
+                        self.assertIn("collateral group signaling avoided", res_non_leader.details)
+                        mock_killpg.assert_not_called()
+                        self.assertIsNotNone(non_leader_proc.poll(), "Direct child was not reaped")
+                finally:
+                    if non_leader_proc.poll() is None:
+                        try:
+                            non_leader_proc.kill()
+                            non_leader_proc.wait(timeout=1.0)
+                        except Exception:
+                            pass
+
+            finally:
+                # Bounded teardown of all spawned processes
+                for p_obj, p_gid in [(target_proc, target_pgid), (bystander_proc, bystander_pgid)]:
+                    if p_gid and p_gid > 1 and p_gid != caller_pgrp and p_gid != caller_pid:
+                        try:
+                            os.killpg(p_gid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                        except Exception:
+                            pass
+                    if p_obj and p_obj.poll() is None:
+                        try:
+                            p_obj.kill()
+                        except Exception:
+                            pass
+                        try:
+                            p_obj.wait(timeout=1.0)
+                        except Exception:
+                            pass
+                if target_gchild_pid and target_gchild_pid > 1 and target_gchild_pid != caller_pid and target_gchild_pid != caller_pgrp:
+                    try:
+                        os.kill(target_gchild_pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
