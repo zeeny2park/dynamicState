@@ -66,6 +66,8 @@ from extractor.ebpf_tracer import (
     TraceValue,
     ProbeCleanupResult,
     find_elf_symbols,
+    _is_strict_int,
+    _safe_repr,
 )
 from extractor.observation_backends import EbpfObservationBackend, ObservationBackend
 
@@ -229,14 +231,35 @@ class TestEbpfTracerUnit(unittest.TestCase):
             ProcessInspection: (status, detail, info) where status is in
             {"ACTIVE", "ZOMBIE", "ABSENT", "UNKNOWN"}.
         """
-        # 0. Defensive validation of requested target PID before any syscalls or signal operations
-        try:
-            target_pid = int(p)
-        except (ValueError, TypeError):
-            return ProcessInspection("UNKNOWN", f"Invalid non-integer requested PID '{p}'")
+        # 0. Strict type validation of requested target PID before any syscalls, signal operations, or filesystem access
+        if not _is_strict_int(p):
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Invalid non-integer requested PID '{_safe_repr(p)}' (type {type(p).__name__})"
+            )
 
-        if target_pid <= 0:
-            return ProcessInspection("UNKNOWN", f"Invalid non-positive requested PID {target_pid}")
+        if p <= 0:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Invalid non-positive requested PID {p}"
+            )
+
+        target_pid = p
+
+        # Pre-validate expected_pgrp and expected_starttime types if provided
+        if expected_pgrp is not None:
+            if not _is_strict_int(expected_pgrp) or expected_pgrp <= 0:
+                return ProcessInspection(
+                    "UNKNOWN",
+                    f"Invalid expected_pgrp '{_safe_repr(expected_pgrp)}' (type {type(expected_pgrp).__name__}): must be positive integer"
+                )
+
+        if expected_starttime is not None:
+            if not _is_strict_int(expected_starttime) or expected_starttime < 0:
+                return ProcessInspection(
+                    "UNKNOWN",
+                    f"Invalid expected_starttime '{_safe_repr(expected_starttime)}' (type {type(expected_starttime).__name__}): must be non-negative integer"
+                )
 
         # 1. If kill_fn is explicitly provided, verify signal 0 first (allows mock testing of signal errors)
         if kill_fn is not None:
@@ -433,8 +456,8 @@ class TestEbpfTracerUnit(unittest.TestCase):
           invalidate completeness.
         - Returns a structured GroupProcessEnumeration result that callers must verify for completeness.
         """
-        if not isinstance(target_pgid, int) or target_pgid <= 0:
-            err_msg = f"Invalid target_pgid '{target_pgid}': must be positive integer"
+        if not _is_strict_int(target_pgid) or target_pgid <= 0:
+            err_msg = f"Invalid target_pgid '{_safe_repr(target_pgid)}' (type {type(target_pgid).__name__}): must be positive integer"
             return GroupProcessEnumeration(
                 target_pgid=target_pgid,
                 members={},
@@ -2934,8 +2957,8 @@ class TestEbpfTracerUnit(unittest.TestCase):
             r2 = EbpfEnvironmentChecker._terminate_probe_process(mock_idempotent, [], is_session_leader=True)
             self.assertEqual(r1, r2)
 
-        # 13. Invalid/untracked PID behavior (None, string, negative, 0, 1)
-        for invalid_pid in [None, "invalid_pid", -10, 0, 1]:
+        # 13. Invalid/untracked PID behavior (None, string, bool, float, negative, 0, 1)
+        for invalid_pid in [None, "invalid_pid", "123", True, False, 1.5, 100.0, -42.0, -10, 0, 1]:
             mock_invalid = MagicMock()
             mock_invalid.pid = invalid_pid
             mock_invalid.poll.return_value = 0
@@ -4863,10 +4886,37 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 insp_post_target_p = self._inspect_process(target_pgid, expected_starttime=target_p_stime)
                 self.assertEqual(insp_post_target_p.status, "ABSENT")
 
-                insp_post_target_g = self._inspect_process(
-                    target_gchild_pid, expected_pgrp=target_pgid, expected_starttime=target_g_stime
+                # Bounded wait with monotonic clock for target grandchild to reach terminal non-active state (ABSENT or ZOMBIE)
+                deadline = time.monotonic() + 2.0
+                insp_post_target_g = None
+                while time.monotonic() < deadline:
+                    insp_post_target_g = self._inspect_process(
+                        target_gchild_pid, expected_pgrp=target_pgid, expected_starttime=target_g_stime
+                    )
+                    if insp_post_target_g.status in ("ABSENT", "ZOMBIE"):
+                        break
+                    time.sleep(0.01)
+
+                self.assertIsNotNone(insp_post_target_g)
+                self.assertNotEqual(
+                    insp_post_target_g.status, "ACTIVE",
+                    f"Grandchild {target_gchild_pid} remained active after cleanup: {insp_post_target_g}"
                 )
-                self.assertNotEqual(insp_post_target_g.status, "ACTIVE")
+                self.assertNotEqual(
+                    insp_post_target_g.status, "UNKNOWN",
+                    f"Grandchild {target_gchild_pid} inspection inconclusive after cleanup: {insp_post_target_g}"
+                )
+                self.assertIn(
+                    insp_post_target_g.status, ("ABSENT", "ZOMBIE"),
+                    f"Grandchild {target_gchild_pid} was not terminated (got {insp_post_target_g.status})"
+                )
+
+                # Direct verification of target process group enumeration
+                enum_post = self._get_group_processes(target_pgid)
+                self.assertTrue(enum_post.complete, f"Group enumeration incomplete: {enum_post.diagnostics}")
+                self.assertEqual(enum_post.active_members, {})
+                self.assertEqual(enum_post.unknown_members, {})
+                self.assertTrue(enum_post.is_clean())
 
                 # 5. Direct verification: bystander process was NOT signaled and remains ACTIVE
                 self.assertIsNone(bystander_proc.poll(), "Bystander process was mistakenly reaped or killed!")
@@ -4941,6 +4991,242 @@ class TestEbpfTracerUnit(unittest.TestCase):
                         os.kill(target_gchild_pid, signal.SIGKILL)
                     except Exception:
                         pass
+
+
+    def test_81_strict_pid_pgid_type_safety_matrix(self):
+        """Scenario 81: Strict PID and PGID type safety across inspection, enumeration, and termination."""
+        class CustomIntObject:
+            def __int__(self):
+                return 7001
+
+        class ExplosiveReprObject:
+            def __repr__(self):
+                raise RuntimeError("Explosive repr failure")
+
+        # 1. Exhaustive matrix of non-integer, boolean, float, and malformed PID inputs to _inspect_process
+        bad_pids = [
+            ("true_bool", True),
+            ("false_bool", False),
+            ("float_val", 100.5),
+            ("float_exact", 100.0),
+            ("float_neg", -42.0),
+            ("none_val", None),
+            ("numeric_str", "1234"),
+            ("zero_str", "0"),
+            ("neg_str", "-42"),
+            ("alpha_str", "not_a_pid"),
+            ("empty_str", ""),
+            ("zero_int", 0),
+            ("neg_int", -42),
+            ("custom_int_obj", CustomIntObject()),
+            ("explosive_repr_obj", ExplosiveReprObject()),
+        ]
+
+        for case_name, bad_p in bad_pids:
+            with self.subTest(inspect_bad_pid=case_name):
+                kill_calls = []
+                stat_calls = []
+                insp = self._inspect_process(
+                    bad_p,
+                    kill_fn=lambda p, s: kill_calls.append((p, s)),
+                    stat_reader=lambda p: (stat_calls.append(p) or "7001 (task) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"),
+                )
+                self.assertEqual(insp.status, "UNKNOWN")
+                self.assertNotEqual(insp.status, "ABSENT")
+                self.assertNotEqual(insp.status, "ACTIVE")
+                self.assertIn(insp.status, {"UNKNOWN"})
+                self.assertEqual(kill_calls, [], f"kill_fn was invoked for invalid PID {case_name}")
+                self.assertEqual(stat_calls, [], f"stat_reader was invoked for invalid PID {case_name}")
+
+        # 2. Type boundaries for expected_pgrp and expected_starttime in _inspect_process
+        bad_expected_pgrps = [
+            ("pgrp_true", True),
+            ("pgrp_float", 100.0),
+            ("pgrp_str", "100"),
+            ("pgrp_zero", 0),
+            ("pgrp_neg", -1),
+        ]
+        for name, bad_pgrp in bad_expected_pgrps:
+            with self.subTest(expected_pgrp=name):
+                insp = self._inspect_process(7001, expected_pgrp=bad_pgrp)
+                self.assertEqual(insp.status, "UNKNOWN")
+                self.assertIn("Invalid expected_pgrp", insp.detail)
+
+        bad_expected_stimes = [
+            ("stime_true", True),
+            ("stime_float", 500.5),
+            ("stime_str", "50000"),
+            ("stime_neg", -1),
+        ]
+        for name, bad_stime in bad_expected_stimes:
+            with self.subTest(expected_starttime=name):
+                insp = self._inspect_process(7001, expected_starttime=bad_stime)
+                self.assertEqual(insp.status, "UNKNOWN")
+                self.assertIn("Invalid expected_starttime", insp.detail)
+
+        # 3. Exhaustive matrix of bad target_pgid inputs to _get_group_processes
+        bad_pgids = [
+            ("true_bool", True),
+            ("false_bool", False),
+            ("float_val", 100.5),
+            ("float_exact", 100.0),
+            ("float_neg", -42.0),
+            ("none_val", None),
+            ("numeric_str", "1234"),
+            ("alpha_str", "not_a_pgid"),
+            ("empty_str", ""),
+            ("zero_int", 0),
+            ("neg_int", -42),
+            ("custom_int_obj", CustomIntObject()),
+            ("explosive_repr_obj", ExplosiveReprObject()),
+        ]
+        for case_name, bad_pgid in bad_pgids:
+            with self.subTest(enum_bad_pgid=case_name):
+                listdir_calls = []
+                stat_calls = []
+                enum_res = self._get_group_processes(
+                    bad_pgid,
+                    listdir_fn=lambda d: (listdir_calls.append(d) or ["7001"]),
+                    stat_reader=lambda p: (stat_calls.append(p) or "7001 (task) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"),
+                )
+                self.assertFalse(enum_res.complete)
+                self.assertFalse(enum_res.is_clean())
+                self.assertFalse(enum_res.is_empty())
+                self.assertIsNotNone(enum_res.scan_error)
+                self.assertEqual(listdir_calls, [], f"listdir_fn called for bad pgid {case_name}")
+                self.assertEqual(stat_calls, [], f"stat_reader called for bad pgid {case_name}")
+                with self.assertRaises(RuntimeError):
+                    len(enum_res)
+                with self.assertRaises(RuntimeError):
+                    bool(enum_res)
+
+        # 4. Bad process group IDs in _verify_process_group_state
+        for bad_id in [True, False, 100.5, 100.0, -42.0, None, "1234", "not_a_pgid", 0, 1, -10, CustomIntObject(), ExplosiveReprObject()]:
+            term, err = EbpfEnvironmentChecker._verify_process_group_state(bad_id, ["sudo", "-n"])
+            self.assertIsNone(term)
+            self.assertIsNotNone(err)
+            self.assertIn("Invalid process group ID", err)
+
+        # 5. Invalid PIDs in trace() fail immediately without syscalls
+        tracer = EbpfTracer()
+        for bad_pid in [True, False, 1.5, "123", None, 0, -1, CustomIntObject()]:
+            sess = tracer.trace(binary_path="/bin/ls", function_name="main", pid=bad_pid)
+            self.assertEqual(sess.status, "FAILED")
+            self.assertIn("Invalid target PID", sess.error_message)
+
+    def test_82_process_state_quadrant_and_clean_verdict_proof(self):
+        """Scenario 82: Independent verification of process state quadrants and ProbeCleanupResult invariants."""
+        # --- Part 1: Four distinct process state quadrants ---
+        # Quadrant 1 (ACTIVE): Living process in group prevents CLEAN and EMPTY
+        active_stat = "8101 (worker) R 100 8100 8100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp_act = self._inspect_process(8101, stat_reader=lambda p: active_stat)
+        self.assertEqual(insp_act.status, "ACTIVE")
+        enum_act = self._get_group_processes(
+            8100, listdir_fn=lambda d: ["8101"], stat_reader=lambda p: active_stat
+        )
+        self.assertTrue(enum_act.complete)
+        self.assertIn(8101, enum_act.active_members)
+        self.assertFalse(enum_act.is_clean())
+        self.assertFalse(enum_act.is_empty())
+
+        # Quadrant 2 (ZOMBIE): Zombie in group permits is_clean()=True, but forbids is_empty()=True
+        zombie_stat = "8102 (worker) Z 100 8100 8100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp_zomb = self._inspect_process(8102, stat_reader=lambda p: zombie_stat)
+        self.assertEqual(insp_zomb.status, "ZOMBIE")
+        enum_zomb = self._get_group_processes(
+            8100, listdir_fn=lambda d: ["8102"], stat_reader=lambda p: zombie_stat
+        )
+        self.assertTrue(enum_zomb.complete)
+        self.assertEqual(enum_zomb.active_members, {})
+        self.assertIn(8102, enum_zomb.members)
+        self.assertTrue(enum_zomb.is_clean(), "Zombie waiting for OS reaper permits is_clean()=True")
+        self.assertFalse(enum_zomb.is_empty(), "Zombie lingering in /proc strictly forbids is_empty()=True")
+
+        # Quadrant 3 (ABSENT): Reaped process permits both is_clean()=True and is_empty()=True
+        def raise_fnf(p):
+            raise FileNotFoundError(f"/proc/{p}/stat absent")
+        insp_abs = self._inspect_process(8103, stat_reader=raise_fnf)
+        self.assertEqual(insp_abs.status, "ABSENT")
+        enum_abs = self._get_group_processes(8100, listdir_fn=lambda d: [], stat_reader=raise_fnf)
+        self.assertTrue(enum_abs.complete)
+        self.assertEqual(enum_abs.members, {})
+        self.assertTrue(enum_abs.is_clean())
+        self.assertTrue(enum_abs.is_empty())
+
+        # PID reuse detection yielding ABSENT:
+        reuse_stat = "8103 (worker) S 100 8100 8100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 99999"
+        insp_reuse = self._inspect_process(8103, expected_starttime=50000, stat_reader=lambda p: reuse_stat)
+        self.assertEqual(insp_reuse.status, "ABSENT")
+        self.assertIn("PID reused", insp_reuse.detail)
+
+        # Quadrant 4 (UNKNOWN): Inconclusive inspection never yields ABSENT or CLEAN
+        # 4a. PermissionError on stat read
+        def raise_perm(p):
+            raise PermissionError("EACCES")
+        insp_unk_perm = self._inspect_process(8104, stat_reader=raise_perm)
+        self.assertEqual(insp_unk_perm.status, "UNKNOWN")
+        self.assertNotEqual(insp_unk_perm.status, "ABSENT")
+        enum_unk_perm = self._get_group_processes(8100, listdir_fn=lambda d: ["8104"], stat_reader=raise_perm)
+        self.assertFalse(enum_unk_perm.complete)
+        self.assertIn(8104, enum_unk_perm.unknown_candidates)
+        self.assertFalse(enum_unk_perm.is_clean())
+        self.assertFalse(enum_unk_perm.is_empty())
+
+        # 4b. Malformed stat record with unparsed PGID
+        bad_stat = "8105 (bad_worker) S 100 corrupt_pgid 8100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp_unk_bad = self._inspect_process(8105, stat_reader=lambda p: bad_stat)
+        self.assertEqual(insp_unk_bad.status, "UNKNOWN")
+        enum_unk_bad = self._get_group_processes(8100, listdir_fn=lambda d: ["8105"], stat_reader=lambda p: bad_stat)
+        self.assertFalse(enum_unk_bad.complete)
+        self.assertIn(8105, enum_unk_bad.unknown_candidates)
+        self.assertFalse(enum_unk_bad.is_clean())
+        self.assertFalse(enum_unk_bad.is_empty())
+
+        # 4c. Valid PGID but unrecognized state symbol ('Q') retains target PGID as unknown_members
+        unrec_stat = "8106 (worker) Q 100 8100 8100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp_unrec = self._inspect_process(8106, stat_reader=lambda p: unrec_stat)
+        self.assertEqual(insp_unrec.status, "UNKNOWN")
+        enum_unrec = self._get_group_processes(8100, listdir_fn=lambda d: ["8106"], stat_reader=lambda p: unrec_stat)
+        self.assertTrue(enum_unrec.complete)
+        self.assertIn(8106, enum_unrec.unknown_members)
+        self.assertFalse(enum_unrec.is_clean(), "Unknown state token in target group prevents is_clean()=True")
+        self.assertFalse(enum_unrec.is_empty())
+
+        # --- Part 2: Table-driven ProbeCleanupResult invariant matrix ---
+        valid_matrix = [
+            (True, True, True, "CLEAN"),
+            (True, True, True, "ALREADY_EXITED"),
+            (False, False, False, "NO_PROCESS"),
+            (False, False, False, "REAP_FAILED"),
+            (False, True, False, "GROUP_KILL_FAILED"),
+            (False, True, False, "UNCERTAIN"),
+            (False, True, True, "UNCERTAIN"),
+            (False, False, False, "UNCERTAIN"),
+        ]
+        for succ, reaped, term, st in valid_matrix:
+            res = ProbeCleanupResult(
+                success=succ, child_reaped=reaped, group_terminated=term, status=st, details="valid"
+            )
+            self.assertEqual(bool(res), succ)
+
+        contradictory_matrix = [
+            (True, True, True, "UNCERTAIN"),
+            (True, True, False, "CLEAN"),
+            (True, False, True, "CLEAN"),
+            (False, True, True, "CLEAN"),
+            (False, True, True, "ALREADY_EXITED"),
+            (False, True, False, "NO_PROCESS"),
+            (False, True, False, "REAP_FAILED"),
+            (False, True, True, "GROUP_KILL_FAILED"),
+            (False, False, False, "GROUP_KILL_FAILED"),
+            (False, False, True, "UNCERTAIN"),
+            (False, True, True, "INVALID_STATUS"),
+        ]
+        for succ, reaped, term, st in contradictory_matrix:
+            with self.assertRaises(ValueError):
+                ProbeCleanupResult(
+                    success=succ, child_reaped=reaped, group_terminated=term, status=st, details="contradictory"
+                )
 
 
 if __name__ == "__main__":

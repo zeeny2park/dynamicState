@@ -38,6 +38,25 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfSubprogram
 logger = logging.getLogger("dynamicstate.ebpf_tracer")
 
 
+def _safe_repr(obj: Any, max_len: int = 100) -> str:
+    """Safely format an object representation without raising exceptions."""
+    try:
+        r = repr(obj)
+        if len(r) > max_len:
+            return r[:max_len] + "..."
+        return r
+    except Exception:
+        try:
+            return f"<{type(obj).__name__} object at {hex(id(obj))}>"
+        except Exception:
+            return "<unprintable object>"
+
+
+def _is_strict_int(val: Any) -> bool:
+    """Return True if and only if val is a genuine int (not bool, float, str, or custom __int__)."""
+    return isinstance(val, int) and not isinstance(val, bool)
+
+
 # -----------------------------------------------------------------------------
 # Value status indicators & Observation schemas
 # -----------------------------------------------------------------------------
@@ -433,8 +452,8 @@ class EbpfEnvironmentChecker:
             - (False, None): verified that living processes remain in process group pid (signal 0 delivered).
             - (None, error_reason): inconclusive (permission error, command failure, unexpected error, timeout).
         """
-        if not isinstance(pid, int) or pid <= 1:
-            return None, f"Invalid process group ID: {pid}"
+        if not _is_strict_int(pid) or pid <= 1:
+            return None, f"Invalid process group ID: {_safe_repr(pid)} ({type(pid).__name__})"
 
         try:
             caller_pgrp = os.getpgrp()
@@ -510,8 +529,8 @@ class EbpfEnvironmentChecker:
         pid = getattr(proc, "pid", None)
         child_already_exited = (proc.poll() is not None)
 
-        # 1. Handle non-int or invalid PIDs (e.g. mock/untracked, pid <= 1)
-        if not isinstance(pid, int) or pid <= 1:
+        # 1. Handle non-int or invalid PIDs (e.g. mock/untracked, pid <= 1, bool, float)
+        if not _is_strict_int(pid) or pid <= 1:
             child_reaped = child_already_exited
             if not child_already_exited:
                 try:
@@ -529,14 +548,14 @@ class EbpfEnvironmentChecker:
                     child_reaped=False,
                     group_terminated=False,
                     status="REAP_FAILED",
-                    details=f"Direct child could not be reaped (mock/untracked pid {pid})",
+                    details=f"Direct child could not be reaped (mock/untracked pid {_safe_repr(pid)})",
                 )
             return ProbeCleanupResult(
                 success=False,
                 child_reaped=True,
                 group_terminated=False,
                 status="UNCERTAIN",
-                details=f"Direct child reaped/exited, but process group could not be verified (untracked/invalid pid {pid})",
+                details=f"Direct child reaped/exited, but process group could not be verified (untracked/invalid pid {_safe_repr(pid)})",
             )
 
         # 2. Safety guard: Never signal caller's own process or process group
@@ -1732,7 +1751,7 @@ class EbpfTracer:
         session_id = f"trace_ebpf_{uuid.uuid4().hex[:12]}"
 
         # 1. Validate target process PID and accessibility
-        if pid <= 0:
+        if not _is_strict_int(pid) or pid <= 0:
             return TraceObservationSession(
                 session_id=session_id,
                 target_pid=pid,
@@ -1746,7 +1765,7 @@ class EbpfTracer:
                 start_time=t_start_iso,
                 end_time=datetime.now(timezone.utc).isoformat(),
                 status="FAILED",
-                error_message=f"Invalid target PID: {pid}",
+                error_message=f"Invalid target PID: {_safe_repr(pid)} ({type(pid).__name__})",
             )
 
         try:
