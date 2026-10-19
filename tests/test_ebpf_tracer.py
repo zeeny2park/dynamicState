@@ -2373,7 +2373,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
             mock_running_sudo.kill.assert_called_once()
             mock_running_sudo.communicate.assert_called_once()
 
-        # 8. Group kill fails or returns ambiguous diagnostics -> GROUP_KILL_FAILED
+        # 8a. Group kill fails with error, but subsequent verify detects absence -> UNCERTAIN (group_terminated=True, success=False)
         mock_kill_err = MagicMock()
         mock_kill_err.pid = 6543
         mock_kill_err.poll.side_effect = [None, 0]
@@ -2386,8 +2386,30 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 mock_kill_err, ["sudo", "-n"], is_session_leader=True
             )
             self.assertFalse(res_kerr)
-            self.assertEqual(res_kerr.status, "GROUP_KILL_FAILED")
+            self.assertEqual(res_kerr.status, "UNCERTAIN")
+            self.assertTrue(res_kerr.child_reaped)
+            self.assertTrue(res_kerr.group_terminated)
             self.assertIn("Operation not permitted", res_kerr.details)
+            self.assertIn("causality UNCERTAIN", res_kerr.details)
+
+        # 8b. Group kill fails with error, and subsequent verify detects group STILL ALIVE -> GROUP_KILL_FAILED (group_terminated=False)
+        mock_kill_alive = MagicMock()
+        mock_kill_alive.pid = 6544
+        mock_kill_alive.poll.side_effect = [None, 0]
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stderr="kill: (-6544): Operation not permitted", stdout=""),
+                MagicMock(returncode=0, stderr="", stdout=""),
+                MagicMock(returncode=0, stderr="", stdout=""),
+            ]
+            res_alive = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_kill_alive, ["sudo", "-n"], is_session_leader=True, group_reap_timeout=0.0
+            )
+            self.assertFalse(res_alive)
+            self.assertEqual(res_alive.status, "GROUP_KILL_FAILED")
+            self.assertTrue(res_alive.child_reaped)
+            self.assertFalse(res_alive.group_terminated)
+            self.assertIn("Operation not permitted", res_alive.details)
 
         # 9. Signal-0 permission failure and command timeout -> UNCERTAIN
         mock_uncertain = MagicMock()
@@ -2815,11 +2837,13 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertTrue(d["group_terminated"])
 
         # 7. Internal consistency invariant
-        # success=True MUST imply both child_reaped=True and group_terminated=True
         r_no_proc = ProbeCleanupResult(
             success=False, child_reaped=False, group_terminated=False, status="NO_PROCESS", details="No process"
         )
-        results = [r_success1, r_success2, r_diff_details, r_failed, r_no_proc]
+        r_unc_absence = ProbeCleanupResult(
+            success=False, child_reaped=True, group_terminated=True, status="UNCERTAIN", details="kill failed, absence verified"
+        )
+        results = [r_success1, r_success2, r_diff_details, r_failed, r_no_proc, r_unc_absence]
         for r in results:
             if r.success:
                 self.assertTrue(r.child_reaped)
@@ -2827,17 +2851,36 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertIn(r.status, ("CLEAN", "ALREADY_EXITED"))
             else:
                 self.assertIn(r.status, ("GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN", "NO_PROCESS"))
+                if r.status == "GROUP_KILL_FAILED":
+                    self.assertFalse(r.group_terminated)
+                    self.assertTrue(r.child_reaped)
+                elif r.status in ("NO_PROCESS", "REAP_FAILED"):
+                    self.assertFalse(r.child_reaped)
+                    self.assertFalse(r.group_terminated)
 
     def test_68_real_process_group_lifecycle_and_cleanup(self):
         """Scenario 68: Real operating-system process and process-group lifecycle cleanup test.
 
         Spawns a real process with start_new_session=True (which spawns a real child in its group),
         uses a filesystem token for deterministic synchronization (avoiding sleep races),
-        exercises _terminate_probe_process, and verifies that the entire process group is
-        terminated with no surviving or zombie processes.
+        inspects Linux /proc/<pid>/stat process states across the lifecycle, exercises
+        _terminate_probe_process, and verifies that the entire process group is terminated
+        with no surviving or zombie processes.
         """
         if not sys.platform.startswith("linux"):
             raise unittest.SkipTest("Requires Linux platform")
+
+        def read_proc_state(p: int) -> Optional[str]:
+            """Helper to inspect process state character ('R', 'S', 'Z', etc.) from /proc/<pid>/stat."""
+            try:
+                with open(f"/proc/{p}/stat", "r") as f:
+                    content = f.read().strip()
+                rparen = content.rfind(")")
+                if rparen != -1 and rparen + 2 < len(content):
+                    return content[rparen + 2]
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                return None
+            return None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             token_file = os.path.join(tmpdir, "gchild_ready.token")
@@ -2875,6 +2918,14 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertIsNone(proc.poll())
                 self.assertEqual(os.getpgid(pgid), pgid)
                 self.assertEqual(os.getpgid(gchild_pid), pgid)
+
+                # Verify live process states before cleanup (should be S for sleeping or R for running)
+                parent_st = read_proc_state(pgid)
+                gchild_st = read_proc_state(gchild_pid)
+                if parent_st is not None:
+                    self.assertIn(parent_st, ("S", "R", "D"))
+                if gchild_st is not None:
+                    self.assertIn(gchild_st, ("S", "R", "D"))
 
                 # Exercise real cleanup
                 cleanup_res = EbpfEnvironmentChecker._terminate_probe_process(proc, [], is_session_leader=True)
@@ -2914,8 +2965,12 @@ class TestEbpfTracerUnit(unittest.TestCase):
                         break
 
                 self.assertTrue(gchild_dead, f"Grandchild PID {gchild_pid} still detected via signal 0 after timeout")
+
+                # Verify that no lingering zombie entries remain in /proc
+                self.assertIsNone(read_proc_state(pgid), f"Parent process PID {pgid} still lingers in /proc")
+                self.assertIsNone(read_proc_state(gchild_pid), f"Grandchild PID {gchild_pid} still lingers in /proc")
             finally:
-                # Guaranteed process cleanup in case of test failure
+                # Guaranteed bounded process cleanup in case of test failure
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                 except Exception:
@@ -2995,12 +3050,31 @@ class TestEbpfTracerUnit(unittest.TestCase):
         with self.assertRaises(ValueError):
             ProbeCleanupResult(success=False, child_reaped=False, group_terminated=True, status="NO_PROCESS", details="")
 
-        # 5. UNCERTAIN and REAP_FAILED cannot have group_terminated=True or success=True
-        for invalid_status in ("UNCERTAIN", "REAP_FAILED"):
-            with self.assertRaises(ValueError):
-                ProbeCleanupResult(success=False, child_reaped=True, group_terminated=True, status=invalid_status, details="")
-            with self.assertRaises(ValueError):
-                ProbeCleanupResult(success=True, child_reaped=True, group_terminated=False, status=invalid_status, details="")
+        # 5. REAP_FAILED cannot have child_reaped=True, group_terminated=True, or success=True
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=False, child_reaped=True, group_terminated=True, status="REAP_FAILED", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=False, child_reaped=True, group_terminated=False, status="REAP_FAILED", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=False, child_reaped=False, group_terminated=True, status="REAP_FAILED", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=True, child_reaped=False, group_terminated=False, status="REAP_FAILED", details="")
+
+        # 6. GROUP_KILL_FAILED requires success=False, group_terminated=False, child_reaped=True
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=False, child_reaped=True, group_terminated=True, status="GROUP_KILL_FAILED", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=True, child_reaped=True, group_terminated=False, status="GROUP_KILL_FAILED", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=False, child_reaped=False, group_terminated=False, status="GROUP_KILL_FAILED", details="")
+
+        # 7. UNCERTAIN cannot claim success=True, or group_terminated=True when child_reaped=False
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=True, child_reaped=True, group_terminated=False, status="UNCERTAIN", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=True, child_reaped=True, group_terminated=True, status="UNCERTAIN", details="")
+        with self.assertRaises(ValueError):
+            ProbeCleanupResult(success=False, child_reaped=False, group_terminated=True, status="UNCERTAIN", details="")
 
     def test_71_cleanup_failure_propagation_in_offset_support(self):
         """Scenario 71: Verify cleanup warnings are propagated without distorting kernel capability."""
@@ -3069,9 +3143,9 @@ class TestEbpfTracerUnit(unittest.TestCase):
             (False, False, False, "NO_PROCESS", "No proc"),
             (False, True, False, "UNCERTAIN", "Not leader"),
             (False, False, False, "UNCERTAIN", "Untracked"),
+            (False, True, True, "UNCERTAIN", "Kill signal failed, but descendants absent"),
             (False, False, False, "REAP_FAILED", "Stuck child"),
             (False, True, False, "GROUP_KILL_FAILED", "Kill failed, descendants alive"),
-            (False, True, True, "GROUP_KILL_FAILED", "Kill failed, but descendants absent"),
         ]
         for success, child_reaped, group_terminated, status, details in valid_cases:
             res = ProbeCleanupResult(
@@ -3107,13 +3181,17 @@ class TestEbpfTracerUnit(unittest.TestCase):
             (False, True, False, "NO_PROCESS", "Invalid"),
             (False, False, True, "NO_PROCESS", "Invalid"),
             (True, False, False, "NO_PROCESS", "Invalid"),
-            # UNCERTAIN claiming group terminated
-            (False, True, True, "UNCERTAIN", "Invalid"),
+            # UNCERTAIN claiming group terminated when child not reaped
+            (False, False, True, "UNCERTAIN", "Invalid"),
             # REAP_FAILED claiming child reaped or group terminated
             (False, True, False, "REAP_FAILED", "Invalid"),
             (False, False, True, "REAP_FAILED", "Invalid"),
-            # GROUP_KILL_FAILED claiming success
+            (False, True, True, "REAP_FAILED", "Invalid"),
+            # GROUP_KILL_FAILED claiming success, group_terminated=True, or child not reaped
             (True, True, True, "GROUP_KILL_FAILED", "Invalid"),
+            (False, True, True, "GROUP_KILL_FAILED", "Invalid"),
+            (False, False, False, "GROUP_KILL_FAILED", "Invalid"),
+            (False, False, True, "GROUP_KILL_FAILED", "Invalid"),
         ]
         for success, child_reaped, group_terminated, status, details in invalid_cases:
             with self.assertRaises(ValueError):

@@ -278,25 +278,34 @@ class ProbeCleanupResult:
                     f"Contradictory ProbeCleanupResult: NO_PROCESS requires success=False, "
                     f"child_reaped=False, group_terminated=False, got {self}"
                 )
-        # Invariant 4: UNCERTAIN and REAP_FAILED cannot claim group_terminated=True or success=True
-        if self.status in ("UNCERTAIN", "REAP_FAILED"):
-            if self.group_terminated or self.success:
-                raise ValueError(
-                    f"Contradictory ProbeCleanupResult: status={self.status} cannot have "
-                    f"group_terminated=True or success=True, got {self}"
-                )
-        # Invariant 5: REAP_FAILED requires child_reaped=False
+        # Invariant 4: REAP_FAILED requires success=False, child_reaped=False, group_terminated=False
         if self.status == "REAP_FAILED":
-            if self.child_reaped:
+            if self.success or self.child_reaped or self.group_terminated:
                 raise ValueError(
-                    f"Contradictory ProbeCleanupResult: status=REAP_FAILED requires child_reaped=False, got {self}"
+                    f"Contradictory ProbeCleanupResult: REAP_FAILED requires success=False, "
+                    f"child_reaped=False, group_terminated=False, got {self}"
                 )
-        # Invariant 6: GROUP_KILL_FAILED cannot claim success=True
+        # Invariant 5: GROUP_KILL_FAILED requires success=False, group_terminated=False, child_reaped=True
         if self.status == "GROUP_KILL_FAILED":
+            if self.success or self.group_terminated or not self.child_reaped:
+                raise ValueError(
+                    f"Contradictory ProbeCleanupResult: status=GROUP_KILL_FAILED requires success=False, "
+                    f"group_terminated=False, and child_reaped=True, got {self}"
+                )
+        # Invariant 6: UNCERTAIN requires success=False, and cannot claim group_terminated=True if child_reaped=False
+        if self.status == "UNCERTAIN":
             if self.success:
                 raise ValueError(
-                    f"Contradictory ProbeCleanupResult: status=GROUP_KILL_FAILED cannot have success=True, got {self}"
+                    f"Contradictory ProbeCleanupResult: UNCERTAIN cannot have success=True, got {self}"
                 )
+            if self.group_terminated and not self.child_reaped:
+                raise ValueError(
+                    f"Contradictory ProbeCleanupResult: UNCERTAIN cannot claim group_terminated=True "
+                    f"when child_reaped=False, got {self}"
+                )
+        # Invariant 7: status must be one of the recognized contract values
+        if self.status not in ("CLEAN", "ALREADY_EXITED", "GROUP_KILL_FAILED", "REAP_FAILED", "UNCERTAIN", "NO_PROCESS"):
+            raise ValueError(f"Unknown ProbeCleanupResult status: {self.status}")
 
     def __bool__(self) -> bool:
         return self.success
@@ -651,10 +660,21 @@ class EbpfEnvironmentChecker:
                         elif term is None:
                             break
                 if kill_err:
+                    if group_terminated is True:
+                        return ProbeCleanupResult(
+                            success=False,
+                            child_reaped=True,
+                            group_terminated=True,
+                            status="UNCERTAIN",
+                            details=(
+                                f"Direct child already exited; process group SIGKILL failed ({kill_err}), "
+                                f"but process group {pid} verified absent via signal 0 (causality UNCERTAIN)"
+                            ),
+                        )
                     return ProbeCleanupResult(
                         success=False,
                         child_reaped=True,
-                        group_terminated=bool(group_terminated),
+                        group_terminated=False,
                         status="GROUP_KILL_FAILED",
                         details=f"Process group SIGKILL failed: {kill_err}",
                     )
@@ -760,10 +780,21 @@ class EbpfEnvironmentChecker:
                     break
 
         if group_kill_err:
+            if group_terminated is True:
+                return ProbeCleanupResult(
+                    success=False,
+                    child_reaped=True,
+                    group_terminated=True,
+                    status="UNCERTAIN",
+                    details=(
+                        f"Direct child reaped, but process group SIGKILL command failed ({group_kill_err}); "
+                        f"process group {pid} verified absent via signal 0 (causality UNCERTAIN)"
+                    ),
+                )
             return ProbeCleanupResult(
                 success=False,
                 child_reaped=True,
-                group_terminated=bool(group_terminated),
+                group_terminated=False,
                 status="GROUP_KILL_FAILED",
                 details=f"Process group SIGKILL command failed: {group_kill_err}",
             )

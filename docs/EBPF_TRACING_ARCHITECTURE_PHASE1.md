@@ -865,6 +865,61 @@ Phase 1.17 audits all control-flow paths in `EbpfEnvironmentChecker.check_uprobe
   - `status == "GROUP_KILL_FAILED"` strictly requires `success=False`.
   - Table-driven unit test `test_72` validates the entire matrix of valid and invalid state combinations.
 
+---
+
+## 22. Phase 1.18 — Cleanup State Semantics & OS Lifecycle Evidence Consistency
+
+### 22.1 Elimination of the `GROUP_KILL_FAILED` vs `group_terminated=True` Contradiction
+Phase 1.17 permitted a semantic contradiction where `_terminate_probe_process` returned `status="GROUP_KILL_FAILED"` while simultaneously reporting `group_terminated=True`. This occurred when a SIGKILL signal dispatch command reported an error (e.g. exit code 1 / `Operation not permitted`), but a subsequent verification check observed that the target process group was absent (`ESRCH`).
+
+In Phase 1.18, this contradiction is resolved through strict causal separation:
+1. **`GROUP_KILL_FAILED` Requires `group_terminated=False`**:
+   - By definition, `GROUP_KILL_FAILED` signifies that the teardown failed to terminate the process group and active processes remain in the target group (`group_terminated=False`).
+   - Claiming `GROUP_KILL_FAILED` on a process group whose absence has been positively verified via signal 0 ESRCH violates internal non-contradiction.
+2. **Causality Classification when Signal Dispatch Fails**:
+   - **Signal Dispatch Failed + Process Group Alive**: Classified as `GROUP_KILL_FAILED` (`group_terminated=False`, `child_reaped=True`, `success=False`). Active processes still linger.
+   - **Signal Dispatch Failed + Verification Inconclusive**: Classified as `UNCERTAIN` (`group_terminated=False`, `child_reaped=True`, `success=False`). State could not be verified due to permission errors or timeout.
+   - **Signal Dispatch Failed + Process Group Absent**: Classified as `UNCERTAIN` (`group_terminated=True`, `child_reaped=True`, `success=False`). While target process group absence was verified via signal 0 ESRCH (`group_terminated=True`), the signal dispatch command encountered an error; clean termination causality cannot be confirmed (`success=False`).
+
+### 22.2 Comprehensive ProbeCleanupResult State Matrix
+The contract between `status`, `success`, `child_reaped`, and `group_terminated` is strictly codified:
+
+| Status | `success` | `child_reaped` | `group_terminated` | Operational Meaning |
+| :--- | :---: | :---: | :---: | :--- |
+| `CLEAN` | `True` | `True` | `True` | Active probe child reaped, process group signaled and verified absent via signal 0 ESRCH. |
+| `ALREADY_EXITED` | `True` | `True` | `True` | Probe child had already exited before cleanup began; process group verified absent via signal 0 ESRCH. |
+| `NO_PROCESS` | `False` | `False` | `False` | `proc` was `None`; no process was provided to terminate or reap. |
+| `REAP_FAILED` | `False` | `False` | `False` | `proc` was provided, but direct child could not be reaped (communicate/wait timed out, `poll() is None`). |
+| `GROUP_KILL_FAILED` | `False` | `True` | `False` | Direct child reaped, but process group still contains active processes after kill attempt. |
+| `UNCERTAIN` | `False` | `True` / `False` | `False` | Group state unverified (non-session leader, untracked PID, caller PGID, verify timeout/permission error). |
+| `UNCERTAIN` | `False` | `True` | `True` | Direct child reaped, process group verified absent, but SIGKILL signal dispatch failed (causality uncertain). |
+
+### 22.3 Complete `ProbeCleanupResult` Invariant Rules (`__post_init__`)
+All state combinations are strictly validated at construction time:
+1. `success=True` $\iff$ `child_reaped=True` $\land$ `group_terminated=True` $\land$ `status in ('CLEAN', 'ALREADY_EXITED')`.
+2. `status in ('CLEAN', 'ALREADY_EXITED')` $\iff$ `success=True` $\land$ `child_reaped=True` $\land$ `group_terminated=True`.
+3. `status == 'NO_PROCESS'` $\implies$ `success=False` $\land$ `child_reaped=False` $\land$ `group_terminated=False`.
+4. `status == 'REAP_FAILED'` $\implies$ `success=False` $\land$ `child_reaped=False` $\land$ `group_terminated=False`.
+5. `status == 'GROUP_KILL_FAILED'` $\implies$ `success=False` $\land$ `group_terminated=False` $\land$ `child_reaped=True`.
+6. `status == 'UNCERTAIN'` $\implies$ `success=False` $\land$ (`group_terminated=False` $\lor$ (`group_terminated=True` $\land$ `child_reaped=True`)).
+7. `status` must be one of the six recognized contract strings.
+
+### 22.4 Operating-System Process Lifecycle & Zombie Observation (`test_68`)
+Phase 1.18 hardens `test_68` with evidence-based operating-system process inspection:
+1. **Linux Process State Inspection**:
+   - Reads `/proc/<pid>/stat` field 3 to inspect exact kernel process states:
+     - `'R'` (running) or `'S'` (interruptible sleep): normal execution.
+     - `'Z'` (zombie): process has terminated, but remains in the kernel process table until reaped by its parent or adopted init/subreaper.
+2. **Zombie Lifetime and Signal 0 Semantics**:
+   - In Linux, `kill(pid, 0)` and `killpg(pgid, 0)` return 0 (success) as long as a zombie process remains in the PID table.
+   - When the direct parent process exits, descendant processes are reparented to PID 1 (or systemd/subreaper).
+   - PID 1 reaps orphaned zombies asynchronously; during this window, `/proc/<pid>` transitions to state `'Z'` before being removed from `/proc`.
+3. **Evidence-Based Teardown Verification**:
+   - `test_68` performs bounded polling (up to 2.0s) for complete removal from the OS process table.
+   - Full elimination is asserted via both `os.killpg(pgid, 0)` raising `ProcessLookupError` (ESRCH), `os.kill(gchild_pid, 0)` raising `ProcessLookupError`, and `/proc/<pid>` being completely absent (`read_proc_state(pid) is None`).
+   - A robust `try ... finally` block guarantees emergency SIGKILL delivery and waitpid cleanup to prevent any orphaned background processes on test failures.
+
+
 
 
 
