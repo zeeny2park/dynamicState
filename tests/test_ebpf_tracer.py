@@ -194,6 +194,21 @@ class GroupProcessEnumeration:
 class TestEbpfTracerUnit(unittest.TestCase):
     """Hermetic unit tests for eBPF tracer decoder, schemas, capability detection, and identity verification."""
 
+    _RECOGNIZED_KERNEL_STATES = {
+        "R",  # Running
+        "S",  # Interruptible sleep
+        "D",  # Uninterruptible sleep (disk)
+        "Z",  # Zombie
+        "T",  # Stopped on signal
+        "t",  # Tracing stop
+        "W",  # Paging
+        "X",  # Dead
+        "x",  # Dead
+        "K",  # Wakekill
+        "P",  # Parked
+        "I",  # Idle
+    }
+
     @classmethod
     def _inspect_process(
         cls,
@@ -206,8 +221,9 @@ class TestEbpfTracerUnit(unittest.TestCase):
     ) -> ProcessInspection:
         """Inspect process state, distinguishing absence, zombie, active, and unknown states.
 
-        Inspects /proc/<p>/stat (handling complex comm with parens/spaces), verifies process group
-        membership and starttime to detect PID reuse, and checks signal 0 when explicitly requested.
+        Inspects /proc/<p>/stat (handling complex comm with parens/spaces), validates complete
+        structural fields through Linux field 22 (starttime), verifies process group membership
+        and starttime to detect PID reuse, and checks signal 0 when explicitly requested.
 
         Returns:
             ProcessInspection: (status, detail, info) where status is in
@@ -251,26 +267,58 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
         comm = content[lparen + 1:rparen]
         rest = content[rparen + 1:].strip().split()
-        if len(rest) < 3:
+
+        # Linux /proc/<pid>/stat field specification (proc(5)):
+        # Field 1: pid (preceding comm)
+        # Field 2: comm (within outermost parentheses)
+        # Post-comm fields (rest list, 0-indexed):
+        #   rest[0]:  Field 3  - state (%c)
+        #   rest[1]:  Field 4  - ppid (%d)
+        #   rest[2]:  Field 5  - pgrp (%d)
+        #   rest[3]:  Field 6  - session (%d)
+        #   rest[4]:  Field 7  - tty_nr (%d)
+        #   rest[5]:  Field 8  - tpgid (%d)
+        #   rest[6]:  Field 9  - flags (%u)
+        #   rest[7]:  Field 10 - minflt (%lu)
+        #   rest[8]:  Field 11 - cminflt (%lu)
+        #   rest[9]:  Field 12 - majflt (%lu)
+        #   rest[10]: Field 13 - cmajflt (%lu)
+        #   rest[11]: Field 14 - utime (%lu)
+        #   rest[12]: Field 15 - stime (%lu)
+        #   rest[13]: Field 16 - cutime (%ld)
+        #   rest[14]: Field 17 - cstime (%ld)
+        #   rest[15]: Field 18 - priority (%ld)
+        #   rest[16]: Field 19 - nice (%ld)
+        #   rest[17]: Field 20 - num_threads (%ld)
+        #   rest[18]: Field 21 - itrealvalue (%ld)
+        #   rest[19]: Field 22 - starttime (%llu)
+        # Minimum required post-comm fields: 20 (to extract through field 22 starttime).
+        if len(rest) < 20:
             return ProcessInspection(
                 "UNKNOWN",
-                f"Insufficient fields ({len(rest)}) in /proc/{p}/stat: {content[:80]}"
+                f"Insufficient fields ({len(rest)} < 20): Missing starttime (field 22) in /proc/{p}/stat: {content[:80]}"
             )
 
-        state_char = rest[0]
+        state_token = rest[0]
         try:
             ppid = int(rest[1])
             pgrp = int(rest[2])
-            starttime = int(rest[19]) if len(rest) >= 20 else None
+            starttime = int(rest[19])
         except ValueError as e:
             return ProcessInspection(
                 "UNKNOWN",
                 f"Non-integer field in /proc/{p}/stat: {e}"
             )
 
+        if starttime < 0:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Invalid negative starttime ({starttime}) in /proc/{p}/stat"
+            )
+
         info = {
             "comm": comm,
-            "state": state_char,
+            "state": state_token,
             "ppid": ppid,
             "pgrp": pgrp,
             "starttime": starttime,
@@ -278,12 +326,6 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
         # Identity and PID reuse verification:
         if expected_starttime is not None:
-            if starttime is None:
-                return ProcessInspection(
-                    "UNKNOWN",
-                    f"Missing starttime in /proc/{p}/stat; cannot verify identity against {expected_starttime}",
-                    info,
-                )
             if starttime != expected_starttime:
                 return ProcessInspection(
                     "ABSENT",
@@ -299,16 +341,25 @@ class TestEbpfTracerUnit(unittest.TestCase):
                     info,
                 )
 
-        if state_char == "Z":
-            return ProcessInspection("ZOMBIE", "Z", info)
-        elif state_char in ("R", "S", "D", "T", "t", "W", "X", "x", "K", "P", "I"):
-            return ProcessInspection("ACTIVE", state_char, info)
-        else:
+        # State token validation: exactly one recognized kernel state character
+        if len(state_token) != 1:
             return ProcessInspection(
                 "UNKNOWN",
-                f"Unrecognized kernel process state '{state_char}'",
-                info
+                f"Invalid multi-character state token '{state_token}' in /proc/{p}/stat",
+                info,
             )
+
+        if state_token not in cls._RECOGNIZED_KERNEL_STATES:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Unrecognized kernel process state '{state_token}'",
+                info,
+            )
+
+        if state_token == "Z":
+            return ProcessInspection("ZOMBIE", "Z", info)
+        else:
+            return ProcessInspection("ACTIVE", state_token, info)
 
     @classmethod
     def _get_group_processes(
@@ -3251,6 +3302,8 @@ class TestEbpfTracerUnit(unittest.TestCase):
                     f"Pre-cleanup: Grandchild PID {gchild_pid} should be ACTIVE, got {gchild_insp_pre}"
                 )
                 gchild_starttime = gchild_insp_pre.info.get("starttime")
+                self.assertIsInstance(gchild_starttime, int, f"Grandchild starttime must be an integer: {gchild_insp_pre}")
+                self.assertGreaterEqual(gchild_starttime, 0, f"Grandchild starttime must be non-negative: {gchild_insp_pre}")
 
                 # Exercise real cleanup
                 cleanup_res = EbpfEnvironmentChecker._terminate_probe_process(proc, [], is_session_leader=True)
@@ -3364,6 +3417,17 @@ class TestEbpfTracerUnit(unittest.TestCase):
                         insp.status, "ZOMBIE",
                         f"Non-zombie process {p} lingering in process group {pgid}: {insp}; context: {diag_ctx}"
                     )
+
+                # Process group cleanliness and emptiness contracts
+                self.assertTrue(
+                    last_enum.is_clean(),
+                    f"Process group {pgid} is not clean: context: {diag_ctx}"
+                )
+                self.assertEqual(
+                    last_enum.is_empty(),
+                    len(last_enum.members) == 0,
+                    f"is_empty() mismatch with members length: context: {diag_ctx}"
+                )
             finally:
                 caller_pgrp = os.getpgrp()
                 caller_pid = os.getpid()
@@ -3822,7 +3886,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertEqual(m1_insp.status, "UNKNOWN")
         self.assertIn("Malformed parentheses", m1_insp.detail)
 
-        # 5. Malformed stat: truncated fields (< 3 fields after comm)
+        # 5. Malformed stat: truncated fields (< 20 fields after comm)
         malformed_stat_2 = "1004 (truncated) S"
         m2_insp = self._inspect_process(
             1004,
@@ -3833,7 +3897,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertIn("Insufficient fields", m2_insp.detail)
 
         # 6. Malformed stat: non-integer ppid/pgrp
-        malformed_stat_3 = "1005 (bad_ints) S not_an_int not_an_int"
+        malformed_stat_3 = "1005 (bad_ints) S not_an_int not_an_int 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000"
         m3_insp = self._inspect_process(
             1005,
             stat_reader=lambda p: malformed_stat_3,
@@ -4117,6 +4181,215 @@ class TestEbpfTracerUnit(unittest.TestCase):
             self.assertEqual(res_caller_g.status, "UNCERTAIN")
             self.assertIn("Refusing to signal caller's own process or group", res_caller_g.details)
             mock_killpg.assert_not_called()
+
+    def test_77_complete_proc_stat_validation_and_lifecycle_verdicts(self):
+        """Scenario 77: Hermetic validation of complete stat fields, structural integrity, and lifecycle verdicts."""
+        # 1. Stat record with only state, PPID, and PGID fields (< 20 fields) is UNKNOWN
+        short_stat = "5001 (short) S 1 1234"
+        insp_short = self._inspect_process(5001, stat_reader=lambda p: short_stat)
+        self.assertEqual(insp_short.status, "UNKNOWN")
+        self.assertIn("Insufficient fields", insp_short.detail)
+        self.assertIsNone(insp_short.info.get("pgrp"))
+
+        # 2. Record truncated just before starttime (fields 3 through 21; 19 fields after comm) is UNKNOWN without expected_starttime
+        just_before_stime = "5002 (almost) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0"
+        insp_no_stime_req = self._inspect_process(5002, stat_reader=lambda p: just_before_stime)
+        self.assertEqual(insp_no_stime_req.status, "UNKNOWN")
+        self.assertIn("Insufficient fields", insp_no_stime_req.detail)
+        self.assertIn("Missing starttime", insp_no_stime_req.detail)
+        self.assertIsNone(insp_no_stime_req.info.get("pgrp"))
+
+        # 3. Complete record with valid starttime is parsed correctly (20 fields after comm)
+        valid_stat = "5003 (valid_task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890"
+        insp_valid = self._inspect_process(5003, stat_reader=lambda p: valid_stat)
+        self.assertEqual(insp_valid.status, "ACTIVE")
+        self.assertEqual(insp_valid.detail, "S")
+        self.assertEqual(insp_valid.info["comm"], "valid_task")
+        self.assertEqual(insp_valid.info["ppid"], 100)
+        self.assertEqual(insp_valid.info["pgrp"], 1234)
+        self.assertEqual(insp_valid.info["starttime"], 67890)
+
+        # 4. Malformed required numeric fields (non-integer or negative starttime) are UNKNOWN
+        # 4a. Non-integer PPID
+        bad_ppid_stat = "5004 (bad_ppid) S not_int 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890"
+        insp_bad_ppid = self._inspect_process(5004, stat_reader=lambda p: bad_ppid_stat)
+        self.assertEqual(insp_bad_ppid.status, "UNKNOWN")
+        self.assertIn("Non-integer field", insp_bad_ppid.detail)
+        self.assertIsNone(insp_bad_ppid.info.get("pgrp"))
+
+        # 4b. Non-integer PGID
+        bad_pgrp_stat = "5004 (bad_pgrp) S 100 not_pgrp 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890"
+        insp_bad_pgrp = self._inspect_process(5004, stat_reader=lambda p: bad_pgrp_stat)
+        self.assertEqual(insp_bad_pgrp.status, "UNKNOWN")
+        self.assertIn("Non-integer field", insp_bad_pgrp.detail)
+        self.assertIsNone(insp_bad_pgrp.info.get("pgrp"))
+
+        # 4c. Non-integer starttime
+        bad_stime_stat = "5004 (bad_stime) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 not_a_num"
+        insp_bad_stime = self._inspect_process(5004, stat_reader=lambda p: bad_stime_stat)
+        self.assertEqual(insp_bad_stime.status, "UNKNOWN")
+        self.assertIn("Non-integer field", insp_bad_stime.detail)
+        self.assertIsNone(insp_bad_stime.info.get("pgrp"))
+
+        # 4d. Negative starttime
+        neg_stime_stat = "5004 (neg_stime) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 -100"
+        insp_neg_stime = self._inspect_process(5004, stat_reader=lambda p: neg_stime_stat)
+        self.assertEqual(insp_neg_stime.status, "UNKNOWN")
+        self.assertIn("Invalid negative starttime", insp_neg_stime.detail)
+        self.assertIsNone(insp_neg_stime.info.get("pgrp"))
+
+        # 5. Invalid or multi-character state token is UNKNOWN
+        # 5a. Multi-character state token
+        multi_stat = "5005 (multi) SLEEP 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890"
+        insp_multi = self._inspect_process(5005, stat_reader=lambda p: multi_stat)
+        self.assertEqual(insp_multi.status, "UNKNOWN")
+        self.assertIn("Invalid multi-character state token", insp_multi.detail)
+
+        # 5b. Unrecognized single-character state token
+        unrec_stat = "5005 (weird) ? 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890"
+        insp_unrec = self._inspect_process(5005, stat_reader=lambda p: unrec_stat)
+        self.assertEqual(insp_unrec.status, "UNKNOWN")
+        self.assertIn("Unrecognized kernel process state '?'", insp_unrec.detail)
+
+        # 6. Expected starttime cannot be verified when starttime is missing (returns UNKNOWN, not ABSENT)
+        insp_exp_missing = self._inspect_process(
+            5006,
+            expected_starttime=67890,
+            stat_reader=lambda p: just_before_stime,
+        )
+        self.assertEqual(insp_exp_missing.status, "UNKNOWN")
+        self.assertNotEqual(insp_exp_missing.status, "ABSENT")
+        self.assertIn("Missing starttime", insp_exp_missing.detail)
+
+        # 7. Candidate whose PGID is readable but state is invalid is retained as UNKNOWN member if belonging to target PGID
+        invalid_state_in_group = "5007 (inv_task) ?? 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890"
+        enum_unk_mem = self._get_group_processes(
+            1234,
+            listdir_fn=lambda d: ["5007"],
+            stat_reader=lambda p: invalid_state_in_group,
+        )
+        self.assertTrue(enum_unk_mem.complete)  # All candidates resolved; group membership is known
+        self.assertIn(5007, enum_unk_mem.members)
+        self.assertEqual(enum_unk_mem.members[5007].status, "UNKNOWN")
+        self.assertIn(5007, enum_unk_mem.unknown_members)
+        self.assertEqual(enum_unk_mem.active_members, {})
+        self.assertEqual(enum_unk_mem.unknown_candidates, {})
+        self.assertFalse(enum_unk_mem.is_clean())  # UNKNOWN member prevents clean verdict
+        self.assertFalse(enum_unk_mem.is_empty())
+
+        # 8. Candidate with indeterminate PGID makes enumeration incomplete
+        enum_indet = self._get_group_processes(
+            1234,
+            listdir_fn=lambda d: ["5008"],
+            stat_reader=lambda p: "5008 (trunc) S 100",  # truncated, < 20 fields
+        )
+        self.assertFalse(enum_indet.complete)
+        self.assertIn(5008, enum_indet.unknown_candidates)
+        self.assertEqual(enum_indet.unknown_candidates[5008].status, "UNKNOWN")
+        self.assertEqual(enum_indet.members, {})
+        self.assertFalse(enum_indet.is_clean())
+        self.assertFalse(enum_indet.is_empty())
+        with self.assertRaises(RuntimeError):
+            len(enum_indet)
+        with self.assertRaises(RuntimeError):
+            bool(enum_indet)
+
+        # 9. Complete scan with no members is distinguishable from incomplete scan with no confirmed members
+        # Complete empty scan
+        enum_comp_empty = self._get_group_processes(
+            1234,
+            listdir_fn=lambda d: ["5009"],
+            stat_reader=lambda p: "5009 (foreign) S 100 9999 9999 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890",
+        )
+        self.assertTrue(enum_comp_empty.complete)
+        self.assertEqual(enum_comp_empty.members, {})
+        self.assertEqual(enum_comp_empty.unknown_candidates, {})
+        self.assertTrue(enum_comp_empty.is_empty())
+        self.assertTrue(enum_comp_empty.is_clean())
+        self.assertEqual(len(enum_comp_empty), 0)
+        self.assertFalse(bool(enum_comp_empty))
+
+        # Incomplete scan with 0 confirmed members
+        enum_incomp = self._get_group_processes(
+            1234,
+            listdir_fn=lambda d: ["5010"],
+            stat_reader=lambda p: "5010 malformed_line_no_parens",
+        )
+        self.assertFalse(enum_incomp.complete)
+        self.assertEqual(enum_incomp.members, {})
+        self.assertEqual(len(enum_incomp.unknown_candidates), 1)
+        self.assertFalse(enum_incomp.is_empty())
+        self.assertFalse(enum_incomp.is_clean())
+        with self.assertRaises(RuntimeError):
+            len(enum_incomp)
+        with self.assertRaises(RuntimeError):
+            bool(enum_incomp)
+
+        # 10. Table-driven verification of lifecycle state outcomes and predicates
+        test_table = [
+            # (name, stat_line, exp_pgrp, exp_stime, exp_status, exp_detail_sub, exp_is_clean, exp_is_empty)
+            (
+                "pid_reuse_pgrp_mismatch",
+                "5011 (task) S 100 8888 8888 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890",
+                1234,  # expected_pgrp
+                None,  # expected_starttime
+                "ABSENT",
+                "pgrp 8888 != expected 1234",
+                None,
+                None,
+            ),
+            (
+                "pid_reuse_starttime_mismatch",
+                "5011 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 99999",
+                1234,
+                67890,  # expected_starttime
+                "ABSENT",
+                "starttime 99999 != expected 67890",
+                None,
+                None,
+            ),
+            (
+                "confirmed_zombie_member",
+                "5012 (zomb) Z 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890",
+                1234,
+                None,
+                "ZOMBIE",
+                "Z",
+                True,   # is_clean: True because zombie is dead (no active or unknown)
+                False,  # is_empty: False because member exists
+            ),
+            (
+                "confirmed_active_member",
+                "5013 (active) R 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890",
+                1234,
+                None,
+                "ACTIVE",
+                "R",
+                False,  # is_clean: False because active member survives
+                False,  # is_empty: False
+            ),
+        ]
+
+        for name, s_line, exp_pg, exp_st, exp_stat, exp_det, exp_clean, exp_empty in test_table:
+            with self.subTest(case=name):
+                insp = self._inspect_process(
+                    5011,
+                    expected_pgrp=exp_pg,
+                    expected_starttime=exp_st,
+                    stat_reader=lambda p, sl=s_line: sl,
+                )
+                self.assertEqual(insp.status, exp_stat)
+                self.assertIn(exp_det, insp.detail)
+
+                if exp_clean is not None:
+                    enum_case = self._get_group_processes(
+                        1234,
+                        listdir_fn=lambda d: ["5011"],
+                        stat_reader=lambda p, sl=s_line: sl,
+                    )
+                    self.assertTrue(enum_case.complete)
+                    self.assertEqual(enum_case.is_clean(), exp_clean)
+                    self.assertEqual(enum_case.is_empty(), exp_empty)
 
 
 if __name__ == "__main__":
