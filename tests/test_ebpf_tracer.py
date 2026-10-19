@@ -265,11 +265,38 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 f"Malformed parentheses in /proc/{p}/stat: {content[:80]}"
             )
 
+        # 1. Parse and validate leading PID (Field 1) before opening parenthesis of comm (Field 2)
+        leading_token = content[:lparen].strip()
+        if not leading_token:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Missing leading PID before comm in /proc/{p}/stat: {content[:80]}"
+            )
+        try:
+            stat_pid = int(leading_token)
+        except ValueError:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Malformed non-numeric leading PID '{leading_token}' in /proc/{p}/stat: {content[:80]}"
+            )
+
+        if stat_pid <= 0:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Invalid non-positive PID {stat_pid} in /proc/{p}/stat"
+            )
+
+        if stat_pid != p:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Mismatched PID in /proc/{p}/stat: stat PID {stat_pid} != requested PID {p}"
+            )
+
         comm = content[lparen + 1:rparen]
         rest = content[rparen + 1:].strip().split()
 
         # Linux /proc/<pid>/stat field specification (proc(5)):
-        # Field 1: pid (preceding comm)
+        # Field 1: pid (preceding comm, validated above)
         # Field 2: comm (within outermost parentheses)
         # Post-comm fields (rest list, 0-indexed):
         #   rest[0]:  Field 3  - state (%c)
@@ -293,6 +320,10 @@ class TestEbpfTracerUnit(unittest.TestCase):
         #   rest[18]: Field 21 - itrealvalue (%ld)
         #   rest[19]: Field 22 - starttime (%llu)
         # Minimum required post-comm fields: 20 (to extract through field 22 starttime).
+        # We validate structural field count (minimum 20 post-comm fields through field 22 starttime)
+        # and semantic identity fields (PID, comm, state, PPID, PGID, starttime). Fields 6-21 are
+        # parsed structurally by token separation but not individually semantic-checked, to maintain
+        # broad kernel compatibility without over-constraining variable metrics.
         if len(rest) < 20:
             return ProcessInspection(
                 "UNKNOWN",
@@ -308,6 +339,18 @@ class TestEbpfTracerUnit(unittest.TestCase):
             return ProcessInspection(
                 "UNKNOWN",
                 f"Non-integer field in /proc/{p}/stat: {e}"
+            )
+
+        if ppid < 0:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Invalid negative ppid ({ppid}) in /proc/{p}/stat"
+            )
+
+        if pgrp < 0:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Invalid negative pgrp ({pgrp}) in /proc/{p}/stat"
             )
 
         if starttime < 0:
@@ -3301,6 +3344,10 @@ class TestEbpfTracerUnit(unittest.TestCase):
                     gchild_insp_pre.status, "ACTIVE",
                     f"Pre-cleanup: Grandchild PID {gchild_pid} should be ACTIVE, got {gchild_insp_pre}"
                 )
+                parent_starttime = parent_insp_pre.info.get("starttime")
+                self.assertIsInstance(parent_starttime, int, f"Parent starttime must be an integer: {parent_insp_pre}")
+                self.assertGreaterEqual(parent_starttime, 0, f"Parent starttime must be non-negative: {parent_insp_pre}")
+
                 gchild_starttime = gchild_insp_pre.info.get("starttime")
                 self.assertIsInstance(gchild_starttime, int, f"Grandchild starttime must be an integer: {gchild_insp_pre}")
                 self.assertGreaterEqual(gchild_starttime, 0, f"Grandchild starttime must be non-negative: {gchild_insp_pre}")
@@ -3317,7 +3364,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 # Lifecycle Checkpoint 2 (Immediate post-cleanup):
                 # 2a. Direct child must be reaped by our process via communicate()/wait()
                 self.assertIsNotNone(proc.poll(), f"Direct child PID {pgid} was not reaped by communicate()/wait()")
-                parent_insp_post = self._inspect_process(pgid)
+                parent_insp_post = self._inspect_process(pgid, expected_starttime=parent_starttime)
                 self.assertEqual(
                     parent_insp_post.status, "ABSENT",
                     f"Direct child PID {pgid} was reaped with waitpid but still observed in process table: {parent_insp_post}"
@@ -3369,7 +3416,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 )
 
                 # Direct child must remain completely absent
-                final_parent_insp = self._inspect_process(pgid)
+                final_parent_insp = self._inspect_process(pgid, expected_starttime=parent_starttime)
                 self.assertEqual(
                     final_parent_insp.status, "ABSENT",
                     f"Direct child PID {pgid} re-appeared in process table: {final_parent_insp}; context: {diag_ctx}"
@@ -4252,10 +4299,11 @@ class TestEbpfTracerUnit(unittest.TestCase):
         self.assertIn("Unrecognized kernel process state '?'", insp_unrec.detail)
 
         # 6. Expected starttime cannot be verified when starttime is missing (returns UNKNOWN, not ABSENT)
+        just_before_stime_5006 = "5006 (almost) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0"
         insp_exp_missing = self._inspect_process(
             5006,
             expected_starttime=67890,
-            stat_reader=lambda p: just_before_stime,
+            stat_reader=lambda p: just_before_stime_5006,
         )
         self.assertEqual(insp_exp_missing.status, "UNKNOWN")
         self.assertNotEqual(insp_exp_missing.status, "ABSENT")
@@ -4327,9 +4375,10 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
         # 10. Table-driven verification of lifecycle state outcomes and predicates
         test_table = [
-            # (name, stat_line, exp_pgrp, exp_stime, exp_status, exp_detail_sub, exp_is_clean, exp_is_empty)
+            # (name, req_pid, stat_line, exp_pgrp, exp_stime, exp_status, exp_detail_sub, exp_is_clean, exp_is_empty)
             (
                 "pid_reuse_pgrp_mismatch",
+                5011,
                 "5011 (task) S 100 8888 8888 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890",
                 1234,  # expected_pgrp
                 None,  # expected_starttime
@@ -4340,6 +4389,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
             ),
             (
                 "pid_reuse_starttime_mismatch",
+                5011,
                 "5011 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 99999",
                 1234,
                 67890,  # expected_starttime
@@ -4350,6 +4400,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
             ),
             (
                 "confirmed_zombie_member",
+                5012,
                 "5012 (zomb) Z 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890",
                 1234,
                 None,
@@ -4360,6 +4411,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
             ),
             (
                 "confirmed_active_member",
+                5013,
                 "5013 (active) R 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 67890",
                 1234,
                 None,
@@ -4370,10 +4422,10 @@ class TestEbpfTracerUnit(unittest.TestCase):
             ),
         ]
 
-        for name, s_line, exp_pg, exp_st, exp_stat, exp_det, exp_clean, exp_empty in test_table:
+        for name, r_pid, s_line, exp_pg, exp_st, exp_stat, exp_det, exp_clean, exp_empty in test_table:
             with self.subTest(case=name):
                 insp = self._inspect_process(
-                    5011,
+                    r_pid,
                     expected_pgrp=exp_pg,
                     expected_starttime=exp_st,
                     stat_reader=lambda p, sl=s_line: sl,
@@ -4384,12 +4436,202 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 if exp_clean is not None:
                     enum_case = self._get_group_processes(
                         1234,
-                        listdir_fn=lambda d: ["5011"],
+                        listdir_fn=lambda d, rp=r_pid: [str(rp)],
                         stat_reader=lambda p, sl=s_line: sl,
                     )
                     self.assertTrue(enum_case.complete)
                     self.assertEqual(enum_case.is_clean(), exp_clean)
                     self.assertEqual(enum_case.is_empty(), exp_empty)
+
+    def test_78_process_identity_anchoring_and_stat_verification(self):
+        """Scenario 78: Defensive process identity anchoring, stat validation, and lifecycle verdicts."""
+        # 1. Leading PID matches requested PID
+        valid_stat = "6001 (task1) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp1 = self._inspect_process(6001, stat_reader=lambda p: valid_stat)
+        self.assertEqual(insp1.status, "ACTIVE")
+        self.assertEqual(insp1.detail, "S")
+        self.assertEqual(insp1.info["comm"], "task1")
+        self.assertEqual(insp1.info["ppid"], 1)
+        self.assertEqual(insp1.info["pgrp"], 1234)
+        self.assertEqual(insp1.info["starttime"], 50000)
+
+        # 2. Leading PID differs from requested PID -> UNKNOWN (never ABSENT)
+        mismatch_stat = "9999 (foreign) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp2 = self._inspect_process(6002, stat_reader=lambda p: mismatch_stat)
+        self.assertEqual(insp2.status, "UNKNOWN")
+        self.assertNotEqual(insp2.status, "ABSENT")
+        self.assertIn("Mismatched PID in /proc/6002/stat: stat PID 9999 != requested PID 6002", insp2.detail)
+        self.assertIsNone(insp2.info.get("pgrp"))
+
+        # 3. Missing or non-numeric leading PID -> UNKNOWN
+        # 3a. Missing leading PID (starts directly with parenthesis)
+        no_pid_stat = "(task) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp3a = self._inspect_process(6003, stat_reader=lambda p: no_pid_stat)
+        self.assertEqual(insp3a.status, "UNKNOWN")
+        self.assertIn("Missing leading PID before comm", insp3a.detail)
+        self.assertIsNone(insp3a.info.get("pgrp"))
+
+        # 3b. Non-numeric leading PID
+        str_pid_stat = "not_a_pid (task) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp3b = self._inspect_process(6003, stat_reader=lambda p: str_pid_stat)
+        self.assertEqual(insp3b.status, "UNKNOWN")
+        self.assertIn("Malformed non-numeric leading PID 'not_a_pid'", insp3b.detail)
+        self.assertIsNone(insp3b.info.get("pgrp"))
+
+        # 3c. Multi-token leading PID
+        multi_token_stat = "6003 6004 (task) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp3c = self._inspect_process(6003, stat_reader=lambda p: multi_token_stat)
+        self.assertEqual(insp3c.status, "UNKNOWN")
+        self.assertIn("Malformed non-numeric leading PID", insp3c.detail)
+        self.assertIsNone(insp3c.info.get("pgrp"))
+
+        # 3d. Non-positive leading PID
+        neg_pid_stat = "-6003 (task) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp3d = self._inspect_process(6003, stat_reader=lambda p: neg_pid_stat)
+        self.assertEqual(insp3d.status, "UNKNOWN")
+        self.assertIn("Invalid non-positive PID -6003", insp3d.detail)
+        self.assertIsNone(insp3d.info.get("pgrp"))
+
+        # 3e. Zero leading PID
+        zero_pid_stat = "0 (task) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp3e = self._inspect_process(6003, stat_reader=lambda p: zero_pid_stat)
+        self.assertEqual(insp3e.status, "UNKNOWN")
+        self.assertIn("Invalid non-positive PID 0", insp3e.detail)
+        self.assertIsNone(insp3e.info.get("pgrp"))
+
+        # 4. comm contains spaces and embedded parentheses and is parsed correctly
+        nested_comm_stat = "6004 (task (with) [spaces] and (parens)) S 10 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp4 = self._inspect_process(6004, stat_reader=lambda p: nested_comm_stat)
+        self.assertEqual(insp4.status, "ACTIVE")
+        self.assertEqual(insp4.detail, "S")
+        self.assertEqual(insp4.info["comm"], "task (with) [spaces] and (parens)")
+        self.assertEqual(insp4.info["ppid"], 10)
+        self.assertEqual(insp4.info["pgrp"], 1234)
+        self.assertEqual(insp4.info["starttime"], 50000)
+
+        # 5. Negative ppid and pgrp values are rejected as UNKNOWN
+        # 5a. Negative ppid
+        neg_ppid_stat = "6005 (task) S -1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp5a = self._inspect_process(6005, stat_reader=lambda p: neg_ppid_stat)
+        self.assertEqual(insp5a.status, "UNKNOWN")
+        self.assertIn("Invalid negative ppid (-1)", insp5a.detail)
+        self.assertIsNone(insp5a.info.get("pgrp"))
+
+        # 5b. Negative pgrp
+        neg_pgrp_stat = "6005 (task) S 1 -500 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp5b = self._inspect_process(6005, stat_reader=lambda p: neg_pgrp_stat)
+        self.assertEqual(insp5b.status, "UNKNOWN")
+        self.assertIn("Invalid negative pgrp (-500)", insp5b.detail)
+        self.assertIsNone(insp5b.info.get("pgrp"))
+
+        # 6. Existing valid stat record still parses correctly
+        full_stat = "6006 (full_task) R 100 1234 1234 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 50000 123456 789 18446744073709551615 4194304 4198400 140737488347136 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0"
+        insp6 = self._inspect_process(6006, stat_reader=lambda p: full_stat)
+        self.assertEqual(insp6.status, "ACTIVE")
+        self.assertEqual(insp6.detail, "R")
+        self.assertEqual(insp6.info["comm"], "full_task")
+        self.assertEqual(insp6.info["ppid"], 100)
+        self.assertEqual(insp6.info["pgrp"], 1234)
+        self.assertEqual(insp6.info["starttime"], 50000)
+
+        # 7. Truncated records, malformed state tokens, and missing starttime remain UNKNOWN
+        # 7a. Truncated (< 20 fields)
+        trunc_stat = "6007 (trunc) S 100 1234 1234"
+        insp7a = self._inspect_process(6007, stat_reader=lambda p: trunc_stat)
+        self.assertEqual(insp7a.status, "UNKNOWN")
+        self.assertIn("Insufficient fields", insp7a.detail)
+
+        # 7b. Malformed multi-character state token
+        multi_state_stat = "6007 (state_err) RUNNING 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"
+        insp7b = self._inspect_process(6007, stat_reader=lambda p: multi_state_stat)
+        self.assertEqual(insp7b.status, "UNKNOWN")
+        self.assertIn("Invalid multi-character state token", insp7b.detail)
+
+        # 7c. Missing starttime with expected_starttime
+        trunc_before_stime = "6007 (no_stime) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0"
+        insp7c = self._inspect_process(6007, expected_starttime=50000, stat_reader=lambda p: trunc_before_stime)
+        self.assertEqual(insp7c.status, "UNKNOWN")
+        self.assertNotEqual(insp7c.status, "ABSENT")
+        self.assertIn("Missing starttime", insp7c.detail)
+
+        # 8. PID reuse through expected_pgrp/expected_starttime retains existing semantics
+        # 8a. pgrp mismatch -> ABSENT
+        insp8a = self._inspect_process(
+            6008,
+            expected_pgrp=9999,
+            stat_reader=lambda p: "6008 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000",
+        )
+        self.assertEqual(insp8a.status, "ABSENT")
+        self.assertIn("pgrp 1234 != expected 9999", insp8a.detail)
+
+        # 8b. starttime mismatch -> ABSENT
+        insp8b = self._inspect_process(
+            6008,
+            expected_pgrp=1234,
+            expected_starttime=99999,
+            stat_reader=lambda p: "6008 (task) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000",
+        )
+        self.assertEqual(insp8b.status, "ABSENT")
+        self.assertIn("starttime 50000 != expected 99999", insp8b.detail)
+
+        # 9. Invalid identity evidence cannot make GroupProcessEnumeration complete and clean incorrectly
+        invalid_stat_cases = [
+            ("mismatched_pid", lambda p: "9999 (other) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"),
+            ("missing_leading_pid", lambda p: "(no_pid) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"),
+            ("non_numeric_pid", lambda p: "bad_pid (bad) S 100 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"),
+            ("negative_pgrp", lambda p: "6009 (neg_pg) S 100 -1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"),
+            ("negative_ppid", lambda p: "6009 (neg_pp) S -1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000"),
+        ]
+        for case_name, reader_fn in invalid_stat_cases:
+            with self.subTest(candidate_case=case_name):
+                enum_res = self._get_group_processes(
+                    1234,
+                    listdir_fn=lambda d: ["6009"],
+                    stat_reader=reader_fn,
+                )
+                self.assertFalse(enum_res.complete, f"Case {case_name} must not be marked complete")
+                self.assertIn(6009, enum_res.unknown_candidates)
+                self.assertEqual(enum_res.members, {})
+                self.assertFalse(enum_res.is_clean(), f"Case {case_name} must not be clean")
+                self.assertFalse(enum_res.is_empty(), f"Case {case_name} must not be empty")
+                with self.assertRaises(RuntimeError):
+                    len(enum_res)
+                with self.assertRaises(RuntimeError):
+                    bool(enum_res)
+
+        # 10. Existing transient exit, zombie, surviving active member, and caller-process/group signal safety
+        # 10a. Transient exit remains complete and clean
+        enum_trans = self._get_group_processes(
+            1234,
+            listdir_fn=lambda d: ["6010"],
+            stat_reader=lambda p: (_ for _ in ()).throw(FileNotFoundError("Reaped")),
+        )
+        self.assertTrue(enum_trans.complete)
+        self.assertIn(6010, enum_trans.transient_exits)
+        self.assertTrue(enum_trans.is_clean())
+        self.assertTrue(enum_trans.is_empty())
+
+        # 10b. Zombie member permits is_clean() == True, but forbids is_empty() == True
+        enum_zomb = self._get_group_processes(
+            1234,
+            listdir_fn=lambda d: ["6011"],
+            stat_reader=lambda p: "6011 (zomb) Z 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000",
+        )
+        self.assertTrue(enum_zomb.complete)
+        self.assertIn(6011, enum_zomb.zombie_members)
+        self.assertTrue(enum_zomb.is_clean())
+        self.assertFalse(enum_zomb.is_empty())
+
+        # 10c. Surviving active member forbids both is_clean() and is_empty()
+        enum_act = self._get_group_processes(
+            1234,
+            listdir_fn=lambda d: ["6012"],
+            stat_reader=lambda p: "6012 (act) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 50000",
+        )
+        self.assertTrue(enum_act.complete)
+        self.assertIn(6012, enum_act.active_members)
+        self.assertFalse(enum_act.is_clean())
+        self.assertFalse(enum_act.is_empty())
 
 
 if __name__ == "__main__":
