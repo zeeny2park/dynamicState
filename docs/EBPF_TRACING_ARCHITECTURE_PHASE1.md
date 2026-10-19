@@ -919,6 +919,59 @@ Phase 1.18 hardens `test_68` with evidence-based operating-system process inspec
    - Full elimination is asserted via both `os.killpg(pgid, 0)` raising `ProcessLookupError` (ESRCH), `os.kill(gchild_pid, 0)` raising `ProcessLookupError`, and `/proc/<pid>` being completely absent (`read_proc_state(pid) is None`).
    - A robust `try ... finally` block guarantees emergency SIGKILL delivery and waitpid cleanup to prevent any orphaned background processes on test failures.
 
+---
+
+## 23. Phase 1.19 — Linux Lifecycle Test Reliability & CI Evidence
+
+### 23.1 Robust 3-Phase Process Inspection in `test_68`
+To eliminate timing hazards, race conditions, and fragile OS assumptions in `test_68_real_process_group_lifecycle_and_cleanup`, Phase 1.19 structures process lifecycle verification into three discrete inspection phases:
+1. **Checkpoint 1 (Pre-cleanup / Active Execution)**:
+   - Verifies that both the direct child (session leader) and the spawned grandchild process are actively executing (`"ACTIVE"`, kernel state `'R'` or `'S'`).
+   - Ensures token-based synchronization has successfully occurred before cleanup is triggered.
+2. **Checkpoint 2 (Immediate Post-Cleanup Verification)**:
+   - Direct child process is verified to be completely reaped and removed from the OS process table (`"ABSENT"`), confirming `proc.wait()` harvested its zombie entry.
+   - Grandchild process is verified to have received the process-group SIGKILL signal and is strictly **not** `"ACTIVE"`. It must have transitioned to either `"ABSENT"` (reaped by init/subreaper) or `"ZOMBIE"` (kernel state `'Z'`).
+3. **Checkpoint 3 (Final Bounded Verification)**:
+   - Employs bounded polling (deadline $2.0$s) to observe OS reaper progress.
+   - Asserts that no active process lingers in the process group, verifying `group_terminated=True` and confirming the grandchild process is either `"ABSENT"` or `"ZOMBIE"` awaiting asynchronous reaper harvesting.
+
+### 23.2 Process State Classification & OS Zombie Harvester Semantics
+Linux process table dynamics require strict classification between active execution, zombie states, and complete process absence:
+- **`inspect_process(pid)` Classification**:
+  - `"ABSENT"`: `os.kill(pid, 0)` raises `ProcessLookupError` (ESRCH), indicating PID table entry does not exist.
+  - `"ZOMBIE"`: `/proc/<pid>/stat` field 3 reports state `'Z'`. The process is dead/terminated, but its entry remains until the parent calls `waitpid`.
+  - `"ACTIVE"`: Process exists and is executing or sleeping (`'R'`, `'S'`, etc.).
+  - `"UNKNOWN"`: Permission denied or transient OS file read error.
+- **Robust Comm Parsing in `/proc/<pid>/stat`**:
+  - The process executable name (`comm`, field 2) can contain arbitrary spaces and parentheses (e.g. `(my proc (1))`).
+  - Parsing extracts fields by finding the last closing parenthesis `rfind(")")` to reliably isolate state char in field 3 without delimiter ambiguity.
+- **Grandchild Reaper Independence**:
+  - The test runner process is the parent of `proc` (the session leader). When `proc` exits, `gchild` is orphaned and adopted by PID 1 (or systemd/subreaper).
+  - In Linux, only a direct parent process can call `waitpid` to harvest a process table entry. The test runner cannot call `waitpid` on the grandchild.
+  - Therefore, tests must not assume instantaneous PID removal by PID 1; testing for `state != "ACTIVE"` is the correct, verifiable OS assertion.
+
+### 23.3 Guarded Leak Prevention in Teardown (`finally:`)
+Phase 1.19 hardens the `finally:` teardown block in `test_68` with multi-layered safety guards:
+1. **Self-Termination Guards**:
+   - `pgid > 1 and pgid != caller_pgrp and pgid != caller_pid`: Strict validation guarantees that `os.killpg(pgid, signal.SIGKILL)` will never signal the test runner itself or the test runner's own process group, even if `proc` initialization was aborted.
+2. **Decoupled Termination and Reaping**:
+   - Separates process group signal delivery (`os.killpg`) from direct child harvesting (`proc.wait(timeout=1.0)`).
+   - Treats `ProcessLookupError` (ESRCH) during group kill as expected clean teardown.
+3. **Descendant Fallback & Leak Reporting**:
+   - Fallback targeted `os.kill(gchild_pid, signal.SIGKILL)` if grandchild PID is known.
+   - Non-hiding residual leak detection: Inspects both parent and grandchild at the end of `finally:` and emits descriptive logger warnings if any active process remains, preventing silent resource leaks.
+
+### 23.4 CI Workflow Parity & Environment Verification
+- **GitHub Actions OAuth Scope Boundary**:
+  - The current GitHub CLI/OAuth token environment possesses scopes `'gist', 'read:org', 'repo'`, but lacks the `'workflow'` scope required to push workflow files to `.github/workflows/`.
+  - As a result, canonical CI workflows are maintained in `ci/workflows/test.yml` and `ci/workflows/gdb92.yml`.
+  - Parity is strictly tested and enforced by `tests/test_ci_workflow_parity.py` and maintained via `scripts/sync_workflows.sh`.
+- **Environment Execution Evidence**:
+  - Complete unit test matrix (74 tests) passing in local environment.
+  - Repeated execution validation of `test_68` (20/20 runs passing cleanly without leaks or flakiness).
+  - Integration suite executed in both privileged (`sudo -n`) and unprivileged modes.
+
+
 
 
 

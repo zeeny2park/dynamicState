@@ -2863,24 +2863,66 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
         Spawns a real process with start_new_session=True (which spawns a real child in its group),
         uses a filesystem token for deterministic synchronization (avoiding sleep races),
-        inspects Linux /proc/<pid>/stat process states across the lifecycle, exercises
-        _terminate_probe_process, and verifies that the entire process group is terminated
-        with no surviving or zombie processes.
+        inspects Linux /proc/<pid>/stat process states across 3 distinct lifecycle checkpoints
+        (pre-cleanup, immediate post-cleanup, and final bounded verification), exercises
+        _terminate_probe_process, and verifies that the process group and descendant processes
+        are cleanly terminated without active leaks or assumption of synchronous init reaping.
         """
         if not sys.platform.startswith("linux"):
             raise unittest.SkipTest("Requires Linux platform")
 
-        def read_proc_state(p: int) -> Optional[str]:
-            """Helper to inspect process state character ('R', 'S', 'Z', etc.) from /proc/<pid>/stat."""
+        def inspect_process(p: int) -> Tuple[str, Optional[str]]:
+            """Inspect process state, distinguishing absence, zombie, active, and unknown states.
+
+            kill(pid, 0) checks existence and permission to signal. On Linux:
+            - A running or sleeping process exists: kill(p, 0) succeeds (returns 0).
+            - A zombie process also exists in the kernel PID table until reaped by its parent
+              or reparented init/subreaper: kill(p, 0) succeeds (returns 0).
+            - When completely reaped or non-existent: kill(p, 0) raises ProcessLookupError (ESRCH).
+
+            /proc/<pid>/stat provides the definitive kernel task state:
+            - The comm field (field 2) is enclosed in parentheses and can contain spaces/parens.
+              We parse using rfind(')') to safely locate the end of comm.
+            - Field 3 immediately following is the state character:
+              'R' (running), 'S' (sleeping), 'D' (disk sleep), 'T' (stopped), 'Z' (zombie).
+
+            Returns:
+                Tuple[str, Optional[str]]: (classification, raw_state_or_detail)
+                - ("ABSENT", None): PID does not exist in kernel process table.
+                - ("ZOMBIE", "Z"): Process has terminated execution but remains in task table
+                  awaiting waitpid from its parent/subreaper.
+                - ("ACTIVE", state_char): Process is alive ('R', 'S', etc.).
+                - ("UNKNOWN", error_msg): Permission denied or error reading /proc/<pid>/stat.
+            """
+            # 1. Signal 0 existence check
+            try:
+                os.kill(p, 0)
+            except ProcessLookupError:
+                return "ABSENT", None
+            except PermissionError as e:
+                return "UNKNOWN", f"PermissionError: {e}"
+            except Exception as e:
+                return "UNKNOWN", f"Signal error: {e}"
+
+            # 2. Inspect /proc/<p>/stat for definitive execution state
             try:
                 with open(f"/proc/{p}/stat", "r") as f:
                     content = f.read().strip()
                 rparen = content.rfind(")")
                 if rparen != -1 and rparen + 2 < len(content):
-                    return content[rparen + 2]
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                return None
-            return None
+                    st = content[rparen + 2]
+                    if st == "Z":
+                        return "ZOMBIE", "Z"
+                    return "ACTIVE", st
+            except FileNotFoundError:
+                # Race condition: reaped between os.kill and open
+                return "ABSENT", None
+            except PermissionError as e:
+                return "UNKNOWN", f"PermissionError: {e}"
+            except Exception as e:
+                return "UNKNOWN", f"Stat read error: {e}"
+
+            return "ACTIVE", None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             token_file = os.path.join(tmpdir, "gchild_ready.token")
@@ -2919,68 +2961,136 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertEqual(os.getpgid(pgid), pgid)
                 self.assertEqual(os.getpgid(gchild_pid), pgid)
 
-                # Verify live process states before cleanup (should be S for sleeping or R for running)
-                parent_st = read_proc_state(pgid)
-                gchild_st = read_proc_state(gchild_pid)
-                if parent_st is not None:
-                    self.assertIn(parent_st, ("S", "R", "D"))
-                if gchild_st is not None:
-                    self.assertIn(gchild_st, ("S", "R", "D"))
+                # Lifecycle Checkpoint 1 (Pre-cleanup): both parent and grandchild must be actively executing
+                parent_cls_pre, parent_st_pre = inspect_process(pgid)
+                gchild_cls_pre, gchild_st_pre = inspect_process(gchild_pid)
+                self.assertEqual(
+                    parent_cls_pre, "ACTIVE",
+                    f"Pre-cleanup: Parent PID {pgid} should be ACTIVE, got {parent_cls_pre} ({parent_st_pre})"
+                )
+                self.assertEqual(
+                    gchild_cls_pre, "ACTIVE",
+                    f"Pre-cleanup: Grandchild PID {gchild_pid} should be ACTIVE, got {gchild_cls_pre} ({gchild_st_pre})"
+                )
 
                 # Exercise real cleanup
                 cleanup_res = EbpfEnvironmentChecker._terminate_probe_process(proc, [], is_session_leader=True)
 
-                # Verify cleanup outcome
+                # Verify cleanup contract outcome
                 self.assertTrue(cleanup_res.success)
                 self.assertTrue(cleanup_res.child_reaped)
                 self.assertTrue(cleanup_res.group_terminated)
                 self.assertEqual(cleanup_res.status, "CLEAN")
 
-                # Verify direct-child reaping separately from process-group state
-                self.assertIsNotNone(proc.poll(), "Direct child was not reaped")
+                # Lifecycle Checkpoint 2 (Immediate post-cleanup):
+                # 2a. Direct child must be reaped by our process via communicate()/wait()
+                self.assertIsNotNone(proc.poll(), f"Direct child PID {pgid} was not reaped by communicate()/wait()")
+                parent_cls_post, parent_st_post = inspect_process(pgid)
+                self.assertEqual(
+                    parent_cls_post, "ABSENT",
+                    f"Direct child PID {pgid} was reaped with waitpid but still observed in process table: {parent_cls_post} ({parent_st_post})"
+                )
 
-                # Verify on real OS that process group is completely dead (os.killpg raises ESRCH)
-                # Bounded polling accounts for asynchronous reaper (PID 1 / subreaper) zombie collection
-                group_dead = False
-                deadline = time.time() + 2.0
-                while time.time() < deadline:
+                # 2b. Grandchild was signaled with SIGKILL: it must NOT be actively executing.
+                # It may be ABSENT (already harvested) or ZOMBIE (awaiting init/subreaper reaping).
+                gchild_cls_post, gchild_st_post = inspect_process(gchild_pid)
+                self.assertNotEqual(
+                    gchild_cls_post, "ACTIVE",
+                    f"Grandchild PID {gchild_pid} is still actively executing ({gchild_st_post}) immediately after cleanup"
+                )
+
+                # Lifecycle Checkpoint 3 (Final bounded verification):
+                # Bounded wait for OS reaper (PID 1 / subreaper) to clear zombie from process table.
+                # Note: Grandchild is an orphan adopted by PID 1/subreaper; our process cannot waitpid it.
+                poll_deadline = time.time() + 2.0
+                last_gchild_cls = None
+                last_gchild_raw = None
+                last_group_alive = True
+                while time.time() < poll_deadline:
+                    last_gchild_cls, last_gchild_raw = inspect_process(gchild_pid)
                     try:
                         os.killpg(pgid, 0)
-                        time.sleep(0.01)
+                        last_group_alive = True
                     except ProcessLookupError:
-                        group_dead = True
+                        last_group_alive = False
+
+                    # Early exit if process group and grandchild are completely absent
+                    if last_gchild_cls == "ABSENT" and not last_group_alive:
                         break
+                    time.sleep(0.01)
 
-                self.assertTrue(group_dead, f"Process group {pgid} still detected via signal 0 after timeout")
+                # Verify process group does not contain surviving active processes
+                if last_group_alive:
+                    self.assertNotEqual(
+                        last_gchild_cls, "ACTIVE",
+                        f"Process group {pgid} still active after timeout: Grandchild PID {gchild_pid} is still ACTIVE ({last_gchild_raw})"
+                    )
 
-                # Verify descendant process is absent or reaped by reaper
-                gchild_dead = False
-                deadline = time.time() + 2.0
-                while time.time() < deadline:
-                    try:
-                        os.kill(gchild_pid, 0)
-                        time.sleep(0.01)
-                    except ProcessLookupError:
-                        gchild_dead = True
-                        break
+                # Verify grandchild is not active (must be ABSENT or ZOMBIE awaiting reaper)
+                self.assertNotEqual(
+                    last_gchild_cls, "ACTIVE",
+                    f"Grandchild PID {gchild_pid} in PGID {pgid} is still actively executing ({last_gchild_raw}) after timeout"
+                )
+                self.assertIn(
+                    last_gchild_cls, ("ABSENT", "ZOMBIE"),
+                    f"Grandchild PID {gchild_pid} in unexpected state: {last_gchild_cls} ({last_gchild_raw})"
+                )
 
-                self.assertTrue(gchild_dead, f"Grandchild PID {gchild_pid} still detected via signal 0 after timeout")
-
-                # Verify that no lingering zombie entries remain in /proc
-                self.assertIsNone(read_proc_state(pgid), f"Parent process PID {pgid} still lingers in /proc")
-                self.assertIsNone(read_proc_state(gchild_pid), f"Grandchild PID {gchild_pid} still lingers in /proc")
+                # Direct child must remain completely absent
+                final_parent_cls, _ = inspect_process(pgid)
+                self.assertEqual(final_parent_cls, "ABSENT", f"Direct child PID {pgid} re-appeared in process table")
             finally:
-                # Guaranteed bounded process cleanup in case of test failure
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except Exception:
-                    pass
-                if proc.poll() is None:
+                caller_pgrp = os.getpgrp()
+                caller_pid = os.getpid()
+
+                # 1. Guarded process-group termination (never signal caller's process or group)
+                if isinstance(pgid, int) and pgid > 1 and pgid != caller_pgrp and pgid != caller_pid:
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # Group already terminated - normal expected cleanup
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning("Failed to killpg(%s) in finally: %s", pgid, e)
+
+                # 2. Direct child wait/reap with bounded timeout
+                if proc is not None and proc.poll() is None:
                     try:
                         proc.kill()
-                        proc.wait(timeout=0.5)
-                    except Exception:
+                    except (ProcessLookupError, PermissionError):
                         pass
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        import logging
+                        logging.getLogger(__name__).warning("Direct child proc PID %s could not be reaped within 1.0s timeout", proc.pid)
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning("Error waiting for proc PID %s in finally: %s", proc.pid, e)
+
+                # 3. Descendant fallback termination (if discovered and safe)
+                if isinstance(gchild_pid, int) and gchild_pid > 1 and gchild_pid != caller_pid and gchild_pid != caller_pgrp:
+                    try:
+                        os.kill(gchild_pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning("Failed to kill grandchild %s in finally: %s", gchild_pid, e)
+
+                # 4. Final safety diagnostic verification without hiding residual active leaks
+                residual_leaks = []
+                if isinstance(pgid, int) and pgid > 1 and pgid != caller_pgrp:
+                    cls_p, raw_p = inspect_process(pgid)
+                    if cls_p == "ACTIVE":
+                        residual_leaks.append(f"Parent PID {pgid} is still {cls_p} ({raw_p})")
+                if isinstance(gchild_pid, int) and gchild_pid > 1 and gchild_pid != caller_pid:
+                    cls_g, raw_g = inspect_process(gchild_pid)
+                    if cls_g == "ACTIVE":
+                        residual_leaks.append(f"Grandchild PID {gchild_pid} is still {cls_g} ({raw_g})")
+                if residual_leaks:
+                    import logging
+                    logging.getLogger(__name__).warning("Residual active process leak after test_68 cleanup: %s", ", ".join(residual_leaks))
 
     def test_69_no_mock_specific_branches_in_production(self):
         """Scenario 69: Verify production code contains no test-framework-specific attributes or mocks."""
