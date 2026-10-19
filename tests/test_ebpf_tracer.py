@@ -70,8 +70,159 @@ from extractor.ebpf_tracer import (
 from extractor.observation_backends import EbpfObservationBackend, ObservationBackend
 
 
+class ProcessInspection:
+    """Structured inspection result of a process's OS state."""
+    def __init__(
+        self,
+        status: str,
+        detail: Optional[str] = None,
+        info: Optional[Dict[str, Any]] = None,
+    ):
+        self.status = status      # "ACTIVE", "ZOMBIE", "ABSENT", "UNKNOWN"
+        self.detail = detail      # state char, error reason, or diagnostic detail
+        self.info = info or {}    # dict with comm, state, ppid, pgrp, starttime
+
+    def __iter__(self):
+        # Enables backwards-compatible 2-tuple unpacking: status, detail = inspect_process(pid)
+        return iter((self.status, self.detail))
+
+    def __repr__(self):
+        pgrp_info = f", pgrp={self.info.get('pgrp')}" if "pgrp" in self.info else ""
+        return f"ProcessInspection(status={self.status!r}, detail={self.detail!r}{pgrp_info})"
+
+
 class TestEbpfTracerUnit(unittest.TestCase):
     """Hermetic unit tests for eBPF tracer decoder, schemas, capability detection, and identity verification."""
+
+    @classmethod
+    def _inspect_process(
+        cls,
+        p: int,
+        expected_pgrp: Optional[int] = None,
+        expected_starttime: Optional[int] = None,
+        stat_reader: Optional[Callable[[int], str]] = None,
+        kill_fn: Optional[Callable[[int, int], None]] = None,
+    ) -> ProcessInspection:
+        """Inspect process state, distinguishing absence, zombie, active, and unknown states.
+
+        Defensively checks signal 0, parses /proc/<p>/stat (handling complex comm with parens/spaces),
+        and verifies process group membership and starttime to detect PID reuse.
+
+        Returns:
+            ProcessInspection: (status, detail, info) where status is in
+            {"ACTIVE", "ZOMBIE", "ABSENT", "UNKNOWN"}.
+        """
+        _kill = kill_fn or os.kill
+        # 1. Signal 0 existence check
+        try:
+            _kill(p, 0)
+        except ProcessLookupError:
+            return ProcessInspection("ABSENT", "ProcessLookupError (ESRCH)")
+        except PermissionError as e:
+            return ProcessInspection("UNKNOWN", f"PermissionError: {e}")
+        except Exception as e:
+            return ProcessInspection("UNKNOWN", f"Signal error: {e}")
+
+        # 2. Inspect /proc/<p>/stat for definitive execution state
+        try:
+            if stat_reader is not None:
+                content = stat_reader(p).strip()
+            else:
+                with open(f"/proc/{p}/stat", "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+        except (FileNotFoundError, ProcessLookupError):
+            # Race condition: reaped between signal check and /proc read
+            return ProcessInspection("ABSENT", "Stat file absent (process reaped)")
+        except PermissionError as e:
+            return ProcessInspection("UNKNOWN", f"PermissionError reading /proc/{p}/stat: {e}")
+        except Exception as e:
+            return ProcessInspection("UNKNOWN", f"Stat read error: {e}")
+
+        # Defensive parsing of /proc/<pid>/stat
+        lparen = content.find("(")
+        rparen = content.rfind(")")
+        if lparen == -1 or rparen == -1 or rparen <= lparen:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Malformed parentheses in /proc/{p}/stat: {content[:80]}"
+            )
+
+        comm = content[lparen + 1:rparen]
+        rest = content[rparen + 1:].strip().split()
+        if len(rest) < 3:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Insufficient fields ({len(rest)}) in /proc/{p}/stat: {content[:80]}"
+            )
+
+        state_char = rest[0]
+        try:
+            ppid = int(rest[1])
+            pgrp = int(rest[2])
+            starttime = int(rest[19]) if len(rest) >= 20 else None
+        except ValueError as e:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Non-integer field in /proc/{p}/stat: {e}"
+            )
+
+        info = {
+            "comm": comm,
+            "state": state_char,
+            "ppid": ppid,
+            "pgrp": pgrp,
+            "starttime": starttime,
+        }
+
+        # PID reuse verification: if PID exists but belongs to different PGID or starttime
+        if expected_pgrp is not None and pgrp != expected_pgrp:
+            return ProcessInspection(
+                "ABSENT",
+                f"PID reused (pgrp {pgrp} != expected {expected_pgrp})",
+                info
+            )
+        if expected_starttime is not None and starttime is not None and starttime != expected_starttime:
+            return ProcessInspection(
+                "ABSENT",
+                f"PID reused (starttime {starttime} != expected {expected_starttime})",
+                info
+            )
+
+        if state_char == "Z":
+            return ProcessInspection("ZOMBIE", "Z", info)
+        elif state_char in ("R", "S", "D", "T", "t", "W", "X", "x", "K", "P", "I"):
+            return ProcessInspection("ACTIVE", state_char, info)
+        else:
+            return ProcessInspection(
+                "UNKNOWN",
+                f"Unrecognized kernel process state '{state_char}'",
+                info
+            )
+
+    @classmethod
+    def _get_group_processes(
+        cls,
+        target_pgid: int,
+        proc_dir: str = "/proc",
+    ) -> Dict[int, ProcessInspection]:
+        """Scan /proc to enumerate all processes currently belonging to target_pgid."""
+        members = {}
+        try:
+            entries = os.listdir(proc_dir)
+        except Exception:
+            return members
+
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            candidate_pid = int(entry)
+            insp = cls._inspect_process(candidate_pid)
+            if insp.status == "ABSENT":
+                continue
+            if insp.info.get("pgrp") == target_pgid:
+                members[candidate_pid] = insp
+        return members
+
 
     def setUp(self):
         self.target_pid = 4242
@@ -2867,62 +3018,11 @@ class TestEbpfTracerUnit(unittest.TestCase):
         (pre-cleanup, immediate post-cleanup, and final bounded verification), exercises
         _terminate_probe_process, and verifies that the process group and descendant processes
         are cleanly terminated without active leaks or assumption of synchronous init reaping.
+        Enumerates /proc entries to verify process-group absence without relying on killpg(0) alone,
+        and accounts for PID reuse and races.
         """
         if not sys.platform.startswith("linux"):
             raise unittest.SkipTest("Requires Linux platform")
-
-        def inspect_process(p: int) -> Tuple[str, Optional[str]]:
-            """Inspect process state, distinguishing absence, zombie, active, and unknown states.
-
-            kill(pid, 0) checks existence and permission to signal. On Linux:
-            - A running or sleeping process exists: kill(p, 0) succeeds (returns 0).
-            - A zombie process also exists in the kernel PID table until reaped by its parent
-              or reparented init/subreaper: kill(p, 0) succeeds (returns 0).
-            - When completely reaped or non-existent: kill(p, 0) raises ProcessLookupError (ESRCH).
-
-            /proc/<pid>/stat provides the definitive kernel task state:
-            - The comm field (field 2) is enclosed in parentheses and can contain spaces/parens.
-              We parse using rfind(')') to safely locate the end of comm.
-            - Field 3 immediately following is the state character:
-              'R' (running), 'S' (sleeping), 'D' (disk sleep), 'T' (stopped), 'Z' (zombie).
-
-            Returns:
-                Tuple[str, Optional[str]]: (classification, raw_state_or_detail)
-                - ("ABSENT", None): PID does not exist in kernel process table.
-                - ("ZOMBIE", "Z"): Process has terminated execution but remains in task table
-                  awaiting waitpid from its parent/subreaper.
-                - ("ACTIVE", state_char): Process is alive ('R', 'S', etc.).
-                - ("UNKNOWN", error_msg): Permission denied or error reading /proc/<pid>/stat.
-            """
-            # 1. Signal 0 existence check
-            try:
-                os.kill(p, 0)
-            except ProcessLookupError:
-                return "ABSENT", None
-            except PermissionError as e:
-                return "UNKNOWN", f"PermissionError: {e}"
-            except Exception as e:
-                return "UNKNOWN", f"Signal error: {e}"
-
-            # 2. Inspect /proc/<p>/stat for definitive execution state
-            try:
-                with open(f"/proc/{p}/stat", "r") as f:
-                    content = f.read().strip()
-                rparen = content.rfind(")")
-                if rparen != -1 and rparen + 2 < len(content):
-                    st = content[rparen + 2]
-                    if st == "Z":
-                        return "ZOMBIE", "Z"
-                    return "ACTIVE", st
-            except FileNotFoundError:
-                # Race condition: reaped between os.kill and open
-                return "ABSENT", None
-            except PermissionError as e:
-                return "UNKNOWN", f"PermissionError: {e}"
-            except Exception as e:
-                return "UNKNOWN", f"Stat read error: {e}"
-
-            return "ACTIVE", None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             token_file = os.path.join(tmpdir, "gchild_ready.token")
@@ -2943,8 +3043,8 @@ class TestEbpfTracerUnit(unittest.TestCase):
             gchild_pid = None
             try:
                 # Deterministic sync: wait for grandchild to write token file
-                deadline = time.time() + 4.0
-                while time.time() < deadline:
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline:
                     if os.path.exists(token_file) and os.path.getsize(token_file) > 0:
                         try:
                             with open(token_file, "r") as f:
@@ -2962,16 +3062,17 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertEqual(os.getpgid(gchild_pid), pgid)
 
                 # Lifecycle Checkpoint 1 (Pre-cleanup): both parent and grandchild must be actively executing
-                parent_cls_pre, parent_st_pre = inspect_process(pgid)
-                gchild_cls_pre, gchild_st_pre = inspect_process(gchild_pid)
+                parent_insp_pre = self._inspect_process(pgid, expected_pgrp=pgid)
+                gchild_insp_pre = self._inspect_process(gchild_pid, expected_pgrp=pgid)
                 self.assertEqual(
-                    parent_cls_pre, "ACTIVE",
-                    f"Pre-cleanup: Parent PID {pgid} should be ACTIVE, got {parent_cls_pre} ({parent_st_pre})"
+                    parent_insp_pre.status, "ACTIVE",
+                    f"Pre-cleanup: Parent PID {pgid} should be ACTIVE, got {parent_insp_pre}"
                 )
                 self.assertEqual(
-                    gchild_cls_pre, "ACTIVE",
-                    f"Pre-cleanup: Grandchild PID {gchild_pid} should be ACTIVE, got {gchild_cls_pre} ({gchild_st_pre})"
+                    gchild_insp_pre.status, "ACTIVE",
+                    f"Pre-cleanup: Grandchild PID {gchild_pid} should be ACTIVE, got {gchild_insp_pre}"
                 )
+                gchild_starttime = gchild_insp_pre.info.get("starttime")
 
                 # Exercise real cleanup
                 cleanup_res = EbpfEnvironmentChecker._terminate_probe_process(proc, [], is_session_leader=True)
@@ -2985,60 +3086,100 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 # Lifecycle Checkpoint 2 (Immediate post-cleanup):
                 # 2a. Direct child must be reaped by our process via communicate()/wait()
                 self.assertIsNotNone(proc.poll(), f"Direct child PID {pgid} was not reaped by communicate()/wait()")
-                parent_cls_post, parent_st_post = inspect_process(pgid)
+                parent_insp_post = self._inspect_process(pgid)
                 self.assertEqual(
-                    parent_cls_post, "ABSENT",
-                    f"Direct child PID {pgid} was reaped with waitpid but still observed in process table: {parent_cls_post} ({parent_st_post})"
+                    parent_insp_post.status, "ABSENT",
+                    f"Direct child PID {pgid} was reaped with waitpid but still observed in process table: {parent_insp_post}"
                 )
 
                 # 2b. Grandchild was signaled with SIGKILL: it must NOT be actively executing.
                 # It may be ABSENT (already harvested) or ZOMBIE (awaiting init/subreaper reaping).
-                gchild_cls_post, gchild_st_post = inspect_process(gchild_pid)
+                gchild_insp_post = self._inspect_process(
+                    gchild_pid, expected_pgrp=pgid, expected_starttime=gchild_starttime
+                )
                 self.assertNotEqual(
-                    gchild_cls_post, "ACTIVE",
-                    f"Grandchild PID {gchild_pid} is still actively executing ({gchild_st_post}) immediately after cleanup"
+                    gchild_insp_post.status, "ACTIVE",
+                    f"Grandchild PID {gchild_pid} is still actively executing ({gchild_insp_post}) immediately after cleanup"
+                )
+                self.assertNotEqual(
+                    gchild_insp_post.status, "UNKNOWN",
+                    f"Grandchild PID {gchild_pid} inspection is unknown/inconclusive immediately after cleanup: {gchild_insp_post}"
                 )
 
                 # Lifecycle Checkpoint 3 (Final bounded verification):
-                # Bounded wait for OS reaper (PID 1 / subreaper) to clear zombie from process table.
+                # Bounded wait with monotonic clock for OS reaper (PID 1 / subreaper) to clear zombie from process table.
                 # Note: Grandchild is an orphan adopted by PID 1/subreaper; our process cannot waitpid it.
-                poll_deadline = time.time() + 2.0
-                last_gchild_cls = None
-                last_gchild_raw = None
-                last_group_alive = True
-                while time.time() < poll_deadline:
-                    last_gchild_cls, last_gchild_raw = inspect_process(gchild_pid)
+                poll_deadline = time.monotonic() + 2.0
+                last_gchild_insp = None
+                last_group_members = {}
+                last_killpg_alive = True
+                while time.monotonic() < poll_deadline:
+                    last_gchild_insp = self._inspect_process(
+                        gchild_pid, expected_pgrp=pgid, expected_starttime=gchild_starttime
+                    )
+                    last_group_members = self._get_group_processes(pgid)
                     try:
                         os.killpg(pgid, 0)
-                        last_group_alive = True
+                        last_killpg_alive = True
                     except ProcessLookupError:
-                        last_group_alive = False
+                        last_killpg_alive = False
 
-                    # Early exit if process group and grandchild are completely absent
-                    if last_gchild_cls == "ABSENT" and not last_group_alive:
+                    # Early exit if process group has no members in /proc and killpg indicates absent
+                    if len(last_group_members) == 0 and last_gchild_insp.status == "ABSENT" and not last_killpg_alive:
                         break
                     time.sleep(0.01)
 
-                # Verify process group does not contain surviving active processes
-                if last_group_alive:
-                    self.assertNotEqual(
-                        last_gchild_cls, "ACTIVE",
-                        f"Process group {pgid} still active after timeout: Grandchild PID {gchild_pid} is still ACTIVE ({last_gchild_raw})"
-                    )
-
-                # Verify grandchild is not active (must be ABSENT or ZOMBIE awaiting reaper)
-                self.assertNotEqual(
-                    last_gchild_cls, "ACTIVE",
-                    f"Grandchild PID {gchild_pid} in PGID {pgid} is still actively executing ({last_gchild_raw}) after timeout"
-                )
-                self.assertIn(
-                    last_gchild_cls, ("ABSENT", "ZOMBIE"),
-                    f"Grandchild PID {gchild_pid} in unexpected state: {last_gchild_cls} ({last_gchild_raw})"
+                diag_ctx = (
+                    f"PGID={pgid}, gchild_PID={gchild_pid}, "
+                    f"last_gchild={last_gchild_insp}, "
+                    f"group_members={last_group_members}, "
+                    f"killpg_alive={last_killpg_alive}"
                 )
 
                 # Direct child must remain completely absent
-                final_parent_cls, _ = inspect_process(pgid)
-                self.assertEqual(final_parent_cls, "ABSENT", f"Direct child PID {pgid} re-appeared in process table")
+                final_parent_insp = self._inspect_process(pgid)
+                self.assertEqual(
+                    final_parent_insp.status, "ABSENT",
+                    f"Direct child PID {pgid} re-appeared in process table: {final_parent_insp}; context: {diag_ctx}"
+                )
+
+                # Verify grandchild is not active (must be ABSENT or ZOMBIE awaiting reaper)
+                self.assertNotEqual(
+                    last_gchild_insp.status, "ACTIVE",
+                    f"Grandchild PID {gchild_pid} in PGID {pgid} is still actively executing after timeout: {last_gchild_insp}; context: {diag_ctx}"
+                )
+                self.assertNotEqual(
+                    last_gchild_insp.status, "UNKNOWN",
+                    f"Grandchild PID {gchild_pid} inspection is unknown/inconclusive: {last_gchild_insp}; context: {diag_ctx}"
+                )
+                self.assertIn(
+                    last_gchild_insp.status, ("ABSENT", "ZOMBIE"),
+                    f"Grandchild PID {gchild_pid} in unexpected state: {last_gchild_insp}; context: {diag_ctx}"
+                )
+
+                # Verify intended process group has NO surviving active members (do not rely on killpg(0) alone)
+                active_group_members = {
+                    p: insp for p, insp in last_group_members.items() if insp.status == "ACTIVE"
+                }
+                self.assertEqual(
+                    active_group_members, {},
+                    f"Process group {pgid} contains surviving active processes after timeout: {active_group_members}; context: {diag_ctx}"
+                )
+
+                unknown_group_members = {
+                    p: insp for p, insp in last_group_members.items() if insp.status == "UNKNOWN"
+                }
+                self.assertEqual(
+                    unknown_group_members, {},
+                    f"Process group {pgid} contains unknown/inconclusive processes after timeout: {unknown_group_members}; context: {diag_ctx}"
+                )
+
+                # Any residual group members must strictly be ZOMBIEs awaiting async reaping by PID 1
+                for p, insp in last_group_members.items():
+                    self.assertEqual(
+                        insp.status, "ZOMBIE",
+                        f"Non-zombie process {p} lingering in process group {pgid}: {insp}; context: {diag_ctx}"
+                    )
             finally:
                 caller_pgrp = os.getpgrp()
                 caller_pid = os.getpid()
@@ -3081,13 +3222,17 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 # 4. Final safety diagnostic verification without hiding residual active leaks
                 residual_leaks = []
                 if isinstance(pgid, int) and pgid > 1 and pgid != caller_pgrp:
-                    cls_p, raw_p = inspect_process(pgid)
-                    if cls_p == "ACTIVE":
-                        residual_leaks.append(f"Parent PID {pgid} is still {cls_p} ({raw_p})")
-                if isinstance(gchild_pid, int) and gchild_pid > 1 and gchild_pid != caller_pid:
-                    cls_g, raw_g = inspect_process(gchild_pid)
-                    if cls_g == "ACTIVE":
-                        residual_leaks.append(f"Grandchild PID {gchild_pid} is still {cls_g} ({raw_g})")
+                    p_insp = self._inspect_process(pgid)
+                    if p_insp.status == "ACTIVE":
+                        residual_leaks.append(f"Parent PID {pgid} is still {p_insp}")
+                    grp_m = self._get_group_processes(pgid)
+                    for p_mem, insp_mem in grp_m.items():
+                        if insp_mem.status == "ACTIVE" and p_mem != caller_pid:
+                            residual_leaks.append(f"Group member PID {p_mem} in PGID {pgid} is still {insp_mem}")
+                if isinstance(gchild_pid, int) and gchild_pid > 1 and gchild_pid != caller_pid and gchild_pid != caller_pgrp:
+                    g_insp = self._inspect_process(gchild_pid)
+                    if g_insp.status == "ACTIVE":
+                        residual_leaks.append(f"Grandchild PID {gchild_pid} is still {g_insp}")
                 if residual_leaks:
                     import logging
                     logging.getLogger(__name__).warning("Residual active process leak after test_68 cleanup: %s", ", ".join(residual_leaks))
@@ -3452,8 +3597,147 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertIn("Corrupted pipe descriptor", reason)
                 self.assertIn("[cleanup warning: GROUP_KILL_FAILED - Kill signal rejected]", reason)
 
+    def test_75_process_inspection_defensive_parsing_and_pid_reuse(self):
+        """Scenario 75: Verify defensive /proc/<pid>/stat parsing, diagnostics, and PID reuse detection."""
+        # 1. Active process with complex comm containing spaces and nested parentheses
+        complex_stat = "1001 (complex (sub) name) S 500 1200 1200 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 54321 12345 678"
+        insp = self._inspect_process(
+            1001,
+            stat_reader=lambda p: complex_stat,
+            kill_fn=lambda p, s: None,
+        )
+        self.assertEqual(insp.status, "ACTIVE")
+        self.assertEqual(insp.detail, "S")
+        self.assertEqual(insp.info["comm"], "complex (sub) name")
+        self.assertEqual(insp.info["ppid"], 500)
+        self.assertEqual(insp.info["pgrp"], 1200)
+        self.assertEqual(insp.info["starttime"], 54321)
+
+        # 2. Backwards-compatible 2-tuple unpacking
+        status, detail = insp
+        self.assertEqual(status, "ACTIVE")
+        self.assertEqual(detail, "S")
+
+        # 3. Zombie process
+        zombie_stat = "1002 (zombie_task) Z 500 1200 1200 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 54322"
+        z_insp = self._inspect_process(
+            1002,
+            stat_reader=lambda p: zombie_stat,
+            kill_fn=lambda p, s: None,
+        )
+        self.assertEqual(z_insp.status, "ZOMBIE")
+        self.assertEqual(z_insp.detail, "Z")
+
+        # 4. Malformed stat: missing parentheses
+        malformed_stat_1 = "1003 malformed_task S 500 1200"
+        m1_insp = self._inspect_process(
+            1003,
+            stat_reader=lambda p: malformed_stat_1,
+            kill_fn=lambda p, s: None,
+        )
+        self.assertEqual(m1_insp.status, "UNKNOWN")
+        self.assertIn("Malformed parentheses", m1_insp.detail)
+
+        # 5. Malformed stat: truncated fields (< 3 fields after comm)
+        malformed_stat_2 = "1004 (truncated) S"
+        m2_insp = self._inspect_process(
+            1004,
+            stat_reader=lambda p: malformed_stat_2,
+            kill_fn=lambda p, s: None,
+        )
+        self.assertEqual(m2_insp.status, "UNKNOWN")
+        self.assertIn("Insufficient fields", m2_insp.detail)
+
+        # 6. Malformed stat: non-integer ppid/pgrp
+        malformed_stat_3 = "1005 (bad_ints) S not_an_int not_an_int"
+        m3_insp = self._inspect_process(
+            1005,
+            stat_reader=lambda p: malformed_stat_3,
+            kill_fn=lambda p, s: None,
+        )
+        self.assertEqual(m3_insp.status, "UNKNOWN")
+        self.assertIn("Non-integer field", m3_insp.detail)
+
+        # 7. Unrecognized kernel state character
+        unknown_state_stat = "1006 (weird) ? 500 1200 1200 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 54322"
+        u_insp = self._inspect_process(
+            1006,
+            stat_reader=lambda p: unknown_state_stat,
+            kill_fn=lambda p, s: None,
+        )
+        self.assertEqual(u_insp.status, "UNKNOWN")
+        self.assertIn("Unrecognized kernel process state '?'", u_insp.detail)
+
+        # 8. PID reuse detection: PGID mismatch
+        # Process exists and is ACTIVE, but its pgrp is 1200, while we expect 9999
+        reuse_pgrp = self._inspect_process(
+            1001,
+            expected_pgrp=9999,
+            stat_reader=lambda p: complex_stat,
+            kill_fn=lambda p, s: None,
+        )
+        self.assertEqual(reuse_pgrp.status, "ABSENT")
+        self.assertIn("PID reused (pgrp 1200 != expected 9999)", reuse_pgrp.detail)
+
+        # 9. PID reuse detection: starttime mismatch
+        # Process exists, pgrp matches 1200, but starttime is 54321 while we expect 11111
+        reuse_time = self._inspect_process(
+            1001,
+            expected_pgrp=1200,
+            expected_starttime=11111,
+            stat_reader=lambda p: complex_stat,
+            kill_fn=lambda p, s: None,
+        )
+        self.assertEqual(reuse_time.status, "ABSENT")
+        self.assertIn("PID reused (starttime 54321 != expected 11111)", reuse_time.detail)
+
+        # 10. Process lookup error (kill raises ESRCH)
+        def mock_esrch(p, s):
+            raise ProcessLookupError(3, "No such process")
+        absent_insp = self._inspect_process(9999, kill_fn=mock_esrch)
+        self.assertEqual(absent_insp.status, "ABSENT")
+
+        # 11. Permission error on kill
+        def mock_eacces(p, s):
+            raise PermissionError(1, "Operation not permitted")
+        perm_insp = self._inspect_process(9998, kill_fn=mock_eacces)
+        self.assertEqual(perm_insp.status, "UNKNOWN")
+        self.assertIn("PermissionError", perm_insp.detail)
+
+        # 12. Group process enumeration
+        with tempfile.TemporaryDirectory() as fake_proc:
+            os.makedirs(os.path.join(fake_proc, "2001"))
+            os.makedirs(os.path.join(fake_proc, "2002"))
+            os.makedirs(os.path.join(fake_proc, "2003"))
+            os.makedirs(os.path.join(fake_proc, "non_numeric"))
+            with open(os.path.join(fake_proc, "2001", "stat"), "w", encoding="utf-8") as f:
+                f.write("2001 (proc1) S 100 5500 5500 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000\n")
+            with open(os.path.join(fake_proc, "2002", "stat"), "w", encoding="utf-8") as f:
+                f.write("2002 (proc2) Z 100 5500 5500 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1001\n")
+            with open(os.path.join(fake_proc, "2003", "stat"), "w", encoding="utf-8") as f:
+                f.write("2003 (other) S 100 8888 8888 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1002\n")
+
+            real_open = open
+            def mock_fake_open(path, *args, **kwargs):
+                if isinstance(path, str) and path.startswith("/proc/") and path.endswith("/stat"):
+                    parts = path.split("/")
+                    pid_str = parts[2]
+                    fake_path = os.path.join(fake_proc, pid_str, "stat")
+                    return real_open(fake_path, *args, **kwargs)
+                return real_open(path, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=mock_fake_open), \
+                 patch("os.kill", return_value=None):
+                group_5500 = self._get_group_processes(5500, proc_dir=fake_proc)
+                self.assertIn(2001, group_5500)
+                self.assertIn(2002, group_5500)
+                self.assertNotIn(2003, group_5500)
+                self.assertEqual(group_5500[2001].status, "ACTIVE")
+                self.assertEqual(group_5500[2002].status, "ZOMBIE")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

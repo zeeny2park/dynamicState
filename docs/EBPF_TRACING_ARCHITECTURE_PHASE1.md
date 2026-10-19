@@ -971,6 +971,51 @@ Phase 1.19 hardens the `finally:` teardown block in `test_68` with multi-layered
   - Repeated execution validation of `test_68` (20/20 runs passing cleanly without leaks or flakiness).
   - Integration suite executed in both privileged (`sudo -n`) and unprivileged modes.
 
+---
+
+## 24. Phase 1.20 — Lifecycle Verification Hardening & Reproducible Test Evidence
+
+### 24.1 Structured Process State Inspection (`ProcessInspection` & `_inspect_process`)
+Phase 1.20 establishes a hardened OS inspection foundation for Linux process lifecycles:
+1. **Defensive `/proc/<pid>/stat` Parsing**:
+   - Safely isolates the `comm` field using `find('(')` and `rfind(')')`, accommodating arbitrary executable names with spaces or nested parentheses (e.g. `(my (proc) 1)`).
+   - Extracts subsequent fields strictly after the closing parenthesis: `state` (field 3), `ppid` (field 4), `pgrp` (field 5), and `starttime` (field 22).
+   - Validates numerical conversions and field counts; raises descriptive `UNKNOWN` errors rather than silently inferring process activity on corrupt or truncated stat data.
+2. **Explicit 4-State Inspection Model**:
+   - `ACTIVE`: Process is verified to exist and is actively executing or sleeping in the kernel (`R`, `S`, `D`, etc.).
+   - `ZOMBIE`: Process execution has terminated, but the task table entry remains (`Z`) awaiting harvesting by its parent or subreaper.
+   - `ABSENT`: Positively confirmed non-existence via `ProcessLookupError` (ESRCH), missing `/proc` entry, or PID reuse by an unrelated process.
+   - `UNKNOWN`: Inconclusive state resulting from permission errors, stat read errors, or malformed kernel files. **`UNKNOWN` is never treated as proof of termination.**
+3. **PID Reuse & Race Condition Detection**:
+   - Validates candidate PIDs against `expected_pgrp` and `expected_starttime`. If an active PID is encountered whose process group or boot start time does not match the target process, it is proven that the original process exited and its PID was recycled by the kernel. The target process is therefore accurately reported as `ABSENT`.
+
+### 24.2 True Process-Group Enumeration vs `killpg(0)` Semantics
+In Linux, `killpg(pgid, 0)` returns success ($0$) as long as *any* entry in the kernel process table has process group `pgid`, including terminated zombie tasks awaiting asynchronous reaping by PID 1 / subreaper. Consequently, `killpg(pgid, 0)` alone cannot prove whether active processes remain or whether the process group is clean.
+- `_get_group_processes(target_pgid)` actively scans `/proc` numeric directories to enumerate every process belonging to the group.
+- The test asserts:
+  - `active_group_members == {}`: Verifies zero surviving active processes in the target group.
+  - `unknown_group_members == {}`: Confirms no unverified/inconclusive processes linger.
+  - Any remaining group members are strictly validated to have `status == "ZOMBIE"`.
+
+### 24.3 Monotonic Deadlines & Contextual Failure Diagnostics
+- All bounded polling loops throughout lifecycle tests employ monotonic clocks (`time.monotonic()`), eliminating clock jump or NTP time-step skew hazards.
+- All assertion failures incorporate rich diagnostic contexts:
+  - `PGID`, `gchild_PID`, `last_gchild_insp`, `group_members`, and `killpg_alive`.
+
+### 24.4 Reproducible Test Evidence & CI Discoverability
+- **Remote CI Discoverability**:
+  - `gh auth status` demonstrates that the available OAuth token possesses `'gist', 'read:org', 'repo'`, but lacks the `'workflow'` scope required to push workflow files to `.github/workflows/`.
+  - Without `.github/workflows/` on the remote branch, GitHub Actions cannot discover workflows (`gh run list` reports `no runs found`).
+  - Canonical workflow specifications reside in `ci/workflows/test.yml` and `ci/workflows/gdb92.yml`. Parity and drift prevention are validated locally via `tests/test_ci_workflow_parity.py` and `scripts/sync_workflows.sh`.
+- **Environment Execution Matrix**:
+  - Environment: Linux 6.17.0-1014-oracle aarch64, Python 3.12, GCC 13.3.0, bpftrace v0.20.2.
+  - Unit Test Suite (`tests/test_ebpf_tracer.py`): 75/75 passed (including `test_75` defensive stat & PID reuse testing).
+  - Lifecycle Repeatability (`test_68`): 20/20 consecutive runs passed without active leaks or timing flakiness (~0.070s per run).
+  - CI Parity Suite (`tests/test_ci_workflow_parity.py`): 7/7 passed (5 passed, 2 skipped due to documented OAuth permission boundary).
+  - Privileged Integration Suite (`sudo -n python3 -m unittest -v tests/test_ebpf_integration.py`): 17/17 passed.
+  - Unprivileged Integration Suite (`python3 -m unittest -v tests/test_ebpf_integration.py`): 17/17 passed.
+
+
 
 
 
