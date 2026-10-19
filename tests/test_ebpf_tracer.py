@@ -91,6 +91,106 @@ class ProcessInspection:
         return f"ProcessInspection(status={self.status!r}, detail={self.detail!r}{pgrp_info})"
 
 
+class GroupProcessEnumeration:
+    """Structured, fail-closed result of scanning /proc for members of a process group."""
+
+    def __init__(
+        self,
+        target_pgid: int,
+        members: Dict[int, ProcessInspection],
+        complete: bool,
+        unknown_candidates: Optional[Dict[int, ProcessInspection]] = None,
+        scan_error: Optional[str] = None,
+        transient_exits: Optional[List[int]] = None,
+        diagnostics: Optional[List[str]] = None,
+    ):
+        self.target_pgid = target_pgid
+        self.members = members  # PIDs confirmed belonging to target_pgid -> ProcessInspection
+        self.complete = complete  # True ONLY if directory enumeration succeeded and no indeterminate candidates exist
+        self.unknown_candidates = unknown_candidates or {}  # PIDs whose group membership could not be verified
+        self.scan_error = scan_error  # Error string if directory enumeration failed
+        self.transient_exits = transient_exits or []  # PIDs that vanished between listdir and inspection (benign)
+        self.diagnostics = diagnostics or []
+
+    @property
+    def active_members(self) -> Dict[int, ProcessInspection]:
+        """Confirmed group members with ACTIVE status."""
+        return {p: insp for p, insp in self.members.items() if getattr(insp, "status", None) == "ACTIVE"}
+
+    @property
+    def zombie_members(self) -> Dict[int, ProcessInspection]:
+        """Confirmed group members with ZOMBIE status."""
+        return {p: insp for p, insp in self.members.items() if getattr(insp, "status", None) == "ZOMBIE"}
+
+    @property
+    def unknown_members(self) -> Dict[int, ProcessInspection]:
+        """Confirmed group members with UNKNOWN status."""
+        return {p: insp for p, insp in self.members.items() if getattr(insp, "status", None) == "UNKNOWN"}
+
+    def is_clean(self) -> bool:
+        """True ONLY if scan was complete, and zero active or unknown members or candidates exist."""
+        return (
+            self.complete
+            and len(self.active_members) == 0
+            and len(self.unknown_members) == 0
+            and len(self.unknown_candidates) == 0
+        )
+
+    def is_empty(self) -> bool:
+        """True ONLY if scan was complete, and zero members of any state or unknown candidates exist."""
+        return (
+            self.complete
+            and len(self.members) == 0
+            and len(self.unknown_candidates) == 0
+        )
+
+    def items(self):
+        return self.members.items()
+
+    def keys(self):
+        return self.members.keys()
+
+    def values(self):
+        return self.members.values()
+
+    def get(self, pid: int, default=None):
+        return self.members.get(pid, default)
+
+    def __getitem__(self, pid: int) -> ProcessInspection:
+        return self.members[pid]
+
+    def __contains__(self, pid: int) -> bool:
+        return pid in self.members
+
+    def __iter__(self):
+        return iter(self.members)
+
+    def __len__(self) -> int:
+        if not self.complete:
+            raise RuntimeError(
+                f"Cannot determine length of incomplete GroupProcessEnumeration for PGID {self.target_pgid}: "
+                f"scan_error={self.scan_error}, unknown_candidates={list(self.unknown_candidates.keys())}"
+            )
+        return len(self.members)
+
+    def __bool__(self) -> bool:
+        if not self.complete:
+            raise RuntimeError(
+                f"Cannot evaluate boolean value of incomplete GroupProcessEnumeration for PGID {self.target_pgid}: "
+                f"scan_error={self.scan_error}, unknown_candidates={list(self.unknown_candidates.keys())}"
+            )
+        return len(self.members) > 0
+
+    def __repr__(self) -> str:
+        status_str = "COMPLETE" if self.complete else f"INCOMPLETE(err={self.scan_error!r})"
+        return (
+            f"GroupProcessEnumeration(target_pgid={self.target_pgid}, status={status_str}, "
+            f"members={len(self.members)}, active={len(self.active_members)}, "
+            f"zombies={len(self.zombie_members)}, unknown_candidates={len(self.unknown_candidates)}, "
+            f"transient_exits={len(self.transient_exits)})"
+        )
+
+
 class TestEbpfTracerUnit(unittest.TestCase):
     """Hermetic unit tests for eBPF tracer decoder, schemas, capability detection, and identity verification."""
 
@@ -102,36 +202,38 @@ class TestEbpfTracerUnit(unittest.TestCase):
         expected_starttime: Optional[int] = None,
         stat_reader: Optional[Callable[[int], str]] = None,
         kill_fn: Optional[Callable[[int, int], None]] = None,
+        proc_dir: str = "/proc",
     ) -> ProcessInspection:
         """Inspect process state, distinguishing absence, zombie, active, and unknown states.
 
-        Defensively checks signal 0, parses /proc/<p>/stat (handling complex comm with parens/spaces),
-        and verifies process group membership and starttime to detect PID reuse.
+        Inspects /proc/<p>/stat (handling complex comm with parens/spaces), verifies process group
+        membership and starttime to detect PID reuse, and checks signal 0 when explicitly requested.
 
         Returns:
             ProcessInspection: (status, detail, info) where status is in
             {"ACTIVE", "ZOMBIE", "ABSENT", "UNKNOWN"}.
         """
-        _kill = kill_fn or os.kill
-        # 1. Signal 0 existence check
-        try:
-            _kill(p, 0)
-        except ProcessLookupError:
-            return ProcessInspection("ABSENT", "ProcessLookupError (ESRCH)")
-        except PermissionError as e:
-            return ProcessInspection("UNKNOWN", f"PermissionError: {e}")
-        except Exception as e:
-            return ProcessInspection("UNKNOWN", f"Signal error: {e}")
+        # 1. If kill_fn is explicitly provided, verify signal 0 first (allows mock testing of signal errors)
+        if kill_fn is not None:
+            try:
+                kill_fn(p, 0)
+            except ProcessLookupError:
+                return ProcessInspection("ABSENT", "ProcessLookupError (ESRCH)")
+            except PermissionError as e:
+                return ProcessInspection("UNKNOWN", f"PermissionError: {e}")
+            except Exception as e:
+                return ProcessInspection("UNKNOWN", f"Signal error: {e}")
 
         # 2. Inspect /proc/<p>/stat for definitive execution state
         try:
             if stat_reader is not None:
                 content = stat_reader(p).strip()
             else:
-                with open(f"/proc/{p}/stat", "r", encoding="utf-8") as f:
+                stat_path = os.path.join(proc_dir, str(p), "stat")
+                with open(stat_path, "r", encoding="utf-8") as f:
                     content = f.read().strip()
         except (FileNotFoundError, ProcessLookupError):
-            # Race condition: reaped between signal check and /proc read
+            # Process does not exist in /proc (or reaped)
             return ProcessInspection("ABSENT", "Stat file absent (process reaped)")
         except PermissionError as e:
             return ProcessInspection("UNKNOWN", f"PermissionError reading /proc/{p}/stat: {e}")
@@ -174,19 +276,28 @@ class TestEbpfTracerUnit(unittest.TestCase):
             "starttime": starttime,
         }
 
-        # PID reuse verification: if PID exists but belongs to different PGID or starttime
-        if expected_pgrp is not None and pgrp != expected_pgrp:
-            return ProcessInspection(
-                "ABSENT",
-                f"PID reused (pgrp {pgrp} != expected {expected_pgrp})",
-                info
-            )
-        if expected_starttime is not None and starttime is not None and starttime != expected_starttime:
-            return ProcessInspection(
-                "ABSENT",
-                f"PID reused (starttime {starttime} != expected {expected_starttime})",
-                info
-            )
+        # Identity and PID reuse verification:
+        if expected_starttime is not None:
+            if starttime is None:
+                return ProcessInspection(
+                    "UNKNOWN",
+                    f"Missing starttime in /proc/{p}/stat; cannot verify identity against {expected_starttime}",
+                    info,
+                )
+            if starttime != expected_starttime:
+                return ProcessInspection(
+                    "ABSENT",
+                    f"PID reused (starttime {starttime} != expected {expected_starttime})",
+                    info,
+                )
+
+        if expected_pgrp is not None:
+            if pgrp != expected_pgrp:
+                return ProcessInspection(
+                    "ABSENT",
+                    f"PID reused (pgrp {pgrp} != expected {expected_pgrp})",
+                    info,
+                )
 
         if state_char == "Z":
             return ProcessInspection("ZOMBIE", "Z", info)
@@ -204,24 +315,91 @@ class TestEbpfTracerUnit(unittest.TestCase):
         cls,
         target_pgid: int,
         proc_dir: str = "/proc",
-    ) -> Dict[int, ProcessInspection]:
-        """Scan /proc to enumerate all processes currently belonging to target_pgid."""
-        members = {}
+        listdir_fn: Optional[Callable[[str], List[str]]] = None,
+        stat_reader: Optional[Callable[[int], str]] = None,
+    ) -> GroupProcessEnumeration:
+        """Scan /proc to enumerate all processes currently belonging to target_pgid.
+
+        Fail-closed semantics:
+        - If directory enumeration fails (PermissionError, OSError), returns an incomplete scan
+          with scan_error and complete=False.
+        - If candidate PIDs cannot be inspected (e.g. PermissionError or corrupted stat), they are
+          tracked in unknown_candidates and complete=False.
+        - If a candidate exits between listdir and inspection (stat FileNotFoundError or ProcessLookupError),
+          this is classified as a benign transient exit (the process is confirmed ABSENT) and does NOT
+          invalidate completeness.
+        - Returns a structured GroupProcessEnumeration result that callers must verify for completeness.
+        """
+        _listdir = listdir_fn or os.listdir
+        members: Dict[int, ProcessInspection] = {}
+        unknown_candidates: Dict[int, ProcessInspection] = {}
+        transient_exits: List[int] = []
+        diagnostics: List[str] = []
+
         try:
-            entries = os.listdir(proc_dir)
-        except Exception:
-            return members
+            entries = _listdir(proc_dir)
+        except OSError as e:
+            err_msg = f"Failed to list directory {proc_dir}: {e}"
+            return GroupProcessEnumeration(
+                target_pgid=target_pgid,
+                members={},
+                complete=False,
+                unknown_candidates={},
+                scan_error=err_msg,
+                transient_exits=[],
+                diagnostics=[err_msg],
+            )
 
         for entry in entries:
             if not entry.isdigit():
                 continue
             candidate_pid = int(entry)
-            insp = cls._inspect_process(candidate_pid)
+            insp = cls._inspect_process(
+                candidate_pid,
+                proc_dir=proc_dir,
+                stat_reader=stat_reader,
+            )
+
             if insp.status == "ABSENT":
+                # Benign transient race: candidate exited/reaped between listdir and stat inspection.
+                # A confirmed absent process has no active threads in any process group.
+                transient_exits.append(candidate_pid)
                 continue
-            if insp.info.get("pgrp") == target_pgid:
+
+            candidate_pgrp = insp.info.get("pgrp")
+
+            if insp.status == "UNKNOWN":
+                if candidate_pgrp == target_pgid:
+                    # Belongs to target_pgid, but internal state character or fields are unknown
+                    members[candidate_pid] = insp
+                    diagnostics.append(
+                        f"PID {candidate_pid} in target PGID {target_pgid} has UNKNOWN state: {insp.detail}"
+                    )
+                elif candidate_pgrp is None:
+                    # Inconclusive inspection: cannot determine if this process belongs to target_pgid!
+                    unknown_candidates[candidate_pid] = insp
+                    diagnostics.append(
+                        f"PID {candidate_pid} group membership indeterminate ({insp.detail})"
+                    )
+                else:
+                    # candidate_pgrp is known and != target_pgid: belongs to another group, safely ignored
+                    pass
+                continue
+
+            # insp.status in ("ACTIVE", "ZOMBIE")
+            if candidate_pgrp == target_pgid:
                 members[candidate_pid] = insp
-        return members
+
+        is_complete = len(unknown_candidates) == 0
+        return GroupProcessEnumeration(
+            target_pgid=target_pgid,
+            members=members,
+            complete=is_complete,
+            unknown_candidates=unknown_candidates,
+            scan_error=None,
+            transient_exits=transient_exits,
+            diagnostics=diagnostics,
+        )
 
 
     def setUp(self):
@@ -3111,28 +3289,29 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 # Note: Grandchild is an orphan adopted by PID 1/subreaper; our process cannot waitpid it.
                 poll_deadline = time.monotonic() + 2.0
                 last_gchild_insp = None
-                last_group_members = {}
+                last_enum = None
                 last_killpg_alive = True
                 while time.monotonic() < poll_deadline:
                     last_gchild_insp = self._inspect_process(
                         gchild_pid, expected_pgrp=pgid, expected_starttime=gchild_starttime
                     )
-                    last_group_members = self._get_group_processes(pgid)
+                    last_enum = self._get_group_processes(pgid)
                     try:
                         os.killpg(pgid, 0)
                         last_killpg_alive = True
                     except ProcessLookupError:
                         last_killpg_alive = False
 
-                    # Early exit if process group has no members in /proc and killpg indicates absent
-                    if len(last_group_members) == 0 and last_gchild_insp.status == "ABSENT" and not last_killpg_alive:
+                    # Early exit ONLY if the scan was verified complete, group is genuinely empty,
+                    # grandchild is absent, and killpg confirms dead group
+                    if last_enum.is_empty() and last_gchild_insp.status == "ABSENT" and not last_killpg_alive:
                         break
                     time.sleep(0.01)
 
                 diag_ctx = (
                     f"PGID={pgid}, gchild_PID={gchild_pid}, "
                     f"last_gchild={last_gchild_insp}, "
-                    f"group_members={last_group_members}, "
+                    f"group_enum={last_enum}, "
                     f"killpg_alive={last_killpg_alive}"
                 )
 
@@ -3157,25 +3336,30 @@ class TestEbpfTracerUnit(unittest.TestCase):
                     f"Grandchild PID {gchild_pid} in unexpected state: {last_gchild_insp}; context: {diag_ctx}"
                 )
 
-                # Verify intended process group has NO surviving active members (do not rely on killpg(0) alone)
-                active_group_members = {
-                    p: insp for p, insp in last_group_members.items() if insp.status == "ACTIVE"
-                }
+                # Process-group enumeration must be verified complete (fail-closed against /proc listing failures or indeterminate candidates)
+                self.assertTrue(
+                    last_enum.complete,
+                    f"Process group {pgid} enumeration scan was incomplete or failed: {last_enum.diagnostics}; context: {diag_ctx}"
+                )
                 self.assertEqual(
-                    active_group_members, {},
-                    f"Process group {pgid} contains surviving active processes after timeout: {active_group_members}; context: {diag_ctx}"
+                    last_enum.unknown_candidates, {},
+                    f"Process group {pgid} enumeration encountered indeterminate candidates: {last_enum.unknown_candidates}; context: {diag_ctx}"
                 )
 
-                unknown_group_members = {
-                    p: insp for p, insp in last_group_members.items() if insp.status == "UNKNOWN"
-                }
+                # Verify intended process group has NO surviving active members (do not rely on killpg(0) alone)
                 self.assertEqual(
-                    unknown_group_members, {},
-                    f"Process group {pgid} contains unknown/inconclusive processes after timeout: {unknown_group_members}; context: {diag_ctx}"
+                    last_enum.active_members, {},
+                    f"Process group {pgid} contains surviving active processes after timeout: {last_enum.active_members}; context: {diag_ctx}"
+                )
+
+                # Verify intended process group has NO unknown members
+                self.assertEqual(
+                    last_enum.unknown_members, {},
+                    f"Process group {pgid} contains unknown/inconclusive processes after timeout: {last_enum.unknown_members}; context: {diag_ctx}"
                 )
 
                 # Any residual group members must strictly be ZOMBIEs awaiting async reaping by PID 1
-                for p, insp in last_group_members.items():
+                for p, insp in last_enum.members.items():
                     self.assertEqual(
                         insp.status, "ZOMBIE",
                         f"Non-zombie process {p} lingering in process group {pgid}: {insp}; context: {diag_ctx}"
@@ -3225,8 +3409,8 @@ class TestEbpfTracerUnit(unittest.TestCase):
                     p_insp = self._inspect_process(pgid)
                     if p_insp.status == "ACTIVE":
                         residual_leaks.append(f"Parent PID {pgid} is still {p_insp}")
-                    grp_m = self._get_group_processes(pgid)
-                    for p_mem, insp_mem in grp_m.items():
+                    grp_enum = self._get_group_processes(pgid)
+                    for p_mem, insp_mem in grp_enum.members.items():
                         if insp_mem.status == "ACTIVE" and p_mem != caller_pid:
                             residual_leaks.append(f"Group member PID {p_mem} in PGID {pgid} is still {insp_mem}")
                 if isinstance(gchild_pid, int) and gchild_pid > 1 and gchild_pid != caller_pid and gchild_pid != caller_pgrp:
@@ -3734,6 +3918,205 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertNotIn(2003, group_5500)
                 self.assertEqual(group_5500[2001].status, "ACTIVE")
                 self.assertEqual(group_5500[2002].status, "ZOMBIE")
+                self.assertTrue(group_5500.complete)
+                self.assertEqual(len(group_5500), 2)
+                self.assertEqual(len(group_5500.active_members), 1)
+                self.assertEqual(len(group_5500.zombie_members), 1)
+                self.assertFalse(group_5500.is_clean())
+                self.assertFalse(group_5500.is_empty())
+
+    def test_76_fail_closed_group_process_enumeration(self):
+        """Scenario 76: Unit test fail-closed process enumeration and lifecycle evidence integrity."""
+        # Case 1: /proc directory listing failure (PermissionError, OSError) -> marked incomplete, len/bool raise
+        def mock_listdir_perm(d):
+            raise PermissionError(13, "Permission denied: /proc")
+
+        enum_err = self._get_group_processes(4000, listdir_fn=mock_listdir_perm)
+        self.assertFalse(enum_err.complete)
+        self.assertIsNotNone(enum_err.scan_error)
+        self.assertIn("Permission denied", enum_err.scan_error)
+        self.assertEqual(enum_err.members, {})
+        self.assertEqual(enum_err.unknown_candidates, {})
+        self.assertFalse(enum_err.is_clean())
+        self.assertFalse(enum_err.is_empty())
+        with self.assertRaises(RuntimeError) as ctx_len:
+            len(enum_err)
+        self.assertIn("Cannot determine length of incomplete", str(ctx_len.exception))
+        with self.assertRaises(RuntimeError) as ctx_bool:
+            bool(enum_err)
+        self.assertIn("Cannot evaluate boolean value of incomplete", str(ctx_bool.exception))
+
+        # Case 2: Candidate process stat file cannot be read (PermissionError) -> tracked as unknown, incomplete
+        def mock_stat_perm(pid):
+            if pid == 4001:
+                raise PermissionError(13, "Permission denied")
+            return "4002 (other) S 1 9999 9999 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000"
+
+        enum_cand_perm = self._get_group_processes(
+            4000,
+            listdir_fn=lambda d: ["4001", "4002"],
+            stat_reader=mock_stat_perm,
+        )
+        self.assertFalse(enum_cand_perm.complete)
+        self.assertIn(4001, enum_cand_perm.unknown_candidates)
+        self.assertEqual(enum_cand_perm.unknown_candidates[4001].status, "UNKNOWN")
+        self.assertIn("PermissionError", enum_cand_perm.unknown_candidates[4001].detail)
+        self.assertFalse(enum_cand_perm.is_clean())
+        self.assertFalse(enum_cand_perm.is_empty())
+        with self.assertRaises(RuntimeError):
+            len(enum_cand_perm)
+
+        # Case 3: Candidate stat malformed/truncated -> tracked as unknown candidate, incomplete
+        # Subcase 3a: Corrupted stat line missing closing parenthesis
+        enum_malformed = self._get_group_processes(
+            4000,
+            listdir_fn=lambda d: ["4003"],
+            stat_reader=lambda p: "4003 malformed_line_without_parens",
+        )
+        self.assertFalse(enum_malformed.complete)
+        self.assertIn(4003, enum_malformed.unknown_candidates)
+        self.assertEqual(enum_malformed.unknown_candidates[4003].status, "UNKNOWN")
+        self.assertIn("Malformed parentheses", enum_malformed.unknown_candidates[4003].detail)
+
+        # Subcase 3b: Missing starttime when expected_starttime requested -> UNKNOWN
+        truncated_stat = "4004 (trunc_task) S 100 4000 4000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0"  # only 19 fields after comm
+        insp_no_stime = self._inspect_process(
+            4004,
+            expected_pgrp=4000,
+            expected_starttime=98765,
+            stat_reader=lambda p: truncated_stat,
+        )
+        self.assertEqual(insp_no_stime.status, "UNKNOWN")
+        self.assertIn("Missing starttime", insp_no_stime.detail)
+
+        # Case 4: Candidate vanishes between listdir and inspection (FileNotFoundError / ESRCH) -> benign transient exit, complete
+        def mock_stat_vanish(pid):
+            if pid == 4005:
+                raise FileNotFoundError(2, "No such file or directory: /proc/4005/stat")
+            return "4006 (other) S 1 8888 8888 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000"
+
+        enum_vanish = self._get_group_processes(
+            4000,
+            listdir_fn=lambda d: ["4005", "4006"],
+            stat_reader=mock_stat_vanish,
+        )
+        self.assertTrue(enum_vanish.complete)
+        self.assertIn(4005, enum_vanish.transient_exits)
+        self.assertEqual(enum_vanish.members, {})
+        self.assertEqual(enum_vanish.unknown_candidates, {})
+        self.assertTrue(enum_vanish.is_empty())
+        self.assertTrue(enum_vanish.is_clean())
+        self.assertEqual(len(enum_vanish), 0)
+        self.assertFalse(bool(enum_vanish))
+
+        # Case 5: PID reuse: stat file readable, but PGID or starttime mismatches expected identity -> ABSENT
+        # 5a: PGID mismatch
+        insp_reuse_pgid = self._inspect_process(
+            4007,
+            expected_pgrp=4000,
+            stat_reader=lambda p: "4007 (task) S 1 7777 7777 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 55555",
+        )
+        self.assertEqual(insp_reuse_pgid.status, "ABSENT")
+        self.assertIn("PID reused (pgrp 7777 != expected 4000)", insp_reuse_pgid.detail)
+
+        # 5b: starttime mismatch
+        insp_reuse_time = self._inspect_process(
+            4007,
+            expected_pgrp=4000,
+            expected_starttime=11111,
+            stat_reader=lambda p: "4007 (task) S 1 4000 4000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 99999",
+        )
+        self.assertEqual(insp_reuse_time.status, "ABSENT")
+        self.assertIn("PID reused (starttime 99999 != expected 11111)", insp_reuse_time.detail)
+
+        # Case 6: Genuinely empty group: scan succeeds with zero members and zero unknowns -> verified complete and empty
+        enum_empty = self._get_group_processes(
+            4000,
+            listdir_fn=lambda d: ["4008", "4009"],
+            stat_reader=lambda p: f"{p} (other) S 1 9999 9999 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000",
+        )
+        self.assertTrue(enum_empty.complete)
+        self.assertEqual(enum_empty.members, {})
+        self.assertEqual(enum_empty.unknown_candidates, {})
+        self.assertTrue(enum_empty.is_empty())
+        self.assertTrue(enum_empty.is_clean())
+        self.assertEqual(len(enum_empty), 0)
+        self.assertFalse(bool(enum_empty))
+
+        # Case 7: Zombie members remain: scan succeeds, complete, zombie members reported, not clean/empty
+        enum_zombie = self._get_group_processes(
+            4000,
+            listdir_fn=lambda d: ["4010"],
+            stat_reader=lambda p: "4010 (dead_child) Z 1 4000 4000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000",
+        )
+        self.assertTrue(enum_zombie.complete)
+        self.assertIn(4010, enum_zombie.zombie_members)
+        self.assertEqual(enum_zombie.active_members, {})
+        self.assertTrue(enum_zombie.is_clean())  # no active or unknown members
+        self.assertFalse(enum_zombie.is_empty())  # zombie member exists
+        self.assertEqual(len(enum_zombie), 1)
+        self.assertTrue(bool(enum_zombie))
+
+        # Case 8: Active member survives: scan succeeds, complete, active members reported, not clean
+        enum_active = self._get_group_processes(
+            4000,
+            listdir_fn=lambda d: ["4011"],
+            stat_reader=lambda p: "4011 (live_task) R 1 4000 4000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000",
+        )
+        self.assertTrue(enum_active.complete)
+        self.assertIn(4011, enum_active.active_members)
+        self.assertFalse(enum_active.is_clean())
+        self.assertFalse(enum_active.is_empty())
+        self.assertEqual(len(enum_active), 1)
+        self.assertTrue(bool(enum_active))
+
+        # Case 9: Caller asserting group cleanliness fails when UNKNOWN member or incomplete scan returned
+        # 9a: Incomplete scan
+        self.assertFalse(enum_err.is_clean())
+        self.assertFalse(enum_cand_perm.is_clean())
+        self.assertFalse(enum_malformed.is_clean())
+
+        # 9b: UNKNOWN member in target group
+        enum_unk_member = self._get_group_processes(
+            4000,
+            listdir_fn=lambda d: ["4012"],
+            stat_reader=lambda p: "4012 (mystery) ? 1 4000 4000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000",
+        )
+        self.assertTrue(enum_unk_member.complete)  # Group membership known (4000), but state char is '?'
+        self.assertIn(4012, enum_unk_member.unknown_members)
+        self.assertFalse(enum_unk_member.is_clean())
+        self.assertFalse(enum_unk_member.is_empty())
+
+        # Case 10: Teardown safety guards in lifecycle tests prevent signaling caller PID/PGID
+        # Verify EbpfEnvironmentChecker._terminate_probe_process refuses to signal caller PID or caller PGID
+        caller_pid = os.getpid()
+        caller_pgid = os.getpgrp()
+
+        mock_caller_proc = MagicMock()
+        mock_caller_proc.pid = caller_pid
+        mock_caller_proc.poll.return_value = 0
+
+        with patch("os.killpg") as mock_killpg, patch("os.kill") as mock_kill:
+            res_caller_p = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_caller_proc, [], is_session_leader=True
+            )
+            self.assertFalse(res_caller_p)
+            self.assertEqual(res_caller_p.status, "UNCERTAIN")
+            self.assertIn("Refusing to signal caller's own process or group", res_caller_p.details)
+            mock_killpg.assert_not_called()
+
+        mock_caller_grp = MagicMock()
+        mock_caller_grp.pid = caller_pgid
+        mock_caller_grp.poll.return_value = 0
+
+        with patch("os.killpg") as mock_killpg, patch("os.kill") as mock_kill:
+            res_caller_g = EbpfEnvironmentChecker._terminate_probe_process(
+                mock_caller_grp, [], is_session_leader=True
+            )
+            self.assertFalse(res_caller_g)
+            self.assertEqual(res_caller_g.status, "UNCERTAIN")
+            self.assertIn("Refusing to signal caller's own process or group", res_caller_g.details)
+            mock_killpg.assert_not_called()
 
 
 if __name__ == "__main__":

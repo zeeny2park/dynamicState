@@ -1015,6 +1015,46 @@ In Linux, `killpg(pgid, 0)` returns success ($0$) as long as *any* entry in the 
   - Privileged Integration Suite (`sudo -n python3 -m unittest -v tests/test_ebpf_integration.py`): 17/17 passed.
   - Unprivileged Integration Suite (`python3 -m unittest -v tests/test_ebpf_integration.py`): 17/17 passed.
 
+---
+
+## 25. Phase 1.21 — Fail-Closed Process Enumeration & Lifecycle Evidence Integrity
+
+### 25.1 Fail-Closed Group Enumeration Contract (`GroupProcessEnumeration`)
+Phase 1.21 replaces unstructured dictionary returns from `/proc` scanning with a structured, fail-closed result object (`GroupProcessEnumeration`):
+1. **Incomplete Scan Protection**:
+   - If directory enumeration of `/proc` fails (e.g. `PermissionError`, `OSError`), the scan is marked `complete=False` with `scan_error` set.
+   - If candidate processes cannot be inspected or their group membership cannot be proven (e.g. `pgrp is None` due to stat read permission failure or truncated content), they are tracked in `unknown_candidates` and the scan is marked `complete=False`.
+   - Callers evaluating `len(enum)` or `bool(enum)` on an incomplete scan receive an immediate `RuntimeError`. This guarantees that an incomplete scan can **never** be silently treated as an empty container or proof of a clean process group.
+2. **Cleanliness vs Emptiness Predicates**:
+   - `is_empty()` returns `True` strictly when `complete=True`, `len(members) == 0`, and `len(unknown_candidates) == 0`.
+   - `is_clean()` returns `True` strictly when `complete=True`, `len(active_members) == 0`, `len(unknown_members) == 0`, and `len(unknown_candidates) == 0`. Zombie members (state `'Z'`) waiting for asynchronous harvesting by PID 1/subreaper do not prevent `is_clean()`, but do prevent `is_empty()`.
+
+### 25.2 Benign Transient Races vs Genuine Inspection Failures
+Operating-system process tables are inherently concurrent. A candidate PID listed during directory traversal may exit before its stat file is inspected:
+1. **Benign Transient Exit**:
+   - If `open(f"/proc/{pid}/stat")` raises `FileNotFoundError` or `ProcessLookupError`, the process has exited and been harvested by its parent.
+   - A non-existent PID cannot have active threads in any process group. Such occurrences are recorded in `transient_exits` and do **not** invalidate scan completeness.
+2. **Genuine Inspection Failure**:
+   - If reading `/proc/{pid}/stat` raises `PermissionError`, the process exists but its group identity is obscured.
+   - If `/proc/{pid}/stat` is truncated, corrupted, or has non-integer numerical fields, its group membership cannot be verified.
+   - These occurrences are recorded in `unknown_candidates`, marking the entire scan `complete=False`.
+
+### 25.3 Stat-First Inspection Order & Host Portability
+On Linux systems without `hidepid` mounting, `/proc/<pid>/stat` has mode `0444` (`-r--r--r--`), readable by unprivileged users for all processes on the host. In contrast, `kill(pid, 0)` requires matching UID or `CAP_KILL` capability, raising `PermissionError` (EPERM) when called by unprivileged users on system or root-owned processes:
+1. **Stat-First Inspection**:
+   - `_inspect_process` and `_get_group_processes` inspect `/proc/<pid>/stat` directly to extract `comm`, `state`, `ppid`, `pgrp`, and `starttime`.
+   - System processes owned by root or other users report their `pgrp` (e.g. `pgrp == 1` for systemd) and are conclusively excluded from the target PGID scan without triggering signal permission rejections.
+   - Explicit `kill_fn` parameter is reserved for hermetic test injection of signal lookup and permission errors.
+
+### 25.4 Reproducible Test Evidence & Verification Commands
+- **Environment**: Linux 6.17.0-1014-oracle aarch64, Python 3.12, GCC 13.3.0, bpftrace v0.20.2.
+- **Unit Test Suite (`tests/test_ebpf_tracer.py`)**: 76/76 passed in 4.30s (including `test_76` covering all 10 fail-closed enumeration cases).
+- **Lifecycle Repeatability (`test_68`)**: 20/20 consecutive runs passed without active leaks, flakiness, or orphan processes (~0.09s per run).
+- **CI Workflow Parity (`tests/test_ci_workflow_parity.py`)**: 7/7 passed (5 passed, 2 skipped due to documented OAuth permission boundary).
+- **Privileged Integration Suite (`sudo -n python3 -m unittest -v tests/test_ebpf_integration.py`)**: 17/17 passed in 20.70s.
+- **Unprivileged Integration Suite (`python3 -m unittest -v tests/test_ebpf_integration.py`)**: 17/17 passed in 53.68s.
+
+
 
 
 
