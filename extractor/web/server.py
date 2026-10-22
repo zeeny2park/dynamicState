@@ -1765,6 +1765,98 @@ class WebApiAdapter:
         except Exception as e:
             return {"success": False, "error": {"code": "EVAL_PATHS_ERROR", "message": str(e)}}
 
+    def save_golden_baseline_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Saves current live target state as a named Golden Baseline."""
+        try:
+            pid = int(params.get("pid") or 0)
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            if not companion_elf or not os.path.isfile(companion_elf):
+                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            exprs = params.get("expressions")
+            if isinstance(exprs, str):
+                exprs = [e.strip() for e in exprs.split(",") if e.strip()]
+            label = str(params.get("label") or "Golden Baseline").strip()
+            rec = self.watch_manager.save_golden_baseline(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                label=label,
+                expressions=exprs,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": rec}
+        except Exception as e:
+            return {"success": False, "error": {"code": "GOLDEN_BASELINE_SAVE_ERROR", "message": str(e)}}
+
+    def list_golden_baselines_api(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Lists all saved Golden Baselines."""
+        try:
+            p = params or {}
+            bid = (p.get("binary_build_id") or "").strip() or None
+            items = self.watch_manager.list_golden_baselines(binary_build_id=bid)
+            return {"success": True, "data": {"total": len(items), "baselines": items}}
+        except Exception as e:
+            return {"success": False, "error": {"code": "GOLDEN_BASELINE_LIST_ERROR", "message": str(e)}}
+
+    def compare_golden_baseline_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Compares current live process against a saved Golden Baseline."""
+        try:
+            baseline_id = (params.get("baseline_id") or "").strip()
+            if not baseline_id:
+                return {"success": False, "error": {"code": "INVALID_BASELINE_ID", "message": "baseline_id is required"}}
+            pid = int(params.get("pid") or 0)
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip() or None
+            res = self.watch_manager.compare_with_golden_baseline(
+                baseline_id=baseline_id,
+                pid=pid,
+                companion_elf_path=companion_elf,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "GOLDEN_BASELINE_COMPARE_ERROR", "message": str(e)}}
+
+    def run_diagnostic_recipe_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Executes a guided diagnostic recipe (instant_xray, before_after_diff, timeseries_watch)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            if not companion_elf or not os.path.isfile(companion_elf):
+                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            recipe = str(params.get("recipe") or "instant_xray")
+            exprs = params.get("expressions")
+            if isinstance(exprs, str):
+                exprs = [e.strip() for e in exprs.split(",") if e.strip()]
+            res = self.watch_manager.run_diagnostic_recipe(
+                recipe=recipe,
+                pid=pid,
+                companion_elf_path=companion_elf,
+                expressions=exprs,
+                duration_ms=int(params.get("duration_ms") or 1000),
+                interval_ms=int(params.get("interval_ms") or 200),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "DIAGNOSTIC_RECIPE_ERROR", "message": str(e)}}
+
     def capture_and_diff_paths_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Samples C/C++ symbol expressions twice across wait_ms and returns changed/unchanged fields."""
         try:
@@ -2743,6 +2835,13 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 }))
                 return
 
+            # GET /api/watch/baselines
+            if path == "/api/watch/baselines":
+                self._send_json(adapter.list_golden_baselines_api({
+                    "binary_build_id": q_param("binary_build_id"),
+                }))
+                return
+
             # GET /api/watch/search-symbols
             if path == "/api/watch/search-symbols":
                 self._send_json(adapter.search_dwarf_symbols_api({
@@ -2944,6 +3043,21 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             # POST /api/watch/eval-paths
             if path == "/api/watch/eval-paths":
                 self._send_json(adapter.evaluate_symbol_paths_api(body))
+                return
+
+            # POST /api/watch/recipe
+            if path == "/api/watch/recipe":
+                self._send_json(adapter.run_diagnostic_recipe_api(body))
+                return
+
+            # POST /api/watch/baseline/save
+            if path == "/api/watch/baseline/save":
+                self._send_json(adapter.save_golden_baseline_api(body))
+                return
+
+            # POST /api/watch/baseline/compare
+            if path == "/api/watch/baseline/compare":
+                self._send_json(adapter.compare_golden_baseline_api(body))
                 return
 
             # POST /api/watch/capture-diff

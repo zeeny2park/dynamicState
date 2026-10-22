@@ -852,5 +852,101 @@ def runtime_capture_and_diff(
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
+@server.tool()
+def runtime_run_diagnostic_recipe(
+    pid: int,
+    companion_elf: str,
+    recipe: str = "instant_xray",
+    expressions: Optional[List[str]] = None,
+    duration_ms: int = 1000,
+    interval_ms: int = 200,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Run a guided embedded diagnostic recipe in a single call:
+    - 'instant_xray': Decode top state globals and heap pointer targets immediately (Silent Hang triage).
+    - 'before_after_diff': Sample twice across `duration_ms` and report mutated vs unchanged fields.
+    - 'timeseries_watch': Sample periodically over `duration_ms` and classify active vs stuck variables.
+    """
+    try:
+        res = runtime.watch_session_manager.run_diagnostic_recipe(
+            recipe=recipe,
+            pid=pid,
+            companion_elf_path=companion_elf,
+            expressions=expressions,
+            duration_ms=duration_ms,
+            interval_ms=interval_ms,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_golden_baseline_save(
+    pid: int,
+    companion_elf: str,
+    label: str = "Golden Baseline",
+    expressions: Optional[List[str]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Save the current healthy runtime state of a process as a persistent Golden Baseline for future comparison."""
+    try:
+        rec = runtime.watch_session_manager.save_golden_baseline(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            label=label,
+            expressions=expressions,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **rec})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_golden_baseline_compare(
+    baseline_id: str,
+    pid: int,
+    companion_elf: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Compare a currently running local or remote embedded process against a saved Golden Baseline."""
+    try:
+        res = runtime.watch_session_manager.compare_with_golden_baseline(
+            baseline_id=baseline_id,
+            pid=pid,
+            companion_elf_path=companion_elf,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
 if __name__ == "__main__":
     server.run(transport="stdio")

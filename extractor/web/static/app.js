@@ -9587,6 +9587,10 @@
             }
           }
 
+          // Render Smart Recommended Symbol Chips
+          renderSmartRecommendedChips(d.recommended_symbols || []);
+          loadGoldenBaselinesList(d.debug_image_build_id || d.target_build_id);
+
           // Preload mappings and threads in background
           loadTemporalMemoryMap(false);
           updatePersistentTargetBar(d);
@@ -10142,6 +10146,149 @@
     showToastNotification('Transferred snapshot diff context to investigation goal', 'success');
   }
 
+
+  function renderSmartRecommendedChips(symbols) {
+    const container = document.getElementById('te-smart-watch-chips');
+    if (!container) return;
+    if (!symbols || symbols.length === 0) {
+      container.innerHTML = '<span class="text-xs text-muted">No ranked state symbols discovered.</span>';
+      return;
+    }
+    const chips = [];
+    for (const s of symbols.slice(0, 10)) {
+      const expr = (s.is_pointer && s.members && s.members.length > 0)
+        ? (s.members[0].expression || `${s.name}->${s.members[0].name}`)
+        : s.name;
+      chips.push(
+        `<button type="button" class="btn btn-xs btn-outline mono smart-watch-chip" data-expr="${escapeHtml(expr)}" title="Type: ${escapeHtml(s.type_name || '')} @ ${escapeHtml(s.runtime_address || '')}">➕ ${escapeHtml(expr)}</button>`
+      );
+    }
+    container.innerHTML = chips.join(' ');
+    container.querySelectorAll('.smart-watch-chip').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const ex = btn.getAttribute('data-expr');
+        if (!ex) return;
+        const evalIn = document.getElementById('te-eval-expr-input');
+        if (evalIn) evalIn.value = ex;
+        const sid = await ensureActiveWatchSession();
+        if (sid) {
+          await apiPost(`/api/watch/session/${encodeURIComponent(sid)}/watch`, {
+            action: 'add',
+            name: ex,
+            expression: ex,
+            address: 0,
+            scope: 'expression',
+            source: 'smart_suggestion',
+          });
+          await refreshActiveWatchSession();
+          showToastNotification(`Added '${ex}' to Watch List`, 'success');
+        }
+      });
+    });
+  }
+
+  async function handleRunDiagnosticRecipe(recipeName) {
+    const outDiv = document.getElementById('scenario-recipe-output');
+    if (!teState.targetPid || !teState.companionElf) {
+      showToastNotification('Validate target first before running a diagnostic recipe', 'warning');
+      return;
+    }
+    if (outDiv) {
+      outDiv.style.display = 'block';
+      outDiv.textContent = `⏳ Running ${recipeName}...`;
+    }
+    const remHostEl = document.getElementById('te-remote-host');
+    const remUserEl = document.getElementById('te-remote-user');
+    const remPortEl = document.getElementById('te-remote-port');
+    const remJumpEl = document.getElementById('te-remote-jump');
+    const payload = {
+      recipe: recipeName,
+      pid: parseInt(teState.targetPid, 10),
+      companion_elf: teState.companionElf,
+      duration_ms: recipeName === 'timeseries_watch' ? 800 : 400,
+      interval_ms: 150,
+    };
+    if (remHostEl && remHostEl.value.trim()) {
+      payload.remote_host = remHostEl.value.trim();
+      if (remUserEl && remUserEl.value.trim()) payload.ssh_user = remUserEl.value.trim();
+      if (remPortEl && remPortEl.value.trim()) payload.ssh_port = parseInt(remPortEl.value.trim(), 10) || 22;
+      if (remJumpEl && remJumpEl.value.trim()) payload.ssh_proxy_jump = remJumpEl.value.trim();
+    }
+    try {
+      const res = await apiPost('/api/watch/recipe', payload);
+      if (res.success && res.data && outDiv) {
+        const d = res.data;
+        if (d.session_id) {
+          teState.sessionId = d.session_id;
+          await refreshActiveWatchSession();
+        }
+        outDiv.innerHTML = `<pre style="margin:0; white-space:pre-wrap;">${escapeHtml(JSON.stringify(d, null, 2))}</pre>`;
+      } else if (outDiv) {
+        outDiv.textContent = res.error?.message || 'Recipe execution failed';
+      }
+    } catch (e) {
+      if (outDiv) outDiv.textContent = 'Error: ' + e;
+    }
+  }
+
+  async function loadGoldenBaselinesList(buildId) {
+    const sel = document.getElementById('select-golden-baseline');
+    if (!sel) return;
+    try {
+      const q = buildId ? `?binary_build_id=${encodeURIComponent(buildId)}` : '';
+      const res = await apiGet(`/api/watch/baselines${q}`);
+      if (res.success && res.data && Array.isArray(res.data.baselines)) {
+        const list = res.data.baselines;
+        sel.innerHTML = '<option value="">-- Select Saved Baseline --</option>' +
+          list.map(b => `<option value="${escapeHtml(b.baseline_id)}">${escapeHtml(b.label)} (${b.fields_count} fields)</option>`).join('');
+        if (list.length > 0) sel.value = list[0].baseline_id;
+      }
+    } catch (_) {}
+  }
+
+  async function handleSaveGoldenBaseline() {
+    if (!teState.targetPid || !teState.companionElf) {
+      showToastNotification('Connect and validate target first', 'warning');
+      return;
+    }
+    const lblEl = document.getElementById('input-golden-baseline-label');
+    const label = (lblEl && lblEl.value.trim()) ? lblEl.value.trim() : 'Golden Baseline';
+    const res = await apiPost('/api/watch/baseline/save', {
+      pid: parseInt(teState.targetPid, 10),
+      companion_elf: teState.companionElf,
+      label: label,
+    });
+    if (res.success && res.data) {
+      await loadGoldenBaselinesList();
+      showToastNotification(`Saved Golden Baseline '${res.data.label}'`, 'success');
+    } else {
+      showToastNotification(res.error?.message || 'Failed saving baseline', 'error');
+    }
+  }
+
+  async function handleCompareGoldenBaseline() {
+    const sel = document.getElementById('select-golden-baseline');
+    const outDiv = document.getElementById('golden-baseline-diff-output');
+    const bid = sel ? sel.value : '';
+    if (!bid || !teState.targetPid) {
+      showToastNotification('Select a Golden Baseline and ensure target is connected', 'warning');
+      return;
+    }
+    const res = await apiPost('/api/watch/baseline/compare', {
+      baseline_id: bid,
+      pid: parseInt(teState.targetPid, 10),
+      companion_elf: teState.companionElf,
+    });
+    if (outDiv) {
+      outDiv.style.display = 'block';
+      if (res.success && res.data) {
+        outDiv.innerHTML = `<pre class="mono text-xs" style="margin:0; white-space:pre-wrap;">${escapeHtml(JSON.stringify({summary: res.data.summary, changed: res.data.changed, unchanged: res.data.unchanged}, null, 2))}</pre>`;
+      } else {
+        outDiv.textContent = res.error?.message || 'Comparison failed';
+      }
+    }
+  }
+
   function initPhase28Handlers() {
     const btnVal = document.getElementById('btn-validate-target');
     const btnInspect = document.getElementById('btn-inspect-runtime');
@@ -10305,6 +10452,20 @@
         showToastNotification(`Added ${exprs.length} symbol path(s) to Watch List`, 'success');
       });
     }
+
+    // Phase 3: Diagnostic Recipes & Golden Baselines Handlers
+    const btnRecXray = document.getElementById('btn-recipe-instant-xray');
+    const btnRecDiff = document.getElementById('btn-recipe-before-after');
+    const btnRecWatch = document.getElementById('btn-recipe-auto-watch');
+    const btnSaveGold = document.getElementById('btn-save-golden-baseline');
+    const btnCmpGold = document.getElementById('btn-compare-golden-baseline');
+
+    if (btnRecXray) btnRecXray.addEventListener('click', () => handleRunDiagnosticRecipe('instant_xray'));
+    if (btnRecDiff) btnRecDiff.addEventListener('click', () => handleRunDiagnosticRecipe('before_after_diff'));
+    if (btnRecWatch) btnRecWatch.addEventListener('click', () => handleRunDiagnosticRecipe('timeseries_watch'));
+    if (btnSaveGold) btnSaveGold.addEventListener('click', handleSaveGoldenBaseline);
+    if (btnCmpGold) btnCmpGold.addEventListener('click', handleCompareGoldenBaseline);
+
 
     // Phase 31 Guided Journey Transition Buttons
     const btnStep1To2 = document.getElementById('btn-step1-to-step2');

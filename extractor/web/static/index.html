@@ -316,6 +316,45 @@
 
             <div id="diag-feedback-banner" class="banner mb-3 text-xs" style="display: none;"></div>
 
+            <!-- Phase 3: Smart Recommended Watch Chips -->
+            <div id="te-smart-watch-chips-card" class="mb-3" style="background: rgba(56, 189, 248, 0.06); padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border-color);">
+              <div class="d-flex justify-content-between align-items-center mb-1">
+                <span class="text-xs font-bold" style="color: var(--accent);">💡 Smart Recommended Symbols (Click to Watch or Inspect)</span>
+                <span class="text-xs text-muted">Auto-ranked from DWARF state, counter, queue &amp; pointer symbols</span>
+              </div>
+              <div id="te-smart-watch-chips" class="d-flex flex-wrap gap-1 mt-1">
+                <span class="text-xs text-muted">Validate target to load smart symbol suggestions...</span>
+              </div>
+            </div>
+
+            <!-- Phase 3: 3-Scenario Diagnostic Recipe Launchpad -->
+            <div id="scenario-recipes-launchpad" class="mb-3" style="background: rgba(0,0,0,0.24); padding: 12px 14px; border-radius: 6px; border: 1px solid var(--border-color);">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <div>
+                  <span class="font-bold text-xs" style="color: var(--text-main);">🩺 Quick Diagnostic Recipes (언제 어떤 분석을 쓸지 선택하세요)</span>
+                  <span class="text-muted text-xs ms-2">One-click guided workflows with 0.00 ms target interruption</span>
+                </div>
+              </div>
+              <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+                <div style="background: var(--bg-input); padding: 10px; border-radius: 5px; border: 1px solid var(--border-color);">
+                  <div class="font-bold text-xs mb-1" style="color: var(--accent);">⚡ 1. Silent Hang / Instant X-Ray</div>
+                  <div class="text-xs text-muted mb-2">프로세스가 멈춘 것처럼 보일 때 주요 전역 구조체와 힙 포인터 값을 즉시 해독합니다.</div>
+                  <button type="button" class="btn btn-primary btn-xs w-full" id="btn-recipe-instant-xray">Run Instant X-Ray</button>
+                </div>
+                <div style="background: var(--bg-input); padding: 10px; border-radius: 5px; border: 1px solid var(--border-color);">
+                  <div class="font-bold text-xs mb-1" style="color: var(--accent);">⚖️ 2. Before / After State Diff</div>
+                  <div class="text-xs text-muted mb-2">이벤트 전후 시간차를 두고 2회 무중단 샘플링하여 변경된 필드만 추출합니다.</div>
+                  <button type="button" class="btn btn-outline btn-xs w-full" id="btn-recipe-before-after">Run 500ms State Diff</button>
+                </div>
+                <div style="background: var(--bg-input); padding: 10px; border-radius: 5px; border: 1px solid var(--border-color);">
+                  <div class="font-bold text-xs mb-1" style="color: var(--accent);">📈 3. Auto Time-Series Watch</div>
+                  <div class="text-xs text-muted mb-2">주요 변수를 연속 샘플링하여 활발히 변하는 변수와 고착된(Stuck) 변수를 분류합니다.</div>
+                  <button type="button" class="btn btn-success btn-xs w-full" id="btn-recipe-auto-watch">Run Auto-Watch</button>
+                </div>
+              </div>
+              <div id="scenario-recipe-output" class="mono text-xs mt-2" style="display: none; background: rgba(0,0,0,0.35); padding: 10px; border-radius: 4px; max-height: 240px; overflow-y: auto;"></div>
+            </div>
+
             <!-- Workflow Action Buttons -->
             <div id="step1-next-action-card" style="background: rgba(0,0,0,0.2); padding: 14px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
               <div>
@@ -822,6 +861,27 @@
               </table>
             </div>
           </div>
+        </div>
+
+        <!-- Phase 3: Golden Baseline Pinning & Live Drift Comparison Card -->
+        <div class="card mb-3" id="card-golden-baseline">
+          <div class="card-header d-flex justify-content-between align-items-center" style="padding: 10px 14px; background: rgba(0,0,0,0.2);">
+            <div>
+              <h3 class="text-xs font-bold uppercase tracking-wider text-muted flex items-center gap-2">
+                <span>🏆</span> <span>Golden Baseline (정상 상태 기준점 저장 및 실시간 비교)</span>
+              </h3>
+              <div class="text-xs text-muted">Save a known-good runtime state and compare live target memory against it at any time.</div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <input type="text" id="input-golden-baseline-label" class="form-input form-input-xs" placeholder="Baseline label (e.g. Healthy_Idle)" style="width: 190px;">
+              <button type="button" class="btn btn-outline btn-xs" id="btn-save-golden-baseline">📌 Save Golden Baseline</button>
+              <select id="select-golden-baseline" class="input-select input-select-xs mono" style="width: 200px;">
+                <option value="">-- Select Saved Baseline --</option>
+              </select>
+              <button type="button" class="btn btn-primary btn-xs" id="btn-compare-golden-baseline">⚖️ Compare vs Golden</button>
+            </div>
+          </div>
+          <div class="card-body" id="golden-baseline-diff-output" style="display: none; padding: 10px 14px;"></div>
         </div>
 
         <!-- Side-by-Side Snapshot Comparison Card -->
