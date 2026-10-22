@@ -106,3 +106,19 @@ This bundle can be transferred to any host machine running dynamicState and load
 from extractor.memory_snapshot import RawMemorySnapshot
 snapshot = RawMemorySnapshot.load("path/to/snapshot_dir")
 ```
+
+### Lightweight Slice Read & Persistent Daemon Modes (Phase 2)
+
+For high-frequency remote watch sessions and deep pointer-chain traversal without writing snapshot files to embedded flash/tmpfs:
+
+```bash
+# 1. One-shot zero-disk slice read (outputs compact JSON with hex bytes to stdout)
+./dynamicstate-collector -p 1234 --read-slices 0x555555558000:16,0x555555558020:4
+
+# 2. Persistent stdio RPC daemon mode (for SSH ControlMaster / streaming pipelines)
+./dynamicstate-collector --daemon
+# Commands on stdin:
+#   PING
+#   READ 1234 0x555555558000:16,0x555555558020:4
+#   QUIT
+```

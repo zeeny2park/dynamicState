@@ -77,6 +77,8 @@ void collector_classify_region(parsed_region_t *r, const char *exe_path);
 int collector_filter_regions(parsed_region_t *regions, int count, const collector_config_t *cfg, int *selected_count_out);
 int collector_read_region(pid_t pid, int mem_fd, int backend, uint64_t start, size_t size, void *buf, size_t *bytes_read);
 int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out);
+int collector_read_slices(pid_t pid, int backend, const char *slices_spec, void *out_file);
+int collector_daemon_loop(int backend, void *in_file, void *out_file);
 
 #ifdef __cplusplus
 }

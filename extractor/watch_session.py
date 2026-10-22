@@ -718,6 +718,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         ssh_proxy_command: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
+        collector_path: Optional[str] = None,
     ) -> TargetExecutionAdapter:
         if adapter is not None:
             return adapter
@@ -729,6 +730,7 @@ class WatchSessionManager:
                 key_file=ssh_key,
                 proxy_jump=ssh_proxy_jump,
                 proxy_command=ssh_proxy_command,
+                collector_path=collector_path,
             )
         return LocalTargetAdapter()
 
@@ -1224,7 +1226,31 @@ class WatchSessionManager:
                 raise ValueError(f"Session '{session_id}' not found")
 
             raw_addr = item_dict.get("address") or item_dict.get("runtime_address", 0)
-            addr_int = int(raw_addr, 16) if isinstance(raw_addr, str) and raw_addr.startswith("0x") else int(raw_addr)
+            addr_int = int(raw_addr, 16) if isinstance(raw_addr, str) and raw_addr.startswith("0x") else int(raw_addr or 0)
+            expr_candidate = (item_dict.get("expression") or item_dict.get("name") or "").strip()
+            adapter = self._adapters.get(session_id) or self._resolve_adapter(pid=session.pid)
+
+            # Auto-resolve C/C++ symbol expression if address is 0/omitted and companion ELF is present
+            if addr_int == 0 and expr_candidate and session.companion_elf_path and os.path.exists(session.companion_elf_path):
+                try:
+                    ev_res = self.evaluate_symbol_paths(
+                        pid=session.pid,
+                        companion_elf_path=session.companion_elf_path,
+                        expressions=[expr_candidate],
+                        adapter=adapter,
+                    )
+                    ev_list = ev_res.get("results", [])
+                    if ev_list and ev_list[0].get("runtime_address_int"):
+                        addr_int = int(ev_list[0]["runtime_address_int"])
+                        if not item_dict.get("size") and ev_list[0].get("size"):
+                            item_dict["size"] = int(ev_list[0]["size"])
+                        if (not item_dict.get("type_name") or item_dict.get("type_name") == "raw_bytes") and ev_list[0].get("type_name"):
+                            item_dict["type_name"] = ev_list[0]["type_name"]
+                        if not item_dict.get("expression"):
+                            item_dict["expression"] = expr_candidate
+                except Exception:
+                    pass
+
             size = int(item_dict.get("size", 4))
             if size <= 0 or size > 65536:
                 raise ValueError(f"Invalid size {size}: must be between 1 and 65536 bytes")
@@ -1420,6 +1446,128 @@ class WatchSessionManager:
             }
             return entry, "PARTIAL"
 
+    def _sample_session_watch_items(
+        self,
+        session: ObservationSession,
+        adapter: TargetExecutionAdapter,
+    ) -> Tuple[Dict[str, Dict[str, Any]], str]:
+        """Samples all watch items for a session, supporting dynamic pointer-chain expressions
+        and single-roundtrip batched memory reads on remote targets.
+        """
+        values: Dict[str, Dict[str, Any]] = {}
+        obs_completeness = "COMPLETE"
+        items = list(session.watch_items)
+        if not items:
+            return values, obs_completeness
+
+        dynamic_expr_items: List[WatchItem] = []
+        direct_items: List[WatchItem] = []
+        has_companion = bool(session.companion_elf_path and os.path.exists(session.companion_elf_path))
+
+        for item in items:
+            expr_str = (item.expression or "").strip()
+            if has_companion and expr_str and ("->" in expr_str or "*" in expr_str or "[" in expr_str):
+                dynamic_expr_items.append(item)
+            else:
+                direct_items.append(item)
+
+        # 1. Dynamically evaluate pointer-chain / array watch items via DWARF traversal
+        if dynamic_expr_items and has_companion:
+            exprs = [str(w.expression or w.name) for w in dynamic_expr_items]
+            try:
+                ev_res = self.evaluate_symbol_paths(
+                    pid=session.pid,
+                    companion_elf_path=str(session.companion_elf_path),
+                    expressions=exprs,
+                    adapter=adapter,
+                )
+                ev_map = {r["expression"]: r for r in ev_res.get("results", [])}
+            except Exception:
+                ev_map = {}
+
+            for w in dynamic_expr_items:
+                ex = str(w.expression or w.name)
+                r = ev_map.get(ex)
+                if r and r.get("status") == "OBSERVED":
+                    if r.get("runtime_address_int"):
+                        w.address = int(r["runtime_address_int"])
+                    values[w.item_id] = {
+                        "value": r.get("value"),
+                        "raw_hex": r.get("raw_hex", ""),
+                        "status": "OBSERVED",
+                        "error": None,
+                        "is_pointer": bool(w.type_name.endswith("*")),
+                        "resolved_address": r.get("runtime_address"),
+                        "pointer_chain": r.get("pointer_chain"),
+                    }
+                else:
+                    obs_completeness = "PARTIAL"
+                    values[w.item_id] = {
+                        "value": None,
+                        "raw_hex": "",
+                        "status": (r.get("status") if r else "UNAVAILABLE"),
+                        "error": (r.get("error") if r else "Dynamic expression evaluation failed"),
+                        "is_pointer": bool(w.type_name.endswith("*")),
+                    }
+
+        # 2. Sample direct-address items (use batch read when remote and >= 2 non-pointer items)
+        non_ptr_direct = [
+            w for w in direct_items
+            if not (w.type_name in ("pointer", "void*") or w.type_name.endswith("*"))
+        ]
+        ptr_direct = [
+            w for w in direct_items
+            if (w.type_name in ("pointer", "void*") or w.type_name.endswith("*"))
+        ]
+
+        if adapter.is_remote() and len(non_ptr_direct) >= 2 and hasattr(adapter, "read_memory_batch"):
+            slices = [(w.address, w.size) for w in non_ptr_direct]
+            batch_res = adapter.read_memory_batch(session.pid, slices)
+            for w, (raw_bytes, read_st, read_err) in zip(non_ptr_direct, batch_res):
+                if read_st == "OBSERVED" and raw_bytes is not None:
+                    decoded_val, dec_err = decode_value_from_bytes(raw_bytes, w.type_name)
+                    st = "OBSERVED" if dec_err is None else "DECODE_ERROR"
+                    values[w.item_id] = {
+                        "value": decoded_val,
+                        "raw_hex": raw_bytes.hex(),
+                        "status": st,
+                        "error": dec_err,
+                        "is_pointer": False,
+                    }
+                    if st != "OBSERVED":
+                        obs_completeness = "PARTIAL"
+                elif read_st == "PARTIAL":
+                    obs_completeness = "PARTIAL"
+                    values[w.item_id] = {
+                        "value": None,
+                        "raw_hex": raw_bytes.hex() if raw_bytes else "",
+                        "status": "PARTIAL",
+                        "error": read_err or "Partial memory read",
+                        "is_pointer": False,
+                    }
+                else:
+                    obs_completeness = "PARTIAL"
+                    values[w.item_id] = {
+                        "value": None,
+                        "raw_hex": "",
+                        "status": read_st if read_st in ("UNAVAILABLE", "PERMISSION_DENIED", "TARGET_TERMINATED") else "UNAVAILABLE",
+                        "error": read_err or "Memory read failed or unmapped",
+                        "is_pointer": False,
+                    }
+            for w in ptr_direct:
+                item_entry, comp = self._sample_watch_item(adapter, session.pid, w)
+                values[w.item_id] = item_entry
+                if comp != "COMPLETE":
+                    obs_completeness = "PARTIAL"
+        else:
+            for w in direct_items:
+                item_entry, comp = self._sample_watch_item(adapter, session.pid, w)
+                values[w.item_id] = item_entry
+                if comp != "COMPLETE":
+                    obs_completeness = "PARTIAL"
+
+        return values, obs_completeness
+
     def capture_once(self, session_id: str) -> Observation:
         """Executes a single synchronous capture of all watch items for a session."""
         with self._lock:
@@ -1442,11 +1590,7 @@ class WatchSessionManager:
             if not alive:
                 raise RuntimeError(f"Target process PID {session.pid} is not accessible: {live_err}")
 
-            for item in list(session.watch_items):
-                item_entry, completeness = self._sample_watch_item(adapter, session.pid, item)
-                values[item.item_id] = item_entry
-                if completeness != "COMPLETE":
-                    obs_completeness = "PARTIAL"
+            values, obs_completeness = self._sample_session_watch_items(session, adapter)
 
             t_end_ns = time.monotonic_ns()
             latency_us = round((t_end_ns - t_start_ns) / 1000.0, 2)
@@ -1719,11 +1863,7 @@ class WatchSessionManager:
             values: Dict[str, Dict[str, Any]] = {}
             obs_completeness = "COMPLETE"
 
-            for item in list(session.watch_items):
-                item_entry, completeness = self._sample_watch_item(adapter, session.pid, item)
-                values[item.item_id] = item_entry
-                if completeness != "COMPLETE":
-                    obs_completeness = "PARTIAL"
+            values, obs_completeness = self._sample_session_watch_items(session, adapter)
 
             t_end_ns = time.monotonic_ns()
             latency_us = round((t_end_ns - t_start_ns) / 1000.0, 2)

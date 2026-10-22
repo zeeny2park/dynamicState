@@ -36,14 +36,18 @@ int main(int argc, char *argv[]) {
         {"max-region", required_argument, 0, 'r'},
         {"policy", required_argument, 0, 'P'},
         {"backend", required_argument, 0, 'B'},
+        {"read-slices", required_argument, 0, 's'},
+        {"daemon", no_argument, 0, 'd'},
         {"verbose", no_argument, 0, 'v'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
+    const char *read_slices_spec = NULL;
+    int daemon_mode = 0;
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "p:o:m:r:vh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:o:m:r:s:dvh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 cfg.pid = (pid_t)atoi(optarg);
@@ -75,6 +79,12 @@ int main(int argc, char *argv[]) {
                     cfg.backend = BACKEND_AUTO;
                 }
                 break;
+            case 's':
+                read_slices_spec = optarg;
+                break;
+            case 'd':
+                daemon_mode = 1;
+                break;
             case 'v':
                 cfg.verbose = 1;
                 break;
@@ -87,9 +97,21 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (daemon_mode) {
+        return collector_daemon_loop(cfg.backend, stdin, stdout);
+    }
+
     /* Positional PID argument if not supplied via -p */
     if (cfg.pid <= 0 && optind < argc) {
         cfg.pid = (pid_t)atoi(argv[optind]);
+    }
+
+    if (read_slices_spec != NULL) {
+        if (cfg.pid <= 0) {
+            fprintf(stderr, "Error: Valid PID required for --read-slices.\n");
+            return 1;
+        }
+        return (collector_read_slices(cfg.pid, cfg.backend, read_slices_spec, stdout) == 0) ? 0 : 1;
     }
 
     if (cfg.pid <= 0) {

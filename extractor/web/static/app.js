@@ -10279,6 +10279,33 @@
       });
     }
 
+    const btnWatchExpr = document.getElementById('btn-te-watch-expr');
+    if (btnWatchExpr) {
+      btnWatchExpr.addEventListener('click', async () => {
+        const exprInput = document.getElementById('te-eval-expr-input');
+        const rawExpr = exprInput ? exprInput.value.trim() : '';
+        if (!rawExpr || !teState.targetPid || !teState.companionElf) {
+          showToastNotification('Connect target and enter a symbol path expression first', 'warning');
+          return;
+        }
+        const sid = await ensureActiveWatchSession();
+        if (!sid) return;
+        const exprs = rawExpr.split(',').map(s => s.trim()).filter(Boolean);
+        for (const ex of exprs) {
+          await apiPost(`/api/watch/session/${encodeURIComponent(sid)}/watch`, {
+            action: 'add',
+            name: ex,
+            expression: ex,
+            address: 0,
+            scope: 'expression',
+            source: 'symbol_path',
+          });
+        }
+        await refreshActiveWatchSession();
+        showToastNotification(`Added ${exprs.length} symbol path(s) to Watch List`, 'success');
+      });
+    }
+
     // Phase 31 Guided Journey Transition Buttons
     const btnStep1To2 = document.getElementById('btn-step1-to-step2');
     const btnStep2To3 = document.getElementById('btn-step2-to-step3');

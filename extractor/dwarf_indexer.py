@@ -5,10 +5,13 @@ and global/static variable locations from ELF artifacts without running GDB or s
 target processes.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+import hashlib
+import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -292,6 +295,85 @@ class DwarfIndex:
         results.sort(key=lambda r: (r.get("score", 0.0), r.get("name", "")), reverse=True)
         return results[:max(1, limit)]
 
+    def to_cache_dict(self) -> Dict[str, Any]:
+        """Serialize DwarfIndex to a JSON-compatible dictionary for persistent disk caching."""
+        return {
+            "schema_version": "1.0.0",
+            "artifact_path": self.artifact_path,
+            "build_id": self.build_id,
+            "pointer_size": self.pointer_size,
+            "endianness": self.endianness,
+            "elf_class": self.elf_class,
+            "architecture": self.architecture,
+            "elf_type": self.elf_type,
+            "pt_loads": self.pt_loads,
+            "file_table": {str(k): v for k, v in self.file_table.items()},
+            "types": [asdict(t) for t in self.types_by_die.values()],
+            "variables": [asdict(v) for v in self.variables],
+            "subprograms": [asdict(s) for s in self.subprograms],
+        }
+
+    @classmethod
+    def from_cache_dict(cls, d: Dict[str, Any]) -> "DwarfIndex":
+        """Deserialize DwarfIndex from a cached dictionary."""
+        idx = cls(
+            artifact_path=d.get("artifact_path", ""),
+            build_id=d.get("build_id"),
+            pointer_size=int(d.get("pointer_size", 8)),
+            endianness=d.get("endianness", "little"),
+            elf_class=d.get("elf_class", "ELF64"),
+            architecture=d.get("architecture", "x86_64"),
+            elf_type=d.get("elf_type", "ET_DYN"),
+            pt_loads=d.get("pt_loads", []),
+            file_table={int(k): v for k, v in d.get("file_table", {}).items()},
+        )
+        for td in d.get("types", []):
+            members = [DwarfMember(**m) for m in td.get("members", [])]
+            bases = [DwarfBaseClass(**b) for b in td.get("base_classes", [])]
+            enums = {int(k): v for k, v in td.get("enum_values", {}).items()}
+            dt = DwarfType(
+                die_offset=int(td["die_offset"]),
+                tag=td.get("tag", ""),
+                name=td.get("name", ""),
+                byte_size=int(td.get("byte_size", 0)),
+                members=members,
+                base_classes=bases,
+                target_type_offset=td.get("target_type_offset"),
+                array_count=td.get("array_count"),
+                enum_values=enums,
+                decl_file=td.get("decl_file"),
+                decl_line=td.get("decl_line"),
+            )
+            idx.types_by_die[dt.die_offset] = dt
+            if dt.name:
+                idx.types_by_name.setdefault(dt.name, []).append(dt)
+
+        for vd in d.get("variables", []):
+            dv = DwarfVariable(**vd)
+            idx.variables.append(dv)
+            if dv.name:
+                idx.variables_by_name.setdefault(dv.name, []).append(dv)
+            if dv.link_time_address is not None and not dv.is_declaration and dv.name:
+                if dv.is_external:
+                    idx.global_variables.append(dv)
+                else:
+                    idx.static_variables.append(dv)
+
+        for sd in d.get("subprograms", []):
+            svars = [DwarfVariable(**v) for v in sd.get("variables", [])]
+            rules = [tuple(r) for r in sd.get("cfa_rules", [])]
+            sd_copy = dict(sd)
+            sd_copy["variables"] = svars
+            sd_copy["cfa_rules"] = rules
+            sp = DwarfSubprogram(**sd_copy)
+            idx.subprograms.append(sp)
+            if sp.name:
+                idx.subprograms_by_name.setdefault(sp.name, []).append(sp)
+            if sp.linkage_name and sp.linkage_name != sp.name:
+                idx.subprograms_by_name.setdefault(sp.linkage_name, []).append(sp)
+
+        return idx
+
     def get_type_name(self, type_offset: Optional[int]) -> str:
         """Construct canonical human-readable type signature."""
         if type_offset is None:
@@ -514,10 +596,19 @@ class DwarfIndexer:
     """Thread-safe indexer and cache manager for DWARF debug images."""
 
     _cache: Dict[Tuple[str, int, int, Optional[str]], DwarfIndex] = {}
+    _fast_sym_cache: Dict[Tuple[str, int, int, Optional[str]], List[Dict[str, Any]]] = {}
     _lock = threading.Lock()
 
     @classmethod
-    def get_index(cls, artifact_path: str) -> DwarfIndex:
+    def _get_disk_cache_path(cls, cache_key: Tuple[str, int, int, Optional[str]]) -> str:
+        cache_dir = os.environ.get("DYNAMICSTATE_DWARF_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "dynamicstate_dwarf_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        raw_key = f"{cache_key[0]}|{cache_key[1]}|{cache_key[2]}|{cache_key[3] or ''}"
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:24]
+        return os.path.join(cache_dir, f"dwarf_idx_{digest}.json")
+
+    @classmethod
+    def get_index(cls, artifact_path: str, use_disk_cache: bool = True) -> DwarfIndex:
         abs_path = os.path.abspath(artifact_path)
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"Debug artifact not found: {abs_path}")
@@ -534,7 +625,29 @@ class DwarfIndexer:
             if cache_key in cls._cache:
                 return cls._cache[cache_key]
 
+        # Stage 1: Check persistent on-disk DWARF cache to avoid slow readelf --debug-dump=info
+        disk_cache_file = cls._get_disk_cache_path(cache_key) if use_disk_cache else None
+        if disk_cache_file and os.path.isfile(disk_cache_file):
+            try:
+                with open(disk_cache_file, "r", encoding="utf-8") as cf:
+                    cached_data = json.load(cf)
+                index = DwarfIndex.from_cache_dict(cached_data)
+                with cls._lock:
+                    cls._cache[cache_key] = index
+                return index
+            except Exception:
+                pass
+
         index = cls._build_index(abs_path, elf_info)
+
+        if disk_cache_file:
+            try:
+                tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(disk_cache_file), prefix="dw_", suffix=".tmp")
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as tf:
+                    json.dump(index.to_cache_dict(), tf, ensure_ascii=False)
+                os.replace(tmp_path, disk_cache_file)
+            except Exception:
+                pass
 
         with cls._lock:
             cls._cache[cache_key] = index
@@ -542,10 +655,91 @@ class DwarfIndexer:
         return index
 
     @classmethod
+    def get_fast_symbol_table(
+        cls,
+        artifact_path: str,
+        load_bias: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Stage-1 ultra-fast symbol table scanner using `readelf -s -W` (.symtab / .dynsym).
+        
+        Extracts global and static OBJECT symbols with exact addresses and byte sizes in milliseconds
+        without parsing full DWARF DIE trees.
+        """
+        abs_path = os.path.abspath(artifact_path)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"Debug artifact not found: {abs_path}")
+
+        st = os.stat(abs_path)
+        elf_info: BinaryIdentity = inspect_elf(abs_path)
+        is_dyn = (elf_info.elf_type == "ET_DYN")
+        cache_key = (abs_path, st.st_mtime_ns, st.st_size, elf_info.build_id)
+
+        with cls._lock:
+            base_syms = cls._fast_sym_cache.get(cache_key)
+
+        if base_syms is None:
+            base_syms = []
+            try:
+                proc = subprocess.run(
+                    ["readelf", "-s", "-W", abs_path],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                # Example line:
+                #    45: 0000000000007340    24 OBJECT  GLOBAL DEFAULT   25 g_session
+                sym_re = re.compile(
+                    r"^\s*\d+:\s+([0-9a-fA-F]+)\s+(\d+|0x[0-9a-fA-F]+)\s+(OBJECT|FUNC)\s+(GLOBAL|LOCAL|WEAK)\s+\S+\s+(\S+)\s+(.+)$"
+                )
+                seen = set()
+                for line in proc.stdout.splitlines():
+                    m = sym_re.match(line)
+                    if not m:
+                        continue
+                    addr_hex, sz_str, stype, bind, ndx, raw_name = m.groups()
+                    if ndx == "UND":
+                        continue
+                    addr = int(addr_hex, 16)
+                    if addr == 0:
+                        continue
+                    sz = int(sz_str, 16) if sz_str.startswith("0x") else int(sz_str)
+                    name = raw_name.strip().split("@")[0]
+                    if not name or name.startswith("_"):
+                        continue
+                    if (name, addr) in seen:
+                        continue
+                    seen.add((name, addr))
+                    base_syms.append({
+                        "name": name,
+                        "symbol_type": stype,
+                        "binding": bind,
+                        "link_time_address_int": addr,
+                        "link_time_address": f"0x{addr:x}",
+                        "size": sz,
+                    })
+            except Exception:
+                base_syms = []
+
+            with cls._lock:
+                cls._fast_sym_cache[cache_key] = base_syms
+
+        out: List[Dict[str, Any]] = []
+        for s in base_syms:
+            lt_addr = s["link_time_address_int"]
+            rt_addr = (load_bias + lt_addr) if is_dyn else lt_addr
+            out.append({
+                **s,
+                "runtime_address_int": rt_addr,
+                "runtime_address": f"0x{rt_addr:x}",
+            })
+        return out
+
+    @classmethod
     def clear_cache(cls) -> None:
         """Clear cached DwarfIndex instances (used in test teardown)."""
         with cls._lock:
             cls._cache.clear()
+            cls._fast_sym_cache.clear()
 
     @classmethod
     def _clean_str(cls, val: str) -> str:

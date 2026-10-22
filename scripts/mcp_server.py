@@ -693,6 +693,7 @@ def runtime_symbol_search(
     ssh_port: int = 22,
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
+    fast_only: bool = False,
 ) -> str:
     """Search DWARF global/static variables, struct definitions, and enums by keyword with smart state ranking.
 
@@ -709,7 +710,6 @@ def runtime_symbol_search(
         if not companion_elf or not os.path.isfile(companion_elf):
             return _format_watch_result({"success": False, "error": f"Companion ELF not found: '{companion_elf}'", "error_code": "DEBUG_IMAGE_NOT_FOUND"})
 
-        idx = DwarfIndexer.get_index(companion_elf)
         load_bias_int = 0
         if pid and pid > 0:
             try:
@@ -725,6 +725,23 @@ def runtime_symbol_search(
                 load_bias_int = map_data.get("base_address_int", 0)
             except Exception:
                 load_bias_int = 0
+
+        if fast_only:
+            fast_syms = DwarfIndexer.get_fast_symbol_table(companion_elf, load_bias=load_bias_int)
+            q_low = (query or "").strip().lower()
+            if q_low:
+                fast_syms = [s for s in fast_syms if q_low in s["name"].lower()]
+            fast_syms = fast_syms[:max(1, min(int(limit), 200))]
+            return _format_watch_result({
+                "success": True,
+                "companion_elf": os.path.abspath(companion_elf),
+                "query": query,
+                "mode": "fast_symtab",
+                "returned_count": len(fast_syms),
+                "symbols": fast_syms,
+            })
+
+        idx = DwarfIndexer.get_index(companion_elf)
 
         results = idx.search_symbols(
             query=query,

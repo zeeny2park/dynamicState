@@ -72,6 +72,14 @@ class TargetExecutionAdapter(ABC):
         """
         pass
 
+    def read_memory_batch(
+        self,
+        pid: int,
+        slices: List[Tuple[int, int]],
+    ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
+        """Reads multiple (address, size) slices in a single batch operation when supported."""
+        return [self.read_memory(pid, addr, sz) for addr, sz in slices]
+
     @abstractmethod
     def is_remote(self) -> bool:
         """Returns True if the target is on a remote host, False if local."""
@@ -393,6 +401,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         ssh_bin: str = "ssh",
         command_runner: Optional[Callable[[List[str], float], Tuple[int, str, str]]] = None,
         use_control_master: bool = False,
+        collector_path: Optional[str] = None,
     ):
         if not host:
             raise ValueError("Remote host must be specified")
@@ -406,6 +415,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.ssh_bin = ssh_bin
         self._command_runner = command_runner or self._default_command_runner
         self.use_control_master = bool(use_control_master)
+        self.collector_path = (collector_path or "").strip() or None
 
     def is_remote(self) -> bool:
         return True
@@ -625,9 +635,127 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         threads.sort(key=lambda t: t["tid"])
         return threads
 
+    def _read_slices_via_collector(
+        self,
+        pid: int,
+        slices: List[Tuple[int, int]],
+    ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
+        """Uses C99 dynamicstate-collector --read-slices on the remote target for zero-stop process_vm_readv batch reads."""
+        if not self.collector_path or not slices:
+            return None
+        import json as _json
+        spec = ",".join(f"0x{int(addr):x}:{max(0, int(sz))}" for addr, sz in slices)
+        cmd = f"{shlex.quote(self.collector_path)} -p {int(pid)} --read-slices {shlex.quote(spec)} 2>/dev/null"
+        rc, stdout, _ = self.run_ssh(cmd)
+        if rc != 0 or not stdout.strip():
+            return None
+        try:
+            payload = _json.loads(stdout.strip().splitlines()[-1])
+            if not payload.get("success") or "slices" not in payload:
+                if payload.get("error") == "TARGET_TERMINATED":
+                    return [(None, "TARGET_TERMINATED", "Remote process terminated") for _ in slices]
+                return None
+            out_list: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+            raw_slices = payload.get("slices", [])
+            for idx, (req_addr, req_sz) in enumerate(slices):
+                if req_sz <= 0:
+                    out_list.append((b"", "OBSERVED", None))
+                    continue
+                s_item = raw_slices[idx] if idx < len(raw_slices) else {}
+                st = s_item.get("status", "UNAVAILABLE")
+                hex_str = s_item.get("hex", "")
+                raw_b = bytes.fromhex(hex_str) if hex_str else b""
+                if st == "OBSERVED" and len(raw_b) == req_sz:
+                    out_list.append((raw_b, "OBSERVED", None))
+                elif len(raw_b) > 0:
+                    out_list.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{req_sz} bytes"))
+                else:
+                    out_list.append((None, st if st in ("UNAVAILABLE", "PERMISSION_DENIED", "TARGET_TERMINATED") else "UNAVAILABLE", f"Collector read status: {st} at 0x{req_addr:x}"))
+            return out_list
+        except Exception:
+            return None
+
+    def read_memory_batch(
+        self,
+        pid: int,
+        slices: List[Tuple[int, int]],
+    ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
+        """Reads multiple memory slices in a single SSH roundtrip (via C99 collector or batched POSIX shell)."""
+        if not slices:
+            return []
+        if len(slices) == 1 and not self.collector_path:
+            return [self.read_memory(pid, slices[0][0], slices[0][1])]
+
+        if self.collector_path:
+            coll_res = self._read_slices_via_collector(pid, slices)
+            if coll_res is not None:
+                return coll_res
+
+        # Single-SSH batched shell read with page-aligned dd fallback for 64-bit BusyBox offsets
+        cmds = []
+        for idx, (addr, sz) in enumerate(slices):
+            a_int = int(addr)
+            s_int = max(0, int(sz))
+            if s_int == 0:
+                cmds.append(f"echo '{idx}|'")
+                continue
+            page_sz = 4096
+            page_num = a_int // page_sz
+            page_off = a_int % page_sz
+            pages_needed = ((page_off + s_int + page_sz - 1) // page_sz)
+            cmds.append(
+                f"b=$(dd if=/proc/{int(pid)}/mem bs=1 skip={a_int} count={s_int} 2>/dev/null | base64 | tr -d '\\n'); "
+                f"if [ -z \"$b\" ]; then "
+                f"b=$(dd if=/proc/{int(pid)}/mem bs={page_sz} skip={page_num} count={pages_needed} 2>/dev/null | "
+                f"dd bs=1 skip={page_off} count={s_int} 2>/dev/null | base64 | tr -d '\\n'); "
+                f"fi; "
+                f"echo \"{idx}|$b\""
+            )
+        remote_script = "; ".join(cmds)
+        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
+        if rc != 0:
+            alive, live_err = self.check_liveness(pid)
+            if not alive:
+                st = "UNAVAILABLE" if (live_err and ("transport" in live_err.lower() or "timed out" in live_err.lower())) else "TARGET_TERMINATED"
+                return [(None, st, live_err or "Remote process terminated") for _ in slices]
+            return [(None, "UNAVAILABLE", f"SSH batch read failed: {stderr.strip()}") for _ in slices]
+
+        by_idx: Dict[int, str] = {}
+        for line in stdout.splitlines():
+            if "|" in line:
+                k_str, val_b64 = line.strip().split("|", 1)
+                if k_str.isdigit():
+                    by_idx[int(k_str)] = val_b64.strip()
+
+        results: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        for idx, (addr, sz) in enumerate(slices):
+            if sz <= 0:
+                results.append((b"", "OBSERVED", None))
+                continue
+            b64_str = by_idx.get(idx, "")
+            if not b64_str:
+                results.append((None, "UNAVAILABLE", f"Address 0x{int(addr):x} is not mapped or inaccessible on {self.target_host()}"))
+                continue
+            try:
+                raw_b = base64.b64decode(b64_str)
+                if len(raw_b) == sz:
+                    results.append((raw_b, "OBSERVED", None))
+                elif len(raw_b) > 0:
+                    results.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{sz} bytes"))
+                else:
+                    results.append((None, "UNAVAILABLE", f"Zero bytes returned at 0x{int(addr):x}"))
+            except Exception as e:
+                results.append((None, "UNAVAILABLE", f"Base64 decode failure: {e}"))
+        return results
+
     def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
         if size <= 0:
             return b"", "OBSERVED", None
+
+        if self.collector_path:
+            coll_res = self._read_slices_via_collector(pid, [(address, size)])
+            if coll_res is not None and len(coll_res) == 1:
+                return coll_res[0]
 
         # Remote memory read via dd and base64
         # dd skip requires decimal integer

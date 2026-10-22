@@ -661,3 +661,141 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     }
     return 0;
 }
+
+int collector_read_slices(pid_t pid, int backend, const char *slices_spec, void *out_file) {
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    if (pid <= 0 || !slices_spec || !slices_spec[0]) {
+        fprintf(out, "{\"success\":false,\"error\":\"INVALID_ARGS\",\"pid\":%d}\n", (int)pid);
+        fflush(out);
+        return -1;
+    }
+
+    uint64_t st_before = 0;
+    if (collector_get_process_starttime(pid, &st_before) < 0) {
+        fprintf(out, "{\"success\":false,\"error\":\"TARGET_TERMINATED\",\"pid\":%d}\n", (int)pid);
+        fflush(out);
+        return -1;
+    }
+
+    char mem_path[128];
+    snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", (int)pid);
+    int mem_fd = open(mem_path, O_RDONLY);
+
+    int64_t t_start = get_time_ns();
+    const char *backend_name = (backend == BACKEND_PROC_MEM) ? "pread" : "process_vm_readv";
+
+    fprintf(out, "{\"success\":true,\"pid\":%d,\"backend\":\"%s\",\"slices\":[", (int)pid, backend_name);
+
+    char *spec_copy = strdup(slices_spec);
+    if (!spec_copy) {
+        if (mem_fd >= 0) close(mem_fd);
+        fprintf(out, "]}\n");
+        fflush(out);
+        return -1;
+    }
+
+    int slice_idx = 0;
+    char *saveptr = NULL;
+    char *token = strtok_r(spec_copy, ",", &saveptr);
+    while (token != NULL) {
+        while (*token == ' ' || *token == '\t') token++;
+        char *colon = strchr(token, ':');
+        if (colon) {
+            *colon = '\0';
+            const char *addr_str = token;
+            const char *size_str = colon + 1;
+            uint64_t addr = strtoull(addr_str, NULL, 0);
+            size_t sz = (size_t)strtoull(size_str, NULL, 0);
+            if (sz > 65536) sz = 65536;
+
+            unsigned char *buf = (sz > 0) ? (unsigned char *)malloc(sz) : NULL;
+            size_t nread = 0;
+            int rc = -1;
+            if (sz == 0) {
+                rc = 0;
+            } else if (buf) {
+                rc = collector_read_region(pid, mem_fd, backend, addr, sz, buf, &nread);
+            }
+
+            const char *status = "UNAVAILABLE";
+            if (rc == 0 && nread == sz) {
+                status = "OBSERVED";
+            } else if (rc == 0 && nread > 0) {
+                status = "PARTIAL";
+            } else {
+                uint64_t st_check = 0;
+                if (collector_get_process_starttime(pid, &st_check) < 0) {
+                    status = "TARGET_TERMINATED";
+                } else if (errno == EPERM || errno == EACCES) {
+                    status = "PERMISSION_DENIED";
+                }
+            }
+
+            fprintf(out, "%s{\"address\":\"0x%llx\",\"size\":%zu,\"bytes_read\":%zu,\"status\":\"%s\",\"hex\":\"",
+                    (slice_idx > 0) ? "," : "",
+                    (unsigned long long)addr, sz, nread, status);
+            for (size_t b = 0; b < nread; b++) {
+                fprintf(out, "%02x", buf[b]);
+            }
+            fprintf(out, "\"}");
+            if (buf) free(buf);
+            slice_idx++;
+        }
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    free(spec_copy);
+    if (mem_fd >= 0) close(mem_fd);
+
+    int64_t t_end = get_time_ns();
+    double dur_us = (double)(t_end - t_start) / 1000.0;
+    fprintf(out, "],\"duration_us\":%.2f}\n", dur_us);
+    fflush(out);
+    return 0;
+}
+
+int collector_daemon_loop(int backend, void *in_file, void *out_file) {
+    FILE *in = in_file ? (FILE *)in_file : stdin;
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    char line[8192];
+
+    while (fgets(line, sizeof(line), in)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') continue;
+
+        if (strncmp(p, "QUIT", 4) == 0 || strncmp(p, "EXIT", 4) == 0) {
+            fprintf(out, "{\"success\":true,\"status\":\"BYE\"}\n");
+            fflush(out);
+            break;
+        }
+        if (strncmp(p, "PING", 4) == 0) {
+            fprintf(out, "{\"success\":true,\"status\":\"PONG\"}\n");
+            fflush(out);
+            continue;
+        }
+        if (strncmp(p, "READ ", 5) == 0) {
+            char *rest = p + 5;
+            while (*rest == ' ') rest++;
+            char *space = strchr(rest, ' ');
+            if (!space) {
+                fprintf(out, "{\"success\":false,\"error\":\"MISSING_SLICES_SPEC\"}\n");
+                fflush(out);
+                continue;
+            }
+            *space = '\0';
+            pid_t pid = (pid_t)atoi(rest);
+            char *spec = space + 1;
+            while (*spec == ' ') spec++;
+            collector_read_slices(pid, backend, spec, out);
+            continue;
+        }
+        fprintf(out, "{\"success\":false,\"error\":\"UNKNOWN_COMMAND\"}\n");
+        fflush(out);
+    }
+    return 0;
+}
