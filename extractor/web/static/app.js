@@ -9499,15 +9499,22 @@
   async function handleValidateTarget() {
     const inputPid = document.getElementById('te-target-pid');
     const inputElf = document.getElementById('te-companion-elf');
+    const remHostEl = document.getElementById('te-remote-host');
+    const remUserEl = document.getElementById('te-remote-user');
+    const remPortEl = document.getElementById('te-remote-port');
+    const remJumpEl = document.getElementById('te-remote-jump');
+    const procNameEl = document.getElementById('te-process-name');
+
     const pidVal = inputPid ? inputPid.value.trim() : '';
     const elfVal = inputElf ? inputElf.value.trim() : '';
+    const procNameVal = procNameEl ? procNameEl.value.trim() : '';
 
-    if (!pidVal) {
-      showToastNotification('Please enter a target PID', 'warning');
+    if (!pidVal && !procNameVal) {
+      showToastNotification('Please enter a target PID or Process Name', 'warning');
       return;
     }
-    const pid = parseInt(pidVal, 10);
-    if (isNaN(pid) || pid <= 0) {
+    const pid = pidVal ? parseInt(pidVal, 10) : 0;
+    if (pidVal && (isNaN(pid) || pid <= 0)) {
       showToastNotification('Target PID must be a positive integer', 'warning');
       return;
     }
@@ -9516,11 +9523,19 @@
     if (btnVal) btnVal.disabled = true;
 
     try {
-      const res = await apiPost('/api/investigation/validate-target', {
-        pid: pid,
+      const valPayload = {
+        pid: pid > 0 ? pid : null,
+        process_name: procNameVal || undefined,
         debug_image: elfVal,
         locale: state.currentLang || 'en'
-      });
+      };
+      if (remHostEl && remHostEl.value.trim()) {
+        valPayload.remote_host = remHostEl.value.trim();
+        if (remUserEl && remUserEl.value.trim()) valPayload.ssh_user = remUserEl.value.trim();
+        if (remPortEl && remPortEl.value.trim()) valPayload.ssh_port = parseInt(remPortEl.value.trim(), 10) || 22;
+        if (remJumpEl && remJumpEl.value.trim()) valPayload.ssh_proxy_jump = remJumpEl.value.trim();
+      }
+      const res = await apiPost('/api/investigation/validate-target', valPayload);
 
       const resDiv = document.getElementById('target-validation-results');
       const badgeConn = document.getElementById('target-conn-badge');
@@ -9532,6 +9547,7 @@
         if (d.valid) {
           teState.targetPid = d.pid;
           teState.companionElf = d.debug_image_path || elfVal;
+          if (inputPid && d.pid) inputPid.value = String(d.pid);
           if (badgeConn) {
             badgeConn.textContent = 'CONNECTED';
             badgeConn.className = 'badge badge-success';
@@ -10160,6 +10176,108 @@
     if (btnNavToInv) btnNavToInv.addEventListener('click', () => switchTab('tab-investigation-overview'));
     if (btnExecuteCompare) btnExecuteCompare.addEventListener('click', handleExecuteSnapshotCompare);
     if (btnSendDiff) btnSendDiff.addEventListener('click', handleSendDiffToInvestigation);
+
+    const btnFindPid = document.getElementById('btn-find-target-pid');
+    if (btnFindPid) {
+      btnFindPid.addEventListener('click', async () => {
+        const procNameEl = document.getElementById('te-process-name');
+        const inputElf = document.getElementById('te-companion-elf');
+        const remHostEl = document.getElementById('te-remote-host');
+        const remUserEl = document.getElementById('te-remote-user');
+        const remPortEl = document.getElementById('te-remote-port');
+        const remJumpEl = document.getElementById('te-remote-jump');
+        const outDiv = document.getElementById('te-process-find-results');
+        const payload = {
+          process_name: procNameEl ? procNameEl.value.trim() : '',
+          companion_elf: inputElf ? inputElf.value.trim() : '',
+        };
+        if (remHostEl && remHostEl.value.trim()) {
+          payload.remote_host = remHostEl.value.trim();
+          if (remUserEl && remUserEl.value.trim()) payload.ssh_user = remUserEl.value.trim();
+          if (remPortEl && remPortEl.value.trim()) payload.ssh_port = parseInt(remPortEl.value.trim(), 10) || 22;
+          if (remJumpEl && remJumpEl.value.trim()) payload.ssh_proxy_jump = remJumpEl.value.trim();
+        }
+        try {
+          const r = await apiPost('/api/target/find-processes', payload);
+          const procs = (r.success && r.data && r.data.processes) ? r.data.processes : [];
+          if (outDiv) {
+            outDiv.style.display = 'block';
+            if (procs.length === 0) {
+              outDiv.textContent = 'No matching processes found.';
+            } else {
+              const top = procs[0];
+              const inputPid = document.getElementById('te-target-pid');
+              if (inputPid) inputPid.value = String(top.pid);
+              outDiv.innerHTML = procs.slice(0, 5).map(p =>
+                `<span class="badge ${p.build_id_match ? 'badge-success' : 'badge-neutral'} me-1" style="cursor:pointer;" onclick="document.getElementById('te-target-pid').value='${p.pid}'">PID ${p.pid}: ${escapeHtml(p.name)} ${p.build_id_match ? '(Build ID Match)' : ''}</span>`
+              ).join(' ');
+            }
+          }
+        } catch (e) {
+          if (outDiv) {
+            outDiv.style.display = 'block';
+            outDiv.textContent = 'Error finding processes: ' + e;
+          }
+        }
+      });
+    }
+
+    const btnEvalExpr = document.getElementById('btn-te-eval-expr');
+    if (btnEvalExpr) {
+      btnEvalExpr.addEventListener('click', async () => {
+        const exprInput = document.getElementById('te-eval-expr-input');
+        const outDiv = document.getElementById('te-eval-expr-results');
+        const rawExpr = exprInput ? exprInput.value.trim() : '';
+        if (!rawExpr || !teState.targetPid || !teState.companionElf) {
+          showToastNotification('Connect target and enter at least one symbol expression', 'warning');
+          return;
+        }
+        const remHostEl = document.getElementById('te-remote-host');
+        const remUserEl = document.getElementById('te-remote-user');
+        const remPortEl = document.getElementById('te-remote-port');
+        const remJumpEl = document.getElementById('te-remote-jump');
+        const payload = {
+          pid: parseInt(teState.targetPid, 10),
+          companion_elf: teState.companionElf,
+          expressions: rawExpr.split(',').map(s => s.trim()).filter(Boolean),
+        };
+        if (remHostEl && remHostEl.value.trim()) {
+          payload.remote_host = remHostEl.value.trim();
+          if (remUserEl && remUserEl.value.trim()) payload.ssh_user = remUserEl.value.trim();
+          if (remPortEl && remPortEl.value.trim()) payload.ssh_port = parseInt(remPortEl.value.trim(), 10) || 22;
+          if (remJumpEl && remJumpEl.value.trim()) payload.ssh_proxy_jump = remJumpEl.value.trim();
+        }
+        const res = await apiPost('/api/watch/eval-paths', payload);
+        if (outDiv && res.success && res.data) {
+          outDiv.innerHTML = `<pre style="margin:0; white-space:pre-wrap;">${escapeHtml(JSON.stringify(res.data.results, null, 2))}</pre>`;
+        } else if (outDiv) {
+          outDiv.textContent = res.error?.message || 'Evaluation failed';
+        }
+      });
+    }
+
+    const btnDiffExpr = document.getElementById('btn-te-diff-expr');
+    if (btnDiffExpr) {
+      btnDiffExpr.addEventListener('click', async () => {
+        const exprInput = document.getElementById('te-eval-expr-input');
+        const outDiv = document.getElementById('te-eval-expr-results');
+        if (!teState.targetPid || !teState.companionElf) {
+          showToastNotification('Connect target first', 'warning');
+          return;
+        }
+        const rawExpr = exprInput ? exprInput.value.trim() : '';
+        const payload = {
+          pid: parseInt(teState.targetPid, 10),
+          companion_elf: teState.companionElf,
+          expressions: rawExpr ? rawExpr.split(',').map(s => s.trim()).filter(Boolean) : [],
+          wait_ms: 500,
+        };
+        const res = await apiPost('/api/watch/capture-diff', payload);
+        if (outDiv && res.success && res.data) {
+          outDiv.innerHTML = `<pre style="margin:0; white-space:pre-wrap;">${escapeHtml(JSON.stringify({summary: res.data.summary, changed: res.data.changed, unchanged: res.data.unchanged}, null, 2))}</pre>`;
+        }
+      });
+    }
 
     // Phase 31 Guided Journey Transition Buttons
     const btnStep1To2 = document.getElementById('btn-step1-to-step2');

@@ -56,7 +56,7 @@ def filter_regions(
             continue
 
         # Skip kernel vsyscall / vvar which often fault on user-space process_vm_readv
-        if r.category in ("vvar", "vdso") or "[vvar]" in r.pathname or "[vsyscall]" in r.pathname:
+        if r.category in ("vvar", "vdso") or "[vvar]" in r.pathname or "[vsyscall]" in r.pathname or "[usertrap]" in r.pathname:
             continue
 
         if pol == POLICY_ALL_READABLE:

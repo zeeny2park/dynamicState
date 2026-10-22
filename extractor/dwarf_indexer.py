@@ -154,6 +154,144 @@ class DwarfIndex:
             return t
         return None
 
+    def search_symbols(
+        self,
+        query: str = "",
+        category: str = "all",
+        limit: int = 50,
+        smart_rank: bool = True,
+        load_bias: int = 0,
+        is_dyn: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Search indexed DWARF global/static variables and composite types with smart state ranking."""
+        q = (query or "").strip().lower()
+        cat = (category or "all").strip().lower()
+        results: List[Dict[str, Any]] = []
+
+        priority_keywords = (
+            "state", "status", "mode", "err", "count", "retry", "queue", "pool",
+            "buf", "mgr", "ctx", "session", "flag", "active", "seq", "config", "ctrl", "node", "heap"
+        )
+
+        def _score_name(name: str, is_struct_or_ptr: bool = False) -> float:
+            score = 0.0
+            nl = name.lower()
+            if q:
+                if nl == q:
+                    score += 100.0
+                elif nl.startswith(q):
+                    score += 50.0
+                elif q in nl:
+                    score += 25.0
+            if smart_rank:
+                for kw in priority_keywords:
+                    if kw in nl:
+                        score += 10.0
+                if is_struct_or_ptr:
+                    score += 5.0
+                if not nl.startswith("_"):
+                    score += 3.0
+            return score
+
+        if cat in ("all", "variables", "globals", "statics"):
+            seen_vars = set()
+            for var in self.variables:
+                if var.link_time_address is None or var.is_declaration or not var.name:
+                    continue
+                if var.name.startswith("__"):
+                    continue
+                if (var.name, var.link_time_address) in seen_vars:
+                    continue
+                seen_vars.add((var.name, var.link_time_address))
+
+                t_name = self.get_type_name(var.type_offset)
+                canon_t = self.resolve_canonical_type(var.type_offset)
+                is_ptr = bool(canon_t and canon_t.tag == "DW_TAG_pointer_type")
+                is_struct = bool(canon_t and canon_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"))
+
+                # Check query against variable name, type name, or member names
+                members_preview = []
+                target_struct = canon_t
+                if is_ptr and canon_t and canon_t.target_type_offset is not None:
+                    target_struct = self.resolve_canonical_type(canon_t.target_type_offset)
+
+                member_match = False
+                if target_struct and target_struct.members:
+                    for m in target_struct.members[:16]:
+                        mt_name = self.get_type_name(m.type_offset)
+                        if q and (q in m.name.lower() or q in mt_name.lower()):
+                            member_match = True
+                        members_preview.append({
+                            "name": m.name,
+                            "type_name": mt_name,
+                            "offset": m.offset,
+                            "size": m.byte_size or 4,
+                            "expression": f"{var.name}->{m.name}" if is_ptr else f"{var.name}.{m.name}",
+                        })
+
+                if q and (q not in var.name.lower() and q not in t_name.lower() and not member_match):
+                    continue
+
+                runtime_addr = (load_bias + var.link_time_address) if is_dyn else var.link_time_address
+                size = canon_t.byte_size if (canon_t and canon_t.byte_size) else 4
+                score = _score_name(var.name, is_struct_or_ptr=(is_struct or is_ptr))
+                if member_match:
+                    score += 15.0
+
+                results.append({
+                    "kind": "global_variable" if var.is_external else "static_variable",
+                    "name": var.name,
+                    "type_name": t_name,
+                    "size": size,
+                    "is_pointer": is_ptr,
+                    "is_struct": is_struct,
+                    "link_time_address": f"0x{var.link_time_address:x}",
+                    "runtime_address": f"0x{runtime_addr:x}",
+                    "source_location": f"{var.decl_file}:{var.decl_line}" if var.decl_file else None,
+                    "members": members_preview,
+                    "score": score,
+                })
+
+        if cat in ("all", "types", "structs", "enums"):
+            seen_types = set()
+            for t in self.types_by_die.values():
+                if not t.name or t.name.startswith("_") or t.name in seen_types:
+                    continue
+                if t.tag not in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_enumeration_type"):
+                    continue
+                seen_types.add(t.name)
+
+                member_match = any(q in m.name.lower() for m in t.members) if q else False
+                enum_match = any(q in ev.lower() for ev in t.enum_values.values()) if q else False
+                if q and (q not in t.name.lower() and not member_match and not enum_match):
+                    continue
+
+                score = _score_name(t.name, is_struct_or_ptr=True) - 2.0
+                entry: Dict[str, Any] = {
+                    "kind": "enum_type" if t.tag == "DW_TAG_enumeration_type" else "struct_type",
+                    "name": t.name,
+                    "type_name": t.name,
+                    "size": t.byte_size,
+                    "source_location": f"{t.decl_file}:{t.decl_line}" if t.decl_file else None,
+                    "score": score,
+                }
+                if t.tag == "DW_TAG_enumeration_type":
+                    entry["enum_values"] = {str(k): v for k, v in list(t.enum_values.items())[:20]}
+                else:
+                    entry["members"] = [
+                        {
+                            "name": m.name,
+                            "type_name": self.get_type_name(m.type_offset),
+                            "offset": m.offset,
+                            "size": m.byte_size or 4,
+                        }
+                        for m in t.members[:20]
+                    ]
+                results.append(entry)
+
+        results.sort(key=lambda r: (r.get("score", 0.0), r.get("name", "")), reverse=True)
+        return results[:max(1, limit)]
+
     def get_type_name(self, type_offset: Optional[int]) -> str:
         """Construct canonical human-readable type signature."""
         if type_offset is None:

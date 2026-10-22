@@ -14,7 +14,25 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from mcp.server.mcpserver import MCPServer
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:
+    class MCPServer:  # type: ignore[no-redef]
+        def __init__(self, name: str, version: str = "1.0.0", description: str = ""):
+            self.name = name
+            self.version = version
+            self.description = description
+            self.tools = {}
+
+        def tool(self, name: Optional[str] = None):
+            def decorator(fn):
+                t_name = name or fn.__name__
+                self.tools[t_name] = fn
+                return fn
+            return decorator
+
+        def run(self, transport: str = "stdio"):
+            pass
 from extractor.agent_runtime import AgentRuntime
 
 server = MCPServer(
@@ -541,6 +559,278 @@ def runtime_watch_session_stop(session_id: str) -> str:
             "end_time": stopped.end_time,
             "total_observations": stopped.total_observations or len(stopped.observations),
         })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+# -----------------------------------------------------------------------------
+# Phase 32: High-Level Intent-Driven MCP Tools for Embedded Live Analysis
+# -----------------------------------------------------------------------------
+
+@server.tool()
+def runtime_target_connect(
+    companion_elf: str,
+    pid: Optional[int] = None,
+    process_name: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Connect to a local or remote embedded target process by PID or process name,
+    verify GNU Build ID against the host's non-stripped companion ELF, calculate ASLR load bias,
+    and return top recommended state variables to inspect.
+
+    Args:
+        companion_elf: Local path on host to non-stripped ELF binary with DWARF symbols.
+        pid: Optional numeric PID on target host (if omitted, resolved via process_name).
+        process_name: Optional process/daemon name on target host (e.g. 'sensor_daemon').
+        remote_host: Optional SSH hostname/IP of embedded device.
+        ssh_user: Optional SSH username.
+        ssh_port: SSH port (default: 22).
+        ssh_key: Optional SSH private key path.
+        ssh_proxy_jump: Optional SSH jump host.
+    """
+    try:
+        from extractor.debug_image import inspect_elf
+        from extractor.dwarf_indexer import DwarfIndexer
+
+        if not companion_elf or not os.path.isfile(companion_elf):
+            return _format_watch_result({
+                "success": False,
+                "error": f"Companion ELF not found: '{companion_elf}'",
+                "error_code": "DEBUG_IMAGE_NOT_FOUND",
+            })
+
+        dbg_ident = inspect_elf(companion_elf)
+        if not dbg_ident.has_debug_info:
+            return _format_watch_result({
+                "success": False,
+                "error": f"Companion ELF '{companion_elf}' has no DWARF debug info (.debug_info missing)",
+                "error_code": "MISSING_DWARF",
+            })
+
+        adapter = runtime.watch_session_manager._resolve_adapter(
+            pid=pid or 1,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+
+        resolved_pid = pid
+        matched_procs = []
+        if (resolved_pid is None or resolved_pid <= 0) and process_name:
+            matched_procs = adapter.find_processes(
+                process_name=process_name,
+                companion_build_id=dbg_ident.build_id,
+                limit=10,
+            )
+            if not matched_procs:
+                return _format_watch_result({
+                    "success": False,
+                    "error": f"No running process matching '{process_name}' found on {adapter.target_host()}",
+                    "error_code": "PROCESS_NOT_FOUND",
+                })
+            resolved_pid = int(matched_procs[0]["pid"])
+
+        if not resolved_pid or resolved_pid <= 0:
+            return _format_watch_result({
+                "success": False,
+                "error": "Provide either 'pid' or 'process_name' to identify the target process",
+                "error_code": "INVALID_TARGET",
+            })
+
+        map_data = runtime.watch_session_manager.get_memory_map_and_threads(
+            pid=resolved_pid,
+            companion_elf_path=companion_elf,
+            adapter=adapter,
+        )
+        load_bias_int = map_data.get("base_address_int", 0)
+        idx = DwarfIndexer.get_index(companion_elf)
+        recommended = idx.search_symbols(
+            query="",
+            category="variables",
+            limit=15,
+            smart_rank=True,
+            load_bias=load_bias_int,
+            is_dyn=(idx.elf_type == "ET_DYN"),
+        )
+
+        return _format_watch_result({
+            "success": True,
+            "pid": resolved_pid,
+            "target_host": adapter.target_host(),
+            "is_remote": adapter.is_remote(),
+            "companion_elf": os.path.abspath(companion_elf),
+            "build_id": dbg_ident.build_id,
+            "architecture": dbg_ident.architecture,
+            "load_bias": map_data.get("load_bias", "0x0"),
+            "threads_count": len(map_data.get("threads", [])),
+            "threads": map_data.get("threads", []),
+            "matched_processes": matched_procs[:5] if matched_procs else None,
+            "recommended_symbols": recommended,
+        })
+    except Exception as e:
+        return _format_watch_result({
+            "success": False,
+            "error": str(e),
+            "error_code": type(e).__name__,
+        })
+
+
+@server.tool()
+def runtime_symbol_search(
+    companion_elf: str,
+    query: str = "",
+    category: str = "all",
+    limit: int = 30,
+    pid: Optional[int] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Search DWARF global/static variables, struct definitions, and enums by keyword with smart state ranking.
+
+    Args:
+        companion_elf: Path to non-stripped companion ELF binary.
+        query: Optional keyword filter (e.g. 'state', 'queue', 'session', 'counter'). Empty returns top-ranked state symbols.
+        category: Filter category ('all', 'variables', 'types', 'structs', 'enums').
+        limit: Max results to return (default: 30).
+        pid: Optional target PID to compute relocated runtime addresses.
+        remote_host: Optional SSH remote host.
+    """
+    try:
+        from extractor.dwarf_indexer import DwarfIndexer
+        if not companion_elf or not os.path.isfile(companion_elf):
+            return _format_watch_result({"success": False, "error": f"Companion ELF not found: '{companion_elf}'", "error_code": "DEBUG_IMAGE_NOT_FOUND"})
+
+        idx = DwarfIndexer.get_index(companion_elf)
+        load_bias_int = 0
+        if pid and pid > 0:
+            try:
+                map_data = runtime.watch_session_manager.get_memory_map_and_threads(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                load_bias_int = map_data.get("base_address_int", 0)
+            except Exception:
+                load_bias_int = 0
+
+        results = idx.search_symbols(
+            query=query,
+            category=category,
+            limit=max(1, min(int(limit), 200)),
+            smart_rank=True,
+            load_bias=load_bias_int,
+            is_dyn=(idx.elf_type == "ET_DYN"),
+        )
+        return _format_watch_result({
+            "success": True,
+            "companion_elf": os.path.abspath(companion_elf),
+            "query": query,
+            "category": category,
+            "returned_count": len(results),
+            "symbols": results,
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_eval_memory_path(
+    pid: int,
+    companion_elf: str,
+    expressions: List[str],
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Evaluate C/C++ symbol path expressions (including structs, pointer dereferences `->`, and array indices `[i]`)
+    directly from live local or remote embedded target memory with 0.00ms process stop time.
+
+    Examples of expressions:
+      - "g_session" (decodes entire struct hierarchy)
+      - "g_session.worker.state.counter"
+      - "g_heap_state->value"
+      - "g_node_a.next->id"
+
+    Args:
+        pid: Target process PID.
+        companion_elf: Path to non-stripped companion ELF with DWARF symbols.
+        expressions: List of C/C++ symbol path expressions to evaluate.
+        remote_host: Optional SSH remote host for embedded device.
+        ssh_user: Optional SSH username.
+        ssh_port: SSH port (default: 22).
+        ssh_key: Optional SSH private key path.
+        ssh_proxy_jump: Optional SSH jump host.
+    """
+    try:
+        data = runtime.watch_session_manager.evaluate_symbol_paths(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            expressions=expressions,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **data})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_capture_and_diff(
+    pid: int,
+    companion_elf: str,
+    expressions: Optional[List[str]] = None,
+    wait_ms: int = 500,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Sample C/C++ symbol expressions twice separated by `wait_ms` (without stopping the process)
+    and return a diff of fields that changed vs. fields that remained stuck/unchanged.
+
+    Args:
+        pid: Target process PID.
+        companion_elf: Path to non-stripped companion ELF with DWARF symbols.
+        expressions: Optional list of symbol expressions (if omitted, auto-selects top state globals).
+        wait_ms: Interval in milliseconds between snapshot A and snapshot B (default: 500ms).
+        remote_host: Optional SSH remote host for embedded device.
+        ssh_user: Optional SSH username.
+        ssh_port: SSH port (default: 22).
+        ssh_key: Optional SSH private key path.
+        ssh_proxy_jump: Optional SSH jump host.
+    """
+    try:
+        data = runtime.watch_session_manager.capture_and_diff_expressions(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            expressions=expressions,
+            wait_ms=wait_ms,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **data})
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 

@@ -234,7 +234,8 @@ int collector_filter_regions(parsed_region_t *regions, int count, const collecto
         /* Skip special kernel virtual mappings */
         if (strcmp(r->pathname, "[vvar]") == 0 ||
             strcmp(r->pathname, "[vdso]") == 0 ||
-            strcmp(r->pathname, "[vsyscall]") == 0) {
+            strcmp(r->pathname, "[vsyscall]") == 0 ||
+            strcmp(r->pathname, "[usertrap]") == 0) {
             continue;
         }
 

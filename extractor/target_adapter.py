@@ -82,6 +82,15 @@ class TargetExecutionAdapter(ABC):
         """Returns the target host identifier (e.g. 'localhost' or 'user@host:port')."""
         pass
 
+    def find_processes(
+        self,
+        process_name: Optional[str] = None,
+        companion_build_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Discovers running processes on the target host, optionally filtered by name or Build ID."""
+        return []
+
     def close(self) -> None:
         """Clean up any active connection or temporary resources."""
         pass
@@ -290,6 +299,80 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         from .watch_session import read_process_memory_slice
         return read_process_memory_slice(pid, address, size)
 
+    def find_processes(
+        self,
+        process_name: Optional[str] = None,
+        companion_build_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        q = (process_name or "").strip().lower()
+        target_bid = (companion_build_id or "").strip().lower() or None
+
+        try:
+            proc_entries = [e for e in os.listdir("/proc") if e.isdigit()]
+        except Exception:
+            return results
+
+        for pid_str in proc_entries:
+            pid = int(pid_str)
+            comm = ""
+            cmdline = ""
+            exe_path = ""
+            try:
+                with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace") as f:
+                    comm = f.read().strip()
+            except Exception:
+                continue
+
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    raw_cmd = f.read(512)
+                    cmdline = raw_cmd.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+
+            try:
+                exe_path = os.path.realpath(f"/proc/{pid}/exe")
+            except Exception:
+                exe_path = ""
+
+            exe_base = os.path.basename(exe_path) if exe_path else ""
+            if q:
+                if q not in comm.lower() and q not in exe_base.lower() and q not in cmdline.lower():
+                    continue
+
+            proc_bid = None
+            bid_match = False
+            if target_bid and exe_path and os.path.isfile(exe_path):
+                try:
+                    ident = inspect_elf(exe_path)
+                    proc_bid = ident.build_id
+                    if proc_bid and proc_bid.lower() == target_bid:
+                        bid_match = True
+                except Exception:
+                    pass
+
+            exact_name = bool(q and (comm.lower() == q or exe_base.lower() == q))
+            results.append({
+                "pid": pid,
+                "name": comm or exe_base or f"pid_{pid}",
+                "executable": exe_path,
+                "cmdline": cmdline,
+                "build_id": proc_bid,
+                "build_id_match": bid_match,
+                "exact_name_match": exact_name,
+                "is_remote": False,
+                "host": self.target_host(),
+            })
+
+        results.sort(key=lambda r: (
+            1 if r.get("build_id_match") else 0,
+            1 if r.get("exact_name_match") else 0,
+            r.get("pid", 0),
+        ), reverse=True)
+        return results[:max(1, limit)]
+
 
 class RemoteSshTargetAdapter(TargetExecutionAdapter):
     """Execution adapter for remote Linux targets accessed via SSH / SSH Proxy.
@@ -309,6 +392,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         timeout_sec: float = 5.0,
         ssh_bin: str = "ssh",
         command_runner: Optional[Callable[[List[str], float], Tuple[int, str, str]]] = None,
+        use_control_master: bool = False,
     ):
         if not host:
             raise ValueError("Remote host must be specified")
@@ -321,6 +405,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.timeout_sec = float(timeout_sec)
         self.ssh_bin = ssh_bin
         self._command_runner = command_runner or self._default_command_runner
+        self.use_control_master = bool(use_control_master)
 
     def is_remote(self) -> bool:
         return True
@@ -360,6 +445,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             args.extend(["-J", self.proxy_jump])
         if self.proxy_command:
             args.extend(["-o", f"ProxyCommand={self.proxy_command}"])
+        if self.use_control_master:
+            args.extend([
+                "-o", "ControlMaster=auto",
+                "-o", "ControlPath=/tmp/dynstate_ssh_%r@%h:%p",
+                "-o", "ControlPersist=60s",
+            ])
 
         target_spec = f"{self.user}@{self.host}" if self.user else self.host
         args.append(target_spec)
@@ -570,3 +661,73 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 return None, "UNAVAILABLE", f"Zero bytes returned at 0x{address:x}"
         except Exception as e:
             return None, "UNAVAILABLE", f"Base64 decode failure: {e}"
+
+    def find_processes(
+        self,
+        process_name: Optional[str] = None,
+        companion_build_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Discovers running processes on the remote target via a single POSIX shell scan of /proc."""
+        remote_script = (
+            "for p in /proc/[0-9]*; do "
+            "[ -d \"$p\" ] || continue; "
+            "pid=$(basename \"$p\"); "
+            "comm=$(cat \"$p/comm\" 2>/dev/null | tr -d '\n' || true); "
+            "[ -n \"$comm\" ] || continue; "
+            "exe=$(readlink -f \"$p/exe\" 2>/dev/null || readlink \"$p/exe\" 2>/dev/null || true); "
+            "cmd=$(tr '\000' ' ' < \"$p/cmdline\" 2>/dev/null | head -c 200 || true); "
+            "echo \"$pid|$comm|$exe|$cmd\"; "
+            "done"
+        )
+        rc, stdout, _ = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
+        results: List[Dict[str, Any]] = []
+        if rc != 0 or not stdout:
+            return results
+
+        q = (process_name or "").strip().lower()
+        target_bid = (companion_build_id or "").strip().lower() or None
+
+        for line in stdout.splitlines():
+            parts = line.strip().split("|", 3)
+            if len(parts) < 2 or not parts[0].isdigit():
+                continue
+            pid = int(parts[0])
+            comm = parts[1].strip()
+            exe_path = parts[2].strip() if len(parts) >= 3 else ""
+            cmdline = parts[3].strip() if len(parts) >= 4 else ""
+            exe_base = os.path.basename(exe_path) if exe_path else ""
+
+            if q:
+                if q not in comm.lower() and q not in exe_base.lower() and q not in cmdline.lower():
+                    continue
+
+            exact_name = bool(q and (comm.lower() == q or exe_base.lower() == q))
+            results.append({
+                "pid": pid,
+                "name": comm or exe_base or f"pid_{pid}",
+                "executable": exe_path,
+                "cmdline": cmdline,
+                "build_id": None,
+                "build_id_match": False,
+                "exact_name_match": exact_name,
+                "is_remote": True,
+                "host": self.target_host(),
+            })
+
+        # Sort exact matches first; if target_bid is provided, verify Build ID on top candidates (up to 5)
+        results.sort(key=lambda r: (1 if r.get("exact_name_match") else 0, r.get("pid", 0)), reverse=True)
+        if target_bid:
+            for cand in results[:5]:
+                ident = self.get_process_identity(cand["pid"])
+                bid = ident.get("build_id")
+                cand["build_id"] = bid
+                if bid and bid.lower() == target_bid:
+                    cand["build_id_match"] = True
+            results.sort(key=lambda r: (
+                1 if r.get("build_id_match") else 0,
+                1 if r.get("exact_name_match") else 0,
+                r.get("pid", 0),
+            ), reverse=True)
+
+        return results[:max(1, limit)]

@@ -1357,27 +1357,185 @@ class WebApiAdapter:
     # -------------------------------------------------------------------------
 
     def validate_target(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Pre-validate target process readability and debug-image compatibility before live capture."""
+        """Pre-validate local or remote embedded target process readability and debug-image compatibility."""
         raw_loc = params.get("locale") or params.get("language") or "en"
         locale = "ko" if str(raw_loc).lower().strip() in ("ko", "kor", "korean") else "en"
         is_ko = (locale == "ko")
 
+        remote_host = (params.get("remote_host") or "").strip() or None
+        ssh_user = (params.get("ssh_user") or "").strip() or None
+        ssh_port = int(params.get("ssh_port") or 22)
+        ssh_key = (params.get("ssh_key") or "").strip() or None
+        ssh_proxy_jump = (params.get("ssh_proxy_jump") or "").strip() or None
+        process_name = (params.get("process_name") or "").strip() or None
+
         raw_pid = params.get("pid")
-        if raw_pid is None or isinstance(raw_pid, bool):
-            msg = "대상 PID가 필요하며 양의 정수여야 합니다." if is_ko else "Target PID is required and must be a positive integer."
-            act = "실행 중인 대상 프로세스의 올바른 PID를 입력하세요." if is_ko else "Enter a valid running process PID."
-            return {"success": False, "error": {"code": "INVALID_PARAM", "message": msg, "next_action": act}}
+        pid: Optional[int] = None
 
-        try:
-            pid = int(raw_pid)
-            if pid <= 0 or pid > 2147483647:
-                raise ValueError("out of range")
-        except (ValueError, TypeError):
-            msg = f"유효하지 않은 PID 형식입니다: '{raw_pid}'. 1 이상의 정수여야 합니다." if is_ko else f"Invalid PID format: '{raw_pid}'. Must be an integer >= 1."
-            act = "실행 중인 대상 프로세스의 올바른 PID를 입력하세요." if is_ko else "Enter a valid running process PID."
-            return {"success": False, "error": {"code": "INVALID_PARAM", "message": msg, "next_action": act}}
+        # Pre-inspect debug image if provided so we can also use its Build ID for process discovery
+        raw_dbg = params.get("debug_image") or params.get("companion_elf")
+        dbg_path: Optional[str] = None
+        dbg_ident = None
+        if raw_dbg and isinstance(raw_dbg, str) and raw_dbg.strip():
+            cand_dbg = os.path.abspath(raw_dbg.strip())
+            if os.path.isfile(cand_dbg):
+                dbg_path = cand_dbg
+                try:
+                    from extractor.debug_image import inspect_elf
+                    dbg_ident = inspect_elf(dbg_path)
+                except Exception:
+                    dbg_ident = None
 
-        # 1. Process existence check
+        # Resolve PID via process_name if pid is omitted/empty and process_name is given
+        if (raw_pid is None or str(raw_pid).strip() in ("", "0")) and process_name:
+            target_adapter = self.watch_manager._resolve_adapter(
+                pid=1,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
+            )
+            matches = target_adapter.find_processes(
+                process_name=process_name,
+                companion_build_id=(dbg_ident.build_id if dbg_ident else None),
+            )
+            if not matches:
+                msg = (
+                    f"대상 호스트({target_adapter.target_host()})에서 프로세스 '{process_name}'를 찾을 수 없습니다."
+                    if is_ko else
+                    f"No running process matching '{process_name}' found on {target_adapter.target_host()}."
+                )
+                act = "프로세스 이름이나 원격 호스트 연결 상태를 확인하세요." if is_ko else "Verify the process name or check target host connectivity."
+                return {"success": True, "data": {"valid": False, "reason": "TARGET_NOT_FOUND", "message": msg, "next_action": act}}
+            pid = int(matches[0]["pid"])
+        else:
+            if raw_pid is None or isinstance(raw_pid, bool):
+                msg = "대상 PID가 필요하며 양의 정수여야 합니다." if is_ko else "Target PID is required and must be a positive integer."
+                act = "실행 중인 대상 프로세스의 올바른 PID를 입력하세요." if is_ko else "Enter a valid running process PID."
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": msg, "next_action": act}}
+
+            try:
+                pid = int(raw_pid)
+                if pid <= 0 or pid > 2147483647:
+                    raise ValueError("out of range")
+            except (ValueError, TypeError):
+                msg = f"유효하지 않은 PID 형식입니다: '{raw_pid}'. 1 이상의 정수여야 합니다." if is_ko else f"Invalid PID format: '{raw_pid}'. Must be an integer >= 1."
+                act = "실행 중인 대상 프로세스의 올바른 PID를 입력하세요." if is_ko else "Enter a valid running process PID."
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": msg, "next_action": act}}
+
+        # Remote Embedded Target Validation Path
+        if remote_host:
+            target_adapter = self.watch_manager._resolve_adapter(
+                pid=pid,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
+            )
+            alive, live_err = target_adapter.check_liveness(pid)
+            if not alive:
+                reason = "PERMISSION_DENIED" if (live_err and "permission" in live_err.lower()) else "TARGET_NOT_FOUND"
+                msg = (
+                    f"원격 타깃({target_adapter.target_host()})의 PID {pid}에 접근할 수 없습니다: {live_err}"
+                    if is_ko else
+                    f"Remote target PID {pid} on {target_adapter.target_host()} is not accessible: {live_err}"
+                )
+                act = "SSH 연결 설정 및 원격 장비에서 대상 프로세스가 실행 중인지 확인하세요." if is_ko else "Verify SSH connectivity and check that the process is running on the remote target."
+                return {"success": True, "data": {"valid": False, "reason": reason, "message": msg, "next_action": act}}
+
+            if not raw_dbg or not isinstance(raw_dbg, str) or not raw_dbg.strip():
+                msg = "매칭되는 non-stripped 디버그 이미지 ELF 경로가 필요합니다." if is_ko else "A matching non-stripped debug image ELF path is required."
+                act = "DWARF 심볼이 포함된 바이너리 경로를 입력하세요." if is_ko else "Provide the path to an unstripped ELF binary containing DWARF symbols."
+                return {"success": True, "data": {"valid": False, "reason": "DEBUG_IMAGE_NOT_FOUND", "message": msg, "next_action": act}}
+
+            dbg_path = os.path.abspath(raw_dbg.strip())
+            if not os.path.isfile(dbg_path):
+                msg = f"디버그 이미지 파일 '{dbg_path}'를 찾을 수 없습니다." if is_ko else f"Debug image file '{dbg_path}' not found."
+                act = "지정한 파일 경로가 실제로 존재하는지 확인하세요." if is_ko else "Verify that the specified file path exists on disk."
+                return {"success": True, "data": {"valid": False, "reason": "DEBUG_IMAGE_NOT_FOUND", "message": msg, "next_action": act}}
+
+            from extractor.debug_image import inspect_elf
+            try:
+                dbg_ident = inspect_elf(dbg_path)
+            except Exception as e:
+                msg = f"디버그 이미지가 유효한 ELF 파일이 아닙니다: {e}" if is_ko else f"Debug image is not a valid ELF file: {e}"
+                act = "유효한 Linux ELF 바이너리를 지정하세요." if is_ko else "Provide a valid Linux ELF executable or shared library."
+                return {"success": True, "data": {"valid": False, "reason": "INVALID_ELF", "message": msg, "next_action": act}}
+
+            if not dbg_ident.has_debug_info:
+                msg = "제공된 디버그 이미지에 DWARF 디버그 정보(.debug_info 섹션)가 없습니다." if is_ko else "Debug image contains no DWARF debug information (.debug_info section is missing)."
+                act = "대상 프로그램을 디버그 플래그(-g 또는 -g3)로 컴파일하고 스트립되지 않은(non-stripped) 바이너리를 지정하세요." if is_ko else "Recompile target with debug symbols (-g or -g3) and provide the non-stripped binary."
+                return {"success": True, "data": {"valid": False, "reason": "MISSING_DWARF", "message": msg, "next_action": act}}
+
+            rem_ident = target_adapter.get_process_identity(pid)
+            rem_bid = rem_ident.get("build_id")
+            if rem_bid and dbg_ident.build_id and rem_bid.lower() != dbg_ident.build_id.lower():
+                msg = (
+                    f"Build ID 불일치: 원격 실행 바이너리({rem_bid[:16]}...)와 호스트 디버그 이미지({dbg_ident.build_id[:16]}...)가 다릅니다."
+                    if is_ko else
+                    f"Build ID mismatch: remote process binary ({rem_bid[:16]}...) does not match debug image ({dbg_ident.build_id[:16]}...)."
+                )
+                act = "원격 임베디드 프로세스와 동일한 빌드에서 생성된 nostrip 바이너리를 지정하세요." if is_ko else "Provide the exact matching debug image compiled from the same build."
+                return {
+                    "success": True,
+                    "data": {
+                        "valid": False,
+                        "reason": "BUILD_ID_MISMATCH",
+                        "message": msg,
+                        "next_action": act,
+                        "target_build_id": rem_bid,
+                        "debug_image_build_id": dbg_ident.build_id,
+                    }
+                }
+
+            rem_arch = rem_ident.get("architecture")
+            if rem_arch and rem_arch != "unknown" and dbg_ident.architecture and rem_arch != dbg_ident.architecture:
+                msg = f"아키텍처 불일치: 원격 프로세스는 {rem_arch}이지만 디버그 이미지는 {dbg_ident.architecture}입니다." if is_ko else f"Architecture mismatch: remote process is {rem_arch} but debug image is {dbg_ident.architecture}."
+                act = f"원격 프로세스 아키텍처({rem_arch})에 맞는 바이너리를 제공하세요." if is_ko else f"Provide a binary matching target architecture ({rem_arch})."
+                return {"success": True, "data": {"valid": False, "reason": "ARCH_MISMATCH", "message": msg, "next_action": act}}
+
+            rec_symbols = []
+            try:
+                from extractor.dwarf_indexer import DwarfIndexer
+                rec_symbols = DwarfIndexer.get_index(dbg_path).search_symbols(limit=10, smart_rank=True)
+            except Exception:
+                rec_symbols = []
+
+            return {
+                "success": True,
+                "data": {
+                    "valid": True,
+                    "reason": "VALID",
+                    "pid": pid,
+                    "is_remote": True,
+                    "target_host": target_adapter.target_host(),
+                    "executable": rem_ident.get("executable") or f"/proc/{pid}/exe",
+                    "executable_path": rem_ident.get("executable") or f"/proc/{pid}/exe",
+                    "target_build_id": rem_bid or dbg_ident.build_id,
+                    "debug_image": dbg_path,
+                    "debug_image_path": dbg_path,
+                    "debug_build_id": dbg_ident.build_id,
+                    "debug_image_build_id": dbg_ident.build_id,
+                    "has_dwarf": dbg_ident.has_debug_info,
+                    "has_debug_info": dbg_ident.has_debug_info,
+                    "build_id_match": True,
+                    "architecture": dbg_ident.architecture,
+                    "arch": dbg_ident.architecture,
+                    "endianness": dbg_ident.endianness,
+                    "endian": dbg_ident.endianness,
+                    "memory_read_backend": "remote_proc_mem",
+                    "capture_backend": "remote_proc_mem",
+                    "backend": "remote_proc_mem",
+                    "capture_quality": "LOW_IMPACT",
+                    "recommended_symbols": rec_symbols,
+                    "message": f"원격 타깃({target_adapter.target_host()}) 프로세스 및 디버그 이미지가 검증되었습니다." if is_ko else f"Remote target ({target_adapter.target_host()}) process and debug image verified successfully.",
+                    "next_action": "상태 캡처 및 무중단 분석을 진행할 수 있습니다." if is_ko else "Ready to capture and analyze remote runtime state.",
+                }
+            }
+
+        # 1. Local Process existence check
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -1420,7 +1578,6 @@ class WebApiAdapter:
             return {"success": True, "data": {"valid": False, "reason": "NO_BACKEND_AVAILABLE", "message": msg, "next_action": act}}
 
         # 4. Check debug image path
-        raw_dbg = params.get("debug_image")
         if not raw_dbg or not isinstance(raw_dbg, str) or not raw_dbg.strip():
             msg = "매칭되는 non-stripped 디버그 이미지 ELF 경로가 필요합니다." if is_ko else "A matching non-stripped debug image ELF path is required."
             act = "DWARF 심볼이 포함된 바이너리 경로를 입력하세요." if is_ko else "Provide the path to an unstripped ELF binary containing DWARF symbols."
@@ -1483,29 +1640,158 @@ class WebApiAdapter:
                 act = f"대상 프로세스 아키텍처({target_ident.architecture})에 맞는 바이너리를 제공하세요." if is_ko else f"Provide a binary matching target architecture ({target_ident.architecture})."
                 return {"success": True, "data": {"valid": False, "reason": "ARCH_MISMATCH", "message": msg, "next_action": act}}
 
+        rec_symbols = []
+        try:
+            from extractor.dwarf_indexer import DwarfIndexer
+            rec_symbols = DwarfIndexer.get_index(dbg_path).search_symbols(limit=10, smart_rank=True)
+        except Exception:
+            rec_symbols = []
+
         return {
             "success": True,
             "data": {
                 "valid": True,
                 "reason": "VALID",
                 "pid": pid,
+                "is_remote": False,
+                "target_host": "localhost",
                 "executable": exe_path or (target_ident.path if target_ident else f"/proc/{pid}/exe"),
+                "executable_path": exe_path or (target_ident.path if target_ident else f"/proc/{pid}/exe"),
                 "target_build_id": target_ident.build_id if target_ident else None,
                 "debug_image": dbg_path,
+                "debug_image_path": dbg_path,
                 "debug_build_id": dbg_ident.build_id,
+                "debug_image_build_id": dbg_ident.build_id,
                 "has_dwarf": dbg_ident.has_debug_info,
                 "has_debug_info": dbg_ident.has_debug_info,
                 "build_id_match": True,
                 "architecture": dbg_ident.architecture,
+                "arch": dbg_ident.architecture,
                 "endianness": dbg_ident.endianness,
+                "endian": dbg_ident.endianness,
                 "memory_read_backend": selected_backend,
                 "capture_backend": selected_backend,
                 "backend": selected_backend,
                 "capture_quality": "CONSISTENT" if selected_backend == "process_vm_readv" else "LOW_IMPACT",
+                "recommended_symbols": rec_symbols,
                 "message": "대상 프로세스 및 디버그 이미지가 검증되었습니다." if is_ko else "Target process and debug image verified successfully.",
                 "next_action": "상태 캡처 및 분석을 진행할 수 있습니다." if is_ko else "Ready to capture and analyze runtime state.",
             }
         }
+
+    def find_target_processes(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Discovers running processes on local or remote target filtered by name or companion ELF Build ID."""
+        try:
+            process_name = (params.get("process_name") or params.get("query") or "").strip() or None
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip() or None
+            remote_host = (params.get("remote_host") or "").strip() or None
+            ssh_user = (params.get("ssh_user") or "").strip() or None
+            ssh_port = int(params.get("ssh_port") or 22)
+            ssh_key = (params.get("ssh_key") or "").strip() or None
+            ssh_proxy_jump = (params.get("ssh_proxy_jump") or "").strip() or None
+
+            companion_bid = None
+            if companion_elf and os.path.isfile(companion_elf):
+                try:
+                    from extractor.debug_image import inspect_elf
+                    companion_bid = inspect_elf(companion_elf).build_id
+                except Exception:
+                    companion_bid = None
+
+            adapter = self.watch_manager._resolve_adapter(
+                pid=1,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
+            )
+            procs = adapter.find_processes(
+                process_name=process_name,
+                companion_build_id=companion_bid,
+                limit=int(params.get("limit") or 30),
+            )
+            return {
+                "success": True,
+                "data": {
+                    "target_host": adapter.target_host(),
+                    "is_remote": adapter.is_remote(),
+                    "companion_build_id": companion_bid,
+                    "processes": procs,
+                }
+            }
+        except Exception as e:
+            return {"success": False, "error": {"code": "FIND_PROCESSES_ERROR", "message": str(e)}}
+
+    def search_dwarf_symbols_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Searches DWARF globals, statics, and composite types with smart ranking."""
+        try:
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            if not companion_elf or not os.path.isfile(companion_elf):
+                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            from extractor.dwarf_indexer import DwarfIndexer
+            idx = DwarfIndexer.get_index(companion_elf)
+            query = str(params.get("query") or "")
+            category = str(params.get("category") or "all")
+            limit = int(params.get("limit") or 50)
+            results = idx.search_symbols(query=query, category=category, limit=limit, smart_rank=True)
+            return {"success": True, "data": {"companion_elf": companion_elf, "total": len(results), "symbols": results}}
+        except Exception as e:
+            return {"success": False, "error": {"code": "SYMBOL_SEARCH_ERROR", "message": str(e)}}
+
+    def evaluate_symbol_paths_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Evaluates C/C++ symbol path expressions against a local or remote target."""
+        try:
+            pid = int(params.get("pid") or 0)
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            if not companion_elf or not os.path.isfile(companion_elf):
+                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            exprs = params.get("expressions") or []
+            if isinstance(exprs, str):
+                exprs = [e.strip() for e in exprs.split(",") if e.strip()]
+            data = self.watch_manager.evaluate_symbol_paths(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                expressions=exprs,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": data}
+        except Exception as e:
+            return {"success": False, "error": {"code": "EVAL_PATHS_ERROR", "message": str(e)}}
+
+    def capture_and_diff_paths_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Samples C/C++ symbol expressions twice across wait_ms and returns changed/unchanged fields."""
+        try:
+            pid = int(params.get("pid") or 0)
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            if not companion_elf or not os.path.isfile(companion_elf):
+                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            exprs = params.get("expressions")
+            if isinstance(exprs, str):
+                exprs = [e.strip() for e in exprs.split(",") if e.strip()]
+            wait_ms = int(params.get("wait_ms") or 500)
+            data = self.watch_manager.capture_and_diff_expressions(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                expressions=exprs,
+                wait_ms=wait_ms,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": data}
+        except Exception as e:
+            return {"success": False, "error": {"code": "CAPTURE_DIFF_ERROR", "message": str(e)}}
 
     # -------------------------------------------------------------------------
     # Phase 21 & Phase 23 Watch Session & Temporal Memory Explorer Endpoints
@@ -2444,6 +2730,29 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_watch_session(session_id))
                 return
 
+            # GET /api/target/processes
+            if path == "/api/target/processes":
+                self._send_json(adapter.find_target_processes({
+                    "process_name": q_param("process_name") or q_param("query"),
+                    "companion_elf": q_param("companion_elf") or q_param("debug_image"),
+                    "remote_host": q_param("remote_host"),
+                    "ssh_user": q_param("ssh_user"),
+                    "ssh_port": q_param("ssh_port", "22"),
+                    "ssh_key": q_param("ssh_key"),
+                    "ssh_proxy_jump": q_param("ssh_proxy_jump"),
+                }))
+                return
+
+            # GET /api/watch/search-symbols
+            if path == "/api/watch/search-symbols":
+                self._send_json(adapter.search_dwarf_symbols_api({
+                    "companion_elf": q_param("companion_elf") or q_param("debug_image"),
+                    "query": q_param("query", ""),
+                    "category": q_param("category", "all"),
+                    "limit": q_param("limit", "50"),
+                }))
+                return
+
             # GET /api/target/inspect-range
             if path == "/api/target/inspect-range":
                 pid_str = q_param("pid")
@@ -2620,6 +2929,26 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if m_watch_item:
                 session_id = m_watch_item.group(1)
                 self._send_json(adapter.update_watch_items(session_id, body))
+                return
+
+            # POST /api/target/find-processes
+            if path in ("/api/target/find-processes", "/api/target/processes"):
+                self._send_json(adapter.find_target_processes(body))
+                return
+
+            # POST /api/watch/search-symbols
+            if path == "/api/watch/search-symbols":
+                self._send_json(adapter.search_dwarf_symbols_api(body))
+                return
+
+            # POST /api/watch/eval-paths
+            if path == "/api/watch/eval-paths":
+                self._send_json(adapter.evaluate_symbol_paths_api(body))
+                return
+
+            # POST /api/watch/capture-diff
+            if path == "/api/watch/capture-diff":
+                self._send_json(adapter.capture_and_diff_paths_api(body))
                 return
 
             # POST /api/target/inspect-range

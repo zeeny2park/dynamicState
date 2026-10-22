@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import errno
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -553,12 +554,20 @@ def calculate_load_bias(
     sorted_loads = sorted(pt_loads, key=lambda p: p.get("p_offset", 0))
     seg0 = sorted_loads[0]
     seg0_off_page = seg0.get("p_offset", 0) - (seg0.get("p_offset", 0) % page_size)
+    seg0_vaddr_page = seg0.get("p_vaddr", 0) - (seg0.get("p_vaddr", 0) % page_size)
 
-    candidates = [m for m in mappings if m.get("offset_int", 0) == seg0_off_page]
+    # Filter out kernel pseudo-mappings ([usertrap], [vdso], [vvar], [vsyscall], [heap], [stack])
+    non_pseudo_maps = [
+        m for m in mappings
+        if not str(m.get("pathname", "")).strip().startswith("[")
+    ]
+    search_pool = non_pseudo_maps if non_pseudo_maps else mappings
+
+    candidates = [m for m in search_pool if m.get("offset_int", 0) == seg0_off_page]
     if not candidates:
-        candidates = [m for m in mappings if m.get("offset_int", 0) == 0]
+        candidates = [m for m in search_pool if m.get("offset_int", 0) == 0]
     if not candidates:
-        candidates = mappings[:1]
+        candidates = search_pool[:1]
 
     if not candidates:
         return {
@@ -570,8 +579,48 @@ def calculate_load_bias(
             "verified_segments": 0,
         }
 
-    best = next((c for c in candidates if c.get("is_executable") or c.get("category") == "code"), candidates[0])
-    seg0_vaddr_page = seg0.get("p_vaddr", 0) - (seg0.get("p_vaddr", 0) % page_size)
+    runtime_exe = ""
+    if isinstance(runtime_identity, dict):
+        runtime_exe = str(runtime_identity.get("executable") or runtime_identity.get("path") or "").strip()
+    elif runtime_identity is not None:
+        runtime_exe = str(getattr(runtime_identity, "path", "") or "").strip()
+    companion_exe = str(getattr(companion_identity, "path", "") or "").strip() if companion_identity else ""
+    runtime_base_name = os.path.basename(runtime_exe) if runtime_exe else ""
+    companion_base_name = os.path.basename(companion_exe) if companion_exe else ""
+
+    def _score_candidate(cand: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
+        c_path = str(cand.get("pathname", "")).strip()
+        c_base = os.path.basename(c_path) if c_path else ""
+        cand_bias = cand["start_int"] - seg0_vaddr_page
+
+        # 1. Exact or basename match with runtime executable
+        exe_match = 0
+        if runtime_exe and c_path and (c_path == runtime_exe or c_base == runtime_base_name):
+            exe_match = 3
+        elif companion_exe and c_path and (c_path == companion_exe or c_base == companion_base_name):
+            exe_match = 2
+        elif c_path and not c_path.startswith("[") and ".so" not in c_base:
+            exe_match = 1
+
+        # 2. Count how many PT_LOAD segments align with mappings of the same module
+        same_module_maps = [m for m in search_pool if str(m.get("pathname", "")).strip() == c_path] if c_path else search_pool
+        seg_verified = 0
+        for s in sorted_loads:
+            exp_vaddr = s.get("p_vaddr", 0) + cand_bias
+            if any(m["start_int"] <= exp_vaddr < m["end_int"] for m in same_module_maps):
+                seg_verified += 1
+
+        # 3. Permission compatibility with seg0 PF_X (p_flags & 1)
+        seg0_is_exec = bool(seg0.get("p_flags", 0) & 1)
+        cand_is_exec = bool(cand.get("is_executable") or cand.get("category") == "code")
+        perm_match = 1 if (seg0_is_exec == cand_is_exec or cand_is_exec) else 0
+
+        # 4. Prefer normal user-space PIE load addresses over low trap pages
+        normal_vma = 1 if cand["start_int"] >= 0x400000 else 0
+
+        return (exe_match, seg_verified, normal_vma, perm_match, -cand["start_int"])
+
+    best = max(candidates, key=_score_candidate)
     load_bias = best["start_int"] - seg0_vaddr_page
 
     verified = 1
@@ -1719,3 +1768,592 @@ class WatchSessionManager:
                 session.status = "STOPPED"
                 session.end_time = datetime.now(timezone.utc).isoformat()
             self._persist_session(session)
+
+    # -------------------------------------------------------------------------
+    # Phase 32: Deep Symbol Path Expression Evaluator & Instant Diff
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _tokenize_symbol_expression(expr: str) -> List[Tuple[str, Any]]:
+        """Tokenizes a C/C++ symbol path expression into traversal operations.
+        
+        Supported forms:
+        - `g_session.worker.state.counter`
+        - `g_heap_state->value`
+        - `(*g_heap_state).value` or `*g_heap_state`
+        - `g_items[2].status` or `g_matrix[1][3]`
+        """
+        s = (expr or "").strip()
+        if not s:
+            raise ValueError("Empty symbol expression")
+
+        # Count leading '*' dereferences e.g. `*g_ptr` or `(*g_ptr).field`
+        leading_derefs = 0
+        while True:
+            s_strip = s.strip()
+            if s_strip.startswith("(*") and ")" in s_strip:
+                close_idx = s_strip.find(")")
+                inner = s_strip[2:close_idx].strip()
+                rest = s_strip[close_idx + 1:].strip()
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", inner):
+                    leading_derefs += 1
+                    s = inner + rest
+                    continue
+            if s_strip.startswith("*"):
+                leading_derefs += 1
+                s = s_strip[1:].strip()
+                continue
+            break
+
+        m_root = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(.*)$", s)
+        if not m_root:
+            raise ValueError(f"Invalid root symbol in expression: '{expr}'")
+
+        root_name = m_root.group(1)
+        rem = m_root.group(2).strip()
+        ops: List[Tuple[str, Any]] = [("ROOT", root_name)]
+        for _ in range(leading_derefs):
+            ops.append(("DEREF", None))
+
+        while rem:
+            if rem.startswith("->"):
+                rem = rem[2:].strip()
+                m_f = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(.*)$", rem)
+                if not m_f:
+                    raise ValueError(f"Expected member name after '->' in '{expr}'")
+                ops.append(("DEREF_MEMBER", m_f.group(1)))
+                rem = m_f.group(2).strip()
+            elif rem.startswith("."):
+                rem = rem[1:].strip()
+                m_f = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(.*)$", rem)
+                if not m_f:
+                    raise ValueError(f"Expected member name after '.' in '{expr}'")
+                ops.append(("MEMBER", m_f.group(1)))
+                rem = m_f.group(2).strip()
+            elif rem.startswith("["):
+                m_idx = re.match(r"^\[\s*(\d+|0x[0-9a-fA-F]+)\s*\](.*)$", rem)
+                if not m_idx:
+                    raise ValueError(f"Invalid array index in '{expr}'")
+                idx_str = m_idx.group(1)
+                idx_val = int(idx_str, 16) if idx_str.startswith("0x") else int(idx_str)
+                ops.append(("INDEX", idx_val))
+                rem = m_idx.group(2).strip()
+            else:
+                raise ValueError(f"Unexpected token '{rem}' in expression '{expr}'")
+
+        return ops
+
+    def _decode_typed_memory(
+        self,
+        adapter: TargetExecutionAdapter,
+        pid: int,
+        idx: DwarfIndex,
+        addr: int,
+        type_offset: Optional[int],
+        depth: int = 0,
+        max_struct_depth: int = 3,
+    ) -> Tuple[Any, str, Optional[str], str]:
+        """Reads and decodes a DWARF type at runtime address `addr` (primitives, enums, arrays, structs)."""
+        canon_t = idx.resolve_canonical_type(type_offset)
+        t_name = idx.get_type_name(type_offset)
+        endian = idx.endianness or "little"
+        ptr_size = idx.pointer_size or 8
+
+        if canon_t is None:
+            raw, st, err = adapter.read_memory(pid, addr, 4)
+            if st != "OBSERVED" or raw is None:
+                return None, st, err, ""
+            val, dec_err = decode_value_from_bytes(raw, t_name, endian=endian)
+            return val, ("OBSERVED" if not dec_err else "DECODE_ERROR"), dec_err, raw.hex()
+
+        byte_size = canon_t.byte_size or (ptr_size if canon_t.tag == "DW_TAG_pointer_type" else 4)
+        byte_size = max(1, min(byte_size, 16384))
+        raw, st, err = adapter.read_memory(pid, addr, byte_size)
+        if st != "OBSERVED" or raw is None:
+            return None, st, err, (raw.hex() if raw else "")
+
+        raw_hex = raw.hex()
+
+        # 1. Pointer type
+        if canon_t.tag == "DW_TAG_pointer_type":
+            fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
+            if len(raw) < ptr_size:
+                return None, "PARTIAL", "Insufficient bytes for pointer", raw_hex
+            ptr_val = struct.unpack(fmt, raw[:ptr_size])[0]
+            return f"0x{ptr_val:x}", "OBSERVED", None, raw_hex
+
+        # 2. Enumeration type
+        if canon_t.tag == "DW_TAG_enumeration_type":
+            int_type = "int32_t" if byte_size == 4 else ("int16_t" if byte_size == 2 else ("int8_t" if byte_size == 1 else "int64_t"))
+            val, dec_err = decode_value_from_bytes(raw, int_type, endian=endian)
+            if dec_err is not None:
+                return None, "DECODE_ERROR", dec_err, raw_hex
+            enum_label = canon_t.enum_values.get(val)
+            if enum_label:
+                return f"{enum_label} ({val})", "OBSERVED", None, raw_hex
+            return val, "OBSERVED", None, raw_hex
+
+        # 3. Array type
+        if canon_t.tag == "DW_TAG_array_type":
+            elem_t = idx.resolve_canonical_type(canon_t.target_type_offset)
+            elem_name = idx.get_type_name(canon_t.target_type_offset).lower()
+            if elem_name in ("char", "signed char", "unsigned char", "const char"):
+                s_val = raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                return s_val, "OBSERVED", None, raw_hex
+            if elem_t and elem_t.byte_size and canon_t.array_count:
+                arr_vals = []
+                esize = elem_t.byte_size
+                for i in range(min(canon_t.array_count, 16)):
+                    slice_bytes = raw[i * esize:(i + 1) * esize]
+                    if len(slice_bytes) < esize:
+                        break
+                    v, _ = decode_value_from_bytes(slice_bytes, elem_t.name or elem_name, endian=endian)
+                    arr_vals.append(v)
+                return arr_vals, "OBSERVED", None, raw_hex
+            return raw_hex, "OBSERVED", None, raw_hex
+
+        # 4. Structure / Class / Union type
+        if canon_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type"):
+            if depth >= max_struct_depth or not canon_t.members:
+                return f"<{t_name} @ 0x{addr:x}>", "OBSERVED", None, raw_hex
+            fields_dict: Dict[str, Any] = {}
+            for mem in canon_t.members:
+                if not mem.name:
+                    continue
+                m_canon = idx.resolve_canonical_type(mem.type_offset)
+                m_tname = idx.get_type_name(mem.type_offset)
+                m_off = mem.offset
+                m_size = mem.byte_size or (m_canon.byte_size if m_canon and m_canon.byte_size else (ptr_size if m_canon and m_canon.tag == "DW_TAG_pointer_type" else 4))
+                if m_off + m_size <= len(raw):
+                    m_slice = raw[m_off:m_off + m_size]
+                    if m_canon and m_canon.tag in ("DW_TAG_structure_type", "DW_TAG_class_type") and depth + 1 < max_struct_depth:
+                        sub_val, _, _, _ = self._decode_typed_memory(
+                            adapter, pid, idx, addr + m_off, mem.type_offset, depth=depth + 1, max_struct_depth=max_struct_depth
+                        )
+                        fields_dict[mem.name] = sub_val
+                    elif m_canon and m_canon.tag == "DW_TAG_enumeration_type":
+                        int_t = "int32_t" if m_size == 4 else ("int16_t" if m_size == 2 else ("int8_t" if m_size == 1 else "int64_t"))
+                        ev_int, _ = decode_value_from_bytes(m_slice, int_t, endian=endian)
+                        ev_lbl = m_canon.enum_values.get(ev_int)
+                        fields_dict[mem.name] = f"{ev_lbl} ({ev_int})" if ev_lbl else ev_int
+                    elif m_canon and m_canon.tag == "DW_TAG_pointer_type":
+                        fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
+                        if len(m_slice) >= ptr_size:
+                            pval = struct.unpack(fmt, m_slice[:ptr_size])[0]
+                            fields_dict[mem.name] = f"0x{pval:x}"
+                    elif m_canon and m_canon.tag == "DW_TAG_array_type":
+                        elem_n = idx.get_type_name(m_canon.target_type_offset).lower()
+                        if elem_n in ("char", "signed char", "unsigned char"):
+                            fields_dict[mem.name] = m_slice.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                        else:
+                            fields_dict[mem.name] = m_slice.hex()
+                    else:
+                        v, _ = decode_value_from_bytes(m_slice, m_canon.name if m_canon and m_canon.name else m_tname, endian=endian)
+                        fields_dict[mem.name] = v
+            return fields_dict, "OBSERVED", None, raw_hex
+
+        # 5. Base / primitive type
+        val, dec_err = decode_value_from_bytes(raw, canon_t.name or t_name, endian=endian)
+        return val, ("OBSERVED" if not dec_err else "DECODE_ERROR"), dec_err, raw_hex
+
+    def evaluate_symbol_paths(
+        self,
+        pid: int,
+        companion_elf_path: str,
+        expressions: List[str],
+        remote_host: Optional[str] = None,
+        ssh_user: Optional[str] = None,
+        ssh_port: int = 22,
+        ssh_key: Optional[str] = None,
+        ssh_proxy_jump: Optional[str] = None,
+        ssh_proxy_command: Optional[str] = None,
+        adapter: Optional[TargetExecutionAdapter] = None,
+        max_pointer_depth: int = 8,
+    ) -> Dict[str, Any]:
+        """Evaluates high-level C/C++ symbol path expressions (including pointer dereferences and arrays)
+        directly against live local or remote embedded target memory with 0.00ms process suspension.
+        """
+        target_adapter = self._resolve_adapter(
+            pid=pid,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+            ssh_proxy_command=ssh_proxy_command,
+            adapter=adapter,
+        )
+
+        map_data = self.get_memory_map_and_threads(
+            pid=pid,
+            companion_elf_path=companion_elf_path,
+            adapter=target_adapter,
+        )
+        load_bias = map_data.get("base_address_int", 0)
+        idx = DwarfIndexer.get_index(companion_elf_path)
+        is_dyn = (idx.elf_type == "ET_DYN")
+        ptr_size = idx.pointer_size or 8
+        endian = idx.endianness or "little"
+        ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
+
+        evaluated: List[Dict[str, Any]] = []
+        t_start_ns = time.monotonic_ns()
+
+        for expr in expressions:
+            expr_str = (expr or "").strip()
+            if not expr_str:
+                continue
+            try:
+                ops = self._tokenize_symbol_expression(expr_str)
+                root_name = ops[0][1]
+                cand_vars = [
+                    v for v in idx.variables_by_name.get(root_name, [])
+                    if v.link_time_address is not None and not v.is_declaration
+                ]
+                if not cand_vars:
+                    evaluated.append({
+                        "expression": expr_str,
+                        "status": "SYMBOL_NOT_FOUND",
+                        "error": f"Root variable '{root_name}' not found in DWARF symbols",
+                        "value": None,
+                    })
+                    continue
+
+                root_var = cand_vars[0]
+                curr_addr = (load_bias + root_var.link_time_address) if is_dyn else root_var.link_time_address
+                curr_type_off = root_var.type_offset
+                pointer_chain: List[Dict[str, Any]] = [{
+                    "step": root_name,
+                    "address": f"0x{curr_addr:x}",
+                    "type_name": idx.get_type_name(curr_type_off),
+                }]
+                hop_count = 0
+                abort_item = None
+
+                for op_kind, op_arg in ops[1:]:
+                    canon_t = idx.resolve_canonical_type(curr_type_off)
+                    if canon_t is None:
+                        abort_item = {
+                            "expression": expr_str,
+                            "status": "TYPE_RESOLUTION_ERROR",
+                            "error": f"Cannot resolve DWARF type at address 0x{curr_addr:x}",
+                            "pointer_chain": pointer_chain,
+                            "value": None,
+                        }
+                        break
+
+                    if op_kind in ("DEREF", "DEREF_MEMBER"):
+                        if canon_t.tag != "DW_TAG_pointer_type":
+                            abort_item = {
+                                "expression": expr_str,
+                                "status": "NOT_A_POINTER",
+                                "error": f"Cannot dereference non-pointer type '{idx.get_type_name(curr_type_off)}'",
+                                "pointer_chain": pointer_chain,
+                                "value": None,
+                            }
+                            break
+                        hop_count += 1
+                        if hop_count > max_pointer_depth:
+                            abort_item = {
+                                "expression": expr_str,
+                                "status": "MAX_POINTER_DEPTH_EXCEEDED",
+                                "error": f"Pointer dereference depth exceeded limit ({max_pointer_depth})",
+                                "pointer_chain": pointer_chain,
+                                "value": None,
+                            }
+                            break
+
+                        raw_ptr, p_st, p_err = target_adapter.read_memory(pid, curr_addr, ptr_size)
+                        if p_st != "OBSERVED" or raw_ptr is None or len(raw_ptr) < ptr_size:
+                            abort_item = {
+                                "expression": expr_str,
+                                "status": p_st if p_st != "OBSERVED" else "UNAVAILABLE",
+                                "error": p_err or f"Failed reading pointer at 0x{curr_addr:x}",
+                                "pointer_chain": pointer_chain,
+                                "value": None,
+                            }
+                            break
+
+                        target_addr = struct.unpack(ptr_fmt, raw_ptr[:ptr_size])[0]
+                        if target_addr == 0:
+                            abort_item = {
+                                "expression": expr_str,
+                                "status": "NULL_POINTER",
+                                "error": f"Pointer at 0x{curr_addr:x} is NULL (0x0)",
+                                "pointer_chain": pointer_chain,
+                                "value": None,
+                            }
+                            break
+
+                        curr_addr = target_addr
+                        curr_type_off = canon_t.target_type_offset
+                        pointer_chain.append({
+                            "step": f"*{pointer_chain[-1]['step']}",
+                            "address": f"0x{curr_addr:x}",
+                            "type_name": idx.get_type_name(curr_type_off),
+                        })
+
+                        if op_kind == "DEREF":
+                            continue
+                        # Fall through to member lookup on dereferenced struct
+                        canon_t = idx.resolve_canonical_type(curr_type_off)
+
+                    if op_kind in ("MEMBER", "DEREF_MEMBER"):
+                        member_name = op_arg
+                        if not canon_t or canon_t.tag not in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type"):
+                            abort_item = {
+                                "expression": expr_str,
+                                "status": "NOT_A_STRUCT",
+                                "error": f"Type '{idx.get_type_name(curr_type_off)}' has no member '{member_name}'",
+                                "pointer_chain": pointer_chain,
+                                "value": None,
+                            }
+                            break
+                        matched_mem = next((m for m in canon_t.members if m.name == member_name), None)
+                        if matched_mem is None:
+                            avail = [m.name for m in canon_t.members if m.name]
+                            abort_item = {
+                                "expression": expr_str,
+                                "status": "MEMBER_NOT_FOUND",
+                                "error": f"Member '{member_name}' not found in '{canon_t.name}'. Available: {avail}",
+                                "pointer_chain": pointer_chain,
+                                "value": None,
+                            }
+                            break
+                        curr_addr = curr_addr + matched_mem.offset
+                        curr_type_off = matched_mem.type_offset
+                        pointer_chain.append({
+                            "step": f".{member_name}",
+                            "address": f"0x{curr_addr:x}",
+                            "type_name": idx.get_type_name(curr_type_off),
+                        })
+
+                    elif op_kind == "INDEX":
+                        arr_idx = int(op_arg)
+                        if not canon_t:
+                            abort_item = {
+                                "expression": expr_str,
+                                "status": "TYPE_RESOLUTION_ERROR",
+                                "error": f"Cannot index unknown type in '{expr_str}'",
+                                "pointer_chain": pointer_chain,
+                                "value": None,
+                            }
+                            break
+                        if canon_t.tag == "DW_TAG_pointer_type":
+                            hop_count += 1
+                            raw_ptr, p_st, p_err = target_adapter.read_memory(pid, curr_addr, ptr_size)
+                            if p_st != "OBSERVED" or not raw_ptr or len(raw_ptr) < ptr_size:
+                                abort_item = {
+                                    "expression": expr_str,
+                                    "status": p_st if p_st != "OBSERVED" else "UNAVAILABLE",
+                                    "error": p_err or f"Failed reading array pointer at 0x{curr_addr:x}",
+                                    "pointer_chain": pointer_chain,
+                                    "value": None,
+                                }
+                                break
+                            base_ptr = struct.unpack(ptr_fmt, raw_ptr[:ptr_size])[0]
+                            if base_ptr == 0:
+                                abort_item = {
+                                    "expression": expr_str,
+                                    "status": "NULL_POINTER",
+                                    "error": f"Array pointer at 0x{curr_addr:x} is NULL (0x0)",
+                                    "pointer_chain": pointer_chain,
+                                    "value": None,
+                                }
+                                break
+                            elem_off = canon_t.target_type_offset
+                            elem_canon = idx.resolve_canonical_type(elem_off)
+                            elem_sz = elem_canon.byte_size if (elem_canon and elem_canon.byte_size) else 4
+                            curr_addr = base_ptr + (arr_idx * elem_sz)
+                            curr_type_off = elem_off
+                        elif canon_t.tag == "DW_TAG_array_type":
+                            elem_off = canon_t.target_type_offset
+                            elem_canon = idx.resolve_canonical_type(elem_off)
+                            elem_sz = elem_canon.byte_size if (elem_canon and elem_canon.byte_size) else 1
+                            curr_addr = curr_addr + (arr_idx * elem_sz)
+                            curr_type_off = elem_off
+                        else:
+                            abort_item = {
+                                "expression": expr_str,
+                                "status": "NOT_INDEXABLE",
+                                "error": f"Type '{idx.get_type_name(curr_type_off)}' does not support indexing",
+                                "pointer_chain": pointer_chain,
+                                "value": None,
+                            }
+                            break
+                        pointer_chain.append({
+                            "step": f"[{arr_idx}]",
+                            "address": f"0x{curr_addr:x}",
+                            "type_name": idx.get_type_name(curr_type_off),
+                        })
+
+                if abort_item is not None:
+                    evaluated.append(abort_item)
+                    continue
+
+                final_canon = idx.resolve_canonical_type(curr_type_off)
+                final_size = final_canon.byte_size if (final_canon and final_canon.byte_size) else (ptr_size if final_canon and final_canon.tag == "DW_TAG_pointer_type" else 4)
+                val, st, err, raw_hex = self._decode_typed_memory(
+                    target_adapter, pid, idx, curr_addr, curr_type_off
+                )
+                evaluated.append({
+                    "expression": expr_str,
+                    "status": st,
+                    "error": err,
+                    "runtime_address": f"0x{curr_addr:x}",
+                    "runtime_address_int": curr_addr,
+                    "type_name": idx.get_type_name(curr_type_off),
+                    "size": final_size,
+                    "value": val,
+                    "raw_hex": raw_hex,
+                    "pointer_chain": pointer_chain,
+                    "source_location": f"{root_var.decl_file}:{root_var.decl_line}" if root_var.decl_file else None,
+                })
+            except Exception as exc:
+                evaluated.append({
+                    "expression": expr_str,
+                    "status": "EVALUATION_ERROR",
+                    "error": str(exc),
+                    "value": None,
+                })
+
+        elapsed_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
+        return {
+            "pid": pid,
+            "target_host": target_adapter.target_host(),
+            "is_remote": target_adapter.is_remote(),
+            "load_bias": f"0x{load_bias:x}",
+            "stop_duration_ms": 0.0,
+            "capture_latency_us": elapsed_us,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "results": evaluated,
+        }
+
+    def capture_and_diff_expressions(
+        self,
+        pid: int,
+        companion_elf_path: str,
+        expressions: Optional[List[str]] = None,
+        wait_ms: int = 500,
+        remote_host: Optional[str] = None,
+        ssh_user: Optional[str] = None,
+        ssh_port: int = 22,
+        ssh_key: Optional[str] = None,
+        ssh_proxy_jump: Optional[str] = None,
+        ssh_proxy_command: Optional[str] = None,
+        adapter: Optional[TargetExecutionAdapter] = None,
+    ) -> Dict[str, Any]:
+        """Samples a set of symbol expressions twice separated by `wait_ms` (with 0.00ms stop time)
+        and returns a structured comparison of changed, unchanged, and unreadable fields.
+        """
+        target_adapter = self._resolve_adapter(
+            pid=pid,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+            ssh_proxy_command=ssh_proxy_command,
+            adapter=adapter,
+        )
+
+        idx = DwarfIndexer.get_index(companion_elf_path)
+        expr_list = [e.strip() for e in (expressions or []) if e and e.strip()]
+        if not expr_list:
+            # Automatically pick top ranked global/static variables
+            top_syms = idx.search_symbols(query="", category="variables", limit=15, smart_rank=True)
+            expr_list = [s["name"] for s in top_syms]
+
+        snap_a = self.evaluate_symbol_paths(
+            pid=pid,
+            companion_elf_path=companion_elf_path,
+            expressions=expr_list,
+            adapter=target_adapter,
+        )
+
+        clamped_wait_ms = max(10, min(int(wait_ms), 30000))
+        time.sleep(clamped_wait_ms / 1000.0)
+
+        snap_b = self.evaluate_symbol_paths(
+            pid=pid,
+            companion_elf_path=companion_elf_path,
+            expressions=expr_list,
+            adapter=target_adapter,
+        )
+
+        def _flatten_val(prefix: str, val: Any, out: Dict[str, Any]) -> None:
+            if isinstance(val, dict):
+                for k, v in val.items():
+                    _flatten_val(f"{prefix}.{k}", v, out)
+            else:
+                out[prefix] = val
+
+        changed: List[Dict[str, Any]] = []
+        unchanged: List[Dict[str, Any]] = []
+        unreadable: List[Dict[str, Any]] = []
+
+        map_a = {r["expression"]: r for r in snap_a.get("results", [])}
+        map_b = {r["expression"]: r for r in snap_b.get("results", [])}
+
+        for expr_str in expr_list:
+            ra = map_a.get(expr_str, {})
+            rb = map_b.get(expr_str, {})
+            st_a = ra.get("status", "MISSING")
+            st_b = rb.get("status", "MISSING")
+
+            if st_a != "OBSERVED" or st_b != "OBSERVED":
+                unreadable.append({
+                    "expression": expr_str,
+                    "status_before": st_a,
+                    "status_after": st_b,
+                    "error": rb.get("error") or ra.get("error"),
+                })
+                continue
+
+            flat_a: Dict[str, Any] = {}
+            flat_b: Dict[str, Any] = {}
+            _flatten_val(expr_str, ra.get("value"), flat_a)
+            _flatten_val(expr_str, rb.get("value"), flat_b)
+
+            all_keys = sorted(set(flat_a.keys()) | set(flat_b.keys()))
+            for k in all_keys:
+                va = flat_a.get(k)
+                vb = flat_b.get(k)
+                if va != vb:
+                    delta = (vb - va) if (isinstance(va, (int, float)) and isinstance(vb, (int, float)) and not isinstance(va, bool) and not isinstance(vb, bool)) else None
+                    changed.append({
+                        "path": k,
+                        "root_expression": expr_str,
+                        "before": va,
+                        "after": vb,
+                        "delta": delta,
+                        "runtime_address": rb.get("runtime_address"),
+                        "type_name": rb.get("type_name"),
+                    })
+                else:
+                    unchanged.append({
+                        "path": k,
+                        "root_expression": expr_str,
+                        "value": va,
+                        "runtime_address": rb.get("runtime_address"),
+                        "type_name": rb.get("type_name"),
+                    })
+
+        return {
+            "pid": pid,
+            "target_host": target_adapter.target_host(),
+            "is_remote": target_adapter.is_remote(),
+            "wait_ms": clamped_wait_ms,
+            "stop_duration_ms": 0.0,
+            "timestamp_before": snap_a.get("timestamp"),
+            "timestamp_after": snap_b.get("timestamp"),
+            "summary": {
+                "expressions_evaluated": len(expr_list),
+                "changed_count": len(changed),
+                "unchanged_count": len(unchanged),
+                "unreadable_count": len(unreadable),
+            },
+            "changed": changed,
+            "unchanged": unchanged,
+            "unreadable": unreadable,
+        }
