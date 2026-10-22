@@ -1372,8 +1372,9 @@ class WebApiAdapter:
         raw_pid = params.get("pid")
         pid: Optional[int] = None
 
-        # Pre-inspect debug image if provided so we can also use its Build ID for process discovery
-        raw_dbg = params.get("debug_image") or params.get("companion_elf")
+        # Pre-inspect debug image if provided (supports comma-separated main ELF + .so debug ELFs)
+        raw_dbg_full = params.get("debug_image") or params.get("companion_elf")
+        raw_dbg = raw_dbg_full.split(",")[0].strip() if (raw_dbg_full and isinstance(raw_dbg_full, str)) else raw_dbg_full
         dbg_path: Optional[str] = None
         dbg_ident = None
         if raw_dbg and isinstance(raw_dbg, str) and raw_dbg.strip():

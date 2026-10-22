@@ -736,6 +736,73 @@ class WatchSessionManager:
             )
         return LocalTargetAdapter()
 
+    @staticmethod
+    def _split_companion_elf_paths(
+        companion_elf_path: Optional[str],
+        extra_debug_images: Optional[List[str]] = None,
+        debug_dir: Optional[str] = None,
+    ) -> Tuple[Optional[str], List[str]]:
+        """Splits primary companion ELF path and any additional shared library (.so) debug ELF paths."""
+        primary: Optional[str] = None
+        extras: List[str] = []
+        if companion_elf_path:
+            parts = [p.strip() for p in str(companion_elf_path).split(",") if p.strip()]
+            if parts:
+                primary = parts[0]
+                extras.extend(parts[1:])
+        if extra_debug_images:
+            for p in extra_debug_images:
+                if p and str(p).strip() and str(p).strip() not in extras and str(p).strip() != primary:
+                    extras.append(str(p).strip())
+        if debug_dir and os.path.isdir(debug_dir):
+            for entry in sorted(os.listdir(debug_dir)):
+                if entry.endswith((".so", ".debug", ".elf")):
+                    fp = os.path.abspath(os.path.join(debug_dir, entry))
+                    if os.path.isfile(fp) and fp != primary and fp not in extras:
+                        extras.append(fp)
+        return primary, extras
+
+    @staticmethod
+    def _resolve_shared_lib_load_bias(
+        so_ident: BinaryIdentity,
+        so_debug_path: str,
+        mappings: List[Dict[str, Any]],
+        page_size: int = 4096,
+    ) -> Optional[Tuple[int, str, List[Dict[str, Any]]]]:
+        """Matches a companion debug .so image to its runtime mappings in /proc/<pid>/maps
+        and computes its per-module ASLR load_bias.
+        """
+        dbg_base = os.path.basename(so_debug_path)
+        # Strip common debug suffixes/prefixes: libfoo_debug.so -> libfoo, libfoo.so.debug -> libfoo.so
+        stem = dbg_base
+        for suf in (".debug", ".elf", "_debug.so", "-debug.so", ".so"):
+            if stem.endswith(suf):
+                stem = stem[:-len(suf)]
+                break
+
+        matched_maps = []
+        runtime_so_path = ""
+        for m in mappings:
+            p = str(m.get("pathname", "")).strip()
+            if not p or p.startswith("["):
+                continue
+            p_base = os.path.basename(p)
+            if p_base == dbg_base or (stem and p_base.startswith(stem) and ".so" in p_base):
+                matched_maps.append(m)
+                if not runtime_so_path:
+                    runtime_so_path = p
+
+        if not matched_maps:
+            return None
+
+        bias_info = calculate_load_bias(
+            companion_identity=so_ident,
+            runtime_identity={"executable": runtime_so_path, "elf_type": so_ident.elf_type, "pt_loads": so_ident.pt_loads},
+            mappings=matched_maps,
+            page_size=page_size,
+        )
+        return bias_info["load_bias"], (os.path.basename(runtime_so_path) or dbg_base), matched_maps
+
     def get_memory_map_and_threads(
         self,
         pid: int,
@@ -747,6 +814,8 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         ssh_proxy_command: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
+        extra_debug_images: Optional[List[str]] = None,
+        debug_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Explores process memory mappings, threads, and discoverable variables across local or remote target."""
         target_adapter = self._resolve_adapter(
@@ -768,6 +837,11 @@ class WatchSessionManager:
         mappings = target_adapter.get_proc_maps(pid)
         threads = target_adapter.get_threads(pid)
         runtime_ident = target_adapter.get_process_identity(pid)
+
+        primary_elf, extra_so_elfs = self._split_companion_elf_paths(
+            companion_elf_path, extra_debug_images=extra_debug_images, debug_dir=debug_dir
+        )
+        companion_elf_path = primary_elf
 
         # 2. Inspect companion ELF (DWARF stays host-side)
         companion_identity: Optional[BinaryIdentity] = None
@@ -860,6 +934,81 @@ class WatchSessionManager:
             except Exception:
                 pass
 
+        # 5. Phase 6: Discover variables from additional shared library (.so) debug images
+        loaded_debug_modules: List[Dict[str, Any]] = []
+        if companion_elf_path and companion_identity:
+            loaded_debug_modules.append({
+                "module": os.path.basename(runtime_ident.get("executable") or companion_elf_path),
+                "debug_image": os.path.abspath(companion_elf_path),
+                "build_id": companion_identity.build_id,
+                "load_bias": f"0x{load_bias:x}",
+                "load_bias_int": load_bias,
+                "is_main_executable": True,
+            })
+
+        for so_path in extra_so_elfs:
+            if not os.path.isfile(so_path):
+                continue
+            try:
+                so_ident = inspect_elf(so_path)
+                if not so_ident.has_debug_info:
+                    continue
+                resolved_so = self._resolve_shared_lib_load_bias(so_ident, so_path, mappings)
+                if resolved_so is None:
+                    continue
+                so_bias, so_mod_name, so_maps = resolved_so
+                so_idx = DwarfIndexer.get_index(so_path)
+                so_is_dyn = (so_idx.elf_type == "ET_DYN")
+                loaded_debug_modules.append({
+                    "module": so_mod_name,
+                    "debug_image": os.path.abspath(so_path),
+                    "build_id": so_ident.build_id,
+                    "load_bias": f"0x{so_bias:x}",
+                    "load_bias_int": so_bias,
+                    "is_main_executable": False,
+                })
+                for var in so_idx.variables:
+                    if var.link_time_address is not None and not var.is_declaration and var.name and not var.name.startswith("__"):
+                        rt_addr = (so_bias + var.link_time_address) if so_is_dyn else var.link_time_address
+                        t_name = so_idx.get_type_name(var.type_offset)
+                        t_die = so_idx.types_by_die.get(var.type_offset)
+                        sz = t_die.byte_size if (t_die and t_die.byte_size) else 4
+                        loc = f"{var.decl_file}:{var.decl_line}" if var.decl_file else None
+                        members = []
+                        if t_die and t_die.members:
+                            for mem in t_die.members:
+                                m_tname = so_idx.get_type_name(mem.type_offset)
+                                m_addr = rt_addr + mem.offset
+                                m_die = so_idx.types_by_die.get(mem.type_offset)
+                                m_sz = mem.byte_size if mem.byte_size else (m_die.byte_size if m_die and m_die.byte_size else 4)
+                                members.append({
+                                    "name": mem.name,
+                                    "full_name": f"{var.name}.{mem.name}",
+                                    "offset": mem.offset,
+                                    "size": m_sz,
+                                    "type_name": m_tname or "unknown",
+                                    "runtime_address": f"0x{m_addr:x}",
+                                    "runtime_address_int": m_addr,
+                                    "is_pointer": bool(m_tname and "*" in m_tname),
+                                })
+                        discoverable_variables.append({
+                            "name": var.name,
+                            "qualified_name": f"{so_mod_name}::{var.name}",
+                            "module": so_mod_name,
+                            "type_name": t_name,
+                            "size": sz,
+                            "link_time_address": f"0x{var.link_time_address:x}",
+                            "runtime_address": f"0x{rt_addr:x}",
+                            "runtime_address_int": rt_addr,
+                            "source_location": loc,
+                            "memory_category": "shared_library",
+                            "is_global": True,
+                            "members": members,
+                            "has_members": len(members) > 0,
+                        })
+            except Exception:
+                pass
+
         return {
             "pid": pid,
             "is_remote": target_adapter.is_remote(),
@@ -869,6 +1018,7 @@ class WatchSessionManager:
             "load_bias": f"0x{load_bias:x}",
             "load_bias_ambiguous": bias_info["is_ambiguous"],
             "load_bias_reason": bias_info.get("ambiguity_reason"),
+            "loaded_debug_modules": loaded_debug_modules,
             "mappings": mappings,
             "threads": threads,
             "discoverable_variables": discoverable_variables,
@@ -916,15 +1066,16 @@ class WatchSessionManager:
             # 2. Inspect runtime executable
             runtime_ident = target_adapter.get_process_identity(pid)
 
-            # 3. Validate companion ELF if supplied
+            # 3. Validate companion ELF if supplied (supports comma-separated main ELF + .so ELFs)
             companion_identity: Optional[BinaryIdentity] = None
-            if companion_elf_path:
-                if not os.path.exists(companion_elf_path):
-                    raise FileNotFoundError(f"Companion ELF binary not found: '{companion_elf_path}'")
+            primary_comp_elf, _ = self._split_companion_elf_paths(companion_elf_path)
+            if primary_comp_elf:
+                if not os.path.exists(primary_comp_elf):
+                    raise FileNotFoundError(f"Companion ELF binary not found: '{primary_comp_elf}'")
                 try:
-                    companion_identity = inspect_elf(companion_elf_path)
+                    companion_identity = inspect_elf(primary_comp_elf)
                 except Exception as e:
-                    raise ValueError(f"Invalid ELF image '{companion_elf_path}': {e}")
+                    raise ValueError(f"Invalid ELF image '{primary_comp_elf}': {e}")
 
                 if not companion_identity.has_debug_info:
                     raise ValueError(f"Companion ELF '{companion_elf_path}' contains no DWARF debug information")
@@ -1947,11 +2098,19 @@ class WatchSessionManager:
                 continue
             break
 
+        # Support optional shared library module qualifier e.g. `libhelper.so::g_sensor`
+        mod_prefix = None
+        if "::" in s:
+            before_col, after_col = s.split("::", 1)
+            if ".so" in before_col or "-" in before_col or "/" in before_col:
+                mod_prefix = before_col.strip()
+                s = after_col.strip()
+
         m_root = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(.*)$", s)
         if not m_root:
             raise ValueError(f"Invalid root symbol in expression: '{expr}'")
 
-        root_name = m_root.group(1)
+        root_name = f"{mod_prefix}::{m_root.group(1)}" if mod_prefix else m_root.group(1)
         rem = m_root.group(2).strip()
         ops: List[Tuple[str, Any]] = [("ROOT", root_name)]
         for _ in range(leading_derefs):
@@ -2054,6 +2213,74 @@ class WatchSessionManager:
                 return arr_vals, "OBSERVED", None, raw_hex
             return raw_hex, "OBSERVED", None, raw_hex
 
+        # 3.5 Phase 5: C++ STL Container Pretty-Decoding (std::string, std::vector, std::unique_ptr, std::shared_ptr)
+        stl_info = idx.classify_stl_type(type_offset)
+        if stl_info is not None:
+            stl_kind = stl_info["stl_kind"]
+            ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
+
+            if stl_kind == "std::string":
+                if len(raw) >= 2 * ptr_size:
+                    data_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
+                    str_len = struct.unpack(ptr_fmt, raw[ptr_size:2 * ptr_size])[0]
+                    if data_ptr == 0 or str_len == 0:
+                        return "", "OBSERVED", None, raw_hex
+                    if 0 < str_len <= 4096:
+                        s_bytes, s_st, _ = adapter.read_memory(pid, data_ptr, int(min(str_len, 1024)))
+                        if s_st == "OBSERVED" and s_bytes is not None:
+                            return s_bytes.decode("utf-8", errors="replace"), "OBSERVED", None, raw_hex
+
+            elif stl_kind == "std::vector":
+                if len(raw) >= 3 * ptr_size:
+                    start_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
+                    finish_ptr = struct.unpack(ptr_fmt, raw[ptr_size:2 * ptr_size])[0]
+                    cap_ptr = struct.unpack(ptr_fmt, raw[2 * ptr_size:3 * ptr_size])[0]
+                    elem_sz = max(1, int(stl_info.get("element_size") or 4))
+                    elem_type_off = stl_info.get("element_type_offset")
+                    count = int((finish_ptr - start_ptr) // elem_sz) if (finish_ptr >= start_ptr and start_ptr > 0) else 0
+                    cap = int((cap_ptr - start_ptr) // elem_sz) if (cap_ptr >= start_ptr and start_ptr > 0) else 0
+                    count = max(0, min(count, 100000))
+                    cap = max(0, min(cap, 100000))
+                    elements = []
+                    if start_ptr > 0 and count > 0 and depth < max_struct_depth:
+                        for i in range(min(count, 16)):
+                            ev_val, ev_st, _, _ = self._decode_typed_memory(
+                                adapter, pid, idx, start_ptr + i * elem_sz, elem_type_off, depth=depth + 1, max_struct_depth=max_struct_depth
+                            )
+                            if ev_st == "OBSERVED":
+                                elements.append(ev_val)
+                    return {
+                        "container": "std::vector",
+                        "element_type": stl_info.get("element_type_name"),
+                        "size": count,
+                        "capacity": cap,
+                        "data_ptr": f"0x{start_ptr:x}",
+                        "elements": elements,
+                    }, "OBSERVED", None, raw_hex
+
+            elif stl_kind in ("std::unique_ptr", "std::shared_ptr", "std::weak_ptr"):
+                if len(raw) >= ptr_size:
+                    target_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
+                    elem_type_off = stl_info.get("element_type_offset")
+                    if target_ptr == 0:
+                        return {
+                            "smart_ptr": stl_kind,
+                            "element_type": stl_info.get("element_type_name"),
+                            "ptr": "0x0",
+                            "target": None,
+                        }, "OBSERVED", None, raw_hex
+                    target_val = None
+                    if depth < max_struct_depth and elem_type_off is not None:
+                        target_val, _, _, _ = self._decode_typed_memory(
+                            adapter, pid, idx, target_ptr, elem_type_off, depth=depth + 1, max_struct_depth=max_struct_depth
+                        )
+                    return {
+                        "smart_ptr": stl_kind,
+                        "element_type": stl_info.get("element_type_name"),
+                        "ptr": f"0x{target_ptr:x}",
+                        "target": target_val,
+                    }, "OBSERVED", None, raw_hex
+
         # 4. Structure / Class / Union type
         if canon_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type"):
             if depth >= max_struct_depth or not canon_t.members:
@@ -2068,7 +2295,7 @@ class WatchSessionManager:
                 m_size = mem.byte_size or (m_canon.byte_size if m_canon and m_canon.byte_size else (ptr_size if m_canon and m_canon.tag == "DW_TAG_pointer_type" else 4))
                 if m_off + m_size <= len(raw):
                     m_slice = raw[m_off:m_off + m_size]
-                    if m_canon and m_canon.tag in ("DW_TAG_structure_type", "DW_TAG_class_type") and depth + 1 < max_struct_depth:
+                    if m_canon and (m_canon.tag in ("DW_TAG_structure_type", "DW_TAG_class_type") or idx.classify_stl_type(mem.type_offset) is not None) and depth + 1 < max_struct_depth:
                         sub_val, _, _, _ = self._decode_typed_memory(
                             adapter, pid, idx, addr + m_off, mem.type_offset, depth=depth + 1, max_struct_depth=max_struct_depth
                         )
@@ -2126,17 +2353,34 @@ class WatchSessionManager:
             adapter=adapter,
         )
 
+        primary_elf, extra_so_elfs = self._split_companion_elf_paths(companion_elf_path)
+        if not primary_elf:
+            raise ValueError("At least one valid companion ELF path is required")
+
         map_data = self.get_memory_map_and_threads(
             pid=pid,
             companion_elf_path=companion_elf_path,
             adapter=target_adapter,
         )
         load_bias = map_data.get("base_address_int", 0)
-        idx = DwarfIndexer.get_index(companion_elf_path)
-        is_dyn = (idx.elf_type == "ET_DYN")
-        ptr_size = idx.pointer_size or 8
-        endian = idx.endianness or "little"
-        ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
+        primary_idx = DwarfIndexer.get_index(primary_elf)
+
+        # Build module contexts: [(mod_name, DwarfIndex, mod_load_bias, is_dyn)]
+        module_contexts: List[Tuple[str, DwarfIndex, int, bool]] = [
+            (os.path.basename(primary_elf), primary_idx, load_bias, (primary_idx.elf_type == "ET_DYN"))
+        ]
+        for mod_info in map_data.get("loaded_debug_modules", []):
+            if not mod_info.get("is_main_executable") and mod_info.get("debug_image"):
+                try:
+                    so_idx = DwarfIndexer.get_index(mod_info["debug_image"])
+                    module_contexts.append((
+                        mod_info.get("module") or os.path.basename(mod_info["debug_image"]),
+                        so_idx,
+                        int(mod_info.get("load_bias_int", 0)),
+                        (so_idx.elf_type == "ET_DYN"),
+                    ))
+                except Exception:
+                    pass
 
         evaluated: List[Dict[str, Any]] = []
         t_start_ns = time.monotonic_ns()
@@ -2147,22 +2391,41 @@ class WatchSessionManager:
                 continue
             try:
                 ops = self._tokenize_symbol_expression(expr_str)
-                root_name = ops[0][1]
-                cand_vars = [
-                    v for v in idx.variables_by_name.get(root_name, [])
-                    if v.link_time_address is not None and not v.is_declaration
-                ]
-                if not cand_vars:
+                raw_root = ops[0][1]
+                mod_filter = None
+                root_name = raw_root
+                if "::" in raw_root:
+                    mod_filter, root_name = raw_root.split("::", 1)
+
+                matched_ctx = None
+                root_var = None
+                for mod_name, m_idx, m_bias, m_dyn in module_contexts:
+                    if mod_filter and mod_filter not in mod_name and os.path.basename(mod_filter) not in mod_name:
+                        continue
+                    cands = [
+                        v for v in m_idx.variables_by_name.get(root_name, [])
+                        if v.link_time_address is not None and not v.is_declaration
+                    ]
+                    if cands:
+                        matched_ctx = (mod_name, m_idx, m_bias, m_dyn)
+                        root_var = cands[0]
+                        break
+
+                if not root_var or not matched_ctx:
                     evaluated.append({
                         "expression": expr_str,
                         "status": "SYMBOL_NOT_FOUND",
-                        "error": f"Root variable '{root_name}' not found in DWARF symbols",
+                        "error": f"Root variable '{raw_root}' not found in DWARF symbols across loaded modules",
                         "value": None,
                     })
                     continue
 
-                root_var = cand_vars[0]
-                curr_addr = (load_bias + root_var.link_time_address) if is_dyn else root_var.link_time_address
+                active_mod_name, idx, active_bias, is_dyn = matched_ctx
+                ptr_size = idx.pointer_size or 8
+                endian = idx.endianness or "little"
+                ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
+
+                curr_addr = (active_bias + root_var.link_time_address) if is_dyn else root_var.link_time_address
                 curr_type_off = root_var.type_offset
                 pointer_chain: List[Dict[str, Any]] = [{
                     "step": root_name,
@@ -2185,7 +2448,9 @@ class WatchSessionManager:
                         break
 
                     if op_kind in ("DEREF", "DEREF_MEMBER"):
-                        if canon_t.tag != "DW_TAG_pointer_type":
+                        stl_curr = idx.classify_stl_type(curr_type_off)
+                        is_smart_ptr = bool(stl_curr and stl_curr["stl_kind"] in ("std::unique_ptr", "std::shared_ptr", "std::weak_ptr"))
+                        if canon_t.tag != "DW_TAG_pointer_type" and not is_smart_ptr:
                             abort_item = {
                                 "expression": expr_str,
                                 "status": "NOT_A_POINTER",
@@ -2228,7 +2493,7 @@ class WatchSessionManager:
                             break
 
                         curr_addr = target_addr
-                        curr_type_off = canon_t.target_type_offset
+                        curr_type_off = stl_curr["element_type_offset"] if is_smart_ptr else canon_t.target_type_offset
                         pointer_chain.append({
                             "step": f"*{pointer_chain[-1]['step']}",
                             "address": f"0x{curr_addr:x}",
@@ -2281,7 +2546,35 @@ class WatchSessionManager:
                                 "value": None,
                             }
                             break
-                        if canon_t.tag == "DW_TAG_pointer_type":
+                        stl_curr = idx.classify_stl_type(curr_type_off)
+                        if stl_curr and stl_curr["stl_kind"] == "std::vector":
+                            hop_count += 1
+                            raw_vec, v_st, v_err = target_adapter.read_memory(pid, curr_addr, 2 * ptr_size)
+                            if v_st != "OBSERVED" or not raw_vec or len(raw_vec) < 2 * ptr_size:
+                                abort_item = {
+                                    "expression": expr_str,
+                                    "status": v_st if v_st != "OBSERVED" else "UNAVAILABLE",
+                                    "error": v_err or f"Failed reading std::vector header at 0x{curr_addr:x}",
+                                    "pointer_chain": pointer_chain,
+                                    "value": None,
+                                }
+                                break
+                            start_ptr = struct.unpack(ptr_fmt, raw_vec[:ptr_size])[0]
+                            finish_ptr = struct.unpack(ptr_fmt, raw_vec[ptr_size:2 * ptr_size])[0]
+                            elem_sz = max(1, int(stl_curr.get("element_size") or 4))
+                            vec_len = int((finish_ptr - start_ptr) // elem_sz) if (finish_ptr >= start_ptr and start_ptr > 0) else 0
+                            if start_ptr == 0 or arr_idx < 0 or arr_idx >= vec_len:
+                                abort_item = {
+                                    "expression": expr_str,
+                                    "status": "OUT_OF_BOUNDS",
+                                    "error": f"Index {arr_idx} out of bounds for std::vector (size={vec_len})",
+                                    "pointer_chain": pointer_chain,
+                                    "value": None,
+                                }
+                                break
+                            curr_addr = start_ptr + (arr_idx * elem_sz)
+                            curr_type_off = stl_curr.get("element_type_offset")
+                        elif canon_t.tag == "DW_TAG_pointer_type":
                             hop_count += 1
                             raw_ptr, p_st, p_err = target_adapter.read_memory(pid, curr_addr, ptr_size)
                             if p_st != "OBSERVED" or not raw_ptr or len(raw_ptr) < ptr_size:
@@ -2348,6 +2641,7 @@ class WatchSessionManager:
                     "size": final_size,
                     "value": val,
                     "raw_hex": raw_hex,
+                    "module": active_mod_name,
                     "pointer_chain": pointer_chain,
                     "source_location": f"{root_var.decl_file}:{root_var.decl_line}" if root_var.decl_file else None,
                 })

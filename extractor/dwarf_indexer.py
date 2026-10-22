@@ -141,6 +141,119 @@ class DwarfIndex:
     def get_type_by_die(self, die_offset: int) -> Optional[DwarfType]:
         return self.types_by_die.get(die_offset)
 
+    def resolve_type_by_name(self, type_name: str) -> Optional[DwarfType]:
+        """Resolves a C/C++ type name (including primitives and structs) to its canonical DwarfType."""
+        if not type_name:
+            return None
+        clean = type_name.strip()
+        for prefix in ("const ", "volatile ", "struct ", "class ", "enum "):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix):].strip()
+        candidates = list(self.types_by_name.get(clean, []))
+        if not candidates and clean.startswith("std::"):
+            candidates = list(self.types_by_name.get(clean[5:].strip(), []))
+        if not candidates:
+            # Handle common C/C++ integer aliases
+            alias_map = {
+                "int32_t": "int",
+                "uint32_t": "unsigned int",
+                "int64_t": "long int",
+                "uint64_t": "long unsigned int",
+                "size_t": "long unsigned int",
+                "int16_t": "short int",
+                "uint16_t": "short unsigned int",
+                "int8_t": "signed char",
+                "uint8_t": "unsigned char",
+                "std::string": "string",
+            }
+            mapped = alias_map.get(clean)
+            if mapped:
+                candidates = list(self.types_by_name.get(mapped, []))
+        if not candidates:
+            return None
+        # Prefer complete definitions (with members or positive byte_size)
+        resolved = []
+        for c in candidates:
+            rc = self.resolve_canonical_type(c.die_offset) or c
+            resolved.append(rc)
+        resolved.sort(key=lambda t: (1 if t.members else 0, t.byte_size or 0), reverse=True)
+        return resolved[0]
+
+    @staticmethod
+    def _extract_first_template_arg(type_name: str) -> Optional[str]:
+        """Extracts the first top-level template argument T from `container<T, ...>`."""
+        lt = type_name.find("<")
+        gt = type_name.rfind(">")
+        if lt == -1 or gt == -1 or gt <= lt + 1:
+            return None
+        inner = type_name[lt + 1:gt].strip()
+        depth = 0
+        for idx, ch in enumerate(inner):
+            if ch == "<":
+                depth += 1
+            elif ch == ">":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                return inner[:idx].strip()
+        return inner.strip()
+
+    def classify_stl_type(self, type_offset: Optional[int]) -> Optional[Dict[str, Any]]:
+        """Detects C++ STL containers (`std::string`, `std::vector`, `std::unique_ptr`, `std::shared_ptr`, `std::weak_ptr`)
+        and resolves their underlying element type metadata.
+        """
+        if type_offset is None:
+            return None
+        canon_t = self.resolve_canonical_type(type_offset)
+        t_name = self.get_type_name(type_offset)
+        c_name = (canon_t.name if canon_t and canon_t.name else t_name).strip()
+
+        # 1. std::string / basic_string<char, ...>
+        if (
+            t_name in ("string", "std::string", "const string", "const std::string")
+            or c_name.startswith("basic_string<char")
+            or c_name in ("string", "std::string")
+        ):
+            return {
+                "stl_kind": "std::string",
+                "element_type_name": "char",
+                "element_type_offset": None,
+                "element_size": 1,
+            }
+
+        # 2. std::vector<T, Alloc>
+        if c_name.startswith("vector<") or c_name.startswith("std::vector<"):
+            elem_name = self._extract_first_template_arg(c_name) or "int"
+            elem_t = self.resolve_type_by_name(elem_name)
+            elem_sz = elem_t.byte_size if (elem_t and elem_t.byte_size > 0) else (self.pointer_size if elem_name.endswith("*") else 4)
+            return {
+                "stl_kind": "std::vector",
+                "element_type_name": elem_name,
+                "element_type_offset": elem_t.die_offset if elem_t else None,
+                "element_size": elem_sz,
+            }
+
+        # 3. std::unique_ptr<T, Deleter>, std::shared_ptr<T>, std::weak_ptr<T>
+        for prefix, kind in (
+            ("unique_ptr<", "std::unique_ptr"),
+            ("std::unique_ptr<", "std::unique_ptr"),
+            ("shared_ptr<", "std::shared_ptr"),
+            ("std::shared_ptr<", "std::shared_ptr"),
+            ("weak_ptr<", "std::weak_ptr"),
+            ("std::weak_ptr<", "std::weak_ptr"),
+        ):
+            if c_name.startswith(prefix):
+                elem_name = self._extract_first_template_arg(c_name) or "void"
+                elem_t = self.resolve_type_by_name(elem_name)
+                elem_sz = elem_t.byte_size if (elem_t and elem_t.byte_size > 0) else 4
+                return {
+                    "stl_kind": kind,
+                    "element_type_name": elem_name,
+                    "element_type_offset": elem_t.die_offset if elem_t else None,
+                    "element_size": elem_sz,
+                }
+
+        return None
+
     def resolve_canonical_type(self, type_offset: Optional[int]) -> Optional[DwarfType]:
         """Traverse typedef, const, volatile qualifiers to reach underlying canonical type."""
         curr = type_offset
@@ -609,7 +722,8 @@ class DwarfIndexer:
 
     @classmethod
     def get_index(cls, artifact_path: str, use_disk_cache: bool = True) -> DwarfIndex:
-        abs_path = os.path.abspath(artifact_path)
+        primary_path = str(artifact_path).split(",")[0].strip() if "," in str(artifact_path) else str(artifact_path).strip()
+        abs_path = os.path.abspath(primary_path)
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"Debug artifact not found: {abs_path}")
 
