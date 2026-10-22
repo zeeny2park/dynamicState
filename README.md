@@ -11,6 +11,11 @@ GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 �
 
 또한, 고성능·통신·프로덕션 환경에서 프로세스 중단 없이 실행 중인 프로세스의 원시 메모리를 비침습적으로 캡처하고(`process_vm_readv`), ELF `PT_LOAD` 세그먼트 기반의 정확한 `load_bias` 계산, `RuntimeModule` 모델 및 `.gnu_debuglink`/Build ID 디버그 아티팩트 검증, 오프라인 DWARF 의미론적 객체 그래프 복원을 수행하는 **Production-grade Low-Impact Observation Hardening (Phase 5.2)** 을 지원합니다.
 
+
+> [!TIP]
+> **🚀 실전 임베디드 무중단 메모리 분석 가이드 (Quickstart Playbook)**:
+> 외부 서버의 `nostrip` ELF로 임베디드 장비 프로세스를 0.00ms 정지로 즉시 분석하는 **4대 시나리오, 1줄 CLI 명령어(`connect`, `eval`, `diff`, `recipe`), Web UI 3대 진단 레시피, 코딩 에이전트 MCP 프롬프트 템플릿**은 [`docs/PRACTICAL_PLAYBOOK_KO.md`](docs/PRACTICAL_PLAYBOOK_KO.md)에서 바로 확인하실 수 있습니다.
+
 ---
 
 ## Architecture & Exploration Pipeline

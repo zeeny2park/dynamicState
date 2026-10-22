@@ -138,6 +138,61 @@ def main():
     trace_parser.add_argument("--json", action="store_true", default=False, help="Print trace results in JSON format")
     trace_parser.add_argument("--no-verify-build-id", action="store_true", default=False, help="Skip build-id verification")
 
+    # 11. connect (Phase 4 simplified workflow)
+    conn_p = subparsers.add_parser("connect", help="Validate local/remote target process by PID or name and list recommended state symbols")
+    conn_p.add_argument("--pid", type=int, default=None, help="Target process PID")
+    conn_p.add_argument("--process-name", type=str, default=None, help="Target process name (auto-discovers PID)")
+    conn_p.add_argument("--debug-image", "--companion-elf", dest="debug_image", type=str, required=True, help="Path to non-stripped companion ELF with DWARF")
+    conn_p.add_argument("--remote-host", type=str, default=None, help="Optional SSH remote embedded host/IP")
+    conn_p.add_argument("--ssh-user", type=str, default=None, help="Optional SSH username")
+    conn_p.add_argument("--ssh-port", type=int, default=22, help="SSH port (default: 22)")
+    conn_p.add_argument("--ssh-key", type=str, default=None, help="Optional SSH private key path")
+    conn_p.add_argument("--ssh-proxy-jump", type=str, default=None, help="Optional SSH ProxyJump")
+    conn_p.add_argument("--auto-deploy-collector", action="store_true", default=False, help="Auto-deploy C99 collector to remote target")
+    conn_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
+
+    # 12. eval (Phase 4 deep symbol path evaluation)
+    eval_p = subparsers.add_parser("eval", help="Evaluate C/C++ symbol path expressions (e.g. g_session.worker.state, g_ptr->field) with 0ms stop")
+    eval_p.add_argument("--pid", type=int, required=True, help="Target process PID")
+    eval_p.add_argument("--debug-image", "--companion-elf", dest="debug_image", type=str, required=True, help="Path to non-stripped companion ELF")
+    eval_p.add_argument("--expr", "--expressions", dest="expr", type=str, required=True, help="Comma-separated C/C++ symbol expressions")
+    eval_p.add_argument("--remote-host", type=str, default=None, help="Optional SSH remote host")
+    eval_p.add_argument("--ssh-user", type=str, default=None, help="Optional SSH user")
+    eval_p.add_argument("--ssh-port", type=int, default=22, help="SSH port")
+    eval_p.add_argument("--ssh-key", type=str, default=None, help="Optional SSH key")
+    eval_p.add_argument("--ssh-proxy-jump", type=str, default=None, help="Optional SSH ProxyJump")
+    eval_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
+
+    # 13. diff (Phase 4 two-point zero-stop diff)
+    diff_p = subparsers.add_parser("diff", help="Sample C/C++ symbol expressions twice across wait-ms and report changed vs unchanged fields")
+    diff_p.add_argument("--pid", type=int, required=True, help="Target process PID")
+    diff_p.add_argument("--debug-image", "--companion-elf", dest="debug_image", type=str, required=True, help="Path to non-stripped companion ELF")
+    diff_p.add_argument("--expr", "--expressions", dest="expr", type=str, default=None, help="Optional comma-separated expressions (defaults to top state globals)")
+    diff_p.add_argument("--wait-ms", type=int, default=500, help="Interval in ms between captures (default: 500)")
+    diff_p.add_argument("--remote-host", type=str, default=None, help="Optional SSH remote host")
+    diff_p.add_argument("--ssh-user", type=str, default=None, help="Optional SSH user")
+    diff_p.add_argument("--ssh-port", type=int, default=22, help="SSH port")
+    diff_p.add_argument("--ssh-key", type=str, default=None, help="Optional SSH key")
+    diff_p.add_argument("--ssh-proxy-jump", type=str, default=None, help="Optional SSH ProxyJump")
+    diff_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
+
+    # 14. recipe (Phase 4 guided diagnostic recipes & Golden Baselines)
+    rec_p = subparsers.add_parser("recipe", help="Run a guided diagnostic recipe (instant_xray, before_after_diff, timeseries_watch) or Golden Baseline check")
+    rec_p.add_argument("--name", type=str, default="instant_xray", choices=["instant_xray", "before_after_diff", "timeseries_watch", "save_baseline", "compare_baseline"], help="Recipe name")
+    rec_p.add_argument("--pid", type=int, required=True, help="Target process PID")
+    rec_p.add_argument("--debug-image", "--companion-elf", dest="debug_image", type=str, required=True, help="Path to non-stripped companion ELF")
+    rec_p.add_argument("--expr", type=str, default=None, help="Optional comma-separated expressions")
+    rec_p.add_argument("--duration-ms", type=int, default=1000, help="Observation window in ms (default: 1000)")
+    rec_p.add_argument("--interval-ms", type=int, default=200, help="Sampling interval in ms (default: 200)")
+    rec_p.add_argument("--baseline-id", type=str, default=None, help="Golden baseline ID for compare_baseline")
+    rec_p.add_argument("--label", type=str, default="Golden Baseline", help="Label for save_baseline")
+    rec_p.add_argument("--remote-host", type=str, default=None, help="Optional SSH remote host")
+    rec_p.add_argument("--ssh-user", type=str, default=None, help="Optional SSH user")
+    rec_p.add_argument("--ssh-port", type=int, default=22, help="SSH port")
+    rec_p.add_argument("--ssh-key", type=str, default=None, help="Optional SSH key")
+    rec_p.add_argument("--ssh-proxy-jump", type=str, default=None, help="Optional SSH ProxyJump")
+    rec_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
+
     args = parser.parse_args()
 
     if args.command == "capture-memory":
@@ -683,6 +738,129 @@ def main():
             sys.exit(1)
         sys.exit(0)
 
+
+
+    elif args.command == "connect":
+        from .watch_session import WatchSessionManager
+        from .debug_image import inspect_elf
+        from .dwarf_indexer import DwarfIndexer
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        adapter = wm._resolve_adapter(
+            pid=args.pid or 1,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        dbg_ident = inspect_elf(args.debug_image)
+        pid = args.pid
+        if (not pid or pid <= 0) and args.process_name:
+            matches = adapter.find_processes(process_name=args.process_name, companion_build_id=dbg_ident.build_id)
+            if not matches:
+                print(json.dumps({"success": False, "error": f"No process matching '{args.process_name}'"}, indent=2))
+                sys.exit(1)
+            pid = int(matches[0]["pid"])
+        if not pid or pid <= 0:
+            print(json.dumps({"success": False, "error": "Valid --pid or --process-name required"}, indent=2))
+            sys.exit(1)
+        coll_info = adapter.ensure_remote_collector() if (args.auto_deploy_collector and hasattr(adapter, "ensure_remote_collector")) else None
+        map_data = wm.get_memory_map_and_threads(pid=pid, companion_elf_path=args.debug_image, adapter=adapter)
+        idx = DwarfIndexer.get_index(args.debug_image)
+        rec_syms = idx.search_symbols(limit=12, smart_rank=True, load_bias=map_data.get("base_address_int", 0), is_dyn=(idx.elf_type == "ET_DYN"))
+        print(json.dumps({
+            "success": True,
+            "pid": pid,
+            "target_host": adapter.target_host(),
+            "is_remote": adapter.is_remote(),
+            "build_id": dbg_ident.build_id,
+            "load_bias": map_data.get("load_bias"),
+            "collector_deployment": coll_info,
+            "recommended_symbols": rec_syms,
+        }, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "eval":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        exprs = [e.strip() for e in args.expr.split(",") if e.strip()]
+        res = wm.evaluate_symbol_paths(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            expressions=exprs,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "diff":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        exprs = [e.strip() for e in args.expr.split(",") if e.strip()] if args.expr else None
+        res = wm.capture_and_diff_expressions(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            expressions=exprs,
+            wait_ms=args.wait_ms,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "recipe":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        exprs = [e.strip() for e in args.expr.split(",") if e.strip()] if args.expr else None
+        if args.name == "save_baseline":
+            res = wm.save_golden_baseline(
+                pid=args.pid,
+                companion_elf_path=args.debug_image,
+                label=args.label,
+                expressions=exprs,
+                remote_host=args.remote_host,
+                ssh_user=args.ssh_user,
+                ssh_port=args.ssh_port,
+                ssh_key=args.ssh_key,
+                ssh_proxy_jump=args.ssh_proxy_jump,
+            )
+        elif args.name == "compare_baseline":
+            if not args.baseline_id:
+                print(json.dumps({"success": False, "error": "--baseline-id is required for compare_baseline"}, indent=2))
+                sys.exit(1)
+            res = wm.compare_with_golden_baseline(
+                baseline_id=args.baseline_id,
+                pid=args.pid,
+                companion_elf_path=args.debug_image,
+                remote_host=args.remote_host,
+                ssh_user=args.ssh_user,
+                ssh_port=args.ssh_port,
+                ssh_key=args.ssh_key,
+                ssh_proxy_jump=args.ssh_proxy_jump,
+            )
+        else:
+            res = wm.run_diagnostic_recipe(
+                recipe=args.name,
+                pid=args.pid,
+                companion_elf_path=args.debug_image,
+                expressions=exprs,
+                duration_ms=args.duration_ms,
+                interval_ms=args.interval_ms,
+                remote_host=args.remote_host,
+                ssh_user=args.ssh_user,
+                ssh_port=args.ssh_port,
+                ssh_key=args.ssh_key,
+                ssh_proxy_jump=args.ssh_proxy_jump,
+            )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
 
 
 if __name__ == "__main__":

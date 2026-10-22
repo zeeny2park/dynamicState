@@ -577,6 +577,7 @@ def runtime_target_connect(
     ssh_port: int = 22,
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
+    auto_deploy_collector: bool = False,
 ) -> str:
     """Connect to a local or remote embedded target process by PID or process name,
     verify GNU Build ID against the host's non-stripped companion ELF, calculate ASLR load bias,
@@ -659,9 +660,14 @@ def runtime_target_connect(
             is_dyn=(idx.elf_type == "ET_DYN"),
         )
 
+        collector_info = None
+        if auto_deploy_collector and hasattr(adapter, "ensure_remote_collector"):
+            collector_info = adapter.ensure_remote_collector()
+
         return _format_watch_result({
             "success": True,
             "pid": resolved_pid,
+            "collector_deployment": collector_info,
             "target_host": adapter.target_host(),
             "is_remote": adapter.is_remote(),
             "companion_elf": os.path.abspath(companion_elf),
@@ -946,6 +952,25 @@ def runtime_golden_baseline_compare(
         return _format_watch_result({"success": True, **res})
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_get_playbook() -> str:
+    """Returns the structured decision playbook for when and how to use dynamicState MCP tools
+    on live local or remote embedded Linux processes.
+    """
+    return _format_watch_result({
+        "success": True,
+        "recommended_workflow": [
+            "1. Connect & Validate: Call `runtime_target_connect(companion_elf=..., process_name=..., remote_host=...)` to resolve PID, verify Build ID, and get top `recommended_symbols`.",
+            "2. Choose Diagnostic Scenario:",
+            "   - Scenario A (Silent Hang / Stuck State): Call `runtime_run_diagnostic_recipe(recipe='instant_xray', ...)` or `runtime_eval_memory_path(expressions=[...])`.",
+            "   - Scenario B (Event Before/After Mutation): Call `runtime_capture_and_diff(expressions=[...], wait_ms=1000)`.",
+            "   - Scenario C (Counter Drift / Stuck Variable Detection): Call `runtime_run_diagnostic_recipe(recipe='timeseries_watch', duration_ms=2000)`.",
+            "   - Scenario D (Regression vs Healthy Baseline): Call `runtime_golden_baseline_save` when healthy, then `runtime_golden_baseline_compare` when degraded.",
+        ],
+        "zero_stop_guarantee": "All recommended tools read memory non-intrusively (0.00ms target stop time) and never inject code into the target process.",
+    })
 
 
 if __name__ == "__main__":

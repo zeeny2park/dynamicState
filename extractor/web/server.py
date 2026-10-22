@@ -1679,6 +1679,30 @@ class WebApiAdapter:
             }
         }
 
+    def deploy_remote_collector_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Deploys or verifies the C99 dynamicstate-collector on a remote SSH target."""
+        try:
+            remote_host = (params.get("remote_host") or "").strip()
+            if not remote_host:
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": "remote_host is required"}}
+            adapter = self.watch_manager._resolve_adapter(
+                pid=1,
+                remote_host=remote_host,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            if not hasattr(adapter, "ensure_remote_collector"):
+                return {"success": False, "error": {"code": "UNSUPPORTED_ADAPTER", "message": "Target adapter is not remote SSH"}}
+            res = adapter.ensure_remote_collector(
+                local_collector_bin=(params.get("local_collector_bin") or "").strip() or None,
+                remote_dest=str(params.get("remote_dest") or "/tmp/dynamicstate-collector"),
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "DEPLOY_COLLECTOR_ERROR", "message": str(e)}}
+
     def find_target_processes(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Discovers running processes on local or remote target filtered by name or companion ELF Build ID."""
         try:
@@ -3028,6 +3052,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if m_watch_item:
                 session_id = m_watch_item.group(1)
                 self._send_json(adapter.update_watch_items(session_id, body))
+                return
+
+            # POST /api/target/deploy-collector
+            if path == "/api/target/deploy-collector":
+                self._send_json(adapter.deploy_remote_collector_api(body))
                 return
 
             # POST /api/target/find-processes

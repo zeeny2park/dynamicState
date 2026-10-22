@@ -859,3 +859,109 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             ), reverse=True)
 
         return results[:max(1, limit)]
+
+    def ensure_remote_collector(
+        self,
+        local_collector_bin: Optional[str] = None,
+        remote_dest: str = "/tmp/dynamicstate-collector",
+    ) -> Dict[str, Any]:
+        """Checks if dynamicstate-collector is present on the remote target, and if not,
+        automatically deploys a matching architecture binary over SSH without requiring scp.
+        Falls back gracefully to batched POSIX shell mode if binary architecture mismatches.
+        """
+        dest = (remote_dest or "/tmp/dynamicstate-collector").strip()
+        check_cmd = f"[ -x {shlex.quote(dest)} ] && {shlex.quote(dest)} --help >/dev/null 2>&1 && echo READY || echo MISSING"
+        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(check_cmd)}")
+        if rc != 0:
+            return {
+                "deployed": False,
+                "status": "SSH_ERROR",
+                "collector_path": None,
+                "reason": stderr.strip() or f"SSH exited with {rc}",
+            }
+
+        if "READY" in stdout:
+            self.collector_path = dest
+            return {
+                "deployed": True,
+                "status": "ALREADY_PRESENT",
+                "collector_path": dest,
+                "reason": "Collector binary already present and executable on target",
+            }
+
+        # Check if local collector binary is available
+        cand_bin = local_collector_bin
+        if not cand_bin:
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            default_bin = os.path.join(repo_root, "target", "collector", "dynamicstate-collector")
+            if os.path.isfile(default_bin):
+                cand_bin = default_bin
+
+        if not cand_bin or not os.path.isfile(cand_bin):
+            return {
+                "deployed": False,
+                "status": "FALLBACK_SHELL",
+                "collector_path": None,
+                "reason": "No local dynamicstate-collector binary found to deploy; using batched POSIX shell fallback",
+            }
+
+        # Check architecture compatibility between local collector binary and remote uname -m
+        try:
+            local_ident = inspect_elf(cand_bin)
+            local_arch = (local_ident.architecture or "").lower()
+        except Exception as e:
+            return {
+                "deployed": False,
+                "status": "FALLBACK_SHELL",
+                "collector_path": None,
+                "reason": f"Local collector binary is not a valid ELF: {e}",
+            }
+
+        rc_u, out_u, _ = self.run_ssh("uname -m 2>/dev/null")
+        rem_arch_raw = out_u.strip().lower() if rc_u == 0 else ""
+        arch_aliases = {
+            "x86_64": ("x86_64", "amd64"),
+            "aarch64": ("aarch64", "arm64"),
+            "arm": ("arm", "armv7l", "armv6l", "armhf"),
+            "riscv64": ("riscv64",),
+            "mips": ("mips", "mips64", "mipsel"),
+        }
+        compatible_remotes = arch_aliases.get(local_arch, (local_arch,))
+        if rem_arch_raw and local_arch and rem_arch_raw not in compatible_remotes:
+            return {
+                "deployed": False,
+                "status": "FALLBACK_SHELL",
+                "collector_path": None,
+                "local_architecture": local_arch,
+                "remote_architecture": rem_arch_raw,
+                "reason": (
+                    f"Architecture mismatch: local collector is '{local_arch}' but remote target is '{rem_arch_raw}'. "
+                    f"Cross-compile collector with CC=<arch>-gcc or use batched POSIX shell fallback."
+                ),
+            }
+
+        with open(cand_bin, "rb") as bf:
+            raw_bytes = bf.read()
+        b64_payload = base64.b64encode(raw_bytes).decode("ascii")
+        upload_cmd = (
+            f"sh -c 'echo {shlex.quote(b64_payload)} | base64 -d > {shlex.quote(dest)} && "
+            f"chmod 755 {shlex.quote(dest)} && {shlex.quote(dest)} --help >/dev/null 2>&1 && echo DEPLOY_OK'"
+        )
+        rc_up, out_up, err_up = self.run_ssh(upload_cmd, timeout=max(10.0, self.timeout_sec * 2))
+        if rc_up == 0 and "DEPLOY_OK" in out_up:
+            self.collector_path = dest
+            return {
+                "deployed": True,
+                "status": "DEPLOYED_BINARY",
+                "collector_path": dest,
+                "bytes_transferred": len(raw_bytes),
+                "architecture": local_arch,
+                "reason": f"Successfully deployed dynamicstate-collector ({len(raw_bytes)} bytes) to {dest}",
+            }
+
+        return {
+            "deployed": False,
+            "status": "FALLBACK_SHELL",
+            "collector_path": None,
+            "reason": f"Failed deploying collector to {dest}: {err_up.strip() or out_up.strip()}",
+        }
