@@ -27,6 +27,45 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from .debug_image import BinaryIdentity, inspect_elf
 
 
+
+def _parse_cpulist(cpulist_str: str) -> List[int]:
+    """Parses Linux CPU list format (e.g. '2', '0,2-4') into a sorted list of CPU IDs."""
+    cpus: List[int] = []
+    if not cpulist_str:
+        return cpus
+    for part in cpulist_str.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            bounds = part.split("-", 1)
+            try:
+                lo, hi = int(bounds[0]), int(bounds[1])
+                if 0 <= lo <= hi and (hi - lo) <= 1024:
+                    cpus.extend(range(lo, hi + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                cpus.append(int(part))
+            except ValueError:
+                pass
+    return sorted(set(cpus))
+
+
+def _get_kernel_isolated_cpus() -> List[int]:
+    """Reads /sys/devices/system/cpu/isolated and /sys/devices/system/cpu/nohz_full."""
+    isolated: List[int] = []
+    for sys_path in ("/sys/devices/system/cpu/isolated", "/sys/devices/system/cpu/nohz_full"):
+        try:
+            if os.path.exists(sys_path):
+                with open(sys_path, "r", encoding="utf-8") as f:
+                    isolated.extend(_parse_cpulist(f.read().strip()))
+        except Exception:
+            pass
+    return sorted(set(isolated))
+
+
 class TargetExecutionAdapter(ABC):
     """Abstract interface for interacting with a local or remote target process."""
 
@@ -180,11 +219,15 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     except Exception:
                         continue
 
+                    path_low = pathname.lower()
+                    is_hugepage = any(k in path_low for k in ("huge", "rtemap", "hugetlb"))
                     category = "anonymous"
                     if pathname == "[heap]":
                         category = "heap"
                     elif pathname.startswith("[stack"):
                         category = "stack"
+                    elif is_hugepage and "w" in perms:
+                        category = "data"
                     elif pathname:
                         if "x" in perms:
                             category = "code"
@@ -204,6 +247,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         "offset_int": off_int,
                         "category": category,
                         "pathname": pathname,
+                        "is_hugepage": is_hugepage,
                         "is_readable": "r" in perms,
                         "is_writable": "w" in perms,
                         "is_executable": "x" in perms,
@@ -213,14 +257,23 @@ class LocalTargetAdapter(TargetExecutionAdapter):
     get_memory_mappings = get_proc_maps
 
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
+        import struct as _struct
         threads: List[Dict[str, Any]] = []
         task_dir = f"/proc/{pid}/task"
         if not os.path.exists(task_dir):
             return threads
 
-        # Pre-fetch proc maps to locate thread stacks
         maps = self.get_proc_maps(pid)
         stack_maps = [m for m in maps if m.get("category") == "stack" or m.get("pathname", "").startswith("[stack")]
+        kernel_isolated = set(_get_kernel_isolated_cpus())
+        sched_policy_names = {
+            0: "SCHED_OTHER",
+            1: "SCHED_FIFO",
+            2: "SCHED_RR",
+            3: "SCHED_BATCH",
+            5: "SCHED_IDLE",
+            6: "SCHED_DEADLINE",
+        }
 
         try:
             for tid_entry in os.listdir(task_dir):
@@ -229,36 +282,122 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     comm = "unknown"
                     state = "UNKNOWN"
                     startstack = 0
+                    utime_ticks = 0
+                    stime_ticks = 0
+                    cpu_id: Optional[int] = None
+                    rt_priority = 0
+                    sched_policy = "SCHED_OTHER"
                     comm_file = os.path.join(task_dir, tid_entry, "comm")
                     if os.path.exists(comm_file):
                         try:
-                            with open(comm_file, "r") as cf:
+                            with open(comm_file, "r", encoding="utf-8", errors="replace") as cf:
                                 comm = cf.read().strip()
                         except Exception:
                             pass
+                    kstkesp = 0
                     stat_file = os.path.join(task_dir, tid_entry, "stat")
                     if os.path.exists(stat_file):
                         try:
-                            with open(stat_file, "r") as sf:
+                            with open(stat_file, "r", encoding="utf-8", errors="replace") as sf:
                                 raw_stat = sf.read().strip()
                                 rparen = raw_stat.rfind(")")
                                 if rparen != -1:
                                     rest = raw_stat[rparen + 1:].strip().split()
                                     if len(rest) >= 1:
                                         state = rest[0]
+                                    if len(rest) >= 13:
+                                        try:
+                                            utime_ticks = int(rest[11])
+                                            stime_ticks = int(rest[12])
+                                        except (ValueError, IndexError):
+                                            pass
                                     if len(rest) >= 26:
                                         try:
                                             startstack = int(rest[25])
                                         except (ValueError, IndexError):
                                             pass
+                                    if len(rest) >= 27:
+                                        try:
+                                            kstkesp = int(rest[26])
+                                        except (ValueError, IndexError):
+                                            pass
+                                    if len(rest) >= 37:
+                                        try:
+                                            cpu_id = int(rest[36])
+                                        except (ValueError, IndexError):
+                                            pass
+                                    if len(rest) >= 39:
+                                        try:
+                                            rt_priority = int(rest[37])
+                                            pol_num = int(rest[38])
+                                            sched_policy = sched_policy_names.get(pol_num, f"POLICY_{pol_num}")
+                                        except (ValueError, IndexError):
+                                            pass
                         except Exception:
                             pass
 
-                    # Determine stack range
+                    cpus_allowed_list = ""
+                    numa_nodes_list = ""
+                    voluntary_cs = 0
+                    nonvoluntary_cs = 0
+                    status_file = os.path.join(task_dir, tid_entry, "status")
+                    if os.path.exists(status_file):
+                        try:
+                            with open(status_file, "r", encoding="utf-8", errors="replace") as stf:
+                                for sline in stf:
+                                    if sline.startswith("Cpus_allowed_list:"):
+                                        cpus_allowed_list = sline.split(":", 1)[1].strip()
+                                    elif sline.startswith("Mems_allowed_list:"):
+                                        numa_nodes_list = sline.split(":", 1)[1].strip()
+                                    elif sline.startswith("voluntary_ctxt_switches:"):
+                                        try:
+                                            voluntary_cs = int(sline.split(":", 1)[1].strip())
+                                        except ValueError:
+                                            pass
+                                    elif sline.startswith("nonvoluntary_ctxt_switches:"):
+                                        try:
+                                            nonvoluntary_cs = int(sline.split(":", 1)[1].strip())
+                                        except ValueError:
+                                            pass
+                        except Exception:
+                            pass
+
+                    pinned_cpus = _parse_cpulist(cpus_allowed_list)
+                    if not pinned_cpus and hasattr(os, "sched_getaffinity"):
+                        try:
+                            pinned_cpus = sorted(os.sched_getaffinity(tid))
+                            if pinned_cpus and not cpus_allowed_list:
+                                cpus_allowed_list = ",".join(str(c) for c in pinned_cpus)
+                        except Exception:
+                            pass
+                    is_single_core_pinned = (len(pinned_cpus) == 1)
+
+                    syscall_sp = 0
+                    is_running_user_space = (state == "R")
+                    syscall_file = os.path.join(task_dir, tid_entry, "syscall")
+                    if os.path.exists(syscall_file):
+                        try:
+                            with open(syscall_file, "r", encoding="utf-8", errors="replace") as syf:
+                                sy_raw = syf.read().strip()
+                                if sy_raw.startswith("running"):
+                                    is_running_user_space = True
+                                else:
+                                    sy_parts = sy_raw.split()
+                                    if len(sy_parts) >= 2 and sy_parts[-2].startswith("0x"):
+                                        syscall_sp = int(sy_parts[-2], 16)
+                        except Exception:
+                            pass
+
+                    sp_int = syscall_sp or kstkesp
+
                     stack_info: Dict[str, Any] = {"status": "UNAVAILABLE", "reason": "Thread stack mapping not identifiable in proc maps"}
                     matched_map = None
-                    if tid == pid:
-                        # Main thread stack
+                    if sp_int > 0:
+                        for m in maps:
+                            if m["start_int"] <= sp_int < m["end_int"]:
+                                matched_map = m
+                                break
+                    if not matched_map and tid == pid:
                         for m in stack_maps:
                             if m.get("pathname") == "[stack]":
                                 matched_map = m
@@ -268,7 +407,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                             if m.get("pathname") == f"[stack:{tid}]":
                                 matched_map = m
                                 break
-                    if not matched_map and startstack > 0:
+                    if not matched_map and tid == pid and startstack > 0:
                         for m in maps:
                             if m["start_int"] <= startstack < m["end_int"]:
                                 matched_map = m
@@ -283,18 +422,95 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                             "end_int": matched_map["end_int"],
                             "size": matched_map["size"],
                             "permissions": matched_map["permissions"],
+                            "sp": f"0x{sp_int:x}" if sp_int > 0 else None,
+                            "sp_int": sp_int if sp_int > 0 else None,
+                            "tcb_address": None,
+                            "tcb_address_int": None,
                         }
 
                     threads.append({
                         "tid": tid,
                         "name": comm,
                         "state": state,
+                        "cpu_id": cpu_id,
+                        "cpus_allowed_list": cpus_allowed_list,
+                        "pinned_cpus": pinned_cpus,
+                        "is_single_core_pinned": is_single_core_pinned,
+                        "is_kernel_isolated_core": bool(cpu_id is not None and cpu_id in kernel_isolated),
+                        "numa_nodes_list": numa_nodes_list,
+                        "sched_policy": sched_policy,
+                        "rt_priority": rt_priority,
+                        "utime_ticks": utime_ticks,
+                        "stime_ticks": stime_ticks,
+                        "voluntary_ctxt_switches": voluntary_cs,
+                        "nonvoluntary_ctxt_switches": nonvoluntary_cs,
+                        "is_running_user_space": is_running_user_space,
                         "stack_info": stack_info,
                         "local_variables": {
                             "status": "UNSUPPORTED",
                             "reason": "Stack frame inspection requires an active debugger backend (GDB/ptrace frame unwind).",
                         },
                     })
+
+            # Resolve stack_info and TCB address for pure user-space poll-mode threads (e.g. DPDK lcores where sp_int == 0)
+            unresolved_threads = [t for t in threads if t["stack_info"].get("status") != "AVAILABLE" or t["stack_info"].get("tcb_address") is None]
+            if unresolved_threads and self._memory_reader is None:
+                target_tids = {t["tid"]: t for t in threads}
+                for m in maps:
+                    if not m.get("is_readable") or not m.get("is_writable"):
+                        continue
+                    pathname = (m.get("pathname") or "").strip()
+                    if pathname and not pathname.startswith("[stack") and not m.get("is_hugepage"):
+                        continue
+                    vma_s = int(m["start_int"])
+                    vma_e = int(m["end_int"])
+                    if (vma_e - vma_s) < 4096:
+                        continue
+                    top_from = max(vma_s, vma_e - 24576)
+                    raw_top, r_st, _ = self.read_memory(pid, top_from, vma_e - top_from)
+                    if r_st != "OBSERVED" or not raw_top or len(raw_top) < 64:
+                        continue
+                    limit = len(raw_top) - 24
+                    for off in range(0, limit, 8):
+                        cand_tcb = top_from + off
+                        w0 = _struct.unpack_from("<Q", raw_top, off)[0]
+                        if w0 != cand_tcb:
+                            continue
+                        w2 = _struct.unpack_from("<Q", raw_top, off + 16)[0]
+                        if w2 != cand_tcb:
+                            continue
+                        tcb_slice = raw_top[off : off + 1536]
+                        matched_tid = None
+                        if len(tcb_slice) >= 0x2d4:
+                            v2d0 = _struct.unpack_from("<i", tcb_slice, 0x2d0)[0]
+                            if v2d0 in target_tids:
+                                matched_tid = v2d0
+                        if matched_tid is None:
+                            for toff in range(0x40, min(len(tcb_slice) - 4, 0x580), 4):
+                                vtid = _struct.unpack_from("<i", tcb_slice, toff)[0]
+                                if vtid in target_tids and vtid != pid:
+                                    matched_tid = vtid
+                                    break
+                        if matched_tid is not None:
+                            th_obj = target_tids[matched_tid]
+                            s_inf = th_obj["stack_info"]
+                            if s_inf.get("status") != "AVAILABLE":
+                                th_obj["stack_info"] = {
+                                    "status": "AVAILABLE",
+                                    "start": m["start"],
+                                    "end": m["end"],
+                                    "start_int": vma_s,
+                                    "end_int": vma_e,
+                                    "size": m["size"],
+                                    "permissions": m["permissions"],
+                                    "sp": None,
+                                    "sp_int": None,
+                                    "tcb_address": f"0x{cand_tcb:x}",
+                                    "tcb_address_int": cand_tcb,
+                                }
+                            else:
+                                s_inf["tcb_address"] = f"0x{cand_tcb:x}"
+                                s_inf["tcb_address_int"] = cand_tcb
         except Exception:
             pass
 

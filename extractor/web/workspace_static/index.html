@@ -1,0 +1,3160 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>dynamicState — Conversational Process Trace Workspace</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: #f8fafc;
+      color: #0f172a;
+      margin: 0;
+      padding: 0;
+      -webkit-font-smoothing: antialiased;
+    }
+    .mono {
+      font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 3px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+    @keyframes slideInCard {
+      from {
+        opacity: 0;
+        transform: translateY(-6px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    .trace-card-anim {
+      animation: slideInCard 0.2s ease-out forwards;
+    }
+    .slot-tile {
+      transition: all 0.14s ease;
+    }
+    .slot-tile:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 10px rgba(15, 23, 42, 0.06);
+    }
+    .slot-tile-selected {
+      outline: 2px solid #2563eb;
+      outline-offset: 1px;
+    }
+  </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden bg-slate-50 text-slate-900">
+
+  <!-- Top Minimalist Target Connection & Workspace Bar -->
+  <header class="border-b border-slate-200 bg-white/95 backdrop-blur px-4 py-2.5 shrink-0">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <!-- Brand & Mode -->
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-xl bg-slate-900 flex items-center justify-center shadow-xs">
+          <span class="font-bold text-white text-xs mono">dS</span>
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-sm font-semibold tracking-tight text-slate-900">dynamicState Workspace</h1>
+            <span class="px-2 py-0.5 text-[11px] font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 mono">0.00ms Zero-Stop</span>
+            <span id="badge-conn-mode" class="px-2 py-0.5 text-[11px] font-medium rounded-full bg-blue-50 text-blue-700 border border-blue-200 mono">READY</span>
+          </div>
+          <p class="text-[11px] text-slate-500">대화형 프로세스 메모리 분석 & 실시간 트레이스 시각화 워크스페이스</p>
+        </div>
+      </div>
+
+      <!-- Compact Target Bar -->
+      <div class="flex flex-wrap items-center gap-2 flex-1 max-w-4xl justify-end">
+        <select id="select-target-mode" class="bg-slate-50 hover:bg-slate-100/80 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 text-slate-700 font-medium focus:outline-none focus:border-blue-500 focus:bg-white transition">
+          <option value="local">🖥 Local Process</option>
+          <option value="ssh">🌐 Remote SSH</option>
+        </select>
+
+        <!-- Remote SSH Fields (Collapsible) -->
+        <div id="ssh-fields-wrap" class="hidden items-center gap-1.5">
+          <input id="input-remote-host" type="text" placeholder="SSH Host (e.g. 192.168.1.50)" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 w-36 text-slate-800 placeholder-slate-400 mono focus:outline-none focus:border-blue-500 focus:bg-white transition" />
+          <input id="input-ssh-user" type="text" placeholder="User (root)" value="root" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2 py-1.5 w-20 text-slate-800 placeholder-slate-400 mono focus:outline-none focus:border-blue-500 focus:bg-white transition" />
+        </div>
+
+        <div class="flex items-center gap-1">
+          <input id="input-target-pid" type="text" placeholder="PID 또는 프로세스명" value="8842" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 w-28 text-slate-800 placeholder-slate-400 mono focus:outline-none focus:border-blue-500 focus:bg-white transition" />
+          <button id="btn-find-proc" type="button" title="실행 중인 프로세스 검색" class="px-2 py-1.5 text-xs rounded-lg bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 transition">🔍</button>
+        </div>
+
+        <input id="input-companion-elf" type="text" placeholder="Nostrip DWARF ELF 경로 (예: /build/media_daemon.debug)" value="/build/pool_target_nostrip" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 w-60 sm:w-72 text-slate-800 placeholder-slate-400 mono focus:outline-none focus:border-blue-500 focus:bg-white transition" />
+
+        <button id="btn-connect-target" type="button" class="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-900 hover:bg-slate-800 text-white shadow-xs transition flex items-center gap-1.5">
+          <span>⚡ 프로세스 연결</span>
+        </button>
+
+        <button id="btn-auto-triage" type="button" title="메모리 오염·데드락·풀 고갈·무한루프 원클릭 종합 진단(Auto-Triage)" class="px-2.5 py-1.5 text-xs font-semibold rounded-lg bg-blue-600 hover:bg-blue-500 text-white shadow-xs transition">
+          🩺 원클릭 종합 진단
+        </button>
+
+        <button id="btn-load-demo" type="button" title="샘플 프로세스(gpMem 32슬롯 + 멀티스레드) 시뮬레이션 로드" class="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition">
+          🧪 데모 로드
+        </button>
+      </div>
+    </div>
+
+    <!-- Process Discovery Dropdown Drawer -->
+    <div id="proc-discovery-drawer" class="hidden mt-2 pt-2 border-t border-slate-100 text-xs">
+      <div class="flex items-center justify-between mb-1.5">
+        <span class="text-slate-500 font-medium">발견된 실행 중 프로세스 (클릭하여 선택):</span>
+        <button id="btn-close-proc-drawer" type="button" class="text-slate-400 hover:text-slate-700">✕ 닫기</button>
+      </div>
+      <div id="proc-discovery-list" class="flex flex-wrap gap-1.5"></div>
+    </div>
+  </header>
+
+  <!-- Main Split-Screen Workspace: Left = Gemini-Style Clean Chat, Right = Live Process Trace Workspace -->
+  <main class="flex-1 flex flex-col lg:flex-row overflow-hidden">
+
+    <!-- LEFT PANE: Minimalist White Conversational Assistant -->
+    <section class="w-full lg:w-[42%] xl:w-[39%] border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col bg-white h-1/2 lg:h-full">
+      <!-- Chat Messages Stream -->
+      <div id="chat-messages" class="flex-1 overflow-y-auto p-5 space-y-4">
+        <!-- Welcome Message -->
+        <div class="flex gap-3">
+          <div class="w-7 h-7 rounded-full bg-slate-900 flex items-center justify-center shrink-0 text-[11px] font-semibold text-white mono">AI</div>
+          <div class="bg-slate-50 border border-slate-200/90 rounded-2xl rounded-tl-sm px-4 py-3.5 text-xs leading-relaxed text-slate-700 space-y-2 max-w-[92%]">
+            <div class="font-semibold text-slate-900">안녕하세요! dynamicState 트레이스 어시스턴트입니다.</div>
+            <p class="text-slate-600">
+              상단에서 <strong>PID</strong>와 <strong>Nostrip ELF 경로</strong>를 연결하거나, 아래 대화창에 궁금한 메모리 상태나 심볼을 자연어로 질문해 보세요.
+              프로세스 정보가 확인될 때마다 오른쪽 <strong>Process Trace Workspace</strong>에 시각화 카드가 추가됩니다.
+            </p>
+            <div class="pt-1 flex flex-wrap gap-1.5">
+              <span class="px-2 py-0.5 rounded-md bg-white border border-slate-200 text-slate-600 mono text-[11px]">예시 1: memory pool *gpMem의 할당 현황을 맵 차트로 그려주세요</span>
+              <span class="px-2 py-0.5 rounded-md bg-white border border-slate-200 text-slate-600 mono text-[11px]">예시 2: gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Quick Prompt Chips & Input Box -->
+      <div class="p-3.5 border-t border-slate-100 bg-white space-y-2.5 shrink-0">
+        <!-- Prompt Chips -->
+        <div class="flex items-center gap-1.5 overflow-x-auto pb-1">
+          <button type="button" data-prompt="지금 프로세스가 왜 멈췄고 어디가 문제인지 증상을 종합 판단해서 분석해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-white shadow-2xs transition">
+            🧠 왜 멈췄지? (자율 종합 조사)
+          </button>
+          <button type="button" data-prompt="무정지 통계적 샘플링으로 CPU 점유율과 콜스택 핫스팟(Flame) 함수를 프로파일링해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-rose-600 hover:bg-rose-500 text-white shadow-2xs transition">
+            🔥 CPU/콜스택 핫스팟 프로파일러
+          </button>
+          <button type="button" data-prompt="버퍼 풀과 워커 스레드 관련된 심볼을 퍼지 의미 매칭으로 알아서 찾아 값을 보여주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 transition">
+            🪄 자연어 퍼지 심볼 매칭
+          </button>
+          <button type="button" data-prompt="DPDK 격리 코어(isolcpus)에서 동작하는 dedicated lcore PMD 스레드와 rte_ring/스핀락 상태를 무정지로 진단해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow-2xs transition">
+            ⚡ DPDK 격리 코어(lcore) & PMD 링 진단
+          </button>
+          <button type="button" data-prompt="활성 스레드 각각의 TCB를 추적해 스레드별 TLS(__thread / thread_local) 변수 값을 무정지로 해독해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-cyan-600 hover:bg-cyan-500 text-white shadow-2xs transition">
+            🧵 스레드별 TLS(thread_local) 해독
+          </button>
+          <button type="button" data-prompt="멀티스레드 환경에서 공유 구조체와 카운터의 무정지 동시성 이중 읽기(Seqlock) 원자성 및 Torn Read 여부를 검증해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 transition">
+            ⚖️ 동시성 이중 읽기(Seqlock) 검증
+          </button>
+          <button type="button" data-prompt="방금 잠깐 튀었는데 타임머신 플라이트 레코더 링버퍼로 스파이크 전후 프레임을 복원해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-violet-600 hover:bg-violet-500 text-white shadow-2xs transition">
+            ⏪ 타임머신 플라이트 레코더
+          </button>
+          <button type="button" data-prompt="평소 정상 Baseline 대비 지금 어떤 행동 편차(Behavioral Drift)가 발생했는지 비교해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-teal-50 hover:bg-teal-100 text-teal-900 border border-teal-200 transition">
+            📉 행동 편차(Drift) 경보
+          </button>
+          <button type="button" data-prompt="스레드·뮤텍스·메모리 풀·IPC 간 인과 종속성 그래프(Dependency Graph)를 그려주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 transition">
+            🕸️ 인과 종속성 그래프
+          </button>
+          <button type="button" data-prompt="문제가 발생한 소스 코드 줄과 실시간 메모리 변수 값을 인라인으로 매핑해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 transition">
+            📝 소스 코드 & 실시간 변수 매핑
+          </button>
+          <button type="button" data-prompt="프로세스 전체 상태를 원클릭 종합 진단(Auto-Triage)해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-2xs transition">
+            🩺 원클릭 종합 진단
+          </button>
+          <button type="button" data-prompt="프로세스 연결 및 X-Ray 블루프린트를 확인해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 transition">
+            🧭 X-Ray 블루프린트
+          </button>
+          <button type="button" data-prompt="활성 스레드 스택 프레임의 함수 인자(Parameter)와 지역변수(Local) 값을 해독해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-sky-50/80 hover:bg-sky-100 text-sky-800 border border-sky-200 transition">
+            📦 스택 지역변수/인자 해독
+          </button>
+          <button type="button" data-prompt="memory pool *gpMem의 메모리 buffer개의 할당 현황을 맵 차트로 그려주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-50/70 hover:bg-emerald-100/80 text-emerald-800 border border-emerald-200 transition">
+            🟩 *gpMem 할당 현황 맵 차트
+          </button>
+          <button type="button" data-prompt="gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-blue-50/70 hover:bg-blue-100/80 text-blue-800 border border-blue-200 transition">
+            🧵 gpMem[9] 사용 중인 스레드 찾기
+          </button>
+          <button type="button" data-prompt="gpMem->buffers[14]를 사용 중인 쓰레드를 찾아주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-violet-50/70 hover:bg-violet-100/80 text-violet-800 border border-violet-200 transition">
+            🔎 gpMem[14] 워커 테이블 역추적
+          </button>
+          <button type="button" data-prompt="gpMem->active_buffers >= 5 조건이 참이 되는 순간을 감시해서 포착해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-rose-50/70 hover:bg-rose-100/80 text-rose-800 border border-rose-200 transition">
+            🎯 조건부 트리거 감시
+          </button>
+          <button type="button" data-prompt="전역 연결 리스트 g_task_list의 next 체인을 끝까지 순회하며 사이클 여부를 확인해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-cyan-50/70 hover:bg-cyan-100/80 text-cyan-800 border border-cyan-200 transition">
+            🔗 연결 리스트 순회
+          </button>
+          <button type="button" data-prompt="활성 스레드의 콜스택과 뮤텍스 락/데드락 보유 현황을 분석해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-indigo-50/70 hover:bg-indigo-100/80 text-indigo-800 border border-indigo-200 transition">
+            🥞 콜스택 & 뮤텍스 분석
+          </button>
+          <button type="button" data-prompt="전역 구조체와 메모리 풀의 포인터 무결성 및 메모리 오염 여부를 감사(Audit)해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-50/70 hover:bg-amber-100/80 text-amber-800 border border-amber-200 transition">
+            🛡️ 메모리 무결성 감사
+          </button>
+          <button type="button" data-prompt="g_session 콜백 함수 포인터와 C++ 객체의 vtable 심볼을 역해석해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-fuchsia-50/70 hover:bg-fuchsia-100/80 text-fuchsia-800 border border-fuchsia-200 transition">
+            🧬 함수 포인터/vtable 해독
+          </button>
+          <button type="button" data-prompt="멀티 프로세스 공유 메모리(SHM) 프로듀서/컨슈머 파이프라인 병목을 진단해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-teal-50/70 hover:bg-teal-100/80 text-teal-800 border border-teal-200 transition">
+            🔄 IPC 파이프라인 병목 진단
+          </button>
+          <button type="button" data-prompt="힙(Heap) 영역의 C++ 다형성 객체 현황과 미참조 메모리 누수(Leak) 의심 인스턴스를 스캔해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-orange-50/70 hover:bg-orange-100/80 text-orange-800 border border-orange-200 transition">
+            🧱 힙(Heap) 객체 & 누수 스캔
+          </button>
+          <button type="button" data-prompt="gpMem.buffers[2].seq 와 buffers[9].owner_tid 값을 관대 표현식 자동 보정(Forgiving Coercer)으로 평가해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-cyan-50/70 hover:bg-cyan-100/80 text-cyan-800 border border-cyan-200 transition">
+            🪄 관대 표현식(.↔-> / 루트 생략) 자동 보정
+          </button>
+          <button type="button" data-prompt="대규모 메모리 풀과 다중 진단을 토큰 예산 압축(Smart Compactor) 및 1-Call 배치 매크로로 실행해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-50/70 hover:bg-emerald-100/80 text-emerald-800 border border-emerald-200 transition">
+            📦 토큰 예산 압축 & 1-Call 배치 매크로
+          </button>
+          <button type="button" data-prompt="가설 검증(Hypothesis Verifier)으로 gpMem.active_buffers >= 3 및 buffers[9].in_use == 1 조건을 검증하고 인시던트 리포트를 생성해 주세요" class="quick-prompt-chip shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium bg-indigo-50/70 hover:bg-indigo-100/80 text-indigo-800 border border-indigo-200 transition">
+            🧪 선언적 가설 검증 & 리포트 생성
+          </button>
+        </div>
+
+        <!-- Input Form -->
+        <form id="chat-form" class="flex items-end gap-2">
+          <div class="flex-1 relative">
+            <textarea
+              id="chat-input"
+              rows="2"
+              placeholder="프로세스 상태 질문 또는 C/C++ 심볼 표현식을 입력하세요 (예: *gpMem 맵 차트 그려줘, gpMem 9번 인덱스 사용 중인 쓰레드 찾아줘)..."
+              class="w-full bg-slate-50 border border-slate-200 rounded-2xl px-3.5 py-2.5 text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:border-blue-500 focus:bg-white focus:ring-2 focus:ring-blue-500/10 resize-none transition"
+            ></textarea>
+          </div>
+          <button
+            id="btn-send-chat"
+            type="submit"
+            class="px-4 py-2.5 rounded-2xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-xs transition shrink-0 h-[56px] flex items-center gap-1.5"
+          >
+            <span>전송</span>
+            <span>↵</span>
+          </button>
+        </form>
+      </div>
+    </section>
+
+    <!-- RIGHT PANE: Progressive Process Trace & Visualization Workspace -->
+    <section class="flex-1 flex flex-col bg-slate-50/80 h-1/2 lg:h-full overflow-hidden">
+      <!-- Trace Workspace Header & Process Status Strip -->
+      <div class="border-b border-slate-200 bg-white px-5 py-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div class="flex items-center gap-3">
+          <div class="flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-700">Process Trace Workspace</h2>
+          </div>
+          <span id="trace-count-badge" class="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 border border-slate-200 text-[11px] font-medium mono">0 cards</span>
+          <div id="process-telemetry-strip" class="hidden sm:flex items-center gap-2 text-[11px] text-slate-500 mono border-l border-slate-200 pl-3">
+            <span>PID: <strong id="tel-pid" class="text-slate-900">-</strong></span>
+            <span>•</span>
+            <span>BuildID: <strong id="tel-buildid" class="text-emerald-700">-</strong></span>
+            <span>•</span>
+            <span>Bias: <strong id="tel-bias" class="text-blue-700">-</strong></span>
+            <span>•</span>
+            <span>Threads: <strong id="tel-threads" class="text-slate-900">-</strong></span>
+          </div>
+        </div>
+
+        <!-- Workspace Filter Tabs & Actions -->
+        <div class="flex items-center gap-1.5">
+          <div class="flex bg-slate-100 border border-slate-200/80 rounded-lg p-0.5 text-[11px]">
+            <button type="button" data-filter="ALL" class="ws-filter-btn px-2.5 py-1 rounded-md bg-white text-slate-900 shadow-2xs font-medium">전체</button>
+            <button type="button" data-filter="POOL_MAP" class="ws-filter-btn px-2.5 py-1 rounded-md text-slate-600 hover:text-slate-900">풀 맵</button>
+            <button type="button" data-filter="THREAD_OWNER" class="ws-filter-btn px-2.5 py-1 rounded-md text-slate-600 hover:text-slate-900">스레드 추적</button>
+            <button type="button" data-filter="XRAY_BLUEPRINT" class="ws-filter-btn px-2.5 py-1 rounded-md text-slate-600 hover:text-slate-900">블루프린트</button>
+            <button type="button" data-filter="SYMBOL_EVAL" class="ws-filter-btn px-2.5 py-1 rounded-md text-slate-600 hover:text-slate-900">심볼/Diff</button>
+          </div>
+          <button id="btn-export-report" type="button" title="현재 쌓인 트레이스 카드를 마크다운 리포트로 내보내기" class="px-2.5 py-1 text-[11px] font-medium rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition">
+            📄 리포트 저장
+          </button>
+          <button id="btn-clear-workspace" type="button" title="고정되지 않은 트레이스 카드 비우기" class="px-2.5 py-1 text-[11px] font-medium rounded-lg bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 transition">
+            비우기
+          </button>
+        </div>
+      </div>
+
+      <!-- Dynamic Trace Visualization Cards Container -->
+      <div id="workspace-cards-container" class="flex-1 overflow-y-auto p-5 space-y-4">
+        <!-- Empty State (Shown before any process trace is added) -->
+        <div id="workspace-empty-state" class="h-full flex flex-col items-center justify-center text-center p-8 border border-dashed border-slate-200 rounded-2xl bg-white">
+          <div class="w-11 h-11 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center text-lg mb-3">
+            📊
+          </div>
+          <h3 class="text-sm font-semibold text-slate-800 mb-1">확인된 프로세스 트레이스 정보가 여기에 실시간으로 쌓입니다</h3>
+          <p class="text-xs text-slate-500 max-w-md mb-4 leading-relaxed">
+            왼쪽 대화창에서 질문을 입력하거나 상단의 <strong>⚡ 프로세스 연결</strong>을 누르면,
+            메모리 풀 할당 맵 차트·점유 스레드 역추적·심볼 구조체 카드가 깔끔하게 추가됩니다.
+          </p>
+          <div class="flex flex-wrap justify-center gap-2">
+            <button type="button" id="btn-empty-pool-demo" class="px-3.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium shadow-xs transition">
+              🟩 *gpMem 메모리 풀 맵 바로 그리기
+            </button>
+            <button type="button" id="btn-empty-owner-demo" class="px-3.5 py-1.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 text-xs font-medium transition">
+              🧵 gpMem[9] 사용 중인 스레드 바로 찾기
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Toast Notification -->
+  <div id="ws-toast" class="fixed bottom-4 right-4 hidden z-50 px-3.5 py-2 rounded-xl bg-slate-900 text-xs text-white shadow-lg"></div>
+
+  <script>
+    // =========================================================================
+    // Application State & Built-In Live Simulation Fallback (for Canvas / Demo)
+    // =========================================================================
+    const wsState = {
+      mode: 'local',
+      pid: 8842,
+      companionElf: '/build/pool_target_nostrip',
+      remoteHost: '',
+      sshUser: 'root',
+      isDemoFallback: false,
+      activeFilter: 'ALL',
+      seqCounter: 0,
+      cards: [], // [{ id, seq, type, title, timestamp, pinned, data, selectedSlotIdx }]
+    };
+
+    function showToast(msg) {
+      const el = document.getElementById('ws-toast');
+      if (!el) return;
+      el.textContent = msg;
+      el.classList.remove('hidden');
+      clearTimeout(wsState._toastTimer);
+      wsState._toastTimer = setTimeout(() => el.classList.add('hidden'), 3000);
+    }
+
+    function escapeHtml(str) {
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    // Built-in realistic target dataset used when running in standalone Canvas preview
+    // or when the user clicks "데모 로드"
+    function buildSimulatedPoolData(expr = '*gpMem') {
+      const allocatedSet = new Set([0, 2, 5, 9, 14, 21, 30]);
+      const ownerTidMap = { 0: 8842, 2: 8847, 5: 8842, 9: 0, 14: 0, 21: 8851, 30: 8847 };
+      const slots = [];
+      let bitmap = '';
+      const baseAddr = 0x55a04020;
+      const elemSize = 24;
+
+      for (let i = 0; i < 32; i++) {
+        const isAlloc = allocatedSet.has(i);
+        bitmap += isAlloc ? '1' : '0';
+        const slotAddr = baseAddr + i * elemSize;
+        const tidVal = ownerTidMap[i] || 0;
+        slots.push({
+          index: i,
+          expression: `gpMem->buffers[${i}]`,
+          runtime_address: '0x' + slotAddr.toString(16),
+          runtime_address_int: slotAddr,
+          size: elemSize,
+          status: isAlloc ? 'IN_USE' : 'FREE',
+          is_allocated: isAlloc,
+          owner_hint: tidVal > 0 ? tidVal : (i === 9 ? 'stack:buf9_worker' : (i === 14 ? 'g_workers[1]' : null)),
+          fields: {
+            in_use: isAlloc ? 1 : 0,
+            size: isAlloc ? (i + 1) * 128 : 0,
+            owner_tid: tidVal,
+            seq: isAlloc ? 100 + i : 0,
+            data_ptr: isAlloc ? '0x' + (0x7f8a001000 + i * 0x400).toString(16) : '0x0',
+          },
+        });
+      }
+
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || 'localhost',
+        stop_duration_ms: 0.0,
+        evaluation_latency_us: 142.5,
+        base_expression: expr,
+        resolved_array_expression: 'gpMem->buffers',
+        array_base_address: '0x55a04020',
+        element_type: 'BufferSlot',
+        element_size: elemSize,
+        element_decl_location: 'pool_target.cpp:11',
+        status_detection_basis: 'field:in_use',
+        pool_metadata: { total_buffers: 32, active_buffers: 7 },
+        pool_summary: {
+          total_slots: 32,
+          allocated_count: 7,
+          free_count: 25,
+          utilization_pct: 21.88,
+          allocated_indices: [0, 2, 5, 9, 14, 21, 30],
+          free_indices: [1, 3, 4, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 31],
+        },
+        allocation_bitmap: bitmap,
+        slots: slots,
+        llm_next_step_hint: "할당된 슬롯(예: 9번 인덱스)을 클릭하거나 'gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요'라고 질문하면 스레드 스택 및 워커 테이블을 역추적합니다.",
+      };
+    }
+
+    function buildSimulatedOwnerData(targetExpr = 'gpMem->buffers[9]') {
+      const mIdx = targetExpr.match(/\[(\d+)\]/);
+      const slotIdx = mIdx ? parseInt(mIdx[1], 10) : 9;
+      const slotAddr = 0x55a04020 + slotIdx * 24;
+      const slotHex = '0x' + slotAddr.toString(16);
+      const dataHex = '0x' + (0x7f8a001000 + slotIdx * 0x400).toString(16);
+
+      let matchedThreads = [];
+      let globalRefs = [];
+
+      if (slotIdx === 9) {
+        matchedThreads = [
+          {
+            tid: 8849,
+            thread_name: 'buf9_worker',
+            thread_state: 'S',
+            confidence: 'HIGH',
+            evidence: [
+              {
+                evidence_kind: 'THREAD_STACK_POINTER_REFERENCE',
+                confidence: 'HIGH',
+                detail: `Thread 8849 (buf9_worker) holds pointer to &(${targetExpr}) (${slotHex}) as a local variable on its active stack frame at 0x7f9c20ff1dc8`,
+                stack_reference_address: '0x7f9c20ff1dc8',
+                points_to: slotHex,
+                points_to_label: `&(${targetExpr})`,
+              },
+            ],
+          },
+        ];
+      } else if (slotIdx === 14) {
+        matchedThreads = [
+          {
+            tid: 8849,
+            thread_name: 'buf9_worker',
+            thread_state: 'S',
+            confidence: 'HIGH',
+            evidence: [
+              {
+                evidence_kind: 'GLOBAL_WORKER_TABLE_POINTER',
+                confidence: 'HIGH',
+                detail: `Global struct 'g_workers[1].active_buf' holds pointer to &(${targetExpr}) (${slotHex}) and is bound to TID 8849 (buf9_worker)`,
+                symbol: 'g_workers[1].active_buf',
+                points_to: slotHex,
+              },
+            ],
+          },
+        ];
+        globalRefs = [
+          {
+            symbol: 'g_workers[1].active_buf',
+            module: 'pool_target_nostrip',
+            reference_address: '0x55a04410',
+            points_to: `${slotHex} (&(${targetExpr}))`,
+            associated_tid: 8849,
+          },
+        ];
+      } else if (slotIdx === 0 || slotIdx === 5) {
+        matchedThreads = [
+          {
+            tid: 8842,
+            thread_name: 'pool_target_nos',
+            thread_state: 'S',
+            confidence: 'HIGH',
+            evidence: [
+              {
+                evidence_kind: 'STRUCT_OWNER_TID_FIELD',
+                confidence: 'HIGH',
+                detail: `Target field 'owner_tid' directly stores active thread TID 8842 (pool_target_nos)`,
+                field: 'owner_tid',
+                value: 8842,
+              },
+            ],
+          },
+        ];
+      } else if (slotIdx === 2 || slotIdx === 30) {
+        matchedThreads = [
+          {
+            tid: 8847,
+            thread_name: 'io_dispatcher',
+            thread_state: 'S',
+            confidence: 'HIGH',
+            evidence: [
+              {
+                evidence_kind: 'STRUCT_OWNER_TID_FIELD',
+                confidence: 'HIGH',
+                detail: `Target field 'owner_tid' directly stores active thread TID 8847 (io_dispatcher)`,
+                field: 'owner_tid',
+                value: 8847,
+              },
+            ],
+          },
+        ];
+      } else if (slotIdx === 21) {
+        matchedThreads = [
+          {
+            tid: 8851,
+            thread_name: 'telemetry_tx',
+            thread_state: 'S',
+            confidence: 'HIGH',
+            evidence: [
+              {
+                evidence_kind: 'STRUCT_OWNER_TID_FIELD',
+                confidence: 'HIGH',
+                detail: `Target field 'owner_tid' directly stores active thread TID 8851 (telemetry_tx)`,
+                field: 'owner_tid',
+                value: 8851,
+              },
+            ],
+          },
+        ];
+      }
+
+      const isAlloc = [0, 2, 5, 9, 14, 21, 30].includes(slotIdx);
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || 'localhost',
+        stop_duration_ms: 0.0,
+        evaluation_latency_us: 198.4,
+        target_expression: `gpMem->buffers[${slotIdx}]`,
+        target_runtime_address: slotHex,
+        target_size: 24,
+        target_type: 'BufferSlot',
+        target_decl_location: 'pool_target.cpp:11',
+        target_value: {
+          in_use: isAlloc ? 1 : 0,
+          size: isAlloc ? (slotIdx + 1) * 128 : 0,
+          owner_tid: (slotIdx === 0 || slotIdx === 5) ? 8842 : ((slotIdx === 2 || slotIdx === 30) ? 8847 : (slotIdx === 21 ? 8851 : 0)),
+          seq: isAlloc ? 100 + slotIdx : 0,
+          data_ptr: isAlloc ? dataHex : '0x0',
+        },
+        searched_pointer_targets: {
+          [slotHex]: `&(gpMem->buffers[${slotIdx}])`,
+          ...(isAlloc ? { [dataHex]: `(gpMem->buffers[${slotIdx}]).data_ptr` } : {}),
+        },
+        matched_threads_count: matchedThreads.length,
+        matched_threads: matchedThreads,
+        global_references: globalRefs,
+        active_threads_checked: 4,
+        llm_next_step_hint: matchedThreads.length > 0
+          ? `TID ${matchedThreads[0].tid} (${matchedThreads[0].thread_name.trim()}) 스레드가 'gpMem->buffers[${slotIdx}]'(${slotHex})를 점유/참조 중입니다. 소스 코드에서 '${matchedThreads[0].thread_name.trim()}' 진입 함수를 확인하세요.`
+          : `현재 'gpMem->buffers[${slotIdx}]'(${slotHex}) 주소를 보유한 활성 스레드가 없습니다 (미할당 상태이거나 레지스터에만 일시 존재).`,
+      };
+    }
+
+    function buildSimulatedBlueprintData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || 'localhost',
+        stop_duration_ms: 0.0,
+        load_bias: '0x55a00000',
+        build_id: '8f4b2c91e07a4d119302c5b6a8d1e704c92a1103',
+        threads_count: 4,
+        threads: [
+          { tid: 8842, name: 'pool_target_nos', state: 'S', sp: '0x7ffd81a04210' },
+          { tid: 8847, name: 'io_dispatcher', state: 'S', sp: '0x7f9c217f2dc0' },
+          { tid: 8849, name: 'buf9_worker', state: 'S', sp: '0x7f9c20ff1d90' },
+          { tid: 8851, name: 'telemetry_tx', state: 'S', sp: '0x7f9c1fff0e10' },
+        ],
+        categories: {
+          memory_pools_and_buffers: [
+            { name: 'gpMem', type_name: 'MemPool*', runtime_address: '0x55a04010', decl_location: 'pool_target.cpp:32', recommended_pool_expression: '*gpMem' },
+            { name: 'g_pool_storage', type_name: 'MemPool', runtime_address: '0x55a04018', decl_location: 'pool_target.cpp:31', recommended_pool_expression: 'g_pool_storage' },
+          ],
+          thread_and_worker_contexts: [
+            { name: 'g_workers', type_name: 'WorkerContext[4]', runtime_address: '0x55a04400', decl_location: 'pool_target.cpp:33' },
+          ],
+          state_machines_and_flags: [
+            { name: 'g_ready', type_name: 'volatile int', runtime_address: '0x55a04460', decl_location: 'pool_target.cpp:34' },
+          ],
+          counters_and_metrics: [],
+          stl_containers: [],
+        },
+      };
+    }
+
+    function buildSimulatedConditionData(condExpr = "gpMem->active_buffers >= 5") {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        condition_expression: condExpr,
+        triggered: true,
+        samples_taken: 4,
+        poll_interval_ms: 40,
+        elapsed_ms: 124.6,
+        clause_evaluations: [
+          { clause: condExpr, lhs: "gpMem->active_buffers", observed_value: 7, operator: ">=", expected_rhs: 5, matched: true }
+        ],
+        changed: [
+          { path: "gpMem->active_buffers", before: 4, after: 7, delta: 3 },
+          { path: "gpMem->buffers[9].in_use", before: 0, after: 1, delta: 1 }
+        ],
+        llm_next_step_hint: "Condition '" + condExpr + "' TRIGGERED after 124.6ms (4 zero-stop samples). 2 field(s) mutated during the watch window."
+      };
+    }
+
+    function buildSimulatedLinkedListData(headExpr = "g_task_list") {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        head_expression: headExpr,
+        node_type: "TaskNode",
+        node_size: 32,
+        next_field: "next",
+        nodes_count: 4,
+        termination_reason: "NULL_TERMINATED",
+        cycle_detected: false,
+        corrupted_link_detected: false,
+        ascii_chain_summary: "[#0 @ 0x55a08100] ➔ [#1 @ 0x55a08140] ➔ [#2 @ 0x55a08180] ➔ [#3 @ 0x55a081c0] ➔ NULL (0x0)",
+        nodes: [
+          { index: 0, address: "0x55a08100", next_address: "0x55a08140", fields: { task_id: 101, prio: 1, slot_idx: 9, next: "0x55a08140" } },
+          { index: 1, address: "0x55a08140", next_address: "0x55a08180", fields: { task_id: 102, prio: 2, slot_idx: 14, next: "0x55a08180" } },
+          { index: 2, address: "0x55a08180", next_address: "0x55a081c0", fields: { task_id: 103, prio: 1, slot_idx: 2, next: "0x55a081c0" } },
+          { index: 3, address: "0x55a081c0", next_address: "0x0", fields: { task_id: 104, prio: 3, slot_idx: 30, next: "0x0" } }
+        ],
+        llm_next_step_hint: "Successfully traversed 4 node(s) in '" + headExpr + "' (NULL_TERMINATED) with 0.00ms stop."
+      };
+    }
+
+    function buildSimulatedCallstackData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        threads_inspected: 3,
+        locks_inspected: 1,
+        deadlock_detected: false,
+        locks: [
+          { name: "g_pool_mutex", runtime_address: "0x55a04480", type_name: "pthread_mutex_t", is_locked: true, owner_tid: 8849, owner_thread_name: "buf9_worker", waiting_tids: [8847] }
+        ],
+        threads: [
+          {
+            tid: 8849, name: "buf9_worker", state: "S", syscall: "nanosleep", waiting_on_lock: null,
+            callstack: [
+              { frame_index: 0, function_name: "hold_slot_on_stack", symbol_plus_offset: "hold_slot_on_stack+0x24", source_location: "pool_target.cpp:62", runtime_pc: "0x55a011c4" },
+              { frame_index: 1, function_name: "worker_fn", symbol_plus_offset: "worker_fn+0x48", source_location: "pool_target.cpp:72", runtime_pc: "0x55a01218" }
+            ]
+          },
+          {
+            tid: 8847, name: "io_dispatcher", state: "S", syscall: "futex",
+            waiting_on_lock: { lock_name: "g_pool_mutex", lock_address: "0x55a04480", held_by_tid: 8849, held_by_thread_name: "buf9_worker" },
+            callstack: [
+              { frame_index: 0, function_name: "acquire_pool_slot", symbol_plus_offset: "acquire_pool_slot+0x1e", source_location: "pool_target.cpp:48", runtime_pc: "0x55a0114e" },
+              { frame_index: 1, function_name: "io_dispatch_loop", symbol_plus_offset: "io_dispatch_loop+0x60", source_location: "pool_target.cpp:85", runtime_pc: "0x55a01290" }
+            ]
+          }
+        ],
+        llm_next_step_hint: "Lock contention active: TID 8847 (io_dispatcher) is blocked in futex() waiting on g_pool_mutex held by TID 8849 (buf9_worker)."
+      };
+    }
+
+    function buildSimulatedAuditData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        health_status: "ANOMALIES_DETECTED",
+        checked_symbols_count: 8,
+        anomalies_count: 2,
+        anomalies: [
+          {
+            anomaly_kind: "DANGLING_OR_UNMAPPED_POINTER",
+            severity: "HIGH",
+            expression: "gpMem->buffers[21].data_ptr",
+            runtime_address: "0x55a04228",
+            observed_value: "0xdeadbeef00",
+            expected_constraint: "NULL (0x0) or address within mapped readable VMA",
+            detail: "Pointer field 'gpMem->buffers[21].data_ptr' holds unmapped/invalid address 0xdeadbeef00"
+          },
+          {
+            anomaly_kind: "CORRUPTED_BOOL_VALUE",
+            severity: "HIGH",
+            expression: "g_workers[2].is_healthy",
+            runtime_address: "0x55a04434",
+            observed_value: 65,
+            expected_constraint: "0 (false) or 1 (true)",
+            detail: "Boolean field 'g_workers[2].is_healthy' contains corrupted byte 0x41 (65), indicating adjacent buffer overflow"
+          }
+        ],
+        llm_next_step_hint: "Detected 2 memory integrity anomalies: [DANGLING_OR_UNMAPPED_POINTER] gpMem->buffers[21].data_ptr = 0xdeadbeef00; [CORRUPTED_BOOL_VALUE] g_workers[2].is_healthy = 65"
+      };
+    }
+
+    function buildSimulatedCodePtrData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        results: [
+          {
+            expression: "g_session",
+            kind: "POLYMORPHIC_VTABLE",
+            runtime_address: "0x55a04500",
+            vtable_entries: [
+              { slot_index: 0, function_name: "RtspMediaSession::onPacket", source_location: "media_session.cpp:118", runtime_address: "0x55a01420" },
+              { slot_index: 1, function_name: "RtspMediaSession::onTimeout", source_location: "media_session.cpp:145", runtime_address: "0x55a01490" }
+            ],
+            resolved_function_members: {
+              on_error_cb: { function_name: "default_error_handler", source_location: "main.cpp:42", runtime_address: "0x55a01080" }
+            }
+          }
+        ]
+      };
+    }
+
+    function buildSimulatedAutoTriageData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        overall_status: "CRITICAL_ISSUES_FOUND",
+        health_score: 40,
+        findings_count: 3,
+        source_remediation_targets: ["pool_target.cpp:62", "pool_target.cpp:48"],
+        findings: [
+          {
+            severity: "CRITICAL",
+            category: "MEMORY_CORRUPTION",
+            title: "DANGLING_OR_UNMAPPED_POINTER on 'gpMem->buffers[21].data_ptr'",
+            summary: "Pointer field 'gpMem->buffers[21].data_ptr' holds unmapped/invalid address 0xdeadbeef00",
+            recommended_action: "Inspect buffer release and pointer reset logic on gpMem->buffers[21]."
+          },
+          {
+            severity: "HIGH",
+            category: "MUTEX_LOCK_HELD",
+            title: "Mutex 'g_pool_mutex' Held by TID 8849 (buf9_worker)",
+            summary: "Mutex g_pool_mutex (0x55a04480) is locked by TID 8849 with waiting thread [8847]",
+            source_location: "pool_target.cpp:62",
+            recommended_action: "Check why TID 8849 (buf9_worker) is holding 'g_pool_mutex' inside hold_slot_on_stack()."
+          },
+          {
+            severity: "HIGH",
+            category: "MEMORY_CORRUPTION",
+            title: "CORRUPTED_BOOL_VALUE on 'g_workers[2].is_healthy'",
+            summary: "Boolean field 'g_workers[2].is_healthy' contains corrupted byte 0x41 (65)",
+            recommended_action: "Check adjacent array bounds in g_workers[]."
+          }
+        ],
+        llm_next_step_hint: "Auto-Triage found 3 issue(s) (Health Score: 40/100, Status: CRITICAL_ISSUES_FOUND). Top finding: [CRITICAL] DANGLING_OR_UNMAPPED_POINTER on 'gpMem->buffers[21].data_ptr'"
+      };
+    }
+
+    function buildSimulatedFrameLocalsData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        threads_count: 2,
+        threads: [
+          {
+            tid: 8849,
+            name: "buf9_worker",
+            state: "S",
+            frames_count: 2,
+            frames: [
+              {
+                frame_index: 0,
+                function_name: "hold_slot_on_stack",
+                source_location: "pool_target.cpp:60",
+                runtime_pc: "0x55a011c4",
+                cfa_address: "0x7f9c20ff1dc0",
+                parameters: [
+                  { name: "holder", type_name: "BufferSlot**", runtime_address: "0x7f9c20ff1da8", value: "0x7f9c20ff1dc8" }
+                ],
+                locals: [
+                  { name: "spin_ticks", type_name: "int32_t", runtime_address: "0x7f9c20ff1db4", value: 142 }
+                ]
+              },
+              {
+                frame_index: 1,
+                function_name: "worker_fn",
+                source_location: "pool_target.cpp:67",
+                runtime_pc: "0x55a01218",
+                cfa_address: "0x7f9c20ff1df0",
+                parameters: [
+                  { name: "arg", type_name: "void*", runtime_address: "0x7f9c20ff1dd8", value: "0x0" }
+                ],
+                locals: [
+                  { name: "local_slot", type_name: "BufferSlot*", runtime_address: "0x7f9c20ff1dc8", value: "0x55a040f8" }
+                ]
+              }
+            ]
+          }
+        ],
+        llm_next_step_hint: "Decoded stack frame parameters and local variables across 2 thread(s) with 0.00ms stop."
+      };
+    }
+
+    function buildSimulatedFlightRecorderData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        frames_recorded: 8,
+        ring_buffer_total_frames: 24,
+        interval_ms: 25,
+        elapsed_ms: 198.2,
+        transient_glitches_count: 2,
+        transient_glitches: [
+          {
+            path: "gpMem->active_buffers",
+            pattern: "TRANSIENT_SPIKE_REVERSAL",
+            baseline_value: 7,
+            spike_value: 31,
+            restored_value: 7,
+            peak_frame_seq: 4,
+            timeline_values: [7, 7, 19, 31, 22, 7, 7, 7]
+          },
+          {
+            path: "g_transient_error_spike",
+            pattern: "TRANSIENT_SPIKE_REVERSAL",
+            baseline_value: 0,
+            spike_value: 503,
+            restored_value: 0,
+            peak_frame_seq: 4,
+            timeline_values: [0, 0, 0, 503, 0, 0, 0, 0]
+          }
+        ],
+        time_machine_triad: {
+          pre_anomaly_frame: { frame_seq: 3, offset_ms: 50.1, stress_score: 95, stress_highlights: ["gpMem->active_buffers=19"] },
+          peak_anomaly_frame: { frame_seq: 4, offset_ms: 75.4, stress_score: 2670, stress_highlights: ["gpMem->active_buffers=31", "g_transient_error_spike=503"] },
+          post_anomaly_frame: { frame_seq: 5, offset_ms: 100.8, stress_score: 110, stress_highlights: ["gpMem->active_buffers=22"] }
+        },
+        llm_next_step_hint: "Flight Recorder captured 8 zero-stop frames (198.2ms) and detected 2 transient spike reversal(s): gpMem->active_buffers (7 ➔ 31 ➔ 7 at frame #4), g_transient_error_spike (0 ➔ 503 ➔ 0 at frame #4)"
+      };
+    }
+
+    function buildSimulatedBehavioralDriftData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        drift_status: "SEVERE_BEHAVIORAL_DRIFT",
+        drift_score: 75,
+        drifted_dimensions_count: 3,
+        drifted_dimensions: [
+          {
+            dimension: "HEAP_LEAK_GROWTH",
+            severity: "CRITICAL",
+            metric: "heap_leaked_candidates",
+            baseline: 0,
+            current: 1,
+            detail: "Unreferenced C++ heap leak candidates increased from 0 to 1 (RtspSession @ 0x55a096e0)."
+          },
+          {
+            dimension: "NEW_MUTEX_CONTENTION",
+            severity: "HIGH",
+            metric: "g_pool_mutex",
+            baseline: "UNLOCKED",
+            current: "LOCKED (Owner TID 8849)",
+            detail: "Mutex 'g_pool_mutex' was UNLOCKED in baseline but is currently LOCKED."
+          },
+          {
+            dimension: "MEMORY_POOL_UTILIZATION_DRIFT",
+            severity: "MEDIUM",
+            metric: "gpMem->buffers",
+            baseline: "2/32 (6.25%)",
+            current: "7/32 (21.88%)",
+            detail: "Pool 'gpMem->buffers' utilization shifted by +15.6%."
+          }
+        ],
+        llm_next_step_hint: "Behavioral Drift Check: SEVERE_BEHAVIORAL_DRIFT (Drift Score: 75/100, 3 dimension(s) shifted). Unreferenced C++ heap leak candidates increased from 0 to 1."
+      };
+    }
+
+    function buildSimulatedDpdkLcoreData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        sample_window_ms: 40,
+        kernel_isolated_cpus: [2, 3],
+        hugepage_mappings_count: 1,
+        hugepage_mappings: [
+          { start: "0x100000000", end: "0x140000000", size: 1073741824, permissions: "rw-s", pathname: "/dev/hugepages/rtemap_0" }
+        ],
+        lcore_threads_count: 3,
+        dedicated_pmd_lcores_count: 2,
+        overall_dpdk_status: "LCORE_DEADLOOP_OR_RING_STALL_DETECTED",
+        lcores: [
+          {
+            tid: 8849,
+            name: "lcore-worker-2",
+            state: "R",
+            lcore_role: "DPDK_PMD_DEDICATED_LCORE",
+            lcore_id: 2,
+            cpu_id: 2,
+            cpus_allowed_list: "2",
+            is_single_core_pinned: true,
+            is_kernel_isolated_core: true,
+            sched_policy: "SCHED_FIFO",
+            rt_priority: 99,
+            utime_delta_ticks: 4,
+            stime_delta_ticks: 0,
+            voluntary_ctxt_switches_delta: 0,
+            nonvoluntary_ctxt_switches_delta: 0,
+            isolation_jitter_detected: false,
+            tcb_address: "0x7f9c1ffed640",
+            per_lcore_tls: { per_lcore__lcore_id: 2, tls_rx_burst_pkts: 194820 },
+            per_lcore_tls_deltas: { per_lcore__lcore_id: 0, tls_rx_burst_pkts: 1420 },
+            progress_delta: 1420,
+            pmd_health_status: "PMD_POLLING_HEALTHY",
+            top_function: "pmd_poll_rx_tx_burst",
+            top_source_location: "dpdk_pmd.cpp:88"
+          },
+          {
+            tid: 8850,
+            name: "lcore-worker-3",
+            state: "R",
+            lcore_role: "DPDK_PMD_DEDICATED_LCORE",
+            lcore_id: 3,
+            cpu_id: 3,
+            cpus_allowed_list: "3",
+            is_single_core_pinned: true,
+            is_kernel_isolated_core: true,
+            sched_policy: "SCHED_FIFO",
+            rt_priority: 99,
+            utime_delta_ticks: 4,
+            stime_delta_ticks: 0,
+            voluntary_ctxt_switches_delta: 0,
+            nonvoluntary_ctxt_switches_delta: 0,
+            isolation_jitter_detected: false,
+            tcb_address: "0x7f9c1f7ec640",
+            per_lcore_tls: { per_lcore__lcore_id: 3, tls_rx_burst_pkts: 84100 },
+            per_lcore_tls_deltas: { per_lcore__lcore_id: 0, tls_rx_burst_pkts: 0 },
+            progress_delta: 0,
+            pmd_health_status: "LCORE_STUCK_DEADLOOP",
+            top_function: "rte_ring_enqueue_burst_spin",
+            top_source_location: "dpdk_pmd.cpp:134"
+          }
+        ],
+        lockless_rings_count: 1,
+        lockless_rings: [
+          {
+            expression: "g_dpdk_rx_ring",
+            type_name: "rte_ring",
+            runtime_address: "0x100004000",
+            capacity: 1024,
+            mask: "0x3ff",
+            prod_head: 520,
+            prod_tail: 512,
+            cons_head: 500,
+            cons_tail: 500,
+            inflight_entries: 12,
+            utilization_pct: 1.17,
+            throughput_delta: 0,
+            ring_status: "STUCK_PROD_INFLIGHT_RESERVATION"
+          }
+        ],
+        spinlocks_count: 1,
+        spinlocks: [
+          {
+            expression: "g_tx_port_spinlock",
+            runtime_address: "0x55a04620",
+            locked_before: 1,
+            locked_after: 1,
+            spinlock_status: "CONTENDED_OR_STUCK_LOCKED"
+          }
+        ],
+        llm_next_step_hint: "DPDK Isolated-Core & PMD Audit: LCORE_DEADLOOP_OR_RING_STALL_DETECTED across 2 dedicated PMD lcore(s) and 1 lockless ring(s) in 0.00ms zero-stop mode."
+      };
+    }
+
+    function buildSimulatedTlsInspectorData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        pt_tls_geometry: { tls_memsz: 16, tls_align: 8, aligned_tls_memsz: 16 },
+        tls_variables_discovered: 2,
+        tcb_resolved_count: 3,
+        threads_count: 3,
+        variable_summaries: [
+          { name: "tls_worker_slot_id", type_name: "int", tls_offset: "0x0", threads_observed: 3, unique_values_count: 3, has_per_thread_divergence: true },
+          { name: "tls_processed_packets", type_name: "uint64_t", tls_offset: "0x8", threads_observed: 3, unique_values_count: 3, has_per_thread_divergence: true }
+        ],
+        threads: [
+          {
+            tid: 8842,
+            name: "main_supervisor",
+            state: "S",
+            tcb_address: "0x7f9c21004740",
+            tls_block_base: "0x7f9c21004730",
+            tls_variables: [
+              { name: "tls_worker_slot_id", type_name: "int", tls_offset: "0x0", runtime_address: "0x7f9c21004730", value: 0 },
+              { name: "tls_processed_packets", type_name: "uint64_t", tls_offset: "0x8", runtime_address: "0x7f9c21004738", value: 12 }
+            ]
+          },
+          {
+            tid: 8847,
+            name: "io_dispatcher",
+            state: "S",
+            tcb_address: "0x7f9c207ef640",
+            tls_block_base: "0x7f9c207ef630",
+            tls_variables: [
+              { name: "tls_worker_slot_id", type_name: "int", tls_offset: "0x0", runtime_address: "0x7f9c207ef630", value: 2 },
+              { name: "tls_processed_packets", type_name: "uint64_t", tls_offset: "0x8", runtime_address: "0x7f9c207ef638", value: 1840 }
+            ]
+          },
+          {
+            tid: 8849,
+            name: "buf9_worker",
+            state: "R",
+            tcb_address: "0x7f9c1ffed640",
+            tls_block_base: "0x7f9c1ffed630",
+            tls_variables: [
+              { name: "tls_worker_slot_id", type_name: "int", tls_offset: "0x0", runtime_address: "0x7f9c1ffed630", value: 9 },
+              { name: "tls_processed_packets", type_name: "uint64_t", tls_offset: "0x8", runtime_address: "0x7f9c1ffed638", value: 94210 }
+            ]
+          }
+        ],
+        llm_next_step_hint: "Decoded 2 TLS (__thread / thread_local) variable(s) across 3/3 thread TCB(s) in 0.00ms zero-stop mode."
+      };
+    }
+
+    function buildSimulatedConcurrencyVerifierData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        overall_consistency_status: "ACTIVE_CONCURRENT_MUTATIONS_DETECTED",
+        symbols_checked_count: 3,
+        atomic_consistent_count: 1,
+        torn_read_recovered_count: 1,
+        concurrently_mutating_count: 1,
+        symbols: [
+          {
+            expression: "gpMem",
+            type_name: "MemPool*",
+            checked_address: "0x55a04020",
+            checked_byte_size: 776,
+            consistency_status: "ATOMIC_CONSISTENT",
+            attempts_used: 1,
+            mutating_fields: [],
+            verified_value: { total_buffers: 32, active_buffers: 7 }
+          },
+          {
+            expression: "g_workers",
+            type_name: "WorkerContext[4]",
+            checked_address: "0x55a04400",
+            checked_byte_size: 96,
+            consistency_status: "TORN_READ_RECOVERED",
+            attempts_used: 2,
+            mutating_fields: [],
+            verified_value: "[4 elements verified]"
+          },
+          {
+            expression: "g_fast_telemetry_seq",
+            type_name: "uint64_t",
+            checked_address: "0x55a04540",
+            checked_byte_size: 8,
+            consistency_status: "CONCURRENTLY_MUTATING",
+            attempts_used: 3,
+            mutating_fields: ["value"],
+            verified_value: 948215
+          }
+        ],
+        llm_next_step_hint: "Seqlock Concurrency Verification: ACTIVE_CONCURRENT_MUTATIONS_DETECTED (1 atomic consistent, 1 torn-read recovered, 1 concurrently mutating in 0.00ms stop)."
+      };
+    }
+
+    function buildSimulatedStatisticalHotspotsData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        samples_taken: 8,
+        interval_ms: 30,
+        elapsed_ms: 246.4,
+        thread_cpu_profiles: [
+          { tid: 8849, name: "buf9_worker", state: "R", utime_delta_ticks: 19, stime_delta_ticks: 3, total_delta_ticks: 22, runnable_sample_pct: 87.5, cpu_share_pct: 84.6 },
+          { tid: 8851, name: "telemetry_tx", state: "S", utime_delta_ticks: 3, stime_delta_ticks: 1, total_delta_ticks: 4, runnable_sample_pct: 12.5, cpu_share_pct: 15.4 },
+          { tid: 8847, name: "io_dispatcher", state: "S", utime_delta_ticks: 0, stime_delta_ticks: 0, total_delta_ticks: 0, runnable_sample_pct: 0.0, cpu_share_pct: 0.0 }
+        ],
+        hotspot_functions: [
+          { function_name: "hold_slot_on_stack", source_location: "pool_target.cpp:62", self_samples: 7, inclusive_samples: 8, self_pct: 87.5, inclusive_pct: 100.0, threads: ["TID 8849 (buf9_worker)"] },
+          { function_name: "worker_fn", source_location: "pool_target.cpp:72", self_samples: 0, inclusive_samples: 8, self_pct: 0.0, inclusive_pct: 100.0, threads: ["TID 8849 (buf9_worker)"] },
+          { function_name: "acquire_pool_slot", source_location: "pool_target.cpp:48", self_samples: 8, inclusive_samples: 8, self_pct: 100.0, inclusive_pct: 100.0, threads: ["TID 8847 (io_dispatcher)"] }
+        ],
+        flame_stacks: [
+          { folded_stack: "buf9_worker;worker_fn;hold_slot_on_stack", samples: 8, pct: 100.0 },
+          { folded_stack: "io_dispatcher;io_dispatch_loop;acquire_pool_slot", samples: 8, pct: 100.0 }
+        ],
+        counter_rates: [
+          { expression: "gpMem->buffers[9].seq", before: 109, after: 141, delta: 32, rate_per_sec: 129.87 },
+          { expression: "gpMem->active_buffers", before: 7, after: 7, delta: 0, rate_per_sec: 0.0 }
+        ],
+        llm_next_step_hint: "Statistical hotspot profiling (8 samples over 246.4ms, 0.00ms stop): Top hotspot function is `hold_slot_on_stack()` (100.0% inclusive, pool_target.cpp:62) on thread TID 8849 (buf9_worker, CPU share 84.6%)."
+      };
+    }
+
+    function buildSimulatedFuzzyIntentData(query = "버퍼 풀과 워커 스레드 관련된 심볼을 퍼지 의미 매칭으로 알아서 찾아 값을 보여주세요") {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        natural_query: query,
+        expanded_keywords: ["pool", "mem", "buf", "slot", "worker", "thread", "tid"],
+        matches_count: 3,
+        matches: [
+          {
+            symbol_name: "gpMem",
+            recommended_expression: "*gpMem",
+            type_name: "MemPool*",
+            decl_location: "pool_target.cpp:32",
+            member_fields: ["total_buffers", "active_buffers", "buffers"],
+            relevance_score: 95,
+            matched_concepts: ["pool", "mem", "buf"],
+            live_value: { total_buffers: 32, active_buffers: 7 }
+          },
+          {
+            symbol_name: "g_workers",
+            recommended_expression: "g_workers",
+            type_name: "WorkerContext[4]",
+            decl_location: "pool_target.cpp:33",
+            member_fields: ["tid", "active_buf", "is_healthy"],
+            relevance_score: 80,
+            matched_concepts: ["worker", "tid", "buf"],
+            live_value: [{ tid: 8847, active_buf: "0x0", is_healthy: 1 }, { tid: 8849, active_buf: "0x55a04170", is_healthy: 1 }]
+          },
+          {
+            symbol_name: "g_pool_mutex",
+            recommended_expression: "g_pool_mutex",
+            type_name: "pthread_mutex_t",
+            decl_location: "pool_target.cpp:35",
+            member_fields: ["__data"],
+            relevance_score: 45,
+            matched_concepts: ["pool"],
+            live_value: { __owner: 8849, __lock: 2 }
+          }
+        ],
+        llm_next_step_hint: "Resolved '" + query + "' to 3 DWARF symbol(s): *gpMem (MemPool*), g_workers (WorkerContext[4]), g_pool_mutex (pthread_mutex_t)"
+      };
+    }
+
+    function buildSimulatedDependencyGraphData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        nodes_count: 6,
+        edges_count: 5,
+        root_blocker_nodes: [
+          { id: "THREAD:8849", kind: "THREAD", label: "TID 8849 (buf9_worker)", status: "NORMAL", metadata: { source_location: "pool_target.cpp:62", top_function: "hold_slot_on_stack" } }
+        ],
+        causal_chains: [
+          {
+            chain_type: "LOCK_CONTENTION_CHAIN",
+            root_blocker_id: "THREAD:8849",
+            root_blocker_label: "TID 8849 (buf9_worker)",
+            source_location: "pool_target.cpp:62",
+            impacted_entities: ["THREAD:8847", "LOCK:g_pool_mutex", "SLOT:gpMem->buffers[9]"],
+            steps: [
+              "TID 8847 (io_dispatcher) is BLOCKED waiting on Mutex g_pool_mutex (0x55a04480)",
+              "Mutex g_pool_mutex is currently HELD by TID 8849 (buf9_worker) at pool_target.cpp:62",
+              "TID 8849 (buf9_worker) simultaneously occupies SLOT:gpMem->buffers[9]"
+            ],
+            ascii_flow: "[TID 8847 (io_dispatcher)] ──(waits)──▶ [Mutex g_pool_mutex] ──(held by)──▶ [TID 8849 (buf9_worker)] ──(occupies)──▶ [SLOT:gpMem->buffers[9]]"
+          },
+          {
+            chain_type: "IPC_BACKLOG_CHAIN",
+            root_blocker_id: "PEER_PROC:4120",
+            root_blocker_label: "PID 4120 (encoder_daemon)",
+            source_location: null,
+            impacted_entities: ["PROC:8842"],
+            steps: [
+              "Consumer is lagging behind producer by 18 item(s) (producer_seq=142, consumer_seq=124)."
+            ],
+            ascii_flow: "[PID 8842] ──(SHM backlog 18)──▶ [PID 4120 (encoder_daemon)]"
+          }
+        ],
+        nodes: [
+          { id: "PROC:8842", kind: "PROCESS", label: "PID 8842 (pool_target_nostrip)", status: "NORMAL" },
+          { id: "THREAD:8847", kind: "THREAD", label: "TID 8847 (io_dispatcher)", status: "BLOCKED" },
+          { id: "LOCK:g_pool_mutex", kind: "MUTEX_LOCK", label: "Mutex g_pool_mutex (0x55a04480)", status: "CONTENDED" },
+          { id: "THREAD:8849", kind: "THREAD", label: "TID 8849 (buf9_worker)", status: "NORMAL" },
+          { id: "SLOT:gpMem->buffers[9]", kind: "BUFFER_SLOT", label: "gpMem->buffers[9] (0x55a040f8)", status: "IN_USE" },
+          { id: "PEER_PROC:4120", kind: "PEER_PROCESS", label: "Peer PID 4120 (encoder_daemon)", status: "NORMAL" }
+        ],
+        edges: [
+          { from: "THREAD:8847", to: "LOCK:g_pool_mutex", relation: "WAITS_ON_LOCK", detail: "futex wait" },
+          { from: "LOCK:g_pool_mutex", to: "THREAD:8849", relation: "HELD_BY_THREAD", detail: "owner_tid=8849" },
+          { from: "THREAD:8849", to: "SLOT:gpMem->buffers[9]", relation: "OCCUPIES_SLOT", detail: "stack pointer reference" }
+        ],
+        llm_next_step_hint: "Synthesized 2 causal chain(s) across 6 runtime entities. Top root blocker: [TID 8847 (io_dispatcher)] ──(waits)──▶ [Mutex g_pool_mutex] ──(held by)──▶ [TID 8849 (buf9_worker)]"
+      };
+    }
+
+    function buildSimulatedSourceCorrelationData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        snippets_count: 1,
+        snippets: [
+          {
+            file_hint: "pool_target.cpp",
+            resolved_source_path: "/build/pool_target.cpp",
+            target_line: 62,
+            function_name: "hold_slot_on_stack",
+            tid: 8849,
+            thread_name: "buf9_worker",
+            live_variables: { holder: "0x7f9c20ff1dc8", spin_ticks: 142, local_slot: "0x55a040f8", gpMem: "0x55a04018" },
+            annotated_lines: [
+              { line_number: 59, is_target_line: false, code: "void hold_slot_on_stack(BufferSlot** holder) {", live_annotations: { holder: "0x7f9c20ff1dc8" }, formatted: "    59 | void hold_slot_on_stack(BufferSlot** holder) {   // [LIVE] holder=\"0x7f9c20ff1dc8\"" },
+              { line_number: 60, is_target_line: false, code: "    int spin_ticks = 142;", live_annotations: { spin_ticks: 142 }, formatted: "    60 |     int spin_ticks = 142;   // [LIVE] spin_ticks=142" },
+              { line_number: 61, is_target_line: false, code: "    pthread_mutex_lock(&g_pool_mutex);", live_annotations: {}, formatted: "    61 |     pthread_mutex_lock(&g_pool_mutex);" },
+              { line_number: 62, is_target_line: true, code: "    while (g_ready && spin_ticks > 0) { usleep(50000); }", live_annotations: { spin_ticks: 142 }, formatted: "▶   62 |     while (g_ready && spin_ticks > 0) { usleep(50000); }   // [LIVE] spin_ticks=142" },
+              { line_number: 63, is_target_line: false, code: "    pthread_mutex_unlock(&g_pool_mutex);", live_annotations: {}, formatted: "    63 |     pthread_mutex_unlock(&g_pool_mutex);" }
+            ]
+          }
+        ],
+        llm_next_step_hint: "Correlated 1 active source location(s) with inline live runtime variable values."
+      };
+    }
+
+    function buildSimulatedSymptomInvestigationData(query = "지금 프로세스가 왜 멈췄고 어디가 문제인지 증상을 종합 판단해서 분석해 주세요") {
+      const dg = buildSimulatedDependencyGraphData();
+      const sc = buildSimulatedSourceCorrelationData();
+      const tr = buildSimulatedAutoTriageData();
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        symptom_query: query,
+        classified_symptom: "HANG_OR_DEADLOCK",
+        root_cause_hypothesis: "[MUTEX_LOCK_HELD] Mutex 'g_pool_mutex' Held by TID 8849 (buf9_worker) — [TID 8847 (io_dispatcher)] ──(waits)──▶ [Mutex g_pool_mutex] ──(held by)──▶ [TID 8849 (buf9_worker)] ──(occupies)──▶ [SLOT:gpMem->buffers[9]]",
+        confidence_score: 0.94,
+        health_score: 40,
+        findings_count: tr.findings.length,
+        findings: tr.findings,
+        causal_chains: dg.causal_chains,
+        dependency_graph: dg,
+        annotated_source_snippets: sc.snippets,
+        remediation_steps: [
+          "Check why TID 8849 (buf9_worker) is holding 'g_pool_mutex' inside hold_slot_on_stack() at pool_target.cpp:62 without releasing it.",
+          "Inspect buffer release and pointer reset logic on gpMem->buffers[21] (0xdeadbeef00).",
+          "Verify destructor / smart-pointer lifecycle for unreferenced RtspSession heap object @ 0x55a096e0."
+        ],
+        llm_next_step_hint: "Symptom Investigation (HANG_OR_DEADLOCK) complete with confidence 94%: TID 8849 (buf9_worker) holds g_pool_mutex at pool_target.cpp:62 while occupying gpMem->buffers[9], blocking TID 8847 (io_dispatcher)."
+      };
+    }
+
+    function buildSimulatedIpcPipelineData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        pipeline_health: "CONSUMER_LAGGING",
+        bottleneck_diagnosis: "Consumer is lagging behind producer by 18 item(s) (producer_seq=142, consumer_seq=124).",
+        metrics: {
+          producer_seq: 142,
+          consumer_seq: 124,
+          pending_backlog: 18,
+          capacity: 32,
+          backlog_utilization_pct: 56.25,
+          lock_owner_pid: 8842
+        },
+        shared_mappings: [
+          { start: "0x7f9c30000000", end: "0x7f9c30010000", size: 65536, permissions: "rw-s", pathname: "/dev/shm/ds_media_ring" }
+        ],
+        decoded_overlay: {
+          cast_type: "ShmRingHeader",
+          address: "0x7f9c30000000",
+          byte_size: 16,
+          status: "OBSERVED",
+          value: { magic_tag: 1397247281, producer_seq: 142, consumer_seq: 124, capacity: 32 }
+        },
+        peer_processes: [
+          { peer_pid: 4120, peer_name: "encoder_daemon", peer_state: "S", shared_pathname: "/dev/shm/ds_media_ring" }
+        ],
+        ipc_fds: [
+          { fd: 4, target: "/dev/shm/ds_media_ring" },
+          { fd: 7, target: "socket:[194821]" }
+        ],
+        llm_next_step_hint: "[CONSUMER_LAGGING] Consumer is lagging behind producer by 18 item(s) (producer_seq=142, consumer_seq=124). Connected peer process: PID 4120 (encoder_daemon)."
+      };
+    }
+
+    function buildSimulatedHeapScanData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        scanned_heap_bytes: 135168,
+        known_polymorphic_classes: ["BaseSession", "RtspSession"],
+        total_objects_found: 3,
+        leaked_candidates_count: 1,
+        class_histogram: {
+          RtspSession: { total: 3, on_heap: 2, on_global: 1, leaked_candidates: 1 }
+        },
+        objects: [
+          {
+            class_name: "RtspSession",
+            address: "0x55a092a0",
+            byte_size: 24,
+            region: "heap",
+            vptr_target: "0x55a03d90",
+            is_referenced: true,
+            referenced_by: ["global_data@0x55a04510"],
+            is_leaked_candidate: false,
+            fields: { session_id: 1001 }
+          },
+          {
+            class_name: "RtspSession",
+            address: "0x55a096e0",
+            byte_size: 24,
+            region: "heap",
+            vptr_target: "0x55a03d90",
+            is_referenced: false,
+            referenced_by: [],
+            is_leaked_candidate: true,
+            fields: { session_id: 9999 }
+          },
+          {
+            class_name: "RtspSession",
+            address: "0x55a04520",
+            byte_size: 24,
+            region: "global_data",
+            vptr_target: "0x55a03d90",
+            is_referenced: true,
+            referenced_by: ["global_data@0x55a04500"],
+            is_leaked_candidate: false,
+            fields: { session_id: 999 }
+          }
+        ],
+        llm_next_step_hint: "Detected 1 unreachable/leaked C++ heap object(s) out of 3 live polymorphic instance(s)!"
+      };
+    }
+
+    function buildSimulatedShmData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || "localhost",
+        stop_duration_ms: 0.0,
+        shared_mappings_count: 1,
+        shared_mappings: [
+          { start: "0x7f9c30000000", end: "0x7f9c30010000", size: 65536, permissions: "rw-s", pathname: "/dev/shm/ds_media_ring" }
+        ],
+        decoded_overlay: {
+          cast_type: "MemPool",
+          address: "0x7f9c30000000",
+          byte_size: 776,
+          status: "OBSERVED",
+          value: { total_buffers: 32, active_buffers: 7 }
+        },
+        peer_processes_count: 1,
+        peer_processes: [
+          { peer_pid: 4120, peer_name: "encoder_daemon", shared_pathname: "/dev/shm/ds_media_ring" }
+        ],
+        llm_next_step_hint: "Decoded 'MemPool' at 0x7f9c30000000 and found 1 peer process (PID 4120 encoder_daemon) sharing /dev/shm/ds_media_ring."
+      };
+    }
+
+    function buildSimulatedDiffData() {
+      return {
+        pid: wsState.pid || 8842,
+        target_host: wsState.remoteHost || 'localhost',
+        wait_ms: 500,
+        stop_duration_ms: 0.0,
+        summary: {
+          total_fields_compared: 6,
+          changed_count: 2,
+          unchanged_count: 4,
+        },
+        changed: [
+          { path: 'gpMem->buffers[9].seq', before: 109, after: 114, delta: 5 },
+          { path: 'gpMem->buffers[2].seq', before: 102, after: 105, delta: 3 },
+        ],
+        unchanged: [
+          { path: 'gpMem->total_buffers', value: 32 },
+          { path: 'gpMem->active_buffers', value: 7 },
+          { path: 'gpMem->buffers[9].in_use', value: 1 },
+          { path: 'g_workers[1].tid', value: 8849 },
+        ],
+      };
+    }
+
+    // =========================================================================
+    // Backend API Caller with Graceful Fallback to Built-In Simulation
+    // =========================================================================
+    async function callWorkspaceBackend(endpoint, payload) {
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          const json = await res.json();
+          if (json && json.success) {
+            wsState.isDemoFallback = false;
+            updateConnectionBadge('LIVE BACKEND', 'emerald');
+            return json.data;
+          }
+          if (json && json.error) {
+            throw new Error(json.error.message || 'API Error');
+          }
+        }
+      } catch (err) {
+        wsState.isDemoFallback = true;
+        updateConnectionBadge('SIMULATION MODE', 'amber');
+      }
+      return null;
+    }
+
+    function updateConnectionBadge(text, color) {
+      const badge = document.getElementById('badge-conn-mode');
+      if (!badge) return;
+      badge.textContent = text;
+      if (color === 'emerald') {
+        badge.className = 'px-2 py-0.5 text-[11px] font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 mono';
+      } else if (color === 'amber') {
+        badge.className = 'px-2 py-0.5 text-[11px] font-medium rounded-full bg-amber-50 text-amber-700 border border-amber-200 mono';
+      } else {
+        badge.className = 'px-2 py-0.5 text-[11px] font-medium rounded-full bg-blue-50 text-blue-700 border border-blue-200 mono';
+      }
+    }
+
+    function updateTelemetryStrip(info) {
+      const strip = document.getElementById('process-telemetry-strip');
+      if (!strip) return;
+      strip.classList.remove('hidden');
+      strip.classList.add('flex');
+      if (info.pid) document.getElementById('tel-pid').textContent = String(info.pid);
+      if (info.build_id) document.getElementById('tel-buildid').textContent = String(info.build_id).slice(0, 12) + '…';
+      if (info.load_bias) document.getElementById('tel-bias').textContent = info.load_bias;
+      if (info.threads_count !== undefined) document.getElementById('tel-threads').textContent = String(info.threads_count);
+    }
+
+    // =========================================================================
+    // Chat Stream Rendering (Clean White Theme)
+    // =========================================================================
+    function appendUserChatMessage(text) {
+      const container = document.getElementById('chat-messages');
+      const div = document.createElement('div');
+      div.className = 'flex justify-end';
+      div.innerHTML = `
+        <div class="bg-slate-900 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 text-xs max-w-[85%] leading-relaxed shadow-2xs">
+          ${escapeHtml(text)}
+        </div>
+      `;
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function appendAssistantChatMessage(title, bodyHtml, linkedCards = []) {
+      const container = document.getElementById('chat-messages');
+      const div = document.createElement('div');
+      div.className = 'flex gap-3';
+
+      const cardsPillsHtml = linkedCards.length > 0
+        ? `<div class="pt-2 border-t border-slate-200/80 flex flex-wrap items-center gap-1.5">
+            <span class="text-[11px] text-slate-500">워크스페이스 카드:</span>
+            ${linkedCards.map(c => `
+              <button type="button" onclick="focusTraceCard('${escapeHtml(c.id)}')" class="px-2 py-0.5 rounded-md bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-medium mono transition shadow-2xs">
+                #${escapeHtml(c.seq)} ${escapeHtml(c.title)} →
+              </button>
+            `).join('')}
+          </div>`
+        : '';
+
+      div.innerHTML = `
+        <div class="w-7 h-7 rounded-full bg-slate-900 flex items-center justify-center shrink-0 text-[11px] font-semibold text-white mono">AI</div>
+        <div class="bg-slate-50 border border-slate-200/90 rounded-2xl rounded-tl-sm px-4 py-3 text-xs leading-relaxed text-slate-700 space-y-2 max-w-[92%]">
+          <div class="font-semibold text-slate-900">${escapeHtml(title)}</div>
+          <div class="text-slate-600 space-y-1.5">${bodyHtml}</div>
+          ${cardsPillsHtml}
+        </div>
+      `;
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    // =========================================================================
+    // Trace Workspace Card Management & Rendering (Clean White Theme)
+    // =========================================================================
+    function addTraceCard(type, title, data) {
+      wsState.seqCounter += 1;
+      const seqLabel = `TR-${String(wsState.seqCounter).padStart(2, '0')}`;
+      const cardObj = {
+        id: `card_${Date.now()}_${wsState.seqCounter}`,
+        seq: seqLabel,
+        type: type, // 'POOL_MAP' | 'THREAD_OWNER' | 'XRAY_BLUEPRINT' | 'SYMBOL_EVAL'
+        title: title,
+        timestamp: new Date().toLocaleTimeString('ko-KR', { hour12: false }),
+        pinned: false,
+        data: data,
+        selectedSlotIdx: type === 'POOL_MAP' ? (data.pool_summary?.allocated_indices?.[0] ?? 9) : 0,
+      };
+      wsState.cards.unshift(cardObj);
+      renderWorkspaceCards();
+      return cardObj;
+    }
+
+    window.focusTraceCard = function(cardId) {
+      const el = document.getElementById(cardId);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('ring-2', 'ring-blue-500');
+      setTimeout(() => el.classList.remove('ring-2', 'ring-blue-500'), 1800);
+    };
+
+    window.refreshTraceCard = function(cardId) {
+      const card = wsState.cards.find(c => c.id === cardId);
+      if (!card) return;
+      card.timestamp = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+      if (card.type === 'POOL_MAP' && card.data && card.data.slots) {
+        card.data.slots.forEach(s => {
+          if (s.is_allocated && s.fields && typeof s.fields.seq === 'number') {
+            s.fields.seq += 1;
+          }
+        });
+      } else if (card.type === 'IPC_PIPELINE' && card.data && card.data.metrics) {
+        card.data.metrics.producer_seq = (card.data.metrics.producer_seq || 100) + 2;
+        card.data.metrics.consumer_seq = (card.data.metrics.consumer_seq || 90) + 1;
+        card.data.metrics.pending_backlog = Math.max(0, card.data.metrics.producer_seq - card.data.metrics.consumer_seq);
+      }
+      renderWorkspaceCards();
+    };
+
+    window.toggleLiveWatchCard = function(cardId) {
+      const card = wsState.cards.find(c => c.id === cardId);
+      if (!card) return;
+      card.liveWatch = !card.liveWatch;
+      if (card.liveWatch) {
+        card._timer = setInterval(() => {
+          window.refreshTraceCard(cardId);
+        }, 1000);
+        showToast(`#${card.seq} 카드 1초 실시간 감시 시작`);
+      } else {
+        if (card._timer) clearInterval(card._timer);
+        card._timer = null;
+        showToast(`#${card.seq} 카드 실시간 감시 중지`);
+      }
+      renderWorkspaceCards();
+    };
+
+    window.togglePinCard = function(cardId) {
+      const card = wsState.cards.find(c => c.id === cardId);
+      if (!card) return;
+      card.pinned = !card.pinned;
+      renderWorkspaceCards();
+    };
+
+    window.removeTraceCard = function(cardId) {
+      const target = wsState.cards.find(c => c.id === cardId);
+      if (target && target._timer) clearInterval(target._timer);
+      wsState.cards = wsState.cards.filter(c => c.id !== cardId);
+      renderWorkspaceCards();
+    };
+
+    window.selectPoolSlot = function(cardId, slotIdx) {
+      const card = wsState.cards.find(c => c.id === cardId);
+      if (!card) return;
+      card.selectedSlotIdx = slotIdx;
+      renderWorkspaceCards();
+    };
+
+    window.triggerOwnerLookupFromSlot = function(slotExpr) {
+      handleUserPrompt(`${slotExpr} 슬롯을 사용 중인 쓰레드를 찾아주세요`);
+    };
+
+    window.triggerPromptFromChip = function(promptText) {
+      handleUserPrompt(promptText);
+    };
+
+    function renderPoolMapCardBody(card) {
+      const d = card.data;
+      const sum = d.pool_summary || {};
+      const slots = d.slots || [];
+      const selectedSlot = slots[card.selectedSlotIdx] || slots[0] || null;
+
+      const tilesHtml = slots.map(s => {
+        const isAlloc = s.status === 'IN_USE' || s.is_allocated;
+        const isSel = s.index === card.selectedSlotIdx;
+        const bgCls = isAlloc
+          ? 'bg-emerald-50 border-emerald-300 text-emerald-900 hover:bg-emerald-100/70'
+          : 'bg-slate-50/70 border-slate-200/90 text-slate-400 hover:bg-slate-100 hover:text-slate-600';
+        const selCls = isSel ? 'slot-tile-selected' : '';
+        const subText = isAlloc
+          ? (s.owner_hint ? `T:${String(s.owner_hint).slice(0, 6)}` : `${s.fields?.size || ''}B`)
+          : 'FREE';
+
+        return `
+          <button
+            type="button"
+            onclick="selectPoolSlot('${escapeHtml(card.id)}', ${s.index})"
+            class="slot-tile ${bgCls} ${selCls} border rounded-lg p-1.5 flex flex-col items-center justify-center text-center cursor-pointer"
+            title="Slot #${s.index} (${s.runtime_address}) - ${s.status}"
+          >
+            <span class="text-[11px] font-bold mono">#${String(s.index).padStart(2, '0')}</span>
+            <span class="text-[9px] mono truncate max-w-full opacity-85">${escapeHtml(subText)}</span>
+          </button>
+        `;
+      }).join('');
+
+      let inspectorHtml = '';
+      if (selectedSlot) {
+        const fieldsEntries = Object.entries(selectedSlot.fields || {});
+        inspectorHtml = `
+          <div class="mt-3 pt-3 border-t border-slate-100 bg-slate-50/90 rounded-xl p-3 border border-slate-200/80 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div class="space-y-1.5">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-xs font-bold mono text-slate-900">${escapeHtml(selectedSlot.expression)}</span>
+                <span class="px-2 py-0.5 rounded-md text-[10px] font-semibold mono ${selectedSlot.is_allocated ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-slate-200/70 text-slate-600'}">
+                  ${escapeHtml(selectedSlot.status)}
+                </span>
+                <span class="text-[11px] text-slate-500 mono">@ ${escapeHtml(selectedSlot.runtime_address)} (${selectedSlot.size}B)</span>
+              </div>
+              <div class="flex flex-wrap gap-1.5">
+                ${fieldsEntries.map(([k, v]) => `
+                  <span class="px-2 py-0.5 rounded-md bg-white border border-slate-200 text-[11px] mono">
+                    <span class="text-slate-500">${escapeHtml(k)}:</span>
+                    <strong class="text-slate-800">${escapeHtml(String(v))}</strong>
+                  </span>
+                `).join('')}
+              </div>
+            </div>
+            <button
+              type="button"
+              onclick="triggerOwnerLookupFromSlot('${escapeHtml(selectedSlot.expression)}')"
+              class="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium mono shrink-0 transition shadow-2xs"
+            >
+              🧵 #${selectedSlot.index}번 슬롯 점유 스레드 역추적
+            </button>
+          </div>
+        `;
+      }
+
+      return `
+        <div class="space-y-3">
+          <!-- Pool Summary Metrics -->
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <div class="bg-slate-50 border border-slate-200/80 rounded-xl p-2.5">
+              <div class="text-[10px] font-medium text-slate-500">배열 심볼 & 시작 주소</div>
+              <div class="text-xs font-semibold text-blue-700 mono truncate mt-0.5">${escapeHtml(d.resolved_array_expression)} (${escapeHtml(d.array_base_address)})</div>
+            </div>
+            <div class="bg-slate-50 border border-slate-200/80 rounded-xl p-2.5">
+              <div class="text-[10px] font-medium text-slate-500">원소 타입 & 크기</div>
+              <div class="text-xs font-semibold text-slate-800 mono mt-0.5">${escapeHtml(d.element_type)} (${d.element_size}B)</div>
+            </div>
+            <div class="bg-slate-50 border border-slate-200/80 rounded-xl p-2.5">
+              <div class="text-[10px] font-medium text-slate-500">할당(IN_USE) / 전체 슬롯</div>
+              <div class="text-xs font-bold text-emerald-700 mono mt-0.5">${sum.allocated_count} / ${sum.total_slots} (${sum.utilization_pct}%)</div>
+            </div>
+            <div class="bg-slate-50 border border-slate-200/80 rounded-xl p-2.5">
+              <div class="text-[10px] font-medium text-slate-500">할당된 인덱스 목록</div>
+              <div class="text-xs font-semibold text-slate-800 mono truncate mt-0.5">[${(sum.allocated_indices || []).join(', ')}]</div>
+            </div>
+          </div>
+
+          <!-- Utilization Progress Bar -->
+          <div class="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden border border-slate-200/60">
+            <div class="h-full bg-emerald-500" style="width: ${Math.min(100, sum.utilization_pct || 0)}%"></div>
+          </div>
+
+          <!-- Interactive 2D Memory Pool Tile Grid -->
+          <div>
+            <div class="flex items-center justify-between text-[11px] text-slate-500 mb-1.5">
+              <span>슬롯 할당 맵 차트 (슬롯 클릭 시 상세 필드 및 스레드 역추적):</span>
+              <div class="flex items-center gap-3 mono">
+                <span class="flex items-center gap-1 text-slate-700"><span class="w-2.5 h-2.5 rounded-xs bg-emerald-100 border border-emerald-400 inline-block"></span> IN_USE (${sum.allocated_count})</span>
+                <span class="flex items-center gap-1 text-slate-500"><span class="w-2.5 h-2.5 rounded-xs bg-slate-100 border border-slate-300 inline-block"></span> FREE (${sum.free_count})</span>
+              </div>
+            </div>
+            <div class="grid grid-cols-8 sm:grid-cols-8 md:grid-cols-16 gap-1.5">
+              ${tilesHtml}
+            </div>
+          </div>
+
+          ${inspectorHtml}
+        </div>
+      `;
+    }
+
+    function renderThreadOwnerCardBody(card) {
+      const d = card.data;
+      const matched = d.matched_threads || [];
+      const targetVal = d.target_value && typeof d.target_value === 'object' ? d.target_value : { value: d.target_value };
+
+      const matchedHtml = matched.length > 0
+        ? matched.map(m => `
+            <div class="bg-emerald-50/60 border border-emerald-200 rounded-xl p-3.5 space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center gap-2">
+                  <span class="px-2 py-0.5 rounded-md bg-emerald-600 text-white text-xs font-bold mono">
+                    TID ${m.tid}
+                  </span>
+                  <span class="text-sm font-bold text-slate-900 mono">${escapeHtml(m.thread_name)}</span>
+                  <span class="text-xs text-slate-500 mono">(State: ${escapeHtml(m.thread_state)})</span>
+                </div>
+                <span class="px-2.5 py-0.5 rounded-full bg-white text-emerald-700 border border-emerald-200 text-[11px] font-semibold mono">
+                  Confidence: ${escapeHtml(m.confidence)}
+                </span>
+              </div>
+              <div class="space-y-1.5">
+                ${(m.evidence || []).map(ev => `
+                  <div class="bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs shadow-2xs">
+                    <div class="flex flex-wrap items-center gap-2 mb-1">
+                      <span class="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 mono font-semibold">${escapeHtml(ev.evidence_kind)}</span>
+                      ${ev.stack_reference_address ? `<span class="text-[11px] text-slate-700 font-medium mono">Stack Frame Addr: ${escapeHtml(ev.stack_reference_address)} ➔ ${escapeHtml(ev.points_to)}</span>` : ''}
+                      ${ev.symbol ? `<span class="text-[11px] text-violet-700 font-medium mono">Symbol: ${escapeHtml(ev.symbol)}</span>` : ''}
+                    </div>
+                    <div class="text-slate-600">${escapeHtml(ev.detail)}</div>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          `).join('')
+        : `
+          <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-500">
+            활성 스레드(${d.active_threads_checked || 0}개)의 스택 메모리, 구조체 내부 TID 필드, 전역 워커 테이블을 스캔했으나 현재 <code>${escapeHtml(d.target_expression)}</code> (${escapeHtml(d.target_runtime_address)})를 참조 중인 스레드가 발견되지 않았습니다.
+          </div>
+        `;
+
+      return `
+        <div class="space-y-3">
+          <!-- Target Slot Summary Banner -->
+          <div class="bg-slate-50 border border-slate-200/80 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div class="text-[10px] font-medium text-slate-500">역추적 대상 심볼 / 버퍼 슬롯</div>
+              <div class="flex items-center gap-2 mt-0.5">
+                <span class="text-xs font-bold text-slate-900 mono">${escapeHtml(d.target_expression)}</span>
+                <span class="text-xs text-blue-700 font-medium mono">@ ${escapeHtml(d.target_runtime_address)}</span>
+                <span class="text-[11px] text-slate-500 mono">(${escapeHtml(d.target_type)}, ${d.target_size}B)</span>
+              </div>
+            </div>
+            <div class="flex flex-wrap gap-1.5">
+              ${Object.entries(targetVal || {}).map(([k, v]) => `
+                <span class="px-2 py-0.5 rounded-md bg-white border border-slate-200 text-[11px] mono">
+                  <span class="text-slate-500">${escapeHtml(k)}:</span>
+                  <strong class="text-slate-800">${escapeHtml(String(v))}</strong>
+                </span>
+              `).join('')}
+            </div>
+          </div>
+
+          <!-- Matched Owner Threads -->
+          <div class="space-y-2">
+            <div class="text-[11px] font-semibold text-slate-700">
+              검출된 점유/참조 스레드 (${d.matched_threads_count || 0}건, 스캔 대상 스레드 ${d.active_threads_checked || 0}개):
+            </div>
+            ${matchedHtml}
+          </div>
+
+          <!-- Next Step Hint -->
+          ${d.llm_next_step_hint ? `
+            <div class="bg-blue-50/70 border border-blue-200 rounded-xl px-3 py-2 text-[11px] text-blue-900">
+              💡 <strong>분석 가이드:</strong> ${escapeHtml(d.llm_next_step_hint)}
+            </div>
+          ` : ''}
+        </div>
+      `;
+    }
+
+    function renderBlueprintCardBody(card) {
+      const d = card.data;
+      const cats = d.categories || {};
+      const pools = cats.memory_pools_and_buffers || [];
+      const workers = cats.thread_and_worker_contexts || [];
+      const states = cats.state_machines_and_flags || [];
+      const threads = d.threads || [];
+
+      return `
+        <div class="space-y-3">
+          <!-- Active Threads Row -->
+          <div>
+            <div class="text-[11px] text-slate-500 mb-1.5 font-medium">활성 스레드 (${threads.length}개, /proc/${d.pid}/task 무정지 스캔):</div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+              ${threads.map(t => `
+                <div class="bg-slate-50 border border-slate-200/80 rounded-lg px-3 py-1.5 flex items-center justify-between text-xs mono">
+                  <div>
+                    <span class="text-emerald-700 font-bold">TID ${t.tid}</span>
+                    <span class="text-slate-800 font-medium ml-1.5">${escapeHtml(t.name)}</span>
+                  </div>
+                  <div class="text-[11px] text-slate-500">
+                    State:${escapeHtml(t.state)} ${t.sp ? `· SP:${escapeHtml(t.sp)}` : ''}
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+
+          <!-- Discovered Memory Pools & Global Symbols -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+            <div class="bg-slate-50 border border-slate-200/80 rounded-xl p-3 space-y-2">
+              <div class="text-[11px] font-semibold text-slate-800">🟩 발견된 메모리 풀 / 버퍼 (클릭 시 맵 차트 생성)</div>
+              <div class="flex flex-wrap gap-1.5">
+                ${pools.length > 0 ? pools.map(p => `
+                  <button
+                    type="button"
+                    onclick="triggerPromptFromChip('memory pool ${escapeHtml(p.recommended_pool_expression || p.name)}의 메모리 buffer개의 할당 현황을 맵 차트로 그려주세요')"
+                    class="px-2.5 py-1 rounded-lg bg-white hover:bg-emerald-50 border border-slate-200 hover:border-emerald-300 text-xs text-slate-800 mono transition text-left shadow-2xs"
+                  >
+                    <strong class="text-emerald-700">${escapeHtml(p.name)}</strong> <span class="text-[10px] text-slate-500">(${escapeHtml(p.type_name)} @ ${escapeHtml(p.runtime_address)})</span>
+                  </button>
+                `).join('') : '<span class="text-xs text-slate-400">감지된 메모리 풀 심볼 없음</span>'}
+              </div>
+            </div>
+
+            <div class="bg-slate-50 border border-slate-200/80 rounded-xl p-3 space-y-2">
+              <div class="text-[11px] font-semibold text-slate-800">🧵 워커 컨텍스트 & 상태 심볼 (클릭 시 해독)</div>
+              <div class="flex flex-wrap gap-1.5">
+                ${[...workers, ...states].map(w => `
+                  <button
+                    type="button"
+                    onclick="triggerPromptFromChip('${escapeHtml(w.name)} 심볼 값을 확인해 주세요')"
+                    class="px-2.5 py-1 rounded-lg bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-300 text-xs text-slate-800 mono transition text-left shadow-2xs"
+                  >
+                    <strong class="text-blue-700">${escapeHtml(w.name)}</strong> <span class="text-[10px] text-slate-500">(${escapeHtml(w.type_name)})</span>
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderSymbolOrDiffCardBody(card) {
+      const d = card.data;
+      if (d.changed || d.unchanged) {
+        const changed = d.changed || [];
+        const unchanged = d.unchanged || [];
+        return `
+          <div class="space-y-2.5">
+            <div class="flex items-center gap-2.5 text-xs">
+              <span class="px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 border border-amber-200 mono font-semibold">변경됨(CHANGED): ${changed.length}</span>
+              <span class="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 border border-slate-200 mono">유지됨(UNCHANGED): ${unchanged.length}</span>
+              <span class="text-slate-500 text-[11px] mono">Window: ${d.wait_ms || 500}ms (0.00ms stop)</span>
+            </div>
+            ${changed.length > 0 ? `
+              <div class="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                <table class="w-full text-left text-xs mono">
+                  <thead class="bg-slate-50 text-slate-500 text-[11px] border-b border-slate-200">
+                    <tr>
+                      <th class="px-3 py-2 font-semibold">필드 경로 (Path)</th>
+                      <th class="px-3 py-2 font-semibold">이전 값 (Before)</th>
+                      <th class="px-3 py-2 font-semibold">이후 값 (After)</th>
+                      <th class="px-3 py-2 font-semibold">변화량 (Delta)</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-100">
+                    ${changed.map(c => `
+                      <tr>
+                        <td class="px-3 py-2 text-slate-900 font-semibold">${escapeHtml(c.path)}</td>
+                        <td class="px-3 py-2 text-slate-500">${escapeHtml(String(c.before))}</td>
+                        <td class="px-3 py-2 text-emerald-700 font-bold">${escapeHtml(String(c.after))}</td>
+                        <td class="px-3 py-2 text-blue-700 font-medium">${c.delta !== null && c.delta !== undefined ? (c.delta > 0 ? `+${c.delta}` : c.delta) : 'CHANGED'}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              </div>
+            ` : '<div class="text-xs text-slate-500">측정 구간 동안 변경된 필드가 없습니다.</div>'}
+          </div>
+        `;
+      }
+
+      const results = d.results || [d];
+      return `
+        <div class="space-y-2">
+          ${results.map(r => `
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1.5">
+              <div class="flex flex-wrap items-center justify-between gap-1.5">
+                <div class="flex items-center gap-1.5 flex-wrap">
+                  <span class="text-xs font-bold text-slate-900 mono">${escapeHtml(r.expression || r.name || 'Symbol')}</span>
+                  ${r.was_coerced && r.resolved_expression ? `<span class="px-1.5 py-0.5 rounded bg-cyan-50 text-cyan-800 border border-cyan-200 text-[10px] mono font-semibold">🪄 Coerced ➔ ${escapeHtml(r.resolved_expression)}</span>` : ''}
+                </div>
+                <span class="text-[11px] text-slate-500 mono">${escapeHtml(r.type_name || '')} @ ${escapeHtml(r.runtime_address || '')}</span>
+              </div>
+              <pre class="text-[11px] mono text-slate-800 bg-white border border-slate-200 p-2.5 rounded-lg overflow-x-auto">${escapeHtml(JSON.stringify(r.value, null, 2))}</pre>
+              ${r.self_repair ? `<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-[11px] text-amber-900 mono">🔧 <strong>자가 복구 가이드(Self-Repair):</strong> ${escapeHtml(r.self_repair.self_repair_hint || '')}</div>` : ''}
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function renderPhase10CardBody(card) {
+      const d = card.data || {};
+      if (card.type === "DPDK_LCORE_INSPECTOR") {
+        const lcores = d.lcores || [];
+        const rings = d.lockless_rings || [];
+        const spins = d.spinlocks || [];
+        const huges = d.hugepage_mappings || [];
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-indigo-950 text-white rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <div>
+                <div class="text-[10px] text-indigo-300">DPDK Isolated-Core PMD & Lockless Ring Audit (Window ${d.sample_window_ms || 40}ms · Hugepages ${huges.length} · Isolated CPUs [${(d.kernel_isolated_cpus || []).join(",")}])</div>
+                <div class="font-bold text-xs sm:text-sm mt-0.5">${escapeHtml(d.overall_dpdk_status)} · Dedicated PMD ${d.dedicated_pmd_lcores_count || 0}개 · Ring ${rings.length}개</div>
+              </div>
+              <span class="px-2.5 py-0.5 rounded-full bg-indigo-500/30 text-indigo-200 border border-indigo-400/30 text-[11px] font-bold">0.00ms Zero-Jitter</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              ${lcores.map(lc => {
+                const stBadge = lc.pmd_health_status === "PMD_POLLING_HEALTHY"
+                  ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                  : (lc.pmd_health_status === "LCORE_STUCK_DEADLOOP" ? "bg-rose-50 text-rose-800 border-rose-200" : "bg-slate-100 text-slate-700 border-slate-200");
+                return `
+                  <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-1.5 mono">
+                    <div class="flex flex-wrap items-center justify-between gap-1 border-b border-slate-100 pb-1.5">
+                      <span class="font-bold text-slate-900">TID ${lc.tid} (${escapeHtml(lc.name)}) · CPU#${lc.cpu_id ?? "-"} (Allowed: ${escapeHtml(lc.cpus_allowed_list || "-")})</span>
+                      <span class="px-2 py-0.5 rounded border text-[10px] font-bold ${stBadge}">${escapeHtml(lc.pmd_health_status)}</span>
+                    </div>
+                    <div class="text-[11px] text-slate-600">
+                      Role: <strong>${escapeHtml(lc.lcore_role)}</strong> · Leaf Fn: <strong class="text-indigo-700">${escapeHtml(lc.top_function || "-")}()</strong> (${escapeHtml(lc.top_source_location || "-")})
+                    </div>
+                    <div class="text-[11px] text-slate-500">
+                      Progress Δ: <strong>${lc.progress_delta ?? 0}</strong> · NonVolCS Δ: <strong>${lc.nonvoluntary_ctxt_switches_delta ?? 0}</strong> · TLS: ${escapeHtml(JSON.stringify(lc.per_lcore_tls || {}))}
+                    </div>
+                  </div>
+                `;
+              }).join("")}
+            </div>
+            ${rings.length > 0 ? `
+              <div class="space-y-1.5">
+                <div class="text-[11px] font-bold text-slate-700">🔄 DPDK Lockless Rings (rte_ring):</div>
+                ${rings.map(r => `
+                  <div class="bg-slate-50 border border-slate-200 rounded-xl p-2.5 flex flex-wrap items-center justify-between gap-2 mono text-[11px]">
+                    <div>
+                      <strong class="text-slate-900">${escapeHtml(r.expression)}</strong> (${escapeHtml(r.runtime_address || "-")}) · prod[head=${r.prod_head}, tail=${r.prod_tail}] · cons[head=${r.cons_head}, tail=${r.cons_tail}] · Δ=${r.throughput_delta}
+                    </div>
+                    <span class="px-2 py-0.5 rounded font-bold ${r.ring_status === "HEALTHY_FLOWING" ? "bg-emerald-100 text-emerald-800" : "bg-rose-100 text-rose-800"}">${escapeHtml(r.ring_status)}</span>
+                  </div>
+                `).join("")}
+              </div>
+            ` : ""}
+          </div>
+        `;
+      }
+
+      if (card.type === "TLS_INSPECTOR") {
+        const ths = d.threads || [];
+        const geom = d.pt_tls_geometry || {};
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-cyan-950 text-white rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <div>
+                <div class="text-[10px] text-cyan-300">ELF PT_TLS Block Geometry (memsz=${geom.tls_memsz || 0}B · align=${geom.tls_align || 8}B · aligned=${geom.aligned_tls_memsz || 0}B)</div>
+                <div class="font-bold text-xs sm:text-sm mt-0.5">스레드별 독립 TLS(__thread / thread_local) 변수 ${d.tls_variables_discovered || 0}개 · TCB ${d.tcb_resolved_count || 0}/${d.threads_count || 0}개 해독</div>
+              </div>
+              <span class="px-2.5 py-0.5 rounded-full bg-cyan-500/30 text-cyan-200 border border-cyan-400/30 text-[11px] font-bold">0.00ms Zero-Stop TLS</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              ${ths.map(t => `
+                <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-2 mono">
+                  <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+                    <span class="font-bold text-slate-900">TID ${t.tid} (${escapeHtml(t.name)})</span>
+                    <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px]">TCB ${escapeHtml(t.tcb_address || "-")}</span>
+                  </div>
+                  <div class="space-y-1.5">
+                    ${(t.tls_variables || []).map(v => `
+                      <div class="bg-slate-50 border border-slate-200/80 rounded-lg px-2.5 py-1.5 flex items-center justify-between">
+                        <div>
+                          <div class="font-bold text-cyan-800">${escapeHtml(v.name)}</div>
+                          <div class="text-[10px] text-slate-400">${escapeHtml(v.type_name)} · TLS+${escapeHtml(v.tls_offset)}</div>
+                        </div>
+                        <span class="font-bold text-slate-900 text-xs">${escapeHtml(typeof v.value === "object" ? JSON.stringify(v.value) : String(v.value))}</span>
+                      </div>
+                    `).join("")}
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "CONCURRENCY_VERIFIER") {
+        const syms = d.symbols || [];
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <div>
+                <div class="text-[10px] text-slate-500">Optimistic Seqlock Double-Read Verification (Read 1 ➔ Read 2)</div>
+                <div class="font-bold text-slate-900 mt-0.5">${escapeHtml(d.overall_consistency_status)}</div>
+              </div>
+              <div class="flex items-center gap-1.5 text-[11px]">
+                <span class="px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-bold">Atomic: ${d.atomic_consistent_count || 0}</span>
+                <span class="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-bold">Recovered: ${d.torn_read_recovered_count || 0}</span>
+                <span class="px-2 py-0.5 rounded bg-rose-50 text-rose-800 border border-rose-200 font-bold">Mutating: ${d.concurrently_mutating_count || 0}</span>
+              </div>
+            </div>
+            <div class="space-y-2">
+              ${syms.map(s => {
+                const stCls = s.consistency_status === "ATOMIC_CONSISTENT"
+                  ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                  : (s.consistency_status === "TORN_READ_RECOVERED" ? "bg-amber-50 text-amber-800 border-amber-200" : "bg-rose-50 text-rose-800 border-rose-200");
+                return `
+                  <div class="bg-white border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+                    <div>
+                      <div class="font-bold text-slate-900">${escapeHtml(s.expression)} <span class="text-slate-400 font-normal">(${escapeHtml(s.type_name)} · ${s.checked_byte_size}B @ ${escapeHtml(s.checked_address)})</span></div>
+                      <div class="text-[11px] text-slate-500 mt-0.5">검증 값: <strong>${escapeHtml(typeof s.verified_value === "object" ? JSON.stringify(s.verified_value) : String(s.verified_value))}</strong> · 시도 횟수: ${s.attempts_used}회</div>
+                    </div>
+                    <span class="px-2.5 py-1 rounded-lg border text-[11px] font-bold ${stCls}">${escapeHtml(s.consistency_status)}</span>
+                  </div>
+                `;
+              }).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "FLIGHT_RECORDER") {
+        const glitches = d.transient_glitches || [];
+        const triad = d.time_machine_triad || {};
+        const preF = triad.pre_anomaly_frame || {};
+        const peakF = triad.peak_anomaly_frame || {};
+        const postF = triad.post_anomaly_frame || {};
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-violet-950 text-white rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div class="text-[10px] text-violet-300 mono">Blackbox Circular Ring Buffer (${d.frames_recorded || 8} micro-frames · ${d.elapsed_ms || 0}ms)</div>
+                <div class="font-bold text-xs sm:text-sm mt-0.5">순간 스파이크/글리치(A ➔ B ➔ A) ${glitches.length}건 포착</div>
+              </div>
+              <span class="px-2.5 py-0.5 rounded-full bg-violet-500/30 text-violet-200 border border-violet-400/30 font-bold mono text-[11px]">Peak Frame #${peakF.frame_seq || 4}</span>
+            </div>
+            <div class="grid grid-cols-3 gap-2 mono text-[11px]">
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+                <div class="text-[10px] text-slate-500">① 스파이크 직전 (Frame #${preF.frame_seq || 3})</div>
+                <div class="font-bold text-slate-800 mt-0.5">Stress: ${preF.stress_score ?? 0}</div>
+                <div class="text-[10px] text-slate-500 truncate mt-0.5">${escapeHtml((preF.stress_highlights || []).join(", ") || "정상")}</div>
+              </div>
+              <div class="bg-rose-50 border border-rose-300 rounded-xl p-2.5">
+                <div class="text-[10px] text-rose-700 font-bold">② 피크 순간 (Frame #${peakF.frame_seq || 4})</div>
+                <div class="font-bold text-rose-900 mt-0.5">Stress: ${peakF.stress_score ?? 0} 🚨</div>
+                <div class="text-[10px] text-rose-700 truncate mt-0.5">${escapeHtml((peakF.stress_highlights || []).join(", "))}</div>
+              </div>
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+                <div class="text-[10px] text-slate-500">③ 복구 직후 (Frame #${postF.frame_seq || 5})</div>
+                <div class="font-bold text-slate-800 mt-0.5">Stress: ${postF.stress_score ?? 0}</div>
+                <div class="text-[10px] text-slate-500 truncate mt-0.5">${escapeHtml((postF.stress_highlights || []).join(", ") || "복구됨")}</div>
+              </div>
+            </div>
+            <div class="space-y-2">
+              ${glitches.map(g => `
+                <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-1.5 mono">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <strong class="text-slate-900">${escapeHtml(g.path)}</strong>
+                    <span class="px-2 py-0.5 rounded bg-rose-100 text-rose-800 text-[10px] font-bold">${escapeHtml(String(g.baseline_value))} ➔ ${escapeHtml(String(g.spike_value))} ➔ ${escapeHtml(String(g.restored_value))} (Frame #${g.peak_frame_seq})</span>
+                  </div>
+                  <div class="text-[11px] text-slate-500">시계열 궤적: [${(g.timeline_values || []).map(v => escapeHtml(String(v))).join(" → ")}]</div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "BEHAVIORAL_DRIFT") {
+        const dims = d.drifted_dimensions || [];
+        const score = d.drift_score ?? 0;
+        const badgeCls = score >= 50 ? "bg-rose-50 text-rose-800 border-rose-200" : (score > 0 ? "bg-amber-50 text-amber-800 border-amber-200" : "bg-emerald-50 text-emerald-800 border-emerald-200");
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div class="text-[10px] text-slate-500">정상 Baseline 대비 다차원 행동 편차(Behavioral Drift)</div>
+                <div class="font-bold text-slate-900 mt-0.5">${escapeHtml(d.drift_status)} · 변이 차원 ${dims.length}건</div>
+              </div>
+              <span class="px-3 py-1 rounded-xl border font-bold mono ${badgeCls}">Drift Score: ${score} / 100</span>
+            </div>
+            <div class="space-y-2">
+              ${dims.map(dm => `
+                <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-1">
+                  <div class="flex flex-wrap items-center justify-between gap-2 mono">
+                    <span class="font-bold text-slate-900">[${escapeHtml(dm.dimension)}] ${escapeHtml(dm.metric)}</span>
+                    <span class="text-[11px] text-blue-700 font-semibold">Baseline: ${escapeHtml(String(dm.baseline))} ➔ Current: ${escapeHtml(String(dm.current))}</span>
+                  </div>
+                  <div class="text-slate-600">${escapeHtml(dm.detail)}</div>
+                </div>
+              `).join("") || '<div class="text-slate-500">모든 지표가 Baseline과 일치합니다.</div>'}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "STATISTICAL_HOTSPOTS") {
+        const ths = d.thread_cpu_profiles || [];
+        const fns = d.hotspot_functions || [];
+        const flames = d.flame_stacks || [];
+        const rates = d.counter_rates || [];
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <div>
+                <span class="text-slate-500">샘플 수:</span> <strong>${d.samples_taken || 0}회</strong>
+                <span class="mx-1.5">·</span>
+                <span class="text-slate-500">측정 구간:</span> <strong>${d.elapsed_ms || 0}ms</strong>
+              </div>
+              <span class="px-2.5 py-0.5 rounded-full bg-rose-50 text-rose-700 border border-rose-200 font-bold">0.00ms Statistical Profiler</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-2">
+                <div class="text-[11px] font-bold text-slate-800">🔥 상위 핫스팟 함수 (Callstack Residency):</div>
+                ${fns.slice(0, 5).map(fn => `
+                  <div class="space-y-1">
+                    <div class="flex items-center justify-between mono text-[11px]">
+                      <span class="font-bold text-slate-900">${escapeHtml(fn.function_name)}()</span>
+                      <span class="text-rose-700 font-bold">Self ${fn.self_pct}% · Incl ${fn.inclusive_pct}%</span>
+                    </div>
+                    <div class="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                      <div class="h-full bg-rose-500" style="width: ${Math.min(100, fn.inclusive_pct || 0)}%"></div>
+                    </div>
+                    <div class="text-[10px] text-slate-400 mono">${escapeHtml(fn.source_location || "")} · ${escapeHtml((fn.threads || []).join(", "))}</div>
+                  </div>
+                `).join("")}
+              </div>
+              <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-2">
+                <div class="text-[11px] font-bold text-slate-800">🧵 스레드별 CPU 점유율 (utime+stime Tick Delta):</div>
+                ${ths.map(t => `
+                  <div class="space-y-1">
+                    <div class="flex items-center justify-between mono text-[11px]">
+                      <span><strong>TID ${t.tid}</strong> (${escapeHtml(t.name)}) · State:${escapeHtml(t.state)}</span>
+                      <span class="font-bold text-blue-700">${t.cpu_share_pct}% (${t.total_delta_ticks} ticks)</span>
+                    </div>
+                    <div class="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                      <div class="h-full bg-blue-600" style="width: ${Math.min(100, t.cpu_share_pct || 0)}%"></div>
+                    </div>
+                  </div>
+                `).join("")}
+                ${rates.length > 0 ? `
+                  <div class="pt-2 border-t border-slate-100 space-y-1">
+                    <div class="text-[10px] font-semibold text-slate-500">초당 카운터 변이 속도 (Velocity):</div>
+                    ${rates.map(r => `<div class="mono text-[11px] text-emerald-700">${escapeHtml(r.expression)}: <strong>${r.rate_per_sec}/s</strong> (Δ=${r.delta})</div>`).join("")}
+                  </div>
+                ` : ""}
+              </div>
+            </div>
+            ${flames.length > 0 ? `
+              <div class="bg-slate-900 text-slate-100 rounded-xl p-3 mono text-[11px] space-y-1">
+                <div class="text-[10px] text-slate-400">Folded Flame-Graph Callstacks:</div>
+                ${flames.slice(0, 4).map(fl => `<div class="flex items-center justify-between"><span class="text-amber-300 truncate">${escapeHtml(fl.folded_stack)}</span><span class="text-slate-300 shrink-0 ml-2">${fl.samples} hits (${fl.pct}%)</span></div>`).join("")}
+              </div>
+            ` : ""}
+          </div>
+        `;
+      }
+
+      if (card.type === "FUZZY_INTENT_RESOLVER") {
+        const matches = d.matches || [];
+        return `
+          <div class="space-y-2.5 text-xs">
+            <div class="bg-amber-50/70 border border-amber-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div class="text-[10px] text-amber-800">자연어 질문 ➔ DWARF 심볼 자동 추론 키워드</div>
+                <div class="mono text-[11px] font-bold text-slate-900 mt-0.5">[${escapeHtml((d.expanded_keywords || []).join(", "))}]</div>
+              </div>
+              <span class="px-2.5 py-0.5 rounded-full bg-white text-amber-900 border border-amber-300 text-[11px] font-bold mono">${matches.length} matched symbols</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              ${matches.map(m => `
+                <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-1.5 mono">
+                  <div class="flex items-center justify-between">
+                    <strong class="text-blue-700 text-xs">${escapeHtml(m.recommended_expression)}</strong>
+                    <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px]">Score ${m.relevance_score} · ${escapeHtml(m.type_name)}</span>
+                  </div>
+                  <div class="text-[10px] text-slate-500">멤버: ${escapeHtml((m.member_fields || []).join(", ") || "-")}</div>
+                  <pre class="text-[11px] bg-slate-50 border border-slate-200 rounded-lg p-2 overflow-x-auto text-slate-800">${escapeHtml(JSON.stringify(m.live_value, null, 2))}</pre>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "SYMPTOM_INVESTIGATION") {
+        const chains = d.causal_chains || [];
+        const snippets = d.annotated_source_snippets || [];
+        const steps = d.remediation_steps || [];
+        const confPct = Math.round((d.confidence_score || 0.9) * 100);
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-slate-900 text-white rounded-xl p-3.5 space-y-1.5">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <span class="px-2 py-0.5 rounded bg-blue-500/20 text-blue-200 border border-blue-400/30 text-[10px] font-bold mono">${escapeHtml(d.classified_symptom || "SYMPTOM_ANALYSIS")}</span>
+                <span class="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 text-[11px] font-bold mono">Confidence: ${confPct}% · Health: ${d.health_score ?? 40}/100</span>
+              </div>
+              <div class="text-xs sm:text-sm font-bold leading-snug pt-0.5">${escapeHtml(d.root_cause_hypothesis || "")}</div>
+            </div>
+            ${chains.length > 0 ? `
+              <div class="space-y-1.5">
+                <div class="text-[11px] font-semibold text-slate-700">🔗 인과 사슬 (Causal Dependency Flow):</div>
+                ${chains.map(c => `
+                  <div class="bg-indigo-50/60 border border-indigo-200 rounded-xl p-2.5 space-y-1">
+                    <div class="mono text-[11px] font-bold text-indigo-950 overflow-x-auto">${escapeHtml(c.ascii_flow)}</div>
+                    <div class="text-[11px] text-slate-600">${(c.steps || []).map(s => `• ${escapeHtml(s)}`).join("<br/>")}</div>
+                  </div>
+                `).join("")}
+              </div>
+            ` : ""}
+            ${snippets.length > 0 ? `
+              <div class="space-y-1.5">
+                <div class="text-[11px] font-semibold text-slate-700">📝 결함 지점 소스 코드 & 실시간 변수 매핑 (${escapeHtml(snippets[0].file_hint)}:${snippets[0].target_line}):</div>
+                <div class="bg-slate-900 text-slate-100 rounded-xl p-3 mono text-[11px] overflow-x-auto space-y-0.5">
+                  ${(snippets[0].annotated_lines || []).map(l => `
+                    <div class="${l.is_target_line ? 'bg-amber-500/20 text-amber-200 font-bold px-1.5 py-0.5 rounded' : 'text-slate-300 px-1.5'}">${escapeHtml(l.formatted)}</div>
+                  `).join("")}
+                </div>
+              </div>
+            ` : ""}
+            ${steps.length > 0 ? `
+              <div class="bg-emerald-50/70 border border-emerald-200 rounded-xl p-3 space-y-1">
+                <div class="text-[11px] font-bold text-emerald-900">🛠️ 종합 권장 조치 (Remediation Plan):</div>
+                ${steps.map((st, idx) => `<div class="text-[11px] text-emerald-800">${idx + 1}. ${escapeHtml(st)}</div>`).join("")}
+              </div>
+            ` : ""}
+          </div>
+        `;
+      }
+
+      if (card.type === "DEPENDENCY_GRAPH") {
+        const chains = d.causal_chains || [];
+        const nodes = d.nodes || [];
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="space-y-2">
+              <div class="text-[11px] font-semibold text-slate-700">검출된 인과 사슬 (${chains.length}건):</div>
+              ${chains.map(c => `
+                <div class="bg-indigo-50/70 border border-indigo-200 rounded-xl p-3 space-y-1.5">
+                  <div class="flex items-center justify-between">
+                    <span class="px-2 py-0.5 rounded bg-indigo-600 text-white text-[10px] font-bold mono">${escapeHtml(c.chain_type)}</span>
+                    ${c.source_location ? `<span class="mono text-[11px] text-indigo-800 font-semibold">📍 ${escapeHtml(c.source_location)}</span>` : ""}
+                  </div>
+                  <div class="mono text-xs font-bold text-slate-900 overflow-x-auto py-0.5">${escapeHtml(c.ascii_flow)}</div>
+                  <div class="text-[11px] text-slate-600 space-y-0.5">
+                    ${(c.steps || []).map(s => `<div>• ${escapeHtml(s)}</div>`).join("")}
+                  </div>
+                </div>
+              `).join("") || '<div class="text-slate-400">블로킹 인과 사슬이 없습니다.</div>'}
+            </div>
+            <div>
+              <div class="text-[11px] font-semibold text-slate-700 mb-1.5">그래프 엔티티 노드 (${nodes.length}개):</div>
+              <div class="flex flex-wrap gap-1.5">
+                ${nodes.map(n => `
+                  <span class="px-2.5 py-1 rounded-lg border text-[11px] mono ${n.status === 'BLOCKED' || n.status === 'CONTENDED' ? 'bg-rose-50 border-rose-200 text-rose-800 font-bold' : 'bg-white border-slate-200 text-slate-700'}">
+                    [${escapeHtml(n.kind)}] ${escapeHtml(n.label)}
+                  </span>
+                `).join("")}
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "SOURCE_CORRELATION") {
+        const snippets = d.snippets || [];
+        return `
+          <div class="space-y-3 text-xs">
+            ${snippets.map(sn => `
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2 mono">
+                  <div>
+                    <strong class="text-slate-900">${escapeHtml(sn.file_hint)}:${sn.target_line}</strong>
+                    ${sn.function_name ? `<span class="text-blue-700 ml-1.5">in ${escapeHtml(sn.function_name)}()</span>` : ""}
+                  </div>
+                  ${sn.tid ? `<span class="px-2 py-0.5 rounded bg-slate-900 text-white text-[10px]">TID ${sn.tid} (${escapeHtml(sn.thread_name || "")})</span>` : ""}
+                </div>
+                <div class="bg-slate-900 text-slate-100 rounded-xl p-3 mono text-[11px] overflow-x-auto space-y-0.5">
+                  ${(sn.annotated_lines || []).map(l => `
+                    <div class="${l.is_target_line ? 'bg-amber-500/20 text-amber-200 font-bold px-1.5 py-0.5 rounded' : 'text-slate-300 px-1.5'}">${escapeHtml(l.formatted)}</div>
+                  `).join("") || '<div class="text-slate-400">소스 코드 라인을 찾을 수 없습니다 (로컬 소스 경로 확인 필요)</div>'}
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        `;
+      }
+
+      if (card.type === "IPC_PIPELINE") {
+        const m = d.metrics || {};
+        const peers = d.peer_processes || [];
+        const fds = d.ipc_fds || [];
+        const healthCls = d.pipeline_health === "HEALTHY_PIPELINE" ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-amber-50 text-amber-800 border-amber-200";
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div class="text-[10px] text-slate-500">멀티 프로세스 파이프라인 상태 진단</div>
+                <div class="font-bold text-slate-900 mt-0.5">${escapeHtml(d.bottleneck_diagnosis || "")}</div>
+              </div>
+              <span class="px-2.5 py-0.5 rounded-full border text-[11px] font-bold mono ${healthCls}">${escapeHtml(d.pipeline_health || "HEALTHY")}</span>
+            </div>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mono">
+              <div class="bg-white border border-slate-200 rounded-xl p-2.5">
+                <div class="text-[10px] text-slate-500">Producer Seq</div>
+                <div class="text-sm font-bold text-blue-700 mt-0.5">${m.producer_seq ?? "-"}</div>
+              </div>
+              <div class="bg-white border border-slate-200 rounded-xl p-2.5">
+                <div class="text-[10px] text-slate-500">Consumer Seq</div>
+                <div class="text-sm font-bold text-emerald-700 mt-0.5">${m.consumer_seq ?? "-"}</div>
+              </div>
+              <div class="bg-white border border-slate-200 rounded-xl p-2.5">
+                <div class="text-[10px] text-slate-500">Pending Backlog</div>
+                <div class="text-sm font-bold text-amber-700 mt-0.5">${m.pending_backlog ?? 0} / ${m.capacity ?? "-"}</div>
+              </div>
+              <div class="bg-white border border-slate-200 rounded-xl p-2.5">
+                <div class="text-[10px] text-slate-500">Ring Utilization</div>
+                <div class="text-sm font-bold text-slate-900 mt-0.5">${m.backlog_utilization_pct ?? 0}%</div>
+              </div>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-2.5 space-y-1">
+                <div class="text-[11px] font-semibold text-slate-700">연결된 피어 프로세스 (${peers.length}개):</div>
+                ${peers.map(p => `<div class="mono text-[11px] text-slate-800">PID <strong>${p.peer_pid}</strong> (${escapeHtml(p.peer_name)}) · State:${escapeHtml(p.peer_state || "S")} · ${escapeHtml(p.shared_pathname)}</div>`).join("") || '<div class="text-slate-400">피어 없음</div>'}
+              </div>
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-2.5 space-y-1">
+                <div class="text-[11px] font-semibold text-slate-700">활성 IPC 파일 디스크립터 (${fds.length}개):</div>
+                ${fds.map(f => `<div class="mono text-[11px] text-slate-600">fd[${f.fd}] ➔ ${escapeHtml(f.target)}</div>`).join("") || '<div class="text-slate-400">IPC FD 없음</div>'}
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "HEAP_SCANNER") {
+        const objs = d.objects || [];
+        const hist = d.class_histogram || {};
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <div>
+                <span class="text-slate-500">스캔된 힙 크기:</span> <strong>${d.scanned_heap_bytes || 0}B</strong>
+                <span class="mx-1.5">·</span>
+                <span class="text-slate-500">발견된 C++ 다형성 객체:</span> <strong>${d.total_objects_found || 0}개</strong>
+              </div>
+              <span class="px-2.5 py-0.5 rounded-full font-bold border ${d.leaked_candidates_count > 0 ? "bg-rose-50 text-rose-700 border-rose-200" : "bg-emerald-50 text-emerald-700 border-emerald-200"}">
+                미참조 누수(Leak) 의심: ${d.leaked_candidates_count || 0}개
+              </span>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              ${Object.entries(hist).map(([clsName, h]) => `
+                <div class="px-3 py-1.5 rounded-xl bg-white border border-slate-200 mono text-[11px]">
+                  <strong class="text-slate-900">${escapeHtml(clsName)}</strong>: 총 ${h.total}개 (Heap ${h.on_heap} · Global ${h.on_global} · <span class="${h.leaked_candidates > 0 ? "text-rose-600 font-bold" : "text-slate-500"}">Leak의심 ${h.leaked_candidates}</span>)
+                </div>
+              `).join("")}
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              ${objs.slice(0, 12).map(o => `
+                <div class="rounded-xl p-2.5 border mono text-[11px] space-y-1 ${o.is_leaked_candidate ? "bg-rose-50/50 border-rose-200" : "bg-white border-slate-200"}">
+                  <div class="flex items-center justify-between">
+                    <span class="font-bold text-slate-900">${escapeHtml(o.class_name)} @ ${escapeHtml(o.address)}</span>
+                    <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold ${o.is_leaked_candidate ? "bg-rose-600 text-white" : "bg-slate-100 text-slate-700"}">
+                      ${o.is_leaked_candidate ? "LEAK CANDIDATE" : escapeHtml(o.region)}
+                    </span>
+                  </div>
+                  <div class="text-slate-600 truncate">fields: ${escapeHtml(JSON.stringify(o.fields || {}))}</div>
+                  <div class="text-[10px] text-slate-400">${o.is_referenced ? `참조됨: ${escapeHtml((o.referenced_by || []).join(", "))}` : "⚠️ 전역/스택/힙 어디에서도 참조되지 않는 고립 객체"}</div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "AUTO_TRIAGE") {
+        const findings = d.findings || [];
+        const score = d.health_score ?? 100;
+        const scoreColor = score >= 80 ? "text-emerald-700 bg-emerald-50 border-emerald-200" : (score >= 50 ? "text-amber-800 bg-amber-50 border-amber-200" : "text-rose-800 bg-rose-50 border-rose-200");
+        return `
+          <div class="space-y-3">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div class="text-[10px] font-medium text-slate-500">프로세스 종합 건강도 및 근본 원인 요약</div>
+                <div class="text-sm font-bold text-slate-900 mt-0.5">${escapeHtml(d.overall_status || "HEALTHY")} · 핵심 발견 ${findings.length}건</div>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="px-3 py-1 rounded-xl border text-xs font-bold mono ${scoreColor}">
+                  Health Score: ${score} / 100
+                </span>
+              </div>
+            </div>
+            <div class="space-y-2">
+              ${findings.map(f => {
+                const sevCls = f.severity === "CRITICAL" ? "bg-rose-600 text-white" : (f.severity === "HIGH" ? "bg-amber-500 text-white" : "bg-blue-600 text-white");
+                return `
+                  <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-1.5 shadow-2xs">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <div class="flex items-center gap-2">
+                        <span class="px-2 py-0.5 rounded text-[10px] font-bold mono ${sevCls}">${escapeHtml(f.severity)}</span>
+                        <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px] font-semibold mono">${escapeHtml(f.category)}</span>
+                        <strong class="text-xs text-slate-900 mono">${escapeHtml(f.title)}</strong>
+                      </div>
+                      ${f.source_location ? `<span class="text-[11px] text-blue-700 font-medium mono">📍 ${escapeHtml(f.source_location)}</span>` : ""}
+                    </div>
+                    <div class="text-xs text-slate-600">${escapeHtml(f.summary)}</div>
+                    ${f.recommended_action ? `<div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-100 rounded-lg px-2.5 py-1.5">🛠️ <strong>권장 조치:</strong> ${escapeHtml(f.recommended_action)}</div>` : ""}
+                  </div>
+                `;
+              }).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "FRAME_LOCALS") {
+        const threads = d.threads || [];
+        return `
+          <div class="space-y-3">
+            ${threads.map(t => `
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
+                <div class="flex items-center justify-between text-xs mono">
+                  <div>
+                    <span class="px-2 py-0.5 rounded bg-slate-900 text-white font-bold">TID ${t.tid}</span>
+                    <strong class="text-slate-900 ml-1.5">${escapeHtml(t.name)}</strong>
+                  </div>
+                  <span class="text-[11px] text-slate-500">${t.frames_count || 0} active frame(s)</span>
+                </div>
+                <div class="space-y-2">
+                  ${(t.frames || []).map(fr => `
+                    <div class="bg-white border border-slate-200 rounded-lg p-2.5 space-y-1.5 text-xs mono">
+                      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-1">
+                        <span class="font-bold text-blue-700">#${fr.frame_index} ${escapeHtml(fr.function_name)}()</span>
+                        <span class="text-[11px] text-slate-400">${escapeHtml(fr.source_location || "")} ${fr.cfa_address ? `· CFA:${escapeHtml(fr.cfa_address)}` : ""}</span>
+                      </div>
+                      <div class="flex flex-wrap gap-1.5 pt-0.5">
+                        ${(fr.parameters || []).map(p => `
+                          <span class="px-2 py-0.5 rounded bg-blue-50 border border-blue-200 text-[11px]">
+                            <span class="text-blue-700 font-semibold">[param] ${escapeHtml(p.name)}:</span>
+                            <strong class="text-slate-900">${escapeHtml(JSON.stringify(p.value))}</strong>
+                            <span class="text-[10px] text-slate-400">(${escapeHtml(p.type_name)})</span>
+                          </span>
+                        `).join("")}
+                        ${(fr.locals || []).map(l => `
+                          <span class="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-[11px]">
+                            <span class="text-emerald-800 font-semibold">[local] ${escapeHtml(l.name)}:</span>
+                            <strong class="text-slate-900">${escapeHtml(JSON.stringify(l.value))}</strong>
+                            <span class="text-[10px] text-slate-400">(${escapeHtml(l.type_name)} @ ${escapeHtml(l.runtime_address)})</span>
+                          </span>
+                        `).join("")}
+                      </div>
+                    </div>
+                  `).join("")}
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        `;
+      }
+
+      if (card.type === "CONDITION_TRIGGER") {
+        const clauses = d.clause_evaluations || [];
+        return `
+          <div class="space-y-2.5">
+            <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-50 border border-slate-200 rounded-xl p-3">
+              <div>
+                <div class="text-[10px] text-slate-500">감시 조건식 (Zero-Stop Watchpoint)</div>
+                <div class="text-xs font-bold text-slate-900 mono mt-0.5">${escapeHtml(d.condition_expression || "")}</div>
+              </div>
+              <div class="flex items-center gap-2 mono text-xs">
+                <span class="px-2.5 py-0.5 rounded-full font-semibold ${d.triggered ? "bg-emerald-100 text-emerald-800 border border-emerald-200" : "bg-amber-100 text-amber-800 border border-amber-200"}">
+                  ${d.triggered ? "TRIGGERED ✓" : "TIMEOUT"}
+                </span>
+                <span class="text-slate-500 text-[11px]">${d.samples_taken || 1} samples · ${d.elapsed_ms || 0}ms</span>
+              </div>
+            </div>
+            ${clauses.length > 0 ? `
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                ${clauses.map(c => `
+                  <div class="bg-white border border-slate-200 rounded-lg p-2.5 text-xs mono flex items-center justify-between">
+                    <span><strong>${escapeHtml(c.lhs)}</strong> = <span class="text-blue-700 font-bold">${escapeHtml(String(c.observed_value))}</span></span>
+                    <span class="text-[11px] text-slate-500">기대조건: ${escapeHtml(c.operator)} ${escapeHtml(String(c.expected_rhs))}</span>
+                  </div>
+                `).join("")}
+              </div>
+            ` : ""}
+            ${d.llm_next_step_hint ? `<div class="bg-blue-50/70 border border-blue-200 rounded-xl px-3 py-2 text-[11px] text-blue-900">💡 ${escapeHtml(d.llm_next_step_hint)}</div>` : ""}
+          </div>
+        `;
+      }
+
+      if (card.type === "LINKED_LIST_CHAIN") {
+        const nodes = d.nodes || [];
+        return `
+          <div class="space-y-2.5">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1">
+              <div class="flex items-center justify-between text-xs">
+                <span class="font-bold text-slate-900 mono">${escapeHtml(d.head_expression)} (${escapeHtml(d.node_type)}, ${d.nodes_count} nodes)</span>
+                <span class="px-2 py-0.5 rounded-md text-[10px] font-semibold mono ${d.cycle_detected || d.corrupted_link_detected ? "bg-rose-100 text-rose-800 border border-rose-200" : "bg-emerald-100 text-emerald-800 border border-emerald-200"}">
+                  ${escapeHtml(d.termination_reason)}
+                </span>
+              </div>
+              <div class="text-[11px] text-blue-700 mono overflow-x-auto pt-1">${escapeHtml(d.ascii_chain_summary || "")}</div>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              ${nodes.slice(0, 12).map(n => `
+                <div class="bg-white border border-slate-200 rounded-lg p-2.5 text-xs mono">
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="font-bold text-slate-900">#${n.index} @ ${escapeHtml(n.address)}</span>
+                    <span class="text-[10px] text-slate-500">next ➔ ${escapeHtml(n.next_address)}</span>
+                  </div>
+                  <div class="text-[11px] text-slate-600 truncate">${escapeHtml(JSON.stringify(n.fields || {}))}</div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "CALLSTACK_AND_LOCKS") {
+        const locks = d.locks || [];
+        const threads = d.threads || [];
+        return `
+          <div class="space-y-3">
+            ${d.deadlock_detected ? `<div class="bg-rose-50 border border-rose-300 rounded-xl p-3 text-xs text-rose-900 font-semibold">🚨 순환 대기 데드락(Deadlock Cycle) 감지됨!</div>` : ""}
+            ${locks.length > 0 ? `
+              <div class="space-y-1.5">
+                <div class="text-[11px] font-semibold text-slate-700">뮤텍스 / 락 상태 (${locks.length}개):</div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  ${locks.map(l => `
+                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs mono flex items-center justify-between">
+                      <div>
+                        <strong class="text-slate-900">${escapeHtml(l.name)}</strong>
+                        <span class="text-[10px] text-slate-500 ml-1">@ ${escapeHtml(l.runtime_address)}</span>
+                      </div>
+                      <span class="px-2 py-0.5 rounded text-[10px] font-semibold ${l.is_locked ? "bg-amber-100 text-amber-800" : "bg-slate-200 text-slate-600"}">
+                        ${l.is_locked ? `LOCKED (Owner TID: ${l.owner_tid || "?"})` : "UNLOCKED"}
+                      </span>
+                    </div>
+                  `).join("")}
+                </div>
+              </div>
+            ` : ""}
+            <div class="space-y-2">
+              <div class="text-[11px] font-semibold text-slate-700">활성 스레드 무정지 콜스택 (${threads.length}개):</div>
+              ${threads.map(t => `
+                <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-1.5">
+                  <div class="flex flex-wrap items-center justify-between gap-2 text-xs mono">
+                    <div>
+                      <span class="px-2 py-0.5 rounded bg-slate-900 text-white font-bold">TID ${t.tid}</span>
+                      <strong class="text-slate-900 ml-1.5">${escapeHtml(t.name)}</strong>
+                      <span class="text-slate-500 ml-1">(State: ${escapeHtml(t.state)}${t.syscall ? ` · syscall: ${escapeHtml(t.syscall)}` : ""})</span>
+                    </div>
+                    ${t.waiting_on_lock ? `<span class="px-2 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200 text-[11px]">⏳ Waiting on ${escapeHtml(t.waiting_on_lock.lock_name)} (held by TID ${t.waiting_on_lock.held_by_tid})</span>` : ""}
+                  </div>
+                  <div class="space-y-1 pl-2 border-l-2 border-slate-200 text-[11px] mono">
+                    ${(t.callstack || []).map(f => `
+                      <div class="flex items-center justify-between text-slate-700">
+                        <span>#${f.frame_index} <strong class="text-blue-700">${escapeHtml(f.symbol_plus_offset || f.function_name)}</strong></span>
+                        <span class="text-slate-400">${escapeHtml(f.source_location || f.runtime_pc || "")}</span>
+                      </div>
+                    `).join("") || `<div class="text-slate-400">스택 프레임 심볼 없음</div>`}
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "MEMORY_AUDIT") {
+        const anomalies = d.anomalies || [];
+        return `
+          <div class="space-y-2.5">
+            <div class="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs mono">
+              <span>감사 완료 심볼: <strong>${d.checked_symbols_count || 0}개</strong></span>
+              <span class="px-2.5 py-0.5 rounded-full font-bold ${anomalies.length > 0 ? "bg-rose-100 text-rose-800 border border-rose-200" : "bg-emerald-100 text-emerald-800 border border-emerald-200"}">
+                ${escapeHtml(d.health_status || "HEALTHY")} (이상 ${anomalies.length}건)
+              </span>
+            </div>
+            ${anomalies.map(a => `
+              <div class="bg-rose-50/50 border border-rose-200 rounded-xl p-3 space-y-1 text-xs">
+                <div class="flex items-center justify-between mono">
+                  <span class="font-bold text-rose-900">[${escapeHtml(a.anomaly_kind)}] ${escapeHtml(a.expression)}</span>
+                  <span class="text-slate-500">@ ${escapeHtml(a.runtime_address)}</span>
+                </div>
+                <div class="text-slate-700">${escapeHtml(a.detail)}</div>
+                <div class="text-[11px] text-slate-500 mono">관측값: <strong>${escapeHtml(String(a.observed_value))}</strong> · 정상 제약: ${escapeHtml(a.expected_constraint)}</div>
+              </div>
+            `).join("")}
+          </div>
+        `;
+      }
+
+      if (card.type === "CODE_POINTERS") {
+        const resList = d.results || [];
+        return `
+          <div class="space-y-2.5">
+            ${resList.map(r => `
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2 text-xs mono">
+                <div class="flex items-center justify-between">
+                  <strong class="text-slate-900">${escapeHtml(r.expression)}</strong>
+                  <span class="px-2 py-0.5 rounded bg-white border border-slate-200 text-[10px] text-slate-600">${escapeHtml(r.kind)}</span>
+                </div>
+                ${r.resolved ? `<div class="bg-white border border-slate-200 rounded-lg p-2 text-blue-700">➔ <strong>${escapeHtml(r.resolved.function_name)}</strong> (${escapeHtml(r.resolved.source_location || r.resolved.runtime_address)})</div>` : ""}
+                ${(r.vtable_entries || []).map(vt => `
+                  <div class="bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 flex items-center justify-between">
+                    <span>vtable[${vt.slot_index}] ➔ <strong class="text-violet-700">${escapeHtml(vt.function_name)}</strong></span>
+                    <span class="text-slate-400 text-[11px]">${escapeHtml(vt.source_location || vt.runtime_address)}</span>
+                  </div>
+                `).join("")}
+              </div>
+            `).join("")}
+          </div>
+        `;
+      }
+
+      if (card.type === "SHARED_MEMORY_IPC") {
+        const shmList = d.shared_mappings || [];
+        const peers = d.peer_processes || [];
+        const ov = d.decoded_overlay;
+        return `
+          <div class="space-y-2.5 text-xs">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1">
+                <div class="text-[11px] font-semibold text-slate-700">공유 메모리 매핑 (${shmList.length}개):</div>
+                ${shmList.map(m => `<div class="mono text-[11px] text-slate-800">${escapeHtml(m.start)} (${m.size}B) · <strong>${escapeHtml(m.pathname || "anon-shared")}</strong></div>`).join("") || '<div class="text-slate-400">매핑 없음</div>'}
+              </div>
+              <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1">
+                <div class="text-[11px] font-semibold text-slate-700">공유 중인 피어 프로세스 (${peers.length}개):</div>
+                ${peers.map(p => `<div class="mono text-[11px] text-emerald-700 font-semibold">PID ${p.peer_pid} (${escapeHtml(p.peer_name)}) · ${escapeHtml(p.shared_pathname)}</div>`).join("") || '<div class="text-slate-400">발견된 피어 프로세스 없음</div>'}
+              </div>
+            </div>
+            ${ov ? `
+              <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-1 mono">
+                <div class="text-[11px] font-bold text-blue-700">DWARF 타입 오버레이 캐스팅: (${escapeHtml(ov.cast_type)}*) @ ${escapeHtml(ov.address)}</div>
+                <pre class="text-[11px] text-slate-800 bg-slate-50 p-2 rounded-lg overflow-x-auto">${escapeHtml(JSON.stringify(ov.value, null, 2))}</pre>
+              </div>
+            ` : ""}
+          </div>
+        `;
+      }
+
+      return renderSymbolOrDiffCardBody(card);
+    }
+
+    function renderWorkspaceCards() {
+      const container = document.getElementById('workspace-cards-container');
+      const emptyState = document.getElementById('workspace-empty-state');
+      const badge = document.getElementById('trace-count-badge');
+
+      const filtered = wsState.cards.filter(c => {
+        if (wsState.activeFilter === 'ALL') return true;
+        return c.type === wsState.activeFilter;
+      });
+
+      if (badge) {
+        badge.textContent = `${wsState.cards.length} cards`;
+      }
+
+      if (filtered.length === 0) {
+        if (emptyState) emptyState.classList.remove('hidden');
+        Array.from(container.querySelectorAll('.trace-card-item')).forEach(el => el.remove());
+        return;
+      }
+
+      if (emptyState) emptyState.classList.add('hidden');
+      Array.from(container.querySelectorAll('.trace-card-item')).forEach(el => el.remove());
+
+      filtered.forEach(card => {
+        const typeBadgeMap = {
+          POOL_MAP: { label: 'MEMORY POOL MAP', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+          THREAD_OWNER: { label: 'THREAD OWNER TRACE', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
+          XRAY_BLUEPRINT: { label: 'PROCESS X-RAY BLUEPRINT', cls: 'bg-slate-100 text-slate-700 border-slate-200' },
+          SYMBOL_EVAL: { label: 'SYMBOL / STATE DIFF', cls: 'bg-violet-50 text-violet-700 border-violet-200' },
+          CONDITION_TRIGGER: { label: 'CONDITION WATCHPOINT', cls: 'bg-rose-50 text-rose-700 border-rose-200' },
+          LINKED_LIST_CHAIN: { label: 'LINKED STRUCTURE CHAIN', cls: 'bg-cyan-50 text-cyan-700 border-cyan-200' },
+          CALLSTACK_AND_LOCKS: { label: 'CALLSTACK & LOCKS', cls: 'bg-indigo-50 text-indigo-700 border-indigo-200' },
+          MEMORY_AUDIT: { label: 'MEMORY INTEGRITY AUDIT', cls: 'bg-amber-50 text-amber-800 border-amber-200' },
+          CODE_POINTERS: { label: 'CODE POINTER & VTABLE', cls: 'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200' },
+          SHARED_MEMORY_IPC: { label: 'SHARED MEMORY IPC', cls: 'bg-teal-50 text-teal-700 border-teal-200' },
+          AUTO_TRIAGE: { label: 'ONE-CLICK AUTO-TRIAGE', cls: 'bg-blue-600 text-white border-blue-600' },
+          FRAME_LOCALS: { label: 'STACK FRAME LOCALS', cls: 'bg-sky-50 text-sky-800 border-sky-200' },
+          IPC_PIPELINE: { label: 'MULTI-PROC IPC PIPELINE', cls: 'bg-teal-50 text-teal-800 border-teal-200' },
+          HEAP_SCANNER: { label: 'HEAP OBJECT & LEAK SCAN', cls: 'bg-orange-50 text-orange-800 border-orange-200' },
+          DPDK_LCORE_INSPECTOR: { label: 'DPDK ISOLATED LCORE & RING', cls: 'bg-indigo-50 text-indigo-800 border-indigo-200' },
+          TLS_INSPECTOR: { label: 'PER-THREAD TLS DECODER', cls: 'bg-cyan-50 text-cyan-800 border-cyan-200' },
+          CONCURRENCY_VERIFIER: { label: 'SEQLOCK CONCURRENCY VERIFIER', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+          FLIGHT_RECORDER: { label: 'TIME-MACHINE FLIGHT RECORDER', cls: 'bg-violet-50 text-violet-800 border-violet-200' },
+          BEHAVIORAL_DRIFT: { label: 'BEHAVIORAL DRIFT DETECTOR', cls: 'bg-teal-50 text-teal-800 border-teal-200' },
+          STATISTICAL_HOTSPOTS: { label: 'STATISTICAL CPU HOTSPOTS', cls: 'bg-rose-50 text-rose-800 border-rose-200' },
+          FUZZY_INTENT_RESOLVER: { label: 'FUZZY SYMBOL RESOLVER', cls: 'bg-amber-50 text-amber-900 border-amber-200' },
+          SYMPTOM_INVESTIGATION: { label: 'AUTONOMOUS SYMPTOM RCA', cls: 'bg-slate-900 text-white border-slate-900' },
+          DEPENDENCY_GRAPH: { label: 'CAUSAL DEPENDENCY GRAPH', cls: 'bg-indigo-50 text-indigo-800 border-indigo-200' },
+          SOURCE_CORRELATION: { label: 'SOURCE & LIVE STATE', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+        };
+        const tBadge = typeBadgeMap[card.type] || typeBadgeMap.SYMBOL_EVAL;
+
+        let bodyContent = '';
+        if (card.type === 'POOL_MAP') bodyContent = renderPoolMapCardBody(card);
+        else if (card.type === 'THREAD_OWNER') bodyContent = renderThreadOwnerCardBody(card);
+        else if (card.type === 'XRAY_BLUEPRINT') bodyContent = renderBlueprintCardBody(card);
+        else if (['DPDK_LCORE_INSPECTOR', 'TLS_INSPECTOR', 'CONCURRENCY_VERIFIER', 'FLIGHT_RECORDER', 'BEHAVIORAL_DRIFT', 'STATISTICAL_HOTSPOTS', 'FUZZY_INTENT_RESOLVER', 'SYMPTOM_INVESTIGATION', 'DEPENDENCY_GRAPH', 'SOURCE_CORRELATION', 'IPC_PIPELINE', 'HEAP_SCANNER', 'AUTO_TRIAGE', 'FRAME_LOCALS', 'CONDITION_TRIGGER', 'LINKED_LIST_CHAIN', 'CALLSTACK_AND_LOCKS', 'MEMORY_AUDIT', 'CODE_POINTERS', 'SHARED_MEMORY_IPC'].includes(card.type)) bodyContent = renderPhase10CardBody(card);
+        else bodyContent = renderSymbolOrDiffCardBody(card);
+
+        const cardEl = document.createElement('div');
+        cardEl.id = card.id;
+        cardEl.className = 'trace-card-item trace-card-anim bg-white border border-slate-200/90 rounded-2xl p-4 shadow-xs transition';
+        cardEl.innerHTML = `
+          <div class="flex flex-wrap items-center justify-between gap-2 pb-3 mb-3 border-b border-slate-100">
+            <div class="flex items-center gap-2">
+              <span class="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 text-[11px] font-bold mono">#${escapeHtml(card.seq)}</span>
+              <span class="px-2 py-0.5 rounded-md border text-[10px] font-semibold mono ${tBadge.cls}">${tBadge.label}</span>
+              <h3 class="text-xs sm:text-sm font-semibold text-slate-900">${escapeHtml(card.title)}</h3>
+            </div>
+            <div class="flex items-center gap-1.5 text-[11px] text-slate-400 mono">
+              <span class="text-emerald-700 font-medium">0.00ms stop</span>
+              <span>•</span>
+              <span>${escapeHtml(card.timestamp)}</span>
+              <button type="button" onclick="refreshTraceCard('${escapeHtml(card.id)}')" title="즉시 새로고침" class="ml-1 px-1.5 py-0.5 rounded hover:bg-slate-100 text-slate-500">↻</button>
+              <button type="button" onclick="toggleLiveWatchCard('${escapeHtml(card.id)}')" title="1초 주기 실시간 폴링" class="px-1.5 py-0.5 rounded border text-[10px] font-semibold ${card.liveWatch ? 'bg-emerald-50 text-emerald-700 border-emerald-300' : 'border-slate-200 text-slate-500 hover:bg-slate-100'}">⏱ 1s</button>
+              <button type="button" onclick="togglePinCard('${escapeHtml(card.id)}')" title="카드 고정" class="px-1.5 py-0.5 rounded hover:bg-slate-100 ${card.pinned ? 'text-amber-600 bg-amber-50' : 'text-slate-400'}">📌</button>
+              <button type="button" onclick="removeTraceCard('${escapeHtml(card.id)}')" title="카드 닫기" class="px-1.5 py-0.5 rounded hover:bg-slate-100 text-slate-400 hover:text-rose-600">✕</button>
+            </div>
+          </div>
+          ${bodyContent}
+        `;
+        container.appendChild(cardEl);
+      });
+    }
+
+    // =========================================================================
+    // Natural-Language Prompt Router (Connects Chat Input -> Trace Workspace)
+    // =========================================================================
+    async function handleUserPrompt(rawPrompt) {
+      const prompt = (rawPrompt || '').trim();
+      if (!prompt) return;
+
+      wsState.pid = parseInt(document.getElementById('input-target-pid').value, 10) || 8842;
+      wsState.companionElf = document.getElementById('input-companion-elf').value.trim() || '/build/pool_target_nostrip';
+      wsState.remoteHost = document.getElementById('input-remote-host').value.trim();
+      wsState.sshUser = document.getElementById('input-ssh-user').value.trim() || 'root';
+
+      appendUserChatMessage(prompt);
+
+      // 1. Try unified backend `/api/workspace/chat` first
+      const backendData = await callWorkspaceBackend('/api/workspace/chat', {
+        message: prompt,
+        pid: wsState.pid,
+        companion_elf: wsState.companionElf,
+        remote_host: wsState.remoteHost || undefined,
+        ssh_user: wsState.sshUser || undefined,
+      });
+
+      if (backendData && Array.isArray(backendData.trace_cards) && backendData.trace_cards.length > 0) {
+        const addedCards = [];
+        backendData.trace_cards.forEach(tc => {
+          const c = addTraceCard(tc.card_type, tc.title, tc.data);
+          addedCards.push(c);
+        });
+        if (backendData.telemetry) {
+          updateTelemetryStrip(backendData.telemetry);
+        }
+        appendAssistantChatMessage(
+          backendData.title || '프로세스 트레이스 분석 완료',
+          `<p>${escapeHtml(backendData.reply_markdown || '')}</p>`,
+          addedCards
+        );
+        return;
+      }
+
+      // 2. Client-side intent routing (calls REST endpoints or falls back to built-in simulation)
+      const pLow = prompt.toLowerCase();
+      const wantsDpdk = pLow.includes('dpdk') || pLow.includes('lcore') || pLow.includes('pmd') || pLow.includes('isolcpus') || pLow.includes('격리 코어') || pLow.includes('dedicated') || pLow.includes('rte_ring');
+      const wantsTls = pLow.includes('tls') || pLow.includes('thread_local') || pLow.includes('__thread') || pLow.includes('스레드별') || pLow.includes('tcb');
+      const wantsSeqlock = pLow.includes('seqlock') || pLow.includes('이중 읽기') || pLow.includes('일관성') || pLow.includes('원자성') || pLow.includes('torn read');
+      const wantsFlightRecorder = pLow.includes('타임머신') || pLow.includes('플라이트 레코더') || pLow.includes('스파이크') || pLow.includes('방금 잠깐') || pLow.includes('링버퍼');
+      const wantsDrift = pLow.includes('행동 편차') || pLow.includes('drift') || pLow.includes('평소') || pLow.includes('baseline 대비');
+      const wantsHotspots = pLow.includes('핫스팟') || pLow.includes('프로파일') || pLow.includes('flame') || pLow.includes('cpu 점유') || pLow.includes('통계적');
+      const wantsFuzzy = pLow.includes('퍼지') || pLow.includes('의미 매칭') || pLow.includes('알아서 찾아');
+      const wantsSymptom = pLow.includes('왜 멈췄') || pLow.includes('자율 종합') || pLow.includes('증상') || pLow.includes('종합 판단') || pLow.includes('응답이 없');
+      const wantsDepGraph = pLow.includes('인과 종속성') || pLow.includes('종속성 그래프') || pLow.includes('의존성 그래프') || pLow.includes('dependency');
+      const wantsSourceCorr = pLow.includes('소스 코드') || pLow.includes('인라인') || pLow.includes('변수 매핑');
+      const wantsIpcPipeline = pLow.includes('파이프라인') || pLow.includes('프로듀서') || pLow.includes('컨슈머') || pLow.includes('병목');
+      const wantsHeapScan = pLow.includes('힙') || pLow.includes('heap') || pLow.includes('누수') || pLow.includes('leak');
+      const wantsTriage = pLow.includes('종합 진단') || pLow.includes('원클릭') || pLow.includes('triage');
+      const wantsFrameLocals = pLow.includes('지역변수') || pLow.includes('지역 변수') || pLow.includes('인자') || pLow.includes('스택 프레임');
+      const wantsCondition = pLow.includes('조건') || pLow.includes('순간') || pLow.includes('포착') || pLow.includes('>=') || pLow.includes('==');
+      const wantsLinked = pLow.includes('연결 리스트') || pLow.includes('체인') || pLow.includes('순회') || pLow.includes('사이클');
+      const wantsCallstack = pLow.includes('콜스택') || pLow.includes('데드락') || pLow.includes('뮤텍스') || pLow.includes('락');
+      const wantsAudit = pLow.includes('무결성') || pLow.includes('감사') || pLow.includes('오염') || pLow.includes('audit');
+      const wantsCodePtr = pLow.includes('함수 포인터') || pLow.includes('콜백') || pLow.includes('vtable');
+      const wantsShm = pLow.includes('공유 메모리') || pLow.includes('shm') || pLow.includes('ipc');
+      const wantsPoolMap = (pLow.includes('맵') || pLow.includes('pool') || pLow.includes('할당') || pLow.includes('buffer') || pLow.includes('버퍼')) && !wantsCondition && !wantsAudit;
+      const wantsThreadOwner = pLow.includes('쓰레드') || pLow.includes('스레드') || pLow.includes('thread') || pLow.includes('누가') || pLow.includes('사용 중인') || pLow.includes('점유') || pLow.includes('인덱스') || pLow.includes('워커');
+      const wantsDiff = pLow.includes('diff') || pLow.includes('전후') || pLow.includes('변화') || pLow.includes('비교');
+      const wantsBlueprint = pLow.includes('블루프린트') || pLow.includes('blueprint') || pLow.includes('연결') || pLow.includes('x-ray') || pLow.includes('구조');
+
+      const createdCards = [];
+
+      if (wantsBlueprint && !wantsPoolMap && !wantsThreadOwner) {
+        let bpData = await callWorkspaceBackend('/api/watch/xray-blueprint', {
+          pid: wsState.pid,
+          companion_elf: wsState.companionElf,
+          remote_host: wsState.remoteHost || undefined,
+        });
+        if (!bpData) bpData = buildSimulatedBlueprintData();
+        updateTelemetryStrip({
+          pid: bpData.pid,
+          build_id: bpData.build_id || '8f4b2c91e07a',
+          load_bias: bpData.load_bias || '0x55a00000',
+          threads_count: bpData.threads_count || 4,
+        });
+        const card = addTraceCard('XRAY_BLUEPRINT', `PID ${bpData.pid} X-Ray 블루프린트 & 활성 스레드`, bpData);
+        createdCards.push(card);
+        appendAssistantChatMessage(
+          `PID ${bpData.pid} 프로세스 X-Ray 블루프린트 확인 완료`,
+          `<p>대상 프로세스(<code>PID ${bpData.pid}</code>)를 멈추지 않고(0.00ms) 활성 스레드 <strong>${bpData.threads_count}개</strong>와 DWARF 전역 메모리 풀/워커 심볼들을 분류해 오른쪽 워크스페이스에 추가했습니다.</p>`,
+          createdCards
+        );
+        return;
+      }
+
+      if (wantsPoolMap) {
+        const exprMatch = prompt.match(/(\*[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*(?:->|\.)[A-Za-z_][A-Za-z0-9_]*|gpMem|g_pool_storage)/);
+        const baseExpr = exprMatch ? exprMatch[1] : '*gpMem';
+        let poolData = await callWorkspaceBackend('/api/watch/scan-pool', {
+          pid: wsState.pid,
+          companion_elf: wsState.companionElf,
+          base_expression: baseExpr,
+          remote_host: wsState.remoteHost || undefined,
+        });
+        if (!poolData) poolData = buildSimulatedPoolData(baseExpr);
+        updateTelemetryStrip({ pid: poolData.pid, build_id: '8f4b2c91e07a', load_bias: '0x55a00000', threads_count: 4 });
+        const card = addTraceCard('POOL_MAP', `${poolData.resolved_array_expression} 메모리 풀 할당 현황 맵 (${poolData.pool_summary.allocated_count}/${poolData.pool_summary.total_slots})`, poolData);
+        createdCards.push(card);
+      }
+
+      if (wantsThreadOwner) {
+        let targetExpr = 'gpMem->buffers[9]';
+        const explicitIdxMatch = prompt.match(/([A-Za-z_][A-Za-z0-9_>-]*\[\d+\])/);
+        const koreanIdxMatch = prompt.match(/(\d+)\s*번/);
+        if (explicitIdxMatch) {
+          targetExpr = explicitIdxMatch[1];
+        } else if (koreanIdxMatch) {
+          targetExpr = `gpMem->buffers[${koreanIdxMatch[1]}]`;
+        }
+        let ownerData = await callWorkspaceBackend('/api/watch/find-owners', {
+          pid: wsState.pid,
+          companion_elf: wsState.companionElf,
+          target_expression: targetExpr,
+          remote_host: wsState.remoteHost || undefined,
+        });
+        if (!ownerData) ownerData = buildSimulatedOwnerData(targetExpr);
+        updateTelemetryStrip({ pid: ownerData.pid, build_id: '8f4b2c91e07a', load_bias: '0x55a00000', threads_count: ownerData.active_threads_checked || 4 });
+        const card = addTraceCard('THREAD_OWNER', `${ownerData.target_expression} 점유 스레드 역추적 결과`, ownerData);
+        createdCards.push(card);
+      }
+
+      if (wantsDpdk) {
+        const dpdkData = buildSimulatedDpdkLcoreData();
+        createdCards.push(addTraceCard('DPDK_LCORE_INSPECTOR', `DPDK 격리 코어(lcore) & PMD 링 무정지 진단 (${dpdkData.overall_dpdk_status})`, dpdkData));
+      }
+      if (wantsTls) {
+        const tlsData = buildSimulatedTlsInspectorData();
+        createdCards.push(addTraceCard('TLS_INSPECTOR', `스레드별 TLS(thread_local) 변수 해독 (${tlsData.tls_variables_discovered} vars · ${tlsData.tcb_resolved_count} TCBs)`, tlsData));
+      }
+      if (wantsSeqlock) {
+        const seqData = buildSimulatedConcurrencyVerifierData();
+        createdCards.push(addTraceCard('CONCURRENCY_VERIFIER', `동시성 이중 읽기(Seqlock) 일관성 검증 (${seqData.overall_consistency_status})`, seqData));
+      }
+      if (wantsFlightRecorder) {
+        const frData = buildSimulatedFlightRecorderData();
+        createdCards.push(addTraceCard('FLIGHT_RECORDER', `타임머신 플라이트 레코더 (${frData.frames_recorded} frames)`, frData));
+      }
+      if (wantsDrift) {
+        const drData = buildSimulatedBehavioralDriftData();
+        createdCards.push(addTraceCard('BEHAVIORAL_DRIFT', `정상 Baseline 대비 행동 편차(Drift) 경보`, drData));
+      }
+      if (wantsHotspots) {
+        const hsData = buildSimulatedStatisticalHotspotsData();
+        createdCards.push(addTraceCard('STATISTICAL_HOTSPOTS', `무정지 통계적 CPU & 콜스택 핫스팟 프로파일러`, hsData));
+      }
+      if (wantsFuzzy) {
+        const fzData = buildSimulatedFuzzyIntentData(prompt);
+        createdCards.push(addTraceCard('FUZZY_INTENT_RESOLVER', `자연어 의도 기반 DWARF 심볼 자동 매칭`, fzData));
+      }
+      if (wantsSymptom) {
+        const symData = buildSimulatedSymptomInvestigationData(prompt);
+        createdCards.push(addTraceCard('SYMPTOM_INVESTIGATION', `증상 기반 자율 종합 조사 (${symData.classified_symptom})`, symData));
+      }
+      if (wantsDepGraph) {
+        const dgData = buildSimulatedDependencyGraphData();
+        createdCards.push(addTraceCard('DEPENDENCY_GRAPH', `스레드·락·버퍼·IPC 인과 종속성 그래프`, dgData));
+      }
+      if (wantsSourceCorr) {
+        const scData = buildSimulatedSourceCorrelationData();
+        createdCards.push(addTraceCard('SOURCE_CORRELATION', `소스 코드 & 실시간 메모리 변수 매핑`, scData));
+      }
+      if (wantsIpcPipeline) {
+        const ipcData = buildSimulatedIpcPipelineData();
+        createdCards.push(addTraceCard('IPC_PIPELINE', `멀티 프로세스 IPC 파이프라인 진단 (${ipcData.pipeline_health})`, ipcData));
+      }
+      if (wantsHeapScan) {
+        const hpData = buildSimulatedHeapScanData();
+        createdCards.push(addTraceCard('HEAP_SCANNER', `힙(Heap) C++ 객체 & 누수 스캔 (Leak의심 ${hpData.leaked_candidates_count}건)`, hpData));
+      }
+      if (wantsTriage) {
+        const trData = buildSimulatedAutoTriageData();
+        createdCards.push(addTraceCard('AUTO_TRIAGE', `원클릭 종합 진단 리포트 (Health ${trData.health_score}/100)`, trData));
+      }
+      if (wantsFrameLocals) {
+        const flData = buildSimulatedFrameLocalsData();
+        createdCards.push(addTraceCard('FRAME_LOCALS', `스레드 스택 프레임 인자 & 지역변수 해독`, flData));
+      }
+      if (wantsCondition) {
+        const condData = buildSimulatedConditionData("gpMem->active_buffers >= 5");
+        createdCards.push(addTraceCard('CONDITION_TRIGGER', `조건부 트리거 감시: ${condData.condition_expression}`, condData));
+      }
+      if (wantsLinked) {
+        const listData = buildSimulatedLinkedListData("g_task_list");
+        createdCards.push(addTraceCard('LINKED_LIST_CHAIN', `g_task_list 연결 리스트 순회 (${listData.nodes_count} nodes)`, listData));
+      }
+      if (wantsCallstack) {
+        const csData = buildSimulatedCallstackData();
+        createdCards.push(addTraceCard('CALLSTACK_AND_LOCKS', `무정지 스레드 콜스택 & 뮤텍스 분석`, csData));
+      }
+      if (wantsAudit) {
+        const auData = buildSimulatedAuditData();
+        createdCards.push(addTraceCard('MEMORY_AUDIT', `메모리 무결성 & 포인터 감사 (${auData.health_status})`, auData));
+      }
+      if (wantsCodePtr) {
+        const cpData = buildSimulatedCodePtrData();
+        createdCards.push(addTraceCard('CODE_POINTERS', `함수 포인터 & C++ vtable 심볼 해독`, cpData));
+      }
+      if (wantsShm) {
+        const shmData = buildSimulatedShmData();
+        createdCards.push(addTraceCard('SHARED_MEMORY_IPC', `공유 메모리(SHM) & 피어 프로세스 분석`, shmData));
+      }
+      if (wantsDiff && createdCards.length === 0) {
+        let diffData = await callWorkspaceBackend('/api/watch/capture-diff', {
+          pid: wsState.pid,
+          companion_elf: wsState.companionElf,
+          wait_ms: 500,
+        });
+        if (!diffData) diffData = buildSimulatedDiffData();
+        const card = addTraceCard('SYMBOL_EVAL', `500ms 전후 상태 변화(Diff) 트레이스`, diffData);
+        createdCards.push(card);
+      }
+
+      if (createdCards.length === 0) {
+        const symMatch = prompt.match(/(\*?[A-Za-z_][A-Za-z0-9_.\->\[\]]*)/);
+        const symExpr = symMatch ? symMatch[1] : '*gpMem';
+        let evalData = await callWorkspaceBackend('/api/watch/eval-paths', {
+          pid: wsState.pid,
+          companion_elf: wsState.companionElf,
+          expressions: [symExpr],
+        });
+        if (!evalData) {
+          const poolData = buildSimulatedPoolData('*gpMem');
+          const c = addTraceCard('POOL_MAP', `gpMem->buffers 메모리 풀 할당 현황 맵`, poolData);
+          createdCards.push(c);
+        } else {
+          const c = addTraceCard('SYMBOL_EVAL', `심볼 평가: ${symExpr}`, evalData);
+          createdCards.push(c);
+        }
+      }
+
+      // Summarize all added cards in the assistant reply
+      const summaryLines = createdCards.map(c => {
+        if (c.type === 'POOL_MAP') {
+          const s = c.data.pool_summary;
+          return `• <strong>${escapeHtml(c.data.resolved_array_expression)}</strong> 총 <strong>${s.total_slots}개</strong> 버퍼 중 <strong>${s.allocated_count}개(${s.utilization_pct}%)</strong>가 할당(IN_USE)되어 있습니다. 할당된 인덱스: <code>[${s.allocated_indices.join(', ')}]</code>`;
+        }
+        if (c.type === 'THREAD_OWNER') {
+          const mt = c.data.matched_threads || [];
+          if (mt.length > 0) {
+            const m0 = mt[0];
+            const ev0 = (m0.evidence && m0.evidence[0]) ? m0.evidence[0].detail : '';
+            return `• <strong>${escapeHtml(c.data.target_expression)}</strong> (<code>${escapeHtml(c.data.target_runtime_address)}</code>)를 사용 중인 스레드는 <strong>TID ${m0.tid} (${escapeHtml(m0.thread_name)})</strong>입니다.<br/><span class="text-slate-500 text-[11px]">증거: ${escapeHtml(ev0)}</span>`;
+          }
+          return `• <strong>${escapeHtml(c.data.target_expression)}</strong>를 현재 점유 중인 스레드가 없습니다.`;
+        }
+        return `• <strong>${escapeHtml(c.title)}</strong> 카드를 워크스페이스에 추가했습니다.`;
+      });
+
+      appendAssistantChatMessage(
+        '프로세스 메모리 트레이스 완료 (0.00ms 무정지)',
+        summaryLines.map(l => `<p>${l}</p>`).join(''),
+        createdCards
+      );
+    }
+
+    // =========================================================================
+    // Event Listeners & Initialization
+    // =========================================================================
+    document.addEventListener('DOMContentLoaded', () => {
+      const selectMode = document.getElementById('select-target-mode');
+      const sshWrap = document.getElementById('ssh-fields-wrap');
+      selectMode.addEventListener('change', () => {
+        wsState.mode = selectMode.value;
+        if (wsState.mode === 'ssh') {
+          sshWrap.classList.remove('hidden');
+          sshWrap.classList.add('flex');
+        } else {
+          sshWrap.classList.add('hidden');
+          sshWrap.classList.remove('flex');
+        }
+      });
+
+      // Chat Form Submit
+      const chatForm = document.getElementById('chat-form');
+      const chatInput = document.getElementById('chat-input');
+      chatForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const text = chatInput.value.trim();
+        if (!text) return;
+        chatInput.value = '';
+        await handleUserPrompt(text);
+      });
+
+      chatInput.addEventListener('keydown', async (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          const text = chatInput.value.trim();
+          if (!text) return;
+          chatInput.value = '';
+          await handleUserPrompt(text);
+        }
+      });
+
+      // Quick Prompt Chips
+      document.querySelectorAll('.quick-prompt-chip').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const p = btn.getAttribute('data-prompt');
+          if (p) handleUserPrompt(p);
+        });
+      });
+
+      // Connect Button
+      document.getElementById('btn-connect-target').addEventListener('click', () => {
+        handleUserPrompt('프로세스 연결 및 X-Ray 블루프린트를 확인해 주세요');
+      });
+
+      // Demo Button (loads *gpMem Pool Map + gpMem[9] Thread Owner immediately)
+      document.getElementById('btn-load-demo').addEventListener('click', async () => {
+        await handleUserPrompt('memory pool *gpMem의 메모리 buffer개의 할당 현황을 맵 차트로 그려주고 gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요');
+      });
+
+      document.getElementById('btn-empty-pool-demo').addEventListener('click', () => {
+        handleUserPrompt('memory pool *gpMem의 메모리 buffer개의 할당 현황을 맵 차트로 그려주세요');
+      });
+
+      document.getElementById('btn-empty-owner-demo').addEventListener('click', () => {
+        handleUserPrompt('gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요');
+      });
+
+      // Find Processes Button
+      const drawer = document.getElementById('proc-discovery-drawer');
+      const procList = document.getElementById('proc-discovery-list');
+      document.getElementById('btn-find-proc').addEventListener('click', async () => {
+        drawer.classList.remove('hidden');
+        procList.innerHTML = '<span class="text-slate-500">프로세스 탐색 중...</span>';
+        const data = await callWorkspaceBackend('/api/target/find-processes', {
+          process_name: '',
+          companion_elf: document.getElementById('input-companion-elf').value.trim(),
+          remote_host: document.getElementById('input-remote-host').value.trim() || undefined,
+        });
+        const procs = (data && data.processes) ? data.processes : [
+          { pid: 8842, name: 'pool_target_nostrip', cmdline: './pool_target_nostrip --workers 4', build_id_match: true },
+          { pid: 4120, name: 'media_daemon', cmdline: '/usr/bin/media_daemon -c /etc/media.conf', build_id_match: false },
+        ];
+        procList.innerHTML = procs.map(p => `
+          <button type="button" onclick="selectDiscoveredProc(${p.pid})" class="px-2.5 py-1 rounded-lg bg-slate-50 hover:bg-slate-100 border ${p.build_id_match ? 'border-emerald-300 text-emerald-800 bg-emerald-50/50' : 'border-slate-200 text-slate-700'} mono text-xs">
+            PID ${p.pid} · ${escapeHtml(p.name)} ${p.build_id_match ? '✓ BuildID 일치' : ''}
+          </button>
+        `).join('');
+      });
+
+      document.getElementById('btn-close-proc-drawer').addEventListener('click', () => {
+        drawer.classList.add('hidden');
+      });
+
+      window.selectDiscoveredProc = function(pid) {
+        document.getElementById('input-target-pid').value = String(pid);
+        drawer.classList.add('hidden');
+        showToast(`PID ${pid} 선택됨`);
+      };
+
+      // Filter Buttons
+      document.querySelectorAll('.ws-filter-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          wsState.activeFilter = btn.getAttribute('data-filter') || 'ALL';
+          document.querySelectorAll('.ws-filter-btn').forEach(b => {
+            b.className = (b === btn)
+              ? 'ws-filter-btn px-2.5 py-1 rounded-md bg-white text-slate-900 shadow-2xs font-medium'
+              : 'ws-filter-btn px-2.5 py-1 rounded-md text-slate-600 hover:text-slate-900';
+          });
+          renderWorkspaceCards();
+        });
+      });
+
+      // Auto-Triage Button
+      const btnTriage = document.getElementById('btn-auto-triage');
+      if (btnTriage) {
+        btnTriage.addEventListener('click', () => {
+          handleUserPrompt('프로세스 전체 상태를 원클릭 종합 진단(Auto-Triage)해 주세요');
+        });
+      }
+
+      // Export Markdown Report Button
+      const btnExport = document.getElementById('btn-export-report');
+      if (btnExport) {
+        btnExport.addEventListener('click', () => {
+          if (wsState.cards.length === 0) {
+            showToast('내보낼 트레이스 카드가 없습니다.');
+            return;
+          }
+          const lines = [
+            `# dynamicState Process Trace Report (PID ${wsState.pid})`,
+            `- Generated At: ${new Date().toISOString()}`,
+            `- Stop Duration: 0.00ms (Zero-Stop)`,
+            `- Total Cards: ${wsState.cards.length}`,
+            ``
+          ];
+          wsState.cards.forEach(c => {
+            lines.push(`## [#${c.seq}] ${c.title} (${c.type})`);
+            lines.push('```json');
+            lines.push(JSON.stringify(c.data, null, 2));
+            lines.push('```');
+            lines.push('');
+          });
+          const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `dynamicstate_trace_pid_${wsState.pid}.md`;
+          a.click();
+          URL.revokeObjectURL(url);
+          showToast('트레이스 리포트(.md)를 저장했습니다.');
+        });
+      }
+
+      // Clear Workspace Button (preserves pinned cards)
+      document.getElementById('btn-clear-workspace').addEventListener('click', () => {
+        wsState.cards = wsState.cards.filter(c => c.pinned);
+        renderWorkspaceCards();
+        showToast('고정된 카드를 제외하고 워크스페이스를 비웠습니다.');
+      });
+    });
+  </script>
+</body>
+</html>

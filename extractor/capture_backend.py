@@ -535,6 +535,7 @@ class CaptureSafetyPolicy:
     """
     max_stop_time_ms: float = 50.0
     max_capture_bytes: int = 64 * 1024 * 1024
+    max_region_bytes: int = 4 * 1024 * 1024
     max_capture_ranges: int = 500
     timeout_ms: int = 1000
     fail_open: bool = True  # Always resume target on error or timeout
@@ -1764,6 +1765,9 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 for m in all_maps:
                     if "r" in m["permissions"] and ("w" in m["permissions"] or m["category"] in ("heap", "stack", "anonymous")):
                         selected_maps.append(m)
+                # Prioritize essential binary/data, heap, and stack regions before large anonymous arenas
+                _cat_prio = {"binary": 0, "heap": 1, "stack": 2, "library": 3, "anonymous": 4, "unknown": 5}
+                selected_maps.sort(key=lambda r: (_cat_prio.get(r.get("category", "unknown"), 5), r.get("start", 0)))
 
         if not selected_maps and plan.memory_ranges:
             for r_start, r_end in plan.memory_ranges:
@@ -1811,7 +1815,10 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 })
                 continue
 
-            chunk_size = min(reg_size, policy.max_capture_bytes - bytes_attempted)
+            max_reg_cap = getattr(policy, "max_region_bytes", 0) or policy.max_capture_bytes
+            if plan.mode in (CaptureMode.TARGETED.value, CaptureMode.OBJECT.value):
+                max_reg_cap = policy.max_capture_bytes
+            chunk_size = min(reg_size, max_reg_cap, policy.max_capture_bytes - bytes_attempted)
             if chunk_size <= 0:
                 bytes_omitted += reg_size
                 omitted_regions.append({
@@ -2833,6 +2840,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 for m in all_maps:
                     if "r" in m["permissions"] and ("w" in m["permissions"] or m["category"] in ("heap", "stack", "anonymous")):
                         selected_maps.append(m)
+                # Prioritize essential binary/data, heap, and stack regions before large anonymous arenas
+                _cat_prio = {"binary": 0, "heap": 1, "stack": 2, "library": 3, "anonymous": 4, "unknown": 5}
+                selected_maps.sort(key=lambda r: (_cat_prio.get(r.get("category", "unknown"), 5), r.get("start", 0)))
 
         if not selected_maps and plan.memory_ranges:
             for r_start, r_end in plan.memory_ranges:
@@ -2878,7 +2888,10 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 })
                 continue
 
-            chunk_size = min(reg_size, policy.max_capture_bytes - bytes_attempted)
+            max_reg_cap = getattr(policy, "max_region_bytes", 0) or policy.max_capture_bytes
+            if plan.mode in (CaptureMode.TARGETED.value, CaptureMode.OBJECT.value):
+                max_reg_cap = policy.max_capture_bytes
+            chunk_size = min(reg_size, max_reg_cap, policy.max_capture_bytes - bytes_attempted)
             if chunk_size <= 0:
                 bytes_omitted += reg_size
                 omitted_regions.append({

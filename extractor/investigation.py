@@ -109,6 +109,7 @@ from .state_corpus import StateCorpus
 from .state_diff import StateDiffEngine
 from .state_lab import compute_semantic_diff
 from .static_analyzer import (
+    get_static_provider,
     IDENTITY_DEBUG_ID_UNAVAILABLE,
     IDENTITY_INCOMPLETE,
     IDENTITY_MISMATCH,
@@ -1350,7 +1351,14 @@ class InvestigationManager:
             session.target_ref["backend_capabilities"] = selected_backend.capabilities
 
             try:
-                live_snap = selected_backend.capture(pid=parsed_pid)
+                from .capture_backend import CaptureSafetyPolicy
+                max_cap_bytes = int(session.budgets.get("max_bytes") or (16 * 1024 * 1024))
+                cap_policy = CaptureSafetyPolicy(
+                    max_capture_bytes=max_cap_bytes,
+                    max_region_bytes=min(4 * 1024 * 1024, max_cap_bytes),
+                    max_capture_ranges=256,
+                )
+                live_snap = selected_backend.capture(pid=parsed_pid, policy=cap_policy)
                 if live_snap.bytes_captured == 0:
                     session.status = "FAILED"
                     session.stages["capture_quality"] = {
@@ -1388,7 +1396,7 @@ class InvestigationManager:
         if static_provider:
             session.static_provider = static_provider
         elif debug_image and os.path.exists(debug_image):
-            session.static_provider = DwarfStaticAnalysisProvider(debug_image)
+            session.static_provider = get_static_provider("dwarf", debug_image)
         else:
             session.static_provider = NullStaticAnalysisProvider()
 
@@ -3866,16 +3874,18 @@ class InvestigationManager:
                     status="UNVERIFIED_PARTIAL" if is_partial_snap else "OBSERVED",
                     uncertainty="Observed from PARTIAL capture snapshot." if is_partial_snap else None,
                 )
-                self._enrich_finding_navigation(session, finding_candidate, target_object=o_dict, target_field=f, snapshot=semantic_state)
                 if first_field_finding is None:
-                    first_field_finding = finding_candidate
+                    first_field_finding = (finding_candidate, o_dict, f)
 
-                # Highlight non-zero or suspicious counters/status fields
+                # Highlight non-zero or suspicious counters/status fields (enrich only kept findings!)
                 if any(k in str(fname).lower() for k in ("counter", "state", "status", "flags", "error", "health", "active", "task", "id")):
+                    self._enrich_finding_navigation(session, finding_candidate, target_object=o_dict, target_field=f, snapshot=semantic_state)
                     session.findings.append(finding_candidate)
 
         if not session.findings and first_field_finding:
-            session.findings.append(first_field_finding)
+            fc_item, fc_obj, fc_fld = first_field_finding
+            self._enrich_finding_navigation(session, fc_item, target_object=fc_obj, target_field=fc_fld, snapshot=semantic_state)
+            session.findings.append(fc_item)
 
         has_partial_objects = False
         has_memory_not_captured = False
@@ -4135,10 +4145,10 @@ class InvestigationManager:
             },
         }
 
-        # Re-enrich all session findings now that static provider has been verified and loaded
+        # Enrich any session findings that do not yet have code_navigation populated
         if provider and provider.is_available():
             for fnd in session.findings:
-                if fnd.object_id or fnd.field_name:
+                if (fnd.object_id or fnd.field_name) and not fnd.code_navigation:
                     self._enrich_finding_navigation(session, fnd, snapshot=session.active_snapshot)
 
     def _execute_stage_synthesis(self, session: InvestigationSession) -> None:

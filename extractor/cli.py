@@ -176,6 +176,38 @@ def main():
     diff_p.add_argument("--ssh-proxy-jump", type=str, default=None, help="Optional SSH ProxyJump")
     diff_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
 
+    # 13b. pool-map (Phase 8 memory pool & buffer array scanner)
+    pool_p = subparsers.add_parser("pool-map", help="Scan a memory pool or buffer array (e.g. *gpMem) and render an allocation map chart")
+    pool_p.add_argument("-p", "--pid", type=int, required=True, help="Target PID")
+    pool_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True, help="Local path to nostrip ELF")
+    pool_p.add_argument("-e", "--expr", type=str, required=True, help="Pool or array expression (e.g. *gpMem, gpMem->buffers)")
+    pool_p.add_argument("-n", "--count", type=int, default=None, help="Optional slot count override")
+    pool_p.add_argument("--status-field", type=str, default=None, help="Optional field name indicating slot allocation")
+    pool_p.add_argument("--remote-host", type=str, default=None, help="Optional SSH remote host")
+    pool_p.add_argument("--ssh-user", type=str, default=None)
+    pool_p.add_argument("--ssh-port", type=int, default=22)
+    pool_p.add_argument("--ssh-key", type=str, default=None)
+    pool_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    pool_p.add_argument("--corpus", type=str, default="corpus")
+
+    # 13c. find-owner (Phase 8 reverse pointer & thread ownership lookup)
+    own_p = subparsers.add_parser("find-owner", help="Find which thread or worker context is using a specific buffer slot (e.g. gpMem->buffers[9])")
+    own_p.add_argument("-p", "--pid", type=int, required=True, help="Target PID")
+    own_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True, help="Local path to nostrip ELF")
+    own_p.add_argument("-e", "--expr", type=str, required=True, help="Target slot/symbol expression (e.g. gpMem->buffers[9] or gpMem[9])")
+    own_p.add_argument("--remote-host", type=str, default=None, help="Optional SSH remote host")
+    own_p.add_argument("--ssh-user", type=str, default=None)
+    own_p.add_argument("--ssh-port", type=int, default=22)
+    own_p.add_argument("--ssh-key", type=str, default=None)
+    own_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    own_p.add_argument("--corpus", type=str, default="corpus")
+
+    # 13d. workspace (Phase 9 Minimalist Chat + Trace Workspace Web UI)
+    ws_p = subparsers.add_parser("workspace", help="Launch the minimalist Gemini-style Chat + Process Trace Workspace Web UI")
+    ws_p.add_argument("--host", type=str, default="127.0.0.1", help="HTTP host to bind (default: 127.0.0.1)")
+    ws_p.add_argument("--port", type=int, default=8080, help="HTTP port to bind (default: 8080)")
+    ws_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
+
     # 14. recipe (Phase 4 guided diagnostic recipes & Golden Baselines)
     rec_p = subparsers.add_parser("recipe", help="Run a guided diagnostic recipe (instant_xray, before_after_diff, timeseries_watch) or Golden Baseline check")
     rec_p.add_argument("--name", type=str, default="instant_xray", choices=["instant_xray", "before_after_diff", "timeseries_watch", "save_baseline", "compare_baseline"], help="Recipe name")
@@ -192,6 +224,294 @@ def main():
     rec_p.add_argument("--ssh-key", type=str, default=None, help="Optional SSH key")
     rec_p.add_argument("--ssh-proxy-jump", type=str, default=None, help="Optional SSH ProxyJump")
     rec_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
+
+    # 15. Phase 10 CLI subcommands (watch-until, traverse-list, callstacks, audit, resolve-func, inspect-shm)
+    wu_p = subparsers.add_parser("watch-until", help="Poll target until condition expression triggers (0.00ms stop)")
+    wu_p.add_argument("-p", "--pid", type=int, required=True)
+    wu_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    wu_p.add_argument("-c", "--condition", type=str, required=True, help="Condition expression e.g. gpMem->active_buffers >= 5")
+    wu_p.add_argument("--poll-ms", type=int, default=40)
+    wu_p.add_argument("--timeout-ms", type=int, default=2000)
+    wu_p.add_argument("--hold-ms", type=int, default=0)
+    wu_p.add_argument("--remote-host", type=str, default=None)
+    wu_p.add_argument("--ssh-user", type=str, default=None)
+    wu_p.add_argument("--ssh-port", type=int, default=22)
+    wu_p.add_argument("--ssh-key", type=str, default=None)
+    wu_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    wu_p.add_argument("--corpus", type=str, default="corpus")
+
+    tl_p = subparsers.add_parser("traverse-list", help="Traverse a non-contiguous linked list or pointer chain (0.00ms stop)")
+    tl_p.add_argument("-p", "--pid", type=int, required=True)
+    tl_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    tl_p.add_argument("-e", "--expr", type=str, required=True, help="Head pointer/struct expression e.g. g_task_list")
+    tl_p.add_argument("--next-field", type=str, default="next")
+    tl_p.add_argument("--max-depth", type=int, default=64)
+    tl_p.add_argument("--remote-host", type=str, default=None)
+    tl_p.add_argument("--ssh-user", type=str, default=None)
+    tl_p.add_argument("--ssh-port", type=int, default=22)
+    tl_p.add_argument("--ssh-key", type=str, default=None)
+    tl_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    tl_p.add_argument("--corpus", type=str, default="corpus")
+
+    cs_p = subparsers.add_parser("callstacks", help="Unwind thread callstacks and inspect mutex locks / deadlocks (0.00ms stop)")
+    cs_p.add_argument("-p", "--pid", type=int, required=True)
+    cs_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    cs_p.add_argument("--tid", type=int, default=None)
+    cs_p.add_argument("--remote-host", type=str, default=None)
+    cs_p.add_argument("--ssh-user", type=str, default=None)
+    cs_p.add_argument("--ssh-port", type=int, default=22)
+    cs_p.add_argument("--ssh-key", type=str, default=None)
+    cs_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    cs_p.add_argument("--corpus", type=str, default="corpus")
+
+    au_p = subparsers.add_parser("audit", help="Audit DWARF pointers, bools, enums, and memory pools for corruption (0.00ms stop)")
+    au_p.add_argument("-p", "--pid", type=int, required=True)
+    au_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    au_p.add_argument("-e", "--expr", type=str, default=None)
+    au_p.add_argument("--remote-host", type=str, default=None)
+    au_p.add_argument("--ssh-user", type=str, default=None)
+    au_p.add_argument("--ssh-port", type=int, default=22)
+    au_p.add_argument("--ssh-key", type=str, default=None)
+    au_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    au_p.add_argument("--corpus", type=str, default="corpus")
+
+    rf_p = subparsers.add_parser("resolve-func", help="Resolve function pointers and C++ vtable slots to source file:line (0.00ms stop)")
+    rf_p.add_argument("-p", "--pid", type=int, required=True)
+    rf_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    rf_p.add_argument("-e", "--expr", type=str, required=True)
+    rf_p.add_argument("--remote-host", type=str, default=None)
+    rf_p.add_argument("--ssh-user", type=str, default=None)
+    rf_p.add_argument("--ssh-port", type=int, default=22)
+    rf_p.add_argument("--ssh-key", type=str, default=None)
+    rf_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    rf_p.add_argument("--corpus", type=str, default="corpus")
+
+    shm_p = subparsers.add_parser("inspect-shm", help="Inspect shared memory / IPC mappings with DWARF type overlay casting (0.00ms stop)")
+    shm_p.add_argument("-p", "--pid", type=int, required=True)
+    shm_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    shm_p.add_argument("--cast-type", type=str, default=None)
+    shm_p.add_argument("--address", type=str, default=None)
+    shm_p.add_argument("--shm-name", type=str, default=None)
+    shm_p.add_argument("--remote-host", type=str, default=None)
+    shm_p.add_argument("--ssh-user", type=str, default=None)
+    shm_p.add_argument("--ssh-port", type=int, default=22)
+    shm_p.add_argument("--ssh-key", type=str, default=None)
+    shm_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    shm_p.add_argument("--corpus", type=str, default="corpus")
+
+    fl_p = subparsers.add_parser("frame-locals", help="Decode active thread stack frame parameters and local variables (0.00ms stop)")
+    fl_p.add_argument("-p", "--pid", type=int, required=True)
+    fl_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    fl_p.add_argument("--tid", type=int, default=None)
+    fl_p.add_argument("--remote-host", type=str, default=None)
+    fl_p.add_argument("--ssh-user", type=str, default=None)
+    fl_p.add_argument("--ssh-port", type=int, default=22)
+    fl_p.add_argument("--ssh-key", type=str, default=None)
+    fl_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    fl_p.add_argument("--corpus", type=str, default="corpus")
+
+    at_p = subparsers.add_parser("auto-triage", help="Run 1-call composite zero-stop incident auto-triage across memory, locks, pools, and lists")
+    at_p.add_argument("-p", "--pid", type=int, required=True)
+    at_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    at_p.add_argument("--remote-host", type=str, default=None)
+    at_p.add_argument("--ssh-user", type=str, default=None)
+    at_p.add_argument("--ssh-port", type=int, default=22)
+    at_p.add_argument("--ssh-key", type=str, default=None)
+    at_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    at_p.add_argument("--corpus", type=str, default="corpus")
+
+    ipc_p = subparsers.add_parser("ipc-pipeline", help="Analyze cross-process shared memory & IPC pipeline bottlenecks (0.00ms stop)")
+    ipc_p.add_argument("-p", "--pid", type=int, required=True)
+    ipc_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    ipc_p.add_argument("--cast-type", type=str, default=None)
+    ipc_p.add_argument("--address", type=str, default=None)
+    ipc_p.add_argument("--shm-name", type=str, default=None)
+    ipc_p.add_argument("--remote-host", type=str, default=None)
+    ipc_p.add_argument("--ssh-user", type=str, default=None)
+    ipc_p.add_argument("--ssh-port", type=int, default=22)
+    ipc_p.add_argument("--ssh-key", type=str, default=None)
+    ipc_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    ipc_p.add_argument("--corpus", type=str, default="corpus")
+
+    hp_p = subparsers.add_parser("scan-heap", help="Scan [heap] for C++ polymorphic objects via vtable and detect unreachable leaks (0.00ms stop)")
+    hp_p.add_argument("-p", "--pid", type=int, required=True)
+    hp_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    hp_p.add_argument("--class-filter", type=str, default=None)
+    hp_p.add_argument("--remote-host", type=str, default=None)
+    hp_p.add_argument("--ssh-user", type=str, default=None)
+    hp_p.add_argument("--ssh-port", type=int, default=22)
+    hp_p.add_argument("--ssh-key", type=str, default=None)
+    hp_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    hp_p.add_argument("--corpus", type=str, default="corpus")
+
+    dg_p = subparsers.add_parser("dependency-graph", help="Synthesize cross-entity dependency & causal graph (0.00ms stop)")
+    dg_p.add_argument("-p", "--pid", type=int, required=True)
+    dg_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    dg_p.add_argument("--remote-host", type=str, default=None)
+    dg_p.add_argument("--ssh-user", type=str, default=None)
+    dg_p.add_argument("--ssh-port", type=int, default=22)
+    dg_p.add_argument("--ssh-key", type=str, default=None)
+    dg_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    dg_p.add_argument("--corpus", type=str, default="corpus")
+
+    cs_p = subparsers.add_parser("correlate-source", help="Correlate DWARF source locations with C/C++ code and inline live variables (0.00ms stop)")
+    cs_p.add_argument("-p", "--pid", type=int, required=True)
+    cs_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    cs_p.add_argument("--source-location", type=str, default=None)
+    cs_p.add_argument("--tid", type=int, default=None)
+    cs_p.add_argument("--context-lines", type=int, default=8)
+    cs_p.add_argument("--remote-host", type=str, default=None)
+    cs_p.add_argument("--ssh-user", type=str, default=None)
+    cs_p.add_argument("--ssh-port", type=int, default=22)
+    cs_p.add_argument("--ssh-key", type=str, default=None)
+    cs_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    cs_p.add_argument("--corpus", type=str, default="corpus")
+
+    is_p = subparsers.add_parser("investigate-symptom", help="Autonomous symptom-driven root-cause investigator (0.00ms stop)")
+    is_p.add_argument("-p", "--pid", type=int, required=True)
+    is_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    is_p.add_argument("-q", "--query", "--symptom", dest="symptom_query", type=str, default="왜 멈췄지? 전체적인 문제를 종합 분석해줘")
+    is_p.add_argument("--remote-host", type=str, default=None)
+    is_p.add_argument("--ssh-user", type=str, default=None)
+    is_p.add_argument("--ssh-port", type=int, default=22)
+    is_p.add_argument("--ssh-key", type=str, default=None)
+    is_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    is_p.add_argument("--corpus", type=str, default="corpus")
+
+    sh_p = subparsers.add_parser("hotspots", help="Zero-stop statistical CPU & callstack hotspot profiler (0.00ms stop)")
+    sh_p.add_argument("-p", "--pid", type=int, required=True)
+    sh_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    sh_p.add_argument("--samples", dest="samples_count", type=int, default=6)
+    sh_p.add_argument("--interval-ms", type=int, default=35)
+    sh_p.add_argument("--remote-host", type=str, default=None)
+    sh_p.add_argument("--ssh-user", type=str, default=None)
+    sh_p.add_argument("--ssh-port", type=int, default=22)
+    sh_p.add_argument("--ssh-key", type=str, default=None)
+    sh_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    sh_p.add_argument("--corpus", type=str, default="corpus")
+
+    fz_p = subparsers.add_parser("fuzzy-resolve", help="Resolve vague natural-language concepts to DWARF symbols and live values (0.00ms stop)")
+    fz_p.add_argument("-p", "--pid", type=int, required=True)
+    fz_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    fz_p.add_argument("-q", "--query", dest="natural_query", type=str, required=True)
+    fz_p.add_argument("--limit", type=int, default=5)
+    fz_p.add_argument("--remote-host", type=str, default=None)
+    fz_p.add_argument("--ssh-user", type=str, default=None)
+    fz_p.add_argument("--ssh-port", type=int, default=22)
+    fz_p.add_argument("--ssh-key", type=str, default=None)
+    fz_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    fz_p.add_argument("--corpus", type=str, default="corpus")
+
+    fr_p = subparsers.add_parser("flight-recorder", help="Zero-stop Anomaly Time-Machine Flight Recorder ring buffer (0.00ms stop)")
+    fr_p.add_argument("-p", "--pid", type=int, required=True)
+    fr_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    fr_p.add_argument("--frames", dest="frames_count", type=int, default=8)
+    fr_p.add_argument("--interval-ms", type=int, default=25)
+    fr_p.add_argument("--remote-host", type=str, default=None)
+    fr_p.add_argument("--ssh-user", type=str, default=None)
+    fr_p.add_argument("--ssh-port", type=int, default=22)
+    fr_p.add_argument("--ssh-key", type=str, default=None)
+    fr_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    fr_p.add_argument("--corpus", type=str, default="corpus")
+
+    bd_p = subparsers.add_parser("behavioral-drift", help="Zero-stop multi-dimensional behavioral drift detector (0.00ms stop)")
+    bd_p.add_argument("-p", "--pid", type=int, required=True)
+    bd_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    bd_p.add_argument("--save-baseline", action="store_true")
+    bd_p.add_argument("--remote-host", type=str, default=None)
+    bd_p.add_argument("--ssh-user", type=str, default=None)
+    bd_p.add_argument("--ssh-port", type=int, default=22)
+    bd_p.add_argument("--ssh-key", type=str, default=None)
+    bd_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    bd_p.add_argument("--corpus", type=str, default="corpus")
+
+    tls_p = subparsers.add_parser("tls-vars", help="Decode per-thread TLS (__thread / thread_local) variables in 0.00ms zero-stop mode")
+    tls_p.add_argument("-p", "--pid", type=int, required=True)
+    tls_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    tls_p.add_argument("--tid", type=int, default=None)
+    tls_p.add_argument("-v", "--vars", dest="variable_names", type=str, default=None, help="Comma-separated TLS variable names")
+    tls_p.add_argument("--remote-host", type=str, default=None)
+    tls_p.add_argument("--ssh-user", type=str, default=None)
+    tls_p.add_argument("--ssh-port", type=int, default=22)
+    tls_p.add_argument("--ssh-key", type=str, default=None)
+    tls_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    tls_p.add_argument("--corpus", type=str, default="corpus")
+
+    vc_p = subparsers.add_parser("verify-consistency", help="Optimistic Seqlock double-read concurrency verifier (0.00ms stop)")
+    vc_p.add_argument("-p", "--pid", type=int, required=True)
+    vc_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    vc_p.add_argument("-e", "--expressions", type=str, default=None, help="Comma-separated expressions to verify")
+    vc_p.add_argument("--retries", type=int, default=3)
+    vc_p.add_argument("--delay-ms", dest="inter_read_delay_ms", type=int, default=4)
+    vc_p.add_argument("--remote-host", type=str, default=None)
+    vc_p.add_argument("--ssh-user", type=str, default=None)
+    vc_p.add_argument("--ssh-port", type=int, default=22)
+    vc_p.add_argument("--ssh-key", type=str, default=None)
+    vc_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    vc_p.add_argument("--corpus", type=str, default="corpus")
+
+    dpdk_p = subparsers.add_parser("dpdk-lcores", help="Inspect DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (0.00ms stop)")
+    dpdk_p.add_argument("-p", "--pid", type=int, required=True)
+    dpdk_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
+    dpdk_p.add_argument("--window-ms", dest="sample_window_ms", type=int, default=40)
+    dpdk_p.add_argument("--rings", dest="ring_expressions", type=str, default=None, help="Comma-separated ring expressions")
+    dpdk_p.add_argument("--spinlocks", dest="spinlock_expressions", type=str, default=None, help="Comma-separated spinlock expressions")
+    dpdk_p.add_argument("--remote-host", type=str, default=None)
+    dpdk_p.add_argument("--ssh-user", type=str, default=None)
+    dpdk_p.add_argument("--ssh-port", type=int, default=22)
+    dpdk_p.add_argument("--ssh-key", type=str, default=None)
+    dpdk_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    dpdk_p.add_argument("--corpus", type=str, default="corpus")
+
+    ask_p = subparsers.add_parser("ask", help="Universal 1-Call Zero-Stop Intent Gateway with forgiving C/C++ expressions & auto-heal PID (0.00ms stop)")
+    ask_p.add_argument("-q", "--question", type=str, required=True, help="C/C++ expression or natural-language diagnostic question")
+    ask_p.add_argument("-p", "--pid", type=int, default=None, help="Optional target PID (auto-resolved if omitted)")
+    ask_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None, help="Optional companion ELF (auto-discovered from /proc/<pid>/exe if omitted)")
+    ask_p.add_argument("--process-name", type=str, default=None)
+    ask_p.add_argument("--remote-host", type=str, default=None)
+    ask_p.add_argument("--ssh-user", type=str, default=None)
+    ask_p.add_argument("--ssh-port", type=int, default=22)
+    ask_p.add_argument("--ssh-key", type=str, default=None)
+    ask_p.add_argument("--ssh-proxy-jump", type=str, default=None)
+    ask_p.add_argument("--corpus", type=str, default="corpus")
+
+    coerce_p = subparsers.add_parser("coerce-expr", help="Forgiving C/C++ Expression Auto-Coercer (. <-> ->, bare member promotion, symbol typos)")
+    coerce_p.add_argument("-e", "--expression", type=str, required=True)
+    coerce_p.add_argument("-p", "--pid", type=int, default=None)
+    coerce_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
+    coerce_p.add_argument("--corpus", type=str, default="corpus")
+
+    sc_p = subparsers.add_parser("smart-compact", help="LLM token-budgeted anomaly-first smart compactor & cursor paginator (0.00ms stop)")
+    sc_p.add_argument("-q", "--query", type=str, default="*gpMem")
+    sc_p.add_argument("-m", "--mode", type=str, default="auto", choices=["auto", "pool", "eval", "ask"])
+    sc_p.add_argument("-p", "--pid", type=int, default=None)
+    sc_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
+    sc_p.add_argument("--max-tokens", type=int, default=800)
+    sc_p.add_argument("--offset", dest="cursor_offset", type=int, default=0)
+    sc_p.add_argument("--page-size", type=int, default=16)
+    sc_p.add_argument("--corpus", type=str, default="corpus")
+
+    be_p = subparsers.add_parser("batch-exec", help="1-Call Multi-Tool Composite Batch Macro Executor (0.00ms stop)")
+    be_p.add_argument("--steps-json", type=str, required=True, help="JSON list of step objects")
+    be_p.add_argument("-p", "--pid", type=int, default=None)
+    be_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
+    be_p.add_argument("--corpus", type=str, default="corpus")
+
+    vh_p = subparsers.add_parser("verify-hypothesis", help="Declarative multi-assertion hypothesis verifier (0.00ms stop)")
+    vh_p.add_argument("--hypothesis", type=str, required=True)
+    vh_p.add_argument("-a", "--assertions", type=str, required=True, help="Comma-separated assertions e.g. 'gpMem.active_buffers>=2,buffers[5].seq==5005'")
+    vh_p.add_argument("-p", "--pid", type=int, default=None)
+    vh_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
+    vh_p.add_argument("--corpus", type=str, default="corpus")
+
+    er_p = subparsers.add_parser("export-report", help="1-Call Zero-Stop Incident Report & Remediation Exporter")
+    er_p.add_argument("--title", type=str, default="dynamicState Zero-Stop Runtime Incident Report")
+    er_p.add_argument("--hypothesis", type=str, default=None)
+    er_p.add_argument("-a", "--assertions", type=str, default=None)
+    er_p.add_argument("-o", "--output", dest="output_path", type=str, default=None)
+    er_p.add_argument("-p", "--pid", type=int, default=None)
+    er_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
+    er_p.add_argument("--corpus", type=str, default="corpus")
 
     args = parser.parse_args()
 
@@ -815,6 +1135,54 @@ def main():
         print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
         sys.exit(0)
 
+    elif args.command == "pool-map":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.scan_memory_pool_or_array(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            base_expression=args.expr,
+            count=args.count,
+            status_field=args.status_field,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "find-owner":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.find_symbol_owners_and_threads(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            target_expression=args.expr,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "workspace":
+        from .agent_runtime import AgentRuntime
+        from .web.server import run_server, run_server_loop
+        from .web.workspace import get_workspace_static_dir
+        corpus_dir = os.path.abspath(args.corpus)
+        os.makedirs(corpus_dir, exist_ok=True)
+        rt = AgentRuntime(corpus_dir=corpus_dir)
+        rt.observation_mode = "LOW_IMPACT"
+        srv = run_server(runtime=rt, host=args.host, port=args.port, static_dir=get_workspace_static_dir())
+        print(f"dynamicState Trace Workspace running at http://{args.host}:{args.port}")
+        sys.stdout.flush()
+        run_server_loop(srv)
+        sys.exit(0)
+
     elif args.command == "recipe":
         from .watch_session import WatchSessionManager
         wm = WatchSessionManager(corpus_dir=args.corpus)
@@ -859,6 +1227,436 @@ def main():
                 ssh_key=args.ssh_key,
                 ssh_proxy_jump=args.ssh_proxy_jump,
             )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+
+    elif args.command == "watch-until":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.watch_until_condition(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            condition_expression=args.condition,
+            poll_interval_ms=args.poll_ms,
+            timeout_ms=args.timeout_ms,
+            hold_duration_ms=args.hold_ms,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "traverse-list":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.traverse_linked_structure(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            head_expression=args.expr,
+            next_field=args.next_field,
+            max_depth=args.max_depth,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "callstacks":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.inspect_thread_callstacks_and_locks(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            tid=args.tid,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "audit":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        exprs = [e.strip() for e in args.expr.split(",") if e.strip()] if args.expr else None
+        res = wm.audit_memory_integrity(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            target_expressions=exprs,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "resolve-func":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        exprs = [e.strip() for e in args.expr.split(",") if e.strip()]
+        res = wm.resolve_code_pointers(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            expressions=exprs,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "inspect-shm":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.inspect_shared_memory_ipc(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            cast_type=args.cast_type,
+            address=args.address,
+            shm_name=args.shm_name,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+
+    elif args.command == "frame-locals":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.inspect_thread_locals_and_frame_vars(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            tid=args.tid,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "auto-triage":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.auto_triage_incident(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+
+    elif args.command == "ipc-pipeline":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.trace_ipc_pipeline(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            cast_type=args.cast_type,
+            address=args.address,
+            shm_name=args.shm_name,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "scan-heap":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.scan_heap_objects(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            class_filter=args.class_filter,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "dependency-graph":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.build_dependency_graph(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "correlate-source":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.correlate_source_and_state(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            source_location=args.source_location,
+            tid=args.tid,
+            context_lines=args.context_lines,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "investigate-symptom":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.investigate_symptom(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            symptom_query=args.symptom_query,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "hotspots":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.sample_statistical_hotspots(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            samples_count=args.samples_count,
+            interval_ms=args.interval_ms,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "fuzzy-resolve":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.resolve_fuzzy_symbol_intent(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            natural_query=args.natural_query,
+            limit=args.limit,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "flight-recorder":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.flight_recorder_time_machine(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            frames_count=args.frames_count,
+            interval_ms=args.interval_ms,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "behavioral-drift":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.detect_behavioral_drift(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            save_as_new_baseline=args.save_baseline,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "tls-vars":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        v_names = [x.strip() for x in args.variable_names.split(",") if x.strip()] if args.variable_names else None
+        res = wm.inspect_thread_local_storage(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            tid=args.tid,
+            variable_names=v_names,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "verify-consistency":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        exprs = [x.strip() for x in args.expressions.split(",") if x.strip()] if args.expressions else None
+        res = wm.verify_concurrent_read_consistency(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            expressions=exprs,
+            retries=args.retries,
+            inter_read_delay_ms=args.inter_read_delay_ms,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "dpdk-lcores":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        r_exprs = [x.strip() for x in args.ring_expressions.split(",") if x.strip()] if args.ring_expressions else None
+        s_exprs = [x.strip() for x in args.spinlock_expressions.split(",") if x.strip()] if args.spinlock_expressions else None
+        res = wm.inspect_dpdk_lcores_and_rings(
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            sample_window_ms=args.sample_window_ms,
+            ring_expressions=r_exprs,
+            spinlock_expressions=s_exprs,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "ask":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.ask_runtime_question(
+            question=args.question,
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            process_name=args.process_name,
+            remote_host=args.remote_host,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_proxy_jump=args.ssh_proxy_jump,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "coerce-expr":
+        from .watch_session import WatchSessionManager
+        from .dwarf_indexer import DwarfIndexer
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        ctx = wm.resolve_target_context(pid=args.pid, companion_elf_path=args.debug_image)
+        primary_elf, _ = wm._split_companion_elf_paths(ctx["companion_elf_path"])
+        idx = DwarfIndexer.get_index(primary_elf)
+        res = wm.coerce_and_resolve_expression(idx=idx, raw_expr=args.expression)
+        res_clean = {k: v for k, v in res.items() if k != "ops"}
+        print(json.dumps({"success": True, "pid": ctx["pid"], "companion_elf": ctx["companion_elf_path"], **res_clean}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "smart-compact":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        res = wm.smart_compact_query(
+            query_or_expression=args.query,
+            mode=args.mode,
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+            max_tokens=args.max_tokens,
+            cursor_offset=args.cursor_offset,
+            page_size=args.page_size,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "batch-exec":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        steps_list = json.loads(args.steps_json)
+        res = wm.execute_batch_macro(
+            steps=steps_list,
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "verify-hypothesis":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        a_list = [x.strip() for x in args.assertions.split(",") if x.strip()]
+        res = wm.verify_runtime_hypothesis(
+            hypothesis=args.hypothesis,
+            assertions=a_list,
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+        )
+        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "export-report":
+        from .watch_session import WatchSessionManager
+        wm = WatchSessionManager(corpus_dir=args.corpus)
+        a_list = [x.strip() for x in args.assertions.split(",") if x.strip()] if args.assertions else None
+        res = wm.export_incident_report(
+            title=args.title,
+            hypothesis=args.hypothesis,
+            assertions=a_list,
+            output_path=args.output_path,
+            pid=args.pid,
+            companion_elf_path=args.debug_image,
+        )
         print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
         sys.exit(0)
 

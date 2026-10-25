@@ -9105,8 +9105,13 @@
   function startTePolling() {
     stopTePolling();
     teState.pollIntervalId = setInterval(async () => {
-      if (!teState.sessionId) return;
-      await refreshTeSessionState();
+      if (!teState.sessionId || teState.isPolling || document.hidden) return;
+      teState.isPolling = true;
+      try {
+        await refreshTeSessionState();
+      } finally {
+        teState.isPolling = false;
+      }
     }, 1000);
   }
 
@@ -9115,11 +9120,12 @@
       clearInterval(teState.pollIntervalId);
       teState.pollIntervalId = null;
     }
+    teState.isPolling = false;
   }
 
   async function refreshTeSessionState() {
     if (!teState.sessionId) return;
-    const res = await apiGet(`/api/watch/session/${teState.sessionId}/observations`);
+    const res = await apiGet(`/api/watch/session/${teState.sessionId}/observations?limit=200`);
     if (res.success && res.data) {
       const prevCount = teState.observations.length;
       teState.observations = res.data.observations || [];
@@ -9186,7 +9192,11 @@
       return;
     }
 
-    container.innerHTML = teState.observations.map((obs, idx) => {
+    const totalObs = teState.observations.length;
+    const startIdx = Math.max(0, totalObs - 60);
+    const visibleObs = teState.observations.slice(startIdx);
+    container.innerHTML = visibleObs.map((obs, relIdx) => {
+      const idx = startIdx + relIdx;
       const isSelected = (idx === teState.currentIndex);
       const btnClass = isSelected ? 'btn-primary font-bold' : 'btn-outline';
       const timeStr = obs.timestamp ? obs.timestamp.slice(11, 19) : `#${obs.seq}`;

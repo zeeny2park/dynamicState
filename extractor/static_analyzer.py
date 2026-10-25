@@ -9,7 +9,17 @@ from abc import ABC, abstractmethod
 import os
 import re
 import subprocess
+import threading
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+
+def _low_priority_preexec() -> None:
+    """Lower CPU scheduling priority for background binutils subprocesses so interactive
+    terminals and target processes never experience keystroke lag."""
+    try:
+        os.nice(10)
+    except Exception:
+        pass
 
 from .dwarf_indexer import DwarfIndex, DwarfIndexer
 from .modules import ModuleAddressResolver, RuntimeModule
@@ -322,7 +332,28 @@ class MockStaticAnalysisProvider(StaticAnalysisProvider):
 
 
 class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
-    """Host-side static analysis provider leveraging DWARF index and standard ELF utilities."""
+    """Host-side static analysis provider leveraging DWARF index and standard ELF utilities.
+
+    Caches parsed symbol tables (`nm -C -n`), disassembled instruction lines (`objdump -d -C`),
+    and static symbol reference lookups per `(abs_path, mtime_ns, size)` so that repeated
+    calls during investigation stages never spawn duplicate binutils subprocesses.
+    """
+
+    _CACHE_LOCK = threading.Lock()
+    _INFLIGHT_LOCKS: Dict[Tuple[str, int, int], threading.Lock] = {}
+    _SYMBOLS_CACHE: Dict[Tuple[str, int, int], Tuple[Dict[str, Dict[str, Any]], Dict[int, Dict[str, Any]], Dict[str, Dict[str, Any]]]] = {}
+    _DISASM_CACHE: Dict[Tuple[str, int, int], List[Tuple[str, str]]] = {}
+    _REFS_CACHE: Dict[Tuple[Tuple[str, int, int], str], List[Dict[str, Any]]] = {}
+    _PROVIDER_INSTANCES: Dict[Tuple[str, int, int], "DwarfStaticAnalysisProvider"] = {}
+
+    @classmethod
+    def clear_caches(cls) -> None:
+        """Clear all cached static analysis tables (used in test teardown)."""
+        with cls._CACHE_LOCK:
+            cls._SYMBOLS_CACHE.clear()
+            cls._DISASM_CACHE.clear()
+            cls._REFS_CACHE.clear()
+            cls._PROVIDER_INSTANCES.clear()
 
     def __init__(self, debug_artifact_path: Optional[str] = None):
         self.debug_artifact_path = os.path.abspath(debug_artifact_path) if debug_artifact_path else None
@@ -330,8 +361,27 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
         self._parsed_symbols: Dict[str, Dict[str, Any]] = {}
         self._functions_by_addr: Dict[int, Dict[str, Any]] = {}
         self._functions_by_name: Dict[str, Dict[str, Any]] = {}
+        self._symbols_loaded: bool = False
         if self.debug_artifact_path and os.path.exists(self.debug_artifact_path):
             self._load_symbols()
+
+    def _get_artifact_key(self) -> Optional[Tuple[str, int, int]]:
+        if not self.debug_artifact_path or not os.path.exists(self.debug_artifact_path):
+            return None
+        try:
+            st = os.stat(self.debug_artifact_path)
+            return (self.debug_artifact_path, st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    @classmethod
+    def _get_inflight_lock(cls, key: Tuple[str, int, int]) -> threading.Lock:
+        with cls._CACHE_LOCK:
+            lock = cls._INFLIGHT_LOCKS.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                cls._INFLIGHT_LOCKS[key] = lock
+            return lock
 
     def is_available(self) -> bool:
         return self.debug_artifact_path is not None and os.path.exists(self.debug_artifact_path)
@@ -348,35 +398,151 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
         return self._dwarf_index
 
     def _load_symbols(self) -> None:
-        if not self.debug_artifact_path or not os.path.exists(self.debug_artifact_path):
+        if self._symbols_loaded:
+            return
+        art_key = self._get_artifact_key()
+        if art_key is None:
             return
 
-        # 1. Parse symbol table using nm -C
-        try:
-            cmd = ["nm", "-C", "-n", self.debug_artifact_path]
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if proc.returncode == 0:
-                for line in proc.stdout.splitlines():
-                    parts = line.strip().split(maxsplit=2)
-                    if len(parts) >= 3:
+        with self._CACHE_LOCK:
+            cached = self._SYMBOLS_CACHE.get(art_key)
+            if cached is not None:
+                self._parsed_symbols, self._functions_by_addr, self._functions_by_name = cached
+                self._symbols_loaded = True
+                return
+
+        inflight = self._get_inflight_lock(art_key)
+        with inflight:
+            with self._CACHE_LOCK:
+                cached = self._SYMBOLS_CACHE.get(art_key)
+                if cached is not None:
+                    self._parsed_symbols, self._functions_by_addr, self._functions_by_name = cached
+                    self._symbols_loaded = True
+                    return
+
+            parsed_symbols: Dict[str, Dict[str, Any]] = {}
+            functions_by_addr: Dict[int, Dict[str, Any]] = {}
+            functions_by_name: Dict[str, Dict[str, Any]] = {}
+
+            try:
+                cmd = ["nm", "-C", "-n", self.debug_artifact_path]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    errors="replace",
+                    preexec_fn=_low_priority_preexec if hasattr(os, "nice") else None,
+                )
+                try:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        parts = line.strip().split(maxsplit=2)
+                        if len(parts) >= 3:
+                            try:
+                                addr = int(parts[0], 16)
+                                sym_type = parts[1]
+                                name = parts[2]
+                                entry = {
+                                    "name": name,
+                                    "address": addr,
+                                    "hex_address": f"0x{addr:x}",
+                                    "type": sym_type,
+                                }
+                                parsed_symbols[name] = entry
+                                if sym_type in ("T", "t", "W", "w"):
+                                    functions_by_addr[addr] = entry
+                                    functions_by_name[name] = entry
+                            except ValueError:
+                                pass
+                finally:
+                    try:
+                        proc.stdout.close()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    proc.wait(timeout=15)
+            except Exception:
+                pass
+
+            with self._CACHE_LOCK:
+                self._SYMBOLS_CACHE[art_key] = (parsed_symbols, functions_by_addr, functions_by_name)
+                self._parsed_symbols = parsed_symbols
+                self._functions_by_addr = functions_by_addr
+                self._functions_by_name = functions_by_name
+                self._symbols_loaded = True
+
+    def _get_cached_disassembly(self) -> List[Tuple[str, str]]:
+        """Run `objdump -d -C` at most once per binary and cache compact (caller_fn, line) pairs
+        filtered to user functions, enforcing a strict line budget (`DYNAMICSTATE_MAX_DISASM_LINES`)."""
+        art_key = self._get_artifact_key()
+        if art_key is None:
+            return []
+
+        with self._CACHE_LOCK:
+            cached = self._DISASM_CACHE.get(art_key)
+            if cached is not None:
+                return cached
+
+        inflight = self._get_inflight_lock(art_key)
+        with inflight:
+            with self._CACHE_LOCK:
+                cached = self._DISASM_CACHE.get(art_key)
+                if cached is not None:
+                    return cached
+
+            max_lines = int(os.environ.get("DYNAMICSTATE_MAX_DISASM_LINES", "150000"))
+            records: List[Tuple[str, str]] = []
+            current_fn: Optional[str] = None
+            skip_fn: bool = False
+
+            try:
+                cmd = ["objdump", "-d", "-C", self.debug_artifact_path]  # type: ignore[list-item]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    errors="replace",
+                    preexec_fn=_low_priority_preexec if hasattr(os, "nice") else None,
+                )
+                try:
+                    assert proc.stdout is not None
+                    line_count = 0
+                    for raw_line in proc.stdout:
+                        line_count += 1
+                        if line_count > max_lines:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                            break
+                        line = raw_line.rstrip("\r\n")
+                        if line.endswith(">:") and "<" in line:
+                            idx = line.find("<")
+                            current_fn = line[idx + 1:-2]
+                            skip_fn = any(current_fn.startswith(p) for p in ("std::", "__", "_"))
+                        elif current_fn and not skip_fn:
+                            s_line = line.strip()
+                            if s_line:
+                                records.append((current_fn, s_line))
+                finally:
+                    try:
+                        proc.stdout.close()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
                         try:
-                            addr = int(parts[0], 16)
-                            sym_type = parts[1]
-                            name = parts[2]
-                            entry = {
-                                "name": name,
-                                "address": addr,
-                                "hex_address": f"0x{addr:x}",
-                                "type": sym_type,
-                            }
-                            self._parsed_symbols[name] = entry
-                            if sym_type in ("T", "t", "W", "w"):
-                                self._functions_by_addr[addr] = entry
-                                self._functions_by_name[name] = entry
-                        except ValueError:
+                            proc.kill()
+                        except Exception:
                             pass
-        except Exception:
-            pass
+            except Exception:
+                records = []
+
+            with self._CACHE_LOCK:
+                self._DISASM_CACHE[art_key] = records
+            return records
 
     def inspect_function(self, name_or_addr: Union[str, int], module: Optional[RuntimeModule] = None) -> Optional[Dict[str, Any]]:
         self._load_symbols()
@@ -423,7 +589,7 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
         module: Optional[RuntimeModule] = None,
         disassembly_text: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        # Lightweight static reference discovery via objdump disassembly if available
+        # Lightweight static reference discovery via cached objdump disassembly if available
         refs: List[Dict[str, Any]] = []
         sym_name = str(name_or_addr)
         if isinstance(name_or_addr, int):
@@ -431,42 +597,68 @@ class DwarfStaticAnalysisProvider(StaticAnalysisProvider):
             if fn:
                 sym_name = fn.get("name", hex(name_or_addr))
 
-        lines = []
         if disassembly_text is not None:
-            lines = disassembly_text.splitlines()
-        elif self.debug_artifact_path:
-            try:
-                cmd = ["objdump", "-d", "-C", self.debug_artifact_path]
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                if proc.returncode == 0:
-                    lines = proc.stdout.splitlines()
-            except Exception:
-                lines = []
+            current_fn = None
+            sym_pattern = re.compile(rf"\b{re.escape(sym_name)}\b")
+            for line in disassembly_text.splitlines():
+                if line.endswith(">:") and "<" in line:
+                    idx = line.find("<")
+                    current_fn = line[idx + 1:-2]
+                elif current_fn and sym_name != current_fn:
+                    if any(current_fn.startswith(p) for p in ("std::", "__", "_")):
+                        continue
+                    if sym_pattern.search(line):
+                        is_write = any(w in line for w in ("mov", "str", "stw", "stx", "="))
+                        refs.append({
+                            "caller_function": current_fn,
+                            "reference_site": line.strip(),
+                            "target": sym_name,
+                            "link_kind": LINK_KIND_FIELD_WRITE_CANDIDATE if is_write else LINK_KIND_CALL_RELATIONSHIP,
+                            "is_verified": False,
+                            "is_candidate_only": True,
+                            "confidence": "CANDIDATE",
+                            "basis": "disassembly_text_match",
+                            "limitation": "Disassembly text search establishes candidate reference only, not proof of verified call edge or field write.",
+                        })
+                        if len(refs) >= 20:
+                            break
+            return refs
 
-        current_fn = None
+        art_key = self._get_artifact_key()
+        if art_key is None:
+            return []
+
+        ref_cache_key = (art_key, sym_name)
+        with self._CACHE_LOCK:
+            cached_refs = self._REFS_CACHE.get(ref_cache_key)
+            if cached_refs is not None:
+                return list(cached_refs)
+
+        disasm_records = self._get_cached_disassembly()
         sym_pattern = re.compile(rf"\b{re.escape(sym_name)}\b")
-        for line in lines:
-            if line.endswith(">:") and "<" in line:
-                idx = line.find("<")
-                current_fn = line[idx + 1:-2]
-            elif current_fn and sym_name != current_fn:
-                if any(current_fn.startswith(p) for p in ("std::", "__", "_")):
-                    continue
-                if sym_pattern.search(line):
-                    is_write = any(w in line for w in ("mov", "str", "stw", "stx", "="))
-                    refs.append({
-                        "caller_function": current_fn,
-                        "reference_site": line.strip(),
-                        "target": sym_name,
-                        "link_kind": LINK_KIND_FIELD_WRITE_CANDIDATE if is_write else LINK_KIND_CALL_RELATIONSHIP,
-                        "is_verified": False,
-                        "is_candidate_only": True,
-                        "confidence": "CANDIDATE",
-                        "basis": "disassembly_text_match",
-                        "limitation": "Disassembly text search establishes candidate reference only, not proof of verified call edge or field write.",
-                    })
-                    if len(refs) >= 20:  # Bound result
-                        break
+        for current_fn, s_line in disasm_records:
+            if sym_name == current_fn or sym_name not in s_line:
+                continue
+            if sym_pattern.search(s_line):
+                is_write = any(w in s_line for w in ("mov", "str", "stw", "stx", "="))
+                refs.append({
+                    "caller_function": current_fn,
+                    "reference_site": s_line,
+                    "target": sym_name,
+                    "link_kind": LINK_KIND_FIELD_WRITE_CANDIDATE if is_write else LINK_KIND_CALL_RELATIONSHIP,
+                    "is_verified": False,
+                    "is_candidate_only": True,
+                    "confidence": "CANDIDATE",
+                    "basis": "disassembly_text_match",
+                    "limitation": "Disassembly text search establishes candidate reference only, not proof of verified call edge or field write.",
+                })
+                if len(refs) >= 20:
+                    break
+
+        with self._CACHE_LOCK:
+            if len(self._REFS_CACHE) > 4096:
+                self._REFS_CACHE.clear()
+            self._REFS_CACHE[ref_cache_key] = list(refs)
         return refs
 
     def get_call_relationships(self, function_name: str, module: Optional[RuntimeModule] = None) -> Dict[str, Any]:
@@ -609,10 +801,25 @@ def get_static_provider(
     backend: str = "dwarf",
     debug_artifact_path: Optional[str] = None,
 ) -> StaticAnalysisProvider:
-    """Factory creating static analysis providers."""
+    """Factory creating static analysis providers with instance reuse per artifact."""
     if backend == "mock":
         return MockStaticAnalysisProvider()
     elif backend == "dwarf":
+        if debug_artifact_path and os.path.exists(debug_artifact_path):
+            try:
+                abs_p = os.path.abspath(debug_artifact_path)
+                st = os.stat(abs_p)
+                key = (abs_p, st.st_mtime_ns, st.st_size)
+                with DwarfStaticAnalysisProvider._CACHE_LOCK:
+                    inst = DwarfStaticAnalysisProvider._PROVIDER_INSTANCES.get(key)
+                    if inst is not None:
+                        return inst
+                inst = DwarfStaticAnalysisProvider(abs_p)
+                with DwarfStaticAnalysisProvider._CACHE_LOCK:
+                    DwarfStaticAnalysisProvider._PROVIDER_INSTANCES[key] = inst
+                return inst
+            except OSError:
+                pass
         return DwarfStaticAnalysisProvider(debug_artifact_path)
     return NullStaticAnalysisProvider()
 

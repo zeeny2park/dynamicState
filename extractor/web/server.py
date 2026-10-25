@@ -1882,6 +1882,1271 @@ class WebApiAdapter:
         except Exception as e:
             return {"success": False, "error": {"code": "DIAGNOSTIC_RECIPE_ERROR", "message": str(e)}}
 
+    def scan_memory_pool_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Scans an entire memory pool or buffer array and returns slot allocation status and map chart."""
+        try:
+            pid = int(params.get("pid") or 0)
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            if not companion_elf:
+                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": "Companion ELF path is required"}}
+            base_expr = (params.get("base_expression") or params.get("expression") or "").strip()
+            if not base_expr:
+                return {"success": False, "error": {"code": "INVALID_EXPRESSION", "message": "base_expression is required"}}
+            count = int(params["count"]) if params.get("count") else None
+            status_field = (params.get("status_field") or "").strip() or None
+            inc_fields = params.get("include_fields")
+            if isinstance(inc_fields, str):
+                inc_fields = [f.strip() for f in inc_fields.split(",") if f.strip()]
+            res = self.watch_manager.scan_memory_pool_or_array(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                base_expression=base_expr,
+                count=count,
+                status_field=status_field,
+                include_fields=inc_fields,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "POOL_SCAN_ERROR", "message": str(e)}}
+
+    def find_symbol_owners_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Finds threads or global worker contexts holding or referencing a specific symbol/slot."""
+        try:
+            pid = int(params.get("pid") or 0)
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            if not companion_elf:
+                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": "Companion ELF path is required"}}
+            target_expr = (params.get("target_expression") or params.get("expression") or "").strip()
+            if not target_expr:
+                return {"success": False, "error": {"code": "INVALID_EXPRESSION", "message": "target_expression is required"}}
+            res = self.watch_manager.find_symbol_owners_and_threads(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                target_expression=target_expr,
+                stack_scan_bytes=int(params.get("stack_scan_bytes") or 65536),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "FIND_OWNERS_ERROR", "message": str(e)}}
+
+    def workspace_chat_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Natural-language conversational router for the Minimalist Trace Workspace UI.
+
+        Translates user chat prompts (e.g. 'memory pool *gpMem의 할당 현황을 맵 차트로 그려주세요',
+        'gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요') into zero-stop process inspections
+        and returns both a conversational reply and structured visual trace cards.
+        """
+        try:
+            msg = str(params.get("message") or params.get("prompt") or "").strip()
+            if not msg:
+                return {"success": False, "error": {"code": "EMPTY_MESSAGE", "message": "Chat message is required"}}
+
+            pid = int(params.get("pid") or 0)
+            companion_elf = str(params.get("companion_elf") or params.get("debug_image") or "").strip()
+            remote_host = (params.get("remote_host") or "").strip() or None
+            ssh_user = (params.get("ssh_user") or "").strip() or None
+            ssh_port = int(params.get("ssh_port") or 22)
+            ssh_key = (params.get("ssh_key") or "").strip() or None
+            ssh_proxy_jump = (params.get("ssh_proxy_jump") or "").strip() or None
+
+            if pid <= 0 or not companion_elf or not os.path.isfile(companion_elf) or self.watch_manager.get_active_target_context().get("pid") == pid:
+                try:
+                    ctx_auto = self.watch_manager.resolve_target_context(
+                        pid=pid if pid > 0 else None,
+                        companion_elf_path=companion_elf or None,
+                        process_name=(params.get("process_name") or "").strip() or None,
+                        remote_host=remote_host,
+                        ssh_user=ssh_user,
+                        ssh_port=ssh_port,
+                        ssh_key=ssh_key,
+                        ssh_proxy_jump=ssh_proxy_jump,
+                    )
+                    pid = ctx_auto["pid"]
+                    companion_elf = ctx_auto["companion_elf_path"]
+                except Exception:
+                    pass
+
+            if pid <= 0 or not companion_elf or not os.path.isfile(companion_elf):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "TARGET_NOT_CONFIGURED",
+                        "message": f"Valid running PID ({pid}) and nostrip ELF ('{companion_elf}') are required",
+                    },
+                }
+
+            msg_low = msg.lower()
+            wants_dpdk = any(k in msg_low for k in ("dpdk", "lcore", "pmd", "isolation", "isolcpus", "격리 코어", "데디케이티드", "dedicated", "rte_ring", "스핀락", "spinlock", "hugepage"))
+            wants_tls = any(k in msg_low for k in ("tls", "thread_local", "__thread", "스레드별", "쓰레드별", "스레드 로컬", "쓰레드 로컬", "tcb")) and not wants_dpdk
+            wants_seqlock = any(k in msg_low for k in ("seqlock", "시퀀스락", "일관성", "원자성", "torn read", "동시성 읽기", "이중 읽기", "double read", "atomic"))
+            wants_flight_recorder = any(k in msg_low for k in ("타임머신", "플라이트 레코더", "flight recorder", "방금 잠깐", "튀었", "간헐적", "스파이크", "글리치", "링버퍼"))
+            wants_drift = any(k in msg_low for k in ("행동 편차", "편차", "평소랑", "드리프트", "drift", "baseline 대비", "이상해졌"))
+            wants_hotspots = any(k in msg_low for k in ("핫스팟", "hotspot", "프로파일", "flame", "cpu 점유", "바쁜 루프", "어느 함수에서 시간을", "통계적 샘플링"))
+            wants_fuzzy = any(k in msg_low for k in ("퍼지", "의미 매칭", "관련된 심볼 찾아", "알아서 심볼", "fuzzy"))
+            wants_symptom = any(k in msg_low for k in ("왜 멈췄", "왜 안", "응답이 없", "버벅", "느려졌", "증상", "자율 조사", "종합 판단", "왜 이래", "무슨 문제"))
+            wants_dep_graph = any(k in msg_low for k in ("인과 그래프", "종속성 그래프", "의존성 그래프", "dependency graph", "causal chain", "인과 사슬", "누가 누구를"))
+            wants_source_corr = any(k in msg_low for k in ("소스 코드", "소스코드", "코드 줄", "인라인", "source", "코드와 변수"))
+            wants_ipc_pipeline = any(k in msg_low for k in ("파이프라인", "pipeline", "프로듀서", "컨슈머", "producer", "consumer", "멀티 프로세스", "병목"))
+            wants_heap_scan = any(k in msg_low for k in ("힙", "heap", "누수", "leak", "객체 스캔", "인스턴스"))
+            wants_triage = any(k in msg_low for k in ("종합 진단", "원클릭 진단", "auto-triage", "triage", "트리아지", "전체 진단", "원인 분석"))
+            wants_frame_locals = any(k in msg_low for k in ("지역 변수", "지역변수", "파라미터", "매개변수", "인자", "local", "frame var", "스택 변수")) and not wants_tls
+            wants_condition = any(k in msg_low for k in ("조건", "순간", "until", "trigger", "트리거", "감시", "포착")) or bool(re.search(r"(==|!=|>=|<=)", msg))
+            wants_linked = any(k in msg_low for k in ("연결 리스트", "리스트", "체인", "순회", "사이클", "cycle", "linked", "next"))
+            wants_callstack = any(k in msg_low for k in ("콜스택", "callstack", "backtrace", "데드락", "deadlock", "뮤텍스", "mutex", "락", "lock", "블로킹", "어느 함수")) and not wants_seqlock
+            wants_audit = any(k in msg_low for k in ("무결성", "감사", "오염", "audit", "corruption", "dangling", "전수 검사", "깨진"))
+            wants_code_ptr = any(k in msg_low for k in ("함수 포인터", "콜백", "callback", "vtable", "vptr", "가상 함수"))
+            wants_shm = any(k in msg_low for k in ("공유 메모리", "shm", "mmap", "캐스팅", "cast", "ipc"))
+            wants_pool = any(k in msg_low for k in ("맵", "pool", "할당", "buffer", "버퍼", "슬롯 현황")) and not wants_condition and not wants_ipc_pipeline and not wants_heap_scan
+            wants_owner = any(k in msg_low for k in ("쓰레드", "스레드", "thread", "누가", "사용 중인", "점유", "owner", "인덱스")) and not wants_callstack and not wants_condition and not wants_frame_locals and not wants_triage and not wants_ipc_pipeline and not wants_heap_scan and not wants_tls and not wants_dpdk
+            wants_diff = any(k in msg_low for k in ("diff", "전후", "변화", "비교"))
+            wants_blueprint = any(k in msg_low for k in ("블루프린트", "blueprint", "연결", "x-ray", "구조")) and not wants_linked
+
+            trace_cards: List[Dict[str, Any]] = []
+            reply_parts: List[str] = []
+
+            bp_data = self.watch_manager.get_process_xray_blueprint(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
+            )
+            pools_list = bp_data.get("categories", {}).get("memory_pools_and_buffers", [])
+            default_pool_expr = pools_list[0]["recommended_pool_expression"] if pools_list else "*gpMem"
+            default_pool_name = pools_list[0]["name"] if pools_list else "gpMem"
+
+            if wants_blueprint and not wants_pool and not wants_owner:
+                trace_cards.append({
+                    "card_type": "XRAY_BLUEPRINT",
+                    "title": f"PID {pid} X-Ray 블루프린트 & 활성 스레드",
+                    "data": bp_data,
+                })
+                reply_parts.append(
+                    f"PID {pid} 프로세스에 무정지(0.00ms)로 연결하여 활성 스레드 {bp_data.get('threads_count', 0)}개와 "
+                    f"메모리 풀 {len(pools_list)}개를 포함한 DWARF 전역 심볼 구조를 워크스페이스에 추가했습니다."
+                )
+
+            if wants_pool:
+                # Extract explicit pool expression or use discovered default pool
+                m_expr = re.search(r"(\*[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*(?:->|\.)[A-Za-z_][A-Za-z0-9_]*)", msg)
+                base_expr = m_expr.group(1) if m_expr else default_pool_expr
+                pool_res = self.watch_manager.scan_memory_pool_or_array(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    base_expression=base_expr,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                p_sum = pool_res["pool_summary"]
+                trace_cards.append({
+                    "card_type": "POOL_MAP",
+                    "title": f"{pool_res['resolved_array_expression']} 메모리 풀 할당 맵 ({p_sum['allocated_count']}/{p_sum['total_slots']})",
+                    "data": pool_res,
+                })
+                reply_parts.append(
+                    f"{pool_res['resolved_array_expression']} 총 {p_sum['total_slots']}개 버퍼 중 "
+                    f"{p_sum['allocated_count']}개({p_sum['utilization_pct']}%)가 할당(IN_USE)되어 있습니다 "
+                    f"(인덱스: {p_sum['allocated_indices']})."
+                )
+
+            if wants_owner:
+                m_idx_expr = re.search(r"([A-Za-z_][A-Za-z0-9_.\->]*\[\s*\d+\s*\])", msg)
+                m_kor_idx = re.search(r"(?:([A-Za-z_][A-Za-z0-9_]*)\s*)?(\d+)\s*번", msg)
+                if m_idx_expr:
+                    target_expr = m_idx_expr.group(1)
+                elif m_kor_idx:
+                    sym_prefix = m_kor_idx.group(1) or default_pool_name
+                    target_expr = f"{sym_prefix}[{m_kor_idx.group(2)}]"
+                else:
+                    target_expr = f"{default_pool_name}[0]"
+
+                owner_res = self.watch_manager.find_symbol_owners_and_threads(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    target_expression=target_expr,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "THREAD_OWNER",
+                    "title": f"{owner_res['target_expression']} 점유 스레드 역추적 결과",
+                    "data": owner_res,
+                })
+                m_threads = owner_res.get("matched_threads", [])
+                if m_threads:
+                    t_str = ", ".join(f"TID {t['tid']} ({t['thread_name']})" for t in m_threads)
+                    reply_parts.append(f"{owner_res['target_expression']} ({owner_res['target_runtime_address']})를 사용 중인 스레드는 {t_str} 입니다.")
+                else:
+                    reply_parts.append(f"{owner_res['target_expression']}를 현재 점유/참조 중인 스레드가 발견되지 않았습니다.")
+
+            if wants_dpdk:
+                dpdk_res = self.watch_manager.inspect_dpdk_lcores_and_rings(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    sample_window_ms=int(params.get("sample_window_ms") or 40),
+                    ring_expressions=params.get("ring_expressions"),
+                    spinlock_expressions=params.get("spinlock_expressions"),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "DPDK_LCORE_INSPECTOR",
+                    "title": f"DPDK 격리 코어(lcore) & PMD 링 무정지 진단 ({dpdk_res['overall_dpdk_status']} · PMD {dpdk_res['dedicated_pmd_lcores_count']}개)",
+                    "data": dpdk_res,
+                })
+                reply_parts.append(dpdk_res.get("llm_next_step_hint", "DPDK 격리 코어 및 PMD 링 분석을 완료했습니다."))
+
+            if wants_tls:
+                tls_res = self.watch_manager.inspect_thread_local_storage(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    tid=int(params["tid"]) if params.get("tid") else None,
+                    variable_names=params.get("variable_names"),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "TLS_INSPECTOR",
+                    "title": f"스레드별 TLS(thread_local) 변수 해독 ({tls_res['tls_variables_discovered']} vars · {tls_res['tcb_resolved_count']}/{tls_res['threads_count']} TCBs)",
+                    "data": tls_res,
+                })
+                reply_parts.append(tls_res.get("llm_next_step_hint", "스레드별 TLS 변수 해독을 완료했습니다."))
+
+            if wants_seqlock:
+                seq_res = self.watch_manager.verify_concurrent_read_consistency(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    expressions=params.get("expressions"),
+                    retries=int(params.get("retries") or 3),
+                    inter_read_delay_ms=int(params.get("inter_read_delay_ms") or 4),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "CONCURRENCY_VERIFIER",
+                    "title": f"동시성 이중 읽기(Seqlock) 일관성 검증 ({seq_res['overall_consistency_status']})",
+                    "data": seq_res,
+                })
+                reply_parts.append(seq_res.get("llm_next_step_hint", "동시성 읽기 일관성 검증을 완료했습니다."))
+
+            if wants_flight_recorder:
+                fr_res = self.watch_manager.flight_recorder_time_machine(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    frames_count=int(params.get("frames_count") or 8),
+                    interval_ms=int(params.get("interval_ms") or 20),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "FLIGHT_RECORDER",
+                    "title": f"타임머신 플라이트 레코더 ({fr_res['frames_recorded']} frames · 글리치 {fr_res['transient_glitches_count']}건)",
+                    "data": fr_res,
+                })
+                reply_parts.append(fr_res.get("llm_next_step_hint", "타임머신 플라이트 레코더 분석을 완료했습니다."))
+
+            if wants_drift:
+                dr_res = self.watch_manager.detect_behavioral_drift(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    save_as_new_baseline=bool(params.get("save_as_new_baseline", False)),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "BEHAVIORAL_DRIFT",
+                    "title": f"행동 편차(Behavioral Drift) 경보 ({dr_res['drift_status']} · Score {dr_res['drift_score']}/100)",
+                    "data": dr_res,
+                })
+                reply_parts.append(dr_res.get("llm_next_step_hint", "행동 편차 진단을 완료했습니다."))
+
+            if wants_hotspots:
+                hs_res = self.watch_manager.sample_statistical_hotspots(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    samples_count=int(params.get("samples_count") or 6),
+                    interval_ms=int(params.get("interval_ms") or 30),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "STATISTICAL_HOTSPOTS",
+                    "title": f"무정지 통계적 CPU & 콜스택 핫스팟 프로파일 ({hs_res['samples_taken']} samples · {hs_res['elapsed_ms']}ms)",
+                    "data": hs_res,
+                })
+                reply_parts.append(hs_res.get("llm_next_step_hint", "무정지 통계적 핫스팟 프로파일링을 완료했습니다."))
+
+            if wants_fuzzy:
+                fz_res = self.watch_manager.resolve_fuzzy_symbol_intent(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    natural_query=msg,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "FUZZY_INTENT_RESOLVER",
+                    "title": f"자연어 의도 기반 DWARF 심볼 자동 매칭 ({fz_res['matches_count']} matches)",
+                    "data": fz_res,
+                })
+                reply_parts.append(fz_res.get("llm_next_step_hint", "자연어 의도 기반 심볼 매칭을 완료했습니다."))
+
+            if wants_symptom:
+                sym_res = self.watch_manager.investigate_symptom(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    symptom_query=msg,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "SYMPTOM_INVESTIGATION",
+                    "title": f"증상 기반 자율 종합 조사 ({sym_res['classified_symptom']} · 확신도 {int(sym_res['confidence_score']*100)}%)",
+                    "data": sym_res,
+                })
+                reply_parts.append(sym_res.get("llm_next_step_hint", "증상 기반 자율 종합 조사를 완료했습니다."))
+
+            if wants_dep_graph:
+                dg_res = self.watch_manager.build_dependency_graph(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "DEPENDENCY_GRAPH",
+                    "title": f"스레드·락·버퍼·IPC 인과 종속성 그래프 ({dg_res['nodes_count']} nodes · {len(dg_res['causal_chains'])} chains)",
+                    "data": dg_res,
+                })
+                reply_parts.append(dg_res.get("llm_next_step_hint", "종속성 및 인과 그래프 합성을 완료했습니다."))
+
+            if wants_source_corr:
+                sc_res = self.watch_manager.correlate_source_and_state(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    source_location=params.get("source_location"),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "SOURCE_CORRELATION",
+                    "title": f"소스 코드 & 실시간 메모리 변수 인라인 매핑 ({sc_res['snippets_count']} snippets)",
+                    "data": sc_res,
+                })
+                reply_parts.append(sc_res.get("llm_next_step_hint", "소스 코드와 실시간 메모리 변수 매핑을 완료했습니다."))
+
+            if wants_ipc_pipeline:
+                ipc_res = self.watch_manager.trace_ipc_pipeline(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    cast_type=params.get("cast_type"),
+                    address=params.get("address"),
+                    shm_name=params.get("shm_name"),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "IPC_PIPELINE",
+                    "title": f"멀티 프로세스 IPC 파이프라인 진단 ({ipc_res['pipeline_health']})",
+                    "data": ipc_res,
+                })
+                reply_parts.append(ipc_res.get("llm_next_step_hint", "멀티 프로세스 IPC 파이프라인 진단을 완료했습니다."))
+
+            if wants_heap_scan:
+                hp_res = self.watch_manager.scan_heap_objects(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    class_filter=params.get("class_filter"),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "HEAP_SCANNER",
+                    "title": f"힙(Heap) C++ 객체 & 누수 스캐너 (객체 {hp_res['total_objects_found']}개 · 누수 의심 {hp_res['leaked_candidates_count']}개)",
+                    "data": hp_res,
+                })
+                reply_parts.append(hp_res.get("llm_next_step_hint", "힙 객체 및 누수 스캔을 완료했습니다."))
+
+            if wants_triage:
+                tr_res = self.watch_manager.auto_triage_incident(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "AUTO_TRIAGE",
+                    "title": f"원클릭 종합 진단 리포트 (Health {tr_res['health_score']}/100 · {tr_res['overall_status']})",
+                    "data": tr_res,
+                })
+                reply_parts.append(tr_res.get("llm_next_step_hint", "원클릭 종합 진단을 완료했습니다."))
+
+            if wants_frame_locals:
+                fl_res = self.watch_manager.inspect_thread_locals_and_frame_vars(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    tid=int(params["tid"]) if params.get("tid") else None,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "FRAME_LOCALS",
+                    "title": f"스레드 스택 프레임 인자 & 지역변수 해독 ({fl_res['threads_count']} threads)",
+                    "data": fl_res,
+                })
+                reply_parts.append(fl_res.get("llm_next_step_hint", "스택 프레임 지역변수 해독을 완료했습니다."))
+
+            if wants_condition:
+                m_cond = re.search(r"([A-Za-z_*][A-Za-z0-9_.\->\[\]]*\s*(?:==|!=|>=|<=|>|<)\s*[A-Za-z0-9_xX.\-]+)", msg)
+                cond_expr = m_cond.group(1) if m_cond else (params.get("condition_expression") or "ANY_CHANGE")
+                cond_res = self.watch_manager.watch_until_condition(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    condition_expression=cond_expr,
+                    poll_interval_ms=int(params.get("poll_interval_ms") or 30),
+                    timeout_ms=int(params.get("timeout_ms") or 800),
+                    hold_duration_ms=int(params.get("hold_duration_ms") or 0),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "CONDITION_TRIGGER",
+                    "title": f"조건부 트리거 감시: {cond_expr} ({TRIGGERED if cond_res[triggered] else TIMEOUT})",
+                    "data": cond_res,
+                })
+                reply_parts.append(cond_res.get("llm_next_step_hint", "조건부 감시를 완료했습니다."))
+
+            if wants_linked:
+                # Find list head symbol in message or DWARF variables
+                m_head = re.search(r"([A-Za-z_][A-Za-z0-9_]*(?:list|head|queue|chain|node|root)[A-Za-z0-9_]*)", msg, re.IGNORECASE)
+                head_expr = m_head.group(1) if m_head else (params.get("head_expression") or "g_task_list")
+                list_res = self.watch_manager.traverse_linked_structure(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    head_expression=head_expr,
+                    next_field=params.get("next_field") or "next",
+                    max_depth=int(params.get("max_depth") or 64),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "LINKED_LIST_CHAIN",
+                    "title": f"{head_expr} 연결 구조 체인 순회 ({list_res['nodes_count']} nodes · {list_res['termination_reason']})",
+                    "data": list_res,
+                })
+                reply_parts.append(list_res.get("llm_next_step_hint", "연결 구조 순회를 완료했습니다."))
+
+            if wants_callstack:
+                cs_res = self.watch_manager.inspect_thread_callstacks_and_locks(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    tid=int(params["tid"]) if params.get("tid") else None,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "CALLSTACK_AND_LOCKS",
+                    "title": f"무정지 스레드 콜스택 & 뮤텍스/데드락 분석 ({cs_res['threads_inspected']} threads)",
+                    "data": cs_res,
+                })
+                reply_parts.append(cs_res.get("llm_next_step_hint", "스레드 콜스택 및 뮤텍스 분석을 완료했습니다."))
+
+            if wants_audit:
+                audit_res = self.watch_manager.audit_memory_integrity(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "MEMORY_AUDIT",
+                    "title": f"메모리 무결성 & 포인터 건강 감사 ({audit_res['health_status']} · 이상 {audit_res['anomalies_count']}건)",
+                    "data": audit_res,
+                })
+                reply_parts.append(audit_res.get("llm_next_step_hint", "메모리 무결성 감사를 완료했습니다."))
+
+            if wants_code_ptr:
+                tokens = re.findall(r"(\*?[A-Za-z_][A-Za-z0-9_.\->\[\]]*)", msg)
+                cands = [t for t in tokens if any(k in t.lower() for k in ("g_", "cb", "handler", "ops", "vptr", "poly", "obj", "session"))]
+                cp_res = self.watch_manager.resolve_code_pointers(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    expressions=cands or [default_pool_expr],
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "CODE_POINTERS",
+                    "title": f"함수 포인터 & C++ vtable 심볼 역해석",
+                    "data": cp_res,
+                })
+                reply_parts.append("함수 포인터 및 가상 함수 테이블(vtable) 심볼 매핑을 완료했습니다.")
+
+            if wants_shm:
+                shm_res = self.watch_manager.inspect_shared_memory_ipc(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    cast_type=params.get("cast_type"),
+                    address=params.get("address"),
+                    shm_name=params.get("shm_name"),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "SHARED_MEMORY_IPC",
+                    "title": f"공유 메모리(SHM/IPC) & 타입 오버레이 분석 ({shm_res['shared_mappings_count']} mappings)",
+                    "data": shm_res,
+                })
+                reply_parts.append(shm_res.get("llm_next_step_hint", "공유 메모리 및 IPC 피어 프로세스 탐색을 완료했습니다."))
+
+            if wants_diff and not trace_cards:
+                diff_res = self.watch_manager.capture_and_diff_expressions(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    wait_ms=int(params.get("wait_ms") or 500),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "SYMBOL_EVAL",
+                    "title": f"{diff_res['wait_ms']}ms 전후 상태 변화(Diff)",
+                    "data": diff_res,
+                })
+                reply_parts.append(
+                    f"{diff_res['wait_ms']}ms 구간 동안 {diff_res['summary']['changed_count']}개 필드가 변경되었고 "
+                    f"{diff_res['summary']['unchanged_count']}개 필드가 유지되었습니다."
+                )
+
+            if not trace_cards:
+                # Default fallback: evaluate expression if found in message, otherwise return X-Ray Blueprint
+                tokens = re.findall(r"(\*?[A-Za-z_][A-Za-z0-9_.\->\[\]]*)", msg)
+                stopwords = {"memory", "pool", "buffer", "thread", "pid", "the", "and", "for"}
+                cand_exprs = [t for t in tokens if t.lower() not in stopwords and (t.startswith("*") or "->" in t or "." in t or "[" in t or t.startswith("g"))]
+                if cand_exprs:
+                    ev_res = self.watch_manager.evaluate_symbol_paths(
+                        pid=pid,
+                        companion_elf_path=companion_elf,
+                        expressions=cand_exprs[:5],
+                        remote_host=remote_host,
+                        ssh_user=ssh_user,
+                        ssh_port=ssh_port,
+                        ssh_key=ssh_key,
+                        ssh_proxy_jump=ssh_proxy_jump,
+                    )
+                    trace_cards.append({
+                        "card_type": "SYMBOL_EVAL",
+                        "title": f"심볼 평가: {', '.join(cand_exprs[:3])}",
+                        "data": ev_res,
+                    })
+                    reply_parts.append(f"요청하신 심볼({', '.join(cand_exprs[:3])})을 무정지(0.00ms)로 해독하여 워크스페이스에 추가했습니다.")
+                else:
+                    trace_cards.append({
+                        "card_type": "XRAY_BLUEPRINT",
+                        "title": f"PID {pid} X-Ray 블루프린트",
+                        "data": bp_data,
+                    })
+                    reply_parts.append(f"PID {pid} 프로세스의 X-Ray 블루프린트를 워크스페이스에 추가했습니다.")
+
+            from extractor.debug_image import inspect_elf
+            elf_ident = inspect_elf(companion_elf)
+            return {
+                "success": True,
+                "data": {
+                    "title": "프로세스 메모리 트레이스 완료 (0.00ms 무정지)",
+                    "reply_markdown": " ".join(reply_parts),
+                    "trace_cards": trace_cards,
+                    "telemetry": {
+                        "pid": pid,
+                        "build_id": elf_ident.build_id,
+                        "load_bias": bp_data.get("load_bias", "0x0"),
+                        "threads_count": bp_data.get("threads_count", 0),
+                    },
+                },
+            }
+        except Exception as e:
+            return {"success": False, "error": {"code": "WORKSPACE_CHAT_ERROR", "message": str(e)}}
+
+    def get_xray_blueprint_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Returns categorized DWARF X-Ray blueprint for a target process."""
+        try:
+            pid = int(params.get("pid") or 0)
+            if pid <= 0:
+                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            if not companion_elf:
+                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": "Companion ELF path is required"}}
+            res = self.watch_manager.get_process_xray_blueprint(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "XRAY_BLUEPRINT_ERROR", "message": str(e)}}
+
+    def watch_until_condition_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Polls target expressions until a condition triggers or times out (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            cond_expr = (params.get("condition_expression") or params.get("condition") or "ANY_CHANGE").strip()
+            res = self.watch_manager.watch_until_condition(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                condition_expression=cond_expr,
+                watch_expressions=params.get("watch_expressions"),
+                poll_interval_ms=int(params.get("poll_interval_ms") or 40),
+                timeout_ms=int(params.get("timeout_ms") or 2000),
+                hold_duration_ms=int(params.get("hold_duration_ms") or 0),
+                find_owner_on_hit=params.get("find_owner_on_hit"),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "WATCH_CONDITION_ERROR", "message": str(e)}}
+
+    def traverse_linked_structure_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Traverses a linked list or pointer chain in 0.00ms zero-stop mode."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            head_expr = (params.get("head_expression") or "").strip()
+            res = self.watch_manager.traverse_linked_structure(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                head_expression=head_expr,
+                next_field=(params.get("next_field") or "next").strip(),
+                max_depth=int(params.get("max_depth") or 64),
+                include_fields=params.get("include_fields"),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "TRAVERSE_LIST_ERROR", "message": str(e)}}
+
+    def inspect_thread_callstacks_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Unwinds thread callstacks and decodes mutex owners / deadlock cycles in 0.00ms zero-stop mode."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.inspect_thread_callstacks_and_locks(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                tid=int(params["tid"]) if params.get("tid") else None,
+                lock_expressions=params.get("lock_expressions"),
+                max_frames=int(params.get("max_frames") or 12),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "CALLSTACK_INSPECT_ERROR", "message": str(e)}}
+
+    def audit_memory_integrity_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Audits DWARF symbols and memory pools for dangling pointers, corrupted bools/enums, and counter drift."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.audit_memory_integrity(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                target_expressions=params.get("target_expressions"),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "MEMORY_AUDIT_ERROR", "message": str(e)}}
+
+    def resolve_code_pointers_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolves function pointers and C++ vtable slots to function names and file:line."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            exprs = params.get("expressions") or []
+            if isinstance(exprs, str):
+                exprs = [e.strip() for e in exprs.split(",") if e.strip()]
+            res = self.watch_manager.resolve_code_pointers(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                expressions=exprs,
+                vtable_slots=int(params.get("vtable_slots") or 6),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "RESOLVE_CODE_PTR_ERROR", "message": str(e)}}
+
+    def inspect_shared_memory_ipc_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Inspects POSIX shm / shared mmap regions with DWARF type overlay casting and peer PID discovery."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.inspect_shared_memory_ipc(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                cast_type=params.get("cast_type"),
+                address=params.get("address"),
+                shm_name=params.get("shm_name"),
+                discover_peer_processes=bool(params.get("discover_peer_processes", True)),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "INSPECT_SHM_ERROR", "message": str(e)}}
+
+    def inspect_thread_locals_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Decodes function parameters and local variables across active thread stack frames (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.inspect_thread_locals_and_frame_vars(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                tid=int(params["tid"]) if params.get("tid") else None,
+                max_frames=int(params.get("max_frames") or 8),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "FRAME_LOCALS_ERROR", "message": str(e)}}
+
+    def auto_triage_incident_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Runs 1-call composite zero-stop incident auto-triage across memory, locks, pools, and lists."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.auto_triage_incident(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "AUTO_TRIAGE_ERROR", "message": str(e)}}
+
+    def trace_ipc_pipeline_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyzes cross-process shared memory & IPC pipeline lag/bottlenecks (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.trace_ipc_pipeline(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                cast_type=params.get("cast_type"),
+                address=params.get("address"),
+                shm_name=params.get("shm_name"),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "IPC_PIPELINE_ERROR", "message": str(e)}}
+
+    def scan_heap_objects_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Scans `[heap]` and `.data` for C++ polymorphic objects via `_vptr` and detects leaked instances."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.scan_heap_objects(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                class_filter=params.get("class_filter"),
+                max_scan_bytes=int(params.get("max_scan_bytes") or 524288),
+                max_objects=int(params.get("max_objects") or 64),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "SCAN_HEAP_ERROR", "message": str(e)}}
+
+    def build_dependency_graph_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Synthesizes directed cross-entity dependency graph and causal chains (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.build_dependency_graph(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "DEPENDENCY_GRAPH_ERROR", "message": str(e)}}
+
+    def correlate_source_and_state_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Correlates DWARF source locations with C/C++ source code and inline live variables."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.correlate_source_and_state(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                source_location=params.get("source_location"),
+                tid=int(params["tid"]) if params.get("tid") else None,
+                context_lines=int(params.get("context_lines") or 8),
+                source_search_dirs=params.get("source_search_dirs"),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "SOURCE_CORRELATE_ERROR", "message": str(e)}}
+
+    def investigate_symptom_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Autonomous symptom-driven root-cause investigator (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            symptom_query = str(params.get("symptom_query") or params.get("query") or params.get("message") or "왜 멈췄지?").strip()
+            res = self.watch_manager.investigate_symptom(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                symptom_query=symptom_query,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "INVESTIGATE_SYMPTOM_ERROR", "message": str(e)}}
+
+    def sample_statistical_hotspots_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Samples statistical CPU & callstack hotspots with 0.00ms stop time."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.sample_statistical_hotspots(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                samples_count=int(params.get("samples_count") or 6),
+                interval_ms=int(params.get("interval_ms") or 35),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "HOTSPOTS_ERROR", "message": str(e)}}
+
+    def resolve_fuzzy_intent_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolves vague natural-language user intent to concrete DWARF symbols and live values."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            natural_query = str(params.get("natural_query") or params.get("query") or params.get("message") or "").strip()
+            res = self.watch_manager.resolve_fuzzy_symbol_intent(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                natural_query=natural_query,
+                limit=int(params.get("limit") or 5),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "FUZZY_INTENT_ERROR", "message": str(e)}}
+
+    def flight_recorder_time_machine_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Captures Flight Recorder Time-Machine micro-frames and detects transient glitches (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.flight_recorder_time_machine(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                frames_count=int(params.get("frames_count") or 8),
+                interval_ms=int(params.get("interval_ms") or 25),
+                watch_expressions=params.get("watch_expressions"),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "FLIGHT_RECORDER_ERROR", "message": str(e)}}
+
+    def detect_behavioral_drift_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Detects multi-dimensional behavioral drift against a baseline profile (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            res = self.watch_manager.detect_behavioral_drift(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                baseline_id=params.get("baseline_id"),
+                save_as_new_baseline=bool(params.get("save_as_new_baseline", False)),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "BEHAVIORAL_DRIFT_ERROR", "message": str(e)}}
+
+    def inspect_thread_local_storage_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Decodes per-thread TLS (__thread / thread_local) variables across all active threads (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            var_names = params.get("variable_names")
+            if isinstance(var_names, str):
+                var_names = [v.strip() for v in var_names.split(",") if v.strip()]
+            res = self.watch_manager.inspect_thread_local_storage(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                tid=int(params["tid"]) if params.get("tid") else None,
+                variable_names=var_names,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "TLS_INSPECT_ERROR", "message": str(e)}}
+
+    def verify_concurrent_read_consistency_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Verifies concurrent read consistency using optimistic Seqlock double-reads (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            exprs = params.get("expressions")
+            if isinstance(exprs, str):
+                exprs = [e.strip() for e in exprs.split(",") if e.strip()]
+            res = self.watch_manager.verify_concurrent_read_consistency(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                expressions=exprs,
+                retries=int(params.get("retries") or 3),
+                inter_read_delay_ms=int(params.get("inter_read_delay_ms") or 4),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "VERIFY_CONSISTENCY_ERROR", "message": str(e)}}
+
+    def inspect_dpdk_lcores_and_rings_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Inspects DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (0.00ms stop)."""
+        try:
+            pid = int(params.get("pid") or 0)
+            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            r_exprs = params.get("ring_expressions")
+            if isinstance(r_exprs, str):
+                r_exprs = [x.strip() for x in r_exprs.split(",") if x.strip()]
+            s_exprs = params.get("spinlock_expressions")
+            if isinstance(s_exprs, str):
+                s_exprs = [x.strip() for x in s_exprs.split(",") if x.strip()]
+            res = self.watch_manager.inspect_dpdk_lcores_and_rings(
+                pid=pid,
+                companion_elf_path=companion_elf,
+                sample_window_ms=int(params.get("sample_window_ms") or 40),
+                ring_expressions=r_exprs,
+                spinlock_expressions=s_exprs,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "DPDK_INSPECT_ERROR", "message": str(e)}}
+
+    def get_active_context_api(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Returns or binds the Stateful Target Session Context."""
+        try:
+            if params and (params.get("pid") or params.get("companion_elf") or params.get("process_name")):
+                res = self.watch_manager.bind_target_context(
+                    pid=int(params["pid"]) if params.get("pid") else None,
+                    companion_elf_path=(params.get("companion_elf") or params.get("debug_image") or "").strip() or None,
+                    process_name=(params.get("process_name") or "").strip() or None,
+                    remote_host=(params.get("remote_host") or "").strip() or None,
+                    ssh_user=(params.get("ssh_user") or "").strip() or None,
+                    ssh_port=int(params.get("ssh_port") or 22),
+                    ssh_key=(params.get("ssh_key") or "").strip() or None,
+                    ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+                )
+                return {"success": True, "data": res}
+            return {"success": True, "data": self.watch_manager.get_active_target_context()}
+        except Exception as e:
+            return {"success": False, "error": {"code": "ACTIVE_CONTEXT_ERROR", "message": str(e)}}
+
+    def coerce_expression_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Forgiving C/C++ Expression Auto-Coercer endpoint."""
+        try:
+            from extractor.dwarf_indexer import DwarfIndexer
+            expr = str(params.get("expression") or "").strip()
+            ctx = self.watch_manager.resolve_target_context(
+                pid=int(params["pid"]) if params.get("pid") else None,
+                companion_elf_path=(params.get("companion_elf") or params.get("debug_image") or "").strip() or None,
+            )
+            primary_elf, _ = self.watch_manager._split_companion_elf_paths(ctx["companion_elf_path"])
+            idx = DwarfIndexer.get_index(primary_elf)
+            res = self.watch_manager.coerce_and_resolve_expression(idx=idx, raw_expr=expr)
+            res_clean = {k: v for k, v in res.items() if k != "ops"}
+            return {"success": True, "data": {"pid": ctx["pid"], "companion_elf": ctx["companion_elf_path"], **res_clean}}
+        except Exception as e:
+            return {"success": False, "error": {"code": "COERCE_EXPRESSION_ERROR", "message": str(e)}}
+
+    def ask_runtime_question_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Universal 1-Call Zero-Stop Intent Gateway endpoint (`/api/watch/ask`)."""
+        try:
+            q = str(params.get("question") or params.get("message") or "").strip()
+            res = self.watch_manager.ask_runtime_question(
+                question=q,
+                pid=int(params["pid"]) if params.get("pid") else None,
+                companion_elf_path=(params.get("companion_elf") or params.get("debug_image") or "").strip() or None,
+                process_name=(params.get("process_name") or "").strip() or None,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "ASK_GATEWAY_ERROR", "message": str(e)}}
+
+    def smart_compact_query_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """LLM Token-Budgeted Smart Compactor & Anomaly-First Pagination endpoint (`/api/watch/smart-compact`)."""
+        try:
+            res = self.watch_manager.smart_compact_query(
+                query_or_expression=str(params.get("query") or params.get("expression") or "*gpMem"),
+                mode=str(params.get("mode") or "auto"),
+                pid=int(params["pid"]) if params.get("pid") else None,
+                companion_elf_path=(params.get("companion_elf") or params.get("debug_image") or "").strip() or None,
+                max_tokens=int(params.get("max_tokens") or 800),
+                drop_zero_or_free=bool(params.get("drop_zero_or_free", True)),
+                cursor_offset=int(params.get("cursor_offset") or 0),
+                page_size=int(params.get("page_size") or 16),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "SMART_COMPACT_ERROR", "message": str(e)}}
+
+    def batch_execute_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """1-Call Multi-Tool Composite Batch Macro Executor endpoint (`/api/watch/batch-execute`)."""
+        try:
+            steps = params.get("steps") or []
+            res = self.watch_manager.execute_batch_macro(
+                steps=steps,
+                pid=int(params["pid"]) if params.get("pid") else None,
+                companion_elf_path=(params.get("companion_elf") or params.get("debug_image") or "").strip() or None,
+                process_name=(params.get("process_name") or "").strip() or None,
+                compact=bool(params.get("compact", True)),
+                max_tokens_per_step=int(params.get("max_tokens_per_step") or 800),
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "BATCH_EXECUTE_ERROR", "message": str(e)}}
+
+    def verify_hypothesis_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Declarative Multi-Assertion Hypothesis Verifier endpoint (`/api/watch/verify-hypothesis`)."""
+        try:
+            assertions = params.get("assertions") or []
+            if isinstance(assertions, str):
+                assertions = [x.strip() for x in assertions.split(",") if x.strip()]
+            res = self.watch_manager.verify_runtime_hypothesis(
+                hypothesis=str(params.get("hypothesis") or "Runtime Hypothesis Verification"),
+                assertions=assertions,
+                correlate_owners=bool(params.get("correlate_owners", True)),
+                pid=int(params["pid"]) if params.get("pid") else None,
+                companion_elf_path=(params.get("companion_elf") or params.get("debug_image") or "").strip() or None,
+                process_name=(params.get("process_name") or "").strip() or None,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "VERIFY_HYPOTHESIS_ERROR", "message": str(e)}}
+
+    def export_incident_report_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """1-Call Incident Report & Remediation Exporter endpoint (`/api/watch/export-report`)."""
+        try:
+            assertions = params.get("assertions")
+            if isinstance(assertions, str):
+                assertions = [x.strip() for x in assertions.split(",") if x.strip()]
+            res = self.watch_manager.export_incident_report(
+                title=str(params.get("title") or "dynamicState Zero-Stop Runtime Incident Report"),
+                hypothesis=params.get("hypothesis"),
+                assertions=assertions,
+                output_path=params.get("output_path"),
+                pid=int(params["pid"]) if params.get("pid") else None,
+                companion_elf_path=(params.get("companion_elf") or params.get("debug_image") or "").strip() or None,
+                process_name=(params.get("process_name") or "").strip() or None,
+                remote_host=(params.get("remote_host") or "").strip() or None,
+                ssh_user=(params.get("ssh_user") or "").strip() or None,
+                ssh_port=int(params.get("ssh_port") or 22),
+                ssh_key=(params.get("ssh_key") or "").strip() or None,
+                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+            )
+            return {"success": True, "data": res}
+        except Exception as e:
+            return {"success": False, "error": {"code": "EXPORT_REPORT_ERROR", "message": str(e)}}
+
     def capture_and_diff_paths_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Samples C/C++ symbol expressions twice across wait_ms and returns changed/unchanged fields."""
         try:
@@ -2034,7 +3299,7 @@ class WebApiAdapter:
         try:
             start_seq = int(query["start_seq"][0]) if query.get("start_seq") else None
             end_seq = int(query["end_seq"][0]) if query.get("end_seq") else None
-            limit = int(query["limit"][0]) if query.get("limit") else None
+            limit = int(query["limit"][0]) if query.get("limit") else 200
             offset = int(query["offset"][0]) if query.get("offset") else 0
             data = self.watch_manager.get_observations(session_id, start_seq=start_seq, end_seq=end_seq, limit=limit, offset=offset)
             return {"success": True, "data": data}
@@ -3095,6 +4360,109 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.capture_and_diff_paths_api(body))
                 return
 
+            # POST /api/watch/scan-pool
+            if path == "/api/watch/scan-pool":
+                self._send_json(adapter.scan_memory_pool_api(body))
+                return
+
+            # POST /api/watch/find-owners
+            if path == "/api/watch/find-owners":
+                self._send_json(adapter.find_symbol_owners_api(body))
+                return
+
+            # POST /api/watch/xray-blueprint
+            if path == "/api/watch/xray-blueprint":
+                self._send_json(adapter.get_xray_blueprint_api(body))
+                return
+
+            # POST /api/workspace/chat
+            if path == "/api/workspace/chat":
+                self._send_json(adapter.workspace_chat_api(body))
+                return
+
+            # Phase 40 (Phase 10) Advanced Diagnostic Routes
+            if path == "/api/watch/until-condition":
+                self._send_json(adapter.watch_until_condition_api(body))
+                return
+            if path == "/api/watch/traverse-list":
+                self._send_json(adapter.traverse_linked_structure_api(body))
+                return
+            if path == "/api/watch/thread-callstacks":
+                self._send_json(adapter.inspect_thread_callstacks_api(body))
+                return
+            if path == "/api/watch/audit-integrity":
+                self._send_json(adapter.audit_memory_integrity_api(body))
+                return
+            if path == "/api/watch/resolve-code-pointers":
+                self._send_json(adapter.resolve_code_pointers_api(body))
+                return
+            if path == "/api/watch/inspect-shm":
+                self._send_json(adapter.inspect_shared_memory_ipc_api(body))
+                return
+            if path == "/api/watch/frame-locals":
+                self._send_json(adapter.inspect_thread_locals_api(body))
+                return
+            if path == "/api/watch/auto-triage":
+                self._send_json(adapter.auto_triage_incident_api(body))
+                return
+            if path == "/api/watch/ipc-pipeline":
+                self._send_json(adapter.trace_ipc_pipeline_api(body))
+                return
+            if path == "/api/watch/scan-heap":
+                self._send_json(adapter.scan_heap_objects_api(body))
+                return
+            if path == "/api/watch/dependency-graph":
+                self._send_json(adapter.build_dependency_graph_api(body))
+                return
+            if path == "/api/watch/correlate-source":
+                self._send_json(adapter.correlate_source_and_state_api(body))
+                return
+            if path == "/api/watch/investigate-symptom":
+                self._send_json(adapter.investigate_symptom_api(body))
+                return
+            if path == "/api/watch/statistical-hotspots":
+                self._send_json(adapter.sample_statistical_hotspots_api(body))
+                return
+            if path == "/api/watch/resolve-fuzzy-intent":
+                self._send_json(adapter.resolve_fuzzy_intent_api(body))
+                return
+            if path == "/api/watch/flight-recorder":
+                self._send_json(adapter.flight_recorder_time_machine_api(body))
+                return
+            if path == "/api/watch/behavioral-drift":
+                self._send_json(adapter.detect_behavioral_drift_api(body))
+                return
+            if path == "/api/watch/tls-storage":
+                self._send_json(adapter.inspect_thread_local_storage_api(body))
+                return
+            if path == "/api/watch/verify-consistency":
+                self._send_json(adapter.verify_concurrent_read_consistency_api(body))
+                return
+            if path == "/api/watch/dpdk-lcores":
+                self._send_json(adapter.inspect_dpdk_lcores_and_rings_api(body))
+                return
+            if path == "/api/watch/active-context":
+                self._send_json(adapter.get_active_context_api(body))
+                return
+            if path == "/api/watch/coerce-expression":
+                self._send_json(adapter.coerce_expression_api(body))
+                return
+            if path == "/api/watch/ask":
+                self._send_json(adapter.ask_runtime_question_api(body))
+                return
+            if path == "/api/watch/smart-compact":
+                self._send_json(adapter.smart_compact_query_api(body))
+                return
+            if path == "/api/watch/batch-execute":
+                self._send_json(adapter.batch_execute_api(body))
+                return
+            if path == "/api/watch/verify-hypothesis":
+                self._send_json(adapter.verify_hypothesis_api(body))
+                return
+            if path == "/api/watch/export-report":
+                self._send_json(adapter.export_incident_report_api(body))
+                return
+
             # POST /api/target/inspect-range
             if path == "/api/target/inspect-range":
                 self._send_json(adapter.inspect_memory_range(body))
@@ -3126,6 +4494,19 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
     # -------------------------------------------------------------------------
 
     def _serve_static(self, path: str) -> None:
+        if path in ("/workspace", "/workspace/"):
+            ws_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace_static")
+            ws_index = os.path.join(ws_dir, "index.html")
+            if os.path.isfile(ws_index):
+                with open(ws_index, "rb") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(content)
+                return
         static_dir = self.server.static_dir
         if not static_dir or not os.path.exists(static_dir):
             self.send_error(404, "Static files directory not found")

@@ -564,12 +564,35 @@ def runtime_watch_session_stop(session_id: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Phase 32: High-Level Intent-Driven MCP Tools for Embedded Live Analysis
+# Phase 32 & Phase 48 (Phase 18): High-Level Intent-Driven MCP Tools with
+# Stateful Target Context, Auto-Heal PID, and Zero-Path ELF Discovery
 # -----------------------------------------------------------------------------
+
+def _resolve_mcp_target(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    process_name: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> Dict[str, Any]:
+    return runtime.watch_session_manager.resolve_target_context(
+        pid=pid,
+        companion_elf_path=companion_elf,
+        process_name=process_name,
+        remote_host=remote_host,
+        ssh_user=ssh_user,
+        ssh_port=ssh_port,
+        ssh_key=ssh_key,
+        ssh_proxy_jump=ssh_proxy_jump,
+    )
+
 
 @server.tool()
 def runtime_target_connect(
-    companion_elf: str,
+    companion_elf: Optional[str] = None,
     pid: Optional[int] = None,
     process_name: Optional[str] = None,
     remote_host: Optional[str] = None,
@@ -596,6 +619,27 @@ def runtime_target_connect(
     try:
         from extractor.debug_image import inspect_elf
         from extractor.dwarf_indexer import DwarfIndexer
+
+        elf_auto_discovered = False
+        elf_discovery_source = None
+        if not companion_elf and (pid or process_name):
+            try:
+                ctx_auto = runtime.watch_session_manager.resolve_target_context(
+                    pid=pid,
+                    companion_elf_path=None,
+                    process_name=process_name,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                pid = ctx_auto["pid"]
+                companion_elf = ctx_auto["companion_elf_path"]
+                elf_auto_discovered = ctx_auto.get("elf_auto_discovered", False)
+                elf_discovery_source = ctx_auto.get("elf_discovery_source")
+            except Exception:
+                pass
 
         if not companion_elf or not os.path.isfile(companion_elf):
             return _format_watch_result({
@@ -664,9 +708,24 @@ def runtime_target_connect(
         if auto_deploy_collector and hasattr(adapter, "ensure_remote_collector"):
             collector_info = adapter.ensure_remote_collector()
 
+        bound_ctx = runtime.watch_session_manager.bind_target_context(
+            pid=resolved_pid,
+            companion_elf_path=companion_elf,
+            process_name=process_name or os.path.basename(companion_elf),
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+            adapter=adapter,
+        )
         return _format_watch_result({
             "success": True,
             "pid": resolved_pid,
+            "elf_auto_discovered": elf_auto_discovered,
+            "elf_discovery_source": elf_discovery_source,
+            "active_context_bound": True,
+            "active_context": bound_ctx,
             "collector_deployment": collector_info,
             "target_host": adapter.target_host(),
             "is_remote": adapter.is_remote(),
@@ -689,7 +748,7 @@ def runtime_target_connect(
 
 @server.tool()
 def runtime_symbol_search(
-    companion_elf: str,
+    companion_elf: Optional[str] = None,
     query: str = "",
     category: str = "all",
     limit: int = 30,
@@ -713,6 +772,13 @@ def runtime_symbol_search(
     """
     try:
         from extractor.dwarf_indexer import DwarfIndexer
+        if not companion_elf or not pid:
+            try:
+                c_info = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+                pid = pid or c_info["pid"]
+                companion_elf = companion_elf or c_info["companion_elf_path"]
+            except Exception:
+                pass
         if not companion_elf or not os.path.isfile(companion_elf):
             return _format_watch_result({"success": False, "error": f"Companion ELF not found: '{companion_elf}'", "error_code": "DEBUG_IMAGE_NOT_FOUND"})
 
@@ -771,9 +837,9 @@ def runtime_symbol_search(
 
 @server.tool()
 def runtime_eval_memory_path(
-    pid: int,
-    companion_elf: str,
-    expressions: List[str],
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    expressions: Optional[List[str]] = None,
     remote_host: Optional[str] = None,
     ssh_user: Optional[str] = None,
     ssh_port: int = 22,
@@ -817,8 +883,8 @@ def runtime_eval_memory_path(
 
 @server.tool()
 def runtime_capture_and_diff(
-    pid: int,
-    companion_elf: str,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
     expressions: Optional[List[str]] = None,
     wait_ms: int = 500,
     remote_host: Optional[str] = None,
@@ -860,8 +926,8 @@ def runtime_capture_and_diff(
 
 @server.tool()
 def runtime_run_diagnostic_recipe(
-    pid: int,
-    companion_elf: str,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
     recipe: str = "instant_xray",
     expressions: Optional[List[str]] = None,
     duration_ms: int = 1000,
@@ -878,6 +944,10 @@ def runtime_run_diagnostic_recipe(
     - 'timeseries_watch': Sample periodically over `duration_ms` and classify active vs stuck variables.
     """
     try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
         res = runtime.watch_session_manager.run_diagnostic_recipe(
             recipe=recipe,
             pid=pid,
@@ -898,8 +968,8 @@ def runtime_run_diagnostic_recipe(
 
 @server.tool()
 def runtime_golden_baseline_save(
-    pid: int,
-    companion_elf: str,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
     label: str = "Golden Baseline",
     expressions: Optional[List[str]] = None,
     remote_host: Optional[str] = None,
@@ -928,8 +998,8 @@ def runtime_golden_baseline_save(
 
 @server.tool()
 def runtime_golden_baseline_compare(
-    baseline_id: str,
-    pid: int,
+    baseline_id: str = "",
+    pid: Optional[int] = None,
     companion_elf: Optional[str] = None,
     remote_host: Optional[str] = None,
     ssh_user: Optional[str] = None,
@@ -939,10 +1009,1123 @@ def runtime_golden_baseline_compare(
 ) -> str:
     """Compare a currently running local or remote embedded process against a saved Golden Baseline."""
     try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
         res = runtime.watch_session_manager.compare_with_golden_baseline(
             baseline_id=baseline_id,
             pid=pid,
             companion_elf_path=companion_elf,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_get_xray_blueprint(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Generate a 1-call Process X-Ray Blueprint categorizing DWARF globals into Memory Pools/Buffers,
+    Thread/Worker Contexts, State Machines, Counters, and C++ STL Containers, with ready-to-run MCP call hints.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.get_process_xray_blueprint(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_scan_memory_pool(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    base_expression: str = "*gpMem",
+    count: Optional[int] = None,
+    status_field: Optional[str] = None,
+    include_fields: Optional[List[str]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Scan an entire memory pool or buffer array (e.g. '*gpMem', 'gpMem->buffers', 'g_buffers')
+    in a single 0.00ms zero-stop batch read and return slot-by-slot allocation status ('IN_USE' vs 'FREE'),
+    utilization summary, allocation_bitmap, and a visual ascii_map_chart.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.scan_memory_pool_or_array(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            base_expression=base_expression,
+            count=count,
+            status_field=status_field,
+            include_fields=include_fields,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_find_symbol_owners(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    target_expression: str = "",
+    stack_scan_bytes: int = 65536,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Find which thread(s) or global worker contexts are currently using or holding a pointer to
+    a specific buffer slot or C/C++ symbol (e.g. 'gpMem->buffers[9]' or 'gpMem[9]') with 0.00ms stop time.
+    Checks: (1) struct owner/TID fields, (2) global worker/context tables, and (3) active thread stack memory.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.find_symbol_owners_and_threads(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            target_expression=target_expression,
+            stack_scan_bytes=stack_scan_bytes,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_watch_until_condition(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    condition_expression: str = "ANY_CHANGE",
+    watch_expressions: Optional[List[str]] = None,
+    poll_interval_ms: int = 40,
+    timeout_ms: int = 2500,
+    hold_duration_ms: int = 0,
+    find_owner_on_hit: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Zero-stop conditional watchpoint & anomaly snapshot catcher (0.00ms stop time).
+    Polls target expressions until `condition_expression` becomes true (or stays true for `hold_duration_ms`,
+    or `ANY_CHANGE` occurs), and immediately captures before/after diffs plus optional thread owner lookup.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.watch_until_condition(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            condition_expression=condition_expression,
+            watch_expressions=watch_expressions,
+            poll_interval_ms=poll_interval_ms,
+            timeout_ms=timeout_ms,
+            hold_duration_ms=hold_duration_ms,
+            find_owner_on_hit=find_owner_on_hit,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_traverse_linked_structure(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    head_expression: str = "",
+    next_field: str = "next",
+    max_depth: int = 64,
+    include_fields: Optional[List[str]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Traverse a non-contiguous linked list, queue, or tree pointer chain (`node->next`) in a single
+    0.00ms zero-stop MCP call. Automatically detects pointer cycles (infinite loops) and corrupted/unmapped links.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.traverse_linked_structure(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            head_expression=head_expression,
+            next_field=next_field,
+            max_depth=max_depth,
+            include_fields=include_fields,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_inspect_thread_callstack_and_locks(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    tid: Optional[int] = None,
+    lock_expressions: Optional[List[str]] = None,
+    max_frames: int = 12,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Zero-stop replacement for `gdb thread apply all bt` + mutex deadlock detector (0.00ms stop time).
+    Unwinds active thread callstacks via stack return addresses & DWARF subprograms, decodes `pthread_mutex_t`
+    (`__owner` TID), matches `futex` wait addresses to mutexes, and detects circular deadlock cycles.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.inspect_thread_callstacks_and_locks(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            tid=tid,
+            lock_expressions=lock_expressions,
+            max_frames=max_frames,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_audit_memory_integrity(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    target_expressions: Optional[List[str]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Automated DWARF-guided memory corruption & pointer health auditor (0.00ms stop time).
+    Detects dangling/unmapped pointers, corrupted bool bytes (buffer overflow), out-of-range enums,
+    memory pool header counter drift, and orphaned thread owner TIDs.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.audit_memory_integrity(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            target_expressions=target_expressions,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_resolve_code_pointers(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    expressions: Optional[List[str]] = None,
+    vtable_slots: int = 6,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Resolve function pointers, callback struct fields, or C++ polymorphic object `_vptr` / `vtable`
+    slots to exact C/C++ function names and DWARF source `file:line` locations (0.00ms stop time).
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.resolve_code_pointers(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            expressions=expressions,
+            vtable_slots=vtable_slots,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_inspect_shared_memory_ipc(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    cast_type: Optional[str] = None,
+    address: Optional[str] = None,
+    shm_name: Optional[str] = None,
+    discover_peer_processes: bool = True,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Inspect POSIX shared memory (`/dev/shm/*`, shared `mmap`) or overlay a DWARF struct type (`cast_type`)
+    onto any arbitrary runtime address, and discover peer processes sharing the same IPC mapping (0.00ms stop time).
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.inspect_shared_memory_ipc(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            cast_type=cast_type,
+            address=address,
+            shm_name=shm_name,
+            discover_peer_processes=discover_peer_processes,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_inspect_thread_locals_and_frame_vars(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    tid: Optional[int] = None,
+    max_frames: int = 8,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Decode formal parameters and local variables (`DW_TAG_formal_parameter`, `DW_TAG_variable`)
+    on active thread callstack frames using DWARF `DW_OP_fbreg` / frame-pointer unwinding in 0.00ms zero-stop mode.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.inspect_thread_locals_and_frame_vars(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            tid=tid,
+            max_frames=max_frames,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_auto_triage_incident(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """1-Call Composite Zero-Stop Incident Auto-Triage & Root-Cause Correlator (0.00ms stop time).
+    Combines Memory Integrity Audit, Thread Callstacks & Mutex Deadlock Check, Memory Pool Pressure Sweep,
+    and Linked-List Cycle Detection into a ranked root-cause scorecard (`findings`, `health_score`).
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.auto_triage_incident(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_trace_ipc_pipeline(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    cast_type: Optional[str] = None,
+    address: Optional[str] = None,
+    shm_name: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Cross-process shared memory (`shm` / `MAP_SHARED`) & IPC FD pipeline bottleneck analyzer (0.00ms stop).
+    Auto-detects or overlays DWARF struct types onto shared memory, calculates producer/consumer sequence lag
+    (`pending_backlog`, `backlog_utilization_pct`), and maps connected peer processes and their states.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.trace_ipc_pipeline(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            cast_type=cast_type,
+            address=address,
+            shm_name=shm_name,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_scan_heap_objects(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    class_filter: Optional[str] = None,
+    max_scan_bytes: int = 524288,
+    max_objects: int = 64,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Zero-stop C++ polymorphic `vtable` (`_ZTV*`) heap & data segment object census + leak detector (0.00ms stop).
+    Scans `[heap]` and `.data` for live C++ class instances via relocated `_vptr` signatures, decodes their DWARF fields,
+    and flags unreferenced heap objects (`is_leaked_candidate = True`).
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.scan_heap_objects(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            class_filter=class_filter,
+            max_scan_bytes=max_scan_bytes,
+            max_objects=max_objects,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+
+
+@server.tool()
+def runtime_build_dependency_graph(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Synthesize a directed cross-entity dependency & causal graph across:
+    `[Process] ➔ [Thread] ➔ [Mutex Lock / Stack Frame] ➔ [Memory Pool Slot / Heap Object] ➔ [Shared Memory Peer]`
+    in 0.00ms zero-stop mode, and identify `root_blocker_nodes` and `causal_chains`.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.build_dependency_graph(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_correlate_source_and_state(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    source_location: Optional[str] = None,
+    tid: Optional[int] = None,
+    context_lines: int = 8,
+    source_search_dirs: Optional[List[str]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Correlate DWARF `file:line` source locations and active stack frames with real C/C++
+    source code files on disk, overlaying live runtime values of parameters, local variables,
+    and referenced global symbols inline (`annotated_lines`) in 0.00ms zero-stop mode.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.correlate_source_and_state(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            source_location=source_location,
+            tid=tid,
+            context_lines=context_lines,
+            source_search_dirs=source_search_dirs,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_investigate_symptom(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    symptom_query: str = "왜 멈췄지? 전체적인 문제를 종합 분석해줘",
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Autonomous Symptom-Driven Multi-Stage Root-Cause Investigator (0.00ms stop time).
+    Accepts any simple, high-level user symptom question (e.g. '왜 멈췄지?', '버벅거려', '메모리가 새는 것 같아',
+    '왜 응답이 없지?') and automatically orchestrates Triage + Causal Dependency Graph + Heap Leak Scan +
+    Source-to-Runtime Inline Code Correlation in a single call.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.investigate_symptom(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            symptom_query=symptom_query,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+
+
+@server.tool()
+def runtime_sample_statistical_hotspots(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    samples_count: int = 6,
+    interval_ms: int = 35,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Zero-stop statistical CPU & callstack hotspot profiler (`0.00ms` stop time).
+    Replacement for `perf top` / `gdb` sampling on stripped or embedded targets: samples thread CPU tick
+    deltas (`utime + stime`), callstack residency (`hotspot_functions`, `flame_stacks`), and counter mutation
+    velocity (`counter_rates`) across `samples_count * interval_ms`.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.sample_statistical_hotspots(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            samples_count=samples_count,
+            interval_ms=interval_ms,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_resolve_fuzzy_intent(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    natural_query: str = "",
+    limit: int = 5,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Semantic / Fuzzy Intent-to-Symbol Resolver (`0.00ms` stop time).
+    Translates vague natural-language concepts (e.g. '버퍼 풀', '워커 스레드', '세션 객체', '작업 리스트',
+    '카운터') into concrete DWARF symbols & member paths, and evaluates their live runtime values immediately.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.resolve_fuzzy_symbol_intent(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            natural_query=natural_query,
+            limit=limit,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+
+
+@server.tool()
+def runtime_flight_recorder_time_machine(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    frames_count: int = 8,
+    interval_ms: int = 25,
+    watch_expressions: Optional[List[str]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Zero-stop Anomaly Time-Machine Flight Recorder (`0.00ms` stop time).
+    Maintains a per-PID circular blackbox ring buffer of micro-snapshots (`frames_count` samples across `interval_ms`),
+    detects transient spikes/glitches (A -> B -> A value reversals), and reconstructs `pre_anomaly_frame`,
+    `peak_anomaly_frame`, and `post_anomaly_frame`.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.flight_recorder_time_machine(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            frames_count=frames_count,
+            interval_ms=interval_ms,
+            watch_expressions=watch_expressions,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_detect_behavioral_drift(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    baseline_id: Optional[str] = None,
+    save_as_new_baseline: bool = False,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Zero-Stop Behavioral Drift Detector (`0.00ms` stop time).
+    Compares a multi-dimensional behavioral fingerprint (scalar symbols, memory pool utilization %,
+    active thread count, mutex locks, and C++ heap object/leak counts) against a saved or learned baseline
+    and reports `drift_score` (0..100), `drift_status`, and `drifted_dimensions`.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.detect_behavioral_drift(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            baseline_id=baseline_id,
+            save_as_new_baseline=save_as_new_baseline,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_inspect_thread_local_storage(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    tid: Optional[int] = None,
+    variable_names: Optional[List[str]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Zero-Stop Per-Thread TLS (`__thread` / `thread_local`) Variable Decoder (`0.00ms` stop time).
+    Resolves ELF `PT_TLS` segment geometry (`memsz`, `align`) and DWARF `DW_OP_form_tls_address` /
+    `DW_OP_gnu_push_tls_address` offsets, locates each thread's glibc TCB (`struct pthread *`) via
+    its `tcbhead_t` self-pointer + TID signature, and decodes per-thread TLS variable values across
+    all active threads without stopping the target process.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.inspect_thread_local_storage(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            tid=tid,
+            variable_names=variable_names,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_verify_concurrent_read_consistency(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    expressions: Optional[List[str]] = None,
+    retries: int = 3,
+    inter_read_delay_ms: int = 4,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Optimistic Seqlock Double-Read Concurrency Verifier (`0.00ms` stop time).
+    Reads target structs, pointers, and state variables twice (`Read 1 -> delay -> Read 2`, with up to `retries` attempts)
+    to verify zero-stop snapshot atomicity, detect torn reads or concurrent mutations in flight, and classify each symbol as:
+    `ATOMIC_CONSISTENT`, `TORN_READ_RECOVERED`, or `CONCURRENTLY_MUTATING`.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.verify_concurrent_read_consistency(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            expressions=expressions,
+            retries=retries,
+            inter_read_delay_ms=inter_read_delay_ms,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_inspect_dpdk_lcores_and_rings(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    sample_window_ms: int = 40,
+    ring_expressions: Optional[List[str]] = None,
+    spinlock_expressions: Optional[List[str]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Zero-Stop DPDK Isolated-Core (`isolcpus`) Dedicated Lcore, PMD Poll-Loop, Lockless Ring (`rte_ring`)
+    & User-Space Spinlock (`rte_spinlock_t`) Inspector (`0.00ms` stop time).
+    Engineered for DPDK / poll-mode dedicated threads running 100% in user space (`state == 'R'`,
+    `syscall == 'running'`, `kstkesp == 0`): decodes CPU core pinning, kernel isolation jitter,
+    `per_lcore_*` TLS variables, pure leaf poll-loop callstacks/locals via `CALL rel32` target recovery,
+    and `rte_ring` producer/consumer head/tail progression vs stalls.
+    """
+    try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
+        res = runtime.watch_session_manager.inspect_dpdk_lcores_and_rings(
+            pid=pid,
+            companion_elf_path=companion_elf,
+            sample_window_ms=sample_window_ms,
+            ring_expressions=ring_expressions,
+            spinlock_expressions=spinlock_expressions,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_get_active_context() -> str:
+    """Return the currently bound Stateful Target Session Context `(pid, process_name, companion_elf_path, build_id, auto_healed_count)`.
+    Once bound via `runtime_target_connect` (or any `runtime_*` tool call), subsequent MCP tool calls can omit `pid` and `companion_elf`.
+    """
+    try:
+        ctx = runtime.watch_session_manager.get_active_target_context()
+        return _format_watch_result({"success": True, **ctx})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_coerce_expression(
+    expression: str,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+) -> str:
+    """Forgiving C/C++ Expression Auto-Coercer (`0.00ms` stop time).
+    Resolves `.` <-> `->` operator mismatches (e.g., `gpMem.buffers[2].seq` -> `gpMem->buffers[2].seq`),
+    bare struct member names without root globals (e.g., `buffers[2].seq` -> `gpMem->buffers[2].seq`),
+    and root/member symbol typos against the target's DWARF index.
+    """
+    try:
+        from extractor.dwarf_indexer import DwarfIndexer
+        ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf)
+        primary_elf, _ = runtime.watch_session_manager._split_companion_elf_paths(ctx["companion_elf_path"])
+        idx = DwarfIndexer.get_index(primary_elf)
+        res = runtime.watch_session_manager.coerce_and_resolve_expression(idx=idx, raw_expr=expression)
+        res_clean = {k: v for k, v in res.items() if k != "ops"}
+        return _format_watch_result({"success": True, "pid": ctx["pid"], "companion_elf": ctx["companion_elf_path"], **res_clean})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_ask(
+    question: str,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    process_name: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Universal 1-Call Zero-Stop Intent Gateway (`0.00ms` stop time).
+    Accepts any C/C++ expression (automatically coercing `.` <-> `->`, bare member names, and typos)
+    OR any natural-language diagnostic question (e.g., 'gpMem.buffers[2].seq', 'buffers[2] 누가 잡고 있어?',
+    'dpdk lcore 상태는?', 'tls 변수 보여줘', '왜 멈췄지?'). Automatically inherits or heals `(pid, companion_elf)`
+    from the active target context so the LLM never needs to repeat parameters or guess tool names.
+    """
+    try:
+        res = runtime.watch_session_manager.ask_runtime_question(
+            question=question,
+            pid=pid,
+            companion_elf_path=companion_elf,
+            process_name=process_name,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_smart_compact_query(
+    query_or_expression: str = "*gpMem",
+    mode: str = "auto",
+    max_tokens: int = 800,
+    drop_zero_or_free: bool = True,
+    cursor_offset: int = 0,
+    page_size: int = 16,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """LLM Context-Window Budgeter & Anomaly-First Smart Compactor (`0.00ms` stop time).
+    Strips repetitive `FREE` slots and zero/NULL struct fields (`drop_zero_or_free=True`), preserves 100%
+    of `IN_USE` / anomalous / non-zero items first, and supports cursor pagination (`cursor_offset`, `page_size`)
+    with `token_reduction_pct` telemetry so massive pools or structs never overflow the LLM context window.
+    """
+    try:
+        res = runtime.watch_session_manager.smart_compact_query(
+            query_or_expression=query_or_expression,
+            mode=mode,
+            pid=pid,
+            companion_elf_path=companion_elf,
+            max_tokens=max_tokens,
+            drop_zero_or_free=drop_zero_or_free,
+            cursor_offset=cursor_offset,
+            page_size=page_size,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_batch_execute(
+    steps: List[Dict[str, Any]],
+    compact: bool = True,
+    max_tokens_per_step: int = 800,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    process_name: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """1-Call Multi-Tool Composite Batch Macro Executor (`0.00ms` stop time).
+    Executes multiple heterogeneous zero-stop steps (`eval`, `scan_pool`, `find_owners`, `tls`,
+    `dpdk_lcores`, `triage`, `ask`) in a single MCP round-trip while sharing target context,
+    ASLR load-bias cache, and DWARF index.
+    """
+    try:
+        res = runtime.watch_session_manager.execute_batch_macro(
+            steps=steps,
+            pid=pid,
+            companion_elf_path=companion_elf,
+            process_name=process_name,
+            compact=compact,
+            max_tokens_per_step=max_tokens_per_step,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_verify_hypothesis(
+    hypothesis: str,
+    assertions: List[str],
+    correlate_owners: bool = True,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    process_name: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Declarative Multi-Assertion Hypothesis Verifier (`0.00ms` stop time).
+    Evaluates a root-cause hypothesis and a list of forgiving C/C++ assertions (`==`, `!=`, `>=`, `<=`,
+    `>`, `<`, `IS_NULL`, `NOT_NULL`), returning `verdict` (`CONFIRMED`, `PARTIALLY_CONFIRMED`, `REFUTED`),
+    `confidence_score`, per-assertion evidence, and automatic thread-owner lookup on referenced buffer slots.
+    """
+    try:
+        res = runtime.watch_session_manager.verify_runtime_hypothesis(
+            hypothesis=hypothesis,
+            assertions=assertions,
+            correlate_owners=correlate_owners,
+            pid=pid,
+            companion_elf_path=companion_elf,
+            process_name=process_name,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_export_incident_report(
+    title: str = "dynamicState Zero-Stop Runtime Incident Report",
+    hypothesis: Optional[str] = None,
+    assertions: Optional[List[str]] = None,
+    output_path: Optional[str] = None,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    process_name: Optional[str] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """1-Call Comprehensive Incident Report & Remediation Exporter (`0.00ms` stop time).
+    Combines Target Identity, Auto-Triage Scorecard, Thread Callstacks & Locks, and Hypothesis
+    Verification into a structured Markdown + JSON report (`report_markdown`, `remediation_checklist`).
+    """
+    try:
+        res = runtime.watch_session_manager.export_incident_report(
+            title=title,
+            hypothesis=hypothesis,
+            assertions=assertions,
+            output_path=output_path,
+            pid=pid,
+            companion_elf_path=companion_elf,
+            process_name=process_name,
             remote_host=remote_host,
             ssh_user=ssh_user,
             ssh_port=ssh_port,
@@ -962,12 +2145,19 @@ def runtime_get_playbook() -> str:
     return _format_watch_result({
         "success": True,
         "recommended_workflow": [
-            "1. Connect & Validate: Call `runtime_target_connect(companion_elf=..., process_name=..., remote_host=...)` to resolve PID, verify Build ID, and get top `recommended_symbols`.",
+            "1. Connect & Blueprint: Call `runtime_target_connect` or `runtime_get_xray_blueprint` to verify Build ID and discover categorized Memory Pools, Worker Contexts, and State Machines.",
             "2. Choose Diagnostic Scenario:",
             "   - Scenario A (Silent Hang / Stuck State): Call `runtime_run_diagnostic_recipe(recipe='instant_xray', ...)` or `runtime_eval_memory_path(expressions=[...])`.",
-            "   - Scenario B (Event Before/After Mutation): Call `runtime_capture_and_diff(expressions=[...], wait_ms=1000)`.",
-            "   - Scenario C (Counter Drift / Stuck Variable Detection): Call `runtime_run_diagnostic_recipe(recipe='timeseries_watch', duration_ms=2000)`.",
-            "   - Scenario D (Regression vs Healthy Baseline): Call `runtime_golden_baseline_save` when healthy, then `runtime_golden_baseline_compare` when degraded.",
+            "   - Scenario B (Memory Pool Allocation Map): Call `runtime_scan_memory_pool(base_expression='*gpMem')` to get the full slot allocation bitmap and map chart in 1 call.",
+            "   - Scenario C (Find Thread Using Buffer Index N): Call `runtime_find_symbol_owners(target_expression='gpMem->buffers[9]')` to scan struct TID fields, worker tables, and thread stacks.",
+            "   - Scenario D (Event Before/After Mutation): Call `runtime_capture_and_diff(expressions=[...], wait_ms=1000)`.",
+            "   - Scenario E (Regression vs Healthy Baseline): Call `runtime_golden_baseline_save` when healthy, then `runtime_golden_baseline_compare` when degraded.",
+            "   - Scenario F (Intermittent Condition Trigger / Watchpoint): Call `runtime_watch_until_condition(condition_expression='gpMem->active_buffers >= 30')`.",
+            "   - Scenario G (Linked List / Tree Pointer Chain & Cycle Detection): Call `runtime_traverse_linked_structure(head_expression='g_task_list', next_field='next')`.",
+            "   - Scenario H (Deadlock / Mutex Owner & Zero-Stop Callstacks): Call `runtime_inspect_thread_callstack_and_locks`.",
+            "   - Scenario I (Memory Corruption / Dangling Pointer Audit): Call `runtime_audit_memory_integrity`.",
+            "   - Scenario J (Function Pointer / C++ vtable Symbolization): Call `runtime_resolve_code_pointers`.",
+            "   - Scenario K (Shared Memory IPC & Type Overlay Casting): Call `runtime_inspect_shared_memory_ipc`."
         ],
         "zero_stop_guarantee": "All recommended tools read memory non-intrusively (0.00ms target stop time) and never inject code into the target process.",
     })

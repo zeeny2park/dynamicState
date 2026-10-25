@@ -55,6 +55,8 @@ class DwarfVariable:
     specification_offset: Optional[int] = None
     decl_file: Optional[str] = None
     decl_line: Optional[int] = None
+    tls_offset: Optional[int] = None
+    is_tls: bool = False
 
 
 @dataclass
@@ -127,6 +129,7 @@ class DwarfIndex:
     architecture: str = "x86_64"
     elf_type: str = "ET_DYN"
     pt_loads: List[Dict[str, Any]] = field(default_factory=list)
+    pt_tls: Optional[Dict[str, Any]] = None
 
     types_by_die: Dict[int, DwarfType] = field(default_factory=dict)
     types_by_name: Dict[str, List[DwarfType]] = field(default_factory=dict)
@@ -134,12 +137,102 @@ class DwarfIndex:
     variables: List[DwarfVariable] = field(default_factory=list)
     global_variables: List[DwarfVariable] = field(default_factory=list)
     static_variables: List[DwarfVariable] = field(default_factory=list)
+    tls_variables: List[DwarfVariable] = field(default_factory=list)
     subprograms: List[DwarfSubprogram] = field(default_factory=list)
     subprograms_by_name: Dict[str, List[DwarfSubprogram]] = field(default_factory=dict)
     file_table: Dict[int, str] = field(default_factory=dict)
 
     def get_type_by_die(self, die_offset: int) -> Optional[DwarfType]:
         return self.types_by_die.get(die_offset)
+
+    def resolve_code_address(self, link_time_pc: int) -> Optional[Dict[str, Any]]:
+        """Resolves a link-time instruction/function address to a DWARF subprogram or ELF symbol."""
+        if link_time_pc <= 0:
+            return None
+
+        best_subp = None
+        best_span = None
+        for subp in self.subprograms:
+            if subp.low_pc is None or subp.low_pc <= 0:
+                continue
+            if subp.low_pc == link_time_pc:
+                best_subp = subp
+                best_span = 0
+                break
+            if subp.high_pc is not None and subp.low_pc <= link_time_pc < subp.high_pc:
+                span = subp.high_pc - subp.low_pc
+                if best_span is None or span < best_span:
+                    best_subp = subp
+                    best_span = span
+
+        if best_subp is not None and best_subp.low_pc is not None:
+            off = link_time_pc - best_subp.low_pc
+            src_loc = f"{best_subp.decl_file}:{best_subp.decl_line}" if best_subp.decl_file else None
+            return {
+                "function_name": best_subp.name,
+                "linkage_name": best_subp.linkage_name or best_subp.name,
+                "low_pc": f"0x{best_subp.low_pc:x}",
+                "low_pc_int": best_subp.low_pc,
+                "offset_in_func": off,
+                "symbol_plus_offset": f"{best_subp.name}+0x{off:x}" if off > 0 else best_subp.name,
+                "decl_file": best_subp.decl_file,
+                "decl_line": best_subp.decl_line,
+                "source_location": src_loc,
+                "resolution_source": "DWARF_SUBPROGRAM",
+            }
+
+        # Fallback: check cached nm function table
+        func_syms = getattr(self, "_cached_nm_funcs", None)
+        if func_syms is None:
+            func_syms = []
+            if self.artifact_path and os.path.isfile(self.artifact_path):
+                try:
+                    proc = subprocess.run(
+                        ["nm", "-C", "-n", self.artifact_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if proc.returncode == 0:
+                        for line in proc.stdout.splitlines():
+                            parts = line.strip().split(None, 2)
+                            if len(parts) == 3 and parts[1] in ("T", "t", "W", "w", "V", "v"):
+                                try:
+                                    f_addr = int(parts[0], 16)
+                                    if f_addr > 0:
+                                        func_syms.append((f_addr, parts[1], parts[2]))
+                                except ValueError:
+                                    pass
+                except Exception:
+                    pass
+            setattr(self, "_cached_nm_funcs", func_syms)
+
+        # Binary search or linear scan on sorted func_syms
+        matched_sym = None
+        for f_addr, f_type, f_name in func_syms:
+            if f_addr <= link_time_pc:
+                if link_time_pc - f_addr <= 65536:
+                    matched_sym = (f_addr, f_type, f_name)
+            else:
+                break
+
+        if matched_sym is not None:
+            f_addr, f_type, f_name = matched_sym
+            off = link_time_pc - f_addr
+            return {
+                "function_name": f_name,
+                "linkage_name": f_name,
+                "low_pc": f"0x{f_addr:x}",
+                "low_pc_int": f_addr,
+                "offset_in_func": off,
+                "symbol_plus_offset": f"{f_name}+0x{off:x}" if off > 0 else f_name,
+                "decl_file": None,
+                "decl_line": None,
+                "source_location": None,
+                "resolution_source": "ELF_SYMTAB",
+            }
+
+        return None
 
     def resolve_type_by_name(self, type_name: str) -> Optional[DwarfType]:
         """Resolves a C/C++ type name (including primitives and structs) to its canonical DwarfType."""
@@ -411,7 +504,7 @@ class DwarfIndex:
     def to_cache_dict(self) -> Dict[str, Any]:
         """Serialize DwarfIndex to a JSON-compatible dictionary for persistent disk caching."""
         return {
-            "schema_version": "1.0.0",
+            "schema_version": "1.1.0",
             "artifact_path": self.artifact_path,
             "build_id": self.build_id,
             "pointer_size": self.pointer_size,
@@ -420,6 +513,7 @@ class DwarfIndex:
             "architecture": self.architecture,
             "elf_type": self.elf_type,
             "pt_loads": self.pt_loads,
+            "pt_tls": self.pt_tls,
             "file_table": {str(k): v for k, v in self.file_table.items()},
             "types": [asdict(t) for t in self.types_by_die.values()],
             "variables": [asdict(v) for v in self.variables],
@@ -438,6 +532,7 @@ class DwarfIndex:
             architecture=d.get("architecture", "x86_64"),
             elf_type=d.get("elf_type", "ET_DYN"),
             pt_loads=d.get("pt_loads", []),
+            pt_tls=d.get("pt_tls"),
             file_table={int(k): v for k, v in d.get("file_table", {}).items()},
         )
         for td in d.get("types", []):
@@ -466,7 +561,9 @@ class DwarfIndex:
             idx.variables.append(dv)
             if dv.name:
                 idx.variables_by_name.setdefault(dv.name, []).append(dv)
-            if dv.link_time_address is not None and not dv.is_declaration and dv.name:
+            if dv.is_tls and dv.tls_offset is not None and not dv.is_declaration and dv.name:
+                idx.tls_variables.append(dv)
+            elif dv.link_time_address is not None and not dv.is_declaration and dv.name:
                 if dv.is_external:
                     idx.global_variables.append(dv)
                 else:
@@ -518,6 +615,15 @@ class DwarfIndex:
 
 _CFI_CACHE: Dict[Tuple[str, int, int, Optional[str]], Dict[int, Dict[str, Any]]] = {}
 _CFI_ERROR: Dict[Tuple[str, int, int, Optional[str]], str] = {}
+_CFI_LOCK = threading.Lock()
+_CFI_INFLIGHT: Dict[Tuple[str, int, int, Optional[str]], threading.Lock] = {}
+
+
+def _low_priority_preexec() -> None:
+    try:
+        os.nice(10)
+    except Exception:
+        pass
 
 
 def _get_cfi_cache_key(path: str) -> Tuple[str, int, int, Optional[str]]:
@@ -538,165 +644,189 @@ def _get_cfi_cache_key(path: str) -> Tuple[str, int, int, Optional[str]]:
 def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[str, Any]]:
     """Parse .eh_frame / .debug_frame CFI rules using readelf to detect frame pointer presence, establishment PC, and rule intervals."""
     cache_key = _get_cfi_cache_key(artifact_path)
-    if cache_key in _CFI_CACHE:
-        return _CFI_CACHE[cache_key]
+    with _CFI_LOCK:
+        if cache_key in _CFI_CACHE:
+            return _CFI_CACHE[cache_key]
+        inflight = _CFI_INFLIGHT.get(cache_key)
+        if inflight is None:
+            inflight = threading.Lock()
+            _CFI_INFLIGHT[cache_key] = inflight
 
-    cfi_map: Dict[int, Dict[str, Any]] = {}
-    try:
-        cmd = ["readelf", "--debug-dump=frames", cache_key[0]]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if res.returncode != 0:
-            _CFI_ERROR[cache_key] = res.stderr.strip() or f"readelf exited with code {res.returncode}"
-            return {}
+    with inflight:
+        with _CFI_LOCK:
+            if cache_key in _CFI_CACHE:
+                return _CFI_CACHE[cache_key]
 
-        fp_reg_names = ("r29", "x29") if arch in ("aarch64", "arm64") else ("r6", "rbp")
-        sp_reg_names = ("r31", "sp") if arch in ("aarch64", "arm64") else ("r7", "rsp")
+        cfi_map: Dict[int, Dict[str, Any]] = {}
+        try:
+            cmd = ["readelf", "--debug-dump=frames", cache_key[0]]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                preexec_fn=_low_priority_preexec if hasattr(os, "nice") else None,
+            )
 
-        cie_re = re.compile(r"^\s*([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+CIE\b")
-        fde_re = re.compile(r"FDE\s+cie=([0-9a-fA-F]+)\s+pc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)")
-        adv_re = re.compile(r"(?:DW_CFA_advance_loc\w*:\s+\d+\s+to\s+|DW_CFA_set_loc:\s+)([0-9a-fA-F]+)")
-        def_cfa_re = re.compile(r"DW_CFA_def_cfa:\s+(\w+)\s+ofs\s+(\d+)")
-        def_cfa_reg_re = re.compile(r"DW_CFA_def_cfa_register:\s+(\w+)")
-        def_cfa_off_re = re.compile(r"DW_CFA_def_cfa_offset:\s+(\d+)")
-        offset_fp_re = re.compile(r"DW_CFA_offset:\s+(?:r29|x29|r6|rbp)\b.*at cfa(-?\d+)")
-        restore_fp_re = re.compile(r"DW_CFA_restore(?:_extended)?:\s+(?:r29|x29|r6|rbp|\b29\b|\b6\b)\b")
+            fp_reg_names = ("r29", "x29") if arch in ("aarch64", "arm64") else ("r6", "rbp")
+            sp_reg_names = ("r31", "sp") if arch in ("aarch64", "arm64") else ("r7", "rsp")
 
-        cie_table: Dict[int, Dict[str, Any]] = {}
-        curr_cie_offset: Optional[int] = None
-        curr_fde: Optional[Dict[str, Any]] = None
-        curr_pc: int = 0
-        curr_cfa_reg: str = "sp"
-        curr_cfa_off: int = 0 if arch in ("aarch64", "arm64") else 8
-        fp_established: bool = False
-        last_rule_pc: int = 0
-        state_stack: List[Tuple[str, int, bool]] = []
+            cie_re = re.compile(r"^\s*([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+CIE\b")
+            fde_re = re.compile(r"FDE\s+cie=([0-9a-fA-F]+)\s+pc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)")
+            adv_re = re.compile(r"(?:DW_CFA_advance_loc\w*:\s+\d+\s+to\s+|DW_CFA_set_loc:\s+)([0-9a-fA-F]+)")
+            def_cfa_re = re.compile(r"DW_CFA_def_cfa:\s+(\w+)\s+ofs\s+(\d+)")
+            def_cfa_reg_re = re.compile(r"DW_CFA_def_cfa_register:\s+(\w+)")
+            def_cfa_off_re = re.compile(r"DW_CFA_def_cfa_offset:\s+(\d+)")
+            offset_fp_re = re.compile(r"DW_CFA_offset:\s+(?:r29|x29|r6|rbp)\b.*at cfa(-?\d+)")
+            restore_fp_re = re.compile(r"DW_CFA_restore(?:_extended)?:\s+(?:r29|x29|r6|rbp|\b29\b|\b6\b)\b")
 
-        for line in res.stdout.splitlines():
-            # Check CIE header
-            m_cie = cie_re.match(line)
-            if m_cie:
-                if curr_fde is not None:
+            cie_table: Dict[int, Dict[str, Any]] = {}
+            curr_cie_offset: Optional[int] = None
+            curr_fde: Optional[Dict[str, Any]] = None
+            curr_pc: int = 0
+            curr_cfa_reg: str = "sp"
+            curr_cfa_off: int = 0 if arch in ("aarch64", "arm64") else 8
+            fp_established: bool = False
+            last_rule_pc: int = 0
+            state_stack: List[Tuple[str, int, bool]] = []
+
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\r\n")
+                # Check CIE header
+                m_cie = cie_re.match(line)
+                if m_cie:
+                    if curr_fde is not None:
+                        curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
+                        curr_fde = None
+                    curr_cie_offset = int(m_cie.group(1), 16)
+                    cie_table[curr_cie_offset] = {
+                        "cfa_reg": "sp",
+                        "cfa_off": 0 if arch in ("aarch64", "arm64") else 8,
+                    }
+                    continue
+
+                # Check FDE header
+                m_fde = fde_re.search(line)
+                if m_fde:
+                    if curr_fde is not None:
+                        curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
+                    cie_off = int(m_fde.group(1), 16)
+                    low_pc = int(m_fde.group(2), 16)
+                    high_pc = int(m_fde.group(3), 16)
+                    curr_fde = {
+                        "low_pc": low_pc,
+                        "high_pc": high_pc,
+                        "has_frame_pointer": False,
+                        "frame_established_pc": None,
+                        "frame_destroyed_pc": None,
+                        "fp_offset_from_cfa": None,
+                        "cfa_rules": [],
+                        "has_unsupported_cfi": False,
+                    }
+                    cfi_map[low_pc] = curr_fde
+                    curr_pc = low_pc
+                    if cie_off in cie_table:
+                        curr_cfa_reg = cie_table[cie_off]["cfa_reg"]
+                        curr_cfa_off = cie_table[cie_off]["cfa_off"]
+                    else:
+                        curr_cfa_reg = "sp"
+                        curr_cfa_off = 0 if arch in ("aarch64", "arm64") else 8
+                    fp_established = False
+                    last_rule_pc = low_pc
+                    state_stack.clear()
+                    curr_cie_offset = None
+                    continue
+
+                if curr_cie_offset is not None:
+                    m_cfa = def_cfa_re.search(line)
+                    if m_cfa:
+                        r = m_cfa.group(1).lower()
+                        r_canon = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
+                        cie_table[curr_cie_offset]["cfa_reg"] = r_canon
+                        cie_table[curr_cie_offset]["cfa_off"] = int(m_cfa.group(2))
+                    m_cfa_r = def_cfa_reg_re.search(line)
+                    if m_cfa_r:
+                        r = m_cfa_r.group(1).lower()
+                        cie_table[curr_cie_offset]["cfa_reg"] = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
+                    m_cfa_o = def_cfa_off_re.search(line)
+                    if m_cfa_o:
+                        cie_table[curr_cie_offset]["cfa_off"] = int(m_cfa_o.group(1))
+                    continue
+
+                if curr_fde is None:
+                    continue
+
+                if re.match(r"^[0-9a-fA-F]{4,16}\s+[0-9a-fA-F]{4,16}\s+[0-9a-fA-F]{4,16}\s+(?:FDE|CIE)", line):
                     curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
                     curr_fde = None
-                curr_cie_offset = int(m_cie.group(1), 16)
-                cie_table[curr_cie_offset] = {
-                    "cfa_reg": "sp",
-                    "cfa_off": 0 if arch in ("aarch64", "arm64") else 8,
-                }
-                continue
+                    continue
 
-            # Check FDE header
-            m_fde = fde_re.search(line)
-            if m_fde:
-                if curr_fde is not None:
-                    curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
-                cie_off = int(m_fde.group(1), 16)
-                low_pc = int(m_fde.group(2), 16)
-                high_pc = int(m_fde.group(3), 16)
-                curr_fde = {
-                    "low_pc": low_pc,
-                    "high_pc": high_pc,
-                    "has_frame_pointer": False,
-                    "frame_established_pc": None,
-                    "frame_destroyed_pc": None,
-                    "fp_offset_from_cfa": None,
-                    "cfa_rules": [],
-                    "has_unsupported_cfi": False,
-                }
-                cfi_map[low_pc] = curr_fde
-                curr_pc = low_pc
-                # Inherit CIE initial rule if present
-                if cie_off in cie_table:
-                    curr_cfa_reg = cie_table[cie_off]["cfa_reg"]
-                    curr_cfa_off = cie_table[cie_off]["cfa_off"]
-                else:
-                    curr_cfa_reg = "sp"
-                    curr_cfa_off = 0 if arch in ("aarch64", "arm64") else 8
-                fp_established = False
-                last_rule_pc = low_pc
-                state_stack.clear()
-                curr_cie_offset = None
-                continue
+                if "DW_CFA_def_cfa_expression" in line or "DW_CFA_expression" in line:
+                    curr_fde["has_unsupported_cfi"] = True
 
-            # If inside CIE, parse initial CFA definition
-            if curr_cie_offset is not None:
+                m_adv = adv_re.search(line)
+                if m_adv:
+                    new_pc = int(m_adv.group(1), 16)
+                    curr_fde["cfa_rules"].append((last_rule_pc, new_pc, curr_cfa_reg, curr_cfa_off, fp_established))
+                    last_rule_pc = new_pc
+                    curr_pc = new_pc
+
+                if "DW_CFA_remember_state" in line:
+                    state_stack.append((curr_cfa_reg, curr_cfa_off, fp_established))
+                if "DW_CFA_restore_state" in line and state_stack:
+                    curr_cfa_reg, curr_cfa_off, fp_established = state_stack.pop()
+
                 m_cfa = def_cfa_re.search(line)
                 if m_cfa:
                     r = m_cfa.group(1).lower()
-                    r_canon = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
-                    cie_table[curr_cie_offset]["cfa_reg"] = r_canon
-                    cie_table[curr_cie_offset]["cfa_off"] = int(m_cfa.group(2))
+                    curr_cfa_reg = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
+                    curr_cfa_off = int(m_cfa.group(2))
+
                 m_cfa_r = def_cfa_reg_re.search(line)
                 if m_cfa_r:
                     r = m_cfa_r.group(1).lower()
-                    cie_table[curr_cie_offset]["cfa_reg"] = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
+                    curr_cfa_reg = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
+
                 m_cfa_o = def_cfa_off_re.search(line)
                 if m_cfa_o:
-                    cie_table[curr_cie_offset]["cfa_off"] = int(m_cfa_o.group(1))
-                continue
+                    curr_cfa_off = int(m_cfa_o.group(1))
 
-            if curr_fde is None:
-                continue
+                m_off = offset_fp_re.search(line)
+                if m_off:
+                    curr_fde["has_frame_pointer"] = True
+                    fp_established = True
+                    curr_fde["fp_offset_from_cfa"] = int(m_off.group(1))
+                    if curr_fde["frame_established_pc"] is None:
+                        curr_fde["frame_established_pc"] = curr_pc
 
-            # An FDE closes on encountering another CIE/FDE header (never on blank lines or nops)
-            if re.match(r"^[0-9a-fA-F]{4,16}\s+[0-9a-fA-F]{4,16}\s+[0-9a-fA-F]{4,16}\s+(?:FDE|CIE)", line):
+                if restore_fp_re.search(line):
+                    fp_established = False
+                    if curr_fde["frame_destroyed_pc"] is None:
+                        curr_fde["frame_destroyed_pc"] = curr_pc
+
+            if curr_fde is not None:
                 curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
-                curr_fde = None
-                continue
 
-            # Detect unsupported complex CFA expressions
-            if "DW_CFA_def_cfa_expression" in line or "DW_CFA_expression" in line:
-                curr_fde["has_unsupported_cfi"] = True
+            stderr_txt = ""
+            if proc.stderr:
+                stderr_txt = proc.stderr.read().strip()
+                proc.stderr.close()
+            proc.stdout.close()
+            rc = proc.wait(timeout=15)
+            if rc != 0:
+                with _CFI_LOCK:
+                    _CFI_ERROR[cache_key] = stderr_txt or f"readelf exited with code {rc}"
+                return {}
+        except Exception as e:
+            with _CFI_LOCK:
+                _CFI_ERROR[cache_key] = str(e)
+            return {}
 
-            m_adv = adv_re.search(line)
-            if m_adv:
-                new_pc = int(m_adv.group(1), 16)
-                curr_fde["cfa_rules"].append((last_rule_pc, new_pc, curr_cfa_reg, curr_cfa_off, fp_established))
-                last_rule_pc = new_pc
-                curr_pc = new_pc
-
-            if "DW_CFA_remember_state" in line:
-                state_stack.append((curr_cfa_reg, curr_cfa_off, fp_established))
-            if "DW_CFA_restore_state" in line and state_stack:
-                curr_cfa_reg, curr_cfa_off, fp_established = state_stack.pop()
-
-            m_cfa = def_cfa_re.search(line)
-            if m_cfa:
-                r = m_cfa.group(1).lower()
-                curr_cfa_reg = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
-                curr_cfa_off = int(m_cfa.group(2))
-
-            m_cfa_r = def_cfa_reg_re.search(line)
-            if m_cfa_r:
-                r = m_cfa_r.group(1).lower()
-                curr_cfa_reg = "fp" if any(x in r for x in fp_reg_names) else ("sp" if any(x in r for x in sp_reg_names) else r)
-
-            m_cfa_o = def_cfa_off_re.search(line)
-            if m_cfa_o:
-                curr_cfa_off = int(m_cfa_o.group(1))
-
-            m_off = offset_fp_re.search(line)
-            if m_off:
-                curr_fde["has_frame_pointer"] = True
-                fp_established = True
-                curr_fde["fp_offset_from_cfa"] = int(m_off.group(1))
-                if curr_fde["frame_established_pc"] is None:
-                    curr_fde["frame_established_pc"] = curr_pc
-
-            if restore_fp_re.search(line):
-                fp_established = False
-                if curr_fde["frame_destroyed_pc"] is None:
-                    curr_fde["frame_destroyed_pc"] = curr_pc
-
-        if curr_fde is not None:
-            curr_fde["cfa_rules"].append((last_rule_pc, curr_fde["high_pc"], curr_cfa_reg, curr_cfa_off, fp_established))
-
-    except Exception as e:
-        _CFI_ERROR[cache_key] = str(e)
-        return {}
-
-    _CFI_CACHE[cache_key] = cfi_map
-    return cfi_map
+        with _CFI_LOCK:
+            _CFI_CACHE[cache_key] = cfi_map
+        return cfi_map
 
 
 def clear_cfi_cache() -> None:
@@ -706,11 +836,21 @@ def clear_cfi_cache() -> None:
 
 
 class DwarfIndexer:
-    """Thread-safe indexer and cache manager for DWARF debug images."""
+    """Thread-safe indexer and cache manager for DWARF debug images with single-flight deduplication."""
 
     _cache: Dict[Tuple[str, int, int, Optional[str]], DwarfIndex] = {}
     _fast_sym_cache: Dict[Tuple[str, int, int, Optional[str]], List[Dict[str, Any]]] = {}
+    _inflight_locks: Dict[Tuple[str, int, int, Optional[str]], threading.Lock] = {}
     _lock = threading.Lock()
+
+    @classmethod
+    def _get_inflight_lock(cls, cache_key: Tuple[str, int, int, Optional[str]]) -> threading.Lock:
+        with cls._lock:
+            lock = cls._inflight_locks.get(cache_key)
+            if lock is None:
+                lock = threading.Lock()
+                cls._inflight_locks[cache_key] = lock
+            return lock
 
     @classmethod
     def _get_disk_cache_path(cls, cache_key: Tuple[str, int, int, Optional[str]]) -> str:
@@ -739,34 +879,41 @@ class DwarfIndexer:
             if cache_key in cls._cache:
                 return cls._cache[cache_key]
 
-        # Stage 1: Check persistent on-disk DWARF cache to avoid slow readelf --debug-dump=info
-        disk_cache_file = cls._get_disk_cache_path(cache_key) if use_disk_cache else None
-        if disk_cache_file and os.path.isfile(disk_cache_file):
-            try:
-                with open(disk_cache_file, "r", encoding="utf-8") as cf:
-                    cached_data = json.load(cf)
-                index = DwarfIndex.from_cache_dict(cached_data)
-                with cls._lock:
-                    cls._cache[cache_key] = index
-                return index
-            except Exception:
-                pass
+        inflight = cls._get_inflight_lock(cache_key)
+        with inflight:
+            with cls._lock:
+                if cache_key in cls._cache:
+                    return cls._cache[cache_key]
 
-        index = cls._build_index(abs_path, elf_info)
+            # Stage 1: Check persistent on-disk DWARF cache to avoid slow readelf --debug-dump=info
+            disk_cache_file = cls._get_disk_cache_path(cache_key) if use_disk_cache else None
+            if disk_cache_file and os.path.isfile(disk_cache_file):
+                try:
+                    with open(disk_cache_file, "r", encoding="utf-8") as cf:
+                        cached_data = json.load(cf)
+                    if cached_data.get("schema_version") == "1.1.0":
+                        index = DwarfIndex.from_cache_dict(cached_data)
+                        with cls._lock:
+                            cls._cache[cache_key] = index
+                        return index
+                except Exception:
+                    pass
 
-        if disk_cache_file:
-            try:
-                tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(disk_cache_file), prefix="dw_", suffix=".tmp")
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as tf:
-                    json.dump(index.to_cache_dict(), tf, ensure_ascii=False)
-                os.replace(tmp_path, disk_cache_file)
-            except Exception:
-                pass
+            index = cls._build_index(abs_path, elf_info)
 
-        with cls._lock:
-            cls._cache[cache_key] = index
+            if disk_cache_file:
+                try:
+                    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(disk_cache_file), prefix="dw_", suffix=".tmp")
+                    with os.fdopen(tmp_fd, "w", encoding="utf-8") as tf:
+                        json.dump(index.to_cache_dict(), tf, ensure_ascii=False)
+                    os.replace(tmp_path, disk_cache_file)
+                except Exception:
+                    pass
 
-        return index
+            with cls._lock:
+                cls._cache[cache_key] = index
+
+            return index
 
     @classmethod
     def get_fast_symbol_table(
@@ -779,7 +926,8 @@ class DwarfIndexer:
         Extracts global and static OBJECT symbols with exact addresses and byte sizes in milliseconds
         without parsing full DWARF DIE trees.
         """
-        abs_path = os.path.abspath(artifact_path)
+        primary_path = str(artifact_path).split(",")[0].strip() if "," in str(artifact_path) else str(artifact_path).strip()
+        abs_path = os.path.abspath(primary_path)
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"Debug artifact not found: {abs_path}")
 
@@ -792,50 +940,59 @@ class DwarfIndexer:
             base_syms = cls._fast_sym_cache.get(cache_key)
 
         if base_syms is None:
-            base_syms = []
-            try:
-                proc = subprocess.run(
-                    ["readelf", "-s", "-W", abs_path],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                # Example line:
-                #    45: 0000000000007340    24 OBJECT  GLOBAL DEFAULT   25 g_session
-                sym_re = re.compile(
-                    r"^\s*\d+:\s+([0-9a-fA-F]+)\s+(\d+|0x[0-9a-fA-F]+)\s+(OBJECT|FUNC)\s+(GLOBAL|LOCAL|WEAK)\s+\S+\s+(\S+)\s+(.+)$"
-                )
-                seen = set()
-                for line in proc.stdout.splitlines():
-                    m = sym_re.match(line)
-                    if not m:
-                        continue
-                    addr_hex, sz_str, stype, bind, ndx, raw_name = m.groups()
-                    if ndx == "UND":
-                        continue
-                    addr = int(addr_hex, 16)
-                    if addr == 0:
-                        continue
-                    sz = int(sz_str, 16) if sz_str.startswith("0x") else int(sz_str)
-                    name = raw_name.strip().split("@")[0]
-                    if not name or name.startswith("_"):
-                        continue
-                    if (name, addr) in seen:
-                        continue
-                    seen.add((name, addr))
-                    base_syms.append({
-                        "name": name,
-                        "symbol_type": stype,
-                        "binding": bind,
-                        "link_time_address_int": addr,
-                        "link_time_address": f"0x{addr:x}",
-                        "size": sz,
-                    })
-            except Exception:
-                base_syms = []
+            inflight = cls._get_inflight_lock(cache_key)
+            with inflight:
+                with cls._lock:
+                    base_syms = cls._fast_sym_cache.get(cache_key)
+                if base_syms is None:
+                    base_syms = []
+                    try:
+                        proc = subprocess.Popen(
+                            ["readelf", "-s", "-W", abs_path],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                            errors="replace",
+                            preexec_fn=_low_priority_preexec if hasattr(os, "nice") else None,
+                        )
+                        sym_re = re.compile(
+                            r"^\s*\d+:\s+([0-9a-fA-F]+)\s+(\d+|0x[0-9a-fA-F]+)\s+(OBJECT|FUNC)\s+(GLOBAL|LOCAL|WEAK)\s+\S+\s+(\S+)\s+(.+)$"
+                        )
+                        seen = set()
+                        assert proc.stdout is not None
+                        for raw_line in proc.stdout:
+                            line = raw_line.rstrip("\r\n")
+                            m = sym_re.match(line)
+                            if not m:
+                                continue
+                            addr_hex, sz_str, stype, bind, ndx, raw_name = m.groups()
+                            if ndx == "UND":
+                                continue
+                            addr = int(addr_hex, 16)
+                            if addr == 0:
+                                continue
+                            sz = int(sz_str, 16) if sz_str.startswith("0x") else int(sz_str)
+                            name = raw_name.strip().split("@")[0]
+                            if not name or name.startswith("_"):
+                                continue
+                            if (name, addr) in seen:
+                                continue
+                            seen.add((name, addr))
+                            base_syms.append({
+                                "name": name,
+                                "symbol_type": stype,
+                                "binding": bind,
+                                "link_time_address_int": addr,
+                                "link_time_address": f"0x{addr:x}",
+                                "size": sz,
+                            })
+                        proc.stdout.close()
+                        proc.wait(timeout=15)
+                    except Exception:
+                        base_syms = []
 
-            with cls._lock:
-                cls._fast_sym_cache[cache_key] = base_syms
+                    with cls._lock:
+                        cls._fast_sym_cache[cache_key] = base_syms
 
         out: List[Dict[str, Any]] = []
         for s in base_syms:
@@ -886,6 +1043,22 @@ class DwarfIndexer:
         return None
 
     @classmethod
+    def _parse_tls_offset(cls, val: str) -> Optional[int]:
+        if "DW_OP_form_tls_address" not in val and "DW_OP_gnu_push_tls_address" not in val:
+            return None
+        if "): " in val:
+            val = val.split("): ", 1)[1]
+        m = re.search(r"DW_OP_const[0-9a-z_]*:\s*(0x[0-9a-fA-F]+|-?\d+)", val)
+        if m:
+            raw = m.group(1)
+            return int(raw, 16) if raw.startswith("0x") else int(raw)
+        if "DW_OP_lit" in val:
+            m_lit = re.search(r"DW_OP_lit(\d+)", val)
+            if m_lit:
+                return int(m_lit.group(1))
+        return 0
+
+    @classmethod
     def _parse_int(cls, val: str) -> int:
         if "): " in val:
             val = val.split("): ", 1)[1]
@@ -902,43 +1075,59 @@ class DwarfIndexer:
 
     @classmethod
     def _parse_line_file_table(cls, path: str) -> Dict[int, str]:
-        """Extract the File Name Table and Directory Table from .debug_line."""
+        """Extract the File Name Table and Directory Table from .debug_line via streaming Popen."""
         files: Dict[int, str] = {}
         dirs: Dict[int, str] = {}
         try:
             cmd = ["readelf", "--debug-dump=line", path]
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if proc.returncode != 0:
-                return files
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                errors="replace",
+                preexec_fn=_low_priority_preexec if hasattr(os, "nice") else None,
+            )
+            try:
+                assert proc.stdout is not None
+                in_dir = False
+                in_file = False
+                for raw_line in proc.stdout:
+                    line = raw_line.rstrip("\r\n")
+                    if "The Directory Table" in line:
+                        in_dir = True
+                        in_file = False
+                        continue
+                    elif "The File Name Table" in line:
+                        in_dir = False
+                        in_file = True
+                        continue
+                    elif line.startswith(" Line Number Statements") or line.startswith(" Opcodes:"):
+                        in_dir = False
+                        in_file = False
+                        continue
 
-            in_dir = False
-            in_file = False
-            for line in proc.stdout.splitlines():
-                if "The Directory Table" in line:
-                    in_dir = True
-                    in_file = False
-                    continue
-                elif "The File Name Table" in line:
-                    in_dir = False
-                    in_file = True
-                    continue
-                elif line.startswith(" Line Number Statements") or line.startswith(" Opcodes:"):
-                    in_dir = False
-                    in_file = False
-                    continue
+                    if not in_dir and not in_file:
+                        continue
 
-                parts = line.strip().split()
-                if in_dir and len(parts) >= 2 and parts[0].isdigit():
-                    idx = int(parts[0])
-                    name = line.split("):")[-1].strip() if "):" in line else parts[-1]
-                    dirs[idx] = name
-                elif in_file and len(parts) >= 3 and parts[0].isdigit():
-                    idx = int(parts[0])
-                    dir_idx = int(parts[1]) if parts[1].isdigit() else 0
-                    name = line.split("):")[-1].strip() if "):" in line else parts[-1]
-                    dir_name = dirs.get(dir_idx, "")
-                    full_path = f"{dir_name}/{name}" if dir_name else name
-                    files[idx] = full_path
+                    parts = line.strip().split()
+                    if in_dir and len(parts) >= 2 and parts[0].isdigit():
+                        idx = int(parts[0])
+                        name = line.split("):")[-1].strip() if "):" in line else parts[-1]
+                        dirs[idx] = name
+                    elif in_file and len(parts) >= 3 and parts[0].isdigit():
+                        idx = int(parts[0])
+                        dir_idx = int(parts[1]) if parts[1].isdigit() else 0
+                        name = line.split("):")[-1].strip() if "):" in line else parts[-1]
+                        dir_name = dirs.get(dir_idx, "")
+                        full_path = f"{dir_name}/{name}" if dir_name else name
+                        files[idx] = full_path
+            finally:
+                try:
+                    proc.stdout.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                proc.wait(timeout=15)
         except Exception:
             pass
         return files
@@ -958,41 +1147,65 @@ class DwarfIndexer:
             architecture=elf_info.architecture,
             elf_type=elf_info.elf_type or "ET_DYN",
             pt_loads=elf_info.pt_loads,
+            pt_tls=elf_info.pt_tls,
             file_table=file_table,
         )
-
-        # Run readelf --debug-dump=info
-        cmd = ["readelf", "--debug-dump=info", path]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            raw_dwarf = proc.stdout
-        except Exception as exc:
-            # Fallback if readelf fails or is missing
-            return index
 
         die_regex = re.compile(r"^\s*<(\d+)><([0-9a-fA-F]+)>:\s*Abbrev Number:\s*(\d+)(?:\s*\((DW_TAG_[a-zA-Z0-9_]+)\))?")
         attr_regex = re.compile(r"^\s*<([0-9a-fA-F]+)>\s*(DW_AT_[a-zA-Z0-9_]+)\s*:\s*(.*)$")
 
+        max_dies = int(os.environ.get("DYNAMICSTATE_MAX_DWARF_DIES", "250000"))
         dies: List[Dict[str, Any]] = []
-        for line in raw_dwarf.splitlines():
-            m_die = die_regex.match(line)
-            if m_die:
-                depth = int(m_die.group(1))
-                offset = int(m_die.group(2), 16)
-                tag = m_die.group(4) or ""
-                dies.append({
-                    "depth": depth,
-                    "offset": offset,
-                    "tag": tag,
-                    "attrs": {}
-                })
-                continue
 
-            m_attr = attr_regex.match(line)
-            if m_attr and dies:
-                attr_name = m_attr.group(2)
-                attr_val = m_attr.group(3).strip()
-                dies[-1]["attrs"][attr_name] = attr_val
+        # Stream readelf --debug-dump=info line-by-line without buffering full stdout in RAM
+        cmd = ["readelf", "--debug-dump=info", path]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                errors="replace",
+                preexec_fn=_low_priority_preexec if hasattr(os, "nice") else None,
+            )
+            try:
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    line = raw_line.rstrip("\r\n")
+                    m_die = die_regex.match(line)
+                    if m_die:
+                        if len(dies) >= max_dies:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                            break
+                        depth = int(m_die.group(1))
+                        offset = int(m_die.group(2), 16)
+                        tag = m_die.group(4) or ""
+                        dies.append({
+                            "depth": depth,
+                            "offset": offset,
+                            "tag": tag,
+                            "attrs": {}
+                        })
+                        continue
+
+                    m_attr = attr_regex.match(line)
+                    if m_attr and dies:
+                        attr_name = m_attr.group(2)
+                        attr_val = m_attr.group(3).strip()
+                        dies[-1]["attrs"][attr_name] = attr_val
+            finally:
+                try:
+                    proc.stdout.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                rc = proc.wait(timeout=30)
+                if rc != 0 and not dies:
+                    return index
+        except Exception:
+            return index
 
         by_offset: Dict[int, Dict[str, Any]] = {d["offset"]: d for d in dies}
 
@@ -1113,7 +1326,10 @@ class DwarfIndexer:
                 name = cls._clean_str(attrs.get("DW_AT_name", ""))
                 linkage_name = cls._clean_str(attrs.get("DW_AT_linkage_name", ""))
                 type_offset = cls._parse_offset(attrs.get("DW_AT_type", ""))
-                loc_addr = cls._parse_addr(attrs.get("DW_AT_location", ""))
+                loc_raw = attrs.get("DW_AT_location", "")
+                loc_addr = cls._parse_addr(loc_raw)
+                tls_off = cls._parse_tls_offset(loc_raw)
+                is_tls_var = (tls_off is not None)
                 is_ext = attrs.get("DW_AT_external") == "1"
                 is_decl = attrs.get("DW_AT_declaration") == "1"
                 spec_offset = cls._parse_offset(attrs.get("DW_AT_specification", ""))
@@ -1149,14 +1365,18 @@ class DwarfIndexer:
                     specification_offset=spec_offset,
                     decl_file=v_file,
                     decl_line=v_line,
+                    tls_offset=tls_off,
+                    is_tls=is_tls_var,
                 )
 
                 if name:
                     index.variables_by_name.setdefault(name, []).append(var)
                 index.variables.append(var)
 
-                # Classify into global vs static
-                if loc_addr is not None and not is_decl and name:
+                # Classify into TLS vs global vs static
+                if is_tls_var and tls_off is not None and not is_decl and name:
+                    index.tls_variables.append(var)
+                elif loc_addr is not None and not is_decl and name:
                     if is_ext:
                         index.global_variables.append(var)
                     else:

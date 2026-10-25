@@ -167,8 +167,11 @@ for i in range(8):
 # Location List Cache & Parser
 # -----------------------------------------------------------------------------
 
+import threading
+
 _LOC_CACHE: Dict[Tuple[str, int, int, Optional[str]], Dict[int, List[Tuple[int, int, str]]]] = {}
 _LOC_ERROR: Dict[Tuple[str, int, int, Optional[str]], str] = {}
+_LOC_LOCK = threading.Lock()
 
 
 def _get_loc_cache_key(path: str) -> Tuple[str, int, int, Optional[str]]:
@@ -203,15 +206,17 @@ def parse_debug_loc_table(artifact_path: str) -> Dict[int, List[Tuple[int, int, 
     4. Base-address selection entries and continuation lines are properly parsed.
     """
     cache_key = _get_loc_cache_key(artifact_path)
-    if cache_key in _LOC_CACHE:
-        return _LOC_CACHE[cache_key]
+    with _LOC_LOCK:
+        if cache_key in _LOC_CACHE:
+            return _LOC_CACHE[cache_key]
 
     loc_table: Dict[int, List[Tuple[int, int, str]]] = {}
     try:
         cmd = ["readelf", "--debug-dump=loc", cache_key[0]]
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if res.returncode != 0:
-            _LOC_ERROR[cache_key] = res.stderr.strip() or f"readelf exited with code {res.returncode}"
+            with _LOC_LOCK:
+                _LOC_ERROR[cache_key] = res.stderr.strip() or f"readelf exited with code {res.returncode}"
             return {}
 
         lines = res.stdout.splitlines()

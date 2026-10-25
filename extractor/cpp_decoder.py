@@ -897,8 +897,11 @@ class DwarfRuntimeResolver:
                 continue
             candidate_vars.append(v)
 
-        # Sort candidate variables canonically by name
+        # Sort candidate variables canonically by name and bound to DYNAMICSTATE_MAX_DECODE_ROOTS
         candidate_vars.sort(key=lambda var: var.name)
+        max_roots = int(os.environ.get("DYNAMICSTATE_MAX_DECODE_ROOTS", "250"))
+        if len(candidate_vars) > max_roots:
+            candidate_vars = candidate_vars[:max_roots]
 
         if not candidate_vars:
             return ResolutionResult(

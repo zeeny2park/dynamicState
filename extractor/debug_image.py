@@ -4,11 +4,22 @@ Supports stripped production binaries by decoupling runtime memory observation
 from DWARF symbol resolution, verifying build-id and architecture compatibility.
 """
 
+import copy
 from dataclasses import asdict, dataclass, field
 import os
 import struct
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+_ELF_IDENTITY_CACHE: Dict[Tuple[str, int, int], "BinaryIdentity"] = {}
+_ELF_CACHE_LOCK = threading.Lock()
+
+
+def clear_elf_identity_cache() -> None:
+    """Clear cached ELF BinaryIdentity records."""
+    with _ELF_CACHE_LOCK:
+        _ELF_IDENTITY_CACHE.clear()
 
 
 @dataclass
@@ -25,6 +36,7 @@ class BinaryIdentity:
     elf_type: Optional[str] = None              # "ET_EXEC", "ET_DYN", etc.
     entry_point: Optional[int] = None
     pt_loads: List[Dict[str, Any]] = field(default_factory=list)
+    pt_tls: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -56,10 +68,25 @@ class CompatibilityResult:
 def inspect_elf(path: str) -> BinaryIdentity:
     """Inspect an ELF binary file and extract its architecture, build ID, and debug sections.
 
-    Pure-Python parser with zero external dependencies.
+    Pure-Python parser with zero external dependencies and stat-verified in-memory caching.
     """
     if not os.path.exists(path):
         raise FileNotFoundError("Binary file not found: {}".format(path))
+
+    abs_path = os.path.abspath(path)
+    try:
+        st = os.stat(abs_path)
+        cache_key = (abs_path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        cache_key = None
+
+    if cache_key is not None:
+        with _ELF_CACHE_LOCK:
+            cached = _ELF_IDENTITY_CACHE.get(cache_key)
+            if cached is not None:
+                res_copy = copy.copy(cached)
+                res_copy.path = abs_path
+                return res_copy
 
     with open(path, "rb") as f:
         ident = f.read(16)
@@ -190,8 +217,9 @@ def inspect_elf(path: str) -> BinaryIdentity:
         }
         elf_type_name = elf_type_map.get(e_type, "ET_0x{:04x}".format(e_type))
 
-        # Program headers: read PT_LOAD segments and PT_NOTE (if needed)
+        # Program headers: read PT_LOAD segments, PT_TLS, and PT_NOTE (if needed)
         pt_loads = []
+        pt_tls = None
         if e_phoff > 0 and e_phnum > 0 and e_phentsize > 0:
             f.seek(e_phoff)
             ph_data = f.read(e_phentsize * e_phnum)
@@ -219,6 +247,25 @@ def inspect_elf(path: str) -> BinaryIdentity:
                         "p_flags": p_flags,
                         "p_align": p_align,
                     })
+                elif p_type == 7:  # PT_TLS
+                    if is_64:
+                        p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = struct.unpack(
+                            endian + "IQQQQQQ", chunk[4:56]
+                        )
+                    else:
+                        p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align = struct.unpack(
+                            endian + "IIIIIII", chunk[4:32]
+                        )
+                    pt_tls = {
+                        "p_type": 7,
+                        "p_offset": p_offset,
+                        "p_vaddr": p_vaddr,
+                        "p_paddr": p_paddr,
+                        "p_filesz": p_filesz,
+                        "p_memsz": p_memsz,
+                        "p_flags": p_flags,
+                        "p_align": max(1, p_align),
+                    }
                 elif p_type == 4 and not build_id:  # PT_NOTE
                     if is_64:
                         p_flags, p_offset, p_vaddr, p_paddr, p_filesz = struct.unpack(endian + "IQQQQ", chunk[4:40])
@@ -247,7 +294,7 @@ def inspect_elf(path: str) -> BinaryIdentity:
         elf_class_str = "ELF64" if ei_class == 2 else ("ELF32" if ei_class == 1 else "UNKNOWN")
         endian_str = "little" if ei_data == 1 else ("big" if ei_data == 2 else "UNKNOWN")
 
-        return BinaryIdentity(
+        ident_obj = BinaryIdentity(
             path=os.path.abspath(path),
             elf_class=elf_class_str,
             architecture=arch_name,
@@ -259,7 +306,14 @@ def inspect_elf(path: str) -> BinaryIdentity:
             elf_type=elf_type_name,
             entry_point=e_entry,
             pt_loads=pt_loads,
+            pt_tls=pt_tls,
         )
+        if cache_key is not None:
+            with _ELF_CACHE_LOCK:
+                if len(_ELF_IDENTITY_CACHE) > 256:
+                    _ELF_IDENTITY_CACHE.clear()
+                _ELF_IDENTITY_CACHE[cache_key] = copy.copy(ident_obj)
+        return ident_obj
 
 
 class DebugImageProvider:
