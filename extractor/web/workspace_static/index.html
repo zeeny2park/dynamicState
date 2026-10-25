@@ -1401,10 +1401,23 @@
 
     // =========================================================================
     // Backend API Caller with Graceful Fallback to Built-In Simulation
+    // (Subpath & Reverse-Proxy Aware)
     // =========================================================================
+    const _rawPath = (window.location && window.location.pathname) ? window.location.pathname : '';
+    const _basePath = _rawPath.endsWith('/')
+      ? _rawPath.slice(0, -1)
+      : _rawPath.replace(/\/[^/]*$/, '');
+
+    function getApiUrl(endpoint) {
+      if (!endpoint.startsWith('/')) {
+        endpoint = '/' + endpoint;
+      }
+      return _basePath ? `${_basePath}${endpoint}` : endpoint;
+    }
+
     async function callWorkspaceBackend(endpoint, payload) {
       try {
-        const res = await fetch(endpoint, {
+        const res = await fetch(getApiUrl(endpoint), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
