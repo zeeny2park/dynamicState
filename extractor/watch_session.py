@@ -9718,6 +9718,7 @@ class WatchSessionManager:
                 })
 
         return {
+            "is_bound": True,
             "pid": int(eff_pid),
             "process_name": eff_proc_name,
             "companion_elf_path": eff_elf,

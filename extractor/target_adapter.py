@@ -568,11 +568,13 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
             proc_bid = None
             bid_match = False
-            if target_bid and exe_path and os.path.isfile(exe_path):
+            has_dwarf = False
+            if exe_path and os.path.isfile(exe_path):
                 try:
                     ident = inspect_elf(exe_path)
                     proc_bid = ident.build_id
-                    if proc_bid and proc_bid.lower() == target_bid:
+                    has_dwarf = bool(getattr(ident, "has_debug_info", False) or getattr(ident, "has_dwarf_info", False))
+                    if target_bid and proc_bid and proc_bid.lower() == target_bid:
                         bid_match = True
                 except Exception:
                     pass
@@ -584,6 +586,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "executable": exe_path,
                 "cmdline": cmdline,
                 "build_id": proc_bid,
+                "has_dwarf_info": has_dwarf,
                 "build_id_match": bid_match,
                 "exact_name_match": exact_name,
                 "is_remote": False,
@@ -593,6 +596,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         results.sort(key=lambda r: (
             1 if r.get("build_id_match") else 0,
             1 if r.get("exact_name_match") else 0,
+            1 if r.get("has_dwarf_info") else 0,
             r.get("pid", 0),
         ), reverse=True)
         return results[:max(1, limit)]

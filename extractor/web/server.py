@@ -1748,6 +1748,60 @@ class WebApiAdapter:
         except Exception as e:
             return {"success": False, "error": {"code": "FIND_PROCESSES_ERROR", "message": str(e)}}
 
+    def _resolve_watch_target(self, params: Dict[str, Any]) -> Tuple[int, str, Optional[str], Optional[str], int, Optional[str], Optional[str]]:
+        """Resolves (pid, companion_elf, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump)
+        supporting numeric PID, process_name string in pid/process_name, and automatic /proc/<pid>/exe DWARF discovery."""
+        raw_pid = params.get("pid")
+        pid = 0
+        process_name = (params.get("process_name") or "").strip() or None
+        if raw_pid is not None:
+            raw_pid_str = str(raw_pid).strip()
+            if raw_pid_str.isdigit():
+                pid = int(raw_pid_str)
+            elif raw_pid_str and not process_name:
+                process_name = raw_pid_str
+        companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip() or None
+        remote_host = (params.get("remote_host") or "").strip() or None
+        ssh_user = (params.get("ssh_user") or "").strip() or None
+        ssh_port = int(params.get("ssh_port") or 22)
+        ssh_key = (params.get("ssh_key") or "").strip() or None
+        ssh_proxy_jump = (params.get("ssh_proxy_jump") or "").strip() or None
+
+        if pid <= 0 or not companion_elf or not os.path.isfile(companion_elf) or process_name:
+            ctx = self.watch_manager.resolve_target_context(
+                pid=pid if pid > 0 else None,
+                companion_elf_path=companion_elf,
+                process_name=process_name,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
+            )
+            pid = int(ctx["pid"])
+            companion_elf = str(ctx["companion_elf_path"])
+            remote_host = ctx.get("remote_host") or remote_host
+            ssh_user = ctx.get("ssh_user") or ssh_user
+            ssh_port = int(ctx.get("ssh_port") or ssh_port)
+            ssh_key = ctx.get("ssh_key") or ssh_key
+            ssh_proxy_jump = ctx.get("ssh_proxy_jump") or ssh_proxy_jump
+        else:
+            # Also bind into active context so subsequent calls remember it
+            try:
+                self.watch_manager.bind_target_context(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    process_name=process_name,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+            except Exception:
+                pass
+        return pid, companion_elf or "", remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump
+
     def search_dwarf_symbols_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Searches DWARF globals, statics, and composite types with smart ranking."""
         try:
@@ -1767,12 +1821,7 @@ class WebApiAdapter:
     def evaluate_symbol_paths_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluates C/C++ symbol path expressions against a local or remote target."""
         try:
-            pid = int(params.get("pid") or 0)
-            if pid <= 0:
-                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
-            if not companion_elf or not os.path.isfile(companion_elf):
-                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             exprs = params.get("expressions") or []
             if isinstance(exprs, str):
                 exprs = [e.strip() for e in exprs.split(",") if e.strip()]
@@ -1793,12 +1842,7 @@ class WebApiAdapter:
     def save_golden_baseline_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Saves current live target state as a named Golden Baseline."""
         try:
-            pid = int(params.get("pid") or 0)
-            if pid <= 0:
-                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
-            if not companion_elf or not os.path.isfile(companion_elf):
-                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             exprs = params.get("expressions")
             if isinstance(exprs, str):
                 exprs = [e.strip() for e in exprs.split(",") if e.strip()]
@@ -1855,12 +1899,7 @@ class WebApiAdapter:
     def run_diagnostic_recipe_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Executes a guided diagnostic recipe (instant_xray, before_after_diff, timeseries_watch)."""
         try:
-            pid = int(params.get("pid") or 0)
-            if pid <= 0:
-                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
-            if not companion_elf or not os.path.isfile(companion_elf):
-                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             recipe = str(params.get("recipe") or "instant_xray")
             exprs = params.get("expressions")
             if isinstance(exprs, str):
@@ -1885,12 +1924,7 @@ class WebApiAdapter:
     def scan_memory_pool_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Scans an entire memory pool or buffer array and returns slot allocation status and map chart."""
         try:
-            pid = int(params.get("pid") or 0)
-            if pid <= 0:
-                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
-            if not companion_elf:
-                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": "Companion ELF path is required"}}
+            pid, companion_elf, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump = self._resolve_watch_target(params)
             base_expr = (params.get("base_expression") or params.get("expression") or "").strip()
             if not base_expr:
                 return {"success": False, "error": {"code": "INVALID_EXPRESSION", "message": "base_expression is required"}}
@@ -1906,11 +1940,11 @@ class WebApiAdapter:
                 count=count,
                 status_field=status_field,
                 include_fields=inc_fields,
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=int(params.get("ssh_port") or 22),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
             )
             return {"success": True, "data": res}
         except Exception as e:
@@ -1919,12 +1953,7 @@ class WebApiAdapter:
     def find_symbol_owners_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Finds threads or global worker contexts holding or referencing a specific symbol/slot."""
         try:
-            pid = int(params.get("pid") or 0)
-            if pid <= 0:
-                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
-            if not companion_elf:
-                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": "Companion ELF path is required"}}
+            pid, companion_elf, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump = self._resolve_watch_target(params)
             target_expr = (params.get("target_expression") or params.get("expression") or "").strip()
             if not target_expr:
                 return {"success": False, "error": {"code": "INVALID_EXPRESSION", "message": "target_expression is required"}}
@@ -1933,11 +1962,11 @@ class WebApiAdapter:
                 companion_elf_path=companion_elf,
                 target_expression=target_expr,
                 stack_scan_bytes=int(params.get("stack_scan_bytes") or 65536),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=int(params.get("ssh_port") or 22),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
             )
             return {"success": True, "data": res}
         except Exception as e:
@@ -1955,30 +1984,16 @@ class WebApiAdapter:
             if not msg:
                 return {"success": False, "error": {"code": "EMPTY_MESSAGE", "message": "Chat message is required"}}
 
-            pid = int(params.get("pid") or 0)
-            companion_elf = str(params.get("companion_elf") or params.get("debug_image") or "").strip()
-            remote_host = (params.get("remote_host") or "").strip() or None
-            ssh_user = (params.get("ssh_user") or "").strip() or None
-            ssh_port = int(params.get("ssh_port") or 22)
-            ssh_key = (params.get("ssh_key") or "").strip() or None
-            ssh_proxy_jump = (params.get("ssh_proxy_jump") or "").strip() or None
-
-            if pid <= 0 or not companion_elf or not os.path.isfile(companion_elf) or self.watch_manager.get_active_target_context().get("pid") == pid:
-                try:
-                    ctx_auto = self.watch_manager.resolve_target_context(
-                        pid=pid if pid > 0 else None,
-                        companion_elf_path=companion_elf or None,
-                        process_name=(params.get("process_name") or "").strip() or None,
-                        remote_host=remote_host,
-                        ssh_user=ssh_user,
-                        ssh_port=ssh_port,
-                        ssh_key=ssh_key,
-                        ssh_proxy_jump=ssh_proxy_jump,
-                    )
-                    pid = ctx_auto["pid"]
-                    companion_elf = ctx_auto["companion_elf_path"]
-                except Exception:
-                    pass
+            try:
+                pid, companion_elf, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump = self._resolve_watch_target(params)
+            except Exception as resolve_exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "TARGET_NOT_CONFIGURED",
+                        "message": str(resolve_exc),
+                    },
+                }
 
             if pid <= 0 or not companion_elf or not os.path.isfile(companion_elf):
                 return {
@@ -2012,8 +2027,13 @@ class WebApiAdapter:
             wants_shm = any(k in msg_low for k in ("공유 메모리", "shm", "mmap", "캐스팅", "cast", "ipc"))
             wants_pool = any(k in msg_low for k in ("맵", "pool", "할당", "buffer", "버퍼", "슬롯 현황")) and not wants_condition and not wants_ipc_pipeline and not wants_heap_scan
             wants_owner = any(k in msg_low for k in ("쓰레드", "스레드", "thread", "누가", "사용 중인", "점유", "owner", "인덱스")) and not wants_callstack and not wants_condition and not wants_frame_locals and not wants_triage and not wants_ipc_pipeline and not wants_heap_scan and not wants_tls and not wants_dpdk
-            wants_diff = any(k in msg_low for k in ("diff", "전후", "변화", "비교"))
-            wants_blueprint = any(k in msg_low for k in ("블루프린트", "blueprint", "연결", "x-ray", "구조")) and not wants_linked
+            wants_hypothesis = any(k in msg_low for k in ("가설", "hypothesis", "검증해", "진위", "assert"))
+            wants_export_report = any(k in msg_low for k in ("리포트 생성", "보고서 생성", "인시던트 리포트", "incident report", "마크다운 리포트"))
+            wants_smart_compact = any(k in msg_low for k in ("토큰 예산", "압축", "smart compact", "페이지네이션", "이상 징후 우선"))
+            wants_batch_macro = any(k in msg_low for k in ("배치 매크로", "batch macro", "복합 실행", "일괄 실행"))
+            wants_coercer = any(k in msg_low for k in ("관대한", "보정", "coercer", "자동 교정")) and not wants_hypothesis
+            wants_diff = any(k in msg_low for k in ("diff", "전후", "변화", "비교")) and not wants_drift
+            wants_blueprint = any(k in msg_low for k in ("블루프린트", "blueprint", "연결", "x-ray", "구조")) and not wants_linked and not wants_hypothesis
 
             trace_cards: List[Dict[str, Any]] = []
             reply_parts: List[str] = []
@@ -2100,6 +2120,125 @@ class WebApiAdapter:
                     reply_parts.append(f"{owner_res['target_expression']} ({owner_res['target_runtime_address']})를 사용 중인 스레드는 {t_str} 입니다.")
                 else:
                     reply_parts.append(f"{owner_res['target_expression']}를 현재 점유/참조 중인 스레드가 발견되지 않았습니다.")
+
+            if wants_hypothesis:
+                assertions = params.get("assertions")
+                if not assertions:
+                    found_asserts = re.findall(r"([A-Za-z_*][A-Za-z0-9_.\->\[\]]*\s*(?:==|!=|>=|<=|>|<|IS_NULL|NOT_NULL)\s*[A-Za-z0-9_xX.\-]*)", msg)
+                    assertions = [a.strip() for a in found_asserts if a.strip()]
+                if not assertions:
+                    assertions = [f"{default_pool_name}.active_buffers >= 1", f"{default_pool_name}.buffers[0].in_use >= 0"]
+                hyp_res = self.watch_manager.verify_runtime_hypothesis(
+                    hypothesis=msg,
+                    assertions=assertions,
+                    correlate_owners=True,
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "HYPOTHESIS_VERIFIER",
+                    "title": f"선언적 가설 검증 ({hyp_res['verdict']} · {hyp_res.get('passed_assertions', 0)}/{hyp_res.get('total_assertions', 0)} assertions)",
+                    "data": hyp_res,
+                })
+                reply_parts.append(hyp_res.get("llm_next_step_hint", "선언적 가설 검증을 완료했습니다."))
+
+            if wants_export_report:
+                rep_res = self.watch_manager.export_incident_report(
+                    title=f"PID {pid} Zero-Stop Runtime Incident Report",
+                    hypothesis=msg,
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "INCIDENT_REPORT",
+                    "title": f"원클릭 인시던트 분석 리포트 (Health {rep_res['health_score']}/100 · {rep_res['overall_status']})",
+                    "data": rep_res,
+                })
+                reply_parts.append(rep_res.get("llm_next_step_hint", "인시던트 리포트 생성을 완료했습니다."))
+
+            if wants_smart_compact:
+                sc_q = params.get("query") or default_pool_expr
+                sc_res = self.watch_manager.smart_compact_query(
+                    query_or_expression=sc_q,
+                    mode="pool",
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    max_tokens=int(params.get("max_tokens") or 600),
+                    drop_zero_or_free=True,
+                    cursor_offset=int(params.get("cursor_offset") or 0),
+                    page_size=int(params.get("page_size") or 8),
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                tb_meta = sc_res.get("token_budget_meta") or {}
+                comp_tok = tb_meta.get("compacted_estimated_tokens", 0)
+                max_tok = tb_meta.get("max_tokens_requested", 600)
+                trace_cards.append({
+                    "card_type": "SMART_COMPACT",
+                    "title": f"토큰 예산 스마트 압축 & 이상 징후 우선 페이지네이션 ({comp_tok}/{max_tok} tokens)",
+                    "data": sc_res,
+                })
+                reply_parts.append(sc_res.get("llm_next_step_hint", "스마트 압축 조회를 완료했습니다."))
+
+            if wants_batch_macro:
+                bm_steps = params.get("steps") or [
+                    {"action": "scan_pool", "expression": default_pool_expr},
+                    {"action": "triage"},
+                ]
+                bm_res = self.watch_manager.execute_batch_macro(
+                    steps=bm_steps,
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    compact=True,
+                    max_tokens_per_step=500,
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "BATCH_MACRO",
+                    "title": f"1-Call 복합 배치 매크로 실행 ({bm_res.get('steps_succeeded', 0)}/{bm_res.get('steps_requested', 0)} steps · 0.00ms stop)",
+                    "data": bm_res,
+                })
+                reply_parts.append(bm_res.get("llm_next_step_hint", "복합 배치 매크로 실행을 완료했습니다."))
+
+            if wants_coercer:
+                from extractor.dwarf_indexer import DwarfIndexer
+                primary_elf, _ = self.watch_manager._split_companion_elf_paths(companion_elf)
+                idx = DwarfIndexer.get_index(primary_elf)
+                raw_c_expr = f"{default_pool_name}.buffers[0].in_use"
+                c_res = self.watch_manager.coerce_and_resolve_expression(idx=idx, raw_expr=raw_c_expr)
+                ev_c = self.watch_manager.evaluate_symbol_paths(
+                    pid=pid,
+                    companion_elf_path=companion_elf,
+                    expressions=[raw_c_expr, f"&{default_pool_name}.buffers[0]"],
+                    remote_host=remote_host,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_proxy_jump=ssh_proxy_jump,
+                )
+                trace_cards.append({
+                    "card_type": "SYMBOL_EVAL",
+                    "title": f"관대한 C/C++ 표현식 자동 보정 평가 ({raw_c_expr} ➔ {c_res.get('canonical_expression')})",
+                    "data": ev_c,
+                })
+                reply_parts.append(f"관대한 표현식 보정기(Auto-Coercer)로 `{raw_c_expr}`를 `{c_res.get('canonical_expression')}`로 자동 교정하여 실시간 해독했습니다.")
 
             if wants_dpdk:
                 dpdk_res = self.watch_manager.inspect_dpdk_lcores_and_rings(
@@ -2378,7 +2517,7 @@ class WebApiAdapter:
                 )
                 trace_cards.append({
                     "card_type": "CONDITION_TRIGGER",
-                    "title": f"조건부 트리거 감시: {cond_expr} ({TRIGGERED if cond_res[triggered] else TIMEOUT})",
+                    "title": f"조건부 트리거 감시: {cond_expr} ({'TRIGGERED' if cond_res.get('triggered') else 'TIMEOUT'})",
                     "data": cond_res,
                 })
                 reply_parts.append(cond_res.get("llm_next_step_hint", "조건부 감시를 완료했습니다."))
@@ -2554,20 +2693,15 @@ class WebApiAdapter:
     def get_xray_blueprint_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Returns categorized DWARF X-Ray blueprint for a target process."""
         try:
-            pid = int(params.get("pid") or 0)
-            if pid <= 0:
-                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
-            if not companion_elf:
-                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": "Companion ELF path is required"}}
+            pid, companion_elf, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump = self._resolve_watch_target(params)
             res = self.watch_manager.get_process_xray_blueprint(
                 pid=pid,
                 companion_elf_path=companion_elf,
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=int(params.get("ssh_port") or 22),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
             )
             return {"success": True, "data": res}
         except Exception as e:
@@ -2576,8 +2710,7 @@ class WebApiAdapter:
     def watch_until_condition_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Polls target expressions until a condition triggers or times out (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             cond_expr = (params.get("condition_expression") or params.get("condition") or "ANY_CHANGE").strip()
             res = self.watch_manager.watch_until_condition(
                 pid=pid,
@@ -2601,8 +2734,7 @@ class WebApiAdapter:
     def traverse_linked_structure_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Traverses a linked list or pointer chain in 0.00ms zero-stop mode."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             head_expr = (params.get("head_expression") or "").strip()
             res = self.watch_manager.traverse_linked_structure(
                 pid=pid,
@@ -2624,8 +2756,7 @@ class WebApiAdapter:
     def inspect_thread_callstacks_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Unwinds thread callstacks and decodes mutex owners / deadlock cycles in 0.00ms zero-stop mode."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.inspect_thread_callstacks_and_locks(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2645,8 +2776,7 @@ class WebApiAdapter:
     def audit_memory_integrity_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Audits DWARF symbols and memory pools for dangling pointers, corrupted bools/enums, and counter drift."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.audit_memory_integrity(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2664,8 +2794,7 @@ class WebApiAdapter:
     def resolve_code_pointers_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Resolves function pointers and C++ vtable slots to function names and file:line."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             exprs = params.get("expressions") or []
             if isinstance(exprs, str):
                 exprs = [e.strip() for e in exprs.split(",") if e.strip()]
@@ -2687,8 +2816,7 @@ class WebApiAdapter:
     def inspect_shared_memory_ipc_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Inspects POSIX shm / shared mmap regions with DWARF type overlay casting and peer PID discovery."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.inspect_shared_memory_ipc(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2709,8 +2837,7 @@ class WebApiAdapter:
     def inspect_thread_locals_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Decodes function parameters and local variables across active thread stack frames (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.inspect_thread_locals_and_frame_vars(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2729,8 +2856,7 @@ class WebApiAdapter:
     def auto_triage_incident_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Runs 1-call composite zero-stop incident auto-triage across memory, locks, pools, and lists."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.auto_triage_incident(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2747,8 +2873,7 @@ class WebApiAdapter:
     def trace_ipc_pipeline_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Analyzes cross-process shared memory & IPC pipeline lag/bottlenecks (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.trace_ipc_pipeline(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2768,8 +2893,7 @@ class WebApiAdapter:
     def scan_heap_objects_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Scans `[heap]` and `.data` for C++ polymorphic objects via `_vptr` and detects leaked instances."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.scan_heap_objects(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2789,8 +2913,7 @@ class WebApiAdapter:
     def build_dependency_graph_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Synthesizes directed cross-entity dependency graph and causal chains (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.build_dependency_graph(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2807,8 +2930,7 @@ class WebApiAdapter:
     def correlate_source_and_state_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Correlates DWARF source locations with C/C++ source code and inline live variables."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.correlate_source_and_state(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2829,8 +2951,7 @@ class WebApiAdapter:
     def investigate_symptom_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Autonomous symptom-driven root-cause investigator (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             symptom_query = str(params.get("symptom_query") or params.get("query") or params.get("message") or "왜 멈췄지?").strip()
             res = self.watch_manager.investigate_symptom(
                 pid=pid,
@@ -2849,8 +2970,7 @@ class WebApiAdapter:
     def sample_statistical_hotspots_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Samples statistical CPU & callstack hotspots with 0.00ms stop time."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.sample_statistical_hotspots(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2869,8 +2989,7 @@ class WebApiAdapter:
     def resolve_fuzzy_intent_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Resolves vague natural-language user intent to concrete DWARF symbols and live values."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             natural_query = str(params.get("natural_query") or params.get("query") or params.get("message") or "").strip()
             res = self.watch_manager.resolve_fuzzy_symbol_intent(
                 pid=pid,
@@ -2890,8 +3009,7 @@ class WebApiAdapter:
     def flight_recorder_time_machine_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Captures Flight Recorder Time-Machine micro-frames and detects transient glitches (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.flight_recorder_time_machine(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2911,8 +3029,7 @@ class WebApiAdapter:
     def detect_behavioral_drift_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Detects multi-dimensional behavioral drift against a baseline profile (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.detect_behavioral_drift(
                 pid=pid,
                 companion_elf_path=companion_elf,
@@ -2931,8 +3048,7 @@ class WebApiAdapter:
     def inspect_thread_local_storage_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Decodes per-thread TLS (__thread / thread_local) variables across all active threads (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             var_names = params.get("variable_names")
             if isinstance(var_names, str):
                 var_names = [v.strip() for v in var_names.split(",") if v.strip()]
@@ -2954,8 +3070,7 @@ class WebApiAdapter:
     def verify_concurrent_read_consistency_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Verifies concurrent read consistency using optimistic Seqlock double-reads (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             exprs = params.get("expressions")
             if isinstance(exprs, str):
                 exprs = [e.strip() for e in exprs.split(",") if e.strip()]
@@ -2978,8 +3093,7 @@ class WebApiAdapter:
     def inspect_dpdk_lcores_and_rings_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Inspects DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (0.00ms stop)."""
         try:
-            pid = int(params.get("pid") or 0)
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             r_exprs = params.get("ring_expressions")
             if isinstance(r_exprs, str):
                 r_exprs = [x.strip() for x in r_exprs.split(",") if x.strip()]
@@ -3006,10 +3120,13 @@ class WebApiAdapter:
         """Returns or binds the Stateful Target Session Context."""
         try:
             if params and (params.get("pid") or params.get("companion_elf") or params.get("process_name")):
+                raw_p = str(params.get("pid") or "").strip()
+                num_p = int(raw_p) if raw_p.isdigit() else None
+                proc_n = (params.get("process_name") or "").strip() or (raw_p if (raw_p and not raw_p.isdigit()) else None)
                 res = self.watch_manager.bind_target_context(
-                    pid=int(params["pid"]) if params.get("pid") else None,
+                    pid=num_p,
                     companion_elf_path=(params.get("companion_elf") or params.get("debug_image") or "").strip() or None,
-                    process_name=(params.get("process_name") or "").strip() or None,
+                    process_name=proc_n,
                     remote_host=(params.get("remote_host") or "").strip() or None,
                     ssh_user=(params.get("ssh_user") or "").strip() or None,
                     ssh_port=int(params.get("ssh_port") or 22),
@@ -3150,12 +3267,7 @@ class WebApiAdapter:
     def capture_and_diff_paths_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Samples C/C++ symbol expressions twice across wait_ms and returns changed/unchanged fields."""
         try:
-            pid = int(params.get("pid") or 0)
-            if pid <= 0:
-                return {"success": False, "error": {"code": "INVALID_PID", "message": "Positive target PID is required"}}
-            companion_elf = (params.get("companion_elf") or params.get("debug_image") or "").strip()
-            if not companion_elf or not os.path.isfile(companion_elf):
-                return {"success": False, "error": {"code": "DEBUG_IMAGE_NOT_FOUND", "message": f"Companion ELF not found: '{companion_elf}'"}}
+            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             exprs = params.get("expressions")
             if isinstance(exprs, str):
                 exprs = [e.strip() for e in exprs.split(",") if e.strip()]

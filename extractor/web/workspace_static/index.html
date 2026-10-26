@@ -97,11 +97,11 @@
         </div>
 
         <div class="flex items-center gap-1">
-          <input id="input-target-pid" type="text" placeholder="PID 또는 프로세스명" value="8842" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 w-28 text-slate-800 placeholder-slate-400 mono focus:outline-none focus:border-blue-500 focus:bg-white transition" />
-          <button id="btn-find-proc" type="button" title="실행 중인 프로세스 검색" class="px-2 py-1.5 text-xs rounded-lg bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 transition">🔍</button>
+          <input id="input-target-pid" type="text" placeholder="PID 또는 프로세스명" value="" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 w-36 text-slate-800 placeholder-slate-400 mono focus:outline-none focus:border-blue-500 focus:bg-white transition" />
+          <button id="btn-find-proc" type="button" title="실행 중인 로컬/원격 프로세스 실시간 검색" class="px-2 py-1.5 text-xs rounded-lg bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 transition">🔍 프로세스 탐색</button>
         </div>
 
-        <input id="input-companion-elf" type="text" placeholder="Nostrip DWARF ELF 경로 (예: /build/media_daemon.debug)" value="/build/pool_target_nostrip" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 w-60 sm:w-72 text-slate-800 placeholder-slate-400 mono focus:outline-none focus:border-blue-500 focus:bg-white transition" />
+        <input id="input-companion-elf" type="text" placeholder="Nostrip ELF 경로 (비워두면 /proc/<pid>/exe 자동 탐색)" value="" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 w-60 sm:w-72 text-slate-800 placeholder-slate-400 mono focus:outline-none focus:border-blue-500 focus:bg-white transition" />
 
         <button id="btn-connect-target" type="button" class="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-900 hover:bg-slate-800 text-white shadow-xs transition flex items-center gap-1.5">
           <span>⚡ 프로세스 연결</span>
@@ -111,8 +111,8 @@
           🩺 원클릭 종합 진단
         </button>
 
-        <button id="btn-load-demo" type="button" title="샘플 프로세스(gpMem 32슬롯 + 멀티스레드) 시뮬레이션 로드" class="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition">
-          🧪 데모 로드
+        <button id="btn-sync-context" type="button" title="백엔드 활성 세션 컨텍스트(ActiveTargetContext) 동기화" class="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition">
+          🔄 세션 동기화
         </button>
       </div>
     </div>
@@ -309,11 +309,14 @@
             메모리 풀 할당 맵 차트·점유 스레드 역추적·심볼 구조체 카드가 깔끔하게 추가됩니다.
           </p>
           <div class="flex flex-wrap justify-center gap-2">
-            <button type="button" id="btn-empty-pool-demo" class="px-3.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium shadow-xs transition">
-              🟩 *gpMem 메모리 풀 맵 바로 그리기
+            <button type="button" id="btn-empty-find-proc" class="px-3.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium shadow-xs transition">
+              🔍 실행 중인 타겟 프로세스 탐색 및 연결
             </button>
-            <button type="button" id="btn-empty-owner-demo" class="px-3.5 py-1.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 text-xs font-medium transition">
-              🧵 gpMem[9] 사용 중인 스레드 바로 찾기
+            <button type="button" id="btn-empty-blueprint" class="px-3.5 py-1.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 text-xs font-medium transition">
+              🧭 연결된 프로세스 X-Ray 블루프린트 열기
+            </button>
+            <button type="button" id="btn-empty-triage" class="px-3.5 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 text-xs font-semibold transition">
+              🩺 원클릭 종합 진단(Auto-Triage) 실행
             </button>
           </div>
         </div>
@@ -330,23 +333,28 @@
     // =========================================================================
     const wsState = {
       mode: 'local',
-      pid: 8842,
-      companionElf: '/build/pool_target_nostrip',
+      pid: 0,
+      processName: '',
+      companionElf: '',
       remoteHost: '',
       sshUser: 'root',
-      isDemoFallback: false,
+      isConnected: false,
+      lastError: null,
       activeFilter: 'ALL',
       seqCounter: 0,
       cards: [], // [{ id, seq, type, title, timestamp, pinned, data, selectedSlotIdx }]
     };
 
-    function showToast(msg) {
+    function showToast(msg, isError = false) {
       const el = document.getElementById('ws-toast');
       if (!el) return;
       el.textContent = msg;
+      el.className = isError
+        ? 'fixed bottom-4 right-4 z-50 px-3.5 py-2 rounded-xl bg-rose-700 text-xs text-white shadow-lg'
+        : 'fixed bottom-4 right-4 z-50 px-3.5 py-2 rounded-xl bg-slate-900 text-xs text-white shadow-lg';
       el.classList.remove('hidden');
       clearTimeout(wsState._toastTimer);
-      wsState._toastTimer = setTimeout(() => el.classList.add('hidden'), 3000);
+      wsState._toastTimer = setTimeout(() => el.classList.add('hidden'), 3500);
     }
 
     function escapeHtml(str) {
@@ -359,1048 +367,41 @@
         .replace(/'/g, '&#39;');
     }
 
-    // Built-in realistic target dataset used when running in standalone Canvas preview
-    // or when the user clicks "데모 로드"
-    function buildSimulatedPoolData(expr = '*gpMem') {
-      const allocatedSet = new Set([0, 2, 5, 9, 14, 21, 30]);
-      const ownerTidMap = { 0: 8842, 2: 8847, 5: 8842, 9: 0, 14: 0, 21: 8851, 30: 8847 };
-      const slots = [];
-      let bitmap = '';
-      const baseAddr = 0x55a04020;
-      const elemSize = 24;
-
-      for (let i = 0; i < 32; i++) {
-        const isAlloc = allocatedSet.has(i);
-        bitmap += isAlloc ? '1' : '0';
-        const slotAddr = baseAddr + i * elemSize;
-        const tidVal = ownerTidMap[i] || 0;
-        slots.push({
-          index: i,
-          expression: `gpMem->buffers[${i}]`,
-          runtime_address: '0x' + slotAddr.toString(16),
-          runtime_address_int: slotAddr,
-          size: elemSize,
-          status: isAlloc ? 'IN_USE' : 'FREE',
-          is_allocated: isAlloc,
-          owner_hint: tidVal > 0 ? tidVal : (i === 9 ? 'stack:buf9_worker' : (i === 14 ? 'g_workers[1]' : null)),
-          fields: {
-            in_use: isAlloc ? 1 : 0,
-            size: isAlloc ? (i + 1) * 128 : 0,
-            owner_tid: tidVal,
-            seq: isAlloc ? 100 + i : 0,
-            data_ptr: isAlloc ? '0x' + (0x7f8a001000 + i * 0x400).toString(16) : '0x0',
-          },
-        });
+    function readTargetInputsIntoState() {
+      const rawPidOrName = (document.getElementById('input-target-pid').value || '').trim();
+      if (/^\d+$/.test(rawPidOrName)) {
+        wsState.pid = parseInt(rawPidOrName, 10);
+        wsState.processName = '';
+      } else {
+        wsState.pid = 0;
+        wsState.processName = rawPidOrName;
       }
-
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || 'localhost',
-        stop_duration_ms: 0.0,
-        evaluation_latency_us: 142.5,
-        base_expression: expr,
-        resolved_array_expression: 'gpMem->buffers',
-        array_base_address: '0x55a04020',
-        element_type: 'BufferSlot',
-        element_size: elemSize,
-        element_decl_location: 'pool_target.cpp:11',
-        status_detection_basis: 'field:in_use',
-        pool_metadata: { total_buffers: 32, active_buffers: 7 },
-        pool_summary: {
-          total_slots: 32,
-          allocated_count: 7,
-          free_count: 25,
-          utilization_pct: 21.88,
-          allocated_indices: [0, 2, 5, 9, 14, 21, 30],
-          free_indices: [1, 3, 4, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 31],
-        },
-        allocation_bitmap: bitmap,
-        slots: slots,
-        llm_next_step_hint: "할당된 슬롯(예: 9번 인덱스)을 클릭하거나 'gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요'라고 질문하면 스레드 스택 및 워커 테이블을 역추적합니다.",
-      };
+      wsState.companionElf = (document.getElementById('input-companion-elf').value || '').trim();
+      wsState.remoteHost = (document.getElementById('input-remote-host').value || '').trim();
+      wsState.sshUser = (document.getElementById('input-ssh-user').value || '').trim() || 'root';
     }
 
-    function buildSimulatedOwnerData(targetExpr = 'gpMem->buffers[9]') {
-      const mIdx = targetExpr.match(/\[(\d+)\]/);
-      const slotIdx = mIdx ? parseInt(mIdx[1], 10) : 9;
-      const slotAddr = 0x55a04020 + slotIdx * 24;
-      const slotHex = '0x' + slotAddr.toString(16);
-      const dataHex = '0x' + (0x7f8a001000 + slotIdx * 0x400).toString(16);
-
-      let matchedThreads = [];
-      let globalRefs = [];
-
-      if (slotIdx === 9) {
-        matchedThreads = [
-          {
-            tid: 8849,
-            thread_name: 'buf9_worker',
-            thread_state: 'S',
-            confidence: 'HIGH',
-            evidence: [
-              {
-                evidence_kind: 'THREAD_STACK_POINTER_REFERENCE',
-                confidence: 'HIGH',
-                detail: `Thread 8849 (buf9_worker) holds pointer to &(${targetExpr}) (${slotHex}) as a local variable on its active stack frame at 0x7f9c20ff1dc8`,
-                stack_reference_address: '0x7f9c20ff1dc8',
-                points_to: slotHex,
-                points_to_label: `&(${targetExpr})`,
-              },
-            ],
-          },
-        ];
-      } else if (slotIdx === 14) {
-        matchedThreads = [
-          {
-            tid: 8849,
-            thread_name: 'buf9_worker',
-            thread_state: 'S',
-            confidence: 'HIGH',
-            evidence: [
-              {
-                evidence_kind: 'GLOBAL_WORKER_TABLE_POINTER',
-                confidence: 'HIGH',
-                detail: `Global struct 'g_workers[1].active_buf' holds pointer to &(${targetExpr}) (${slotHex}) and is bound to TID 8849 (buf9_worker)`,
-                symbol: 'g_workers[1].active_buf',
-                points_to: slotHex,
-              },
-            ],
-          },
-        ];
-        globalRefs = [
-          {
-            symbol: 'g_workers[1].active_buf',
-            module: 'pool_target_nostrip',
-            reference_address: '0x55a04410',
-            points_to: `${slotHex} (&(${targetExpr}))`,
-            associated_tid: 8849,
-          },
-        ];
-      } else if (slotIdx === 0 || slotIdx === 5) {
-        matchedThreads = [
-          {
-            tid: 8842,
-            thread_name: 'pool_target_nos',
-            thread_state: 'S',
-            confidence: 'HIGH',
-            evidence: [
-              {
-                evidence_kind: 'STRUCT_OWNER_TID_FIELD',
-                confidence: 'HIGH',
-                detail: `Target field 'owner_tid' directly stores active thread TID 8842 (pool_target_nos)`,
-                field: 'owner_tid',
-                value: 8842,
-              },
-            ],
-          },
-        ];
-      } else if (slotIdx === 2 || slotIdx === 30) {
-        matchedThreads = [
-          {
-            tid: 8847,
-            thread_name: 'io_dispatcher',
-            thread_state: 'S',
-            confidence: 'HIGH',
-            evidence: [
-              {
-                evidence_kind: 'STRUCT_OWNER_TID_FIELD',
-                confidence: 'HIGH',
-                detail: `Target field 'owner_tid' directly stores active thread TID 8847 (io_dispatcher)`,
-                field: 'owner_tid',
-                value: 8847,
-              },
-            ],
-          },
-        ];
-      } else if (slotIdx === 21) {
-        matchedThreads = [
-          {
-            tid: 8851,
-            thread_name: 'telemetry_tx',
-            thread_state: 'S',
-            confidence: 'HIGH',
-            evidence: [
-              {
-                evidence_kind: 'STRUCT_OWNER_TID_FIELD',
-                confidence: 'HIGH',
-                detail: `Target field 'owner_tid' directly stores active thread TID 8851 (telemetry_tx)`,
-                field: 'owner_tid',
-                value: 8851,
-              },
-            ],
-          },
-        ];
+    function syncStateIntoInputs(ctx) {
+      if (!ctx) return;
+      if (ctx.pid && ctx.pid > 0) {
+        wsState.pid = ctx.pid;
+        document.getElementById('input-target-pid').value = String(ctx.pid);
       }
-
-      const isAlloc = [0, 2, 5, 9, 14, 21, 30].includes(slotIdx);
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || 'localhost',
-        stop_duration_ms: 0.0,
-        evaluation_latency_us: 198.4,
-        target_expression: `gpMem->buffers[${slotIdx}]`,
-        target_runtime_address: slotHex,
-        target_size: 24,
-        target_type: 'BufferSlot',
-        target_decl_location: 'pool_target.cpp:11',
-        target_value: {
-          in_use: isAlloc ? 1 : 0,
-          size: isAlloc ? (slotIdx + 1) * 128 : 0,
-          owner_tid: (slotIdx === 0 || slotIdx === 5) ? 8842 : ((slotIdx === 2 || slotIdx === 30) ? 8847 : (slotIdx === 21 ? 8851 : 0)),
-          seq: isAlloc ? 100 + slotIdx : 0,
-          data_ptr: isAlloc ? dataHex : '0x0',
-        },
-        searched_pointer_targets: {
-          [slotHex]: `&(gpMem->buffers[${slotIdx}])`,
-          ...(isAlloc ? { [dataHex]: `(gpMem->buffers[${slotIdx}]).data_ptr` } : {}),
-        },
-        matched_threads_count: matchedThreads.length,
-        matched_threads: matchedThreads,
-        global_references: globalRefs,
-        active_threads_checked: 4,
-        llm_next_step_hint: matchedThreads.length > 0
-          ? `TID ${matchedThreads[0].tid} (${matchedThreads[0].thread_name.trim()}) 스레드가 'gpMem->buffers[${slotIdx}]'(${slotHex})를 점유/참조 중입니다. 소스 코드에서 '${matchedThreads[0].thread_name.trim()}' 진입 함수를 확인하세요.`
-          : `현재 'gpMem->buffers[${slotIdx}]'(${slotHex}) 주소를 보유한 활성 스레드가 없습니다 (미할당 상태이거나 레지스터에만 일시 존재).`,
-      };
-    }
-
-    function buildSimulatedBlueprintData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || 'localhost',
-        stop_duration_ms: 0.0,
-        load_bias: '0x55a00000',
-        build_id: '8f4b2c91e07a4d119302c5b6a8d1e704c92a1103',
-        threads_count: 4,
-        threads: [
-          { tid: 8842, name: 'pool_target_nos', state: 'S', sp: '0x7ffd81a04210' },
-          { tid: 8847, name: 'io_dispatcher', state: 'S', sp: '0x7f9c217f2dc0' },
-          { tid: 8849, name: 'buf9_worker', state: 'S', sp: '0x7f9c20ff1d90' },
-          { tid: 8851, name: 'telemetry_tx', state: 'S', sp: '0x7f9c1fff0e10' },
-        ],
-        categories: {
-          memory_pools_and_buffers: [
-            { name: 'gpMem', type_name: 'MemPool*', runtime_address: '0x55a04010', decl_location: 'pool_target.cpp:32', recommended_pool_expression: '*gpMem' },
-            { name: 'g_pool_storage', type_name: 'MemPool', runtime_address: '0x55a04018', decl_location: 'pool_target.cpp:31', recommended_pool_expression: 'g_pool_storage' },
-          ],
-          thread_and_worker_contexts: [
-            { name: 'g_workers', type_name: 'WorkerContext[4]', runtime_address: '0x55a04400', decl_location: 'pool_target.cpp:33' },
-          ],
-          state_machines_and_flags: [
-            { name: 'g_ready', type_name: 'volatile int', runtime_address: '0x55a04460', decl_location: 'pool_target.cpp:34' },
-          ],
-          counters_and_metrics: [],
-          stl_containers: [],
-        },
-      };
-    }
-
-    function buildSimulatedConditionData(condExpr = "gpMem->active_buffers >= 5") {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        condition_expression: condExpr,
-        triggered: true,
-        samples_taken: 4,
-        poll_interval_ms: 40,
-        elapsed_ms: 124.6,
-        clause_evaluations: [
-          { clause: condExpr, lhs: "gpMem->active_buffers", observed_value: 7, operator: ">=", expected_rhs: 5, matched: true }
-        ],
-        changed: [
-          { path: "gpMem->active_buffers", before: 4, after: 7, delta: 3 },
-          { path: "gpMem->buffers[9].in_use", before: 0, after: 1, delta: 1 }
-        ],
-        llm_next_step_hint: "Condition '" + condExpr + "' TRIGGERED after 124.6ms (4 zero-stop samples). 2 field(s) mutated during the watch window."
-      };
-    }
-
-    function buildSimulatedLinkedListData(headExpr = "g_task_list") {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        head_expression: headExpr,
-        node_type: "TaskNode",
-        node_size: 32,
-        next_field: "next",
-        nodes_count: 4,
-        termination_reason: "NULL_TERMINATED",
-        cycle_detected: false,
-        corrupted_link_detected: false,
-        ascii_chain_summary: "[#0 @ 0x55a08100] ➔ [#1 @ 0x55a08140] ➔ [#2 @ 0x55a08180] ➔ [#3 @ 0x55a081c0] ➔ NULL (0x0)",
-        nodes: [
-          { index: 0, address: "0x55a08100", next_address: "0x55a08140", fields: { task_id: 101, prio: 1, slot_idx: 9, next: "0x55a08140" } },
-          { index: 1, address: "0x55a08140", next_address: "0x55a08180", fields: { task_id: 102, prio: 2, slot_idx: 14, next: "0x55a08180" } },
-          { index: 2, address: "0x55a08180", next_address: "0x55a081c0", fields: { task_id: 103, prio: 1, slot_idx: 2, next: "0x55a081c0" } },
-          { index: 3, address: "0x55a081c0", next_address: "0x0", fields: { task_id: 104, prio: 3, slot_idx: 30, next: "0x0" } }
-        ],
-        llm_next_step_hint: "Successfully traversed 4 node(s) in '" + headExpr + "' (NULL_TERMINATED) with 0.00ms stop."
-      };
-    }
-
-    function buildSimulatedCallstackData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        threads_inspected: 3,
-        locks_inspected: 1,
-        deadlock_detected: false,
-        locks: [
-          { name: "g_pool_mutex", runtime_address: "0x55a04480", type_name: "pthread_mutex_t", is_locked: true, owner_tid: 8849, owner_thread_name: "buf9_worker", waiting_tids: [8847] }
-        ],
-        threads: [
-          {
-            tid: 8849, name: "buf9_worker", state: "S", syscall: "nanosleep", waiting_on_lock: null,
-            callstack: [
-              { frame_index: 0, function_name: "hold_slot_on_stack", symbol_plus_offset: "hold_slot_on_stack+0x24", source_location: "pool_target.cpp:62", runtime_pc: "0x55a011c4" },
-              { frame_index: 1, function_name: "worker_fn", symbol_plus_offset: "worker_fn+0x48", source_location: "pool_target.cpp:72", runtime_pc: "0x55a01218" }
-            ]
-          },
-          {
-            tid: 8847, name: "io_dispatcher", state: "S", syscall: "futex",
-            waiting_on_lock: { lock_name: "g_pool_mutex", lock_address: "0x55a04480", held_by_tid: 8849, held_by_thread_name: "buf9_worker" },
-            callstack: [
-              { frame_index: 0, function_name: "acquire_pool_slot", symbol_plus_offset: "acquire_pool_slot+0x1e", source_location: "pool_target.cpp:48", runtime_pc: "0x55a0114e" },
-              { frame_index: 1, function_name: "io_dispatch_loop", symbol_plus_offset: "io_dispatch_loop+0x60", source_location: "pool_target.cpp:85", runtime_pc: "0x55a01290" }
-            ]
-          }
-        ],
-        llm_next_step_hint: "Lock contention active: TID 8847 (io_dispatcher) is blocked in futex() waiting on g_pool_mutex held by TID 8849 (buf9_worker)."
-      };
-    }
-
-    function buildSimulatedAuditData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        health_status: "ANOMALIES_DETECTED",
-        checked_symbols_count: 8,
-        anomalies_count: 2,
-        anomalies: [
-          {
-            anomaly_kind: "DANGLING_OR_UNMAPPED_POINTER",
-            severity: "HIGH",
-            expression: "gpMem->buffers[21].data_ptr",
-            runtime_address: "0x55a04228",
-            observed_value: "0xdeadbeef00",
-            expected_constraint: "NULL (0x0) or address within mapped readable VMA",
-            detail: "Pointer field 'gpMem->buffers[21].data_ptr' holds unmapped/invalid address 0xdeadbeef00"
-          },
-          {
-            anomaly_kind: "CORRUPTED_BOOL_VALUE",
-            severity: "HIGH",
-            expression: "g_workers[2].is_healthy",
-            runtime_address: "0x55a04434",
-            observed_value: 65,
-            expected_constraint: "0 (false) or 1 (true)",
-            detail: "Boolean field 'g_workers[2].is_healthy' contains corrupted byte 0x41 (65), indicating adjacent buffer overflow"
-          }
-        ],
-        llm_next_step_hint: "Detected 2 memory integrity anomalies: [DANGLING_OR_UNMAPPED_POINTER] gpMem->buffers[21].data_ptr = 0xdeadbeef00; [CORRUPTED_BOOL_VALUE] g_workers[2].is_healthy = 65"
-      };
-    }
-
-    function buildSimulatedCodePtrData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        results: [
-          {
-            expression: "g_session",
-            kind: "POLYMORPHIC_VTABLE",
-            runtime_address: "0x55a04500",
-            vtable_entries: [
-              { slot_index: 0, function_name: "RtspMediaSession::onPacket", source_location: "media_session.cpp:118", runtime_address: "0x55a01420" },
-              { slot_index: 1, function_name: "RtspMediaSession::onTimeout", source_location: "media_session.cpp:145", runtime_address: "0x55a01490" }
-            ],
-            resolved_function_members: {
-              on_error_cb: { function_name: "default_error_handler", source_location: "main.cpp:42", runtime_address: "0x55a01080" }
-            }
-          }
-        ]
-      };
-    }
-
-    function buildSimulatedAutoTriageData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        overall_status: "CRITICAL_ISSUES_FOUND",
-        health_score: 40,
-        findings_count: 3,
-        source_remediation_targets: ["pool_target.cpp:62", "pool_target.cpp:48"],
-        findings: [
-          {
-            severity: "CRITICAL",
-            category: "MEMORY_CORRUPTION",
-            title: "DANGLING_OR_UNMAPPED_POINTER on 'gpMem->buffers[21].data_ptr'",
-            summary: "Pointer field 'gpMem->buffers[21].data_ptr' holds unmapped/invalid address 0xdeadbeef00",
-            recommended_action: "Inspect buffer release and pointer reset logic on gpMem->buffers[21]."
-          },
-          {
-            severity: "HIGH",
-            category: "MUTEX_LOCK_HELD",
-            title: "Mutex 'g_pool_mutex' Held by TID 8849 (buf9_worker)",
-            summary: "Mutex g_pool_mutex (0x55a04480) is locked by TID 8849 with waiting thread [8847]",
-            source_location: "pool_target.cpp:62",
-            recommended_action: "Check why TID 8849 (buf9_worker) is holding 'g_pool_mutex' inside hold_slot_on_stack()."
-          },
-          {
-            severity: "HIGH",
-            category: "MEMORY_CORRUPTION",
-            title: "CORRUPTED_BOOL_VALUE on 'g_workers[2].is_healthy'",
-            summary: "Boolean field 'g_workers[2].is_healthy' contains corrupted byte 0x41 (65)",
-            recommended_action: "Check adjacent array bounds in g_workers[]."
-          }
-        ],
-        llm_next_step_hint: "Auto-Triage found 3 issue(s) (Health Score: 40/100, Status: CRITICAL_ISSUES_FOUND). Top finding: [CRITICAL] DANGLING_OR_UNMAPPED_POINTER on 'gpMem->buffers[21].data_ptr'"
-      };
-    }
-
-    function buildSimulatedFrameLocalsData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        threads_count: 2,
-        threads: [
-          {
-            tid: 8849,
-            name: "buf9_worker",
-            state: "S",
-            frames_count: 2,
-            frames: [
-              {
-                frame_index: 0,
-                function_name: "hold_slot_on_stack",
-                source_location: "pool_target.cpp:60",
-                runtime_pc: "0x55a011c4",
-                cfa_address: "0x7f9c20ff1dc0",
-                parameters: [
-                  { name: "holder", type_name: "BufferSlot**", runtime_address: "0x7f9c20ff1da8", value: "0x7f9c20ff1dc8" }
-                ],
-                locals: [
-                  { name: "spin_ticks", type_name: "int32_t", runtime_address: "0x7f9c20ff1db4", value: 142 }
-                ]
-              },
-              {
-                frame_index: 1,
-                function_name: "worker_fn",
-                source_location: "pool_target.cpp:67",
-                runtime_pc: "0x55a01218",
-                cfa_address: "0x7f9c20ff1df0",
-                parameters: [
-                  { name: "arg", type_name: "void*", runtime_address: "0x7f9c20ff1dd8", value: "0x0" }
-                ],
-                locals: [
-                  { name: "local_slot", type_name: "BufferSlot*", runtime_address: "0x7f9c20ff1dc8", value: "0x55a040f8" }
-                ]
-              }
-            ]
-          }
-        ],
-        llm_next_step_hint: "Decoded stack frame parameters and local variables across 2 thread(s) with 0.00ms stop."
-      };
-    }
-
-    function buildSimulatedFlightRecorderData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        frames_recorded: 8,
-        ring_buffer_total_frames: 24,
-        interval_ms: 25,
-        elapsed_ms: 198.2,
-        transient_glitches_count: 2,
-        transient_glitches: [
-          {
-            path: "gpMem->active_buffers",
-            pattern: "TRANSIENT_SPIKE_REVERSAL",
-            baseline_value: 7,
-            spike_value: 31,
-            restored_value: 7,
-            peak_frame_seq: 4,
-            timeline_values: [7, 7, 19, 31, 22, 7, 7, 7]
-          },
-          {
-            path: "g_transient_error_spike",
-            pattern: "TRANSIENT_SPIKE_REVERSAL",
-            baseline_value: 0,
-            spike_value: 503,
-            restored_value: 0,
-            peak_frame_seq: 4,
-            timeline_values: [0, 0, 0, 503, 0, 0, 0, 0]
-          }
-        ],
-        time_machine_triad: {
-          pre_anomaly_frame: { frame_seq: 3, offset_ms: 50.1, stress_score: 95, stress_highlights: ["gpMem->active_buffers=19"] },
-          peak_anomaly_frame: { frame_seq: 4, offset_ms: 75.4, stress_score: 2670, stress_highlights: ["gpMem->active_buffers=31", "g_transient_error_spike=503"] },
-          post_anomaly_frame: { frame_seq: 5, offset_ms: 100.8, stress_score: 110, stress_highlights: ["gpMem->active_buffers=22"] }
-        },
-        llm_next_step_hint: "Flight Recorder captured 8 zero-stop frames (198.2ms) and detected 2 transient spike reversal(s): gpMem->active_buffers (7 ➔ 31 ➔ 7 at frame #4), g_transient_error_spike (0 ➔ 503 ➔ 0 at frame #4)"
-      };
-    }
-
-    function buildSimulatedBehavioralDriftData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        drift_status: "SEVERE_BEHAVIORAL_DRIFT",
-        drift_score: 75,
-        drifted_dimensions_count: 3,
-        drifted_dimensions: [
-          {
-            dimension: "HEAP_LEAK_GROWTH",
-            severity: "CRITICAL",
-            metric: "heap_leaked_candidates",
-            baseline: 0,
-            current: 1,
-            detail: "Unreferenced C++ heap leak candidates increased from 0 to 1 (RtspSession @ 0x55a096e0)."
-          },
-          {
-            dimension: "NEW_MUTEX_CONTENTION",
-            severity: "HIGH",
-            metric: "g_pool_mutex",
-            baseline: "UNLOCKED",
-            current: "LOCKED (Owner TID 8849)",
-            detail: "Mutex 'g_pool_mutex' was UNLOCKED in baseline but is currently LOCKED."
-          },
-          {
-            dimension: "MEMORY_POOL_UTILIZATION_DRIFT",
-            severity: "MEDIUM",
-            metric: "gpMem->buffers",
-            baseline: "2/32 (6.25%)",
-            current: "7/32 (21.88%)",
-            detail: "Pool 'gpMem->buffers' utilization shifted by +15.6%."
-          }
-        ],
-        llm_next_step_hint: "Behavioral Drift Check: SEVERE_BEHAVIORAL_DRIFT (Drift Score: 75/100, 3 dimension(s) shifted). Unreferenced C++ heap leak candidates increased from 0 to 1."
-      };
-    }
-
-    function buildSimulatedDpdkLcoreData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        sample_window_ms: 40,
-        kernel_isolated_cpus: [2, 3],
-        hugepage_mappings_count: 1,
-        hugepage_mappings: [
-          { start: "0x100000000", end: "0x140000000", size: 1073741824, permissions: "rw-s", pathname: "/dev/hugepages/rtemap_0" }
-        ],
-        lcore_threads_count: 3,
-        dedicated_pmd_lcores_count: 2,
-        overall_dpdk_status: "LCORE_DEADLOOP_OR_RING_STALL_DETECTED",
-        lcores: [
-          {
-            tid: 8849,
-            name: "lcore-worker-2",
-            state: "R",
-            lcore_role: "DPDK_PMD_DEDICATED_LCORE",
-            lcore_id: 2,
-            cpu_id: 2,
-            cpus_allowed_list: "2",
-            is_single_core_pinned: true,
-            is_kernel_isolated_core: true,
-            sched_policy: "SCHED_FIFO",
-            rt_priority: 99,
-            utime_delta_ticks: 4,
-            stime_delta_ticks: 0,
-            voluntary_ctxt_switches_delta: 0,
-            nonvoluntary_ctxt_switches_delta: 0,
-            isolation_jitter_detected: false,
-            tcb_address: "0x7f9c1ffed640",
-            per_lcore_tls: { per_lcore__lcore_id: 2, tls_rx_burst_pkts: 194820 },
-            per_lcore_tls_deltas: { per_lcore__lcore_id: 0, tls_rx_burst_pkts: 1420 },
-            progress_delta: 1420,
-            pmd_health_status: "PMD_POLLING_HEALTHY",
-            top_function: "pmd_poll_rx_tx_burst",
-            top_source_location: "dpdk_pmd.cpp:88"
-          },
-          {
-            tid: 8850,
-            name: "lcore-worker-3",
-            state: "R",
-            lcore_role: "DPDK_PMD_DEDICATED_LCORE",
-            lcore_id: 3,
-            cpu_id: 3,
-            cpus_allowed_list: "3",
-            is_single_core_pinned: true,
-            is_kernel_isolated_core: true,
-            sched_policy: "SCHED_FIFO",
-            rt_priority: 99,
-            utime_delta_ticks: 4,
-            stime_delta_ticks: 0,
-            voluntary_ctxt_switches_delta: 0,
-            nonvoluntary_ctxt_switches_delta: 0,
-            isolation_jitter_detected: false,
-            tcb_address: "0x7f9c1f7ec640",
-            per_lcore_tls: { per_lcore__lcore_id: 3, tls_rx_burst_pkts: 84100 },
-            per_lcore_tls_deltas: { per_lcore__lcore_id: 0, tls_rx_burst_pkts: 0 },
-            progress_delta: 0,
-            pmd_health_status: "LCORE_STUCK_DEADLOOP",
-            top_function: "rte_ring_enqueue_burst_spin",
-            top_source_location: "dpdk_pmd.cpp:134"
-          }
-        ],
-        lockless_rings_count: 1,
-        lockless_rings: [
-          {
-            expression: "g_dpdk_rx_ring",
-            type_name: "rte_ring",
-            runtime_address: "0x100004000",
-            capacity: 1024,
-            mask: "0x3ff",
-            prod_head: 520,
-            prod_tail: 512,
-            cons_head: 500,
-            cons_tail: 500,
-            inflight_entries: 12,
-            utilization_pct: 1.17,
-            throughput_delta: 0,
-            ring_status: "STUCK_PROD_INFLIGHT_RESERVATION"
-          }
-        ],
-        spinlocks_count: 1,
-        spinlocks: [
-          {
-            expression: "g_tx_port_spinlock",
-            runtime_address: "0x55a04620",
-            locked_before: 1,
-            locked_after: 1,
-            spinlock_status: "CONTENDED_OR_STUCK_LOCKED"
-          }
-        ],
-        llm_next_step_hint: "DPDK Isolated-Core & PMD Audit: LCORE_DEADLOOP_OR_RING_STALL_DETECTED across 2 dedicated PMD lcore(s) and 1 lockless ring(s) in 0.00ms zero-stop mode."
-      };
-    }
-
-    function buildSimulatedTlsInspectorData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        pt_tls_geometry: { tls_memsz: 16, tls_align: 8, aligned_tls_memsz: 16 },
-        tls_variables_discovered: 2,
-        tcb_resolved_count: 3,
-        threads_count: 3,
-        variable_summaries: [
-          { name: "tls_worker_slot_id", type_name: "int", tls_offset: "0x0", threads_observed: 3, unique_values_count: 3, has_per_thread_divergence: true },
-          { name: "tls_processed_packets", type_name: "uint64_t", tls_offset: "0x8", threads_observed: 3, unique_values_count: 3, has_per_thread_divergence: true }
-        ],
-        threads: [
-          {
-            tid: 8842,
-            name: "main_supervisor",
-            state: "S",
-            tcb_address: "0x7f9c21004740",
-            tls_block_base: "0x7f9c21004730",
-            tls_variables: [
-              { name: "tls_worker_slot_id", type_name: "int", tls_offset: "0x0", runtime_address: "0x7f9c21004730", value: 0 },
-              { name: "tls_processed_packets", type_name: "uint64_t", tls_offset: "0x8", runtime_address: "0x7f9c21004738", value: 12 }
-            ]
-          },
-          {
-            tid: 8847,
-            name: "io_dispatcher",
-            state: "S",
-            tcb_address: "0x7f9c207ef640",
-            tls_block_base: "0x7f9c207ef630",
-            tls_variables: [
-              { name: "tls_worker_slot_id", type_name: "int", tls_offset: "0x0", runtime_address: "0x7f9c207ef630", value: 2 },
-              { name: "tls_processed_packets", type_name: "uint64_t", tls_offset: "0x8", runtime_address: "0x7f9c207ef638", value: 1840 }
-            ]
-          },
-          {
-            tid: 8849,
-            name: "buf9_worker",
-            state: "R",
-            tcb_address: "0x7f9c1ffed640",
-            tls_block_base: "0x7f9c1ffed630",
-            tls_variables: [
-              { name: "tls_worker_slot_id", type_name: "int", tls_offset: "0x0", runtime_address: "0x7f9c1ffed630", value: 9 },
-              { name: "tls_processed_packets", type_name: "uint64_t", tls_offset: "0x8", runtime_address: "0x7f9c1ffed638", value: 94210 }
-            ]
-          }
-        ],
-        llm_next_step_hint: "Decoded 2 TLS (__thread / thread_local) variable(s) across 3/3 thread TCB(s) in 0.00ms zero-stop mode."
-      };
-    }
-
-    function buildSimulatedConcurrencyVerifierData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        overall_consistency_status: "ACTIVE_CONCURRENT_MUTATIONS_DETECTED",
-        symbols_checked_count: 3,
-        atomic_consistent_count: 1,
-        torn_read_recovered_count: 1,
-        concurrently_mutating_count: 1,
-        symbols: [
-          {
-            expression: "gpMem",
-            type_name: "MemPool*",
-            checked_address: "0x55a04020",
-            checked_byte_size: 776,
-            consistency_status: "ATOMIC_CONSISTENT",
-            attempts_used: 1,
-            mutating_fields: [],
-            verified_value: { total_buffers: 32, active_buffers: 7 }
-          },
-          {
-            expression: "g_workers",
-            type_name: "WorkerContext[4]",
-            checked_address: "0x55a04400",
-            checked_byte_size: 96,
-            consistency_status: "TORN_READ_RECOVERED",
-            attempts_used: 2,
-            mutating_fields: [],
-            verified_value: "[4 elements verified]"
-          },
-          {
-            expression: "g_fast_telemetry_seq",
-            type_name: "uint64_t",
-            checked_address: "0x55a04540",
-            checked_byte_size: 8,
-            consistency_status: "CONCURRENTLY_MUTATING",
-            attempts_used: 3,
-            mutating_fields: ["value"],
-            verified_value: 948215
-          }
-        ],
-        llm_next_step_hint: "Seqlock Concurrency Verification: ACTIVE_CONCURRENT_MUTATIONS_DETECTED (1 atomic consistent, 1 torn-read recovered, 1 concurrently mutating in 0.00ms stop)."
-      };
-    }
-
-    function buildSimulatedStatisticalHotspotsData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        samples_taken: 8,
-        interval_ms: 30,
-        elapsed_ms: 246.4,
-        thread_cpu_profiles: [
-          { tid: 8849, name: "buf9_worker", state: "R", utime_delta_ticks: 19, stime_delta_ticks: 3, total_delta_ticks: 22, runnable_sample_pct: 87.5, cpu_share_pct: 84.6 },
-          { tid: 8851, name: "telemetry_tx", state: "S", utime_delta_ticks: 3, stime_delta_ticks: 1, total_delta_ticks: 4, runnable_sample_pct: 12.5, cpu_share_pct: 15.4 },
-          { tid: 8847, name: "io_dispatcher", state: "S", utime_delta_ticks: 0, stime_delta_ticks: 0, total_delta_ticks: 0, runnable_sample_pct: 0.0, cpu_share_pct: 0.0 }
-        ],
-        hotspot_functions: [
-          { function_name: "hold_slot_on_stack", source_location: "pool_target.cpp:62", self_samples: 7, inclusive_samples: 8, self_pct: 87.5, inclusive_pct: 100.0, threads: ["TID 8849 (buf9_worker)"] },
-          { function_name: "worker_fn", source_location: "pool_target.cpp:72", self_samples: 0, inclusive_samples: 8, self_pct: 0.0, inclusive_pct: 100.0, threads: ["TID 8849 (buf9_worker)"] },
-          { function_name: "acquire_pool_slot", source_location: "pool_target.cpp:48", self_samples: 8, inclusive_samples: 8, self_pct: 100.0, inclusive_pct: 100.0, threads: ["TID 8847 (io_dispatcher)"] }
-        ],
-        flame_stacks: [
-          { folded_stack: "buf9_worker;worker_fn;hold_slot_on_stack", samples: 8, pct: 100.0 },
-          { folded_stack: "io_dispatcher;io_dispatch_loop;acquire_pool_slot", samples: 8, pct: 100.0 }
-        ],
-        counter_rates: [
-          { expression: "gpMem->buffers[9].seq", before: 109, after: 141, delta: 32, rate_per_sec: 129.87 },
-          { expression: "gpMem->active_buffers", before: 7, after: 7, delta: 0, rate_per_sec: 0.0 }
-        ],
-        llm_next_step_hint: "Statistical hotspot profiling (8 samples over 246.4ms, 0.00ms stop): Top hotspot function is `hold_slot_on_stack()` (100.0% inclusive, pool_target.cpp:62) on thread TID 8849 (buf9_worker, CPU share 84.6%)."
-      };
-    }
-
-    function buildSimulatedFuzzyIntentData(query = "버퍼 풀과 워커 스레드 관련된 심볼을 퍼지 의미 매칭으로 알아서 찾아 값을 보여주세요") {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        natural_query: query,
-        expanded_keywords: ["pool", "mem", "buf", "slot", "worker", "thread", "tid"],
-        matches_count: 3,
-        matches: [
-          {
-            symbol_name: "gpMem",
-            recommended_expression: "*gpMem",
-            type_name: "MemPool*",
-            decl_location: "pool_target.cpp:32",
-            member_fields: ["total_buffers", "active_buffers", "buffers"],
-            relevance_score: 95,
-            matched_concepts: ["pool", "mem", "buf"],
-            live_value: { total_buffers: 32, active_buffers: 7 }
-          },
-          {
-            symbol_name: "g_workers",
-            recommended_expression: "g_workers",
-            type_name: "WorkerContext[4]",
-            decl_location: "pool_target.cpp:33",
-            member_fields: ["tid", "active_buf", "is_healthy"],
-            relevance_score: 80,
-            matched_concepts: ["worker", "tid", "buf"],
-            live_value: [{ tid: 8847, active_buf: "0x0", is_healthy: 1 }, { tid: 8849, active_buf: "0x55a04170", is_healthy: 1 }]
-          },
-          {
-            symbol_name: "g_pool_mutex",
-            recommended_expression: "g_pool_mutex",
-            type_name: "pthread_mutex_t",
-            decl_location: "pool_target.cpp:35",
-            member_fields: ["__data"],
-            relevance_score: 45,
-            matched_concepts: ["pool"],
-            live_value: { __owner: 8849, __lock: 2 }
-          }
-        ],
-        llm_next_step_hint: "Resolved '" + query + "' to 3 DWARF symbol(s): *gpMem (MemPool*), g_workers (WorkerContext[4]), g_pool_mutex (pthread_mutex_t)"
-      };
-    }
-
-    function buildSimulatedDependencyGraphData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        nodes_count: 6,
-        edges_count: 5,
-        root_blocker_nodes: [
-          { id: "THREAD:8849", kind: "THREAD", label: "TID 8849 (buf9_worker)", status: "NORMAL", metadata: { source_location: "pool_target.cpp:62", top_function: "hold_slot_on_stack" } }
-        ],
-        causal_chains: [
-          {
-            chain_type: "LOCK_CONTENTION_CHAIN",
-            root_blocker_id: "THREAD:8849",
-            root_blocker_label: "TID 8849 (buf9_worker)",
-            source_location: "pool_target.cpp:62",
-            impacted_entities: ["THREAD:8847", "LOCK:g_pool_mutex", "SLOT:gpMem->buffers[9]"],
-            steps: [
-              "TID 8847 (io_dispatcher) is BLOCKED waiting on Mutex g_pool_mutex (0x55a04480)",
-              "Mutex g_pool_mutex is currently HELD by TID 8849 (buf9_worker) at pool_target.cpp:62",
-              "TID 8849 (buf9_worker) simultaneously occupies SLOT:gpMem->buffers[9]"
-            ],
-            ascii_flow: "[TID 8847 (io_dispatcher)] ──(waits)──▶ [Mutex g_pool_mutex] ──(held by)──▶ [TID 8849 (buf9_worker)] ──(occupies)──▶ [SLOT:gpMem->buffers[9]]"
-          },
-          {
-            chain_type: "IPC_BACKLOG_CHAIN",
-            root_blocker_id: "PEER_PROC:4120",
-            root_blocker_label: "PID 4120 (encoder_daemon)",
-            source_location: null,
-            impacted_entities: ["PROC:8842"],
-            steps: [
-              "Consumer is lagging behind producer by 18 item(s) (producer_seq=142, consumer_seq=124)."
-            ],
-            ascii_flow: "[PID 8842] ──(SHM backlog 18)──▶ [PID 4120 (encoder_daemon)]"
-          }
-        ],
-        nodes: [
-          { id: "PROC:8842", kind: "PROCESS", label: "PID 8842 (pool_target_nostrip)", status: "NORMAL" },
-          { id: "THREAD:8847", kind: "THREAD", label: "TID 8847 (io_dispatcher)", status: "BLOCKED" },
-          { id: "LOCK:g_pool_mutex", kind: "MUTEX_LOCK", label: "Mutex g_pool_mutex (0x55a04480)", status: "CONTENDED" },
-          { id: "THREAD:8849", kind: "THREAD", label: "TID 8849 (buf9_worker)", status: "NORMAL" },
-          { id: "SLOT:gpMem->buffers[9]", kind: "BUFFER_SLOT", label: "gpMem->buffers[9] (0x55a040f8)", status: "IN_USE" },
-          { id: "PEER_PROC:4120", kind: "PEER_PROCESS", label: "Peer PID 4120 (encoder_daemon)", status: "NORMAL" }
-        ],
-        edges: [
-          { from: "THREAD:8847", to: "LOCK:g_pool_mutex", relation: "WAITS_ON_LOCK", detail: "futex wait" },
-          { from: "LOCK:g_pool_mutex", to: "THREAD:8849", relation: "HELD_BY_THREAD", detail: "owner_tid=8849" },
-          { from: "THREAD:8849", to: "SLOT:gpMem->buffers[9]", relation: "OCCUPIES_SLOT", detail: "stack pointer reference" }
-        ],
-        llm_next_step_hint: "Synthesized 2 causal chain(s) across 6 runtime entities. Top root blocker: [TID 8847 (io_dispatcher)] ──(waits)──▶ [Mutex g_pool_mutex] ──(held by)──▶ [TID 8849 (buf9_worker)]"
-      };
-    }
-
-    function buildSimulatedSourceCorrelationData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        snippets_count: 1,
-        snippets: [
-          {
-            file_hint: "pool_target.cpp",
-            resolved_source_path: "/build/pool_target.cpp",
-            target_line: 62,
-            function_name: "hold_slot_on_stack",
-            tid: 8849,
-            thread_name: "buf9_worker",
-            live_variables: { holder: "0x7f9c20ff1dc8", spin_ticks: 142, local_slot: "0x55a040f8", gpMem: "0x55a04018" },
-            annotated_lines: [
-              { line_number: 59, is_target_line: false, code: "void hold_slot_on_stack(BufferSlot** holder) {", live_annotations: { holder: "0x7f9c20ff1dc8" }, formatted: "    59 | void hold_slot_on_stack(BufferSlot** holder) {   // [LIVE] holder=\"0x7f9c20ff1dc8\"" },
-              { line_number: 60, is_target_line: false, code: "    int spin_ticks = 142;", live_annotations: { spin_ticks: 142 }, formatted: "    60 |     int spin_ticks = 142;   // [LIVE] spin_ticks=142" },
-              { line_number: 61, is_target_line: false, code: "    pthread_mutex_lock(&g_pool_mutex);", live_annotations: {}, formatted: "    61 |     pthread_mutex_lock(&g_pool_mutex);" },
-              { line_number: 62, is_target_line: true, code: "    while (g_ready && spin_ticks > 0) { usleep(50000); }", live_annotations: { spin_ticks: 142 }, formatted: "▶   62 |     while (g_ready && spin_ticks > 0) { usleep(50000); }   // [LIVE] spin_ticks=142" },
-              { line_number: 63, is_target_line: false, code: "    pthread_mutex_unlock(&g_pool_mutex);", live_annotations: {}, formatted: "    63 |     pthread_mutex_unlock(&g_pool_mutex);" }
-            ]
-          }
-        ],
-        llm_next_step_hint: "Correlated 1 active source location(s) with inline live runtime variable values."
-      };
-    }
-
-    function buildSimulatedSymptomInvestigationData(query = "지금 프로세스가 왜 멈췄고 어디가 문제인지 증상을 종합 판단해서 분석해 주세요") {
-      const dg = buildSimulatedDependencyGraphData();
-      const sc = buildSimulatedSourceCorrelationData();
-      const tr = buildSimulatedAutoTriageData();
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        symptom_query: query,
-        classified_symptom: "HANG_OR_DEADLOCK",
-        root_cause_hypothesis: "[MUTEX_LOCK_HELD] Mutex 'g_pool_mutex' Held by TID 8849 (buf9_worker) — [TID 8847 (io_dispatcher)] ──(waits)──▶ [Mutex g_pool_mutex] ──(held by)──▶ [TID 8849 (buf9_worker)] ──(occupies)──▶ [SLOT:gpMem->buffers[9]]",
-        confidence_score: 0.94,
-        health_score: 40,
-        findings_count: tr.findings.length,
-        findings: tr.findings,
-        causal_chains: dg.causal_chains,
-        dependency_graph: dg,
-        annotated_source_snippets: sc.snippets,
-        remediation_steps: [
-          "Check why TID 8849 (buf9_worker) is holding 'g_pool_mutex' inside hold_slot_on_stack() at pool_target.cpp:62 without releasing it.",
-          "Inspect buffer release and pointer reset logic on gpMem->buffers[21] (0xdeadbeef00).",
-          "Verify destructor / smart-pointer lifecycle for unreferenced RtspSession heap object @ 0x55a096e0."
-        ],
-        llm_next_step_hint: "Symptom Investigation (HANG_OR_DEADLOCK) complete with confidence 94%: TID 8849 (buf9_worker) holds g_pool_mutex at pool_target.cpp:62 while occupying gpMem->buffers[9], blocking TID 8847 (io_dispatcher)."
-      };
-    }
-
-    function buildSimulatedIpcPipelineData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        pipeline_health: "CONSUMER_LAGGING",
-        bottleneck_diagnosis: "Consumer is lagging behind producer by 18 item(s) (producer_seq=142, consumer_seq=124).",
-        metrics: {
-          producer_seq: 142,
-          consumer_seq: 124,
-          pending_backlog: 18,
-          capacity: 32,
-          backlog_utilization_pct: 56.25,
-          lock_owner_pid: 8842
-        },
-        shared_mappings: [
-          { start: "0x7f9c30000000", end: "0x7f9c30010000", size: 65536, permissions: "rw-s", pathname: "/dev/shm/ds_media_ring" }
-        ],
-        decoded_overlay: {
-          cast_type: "ShmRingHeader",
-          address: "0x7f9c30000000",
-          byte_size: 16,
-          status: "OBSERVED",
-          value: { magic_tag: 1397247281, producer_seq: 142, consumer_seq: 124, capacity: 32 }
-        },
-        peer_processes: [
-          { peer_pid: 4120, peer_name: "encoder_daemon", peer_state: "S", shared_pathname: "/dev/shm/ds_media_ring" }
-        ],
-        ipc_fds: [
-          { fd: 4, target: "/dev/shm/ds_media_ring" },
-          { fd: 7, target: "socket:[194821]" }
-        ],
-        llm_next_step_hint: "[CONSUMER_LAGGING] Consumer is lagging behind producer by 18 item(s) (producer_seq=142, consumer_seq=124). Connected peer process: PID 4120 (encoder_daemon)."
-      };
-    }
-
-    function buildSimulatedHeapScanData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        scanned_heap_bytes: 135168,
-        known_polymorphic_classes: ["BaseSession", "RtspSession"],
-        total_objects_found: 3,
-        leaked_candidates_count: 1,
-        class_histogram: {
-          RtspSession: { total: 3, on_heap: 2, on_global: 1, leaked_candidates: 1 }
-        },
-        objects: [
-          {
-            class_name: "RtspSession",
-            address: "0x55a092a0",
-            byte_size: 24,
-            region: "heap",
-            vptr_target: "0x55a03d90",
-            is_referenced: true,
-            referenced_by: ["global_data@0x55a04510"],
-            is_leaked_candidate: false,
-            fields: { session_id: 1001 }
-          },
-          {
-            class_name: "RtspSession",
-            address: "0x55a096e0",
-            byte_size: 24,
-            region: "heap",
-            vptr_target: "0x55a03d90",
-            is_referenced: false,
-            referenced_by: [],
-            is_leaked_candidate: true,
-            fields: { session_id: 9999 }
-          },
-          {
-            class_name: "RtspSession",
-            address: "0x55a04520",
-            byte_size: 24,
-            region: "global_data",
-            vptr_target: "0x55a03d90",
-            is_referenced: true,
-            referenced_by: ["global_data@0x55a04500"],
-            is_leaked_candidate: false,
-            fields: { session_id: 999 }
-          }
-        ],
-        llm_next_step_hint: "Detected 1 unreachable/leaked C++ heap object(s) out of 3 live polymorphic instance(s)!"
-      };
-    }
-
-    function buildSimulatedShmData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || "localhost",
-        stop_duration_ms: 0.0,
-        shared_mappings_count: 1,
-        shared_mappings: [
-          { start: "0x7f9c30000000", end: "0x7f9c30010000", size: 65536, permissions: "rw-s", pathname: "/dev/shm/ds_media_ring" }
-        ],
-        decoded_overlay: {
-          cast_type: "MemPool",
-          address: "0x7f9c30000000",
-          byte_size: 776,
-          status: "OBSERVED",
-          value: { total_buffers: 32, active_buffers: 7 }
-        },
-        peer_processes_count: 1,
-        peer_processes: [
-          { peer_pid: 4120, peer_name: "encoder_daemon", shared_pathname: "/dev/shm/ds_media_ring" }
-        ],
-        llm_next_step_hint: "Decoded 'MemPool' at 0x7f9c30000000 and found 1 peer process (PID 4120 encoder_daemon) sharing /dev/shm/ds_media_ring."
-      };
-    }
-
-    function buildSimulatedDiffData() {
-      return {
-        pid: wsState.pid || 8842,
-        target_host: wsState.remoteHost || 'localhost',
-        wait_ms: 500,
-        stop_duration_ms: 0.0,
-        summary: {
-          total_fields_compared: 6,
-          changed_count: 2,
-          unchanged_count: 4,
-        },
-        changed: [
-          { path: 'gpMem->buffers[9].seq', before: 109, after: 114, delta: 5 },
-          { path: 'gpMem->buffers[2].seq', before: 102, after: 105, delta: 3 },
-        ],
-        unchanged: [
-          { path: 'gpMem->total_buffers', value: 32 },
-          { path: 'gpMem->active_buffers', value: 7 },
-          { path: 'gpMem->buffers[9].in_use', value: 1 },
-          { path: 'g_workers[1].tid', value: 8849 },
-        ],
-      };
+      if (ctx.companion_elf_path) {
+        wsState.companionElf = ctx.companion_elf_path;
+        document.getElementById('input-companion-elf').value = ctx.companion_elf_path;
+      }
+      if (ctx.remote_host) {
+        wsState.remoteHost = ctx.remote_host;
+        document.getElementById('input-remote-host').value = ctx.remote_host;
+        document.getElementById('select-target-mode').value = 'ssh';
+        document.getElementById('ssh-fields-wrap').classList.remove('hidden');
+        document.getElementById('ssh-fields-wrap').classList.add('flex');
+      }
     }
 
     // =========================================================================
-    // Backend API Caller with Graceful Fallback to Built-In Simulation
+    // Production Backend API Caller (Zero Fake Simulation Fallback)
     // (Subpath & Reverse-Proxy Aware)
     // =========================================================================
     const _rawPath = (window.location && window.location.pathname) ? window.location.pathname : '';
@@ -1416,28 +417,32 @@
     }
 
     async function callWorkspaceBackend(endpoint, payload) {
+      wsState.lastError = null;
       try {
         const res = await fetch(getApiUrl(endpoint), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(payload || {}),
         });
-        if (res.ok) {
-          const json = await res.json();
-          if (json && json.success) {
-            wsState.isDemoFallback = false;
-            updateConnectionBadge('LIVE BACKEND', 'emerald');
-            return json.data;
-          }
-          if (json && json.error) {
-            throw new Error(json.error.message || 'API Error');
-          }
+        const json = await res.json();
+        if (json && json.success) {
+          wsState.isConnected = true;
+          updateConnectionBadge('LIVE CONNECTED', 'emerald');
+          return json.data;
         }
+        const errCode = (json && json.error && json.error.code) ? json.error.code : `HTTP_${res.status}`;
+        const errMsg = (json && json.error && json.error.message) ? json.error.message : `요청 처리 중 오류가 발생했습니다 (HTTP ${res.status})`;
+        wsState.lastError = { code: errCode, message: errMsg };
+        updateConnectionBadge(errCode === 'TARGET_NOT_CONFIGURED' ? 'TARGET REQUIRED' : 'API ERROR', 'amber');
+        return null;
       } catch (err) {
-        wsState.isDemoFallback = true;
-        updateConnectionBadge('SIMULATION MODE', 'amber');
+        wsState.lastError = {
+          code: 'BACKEND_UNREACHABLE',
+          message: err && err.message ? err.message : '백엔드 서버에 연결할 수 없습니다. ./bin/dynamic-state-workspace 가 실행 중인지 확인하세요.',
+        };
+        updateConnectionBadge('DISCONNECTED', 'amber');
+        return null;
       }
-      return null;
     }
 
     function updateConnectionBadge(text, color) {
@@ -1454,11 +459,18 @@
     }
 
     function updateTelemetryStrip(info) {
+      if (!info) return;
       const strip = document.getElementById('process-telemetry-strip');
       if (!strip) return;
       strip.classList.remove('hidden');
       strip.classList.add('flex');
-      if (info.pid) document.getElementById('tel-pid').textContent = String(info.pid);
+      if (info.pid) {
+        wsState.pid = info.pid;
+        document.getElementById('tel-pid').textContent = String(info.pid);
+        if (!document.getElementById('input-target-pid').value.trim()) {
+          document.getElementById('input-target-pid').value = String(info.pid);
+        }
+      }
       if (info.build_id) document.getElementById('tel-buildid').textContent = String(info.build_id).slice(0, 12) + '…';
       if (info.load_bias) document.getElementById('tel-bias').textContent = info.load_bias;
       if (info.threads_count !== undefined) document.getElementById('tel-threads').textContent = String(info.threads_count);
@@ -1480,7 +492,7 @@
       container.scrollTop = container.scrollHeight;
     }
 
-    function appendAssistantChatMessage(title, bodyHtml, linkedCards = []) {
+    function appendAssistantChatMessage(title, bodyHtml, linkedCards = [], isError = false) {
       const container = document.getElementById('chat-messages');
       const div = document.createElement('div');
       div.className = 'flex gap-3';
@@ -1496,11 +508,15 @@
           </div>`
         : '';
 
+      const boxCls = isError
+        ? 'bg-rose-50/70 border border-rose-200 rounded-2xl rounded-tl-sm px-4 py-3 text-xs leading-relaxed text-rose-900 space-y-2 max-w-[92%]'
+        : 'bg-slate-50 border border-slate-200/90 rounded-2xl rounded-tl-sm px-4 py-3 text-xs leading-relaxed text-slate-700 space-y-2 max-w-[92%]';
+
       div.innerHTML = `
-        <div class="w-7 h-7 rounded-full bg-slate-900 flex items-center justify-center shrink-0 text-[11px] font-semibold text-white mono">AI</div>
-        <div class="bg-slate-50 border border-slate-200/90 rounded-2xl rounded-tl-sm px-4 py-3 text-xs leading-relaxed text-slate-700 space-y-2 max-w-[92%]">
-          <div class="font-semibold text-slate-900">${escapeHtml(title)}</div>
-          <div class="text-slate-600 space-y-1.5">${bodyHtml}</div>
+        <div class="w-7 h-7 rounded-full ${isError ? 'bg-rose-600' : 'bg-slate-900'} flex items-center justify-center shrink-0 text-[11px] font-semibold text-white mono">AI</div>
+        <div class="${boxCls}">
+          <div class="font-semibold ${isError ? 'text-rose-950' : 'text-slate-900'}">${escapeHtml(title)}</div>
+          <div class="${isError ? 'text-rose-800' : 'text-slate-600'} space-y-1.5">${bodyHtml}</div>
           ${cardsPillsHtml}
         </div>
       `;
@@ -1509,7 +525,7 @@
     }
 
     // =========================================================================
-    // Trace Workspace Card Management & Rendering (Clean White Theme)
+    // Trace Workspace Card Management & Real Live Refresh
     // =========================================================================
     function addTraceCard(type, title, data) {
       wsState.seqCounter += 1;
@@ -1517,12 +533,12 @@
       const cardObj = {
         id: `card_${Date.now()}_${wsState.seqCounter}`,
         seq: seqLabel,
-        type: type, // 'POOL_MAP' | 'THREAD_OWNER' | 'XRAY_BLUEPRINT' | 'SYMBOL_EVAL'
+        type: type,
         title: title,
         timestamp: new Date().toLocaleTimeString('ko-KR', { hour12: false }),
         pinned: false,
-        data: data,
-        selectedSlotIdx: type === 'POOL_MAP' ? (data.pool_summary?.allocated_indices?.[0] ?? 9) : 0,
+        data: data || {},
+        selectedSlotIdx: type === 'POOL_MAP' ? (data?.pool_summary?.allocated_indices?.[0] ?? 0) : 0,
       };
       wsState.cards.unshift(cardObj);
       renderWorkspaceCards();
@@ -1537,22 +553,97 @@
       setTimeout(() => el.classList.remove('ring-2', 'ring-blue-500'), 1800);
     };
 
-    window.refreshTraceCard = function(cardId) {
+    window.refreshTraceCard = async function(cardId) {
       const card = wsState.cards.find(c => c.id === cardId);
       if (!card) return;
-      card.timestamp = new Date().toLocaleTimeString('ko-KR', { hour12: false });
-      if (card.type === 'POOL_MAP' && card.data && card.data.slots) {
-        card.data.slots.forEach(s => {
-          if (s.is_allocated && s.fields && typeof s.fields.seq === 'number') {
-            s.fields.seq += 1;
-          }
+      readTargetInputsIntoState();
+      const basePayload = {
+        pid: wsState.pid || card.data?.pid || undefined,
+        process_name: wsState.processName || undefined,
+        companion_elf: wsState.companionElf || undefined,
+        remote_host: wsState.remoteHost || undefined,
+        ssh_user: wsState.sshUser || undefined,
+      };
+
+      let freshData = null;
+      if (card.type === 'POOL_MAP') {
+        freshData = await callWorkspaceBackend('/api/watch/scan-pool', {
+          ...basePayload,
+          base_expression: card.data?.base_expression || card.data?.resolved_array_expression || '*gpMem',
         });
-      } else if (card.type === 'IPC_PIPELINE' && card.data && card.data.metrics) {
-        card.data.metrics.producer_seq = (card.data.metrics.producer_seq || 100) + 2;
-        card.data.metrics.consumer_seq = (card.data.metrics.consumer_seq || 90) + 1;
-        card.data.metrics.pending_backlog = Math.max(0, card.data.metrics.producer_seq - card.data.metrics.consumer_seq);
+      } else if (card.type === 'THREAD_OWNER') {
+        freshData = await callWorkspaceBackend('/api/watch/find-owners', {
+          ...basePayload,
+          target_expression: card.data?.target_expression || 'gpMem->buffers[0]',
+        });
+      } else if (card.type === 'XRAY_BLUEPRINT') {
+        freshData = await callWorkspaceBackend('/api/watch/xray-blueprint', basePayload);
+      } else if (card.type === 'DPDK_LCORE_INSPECTOR') {
+        freshData = await callWorkspaceBackend('/api/watch/dpdk-lcores', basePayload);
+      } else if (card.type === 'TLS_INSPECTOR') {
+        freshData = await callWorkspaceBackend('/api/watch/tls-storage', basePayload);
+      } else if (card.type === 'CONCURRENCY_VERIFIER') {
+        freshData = await callWorkspaceBackend('/api/watch/verify-consistency', basePayload);
+      } else if (card.type === 'FLIGHT_RECORDER') {
+        freshData = await callWorkspaceBackend('/api/watch/flight-recorder', basePayload);
+      } else if (card.type === 'BEHAVIORAL_DRIFT') {
+        freshData = await callWorkspaceBackend('/api/watch/behavioral-drift', basePayload);
+      } else if (card.type === 'STATISTICAL_HOTSPOTS') {
+        freshData = await callWorkspaceBackend('/api/watch/statistical-hotspots', basePayload);
+      } else if (card.type === 'SYMPTOM_INVESTIGATION') {
+        freshData = await callWorkspaceBackend('/api/watch/investigate-symptom', {
+          ...basePayload,
+          symptom_query: card.data?.symptom_query || '실시간 상태 재진단',
+        });
+      } else if (card.type === 'DEPENDENCY_GRAPH') {
+        freshData = await callWorkspaceBackend('/api/watch/dependency-graph', basePayload);
+      } else if (card.type === 'SOURCE_CORRELATION') {
+        freshData = await callWorkspaceBackend('/api/watch/correlate-source', basePayload);
+      } else if (card.type === 'IPC_PIPELINE') {
+        freshData = await callWorkspaceBackend('/api/watch/ipc-pipeline', basePayload);
+      } else if (card.type === 'HEAP_SCANNER') {
+        freshData = await callWorkspaceBackend('/api/watch/scan-heap', basePayload);
+      } else if (card.type === 'AUTO_TRIAGE') {
+        freshData = await callWorkspaceBackend('/api/watch/auto-triage', basePayload);
+      } else if (card.type === 'FRAME_LOCALS') {
+        freshData = await callWorkspaceBackend('/api/watch/frame-locals', basePayload);
+      } else if (card.type === 'CALLSTACK_AND_LOCKS') {
+        freshData = await callWorkspaceBackend('/api/watch/callstack-locks', basePayload);
+      } else if (card.type === 'MEMORY_AUDIT') {
+        freshData = await callWorkspaceBackend('/api/watch/audit-integrity', basePayload);
+      } else if (card.type === 'LINKED_LIST_CHAIN') {
+        freshData = await callWorkspaceBackend('/api/watch/traverse-list', {
+          ...basePayload,
+          head_expression: card.data?.head_expression || 'g_task_list',
+        });
+      } else if (card.type === 'HYPOTHESIS_VERIFIER') {
+        freshData = await callWorkspaceBackend('/api/watch/verify-hypothesis', {
+          ...basePayload,
+          hypothesis: card.data?.hypothesis || card.title,
+          assertions: (card.data?.assertion_results || []).map(a => a.assertion),
+        });
+      } else if (card.type === 'SMART_COMPACT') {
+        freshData = await callWorkspaceBackend('/api/watch/smart-compact', {
+          ...basePayload,
+          query: card.data?.query || '*gpMem',
+        });
+      } else if (card.type === 'SYMBOL_EVAL') {
+        const exprs = (card.data?.results || []).map(r => r.expression).filter(Boolean);
+        if (exprs.length > 0) {
+          freshData = await callWorkspaceBackend('/api/watch/eval-paths', {
+            ...basePayload,
+            expressions: exprs,
+          });
+        }
       }
-      renderWorkspaceCards();
+
+      if (freshData) {
+        card.data = freshData;
+        card.timestamp = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+        renderWorkspaceCards();
+      } else if (wsState.lastError) {
+        showToast(`새로고침 실패: ${wsState.lastError.message}`, true);
+      }
     };
 
     window.toggleLiveWatchCard = function(cardId) {
@@ -1563,7 +654,7 @@
         card._timer = setInterval(() => {
           window.refreshTraceCard(cardId);
         }, 1000);
-        showToast(`#${card.seq} 카드 1초 실시간 감시 시작`);
+        showToast(`#${card.seq} 카드 1초 주기 실제 프로세스 메모리 폴링 시작`);
       } else {
         if (card._timer) clearInterval(card._timer);
         card._timer = null;
@@ -2661,8 +1752,115 @@
         `;
       }
 
+      if (card.type === "HYPOTHESIS_VERIFIER") {
+        const results = d.assertion_results || [];
+        const vBadge = d.verdict === "CONFIRMED"
+          ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+          : (d.verdict === "PARTIALLY_CONFIRMED" ? "bg-amber-50 text-amber-800 border-amber-200" : "bg-rose-50 text-rose-800 border-rose-200");
+        return `
+          <div class="space-y-3 text-xs">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <div>
+                <div class="text-[10px] text-slate-500">선언적 가설 검증 (Declarative Multi-Assertion Verifier)</div>
+                <div class="font-bold text-slate-900 mt-0.5">${escapeHtml(d.hypothesis || "")}</div>
+              </div>
+              <span class="px-2.5 py-1 rounded-lg border font-bold ${vBadge}">
+                ${escapeHtml(d.verdict)} (${d.passed_assertions ?? d.passed_count ?? 0}/${d.total_assertions ?? d.assertions_total ?? 0} passed)
+              </span>
+            </div>
+            <div class="space-y-1.5">
+              ${results.map(r => `
+                <div class="bg-white border border-slate-200 rounded-xl p-2.5 flex flex-wrap items-center justify-between gap-2 mono text-[11px]">
+                  <div>
+                    <span class="font-bold ${r.passed ? 'text-emerald-700' : 'text-rose-700'}">${r.passed ? '✓ PASS' : '✗ FAIL'}</span>
+                    <strong class="text-slate-900 ml-1.5">${escapeHtml(r.assertion)}</strong>
+                    ${r.canonical_lhs && r.canonical_lhs !== r.lhs ? `<span class="text-cyan-700 ml-1">(➔ ${escapeHtml(r.canonical_lhs)})</span>` : ''}
+                  </div>
+                  <div class="text-slate-600">
+                    관측값: <strong class="text-slate-900">${escapeHtml(JSON.stringify(r.observed_value))}</strong> · 기대조건: ${escapeHtml(r.operator)} ${escapeHtml(String(r.expected_rhs ?? ""))}
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "SMART_COMPACT") {
+        const tb = d.token_budget_meta || {};
+        const pg = tb.pagination || {};
+        const items = d.slots || d.results || [];
+        return `
+          <div class="space-y-2.5 text-xs">
+            <div class="bg-emerald-50/70 border border-emerald-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <div>
+                <span class="text-slate-600">질의:</span> <strong>${escapeHtml(d.base_expression || d.resolved_array_expression || "*gpMem")}</strong>
+                <span class="mx-1.5">·</span>
+                <span class="text-slate-600">활성/이상 항목:</span> <strong>${pg.total_active_items ?? items.length} / ${pg.total_raw_items ?? items.length}</strong> (생략됨: ${tb.omitted_zero_or_free_count ?? 0})
+              </div>
+              <span class="px-2 py-0.5 rounded bg-white border border-emerald-300 text-emerald-800 text-[11px] font-bold">
+                Tokens: ${tb.compacted_estimated_tokens ?? 0} / ${tb.max_tokens_requested ?? 600} (-${tb.token_reduction_pct ?? 0}%)
+              </span>
+            </div>
+            <pre class="text-[11px] mono bg-slate-900 text-slate-100 rounded-xl p-3 overflow-x-auto max-h-60">${escapeHtml(JSON.stringify(items, null, 2))}</pre>
+          </div>
+        `;
+      }
+
+      if (card.type === "BATCH_MACRO") {
+        const steps = d.step_results || [];
+        return `
+          <div class="space-y-2.5 text-xs">
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <span>실행된 배치 스텝: <strong>${d.steps_succeeded ?? 0}/${d.steps_requested ?? 0} 성공</strong></span>
+              <span class="text-emerald-700 font-bold">0.00ms stop (${d.batch_latency_us ?? 0}us elapsed)</span>
+            </div>
+            <div class="space-y-2">
+              ${steps.map(st => `
+                <div class="bg-white border border-slate-200 rounded-xl p-2.5 mono text-[11px] space-y-1">
+                  <div class="flex items-center justify-between">
+                    <strong class="text-blue-700">${escapeHtml(st.step_id)}: ${escapeHtml(st.action)}</strong>
+                    <span class="px-2 py-0.5 rounded ${st.success ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'} font-bold">${st.success ? 'OK' : 'FAIL'} (${st.elapsed_us || 0}us)</span>
+                  </div>
+                  <pre class="bg-slate-50 p-2 rounded-lg overflow-x-auto text-slate-700 max-h-40">${escapeHtml(JSON.stringify(st.output || st.error, null, 2))}</pre>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      if (card.type === "INCIDENT_REPORT") {
+        return `
+          <div class="space-y-2.5 text-xs">
+            <div class="bg-slate-900 text-white rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
+              <div>
+                <div class="text-[10px] text-slate-400">One-Click Zero-Stop Incident Report</div>
+                <div class="font-bold">${escapeHtml(d.title || "Incident Report")} · Health ${d.health_score ?? 100}/100 (${escapeHtml(d.overall_status || "HEALTHY")})</div>
+              </div>
+              <button type="button" onclick="downloadIncidentMarkdownCard('${escapeHtml(card.id)}')" class="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-semibold">
+                💾 .md 다운로드
+              </button>
+            </div>
+            <pre class="text-[11px] mono bg-slate-50 border border-slate-200 rounded-xl p-3 overflow-x-auto max-h-72 text-slate-800">${escapeHtml(d.report_markdown || "")}</pre>
+          </div>
+        `;
+      }
+
       return renderSymbolOrDiffCardBody(card);
     }
+
+    window.downloadIncidentMarkdownCard = function(cardId) {
+      const card = wsState.cards.find(c => c.id === cardId);
+      if (!card || !card.data || !card.data.report_markdown) return;
+      const blob = new Blob([card.data.report_markdown], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `dynamicstate_incident_report_pid_${card.data.pid || wsState.pid || 'live'}.md`;
+      a.click();
+      URL.revokeObjectURL(url);
+    };
 
     function renderWorkspaceCards() {
       const container = document.getElementById('workspace-cards-container');
@@ -2713,6 +1911,10 @@
           SYMPTOM_INVESTIGATION: { label: 'AUTONOMOUS SYMPTOM RCA', cls: 'bg-slate-900 text-white border-slate-900' },
           DEPENDENCY_GRAPH: { label: 'CAUSAL DEPENDENCY GRAPH', cls: 'bg-indigo-50 text-indigo-800 border-indigo-200' },
           SOURCE_CORRELATION: { label: 'SOURCE & LIVE STATE', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+          HYPOTHESIS_VERIFIER: { label: 'DECLARATIVE HYPOTHESIS VERIFIER', cls: 'bg-indigo-50 text-indigo-800 border-indigo-200' },
+          SMART_COMPACT: { label: 'TOKEN-BUDGET SMART COMPACT', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+          BATCH_MACRO: { label: '1-CALL COMPOSITE BATCH MACRO', cls: 'bg-blue-50 text-blue-800 border-blue-200' },
+          INCIDENT_REPORT: { label: 'INCIDENT REPORT (.MD)', cls: 'bg-slate-900 text-white border-slate-900' },
         };
         const tBadge = typeBadgeMap[card.type] || typeBadgeMap.SYMBOL_EVAL;
 
@@ -2720,7 +1922,7 @@
         if (card.type === 'POOL_MAP') bodyContent = renderPoolMapCardBody(card);
         else if (card.type === 'THREAD_OWNER') bodyContent = renderThreadOwnerCardBody(card);
         else if (card.type === 'XRAY_BLUEPRINT') bodyContent = renderBlueprintCardBody(card);
-        else if (['DPDK_LCORE_INSPECTOR', 'TLS_INSPECTOR', 'CONCURRENCY_VERIFIER', 'FLIGHT_RECORDER', 'BEHAVIORAL_DRIFT', 'STATISTICAL_HOTSPOTS', 'FUZZY_INTENT_RESOLVER', 'SYMPTOM_INVESTIGATION', 'DEPENDENCY_GRAPH', 'SOURCE_CORRELATION', 'IPC_PIPELINE', 'HEAP_SCANNER', 'AUTO_TRIAGE', 'FRAME_LOCALS', 'CONDITION_TRIGGER', 'LINKED_LIST_CHAIN', 'CALLSTACK_AND_LOCKS', 'MEMORY_AUDIT', 'CODE_POINTERS', 'SHARED_MEMORY_IPC'].includes(card.type)) bodyContent = renderPhase10CardBody(card);
+        else if (['DPDK_LCORE_INSPECTOR', 'TLS_INSPECTOR', 'CONCURRENCY_VERIFIER', 'FLIGHT_RECORDER', 'BEHAVIORAL_DRIFT', 'STATISTICAL_HOTSPOTS', 'FUZZY_INTENT_RESOLVER', 'SYMPTOM_INVESTIGATION', 'DEPENDENCY_GRAPH', 'SOURCE_CORRELATION', 'IPC_PIPELINE', 'HEAP_SCANNER', 'AUTO_TRIAGE', 'FRAME_LOCALS', 'CONDITION_TRIGGER', 'LINKED_LIST_CHAIN', 'CALLSTACK_AND_LOCKS', 'MEMORY_AUDIT', 'CODE_POINTERS', 'SHARED_MEMORY_IPC', 'HYPOTHESIS_VERIFIER', 'SMART_COMPACT', 'BATCH_MACRO', 'INCIDENT_REPORT'].includes(card.type)) bodyContent = renderPhase10CardBody(card);
         else bodyContent = renderSymbolOrDiffCardBody(card);
 
         const cardEl = document.createElement('div');
@@ -2756,18 +1958,14 @@
       const prompt = (rawPrompt || '').trim();
       if (!prompt) return;
 
-      wsState.pid = parseInt(document.getElementById('input-target-pid').value, 10) || 8842;
-      wsState.companionElf = document.getElementById('input-companion-elf').value.trim() || '/build/pool_target_nostrip';
-      wsState.remoteHost = document.getElementById('input-remote-host').value.trim();
-      wsState.sshUser = document.getElementById('input-ssh-user').value.trim() || 'root';
-
+      readTargetInputsIntoState();
       appendUserChatMessage(prompt);
 
-      // 1. Try unified backend `/api/workspace/chat` first
       const backendData = await callWorkspaceBackend('/api/workspace/chat', {
         message: prompt,
-        pid: wsState.pid,
-        companion_elf: wsState.companionElf,
+        pid: wsState.pid > 0 ? wsState.pid : undefined,
+        process_name: wsState.processName || undefined,
+        companion_elf: wsState.companionElf || undefined,
         remote_host: wsState.remoteHost || undefined,
         ssh_user: wsState.sshUser || undefined,
       });
@@ -2782,239 +1980,128 @@
           updateTelemetryStrip(backendData.telemetry);
         }
         appendAssistantChatMessage(
-          backendData.title || '프로세스 트레이스 분석 완료',
+          backendData.title || '프로세스 트레이스 분석 완료 (0.00ms 무정지)',
           `<p>${escapeHtml(backendData.reply_markdown || '')}</p>`,
-          addedCards
+          addedCards,
+          false
         );
         return;
       }
 
-      // 2. Client-side intent routing (calls REST endpoints or falls back to built-in simulation)
-      const pLow = prompt.toLowerCase();
-      const wantsDpdk = pLow.includes('dpdk') || pLow.includes('lcore') || pLow.includes('pmd') || pLow.includes('isolcpus') || pLow.includes('격리 코어') || pLow.includes('dedicated') || pLow.includes('rte_ring');
-      const wantsTls = pLow.includes('tls') || pLow.includes('thread_local') || pLow.includes('__thread') || pLow.includes('스레드별') || pLow.includes('tcb');
-      const wantsSeqlock = pLow.includes('seqlock') || pLow.includes('이중 읽기') || pLow.includes('일관성') || pLow.includes('원자성') || pLow.includes('torn read');
-      const wantsFlightRecorder = pLow.includes('타임머신') || pLow.includes('플라이트 레코더') || pLow.includes('스파이크') || pLow.includes('방금 잠깐') || pLow.includes('링버퍼');
-      const wantsDrift = pLow.includes('행동 편차') || pLow.includes('drift') || pLow.includes('평소') || pLow.includes('baseline 대비');
-      const wantsHotspots = pLow.includes('핫스팟') || pLow.includes('프로파일') || pLow.includes('flame') || pLow.includes('cpu 점유') || pLow.includes('통계적');
-      const wantsFuzzy = pLow.includes('퍼지') || pLow.includes('의미 매칭') || pLow.includes('알아서 찾아');
-      const wantsSymptom = pLow.includes('왜 멈췄') || pLow.includes('자율 종합') || pLow.includes('증상') || pLow.includes('종합 판단') || pLow.includes('응답이 없');
-      const wantsDepGraph = pLow.includes('인과 종속성') || pLow.includes('종속성 그래프') || pLow.includes('의존성 그래프') || pLow.includes('dependency');
-      const wantsSourceCorr = pLow.includes('소스 코드') || pLow.includes('인라인') || pLow.includes('변수 매핑');
-      const wantsIpcPipeline = pLow.includes('파이프라인') || pLow.includes('프로듀서') || pLow.includes('컨슈머') || pLow.includes('병목');
-      const wantsHeapScan = pLow.includes('힙') || pLow.includes('heap') || pLow.includes('누수') || pLow.includes('leak');
-      const wantsTriage = pLow.includes('종합 진단') || pLow.includes('원클릭') || pLow.includes('triage');
-      const wantsFrameLocals = pLow.includes('지역변수') || pLow.includes('지역 변수') || pLow.includes('인자') || pLow.includes('스택 프레임');
-      const wantsCondition = pLow.includes('조건') || pLow.includes('순간') || pLow.includes('포착') || pLow.includes('>=') || pLow.includes('==');
-      const wantsLinked = pLow.includes('연결 리스트') || pLow.includes('체인') || pLow.includes('순회') || pLow.includes('사이클');
-      const wantsCallstack = pLow.includes('콜스택') || pLow.includes('데드락') || pLow.includes('뮤텍스') || pLow.includes('락');
-      const wantsAudit = pLow.includes('무결성') || pLow.includes('감사') || pLow.includes('오염') || pLow.includes('audit');
-      const wantsCodePtr = pLow.includes('함수 포인터') || pLow.includes('콜백') || pLow.includes('vtable');
-      const wantsShm = pLow.includes('공유 메모리') || pLow.includes('shm') || pLow.includes('ipc');
-      const wantsPoolMap = (pLow.includes('맵') || pLow.includes('pool') || pLow.includes('할당') || pLow.includes('buffer') || pLow.includes('버퍼')) && !wantsCondition && !wantsAudit;
-      const wantsThreadOwner = pLow.includes('쓰레드') || pLow.includes('스레드') || pLow.includes('thread') || pLow.includes('누가') || pLow.includes('사용 중인') || pLow.includes('점유') || pLow.includes('인덱스') || pLow.includes('워커');
-      const wantsDiff = pLow.includes('diff') || pLow.includes('전후') || pLow.includes('변화') || pLow.includes('비교');
-      const wantsBlueprint = pLow.includes('블루프린트') || pLow.includes('blueprint') || pLow.includes('연결') || pLow.includes('x-ray') || pLow.includes('구조');
+      const errObj = wsState.lastError || {
+        code: 'NO_TRACE_DATA',
+        message: '타겟 프로세스로부터 트레이스 데이터를 가져오지 못했습니다.',
+      };
 
-      const createdCards = [];
+      const helpHtml = `
+        <p><strong>[${escapeHtml(errObj.code)}]</strong> ${escapeHtml(errObj.message)}</p>
+        <p class="text-[11px] mt-1">
+          상단 입력창에 실행 중인 <strong>PID</strong> 또는 <strong>프로세스명</strong>을 입력하거나
+          <button type="button" onclick="openProcessDiscoveryDrawer()" class="underline font-semibold">🔍 프로세스 탐색</button>을 눌러 실행 중인 C/C++ 타겟 프로세스를 선택해 주세요.
+          (바이너리 자체가 DWARF 디버그 섹션을 포함한 경우 ELF 경로는 비워두어도 <code>/proc/&lt;pid&gt;/exe</code>에서 자동 탐색됩니다.)
+        </p>
+      `;
+      appendAssistantChatMessage('실시간 타겟 연결 또는 DWARF 심볼 확인 필요', helpHtml, [], true);
+      showToast(errObj.message, true);
+    }
 
-      if (wantsBlueprint && !wantsPoolMap && !wantsThreadOwner) {
-        let bpData = await callWorkspaceBackend('/api/watch/xray-blueprint', {
-          pid: wsState.pid,
-          companion_elf: wsState.companionElf,
-          remote_host: wsState.remoteHost || undefined,
-        });
-        if (!bpData) bpData = buildSimulatedBlueprintData();
+    async function syncActiveContextFromServer(autoLoadBlueprint = false) {
+      const ctx = await callWorkspaceBackend('/api/watch/active-context', {});
+      if (ctx && ctx.is_bound && ctx.pid) {
+        syncStateIntoInputs(ctx);
         updateTelemetryStrip({
-          pid: bpData.pid,
-          build_id: bpData.build_id || '8f4b2c91e07a',
-          load_bias: bpData.load_bias || '0x55a00000',
-          threads_count: bpData.threads_count || 4,
+          pid: ctx.pid,
+          build_id: ctx.build_id || '-',
         });
-        const card = addTraceCard('XRAY_BLUEPRINT', `PID ${bpData.pid} X-Ray 블루프린트 & 활성 스레드`, bpData);
-        createdCards.push(card);
-        appendAssistantChatMessage(
-          `PID ${bpData.pid} 프로세스 X-Ray 블루프린트 확인 완료`,
-          `<p>대상 프로세스(<code>PID ${bpData.pid}</code>)를 멈추지 않고(0.00ms) 활성 스레드 <strong>${bpData.threads_count}개</strong>와 DWARF 전역 메모리 풀/워커 심볼들을 분류해 오른쪽 워크스페이스에 추가했습니다.</p>`,
-          createdCards
-        );
-        return;
-      }
-
-      if (wantsPoolMap) {
-        const exprMatch = prompt.match(/(\*[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*(?:->|\.)[A-Za-z_][A-Za-z0-9_]*|gpMem|g_pool_storage)/);
-        const baseExpr = exprMatch ? exprMatch[1] : '*gpMem';
-        let poolData = await callWorkspaceBackend('/api/watch/scan-pool', {
-          pid: wsState.pid,
-          companion_elf: wsState.companionElf,
-          base_expression: baseExpr,
-          remote_host: wsState.remoteHost || undefined,
-        });
-        if (!poolData) poolData = buildSimulatedPoolData(baseExpr);
-        updateTelemetryStrip({ pid: poolData.pid, build_id: '8f4b2c91e07a', load_bias: '0x55a00000', threads_count: 4 });
-        const card = addTraceCard('POOL_MAP', `${poolData.resolved_array_expression} 메모리 풀 할당 현황 맵 (${poolData.pool_summary.allocated_count}/${poolData.pool_summary.total_slots})`, poolData);
-        createdCards.push(card);
-      }
-
-      if (wantsThreadOwner) {
-        let targetExpr = 'gpMem->buffers[9]';
-        const explicitIdxMatch = prompt.match(/([A-Za-z_][A-Za-z0-9_>-]*\[\d+\])/);
-        const koreanIdxMatch = prompt.match(/(\d+)\s*번/);
-        if (explicitIdxMatch) {
-          targetExpr = explicitIdxMatch[1];
-        } else if (koreanIdxMatch) {
-          targetExpr = `gpMem->buffers[${koreanIdxMatch[1]}]`;
+        showToast(`활성 타겟 세션 동기화 완료: PID ${ctx.pid}`);
+        if (autoLoadBlueprint && wsState.cards.length === 0) {
+          await handleUserPrompt('프로세스 연결 및 X-Ray 블루프린트를 확인해 주세요');
         }
-        let ownerData = await callWorkspaceBackend('/api/watch/find-owners', {
-          pid: wsState.pid,
-          companion_elf: wsState.companionElf,
-          target_expression: targetExpr,
-          remote_host: wsState.remoteHost || undefined,
-        });
-        if (!ownerData) ownerData = buildSimulatedOwnerData(targetExpr);
-        updateTelemetryStrip({ pid: ownerData.pid, build_id: '8f4b2c91e07a', load_bias: '0x55a00000', threads_count: ownerData.active_threads_checked || 4 });
-        const card = addTraceCard('THREAD_OWNER', `${ownerData.target_expression} 점유 스레드 역추적 결과`, ownerData);
-        createdCards.push(card);
+        return true;
       }
+      return false;
+    }
 
-      if (wantsDpdk) {
-        const dpdkData = buildSimulatedDpdkLcoreData();
-        createdCards.push(addTraceCard('DPDK_LCORE_INSPECTOR', `DPDK 격리 코어(lcore) & PMD 링 무정지 진단 (${dpdkData.overall_dpdk_status})`, dpdkData));
-      }
-      if (wantsTls) {
-        const tlsData = buildSimulatedTlsInspectorData();
-        createdCards.push(addTraceCard('TLS_INSPECTOR', `스레드별 TLS(thread_local) 변수 해독 (${tlsData.tls_variables_discovered} vars · ${tlsData.tcb_resolved_count} TCBs)`, tlsData));
-      }
-      if (wantsSeqlock) {
-        const seqData = buildSimulatedConcurrencyVerifierData();
-        createdCards.push(addTraceCard('CONCURRENCY_VERIFIER', `동시성 이중 읽기(Seqlock) 일관성 검증 (${seqData.overall_consistency_status})`, seqData));
-      }
-      if (wantsFlightRecorder) {
-        const frData = buildSimulatedFlightRecorderData();
-        createdCards.push(addTraceCard('FLIGHT_RECORDER', `타임머신 플라이트 레코더 (${frData.frames_recorded} frames)`, frData));
-      }
-      if (wantsDrift) {
-        const drData = buildSimulatedBehavioralDriftData();
-        createdCards.push(addTraceCard('BEHAVIORAL_DRIFT', `정상 Baseline 대비 행동 편차(Drift) 경보`, drData));
-      }
-      if (wantsHotspots) {
-        const hsData = buildSimulatedStatisticalHotspotsData();
-        createdCards.push(addTraceCard('STATISTICAL_HOTSPOTS', `무정지 통계적 CPU & 콜스택 핫스팟 프로파일러`, hsData));
-      }
-      if (wantsFuzzy) {
-        const fzData = buildSimulatedFuzzyIntentData(prompt);
-        createdCards.push(addTraceCard('FUZZY_INTENT_RESOLVER', `자연어 의도 기반 DWARF 심볼 자동 매칭`, fzData));
-      }
-      if (wantsSymptom) {
-        const symData = buildSimulatedSymptomInvestigationData(prompt);
-        createdCards.push(addTraceCard('SYMPTOM_INVESTIGATION', `증상 기반 자율 종합 조사 (${symData.classified_symptom})`, symData));
-      }
-      if (wantsDepGraph) {
-        const dgData = buildSimulatedDependencyGraphData();
-        createdCards.push(addTraceCard('DEPENDENCY_GRAPH', `스레드·락·버퍼·IPC 인과 종속성 그래프`, dgData));
-      }
-      if (wantsSourceCorr) {
-        const scData = buildSimulatedSourceCorrelationData();
-        createdCards.push(addTraceCard('SOURCE_CORRELATION', `소스 코드 & 실시간 메모리 변수 매핑`, scData));
-      }
-      if (wantsIpcPipeline) {
-        const ipcData = buildSimulatedIpcPipelineData();
-        createdCards.push(addTraceCard('IPC_PIPELINE', `멀티 프로세스 IPC 파이프라인 진단 (${ipcData.pipeline_health})`, ipcData));
-      }
-      if (wantsHeapScan) {
-        const hpData = buildSimulatedHeapScanData();
-        createdCards.push(addTraceCard('HEAP_SCANNER', `힙(Heap) C++ 객체 & 누수 스캔 (Leak의심 ${hpData.leaked_candidates_count}건)`, hpData));
-      }
-      if (wantsTriage) {
-        const trData = buildSimulatedAutoTriageData();
-        createdCards.push(addTraceCard('AUTO_TRIAGE', `원클릭 종합 진단 리포트 (Health ${trData.health_score}/100)`, trData));
-      }
-      if (wantsFrameLocals) {
-        const flData = buildSimulatedFrameLocalsData();
-        createdCards.push(addTraceCard('FRAME_LOCALS', `스레드 스택 프레임 인자 & 지역변수 해독`, flData));
-      }
-      if (wantsCondition) {
-        const condData = buildSimulatedConditionData("gpMem->active_buffers >= 5");
-        createdCards.push(addTraceCard('CONDITION_TRIGGER', `조건부 트리거 감시: ${condData.condition_expression}`, condData));
-      }
-      if (wantsLinked) {
-        const listData = buildSimulatedLinkedListData("g_task_list");
-        createdCards.push(addTraceCard('LINKED_LIST_CHAIN', `g_task_list 연결 리스트 순회 (${listData.nodes_count} nodes)`, listData));
-      }
-      if (wantsCallstack) {
-        const csData = buildSimulatedCallstackData();
-        createdCards.push(addTraceCard('CALLSTACK_AND_LOCKS', `무정지 스레드 콜스택 & 뮤텍스 분석`, csData));
-      }
-      if (wantsAudit) {
-        const auData = buildSimulatedAuditData();
-        createdCards.push(addTraceCard('MEMORY_AUDIT', `메모리 무결성 & 포인터 감사 (${auData.health_status})`, auData));
-      }
-      if (wantsCodePtr) {
-        const cpData = buildSimulatedCodePtrData();
-        createdCards.push(addTraceCard('CODE_POINTERS', `함수 포인터 & C++ vtable 심볼 해독`, cpData));
-      }
-      if (wantsShm) {
-        const shmData = buildSimulatedShmData();
-        createdCards.push(addTraceCard('SHARED_MEMORY_IPC', `공유 메모리(SHM) & 피어 프로세스 분석`, shmData));
-      }
-      if (wantsDiff && createdCards.length === 0) {
-        let diffData = await callWorkspaceBackend('/api/watch/capture-diff', {
-          pid: wsState.pid,
-          companion_elf: wsState.companionElf,
-          wait_ms: 500,
-        });
-        if (!diffData) diffData = buildSimulatedDiffData();
-        const card = addTraceCard('SYMBOL_EVAL', `500ms 전후 상태 변화(Diff) 트레이스`, diffData);
-        createdCards.push(card);
-      }
+    window.openProcessDiscoveryDrawer = async function() {
+      const drawer = document.getElementById('proc-discovery-drawer');
+      const procList = document.getElementById('proc-discovery-list');
+      drawer.classList.remove('hidden');
+      procList.innerHTML = '<span class="text-slate-500">실행 중인 프로세스 실시간 조회 중...</span>';
 
-      if (createdCards.length === 0) {
-        const symMatch = prompt.match(/(\*?[A-Za-z_][A-Za-z0-9_.\->\[\]]*)/);
-        const symExpr = symMatch ? symMatch[1] : '*gpMem';
-        let evalData = await callWorkspaceBackend('/api/watch/eval-paths', {
-          pid: wsState.pid,
-          companion_elf: wsState.companionElf,
-          expressions: [symExpr],
-        });
-        if (!evalData) {
-          const poolData = buildSimulatedPoolData('*gpMem');
-          const c = addTraceCard('POOL_MAP', `gpMem->buffers 메모리 풀 할당 현황 맵`, poolData);
-          createdCards.push(c);
-        } else {
-          const c = addTraceCard('SYMBOL_EVAL', `심볼 평가: ${symExpr}`, evalData);
-          createdCards.push(c);
-        }
-      }
-
-      // Summarize all added cards in the assistant reply
-      const summaryLines = createdCards.map(c => {
-        if (c.type === 'POOL_MAP') {
-          const s = c.data.pool_summary;
-          return `• <strong>${escapeHtml(c.data.resolved_array_expression)}</strong> 총 <strong>${s.total_slots}개</strong> 버퍼 중 <strong>${s.allocated_count}개(${s.utilization_pct}%)</strong>가 할당(IN_USE)되어 있습니다. 할당된 인덱스: <code>[${s.allocated_indices.join(', ')}]</code>`;
-        }
-        if (c.type === 'THREAD_OWNER') {
-          const mt = c.data.matched_threads || [];
-          if (mt.length > 0) {
-            const m0 = mt[0];
-            const ev0 = (m0.evidence && m0.evidence[0]) ? m0.evidence[0].detail : '';
-            return `• <strong>${escapeHtml(c.data.target_expression)}</strong> (<code>${escapeHtml(c.data.target_runtime_address)}</code>)를 사용 중인 스레드는 <strong>TID ${m0.tid} (${escapeHtml(m0.thread_name)})</strong>입니다.<br/><span class="text-slate-500 text-[11px]">증거: ${escapeHtml(ev0)}</span>`;
-          }
-          return `• <strong>${escapeHtml(c.data.target_expression)}</strong>를 현재 점유 중인 스레드가 없습니다.`;
-        }
-        return `• <strong>${escapeHtml(c.title)}</strong> 카드를 워크스페이스에 추가했습니다.`;
+      readTargetInputsIntoState();
+      const data = await callWorkspaceBackend('/api/target/find-processes', {
+        process_name: wsState.processName || '',
+        companion_elf: wsState.companionElf || undefined,
+        remote_host: wsState.remoteHost || undefined,
+        ssh_user: wsState.sshUser || undefined,
+        limit: 40,
       });
 
-      appendAssistantChatMessage(
-        '프로세스 메모리 트레이스 완료 (0.00ms 무정지)',
-        summaryLines.map(l => `<p>${l}</p>`).join(''),
-        createdCards
-      );
+      if (!data || !Array.isArray(data.processes) || data.processes.length === 0) {
+        const msg = wsState.lastError ? wsState.lastError.message : '조건에 맞는 실행 중 프로세스가 없습니다.';
+        procList.innerHTML = `<span class="text-rose-600">${escapeHtml(msg)}</span>`;
+        return;
+      }
+
+      procList.innerHTML = data.processes.map(p => {
+        const hasDwarf = Boolean(p.has_dwarf_info || p.build_id_match);
+        const badgeCls = p.build_id_match
+          ? 'border-emerald-300 text-emerald-900 bg-emerald-50/70 font-semibold'
+          : (hasDwarf ? 'border-blue-300 text-blue-900 bg-blue-50/60 font-medium' : 'border-slate-200 text-slate-700 bg-slate-50');
+        const exeStr = p.executable || '';
+        return `
+          <button
+            type="button"
+            onclick="selectDiscoveredProc(${p.pid}, '${escapeHtml(exeStr)}', ${hasDwarf})"
+            class="px-2.5 py-1 rounded-lg hover:bg-slate-100 border ${badgeCls} mono text-xs transition text-left"
+            title="${escapeHtml(p.cmdline || exeStr)}"
+          >
+            PID ${p.pid} · ${escapeHtml(p.name)}
+            ${p.build_id_match ? ' ✓ BuildID 일치' : (hasDwarf ? ' ★ DWARF 포함' : '')}
+          </button>
+        `;
+      }).join('');
+    };
+
+    window.selectDiscoveredProc = async function(pid, executablePath, hasDwarf) {
+      document.getElementById('input-target-pid').value = String(pid);
+      const elfInput = document.getElementById('input-companion-elf');
+      if (!elfInput.value.trim() && hasDwarf && executablePath) {
+        elfInput.value = executablePath;
+      }
+      document.getElementById('proc-discovery-drawer').classList.add('hidden');
+      showToast(`PID ${pid} 선택됨 — 프로세스 연결을 시작합니다`);
+      await connectToTargetProcess();
+    };
+
+    async function connectToTargetProcess() {
+      readTargetInputsIntoState();
+      if (!wsState.pid && !wsState.processName) {
+        showToast('연결할 PID 또는 프로세스명을 입력하거나 🔍 프로세스 탐색으로 선택해 주세요.', true);
+        await window.openProcessDiscoveryDrawer();
+        return;
+      }
+      const ctx = await callWorkspaceBackend('/api/watch/active-context', {
+        pid: wsState.pid > 0 ? wsState.pid : wsState.processName,
+        process_name: wsState.processName || undefined,
+        companion_elf: wsState.companionElf || undefined,
+        remote_host: wsState.remoteHost || undefined,
+        ssh_user: wsState.sshUser || undefined,
+      });
+      if (!ctx || !ctx.pid) {
+        const err = wsState.lastError ? wsState.lastError.message : '타겟 프로세스 바인딩 실패';
+        appendAssistantChatMessage('타겟 프로세스 연결 실패', `<p>${escapeHtml(err)}</p>`, [], true);
+        showToast(err, true);
+        return;
+      }
+      syncStateIntoInputs(ctx);
+      await handleUserPrompt('프로세스 연결 및 X-Ray 블루프린트를 확인해 주세요');
     }
 
     // =========================================================================
-    // Event Listeners & Initialization
+    // Event Listeners & Startup Initialization
     // =========================================================================
-    document.addEventListener('DOMContentLoaded', () => {
+    document.addEventListener('DOMContentLoaded', async () => {
       const selectMode = document.getElementById('select-target-mode');
       const sshWrap = document.getElementById('ssh-fields-wrap');
       selectMode.addEventListener('change', () => {
@@ -3028,7 +2115,6 @@
         }
       });
 
-      // Chat Form Submit
       const chatForm = document.getElementById('chat-form');
       const chatInput = document.getElementById('chat-input');
       chatForm.addEventListener('submit', async (e) => {
@@ -3049,7 +2135,6 @@
         }
       });
 
-      // Quick Prompt Chips
       document.querySelectorAll('.quick-prompt-chip').forEach(btn => {
         btn.addEventListener('click', () => {
           const p = btn.getAttribute('data-prompt');
@@ -3057,57 +2142,41 @@
         });
       });
 
-      // Connect Button
-      document.getElementById('btn-connect-target').addEventListener('click', () => {
-        handleUserPrompt('프로세스 연결 및 X-Ray 블루프린트를 확인해 주세요');
+      document.getElementById('btn-connect-target').addEventListener('click', async () => {
+        await connectToTargetProcess();
       });
 
-      // Demo Button (loads *gpMem Pool Map + gpMem[9] Thread Owner immediately)
-      document.getElementById('btn-load-demo').addEventListener('click', async () => {
-        await handleUserPrompt('memory pool *gpMem의 메모리 buffer개의 할당 현황을 맵 차트로 그려주고 gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요');
-      });
-
-      document.getElementById('btn-empty-pool-demo').addEventListener('click', () => {
-        handleUserPrompt('memory pool *gpMem의 메모리 buffer개의 할당 현황을 맵 차트로 그려주세요');
-      });
-
-      document.getElementById('btn-empty-owner-demo').addEventListener('click', () => {
-        handleUserPrompt('gpMem 9번 인덱스를 사용 중인 쓰레드를 찾아주세요');
-      });
-
-      // Find Processes Button
-      const drawer = document.getElementById('proc-discovery-drawer');
-      const procList = document.getElementById('proc-discovery-list');
-      document.getElementById('btn-find-proc').addEventListener('click', async () => {
-        drawer.classList.remove('hidden');
-        procList.innerHTML = '<span class="text-slate-500">프로세스 탐색 중...</span>';
-        const data = await callWorkspaceBackend('/api/target/find-processes', {
-          process_name: '',
-          companion_elf: document.getElementById('input-companion-elf').value.trim(),
-          remote_host: document.getElementById('input-remote-host').value.trim() || undefined,
+      const btnSync = document.getElementById('btn-sync-context');
+      if (btnSync) {
+        btnSync.addEventListener('click', async () => {
+          const ok = await syncActiveContextFromServer(true);
+          if (!ok) {
+            await window.openProcessDiscoveryDrawer();
+          }
         });
-        const procs = (data && data.processes) ? data.processes : [
-          { pid: 8842, name: 'pool_target_nostrip', cmdline: './pool_target_nostrip --workers 4', build_id_match: true },
-          { pid: 4120, name: 'media_daemon', cmdline: '/usr/bin/media_daemon -c /etc/media.conf', build_id_match: false },
-        ];
-        procList.innerHTML = procs.map(p => `
-          <button type="button" onclick="selectDiscoveredProc(${p.pid})" class="px-2.5 py-1 rounded-lg bg-slate-50 hover:bg-slate-100 border ${p.build_id_match ? 'border-emerald-300 text-emerald-800 bg-emerald-50/50' : 'border-slate-200 text-slate-700'} mono text-xs">
-            PID ${p.pid} · ${escapeHtml(p.name)} ${p.build_id_match ? '✓ BuildID 일치' : ''}
-          </button>
-        `).join('');
+      }
+
+      const btnEmptyFind = document.getElementById('btn-empty-find-proc');
+      if (btnEmptyFind) {
+        btnEmptyFind.addEventListener('click', () => window.openProcessDiscoveryDrawer());
+      }
+      const btnEmptyBp = document.getElementById('btn-empty-blueprint');
+      if (btnEmptyBp) {
+        btnEmptyBp.addEventListener('click', () => connectToTargetProcess());
+      }
+      const btnEmptyTr = document.getElementById('btn-empty-triage');
+      if (btnEmptyTr) {
+        btnEmptyTr.addEventListener('click', () => handleUserPrompt('프로세스 전체 상태를 원클릭 종합 진단(Auto-Triage)해 주세요'));
+      }
+
+      document.getElementById('btn-find-proc').addEventListener('click', () => {
+        window.openProcessDiscoveryDrawer();
       });
 
       document.getElementById('btn-close-proc-drawer').addEventListener('click', () => {
-        drawer.classList.add('hidden');
+        document.getElementById('proc-discovery-drawer').classList.add('hidden');
       });
 
-      window.selectDiscoveredProc = function(pid) {
-        document.getElementById('input-target-pid').value = String(pid);
-        drawer.classList.add('hidden');
-        showToast(`PID ${pid} 선택됨`);
-      };
-
-      // Filter Buttons
       document.querySelectorAll('.ws-filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
           wsState.activeFilter = btn.getAttribute('data-filter') || 'ALL';
@@ -3120,7 +2189,6 @@
         });
       });
 
-      // Auto-Triage Button
       const btnTriage = document.getElementById('btn-auto-triage');
       if (btnTriage) {
         btnTriage.addEventListener('click', () => {
@@ -3128,16 +2196,33 @@
         });
       }
 
-      // Export Markdown Report Button
+      // Export Real Incident Markdown Report Button via Backend `/api/watch/export-report`
       const btnExport = document.getElementById('btn-export-report');
       if (btnExport) {
-        btnExport.addEventListener('click', () => {
+        btnExport.addEventListener('click', async () => {
+          readTargetInputsIntoState();
+          const repData = await callWorkspaceBackend('/api/watch/export-report', {
+            pid: wsState.pid > 0 ? wsState.pid : undefined,
+            process_name: wsState.processName || undefined,
+            companion_elf: wsState.companionElf || undefined,
+            remote_host: wsState.remoteHost || undefined,
+            ssh_user: wsState.sshUser || undefined,
+            title: `dynamicState Zero-Stop Runtime Incident Report (PID ${wsState.pid || 'live'})`,
+          });
+
+          if (repData && repData.report_markdown) {
+            const c = addTraceCard('INCIDENT_REPORT', `원클릭 인시던트 분석 리포트 (Health ${repData.health_score}/100 · ${repData.overall_status})`, repData);
+            window.downloadIncidentMarkdownCard(c.id);
+            showToast('실시간 인시던트 마크다운 리포트(.md)를 생성하여 저장했습니다.');
+            return;
+          }
+
           if (wsState.cards.length === 0) {
-            showToast('내보낼 트레이스 카드가 없습니다.');
+            showToast(wsState.lastError ? wsState.lastError.message : '내보낼 트레이스 카드가 없습니다.', true);
             return;
           }
           const lines = [
-            `# dynamicState Process Trace Report (PID ${wsState.pid})`,
+            `# dynamicState Process Trace Report (PID ${wsState.pid || 'live'})`,
             `- Generated At: ${new Date().toISOString()}`,
             `- Stop Duration: 0.00ms (Zero-Stop)`,
             `- Total Cards: ${wsState.cards.length}`,
@@ -3154,19 +2239,24 @@
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
-          a.download = `dynamicstate_trace_pid_${wsState.pid}.md`;
+          a.download = `dynamicstate_trace_pid_${wsState.pid || 'live'}.md`;
           a.click();
           URL.revokeObjectURL(url);
-          showToast('트레이스 리포트(.md)를 저장했습니다.');
+          showToast('현재 워크스페이스 트레이스 리포트(.md)를 저장했습니다.');
         });
       }
 
-      // Clear Workspace Button (preserves pinned cards)
       document.getElementById('btn-clear-workspace').addEventListener('click', () => {
+        wsState.cards.forEach(c => {
+          if (!c.pinned && c._timer) clearInterval(c._timer);
+        });
         wsState.cards = wsState.cards.filter(c => c.pinned);
         renderWorkspaceCards();
         showToast('고정된 카드를 제외하고 워크스페이스를 비웠습니다.');
       });
+
+      // Automatically sync with backend ActiveTargetContext on page load
+      await syncActiveContextFromServer(true);
     });
   </script>
 </body>
