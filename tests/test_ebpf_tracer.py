@@ -5228,6 +5228,61 @@ class TestEbpfTracerUnit(unittest.TestCase):
                     success=succ, child_reaped=reaped, group_terminated=term, status=st, details="contradictory"
                 )
 
+    def test_83_trace_cleanup_uses_double_dash_and_safe_pgid(self):
+        """Verify that EbpfTracer.trace cleanup uses '--' delimiter to avoid procps kill option parsing bugs."""
+        tracer = EbpfTracer(use_sudo=True)
+        mock_proc = MagicMock()
+        mock_proc.pid = 1936537
+        mock_proc.poll.return_value = None  # simulate process still running during cleanup
+        mock_proc.wait.side_effect = [subprocess.TimeoutExpired(cmd=["wait"], timeout=2.0), None]
+        mock_proc.stdout.readline.return_value = "Attaching 1 probe...\n"
+        mock_proc.stdout.readlines.return_value = []
+        mock_proc.stderr.readline.return_value = ""
+
+        mock_ident = BinaryIdentity(
+            path="/bin/echo",
+            architecture="x86_64",
+            elf_class="ELF64",
+            endianness="little",
+            build_id="abcdef",
+            stripped=False,
+            pt_loads=[{"p_vaddr": 0x400000, "p_memsz": 0x1000, "p_offset": 0, "p_filesz": 0x1000}],
+        )
+
+        with patch("extractor.ebpf_tracer.inspect_elf", return_value=mock_ident), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.kill", return_value=None), \
+             patch("os.geteuid", return_value=1001), \
+             patch("select.select", return_value=([mock_proc.stdout], [], [])), \
+             patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
+             patch("subprocess.Popen", return_value=mock_proc), \
+             patch("subprocess.run") as mock_run:
+
+            mock_cap.return_value = EbpfCapabilityResult(
+                supported=True,
+                backend="bpftrace",
+                architecture="x86_64",
+                kernel_version="6.17",
+                is_privileged=True,
+                unprivileged_bpf_disabled=0,
+                has_bpf_fs=True,
+            )
+
+            tracer.trace(
+                pid=os.getpid(),
+                binary_path="/bin/echo",
+                function_name="0x400500",
+                duration_s=0.01,
+            )
+
+            # Both SIGINT and SIGKILL calls must have '--' before the -PGID argument
+            self.assertEqual(mock_run.call_count, 2)
+            first_cmd = mock_run.call_args_list[0][0][0]
+            second_cmd = mock_run.call_args_list[1][0][0]
+
+            self.assertEqual(first_cmd, ["sudo", "-n", "kill", "-INT", "--", "-1936537"])
+            self.assertEqual(second_cmd, ["sudo", "-n", "kill", "-KILL", "--", "-1936537"])
+
 
 if __name__ == "__main__":
     unittest.main()

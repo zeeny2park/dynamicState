@@ -2190,10 +2190,10 @@ class EbpfTracer:
             # Reliable attach/detach cleanup
             if proc:
                 try:
-                    if proc.poll() is None:
-                        # Send SIGINT to entire process group
+                    if proc.poll() is None and proc.pid and proc.pid > 1:
+                        # Send SIGINT to entire process group (-- prevents procps kill treating -PID as options)
                         if self.use_sudo and os.geteuid() != 0:
-                            subprocess.run(["sudo", "-n", "kill", "-INT", f"-{proc.pid}"], check=False)
+                            subprocess.run(["sudo", "-n", "kill", "-INT", "--", f"-{proc.pid}"], check=False)
                         else:
                             try:
                                 os.killpg(os.getpgid(proc.pid), signal.SIGINT)
@@ -2203,7 +2203,7 @@ class EbpfTracer:
                             proc.wait(timeout=2.0)
                         except subprocess.TimeoutExpired:
                             if self.use_sudo and os.geteuid() != 0:
-                                subprocess.run(["sudo", "-n", "kill", "-KILL", f"-{proc.pid}"], check=False)
+                                subprocess.run(["sudo", "-n", "kill", "-KILL", "--", f"-{proc.pid}"], check=False)
                             else:
                                 try:
                                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
