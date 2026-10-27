@@ -94,6 +94,7 @@ class TestMcpFirstPhase1(unittest.TestCase):
         cls.bin_path = os.path.join(cls.tmp_dir.name, "mcp_target")
         cls.stripped_bin_path = os.path.join(cls.tmp_dir.name, "mcp_target_stripped")
         cls.mismatch_bin_path = os.path.join(cls.tmp_dir.name, "mcp_target_mismatch")
+        cls.mismatch_stripped_bin_path = os.path.join(cls.tmp_dir.name, "mcp_target_mismatch_stripped")
 
         with open(cls.src_path, "w", encoding="utf-8") as f:
             f.write(REAL_CPP_FIXTURE)
@@ -114,6 +115,9 @@ class TestMcpFirstPhase1(unittest.TestCase):
             ["gcc", "-g", "-O0", "-Wl,--build-id=md5", cls.src_path, "-o", cls.mismatch_bin_path],
             check=True,
         )
+        shutil.copyfile(cls.mismatch_bin_path, cls.mismatch_stripped_bin_path)
+        os.chmod(cls.mismatch_stripped_bin_path, 0o755)
+        subprocess.run(["strip", "--strip-all", cls.mismatch_stripped_bin_path], check=True)
 
         # Launch live target process using stripped binary
         cls.proc = subprocess.Popen([cls.stripped_bin_path])
@@ -304,80 +308,130 @@ class TestMcpFirstPhase1(unittest.TestCase):
 
     def test_08_target_context_switching_and_precedence(self) -> None:
         """Verifies target switching (A -> B), explicit args precedence, and debug image isolation."""
-        # Connect target A
-        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        # Connect target A (compiled with sha1 build-id)
+        conn_a = json.loads(mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path))
+        self.assertTrue(conn_a["success"])
 
-        # Launch target B with mismatching binary
-        proc_b = subprocess.Popen([self.mismatch_bin_path])
+        # Launch target B_stripped (compiled with md5 build-id, stripped of DWARF)
+        proc_b_stripped = subprocess.Popen([self.mismatch_stripped_bin_path])
+        # Launch target B_debug (compiled with md5 build-id, with DWARF symbols)
+        proc_b_debug = subprocess.Popen([self.mismatch_bin_path])
         try:
-            time.sleep(0.1)
+            time.sleep(0.15)
 
-            # 1. Calling tool with explicit target B arguments must use target B (precedence)
+            # 1. While target A is bound, calling tool with explicit PID of stripped target B
+            # without companion ELF MUST NOT leak target A's companion ELF!
+            # Since B has no DWARF and its Build ID (md5) differs from A (sha1), it must definitively fail with DEBUG_IMAGE_NOT_FOUND
+            res_leak = json.loads(
+                mcp_srv.runtime_eval_memory_path(
+                    pid=proc_b_stripped.pid,
+                    expressions=["gpRegistry.magic"],
+                )
+            )
+            self.assertFalse(res_leak["success"])
+            self.assertEqual(res_leak["error_code"], "DEBUG_IMAGE_NOT_FOUND")
+
+            # 2. Calling tool with explicit target B arguments must use target B (precedence)
             res_b = json.loads(
                 mcp_srv.runtime_eval_memory_path(
-                    pid=proc_b.pid,
+                    pid=proc_b_debug.pid,
                     companion_elf=self.mismatch_bin_path,
                     expressions=["gpRegistry.magic"],
                 )
             )
             self.assertTrue(res_b["success"])
-            self.assertEqual(res_b["pid"], proc_b.pid)
+            self.assertEqual(res_b["pid"], proc_b_debug.pid)
+            self.assertEqual(res_b["companion_elf"], self.mismatch_bin_path)
 
-            # 2. Explicit PID of B without companion ELF must NOT leak target A's companion ELF if Build IDs differ
-            res_leak = json.loads(
+            # 3. Explicit PID of unstripped target B without companion ELF auto-discovers B's own image, never A's
+            res_autodisc = json.loads(
                 mcp_srv.runtime_eval_memory_path(
-                    pid=proc_b.pid,
+                    pid=proc_b_debug.pid,
                     expressions=["gpRegistry.magic"],
                 )
             )
-            # proc_b has md5 build id while target A has sha1 build id; if companion ELF could not be resolved from exe,
-            # it must reject rather than silently using target A's companion ELF
-            if not res_leak["success"]:
-                self.assertIn(res_leak["error_code"], ("DEBUG_IMAGE_NOT_FOUND", "BUILD_ID_MISMATCH", "NO_TARGET_SPECIFIED"))
+            self.assertTrue(res_autodisc["success"])
+            self.assertEqual(res_autodisc["pid"], proc_b_debug.pid)
+            self.assertNotEqual(res_autodisc["companion_elf"], self.bin_path)
 
-            # 3. Switching bound target to B: subsequent calls without PID must use B
+            # 4. Switching bound target to B: subsequent calls without PID must use B
             conn_b = json.loads(
-                mcp_srv.runtime_target_connect(pid=proc_b.pid, companion_elf=self.mismatch_bin_path)
+                mcp_srv.runtime_target_connect(pid=proc_b_debug.pid, companion_elf=self.mismatch_bin_path)
             )
             self.assertTrue(conn_b["success"])
-            self.assertEqual(conn_b["pid"], proc_b.pid)
+            self.assertEqual(conn_b["pid"], proc_b_debug.pid)
 
             res_switched = json.loads(mcp_srv.runtime_eval_memory_path(expressions=["gpRegistry.magic"]))
             self.assertTrue(res_switched["success"])
-            self.assertEqual(res_switched["pid"], proc_b.pid)
+            self.assertEqual(res_switched["pid"], proc_b_debug.pid)
+
+            # 5. Remote target isolation: bind remote target A context, verify local target B does not inherit remote params
+            mcp_srv.runtime.watch_session_manager._active_target_context["pid"] = self.proc.pid
+            mcp_srv.runtime.watch_session_manager._active_target_context["remote_host"] = "192.0.2.1"
+            mcp_srv.runtime.watch_session_manager._active_target_context["ssh_user"] = "remote_admin"
+            res_remote_iso = json.loads(
+                mcp_srv.runtime_eval_memory_path(
+                    pid=proc_b_debug.pid,
+                    companion_elf=self.mismatch_bin_path,
+                    expressions=["gpRegistry.magic"],
+                )
+            )
+            self.assertTrue(res_remote_iso["success"])
+            self.assertFalse(res_remote_iso.get("is_remote", False))
         finally:
-            if proc_b.poll() is None:
-                proc_b.terminate()
-                try:
-                    proc_b.wait(timeout=2)
-                except Exception:
-                    proc_b.kill()
+            for p in (proc_b_stripped, proc_b_debug):
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=2)
+                    except Exception:
+                        p.kill()
             # Restore target A context
             mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
 
     def test_09_input_boundaries_rejection(self) -> None:
-        """Verifies strict boundary validation: booleans, fractional floats, and missing target errors."""
-        # 1. Booleans must be rejected as PIDs
-        res_bool_t = json.loads(mcp_srv.runtime_capture_memory(pid=True))
-        self.assertFalse(res_bool_t["success"])
-        self.assertEqual(res_bool_t["error_code"], "INVALID_PID")
-        self.assertIn("boolean", res_bool_t["error"].lower())
+        """Verifies strict boundary validation: booleans, fractional floats, integral floats, and unexpected types."""
+        # 1. Booleans must be rejected as PIDs across public MCP entry points
+        for bad_bool in (True, False):
+            res_bool = json.loads(mcp_srv.runtime_capture_memory(pid=bad_bool))
+            self.assertFalse(res_bool["success"])
+            self.assertEqual(res_bool["error_code"], "INVALID_PID")
+            self.assertIn("boolean", res_bool["error"].lower())
 
-        res_bool_f = json.loads(mcp_srv.runtime_capture_memory(pid=False))
-        self.assertFalse(res_bool_f["success"])
-        self.assertEqual(res_bool_f["error_code"], "INVALID_PID")
+            res_eval_bool = json.loads(mcp_srv.runtime_eval_memory_path(pid=bad_bool, expressions=["x"]))
+            self.assertFalse(res_eval_bool["success"])
+            self.assertEqual(res_eval_bool["error_code"], "INVALID_PID")
 
         # 2. Fractional numeric PIDs must be rejected rather than truncated
-        res_float = json.loads(mcp_srv.runtime_capture_memory(pid=123.45))
-        self.assertFalse(res_float["success"])
-        self.assertEqual(res_float["error_code"], "INVALID_PID")
-        self.assertIn("fractional", res_float["error"].lower())
+        for bad_float in (123.45, "123.45", -10.5):
+            res_float = json.loads(mcp_srv.runtime_capture_memory(pid=bad_float))
+            self.assertFalse(res_float["success"])
+            self.assertEqual(res_float["error_code"], "INVALID_PID")
+            self.assertIn("fractional", res_float["error"].lower())
 
-        res_float_str = json.loads(mcp_srv.runtime_capture_memory(pid="123.45"))
-        self.assertFalse(res_float_str["success"])
-        self.assertEqual(res_float_str["error_code"], "INVALID_PID")
+        # 3. Integral floats and decimal strings are accepted as valid integers per compatibility policy
+        # (Pass through PID validation without error; they fail downstream on dead PID 999999)
+        res_int_float = json.loads(mcp_srv.runtime_capture_memory(pid=999999.0))
+        self.assertFalse(res_int_float["success"])
+        self.assertEqual(res_int_float["error_code"], "PROCESS_EXITED")
 
-        # 3. Missing target context produces NO_TARGET_SPECIFIED rather than generic INVALID_PID
+        res_int_str = json.loads(mcp_srv.runtime_capture_memory(pid="999999.0"))
+        self.assertFalse(res_int_str["success"])
+        self.assertEqual(res_int_str["error_code"], "PROCESS_EXITED")
+
+        # 4. Zero, negative, and reserved PID 1 must be rejected
+        for bad_pid in (0, -1, -99, 1, "0", "-5", "1"):
+            res_bad = json.loads(mcp_srv.runtime_capture_memory(pid=bad_pid))
+            self.assertFalse(res_bad["success"])
+            self.assertEqual(res_bad["error_code"], "INVALID_PID")
+
+        # 5. Malformed strings and unexpected types (list, dict)
+        for bad_type in ("not_a_number", [123], {"pid": 123}):
+            res_type = json.loads(mcp_srv.runtime_capture_memory(pid=bad_type))
+            self.assertFalse(res_type["success"])
+            self.assertEqual(res_type["error_code"], "INVALID_PID")
+
+        # 6. Missing target context produces NO_TARGET_SPECIFIED rather than generic INVALID_PID
         saved_ctx = dict(mcp_srv.runtime.watch_session_manager._active_target_context)
         try:
             mcp_srv.runtime.watch_session_manager._active_target_context.clear()
@@ -401,9 +455,11 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertFalse(c["is_atomic_read"])
         self.assertEqual(c["mechanism"], "ZERO_STOP_CONCURRENT_READ")
         self.assertEqual(c["causal_guarantee"], "NONE")
+        self.assertFalse(c["has_causal_guarantee"])
+        self.assertEqual(c["data_completeness"], "BEST_EFFORT_NON_ATOMIC")
 
     def test_11_batch_macro_failures_and_unknown_actions(self) -> None:
-        """Verifies runtime_batch_execute fails cleanly on unknown actions and sets partial_success appropriately."""
+        """Verifies runtime_batch_execute fails cleanly on unknown actions, structured step failures, and malformed inputs."""
         mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
 
         # 1. Unknown action does NOT fall back to natural language question; reports unsupported action error
@@ -412,6 +468,7 @@ class TestMcpFirstPhase1(unittest.TestCase):
         )
         unk = json.loads(raw_unk)
         self.assertFalse(unk["success"])
+        self.assertFalse(unk["partial_success"])
         self.assertEqual(unk["steps_failed"], 1)
         self.assertEqual(unk["error_code"], "ALL_STEPS_FAILED")
         self.assertIn("unsupported batch action", unk["step_results"][0]["error"].lower())
@@ -431,6 +488,44 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertEqual(mixed["steps_failed"], 1)
         self.assertIn("recovery_hint", mixed)
 
+        # 3. All steps succeed
+        raw_all_ok = mcp_srv.runtime_batch_execute(
+            steps=[
+                {"action": "eval", "expressions": ["gpRegistry.magic"]},
+                {"action": "callstack"},
+            ]
+        )
+        all_ok = json.loads(raw_all_ok)
+        self.assertTrue(all_ok["success"])
+        self.assertFalse(all_ok["partial_success"])
+        self.assertEqual(all_ok["steps_succeeded"], 2)
+        self.assertEqual(all_ok["steps_failed"], 0)
+
+        # 4. Malformed step input in list (e.g. integer or invalid item format)
+        raw_malformed = mcp_srv.runtime_batch_execute(
+            steps=[
+                {"action": "eval", "expressions": ["gpRegistry.magic"]},
+                99999,  # Malformed item in step array
+            ]
+        )
+        malformed = json.loads(raw_malformed)
+        self.assertFalse(malformed["success"])
+        self.assertTrue(malformed["partial_success"])
+        self.assertEqual(malformed["steps_requested"], 2)
+        self.assertEqual(malformed["steps_succeeded"], 1)
+        self.assertEqual(malformed["steps_failed"], 1)
+        self.assertIn("invalid step format", malformed["step_results"][1]["error"].lower())
+
+        # 5. Output-budget compact mode
+        raw_compact = mcp_srv.runtime_batch_execute(
+            steps=[{"action": "eval", "expressions": ["gpRegistry.magic"]}],
+            compact=True,
+            max_tokens_per_step=100,
+        )
+        compact_res = json.loads(raw_compact)
+        self.assertTrue(compact_res["success"])
+        self.assertTrue(compact_res["compact_mode"])
+
     def test_12_session_and_error_contract_standardization(self) -> None:
         """Verifies domain error codes (SESSION_NOT_FOUND) and context inheritance for baseline save."""
         # 1. Non-existent session returns SESSION_NOT_FOUND error code
@@ -449,6 +544,100 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertTrue(res_save["success"])
         self.assertEqual(res_save["pid"], self.proc.pid)
         self.assertIn("baseline_id", res_save)
+
+    def test_13_error_classification_determinism_table(self) -> None:
+        """Table-driven verification of _normalize_mcp_error determinism, collisions, and explicit code precedence."""
+        test_cases = [
+            # 1. Explicit domain codes must ALWAYS be preserved
+            ("Explicit INVALID_PID preserved", "Target PID is required", "INVALID_PID", "INVALID_PID"),
+            ("Explicit NO_TARGET_SPECIFIED preserved", "Invalid target PID", "NO_TARGET_SPECIFIED", "NO_TARGET_SPECIFIED"),
+            ("Explicit BUILD_ID_MISMATCH preserved", "Debug image not found", "BUILD_ID_MISMATCH", "BUILD_ID_MISMATCH"),
+            ("Explicit SESSION_NOT_FOUND preserved", "Snapshot not found", "SESSION_NOT_FOUND", "SESSION_NOT_FOUND"),
+
+            # 2. Heuristic resolution of collisions
+            ("Missing target PID", "No target PID provided and no target session bound", "ValueError", "NO_TARGET_SPECIFIED"),
+            ("Target PID required", "Target PID is required and must be an integer > 1", None, "NO_TARGET_SPECIFIED"),
+            ("Invalid boolean PID", "Invalid target PID: boolean values are not valid PIDs", "ValueError", "INVALID_PID"),
+            ("Fractional PID", "Invalid fractional PID 123.45: PID must be an integer > 1", "ValueError", "INVALID_PID"),
+            ("Reserved PID", "Invalid or reserved system PID 1: PID must be an integer > 1", "ValueError", "INVALID_PID"),
+            ("Unsupported PID type", "Unsupported PID type: list", "ValueError", "INVALID_PID"),
+
+            # 3. Build-id mismatch vs Debug image not found
+            ("Build-id mismatch format", "Target process '123' running executable has build-id 'abc', but companion image 'x' has build-id 'def'. Mismatched symbols rejected.", "ValueError", "BUILD_ID_MISMATCH"),
+            ("Companion ELF not found", "Companion ELF with DWARF debug info could not be resolved for PID 123.", "ValueError", "DEBUG_IMAGE_NOT_FOUND"),
+            ("Debug image missing file", "Debug image not found at '/tmp/foo'", "FileNotFoundError", "DEBUG_IMAGE_NOT_FOUND"),
+
+            # 4. Session vs Snapshot vs Object
+            ("Session not found", "Session 'sess_999' not found", "ValueError", "SESSION_NOT_FOUND"),
+            ("Snapshot not found", "Snapshot 'snap_888' not found", "ValueError", "SNAPSHOT_NOT_FOUND"),
+            ("Object not found", "Object 'obj_777' not found", "ValueError", "OBJECT_NOT_FOUND"),
+
+            # 5. Process exit vs Permission denied
+            ("Process exited", "Process 123 exited with status 0", "RuntimeError", "PROCESS_EXITED"),
+            ("Permission denied", "Permission denied: unable to access /proc/123/mem", "PermissionError", "PERMISSION_DENIED"),
+
+            # 6. Unsupported capability
+            ("Unsupported batch action", "Unsupported batch action 'bad_act'. Supported actions: ...", "ValueError", "UNSUPPORTED_CAPABILITY"),
+
+            # 7. Timeout vs incidental word in variable name
+            ("Real timeout", "Operation timed out after 5000ms", "TimeoutError", "TIMEOUT"),
+            ("Incidental timeout substring", "Syntax error near token timeout_counter", "SyntaxError", "SyntaxError"),
+
+            # 8. Distinguishable unknown exceptions
+            ("Unknown disk error", "Disk quota exceeded", "IOError", "IOError"),
+            ("Empty message with custom code", "", "CustomDriverException", "CustomDriverException"),
+        ]
+
+        for desc, msg, explicit_code, expected_code in test_cases:
+            code, hint = mcp_srv._normalize_mcp_error(msg, explicit_code=explicit_code)
+            self.assertEqual(code, expected_code, f"Failed on case '{desc}': expected {expected_code}, got {code}")
+            if expected_code in ("IOError", "CustomDriverException", "SyntaxError"):
+                self.assertIsNone(hint, f"Case '{desc}' should not fabricate a recovery hint")
+            else:
+                self.assertIsNotNone(hint, f"Case '{desc}' should provide a recovery hint for domain code {expected_code}")
+
+    def test_14_golden_baseline_context_behavior(self) -> None:
+        """Verifies golden baseline context resolution, Build ID compatibility, and serialization immutability."""
+        # 1. Bound target context: save baseline with no explicit PID or image
+        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        raw_b1 = mcp_srv.runtime_golden_baseline_save(label="Baseline_1")
+        b1 = json.loads(raw_b1)
+        self.assertTrue(b1["success"])
+        self.assertEqual(b1["pid"], self.proc.pid)
+        base_id = b1["baseline_id"]
+
+        # 2. Compare baseline with valid bound target
+        raw_cmp = mcp_srv.runtime_golden_baseline_compare(baseline_id=base_id)
+        cmp_res = json.loads(raw_cmp)
+        self.assertTrue(cmp_res["success"])
+        self.assertEqual(cmp_res["pid"], self.proc.pid)
+
+        # 3. Explicit mismatching image must reject with BUILD_ID_MISMATCH
+        raw_mismatch = mcp_srv.runtime_golden_baseline_save(
+            pid=self.proc.pid,
+            companion_elf=self.mismatch_bin_path,
+            label="Baseline_Mismatch",
+        )
+        res_mismatch = json.loads(raw_mismatch)
+        self.assertFalse(res_mismatch["success"])
+        self.assertEqual(res_mismatch["error_code"], "BUILD_ID_MISMATCH")
+
+        # 4. Missing target context when unbound must reject with NO_TARGET_SPECIFIED
+        saved_ctx = dict(mcp_srv.runtime.watch_session_manager._active_target_context)
+        try:
+            mcp_srv.runtime.watch_session_manager._active_target_context.clear()
+            raw_unbound = mcp_srv.runtime_golden_baseline_save(label="Unbound")
+            unbound = json.loads(raw_unbound)
+            self.assertFalse(unbound["success"])
+            self.assertEqual(unbound["error_code"], "NO_TARGET_SPECIFIED")
+        finally:
+            mcp_srv.runtime.watch_session_manager._active_target_context = saved_ctx
+
+        # 5. Immutability of caller-owned dictionary during serialization
+        caller_dict = {"success": False, "error": "Test failure", "original_key": 42}
+        _ = mcp_srv._format_watch_result(caller_dict)
+        self.assertNotIn("error_code", caller_dict, "Serialization must not mutate caller-owned dictionary in place")
+        self.assertEqual(caller_dict["original_key"], 42)
 
 
 if __name__ == "__main__":

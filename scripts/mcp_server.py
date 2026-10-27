@@ -49,7 +49,14 @@ import functools
 
 def _validate_mcp_pid(pid: Any, allow_none: bool = True) -> Optional[int]:
     """Validates and normalizes a PID parameter for MCP tools.
-    Strictly rejects booleans, fractional numbers, negative numbers, PID 0 (when required), and PID 1 (init/systemd).
+    
+    Compatibility Policy:
+    - Rejects booleans (`True`/`False` are not valid PIDs).
+    - Accepts positive integers > 1.
+    - Accepts integral floats (e.g. `123.0`) and decimal strings (`"123.0"`) for JSON number interoperability.
+    - Strictly rejects fractional numeric values (e.g. `123.45`, `"123.45"`).
+    - Rejects negative numbers, PID 0 (when required), and PID 1 (init/systemd).
+    - Strictly rejects unsupported types (list, dict, tuple, etc.).
     """
     if isinstance(pid, bool):
         raise ValueError("Invalid target PID: boolean values are not valid PIDs")
@@ -57,6 +64,8 @@ def _validate_mcp_pid(pid: Any, allow_none: bool = True) -> Optional[int]:
         if not allow_none:
             raise ValueError("No target PID provided and no target session bound")
         return None
+    if not isinstance(pid, (int, float, str)):
+        raise ValueError(f"Unsupported PID type: {type(pid).__name__}")
     if isinstance(pid, float):
         if not pid.is_integer():
             raise ValueError(f"Invalid fractional PID {pid}: PID must be an integer > 1")
@@ -72,7 +81,8 @@ def _validate_mcp_pid(pid: Any, allow_none: bool = True) -> Optional[int]:
                 f_val = float(s)
                 if not f_val.is_integer():
                     raise ValueError(f"Invalid fractional PID '{s}': PID must be an integer > 1")
-                s = str(int(f_val))
+                pid = int(f_val)
+                s = str(pid)
             except ValueError as ve:
                 if "fractional" in str(ve):
                     raise
@@ -102,12 +112,16 @@ def _validate_mcp_pid(pid: Any, allow_none: bool = True) -> Optional[int]:
 def _normalize_mcp_error(err_msg: Any, explicit_code: Optional[str] = None) -> Tuple[str, Optional[str]]:
     """Normalize raw error messages and exception codes into machine-readable MCP error codes and recovery hints.
     
+    Precedence & Guarantees:
+    1. Preserves explicit domain error codes (`explicit_code in domain_codes`) without heuristic mutation.
+    2. Fallback heuristic pattern matching only applies when code is generic (`ValueError`, `RuntimeError`, etc.) or None.
+    3. Handles collisions cleanly (NO_TARGET_SPECIFIED vs INVALID_PID, BUILD_ID_MISMATCH vs DEBUG_IMAGE_NOT_FOUND, etc.).
+    4. Guards against incidental substring false-positives (e.g. 'timeout_counter' does not trigger TIMEOUT).
+    5. Unknown exception types remain distinguishable instead of being collapsed to misleading domain codes.
+    
     Returns:
         (error_code, recovery_hint)
     """
-    msg = str(err_msg or "").strip()
-    msg_lower = msg.lower()
-
     domain_codes = {
         "NO_TARGET_SPECIFIED",
         "INVALID_PID",
@@ -142,51 +156,109 @@ def _normalize_mcp_error(err_msg: Any, explicit_code: Optional[str] = None) -> T
         "TIMEOUT": "Retry with a larger timeout or check if the target process is responsive.",
     }
 
-    # Determine domain error code
-    code = None
+    # Rule 1: Always preserve explicit domain error codes
     if explicit_code and explicit_code in domain_codes:
-        code = explicit_code
+        return explicit_code, hints_by_code.get(explicit_code)
 
-    # Check for target/PID ambiguities first (NO_TARGET_SPECIFIED takes precedence over generic INVALID_PID)
-    if any(k in msg_lower for k in ("no target", "target pid is required", "target pid could not be resolved", "no target session bound", "bind a target first", "target process pid is required", "no investigation target provided")):
+    msg = str(err_msg or "").strip()
+    msg_lower = msg.lower()
+    code: Optional[str] = None
+
+    # Rule 2: Message-based heuristic classification
+    if any(k in msg_lower for k in (
+        "no target pid",
+        "target pid is required",
+        "target pid could not be resolved",
+        "no target session bound",
+        "bind a target first",
+        "target process pid is required",
+        "no investigation target provided",
+        "no target specified",
+    )):
         code = "NO_TARGET_SPECIFIED"
-    elif not code or explicit_code in ("ValueError", "RuntimeError", "KeyError", "Exception", "ERROR"):
-        if any(k in msg_lower for k in ("invalid target pid", "boolean values are not valid", "boolean value is not a valid", "fractional pid", "reserved system pid", "pid must be an integer", "non-numeric target pid", "unsupported pid type", "invalid non-numeric pid")):
-            code = "INVALID_PID"
-        elif any(k in msg_lower for k in ("build_id mismatch", "mismatching debug image", "build id mismatch")):
-            code = "BUILD_ID_MISMATCH"
-        elif any(k in msg_lower for k in ("companion elf", "dwarf debug info could not be resolved", "debug image not found", "cannot find elf", "missing dwarf")):
-            code = "DEBUG_IMAGE_NOT_FOUND"
-        elif (("session" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower)) or "no watch session" in msg_lower):
-            code = "SESSION_NOT_FOUND"
-        elif (("snapshot" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower)) or "no active snapshot" in msg_lower):
-            code = "SNAPSHOT_NOT_FOUND"
-        elif ("object" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower)):
-            code = "OBJECT_NOT_FOUND"
-        elif any(k in msg_lower for k in ("process exited", "target process dead", "no such process", "esrch")):
-            code = "PROCESS_EXITED"
-        elif any(k in msg_lower for k in ("permission denied", "operation not permitted", "eperm", "ptrace_scope")):
-            code = "PERMISSION_DENIED"
-        elif any(k in msg_lower for k in ("unsupported batch action", "unsupported action", "unsupported capability")):
-            code = "UNSUPPORTED_CAPABILITY"
-        elif "timeout" in msg_lower:
-            code = "TIMEOUT"
-        else:
-            code = explicit_code or "ERROR"
+    elif any(k in msg_lower for k in (
+        "invalid target pid",
+        "boolean values are not valid",
+        "boolean value is not a valid",
+        "fractional pid",
+        "reserved system pid",
+        "pid must be an integer",
+        "non-numeric target pid",
+        "unsupported pid type",
+        "unsupported target pid type",
+        "invalid non-numeric pid",
+    )):
+        code = "INVALID_PID"
+    elif ("build-id" in msg_lower or "build_id" in msg_lower or "build id" in msg_lower) and (
+        "mismatch" in msg_lower or "differ" in msg_lower or "rejected" in msg_lower
+    ):
+        code = "BUILD_ID_MISMATCH"
+    elif any(k in msg_lower for k in (
+        "companion elf with dwarf debug info could not be resolved",
+        "debug image not found",
+        "cannot find elf",
+        "missing dwarf",
+        "no such file or directory",
+    )) or ("companion elf" in msg_lower and "not found" in msg_lower):
+        code = "DEBUG_IMAGE_NOT_FOUND"
+    elif (
+        ("session" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower))
+        or "no watch session" in msg_lower
+    ):
+        code = "SESSION_NOT_FOUND"
+    elif (
+        ("snapshot" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower))
+        or "no active snapshot" in msg_lower
+    ):
+        code = "SNAPSHOT_NOT_FOUND"
+    elif ("object" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower)):
+        code = "OBJECT_NOT_FOUND"
+    elif any(k in msg_lower for k in ("target process dead", "no such process", "esrch", "process terminated")) or (
+        "process" in msg_lower and ("exited" in msg_lower or "terminated" in msg_lower)
+    ):
+        code = "PROCESS_EXITED"
+    elif any(k in msg_lower for k in ("permission denied", "operation not permitted", "eperm", "ptrace_scope")):
+        code = "PERMISSION_DENIED"
+    elif any(k in msg_lower for k in ("unsupported batch action", "unsupported capability", "capability not supported")):
+        code = "UNSUPPORTED_CAPABILITY"
+    elif any(k in msg_lower for k in ("timed out", "timeout expired", "operation timed out", "connection timed out")) or msg_lower == "timeout":
+        code = "TIMEOUT"
+    elif "all batch step(s) failed" in msg_lower or "all batch steps failed" in msg_lower:
+        code = "ALL_STEPS_FAILED"
+    elif "batch step(s) failed" in msg_lower:
+        code = "PARTIAL_BATCH_FAILURE"
+    else:
+        code = explicit_code or "ERROR"
 
     hint = hints_by_code.get(code)
     return code, hint
 
 
-def _format_result(res: Any) -> str:
-    """Format AgentActionResult into a clean JSON string with safe fallback serialization and standardized error contracts."""
+def _format_mcp_payload(res: Any) -> str:
+    """Format MCP tool or watch session result into clean JSON string with safe copy and standardized error contracts.
+    
+    Guarantees:
+    - Never mutates caller-owned dictionaries (operates on shallow copy).
+    - Conforms to standard error envelope: success, error, error_code, error_message, recovery_hint.
+    - Never reclassifies success responses as errors.
+    - Does not fabricate error messages when none exist.
+    """
     if hasattr(res, "to_dict"):
         data = res.to_dict()
     elif isinstance(res, dict):
-        data = dict(res)
+        data = dict(res)  # Shallow copy to avoid mutating caller-owned dictionaries
     else:
         data = {"result": str(res)}
-    if isinstance(data, dict) and not data.get("success"):
+
+    # Determine failure state without reclassifying successful responses
+    is_failure = False
+    if "success" in data:
+        is_failure = (data["success"] is False)
+    elif "error" in data or "error_code" in data:
+        is_failure = True
+        data["success"] = False
+
+    if is_failure:
         err = data.get("error")
         err_msg = ""
         if isinstance(err, dict):
@@ -199,14 +271,27 @@ def _format_result(res: Any) -> str:
             err_msg = err
             if "error_message" not in data:
                 data["error_message"] = err
-        else:
-            err_msg = str(err or "")
+        elif "error_message" in data and isinstance(data["error_message"], str):
+            err_msg = data["error_message"]
+            if "error" not in data:
+                data["error"] = err_msg
 
         code, hint = _normalize_mcp_error(err_msg, data.get("error_code"))
         data["error_code"] = code
         if hint and "recovery_hint" not in data:
             data["recovery_hint"] = hint
+
     return json.dumps(data, indent=2, ensure_ascii=False, default=str)
+
+
+def _format_result(res: Any) -> str:
+    """Format AgentActionResult into a clean JSON string with standardized error contracts."""
+    return _format_mcp_payload(res)
+
+
+def _format_watch_result(data: Any) -> str:
+    """Format Watch Session result into clean JSON string with standardized error contracts."""
+    return _format_mcp_payload(data)
 
 
 @server.tool()
@@ -496,18 +581,6 @@ def runtime_get_capabilities() -> str:
 # -----------------------------------------------------------------------------
 # Phase 23: Watch Session and Temporal Explorer MCP Tools
 # -----------------------------------------------------------------------------
-
-def _format_watch_result(data: Any) -> str:
-    """Format Watch Session result into clean JSON string with standardized error contracts."""
-    if isinstance(data, dict):
-        if not data.get("success", True):
-            err_raw = data.get("error")
-            err_str = err_raw if isinstance(err_raw, str) else str(err_raw or "")
-            code, hint = _normalize_mcp_error(err_str, data.get("error_code"))
-            data["error_code"] = code
-            if hint and "recovery_hint" not in data:
-                data["recovery_hint"] = hint
-    return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
 @server.tool()

@@ -40,6 +40,8 @@ ZERO_STOP_NON_ATOMIC_CONSISTENCY: Dict[str, Any] = {
     "is_atomic_read": False,
     "mechanism": "ZERO_STOP_CONCURRENT_READ",
     "causal_guarantee": "NONE",
+    "has_causal_guarantee": False,
+    "data_completeness": "BEST_EFFORT_NON_ATOMIC",
     "warning": "Read concurrently on live running threads without process suspension. Multi-variable observations may reflect distinct execution instants and cannot establish causal sequencing.",
 }
 
@@ -771,6 +773,12 @@ class WatchSessionManager:
                     out.append(item)
                 elif isinstance(item, str) and item.strip():
                     out.append({"action": "eval", "expression": item.strip()})
+                else:
+                    out.append({
+                        "action": "malformed_step",
+                        "raw_item": item,
+                        "error": f"Invalid step format: expected dictionary or expression string, got {type(item).__name__}",
+                    })
             return out
         return []
 
@@ -9666,60 +9674,69 @@ class WatchSessionManager:
         with self._lock:
             saved = dict(self._active_target_context)
 
+        # Strict PID boundary and type checks before any integer coercion
         if isinstance(pid, bool):
             raise ValueError("Invalid target PID: boolean value is not a valid PID")
+        if pid is not None and not isinstance(pid, (int, float, str)):
+            raise ValueError(f"Unsupported target PID type: {type(pid).__name__}")
         if isinstance(pid, float):
             if not pid.is_integer():
                 raise ValueError(f"Invalid fractional target PID {pid}: PID must be an integer > 1")
             pid = int(pid)
         if pid is not None and isinstance(pid, str):
             p_str = pid.strip()
-            if "." in p_str:
-                try:
-                    f_val = float(p_str)
-                    if not f_val.is_integer():
-                        raise ValueError(f"Invalid fractional target PID '{p_str}': PID must be an integer > 1")
-                    pid = int(f_val)
-                    p_str = str(pid)
-                except ValueError as ve:
-                    if "fractional" in str(ve):
-                        raise
-                    pass
-            if p_str.startswith("-") or p_str == "1":
-                raise ValueError(f"Invalid or reserved system PID: {p_str} (PID must be an integer > 1)")
-            if p_str.isdigit():
-                pid = int(p_str)
-            elif p_str and not process_name:
-                process_name = p_str
+            if not p_str:
+                if not process_name and not saved.get("pid"):
+                    raise ValueError("No target PID provided and no target session bound")
                 pid = None
-            elif p_str:
-                raise ValueError(f"Invalid non-numeric target PID: {p_str}")
+            else:
+                if "." in p_str:
+                    try:
+                        f_val = float(p_str)
+                        if not f_val.is_integer():
+                            raise ValueError(f"Invalid fractional target PID '{p_str}': PID must be an integer > 1")
+                        pid = int(f_val)
+                        p_str = str(pid)
+                    except ValueError as ve:
+                        if "fractional" in str(ve):
+                            raise
+                        raise ValueError(f"Invalid non-numeric target PID: {p_str}")
+                if p_str.startswith("-") or p_str == "1":
+                    raise ValueError(f"Invalid or reserved system PID: {p_str} (PID must be an integer > 1)")
+                if p_str.isdigit():
+                    pid = int(p_str)
+                elif not process_name:
+                    process_name = p_str
+                    pid = None
+                else:
+                    raise ValueError(f"Invalid non-numeric target PID: {p_str}")
         if pid is not None and isinstance(pid, int):
             p_int = pid
             if p_int == 1 or p_int < 0:
                 raise ValueError(f"Invalid or reserved system PID {p_int}: PID must be an integer > 1 (PID 1 is reserved)")
-            if p_int == 0 and not process_name and not saved.get("pid"):
+            if p_int == 0:
                 raise ValueError("Invalid target PID 0: PID must be an integer > 1")
-
-        eff_remote_host = remote_host if remote_host is not None else saved.get("remote_host")
-        eff_ssh_user = ssh_user if ssh_user is not None else saved.get("ssh_user")
-        coerced_port = self._coerce_int(ssh_port, 22, 1, 65535)
-        eff_ssh_port = coerced_port if (coerced_port and coerced_port != 22) else self._coerce_int(saved.get("ssh_port"), 22, 1, 65535)
-        eff_ssh_key = ssh_key if ssh_key is not None else saved.get("ssh_key")
-        eff_ssh_jump = ssh_proxy_jump if ssh_proxy_jump is not None else saved.get("ssh_proxy_jump")
 
         explicit_pid = int(pid) if (pid is not None and int(pid) > 1) else None
         saved_pid = int(saved["pid"]) if (saved.get("pid") is not None and int(saved["pid"]) > 0) else None
         eff_pid = explicit_pid if explicit_pid is not None else saved_pid
 
-        # If caller explicitly switched to a different PID without specifying companion_elf_path,
-        # prefer auto-discovering `/proc/<pid>/exe` first if it differs from saved_pid
-        if explicit_pid is not None and saved_pid is not None and explicit_pid != saved_pid and not companion_elf_path:
-            eff_elf = None
-            eff_proc_name = process_name
+        is_same_target = (explicit_pid is None or explicit_pid == saved_pid)
+
+        # Do NOT inherit remote SSH parameters or remote host across different target processes
+        if is_same_target:
+            eff_remote_host = remote_host if remote_host is not None else saved.get("remote_host")
+            eff_ssh_user = ssh_user if ssh_user is not None else saved.get("ssh_user")
+            coerced_port = self._coerce_int(ssh_port, 22, 1, 65535)
+            eff_ssh_port = coerced_port if (coerced_port and coerced_port != 22) else self._coerce_int(saved.get("ssh_port"), 22, 1, 65535)
+            eff_ssh_key = ssh_key if ssh_key is not None else saved.get("ssh_key")
+            eff_ssh_jump = ssh_proxy_jump if ssh_proxy_jump is not None else saved.get("ssh_proxy_jump")
         else:
-            eff_elf = companion_elf_path if (companion_elf_path and str(companion_elf_path).strip()) else saved.get("companion_elf_path")
-            eff_proc_name = process_name or saved.get("process_name")
+            eff_remote_host = remote_host
+            eff_ssh_user = ssh_user
+            eff_ssh_port = self._coerce_int(ssh_port, 22, 1, 65535) or 22
+            eff_ssh_key = ssh_key
+            eff_ssh_jump = ssh_proxy_jump
 
         target_adapter = self._resolve_adapter(
             pid=eff_pid or 1,
@@ -9731,23 +9748,52 @@ class WatchSessionManager:
             adapter=adapter,
         )
 
+        # Inspect actual running target binary Build ID
+        running_target_build_id = None
+        if eff_pid and eff_pid > 0 and not target_adapter.is_remote():
+            try:
+                exe_cand = f"/proc/{eff_pid}/exe"
+                if os.path.exists(exe_cand):
+                    exe_real = os.readlink(exe_cand).replace(" (deleted)", "").strip()
+                    if exe_real and os.path.isfile(exe_real):
+                        running_target_build_id = inspect_elf(exe_real).build_id
+            except Exception:
+                pass
+
+        # If caller explicitly switched to a different PID without specifying companion_elf_path,
+        # prefer auto-discovering `/proc/<pid>/exe` first if it differs from saved_pid
+        if explicit_pid is not None and saved_pid is not None and explicit_pid != saved_pid and not companion_elf_path:
+            eff_elf = None
+            eff_proc_name = process_name
+            known_build_id = running_target_build_id
+        else:
+            eff_elf = companion_elf_path if (companion_elf_path and str(companion_elf_path).strip()) else saved.get("companion_elf_path")
+            eff_proc_name = process_name or saved.get("process_name")
+            known_build_id = saved.get("build_id") if is_same_target else running_target_build_id
+
         elf_auto_discovered = False
         elf_discovery_source = None
         auto_healed_pid = False
         previous_pid = None
 
-        # Step 1: If eff_elf is known, inspect its build_id & basename for process discovery/healing
-        known_build_id = saved.get("build_id")
+        # Step 1: If eff_elf is known, inspect its build_id & basename and verify against running binary
         if eff_elf:
             primary_cand, _ = self._split_companion_elf_paths(eff_elf)
             if primary_cand and os.path.isfile(primary_cand):
                 try:
                     ident = inspect_elf(primary_cand)
-                    known_build_id = ident.build_id
+                    companion_bid = ident.build_id
+                    if running_target_build_id and companion_bid and running_target_build_id != companion_bid:
+                        raise ValueError(
+                            f"Target process '{eff_pid}' running executable has build-id '{running_target_build_id}', "
+                            f"but companion image '{primary_cand}' has build-id '{companion_bid}'. Mismatched symbols rejected."
+                        )
+                    known_build_id = companion_bid or running_target_build_id
                     if not eff_proc_name:
                         eff_proc_name = os.path.basename(primary_cand)
-                except Exception:
-                    pass
+                except Exception as b_exc:
+                    if "Mismatched symbols rejected" in str(b_exc):
+                        raise
 
         # Step 2: Check liveness of eff_pid; if dead (process restarted!) or omitted, attempt PID auto-discovery / auto-healing
         pid_alive = False
@@ -9855,14 +9901,15 @@ class WatchSessionManager:
                     continue
 
             # If still not found, only fallback to saved companion ELF if target was not switched to a different PID,
-            # or if the build IDs match
+            # or if the running target's actual Build ID matches saved companion Build ID
             if not eff_elf and saved.get("companion_elf_path"):
                 saved_companion = saved.get("companion_elf_path")
                 can_inherit = (explicit_pid is None or explicit_pid == saved_pid)
-                if not can_inherit and known_build_id and saved.get("build_id") and known_build_id == saved.get("build_id"):
+                if not can_inherit and running_target_build_id and saved.get("build_id") and running_target_build_id == saved.get("build_id"):
                     can_inherit = True
                 if can_inherit:
                     eff_elf = saved_companion
+                    known_build_id = saved.get("build_id")
 
         if not eff_pid or eff_pid <= 0:
             raise ValueError("Target PID could not be resolved. Provide `pid` or `process_name`, or bind a target first via `runtime_target_connect`.")
@@ -10743,7 +10790,9 @@ class WatchSessionManager:
             action = str(step.get("action") or step.get("tool") or "ask").strip().lower()
             step_t0 = time.monotonic_ns()
             try:
-                if action in ("eval", "runtime_eval_memory_path", "evaluate_symbol_paths"):
+                if action == "malformed_step":
+                    raise ValueError(step.get("error") or "Malformed step input: expected dictionary")
+                elif action in ("eval", "runtime_eval_memory_path", "evaluate_symbol_paths"):
                     exprs = step.get("expressions") or ([step["expression"]] if step.get("expression") else ["*gpMem"])
                     if isinstance(exprs, str):
                         exprs = [x.strip() for x in exprs.split(",") if x.strip()]
@@ -10851,14 +10900,36 @@ class WatchSessionManager:
                     if compact
                     else raw_out
                 )
-                succeeded_count += 1
-                step_results.append({
-                    "step_id": step_id,
-                    "action": action,
-                    "success": True,
-                    "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
-                    "output": final_out,
-                })
+                # Check if step produced a structured failure dictionary without raising
+                is_step_failed = False
+                step_failure_msg = None
+                if isinstance(raw_out, dict):
+                    if raw_out.get("success") is False:
+                        is_step_failed = True
+                        step_failure_msg = raw_out.get("error") or raw_out.get("error_message") or "Step execution returned failure"
+                    elif raw_out.get("status") in ("FAILED", "ERROR") and "results" not in raw_out:
+                        is_step_failed = True
+                        step_failure_msg = raw_out.get("error") or f"Step returned status {raw_out.get('status')}"
+
+                if is_step_failed:
+                    failed_count += 1
+                    step_results.append({
+                        "step_id": step_id,
+                        "action": action,
+                        "success": False,
+                        "error": step_failure_msg,
+                        "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
+                        "output": final_out,
+                    })
+                else:
+                    succeeded_count += 1
+                    step_results.append({
+                        "step_id": step_id,
+                        "action": action,
+                        "success": True,
+                        "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
+                        "output": final_out,
+                    })
             except Exception as step_exc:
                 failed_count += 1
                 step_results.append({
