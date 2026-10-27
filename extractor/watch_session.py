@@ -33,6 +33,14 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
 
 
+ZERO_STOP_NON_ATOMIC_CONSISTENCY: Dict[str, Any] = {
+    "level": "NON_ATOMIC",
+    "is_consistent_snapshot": False,
+    "mechanism": "ZERO_STOP_CONCURRENT_READ",
+    "warning": "Read concurrently on live running threads without process suspension. Multi-variable observations may reflect distinct execution instants.",
+}
+
+
 # -----------------------------------------------------------------------------
 # Ctypes / Linux process_vm_readv binding
 # -----------------------------------------------------------------------------
@@ -2953,6 +2961,7 @@ class WatchSessionManager:
             "is_remote": target_adapter.is_remote(),
             "load_bias": f"0x{load_bias:x}",
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "capture_latency_us": elapsed_us,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "coercions_count": len(coercions_applied),
@@ -2978,17 +2987,6 @@ class WatchSessionManager:
         """Samples a set of symbol expressions twice separated by `wait_ms` (with 0.00ms stop time)
         and returns a structured comparison of changed, unchanged, and unreadable fields.
         """
-        target_adapter = self._resolve_adapter(
-            pid=pid,
-            remote_host=remote_host,
-            ssh_user=ssh_user,
-            ssh_port=ssh_port,
-            ssh_key=ssh_key,
-            ssh_proxy_jump=ssh_proxy_jump,
-            ssh_proxy_command=ssh_proxy_command,
-            adapter=adapter,
-        )
-
         ctx_info = self.resolve_target_context(
             pid=pid,
             companion_elf_path=companion_elf_path,
@@ -3001,6 +2999,17 @@ class WatchSessionManager:
         )
         pid = ctx_info["pid"]
         companion_elf_path = ctx_info["companion_elf_path"]
+
+        target_adapter = self._resolve_adapter(
+            pid=pid,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+            ssh_proxy_command=ssh_proxy_command,
+            adapter=adapter,
+        )
         primary_elf, _ = self._split_companion_elf_paths(companion_elf_path)
         idx = DwarfIndexer.get_index(primary_elf or companion_elf_path)
         expr_list = self._coerce_str_list(expressions)
@@ -3090,6 +3099,7 @@ class WatchSessionManager:
             "is_remote": target_adapter.is_remote(),
             "wait_ms": clamped_wait_ms,
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "timestamp_before": snap_a.get("timestamp"),
             "timestamp_after": snap_b.get("timestamp"),
             "summary": {
@@ -4120,6 +4130,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "base_expression": base_expression,
             "was_coerced": bool(coerced_meta.get("was_coerced")),
@@ -4550,6 +4561,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "target_expression": target_expression,
             "resolved_expression": resolved.get("resolved_expression") or target_expression,
@@ -5253,6 +5265,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "head_expression": head_expr,
             "node_type": node_struct_type.name,
@@ -5630,6 +5643,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "threads_inspected": len(thread_reports),
             "threads": thread_reports,
@@ -5894,6 +5908,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "health_status": "ANOMALIES_DETECTED" if anomalies else "HEALTHY",
             "checked_symbols_count": checked_count,
@@ -6093,6 +6108,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "results": results,
         }
@@ -6232,6 +6248,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "shared_mappings_count": len(shared_mappings),
             "shared_mappings": shared_mappings,
@@ -6499,6 +6516,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "threads_count": len(thread_results),
             "threads": thread_results,
@@ -6674,6 +6692,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "overall_status": overall_status,
             "health_score": score,
@@ -6836,6 +6855,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "pipeline_health": pipeline_health,
             "bottleneck_diagnosis": bottleneck_diagnosis,
@@ -7103,6 +7123,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "scanned_heap_bytes": scanned_heap_bytes,
             "known_polymorphic_classes": sorted(set(vtable_map.values())),
@@ -7427,6 +7448,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "nodes_count": len(nodes),
             "edges_count": len(edges),
@@ -7631,6 +7653,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "snippets_count": len(snippets),
             "snippets": snippets,
@@ -7777,6 +7800,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "symptom_query": symptom_query,
             "classified_symptom": classified_symptom,
@@ -8220,6 +8244,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "natural_query": natural_query,
             "expanded_keywords": expanded_keywords,
@@ -8665,6 +8690,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "drift_status": drift_status,
             "drift_score": drift_score,
@@ -8931,6 +8957,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "pt_tls_geometry": {
                 "tls_memsz": tls_memsz,
@@ -9138,6 +9165,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "overall_consistency_status": overall_status,
             "symbols_checked_count": len(symbol_reports),
@@ -9540,6 +9568,7 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
+            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "sample_window_ms": clamped_win_ms,
             "kernel_isolated_cpus": _get_kernel_isolated_cpus(),
@@ -10732,6 +10761,27 @@ class WatchSessionManager:
                     raw_out = self.auto_triage_incident(
                         pid=eff_pid,
                         companion_elf_path=eff_elf,
+                        adapter=adapter,
+                    )
+                elif action in ("callstack", "callstacks", "locks", "runtime_inspect_thread_callstack_and_locks", "inspect_thread_callstack_and_locks", "inspect_thread_callstacks_and_locks"):
+                    raw_out = self.inspect_thread_callstacks_and_locks(
+                        pid=eff_pid,
+                        companion_elf_path=eff_elf,
+                        adapter=adapter,
+                    )
+                elif action in ("diff", "capture_diff", "capture_and_diff", "runtime_capture_and_diff"):
+                    raw_out = self.capture_and_diff_expressions(
+                        pid=eff_pid,
+                        companion_elf_path=eff_elf,
+                        expressions=step.get("expressions"),
+                        wait_ms=int(step.get("wait_ms") or 200),
+                        adapter=adapter,
+                    )
+                elif action in ("heap", "scan_heap", "runtime_scan_heap_objects", "scan_heap_objects"):
+                    raw_out = self.scan_heap_objects(
+                        pid=eff_pid,
+                        companion_elf_path=eff_elf,
+                        class_filter=step.get("class_filter"),
                         adapter=adapter,
                     )
                 else:

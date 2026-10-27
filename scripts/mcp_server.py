@@ -90,28 +90,45 @@ def _format_result(res: Any) -> str:
     if hasattr(res, "to_dict"):
         data = res.to_dict()
     elif isinstance(res, dict):
-        data = res
+        data = dict(res)
     else:
         data = {"result": str(res)}
+    if isinstance(data, dict) and not data.get("success"):
+        err = data.get("error")
+        if isinstance(err, dict):
+            if "error_code" not in data and "code" in err:
+                data["error_code"] = err["code"]
+            if "error_message" not in data and "message" in err:
+                data["error_message"] = err["message"]
+        elif isinstance(err, str) and "error_code" not in data:
+            data["error_code"] = "ERROR"
     return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
 @server.tool()
 def runtime_capture_memory(
-    pid: int,
+    pid: Optional[int] = None,
     policy: str = "ALL_READABLE",
     max_bytes: int = 33554432,
     timeout_ms: int = 2000
 ) -> str:
     """Capture raw memory of a live running Linux process non-intrusively via process_vm_readv.
     
+    If `pid` is omitted, inherits from the active target bound via `runtime_target_connect`.
+    
     Args:
-        pid: Target process PID.
+        pid: Optional target process PID (if omitted, uses bound target session).
         policy: Region filter policy (ALL_READABLE, STACK, HEAP, GLOBAL, etc.).
         max_bytes: Maximum total bytes to capture (default: 32MB).
         timeout_ms: Timeout in milliseconds.
     """
     try:
+        if pid is None:
+            try:
+                _c = _resolve_mcp_target(pid=pid)
+                pid = _c.get("pid")
+            except Exception:
+                pass
         valid_pid = _validate_mcp_pid(pid, allow_none=False)
         res = runtime.dispatch_action({
             "action": "MEMORY_SNAPSHOT",
@@ -133,12 +150,21 @@ def runtime_observe(
 ) -> str:
     """Observe active execution state, threads, and root objects from a running process or stopped inferior.
     
+    If `pid` or `debug_image` is omitted, inherits from the active target bound via `runtime_target_connect`.
+    
     Args:
-        pid: Optional live process PID.
-        debug_image: Path to external debug ELF binary with DWARF symbols.
+        pid: Optional live process PID (if omitted, uses bound target session).
+        debug_image: Optional path to external debug ELF binary with DWARF symbols (if omitted, uses bound target session).
         mode: Observation mode ('LOW_IMPACT' for non-stop live capture, 'CONSISTENT' for stopped execution).
     """
     try:
+        if pid is None or debug_image is None:
+            try:
+                _c = _resolve_mcp_target(pid=pid, companion_elf=debug_image)
+                pid = pid if pid is not None else _c.get("pid")
+                debug_image = debug_image or _c.get("companion_elf_path")
+            except Exception:
+                pass
         valid_pid = _validate_mcp_pid(pid, allow_none=True)
         res = runtime.dispatch_action({
             "action": "OBSERVE",
@@ -223,16 +249,32 @@ def runtime_start_investigation(
 ) -> str:
     """Launch an evidence-first investigation session against a live PID, offline snapshot, or persistent watch session.
     
+    If target parameters are omitted, inherits from the active target bound via `runtime_target_connect`.
+    
     Args:
         goal: Natural language investigation goal (e.g. 'Investigate worker counter mismatch' or Korean equivalent).
-        pid: Target process PID for live capture.
-        debug_image: Path to external debug ELF binary with DWARF symbols.
+        pid: Target process PID for live capture (if omitted, uses bound target session).
+        debug_image: Path to external debug ELF binary with DWARF symbols (if omitted, uses bound session).
         memory_snapshot_path: Path to offline raw memory snapshot directory.
         watch_session_id: Optional persistent watch session ID (e.g. from runtime_watch_session_create).
         observation_window: Optional dict with start_seq, end_seq, duration_sec, guard_address, etc.
     """
     try:
+        if pid is None and debug_image is None and not memory_snapshot_path and not watch_session_id:
+            try:
+                _c = _resolve_mcp_target(pid=pid, companion_elf=debug_image)
+                pid = _c.get("pid")
+                debug_image = _c.get("companion_elf_path")
+            except Exception:
+                pass
         valid_pid = _validate_mcp_pid(pid, allow_none=True)
+        if valid_pid is None and not memory_snapshot_path and not watch_session_id:
+            return _format_watch_result({
+                "success": False,
+                "error": "No investigation target provided. Specify 'pid', 'memory_snapshot_path', 'watch_session_id', or bind a target first via 'runtime_target_connect'.",
+                "error_code": "NO_TARGET_SPECIFIED",
+                "recovery_hint": "Call runtime_target_connect(pid=..., companion_elf=...) or provide 'pid' to runtime_start_investigation."
+            })
         res = runtime.dispatch_action({
             "action": "START_INVESTIGATION",
             "goal": goal,
@@ -358,7 +400,7 @@ def _format_watch_result(data: Any) -> str:
 
 @server.tool()
 def runtime_watch_session_create(
-    pid: int,
+    pid: Optional[int] = None,
     companion_elf: Optional[str] = None,
     interval_ms: int = 500,
     max_samples: int = 1000,
@@ -372,9 +414,11 @@ def runtime_watch_session_create(
 ) -> str:
     """Create and start a persistent observation session for a local or remote target.
     
+    If `pid` or `companion_elf` is omitted, inherits from the active target bound via `runtime_target_connect`.
+    
     Args:
-        pid: Target process PID (interpreted in target host namespace).
-        companion_elf: Local path to non-stripped companion ELF with DWARF symbols.
+        pid: Optional target process PID (if omitted, uses bound target session).
+        companion_elf: Local path to non-stripped companion ELF with DWARF symbols (if omitted, uses bound session).
         interval_ms: Sampling interval in milliseconds (default: 500ms, clamped 50..60000).
         max_samples: Maximum observations to capture before stopping (default: 1000).
         remote_host: Optional SSH remote host/IP for embedded target observation.
@@ -386,6 +430,13 @@ def runtime_watch_session_create(
         capture_mode: Capture mode ('ZERO_STOP' default).
     """
     try:
+        if pid is None or companion_elf is None:
+            try:
+                _c = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+                pid = pid if pid is not None else _c.get("pid")
+                companion_elf = companion_elf or _c.get("companion_elf_path")
+            except Exception:
+                pass
         pid = _validate_mcp_pid(pid, allow_none=False)
         session = runtime.watch_session_manager.create_session(
             pid=pid,
@@ -475,7 +526,7 @@ def runtime_watch_session_list(include_stopped: bool = True) -> str:
 
 @server.tool()
 def runtime_watch_inspect_target(
-    pid: int,
+    pid: Optional[int] = None,
     companion_elf: Optional[str] = None,
     remote_host: Optional[str] = None,
     ssh_user: Optional[str] = None,
@@ -485,9 +536,11 @@ def runtime_watch_inspect_target(
 ) -> str:
     """Inspect memory mappings, threads, and discoverable variables for a local or remote target.
     
+    If `pid` or `companion_elf` is omitted, inherits from the active target bound via `runtime_target_connect`.
+    
     Args:
-        pid: Target process PID.
-        companion_elf: Local path to non-stripped companion ELF with DWARF symbols.
+        pid: Optional target process PID (if omitted, uses bound target session).
+        companion_elf: Local path to non-stripped companion ELF with DWARF symbols (if omitted, uses bound session).
         remote_host: Optional SSH remote host/IP.
         ssh_user: Optional SSH username.
         ssh_port: SSH port (default: 22).
@@ -495,6 +548,13 @@ def runtime_watch_inspect_target(
         ssh_proxy_jump: Optional SSH jump host.
     """
     try:
+        if pid is None or companion_elf is None:
+            try:
+                _c = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+                pid = pid if pid is not None else _c.get("pid")
+                companion_elf = companion_elf or _c.get("companion_elf_path")
+            except Exception:
+                pass
         pid = _validate_mcp_pid(pid, allow_none=False)
         data = runtime.watch_session_manager.get_memory_map_and_threads(
             pid=pid,

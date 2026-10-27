@@ -337,8 +337,13 @@ class AgentRuntime:
                 pinfo = self.controller.process_info() if callable(self.controller.process_info) else self.controller.process_info
                 if isinstance(pinfo, dict):
                     target_pid = pinfo.get("pid")
+            if target_pid is None and hasattr(self, "watch_session_manager"):
+                active_ctx = self.watch_session_manager.get_active_target_context()
+                target_pid = active_ctx.get("pid")
+                if not debug_image:
+                    debug_image = active_ctx.get("companion_elf_path")
             if not target_pid:
-                return self._error("INVALID_FIELD", "pid is required for LOW_IMPACT observation", "OBSERVE", t0)
+                return self._error("INVALID_FIELD", "pid is required for LOW_IMPACT observation (specify pid or bind target first via runtime_target_connect)", "OBSERVE", t0)
 
             cap_res = self.capture_memory_snapshot(target_pid, policy=policy, max_bytes=max_bytes)
             if not cap_res.success:
@@ -1447,7 +1452,7 @@ class AgentRuntime:
                     return snap, None
             except Exception:
                 pass
-        return None, ("SNAPSHOT_NOT_FOUND", "No active snapshot available")
+        return None, ("SNAPSHOT_NOT_FOUND", "No active snapshot available. Generate a snapshot first using runtime_observe() or runtime_capture_memory(), or evaluate variables directly via runtime_eval_memory_path().")
 
     @staticmethod
     def _get_objects_from_snapshot(snap: Any) -> List[Dict[str, Any]]:
