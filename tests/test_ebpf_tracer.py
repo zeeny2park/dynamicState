@@ -1161,7 +1161,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
 
     def test_27_session_status_lost_events_is_partial(self):
         """Verify that a trace with lost events reports PARTIAL."""
-        tracer = EbpfTracer()
+        tracer = EbpfTracer(use_sudo=False)
 
         mock_ident = BinaryIdentity(
             path="/bin/echo",
@@ -5228,17 +5228,13 @@ class TestEbpfTracerUnit(unittest.TestCase):
                     success=succ, child_reaped=reaped, group_terminated=term, status=st, details="contradictory"
                 )
 
-    def test_83_trace_cleanup_uses_double_dash_and_safe_pgid(self):
-        """Verify that EbpfTracer.trace cleanup uses '--' delimiter to avoid procps kill option parsing bugs."""
+    def test_83_trace_cleanup_never_runs_sudo_kill_without_double_dash_or_on_unverified_pid(self):
+        """Regression guard: EbpfTracer.trace() finally block must NEVER invoke `sudo -n kill -INT -<pid>`
+        without `--` (which procps `/bin/kill` parses as signal `-1` + `-9` + `-3` + ... and can reboot/kill
+        processes if misparsed) and must NEVER invoke sudo kill or os.killpg when proc.pid is a MagicMock,
+        <= 1, or not a verified session leader (`os.getpgid(pid) == pid`).
+        """
         tracer = EbpfTracer(use_sudo=True)
-        mock_proc = MagicMock()
-        mock_proc.pid = 1936537
-        mock_proc.poll.return_value = None  # simulate process still running during cleanup
-        mock_proc.wait.side_effect = [subprocess.TimeoutExpired(cmd=["wait"], timeout=2.0), None]
-        mock_proc.stdout.readline.return_value = "Attaching 1 probe...\n"
-        mock_proc.stdout.readlines.return_value = []
-        mock_proc.stderr.readline.return_value = ""
-
         mock_ident = BinaryIdentity(
             path="/bin/echo",
             architecture="x86_64",
@@ -5249,14 +5245,25 @@ class TestEbpfTracerUnit(unittest.TestCase):
             pt_loads=[{"p_vaddr": 0x400000, "p_memsz": 0x1000, "p_offset": 0, "p_filesz": 0x1000}],
         )
 
+        # Case A: Mock Popen whose poll() stays None in finally (e.g. still running at cleanup),
+        # with high PID 1936537 that is NOT a verified session leader (os.getpgid raises OSError).
+        mock_proc_unverified = MagicMock()
+        mock_proc_unverified.pid = 1936537
+        mock_proc_unverified.poll.return_value = None
+        mock_proc_unverified.stdout.readline.return_value = "Attaching 1 probe...\n"
+        mock_proc_unverified.stdout.readlines.return_value = []
+        mock_proc_unverified.stderr.readline.return_value = ""
+
         with patch("extractor.ebpf_tracer.inspect_elf", return_value=mock_ident), \
              patch("os.path.exists", return_value=True), \
              patch("os.kill", return_value=None), \
-             patch("os.geteuid", return_value=1001), \
-             patch("select.select", return_value=([mock_proc.stdout], [], [])), \
+             patch("os.geteuid", return_value=1000), \
+             patch("os.getpgid", side_effect=ProcessLookupError("No such process")), \
+             patch("select.select", return_value=([mock_proc_unverified.stdout], [], [])), \
              patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
-             patch("subprocess.Popen", return_value=mock_proc), \
-             patch("subprocess.run") as mock_run:
+             patch("subprocess.Popen", return_value=mock_proc_unverified), \
+             patch("subprocess.run") as mock_subproc_run, \
+             patch("os.killpg") as mock_killpg:
 
             mock_cap.return_value = EbpfCapabilityResult(
                 supported=True,
@@ -5275,13 +5282,90 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 duration_s=0.01,
             )
 
-            # Both SIGINT and SIGKILL calls must have '--' before the -PGID argument
-            self.assertEqual(mock_run.call_count, 2)
-            first_cmd = mock_run.call_args_list[0][0][0]
-            second_cmd = mock_run.call_args_list[1][0][0]
+            # Must NOT have invoked `sudo -n kill ...` or `os.killpg` because 1936537 was not a verified session leader
+            mock_subproc_run.assert_not_called()
+            mock_killpg.assert_not_called()
+            mock_proc_unverified.send_signal.assert_called_with(signal.SIGINT)
 
-            self.assertEqual(first_cmd, ["sudo", "-n", "kill", "-INT", "--", "-1936537"])
-            self.assertEqual(second_cmd, ["sudo", "-n", "kill", "-KILL", "--", "-1936537"])
+        # Case B: Confirmed session leader (`os.getpgid(1936537) == 1936537`) with `use_sudo=True`
+        # MUST pass `"--"` before `"-1936537"` so `/bin/kill` never misparses `-1936537` as signal flags!
+        mock_proc_leader = MagicMock()
+        mock_proc_leader.pid = 1936537
+        mock_proc_leader.poll.return_value = None
+        mock_proc_leader.stdout.readline.return_value = "Attaching 1 probe...\n"
+        mock_proc_leader.stdout.readlines.return_value = []
+        mock_proc_leader.stderr.readline.return_value = ""
+        mock_proc_leader.wait.side_effect = [subprocess.TimeoutExpired(cmd="bpftrace", timeout=2.0), 0]
+
+        with patch("extractor.ebpf_tracer.inspect_elf", return_value=mock_ident), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.kill", return_value=None), \
+             patch("os.geteuid", return_value=1000), \
+             patch("os.getpgid", return_value=1936537), \
+             patch("select.select", return_value=([mock_proc_leader.stdout], [], [])), \
+             patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
+             patch("subprocess.Popen", return_value=mock_proc_leader), \
+             patch("subprocess.run") as mock_subproc_run:
+
+            mock_cap.return_value = EbpfCapabilityResult(
+                supported=True,
+                backend="bpftrace",
+                architecture="x86_64",
+                kernel_version="6.17",
+                is_privileged=True,
+                unprivileged_bpf_disabled=0,
+                has_bpf_fs=True,
+            )
+
+            tracer.trace(
+                pid=os.getpid(),
+                binary_path="/bin/echo",
+                function_name="0x400500",
+                duration_s=0.01,
+            )
+
+            self.assertEqual(mock_subproc_run.call_count, 2)
+            cmd_int = mock_subproc_run.call_args_list[0][0][0]
+            cmd_kill = mock_subproc_run.call_args_list[1][0][0]
+            self.assertEqual(cmd_int, ["sudo", "-n", "kill", "-INT", "--", "-1936537"])
+            self.assertEqual(cmd_kill, ["sudo", "-n", "kill", "-KILL", "--", "-1936537"])
+
+    def test_84_codebase_wide_signal_and_sudo_kill_safety_audit(self):
+        """Static AST & source audit across the entire repository to guarantee that:
+        1. No `subprocess.run` / `Popen` call invokes `kill` with a negative PID (`f"-{...}"`)
+           without an explicit `"--"` separator immediately preceding the negative PID argument.
+        2. `extractor/llm_provider.py` and `extractor/ebpf_tracer.py` verify `child_pgid == raw_pid`
+           and `raw_pid > 1` before calling `os.killpg`.
+        3. `extractor/capture_backend.py` enforces `type(self.pid) is not int or self.pid <= 1`
+           before calling `os.kill(self.pid, sig)`.
+        """
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        extractor_dir = os.path.join(repo_root, "extractor")
+
+        for root, dirs, files in os.walk(extractor_dir):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                fpath = os.path.join(root, fn)
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                # Check that any list containing `"kill"` and `f"-{` also includes `"--"`
+                for idx, line in enumerate(content.splitlines(), 1):
+                    if '"kill"' in line and 'f"-{' in line:
+                        self.assertIn(
+                            '"--"',
+                            line,
+                            f"Unsafe kill invocation without '--' found in {fn}:{idx}: {line}",
+                        )
+
+        with open(os.path.join(extractor_dir, "llm_provider.py"), "r", encoding="utf-8") as f:
+            lp_src = f.read()
+        self.assertIn("cand_pgid == raw_pid and cand_pgid > 1", lp_src)
+
+        with open(os.path.join(extractor_dir, "capture_backend.py"), "r", encoding="utf-8") as f:
+            cb_src = f.read()
+        self.assertIn("if type(self.pid) is not int or self.pid <= 1:", cb_src)
 
 
 if __name__ == "__main__":

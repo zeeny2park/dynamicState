@@ -535,10 +535,14 @@ class BaseCLIProvider(BaseLLMProvider):
         if proc is None:
             return
         curr_pgid = os.getpgrp() if (os.name == "posix" and hasattr(os, "getpgrp")) else None
+        raw_pid = getattr(proc, "pid", None)
+        valid_pid = (type(raw_pid) is int and raw_pid > 1)
         child_pgid = None
-        if os.name == "posix":
+        if os.name == "posix" and valid_pid:
             try:
-                child_pgid = os.getpgid(proc.pid)
+                cand_pgid = os.getpgid(raw_pid)
+                if type(cand_pgid) is int and cand_pgid == raw_pid and cand_pgid > 1 and cand_pgid != curr_pgid:
+                    child_pgid = cand_pgid
             except (ProcessLookupError, PermissionError):
                 child_pgid = None
             except Exception:

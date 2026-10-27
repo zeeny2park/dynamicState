@@ -2187,29 +2187,66 @@ class EbpfTracer:
                     break
 
         finally:
-            # Reliable attach/detach cleanup
-            if proc:
+            # Reliable attach/detach cleanup (hardened against mock/untracked PIDs, PGID=0/1, and missing `--` in kill)
+            if proc is not None:
                 try:
-                    if proc.poll() is None and proc.pid and proc.pid > 1:
-                        # Send SIGINT to entire process group (-- prevents procps kill treating -PID as options)
-                        if self.use_sudo and os.geteuid() != 0:
-                            subprocess.run(["sudo", "-n", "kill", "-INT", "--", f"-{proc.pid}"], check=False)
+                    if proc.poll() is None:
+                        child_pid = getattr(proc, "pid", None)
+                        caller_pid = os.getpid()
+                        caller_pgrp = os.getpgrp()
+                        valid_session_leader = False
+                        if _is_strict_int(child_pid) and child_pid > 1 and child_pid not in (caller_pid, caller_pgrp):
+                            try:
+                                child_pgid = os.getpgid(child_pid)
+                                if child_pgid == child_pid and child_pgid > 1 and child_pgid != caller_pgrp:
+                                    valid_session_leader = True
+                            except OSError:
+                                valid_session_leader = False
+
+                        if valid_session_leader:
+                            if self.use_sudo and os.geteuid() != 0:
+                                subprocess.run(
+                                    ["sudo", "-n", "kill", "-INT", "--", f"-{child_pid}"],
+                                    capture_output=True,
+                                    timeout=2.0,
+                                    check=False,
+                                )
+                            else:
+                                try:
+                                    os.killpg(child_pid, signal.SIGINT)
+                                except OSError:
+                                    proc.send_signal(signal.SIGINT)
                         else:
                             try:
-                                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-                            except OSError:
                                 proc.send_signal(signal.SIGINT)
+                            except Exception:
+                                pass
+
                         try:
                             proc.wait(timeout=2.0)
                         except subprocess.TimeoutExpired:
-                            if self.use_sudo and os.geteuid() != 0:
-                                subprocess.run(["sudo", "-n", "kill", "-KILL", "--", f"-{proc.pid}"], check=False)
+                            if valid_session_leader:
+                                if self.use_sudo and os.geteuid() != 0:
+                                    subprocess.run(
+                                        ["sudo", "-n", "kill", "-KILL", "--", f"-{child_pid}"],
+                                        capture_output=True,
+                                        timeout=2.0,
+                                        check=False,
+                                    )
+                                else:
+                                    try:
+                                        os.killpg(child_pid, signal.SIGKILL)
+                                    except OSError:
+                                        proc.kill()
                             else:
                                 try:
-                                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                                except OSError:
                                     proc.kill()
-                            proc.wait(timeout=1.0)
+                                except Exception:
+                                    pass
+                            try:
+                                proc.wait(timeout=1.0)
+                            except Exception:
+                                pass
                     if proc.stdout:
                         try:
                             for rem in proc.stdout.readlines():

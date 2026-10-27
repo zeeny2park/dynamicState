@@ -75,8 +75,13 @@ def read_process_memory_slice(pid: int, address: int, size: int) -> Tuple[Option
         (None, "TARGET_TERMINATED", reason) if target process exited.
         (None, "PERMISSION_DENIED", reason) on EPERM.
     """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return None, "UNAVAILABLE", f"Invalid or reserved system PID: {pid} (must be integer > 1)"
+    if address is None or not isinstance(address, int) or address < 0:
+        return None, "UNAVAILABLE", f"Invalid memory address: {address}"
     if size <= 0:
         return b"", "OBSERVED", None
+    size = min(int(size), 16 * 1024 * 1024)
 
     try:
         os.kill(pid, 0)
@@ -680,6 +685,83 @@ class WatchSessionManager:
             "auto_healed_count": 0,
             "last_previous_pid": None,
         }
+
+    @staticmethod
+    def _coerce_int(
+        val: Any,
+        default: int,
+        min_val: Optional[int] = None,
+        max_val: Optional[int] = None,
+    ) -> int:
+        """Safely coerces arbitrary input to int and clamps within [min_val, max_val]."""
+        if val is None or isinstance(val, bool):
+            res = default
+        else:
+            try:
+                if isinstance(val, str):
+                    s = val.strip()
+                    res = int(s, 16) if s.lower().startswith("0x") else int(float(s))
+                else:
+                    res = int(val)
+            except (ValueError, TypeError, OverflowError):
+                res = default
+        if min_val is not None and res < min_val:
+            res = min_val
+        if max_val is not None and res > max_val:
+            res = max_val
+        return res
+
+    @staticmethod
+    def _coerce_str_list(val: Any) -> List[str]:
+        """Safely coerces None, comma-separated string, JSON list string, or iterable into List[str]."""
+        if val is None:
+            return []
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                return []
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if x is not None and str(x).strip()]
+                except Exception:
+                    pass
+            return [x.strip() for x in s.split(",") if x.strip()]
+        if isinstance(val, (list, tuple, set)):
+            return [str(x).strip() for x in val if x is not None and str(x).strip()]
+        return [str(val).strip()] if str(val).strip() else []
+
+    @staticmethod
+    def _coerce_steps_list(val: Any, max_steps: int = 32) -> List[Dict[str, Any]]:
+        """Safely coerces batch macro steps from JSON string, single dict, or list of dicts."""
+        if val is None:
+            return []
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                return []
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    return [parsed]
+                if isinstance(parsed, list):
+                    val = parsed
+                else:
+                    return [{"action": "ask", "question": s}]
+            except Exception:
+                return [{"action": "ask", "question": s}]
+        if isinstance(val, dict):
+            return [val]
+        if isinstance(val, (list, tuple)):
+            out: List[Dict[str, Any]] = []
+            for item in val[:max_steps]:
+                if isinstance(item, dict):
+                    out.append(item)
+                elif isinstance(item, str) and item.strip():
+                    out.append({"action": "eval", "expression": item.strip()})
+            return out
+        return []
 
     def _get_session_dir(self, session_id: str) -> str:
         d = os.path.join(self.sessions_dir, session_id)
@@ -2487,7 +2569,7 @@ class WatchSessionManager:
         )
         pid = ctx_info["pid"]
         companion_elf_path = ctx_info["companion_elf_path"]
-        expressions = expressions or []
+        expressions = self._coerce_str_list(expressions)
 
         target_adapter = self._resolve_adapter(
             pid=pid,
@@ -2907,8 +2989,21 @@ class WatchSessionManager:
             adapter=adapter,
         )
 
-        idx = DwarfIndexer.get_index(companion_elf_path)
-        expr_list = [e.strip() for e in (expressions or []) if e and e.strip()]
+        ctx_info = self.resolve_target_context(
+            pid=pid,
+            companion_elf_path=companion_elf_path,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+            adapter=adapter,
+        )
+        pid = ctx_info["pid"]
+        companion_elf_path = ctx_info["companion_elf_path"]
+        primary_elf, _ = self._split_companion_elf_paths(companion_elf_path)
+        idx = DwarfIndexer.get_index(primary_elf or companion_elf_path)
+        expr_list = self._coerce_str_list(expressions)
         if not expr_list:
             # Automatically pick top ranked global/static variables
             top_syms = idx.search_symbols(query="", category="variables", limit=15, smart_rank=True)
@@ -9527,13 +9622,34 @@ class WatchSessionManager:
         with self._lock:
             saved = dict(self._active_target_context)
 
+        if isinstance(pid, bool):
+            raise ValueError("Invalid target PID: boolean value is not a valid PID")
+        if pid is not None and isinstance(pid, str):
+            p_str = pid.strip()
+            if p_str.startswith("-") or p_str == "1":
+                raise ValueError(f"Invalid or reserved system PID: {p_str} (PID must be an integer > 1)")
+            if p_str.isdigit():
+                pid = int(p_str)
+            elif p_str and not process_name:
+                process_name = p_str
+                pid = None
+            elif p_str:
+                raise ValueError(f"Invalid non-numeric target PID: {p_str}")
+        if pid is not None and isinstance(pid, (int, float)):
+            p_int = int(pid)
+            if p_int == 1 or p_int < 0:
+                raise ValueError(f"Invalid or reserved system PID {p_int}: PID must be an integer > 1 (PID 1 is reserved)")
+            if p_int == 0 and not process_name and not saved.get("pid"):
+                raise ValueError("Invalid target PID 0: PID must be an integer > 1")
+
         eff_remote_host = remote_host if remote_host is not None else saved.get("remote_host")
         eff_ssh_user = ssh_user if ssh_user is not None else saved.get("ssh_user")
-        eff_ssh_port = ssh_port if (ssh_port and ssh_port != 22) else (saved.get("ssh_port") or 22)
+        coerced_port = self._coerce_int(ssh_port, 22, 1, 65535)
+        eff_ssh_port = coerced_port if (coerced_port and coerced_port != 22) else self._coerce_int(saved.get("ssh_port"), 22, 1, 65535)
         eff_ssh_key = ssh_key if ssh_key is not None else saved.get("ssh_key")
         eff_ssh_jump = ssh_proxy_jump if ssh_proxy_jump is not None else saved.get("ssh_proxy_jump")
 
-        explicit_pid = int(pid) if (pid is not None and int(pid) > 0) else None
+        explicit_pid = int(pid) if (pid is not None and int(pid) > 1) else None
         saved_pid = int(saved["pid"]) if (saved.get("pid") is not None and int(saved["pid"]) > 0) else None
         eff_pid = explicit_pid if explicit_pid is not None else saved_pid
 
@@ -10556,7 +10672,8 @@ class WatchSessionManager:
         succeeded_count = 0
         failed_count = 0
 
-        for idx_s, step in enumerate(steps or []):
+        normalized_steps = self._coerce_steps_list(steps, max_steps=32)
+        for idx_s, step in enumerate(normalized_steps):
             step_id = str(step.get("step_id") or f"step_{idx_s + 1}")
             action = str(step.get("action") or step.get("tool") or "ask").strip().lower()
             step_t0 = time.monotonic_ns()
@@ -10664,13 +10781,13 @@ class WatchSessionManager:
             "stop_duration_ms": 0.0,
             "batch_latency_us": total_latency_us,
             "compact_mode": compact,
-            "steps_requested": len(steps or []),
+            "steps_requested": len(normalized_steps),
             "steps_succeeded": succeeded_count,
             "steps_failed": failed_count,
             "cross_step_highlights": cross_step_highlights,
             "step_results": step_results,
             "llm_next_step_hint": (
-                f"Executed {succeeded_count}/{len(steps or [])} batch diagnostic step(s) in {total_latency_us}us with 0.00ms target stop time."
+                f"Executed {succeeded_count}/{len(normalized_steps)} batch diagnostic step(s) in {total_latency_us}us with 0.00ms target stop time."
             ),
         }
 
@@ -10824,7 +10941,8 @@ class WatchSessionManager:
         eff_pid = ctx_info["pid"]
         eff_elf = ctx_info["companion_elf_path"]
 
-        parsed_list = [self._parse_single_assertion(a) for a in (assertions or []) if str(a).strip()]
+        coerced_assertions = self._coerce_str_list(assertions)
+        parsed_list = [self._parse_single_assertion(a) for a in coerced_assertions if str(a).strip()]
         lhs_exprs = [p["lhs"] for p in parsed_list]
 
         eval_out = self.evaluate_symbol_paths(
@@ -11063,12 +11181,20 @@ class WatchSessionManager:
 
         report_markdown = "\n".join(md_lines) + "\n"
         saved_path = None
-        if output_path:
-            abs_out = os.path.abspath(output_path)
-            os.makedirs(os.path.dirname(abs_out), exist_ok=True)
-            with open(abs_out, "w", encoding="utf-8") as rf:
-                rf.write(report_markdown)
-            saved_path = abs_out
+        save_error = None
+        if output_path and str(output_path).strip():
+            abs_out = os.path.abspath(str(output_path).strip())
+            forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
+            if any(abs_out.startswith(fp) or abs_out == fp.rstrip("/") for fp in forbidden_prefixes):
+                save_error = f"Refusing to write incident report to protected system path: {abs_out}"
+            else:
+                try:
+                    os.makedirs(os.path.dirname(abs_out), exist_ok=True)
+                    with open(abs_out, "w", encoding="utf-8") as rf:
+                        rf.write(report_markdown)
+                    saved_path = abs_out
+                except OSError as os_err:
+                    save_error = f"Failed to write report to {abs_out}: {os_err}" 
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -11086,6 +11212,7 @@ class WatchSessionManager:
             "remediation_checklist": remediation_checklist,
             "report_markdown": report_markdown,
             "saved_path": saved_path,
+            "save_error": save_error,
             "llm_next_step_hint": (
                 f"Generated zero-stop incident report for PID {eff_pid} (Health Score: {triage.get('health_score', 100)}/100, "
                 f"{len(findings)} finding(s))" + (f" and saved to {saved_path}." if saved_path else ".")

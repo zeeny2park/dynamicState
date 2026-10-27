@@ -44,15 +44,56 @@ server = MCPServer(
 runtime = AgentRuntime(corpus_dir=os.path.join(PROJECT_ROOT, "corpus"))
 
 
+import functools
+
+
+def _validate_mcp_pid(pid: Any, allow_none: bool = True) -> Optional[int]:
+    """Validates and normalizes a PID parameter for MCP tools.
+    Strictly rejects booleans, negative numbers, PID 0 (when required), and PID 1 (init/systemd).
+    """
+    if isinstance(pid, bool):
+        raise ValueError("Invalid target PID: boolean values are not valid PIDs")
+    if pid is None:
+        if not allow_none:
+            raise ValueError("Target PID is required and must be an integer > 1")
+        return None
+    if isinstance(pid, str):
+        s = pid.strip()
+        if not s:
+            if not allow_none:
+                raise ValueError("Target PID is required and must be an integer > 1")
+            return None
+        if s.startswith("-") or s == "1":
+            raise ValueError(f"Invalid or reserved system PID '{s}': PID must be an integer > 1")
+        if s.isdigit():
+            p_int = int(s)
+            if p_int <= 1:
+                if p_int == 0 and allow_none:
+                    return None
+                raise ValueError(f"Invalid or reserved system PID {p_int}: PID must be an integer > 1")
+            return p_int
+        raise ValueError(f"Invalid non-numeric PID '{s}'")
+    if isinstance(pid, (int, float)):
+        p_int = int(pid)
+        if p_int == 1 or p_int < 0:
+            raise ValueError(f"Invalid or reserved system PID {p_int}: PID must be an integer > 1 (PID 1 is reserved)")
+        if p_int == 0:
+            if not allow_none:
+                raise ValueError("Invalid target PID 0: PID must be an integer > 1")
+            return None
+        return p_int
+    raise ValueError(f"Unsupported PID type: {type(pid).__name__}")
+
+
 def _format_result(res: Any) -> str:
-    """Format AgentActionResult into a clean JSON string."""
+    """Format AgentActionResult into a clean JSON string with safe fallback serialization."""
     if hasattr(res, "to_dict"):
         data = res.to_dict()
     elif isinstance(res, dict):
         data = res
     else:
         data = {"result": str(res)}
-    return json.dumps(data, indent=2, ensure_ascii=False)
+    return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
 @server.tool()
@@ -70,14 +111,18 @@ def runtime_capture_memory(
         max_bytes: Maximum total bytes to capture (default: 32MB).
         timeout_ms: Timeout in milliseconds.
     """
-    res = runtime.dispatch_action({
-        "action": "MEMORY_SNAPSHOT",
-        "pid": pid,
-        "policy": policy,
-        "max_bytes": max_bytes,
-        "timeout_ms": timeout_ms
-    })
-    return _format_result(res)
+    try:
+        valid_pid = _validate_mcp_pid(pid, allow_none=False)
+        res = runtime.dispatch_action({
+            "action": "MEMORY_SNAPSHOT",
+            "pid": valid_pid,
+            "policy": policy,
+            "max_bytes": max(4096, min(int(max_bytes or 33554432), 134217728)),
+            "timeout_ms": max(50, min(int(timeout_ms or 2000), 30000)),
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": "INVALID_PID" if "PID" in str(e) else type(e).__name__})
 
 
 @server.tool()
@@ -93,13 +138,17 @@ def runtime_observe(
         debug_image: Path to external debug ELF binary with DWARF symbols.
         mode: Observation mode ('LOW_IMPACT' for non-stop live capture, 'CONSISTENT' for stopped execution).
     """
-    res = runtime.dispatch_action({
-        "action": "OBSERVE",
-        "pid": pid,
-        "debug_image": debug_image,
-        "mode": mode
-    })
-    return _format_result(res)
+    try:
+        valid_pid = _validate_mcp_pid(pid, allow_none=True)
+        res = runtime.dispatch_action({
+            "action": "OBSERVE",
+            "pid": valid_pid,
+            "debug_image": debug_image,
+            "mode": mode
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": "INVALID_PID" if "PID" in str(e) else type(e).__name__})
 
 
 @server.tool()
@@ -109,11 +158,14 @@ def runtime_list_objects(snapshot_id: Optional[str] = None) -> str:
     Args:
         snapshot_id: Optional snapshot identifier.
     """
-    res = runtime.dispatch_action({
-        "action": "LIST_OBJECTS",
-        "snapshot_id": snapshot_id
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "LIST_OBJECTS",
+            "snapshot_id": snapshot_id
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -124,12 +176,15 @@ def runtime_inspect_object(object_id: str, snapshot_id: Optional[str] = None) ->
         object_id: Object identifier (e.g. 'obj_0001').
         snapshot_id: Optional snapshot identifier.
     """
-    res = runtime.dispatch_action({
-        "action": "INSPECT_OBJECT",
-        "object_id": object_id,
-        "snapshot_id": snapshot_id
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "INSPECT_OBJECT",
+            "object_id": object_id,
+            "snapshot_id": snapshot_id
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -145,13 +200,16 @@ def runtime_inspect_field(
         field_path: Dot-separated field path (e.g. 'worker.state.counter').
         snapshot_id: Optional snapshot identifier.
     """
-    res = runtime.dispatch_action({
-        "action": "INSPECT_FIELD",
-        "object_id": object_id,
-        "field_path": field_path,
-        "snapshot_id": snapshot_id
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "INSPECT_FIELD",
+            "object_id": object_id,
+            "field_path": field_path,
+            "snapshot_id": snapshot_id
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -173,17 +231,21 @@ def runtime_start_investigation(
         watch_session_id: Optional persistent watch session ID (e.g. from runtime_watch_session_create).
         observation_window: Optional dict with start_seq, end_seq, duration_sec, guard_address, etc.
     """
-    res = runtime.dispatch_action({
-        "action": "START_INVESTIGATION",
-        "goal": goal,
-        "pid": pid,
-        "debug_image": debug_image,
-        "memory_snapshot_path": memory_snapshot_path,
-        "watch_session_id": watch_session_id,
-        "observation_window": observation_window,
-        "authorize_target": True
-    })
-    return _format_result(res)
+    try:
+        valid_pid = _validate_mcp_pid(pid, allow_none=True)
+        res = runtime.dispatch_action({
+            "action": "START_INVESTIGATION",
+            "goal": goal,
+            "pid": valid_pid,
+            "debug_image": debug_image,
+            "memory_snapshot_path": memory_snapshot_path,
+            "watch_session_id": watch_session_id,
+            "observation_window": observation_window,
+            "authorize_target": True
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": "INVALID_PID" if "PID" in str(e) else type(e).__name__})
 
 
 @server.tool()
@@ -193,11 +255,14 @@ def runtime_get_investigation_report(investigation_id: str) -> str:
     Args:
         investigation_id: Investigation session ID (e.g. 'inv_...').
     """
-    res = runtime.dispatch_action({
-        "action": "GET_INVESTIGATION_REPORT",
-        "investigation_id": investigation_id
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "GET_INVESTIGATION_REPORT",
+            "investigation_id": investigation_id
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -207,11 +272,14 @@ def runtime_checkpoint(checkpoint_id: Optional[str] = None) -> str:
     Args:
         checkpoint_id: Optional identifier for checkpoint (e.g. 'C_SEED').
     """
-    res = runtime.dispatch_action({
-        "action": "CHECKPOINT",
-        "checkpoint_id": checkpoint_id
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "CHECKPOINT",
+            "checkpoint_id": checkpoint_id
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -221,11 +289,14 @@ def runtime_restore(checkpoint_id: str) -> str:
     Args:
         checkpoint_id: Checkpoint identifier to restore.
     """
-    res = runtime.dispatch_action({
-        "action": "RESTORE",
-        "checkpoint_id": checkpoint_id
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "RESTORE",
+            "checkpoint_id": checkpoint_id
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -235,11 +306,14 @@ def runtime_list_candidates(snapshot_id: Optional[str] = None) -> str:
     Args:
         snapshot_id: Optional snapshot identifier.
     """
-    res = runtime.dispatch_action({
-        "action": "LIST_MUTATION_CANDIDATES",
-        "snapshot_id": snapshot_id
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "LIST_MUTATION_CANDIDATES",
+            "snapshot_id": snapshot_id
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -250,21 +324,27 @@ def runtime_execute_transition(candidate_id: str, timeout_ms: int = 1000) -> str
         candidate_id: Identifier of the mutation candidate (e.g. 'M0001').
         timeout_ms: Execution timeout in milliseconds.
     """
-    res = runtime.dispatch_action({
-        "action": "EXECUTE_TRANSITION",
-        "candidate_id": candidate_id,
-        "timeout_ms": timeout_ms
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "EXECUTE_TRANSITION",
+            "candidate_id": candidate_id,
+            "timeout_ms": max(50, min(int(timeout_ms or 1000), 30000)),
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
 def runtime_get_capabilities() -> str:
     """Query runtime platform capabilities, supported observation backends, and safety limits."""
-    res = runtime.dispatch_action({
-        "action": "GET_CAPABILITIES"
-    })
-    return _format_result(res)
+    try:
+        res = runtime.dispatch_action({
+            "action": "GET_CAPABILITIES"
+        })
+        return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 # -----------------------------------------------------------------------------
@@ -272,8 +352,8 @@ def runtime_get_capabilities() -> str:
 # -----------------------------------------------------------------------------
 
 def _format_watch_result(data: Any) -> str:
-    """Format Watch Session result into clean JSON string."""
-    return json.dumps(data, indent=2, ensure_ascii=False)
+    """Format Watch Session result into clean JSON string with safe fallback serialization."""
+    return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
 @server.tool()
@@ -306,8 +386,7 @@ def runtime_watch_session_create(
         capture_mode: Capture mode ('ZERO_STOP' default).
     """
     try:
-        if pid <= 0:
-            return _format_watch_result({"success": False, "error": f"Invalid PID {pid}", "error_code": "INVALID_PID"})
+        pid = _validate_mcp_pid(pid, allow_none=False)
         session = runtime.watch_session_manager.create_session(
             pid=pid,
             companion_elf_path=companion_elf,
@@ -416,6 +495,7 @@ def runtime_watch_inspect_target(
         ssh_proxy_jump: Optional SSH jump host.
     """
     try:
+        pid = _validate_mcp_pid(pid, allow_none=False)
         data = runtime.watch_session_manager.get_memory_map_and_threads(
             pid=pid,
             companion_elf_path=companion_elf,
@@ -619,6 +699,9 @@ def runtime_target_connect(
     try:
         from extractor.debug_image import inspect_elf
         from extractor.dwarf_indexer import DwarfIndexer
+
+        if pid is not None:
+            pid = _validate_mcp_pid(pid, allow_none=True)
 
         elf_auto_discovered = False
         elf_discovery_source = None

@@ -966,7 +966,9 @@ class ProcessTargetHandle:
             except Exception as exc:
                 return False, f"SIGNAL_ERROR_{exc}"
         else:
-            # Fallback path: verify starttime before os.kill
+            # Fallback path: verify starttime and strict PID > 1 before os.kill
+            if type(self.pid) is not int or self.pid <= 1:
+                return False, "INVALID_PID_FOR_SIGNAL"
             if self.pre_signal_identity.get("starttime") != self.initial_identity.get("starttime"):
                 return False, "PID_REUSED"
             try:

@@ -159,8 +159,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             return "localhost"
 
     def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
-        if pid <= 0:
-            return False, f"Invalid PID {pid}"
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return False, f"Invalid or reserved system PID {pid} (must be integer > 1)"
         try:
             os.kill(pid, 0)
             return True, None
@@ -540,6 +540,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
         for pid_str in proc_entries:
             pid = int(pid_str)
+            if pid <= 1:
+                continue
             comm = ""
             cmdline = ""
             exe_path = ""

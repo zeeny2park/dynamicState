@@ -416,15 +416,30 @@
       return _basePath ? `${_basePath}${endpoint}` : endpoint;
     }
 
-    async function callWorkspaceBackend(endpoint, payload) {
+    async function callWorkspaceBackend(endpoint, payload, timeoutMs = 15000) {
       wsState.lastError = null;
+      const controller = new AbortController();
+      const timerId = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const res = await fetch(getApiUrl(endpoint), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload || {}),
+          signal: controller.signal,
         });
-        const json = await res.json();
+        clearTimeout(timerId);
+        const rawText = await res.text();
+        let json = null;
+        try {
+          json = rawText ? JSON.parse(rawText) : null;
+        } catch (_parseErr) {
+          wsState.lastError = {
+            code: `HTTP_${res.status}`,
+            message: `서버가 비정상 응답을 반환했습니다 (HTTP ${res.status})`,
+          };
+          updateConnectionBadge('API ERROR', 'amber');
+          return null;
+        }
         if (json && json.success) {
           wsState.isConnected = true;
           updateConnectionBadge('LIVE CONNECTED', 'emerald');
@@ -436,6 +451,7 @@
         updateConnectionBadge(errCode === 'TARGET_NOT_CONFIGURED' ? 'TARGET REQUIRED' : 'API ERROR', 'amber');
         return null;
       } catch (err) {
+        clearTimeout(timerId);
         wsState.lastError = {
           code: 'BACKEND_UNREACHABLE',
           message: err && err.message ? err.message : '백엔드 서버에 연결할 수 없습니다. ./bin/dynamic-state-workspace 가 실행 중인지 확인하세요.',
@@ -555,7 +571,9 @@
 
     window.refreshTraceCard = async function(cardId) {
       const card = wsState.cards.find(c => c.id === cardId);
-      if (!card) return;
+      if (!card || card._refreshInFlight) return;
+      card._refreshInFlight = true;
+      try {
       readTargetInputsIntoState();
       const basePayload = {
         pid: wsState.pid || card.data?.pid || undefined,
@@ -608,7 +626,7 @@
       } else if (card.type === 'FRAME_LOCALS') {
         freshData = await callWorkspaceBackend('/api/watch/frame-locals', basePayload);
       } else if (card.type === 'CALLSTACK_AND_LOCKS') {
-        freshData = await callWorkspaceBackend('/api/watch/callstack-locks', basePayload);
+        freshData = await callWorkspaceBackend('/api/watch/thread-callstacks', basePayload);
       } else if (card.type === 'MEMORY_AUDIT') {
         freshData = await callWorkspaceBackend('/api/watch/audit-integrity', basePayload);
       } else if (card.type === 'LINKED_LIST_CHAIN') {
@@ -638,11 +656,24 @@
       }
 
       if (freshData) {
+        card._failCount = 0;
         card.data = freshData;
         card.timestamp = new Date().toLocaleTimeString('ko-KR', { hour12: false });
         renderWorkspaceCards();
       } else if (wsState.lastError) {
-        showToast(`새로고침 실패: ${wsState.lastError.message}`, true);
+        card._failCount = (card._failCount || 0) + 1;
+        if (card.liveWatch && card._failCount >= 3) {
+          if (card._timer) clearInterval(card._timer);
+          card._timer = null;
+          card.liveWatch = false;
+          renderWorkspaceCards();
+          showToast(`타겟 응답 없음으로 #${card.seq} 실시간 감시를 자동 중지했습니다: ${wsState.lastError.message}`, true);
+        } else {
+          showToast(`새로고침 실패: ${wsState.lastError.message}`, true);
+        }
+      }
+      } finally {
+        card._refreshInFlight = false;
       }
     };
 
