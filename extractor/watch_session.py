@@ -36,8 +36,11 @@ from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSs
 ZERO_STOP_NON_ATOMIC_CONSISTENCY: Dict[str, Any] = {
     "level": "NON_ATOMIC",
     "is_consistent_snapshot": False,
+    "process_stopped": False,
+    "is_atomic_read": False,
     "mechanism": "ZERO_STOP_CONCURRENT_READ",
-    "warning": "Read concurrently on live running threads without process suspension. Multi-variable observations may reflect distinct execution instants.",
+    "causal_guarantee": "NONE",
+    "warning": "Read concurrently on live running threads without process suspension. Multi-variable observations may reflect distinct execution instants and cannot establish causal sequencing.",
 }
 
 
@@ -3144,8 +3147,8 @@ class WatchSessionManager:
 
     def save_golden_baseline(
         self,
-        pid: int,
-        companion_elf_path: str,
+        pid: Optional[int] = None,
+        companion_elf_path: Optional[str] = None,
         label: str = "Golden Baseline",
         expressions: Optional[List[str]] = None,
         remote_host: Optional[str] = None,
@@ -3156,8 +3159,20 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Captures current target state for key symbol expressions and persists it as a Golden Baseline."""
-        target_adapter = self._resolve_adapter(
+        ctx_info = self.resolve_target_context(
             pid=pid,
+            companion_elf_path=companion_elf_path,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+            adapter=adapter,
+        )
+        eff_pid = ctx_info["pid"]
+        eff_elf = ctx_info["companion_elf_path"]
+        target_adapter = self._resolve_adapter(
+            pid=eff_pid,
             remote_host=remote_host,
             ssh_user=ssh_user,
             ssh_port=ssh_port,
@@ -3167,11 +3182,11 @@ class WatchSessionManager:
         )
         expr_list = [e.strip() for e in (expressions or []) if e and e.strip()]
         if not expr_list:
-            expr_list = self._auto_select_diagnostic_expressions(companion_elf_path, max_items=15)
+            expr_list = self._auto_select_diagnostic_expressions(eff_elf, max_items=15)
 
         eval_res = self.evaluate_symbol_paths(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
+            pid=eff_pid,
+            companion_elf_path=eff_elf,
             expressions=expr_list,
             adapter=target_adapter,
         )
@@ -9653,8 +9668,23 @@ class WatchSessionManager:
 
         if isinstance(pid, bool):
             raise ValueError("Invalid target PID: boolean value is not a valid PID")
+        if isinstance(pid, float):
+            if not pid.is_integer():
+                raise ValueError(f"Invalid fractional target PID {pid}: PID must be an integer > 1")
+            pid = int(pid)
         if pid is not None and isinstance(pid, str):
             p_str = pid.strip()
+            if "." in p_str:
+                try:
+                    f_val = float(p_str)
+                    if not f_val.is_integer():
+                        raise ValueError(f"Invalid fractional target PID '{p_str}': PID must be an integer > 1")
+                    pid = int(f_val)
+                    p_str = str(pid)
+                except ValueError as ve:
+                    if "fractional" in str(ve):
+                        raise
+                    pass
             if p_str.startswith("-") or p_str == "1":
                 raise ValueError(f"Invalid or reserved system PID: {p_str} (PID must be an integer > 1)")
             if p_str.isdigit():
@@ -9664,8 +9694,8 @@ class WatchSessionManager:
                 pid = None
             elif p_str:
                 raise ValueError(f"Invalid non-numeric target PID: {p_str}")
-        if pid is not None and isinstance(pid, (int, float)):
-            p_int = int(pid)
+        if pid is not None and isinstance(pid, int):
+            p_int = pid
             if p_int == 1 or p_int < 0:
                 raise ValueError(f"Invalid or reserved system PID {p_int}: PID must be an integer > 1 (PID 1 is reserved)")
             if p_int == 0 and not process_name and not saved.get("pid"):
@@ -9824,9 +9854,15 @@ class WatchSessionManager:
                 except Exception:
                     continue
 
-            # If still not found and saved context has a valid companion_elf_path with matching build_id, fallback to saved
+            # If still not found, only fallback to saved companion ELF if target was not switched to a different PID,
+            # or if the build IDs match
             if not eff_elf and saved.get("companion_elf_path"):
-                eff_elf = saved.get("companion_elf_path")
+                saved_companion = saved.get("companion_elf_path")
+                can_inherit = (explicit_pid is None or explicit_pid == saved_pid)
+                if not can_inherit and known_build_id and saved.get("build_id") and known_build_id == saved.get("build_id"):
+                    can_inherit = True
+                if can_inherit:
+                    eff_elf = saved_companion
 
         if not eff_pid or eff_pid <= 0:
             raise ValueError("Target PID could not be resolved. Provide `pid` or `process_name`, or bind a target first via `runtime_target_connect`.")
@@ -10784,7 +10820,16 @@ class WatchSessionManager:
                         class_filter=step.get("class_filter"),
                         adapter=adapter,
                     )
-                else:
+                elif action in ("verify_consistency", "runtime_verify_concurrent_read_consistency", "verify_concurrent_read_consistency"):
+                    raw_out = self.verify_concurrent_read_consistency(
+                        pid=eff_pid,
+                        companion_elf_path=eff_elf,
+                        expressions=step.get("expressions") or ["gpRegistry.magic"],
+                        retries=int(step.get("retries") or 3),
+                        inter_read_delay_ms=int(step.get("inter_read_delay_ms") or 5),
+                        adapter=adapter,
+                    )
+                elif action in ("ask", "question", "ask_runtime_question", "runtime_ask"):
                     q_txt = str(step.get("question") or step.get("expression") or "프로세스 상태 요약")
                     raw_out = self.ask_runtime_question(
                         question=q_txt,
@@ -10792,6 +10837,8 @@ class WatchSessionManager:
                         companion_elf_path=eff_elf,
                         adapter=adapter,
                     )
+                else:
+                    raise ValueError(f"Unsupported batch action '{action}'. Supported actions: eval, scan_pool, find_owners, tls, dpdk, triage, callstack, diff, heap, verify_consistency, ask.")
 
                 final_out = (
                     self.summarize_for_llm_budget(
@@ -10823,7 +10870,13 @@ class WatchSessionManager:
                 })
 
         total_latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
-        return {
+        total_steps = len(normalized_steps)
+        overall_success = (failed_count == 0)
+        is_partial = (succeeded_count > 0 and failed_count > 0)
+
+        res: Dict[str, Any] = {
+            "success": overall_success,
+            "partial_success": is_partial,
             "pid": eff_pid,
             "companion_elf": eff_elf,
             "auto_healed_pid": ctx_info.get("auto_healed_pid", False),
@@ -10831,15 +10884,25 @@ class WatchSessionManager:
             "stop_duration_ms": 0.0,
             "batch_latency_us": total_latency_us,
             "compact_mode": compact,
-            "steps_requested": len(normalized_steps),
+            "steps_requested": total_steps,
             "steps_succeeded": succeeded_count,
             "steps_failed": failed_count,
             "cross_step_highlights": cross_step_highlights,
             "step_results": step_results,
             "llm_next_step_hint": (
-                f"Executed {succeeded_count}/{len(normalized_steps)} batch diagnostic step(s) in {total_latency_us}us with 0.00ms target stop time."
+                f"Executed {succeeded_count}/{total_steps} batch diagnostic step(s) in {total_latency_us}us with 0.00ms target stop time."
             ),
         }
+        if failed_count > 0:
+            if is_partial:
+                res["error_code"] = "PARTIAL_BATCH_FAILURE"
+                res["error"] = f"{failed_count} of {total_steps} batch step(s) failed"
+                res["recovery_hint"] = "Review failed steps in 'step_results' to diagnose individual action failures."
+            else:
+                res["error_code"] = "ALL_STEPS_FAILED"
+                res["error"] = f"All {failed_count} batch step(s) failed"
+                res["recovery_hint"] = "Check target process liveness and parameters for all batch steps."
+        return res
 
 
     # -------------------------------------------------------------------------

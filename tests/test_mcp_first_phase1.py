@@ -302,6 +302,154 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertEqual(batch["steps_succeeded"], 4)
         self.assertEqual(batch["steps_failed"], 0)
 
+    def test_08_target_context_switching_and_precedence(self) -> None:
+        """Verifies target switching (A -> B), explicit args precedence, and debug image isolation."""
+        # Connect target A
+        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+
+        # Launch target B with mismatching binary
+        proc_b = subprocess.Popen([self.mismatch_bin_path])
+        try:
+            time.sleep(0.1)
+
+            # 1. Calling tool with explicit target B arguments must use target B (precedence)
+            res_b = json.loads(
+                mcp_srv.runtime_eval_memory_path(
+                    pid=proc_b.pid,
+                    companion_elf=self.mismatch_bin_path,
+                    expressions=["gpRegistry.magic"],
+                )
+            )
+            self.assertTrue(res_b["success"])
+            self.assertEqual(res_b["pid"], proc_b.pid)
+
+            # 2. Explicit PID of B without companion ELF must NOT leak target A's companion ELF if Build IDs differ
+            res_leak = json.loads(
+                mcp_srv.runtime_eval_memory_path(
+                    pid=proc_b.pid,
+                    expressions=["gpRegistry.magic"],
+                )
+            )
+            # proc_b has md5 build id while target A has sha1 build id; if companion ELF could not be resolved from exe,
+            # it must reject rather than silently using target A's companion ELF
+            if not res_leak["success"]:
+                self.assertIn(res_leak["error_code"], ("DEBUG_IMAGE_NOT_FOUND", "BUILD_ID_MISMATCH", "NO_TARGET_SPECIFIED"))
+
+            # 3. Switching bound target to B: subsequent calls without PID must use B
+            conn_b = json.loads(
+                mcp_srv.runtime_target_connect(pid=proc_b.pid, companion_elf=self.mismatch_bin_path)
+            )
+            self.assertTrue(conn_b["success"])
+            self.assertEqual(conn_b["pid"], proc_b.pid)
+
+            res_switched = json.loads(mcp_srv.runtime_eval_memory_path(expressions=["gpRegistry.magic"]))
+            self.assertTrue(res_switched["success"])
+            self.assertEqual(res_switched["pid"], proc_b.pid)
+        finally:
+            if proc_b.poll() is None:
+                proc_b.terminate()
+                try:
+                    proc_b.wait(timeout=2)
+                except Exception:
+                    proc_b.kill()
+            # Restore target A context
+            mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+
+    def test_09_input_boundaries_rejection(self) -> None:
+        """Verifies strict boundary validation: booleans, fractional floats, and missing target errors."""
+        # 1. Booleans must be rejected as PIDs
+        res_bool_t = json.loads(mcp_srv.runtime_capture_memory(pid=True))
+        self.assertFalse(res_bool_t["success"])
+        self.assertEqual(res_bool_t["error_code"], "INVALID_PID")
+        self.assertIn("boolean", res_bool_t["error"].lower())
+
+        res_bool_f = json.loads(mcp_srv.runtime_capture_memory(pid=False))
+        self.assertFalse(res_bool_f["success"])
+        self.assertEqual(res_bool_f["error_code"], "INVALID_PID")
+
+        # 2. Fractional numeric PIDs must be rejected rather than truncated
+        res_float = json.loads(mcp_srv.runtime_capture_memory(pid=123.45))
+        self.assertFalse(res_float["success"])
+        self.assertEqual(res_float["error_code"], "INVALID_PID")
+        self.assertIn("fractional", res_float["error"].lower())
+
+        res_float_str = json.loads(mcp_srv.runtime_capture_memory(pid="123.45"))
+        self.assertFalse(res_float_str["success"])
+        self.assertEqual(res_float_str["error_code"], "INVALID_PID")
+
+        # 3. Missing target context produces NO_TARGET_SPECIFIED rather than generic INVALID_PID
+        saved_ctx = dict(mcp_srv.runtime.watch_session_manager._active_target_context)
+        try:
+            mcp_srv.runtime.watch_session_manager._active_target_context.clear()
+            res_none = json.loads(mcp_srv.runtime_capture_memory())
+            self.assertFalse(res_none["success"])
+            self.assertEqual(res_none["error_code"], "NO_TARGET_SPECIFIED")
+            self.assertIn("recovery_hint", res_none)
+        finally:
+            mcp_srv.runtime.watch_session_manager._active_target_context = saved_ctx
+
+    def test_10_consistency_semantics_fields(self) -> None:
+        """Verifies explicit ZERO_STOP concurrency metadata: process_stopped, is_atomic_read, causal_guarantee."""
+        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        raw_ev = mcp_srv.runtime_eval_memory_path(expressions=["gpRegistry.magic"])
+        ev = json.loads(raw_ev)
+        self.assertTrue(ev["success"])
+        c = ev["consistency"]
+        self.assertEqual(c["level"], "NON_ATOMIC")
+        self.assertFalse(c["is_consistent_snapshot"])
+        self.assertFalse(c["process_stopped"])
+        self.assertFalse(c["is_atomic_read"])
+        self.assertEqual(c["mechanism"], "ZERO_STOP_CONCURRENT_READ")
+        self.assertEqual(c["causal_guarantee"], "NONE")
+
+    def test_11_batch_macro_failures_and_unknown_actions(self) -> None:
+        """Verifies runtime_batch_execute fails cleanly on unknown actions and sets partial_success appropriately."""
+        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+
+        # 1. Unknown action does NOT fall back to natural language question; reports unsupported action error
+        raw_unk = mcp_srv.runtime_batch_execute(
+            steps=[{"action": "unknown_action_xyz_123", "data": "bad"}]
+        )
+        unk = json.loads(raw_unk)
+        self.assertFalse(unk["success"])
+        self.assertEqual(unk["steps_failed"], 1)
+        self.assertEqual(unk["error_code"], "ALL_STEPS_FAILED")
+        self.assertIn("unsupported batch action", unk["step_results"][0]["error"].lower())
+
+        # 2. Mixed batch: 1 succeeding step, 1 failing step
+        raw_mixed = mcp_srv.runtime_batch_execute(
+            steps=[
+                {"action": "eval", "expressions": ["gpRegistry.magic"]},
+                {"action": "unknown_nonexistent_tool"},
+            ]
+        )
+        mixed = json.loads(raw_mixed)
+        self.assertFalse(mixed["success"])
+        self.assertTrue(mixed["partial_success"])
+        self.assertEqual(mixed["error_code"], "PARTIAL_BATCH_FAILURE")
+        self.assertEqual(mixed["steps_succeeded"], 1)
+        self.assertEqual(mixed["steps_failed"], 1)
+        self.assertIn("recovery_hint", mixed)
+
+    def test_12_session_and_error_contract_standardization(self) -> None:
+        """Verifies domain error codes (SESSION_NOT_FOUND) and context inheritance for baseline save."""
+        # 1. Non-existent session returns SESSION_NOT_FOUND error code
+        res_obs = json.loads(mcp_srv.runtime_watch_session_observations(session_id="non_existent_session_id_404"))
+        self.assertFalse(res_obs["success"])
+        self.assertEqual(res_obs["error_code"], "SESSION_NOT_FOUND")
+        self.assertIn("recovery_hint", res_obs)
+
+        res_get = json.loads(mcp_srv.runtime_watch_session_get(session_id="non_existent_session_id_404"))
+        self.assertFalse(res_get["success"])
+        self.assertEqual(res_get["error_code"], "SESSION_NOT_FOUND")
+
+        # 2. runtime_golden_baseline_save without PID inherits bound target context
+        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        res_save = json.loads(mcp_srv.runtime_golden_baseline_save(label="Test Baseline"))
+        self.assertTrue(res_save["success"])
+        self.assertEqual(res_save["pid"], self.proc.pid)
+        self.assertIn("baseline_id", res_save)
+
 
 if __name__ == "__main__":
     unittest.main()

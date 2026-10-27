@@ -8,7 +8,7 @@ live memory capture, and C++ semantic investigation.
 import json
 import os
 import sys
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -49,20 +49,34 @@ import functools
 
 def _validate_mcp_pid(pid: Any, allow_none: bool = True) -> Optional[int]:
     """Validates and normalizes a PID parameter for MCP tools.
-    Strictly rejects booleans, negative numbers, PID 0 (when required), and PID 1 (init/systemd).
+    Strictly rejects booleans, fractional numbers, negative numbers, PID 0 (when required), and PID 1 (init/systemd).
     """
     if isinstance(pid, bool):
         raise ValueError("Invalid target PID: boolean values are not valid PIDs")
     if pid is None:
         if not allow_none:
-            raise ValueError("Target PID is required and must be an integer > 1")
+            raise ValueError("No target PID provided and no target session bound")
         return None
+    if isinstance(pid, float):
+        if not pid.is_integer():
+            raise ValueError(f"Invalid fractional PID {pid}: PID must be an integer > 1")
+        pid = int(pid)
     if isinstance(pid, str):
         s = pid.strip()
         if not s:
             if not allow_none:
-                raise ValueError("Target PID is required and must be an integer > 1")
+                raise ValueError("No target PID provided and no target session bound")
             return None
+        if "." in s:
+            try:
+                f_val = float(s)
+                if not f_val.is_integer():
+                    raise ValueError(f"Invalid fractional PID '{s}': PID must be an integer > 1")
+                s = str(int(f_val))
+            except ValueError as ve:
+                if "fractional" in str(ve):
+                    raise
+                raise ValueError(f"Invalid non-numeric PID '{s}'")
         if s.startswith("-") or s == "1":
             raise ValueError(f"Invalid or reserved system PID '{s}': PID must be an integer > 1")
         if s.isdigit():
@@ -73,8 +87,8 @@ def _validate_mcp_pid(pid: Any, allow_none: bool = True) -> Optional[int]:
                 raise ValueError(f"Invalid or reserved system PID {p_int}: PID must be an integer > 1")
             return p_int
         raise ValueError(f"Invalid non-numeric PID '{s}'")
-    if isinstance(pid, (int, float)):
-        p_int = int(pid)
+    if isinstance(pid, int):
+        p_int = pid
         if p_int == 1 or p_int < 0:
             raise ValueError(f"Invalid or reserved system PID {p_int}: PID must be an integer > 1 (PID 1 is reserved)")
         if p_int == 0:
@@ -85,8 +99,87 @@ def _validate_mcp_pid(pid: Any, allow_none: bool = True) -> Optional[int]:
     raise ValueError(f"Unsupported PID type: {type(pid).__name__}")
 
 
+def _normalize_mcp_error(err_msg: Any, explicit_code: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """Normalize raw error messages and exception codes into machine-readable MCP error codes and recovery hints.
+    
+    Returns:
+        (error_code, recovery_hint)
+    """
+    msg = str(err_msg or "").strip()
+    msg_lower = msg.lower()
+
+    domain_codes = {
+        "NO_TARGET_SPECIFIED",
+        "INVALID_PID",
+        "BUILD_ID_MISMATCH",
+        "DEBUG_IMAGE_NOT_FOUND",
+        "MISSING_DWARF",
+        "SESSION_NOT_FOUND",
+        "SNAPSHOT_NOT_FOUND",
+        "OBJECT_NOT_FOUND",
+        "PROCESS_EXITED",
+        "PERMISSION_DENIED",
+        "PARTIAL_BATCH_FAILURE",
+        "ALL_STEPS_FAILED",
+        "UNSUPPORTED_CAPABILITY",
+        "TIMEOUT",
+    }
+
+    hints_by_code = {
+        "NO_TARGET_SPECIFIED": "Bind a target first via `runtime_target_connect(pid=...)` or provide `pid` explicitly.",
+        "INVALID_PID": "Specify a valid positive integer PID greater than 1.",
+        "BUILD_ID_MISMATCH": "Provide the companion ELF binary matching the target's exact Build ID.",
+        "DEBUG_IMAGE_NOT_FOUND": "Verify that companion_elf path exists and contains unstripped DWARF (.debug_info) debug symbols.",
+        "MISSING_DWARF": "Verify that companion_elf path exists and contains unstripped DWARF (.debug_info) debug symbols.",
+        "SESSION_NOT_FOUND": "Query active sessions via `runtime_watch_session_list` or create one via `runtime_watch_session_create`.",
+        "SNAPSHOT_NOT_FOUND": "Capture a fresh memory snapshot via `runtime_capture_memory` before querying snapshot objects.",
+        "OBJECT_NOT_FOUND": "List available object identifiers via `runtime_list_objects`.",
+        "PROCESS_EXITED": "The target process has terminated. Verify if it restarted or bind a new PID via `runtime_target_connect`.",
+        "PERMISSION_DENIED": "Check process ownership or ensure Yama ptrace_scope (/proc/sys/kernel/yama/ptrace_scope) allows memory inspection.",
+        "PARTIAL_BATCH_FAILURE": "Review failed steps in 'step_results' to diagnose individual action failures.",
+        "ALL_STEPS_FAILED": "Check target process liveness and parameters for all batch steps.",
+        "UNSUPPORTED_CAPABILITY": "Check supported capabilities via `runtime_get_capabilities`.",
+        "TIMEOUT": "Retry with a larger timeout or check if the target process is responsive.",
+    }
+
+    # Determine domain error code
+    code = None
+    if explicit_code and explicit_code in domain_codes:
+        code = explicit_code
+
+    # Check for target/PID ambiguities first (NO_TARGET_SPECIFIED takes precedence over generic INVALID_PID)
+    if any(k in msg_lower for k in ("no target", "target pid is required", "target pid could not be resolved", "no target session bound", "bind a target first", "target process pid is required", "no investigation target provided")):
+        code = "NO_TARGET_SPECIFIED"
+    elif not code or explicit_code in ("ValueError", "RuntimeError", "KeyError", "Exception", "ERROR"):
+        if any(k in msg_lower for k in ("invalid target pid", "boolean values are not valid", "boolean value is not a valid", "fractional pid", "reserved system pid", "pid must be an integer", "non-numeric target pid", "unsupported pid type", "invalid non-numeric pid")):
+            code = "INVALID_PID"
+        elif any(k in msg_lower for k in ("build_id mismatch", "mismatching debug image", "build id mismatch")):
+            code = "BUILD_ID_MISMATCH"
+        elif any(k in msg_lower for k in ("companion elf", "dwarf debug info could not be resolved", "debug image not found", "cannot find elf", "missing dwarf")):
+            code = "DEBUG_IMAGE_NOT_FOUND"
+        elif (("session" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower)) or "no watch session" in msg_lower):
+            code = "SESSION_NOT_FOUND"
+        elif (("snapshot" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower)) or "no active snapshot" in msg_lower):
+            code = "SNAPSHOT_NOT_FOUND"
+        elif ("object" in msg_lower and ("not found" in msg_lower or "does not exist" in msg_lower or "unknown" in msg_lower)):
+            code = "OBJECT_NOT_FOUND"
+        elif any(k in msg_lower for k in ("process exited", "target process dead", "no such process", "esrch")):
+            code = "PROCESS_EXITED"
+        elif any(k in msg_lower for k in ("permission denied", "operation not permitted", "eperm", "ptrace_scope")):
+            code = "PERMISSION_DENIED"
+        elif any(k in msg_lower for k in ("unsupported batch action", "unsupported action", "unsupported capability")):
+            code = "UNSUPPORTED_CAPABILITY"
+        elif "timeout" in msg_lower:
+            code = "TIMEOUT"
+        else:
+            code = explicit_code or "ERROR"
+
+    hint = hints_by_code.get(code)
+    return code, hint
+
+
 def _format_result(res: Any) -> str:
-    """Format AgentActionResult into a clean JSON string with safe fallback serialization."""
+    """Format AgentActionResult into a clean JSON string with safe fallback serialization and standardized error contracts."""
     if hasattr(res, "to_dict"):
         data = res.to_dict()
     elif isinstance(res, dict):
@@ -95,13 +188,24 @@ def _format_result(res: Any) -> str:
         data = {"result": str(res)}
     if isinstance(data, dict) and not data.get("success"):
         err = data.get("error")
+        err_msg = ""
         if isinstance(err, dict):
             if "error_code" not in data and "code" in err:
                 data["error_code"] = err["code"]
             if "error_message" not in data and "message" in err:
                 data["error_message"] = err["message"]
-        elif isinstance(err, str) and "error_code" not in data:
-            data["error_code"] = "ERROR"
+            err_msg = str(data.get("error_message") or err.get("message") or "")
+        elif isinstance(err, str):
+            err_msg = err
+            if "error_message" not in data:
+                data["error_message"] = err
+        else:
+            err_msg = str(err or "")
+
+        code, hint = _normalize_mcp_error(err_msg, data.get("error_code"))
+        data["error_code"] = code
+        if hint and "recovery_hint" not in data:
+            data["recovery_hint"] = hint
     return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
@@ -139,7 +243,7 @@ def runtime_capture_memory(
         })
         return _format_result(res)
     except Exception as e:
-        return _format_watch_result({"success": False, "error": str(e), "error_code": "INVALID_PID" if "PID" in str(e) else type(e).__name__})
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -174,7 +278,7 @@ def runtime_observe(
         })
         return _format_result(res)
     except Exception as e:
-        return _format_watch_result({"success": False, "error": str(e), "error_code": "INVALID_PID" if "PID" in str(e) else type(e).__name__})
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -287,7 +391,7 @@ def runtime_start_investigation(
         })
         return _format_result(res)
     except Exception as e:
-        return _format_watch_result({"success": False, "error": str(e), "error_code": "INVALID_PID" if "PID" in str(e) else type(e).__name__})
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
@@ -394,7 +498,15 @@ def runtime_get_capabilities() -> str:
 # -----------------------------------------------------------------------------
 
 def _format_watch_result(data: Any) -> str:
-    """Format Watch Session result into clean JSON string with safe fallback serialization."""
+    """Format Watch Session result into clean JSON string with standardized error contracts."""
+    if isinstance(data, dict):
+        if not data.get("success", True):
+            err_raw = data.get("error")
+            err_str = err_raw if isinstance(err_raw, str) else str(err_raw or "")
+            code, hint = _normalize_mcp_error(err_str, data.get("error_code"))
+            data["error_code"] = code
+            if hint and "recovery_hint" not in data:
+                data["recovery_hint"] = hint
     return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
@@ -1123,6 +1235,10 @@ def runtime_golden_baseline_save(
 ) -> str:
     """Save the current healthy runtime state of a process as a persistent Golden Baseline for future comparison."""
     try:
+        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+            pid = _ctx['pid']
+            companion_elf = _ctx['companion_elf_path']
         rec = runtime.watch_session_manager.save_golden_baseline(
             pid=pid,
             companion_elf_path=companion_elf,
@@ -2198,7 +2314,7 @@ def runtime_batch_execute(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **res})
+        return _format_watch_result(res)
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
