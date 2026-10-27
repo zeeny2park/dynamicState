@@ -1,1894 +1,264 @@
-# Runtime State Explorer — Agent-Native Runtime Engine & State Exploration
+# DynamicState
 
-> [!NOTE]
-> **Status: `DYNAMICSTATE_PHASE15_SIMPLIFIED_UX_AND_REAL_CONVERSATIONAL_LLM_COMPLETE`** — Simplified Investigation UX and Real Conversational LLM Integration Complete  
-> Verified with 656+ Unit/Integration/Security Tests (Full Discovery), 22 Phase 15 Conversational LLM & Simplified Investigation UX Tests, 25 Pipeline Steps in `run_all_tests.sh`, 13 Phase 14 Embedded Linux Production Pilot & Security Gate Tests, Standalone Production Pilot Demonstration Script (`scripts/run_production_pilot.py`), 16 Phase 13 Real C++ Operational Acceptance & Security Gate Tests, 14-Step Automated Acceptance Pipeline (`scripts/run_e2e_operational_acceptance.py`), 11 Phase 12 Conversational Investigation Loop Tests, 83 Causal Validation & Evidence Authenticity Tests, 16 Phase 10 Independent CI Security Gate Tests, 17 Phase 11 Real-Target Release Readiness Tests, Real C++ PIE ASLR Controls, Multithread Branch Isolation, CI Workflow Parity, Machine-Readable Pilot Qualification Schema with Tamper-Evident SHA-256 Signatures, and Non-Atomic Capture Degraded Trust Gates.
+> **Agent-Native Runtime Engine & Non-Intrusive State Explorer for C/C++ Systems**
 
-GDB가 멈춘 순간의 execution context와 DWARF-aware C/C++ object graph를 관찰하고, typed field mutation·continue·snapshot·semantic diff를 통한 결정론적 상태 전이(State Transition)와 동일한 부모 상태(Parent State)로부터 여러 변이 후보를 독립적으로 탐색하는 Branch-safe 런타임 상태 탐색(State Exploration) 및 코퍼스(State Corpus) 영속화를 제공합니다.
+[![Linux](https://img.shields.io/badge/Platform-Linux%20x86__64-blue.svg)](#prerequisites)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](#prerequisites)
+[![Architecture](https://img.shields.io/badge/Agent-Native-brightgreen.svg)](#agent-runtime-protocol-and-mcp-server)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Safety](https://img.shields.io/badge/Safety-Hardened%20Signals%20%26%20AST%20Audited-success.svg)](#safety-boundaries-and-defensive-hardening)
 
-
-나아가 실제 CI/CD 및 프로덕션 환경의 **Stripped Production Binary**와 **External Debug Image** 환경 위에서, 자율 코딩 에이전트(Autonomous Coding Agent)가 GDB 명령어나 원시 메모리 주소를 직접 다루지 않고 오직 고수준 의미론적 개념(Object, Field, State, MutationCandidate, Transition, Exploration, Evidence, Invariant)만을 사용하여 런타임 상태를 관찰하고 탐색할 수 있는 **Agent Runtime Protocol (ARP)** 과 참조 구현체 `AgentRuntime`을 제공합니다.
-
-또한, 고성능·통신·프로덕션 환경에서 프로세스 중단 없이 실행 중인 프로세스의 원시 메모리를 비침습적으로 캡처하고(`process_vm_readv`), ELF `PT_LOAD` 세그먼트 기반의 정확한 `load_bias` 계산, `RuntimeModule` 모델 및 `.gnu_debuglink`/Build ID 디버그 아티팩트 검증, 오프라인 DWARF 의미론적 객체 그래프 복원을 수행하는 **Production-grade Low-Impact Observation Hardening (Phase 5.2)** 을 지원합니다.
-
-
-> [!TIP]
-> **🚀 실전 임베디드 무중단 메모리 분석 가이드 (Quickstart Playbook)**:
-> 외부 서버의 `nostrip` ELF로 임베디드 장비 프로세스를 0.00ms 정지로 즉시 분석하는 **4대 시나리오, 1줄 CLI 명령어(`connect`, `eval`, `diff`, `recipe`), Web UI 3대 진단 레시피, 코딩 에이전트 MCP 프롬프트 템플릿**은 [`docs/PRACTICAL_PLAYBOOK_KO.md`](docs/PRACTICAL_PLAYBOOK_KO.md)에서 바로 확인하실 수 있습니다.
+**DynamicState** is a high-performance, agent-native runtime exploration and live-system debugging platform tailored for Linux C/C++ binaries. It enables both human engineers and autonomous AI coding agents to observe, reconstruct, and navigate live execution state without arbitrary heap corruption or disruptive debugger halts.
 
 ---
 
-## Architecture & Exploration Pipeline
+## 🌟 Key Highlights
+
+- **Zero-Stop Non-Intrusive Memory Capture (`LOW_IMPACT` Mode)**  
+  Capture live process memory at wire speed using Linux `process_vm_readv()` without pausing or halting critical production threads.
+- **Offline Semantic Object Graph Reconstruction**  
+  Resolve memory dumps against external unstripped ELF debug images via DWARF symbol resolution, type canonicalization, and pointer chasing—bypassing raw guesswork.
+- **External Debug Image & Build ID Binding**  
+  Seamlessly inspect stripped production binaries using external `nostrip` binaries or `.debug` files validated against GNU Build-ID and `.gnu_debuglink` CRC32 checksums.
+- **Consistent State Exploration & Checkpointing (`CONSISTENT` Mode)**  
+  Perform deterministic state-space branching, typed mutations, and instant rollback using GDB fork checkpoints for root-cause reproduction.
+- **Agent Runtime Protocol (ARP) & MCP Server**  
+  Full Model Context Protocol (MCP) integration with over 45 native tools, equipping LLM coding agents (Gemini, Claude, Antigravity) with structured runtime introspection.
+- **Real-Time Web Workspace UI**  
+  Interactive browser-based live dashboard with reverse-proxy support, subpath awareness, live trace cards, callstack/lock visualizers, and memory integrity monitors.
+- **Industrial Safety & Defensive Hardening**  
+  Ast-verified signal dispatch, PID bounds checking (strict rejection of PID <= 1 and boolean inputs), safe `kill --` delimiters, and `AbortController` timeouts.
+
+---
+
+## 🏗️ Architecture & Exploration Pipeline
+
+DynamicState separates observation from live process interference through a clean, multi-layered architecture:
 
 ```text
-               Coding Agent / CLI Tool
-                    │
-                    │ Agent Runtime Protocol (JSON Actions & Results)
-                    ▼
-               AgentRuntime
-                    │
-                    ├── Investigation Manager (Goal-driven Hypothesis & Evidence Ledger)
-                    ├── Static Analysis Provider (DWARF / Host-side Code Correlation)
-                    ├── Compact Context (AgentStateContext)
-                    ├── Object & Field Inspection (AgentObject, AgentField)
-                    ├── Candidate Ranker (Deterministic Priority Scoring)
-                    ├── Transition Analyzer (Semantic Facts & Fact-based Evidence)
-                    ├── Invariant Candidate Detector (Structural / Numeric Hypotheses)
-                    ├── Offline Memory Analyzer (DWARF-guided Heap/Stack Graph Reconstruction)
-                    └── Agent Safety Boundaries (Capability Enforcement & Input Validation)
-                    │
-       ┌────────────┴──────────────────────────┐
-       ▼ [CONSISTENT Mode]                     ▼ [LOW_IMPACT Mode]
-RuntimeController                       MemoryCapture (Linux process_vm_readv)
-       │                                       │
-       ├── State Snapshot & Object Graph       ├── Non-intrusive Zero-Stop Capture
-       ├── Typed Mutation & State Restorer     ├── Partial Consistency Tracking (NON_ATOMIC)
-       ├── State Explorer & State Corpus       └── RawMemorySnapshot Artifact Directory
-       └── External Debug Image Provider               │
-               │                                       ▼
-               ▼                             OfflineMemoryAnalyzer
-             GDB                                       │ (DWARF context + memory blobs)
-               │                                       ▼
-               ▼                               RuntimeSnapshot (Semantic Graph)
-       Stripped Production Binary
-       (/proc/<pid>/mem, /proc/exe)
+               Autonomous AI Agent / Web UI / CLI
+                                │
+                                │ Agent Runtime Protocol (JSON-RPC / MCP)
+                                ▼
+                         AgentRuntime
+                                │
+       ┌────────────────────────┴────────────────────────┐
+       ▼ [LOW_IMPACT Mode]                               ▼ [CONSISTENT Mode]
+ Non-Intrusive Live Capture                     Deterministic State Explorer
+  (process_vm_readv)                             (GDB Checkpoints & Ptrace)
+       │                                                 │
+       ├── Zero process halt (0.00ms stop)               ├── Controlled breakpoint stop
+       ├── Accurate PT_LOAD load_bias computation        ├── Typed field mutation
+       ├── Build ID & .gnu_debuglink verification        ├── Rollback & branch exploration
+       └── RawMemorySnapshot persistence                 └── Semantic diff & state hash
+               │                                                 │
+               ▼                                                 ▼
+     OfflineMemoryAnalyzer                             RuntimeController
+               │                                                 │
+               └───────────────┬─────────────────────────────────┘
+                               ▼
+                   Semantic Object Graph
+          (DWARF Typed Roots: Globals / Locals / Heap)
 ```
 
-### Observation Modes
+### Core Invariant: Semantic Reachability over Brute-Force Scanning
 
-| 모드 | 관측 방식 | 프로세스 중단 | 변이/전이/탐색 | 정합성 수준 | 주요 활용 환경 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **`CONSISTENT`** | GDB Breakpoint / ptrace | 중단 (Stop-the-world) | **지원** (Typed Mutation, Continue, Rollback) | `STOPPED` / `ATOMIC` | 개발, CI/CD, 상태 공간 탐색, 버그 재현 |
-| **`LOW_IMPACT`** | Linux `process_vm_readv()` | **중단 없음** (Zero-Stop) | **엄격히 불가** (`CAPABILITY_UNSUPPORTED`) | `NON_ATOMIC` (경고 메타데이터 기록) | 통신, 실시간 제어, 프로덕션 모니터링 |
-
-### Important Architecture Principle
-
-이 시스템은 전체 heap scanner가 아닙니다. 절대로 `/proc/<pid>/mem` 전체를 읽거나 무차별 memory scanning을 하지 않습니다.
+DynamicState is **not** a blind heap scanner. It never traverses `/proc/<pid>/mem` haphazardly. Instead, state exploration is anchored to typed roots:
 
 ```text
-Typed Roots (Global / Static / Frame Locals / Arguments)
+Typed Roots (Global / Static / Frame Locals / Thread Stacks)
     ↓
-DWARF Type Resolution
+DWARF Type Canonicalization & Member Offsets
     ↓
-Field Metadata
+Target Object Resolution (Virtual Address, DWARF Tag)
     ↓
-Pointer Dereference
-    ↓
-Target Object Identification (address, canonical_type)
+Pointer Dereference & Boundary Validation
     ↓
 Recursive Semantic Reachability Traversal
 ```
 
-`/proc/<pid>/maps`는 typed root를 통해 이미 도달한 유효 주소의 storage classification(`heap`, `stack`, `global`, `unknown`)에만 사용되며, 주소 공간 탐색 목적으로 사용되지 않습니다.
+Memory mapping `/proc/<pid>/maps` is strictly consulted to classify storage classes (`global`, `heap`, `stack`, `mmap`), not to invent synthetic addresses.
 
 ---
 
-## Phase Distinction & Progress
+## 🚀 Quickstart
 
-- **Phase 3**: *"Can I execute and observe one deterministic state transition?"*  
-  (단일 결정론적 상태 전이 실행 및 관측: Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> StateTransition)
-- **Phase 4**: *"Can the runtime engine systematically discover new states from a parent runtime state through independent mutations?"*  
-  (단일 부모 상태에서 여러 변이 후보를 안전하게 복원하며 독립적인 상태 공간 가지(Branches)를 체계적으로 탐색)
-- **Phase 4.1**: *"Validation & Hardening — Real GDB Checkpoints, Crash/Timeout Isolation, and Semantic Determinism"*  
-  (GDB 체크포인트 에러 코드 명시화, 자율적 `StateExplorer.run()` 오케스트레이션, `SIGSEGV`/`TIMEOUT` 장애 격리, ASLR 및 Storage-Class 무관 상태 해시, Runtime Capabilities API 및 안전 한계 적용)
-- **External Debug Image Foundation**: *"Production-Grade Stripped Binary Execution with External Debug Images"*  
-  (실제 프로덕션 환경의 stripped 바이너리를 변경 없이 실행하면서 동일 빌드의 외부 unstripped/debug 이미지를 바인딩하여 런타임 상태 추출, 변이, 전이, 탐색을 온전히 수행. GNU Build ID 검증, 아키텍처 호환성 검사, 런타임 프로세스 메모리 격리 보장, 스냅샷 출처(Provenance) 추적)
-- **Phase 5**: *"Agent Runtime Protocol (ARP) & Reference Implementation"*  
-  (자율 코딩 에이전트 전용 의미론적 런타임 인터페이스 구축: GDB 명령어 및 메모리 주소를 철저히 은닉하고, JSON 스키마 기반 Agent Runtime Protocol, 결정론적 후보 랭커(Candidate Ranker), 전이 분석기(Transition Analyzer), 사실 기반 증거 모델(Evidence Model), 구조적 불변식 후보 탐지기(Invariant Detector), 엄격한 안전 경계(Safety Boundary) 및 참조 구현체 `AgentRuntime` 제공)
-- **Phase 5.1**: *"Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis"*  
-  (프로덕션/실시간 애플리케이션을 위한 무중단 원시 메모리 캡처 및 사후 DWARF 오프라인 의미 분석: Linux `process_vm_readv()` 기반 고속 복사, `RawMemorySnapshot` 디스크 영속 아티팩트, 부분 일관성(`NON_ATOMIC`) 모델, `OfflineMemoryAnalyzer` 의미론적 객체 그래프 복원, CLI 도구(`capture-memory`, `analyze-memory`), LOW_IMPACT 모드 엄격한 관측 전용 경계 보장)
-- **Phase 5.2 (Complete)**: *"Production-grade Low-Impact Observation Hardening"*  
-  (ELF `PT_LOAD` 세그먼트 기반의 정확한 `load_bias` 계산, `RuntimeModule` 모델 및 `/proc/<pid>/maps` 모듈 검색, Build ID / `.gnu_debuglink` CRC 디버그 아티팩트 provenance 검증, `DebugArtifactProvider` 및 `DebugInfoProvider` 추상화, `ObservationBackend` 명시적 모델(`GDBObservationBackend` vs `LowImpactObservationBackend`), 오프라인 스냅샷 내 가짜 스레드/프레임 제거 및 실행 상태 `availability="UNAVAILABLE"` 명시화, 프로세스 종료(`ESRCH`) graceful handling, CLI 서브커맨드 `list-modules` 및 `runtime-info` 지원)
-- **Web UI MVP (Complete)**: *"Runtime State Explorer for Human Validation"*  
-  (인간 엔지니어가 런타임 상태, DWARF 객체 그래프, 결정론적 변이 후보, 상태 전이 및 상태 해시, 상태 전이 그래프(SVG), 스냅샷 diff, 자율 탐색 진행 상황을 시각적으로 검증할 수 있는 경량 단일 페이지 웹 UI. 외부 pip 의존성 없는 Python 표준 라이브러리 기반 HTTP 서버, AgentRuntime 1:1 래핑 Web API 어댑터, 임의 GDB/Shell/메모리 쓰기 차단 안전 경계, LOW_IMPACT 관측 전용 표시 및 변이 차단, UNKNOWN 메타데이터 정직성 보장)
-- **Phase 6 (Complete)**: *"Fast Runtime Snapshot + Offline State Laboratory"*  
-  (실행 중 프로세스의 중단 시간을 10ms 미만(실측 0.99~4.27ms)으로 최소화하는 고속 런타임 캡처 아키텍처: 중단 중 DWARF traversal 및 포인터 탐색을 완전히 배제하고 `process_vm_readv` 원시 메모리 캡처 즉시 프로세스를 재개(`SIGCONT`), 오프라인 의미론적 상태 엔진(`OfflineSemanticEngine`)을 통한 DWARF/객체 그래프/계층적 경로(`Session.worker.state.counter`) 복원, 불변 논리 스냅샷 복사 기반 State Laboratory(`StateLaboratory`, `SnapshotMutator`, `compute_semantic_diff`), 다중 스레드 동시성 환경에서의 스레드 영향 분석기(`ThreadImpactAnalyzer` - 직접 참조 스레드와 구조적 도달 가능 스레드 분리), 실시간 프로세스 읽기 검증 기반 Replay(`StateReplayer`), 그리고 7번째 탭 🔬 State Laboratory UI 제공)
-- **Phase 7 (Complete)**: *"Agent-First Investigation Workflow & Evidence Ledger (Inspired by REA)"*  
-  (REA(Reverse Engineer Anything)의 체계적 조사 흐름과 코드 연결 정적 분석 철학을 계승하여 dynamicState를 자연어 요청 기반의 증거 중심 조사(Evidence-First Investigation) 워크플로로 확장: 버전화된 기계 판독 가능 증거 원장(`EvidenceLedger` v1.0.0), 엄격한 사실(Facts)·가설(Hypotheses)·불명(Unknowns) 삼원 분류, 타깃/빌드 ID 일치성 검증, DWARF 기반 정적-동적 코드 연결(`StaticAnalysisProvider`), 고수준 조사 API(`start_investigation`, `compare_observations`, `follow_evidence`, `get_next_steps`), 읽기 전용 기본 안전 정책, 그리고 엔지니어가 원시 주소 없이도 직관적으로 파악할 수 있는 `0. 🔍 Investigation Overview` UI 탭 제공)
-- **Phase 8 (Complete)**: *"Runtime Evidence Authenticity and Independent Function Attribution"*  
-  (스냅샷 바이트 무결성, 캡처 출처, 타깃 프로세스 ID, 상태 전이 검증, 함수 인과 귀속 검증 5개 신뢰 계층 분리; `CaptureReceipt` 및 `compute_snapshot_artifact_hash()` 통한 결정론적 매니페스트 해싱; 단일 작성자 격리 및 실행 추적 기반 함수 귀속 분리; REST/ARP 비신뢰 호출자 플래그 무장해제; DWARF 정적 후보(`STATIC_CANDIDATE`)의 런타임 독립 검증 없는 승격 원천 차단)
-- **Phase 9 (Complete)**: *"Cross-Process Evidence Trust, Key Lifecycle & Real-World Causal Validation"*  
-  (`CaptureKeyStore` 통한 키 수명주기(등록, 회전, 폐기, 프로세스 로컬 임시 키 폴백) 관리; Schema 2.0.0 HMAC-SHA256 기반 프로세스 간 오프라인 영속 스냅샷 상호검증; 폐기/미확인 키 Fail-Closed 보장; 비밀값 비노출(Zero Secret Leakage) 원칙 확립; PID 재활용 방지(`/proc/<pid>/stat` 시작 시간 검증); 실 컴파일 C++ PIE 바이너리 포지티브/네거티브 컨트롤 검증)
-- **Phase 10 (Complete)**: *"Independent Trust Verification & CI Acceptance Gates"*  
-  (전체 10대 신뢰 경계(Capture Backend, Receipt Issuance, Save/Load, Cross-Process, Investigation, REST, ARP, EvidenceLedger, Controlled Execution, Causal Attestation) 신뢰 행렬(Trust-Boundary Matrix) 명세화; 4대 CI 보안 수락 게이트(`TestTrustBoundaryIngressGates`, `TestKeyLifecycleAndConcurrencyGates`, `TestArtifactIntegrityAndAntiTamperingGates`, `TestRealWorldCppCrossProcessAcceptanceGate`) 및 16개 회귀 테스트 구축; `ci/workflows/test.yml` 및 `run_all_tests.sh` 내 보안 게이트 강제 통합)
-- **Phase 11 (Complete)**: *"Real-Target Validation & Release Readiness"*  
-  (재현 가능한 C++ PIE DWARF/Stripped 9대 매트릭스 검증; 단일 작성자 포지티브/네거티브 컨트롤, 동시성 스레드 루프, 실행 추적 인증을 통한 함수 귀속 분리; 100% 바이트 회계 및 `SIGCONT` fail-open 재개 보장; 정지 시간 SLA 초과(`STOP_BUDGET_EXCEEDED`) 시 정합성 강등; 로컬 19단계 파이프라인(`run_all_tests.sh`) 100% 통과 및 원격 GitHub Actions 실행 현황 명시)
-- **Phase 12 (Complete)**: *"Evidence-Driven Root Cause Investigation & Conversational Validation"*  
-  (실제 C/C++ 런타임 결함 조사를 위한 대화형 증거 검증 루프: 관측 사실 -> 가설 생성 -> 차별적 후속 관측 -> 검증 시도 -> 상태 갱신 -> 다음 조치; DWARF 선언/LLM 설명의 정적 후보(`STATIC_CANDIDATE`) 독립 검증 전 승격 차단 원칙; 외부 LLM 의존성 없는 `DeterministicHypothesisGenerator`; 차별적 식별력과 기대 결과를 갖춘 관측 계획기; 관측 사실 드릴다운 인스펙터; 감사 추적 가능한 순차 타임라인(`session.timeline`); 위변조 방지 세션 영속화 및 원장 기반 재검증; Web UI Launchpad 자동/단계별 사이클 제어 및 실시간 타임라인 시각화 제공)
-- **Phase 13 (Complete)**: *"End-to-End Operational Acceptance, Investigation Quality, and Release Readiness"*  
-  (실제 컴파일된 C++ 타깃 프로그램 기반 10대 운영 수락 시나리오 전수 검증: 통제된 상태 전이, 음성 대조군(Negative Control) 베이스라인 안정성 검증, 경쟁 작성자 함수 간 인과 식별, 런타임 추적 부재 시 가설 불확실성 보존, 독립 신뢰 증명 기반 인과 함수 승격(`VALIDATED_CAUSAL_FUNCTION`), Stripped 바이너리 + 분리 DWARF 기호 해석, 불일치 빌드 ID의 안전한 거부(Fail-Closed), 다중 스레드 동시성 환경에서의 인과 과잉주장 차단, 비원자적(NON_ATOMIC) 캡처 및 프로세스 종료 시 정합성 강등, 세션 영속화/재개 시 원장 암호학적 재검증; 신뢰 경계 보안 게이트 회귀 방지; 웹 UI/ARP/CLI 14단계 완전 자동화 종단간 파이프라인(`scripts/run_e2e_operational_acceptance.py`) 및 운영 런북(`docs/operational_acceptance_guide.md`) 완비)
-- **Phase 14 (Complete)**: *"Production Pilot and Release Qualification"*  
-  (대표 임베디드 리눅스 C/C++ IoT 텔레메트리 타깃(`phase14_embedded_telemetry_fixture.cpp`) 대상 프로덕션 파일럿 및 릴리스 검증: Stripped PIE 바이너리 + 분리 컴패니언 DWARF 심볼, ASLR 환경 하 `process_vm_readv` 비침습적 정지/재개 캡처, 통계적 지연 시간 및 처리량 분포 산출(p50/p95/max), 음성 대조군 및 단일 작성자 격리 기반 인과 함수 승격, 상태 전이 검증과 함수 귀속 검증의 엄격한 분리, 경쟁 스레드 활성화 시 인과 주장 거절, 기계 판독 가능 파일럿 검증 보고서(`reports/pilot_qualification_report.json`)의 SHA-256 암호학적 위변조 방지 봉인, 시뮬레이션 타깃과 실 하드웨어 간 명시적 투명 공개(`real_hardware_validated=False`), 단독 실행 파일럿 검증 스크립트(`scripts/run_production_pilot.py`) 및 운영 런북(`docs/production_pilot_runbook.md`) 완비)
-- **Phase 15 (Complete)**: *"Simplified Investigation UX and Real Conversational LLM Integration"*  
-  (단일 조사 워크스페이스 중심의 UX 단순화 및 실제 Conversational LLM 연동: 8개 기술 탭을 전문가 모드(Expert Mode) 뒤로 점진적 공개(Progressive Disclosure) 처리하고 기본 뷰를 [대상 선택 -> 자연어 문제 기술 -> 분석 시작 -> 사실/가설/미확인/추천 조치 확인 -> 승인 및 관측 실행] 흐름으로 재편; OpenAI 호환 REST 엔드포인트(표준 라이브러리 urllib 기반, llama.cpp / vLLM / OpenAI), 로컬 Ollama 어댑터, 로컬 설치 CLI 도구(Gemini `agy`/`gemini`, Gemini ACP `agy-acp` stdio JSON-RPC, Cline/Paseo `cline`/`paseo`, 범용 CLI 템플릿 지원), 외부 LLM 미설정 시 정직한 결정론적 폴백(Deterministic Fallback) 지원; UI 프로바이더 선택 드롭다운 연동; API 키/토큰의 클라이언트/HTML/로그/세션 노출 원천 차단(GET /api/llm/status) 및 비밀 마스킹; 원시 메모리 블록을 배제한 DWARF/차이점/함수후보/원장ID 중심의 컴팩트 컨텍스트 구축 및 SHA-256 핑거프린트 서명; 서버 측 스키마 검증 및 방어적 디스암(원장에 없는 위조 증거 ID 제거, LLM의 VALIDATED 인과 주장 PROPOSED 격하, 후보 함수 STATIC_CANDIDATE 상한 제한); 4단계 진행 표시기([1/4] 컨텍스트 수집 -> [2/4] LLM 분석 -> [3/4] 증거 검증 -> [4/4] 완료), 한국어 추천 질의 칩, 후속 연속 대화 스트림, 추천 관측 원클릭 승인 실행 연동 완비)
-- **Phase 16 (Complete)**: *"CLI Provider Security, Runtime Truthfulness & Process Control"*  
-  (로컬 CLI 실행 보안 강화 및 진실된 런타임 제공자 보고: `--dangerously-skip-permissions` 플래그 제거 및 서버 측 명시적 opt-in 설정으로 제한, 셸 주입 방지를 위한 인자 벡터화 및 셸 메타문자 차단, 최소 권한 프로세스 환경 정제(Secret Scrubbing) 및 안전 작업 디렉터리 격리, 사용자 선택과 실제 호출 제공자 간 일치 보장 및 비침습적 진실된 폴백 감사 추적, 브라우저-API-서브프로세스 간 취소 전파)
-- **Phase 17 (Complete)**: *"CLI Process Isolation Hardening & Investigation Quality Benchmark"*  
-  (진정한 스트리밍 논블로킹 프로세스 격리 및 조사 품질 벤치마크 기반 구축: `selectors` 기반 동시 stdout/stderr 읽기를 통한 파이프 버퍼 데드락 원천 방지, `max_output_bytes` 한도 초과 즉시 자식 및 손자 프로세스 그룹 강제 종료(`SIGTERM`+`SIGKILL`) 및 `ProviderOutputLimitExceededError` 발생(미완성 모델 출력의 침묵 파싱 배제), 파이프 핸들을 상속한 자식/손자 프로세스 누수 및 타임아웃 방지, Gemini ACP stdio 핸드셰이크의 논블로킹 타임아웃 및 기술자 누수 차단, 브라우저 클라이언트의 실행 파일 경로/인자/권한우회 주입 차단(`PRIVILEGED_CONFIG_FORBIDDEN`), 취소 요청 시 세션/원장/타임라인에 대한 늦은 커밋 경합 차단; 6대 정형 C++ 결함 시나리오 대상 조사 품질 벤치마크 하네스 기반 구축)
-- **Phase 18 (Complete)**: *"Independent Investigation Benchmark & Real C++ Snapshot Evaluation"*  
-  (독립적 조사 벤치마크 및 실제 C++ 스냅샷 평가 하네스 고도화: 시스템 출력과 완전 분리된 독립 버전형 기계 판독 가능 Ground Truth 말뭉치(Corpus v1.0.0, 6대 결함 시나리오: 유효 전이, 불일치 캐시 필드, 무효 열거형 값, 널/무효 포인터, 크로스 스레드 비원자성 경쟁, 인과 함수 부재 음성 대조군), 하드코딩된 상수 지표 배제 및 정직한 예측 기반 평가기(`InvestigationEvaluator`), GNU Build ID 기반 분리 심볼(companion DWARF) 검증 및 불일치 감지, 대화형 C++ 타깃 프로세스(PIE, ASLR, Debug Info) 대상 실제 런타임 메모리 캡처(`process_vm_readv`/`procfs`) 기반 조사 평가 트랙과 단위 픽스처 트랙의 분리 운영, 사실 정밀도/재현율/F1, 증거 정밀도/재현율, 미검증 주장 비율 및 디스암율, 불확실성 보정률(Brier 점수 및 2진 일치도), 판별 후속 관측 유용성 산출, **인과 함수 오탐율(False-Positive Causal Rate) 엄격한 0.0% SLA 충족**, 10개 전용 회귀 테스트 통과)
-- **Phase 19 (Complete)**: *"Benchmark Integrity, Real Causal Evidence Verification, and Reproducible Provider Evaluation"*  
-  (벤치마크 진위성 및 독립적 인과 검증 아키텍처 완성: 평가기(Evaluator)와 피평가 시스템(SUT) 간 완벽한 경계 분리 및 그라운드 트루스 누출 차단(적대적 누출 회귀 테스트 통과), 평가기 자체 단위 테스트(`EVALUATOR_UNIT_TEST`)와 실제 프로덕션 런타임 파이프라인(`REAL_RUNTIME_PRODUCT_PIPELINE`)의 점수 분리, 런타임 추적 부재 시 인과 함수를 정적 후보(`STATIC_CANDIDATE`)로 유지하고 인과 검증을 `UNPROVEN`으로 정직하게 보고(조작된 DIAGNOSTIC 추적 제거, 위양성률 0.0% 엄격 유지), 6대 시나리오 전반의 변이 소스·불변식·기대 관측 상태 명세 및 시나리오 6 음성 대조군(Negative Control) 정합성 복원, 시나리오 5 크로스 스레드 경쟁의 무경합 수명주기 스레드 조인 보장, 파이프라인 전 과정(컴파일-빌드ID검증-스폰-스냅샷A-변이및ACK-스냅샷B-종료-DWARF비교-스테이지합성-대화형분석) 스테이지 출처(Provenance) 및 타임아웃 통제, 빈 데이터에 대한 공허한 1.0(vacuous 1.0) 점수 제거(`None` 처리), 반복 실행(`repeat=N`) 및 분산 추적, 다중 프로바이더 비교 매트릭스(`--providers`) 및 폴백/비가용 투명 보고)
-- **Phase 20 (Complete)**: *"Benchmark Execution Integrity and Trustworthy Results"*  
-  (벤치마크 실행 무결성 및 신뢰할 수 있는 결과 검증 체계 확립: 평가 트랙의 엄격한 분리(`REAL_RUNTIME_PRODUCT_PIPELINE` vs `EVALUATOR_UNIT_TEST`) 및 결합 SLA 계산 배제, 프로덕션 인과 오탐 SLA는 적격 완료된 실시간 런타임 시나리오만을 모수로 산출(적격 음성 대조군 부재 시 `0/0 (NOT_EVALUABLE)` 및 통과 불허), 자체 테스트 통과가 프로덕션 SLA에 영향을 미치지 않도록 차단, `evaluator_self_test` 모드 격리(컴파일 및 타깃 프로세스 스폰 원천 배제), 프로바이더 매트릭스 평가 범위 명시(`--provider-scenarios` 또는 스모크 서브셋), 결정론적 폴백 발생 시 `FALLBACK_OCCURRED` 명시 및 모델 성공률(0.0%) 배제, C++ 픽스처 `STATE` 대화형 명령어를 통한 변이 전/후 실시간 상태 독립 검증 및 정확한 변이 응답 일치 확인, 디스크 상의 구체적 산출물(`metadata.json` 및 크기 > 0인 `memory.bin`) 검증, 상위 스테이지 실패 시 하위 스테이지 `FAILED`/`NOT_RUN` 출처 전파, 독립적 다회차 실행(`repeat=N`) 시도/완료/실패 추적 및 JSON-Markdown 보고서 간 전수 일치 검증, 22개 전용 회귀 테스트 통과)
-- **Phase 21 (Complete)**: *"Watch Sessions and Non-Stop Temporal Observation"*  
-  (임베디드 및 실시간 프로세스를 중단시키지 않는 경량 주기적 관측 기반 Watch Session 및 Temporal Memory Explorer 구축)
-- **Phase 22 (Complete)**: *"Zero-Configuration Live Capture & UX Simplification"*  
-  (단일 PID 지정만으로 즉시 관측을 개시하는 Zero-Config 라이브 캡처 및 직관적 웹 UI 단순화)
-- **Phase 23 (Complete)**: *"Remote Watch Sessions and Multi-Context Agent Integration"*  
-  (다중 호스트 타깃 분리 관측, 프로세스 수명주기 댕글링 방지 및 MCP 기반 에이전트 도구 연동)
-- **Phase 24 (Complete)**: *"Evidence-First Temporal Investigation Workflow"*  
-  (자연어 기반 시간적 조사 오케스트레이션, 연속 관측 스트리밍 비교, 메모리 경계/가드 근접성 분석 및 객체 중심 증거 드릴다운)
-- **Phase 25 (Complete)**: *"Evidence-Grounded LLM Investigation & End-to-End Quality Validation"*  
-  (런타임 관측 및 표준 증거 원장 기반 사실 검증, 진실된 프로바이더 상태 보고, 가드/버퍼 경계 의미론 확립, 전용 C++ 픽스처 기반 17개 수락 시나리오 검증)
-- **Phase 26 (Complete)**: *"Real-Execution Quality Verification & Agent-First Investigation UX"*  
-  (하드코딩된 품질 지표 배제 및 명시적 모수/분자 기반 `QualityMetricsReport` 엔진(`NOT_EVALUABLE` 투명 보고), 격리된 실시간 C++ 픽스처 라이브 프로세스 실행 및 음성 대조군(Negative Control: 접근 없는 근접성) 검증, 부분 문자열 루프홀 제거 및 모순 값 거부, 컴패니언 DWARF 심볼 검증 및 미확인 심볼 `UNVERIFIED` 티어 강제, 64비트 가상 주소(5-level paging 포함) 안전 마스킹, 웹 UI 5대 독립 결과 섹션(사실, 가설, 함수 후보, 미확인/대안, 추천 조치) 분리 시각화, 원격 전송 독립성(multi-hop SSH/ProxyJump 중복 구현 배제) 및 ARP 액션 무증설 원칙 준수)
+### Prerequisites
 
----
+- **Linux** (x86_64 or aarch64, kernel 4.10+)
+- **Python 3.9+** (with standard libraries; `pyelftools` recommended)
+- **GDB** (optional, required only for `CONSISTENT` checkpointing mode)
+- Sufficient permissions to inspect target processes (`CAP_SYS_PTRACE` or sudo access for tracing)
 
-## Fast Runtime Snapshot + Offline State Laboratory (Phase 6)
+### Installation
 
-### 1. Motivation: Moving Away from Slow GDB Halts
+Clone the repository:
 
-기존 dynamicState의 주된 실행 모델은 GDB로 타깃 프로세스를 정지시키고(Stop), 중단된 상태에서 DWARF 디버그 정보를 파싱하여 객체 그래프를 순회(Traversal)한 뒤 값을 변경하고 계속 실행(Continue)하는 방식이었습니다.
-
-하지만 이 방식은 다음과 같은 근본적인 한계가 있었습니다:
-1. **타깃 프로세스 장기 중단**: DWARF 순회 및 포인터 체이싱으로 인해 프로세스가 수백 ms 이상 정지되어 실시간 타이머, 하트비트, 네트워크 연결이 끊어짐
-2. **다중 스레드 체크포인트 불안정**: GDB native checkpoint는 multithread 프로세스에서 fork() 불가로 실패함
-3. **라이브 메모리 오염 위험**: 실행 중인 프로세스 메모리를 직접 수정할 때 다른 스레드와의 레이스 컨디션 및 예기치 못한 크래시 발생
-
-Phase 6에서는 이 한계를 극복하기 위해 **초단기 캡처(<10ms) + 오프라인 상태 실험실(State Laboratory)** 아키텍처로 진화했습니다.
-
-```text
-    Running Process
-          │
-          │ ultra-short capture (< 10 ms stop time)
-          ▼
-    Raw Runtime Snapshot
-          │
-          │ process immediately resumes (SIGCONT)
-          ▼
-    Offline Semantic State Engine
-          │
-          ├── DWARF Symbol & Type Resolution
-          ├── Object Graph Reconstruction (Cycle-Safe BFS)
-          ├── Semantic Paths (e.g. Session.worker.state.counter)
-          ├── Deterministic State Hash (SHA-256)
-          ├── State Diff Engine (Changed, Added, Removed)
-          ├── Immutable Snapshot Mutation (Copy-on-Write)
-          └── Snapshot Branch Tree Lineage
-                │
-                ├── State Laboratory
-                │     ├── Snapshot Branch Isolation (Always Verified)
-                │     └── Thread Impact Analysis (Observed vs Potential Reachability)
-                │
-                ▼ (Optional & Explicit)
-     Live Target Replay with Readback Verification
-```
-
-### 2. Core Principles & Safety Guarantees
-
-1. **최소 정지 시간 보장 (< 10 ms)**:
-   - 메모리 맵(`/proc/<pid>/maps`) 사전 분석 및 버퍼 사전 할당
-   - `SIGSTOP` 직후 `process_vm_readv` 메모리 캡처 수행
-   - 메모리 읽기 완료 즉시 `SIGCONT`로 프로세스를 깨우고, DWARF 파싱 및 객체 복원은 사후 오프라인에서 수행
-   - 실측 프로세스 정지 시간: **0.99 ms (단일 스레드) ~ 4.27 ms (4 스레드 C++ 타깃)**
-2. **Fail-Open 안전 복원 정책 (`CaptureSafetyPolicy`)**:
-   - 캡처 도중 타임아웃 초과나 예외가 발생하더라도 `finally:` 블록에서 반드시 `SIGCONT`를 호출하여 프로세스가 정지 상태로 방치되지 않도록 보장
-3. **불변 스냅샷 변이 (Immutable Snapshot Mutation)**:
-   - 기본 변이는 라이브 프로세스가 아닌 논리적 스냅샷 노드를 대상으로 수행
-   - 부모 스냅샷 $S_0$에서 $S_1$을 생성해도 $S_0$는 100% 불변(Immutable) 유지
-   - 형제 브랜치($S_1, S_2$) 간 완벽한 상태 격리 보장
-4. **정직한 스레드 영향 분석 (`ThreadImpactAnalyzer`)**:
-   - 다중 스레드 환경에서 허구의 "Thread Isolated" 주장을 배제
-   - 직접 관측된 영향(`observed_impact`)과 정적 객체 도달 가능성에 기반한 잠재적 영향(`potentially_affected_threads`)을 엄격히 구분
-5. **라이브 리플레이 읽기 검증 (`StateReplayer`)**:
-   - 오프라인에서 검증된 변이를 라이브 프로세스에 적용할 때 `capability`, `attempted`, `completed`, `verified` 4단계를 명확히 분리하고 readback으로 변경값을 실측 검증
-
----
-
-## Agent-First Investigation Workflow & Evidence Ledger (Phase 7)
-
-### 1. Motivation: From Runtime Inspection to Evidence-First Investigation
-
-기존 dynamicState는 GDB 중단점 관측, 초고속 메모리 캡처, 오프라인 DWARF 복원, 상태 실험실(State Laboratory) 등 강력한 런타임 검사 기능들을 갖추고 있었으나, 자연어 요청을 받은 자율 코딩 에이전트(Autonomous Coding Agent) 관점에서는 다음과 같은 간극이 존재했습니다:
-1. **분절된 도구 호출**: 타깃 확인, 스냅샷 획득, DWARF 복원, diff 분석, 소스코드 연결이 각각 별개의 저수준 작업으로 흩어져 있어 에이전트가 단일 목표(Goal)를 중심으로 체계적인 조사를 수행하기 어려움
-2. **증거 출처(Provenance) 및 정합성 불확실성 추적 부재**: 관측된 사실(Direct Observation)과 모델의 추론(Inference/Hypothesis)이 명확히 분리되지 않거나, `process_vm_readv`의 비원자적(NON_ATOMIC) 캡처 한계가 조사 결론에 솔직하게 반영되지 못할 위험
-3. **정적 코드와 동적 런타임 간 연결 고리 부재**: 런타임 힙/스택 주소나 구조체 인스턴스가 실제 리포지토리의 소스 파일, 함수, 정적 기호와 어떻게 결합하는지 명확한 증거(ASLR load_bias, Build ID 일치성) 없이 추측에 의존할 가능성
-
-Phase 7에서는 **REA (Reverse Engineer Anything)** 의 증거 중심 조사 파이프라인과 정적 분석 연결 철학을 dynamicState의 아키텍처에 내재화하여, 자율 코딩 에이전트가 자연어 목표로부터 체계적인 런타임 조사를 수행할 수 있는 완결된 **Agent-First Investigation Workflow**를 구현했습니다.
-
-```text
-               Agent / Engineer Natural-Language Goal
-                                 │
-                                 ▼
-                     start_investigation()
-                                 │
-  ┌──────────────────────────────┴──────────────────────────────┐
-  │ 1. Target & Build Identity Validation                       │
-  │    (ELF header, GNU Build ID, /proc/exe check)              │
-  ├─────────────────────────────────────────────────────────────┤
-  │ 2. Runtime Capture Quality Validation                       │
-  │    (Completeness %, consistency: ATOMIC / NON_ATOMIC, races)│
-  ├─────────────────────────────────────────────────────────────┤
-  │ 3. DWARF Typed Object Interpretation                        │
-  │    (OfflineSemanticEngine, hierarchical semantic paths)     │
-  ├─────────────────────────────────────────────────────────────┤
-  │ 4. Semantic Observation Comparison (when 2 snapshots given) │
-  │    (StateDiffEngine: Changed, Added, Removed + skew flags)  │
-  ├─────────────────────────────────────────────────────────────┤
-  │ 5. Static Code Evidence Linking                             │
-  │    (DwarfStaticAnalysisProvider: ASLR load bias + symbols)  │
-  ├─────────────────────────────────────────────────────────────┤
-  │ 6. Evidence-Driven Next Steps & Report Generation           │
-  │    (Facts / Hypotheses / Unknowns tri-partition)            │
-  └──────────────────────────────┬──────────────────────────────┘
-                                 │
-                                 ▼
-                      EvidenceLedger (v1.0.0)
-                                 │
-                 ┌───────────────┴───────────────┐
-                 ▼                               ▼
-       Agent Runtime Protocol            Web UI Overview
-       (JSON Actions & Results)        (Tab 0: 🔍 Investigation)
+```bash
+git clone https://github.com/zeeny2park/dynamicState.git
+cd dynamicState
 ```
 
 ---
 
-### 2. Phase A: Evidence Ledger & Machine-Readable Schema (v1.0.0)
+## 💻 CLI Usage
 
-모든 조사 단계에서 생성되는 사실과 분석 결과는 버전화된 기계 판독 가능 증거 모델인 `EvidenceLedger`에 영속화됩니다 (`extractor/evidence_ledger.py`).
+DynamicState provides dedicated entry points in `./bin/` for both operators and agents:
 
-#### 핵심 설계 원칙:
-- **경량 참조 모델**: 수십 MB에 달하는 원시 메모리 스냅샷 바이너리를 복제하지 않고, 기존 스냅샷 경로(`snapshot_ref`) 및 아티팩트 메타데이터를 참조
-- **관측(Observation) vs 추론(Inference) 엄격 분리**:
-  - `nature: "observation"`: 런타임 메모리, ELF 헤더, DWARF 디버그 정보로부터 직접 관측된 사실
-  - `nature: "inference"`: 정적 분석 기호 매핑, 원인 가설, 불변식 제안 등 도출된 결론
-  - `nature: "hypothesis"`: 에이전트 또는 엔지니어가 설정한 검증 대상 가설
-- **완전한 출처 체인(Provenance Chain)**: 각 증거 레코드는 상위 증거(`parent_evidence_ids`)를 추적하여, 결론(Finding) → 도달 객체/필드 → 원시 스냅샷 메모리까지 100% 역추적 가능
-- **하위 호환성 및 스키마 검증**: 스키마 버전 `1.0.0` 명시, 누락된 선택 필드의 안전한 기본값 처리, 알 수 없는 메타데이터에 대한 정직한 `UNKNOWN` 표기
+### 1. Launch the Real-Time Workspace Web Service
+
+Start the integrated web workspace server:
+
+```bash
+./bin/dynamic-state-workspace --host 127.0.0.1 --port 8000
+```
+
+Open `http://localhost:8000/workspace` in your browser. The web UI automatically connects to local or remote targets and provides:
+- Live process selection & connection validation
+- Memory pool visualizer & linked structure traverser
+- Callstack & pthread lock inspection
+- Memory corruption & integrity audits
+- Natural language agent chat assistant
+
+### 2. Capture Zero-Stop Memory (`LOW_IMPACT`)
+
+Capture raw memory of a live running process without stopping it:
+
+```bash
+python3 -m extractor.capture_backend capture-memory --pid 12345 --output-dir /tmp/snapshot_12345
+```
+
+### 3. Offline Semantic Analysis
+
+Analyze a captured snapshot against an unstripped binary:
+
+```bash
+python3 -m extractor.capture_backend analyze-memory \
+  --snapshot-dir /tmp/snapshot_12345 \
+  --debug-image /path/to/unstripped_binary.debug
+```
+
+---
+
+## 🤖 Model Context Protocol (MCP) Server
+
+DynamicState includes a production-grade MCP server for autonomous agents:
+
+```bash
+python3 scripts/mcp_server.py
+```
+
+### Agent Configuration (e.g. Claude Desktop, Antigravity, Cursor)
+
+Add the server to your agent's MCP settings:
 
 ```json
 {
-  "evidence_id": "ev_obj_0_worker_count",
-  "session_id": "inv_20261011_045512_829792",
-  "timestamp": 1791694512.83,
-  "evidence_type": "typed_object",
-  "source": "OfflineSemanticEngine",
-  "nature": "observation",
-  "parent_evidence_ids": ["ev_cap_001"],
-  "snapshot_ref": "/tmp/snapshots/snap_001.raw",
-  "consistency": {
-    "level": "NON_ATOMIC",
-    "mapping_race_detected": false,
-    "completeness_pct": 100.0,
-    "limitations": ["Low-impact process_vm_readv capture is inherently non-atomic."]
-  },
-  "object_identity": {
-    "object_id": "obj_0",
-    "canonical_type": "WorkerPool",
-    "semantic_path": "Session.worker_pool.count",
-    "field_name": "count",
-    "field_value": 4,
-    "address": "0x555555562000"
+  "mcpServers": {
+    "dynamicstate": {
+      "command": "python3",
+      "args": ["/absolute/path/to/dynamicState/scripts/mcp_server.py"],
+      "env": {
+        "PYTHONPATH": "/absolute/path/to/dynamicState"
+      }
+    }
   }
 }
 ```
 
----
+### Key MCP Tools
 
-### 3. Phase B: Agent Investigation API
-
-기존에 안정적으로 검증된 엔진(`OfflineSemanticEngine`, `StateDiffEngine`, `RawMemorySnapshot`, `ELFParser`)을 래핑하여 에이전트 전용 고수준 API를 제공합니다 (`extractor/investigation.py`):
-
-| API 작업 | 주요 파라미터 | 반환 내용 및 안전 보장 |
-| :--- | :--- | :--- |
-| `start_investigation` | `goal`, `snapshot_id`/`path`, `debug_image`, `pid`, `constraints`, `budgets`, `authorize_target` | 조사 세션 초기화 및 단계별 파이프라인 자동 실행. 타깃 프로세스 접근 시 `authorize_target=True` 필수 요구. 기본 동작은 100% 읽기 전용 및 오프라인 스냅샷 지원. |
-| `get_investigation_status` | `investigation_id` | 조사 진행 상태(`COMPLETED`, `RUNNING`, `PARTIAL`, `FAILED`), 완료 단계 및 통계 반환. 누락된 데이터나 비정합성은 명시적 `PARTIAL` 및 이유 보고. |
-| `get_evidence` | `investigation_id`, `evidence_id`, `finding_id` | 특정 증거 레코드의 상세 내용 및 상위 출처 체인(Provenance Lineage) 검색. |
-| `compare_observations` | `snapshot_a`, `snapshot_b`, `investigation_id` | 두 스냅샷 간 의미론적 객체/필드 차이 비교. 비원자적 캡처 스냅샷 비교 시 실행 스큐(skew) 불확실성 주의보 자동 첨부. |
-| `follow_evidence` | `investigation_id`, `evidence_id`, `direction` | 특정 증거 레코드로부터 관련된 상위 출처(`parents`), 하위 파생 증거(`children`), 또는 동일 객체 필드/정적 기호(`related`) 탐색. |
-| `get_next_steps` | `investigation_id` | 증거 기반의 실행 가능한 다음 조치 제안. 실행된 조치와 제안된 조치를 명확히 분리 표기. |
-| `generate_report` | `investigation_id` | 관측된 사실(Facts), 검증 대상 가설(Hypotheses), 미확인 불명(Unknowns)으로 구조화된 종합 마크다운/JSON 보고서 생성. |
-
-#### 다중 프로토콜 접근 지원:
-- **Agent Runtime Protocol (ARP)**: `START_INVESTIGATION`, `GET_INVESTIGATION_STATUS`, `GET_EVIDENCE`, `COMPARE_OBSERVATIONS`, `FOLLOW_EVIDENCE`, `GET_NEXT_STEPS`, `GET_INVESTIGATION_REPORT`
-- **CLI Commands**:
-  ```bash
-  # 오프라인 스냅샷 조사 시작
-  dynamic-state investigate --goal "Verify worker state" --snapshot-dir /path/to/snap --debug-image /path/to/bin.debug
-  
-  # 두 스냅샷 의미론적 비교
-  dynamic-state compare /path/to/snapA /path/to/snapB --debug-image /path/to/bin.debug
-  ```
-- **Web REST API**: `POST /api/investigation/start`, `GET /api/investigation/status`, `POST /api/investigation/compare`, `GET /api/investigation/report` 등
+| Tool Name | Description |
+| :--- | :--- |
+| `runtime_target_connect` | Discover and bind a target PID to its external companion ELF image. |
+| `runtime_capture_memory` | Non-intrusively capture process memory (`LOW_IMPACT`). |
+| `runtime_eval_memory_path` | Evaluate DWARF-typed expressions (e.g., `*g_service.config.port`). |
+| `runtime_capture_and_diff` | Compare two temporal snapshots to reveal mutated fields and state drift. |
+| `runtime_inspect_thread_callstack_and_locks` | Inspect callstacks across all threads along with active mutex/rwlock owners. |
+| `runtime_audit_memory_integrity` | Detect heap canary corruption, dangling pointers, and boundary overruns. |
+| `runtime_traverse_linked_structure` | Walk linked lists, trees, and STL containers safely up to max depth. |
+| `runtime_run_diagnostic_recipe` | Execute predefined diagnostic suites (Leak Detection, Deadlock Triage, etc.). |
 
 ---
 
-### 4. REA-Inspired Static Analysis Integration
+## 🧪 Testing & Verification
 
-정적 분석과 런타임 동적 증거 간의 방어 가능한 연결(Defensible Basis)을 제공하기 위해 교체 가능한 `StaticAnalysisProvider` 인터페이스를 구현했습니다 (`extractor/static_analyzer.py`):
+DynamicState enforces rigorous automated testing covering eBPF tracing, signal dispatch, memory integrity, web services, and agent protocol conformance:
 
-- **`DwarfStaticAnalysisProvider`**: 호스트 측 DWARF 컴파일 유닛(CU), 서브프로그램(Subprogram DIE), 변수 위치 표현식, 심볼 테이블(`nm`/`readelf`)을 파싱하여 런타임 메모리 주소를 정적 소스코드 위치와 결합
-- **ASLR Load Bias 보정**: PIE(Position Independent Executable) 바이너리의 런타임 주소에서 동적 `load_bias`를 차감하여 정적 DWARF 가상 주소(VMA)로 정확히 변환
-- **GNU Build ID 교차 검증**: 실행 중인 프로세스의 모듈 Build ID와 디버그 이미지의 Build ID가 엄격히 일치할 때만 링크 생성. 불일치 시 조용한 오작동 대신 명시적 경고 레코드 생성
-- **플러그형 백엔드**: REA, Ghidra, IDA 등 외부 정적 분석 도구로 추후 확장 가능한 추상 인터페이스 유지 (테스트용 `MockStaticAnalysisProvider`, 비활성화용 `NullStaticAnalysisProvider`)
+### Running Test Suites
 
----
-
-### 5. Phase C: Investigation Overview UI (Tab 0)
-
-인간 엔지니어가 메모리 주소나 내부 객체 ID를 몰라도 조사의 핵심 내용과 결론을 한눈에 파악할 수 있는 개요 화면을 제공합니다 (`extractor/web/static/`):
-
-- **🎯 Investigation Goal & Target Identity Card**: 조사 목표, 타깃 PID, 실행 파일 경로, 빌드 ID 일치성, 모듈 아키텍처
-- **🛡️ Capture Quality & Consistency Card**: 일관성 수준(`ATOMIC` vs `NON_ATOMIC`), 캡처 완료율, 매핑 레이스 발생 여부, 알려진 한계 안내
-- **📊 Structured Findings Grouping**:
-  - 🟢 **Observed Facts**: 런타임 메모리 및 DWARF로부터 실측된 불변의 사실
-  - 🟡 **Hypotheses / Inferences**: 상관관계 또는 휴리스틱에 기반한 가설 (증거 출처 링크 포함)
-  - ⚪ **Unknowns / Limitations**: 미수집 메모리 영역, 불일치 빌드, 최적화로 누락된 필드
-- **⚖️ Observation Comparisons**: 두 스냅샷 간 의미론적 차이점 요약 및 비원자적 스냅샷 스큐 안내
-- **🔗 Resolved Static Links**: 의미론적 타입/필드와 C/C++ 소스코드 함수 및 파일 위치(`worker.cpp:42`) 연결 카드
-- **💡 Recommended Next Steps**: 증거에 근거한 구체적인 후속 조치 가이드
-- **⚙️ Advanced Raw View**: 원시 16진수 주소(`0x...`) 및 전체 증거 원장 JSON 뷰어 (클릭 시 아코디언 확장)
-- **Direct Navigation**: 개요 탭의 객체 검사 버튼 클릭 시 `2. 📦 Runtime Objects` 탭의 해당 객체로 즉시 점프
-
----
-
-## Branch-safe Exploration & Checkpoint Architecture
-
-### 1. The Core Invariant
-
-Mutation Candidate A, B, C는 **반드시 동일한 Parent State에서 독립적으로 실행**되어야 합니다.
-
-#### ❌ 잘못된 구조 (Linear Transition Chain):
-```text
-S001
-  │
-  ├─ M1 → S002
-  │         │
-  │         └─ M2 → S003
-  │                    │
-  │                    └─ M3 → S004
-```
-이는 단순한 선형 전이 체인이며, M1의 결과나 부작용(또는 Crash)이 M2, M3에 누적되어 독립적인 상태 공간 탐색이 불가능합니다.
-
-#### ✅ 올바른 구조 (Branch-safe Independent Exploration):
-```text
-                    S001 (Parent State)
-                  /        |        \
-                 /         |         \
-               M1          M2         M3
-               │           │          │
-            restore     restore    restore
-               │           │          │
-              S002        S003       S004
-```
-
-각 변이 후보 실행 직전에 반드시 부모 런타임 체크포인트를 복원(`restore`)하여, 후보 A가 크래시(`SIGSEGV`)나 타임아웃(`TIMEOUT`)을 유발하더라도 다음 후보 B, C는 깨끗한 부모 상태에서 독립적으로 실행됩니다.
-
-### 2. Semantic Snapshot vs Runtime Checkpoint
-
-시스템은 의미론적 스냅샷과 런타임 체크포인트를 명확히 분리합니다:
-
-| 개념 | 식별자 예시 | 역할 및 성격 |
-| :--- | :--- | :--- |
-| **Semantic Snapshot** | `S001`, `S002` | 특정 시점 프로세스의 관측된 실행 컨텍스트와 객체 그래프를 담은 읽기 전용 JSON 아티팩트 |
-| **Runtime Checkpoint**| `C001`, `C002` | 프로세스 메모리와 레지스터를 해당 시점으로 정확히 되돌릴 수 있는 실행 런타임 복원 상태 |
-| **State ID** | `state_000001` | 의미론적 상태 해시(`state_hash`)를 기준으로 코퍼스에 등록된 고유 정규 상태 |
-| **Transition ID** | `T001`, `T002` | 부모 상태에서 자식 상태로의 전이 결과(변이 + 실행 + 디프) 아티팩트 |
-
-> [!IMPORTANT]
-> JSON 스냅샷 자체를 프로세스 메모리 복원 수단으로 사용하지 않습니다. 런타임 복원은 전용 `StateRestorer` 인터페이스를 통해 안전하게 수행됩니다.
-
-### 3. Restore Backend & Multithread Branch Isolation Hardening (`extractor/state_restorer.py`)
-
-dynamicState의 핵심 안전성은 **부모 상태 격리(Parent State Isolation)** 에 있습니다.
-```text
-                    Parent State
-                  /      |      \
-        Mutation A   Mutation B   Mutation C
-            ↓            ↓            ↓
-         Child A      Child B      Child C
-```
-각 변이 후보는 이전 후보의 결과나 부작용에 오염되지 않고 항상 깨끗한 동일 부모 상태로부터 독립적으로 실행되어야 합니다.
-
-#### 1) 멀티스레드 GDB Checkpoint의 근본적 제약 (Ground Truth)
-GDB 내장 `checkpoint` 명령은 리눅스 `fork()` 시스템 콜을 사용합니다. GDB 소스 코드(`linux-fork.c`):
-```c
-if (linux_fork_multiple_threads ())
-  error (_("checkpoint: can't checkpoint multiple threads."));
-```
-리눅스 `fork()`는 호출한 단일 스레드만 복제하므로, 멀티스레드 프로세스를 포크하면 다른 모든 워커 스레드가 증발하고 다른 스레드가 획득했던 뮤텍스는 영원히 잠금 상태로 남아 데드락이 발생합니다. 따라서 raw GDB `checkpoint`는 멀티스레드 프로세스에 사용될 수 없습니다.
-
-#### 2) 세 가지 복원 백엔드 (Restore Backends)
-1. **`GDB_CHECKPOINT` (Single-Thread Only)**:
-   - 단일 스레드 프로세스에서 OS Copy-on-Write `fork()` 기반의 고속 스냅샷 제공
-   - 스레드 수가 2개 이상이면 capability에서 `supported=False`, scope=`SINGLE_THREAD_ONLY`로 보고하며, `checkpoint()` 호출 시 `MULTITHREAD_CHECKPOINT_UNSUPPORTED` 예외 발생
-2. **`RESTART` (Multithread Capable)**:
-   - dynamicState가 바이너리로부터 실행(launch)한 멀티스레드 타깃 프로세스에 대해 결정론적 재시작(`run` to observation breakpoint) 기반의 진정한 브랜치 격리 제공
-   - 각 변이 가지 실행 전 관측 중단점까지 프로그램을 재시작하여 모든 스레드, 스택, TLS(Thread-Local Storage), 힙, 동기화 프리미티브를 부모 상태로 완벽히 복원
-   - `SIGSEGV` 크래시 및 타임아웃 발생 후에도 깨끗한 부모 상태 복원 보장 (GDB 15.1 및 GDB 9.2 실측 검증 완료)
-3. **`NONE` (Attached Multithread Targets)**:
-   - 이미 실행 중인 프로세스에 `attach <pid>`로 연결된 멀티스레드 타깃
-   - OS 포크 불가 및 재시작 불가 환경으로, capability에서 `supported=False`, scope=`NONE` 보고
-   - 탐색 시 예외 크래시 대신 `status="UNAVAILABLE"`과 함께 안전한 대안 액션(`OBSERVE`, `SNAPSHOT`, `LIST_OBJECTS`, `INSPECT_OBJECT`, `LIST_MUTATION_CANDIDATES`)을 안내
-
-#### 3) Multithread Restart Determinism Verification Invariant
-부모 상태(Parent State)에서 분기한 여러 변이 브랜치가 독립적으로 실행된 후 복원되었을 때, 상태 해시의 완벽한 재현성을 검증합니다:
-```text
-Parent State (hash = H_P)
-    ├── Branch A (Mutate -> Continue -> Child A, hash = H_A)
-    ├── restore() -> Process Restart -> R1 (hash = H_R1)
-    ├── Branch B (Mutate -> Continue -> Child B, hash = H_B)
-    └── restore() -> Process Restart -> R2 (hash = H_R2)
-
-Invariant:
-    H_P == H_R1 == H_R2
-    H_A != H_P, H_B != H_P, H_A != H_B
-```
-
-- **Pre-Exploration Determinism Verification (`verify_restart_determinism`)**:
-  자율 탐색 루프 실행 전, 사전 dry-run 재시작을 통해 부모 상태 해시와 복원 후 상태 해시의 일치 여부를 검증합니다. 외부 I/O, 시간, 난수 등으로 인해 상태가 일치하지 않는 경우 임의로 추정하지 않고 `NON_DETERMINISTIC` / `RESTART_REPRODUCTION_FAILED`로 분류하고 필드 단위 불일치 디프를 제공합니다.
-- **Internal Synchronization & Scheduler Metadata Filtering**:
-  Glibc condition variable (`__pthread_cond_s`, `pthread_cond_t`), mutex (`pthread_mutex_t`), 정리 버퍼 (`_condvar_cleanup_buffer`)의 내부 futex 대기 카운터 (`wseq`, `__futex`, `__g1_orig_size`, `__g_refs`, `__wrefs`) 및 스케줄러 래퍼 프레임을 상태 해시 계산에서 정제하여, 커널 스레드 스케줄링 순서에 의한 거짓 불일치(false positive)를 방지합니다.
-- **Thread-Local Storage (TLS) Determinism**:
-  모든 워커 스레드의 `thread_local` 변수(`t_thread_id`, `t_worker_state`, `t_worker_counter`)가 재시작 후에도 일관되게 복원되는지 검증합니다 (`verify_tls_determinism`).
-- **Web UI & Agent Capability Expose**:
-  Web UI 탐색 화면 및 REST API(`/api/runtime/verify_determinism`)에서 Checkpoint Backend, Checkpoint Semantics, Thread Scope, Determinism Status, Branch Isolation 상태를 실시간 가시화하고 "Verify Restart Determinism" 버튼을 통해 대화형 검증을 수행할 수 있습니다.
-
-#### 4) Capability-Aware StateExplorer & Web UI
-- `StateExplorer.run()`은 체크포인트 시도 전 `controller.get_capabilities()`의 `branch_isolation` 상태를 확인하여 격리가 불가능한 환경에서 비정상 종료 없이 즉시 대안을 보고합니다.
-- Web UI의 "Autonomous Exploration" 탭은 타깃의 스레드 수와 브랜치 격리 백엔드를 감지하여, 격리가 불가능한 경우 시각적 경고 배너와 권장 대안 버튼을 제공하고 파괴적인 비격리 실행을 사전에 방지합니다.
-
-- **Explicit Structured Error Codes**:
-  - `MULTITHREAD_CHECKPOINT_UNSUPPORTED`: 멀티스레드 환경에서 fork checkpoint 시도 차단
-  - `MULTITHREAD_BRANCH_ISOLATION_UNSUPPORTED`: 브랜치 격리 미지원으로 인한 탐색 불가
-  - `RESTART_DETERMINISM_FAILED`: 재시작 결정론 검증 실패
-  - `NON_DETERMINISTIC_RUNTIME_STATE`: 외부 비결정론적 상태로 인한 안전 탐색 중단
-  - `CHECKPOINT_CREATE_FAILED`: GDB 체크포인트 포크 실패
-  - `CHECKPOINT_NOT_FOUND`: 요청한 체크포인트 ID가 등록되지 않음
-  - `CHECKPOINT_RESTORE_FAILED`: Master 체크포인트 재시작 또는 Worker 복제 실패
-  - `CHECKPOINT_RELEASE_FAILED`: 체크포인트 프로세스 해제 실패
-  - `CHECKPOINT_STATE_INVALID`: Inferior가 실행 중이거나 디스크립터가 유효하지 않음
-  - `CHECKPOINT_LIMIT_REACHED`: 최대 체크포인트 제한(`max_checkpoints`) 초과
-
----
-
-## Deterministic Semantic State Hash (`extractor/state_hash.py`)
-
-동일한 의미론적 상태는 프로세스 재시작이나 ASLR로 인해 메모리 주소나 물리적 저장 영역이 달라져도 **동일한 16자리 SHA-256 해시**를 산출합니다.
-
-### 배제되는 비의미론적(Non-semantic) 데이터
-- 원시 힙, 스택, 전역 메모리 주소 (ASLR 독립성 보장)
-- 물리적 메모리 저장소 구분 (`storage`: `heap` vs `stack` 메모리 레이아웃 독립성 보장)
-- 관측 단위 객체 레이블 (`object_id`: `obj_0001` 라벨 변경에 무관)
-- OS 스레드 ID (`thread_id`) 및 프로세스 PID
-- 타임스탬프 및 성능 지표 (`*_ms`)
-- `/proc/maps` 호스트 파일시스템 경로
-
-### 정규화(Canonicalization) 원칙
-1. **호출 스택**: 스레드 ID나 PC 대신 호출 스택의 함수명 시퀀스 정규화 (스레드 목록 순서 독립적)
-2. **필드 순서 정규화**: DWARF 선언 순서나 메모리 오프셋에 영향받지 않도록 필드명을 알파벳순 정렬
-3. **객체 그래프 위상 정렬**: 정렬된 루트(Root)들로부터의 BFS 도달 순서에 따라 위상 정규 ID(`C_0`, `C_1`, ...) 부여
-4. **포인터 참조 정규화**: 메모리 주소 대신 상대적 정규 ID(`ref:C_1`), 자기 참조(`self`), 널 포인터(`null`)로 변환하여 **순환 참조(Cycle) 시의 무한 재귀를 원천 차단**
-
----
-
-## Mutation Candidate Generation (`extractor/explorer.py`)
-
-DWARF 타입 정보를 활용하여 정밀한 변이 후보군을 규칙 기반으로 생성합니다:
-
-1. **정수형 (Type-width-aware boundaries)**:
-   - `uint8_t`: `0` ~ `255` (`MAX = 255`)
-   - `uint16_t`: `0` ~ `65535` (`MAX = 65535`)
-   - `uint32_t`: `0` ~ `4294967295` (`MAX = 4294967295`)
-   - `uint64_t`: `0` ~ `18446744073709551615`
-   - 부호 있는 정수(`int8_t`~`int64_t`): 실제 비트 폭에 따른 `MIN` / `MAX`
-   - 후보 생성 규칙: `val - 1`, `val + 1`, `0`, `1`, `MAX`, `MIN` (범위 내 값만 생성, 언더플로우 및 중복 제거)
-2. **열거형 (Enum)**:
-   - DWARF 메타데이터를 파싱하여 심볼릭 멤버 목록 추출
-   - 현재 값 이외의 대체 심볼릭 멤버 후보 생성 (예: `CONNECTED` -> `DISCONNECTED`, `ERROR`)
-3. **포인터 (Pointer)**:
-   - 임의 주소 쓰기를 금지하고 안전한 `null` / `nullptr` 변이만 허용
-4. **부울 (Boolean)**:
-   - `true` <-> `false` 토글
-5. **부동소수점 (Floating Point)**:
-   - 유한수(finite) 경계값: `0.0`, `1.0`, `-1.0`, `val - 1.0`, `val + 1.0`
-
----
-
-## State Corpus & Exploration Artifacts
-
-### Directory Structure
-
-```text
-corpus/
-├── index.json
-├── states/
-│   ├── state_000001/
-│   │   ├── snapshot.json
-│   │   └── metadata.json
-│   └── state_000002/
-├── transitions/
-│   ├── T001.json
-│   └── T002.json
-└── explorations/
-    └── E000001.json
-```
-
-### Exploration Artifact Schema (`corpus/explorations/E000001.json`)
-
-```json
-{
-  "exploration_id": "E000001",
-  "seed_state_id": "state_000001",
-  "seed_snapshot_id": "S001",
-  "parent_checkpoint_id": "C001",
-  "steps": 3,
-  "summary": {
-    "candidates": 6,
-    "executed": 3,
-    "new_states": 2,
-    "duplicate_states": 1,
-    "crashes": 0,
-    "timeouts": 0
-  },
-  "performance": {
-    "checkpoint_creation_ms": 5.21,
-    "candidate_generation_ms": 1.15,
-    "total_time_ms": 48.32,
-    "avg_step_ms": 16.1,
-    "step_metrics": [
-      {
-        "candidate_id": "M0001",
-        "transition_id": "T001",
-        "restore_ms": 4.12,
-        "step_ms": 15.3,
-        "status": "STOPPED",
-        "child_state_id": "state_000002",
-        "interesting": true,
-        "reasons": ["VALUE_CHANGE", "NEW_STATE"]
-      }
-    ]
-  },
-  "states": ["state_000001", "state_000002"],
-  "transitions": ["T001", "T002", "T003"],
-  "new_states": ["state_000002"],
-  "crashes": [],
-  "timeouts": []
-}
-```
-
----
-
-## External Debug Image Architecture for Stripped Production Binaries
-
-실제 CI/CD 및 프로덕션 환경에서는 보안 및 용량 최적화를 위해 바이너리가 완전히 `strip`되어 배포됩니다. dynamicState는 실행 중인 stripped 바이너리의 런타임 메모리를 변경 없이 관찰하면서, 동일 빌드의 unstripped 아티팩트(External Debug Image)로부터 심볼과 DWARF 구조체를 안전하게 바인딩합니다.
-
-```text
-    Runtime Binary
-        │ 실제 실행 (/proc/<pid>/mem, /proc/<pid>/exe, registers)
-        ▼
-   Stripped Production Binary
-        │
-        ▼
-       GDB Backend ───────────────┐ (Zero memory reads from debug image)
-        ▲                         │
-        │ DWARF / Types / Symbols │
-        │ Strict GNU Build ID     ▼
-   External Debug Image     Runtime State Engine
-   (Unstripped / Split DWARF)  (Snapshot, Mutation, Transition, Exploration)
-```
-
-### Core Invariants & Safety Guarantees
-
-1. **Process Memory as Single Source of Truth**:
-   - 런타임 상태 값(Primitive, Pointer, Enum, String 등)은 **오직 실행 중인 프로세스 메모리 및 레지스터**에서만 읽습니다.
-   - 외부 디버그 이미지 파일의 데이터 섹션이나 정적 메모리는 결코 상태 값의 소스로 사용되지 않습니다.
-
-2. **Strict GNU Build ID & Architecture Verification**:
-   - 런타임 바이너리와 외부 디버그 이미지는 ELF 헤더 및 `.note.gnu.build-id`를 대조하여 엄격히 검증됩니다.
-   - 불일치 시 상태 추출을 즉시 거부하며 명확한 에러 코드를 반환합니다:
-     - `BUILD_ID_MISMATCH`: 동일 아키텍처이나 빌드 해시가 불일치함
-     - `ARCHITECTURE_MISMATCH`: ELF 클래스(32/64), 아키텍처(x86_64, aarch64 등), 엔디언 불일치
-     - `BUILD_ID_NOT_AVAILABLE`: Build ID가 누락되고 `.gnu_debuglink`가 불일치함
-     - `DEBUG_INFO_MISSING`: 디버그 이미지에 DWARF 정보(`.debug_*`) 및 심볼이 존재하지 않음
-
-3. **Zero-Dependency ELF Inspector**:
-   - `extractor/debug_image.py`는 `readelf`나 `pyelftools` 등 외부 패키지에 의존하지 않고, 순수 파이썬 struct 기반으로 ELF32/ELF64 헤더, PT_NOTE, `.note.gnu.build-id`, `.gnu_debuglink`, 섹션 헤더를 직접 파싱하여 < 1ms 내에 검증을 완료합니다.
-
-4. **Snapshot Provenance Tracking**:
-   - 모든 스냅샷과 상태 전이 아티팩트는 출처 메타데이터를 보존합니다:
-     ```json
-     "provenance": {
-       "runtime_binary": {
-         "path": "/opt/app/bin/server",
-         "build_id": "d100266b036d9ecf7280e3e01eb5fd541d1cb348",
-         "architecture": "aarch64",
-         "elf_class": "ELF64",
-         "stripped": true
-       },
-       "debug_image": {
-         "path": "/opt/debug/server.debug",
-         "build_id": "d100266b036d9ecf7280e3e01eb5fd541d1cb348",
-         "source": "external",
-         "verified": true,
-         "compatible": true,
-         "reason": "COMPATIBLE"
-       },
-       "performance": {
-         "debug_image_load_ms": 0.35,
-         "binary_identity_check_ms": 0.21,
-         "debug_image_verification_ms": 0.58
-       }
-     }
-     ```
-
-5. **State Hash Invariance**:
-   - 의미론적 상태 해시(`SemanticStateHash`)는 실행 바이너리의 파일 경로, stripped 여부, 디버그 이미지 경로, Build ID에 **완전히 독립적**입니다.
-   - 동일한 논리적 런타임 상태는 unstripped 로컬 바이너리에서 추출하든 stripped 프로덕션 바이너리+외부 디버그 이미지에서 추출하든 100% 동일한 SHA-256 해시를 산출합니다.
-
----
-
-## Usage
-
-### 1. Build and Run Target with External Debug Image
-
-CI/CD 파이프라인에서 분리된 디버그 이미지 생성 및 GDB 실행 예시:
+Run the complete test suite:
 
 ```bash
-# 1. 빌드 및 디버그 심볼 분리
-g++ -g -O0 -o sample examples/sample.cpp
-objcopy --only-keep-debug sample sample.debug
-strip -s -o sample_stripped sample
-
-# 2. GDB 실행 및 외부 디버그 이미지 로드
-gdb -q ./sample_stripped
-(gdb) source gdb/extract_state.py
-(gdb) load-debug-image ./sample.debug
-(gdb) break runtime_state_checkpoint
-(gdb) set args 10
-(gdb) run
+./scripts/run_all_tests.sh
 ```
 
-### 2. GDB Commands
+Or execute focused regression and hardening suites directly:
 
-#### Binary Identity & Capabilities Inspection:
-```gdb
-# 런타임 바이너리와 디버그 이미지의 호환성 및 Build ID 검사
-(gdb) runtime-info
-(gdb) runtime-info --json
-```
+```bash
+# Web Service & MCP Comprehensive Defensive Hardening
+python3 -m unittest tests/test_phase52_web_and_mcp_defensive_hardening.py
 
-#### External Debug Image Binding:
-```gdb
-# 외부 디버그 이미지 로드 및 엄격 검증
-(gdb) load-debug-image /path/to/sample.debug
-```
+# eBPF Tracer & Signal / AST Safety Audits
+python3 -m unittest tests/test_ebpf_tracer.py
 
-#### State Extraction with Debug Image:
-```gdb
-(gdb) extract-state --output snapshot.json
-# 또는 명시적 디버그 이미지 지정:
-(gdb) extract-state --debug-image /path/to/sample.debug --output snapshot.json
-```
+# Real Workspace Web Service Tests
+python3 -m unittest tests/test_phase51_real_workspace_web_service.py
 
-#### High-level Transition Command:
-```gdb
-# Snapshot A -> Mutate -> Continue -> Snapshot B -> Diff -> Transition Artifact를 실행
-(gdb) transition-state --object obj_0001 --field retry --value 3 --id T001 --parent A --child B --output transitions/T001.json
-```
-
-#### Branch-safe State Exploration:
-```gdb
-# 부모 체크포인트를 안전하게 유지하며 최대 N 스텝 독립 변이 탐색 실행
-(gdb) explore-state --steps 5 --timeout-ms 1000 --corpus-dir corpus
-```
-
-#### Corpus Inspection:
-```gdb
-(gdb) corpus-list --corpus-dir corpus
-(gdb) corpus-show state_000001 --corpus-dir corpus
-```
-
-### 3. Programmatic Python API (Agent & Script Usage)
-
-상위 계층(예: 자율 탐색 스크립트 또는 향후 연동될 Coding Agent)은 `StateExplorer` 및 `RuntimeController` API를 직접 호출하여 프로덕션 바이너리를 제어할 수 있습니다:
-
-```python
-import runtime_commands
-from extractor.state_corpus import StateCorpus
-from extractor.explorer import StateExplorer
-
-# 1. 런타임 컨트롤러 초기화 및 외부 디버그 이미지 로드
-controller = runtime_commands._CONTROLLER
-controller.load_debug_image("/path/to/sample.debug")
-
-# 2. 런타임 정보 및 출처 검증
-info = controller.runtime_info()
-assert info["debug_image"]["compatible"] is True
-
-# 3. 코퍼스 및 탐색기 초기화
-corpus = StateCorpus("corpus")
-explorer = StateExplorer(controller, corpus, "corpus")
-
-# 4. 초기 런타임 상태 관측 및 시드 상태 등록
-seed_state_id = explorer.seed()
-
-# 5. 브랜치 안전 자율 상태 공간 탐색 실행
-result = explorer.run(max_steps=10, timeout_ms=1000)
-
-print("Exploration ID:", result["exploration_id"])
-print("New states found:", result["summary"]["new_states"])
-print("Crashes detected:", result["summary"]["crashes"])
-print("Timeouts detected:", result["summary"]["timeouts"])
+# Watch Session & Temporal State Tests
+python3 -m unittest tests/test_phase21_watch_session.py
 ```
 
 ---
 
-## Runtime Capabilities & Safety Limits
+## 🛡️ Safety Boundaries and Defensive Hardening
 
-### 1. Capabilities API (`extractor/runtime_controller.py`)
+DynamicState is engineered with zero-compromise safety guarantees for production environments:
 
-상위 에이전트 및 컨트롤러 계층이 현재 백엔드의 지원 기능을 프로그래밍 방식으로 질의할 수 있습니다:
+1. **Strict Signal & PID Isolation**:
+   - Every `kill` command is dispatched with explicit `--` parameter termination to prevent procps negative PID option misparsing (`kill -INT -- -<PGID>`).
+   - Hardened PID guards reject non-integer, negative, or reserved PIDs (`pid <= 1`).
+   - Process group killing is restricted exclusively to confirmed session leaders (`child_pgid == child_pid`).
 
-```python
-caps = controller.get_capabilities()
-# RuntimeCapabilities(
-#     checkpoint=True,
-#     restore=True,
-#     typed_mutation=True,
-#     semantic_snapshot=True,
-#     semantic_diff=True,
-#     state_hash=True,
-#     branch_exploration=True,
-#     crash_recovery=True,
-#     timeout_recovery=True,
-#     external_debug_image=True,
-#     multi_thread_determinism=False,
-#     external_io_rollback=False,
-#     exploration_mode="deterministic_single_thread_context",
-#     backend="gdb_fork"
-# )
-```
+2. **Web & API Defensiveness**:
+   - All REST endpoints reject malformed JSON and adversarial parameter types gracefully.
+   - Per-card failure isolation in `/api/workspace/chat` ensures one failed query never degrades healthy cards.
+   - Browser client uses `AbortController` timeouts and automatic 3-strike circuit breakers for unresponsive targets.
 
-### 2. Exploration Safety Limits
-
-- **`max_steps`** (기본값: 10): 단일 탐색 세션 동안 실행할 최대 변이 스텝 수
-- **`max_candidates`** (기본값: 50): 단일 상태에서 생성할 수 있는 최대 변이 후보 수
-- **`max_corpus_states`** (기본값: 100): 코퍼스에 저장 가능한 최대 고유 상태 수
-- **`max_checkpoints`** (기본값: 10): 동시에 유지 가능한 최대 런타임 체크포인트 수
-- **`timeout_ms`** (기본값: 1000ms): 자식 브랜치 실행 지속 시간 상한 (무한 루프 방지)
+3. **Memory Safety Contract**:
+   - Zero-stop memory reads via `process_vm_readv` never modify inferior process memory or write to inferior address spaces.
+   - Bounded recursion limits on pointer dereferencing and cyclic container detection prevent infinite loops and runaway allocations.
 
 ---
 
-## Phase 5: Agent Runtime Protocol (ARP) & Reference Implementation
-
-Phase 5는 dynamicState를 사람이 직접 GDB API를 다루는 저수준 디버깅 도구에서, 자율 코딩 에이전트(Autonomous Coding Agent)가 프로그래밍 방식으로 런타임 상태 공간을 안전하게 관찰하고 탐색할 수 있는 **Agent-Native Runtime Engine**으로 진화시킵니다.
-
-### 1. Core Principles & Safety Boundaries
-
-1. **Strictly NO LLM / Deterministic Core**: 런타임 엔진, 변이 후보 생성기, 우선순위 랭커, 전이 분석기는 100% 결정론적인 알고리즘과 휴리스틱 규칙으로 구동되며, LLM 추론이나 프롬프트 엔지니어링에 의존하지 않습니다.
-2. **Future MCP 1:1 Mapping**: 향후 Model Context Protocol (MCP) 도구 인터페이스로 1:1 직결될 수 있도록 JSON Schema 기반의 전송 계층 독립적 프로토콜로 설계되었습니다.
-3. **Strict Abstraction & Safety Boundary**:
-   - 에이전트는 GDB command, shell command, raw memory address(`0x7fff...`), DWARF 심볼 테이블을 직접 호출하거나 전달할 수 없습니다.
-   - 모든 변이는 런타임 엔진이 검증하고 제안한 `MutationCandidate` 식별자를 통해서만 인가되며, 임의 메모리 쓰기나 체크포인트 우회는 엄격히 거부됩니다(`CAPABILITY_UNSUPPORTED`, `INVALID_CANDIDATE`).
-4. **Stripped Production Binary + External Debug Image**: 실제 프로덕션 환경의 stripped 바이너리와 external debug image 조합에서도 출처(Provenance)를 온전히 추적하며 완벽하게 동작합니다.
-
-### 2. Semantic Concept Distinction
-
-시스템은 에이전트가 혼동하기 쉬운 핵심 개념들을 엄격히 분리하여 모델링합니다:
-
-| 개념 | 클래스 | 정의 및 역할 |
-| :--- | :--- | :--- |
-| **Semantic Snapshot** | `RuntimeSnapshot` | 특정 실행 중단 시점의 DWARF 기반 의미론적 관측 데이터 (정적 그래프 데이터) |
-| **Runtime Checkpoint** | `RuntimeCheckpoint` | 부모 상태로 즉각 롤백할 수 있는 OS/GDB 레벨의 실제 실행 가능 프로세스 포크 핸들 |
-| **Semantic State** | `AgentStateContext` | 코퍼스에 저장된 정규화된 고유 상태 (`state_000001`, SHA-256 해시 기반 중복 제거) |
-| **State Transition** | `AgentTransition` | 부모 상태에서 변이 적용 및 실행 후 자식 상태로 전이된 결과 및 변경 내역 |
-| **Observed Evidence** | `AgentEvidence` | 전이 결과로부터 관측된 객관적 사실 (가정이나 주관적 버그 판단 배제) |
-| **Invariant Candidate** | `AgentInvariantCandidate` | 관측된 상태로부터 제안된 가설 단계의 구조적/수치적 불변식 (`status="unconfirmed_candidate"`) |
-
-### 3. Protocol Schemas (`protocol/`)
-
-- [`protocol/actions.schema.json`](file:///home/ubuntu/workspace/ut/protocol/actions.schema.json): 16가지 에이전트 액션 정의 (`OBSERVE`, `SNAPSHOT`, `LIST_OBJECTS`, `INSPECT_OBJECT`, `INSPECT_FIELD`, `LIST_MUTATION_CANDIDATES`, `CHECKPOINT`, `RESTORE`, `EXECUTE_TRANSITION`, `INSPECT_TRANSITION`, `INSPECT_STATE`, `LIST_STATES`, `GET_CAPABILITIES`, `EXPLORE`, `STATE_HASH`, `DETECT_INVARIANTS`)
-- [`protocol/results.schema.json`](file:///home/ubuntu/workspace/ut/protocol/results.schema.json): 표준화된 응답 봉투(`AgentActionResult`) 및 17개 표준 에러 코드 (`INVALID_OBJECT`, `INVALID_FIELD`, `INVALID_CANDIDATE`, `MUTATION_REJECTED`, `RUNTIME_NOT_STOPPED`, `CAPABILITY_UNSUPPORTED` 등)
-- [`protocol/context.schema.json`](file:///home/ubuntu/workspace/ut/protocol/context.schema.json): 컨텍스트 윈도우가 제한된 에이전트를 위한 압축 요약 컨텍스트 (`AgentStateContext`)
-- [`protocol/mutations.schema.json`](file:///home/ubuntu/workspace/ut/protocol/mutations.schema.json): 우선순위 점수와 랭킹 사유가 부여된 변이 후보 모델 (`AgentMutationCandidate`)
-
-### 4. Deterministic Candidate Ranker (`extractor/candidate_ranker.py`)
-
-단일 상태에서 수십 개의 변이 후보가 생성될 때, 에이전트가 탐색 가치가 높은 후보를 먼저 선택할 수 있도록 결정론적 우선순위 점수(Priority Score)를 계산합니다:
-
-- **Enum 전이 (+4.0점)**: 상태 머신 분기 전이 가능성이 가장 높음 (`SessionState::CONNECTED` -> `ERROR`, `DISCONNECTED`)
-- **수치 경계값 (+3.0점)**: 0, 1, 최대값-1, 최대값, 임계값 경계
-- **분기 민감 필드명 (+2.5점)**: 이름에 `state`, `status`, `flag`, `mode`, `type`, `error`, `retry`가 포함된 필드
-- **최근 변경된 필드 (+2.0점)**: 직전 전이에서 변경된 객체의 필드
-- **불변식 관련 필드 (+1.5점)**: `length`, `capacity`, `size`, `count`, `limit` 등
-- **실행 컨텍스트 도달 객체 (+1.0점)**: 현재 중단점 스택 프레임에서 직접 참조되는 객체
-- **포인터 널 전이 (+2.0점)**: 유효 포인터를 nullptr로 전이하여 방어 로직 검증
-
-각 후보는 `ranking_reasons` 배열을 통해 왜 해당 점수가 부여되었는지 투명하게 설명됩니다.
-
-### 5. Transition Analyzer & Invariant Candidate Detector
-
-- **TransitionAnalyzer (`extractor/transition_analyzer.py`)**:
-  - `branch_changed`: 실행 함수 변경, 크래시, 타임아웃, 상태/플래그 필드 변경, 객체 생성/소멸 여부를 종합하여 실제 코드 분기 변화 발생 여부를 불리언으로 판정
-  - `facts`: `field_changed`, `reference_changed`, `object_created`, `object_removed`, `crash`, `timeout` 등의 객관적 사실 딕셔너리 추출
-  - `evidence`: "Field Session.retry changed from 2 to 3"과 같은 관측된 사실만을 기록하는 구조화된 증거 목록 생성 (주관적 버그 단정 배제)
-- **InvariantDetector (`extractor/invariant_detector.py`)**:
-  - 관측된 객체 그래프로부터 구조적 경계 불변식(`Buffer.length <= Buffer.capacity`), 비음수 범위(`Session.retry >= 0`), 유효 포인터 불변식(`Session.buffer != nullptr`)을 가설 후보로 자동 제안
-
-### 6. Simulated Agent Python Workflow
-
-```python
-from extractor.agent_runtime import AgentRuntime
-
-# 1. AgentRuntime 초기화 (Stripped binary + External debug image 바인딩)
-agent = AgentRuntime(controller, corpus_dir="corpus")
-
-# 2. 고수준 의미론적 런타임 상태 관측 (GDB 명령어 은닉)
-res = agent.observe()
-ctx = res.data
-print(f"Current Function: {ctx.execution.function}, Snapshot: {ctx.snapshot_id}")
-
-# 3. 객체 탐색 및 상세 필드 조사
-res_objs = agent.list_objects()
-session_id = next(o.object_id for o in res_objs.data if o.type == "Session")
-field_retry = agent.inspect_field(session_id, "retry").data
-
-# 4. 결정론적으로 랭킹된 변이 후보 확인 및 선택
-candidates = agent.list_mutation_candidates().data
-top_candidate = candidates[0]  # 최고 우선순위 점수 후보
-print(f"Selected Candidate: {top_candidate.candidate_id} (Score: {top_candidate.priority_score})")
-print(f"Reasons: {top_candidate.ranking_reasons}")
-
-# 5. 상태 전이 실행 (자동 부모 체크포인트 복원 및 격리)
-res_trans = agent.execute_transition(top_candidate.candidate_id, timeout_ms=1000)
-trans = res_trans.data
-print(f"Branch Changed: {trans.facts['branch_changed']}")
-print(f"Observed Evidence Count: {len(trans.evidence)}")
-
-# 6. 구조적 불변식 후보 탐지
-invariants = agent.detect_invariant_candidates().data
-for inv in invariants:
-    print(f"Invariant Candidate: {inv.expression} (Confidence: {inv.confidence})")
-
-# 7. 자율 상태 공간 탐색 루프 실행
-exp_res = agent.explore(max_steps=5, timeout_ms=1000).data
-print(f"Exploration complete: {exp_res.steps} steps executed, {exp_res.new_states} new states")
-```
-
----
-
-## Phase 5.1: Low-Impact Runtime Memory Snapshot + Offline Semantic Analysis
-
-통신 장비, 실시간 스트리밍, 대규모 트래픽을 처리하는 프로덕션 환경에서는 GDB 중단점 설정이나 프로세스 일시 정지(Stop-the-world) 자체가 서비스 지연이나 타이밍 변화를 유발할 수 있습니다. Phase 5.1은 프로세스를 장시간 중단하지 않고 필요한 가상 메모리 영역만을 고속 복사한 뒤, 오프라인에서 DWARF 디버그 정보와 결합하여 의미론적 상태 객체 그래프를 복원하는 완전 분리형 파이프라인을 제공합니다.
-
-### 1. Zero-Stop Architecture & Separation of Concerns
+## 📂 Project Structure
 
 ```text
-[Online / Live Process]
-Running Linux Process (PID)
-      │
-      │ process_vm_readv() (10~20ms, non-intrusive)
-      ▼
-RawMemorySnapshot Directory Artifact
-      │ (metadata.json, manifest.json, maps.json, memory/*.bin)
-═════════════════════════════════════════════════════════════════
-[Offline / Isolated Environment]
-RawMemorySnapshot + External Debug Image (DWARF)
-      │
-      ▼
-OfflineMemoryAnalyzer (No inferior process, bounds-checked)
-      │
-      ▼
-RuntimeSnapshot (Semantic Object Graph & State Hash)
-```
-
-### 2. On-Disk Artifact Structure (`RawMemorySnapshot`)
-
-메모리 캡처 결과물은 자립형(Self-contained) 디렉터리 구조로 디스크에 저장됩니다:
-
-```text
-mem_snap_001/
-├── metadata.json       # PID, 타임스탬프, 바이너리 경로, 일관성 메타데이터, 캡처 시간(us)
-├── manifest.json       # 캡처된 영역 목록 (start_addr, end_addr, size, checksum, blob path)
-├── maps.json           # 전체 /proc/<pid>/maps 스냅샷
-└── memory/
-    ├── region_0x0000000000400000.bin
-    ├── region_0x00007fffa0000000.bin
-    └── ...
-```
-
-### 3. Partial Consistency Tracking (`SnapshotConsistency`)
-
-실행 중인 프로세스의 메모리를 프로세스 중단 없이 복사하므로 스냅샷은 본질적으로 **Non-Atomic**입니다:
-
-- **`NON_ATOMIC`**: 프로세스가 실행 중인 상태에서 `process_vm_readv()`로 복사됨. 영역 간 동시성 레이스가 존재할 수 있음.
-- **`warnings` 메타데이터**: `"Memory captured while process was executing; potential torn reads between regions"`.
-- 의미론적 스냅샷(`RuntimeSnapshot`) 및 출처(`provenance`)에도 `capture_mode: "LOW_IMPACT"`, `consistency: "NON_ATOMIC"`이 명시되어 분석자가 일관성 한계를 명확히 인식할 수 있습니다.
-
-### 4. Region Selection Policies (`SnapshotPolicy`)
-
-필요한 메모리 영역만을 선택하여 캡처 시간과 디스크 사용량을 최소화합니다:
-
-- **`STACK`**: 스레드 스택 영역만 캡처
-- **`HEAP`**: 힙 메모리 영역만 캡처
-- **`GLOBAL`**: 데이터 및 BSS 세그먼트만 캡처
-- **`ALL_READABLE`**: 읽기 가능한 모든 가상 메모리 영역 (기본값)
-- **`SELECTED`**: 명시적으로 지정한 메모리 주소 범위
-
-안전 상한(`max_bytes`, 기본 32MB) 및 개별 영역 크기 제한(`max_region_bytes`)을 적용하여 OOM 및 디스크 고갈을 방지합니다.
-
-### 5. Offline Semantic Analysis (`OfflineMemoryAnalyzer`)
-
-오프라인 분석기는 실행 중인 프로세스나 GDB inferior 없이 순수 정적 데이터와 DWARF 디버그 이미지로부터 객체 그래프를 복원합니다:
-
-1. **ASLR Load Slide 보정**: `maps.json`의 실행 파일 로드 주소와 ELF 헤더 기본 주소 간의 차이를 계산하여 전역 심볼의 실제 런타임 주소를 매핑합니다.
-2. **Bounds-Checked 메모리 리더**: `SnapshotMemoryReader`를 통해 캡처되지 않은 영역이나 범위를 벗어난 주소 참조 시 안전하게 `None` 또는 fallback을 반환합니다.
-3. **DWARF 기반 도달성 탐색**: 전역 루트 심볼로부터 시작하여 포인터를 역참조하며 힙/스택 객체를 재귀적으로 탐색합니다.
-4. **순환 참조 방지 및 깊이 제한**: 방문 주소 추적으로 순환 참조(`Session.parent -> Session`)를 안전하게 감지하고 최대 탐색 깊이(`MAX_OBJECT_DEPTH=8`)를 강제합니다.
-
-### 6. Strict Safety Boundaries in `LOW_IMPACT` Mode
-
-- **관측 전용 (Read-Only)**: `LOW_IMPACT` 관측 모드에서는 변이(`Typed Mutation`), 재개(`Continue`), 상태 전이(`Execute Transition`), 체크포인트 복원(`Restore`)이 **원천 차단**됩니다.
-- 에이전트가 변이를 시도하면 즉시 `CAPABILITY_UNSUPPORTED` 에러 코드가 반환됩니다.
-- 임의 주소 메모리 쓰기, 임의 shell/ptrace 명령 실행을 차단합니다.
-
-### 7. CLI Usage
-
-런타임 CLI 도구 `dynamic-state`를 통해 명령줄에서 직접 메모리 캡처 및 오프라인 분석을 수행할 수 있습니다:
-
-```bash
-# 1. 실행 중인 프로세스의 메모리 무중단 캡처
-bin/dynamic-state capture-memory \
-    --pid 12345 \
-    --policy ALL_READABLE \
-    --max-bytes 33554432 \
-    --output ./snapshots/mem_snap_001 \
-    --snapshot-id M0001
-
-# 2. 캡처된 원시 메모리와 외부 디버그 이미지를 결합하여 의미론적 스냅샷 분석
-bin/dynamic-state analyze-memory \
-    --snapshot ./snapshots/mem_snap_001 \
-    --debug-image ./artifacts/app.debug \
-    --output ./snapshots/semantic_snap_001.json
-```
-
-### 8. Agent Runtime Protocol Actions
-
-에이전트 프로토콜에 신규 액션 3종이 추가되었습니다:
-
-- **`MEMORY_SNAPSHOT`**: 지정된 PID와 정책으로 비침습적 원시 메모리 스냅샷 생성
-- **`ANALYZE_MEMORY_SNAPSHOT`**: 캡처된 원시 메모리 아티팩트와 외부 디버그 이미지를 오프라인 분석하여 `AgentStateContext` 반환
-- **`GET_MEMORY_SNAPSHOT`**: 캡처된 원시 메모리 스냅샷 메타데이터 및 매니페스트 조회
-- **`GET_MODULES`**: 런타임 모듈 목록 및 베이스/로드 바이어스 메타데이터 조회
-
----
-
-## Phase 5.2: Production-grade Low-Impact Observation Hardening
-
-Phase 5.2에서는 실행 중인 Linux 프로세스를 중단하지 않고 관찰하는 `LOW_IMPACT` observation 기능을 실제 프로덕션 및 CI/CD 환경에 적합한 엔터프라이즈 수준으로 강화(Hardening)하였습니다.
-
-### 1. Accurate ELF `load_bias` Calculation via `PT_LOAD`
-단순 메모리 매핑 최저 주소가 아닌 ELF 프로그램 헤더의 `PT_LOAD` 세그먼트를 파싱하여 정확한 `load_bias`를 계산합니다:
-$$\text{load\_bias} = \text{runtime\_mapping\_start} - \text{PT\_LOAD.p\_vaddr}$$
-- **Non-PIE (`ET_EXEC`)**: runtime mapping 주소가 ELF 가상 주소와 일치하므로 `load_bias = 0`.
-- **PIE (`ET_DYN`) with/without ASLR**: ELF 가상 주소 0x0 기준 런타임 베이스와의 델타 반영 (`load_bias = runtime_base`).
-- **Shared Libraries (`ET_DYN`)**: 런타임에 동적으로 로드된 공유 라이브러리의 오프셋 0 세그먼트 기준 load bias 자동 산출.
-
-### 2. `RuntimeModule` Model & Module Address Resolution
-`/proc/<pid>/maps`를 파싱하여 메인 바이너리 및 동적 공유 라이브러리를 포괄하는 `RuntimeModule` 객체를 구성하고 스냅샷 아티팩트(`modules.json`)로 보존합니다:
-- `module_for_address(runtime_addr)`: 런타임 가상 주소가 속한 모듈 검색
-- `runtime_to_elf(runtime_addr)`: 런타임 가상 주소를 ELF 심볼 가상 주소로 변환
-- `elf_to_runtime(module, elf_addr)`: ELF 정적 주소를 프로세스 런타임 주소로 변환
-
-### 3. Capture-time Build ID Provenance & `.gnu_debuglink` CRC Verification
-- 캡처 시점에 `/proc/<pid>/exe` 및 맵핑 파일의 ELF 헤더에서 GNU Build ID를 추출하여 메타데이터에 보존 (`build_id_status: VERIFIED | NOT_AVAILABLE`).
-- 외부 디버그 심볼 탐색 시 `.gnu_debuglink` 섹션 파싱 및 CRC32 검증을 지원합니다.
-- `DebugArtifactProvider`의 명확한 우선순위:
-  1. 명시적으로 등록된 디버그 이미지 (`--debug-image`)
-  2. Build ID 경로 (`.build-id/xx/yyyy.debug`)
-  3. `.gnu_debuglink` (동일 디렉터리, `.debug/`, `/usr/lib/debug/` 및 CRC 검증)
-  4. 런타임 바이너리 자체 (unstripped인 경우)
-- Build ID 불일치 시 `DEBUG_IMAGE_MISMATCH` 오류로 즉각 거부합니다.
-
-### 4. `DebugInfoProvider` Abstraction & Zero Live Inferior Intervention
-디버그 정보 추출 계층을 오프라인 분석기와 완전히 분리하는 `DebugInfoProvider` 추상 인터페이스를 도입했습니다:
-- **`GdbDebugInfoProvider`**: 라이브 프로세스 부착/중단 없이 GDB를 배치 모드(`-batch`)로 디스크의 디버그 이미지만 분석하여 DWARF 전역 심볼 및 구조체/열거형 레이아웃을 일괄 추출합니다.
-- **`NativeDwarfDebugInfoProvider`**: 향후 네이티브 DWARF 파서 확장을 위한 인터페이스 스텁.
-
-### 5. Architectural Separation of Observation Backends
-- **`GDBObservationBackend` (`CONSISTENT`)**: ptrace/GDB 부착, 프로세스 중단, 정확한 콜스택/레지스터 관측, `typed_mutation` 및 `state_restorer` 브랜칭 탐색 지원.
-- **`LowImpactObservationBackend` (`LOW_IMPACT`)**: `process_vm_readv` 기반 제로-스톱 메모리 복사, 비원자적(`NON_ATOMIC`) 정합성, 엄격한 읽기 전용(변이 및 실행 제어 거부).
-
-### 6. Honest Execution Context Contract
-LOW_IMPACT 모드에서는 ptrace 없이 레지스터/콜스택을 캡처할 수 없으므로, 가짜 스레드나 더미 프레임을 절대 생성하지 않습니다:
-```json
-"execution": {
-  "availability": "UNAVAILABLE",
-  "reason": "LOW_IMPACT_MEMORY_SNAPSHOT",
-  "threads": []
-}
-```
-
-### 7. Process Exit & Race Resilience
-캡처 도중 대상 프로세스가 종료(`ESRCH`)되는 레이스 컨디션을 감지하여 비정상 크래시 없이 부분 캡처된 아티팩트를 보존하고 `status: "PROCESS_EXITED"`로 안전하게 마킹합니다.
-
-### 8. CLI Toolchain Extensions
-```bash
-# 1. 지원 런타임 백엔드 및 안전 계약 확인
-dynamic-state runtime-info
-
-# 2. 캡처된 스냅샷 또는 라이브 프로세스의 런타임 모듈 목록 조회
-dynamic-state list-modules --snapshot ./snapshots/mem_snap_001
-dynamic-state list-modules --pid 12345
-
-# 3. 비침습적 메모리 캡처 및 오프라인 분석
-dynamic-state capture-memory --pid 12345 --output ./snapshots/mem_snap_001
-dynamic-state analyze-memory --snapshot ./snapshots/mem_snap_001 --debug-image ./artifacts/app.debug --output ./snapshots/semantic.json
+dynamicState/
+├── bin/
+│   └── dynamic-state-workspace      # Web service launcher script
+├── extractor/
+│   ├── capture_backend.py          # process_vm_readv memory capture engine
+│   ├── dwarf_indexer.py            # DWARF debugging information parser
+│   ├── ebpf_tracer.py              # bpftrace / eBPF kernel tracing adapter
+│   ├── explorer.py                 # Deterministic state-space explorer
+│   ├── llm_provider.py             # LLM provider integration & CLI wrappers
+│   ├── runtime_controller.py       # GDB checkpoint & restore backend
+│   ├── state_hash.py               # Canonical semantic state hasher
+│   ├── target_adapter.py           # Target process inspection & liveness
+│   ├── watch_session.py            # Persistent temporal watch sessions
+│   └── web/
+│       ├── server.py               # Production REST API & WebSocket server
+│       └── workspace_static/       # Browser UI (HTML5, Tailwind, JS)
+├── scripts/
+│   ├── mcp_server.py               # Model Context Protocol (MCP) server
+│   └── run_all_tests.sh            # Automated end-to-end test runner
+├── tests/                          # 80+ comprehensive test suites
+└── docs/                           # Architectural specs & practical playbooks
 ```
 
 ---
 
-## Runtime Capabilities & Safety Limits
+## 📄 License
 
-### 1. Capabilities API (`extractor/runtime_controller.py`)
-
-상위 에이전트 및 컨트롤러 계층이 현재 백엔드의 지원 기능을 프로그래밍 방식으로 질의할 수 있습니다:
-
-```python
-caps = controller.get_capabilities()
-# RuntimeCapabilities(
-#     checkpoint=True,
-#     restore=True,
-#     typed_mutation=True,
-#     semantic_snapshot=True,
-#     semantic_diff=True,
-#     state_hash=True,
-#     branch_exploration=True,
-#     crash_recovery=True,
-#     timeout_recovery=True,
-#     external_debug_image=True,
-#     observation={"consistent_gdb": True, "low_impact_memory_snapshot": True},
-#     memory_snapshot={"process_vm_readv": True, "offline_analyzer": True},
-#     multi_thread_determinism=False,
-#     external_io_rollback=False,
-#     exploration_mode="deterministic_single_thread_context",
-#     backend="gdb_fork"
-# )
-```
-
-### 2. Exploration Safety Limits
-
-- **`max_steps`** (기본값: 10): 단일 탐색 세션 동안 실행할 최대 변이 스텝 수
-- **`max_candidates`** (기본값: 50): 단일 상태에서 생성할 수 있는 최대 변이 후보 수
-- **`max_corpus_states`** (기본값: 100): 코퍼스에 저장 가능한 최대 고유 상태 수
-- **`max_checkpoints`** (기본값: 10): 동시에 유지 가능한 최대 런타임 체크포인트 수
-- **`timeout_ms`** (기본값: 1000ms): 자식 브랜치 실행 지속 시간 상한 (무한 루프 방지)
-
----
-
-## Web UI MVP — Runtime State Explorer
-
-dynamicState의 런타임 상태 및 상태 공간 탐색 결과를 인간 엔지니어가 직관적으로 검증하고 상호작용할 수 있는 웹 기반 탐색기(Runtime State Explorer)를 제공합니다.
-
-> [!IMPORTANT]
-> **Visualization & Interaction Layer Contract**:
-> - Web UI는 `AgentRuntime`의 시각화 및 상호작용 레이어일 뿐이며, 제2의 런타임 구현체가 아닙니다.
-> - 파일 시스템에 영속화된 JSON 아티팩트(`corpus/`, `snapshots/`)가 시스템의 유일한 Canonical State입니다.
-> - 별도의 DB(PostgreSQL, SQLite, Redis 등)를 도입하지 않고 순수 표준 라이브러리(`http.server.ThreadingHTTPServer`)로 동작합니다.
-> - 외부 pip 패키지 설치 없이 즉시 실행됩니다 (`Zero External Dependencies`).
-
-### Architecture
-
-```text
-       Web UI (Browser)
-             │
-             │ HTTP / JSON REST API
-             ▼
-     WebApiAdapter (extractor/web/server.py)
-             │
-             │ Strict Semantic ARP Dispatch
-             ▼
-        AgentRuntime
-             │
-             ├── Snapshot & State Corpus (corpus/)
-             ├── Object Graph Inspection
-             ├── Candidate Ranking
-             ├── Typed Mutation & State Restorer (Checkpoint/Restore)
-             ├── Transition Analyzer & State Diff Engine
-             ├── Autonomous StateExplorer Loop
-             └── Platform Provenance & Capabilities
-                     │
-             ┌───────┴────────┐
-             ▼                ▼
-     RuntimeController   MemoryCapture (LOW_IMPACT)
-             │                │
-            GDB          process_vm_readv
-```
-
-### Supported Views
-
-1. **Runtime & Provenance Overview**: 실행 상태(`STOPPED`/`RUNNING`), 관측 모드(`CONSISTENT`/`LOW_IMPACT`), PID, 실행 파일 및 디버그 이미지 검증 상태, 아키텍처/엔디안/ELF 클래스, 로드된 모듈 목록(Base/End/Load Bias/Build ID) 및 탐색 안전 한계.
-2. **State Graph & Explorer**: 전체 상태 코퍼스 목록, 단축 상태 해시(Monospace), 계층형 SVG 상태 전이 그래프(상태 노드, 변이 필드/값 방향성 화살표, STOPPED/CRASHED/TIMEOUT 색상 구분).
-3. **Object Graph & Inspector**: 실행 루트로부터 도달 가능한 의미론적 객체 트리/그래프, 대규모 객체 탐색 시 브라우저 프리징 방지를 위한 Truncation Guard(100개 초과 시 알림), 필드별 타입·값·포인터 참조 링크·가변성(`mutable`/`read_only`) 확인.
-4. **Typed Mutation & Transition Execution**: 랭킹된 변이 후보군(현재값 → 제안값, 생성 사유) 조회, `[Execute]` 버튼을 통한 안전한 전이 실행, 실행 결과(자식 상태 ID, 상태 해시, 의미론적 변경 필드) 실시간 확인.
-5. **Semantic State Diff**: 임의의 두 스냅샷(부모-자식) 간 값 변경, 참조 변경, 객체 생성/삭제 요약 및 필드별 변경 전후 상세 테이블.
-6. **Autonomous Explore**: `max_steps`, `timeout_ms`, `max_states` 파라미터를 설정하여 `StateExplorer` 자율 루프 실행 및 실시간 결과 메트릭(스텝수, 신규 상태수, 전이수, 크래시수, 타임아웃수) 확인.
-7. **Raw JSON Artifact Viewer**: 모든 화면에서 `[View JSON]` 모달을 통해 표준 JSON 스키마 아티팩트 직접 열람 및 클립보드 복사.
-
-### Startup & CLI
-
-```bash
-# 1. Python 모듈로 실행 (기본 127.0.0.1:8000)
-python3 -m extractor.web --host 127.0.0.1 --port 8000 --corpus corpus
-
-# 2. 전용 CLI 스크립트로 실행
-./bin/dynamic-state-ui --host 127.0.0.1 --port 8000 --corpus corpus
-```
-
-서버 시작 시 다음과 같이 바인딩 주소가 출력됩니다:
-```text
-========================================
- dynamicState Web UI
- http://127.0.0.1:8000
- Mode: CONSISTENT
- Corpus: /path/to/corpus
- Press Ctrl+C to terminate.
-========================================
-```
-
-### Web API Endpoints
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/api/health` | 서버 상태, ARP 버전, 현재 관측 모드 반환 |
-| `GET` | `/api/capabilities` | 런타임 기능 및 안전 한계(limits) 반환 |
-| `GET` | `/api/runtime` | 런타임 상태, PID, 아키텍처/엔디안/ELF, 모듈 통계 반환 |
-| `GET` | `/api/modules` | 로드된 런타임 모듈 목록 (`?snapshot_id=`) |
-| `GET` | `/api/provenance` | 스냅샷의 빌드 및 디버그 아티팩트 provenance |
-| `GET` | `/api/states` | 코퍼스에 저장된 모든 상태 요약 목록 |
-| `GET` | `/api/states/{state_id}` | 특정 상태의 상세 의미론적 컨텍스트 |
-| `GET` | `/api/states/{state_id}/objects` | 특정 상태의 도달 가능한 객체 목록 |
-| `GET` | `/api/objects/{object_id}` | 특정 객체의 상세 정보 및 필드 목록 |
-| `GET` | `/api/objects/{object_id}/fields` | 객체 내 필드 정보 (`?field=`) |
-| `GET` | `/api/transitions` | 기록된 모든 상태 전이 목록 |
-| `GET` | `/api/transitions/{transition_id}` | 상태 전이 상세 사실(Facts) 및 증거(Evidence) |
-| `GET` | `/api/snapshots/{id}/diff/{other_id}` | 두 스냅샷 간 의미론적 Diff 계산 |
-| `GET` | `/api/mutation-candidates` | 변이 후보 목록 (`?object_id=&field=`) |
-| `GET` | `/api/state-graph` | 시각화용 노드 및 엣지 그래프 데이터 |
-| `POST` | `/api/observe` | 프로세스 의미론적 상태 관측 (`mode`, `pid`, `debug_image`) |
-| `POST` | `/api/snapshot` | 새 런타임 스냅샷 캡처 |
-| `POST` | `/api/mutation` | 유효 변이 후보 실행 및 자식 상태 생성 |
-| `POST` | `/api/checkpoint` | 프로세스 브랜치 체크포인트 생성 |
-| `POST` | `/api/restore` | 프로세스 체크포인트 복원 |
-| `POST` | `/api/explore` | 자율 상태 탐색 루프 실행 |
-
-### Safety Boundaries & Metadata Honesty
-
-- **임의 명령 및 메모리 쓰기 차단**: `/api/gdb-command`, `/api/write-memory`, `/api/eval-expression`, `/api/arbitrary-command` 등 GDB/Shell 우회 엔드포인트는 존재하지 않으며 호출 시 즉시 403 Forbidden으로 차단됩니다.
-- **LOW_IMPACT 모드 엄격 제한**: `LOW_IMPACT` 관측 시 UI 상단에 경고 배너가 표시되며, 변이 후보 조회 및 변이 실행, 체크포인트 요청은 `CAPABILITY_UNSUPPORTED` 에러와 함께 비활성화됩니다.
-- **메타데이터 정직성(Metadata Honesty)**: 타깃 아키텍처, 엔디안, ELF 클래스가 검증되지 않은 경우 임의로 "little"이나 64비트로 추측하지 않고 `UNKNOWN`으로 정직하게 표시합니다.
-
----
-
-## Testing
-
-모든 단위 테스트와 14개의 GDB 및 `process_vm_readv` 종단간 통합 테스트 스크립트, 그리고 Web API 및 End-to-End 수락 테스트가 완전히 통과합니다:
-
-```bash
-# Phase 20 벤치마크 실행 무결성 및 신뢰할 수 있는 결과 검증 (22개 테스트)
-python3 -m unittest tests/test_investigation_quality_benchmark.py -v
-python3 benchmarks/investigation_quality/run_benchmark.py --smoke
-python3 benchmarks/investigation_quality/run_benchmark.py --mode evaluator_self_test
-
-# Phase 19 벤치마크 무결성, 실 인과 증거 검증 및 재현 가능 프로바이더 평가 (14개 테스트)
-python3 -m unittest tests/test_investigation_quality_benchmark.py -v
-python3 benchmarks/investigation_quality/run_benchmark.py --mode real_runtime
-
-# Phase 18 독립적 조사 벤치마크 및 실제 C++ 스냅샷 평가 (10개 테스트 + 실 런타임/단위 하네스)
-python3 -m unittest tests/test_investigation_quality_benchmark.py -v
-python3 benchmarks/investigation_quality/run_benchmark.py --mode all --smoke
-
-# Phase 17 CLI 프로세스 격리 강화 및 회귀 테스트 (10개 테스트)
-python3 -m unittest tests/test_phase17_process_isolation_regression.py -v
-
-# Phase 16 CLI 프로바이더 보안, 런타임 진실성 및 E2E 검증 (14개 테스트)
-python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py -v
-
-# Phase 15 대화형 LLM 및 단순화 조사 워크스페이스 (22개 테스트)
-python3 -m unittest tests/test_phase15_conversational_llm.py -v
-
-# 0. Phase 14 임베디드 리눅스 프로덕션 파일럿 및 릴리스 검증 (13개 테스트 + 단독 실행 파일럿 스크립트)
-python3 -m unittest tests/test_phase14_production_pilot.py -v
-python3 scripts/run_production_pilot.py --smoke
-
-# 1. Phase 13 종단간 운영 수락 파이프라인 및 회귀 보안 게이트 (16개 테스트 + 14개 자동화 파이프라인 스텝)
-python3 -m unittest tests/test_phase13_operational_acceptance.py -v
-python3 scripts/run_e2e_operational_acceptance.py
-
-# 2. Phase 12 대화형 증거 기반 조사 루프 테스트 (11개 테스트)
-python3 -m unittest tests/test_phase12_investigation_loop.py -v
-
-# 3. 단위 및 통합 전체 테스트 (634+ unit/integration tests across all modules, including Phase 8-14 suites)
-python3 -m unittest discover -s tests -v
-
-# 4. Phase 8 & 9 런타임 증거 진위성 및 인과 검증 하드닝 스위트 (83개 테스트)
-python3 -m unittest tests/test_causal_validation_hardening.py -v
-
-# 5. Phase 10 독립 신뢰 검증 및 CI 보안 수락 게이트 스위트 (16개 테스트)
-python3 -m unittest tests/test_phase10_ci_security_gates.py -v
-
-# 6. Phase 11 실 타깃 매트릭스 및 동시성 검증 스위트 (17개 테스트)
-python3 -m unittest tests/test_phase11_real_target_release_readiness.py -v
-
-# 6. Phase 7 조사 워크플로 및 증거 원장 전용 테스트 스위트 (29개 테스트)
-python3 -m unittest tests/test_evidence_schema.py -v
-python3 -m unittest tests/test_investigation_identity_and_static.py -v
-python3 -m unittest tests/test_investigation_comparison.py -v
-python3 -m unittest tests/test_investigation_api.py -v
-python3 -m unittest tests/test_investigation_ui.py -v
-python3 -m unittest tests/test_investigation_backward_compatibility.py -v
-python3 -m unittest tests/test_investigation_e2e_fixture.py -v
-
-# 3. Web UI MVP End-to-End 수락 시나리오 (24개 스텝 전수 검증)
-bash tests/manual_acceptance_web_ui.sh
-
-# 4. Phase 1 & 2 GDB 기본 통합 테스트
-bash tests/integration_gdb.sh
-
-# 5. Phase 3 상태 전이 E2E 통합 테스트
-bash tests/integration_state_transition.sh
-
-# 6. Phase 3 타입 변이 및 유효성 검증 테스트
-bash tests/integration_mutation_validation.sh
-
-# 7. Phase 3 크래시(SIGSEGV) 및 타임아웃 전이 테스트
-bash tests/integration_transition_failure.sh
-
-# 8. Phase 3 종합 통합 테스트
-bash tests/integration_phase3.sh
-
-# 9. Phase 4 코퍼스 저장 및 중복 제거 탐색 테스트
-bash tests/integration_exploration.sh
-
-# 10. Phase 4 Branch-safe 독립 후보 전이 통합 테스트
-bash tests/integration_exploration_branching.sh
-
-# 11. Phase 4.1 StateExplorer.run() 자율 브랜칭 GDB 통합 테스트
-bash tests/integration_explorer_real_gdb.sh
-
-# 12. Phase 4.1 크래시/타임아웃 장애 격리 GDB 통합 테스트
-bash tests/integration_explorer_failure_isolation.sh
-
-# 13. External Debug Image 호환성/Build-ID 불일치 거부 및 상태 추출 통합 테스트
-bash tests/integration_stripped_debug_image.sh
-
-# 14. Stripped 바이너리 상태 전이 및 상태 공간 탐색 통합 테스트
-bash tests/integration_stripped_transition.sh
-
-# 15. Phase 5 Agent Runtime Protocol 종단간 시뮬레이션 통합 테스트
-bash tests/integration_agent_runtime.sh
-
-# 16. Phase 5.1 Low-Impact Memory Snapshot + Offline Analysis E2E 통합 테스트
-bash tests/integration_low_impact_snapshot.sh
-
-# 17. Phase 5.2 Production-Grade Low-Impact Observation Hardening 통합 테스트
-bash tests/integration_phase5_2_hardening.sh
-
-# 18. 전체 통합 테스트 자동 실행 스크립트
-bash run_all_tests.sh
-```
-
----
-
-## Boundaries & Known Limitations
-
-- **LOW_IMPACT Observation Contract**: Zero-stop (`process_stop=False`, `ptrace=False`), read-only memory capture via `process_vm_readv`. Execution context (`thread_id`, `pc`, `frames`) is explicitly reported as `UNAVAILABLE`. Mutation, checkpoint/restore, continue, and exploration are strictly rejected with `CAPABILITY_UNSUPPORTED`.
-- **Shared Library Semantic Scope**: `discover_modules` discovers all loaded dynamic libraries, calculates their load biases, checks their Build IDs, and enforces address boundary guards. Semantic root and type reconstruction currently targets the main executable module; shared library global roots require registered debug artifacts and are not cross-interpreted using the main executable's DWARF.
-- **Target Endianness & Pointer Width**: Target endianness is obtained strictly from target ELF/module metadata. Unknown endianness is never assumed to be little-endian (results in explicit `TARGET_ENDIANNESS_UNAVAILABLE` error or `None`). Pointer width is obtained strictly from the ELF class (4 bytes for ELF32, 8 bytes for ELF64); unknown ELF class does not default to 64-bit (`ptr_size = None`).
-- **Mapping Race Detection & Non-Atomic Snapshots**: LOW_IMPACT capture is strictly non-atomic (`consistency.level = NON_ATOMIC`). Mapping changes (address range, permissions, offset, device/inode, or pathname) occurring during capture are detected via pre- and post-capture fingerprinting and flagged with `consistency.mapping_race_detected = True` and snapshot `status: "PARTIAL"`.
-- **Multi-thread Nondeterminism**: 다중 스레드 레이스 컨디션에 따른 비결정론적 스케줄링은 현재 싱글 스레드/중단점 컨텍스트에 초점이 맞춰져 있습니다.
-- **External I/O & Socket State**: 프로세스 외부 커널 소켓 연결이나 원격 RPC 상태는 OS fork만으로 완전 롤백되지 않습니다.
-- **Optimized Binaries (-O2/-O3)**: 컴파일러 인라인화 및 레지스터 할당으로 DWARF 위치 표현식이 `<optimized out>`인 필드는 변이가 제한됩니다.
-- **Automated Restart Loop**: 무제한 프로세스 재생성 루프는 안전성 원칙에 따라 방지되며, 최대 탐색 스텝(`max_steps`)과 타임아웃 제한이 적용됩니다.
-
----
-
-## Human-Centric Memory Snapshot Explorer & Web UI
-
-The Web UI is structured into **8 clear tabs** providing progressive disclosure from high-level agent investigation down to low-level byte and graph inspectors:
-
-0. **🔍 Investigation Overview (Default First Screen)**:
-   - **Goal & Target Identity**: User/agent natural-language goal, Target PID, Executable, GNU Build ID match status, and architecture.
-   - **Capture Quality & Consistency**: Atomic / Non-Atomic capture status, completeness %, mapping race warning, and honest limitations.
-   - **Structured Findings**: Facts (observed runtime state), Hypotheses (inferences), and Unknowns (missing regions, unmapped symbols).
-   - **Observation Comparisons**: Semantic diff summary between observations with non-atomic capture skew notices.
-   - **Resolved Static Links**: C/C++ source file/function links resolved via DWARF static analyzer with ASLR load bias compensation.
-   - **Recommended Next Steps**: Evidence-driven actionable follow-ups clearly distinguishing executed vs suggested actions.
-   - **Advanced Raw View**: Hexadecimal memory addresses (`0x...`) and raw machine-readable Evidence Ledger JSON viewer.
-1. **🧠 Memory Snapshot**:
-   - **Capture Status**: Status (`COMPLETE`/`PARTIAL`), Total Captured Size (MB), Capture Duration (ms), Consistency Level, Architecture, Pointer Width, Endianness.
-   - **Memory Breakdown**: Visual proportional stacked bar and category cards (Heap, Stack, Global Data, Executable Code, Shared Libraries, Other Mappings).
-   - **Discovered Semantic Runtime Objects**: Discovered count, storage breakdown, and an expandable ASCII/box semantic hierarchy preview with direct "Inspect →" actions.
-   - **Snapshot Quality & Provenance**: Completeness %, mapping race detection, partial/failed read counts, external debug image verification, and GNU Build ID matching.
-2. **📦 Runtime Objects**: Complete list of semantic objects, storage badges, field values, and progressive disclosure inspectors.
-3. **🕸️ Object Graph**: Interactive SVG object graph with zoom/pan and visual cycle indicators.
-4. **📜 History / State Diff**: Checkpoint timeline and semantic diffs showing exact field-level state transitions.
-5. **⚡ Advanced Exploration**: Mutation candidate inspection, hypothesis execution, continue, rollback, and autonomous exploration loop.
-6. **🛠️ System / Provenance**: ELF metadata, Build ID matching, loaded modules table, and GDB compatibility report.
-7. **🔬 State Laboratory**: Fast snapshot inspection, branch isolation verification, thread impact analysis, and state replay.
-
----
-
-## Embedded Deployment Architecture
-
-dynamicState strictly separates developer host workstations from resource-constrained target boards:
-- **Target Boards Require ZERO Python and ZERO Web Server**.
-- **Pattern 1: Remote GDB**: `gdbserver` on target, dynamicState + GDB on host. Full `CONSISTENT` mutation and exploration support.
-- **Pattern 2: Native C99 Collector (`target/collector/`)**: Zero-dependency POSIX C99 binary capturing `/proc/<pid>/maps` and `/proc/<pid>/mem` via `process_vm_readv` or `pread`. Generates standard snapshot bundles for offline analysis.
-- **Pattern 3: Shell Prototype (`scripts/target_capture.sh`)**: Quick triage script using BusyBox POSIX shell tools.
-
-See [`docs/EMBEDDED_DEPLOYMENT_ARCHITECTURE.md`](file:///home/ubuntu/workspace/ut/docs/EMBEDDED_DEPLOYMENT_ARCHITECTURE.md) and [`docs/GDB_COMPATIBILITY.md`](file:///home/ubuntu/workspace/ut/docs/GDB_COMPATIBILITY.md) for complete details.
-
----
-
-## Technical Verification & Claims Matrix
-
-To prevent overclaiming, every capability in dynamicState is categorized under strict verification levels:
-
-| Component / Feature | Implementation Status | Test Scope | Verification Level | Real Target Evidence |
-| :--- | :--- | :--- | :--- | :--- |
-| **Evidence Ledger (v1.0.0)** | Complete | 8 unit tests, schema validation, backward compat | **UNIT TESTED** | Validates schema, provenance chains, optional fields |
-| **Agent Investigation API** | Complete | 10 unit/integration tests, ARP protocol, CLI, REST | **INTEGRATION TESTED** | Real C++ sample, offline snapshots, authorized live targets |
-| **Static-Dynamic Code Linking** | Complete | 6 unit tests, DWARF subprogram / CU parser | **INTEGRATION TESTED** | ASLR load bias adjustment, GNU Build ID cross-validation |
-| **Semantic Observation Diff** | Complete | 2 unit tests, multi-snapshot comparison | **UNIT TESTED** | Diff engine with honest non-atomic skew warnings |
-| **Investigation Overview UI** | Complete | 4 UI structure & rendering tests, mock/real API | **INTEGRATION TESTED** | Renders facts/hypotheses/unknowns, jump-to-object |
-| **Real C++ PIE Investigation E2E** | Complete | 1 end-to-end fixture test on compiled C++ binary | **REAL TARGET VALIDATED** | Stripped ELF, external DWARF, process_vm_readv capture |
-| **Memory Snapshot Explorer (Web UI)** | Complete | 13 API tests, 2 lifecycle tests, 24 acceptance steps | **REAL TARGET VALIDATED** | Verified via browser & automated acceptance harness |
-| **Subprocess Server Lifecycle** | Complete | Real `subprocess.Popen` with SIGINT/SIGTERM | **INTEGRATION TESTED** | Clean exit (code 0), immediate port re-bind |
-| **GDB Version Fallback Elimination** | Complete | 6 unit tests with explicit `status="UNKNOWN"` | **UNIT TESTED** | Unknown GDB returns `status="UNKNOWN"`, `major=None` |
-| **GDB 9.2 Frame & Snapshot Traversal** | Complete | Docker Ubuntu 20.04 with genuine GDB 9.2 | **REAL GDB 9.2 VERIFIED** | Executed in container (`dynamicstate-gdb92:latest`) |
-| **Native C99 Target Collector** | Complete | 3 unit/integration tests with GCC/Make | **REAL TARGET VALIDATED** | Captures live process, reloaded by `RawMemorySnapshot.load` |
-| **Agent Semantic Protocol Leakage Guard** | Complete | 7 contract tests with recursive leakage scanner | **INTEGRATION TESTED** | Zero pointers (`0x...`), PIDs, PCs, or GDB commands leak |
-| **LOW_IMPACT process_vm_readv Capture** | Complete | Process memory capture & mapping race detection | **REAL TARGET VALIDATED** | Tested on live Linux processes on AArch64 host |
-| **Offline DWARF Semantic Reconstruction** | Complete | Unstripped debug image + raw snapshot bundles | **INTEGRATION TESTED** | Reconstructs semantic graph without live process |
-| **Branch-Safe State Exploration** | Complete | Checkpoint-restore, crash isolation (SIGSEGV) | **INTEGRATION TESTED** | Verified multi-branch exploration |
-| **Workflow Parity & Drift Prevention** | Complete | 7 unit tests, PyYAML validation, isolated directory repair | **REAL TARGET VALIDATED** | Byte-for-byte parity between ci/workflows and .github/workflows |
-| **Capture Performance & Acceptance Gates** | Complete | 12 unit tests, ELF verification, byte accounting, SLA checks | **REAL TARGET VALIDATED** | 20-run benchmark across process_vm_readv & procfs |
-| **Conversational Investigation Loop (Phase 12)** | Complete | 11 loop tests, observation planner, drilldown | **INTEGRATION TESTED** | Validates deterministic hypotheses, observation outcomes, timeline |
-| **Phase 13 Operational Acceptance** | Complete | 16 E2E scenario & security tests, 14-step automated pipeline | **REAL TARGET VALIDATED** | Verified on live compiled C++ inferior, ASLR PIE, single-writer & concurrency |
-| **Phase 14 Production Pilot Qualification** | Complete | 13 pilot & security tests, standalone pilot runner | **REAL TARGET VALIDATED** | Embedded Linux IoT telemetry target, stripped PIE, companion DWARF, p50/p95 latency distributions |
-| **Machine-Readable Pilot Report & SHA-256 Seal** | Complete | Tamper-evident schema, SHA-256 payload integrity hash | **INTEGRATION TESTED** | `reports/pilot_qualification_report.json`, strict hardware disclosures |
-| **Trusted Causal Verification Engine** | Complete | Attestation proof verification, negative control baseline checks | **INTEGRATION TESTED** | Rejects unverified attribution, forged proofs, and conflated state transitions |
-| **Observation Plan Lifecycle** | Complete | State transitions (PROPOSED->EXECUTED->VERIFIED/FAILED/CANCELED) | **INTEGRATION TESTED** | Prevents duplicate execution, tracks cancellation, UI interactive controls |
-| **Phase 15 Conversational LLM & Simplified UX** | Complete | 22 conversational tests, local CLI/REST LLM & fallback | **REAL TARGET VALIDATED** | Single-pane workspace, OpenAI/Ollama/Gemini/ACP/Cline CLI integration, evidence claim disarming, secret redaction |
-| **Phase 16 CLI Provider Security & Truthfulness** | Complete | 14 security & lifecycle tests, privilege drop | **INTEGRATION TESTED** | Safe argument vectors, bounded execution, secret redaction, server-side template validation |
-| **Phase 17 CLI Process Isolation & Benchmark** | Complete | 10 process isolation tests, child/grandchild cleanup | **REAL TARGET VALIDATED** | Non-blocking streaming I/O, process group termination, privileged config defense |
-| **Phase 18 Independent Benchmark & Real C++ Eval** | Complete | 10 evaluation tests, 6 real-runtime scenarios | **REAL TARGET VALIDATED** | Independent versioned corpus, honest metric derivation, GNU Build ID validation, 0% FP causal SLA |
-| **Phase 19 Benchmark Integrity & Real Causal Eval** | Complete | 14 regression & benchmark tests, 6 real-runtime scenarios | **REAL TARGET VALIDATED** | Zero ground-truth leakage, 0.0% FP causal SLA (0/5), stage provenance, multi-provider matrix, honest None on empty data |
-| **Phase 20 Benchmark Execution Integrity & Results** | Complete | 22 regression & benchmark tests, track segregation | **REAL TARGET VALIDATED** | Strict track decoupling, non-evaluable empty denominator, mode isolation, truthful fallback labeling, live STATE provenance |
-
----
-
-## Continuous Integration & Workflow Synchronization
-
-Canonical CI workflow definitions are maintained under `ci/workflows/`:
-- `ci/workflows/test.yml`: Full test suite, compiler build, E2E investigation, and benchmark smoke validation.
-- `ci/workflows/gdb92.yml`: Dockerized legacy GDB 9.2 compatibility verification.
-
-### Synchronizing Workflows
-To synchronize canonical workflows to `.github/workflows/` or repair drift:
-```bash
-./scripts/sync_workflows.sh
-```
-> [!NOTE]
-> **GitHub Actions Permissions Note**: GitHub enforces that creating or updating workflows under `.github/workflows/` requires an OAuth token or personal access token with the `workflow` scope. When operating with an OAuth App token lacking `workflow` scope, pushes touching `.github/workflows/` are rejected by GitHub's pre-receive hook. The canonical definitions remain under `ci/workflows/`, and `scripts/sync_workflows.sh` provides deterministic synchronization.
-
----
-
-## Performance Benchmarking & Acceptance Gates
-
-dynamicState includes an automated benchmark harness measuring process suspension overhead, memory throughput, and quality invariants against a running C++ process.
-
-### Reproducible Commands
-1. **Smoke Validation** (CI-safe, 3 iterations, checks schema, byte accounting, payload integrity, and SLA gates):
-   ```bash
-   python3 -m benchmarks.capture_benchmark --smoke
-   ```
-
-2. **Full Benchmark Run** (20 iterations, generates environment-specific report without overwriting baseline):
-   ```bash
-   python3 -m benchmarks.capture_benchmark --iterations 20 --output benchmarks/latest_results.json
-   ```
-
-3. **Performance Acceptance Run** (20 iterations, enforces statistical sample gates and workload equivalence):
-   ```bash
-   python3 -m benchmarks.capture_benchmark --iterations 20 --acceptance --output benchmarks/latest_results.json
-   ```
-
-4. **Local Test Suite Commands**:
-   ```bash
-   # Benchmark harness & acceptance gates integrity
-   python3 -m unittest tests/test_capture_benchmark.py -v
-
-   # Capture lifecycle, identity race, and invariant seams (54 tests)
-   python3 -m unittest tests/test_capture_lifecycle_seam.py -v
-
-   # Real runtime C++ process live capture & mutation validation (20 tests)
-   python3 -m unittest tests/test_real_runtime_validation.py -v
-
-   # End-to-end C++ investigation pipeline scenarios A-E (5 tests)
-   python3 -m unittest tests/test_cpp_e2e_investigation.py -v
-
-   # Phase 13 Real C++ Operational Acceptance & Security Gates (16 tests)
-   python3 -m unittest tests/test_phase13_operational_acceptance.py -v
-
-   # Phase 13 Automated 14-Step Acceptance Pipeline
-   python3 scripts/run_e2e_operational_acceptance.py
-
-   # Phase 14 Embedded Linux Production Pilot & Security Gates (13 tests)
-   python3 -m unittest tests/test_phase14_production_pilot.py -v
-
-   # Phase 14 Production Pilot Demonstration Script
-   python3 scripts/run_production_pilot.py --smoke
-
-   # Phase 15 Conversational LLM & Simplified Investigation UX (22 tests)
-   python3 -m unittest tests/test_phase15_conversational_llm.py -v
-
-   # Phase 16 CLI Provider Security & Truthfulness (14 tests)
-   python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py -v
-
-   # Phase 17 CLI Process Isolation Hardening (10 tests)
-   python3 -m unittest tests/test_phase17_process_isolation_regression.py -v
-
-   # Phase 18 Independent Investigation Benchmark & Real C++ Snapshot Evaluation (10 tests)
-   python3 -m unittest tests/test_investigation_quality_benchmark.py -v
-   python3 benchmarks/investigation_quality/run_benchmark.py --mode all --smoke
-
-   # Phase 20 Benchmark Execution Integrity & Trustworthy Results (22 tests)
-   python3 -m unittest tests/test_investigation_quality_benchmark.py -v
-   python3 benchmarks/investigation_quality/run_benchmark.py --smoke
-
-   # Phase 19 Benchmark Integrity & Real Causal Evidence Verification (14 tests)
-   python3 -m unittest tests/test_investigation_quality_benchmark.py -v
-   python3 benchmarks/investigation_quality/run_benchmark.py --mode real_runtime
-
-   # Full test discovery suite (702+ tests)
-   python3 -m unittest discover -s tests -v
-   ```
-
-### Canonical Capture Quality Contract
-Capture quality follows a strict, monotonic trust contract from initial capture through deserialization, typed decoding, StateDiff, EvidenceLedger, and investigation reports:
-- **`COMPLETE`**: 100% of requested bytes read (`bytes_requested == bytes_read`), target stop confirmed, target resume confirmed, thread and map enumeration succeeded without synthetic fallbacks, and zero mapping races detected.
-- **`PARTIAL`**: Incomplete byte capture (`bytes_read < bytes_requested`), mapping race detected (`MAPPING_RACE_DETECTED` from concurrent unmapping, permission changes, or layout shift), thread or map enumeration partial or empty, target resume unconfirmed, or suspension exceeded budget (`STOP_BUDGET_EXCEEDED`).
-- **`FAILED`**: Zero bytes read, target process exited prior to capture, permission denied (`EPERM`/`EACCES`), or unrecoverable I/O error.
-- **`INVALID`**: Target identity mismatch or PID reuse detected (`PID_REUSED`), indicating captured bytes cannot be attributed to the intended inferior.
-- **Monotonic Degradation**: Once degraded to `PARTIAL`, `FAILED`, or `INVALID`, downstream components never promote the snapshot back to `COMPLETE`. EvidenceLedger tags findings from non-COMPLETE captures with explicit caveats.
-
-### Stop Budget SLA vs Temporal Consistency
-`CaptureSafetyPolicy.max_stop_time_ms` and snapshot consistency are orthogonal:
-- **Stop Budget SLA (`stop_budget_compliance`)**: An SLA detection and bounding threshold (e.g., limit = 2.0 ms), not an OS real-time scheduling guarantee. Work volume is pre-bounded (`max_capture_bytes`). If target suspension exceeds the threshold, `STOP_BUDGET_EXCEEDED` is recorded and quality is demoted to `PARTIAL`, but target resumption is never aborted.
-- **Temporal Consistency (`temporal_consistency`)**: Characterizes cross-region and cross-thread alignment (`ATOMIC_STOPPED`, `SIGNAL_STOPPED`, `NON_ATOMIC`, `UNVERIFIED_TEMPORAL`).
-- **Orthogonality**: A capture can be compliant with its stop budget but non-atomic (e.g., zero-stop mode), or atomic while exceeding its stop budget. Compliance with a stop budget does not imply atomicity, nor vice versa.
-
-### Backend Equivalence & Spatial vs Temporal Identity
-dynamicState supports both `process_vm_readv` (direct syscall) and `procfs` (`/proc/<pid>/mem` fallback):
-- **Equivalence**: Both backends capture equivalent memory ranges, byte counts, and region mappings under equivalent policies.
-- **Spatial Equivalence != Temporal Identity**: Matching address ranges between snapshots or between backends do **NOT** imply temporal identity for non-atomic captures. Active threads continue to mutate memory state between reads; therefore, spatial equivalence confirms identical layout selection, while temporal variance is honestly tracked in the provenance metadata.
-
-### Benchmark Baseline Protection & Failure Reproduction
-- **Baseline Protection**: The canonical reference baseline at `benchmarks/baseline_results.json` is protected against accidental overwriting. Neither `--smoke` runs nor failed `--acceptance` runs can overwrite the baseline.
-- **Failure Reproduction**: Running with `--acceptance` enforces non-zero exit codes upon any byte accounting violations, missing required metrics/samples, payload corruptions, or quality downgrades. Detailed diagnostic messages are emitted directly to stderr and recorded in the JSON output.
-
-### Phase 21: Persistent Watch Session & Temporal Memory Explorer Foundation
-Phase 21 builds the end-to-end foundation for temporal memory observation and interactive state replay:
-- **Versioned Observation Data Contracts (`extractor/watch_session.py`)**:
-  - `ObservationSession` (schema 1.0.0): Target PID, binary Build ID, companion debug ELF, start/end times, interval, status (`RUNNING` / `STOPPED`), watch items, and provenance.
-  - `WatchItem`: Stable item ID, scope (`global`, `heap`, `thread`, `address_range`), virtual memory address, DWARF type name, size, and source location.
-  - `Observation`: Monotonic sequence (`seq`), nanosecond monotonic timestamp (`monotonic_ns`), wall-clock ISO-8601 timestamp, decoded values, raw hex bytes, and observation status (`OBSERVED`, `PARTIAL`, `UNAVAILABLE`, `DECODE_ERROR`).
-  - `CaptureGap`: Timestamped tracking of sampling discontinuities (`SAMPLING_OVERRUN`, `PROCESS_SLEEPING`, `MAPPING_CHANGED`).
-  - `AllocationEvent`: Strict schema contract for heap alloc/free events.
-- **Five Primary Explorer Views**:
-  - **Area A: Target & Watch Session Controls**: Connects to target PID, validates GNU Build ID between companion ELF and running process, configures interval (100ms–2000ms), and exposes zero-stop capture controls.
-  - **Area B: Thread and Memory Map Explorer**: Inspects `/proc/<pid>/task` threads, parses `/proc/<pid>/maps` regions with category filtering (Code, Data/BSS, Heap, Stack, Anonymous), and indexes discoverable DWARF global/static variables with PIE/DYN runtime address relocation.
-  - **Area C: Active Watch List**: Allows adding variables directly from DWARF or specifying raw memory address ranges with read-safety bounds checking. Selection persists durably to disk across browser refreshes and restarts.
-  - **Area D: Temporal State Table & Replay Navigation**: Non-destructive replay over immutable recorded observations. Features playback controls (Play/Pause, Prev, Next, Home, End), timeline scrubbing slider, keyboard shortcuts (Arrow keys, Home, End, Spacebar with input-focus guards), changed-value highlighting (`.val-changed`), delta computation, and recent observations time-series matrix.
-  - **Area E: Allocation Events (Truthful Capability Display)**: Truthfully reports `ALLOCATION_TRACING_UNAVAILABLE` when running without an active heap tracer probe. Documents sampling limits and specifies the future allocator recorder adapter contract without producing fabricated events.
-- **Capture Semantics, Overhead & Limitations**:
-  - **Stop Duration**: 0.00 ms (Zero-Stop, `process_vm_readv` reads target virtual memory without suspending inferior execution).
-  - **Latency**: Sub-millisecond tick latency recorded per observation (`capture_latency_us`).
-  - **No Fabrication**: Unmapped or inaccessible memory returns `UNAVAILABLE` or `PARTIAL`; values are never interpolated or defaulted to zero.
-
-### Phase 22: Zero-Configuration Live Capture, Language-Aligned LLM & Simplified UX
-Phase 22 transforms dynamicState from a technical runtime inspection dashboard into an intuitive investigation product:
-- **Two-Input Live Capture**: The basic workflow requires only two fields:
-  1. Target PID (`pid`)
-  2. Matching unstripped ELF / debug image path (`debug_image`)
-- **Automated Discovery & Pre-Validation (`POST /api/investigation/validate-target`)**:
-  - Automatically inspects `/proc/<pid>/exe`, checks GNU Build ID parity, verifies DWARF `.debug_info` presence, and tests zero-stop memory read backend accessibility (`process_vm_readv` / `procfs`).
-  - Reports actionable, localized diagnostic guidance for errors (ESRCH, EPERM, missing DWARF, Build ID mismatch).
-- **Language-Aligned LLM (`locale: 'ko' | 'en'`)**:
-  - The UI locale (`currentLang`) authoritatively drives LLM prompts, requiring natural-language explanations in the selected language.
-  - **Technical Symbol Protection**: C/C++ symbols, function names, source paths, memory addresses, and JSON schema keys are strictly preserved in their original form without translation or corruption.
-  - Offline CI and deterministic fallback provider (`DeterministicFallbackProvider`) automatically return localized responses matching the active locale.
-- **Radical Default UX Simplification**:
-  - **Area 1: TARGET**: Two-input connection form when disconnected; clean PID, binary, Build ID, and capture quality summary when connected.
-  - **Area 2: INVESTIGATION RESULT**: Concise diagnostic summary, NON_ATOMIC snapshot warnings, and three prioritized sections (Confirmed facts, Possible causes, What to do next) with progressive disclosure toggles.
-  - **Area 3: ASK A QUESTION**: Conversational natural language interface for interactive problem diagnosis.
-  - **Expert Mode**: Preserves all 8 deep-dive navigation tabs, low-level metrics bars, mutation labs, and raw evidence ledgers without regression.
-
-### Phase 23: Remote Watch Sessions and MCP Integration
-Phase 23 connects the Watch Session and Temporal Memory Explorer to embedded Linux targets across multi-hop SSH/SSH Proxy environments, exposing complete session lifecycle and streaming observation exploration through both MCP tools and the Web UI:
-- **Target Execution Adapter (`extractor/target_adapter.py`)**:
-  - `TargetExecutionAdapter`: Unified abstraction separating target operations from host inspection.
-  - `LocalTargetAdapter`: Zero-stop memory reads via `process_vm_readv` (fallback `/proc/<pid>/mem`) and local `/proc` introspection.
-  - `RemoteSshTargetAdapter`: High-efficiency transport over SSH, supporting multi-hop jump hosts (`proxy_jump`), proxy commands (`proxy_command`), custom ports, and keys.
-  - **Strict Target Namespace Separation**: PIDs are interpreted exclusively in the target host's namespace; local `/proc` is never touched or inspected for remote targets.
-  - **Zero Python on Target**: Operates without Python or debugger dependencies on the embedded device. Reads remote `/proc/<pid>/maps`, threads from `/proc/<pid>/task`, and memory slices via `dd | base64`. Companion unstripped ELF with DWARF stays on developer host.
-  - GNU Build ID and architecture are verified by reading remote ELF header bytes and parsing them with host-side tools.
-- **Address Correctness & PT_LOAD Load-Bias Relocation**:
-  - `calculate_load_bias`: Accurately computes load bias by matching ELF `PT_LOAD` segments against `/proc/<pid>/maps` file offsets and virtual address ranges, rather than relying on naive first-mapping heuristics.
-  - Correctly relocates PIE/DYN (`ET_DYN`) binaries, keeps non-PIE (`ET_EXEC`) load bias at 0, handles split mappings (code, rodata, data/bss), and explicitly flags ambiguous relocation states.
-- **Append-Friendly Durable Observation Store**:
-  - Eliminates monolithic JSON re-serialization overhead by logging observations to append-only `observations.jsonl` while persisting metadata in `session.json`.
-  - Supports streaming pagination (`limit`, `offset`, `start_seq`, `end_seq`) to query observation intervals without loading entire datasets into memory.
-  - Enforces resource bounds: `max_samples`, storage byte limits (`max_storage_bytes`), and session duration limits (`max_duration_sec`).
-  - Graceful restart recovery: upon restart, sessions without active workers are safely marked `STOPPED` with an explicit `SERVER_RESTARTED_CAPTURE_ABORTED` gap. Full backward compatibility with legacy monolithic session files is maintained.
-- **Model Context Protocol (MCP) Tools (`scripts/mcp_server.py`)**:
-  - Exposes 9 validated MCP tools:
-    - `runtime_watch_session_create`: Start a persistent watch session for local or remote PID.
-    - `runtime_watch_session_status`: Fast compact status query (health, sample counts, latency).
-    - `runtime_watch_session_get`: Session metadata, configuration, watch items, and capabilities.
-    - `runtime_watch_session_list`: List active and persisted watch sessions.
-    - `runtime_watch_inspect_target`: Explore threads, memory maps, and discoverable variables.
-    - `runtime_watch_item_add`: Add a variable or raw memory address to active watch list.
-    - `runtime_watch_item_remove`: Remove a watch item without deleting observation history.
-    - `runtime_watch_session_observations`: Paginated retrieval of recorded observations and gaps.
-    - `runtime_watch_session_stop`: Gracefully stop sampling and flush session state.
-- **UI and MCP Consistency**:
-  - MCP-created sessions immediately appear in the Web UI session switcher dropdown (`GET /api/watch/sessions`).
-  - Watch list modifications made via Web API or MCP are bidirectionally visible and preserved.
-  - Truthful capability reporting: allocation events remain strictly reported as `UNSUPPORTED_ON_BACKEND` unless a real allocation tracer probe is attached.
-  - Simple default UX is preserved (local PID + companion ELF) with an optional expandable remote SSH drawer for embedded targets.
-
-### Phase 24: Evidence-First Temporal Investigation Workflow
-Phase 24 connects Watch Sessions and the Temporal Memory Explorer to the conversational investigation workflow, canonical EvidenceLedger, static code analysis, and object-centric drilldown:
-- **Natural-Language Temporal Orchestration**:
-  - Translates user goals (English and Korean) into bounded temporal observation plans (`TemporalInvestigationPlan`).
-  - Supports intuitive goal understanding (e.g., *"특정 Buffer memory pool을 10초간 모니터링하면서 memory guard 근처까지 접근하는 변수가 무엇인지 알아봐줘"*).
-  - Automatically parses memory addresses, observation windows, buffer bounds, and guard proximity parameters.
-- **Evidence Provenance & Canonical Ledger**:
-  - Reuses canonical `EvidenceRecord` entries linking session ID, observation sequence/time, capture quality, target identity, Build ID, address/range, type/field path, DWARF source location, and static candidate functions.
-  - Distinguishes observed facts, inferred hypotheses, unknowns, and candidate causal functions.
-  - Candidate functions remain strictly in `STATIC_CANDIDATE` or `EVIDENCE_SUPPORTED` tiers and are never promoted to validated causality without independent execution tracing.
-- **Streaming & Memory-Bounded Observation Comparison**:
-  - Evaluates temporal observations through streaming pagination chunks without loading unbounded JSONL histories into memory.
-  - Distinctly classifies watch item states:
-    - `CHANGED`: Values transitioning across sequences.
-    - `UNCHANGED`: Values remaining steady across the requested window.
-    - `PARTIAL`: Partially read structures or memory reads.
-    - `MISSING`: Unrecorded or unavailable samples (never silently treated as unchanged).
-- **Buffer & Memory Guard Proximity Safety**:
-  - Evaluates byte distance between pointer variables and guard page boundaries.
-  - Strictly enforces `LOW_IMPACT` honest capture semantics: snapshot proximity alone does NOT prove actual memory reads, writes, buffer overruns, or guard crossings.
-  - Recommends non-invasive follow-up actions (hardware watchpoints or dynamic probes on guard pages).
-- **Object-Centric Evidence Drill-Down (`GET_FINDING_DRILLDOWN`)**:
-  - Provides drill-down navigation: Finding &rarr; C++ object/field &rarr; pointer/size/guard distance &rarr; DWARF type/source location &rarr; candidate functions &rarr; evidence ledger records &rarr; uncertainty notices.
-- **Simplified Investigation Workspace**:
-  - Enhances Basic Investigation Mode with a Target Source toggle (Live PID vs. Observation Session), watch session selector, observation window duration input, and a Finding Evidence Drilldown Modal (`#modal-finding-drilldown`).
-  - Strict secret redaction preserves confidentiality of API tokens, keys, and raw memory dumps across all views.
-
-### Phase 25: Evidence-Grounded LLM Investigation & End-to-End Quality Validation
-Phase 25 ensures that conversational temporal investigations produce conclusions genuinely supported by runtime observations, DWARF symbols, and canonical evidence records, verifying the entire workflow end-to-end:
-- **Truthful LLM vs. Deterministic Fallback**:
-  - Distinguishes real LLM provider execution, deterministic fallback, provider unavailable, timeout, and cancellation statuses (`MODEL_ROUNDTRIP_VERIFIED`, `FALLBACK`, `DETERMINISTIC_RULES`, `UNAVAILABLE`, `TIMEOUT`, `CANCELLED`).
-  - Removed misleading canned claims when raw facts are empty; deterministic fallback explicitly disclaims that no external LLM was contacted and no invariant violations were detected in examined observations.
-  - Basic Investigation UI and conversational chat display truthful provider execution status badges (`#basic-badge-provider-status`).
-- **Evidence-Grounded Claim Validation & Symbol Verification**:
-  - Every factual claim asserted by LLM reasoning is validated against active confirmed findings (`session.findings`) and canonical `EvidenceLedger` records; ungrounded assertions are demoted to unknowns and disarmed claims.
-  - Candidate functions proposed by LLM are verified against companion ELF symbols (`inspect_elf(companion_elf).symbols`) and static candidate lists; non-existent/hallucinated function names are stripped.
-  - Irrelevant evidence citations (such as citing a `RUNTIME_IDENTITY` record to support a memory corruption claim) are automatically stripped.
-  - Static function candidates and temporal correlations are never promoted to `VALIDATED_CAUSAL_FUNCTION` without authentic independent runtime proof (`TrustedCausalVerifier` attestation).
-- **Temporal Semantics & Boundary Grounding**:
-  - Boundary kinds are grounded into `CONFIGURED_GUARD_ADDRESS`, `KNOWN_BUFFER_END`, `MEMORY_MAP_BOUNDARY`, and `UNKNOWN`.
-  - Removed silent `+4096` buffer address substitutions; when boundary coordinates are ungrounded, proximity calculations are suppressed and an explicit `Memory Guard Boundary Unknown` finding (`category="unknown"`) is emitted.
-  - Added 64-bit address masking, null pointer guards, and safe boundary distance findings (`fnd_guard_safe`) when pointers remain safely away from guard boundaries.
-  - Temporal summaries explicitly include discrete periodic sampling notices, duration in milliseconds, and gap counts.
-- **Dedicated Real-Runtime Fixtures & 17 Quality Acceptance Scenarios**:
-  - Added `tests/fixtures/real_runtime/guard_pool_fixture.cpp` featuring real buffer pool, `PROT_NONE` guard page, safe pointer, and near pointer (negative control: proximity without write access).
-  - Validated across all 17 required scenarios in `tests/test_phase25_grounded_investigation.py`:
-    1. Valid state transition.
-    2. Pointer near known boundary without actual access (negative control: remains unproven).
-    3. Actual invalid access only when independently observable by test harness.
-    4. Unchanged values correctly identified.
-    5. Partial read correctly identified and not reported as unchanged.
-    6. Capture gap recorded and missing samples not assumed unchanged.
-    7. Target exit/restart.
-    8. Build ID mismatch fails closed.
-    9. Missing DWARF handled gracefully without inventing types.
-    10. Remote-session failure handled truthfully.
-    11. Provider unavailable handled truthfully without pretending LLM succeeded.
-    12. LLM timeout and cancellation terminates process group cleanly.
-    13. Malformed provider output disarmed into safe schema.
-    14. Fabricated evidence IDs stripped (100% rejection rate).
-    15. Unsupported causal claims and static candidates never promoted to validated causality (0.0% false-positive rate).
-    16. Secret redaction preserved across all findings and ledger records.
-    17. Large paginated histories processed with streaming bounds.
-- **Measured Quality Metrics**:
-  - **Scenario Coverage**: 17 / 17 (100.0%)
-  - **False-Positive Causal Promotion Rate**: 0.0%
-  - **Unsupported Claim Rejection Rate**: 100.0%
-
-### Phase 26: Real-Execution Quality Verification & Agent-First Investigation UX
-Phase 26 closes the gap between synthetic assertions and trustworthy real-runtime investigation, establishing transparent quality metrics and an agent-first investigation workflow:
-- **Explicit Quality Metrics & Transparent Denominators (`QualityMetricsReport`)**:
-  - Replaced hardcoded constants, order-dependent mutable state, and unverified pass counts with explicit computed metrics.
-  - Transparently reports `NOT_EVALUABLE` when the denominator is zero rather than claiming 0.0% error or 100.0% success.
-  - Quality metrics engine (`extractor/investigation_quality.py`) outputs formatted markdown and CLI tables:
-    - **Scenario Execution & Pass Rate**: 17 / 17 (100.0%)
-    - **Unsupported Claim Rejection Rate**: 4 / 4 (100.0%)
-    - **Invalid Evidence Reference Rejection Rate**: 4 / 4 (100.0%)
-    - **False-Positive Causal Promotion Rate**: 0 / 2 (0.0% FP)
-- **Real-Runtime Fixture Verification & Negative Control**:
-  - Live execution of `tests/fixtures/real_runtime/guard_pool_fixture.cpp` in an isolated test harness (`test_01`).
-  - Verifies process spawning, handshake parsing (`PID`, `POOL`, `GUARD`), and memory layout.
-  - Proves the negative control: a pointer situated near a memory guard (`guard_addr - 16`, within the 64-byte threshold) without an actual invalid access event is correctly identified as near, but candidate functions are **never** promoted to `VALIDATED_CAUSAL_FUNCTION` or marked as root cause.
-  - Verifies clean shutdown via `SIGTERM` with exit code 0.
-- **Evidence-Grounded Semantic Trustworthiness**:
-  - Fails closed when session findings or evidence ledger records are empty: arbitrary asserted facts are rejected and disarmed.
-  - Eliminated substring matching loopholes (e.g. `'ptr'` matching `'g_guard_state.near_ptr'`, `'data'` matching `'dataset'`); only exact leaf identifiers or hierarchical path matches are accepted.
-  - Contradictory value rejection: asserted fact values contradicting confirmed finding values are rejected.
-  - Companion ELF symbol validation: non-existent symbols are flagged as `FABRICATED` and stripped; symbols in stripped binaries without companion DWARF are labeled `UNVERIFIED` tier.
-  - Irrelevant and fabricated evidence references (such as citing a `RUNTIME_IDENTITY` record for a memory corruption claim) are stripped.
-- **Temporal Semantics & Boundary Grounding**:
-  - Enforced 64-bit address masking (`& 0xFFFFFFFFFFFFFFFF`), null pointer skipping, and canonical user-space address bounds up to 5-level paging (`0x7FFFFFFFFFFFFFFF`).
-  - Distinct boundary classifications (`CONFIGURED_GUARD_ADDRESS`, `KNOWN_BUFFER_END`, `MEMORY_MAP_BOUNDARY`, `UNKNOWN`), ensuring memory map boundaries never falsely infer buffer capacity.
-  - Missing, partial, and gap states are strictly differentiated from `UNCHANGED`.
-- **Agent-First Investigation UX**:
-  - Web UI investigation results cleanly organized into 5 dedicated sections:
-    - **2A. Observed Facts**: Confirmed facts grounded against EvidenceLedger.
-    - **2B. Inferred Hypotheses**: Disarmed hypotheses with explicit confidence and uncertainty notes.
-    - **2C. Function Candidates**: Visual badges for `VALIDATED_CAUSAL`, `EVIDENCE_SUPPORTED`, `STATIC_CANDIDATE`, and `UNVERIFIED`.
-    - **2D. Unknowns & Alternative Explanations**: Highlighted open uncertainties, missing DWARF notices, and unverified symbols.
-    - **2E. Recommended Next Steps**: Prioritized follow-up actions with risk levels and rationale.
-  - Interactive show-more toggles and one-click evidence drilldown modal integration.
-- **Transport Independence & ARP Action Freeze**:
-  - Preserved strict transport boundary: DynamicState does not duplicate multi-hop SSH, ProxyJump, or remote execution adapters (delegated to existing `xssh` tools).
-  - Frozen ARP action types: no new ARP actions introduced; unsupported action requests safely return `CAPABILITY_UNSUPPORTED`.
-
-### Phase 28: Runtime Memory Explorer and Time-based State Inspection UX
-Phase 28 establishes an interactive, memory-centric inspection and temporal state-tracking workflow:
-`Target Connection -> Runtime Structure Exploration -> User-Selected Watch Items -> Repeated Captures -> Timeline & Diffs -> Evidence-Backed Investigation`.
-
-- **Target Connection & Compatibility Validation (Tab 1: Target Setup)**:
-  - Explicit PID and companion non-stripped debug ELF input fields.
-  - Verifies process liveness (`/proc/<pid>`), executable identity, architecture, and GNU Build ID matching.
-  - Inspects DWARF compilation units, global variables, and type tables before capture.
-  - Transparent error diagnostics when Build IDs mismatch or permissions are denied (`EPERM`).
-
-- **Runtime Structure Exploration (Tab 2: Runtime Explorer)**:
-  - **Threads View**: Lists OS thread IDs, thread names, execution status, and stack address ranges (`[stack_start, stack_end]`, size in KB). Truthfully reports local variables as `UNSUPPORTED` with clear explanation of debugger frame unwinding requirements.
-  - **Memory Maps View**: Lists virtual memory mappings with address ranges, sizes, permissions (`rwxp`), device/inode, and mapped file paths or classifications (`[heap]`, `[stack]`, `[anon]`).
-  - **Bounded Memory Range Inspector**: Safely reads up to 4096 bytes via `process_vm_readv` (zero process interruption). Formats canonical hexadecimal and ASCII dumps with offset markings. Correlates addresses against companion DWARF variables to highlight named symbols. Returns truthful statuses (`OBSERVED`, `PARTIAL`, `UNMAPPED`).
-  - **Object & Variable Tree**: Traverses DWARF type hierarchy for structs/classes, member fields, offsets, byte sizes, and pointer types without fabricating values.
-
-- **User-Selected Watch Items (Tab 3: Watch List)**:
-  - Operators select specific variables, fields, or bounded memory address ranges to track over time.
-  - Enforces bounded reads (1 to 65,536 bytes) and scope/source attribution (`global_variable`, `memory_map`, `thread_stack`, `custom_range`, `object_field`).
-  - Dynamic addition and removal of watch items with live address validation against target memory maps.
-
-- **Timeline & State Diffing (Tab 4: Timeline / Compare)**:
-  - **On-Demand Zero-Stop Snapshot Capture**: Trigger single synchronous capture snapshots (`POST /api/watch/session/{id}/capture`) with exact nanosecond timestamps and microsecond latency measurement.
-  - **Chronological Timeline**: Ordered historical observations with completeness status (`COMPLETE`, `PARTIAL`, `FAILED`).
-  - **State-Aware Diffing Engine**: Strict 6-state distinction:
-    - `CHANGED`: Values or raw bytes altered between captures.
-    - `UNCHANGED`: Validated identical values.
-    - `UNREADABLE`: Inaccessible memory or guard pages (`PROT_NONE`) — never falsely reported as unchanged.
-    - `PARTIAL`: Incomplete memory reads.
-    - `MISSING`: Watch item omitted from one observation.
-    - `UNKNOWN`: Decoding errors or type mismatches.
-  - **Pointer Semantics**: Distinguishes pointer address change (`pointer_address_changed`) vs. changes within dereferenced memory buffers.
-
-- **Evidence-Backed Investigation Handoff (Tab 5: Investigation)**:
-  - Direct one-click export of observed state diffs into `EvidenceLedger` and active investigation sessions.
-  - Full provenance preservation (`session_id`, `observation_seq`, `pid`, `address`, `byte_range`, `timestamp`).
-
-- **Capability Matrix**:
-  | Capability | Status | Implementation Details |
-  | :--- | :--- | :--- |
-  | Target Connection & Build ID Validation | **Working** | `debug_image.py`, `LocalTargetAdapter.check_liveness`, Build ID sha1/md5 check |
-  | Thread Stack Range Detection | **Working** | `/proc/<pid>/task/<tid>/stat` & `/proc/<pid>/maps` stack matching |
-  | Thread Local Variable Unwinding | **Unsupported** | Truthfully reported as `UNSUPPORTED` (requires DWARF CFI unwind engine / GDB frame) |
-  | Memory Map Navigation & Classification | **Working** | `LocalTargetAdapter.get_memory_mappings`, permission & path parsing |
-  | Bounded Memory Range Inspector | **Working** | `read_process_memory_slice`, hex+ASCII dump formatting (max 4096 bytes) |
-  | DWARF Global Variable Tree & Struct Decode | **Working** | `DwarfIndexer`, recursive member offset traversal, endian-aware unpack |
-  | User Watch List Management | **Working** | `WatchSessionManager.add_watch_item`, bounded size (1-65536 bytes), scope attribution |
-  | Zero-Stop On-Demand Snapshot Capture | **Working** | `WatchSessionManager.capture_once`, `process_vm_readv` (latency < 100 μs) |
-  | Multi-State Snapshot Diffing | **Working** | `WatchSessionManager.compare_observations`, strict UNREADABLE != UNCHANGED |
-  | Pointer vs Pointed-To Memory Diffing | **Working** | DWARF pointer type detection & pointer address transition tracking |
-  | Investigation & Ledger Handoff | **Working** | `EvidenceLedger.add_record`, `InvestigationManager.start_investigation` |
-  | Remote Multi-Hop Target Access | **Delegated** | Preserved transport boundary: delegated to registered external `xssh` tools |
-
-- **Manual Verification Guide**:
-  1. Compile and launch the real-runtime test fixture:
-     ```bash
-     g++ -fPIE -pie -g -O0 -fno-inline -fno-omit-frame-pointer -Wl,--build-id=sha1 tests/fixtures/real_runtime/scenario_target.cpp -o /tmp/target_debug.elf -lpthread
-     strip -s -o /tmp/target_prod.stripped /tmp/target_debug.elf
-     /tmp/target_prod.stripped
-     ```
-  2. Start the web UI server:
-     ```bash
-     python3 -m extractor.web.server --port 8080 --corpus corpus
-     ```
-  3. Open `http://localhost:8080/` in a browser:
-     - **Tab 1 (Target Setup)**: Enter the PID and companion debug ELF `/tmp/target_debug.elf`. Click **Inspect Runtime Target**. Verify target identity, Build ID compatibility, and memory map counts.
-     - **Tab 2 (Runtime Explorer)**:
-       - View threads and verify stack address ranges. Note that local variables are marked `UNSUPPORTED`.
-       - View memory maps. Click **Inspect Range** on an address (e.g. `g_state` or stack). Verify the hex/ASCII dump and matched DWARF symbol.
-     - **Tab 3 (Watch List)**: Select variables (e.g. `g_state.sequence`, `g_state.status`) and click **Add to Watch List**. Verify the items appear in the table with scope and address.
-     - **Tab 4 (Timeline / Compare)**:
-       - Click **Capture Snapshot Now** to record observation #1.
-       - Send a mutation command to the target process via stdin (e.g. `SET sequence 9999`).
-       - Click **Capture Snapshot Now** to record observation #2.
-       - Select Snapshot #1 and Snapshot #2 in the compare dropdowns and click **Compare Selected Snapshots**.
-       - Verify that `sequence` is labeled `CHANGED` with before/after values, while `status` is labeled `UNCHANGED`.
-     - **Tab 5 (Investigation)**: Click **Send Diff to Investigation** to initiate a grounded investigation citing the exact observation sequences.
-
-### Phase 29: Complete and Validate the Browser-Based Runtime Investigation Workflow
-Phase 29 delivers a fully tested, end-to-end browser investigation experience verified through automated headless Chromium tests via Playwright against live running C++ processes (`tests/fixtures/real_runtime/scenario_target.cpp`).
-
-- **Target Connection & Validation (Step A — Tab 1)**:
-  - Form state persistence: Two-way binding between Tab 1 input forms (`#te-target-pid`, `#te-companion-elf`), Tab 5 forms, and `sessionStorage`. Values survive tab switching and browser refreshes.
-  - Complete internationalization (i18n): Dynamic real-time switching between English and Korean (`#btn-lang-en`, `#btn-lang-ko`) across all workflow tabs, badges, headers, and modal dialogues.
-  - Transparent Low-Impact Zero-Stop verification banner: Real-time report of zero process suspension time using `process_vm_readv` (latency < 100 μs).
-  - Explicit non-speculative state: Target connection does not trigger automated speculative investigation reports without explicit user intent.
-
-- **Runtime Explorer & DWARF Struct Expansion (Step B — Tab 2)**:
-  - Live OS Threads: Displays active thread IDs, execution states, and stack boundaries (`[stack_start, stack_end]`).
-  - Memory Mappings: Categorized memory ranges (Heap, Stack, Code, Data) with raw hex/ASCII slice inspect modal.
-  - DWARF Struct Member Unrolling: Expandable struct variables (e.g. `g_state` -> `sequence`, `status`, `buffer`, `active`) with inline toggle (`▶`/`▼`) and individual "Watch" action buttons per member.
-
-- **User-Selected Watch Items Management (Step C — Tab 3)**:
-  - Watch list table displays monitored symbols, source provenance (`global_variable`, `struct_member`, `memory_map`, `custom_range`), address, type, and status.
-  - Interactive "Add Custom Range" drawer and one-click item removal with instant UI synchronization.
-
-- **Timeline Navigation, Diffing & Provenance Drilldown (Step D — Tab 4)**:
-  - Repeated synchronous captures: Baseline Snapshot #1 and mutation Snapshot #2 captured via explicit user action (`#btn-manual-capture-now` / `#btn-timeline-capture-now`).
-  - Interactive scrubber slider and clickable snapshot sequence pills (`#1`, `#2`) to inspect temporal points in time.
-  - Side-by-side snapshot comparison distinguishing 8 diff states: `CHANGED`, `UNCHANGED`, `ADDED`, `REMOVED`, `UNREADABLE`, `PARTIAL`, `MISSING`, `UNKNOWN`.
-  - Pointer semantics breakdown (`POINTER_ADDRESS_CHANGED`, `REFERENCED_MEMORY_CHANGED`, `STABLE`).
-  - Provenance drilldown modal (`#modal-provenance-drilldown`): Inspects underlying kernel read backend (`process_vm_readv`), zero-stop pause duration (0.00 ms), raw hexadecimal bytes before/after, and byte provenance.
-
-- **Investigation Integration Handoff (Step E — Tab 5)**:
-  - "Investigate this Difference" button transfers mutated variable context, observation sequence numbers, and diff values directly into Tab 5 Investigation Goal input.
-  - Automatically switches target source to Watch Session mode and updates the active session dropdown.
-
-- **Automated Browser E2E Test Suite**:
-  - `tests/test_phase29_browser_e2e.py`: 5 automated real-browser Playwright test scenarios:
-    1. `test_01_target_setup_i18n_persistence_and_validation`: Target inputs, sessionStorage persistence, English/Korean toggles, validation diagnostics.
-    2. `test_02_runtime_explorer_threads_maps_and_struct_members`: Thread exploration, memory mappings, struct member unrolling, and individual watch item addition.
-    3. `test_03_watchlist_management_and_removal`: Watchlist items display, custom range addition, and item deletion.
-    4. `test_04_repeated_captures_mutation_timeline_diffs_and_provenance`: Inferior process state mutation via stdin (`SET sequence 9999`), repeated captures, timeline navigation, side-by-side diffing, and provenance drilldown modal.
-    5. `test_05_investigation_integration_handoff`: Handoff of diff context into Tab 5 Investigation Goal and watch session selection.
-
-### Phase 30: Runtime Investigation UX Hardening, Real-Capture Integrity, and Browser Acceptance
-Phase 30 hardens the primary investigation journey into a simple, reliable linear flow, establishes strict truthfulness for pointer vs. referenced memory mutations and unmapped/guard memory reads, guarantees tamper-proof provenance drilldown, and eliminates ungrounded speculation on sessions with 0 observations.
-
-- **Simplified Linear Journey in Basic Mode**:
-  `Target -> Explore -> Select variables -> Capture -> Compare -> Ask about changes`
-  - Single guided journey eliminating competing navigation dead-ends and unrequested automated reports.
-  - Clear progression states, action buttons, and descriptive empty states explaining next steps.
-  - Real-time synchronization of target PID, companion debug ELF, and selected watch session across all tabs and browser reloads.
-
-- **Strict Pointer Semantics**:
-  - Distinguishes pointer address reassignment (`POINTER_ADDRESS_CHANGED`) from changes within pointed-to memory buffers (`REFERENCED_MEMORY_CHANGED`).
-  - Sampling helper automatically inspects bounded slices (up to 64 bytes) of valid pointer targets via `process_vm_readv`.
-  - Side-by-side diffing and provenance modal clearly attribute whether the pointer itself was repointed or the buffer content was mutated.
-
-- **Truthful Guard & Unmapped Memory Handling**:
-  - Memory reads against unmapped regions or `PROT_NONE` guard pages are truthfully recorded as `UNREADABLE` / `UNAVAILABLE`.
-  - Zero fabrication: guard pages and inaccessible addresses are never replaced with dummy `0x00` bytes.
-
-- **Tamper-Proof Provenance Drilldown**:
-  - Every snapshot diff inspection displays verified target PID, companion ELF Build ID sha1/md5, kernel read backend (`process_vm_readv`), monotonic timestamps, before/after raw hex bytes, and observation status.
-  - Dedicated inspection section for pointer targets and referenced memory.
-
-- **Zero-Observation Speculation Guard**:
-  - Requesting an investigation question on a watch session with 0 observations immediately yields `status: PARTIAL` with a clear advisory finding and next action to capture snapshots first, completely preventing ungrounded LLM hallucinations.
-
-- **Negative Control & Error Resilience**:
-  - Verified error handling for invalid PIDs (`TARGET_NOT_FOUND`), target process exit mid-session (`ESRCH`), companion ELF Build ID mismatch (`BUILD_ID_MISMATCH`), and missing DWARF companion image (`MISSING_DWARF`).
-
-- **Automated Real-Capture E2E Acceptance Suite**:
-  - `tests/test_phase30_real_capture_e2e.py`: 4 automated real-browser Playwright test scenarios against a live C++ inferior (`scenario_target.cpp`):
-    1. `test_01_primary_journey_complete_linear_workflow`: Full linear journey from target connection, thread/map/DWARF exploration, variable selection (`sequence`, `status`, `active`), baseline & mutation snapshots, side-by-side diffing, provenance modal, and handoff to Tab 5 Investigation analysis.
-    2. `test_02_pointer_reassignment_vs_referenced_memory_mutation`: Strict verification distinguishing pointer target reassignment (`POINTER_ADDRESS_CHANGED`) from referenced memory mutation (`REFERENCED_MEMORY_CHANGED`).
-    3. `test_03_unmapped_guard_memory_truthfulness`: Guard page (`PROT_NONE`) unreadability verification ensuring honest `UNAVAILABLE` status without fabricated zeroes.
-    4. `test_04_negative_cases_and_error_handling`: Comprehensive negative tests covering invalid PID, process termination mid-capture, Build ID mismatch, missing DWARF companion image, and 0-observation safety.
-
-- **Phase 30 Capability Matrix**:
-  | Capability | Status | Implementation Details |
-  | :--- | :--- | :--- |
-  | Linear Basic Investigation Journey | **Working** | Step-by-step progress cards, automated handoff, no unsolicited reports |
-  | Target Connection & Build ID Validation | **Working** | Strict sha1/md5 Build ID matching; fails closed on `BUILD_ID_MISMATCH` |
-  | Process Exit & Liveness Verification | **Working** | `os.kill(pid, 0)` check; truthful `ESRCH` reporting on process termination |
-  | Thread Stack Boundaries | **Working** | `/proc/<pid>/task/<tid>/stat` & memory map matching |
-  | Thread Local Variable Unwinding | **Unsupported** | Truthfully reported as `UNSUPPORTED` without fabricated stack frames |
-  | Memory Map Navigation & Inspection | **Working** | Bounded slice inspection (up to 4096 bytes) with hex/ASCII view |
-  | DWARF Global & Struct Unrolling | **Working** | Recursive type & offset traversal for typed C/C++ structures |
-  | User Watch List Management | **Working** | Scope attribution, custom address range adding, instant removal |
-  | Zero-Stop On-Demand Capture | **Working** | `process_vm_readv` (latency < 100 μs, zero process suspension) |
-  | Pointer Address vs Dereference Diffing | **Working** | Distinguishes `POINTER_ADDRESS_CHANGED` from `REFERENCED_MEMORY_CHANGED` |
-  | Guard / Unmapped Memory Truthfulness | **Working** | Returns `UNREADABLE` / `UNAVAILABLE`; never fabricates `0x00` bytes |
-  | Provenance Drilldown Modal | **Working** | Verified PID, verified Build ID, backend, raw hex bytes, status |
-  | Zero-Observation Speculation Guard | **Working** | Returns `status: PARTIAL` with action guidance; blocks hallucination |
-  | Investigation & Ledger Integration | **Working** | Handoff into `EvidenceLedger` and Tab 5 Investigation goal |
-
-### Phase 31: Investigation-First Basic Mode UX
-
-Phase 31 redesigns the primary Basic Mode workflow into a guided, 6-stage investigation journey:
-`Connect target -> Explore runtime -> Select memory/variables -> Capture over time -> Compare changes -> Ask a question.`
-
-The interface guides users seamlessly through live runtime investigation with compact persistent state, clear stage transitions, contextual detail inspection, and anti-hallucination evidence grounding.
-
-- **Persistent Target Bar**:
-  - Compact `#basic-persistent-target-bar` anchored across all investigation tabs in Basic Mode.
-  - Live display of target PID, companion debug ELF, GNU Build ID status (`MATCHED`), connection badge (`CONNECTED`), and Zero-Stop backend badge (`process_vm_readv`).
-  - Integrated `[🔄 Switch Target]` button allowing instant retargeting without losing session continuity.
-  - Seamless English / 한국어 language switching preserving all active target and session metadata.
-
-- **Guided 6-Stage Investigation Flow**:
-  1. **Step 1: Connect Target**: Target PID & Companion ELF setup, GNU Build ID validation, and `#btn-step1-to-step2` transition footer.
-  2. **Step 2: Explore Runtime**: Primary entry points for Threads & Memory Maps. Contextual inspection cards (`#te-thread-details-card` with stack range and memory hex inspector link, `#te-var-details-card` with type, size, location, and 1-click watch addition), with `#btn-step2-to-step3` transition footer.
-  3. **Step 3: Watch List**: Compact monitored variables table with explicit add/remove actions, real-time item count badge (`#watchlist-count-badge`), clear explanation of unreadable/unmapped/guard page memory, immediate baseline capture (`#btn-step3-capture-now`), and `#btn-step3-to-step4` transition footer.
-  4. **Step 4: Timeline & Compare**: Snapshot sequence chips, zero process suspension (0.00 ms stop duration), side-by-side diff with strict pointer semantics (`POINTER_ADDRESS_CHANGED` vs `REFERENCED_MEMORY_CHANGED`), provenance modal, and `#btn-step4-to-step5` transition footer.
-  5. **Step 5: Ask About State**: Evidence-grounded conversational interface. Active investigation scope context chip (`#basic-investigation-context` showing PID, compared snapshot numbers, and watched items count). Zero-observation warning banner (`#basic-no-observations-alert`) and strict prevention of ungrounded LLM questions when 0 observations exist. Auto-binding of temporal session when observations are recorded.
-
-- **Browser Acceptance Test Suite**:
-  - `tests/test_phase31_basic_mode_ux.py`: 6 automated end-to-end Playwright browser tests:
-    1. `test_01_persistent_target_bar_and_navigation_persistence`: Validates Persistent Target Bar presence, PID & Build ID sync, tab navigation persistence, and switch target action.
-    2. `test_02_runtime_explorer_contextual_details_and_transitions`: Validates Thread details card with stack inspection link, Variable details card with struct member details, 1-click watch addition, and Step 2 to Step 3 footer transition.
-    3. `test_03_watchlist_and_unmapped_guard_memory_clarification`: Validates custom guard page watch item addition, capture execution, clear `UNREADABLE` status with "Unmapped / inaccessible" explanation, and Step 3 to Step 4 footer transition.
-    4. `test_04_timeline_compare_and_investigation_workflow_handoff`: Validates baseline and post-mutation captures, side-by-side diffing, diff handoff to investigation, active investigation scope context chip, and evidence-grounded follow-up question.
-    5. `test_05_zero_observations_prompt_and_hallucination_prevention`: Validates that asking questions with 0 captured observations displays warning alert, immediately prompts the user without hallucinating or making speculative LLM calls, and guides the user to Step 4.
-    6. `test_06_bilingual_i18n_verification`: Validates seamless English and Korean toggle across the Persistent Target Bar, journey buttons, detail cards, and active investigation scope chip.
-
-- **Phase 31 Capability Matrix**:
-  | Capability | Status | Implementation Details |
-  | :--- | :--- | :--- |
-  | Persistent Compact Target Bar | **Working** | `#basic-persistent-target-bar` with PID, ELF path, Build ID status, and Switch Target |
-  | Contextual Thread Inspector | **Working** | `#te-thread-details-card` with stack range and 1-click memory inspector handoff |
-  | Contextual Variable Inspector | **Working** | `#te-var-details-card` with type, size, source file:line, and 1-click watch list adding |
-  | Guided Journey Transition Footers | **Working** | Step 1 -> Step 2 -> Step 3 -> Step 4 -> Step 5 linear navigation |
-  | Guard Memory & Unmapped Clarification | **Working** | Unmapped / PROT_NONE pages explicitly marked `UNREADABLE` with explanation |
-  | Investigation Scope Context Chip | **Working** | `#basic-investigation-context` displays PID, compared snapshot numbers, and items count |
-  | Zero-Observation Hallucination Prevention | **Working** | Blocks ungrounded LLM questions when 0 observations exist; prompts user to Step 4 |
-  | Multi-Threaded HTTP Server | **Working** | `http.server.ThreadingHTTPServer` prevents client disconnections from blocking requests |
-  | Bilingual Support (EN / KO) | **Working** | Complete Korean and English translations across all Phase 31 workflow elements |
-
-### Local Validation & GitHub Actions Constraint Notice
-> [!NOTE]
-> **Environment & Workflow Constraints**: GitHub Actions workflows cannot currently be created or modified remotely due to repository OAuth token permission scopes (`workflow` scope absent). Canonical workflow files reside strictly in `ci/workflows/` (with byte-parity tooling in `scripts/sync_workflows.sh`). All verification and benchmark results reported in this phase are based on genuine local executions on the target environment.
-
+DynamicState is released under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.
