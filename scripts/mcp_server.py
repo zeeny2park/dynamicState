@@ -1308,10 +1308,17 @@ def runtime_golden_baseline_save(
 ) -> str:
     """Save the current healthy runtime state of a process as a persistent Golden Baseline for future comparison."""
     try:
-        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
-            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
-            pid = _ctx['pid']
-            companion_elf = _ctx['companion_elf_path']
+        _ctx = _resolve_mcp_target(
+            pid=pid,
+            companion_elf=companion_elf,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        pid = _ctx['pid']
+        companion_elf = _ctx['companion_elf_path']
         rec = runtime.watch_session_manager.save_golden_baseline(
             pid=pid,
             companion_elf_path=companion_elf,
@@ -1341,10 +1348,17 @@ def runtime_golden_baseline_compare(
 ) -> str:
     """Compare a currently running local or remote embedded process against a saved Golden Baseline."""
     try:
-        if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
-            _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
-            pid = _ctx['pid']
-            companion_elf = _ctx['companion_elf_path']
+        _ctx = _resolve_mcp_target(
+            pid=pid,
+            companion_elf=companion_elf,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+        )
+        pid = _ctx['pid']
+        companion_elf = _ctx['companion_elf_path']
         res = runtime.watch_session_manager.compare_with_golden_baseline(
             baseline_id=baseline_id,
             pid=pid,

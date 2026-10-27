@@ -378,6 +378,25 @@ class TestMcpFirstPhase1(unittest.TestCase):
             )
             self.assertTrue(res_remote_iso["success"])
             self.assertFalse(res_remote_iso.get("is_remote", False))
+
+            # 6. Verify stale, missing, or mismatched target context produces actionable errors:
+            # 6a. Stale/terminated process produces PROCESS_EXITED
+            proc_dead = subprocess.Popen(["true"])
+            proc_dead.wait()
+            res_stale = json.loads(mcp_srv.runtime_capture_memory(pid=proc_dead.pid))
+            self.assertFalse(res_stale["success"])
+            self.assertEqual(res_stale["error_code"], "PROCESS_EXITED")
+
+            # 6b. Mismatched companion ELF produces BUILD_ID_MISMATCH
+            res_mismatch = json.loads(
+                mcp_srv.runtime_eval_memory_path(
+                    pid=self.proc.pid,
+                    companion_elf=self.mismatch_bin_path,
+                    expressions=["gpRegistry.magic"],
+                )
+            )
+            self.assertFalse(res_mismatch["success"])
+            self.assertEqual(res_mismatch["error_code"], "BUILD_ID_MISMATCH")
         finally:
             for p in (proc_b_stripped, proc_b_debug):
                 if p.poll() is None:
@@ -612,7 +631,46 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertTrue(cmp_res["success"])
         self.assertEqual(cmp_res["pid"], self.proc.pid)
 
-        # 3. Explicit mismatching image must reject with BUILD_ID_MISMATCH
+        # 3. Explicit PID with no image inherits bound image
+        raw_pid_only = mcp_srv.runtime_golden_baseline_save(pid=self.proc.pid, label="PID_Only")
+        res_pid_only = json.loads(raw_pid_only)
+        self.assertTrue(res_pid_only["success"])
+        self.assertEqual(res_pid_only["pid"], self.proc.pid)
+
+        # 4. Explicit image with no PID inherits bound PID
+        raw_img_only = mcp_srv.runtime_golden_baseline_save(companion_elf=self.bin_path, label="Img_Only")
+        res_img_only = json.loads(raw_img_only)
+        self.assertTrue(res_img_only["success"])
+        self.assertEqual(res_img_only["pid"], self.proc.pid)
+
+        # 5. Explicit PID and image matching bound target
+        raw_match = mcp_srv.runtime_golden_baseline_save(pid=self.proc.pid, companion_elf=self.bin_path, label="Match_Both")
+        res_match = json.loads(raw_match)
+        self.assertTrue(res_match["success"])
+        self.assertEqual(res_match["pid"], self.proc.pid)
+
+        # 6. Explicit PID and image differing from bound target (Target B)
+        proc_b_debug = subprocess.Popen([self.mismatch_bin_path])
+        try:
+            time.sleep(0.1)
+            raw_diff = mcp_srv.runtime_golden_baseline_save(
+                pid=proc_b_debug.pid,
+                companion_elf=self.mismatch_bin_path,
+                label="Baseline_Target_B",
+            )
+            res_diff = json.loads(raw_diff)
+            self.assertTrue(res_diff["success"])
+            self.assertEqual(res_diff["pid"], proc_b_debug.pid)
+        finally:
+            proc_b_debug.terminate()
+            try:
+                proc_b_debug.wait(timeout=2)
+            except Exception:
+                proc_b_debug.kill()
+            # Restore target A context
+            mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+
+        # 7. Explicit mismatching image must reject with BUILD_ID_MISMATCH
         raw_mismatch = mcp_srv.runtime_golden_baseline_save(
             pid=self.proc.pid,
             companion_elf=self.mismatch_bin_path,
@@ -622,7 +680,7 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertFalse(res_mismatch["success"])
         self.assertEqual(res_mismatch["error_code"], "BUILD_ID_MISMATCH")
 
-        # 4. Missing target context when unbound must reject with NO_TARGET_SPECIFIED
+        # 8. Missing target context when unbound must reject with NO_TARGET_SPECIFIED
         saved_ctx = dict(mcp_srv.runtime.watch_session_manager._active_target_context)
         try:
             mcp_srv.runtime.watch_session_manager._active_target_context.clear()
@@ -633,7 +691,7 @@ class TestMcpFirstPhase1(unittest.TestCase):
         finally:
             mcp_srv.runtime.watch_session_manager._active_target_context = saved_ctx
 
-        # 5. Immutability of caller-owned dictionary during serialization
+        # 9. Immutability of caller-owned dictionary during serialization
         caller_dict = {"success": False, "error": "Test failure", "original_key": 42}
         _ = mcp_srv._format_watch_result(caller_dict)
         self.assertNotIn("error_code", caller_dict, "Serialization must not mutate caller-owned dictionary in place")
