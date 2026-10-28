@@ -396,11 +396,11 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
                 if conn_res.get("success"):
                     connected = True
                     break
-            except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
-                # Legitimate bounded retry on early process startup transient decoding/IO states
-                last_conn_err = f"{type(e).__name__}: {e}"
+            except json.JSONDecodeError as e:
+                # Legitimate bounded retry strictly on transient incomplete JSON during early process startup
+                last_conn_err = f"JSONDecodeError: {e}"
             except Exception as e:
-                # Fatal unexpected programming error: fail fast without swallowing or retrying until timeout
+                # Fatal unexpected programming defect or invalid contract: fail fast without swallowing or retrying until timeout
                 self.fail(f"Unexpected programming error during target connection: {type(e).__name__}: {e}")
             time.sleep(0.005)
 
@@ -435,11 +435,11 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
                         break
                 elif not eval_res.get("success"):
                     last_eval_err = eval_res.get("error") or eval_res.get("error_code")
-            except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
-                # Legitimate bounded retry on early process startup transient decoding/IO states
-                last_eval_err = f"{type(e).__name__}: {e}"
+            except json.JSONDecodeError as e:
+                # Legitimate bounded retry strictly on transient incomplete JSON during early process startup
+                last_eval_err = f"JSONDecodeError: {e}"
             except Exception as e:
-                # Fatal unexpected programming error: fail fast without swallowing or retrying until timeout
+                # Fatal unexpected programming defect or schema mismatch: fail fast without swallowing or retrying until timeout
                 self.fail(f"Unexpected programming error during target readiness check: {type(e).__name__}: {e}")
             time.sleep(0.005)
 
@@ -1152,26 +1152,55 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             if self.proc.poll() is None:
                 mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
 
-        # 10. Verify class teardown exception safety: tmp_dir.cleanup() executed even if context reset fails
+        # 10. Exercise the actual TestMcpRuntimeDiagnostics.tearDownClass method
         mock_tmp = mock.MagicMock()
         mock_reset_err = RuntimeError("simulated context reset failure in teardown")
-        with mock.patch.object(sys.modules[__name__], "_reset_test_target_context", side_effect=mock_reset_err):
-            # Mirror the structured tearDownClass pattern to prove execution
-            context_err = None
-            tmpdir_err = None
-            try:
-                _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
-            except Exception as e:
-                context_err = e
-            try:
-                mock_tmp.cleanup()
-            except Exception as e:
-                tmpdir_err = e
+        mock_tmp_err = OSError("simulated tmpdir cleanup failure in teardown")
 
-            # Verify tmp.cleanup() was unconditionally executed
-            mock_tmp.cleanup.assert_called_once()
-            self.assertIs(context_err, mock_reset_err)
-            self.assertIsNone(tmpdir_err)
+        real_tmp_dir = self.__class__.tmp_dir
+        try:
+            self.__class__.tmp_dir = mock_tmp
+
+            # Scenario A: Context-reset fails -> verify actual tearDownClass still executes tmp_dir.cleanup()
+            with mock.patch.object(sys.modules[__name__], "_reset_test_target_context", side_effect=mock_reset_err):
+                with self.assertRaises(RuntimeError) as cm_td_a:
+                    self.__class__.tearDownClass()
+                self.assertIs(cm_td_a.exception, mock_reset_err)
+                mock_tmp.cleanup.assert_called_once()
+
+            mock_tmp.cleanup.reset_mock()
+
+            # Scenario B: Both context-reset AND directory cleanup fail -> verify actual tearDownClass preserves both errors
+            mock_tmp.cleanup.side_effect = mock_tmp_err
+            with mock.patch.object(sys.modules[__name__], "_reset_test_target_context", side_effect=mock_reset_err):
+                with self.assertRaises(RuntimeError) as cm_td_b:
+                    self.__class__.tearDownClass()
+                err_msg = str(cm_td_b.exception)
+                self.assertIn("Multiple teardown errors", err_msg)
+                self.assertIn("simulated context reset failure in teardown", err_msg)
+                self.assertIn("simulated tmpdir cleanup failure in teardown", err_msg)
+                self.assertIs(cm_td_b.exception.__cause__, mock_reset_err)
+                mock_tmp.cleanup.assert_called_once()
+        finally:
+            self.__class__.tmp_dir = real_tmp_dir
+            # Guarantee target context is clean and rebound to self.proc for subsequent tearDown
+            _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
+            if self.proc.poll() is None:
+                mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+
+        # 11. Verify prompt failure and absence of retries on unexpected programming defects
+        # Transient retry should be strictly confined to JSONDecodeError, while KeyError/TypeError fail immediately
+        fake_programming_err = KeyError("unexpected_schema_key_defect")
+        with mock.patch("scripts.mcp_server.runtime_eval_memory_path", side_effect=fake_programming_err):
+            # Assert that unexpected error triggers immediate failure without looping for 2.0s
+            t_start = time.time()
+            with self.assertRaises(KeyError):
+                try:
+                    mcp_srv.runtime_eval_memory_path(expressions=["g_service_manager.magic"])
+                except json.JSONDecodeError:
+                    pass  # JSONDecodeError would be caught by retry
+            elapsed = time.time() - t_start
+            self.assertLess(elapsed, 0.5, "Unexpected programming error must fail immediately without retry delays")
 
 
 if __name__ == "__main__":
