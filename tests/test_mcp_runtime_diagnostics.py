@@ -322,55 +322,108 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.proc = subprocess.Popen([self.bin_path])
 
         # Bounded readiness check: replace fixed sleep with verified memory initialization handshake
-        ready = False
+        # 1. Connect target context with bounded polling (avoid repeated connect once bound)
         start_t = time.time()
         timeout = 2.0
-        init_err = None
+        connected = False
+        conn_res = None
+        last_conn_err = None
 
         while time.time() - start_t < timeout:
             if self.proc.poll() is not None:
                 self.fail(f"Target process exited prematurely during setUp with returncode {self.proc.returncode}")
             try:
-                # 1. Connect target context
                 conn_raw = mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
-                conn = json.loads(conn_raw)
-                if conn.get("success"):
-                    # 2. Verify target process has completed initialization of global state
-                    eval_raw = mcp_srv.runtime_eval_memory_path(expressions=["g_service_manager.magic"])
-                    eval_res = json.loads(eval_raw)
-                    if eval_res.get("success") and eval_res.get("results"):
-                        if eval_res["results"][0].get("value") == 0xC0FFEE01:
-                            ready = True
-                            break
+                conn_res = json.loads(conn_raw)
+                if conn_res.get("success"):
+                    connected = True
+                    break
             except Exception as e:
-                init_err = e
+                last_conn_err = e
+            time.sleep(0.005)
+
+        if not connected:
+            self._cleanup_process(self.proc)
+            proc_status = f"alive (PID {self.proc.pid})" if self.proc.poll() is None else f"exited (code {self.proc.returncode})"
+            self.fail(
+                f"Target process failed connection within {timeout}s (proc {proc_status}): conn={conn_res}, err={last_conn_err}"
+            )
+
+        # 2. Bounded poll for target global state initialization (g_service_manager.magic and g_stall_holder_ready)
+        ready = False
+        last_eval = None
+        last_eval_err = None
+
+        while time.time() - start_t < timeout:
+            if self.proc.poll() is not None:
+                self.fail(f"Target process exited prematurely during setUp with returncode {self.proc.returncode}")
+            try:
+                eval_raw = mcp_srv.runtime_eval_memory_path(
+                    expressions=["g_service_manager.magic", "g_stall_holder_ready"]
+                )
+                eval_res = json.loads(eval_raw)
+                if eval_res.get("success") and eval_res.get("results"):
+                    vals = {r["expression"]: r.get("value") for r in eval_res["results"]}
+                    last_eval = vals
+                    if vals.get("g_service_manager.magic") == 0xC0FFEE01 and vals.get("g_stall_holder_ready") == 1:
+                        ready = True
+                        break
+            except Exception as e:
+                last_eval_err = e
             time.sleep(0.005)
 
         if not ready:
             self._cleanup_process(self.proc)
-            self.fail(f"Target process failed readiness check within {timeout}s: {init_err}")
+            proc_status = f"alive (PID {self.proc.pid})" if self.proc.poll() is None else f"exited (code {self.proc.returncode})"
+            self.fail(
+                f"Target process failed readiness check within {timeout}s (proc {proc_status}): last_eval={last_eval}, err={last_eval_err}"
+            )
 
     def tearDown(self) -> None:
-        # Guarantee child process is always terminated and cleaned up even on assertion failure
+        cleanup_err = None
+        # Guarantee child process is cleanly terminated and verified exited
         try:
             if hasattr(self, "proc") and self.proc:
                 self._cleanup_process(self.proc)
+        except Exception as e:
+            cleanup_err = e
         finally:
             # Clear target context so no stale PID, companion ELF, or session leaks to the next test
             with mcp_srv.runtime.watch_session_manager._lock:
                 mcp_srv.runtime.watch_session_manager._active_target_context.clear()
+                mcp_srv.runtime.watch_session_manager._active_target_context.update({
+                    "pid": None,
+                    "process_name": None,
+                    "companion_elf_path": None,
+                    "build_id": None,
+                    "remote_host": None,
+                    "ssh_user": None,
+                    "ssh_port": 22,
+                    "ssh_key": None,
+                    "ssh_proxy_jump": None,
+                    "bound_at_unix": None,
+                    "auto_healed_count": 0,
+                    "last_previous_pid": None,
+                })
+                mcp_srv.runtime.watch_session_manager._sessions.clear()
+
+        if cleanup_err:
+            raise cleanup_err
 
     def _cleanup_process(self, proc: Optional[subprocess.Popen]) -> None:
-        if proc and proc.poll() is None:
-            proc.terminate()
+        if not proc or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
             try:
                 proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                try:
-                    proc.wait(timeout=2.0)
-                except Exception:
-                    pass
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(f"Child process {proc.pid} refused to exit after kill() within timeout") from e
+        if proc.poll() is None:
+            raise RuntimeError(f"Child process {proc.pid} is still alive after cleanup sequence")
 
     def _read_eval_single(self, expr: str) -> Any:
         """Helper to evaluate single expression and return its result dictionary."""
@@ -427,8 +480,9 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
 
         elapsed = time.time() - start
         err_detail = f", last error: {type(last_error).__name__}: {last_error}" if last_error else ""
+        proc_status = f"process alive (PID {self.proc.pid})" if (hasattr(self, "proc") and self.proc and self.proc.poll() is None) else "process exited"
         raise TimeoutError(
-            f"Timed out after {elapsed:.2f}s waiting for {description}. Last observed value: {last_observed}{err_detail}"
+            f"Timed out after {elapsed:.2f}s waiting for {description}. Target {proc_status}. Last observed value: {last_observed}{err_detail}"
         )
 
     def _wait_for_ack(self, expected_ack: int, timeout: float = 2.0) -> int:
@@ -450,6 +504,13 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(conn["success"])
         self.assertEqual(conn["pid"], self.proc.pid)
         self.assertIsNotNone(conn.get("build_id"))
+
+        # Verify active target context matches connection result
+        active_ctx = mcp_srv.runtime.watch_session_manager.get_active_target_context()
+        self.assertTrue(active_ctx["has_active_context"])
+        self.assertEqual(active_ctx["pid"], self.proc.pid)
+        self.assertEqual(active_ctx["companion_elf_path"], self.bin_path)
+        self.assertEqual(active_ctx["build_id"], conn["build_id"])
 
         initial_ack = self._read_eval_single("g_ack_seq")["value"]
         self.assertEqual(initial_ack, 0, "Initial ack sequence must be 0")
@@ -545,6 +606,8 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         )
         res_after_2 = json.loads(raw_after_2)
         self.assertTrue(res_after_2["success"])
+        for item in res_after_2["results"]:
+            self.assertEqual(item["status"], "OBSERVED")
         vals_2 = {r["expression"]: r["value"] for r in res_after_2["results"]}
 
         self.assertEqual(vals_2["g_service_manager.phase"], 40)  # SERVICE_COMPLETED
@@ -569,6 +632,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertEqual(len(hyp["assertion_results"]), 4)
         for ev in hyp["assertion_results"]:
             self.assertTrue(ev["passed"])
+            self.assertEqual(ev["evaluation_status"], "OBSERVED")
 
     def test_02_scenario_b_data_structure_invariant_violation(self) -> None:
         """Scenario B: Data-structure invariant violation.
@@ -620,6 +684,8 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         )
         res_post = json.loads(raw_post)
         self.assertTrue(res_post["success"])
+        for item in res_post["results"]:
+            self.assertEqual(item["status"], "OBSERVED")
         post_vals = {r["expression"]: r["value"] for r in res_post["results"]}
 
         # Documented Invariant 1 Violation established:
@@ -658,6 +724,10 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(hyp["success"])
         self.assertEqual(hyp["verdict"], "CONFIRMED")
         self.assertEqual(hyp["confidence_score"], 1.0)
+        self.assertEqual(len(hyp["assertion_results"]), 3)
+        for ar in hyp["assertion_results"]:
+            self.assertTrue(ar["passed"])
+            self.assertIn(ar["evaluation_status"], ("OBSERVED", "NULL_POINTER"))
 
         # 5. Linked List Invariant: Clean list is acyclic; cycle list violates invariant
         raw_clean = mcp_srv.runtime_traverse_linked_structure(
@@ -682,23 +752,29 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(res_cycle["success"])
         self.assertTrue(res_cycle["cycle_detected"], "Cycle detector must detect cycle in g_cycle_head")
         self.assertEqual(res_cycle["cycle_target_index"], 1)
+        self.assertEqual(res_cycle["nodes_count"], 3)
+        self.assertEqual(res_cycle["termination_reason"], "CYCLE_DETECTED")
+        target_node = res_cycle["nodes"][res_cycle["cycle_target_index"]]
+        self.assertEqual(target_node["fields"]["id"], 51)
+        self.assertEqual(target_node["address"], res_cycle["cycle_target_address"])
 
         # 6. Verify 0xDEADBEEF is truly an unmapped address in this process environment
+        # Precondition check: verify /proc/<pid>/maps is actually readable and inspected
+        vmas_checked = 0
         is_mapped = False
-        try:
-            with open(f"/proc/{self.proc.pid}/maps", "r", encoding="utf-8") as mf:
-                for line in mf:
-                    parts = line.split()
-                    if parts:
-                        addr_range = parts[0].split("-")
-                        if len(addr_range) == 2:
-                            start_vma = int(addr_range[0], 16)
-                            end_vma = int(addr_range[1], 16)
-                            if start_vma <= 0xDEADBEEF < end_vma:
-                                is_mapped = True
-                                break
-        except Exception:
-            pass
+        with open(f"/proc/{self.proc.pid}/maps", "r", encoding="utf-8") as mf:
+            for line in mf:
+                parts = line.split()
+                if parts:
+                    addr_range = parts[0].split("-")
+                    if len(addr_range) == 2:
+                        start_vma = int(addr_range[0], 16)
+                        end_vma = int(addr_range[1], 16)
+                        vmas_checked += 1
+                        if start_vma <= 0xDEADBEEF < end_vma:
+                            is_mapped = True
+                            break
+        self.assertGreater(vmas_checked, 0, "Precondition: Must have inspected at least one VMA in /proc/<pid>/maps")
         self.assertFalse(is_mapped, "Test precondition: 0xDEADBEEF must not be in any mapped VMA")
 
         # 7. Memory Integrity Audit validates unmapped address without dereferencing
@@ -708,13 +784,15 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         res_audit = json.loads(raw_audit)
         self.assertTrue(res_audit["success"])
         self.assertEqual(res_audit["health_status"], "ANOMALIES_DETECTED")
+        self.assertGreaterEqual(res_audit["checked_symbols_count"], 1)
+        self.assertEqual(res_audit["anomalies_count"], 1)
         anomalies = res_audit.get("anomalies", [])
-        anom_types = [a["anomaly_kind"] for a in anomalies]
-        self.assertIn("DANGLING_OR_UNMAPPED_POINTER", anom_types)
+        self.assertEqual(len(anomalies), 1)
 
-        ptr_anomaly = next((a for a in anomalies if a["expression"] == "g_integrity_target.dangling_ptr"), None)
-        self.assertIsNotNone(ptr_anomaly, "Audit must identify g_integrity_target.dangling_ptr as anomaly")
+        ptr_anomaly = anomalies[0]
+        self.assertEqual(ptr_anomaly["expression"], "g_integrity_target.dangling_ptr")
         self.assertEqual(ptr_anomaly["anomaly_kind"], "DANGLING_OR_UNMAPPED_POINTER")
+        self.assertEqual(ptr_anomaly["severity"], "HIGH")
         self.assertIn("deadbeef", str(ptr_anomaly["observed_value"]).lower())
 
     def test_03_scenario_c_progress_failure_and_pointer_state(self) -> None:
@@ -727,28 +805,40 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         res_stacks = json.loads(raw_stacks)
         self.assertTrue(res_stacks["success"])
         threads = res_stacks.get("threads", [])
-        self.assertGreaterEqual(len(threads), 2, "Expected at least 2 threads inspected in multi-threaded fixture")
+        self.assertGreaterEqual(len(threads), 3, "Expected at least 3 threads (main, holder, worker) in multi-threaded fixture")
 
-        # Validate thread inspection observations without platform-fragile assumptions
-        thread_names = [t.get("name") for t in threads if t.get("name")]
-        if thread_names:
-            self.assertTrue(
-                any("stall_holder" in n for n in thread_names),
-                f"Expected stall_holder in thread list: {thread_names}",
-            )
-            self.assertTrue(
-                any("stall_worker" in n for n in thread_names),
-                f"Expected stall_worker in thread list: {thread_names}",
-            )
+        # Required thread identity verification: no conditional bypass or vacuous pass
+        threads_by_name = {t.get("name"): t for t in threads if t.get("name")}
+        self.assertIn("stall_holder", threads_by_name, f"Expected stall_holder in thread list: {list(threads_by_name.keys())}")
+        self.assertIn("stall_worker", threads_by_name, f"Expected stall_worker in thread list: {list(threads_by_name.keys())}")
 
-        # Verify waiting or blocked thread is observed
-        has_waiting = any(
-            t.get("waiting_on_lock") is not None
-            or "futex" in str(t.get("syscall", "")).lower()
-            or t.get("state") in ("S", "D")
-            for t in threads
-        )
-        self.assertTrue(has_waiting, "Waiting thread or futex syscall must be detected in thread inspection")
+        holder_thread = threads_by_name["stall_holder"]
+        worker_thread = threads_by_name["stall_worker"]
+
+        # Validate required thread metadata fields
+        for t in (holder_thread, worker_thread):
+            self.assertIsInstance(t["tid"], int)
+            self.assertGreater(t["tid"], 0)
+            self.assertIn(t["state"], ("S", "R", "D"))
+            self.assertIn("callstack", t)
+            self.assertIsInstance(t["frames_count"], int)
+
+        # Mutex lock contention verification
+        locks = res_stacks.get("locks", [])
+        self.assertGreaterEqual(len(locks), 1, "Expected at least 1 lock in locks report")
+        stall_mutex = next((l for l in locks if l.get("name") == "g_stall_mutex"), None)
+        self.assertIsNotNone(stall_mutex, f"Expected g_stall_mutex in locks report: {[l.get('name') for l in locks]}")
+        self.assertTrue(stall_mutex["is_locked"], "g_stall_mutex must be locked")
+        self.assertEqual(stall_mutex["owner_tid"], holder_thread["tid"], "stall_holder must be recorded as lock owner")
+        self.assertEqual(stall_mutex["owner_thread_name"], "stall_holder")
+        self.assertIn(worker_thread["tid"], stall_mutex.get("waiting_tids", []))
+
+        # Blocked / waiting worker thread verification
+        worker_wait = worker_thread.get("waiting_on_lock")
+        self.assertIsNotNone(worker_wait, "stall_worker must be recorded as waiting_on_lock")
+        self.assertEqual(worker_wait["lock_name"], "g_stall_mutex")
+        self.assertEqual(worker_wait["held_by_tid"], holder_thread["tid"])
+        self.assertEqual(worker_wait["held_by_thread_name"], "stall_holder")
 
         # 2. Progress Counter Verification: sample over observation window to prove lack of progress
         raw_sample_1 = mcp_srv.runtime_eval_memory_path(
@@ -762,6 +852,8 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         )
         res_1 = json.loads(raw_sample_1)
         self.assertTrue(res_1["success"])
+        for item in res_1["results"]:
+            self.assertEqual(item["status"], "OBSERVED")
         vals_1 = {r["expression"]: r["value"] for r in res_1["results"]}
 
         # Observation window: deliberately wait 100ms to observe whether the progress counter advances
@@ -772,6 +864,8 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         )
         res_2 = json.loads(raw_sample_2)
         self.assertTrue(res_2["success"])
+        for item in res_2["results"]:
+            self.assertEqual(item["status"], "OBSERVED")
         vals_2 = {r["expression"]: r["value"] for r in res_2["results"]}
 
         # Assert Progress Failure: progress_counter remains identical across time interval in this fixture
@@ -804,6 +898,10 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(hyp["success"])
         self.assertEqual(hyp["verdict"], "CONFIRMED")
         self.assertEqual(hyp["confidence_score"], 1.0)
+        self.assertEqual(len(hyp["assertion_results"]), 4)
+        for ar in hyp["assertion_results"]:
+            self.assertTrue(ar["passed"])
+            self.assertIn(ar["evaluation_status"], ("OBSERVED", "NULL_POINTER"))
 
     def test_04_evidence_semantics_and_failure_handling(self) -> None:
         """Scenario D / Phase 4: Evidence semantics, hypothesis refutation, non-atomic consistency, and error handling.
@@ -878,6 +976,12 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertFalse(res_stale["success"])
         self.assertEqual(res_stale["error_code"], "PROCESS_EXITED")
         self.assertIsNotNone(res_stale.get("recovery_hint"))
+
+        # Verify target context isolation: explicit call with dead PID did not corrupt active context
+        active_ctx = mcp_srv.runtime.watch_session_manager.get_active_target_context()
+        self.assertTrue(active_ctx["has_active_context"])
+        self.assertEqual(active_ctx["pid"], self.proc.pid)
+        self.assertEqual(active_ctx["companion_elf_path"], self.bin_path)
 
         # 5. Deterministic repeated evaluation
         for _ in range(3):
