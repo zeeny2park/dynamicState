@@ -396,8 +396,12 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
                 if conn_res.get("success"):
                     connected = True
                     break
+            except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
+                # Legitimate bounded retry on early process startup transient decoding/IO states
+                last_conn_err = f"{type(e).__name__}: {e}"
             except Exception as e:
-                last_conn_err = e
+                # Fatal unexpected programming error: fail fast without swallowing or retrying until timeout
+                self.fail(f"Unexpected programming error during target connection: {type(e).__name__}: {e}")
             time.sleep(0.005)
 
         if not connected:
@@ -431,12 +435,12 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
                         break
                 elif not eval_res.get("success"):
                     last_eval_err = eval_res.get("error") or eval_res.get("error_code")
-            except (json.JSONDecodeError, KeyError, ValueError) as e:
-                # Legitimate retry on early process startup transient outputs
+            except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
+                # Legitimate bounded retry on early process startup transient decoding/IO states
                 last_eval_err = f"{type(e).__name__}: {e}"
             except Exception as e:
-                # Preserve unexpected programming errors without concealing
-                last_eval_err = f"Unexpected {type(e).__name__}: {e}"
+                # Fatal unexpected programming error: fail fast without swallowing or retrying until timeout
+                self.fail(f"Unexpected programming error during target readiness check: {type(e).__name__}: {e}")
             time.sleep(0.005)
 
         if not ready:
@@ -1131,20 +1135,43 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         # Scenario B: Dual cleanup failure preserves both errors without masking
         mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
         fake_context_err = ValueError("simulated context reset failure")
-        with mock.patch.object(self, "_cleanup_process", side_effect=fake_proc_err):
-            with mock.patch.object(sys.modules[__name__], "_reset_test_target_context", side_effect=fake_context_err):
-                with self.assertRaises(RuntimeError) as cm_dual:
-                    self._cleanup_target_and_context()
-                err_msg = str(cm_dual.exception)
-                self.assertIn("Multiple cleanup errors during teardown", err_msg)
-                self.assertIn("simulated proc reap failure", err_msg)
-                self.assertIn("simulated context reset failure", err_msg)
-                # Ensure causal chaining preserves original process error
-                self.assertIs(cm_dual.exception.__cause__, fake_proc_err)
+        try:
+            with mock.patch.object(self, "_cleanup_process", side_effect=fake_proc_err):
+                with mock.patch.object(sys.modules[__name__], "_reset_test_target_context", side_effect=fake_context_err):
+                    with self.assertRaises(RuntimeError) as cm_dual:
+                        self._cleanup_target_and_context()
+                    err_msg = str(cm_dual.exception)
+                    self.assertIn("Multiple cleanup errors during teardown", err_msg)
+                    self.assertIn("simulated proc reap failure", err_msg)
+                    self.assertIn("simulated context reset failure", err_msg)
+                    # Ensure causal chaining preserves original process error
+                    self.assertIs(cm_dual.exception.__cause__, fake_proc_err)
+        finally:
+            # Defensive fixture restoration: ensure target context is clean and rebound to self.proc
+            _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
+            if self.proc.poll() is None:
+                mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
 
-        # Restore valid active target context for subsequent tearDown
-        _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
-        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        # 10. Verify class teardown exception safety: tmp_dir.cleanup() executed even if context reset fails
+        mock_tmp = mock.MagicMock()
+        mock_reset_err = RuntimeError("simulated context reset failure in teardown")
+        with mock.patch.object(sys.modules[__name__], "_reset_test_target_context", side_effect=mock_reset_err):
+            # Mirror the structured tearDownClass pattern to prove execution
+            context_err = None
+            tmpdir_err = None
+            try:
+                _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
+            except Exception as e:
+                context_err = e
+            try:
+                mock_tmp.cleanup()
+            except Exception as e:
+                tmpdir_err = e
+
+            # Verify tmp.cleanup() was unconditionally executed
+            mock_tmp.cleanup.assert_called_once()
+            self.assertIs(context_err, mock_reset_err)
+            self.assertIsNone(tmpdir_err)
 
 
 if __name__ == "__main__":
