@@ -379,10 +379,15 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         # Register structured cleanup immediately so cleanup runs on any setUp failure path
         self.addCleanup(self._cleanup_target_and_context)
 
-        # Bounded readiness check: replace fixed sleep with verified memory initialization handshake
         # 1. Connect target context with independent bounded polling budget
+        self._poll_target_connection(connect_timeout=2.0)
+
+        # 2. Bounded poll for target global state initialization with independent timeout budget
+        self._poll_target_readiness(readiness_timeout=2.0)
+
+    def _poll_target_connection(self, connect_timeout: float = 2.0) -> None:
+        """Polls MCP target connection with bounded budget, retrying only transient startup JSON decode errors."""
         connect_start = time.time()
-        connect_timeout = 2.0
         connected = False
         conn_res = None
         last_conn_err = None
@@ -410,9 +415,9 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
                 f"Target process failed connection within {connect_timeout}s (proc {proc_status}): conn={conn_res}, err={last_conn_err}"
             )
 
-        # 2. Bounded poll for target global state initialization with independent timeout budget
+    def _poll_target_readiness(self, readiness_timeout: float = 2.0) -> None:
+        """Polls target global memory initialization with bounded budget, retrying only transient startup JSON decode errors."""
         ready_start = time.time()
-        readiness_timeout = 2.0
         ready = False
         last_eval = None
         last_eval_res = None
@@ -979,14 +984,13 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             self.assertTrue(ar["passed"])
             self.assertIn(ar["evaluation_status"], ("OBSERVED", "NULL_POINTER"))
 
-    def test_04_evidence_semantics_and_failure_handling(self) -> None:
-        """Scenario D / Phase 4: Evidence semantics, hypothesis refutation, non-atomic consistency, and error handling.
+    def test_04_evidence_semantics_and_partial_results(self) -> None:
+        """Scenario D / Step 1: Evidence semantics, hypothesis refutation, non-atomic consistency, and partial results.
         Verifies:
         - Observed facts are distinguishable from derived comparisons.
         - Refuted or partially confirmed hypotheses are never reported as CONFIRMED.
         - Non-atomic observations explicitly report lack of atomicity and causal guarantees.
         - Partial per-expression evaluation failures are distinguishable from complete success.
-        - Actionable error codes on missing symbols, stale PIDs, and Build ID mismatches.
         """
         # 1. Distinguishable Evidence: facts vs comparisons vs refuted hypotheses
         # Refuted hypothesis (assertion fails: phase == 999)
@@ -1044,7 +1048,16 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertIsNone(eval_items["non_existent_symbol_xyz"]["value"])
         self.assertIn("error", eval_items["non_existent_symbol_xyz"])
 
-        # 4. Actionable error on terminated process (stale PID)
+    def test_05_target_context_isolation_and_build_id_rejection(self) -> None:
+        """Scenario D / Step 2: Target-context isolation, stale PIDs, rebinding, and Build ID verification.
+        Verifies:
+        - Stale/terminated process returns actionable PROCESS_EXITED without corrupting active context.
+        - Deterministic repeated evaluation across successive calls.
+        - Isolated context and session purging via _reset_test_target_context.
+        - Context rebinding asserts success, PID, companion ELF, and Build ID against active context.
+        - Mismatched companion ELF returns BUILD_ID_MISMATCH and preserves existing target context.
+        """
+        # 1. Actionable error on terminated process (stale PID)
         proc_dead = subprocess.Popen(["true"])
         proc_dead.wait()
         raw_stale = mcp_srv.runtime_capture_memory(pid=proc_dead.pid)
@@ -1060,26 +1073,14 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertEqual(active_ctx["companion_elf_path"], self.bin_path)
         self.assertIsNotNone(active_ctx.get("build_id"))
 
-        # 5. Deterministic repeated evaluation
+        # 2. Deterministic repeated evaluation
         for _ in range(3):
             rep_raw = mcp_srv.runtime_eval_memory_path(expressions=["g_service_manager.magic"])
             rep_res = json.loads(rep_raw)
             self.assertTrue(rep_res["success"])
             self.assertEqual(rep_res["results"][0]["value"], 0xC0FFEE01)
 
-        # 6. Verify cleanup escalation on failure paths: process ignoring SIGTERM is killed via SIGKILL
-        dummy_stubborn = subprocess.Popen([
-            "python3", "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)"
-        ])
-        try:
-            self._cleanup_process(dummy_stubborn, terminate_timeout=0.15, kill_timeout=0.5)
-            self.assertIsNotNone(dummy_stubborn.poll(), "Escalated cleanup must terminate process via SIGKILL")
-        finally:
-            if dummy_stubborn.poll() is None:
-                dummy_stubborn.kill()
-                dummy_stubborn.wait()
-
-        # 7. Verify isolated context and session cleanup helper
+        # 3. Verify isolated context and session cleanup helper
         # Create a dummy session in watch_session_manager to test session map purging
         mcp_srv.runtime.watch_session_manager._sessions["dummy_test_session"] = None
         _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
@@ -1103,7 +1104,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertEqual(rebound_ctx["companion_elf_path"], self.bin_path)
         self.assertEqual(rebound_ctx["build_id"], rebind_res["build_id"])
 
-        # 8. Verify Build ID verification and context isolation on mismatched companion ELF
+        # 4. Verify Build ID verification and context isolation on mismatched companion ELF
         raw_mismatch = mcp_srv.runtime_eval_memory_path(
             pid=self.proc.pid,
             companion_elf=self.mismatch_bin_path,
@@ -1119,7 +1120,28 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertEqual(ctx_after_mismatch["pid"], self.proc.pid)
         self.assertEqual(ctx_after_mismatch["companion_elf_path"], self.bin_path)
 
-        # 9. Verify cleanup exception safety and error preservation under failure paths
+    def test_06_cleanup_exception_safety_and_teardown_lifecycle(self) -> None:
+        """Scenario D / Step 3: Cleanup exception safety, SIGKILL escalation, and class teardown lifecycle.
+        Verifies:
+        - Child process refusing SIGTERM is cleanly terminated via SIGKILL escalation.
+        - Process cleanup failure does not prevent target context and session reset.
+        - Dual cleanup failure preserves both errors with causal chaining (__cause__).
+        - Actual TestMcpRuntimeDiagnostics.tearDownClass executes tmp_dir.cleanup() even when context reset fails.
+        - Simultaneous failures in tearDownClass preserve both error details.
+        """
+        # 1. Verify cleanup escalation on failure paths: process ignoring SIGTERM is killed via SIGKILL
+        dummy_stubborn = subprocess.Popen([
+            "python3", "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)"
+        ])
+        try:
+            self._cleanup_process(dummy_stubborn, terminate_timeout=0.15, kill_timeout=0.5)
+            self.assertIsNotNone(dummy_stubborn.poll(), "Escalated cleanup must terminate process via SIGKILL")
+        finally:
+            if dummy_stubborn.poll() is None:
+                dummy_stubborn.kill()
+                dummy_stubborn.wait()
+
+        # 2. Verify cleanup exception safety and error preservation under failure paths
         # Scenario A: Process cleanup error does NOT prevent target context reset
         mcp_srv.runtime.watch_session_manager._sessions["orphan_test_session"] = None
         fake_proc_err = RuntimeError("simulated proc reap failure")
@@ -1152,7 +1174,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             if self.proc.poll() is None:
                 mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
 
-        # 10. Exercise the actual TestMcpRuntimeDiagnostics.tearDownClass method
+        # 3. Exercise the actual TestMcpRuntimeDiagnostics.tearDownClass method
         mock_tmp = mock.MagicMock()
         mock_reset_err = RuntimeError("simulated context reset failure in teardown")
         mock_tmp_err = OSError("simulated tmpdir cleanup failure in teardown")
@@ -1188,19 +1210,50 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             if self.proc.poll() is None:
                 mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
 
-        # 11. Verify prompt failure and absence of retries on unexpected programming defects
-        # Transient retry should be strictly confined to JSONDecodeError, while KeyError/TypeError fail immediately
-        fake_programming_err = KeyError("unexpected_schema_key_defect")
-        with mock.patch("scripts.mcp_server.runtime_eval_memory_path", side_effect=fake_programming_err):
-            # Assert that unexpected error triggers immediate failure without looping for 2.0s
-            t_start = time.time()
-            with self.assertRaises(KeyError):
-                try:
-                    mcp_srv.runtime_eval_memory_path(expressions=["g_service_manager.magic"])
-                except json.JSONDecodeError:
-                    pass  # JSONDecodeError would be caught by retry
-            elapsed = time.time() - t_start
-            self.assertLess(elapsed, 0.5, "Unexpected programming error must fail immediately without retry delays")
+    def test_07_startup_readiness_retry_and_fast_failure(self) -> None:
+        """Scenario D / Step 4: Startup and readiness retry classification and deterministic fast failure.
+        Verifies:
+        - Unexpected programming defects (KeyError/TypeError) fail fast without retry loops (call_count == 1).
+        - Genuine transient startup decode states (JSONDecodeError) retry and recover when target stabilizes (call_count == 3).
+        - Persistent transient decode errors exhaust the bounded budget and surface actionable diagnostics.
+        """
+        # 1. Fast failure on unexpected programming defects: zero retry loops, deterministic single invocation
+        fake_defect = KeyError("unrecognized_contract_member")
+        with mock.patch("scripts.mcp_server.runtime_eval_memory_path", side_effect=fake_defect) as mock_eval:
+            with self.assertRaises(AssertionError) as cm_fail:
+                self._poll_target_readiness(readiness_timeout=2.0)
+            self.assertIn("Unexpected programming error during target readiness check: KeyError", str(cm_fail.exception))
+            self.assertEqual(mock_eval.call_count, 1, "Unexpected programming defect must fail immediately with call_count == 1")
+
+        # 2. Transient retry on JSONDecodeError: successfully recovers when target startup JSON stabilizes
+        valid_ready_json = json.dumps({
+            "success": True,
+            "results": [
+                {"expression": "g_service_manager.magic", "value": 0xC0FFEE01},
+                {"expression": "g_stall_holder_ready", "value": 1},
+            ],
+        })
+        transient_err = json.JSONDecodeError("Expecting value", "bad json fragment", 0)
+        with mock.patch(
+            "scripts.mcp_server.runtime_eval_memory_path",
+            side_effect=[transient_err, transient_err, valid_ready_json],
+        ) as mock_retry:
+            # Must succeed without raising AssertionError
+            self._poll_target_readiness(readiness_timeout=2.0)
+            self.assertEqual(mock_retry.call_count, 3, "Transient JSONDecodeError must retry until valid response is observed")
+
+        # 3. Timeout when transient JSONDecodeError persists beyond budget
+        with mock.patch(
+            "scripts.mcp_server.runtime_eval_memory_path",
+            side_effect=transient_err,
+        ) as mock_exhaust:
+            with self.assertRaises(AssertionError) as cm_timeout:
+                self._poll_target_readiness(readiness_timeout=0.03)
+            err_text = str(cm_timeout.exception)
+            self.assertIn("failed readiness check within 0.03s", err_text)
+            self.assertIn("JSONDecodeError", err_text)
+            self.assertIn("proc alive (PID", err_text)
+            self.assertGreaterEqual(mock_exhaust.call_count, 2, "Must perform bounded retries before timing out")
 
 
 if __name__ == "__main__":
