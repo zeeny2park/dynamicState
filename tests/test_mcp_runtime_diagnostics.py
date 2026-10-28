@@ -1,10 +1,17 @@
 """DynamicState — MCP Runtime Diagnostic Scenarios & Correctness Validation.
 
-Exercises real runtime diagnostic correctness using isolated C/C++ fixture processes:
-Scenario A: Known state transition (before/after values, golden baseline comparison, delta validation).
-Scenario B: Data-structure invariant violation (registry desync, null buffer pointer, linked list cycle detection, memory audit).
-Scenario C: Progress failure & pointer-state issue (stalled mutex waiter thread, zero progress counter, null active handler).
-Scenario D: Evidence semantics & failure handling (facts vs derived comparisons, refuted/partial hypothesis verdicts, non-atomic consistency metadata, partial per-expression results).
+Harden diagnostic test reliability, fixture isolation, and evidence semantics:
+- Scenario A: Known state transition (before/after values, golden baseline comparison, delta validation).
+- Scenario B: Data-structure invariant violation (registry desync, null buffer pointer, linked list cycle detection, memory audit).
+- Scenario C: Progress failure & pointer-state issue (stalled mutex waiter thread, zero progress counter, null active handler).
+- Scenario D: Evidence semantics & failure handling (facts vs derived comparisons, refuted/partial hypothesis verdicts, non-atomic consistency metadata, partial per-expression results).
+
+Guarantees:
+1. Fresh disposable process per test method: eliminates cross-test state leakage.
+2. Async-signal-safe handlers: POSIX signals set volatile sig_atomic_t flags; transitions executed in main loop.
+3. Deterministic synchronization: bounded condition waiting replaces fixed sleeps.
+4. Precise evidence semantics: direct observations distinguished from derived comparisons and hypothesis verdicts.
+5. Robust cleanup: child processes and temporary files are reliably terminated and unlinked in tearDown.
 """
 
 import json
@@ -14,6 +21,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from typing import Any, Callable, Dict, Optional
 
 import scripts.mcp_server as mcp_srv
 
@@ -27,6 +35,25 @@ DIAGNOSTIC_FIXTURE_C = r"""#define _GNU_SOURCE
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+
+// =========================================================================
+// Strict Async-Signal-Safe Control Flags
+// Signal handlers ONLY set these atomic flags. Struct mutations and string
+// copies are executed strictly in the main thread loop.
+// =========================================================================
+static volatile sig_atomic_t g_trigger_phase_transition = 0;
+static volatile sig_atomic_t g_trigger_registry_defect = 0;
+volatile uint32_t g_ack_seq = 0;
+
+void on_sigusr1(int sig) {
+    (void)sig;
+    g_trigger_phase_transition = 1;
+}
+
+void on_sigusr2(int sig) {
+    (void)sig;
+    g_trigger_registry_defect = 1;
+}
 
 // =========================================================================
 // Scenario A: Known State Transition Target
@@ -140,36 +167,8 @@ void *stall_worker_func(void *arg) {
     return NULL;
 }
 
-// =========================================================================
-// Controlled Triggers via POSIX signals
-// =========================================================================
-void on_sigusr1(int sig) {
-    (void)sig;
-    if (g_service_manager.phase == SERVICE_IDLE) {
-        g_service_manager.phase = SERVICE_PROCESSING;
-        g_service_manager.active_tasks = 5;
-        g_service_manager.total_bytes += 4096;
-    } else if (g_service_manager.phase == SERVICE_PROCESSING) {
-        g_service_manager.phase = SERVICE_COMPLETED;
-        g_service_manager.active_tasks = 0;
-        g_service_manager.total_bytes += 2048;
-    }
-    g_service_manager.transition_count++;
-}
-
-void on_sigusr2(int sig) {
-    (void)sig;
-    // Break registry invariant:
-    // Slot 2 becomes in_use = 1, but buffer_ptr is NULL and active_workers is NOT incremented!
-    g_worker_registry.slots[2].in_use = 1;
-    g_worker_registry.slots[2].task_id = 9002;
-    g_worker_registry.slots[2].buffer_ptr = NULL;
-    strncpy(g_worker_registry.slots[2].tag, "injected_defect", 23);
-    // Notice: g_worker_registry.active_workers is deliberately NOT changed (stays 2)
-}
-
 int main(void) {
-    // Setup Scenario A
+    // Setup Scenario A initial state
     memset(&g_service_manager, 0, sizeof(g_service_manager));
     g_service_manager.magic = 0xC0FFEE01;
     g_service_manager.phase = SERVICE_IDLE;
@@ -177,7 +176,7 @@ int main(void) {
     g_service_manager.active_tasks = 0;
     g_service_manager.total_bytes = 1024;
 
-    // Setup Scenario B
+    // Setup Scenario B initial state
     memset(&g_worker_registry, 0, sizeof(g_worker_registry));
     g_worker_registry.registry_magic = 0xBEEFCAFE;
     g_worker_registry.total_slots = 4;
@@ -225,13 +224,13 @@ int main(void) {
     g_list_cycle[2].next = &g_list_cycle[1]; // cycle back to 1
     g_cycle_head = &g_list_cycle[0];
 
-    // Integrity target setup
+    // Integrity target setup (unmapped pointer constant, never dereferenced in C)
     g_integrity_target.magic = 0xAA55AA55;
     g_integrity_target.is_healthy = true;
     g_integrity_target.mode = MODE_NORMAL;
-    g_integrity_target.dangling_ptr = (int32_t*)0xDEADBEEF; // Dangling / invalid pointer
+    g_integrity_target.dangling_ptr = (int32_t*)0xDEADBEEF;
 
-    // Setup Scenario C
+    // Setup Scenario C initial state
     memset(&g_progress_tracker, 0, sizeof(g_progress_tracker));
     g_progress_tracker.tracker_magic = 0x57A11ED0;
     g_progress_tracker.is_running = 1;
@@ -239,15 +238,17 @@ int main(void) {
     g_progress_tracker.progress_counter = 100;
     g_progress_tracker.active_handler = NULL; // Controlled null pointer state
 
-    // Signal registrations
+    // Signal registrations with SA_RESTART
     struct sigaction sa1;
     memset(&sa1, 0, sizeof(sa1));
     sa1.sa_handler = on_sigusr1;
+    sa1.sa_flags = SA_RESTART;
     sigaction(SIGUSR1, &sa1, NULL);
 
     struct sigaction sa2;
     memset(&sa2, 0, sizeof(sa2));
     sa2.sa_handler = on_sigusr2;
+    sa2.sa_flags = SA_RESTART;
     sigaction(SIGUSR2, &sa2, NULL);
 
     // Launch stall threads
@@ -255,8 +256,35 @@ int main(void) {
     pthread_create(&th1, NULL, stall_holder_func, NULL);
     pthread_create(&th2, NULL, stall_worker_func, NULL);
 
+    // Main execution loop: safely executes state mutations requested via signal flags
     while (1) {
-        usleep(50000);
+        if (g_trigger_phase_transition) {
+            g_trigger_phase_transition = 0;
+            if (g_service_manager.phase == SERVICE_IDLE) {
+                g_service_manager.phase = SERVICE_PROCESSING;
+                g_service_manager.active_tasks = 5;
+                g_service_manager.total_bytes += 4096;
+            } else if (g_service_manager.phase == SERVICE_PROCESSING) {
+                g_service_manager.phase = SERVICE_COMPLETED;
+                g_service_manager.active_tasks = 0;
+                g_service_manager.total_bytes += 2048;
+            }
+            g_service_manager.transition_count++;
+            g_ack_seq++; // Acknowledge completion of phase transition
+        }
+
+        if (g_trigger_registry_defect) {
+            g_trigger_registry_defect = 0;
+            // Inject invariant defect cleanly in main thread (not in signal handler)
+            g_worker_registry.slots[2].in_use = 1;
+            g_worker_registry.slots[2].task_id = 9002;
+            g_worker_registry.slots[2].buffer_ptr = NULL;
+            memcpy((void*)g_worker_registry.slots[2].tag, "injected_defect", 16);
+            // active_workers is deliberately NOT incremented (remains 2) to establish desynchronization
+            g_ack_seq++; // Acknowledge completion of defect injection
+        }
+
+        usleep(2000);
     }
     return 0;
 }
@@ -281,23 +309,42 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             check=True,
         )
 
-        # Launch live disposable target process
-        cls.proc = subprocess.Popen([cls.bin_path])
-        time.sleep(0.2)
-
     @classmethod
     def tearDownClass(cls) -> None:
-        if cls.proc and cls.proc.poll() is None:
-            cls.proc.terminate()
-            try:
-                cls.proc.wait(timeout=2)
-            except Exception:
-                cls.proc.kill()
         cls.tmp_dir.cleanup()
 
     def setUp(self) -> None:
-        # Guarantee target context is cleanly bound to cls.proc before each test
-        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        # Launch a fresh, disposable process per test method to eliminate inter-test state leakage
+        self.proc = subprocess.Popen([self.bin_path])
+        # Bounded wait for process initialization
+        time.sleep(0.08)
+        # Guarantee target context is cleanly bound to self.proc
+        conn_raw = mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        conn = json.loads(conn_raw)
+        if not conn.get("success"):
+            self.proc.terminate()
+            self.fail(f"Failed to connect target context to fresh process: {conn}")
+
+    def tearDown(self) -> None:
+        # Guarantee child process is always terminated and cleaned up even on assertion failure
+        if hasattr(self, "proc") and self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                self.proc.kill()
+
+    def _wait_for_condition(self, predicate: Callable[[], bool], timeout: float = 2.0, step: float = 0.01) -> bool:
+        """Polls predicate with bounded timeout to establish deterministic synchronization."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                if predicate():
+                    return True
+            except Exception:
+                pass
+            time.sleep(step)
+        return False
 
     def test_01_scenario_a_known_state_transition(self) -> None:
         """Scenario A: Known state transition.
@@ -323,8 +370,11 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         )
         res_initial = json.loads(raw_initial)
         self.assertTrue(res_initial["success"])
-        vals_0 = {r["expression"]: r["value"] for r in res_initial["results"]}
+        # Verify individual expression evaluation statuses
+        for item in res_initial["results"]:
+            self.assertEqual(item["status"], "OBSERVED")
 
+        vals_0 = {r["expression"]: r["value"] for r in res_initial["results"]}
         self.assertEqual(vals_0["g_service_manager.magic"], 0xC0FFEE01)
         self.assertEqual(vals_0["g_service_manager.phase"], 10)  # SERVICE_IDLE
         self.assertEqual(vals_0["g_service_manager.transition_count"], 0)
@@ -347,7 +397,13 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
 
         # 4. Controlled Trigger 1: Transition IDLE (10) -> PROCESSING (20)
         os.kill(self.proc.pid, signal.SIGUSR1)
-        time.sleep(0.08)
+        # Bounded synchronization: wait until transition_count advances to 1
+        synced_1 = self._wait_for_condition(
+            lambda: json.loads(
+                mcp_srv.runtime_eval_memory_path(expressions=["g_service_manager.transition_count"])
+            )["results"][0]["value"] == 1
+        )
+        self.assertTrue(synced_1, "Controlled transition 1 did not complete within bounded timeout")
 
         # 5. Exact Expected Observation Post-Transition 1
         raw_after_1 = mcp_srv.runtime_eval_memory_path(
@@ -360,8 +416,10 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         )
         res_after_1 = json.loads(raw_after_1)
         self.assertTrue(res_after_1["success"])
-        vals_1 = {r["expression"]: r["value"] for r in res_after_1["results"]}
+        for item in res_after_1["results"]:
+            self.assertEqual(item["status"], "OBSERVED")
 
+        vals_1 = {r["expression"]: r["value"] for r in res_after_1["results"]}
         self.assertEqual(vals_1["g_service_manager.phase"], 20)  # SERVICE_PROCESSING
         self.assertEqual(vals_1["g_service_manager.transition_count"], 1)
         self.assertEqual(vals_1["g_service_manager.active_tasks"], 5)
@@ -375,12 +433,19 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         changes = {c["path"]: c for c in cmp_res["changed"]}
         self.assertEqual(changes["g_service_manager.phase"]["golden_value"], 10)
         self.assertEqual(changes["g_service_manager.phase"]["live_value"], 20)
+        self.assertEqual(changes["g_service_manager.phase"]["delta"], 10)
         self.assertEqual(changes["g_service_manager.transition_count"]["golden_value"], 0)
         self.assertEqual(changes["g_service_manager.transition_count"]["live_value"], 1)
+        self.assertEqual(changes["g_service_manager.transition_count"]["delta"], 1)
 
         # 7. Controlled Trigger 2: Transition PROCESSING (20) -> COMPLETED (40)
         os.kill(self.proc.pid, signal.SIGUSR1)
-        time.sleep(0.08)
+        synced_2 = self._wait_for_condition(
+            lambda: json.loads(
+                mcp_srv.runtime_eval_memory_path(expressions=["g_service_manager.transition_count"])
+            )["results"][0]["value"] == 2
+        )
+        self.assertTrue(synced_2, "Controlled transition 2 did not complete within bounded timeout")
 
         # 8. Exact Expected Observation Post-Transition 2
         raw_after_2 = mcp_srv.runtime_eval_memory_path(
@@ -400,9 +465,9 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertEqual(vals_2["g_service_manager.active_tasks"], 0)
         self.assertEqual(vals_2["g_service_manager.total_bytes"], 7168)  # 5120 + 2048
 
-        # 9. Declarative Hypothesis Verification
+        # 9. Declarative Hypothesis Verification (validates predicate satisfaction, not causality)
         raw_hyp = mcp_srv.runtime_verify_hypothesis(
-            hypothesis="Service completed lifecycle with 2 transitions and 7168 total processed bytes",
+            hypothesis="Service reached COMPLETED state with 2 transitions and 7168 total processed bytes",
             assertions=[
                 "g_service_manager.phase == 40",
                 "g_service_manager.transition_count == 2",
@@ -424,7 +489,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         1. Registry Invariant: active_workers == sum(slots[i].in_use)
         2. Pointer Invariant: slot.buffer_ptr != NULL when in_use == 1
         3. Linked List Invariant: pointer traversal must be acyclic
-        4. Memory Integrity Invariant: no invalid/dangling pointers
+        4. Memory Integrity Invariant: no invalid/unmapped pointer addresses
         """
         # 1. Setup & Expected Initial Invariant State
         raw_reg = mcp_srv.runtime_eval_memory_path(
@@ -447,9 +512,14 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertEqual(reg_vals["g_worker_registry.slots[3].in_use"], 0)
         # Initial invariant holds: active_workers (2) == in_use count (1 + 1 + 0 + 0 = 2)
 
-        # 2. Controlled Trigger: Break invariant via SIGUSR2
+        # 2. Controlled Trigger: Break invariant via SIGUSR2 with bounded wait
         os.kill(self.proc.pid, signal.SIGUSR2)
-        time.sleep(0.08)
+        synced = self._wait_for_condition(
+            lambda: json.loads(
+                mcp_srv.runtime_eval_memory_path(expressions=["g_worker_registry.slots[2].in_use"])
+            )["results"][0]["value"] == 1
+        )
+        self.assertTrue(synced, "Controlled registry defect injection did not complete within bounded timeout")
 
         # 3. Exact Expected Observation: Proves Invariant Violation
         raw_post = mcp_srv.runtime_eval_memory_path(
@@ -528,7 +598,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(res_cycle["cycle_detected"], "Cycle detector must detect cycle in g_cycle_head")
         self.assertEqual(res_cycle["cycle_target_index"], 1)
 
-        # 6. Memory Integrity Audit validates invalid/dangling pointer
+        # 6. Memory Integrity Audit validates unmapped address without dereferencing
         raw_audit = mcp_srv.runtime_audit_memory_integrity(
             target_expressions=["g_integrity_target"],
         )
@@ -553,16 +623,18 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         threads = res_stacks.get("threads", [])
         self.assertGreaterEqual(len(threads), 2)
 
-        thread_names = [t.get("name") for t in threads]
-        self.assertIn("stall_holder", thread_names)
-        self.assertIn("stall_worker", thread_names)
+        # Validate thread inspection observations without platform-fragile assumptions
+        thread_names = [t.get("name") for t in threads if t.get("name")]
+        self.assertTrue(
+            "stall_holder" in thread_names and "stall_worker" in thread_names,
+            f"Expected worker threads in thread list: {thread_names}",
+        )
 
-        # Verify mutex contention is detected or waiting thread is found
         has_waiting = any(
             t.get("waiting_on_lock") is not None or "futex" in str(t.get("syscall", "")).lower()
             for t in threads
         )
-        self.assertTrue(has_waiting, "Waiting thread or futex syscall must be detected in thread callstack inspection")
+        self.assertTrue(has_waiting, "Waiting thread or futex syscall must be detected in thread inspection")
 
         # 2. Progress Counter Verification: sample over delta to prove lack of progress
         raw_sample_1 = mcp_srv.runtime_eval_memory_path(
@@ -587,7 +659,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(res_2["success"])
         vals_2 = {r["expression"]: r["value"] for r in res_2["results"]}
 
-        # Assert Progress Failure (stalled): progress_counter is identical across time interval
+        # Assert Progress Failure: progress_counter remains identical across time interval
         self.assertEqual(vals_1["g_progress_tracker.progress_counter"], 100)
         self.assertEqual(vals_2["g_progress_tracker.progress_counter"], 100)
         self.assertEqual(
