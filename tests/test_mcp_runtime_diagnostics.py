@@ -20,9 +20,11 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import scripts.mcp_server as mcp_srv
@@ -332,6 +334,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         cls.tmp_dir = tempfile.TemporaryDirectory(prefix="mcp_diag_")
         cls.src_path = os.path.join(cls.tmp_dir.name, "diagnostic_target.c")
         cls.bin_path = os.path.join(cls.tmp_dir.name, "diagnostic_target")
+        cls.mismatch_bin_path = os.path.join(cls.tmp_dir.name, "diagnostic_target_mismatch")
 
         with open(cls.src_path, "w", encoding="utf-8") as f:
             f.write(DIAGNOSTIC_FIXTURE_C)
@@ -341,13 +344,34 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             ["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", cls.src_path, "-o", cls.bin_path],
             check=True,
         )
+        # Compile companion ELF with different build-id to test build-id mismatch detection
+        subprocess.run(
+            ["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=md5", cls.src_path, "-o", cls.mismatch_bin_path],
+            check=True,
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:
+        context_err = None
+        tmpdir_err = None
         try:
             _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
-        finally:
+        except Exception as e:
+            context_err = e
+        try:
             cls.tmp_dir.cleanup()
+        except Exception as e:
+            tmpdir_err = e
+
+        if context_err and tmpdir_err:
+            raise RuntimeError(
+                f"Multiple teardown errors: context reset failed ({context_err}), "
+                f"and tmp_dir cleanup failed ({tmpdir_err})"
+            ) from context_err
+        elif context_err:
+            raise context_err
+        elif tmpdir_err:
+            raise tmpdir_err
 
     def setUp(self) -> None:
         # Launch a fresh, disposable process per test method to eliminate inter-test state leakage
@@ -387,6 +411,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         readiness_timeout = 2.0
         ready = False
         last_eval = None
+        last_eval_res = None
         last_eval_err = None
 
         while time.time() - ready_start < readiness_timeout:
@@ -397,36 +422,56 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
                     expressions=["g_service_manager.magic", "g_stall_holder_ready"]
                 )
                 eval_res = json.loads(eval_raw)
+                last_eval_res = eval_res
                 if eval_res.get("success") and eval_res.get("results"):
                     vals = {r["expression"]: r.get("value") for r in eval_res["results"]}
                     last_eval = vals
                     if vals.get("g_service_manager.magic") == 0xC0FFEE01 and vals.get("g_stall_holder_ready") == 1:
                         ready = True
                         break
+                elif not eval_res.get("success"):
+                    last_eval_err = eval_res.get("error") or eval_res.get("error_code")
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                # Legitimate retry on early process startup transient outputs
+                last_eval_err = f"{type(e).__name__}: {e}"
             except Exception as e:
-                last_eval_err = e
+                # Preserve unexpected programming errors without concealing
+                last_eval_err = f"Unexpected {type(e).__name__}: {e}"
             time.sleep(0.005)
 
         if not ready:
             proc_status = f"alive (PID {self.proc.pid})" if self.proc.poll() is None else f"exited (code {self.proc.returncode})"
             self.fail(
-                f"Target process failed readiness check within {readiness_timeout}s (proc {proc_status}): last_eval={last_eval}, err={last_eval_err}"
+                f"Target process failed readiness check within {readiness_timeout}s (proc {proc_status}): "
+                f"last_eval={last_eval}, last_res={last_eval_res}, err={last_eval_err}"
             )
 
     def _cleanup_target_and_context(self) -> None:
         """Structured cleanup executed on both normal completion and every failure path (including setUp failures)."""
-        cleanup_err = None
+        proc_err = None
+        context_err = None
+
         try:
             if hasattr(self, "proc") and self.proc:
                 self._cleanup_process(self.proc)
         except Exception as e:
-            cleanup_err = e
-        finally:
+            proc_err = e
+
+        try:
             # Clear target context and sessions so no stale state leaks to the next test
             _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
+        except Exception as e:
+            context_err = e
 
-        if cleanup_err:
-            raise RuntimeError(f"Cleanup error during teardown: {cleanup_err}") from cleanup_err
+        if proc_err and context_err:
+            raise RuntimeError(
+                f"Multiple cleanup errors during teardown: process cleanup failed ({proc_err}), "
+                f"and context reset failed ({context_err})"
+            ) from proc_err
+        elif proc_err:
+            raise RuntimeError(f"Process cleanup error during teardown: {proc_err}") from proc_err
+        elif context_err:
+            raise RuntimeError(f"Target context reset error during teardown: {context_err}") from context_err
 
     def tearDown(self) -> None:
         # addCleanup(_cleanup_target_and_context) handles process reaping and context reset reliably
@@ -1053,6 +1098,53 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertEqual(rebound_ctx["pid"], self.proc.pid)
         self.assertEqual(rebound_ctx["companion_elf_path"], self.bin_path)
         self.assertEqual(rebound_ctx["build_id"], rebind_res["build_id"])
+
+        # 8. Verify Build ID verification and context isolation on mismatched companion ELF
+        raw_mismatch = mcp_srv.runtime_eval_memory_path(
+            pid=self.proc.pid,
+            companion_elf=self.mismatch_bin_path,
+            expressions=["g_service_manager.magic"],
+        )
+        res_mismatch = json.loads(raw_mismatch)
+        self.assertFalse(res_mismatch["success"])
+        self.assertEqual(res_mismatch["error_code"], "BUILD_ID_MISMATCH")
+
+        # Ensure active target context was not altered or corrupted by failed mismatched call
+        ctx_after_mismatch = mcp_srv.runtime.watch_session_manager.get_active_target_context()
+        self.assertTrue(ctx_after_mismatch["has_active_context"])
+        self.assertEqual(ctx_after_mismatch["pid"], self.proc.pid)
+        self.assertEqual(ctx_after_mismatch["companion_elf_path"], self.bin_path)
+
+        # 9. Verify cleanup exception safety and error preservation under failure paths
+        # Scenario A: Process cleanup error does NOT prevent target context reset
+        mcp_srv.runtime.watch_session_manager._sessions["orphan_test_session"] = None
+        fake_proc_err = RuntimeError("simulated proc reap failure")
+        with mock.patch.object(self, "_cleanup_process", side_effect=fake_proc_err):
+            with self.assertRaises(RuntimeError) as cm_proc:
+                self._cleanup_target_and_context()
+            self.assertIn("Process cleanup error during teardown", str(cm_proc.exception))
+            # Target context and sessions must be cleanly reset despite the process cleanup failure
+            cleared = mcp_srv.runtime.watch_session_manager.get_active_target_context()
+            self.assertFalse(cleared["has_active_context"])
+            self.assertEqual(len(mcp_srv.runtime.watch_session_manager._sessions), 0)
+
+        # Scenario B: Dual cleanup failure preserves both errors without masking
+        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        fake_context_err = ValueError("simulated context reset failure")
+        with mock.patch.object(self, "_cleanup_process", side_effect=fake_proc_err):
+            with mock.patch.object(sys.modules[__name__], "_reset_test_target_context", side_effect=fake_context_err):
+                with self.assertRaises(RuntimeError) as cm_dual:
+                    self._cleanup_target_and_context()
+                err_msg = str(cm_dual.exception)
+                self.assertIn("Multiple cleanup errors during teardown", err_msg)
+                self.assertIn("simulated proc reap failure", err_msg)
+                self.assertIn("simulated context reset failure", err_msg)
+                # Ensure causal chaining preserves original process error
+                self.assertIs(cm_dual.exception.__cause__, fake_proc_err)
+
+        # Restore valid active target context for subsequent tearDown
+        _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
+        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
 
 
 if __name__ == "__main__":
