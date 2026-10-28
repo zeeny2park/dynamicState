@@ -344,22 +344,26 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
-        cls.tmp_dir.cleanup()
+        try:
+            _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
+        finally:
+            cls.tmp_dir.cleanup()
 
     def setUp(self) -> None:
         # Launch a fresh, disposable process per test method to eliminate inter-test state leakage
         self.proc = subprocess.Popen([self.bin_path])
+        # Register structured cleanup immediately so cleanup runs on any setUp failure path
+        self.addCleanup(self._cleanup_target_and_context)
 
         # Bounded readiness check: replace fixed sleep with verified memory initialization handshake
-        # 1. Connect target context with bounded polling (avoid repeated connect once bound)
-        start_t = time.time()
-        timeout = 2.0
+        # 1. Connect target context with independent bounded polling budget
+        connect_start = time.time()
+        connect_timeout = 2.0
         connected = False
         conn_res = None
         last_conn_err = None
 
-        while time.time() - start_t < timeout:
+        while time.time() - connect_start < connect_timeout:
             if self.proc.poll() is not None:
                 self.fail(f"Target process exited prematurely during setUp with returncode {self.proc.returncode}")
             try:
@@ -373,19 +377,19 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             time.sleep(0.005)
 
         if not connected:
-            self._cleanup_process(self.proc)
-            _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
             proc_status = f"alive (PID {self.proc.pid})" if self.proc.poll() is None else f"exited (code {self.proc.returncode})"
             self.fail(
-                f"Target process failed connection within {timeout}s (proc {proc_status}): conn={conn_res}, err={last_conn_err}"
+                f"Target process failed connection within {connect_timeout}s (proc {proc_status}): conn={conn_res}, err={last_conn_err}"
             )
 
-        # 2. Bounded poll for target global state initialization (g_service_manager.magic and g_stall_holder_ready)
+        # 2. Bounded poll for target global state initialization with independent timeout budget
+        ready_start = time.time()
+        readiness_timeout = 2.0
         ready = False
         last_eval = None
         last_eval_err = None
 
-        while time.time() - start_t < timeout:
+        while time.time() - ready_start < readiness_timeout:
             if self.proc.poll() is not None:
                 self.fail(f"Target process exited prematurely during setUp with returncode {self.proc.returncode}")
             try:
@@ -404,16 +408,14 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             time.sleep(0.005)
 
         if not ready:
-            self._cleanup_process(self.proc)
-            _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
             proc_status = f"alive (PID {self.proc.pid})" if self.proc.poll() is None else f"exited (code {self.proc.returncode})"
             self.fail(
-                f"Target process failed readiness check within {timeout}s (proc {proc_status}): last_eval={last_eval}, err={last_eval_err}"
+                f"Target process failed readiness check within {readiness_timeout}s (proc {proc_status}): last_eval={last_eval}, err={last_eval_err}"
             )
 
-    def tearDown(self) -> None:
+    def _cleanup_target_and_context(self) -> None:
+        """Structured cleanup executed on both normal completion and every failure path (including setUp failures)."""
         cleanup_err = None
-        # Guarantee child process is cleanly terminated and verified exited
         try:
             if hasattr(self, "proc") and self.proc:
                 self._cleanup_process(self.proc)
@@ -424,7 +426,11 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
 
         if cleanup_err:
-            raise RuntimeError(f"TearDown cleanup error: {cleanup_err}") from cleanup_err
+            raise RuntimeError(f"Cleanup error during teardown: {cleanup_err}") from cleanup_err
+
+    def tearDown(self) -> None:
+        # addCleanup(_cleanup_target_and_context) handles process reaping and context reset reliably
+        pass
 
     def _cleanup_process(
         self,
@@ -1033,8 +1039,20 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertIsNone(cleared_ctx["pid"])
         self.assertIsNone(cleared_ctx["companion_elf_path"])
         self.assertEqual(len(mcp_srv.runtime.watch_session_manager._sessions), 0)
-        # Rebind to current test proc so tearDown remains consistent
-        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+
+        # Rebind to current test proc and assert returned success, PID, companion ELF, and Build ID
+        rebind_raw = mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
+        rebind_res = json.loads(rebind_raw)
+        self.assertTrue(rebind_res["success"], f"Rebinding failed: {rebind_res}")
+        self.assertEqual(rebind_res["pid"], self.proc.pid)
+        self.assertEqual(rebind_res["companion_elf"], self.bin_path)
+        self.assertIsNotNone(rebind_res.get("build_id"))
+
+        rebound_ctx = mcp_srv.runtime.watch_session_manager.get_active_target_context()
+        self.assertTrue(rebound_ctx["has_active_context"])
+        self.assertEqual(rebound_ctx["pid"], self.proc.pid)
+        self.assertEqual(rebound_ctx["companion_elf_path"], self.bin_path)
+        self.assertEqual(rebound_ctx["build_id"], rebind_res["build_id"])
 
 
 if __name__ == "__main__":
