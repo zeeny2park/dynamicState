@@ -295,6 +295,35 @@ int main(void) {
 """
 
 
+def _reset_test_target_context(wm: Any) -> None:
+    """Isolates private-state cleanup in a narrow, documented test helper.
+
+    Rationale:
+    WatchSessionManager maintains process-lifetime state (_active_target_context and _sessions)
+    designed for long-lived MCP server lifecycles, and intentionally does not expose a public
+    client-facing reset or unbind action. To guarantee complete inter-test isolation without
+    polluting the production MCP contract with test-only endpoints, this helper resets the
+    manager's internal target context and session map under its thread-safety lock.
+    """
+    with wm._lock:
+        wm._active_target_context.clear()
+        wm._active_target_context.update({
+            "pid": None,
+            "process_name": None,
+            "companion_elf_path": None,
+            "build_id": None,
+            "remote_host": None,
+            "ssh_user": None,
+            "ssh_port": 22,
+            "ssh_key": None,
+            "ssh_proxy_jump": None,
+            "bound_at_unix": None,
+            "auto_healed_count": 0,
+            "last_previous_pid": None,
+        })
+        wm._sessions.clear()
+
+
 class TestMcpRuntimeDiagnostics(unittest.TestCase):
     """End-to-end validation of real runtime diagnostic correctness across MCP workflows."""
 
@@ -315,6 +344,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
         cls.tmp_dir.cleanup()
 
     def setUp(self) -> None:
@@ -344,6 +374,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
 
         if not connected:
             self._cleanup_process(self.proc)
+            _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
             proc_status = f"alive (PID {self.proc.pid})" if self.proc.poll() is None else f"exited (code {self.proc.returncode})"
             self.fail(
                 f"Target process failed connection within {timeout}s (proc {proc_status}): conn={conn_res}, err={last_conn_err}"
@@ -374,6 +405,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
 
         if not ready:
             self._cleanup_process(self.proc)
+            _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
             proc_status = f"alive (PID {self.proc.pid})" if self.proc.poll() is None else f"exited (code {self.proc.returncode})"
             self.fail(
                 f"Target process failed readiness check within {timeout}s (proc {proc_status}): last_eval={last_eval}, err={last_eval_err}"
@@ -388,38 +420,27 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         except Exception as e:
             cleanup_err = e
         finally:
-            # Clear target context so no stale PID, companion ELF, or session leaks to the next test
-            with mcp_srv.runtime.watch_session_manager._lock:
-                mcp_srv.runtime.watch_session_manager._active_target_context.clear()
-                mcp_srv.runtime.watch_session_manager._active_target_context.update({
-                    "pid": None,
-                    "process_name": None,
-                    "companion_elf_path": None,
-                    "build_id": None,
-                    "remote_host": None,
-                    "ssh_user": None,
-                    "ssh_port": 22,
-                    "ssh_key": None,
-                    "ssh_proxy_jump": None,
-                    "bound_at_unix": None,
-                    "auto_healed_count": 0,
-                    "last_previous_pid": None,
-                })
-                mcp_srv.runtime.watch_session_manager._sessions.clear()
+            # Clear target context and sessions so no stale state leaks to the next test
+            _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
 
         if cleanup_err:
-            raise cleanup_err
+            raise RuntimeError(f"TearDown cleanup error: {cleanup_err}") from cleanup_err
 
-    def _cleanup_process(self, proc: Optional[subprocess.Popen]) -> None:
+    def _cleanup_process(
+        self,
+        proc: Optional[subprocess.Popen],
+        terminate_timeout: float = 1.5,
+        kill_timeout: float = 1.5,
+    ) -> None:
         if not proc or proc.poll() is not None:
             return
         proc.terminate()
         try:
-            proc.wait(timeout=2.0)
+            proc.wait(timeout=terminate_timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             try:
-                proc.wait(timeout=2.0)
+                proc.wait(timeout=kill_timeout)
             except subprocess.TimeoutExpired as e:
                 raise RuntimeError(f"Child process {proc.pid} refused to exit after kill() within timeout") from e
         if proc.poll() is None:
@@ -982,6 +1003,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(active_ctx["has_active_context"])
         self.assertEqual(active_ctx["pid"], self.proc.pid)
         self.assertEqual(active_ctx["companion_elf_path"], self.bin_path)
+        self.assertIsNotNone(active_ctx.get("build_id"))
 
         # 5. Deterministic repeated evaluation
         for _ in range(3):
@@ -989,6 +1011,30 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
             rep_res = json.loads(rep_raw)
             self.assertTrue(rep_res["success"])
             self.assertEqual(rep_res["results"][0]["value"], 0xC0FFEE01)
+
+        # 6. Verify cleanup escalation on failure paths: process ignoring SIGTERM is killed via SIGKILL
+        dummy_stubborn = subprocess.Popen([
+            "python3", "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)"
+        ])
+        try:
+            self._cleanup_process(dummy_stubborn, terminate_timeout=0.15, kill_timeout=0.5)
+            self.assertIsNotNone(dummy_stubborn.poll(), "Escalated cleanup must terminate process via SIGKILL")
+        finally:
+            if dummy_stubborn.poll() is None:
+                dummy_stubborn.kill()
+                dummy_stubborn.wait()
+
+        # 7. Verify isolated context and session cleanup helper
+        # Create a dummy session in watch_session_manager to test session map purging
+        mcp_srv.runtime.watch_session_manager._sessions["dummy_test_session"] = None
+        _reset_test_target_context(mcp_srv.runtime.watch_session_manager)
+        cleared_ctx = mcp_srv.runtime.watch_session_manager.get_active_target_context()
+        self.assertFalse(cleared_ctx["has_active_context"])
+        self.assertIsNone(cleared_ctx["pid"])
+        self.assertIsNone(cleared_ctx["companion_elf_path"])
+        self.assertEqual(len(mcp_srv.runtime.watch_session_manager._sessions), 0)
+        # Rebind to current test proc so tearDown remains consistent
+        mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
 
 
 if __name__ == "__main__":
