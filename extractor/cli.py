@@ -116,6 +116,7 @@ def main():
     inv_parser.add_argument("--pid", type=int, default=None, help="Target process PID")
     inv_parser.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (default: corpus)")
     inv_parser.add_argument("--output", type=str, default=None, help="Path to save investigation report JSON")
+    inv_parser.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional path to write standalone Zero-CDN HTML investigation report")
     inv_parser.add_argument("--json", action="store_true", default=False, help="Print output in JSON format")
     inv_parser.add_argument("--authorize-target", action="store_true", default=False, help="Explicitly authorize live target interaction")
 
@@ -500,6 +501,7 @@ def main():
     vh_p = subparsers.add_parser("verify-hypothesis", help="Declarative multi-assertion hypothesis verifier (0.00ms stop)")
     vh_p.add_argument("--hypothesis", type=str, required=True)
     vh_p.add_argument("-a", "--assertions", type=str, required=True, help="Comma-separated assertions e.g. 'gpMem.active_buffers>=2,buffers[5].seq==5005'")
+    vh_p.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional output path for standalone Zero-CDN HTML verification report")
     vh_p.add_argument("-p", "--pid", type=int, default=None)
     vh_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
     vh_p.add_argument("--corpus", type=str, default="corpus")
@@ -509,6 +511,7 @@ def main():
     er_p.add_argument("--hypothesis", type=str, default=None)
     er_p.add_argument("-a", "--assertions", type=str, default=None)
     er_p.add_argument("-o", "--output", dest="output_path", type=str, default=None)
+    er_p.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional output path for standalone Zero-CDN HTML incident report")
     er_p.add_argument("-p", "--pid", type=int, default=None)
     er_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
     er_p.add_argument("--corpus", type=str, default="corpus")
@@ -876,6 +879,21 @@ def main():
                 with open(out_p, "w", encoding="utf-8") as f:
                     json.dump(report, f, indent=2)
                 print(f"Investigation report saved to {out_p}")
+
+            if getattr(args, "report_html_path", None) and report.get("report_html"):
+                html_p = os.path.abspath(args.report_html_path)
+                forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
+                if any(html_p.startswith(fp) or html_p == fp.rstrip("/") for fp in forbidden_prefixes):
+                    print(f"WARNING: Refusing to write HTML report to protected system path: {html_p}", file=sys.stderr)
+                else:
+                    try:
+                        os.makedirs(os.path.dirname(html_p), exist_ok=True)
+                        with open(html_p, "w", encoding="utf-8") as f:
+                            f.write(report["report_html"])
+                        if not args.json:
+                            print(f"HTML investigation report saved to {html_p}")
+                    except OSError as os_err:
+                        print(f"WARNING: Failed to write HTML report to {html_p}: {os_err}", file=sys.stderr)
 
             if args.json:
                 print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -1641,7 +1659,10 @@ def main():
             assertions=a_list,
             pid=args.pid,
             companion_elf_path=args.debug_image,
+            report_html_path=getattr(args, "report_html_path", None),
         )
+        if res.get("save_html_error"):
+            print(f"WARNING: {res['save_html_error']}", file=sys.stderr)
         print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
         sys.exit(0)
 
@@ -1654,9 +1675,14 @@ def main():
             hypothesis=args.hypothesis,
             assertions=a_list,
             output_path=args.output_path,
+            report_html_path=getattr(args, "report_html_path", None),
             pid=args.pid,
             companion_elf_path=args.debug_image,
         )
+        if res.get("save_error"):
+            print(f"WARNING: {res['save_error']}", file=sys.stderr)
+        if res.get("save_html_error"):
+            print(f"WARNING: {res['save_html_error']}", file=sys.stderr)
         print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
         sys.exit(0)
 

@@ -11111,6 +11111,7 @@ class WatchSessionManager:
         ssh_key: Optional[str] = None,
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
+        report_html_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Declarative Multi-Assertion Hypothesis Verifier (`runtime_verify_hypothesis`) in 0.00ms zero-stop mode.
         Evaluates a list of forgiving C/C++ assertions (`==`, `!=`, `>=`, `<=`, `>`, `<`, `IS_NULL`, `NOT_NULL`),
@@ -11233,6 +11234,46 @@ class WatchSessionManager:
             verdict = "REFUTED"
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
+
+        # Build DiagnosticVerdict for Zero-CDN HTML & JSON export (computed once)
+        diag_evals = []
+        for a_item in assertion_results:
+            diag_evals.append(VerdictEngine.evaluate_assertion(
+                raw_assertion=a_item.get("assertion", ""),
+                lhs=a_item.get("lhs_expression", ""),
+                op=a_item.get("operator", "=="),
+                rhs_raw=str(a_item.get("expected")) if a_item.get("expected") is not None else None,
+                observed_value=a_item.get("observed_value"),
+                obs_status=a_item.get("evaluation_status", "OBSERVED"),
+                res_expr=a_item.get("resolved_expression", ""),
+            ))
+
+        synth_verdict = VerdictEngine.synthesize_verdict(
+            hypothesis=hypothesis,
+            evaluations=diag_evals,
+            target_identity={"pid": eff_pid, "companion_elf": eff_elf},
+            causal_attribution_verified=False,
+            budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": latency_us}},
+        )
+        report_html = ZeroCdnReporter.render_html(synth_verdict, title=f"dynamicState Hypothesis Verification: {hypothesis[:40]}")
+        report_json = ZeroCdnReporter.render_json(synth_verdict)
+
+        saved_html_path = None
+        save_html_error = None
+        if report_html_path and str(report_html_path).strip():
+            abs_html = os.path.abspath(str(report_html_path).strip())
+            forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
+            if any(abs_html.startswith(fp) or abs_html == fp.rstrip("/") for fp in forbidden_prefixes):
+                save_html_error = f"Refusing to write HTML report to protected system path: {abs_html}"
+            else:
+                try:
+                    os.makedirs(os.path.dirname(abs_html), exist_ok=True)
+                    with open(abs_html, "w", encoding="utf-8") as hf:
+                        hf.write(report_html)
+                    saved_html_path = abs_html
+                except OSError as os_err:
+                    save_html_error = f"Failed to write HTML report to {abs_html}: {os_err}"
+
         return {
             "pid": eff_pid,
             "companion_elf": eff_elf,
@@ -11247,6 +11288,10 @@ class WatchSessionManager:
             "abstain_assertions": abstain_count,
             "assertion_results": assertion_results,
             "correlated_slot_owners": correlated_slot_owners,
+            "report_html": report_html,
+            "report_json": report_json,
+            "saved_html_path": saved_html_path,
+            "save_html_error": save_html_error,
             "llm_next_step_hint": (
                 f"Hypothesis '{hypothesis}' is {verdict} ({passed_count}/{total_cnt} assertions passed, "
                 f"confidence {round(pass_ratio * 100, 1)}%) in 0.00ms zero-stop mode."
@@ -11268,6 +11313,7 @@ class WatchSessionManager:
         ssh_key: Optional[str] = None,
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
+        report_html_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """1-Call Comprehensive Incident Report & Source-Level Remediation Exporter (`runtime_export_incident_report`).
         Synthesizes Target Identity, Auto-Triage Root-Cause Scorecard, Thread Callstacks & Locks,
@@ -11384,25 +11430,9 @@ class WatchSessionManager:
             md_lines.append(f"{idx_r}. [ ] {r_step}")
 
         report_markdown = "\n".join(md_lines) + "\n"
-        saved_path = None
-        save_error = None
-        if output_path and str(output_path).strip():
-            abs_out = os.path.abspath(str(output_path).strip())
-            forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
-            if any(abs_out.startswith(fp) or abs_out == fp.rstrip("/") for fp in forbidden_prefixes):
-                save_error = f"Refusing to write incident report to protected system path: {abs_out}"
-            else:
-                try:
-                    os.makedirs(os.path.dirname(abs_out), exist_ok=True)
-                    with open(abs_out, "w", encoding="utf-8") as rf:
-                        rf.write(report_markdown)
-                    saved_path = abs_out
-                except OSError as os_err:
-                    save_error = f"Failed to write report to {abs_out}: {os_err}" 
-
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
 
-        # Generate zero-CDN HTML & normalized JSON deliverables
+        # Generate zero-CDN HTML & normalized JSON deliverables (computed once)
         diag_evals = []
         if hyp_res and hyp_res.get("assertion_results"):
             for a_item in hyp_res.get("assertion_results", []):
@@ -11427,6 +11457,42 @@ class WatchSessionManager:
         report_html = ZeroCdnReporter.render_html(synth_verdict, title=title, remediation_checklist=remediation_checklist)
         report_json = ZeroCdnReporter.render_json(synth_verdict)
 
+        # Handle primary output_path (markdown or html based on extension)
+        saved_path = None
+        save_error = None
+        if output_path and str(output_path).strip():
+            abs_out = os.path.abspath(str(output_path).strip())
+            forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
+            if any(abs_out.startswith(fp) or abs_out == fp.rstrip("/") for fp in forbidden_prefixes):
+                save_error = f"Refusing to write incident report to protected system path: {abs_out}"
+            else:
+                try:
+                    os.makedirs(os.path.dirname(abs_out), exist_ok=True)
+                    is_html_out = abs_out.lower().endswith((".html", ".htm"))
+                    to_write = report_html if is_html_out else report_markdown
+                    with open(abs_out, "w", encoding="utf-8") as rf:
+                        rf.write(to_write)
+                    saved_path = abs_out
+                except OSError as os_err:
+                    save_error = f"Failed to write report to {abs_out}: {os_err}"
+
+        # Handle explicit report_html_path if provided
+        saved_html_path = None
+        save_html_error = None
+        if report_html_path and str(report_html_path).strip():
+            abs_html = os.path.abspath(str(report_html_path).strip())
+            forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
+            if any(abs_html.startswith(fp) or abs_html == fp.rstrip("/") for fp in forbidden_prefixes):
+                save_html_error = f"Refusing to write HTML report to protected system path: {abs_html}"
+            else:
+                try:
+                    os.makedirs(os.path.dirname(abs_html), exist_ok=True)
+                    with open(abs_html, "w", encoding="utf-8") as hf:
+                        hf.write(report_html)
+                    saved_html_path = abs_html
+                except OSError as os_err:
+                    save_html_error = f"Failed to write HTML report to {abs_html}: {os_err}"
+
         return {
             "pid": eff_pid,
             "companion_elf": eff_elf,
@@ -11445,6 +11511,8 @@ class WatchSessionManager:
             "report_json": report_json,
             "saved_path": saved_path,
             "save_error": save_error,
+            "saved_html_path": saved_html_path,
+            "save_html_error": save_html_error,
             "llm_next_step_hint": (
                 f"Generated zero-stop incident report for PID {eff_pid} (Health Score: {triage.get('health_score', 100)}/100, "
                 f"{len(findings)} finding(s))" + (f" and saved to {saved_path}." if saved_path else ".")
