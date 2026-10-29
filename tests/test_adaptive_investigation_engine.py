@@ -57,6 +57,7 @@ from extractor.verdict_engine import (
     DIAG_CONFIRMED,
     DIAG_INCONCLUSIVE,
     DIAG_NO_ISSUE_DETECTED,
+    DIAG_REFUTED,
     DIAG_SUSPECTED,
     OBS_STATUS_OBSERVED,
     OBS_STATUS_READ_ERROR,
@@ -322,7 +323,7 @@ class TestAdaptiveInvestigationEngine(unittest.TestCase):
             tofile="mutated_run",
         ))
         self.assertTrue(len(diff) > 0)
-        self.assertEqual(v_mut.final_diagnosis, DIAG_NO_ISSUE_DETECTED)  # Counter != 10 contradicted the hypothesis
+        self.assertEqual(v_mut.final_diagnosis, DIAG_REFUTED)  # Counter != 10 contradicted the hypothesis
 
     def test_08_live_target_operational_acceptance(self):
         """Phase 7: Live C++ multithread process operational evaluation with 0.00ms stop time."""

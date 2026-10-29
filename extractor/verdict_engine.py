@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import html
 import json
+import os
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -50,8 +51,38 @@ HYP_STATE_INCONCLUSIVE = "INCONCLUSIVE"
 # 4. Final Diagnosis
 DIAG_CONFIRMED = "CONFIRMED"
 DIAG_SUSPECTED = "SUSPECTED"
+DIAG_PARTIALLY_CONFIRMED = "PARTIALLY_CONFIRMED"
+DIAG_REFUTED = "REFUTED"
 DIAG_NO_ISSUE_DETECTED = "NO_ISSUE_DETECTED"
 DIAG_INCONCLUSIVE = "INCONCLUSIVE"
+
+
+def sanitize_report_output_path(
+    path_str: Optional[str],
+    file_type: str = "report",
+) -> Tuple[Optional[str], Optional[str]]:
+    """Sanitizes and validates output path against system paths and symlink traversal.
+
+    Returns: (sanitized_abs_path, error_message)
+    """
+    if not path_str or not str(path_str).strip():
+        return None, None
+    raw = str(path_str).strip()
+    if "\x00" in raw:
+        return None, f"Invalid path containing null bytes: {raw}"
+    abs_path = os.path.abspath(raw)
+    real_path = os.path.realpath(abs_path)
+
+    forbidden_prefixes = (
+        "/etc/", "/proc/", "/sys/", "/dev/", "/boot/",
+        "/bin/", "/sbin/", "/usr/", "/lib/", "/lib64/",
+    )
+    for p in (abs_path, real_path):
+        clean_p = p.rstrip("/") + "/"
+        if any(clean_p.startswith(fp) for fp in forbidden_prefixes):
+            return None, f"Refusing to write {file_type} to protected system path: {raw} (resolved: {real_path})"
+
+    return abs_path, None
 
 
 @dataclass
@@ -231,12 +262,19 @@ class VerdictEngine:
         if total == 0:
             hyp_state = HYP_STATE_INCONCLUSIVE
             confidence = 0.0
+        elif abstained > 0 and passed == 0 and failed == 0:
+            hyp_state = HYP_STATE_INCONCLUSIVE
+            confidence = 0.0
+            limitations.append(f"{abstained} assertion(s) yielded ABSTAIN due to observation failures.")
         elif abstained > 0:
             hyp_state = HYP_STATE_INCONCLUSIVE
             confidence = round(passed / float(total), 3)
             limitations.append(f"{abstained} assertion(s) yielded ABSTAIN due to observation failures.")
-        elif failed > 0:
+        elif failed > 0 and passed == 0:
             hyp_state = HYP_STATE_CONTRADICTED
+            confidence = round(failed / float(total), 3)
+        elif failed > 0 and passed > 0:
+            hyp_state = HYP_STATE_INCONCLUSIVE
             confidence = round(passed / float(total), 3)
         elif passed == total:
             hyp_state = HYP_STATE_SUPPORTED
@@ -250,8 +288,10 @@ class VerdictEngine:
             diagnosis = DIAG_INCONCLUSIVE
         elif abstained > 0 and passed == 0 and failed == 0:
             diagnosis = DIAG_INCONCLUSIVE
-        elif failed > 0:
-            diagnosis = DIAG_NO_ISSUE_DETECTED if passed == 0 else DIAG_INCONCLUSIVE
+        elif failed > 0 and passed == 0:
+            diagnosis = DIAG_REFUTED
+        elif failed > 0 and passed > 0:
+            diagnosis = DIAG_PARTIALLY_CONFIRMED
         elif passed == total and total > 0:
             # All assertions passed! Now check causal attribution
             if attribution_basis == ATTRIBUTION_BASIS_CALL_STACK and not causal_attribution_verified:
@@ -307,10 +347,12 @@ class ZeroCdnReporter:
     ) -> str:
         """Renders an elegant, self-contained HTML report with NO external CDN dependencies."""
         v_color = {
-            DIAG_CONFIRMED: "#ef4444",      # Red
-            DIAG_SUSPECTED: "#f59e0b",      # Amber
-            DIAG_NO_ISSUE_DETECTED: "#10b981", # Green
-            DIAG_INCONCLUSIVE: "#6b7280",   # Gray
+            DIAG_CONFIRMED: "#ef4444",              # Red (Confirmed Incident / Root Cause)
+            DIAG_SUSPECTED: "#f59e0b",              # Amber (Suspected)
+            DIAG_PARTIALLY_CONFIRMED: "#f59e0b",    # Amber (Partially Confirmed)
+            DIAG_REFUTED: "#3b82f6",                # Blue (Refuted Hypothesis)
+            DIAG_NO_ISSUE_DETECTED: "#10b981",      # Green (Healthy / Normal)
+            DIAG_INCONCLUSIVE: "#6b7280",           # Gray (Inconclusive)
         }.get(verdict.final_diagnosis, "#6b7280")
 
         esc = html.escape

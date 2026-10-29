@@ -208,6 +208,194 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
         self.assertIn(verdict, html_text)
         self.assertIn("Worker counter is valid", html_text)
 
+    def test_07_investigate_default_and_report_html_option(self):
+        """investigate command: default generates no files, --report-html creates HTML with matching JSON."""
+        work_dir = os.path.join(self.tmp_dir, "inv_work")
+        os.makedirs(work_dir, exist_ok=True)
+        files_before = set(os.listdir(work_dir))
+
+        corpus_dir = os.path.join(self.tmp_dir, "corpus")
+
+        # 1. Default execution -> no HTML file
+        cmd_default = [
+            sys.executable, "-m", "extractor.cli", "investigate",
+            "--goal", "Investigate worker session state",
+            "-p", str(self.proc.pid),
+            "--debug-image", self.target_bin,
+            "--corpus", corpus_dir,
+            "--authorize-target",
+            "--json",
+        ]
+        env = dict(os.environ, PYTHONPATH=os.path.abspath("."))
+        res_def = subprocess.run(cmd_default, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=work_dir, env=env)
+        self.assertEqual(res_def.returncode, 0, f"investigate default failed: {res_def.stderr}")
+        data_def = json.loads(res_def.stdout)
+        self.assertEqual(data_def.get("goal"), "Investigate worker session state")
+        self.assertEqual(files_before, set(os.listdir(work_dir)))
+
+        # 2. With --report-html -> standalone HTML file created
+        html_path = os.path.join(work_dir, "investigate_report.html")
+        cmd_html = [
+            sys.executable, "-m", "extractor.cli", "investigate",
+            "--goal", "Investigate worker session state",
+            "-p", str(self.proc.pid),
+            "--debug-image", self.target_bin,
+            "--corpus", corpus_dir,
+            "--authorize-target",
+            "--report-html", html_path,
+            "--json",
+        ]
+        res_html = subprocess.run(cmd_html, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=work_dir, env=env)
+        self.assertEqual(res_html.returncode, 0, f"investigate --report-html failed: {res_html.stderr}")
+        self.assertTrue(os.path.isfile(html_path))
+
+        with open(html_path, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        self.assertIn("<!DOCTYPE html>", html_content)
+        self.assertIn("Investigate worker session state", html_content)
+        self.assertNotIn("http://", html_content)
+        self.assertNotIn("https://", html_content)
+
+    def test_08_investigate_output_collision_prevention(self):
+        """investigate: passing same path to --output and --report-html does not clobber JSON report."""
+        same_path = os.path.join(self.tmp_dir, "inv_collision.json")
+        cmd = [
+            sys.executable, "-m", "extractor.cli", "investigate",
+            "--goal", "Verify worker integrity",
+            "-p", str(self.proc.pid),
+            "--debug-image", self.target_bin,
+            "--corpus", os.path.join(self.tmp_dir, "corpus"),
+            "--authorize-target",
+            "--output", same_path,
+            "--report-html", same_path,
+            "--json",
+        ]
+        env = dict(os.environ, PYTHONPATH=os.path.abspath("."))
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("WARNING: Refusing to overwrite JSON output path", res.stderr)
+
+        # Primary JSON output must remain valid JSON
+        self.assertTrue(os.path.isfile(same_path))
+        with open(same_path, "r", encoding="utf-8") as f:
+            saved_json = json.load(f)
+        self.assertEqual(saved_json.get("goal"), "Verify worker integrity")
+
+    def test_09_export_report_output_collision_prevention(self):
+        """export-report: passing identical path to -o and --report-html prevents clobbering primary report."""
+        same_path = os.path.join(self.tmp_dir, "export_collision.md")
+        cmd = [
+            sys.executable, "-m", "extractor.cli", "export-report",
+            "-p", str(self.proc.pid),
+            "-d", self.target_bin,
+            "-o", same_path,
+            "--report-html", same_path,
+            "--corpus", os.path.join(self.tmp_dir, "corpus"),
+        ]
+        env = dict(os.environ, PYTHONPATH=os.path.abspath("."))
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.assertEqual(res.returncode, 0)
+
+        data = json.loads(res.stdout)
+        self.assertTrue(data.get("success"))
+        self.assertIn("Refusing to overwrite primary output path", data.get("save_html_error", ""))
+
+        # Primary markdown report must be preserved
+        with open(same_path, "r", encoding="utf-8") as f:
+            md_content = f.read()
+        self.assertTrue(md_content.startswith("# "))
+        self.assertNotIn("<!DOCTYPE html>", md_content)
+
+    def test_10_symlink_traversal_attack_prevention(self):
+        """Symlink pointing to protected path like /etc must be resolved via realpath and rejected."""
+        symlink_dir = os.path.join(self.tmp_dir, "evil_symlink_to_etc")
+        try:
+            os.symlink("/etc", symlink_dir)
+        except OSError:
+            self.skipTest("Filesystem does not support symlinks; skipping.")
+
+        evil_html_target = os.path.join(symlink_dir, "exploit_incident.html")
+
+        cmd = [
+            sys.executable, "-m", "extractor.cli", "export-report",
+            "-p", str(self.proc.pid),
+            "-d", self.target_bin,
+            "--report-html", evil_html_target,
+            "--corpus", os.path.join(self.tmp_dir, "corpus"),
+        ]
+        env = dict(os.environ, PYTHONPATH=os.path.abspath("."))
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("WARNING: Refusing to write HTML report to protected system path", res.stderr)
+
+        data = json.loads(res.stdout)
+        self.assertTrue(data.get("success"))
+        self.assertIn("Refusing to write HTML report to protected system path", data.get("save_html_error", ""))
+        self.assertFalse(os.path.exists("/etc/exploit_incident.html"))
+
+    def test_11_verdict_mapping_consistency_refuted_and_partially_confirmed(self):
+        """REFUTED and PARTIALLY_CONFIRMED states match identically between JSON verdict and HTML banner."""
+        # Scenario A: Contradicted / REFUTED
+        html_refuted = os.path.join(self.tmp_dir, "refuted_test.html")
+        cmd_refuted = [
+            sys.executable, "-m", "extractor.cli", "verify-hypothesis",
+            "--hypothesis", "Counter has impossible value 999999",
+            "-a", "g_session.worker.state.counter == 999999",
+            "-p", str(self.proc.pid),
+            "-d", self.target_bin,
+            "--report-html", html_refuted,
+            "--corpus", os.path.join(self.tmp_dir, "corpus"),
+        ]
+        env = dict(os.environ, PYTHONPATH=os.path.abspath("."))
+        res_a = subprocess.run(cmd_refuted, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.assertEqual(res_a.returncode, 0)
+        data_a = json.loads(res_a.stdout)
+        self.assertEqual(data_a["verdict"], "REFUTED")
+        with open(html_refuted, "r", encoding="utf-8") as f:
+            html_a = f.read()
+        self.assertIn('<div class="verdict-title">', html_a)
+        self.assertIn("REFUTED</div>", html_a)
+
+        # Scenario B: Partial / PARTIALLY_CONFIRMED (one passes, one fails)
+        html_partial = os.path.join(self.tmp_dir, "partial_test.html")
+        cmd_partial = [
+            sys.executable, "-m", "extractor.cli", "verify-hypothesis",
+            "--hypothesis", "Partial counter verification",
+            "-a", "g_session.worker.state.counter >= 0,g_session.worker.state.counter == 999999",
+            "-p", str(self.proc.pid),
+            "-d", self.target_bin,
+            "--report-html", html_partial,
+            "--corpus", os.path.join(self.tmp_dir, "corpus"),
+        ]
+        res_b = subprocess.run(cmd_partial, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.assertEqual(res_b.returncode, 0)
+        data_b = json.loads(res_b.stdout)
+        self.assertEqual(data_b["verdict"], "PARTIALLY_CONFIRMED")
+        with open(html_partial, "r", encoding="utf-8") as f:
+            html_b = f.read()
+        self.assertIn('<div class="verdict-title">', html_b)
+        self.assertIn("PARTIALLY_CONFIRMED</div>", html_b)
+
+    def test_12_export_report_health_no_issue_detected(self):
+        """export-report on healthy target without assertions reflects NO_ISSUE_DETECTED in HTML banner."""
+        html_out = os.path.join(self.tmp_dir, "healthy_export.html")
+        cmd = [
+            sys.executable, "-m", "extractor.cli", "export-report",
+            "-p", str(self.proc.pid),
+            "-d", self.target_bin,
+            "--report-html", html_out,
+            "--corpus", os.path.join(self.tmp_dir, "corpus"),
+        ]
+        env = dict(os.environ, PYTHONPATH=os.path.abspath("."))
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.assertEqual(res.returncode, 0)
+        data = json.loads(res.stdout)
+        self.assertEqual(data.get("overall_status"), "HEALTHY")
+
+        with open(html_out, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        self.assertIn("NO_ISSUE_DETECTED</div>", html_content)
+
 
 if __name__ == "__main__":
     unittest.main()

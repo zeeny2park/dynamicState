@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .memory_capture import MemoryCapture
 from .offline_analyzer import OfflineMemoryAnalyzer
 from .investigation import InvestigationManager
+from .verdict_engine import sanitize_report_output_path
 
 
 def main():
@@ -113,7 +114,7 @@ def main():
     inv_parser.add_argument("--snapshot", type=str, default=None, help="Snapshot ID or path")
     inv_parser.add_argument("--memory-snapshot", type=str, default=None, help="Path to raw memory snapshot directory")
     inv_parser.add_argument("--debug-image", type=str, default=None, help="Path to external debug image / ELF binary")
-    inv_parser.add_argument("--pid", type=int, default=None, help="Target process PID")
+    inv_parser.add_argument("-p", "--pid", type=int, default=None, help="Target process PID")
     inv_parser.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (default: corpus)")
     inv_parser.add_argument("--output", type=str, default=None, help="Path to save investigation report JSON")
     inv_parser.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional path to write standalone Zero-CDN HTML investigation report")
@@ -864,7 +865,7 @@ def main():
     elif args.command == "investigate":
         mgr = InvestigationManager(corpus_dir=args.corpus)
         try:
-            report = mgr.start_investigation(
+            init_res = mgr.start_investigation(
                 goal=args.goal,
                 snapshot_id=args.snapshot,
                 memory_snapshot_path=args.memory_snapshot,
@@ -872,28 +873,46 @@ def main():
                 debug_image=args.debug_image,
                 authorize_target=args.authorize_target,
             )
+            inv_id = init_res.get("investigation_id")
+            if inv_id and inv_id in mgr.sessions:
+                report = mgr.generate_report(inv_id)
+            else:
+                report = init_res
 
+            sanitized_out = None
             if args.output:
-                out_p = os.path.abspath(args.output)
-                os.makedirs(os.path.dirname(out_p), exist_ok=True)
-                with open(out_p, "w", encoding="utf-8") as f:
-                    json.dump(report, f, indent=2)
-                print(f"Investigation report saved to {out_p}")
+                sanitized_out, out_err = sanitize_report_output_path(args.output, file_type="investigation JSON report")
+                if out_err:
+                    print(f"WARNING: {out_err}", file=sys.stderr)
+                elif sanitized_out:
+                    try:
+                        os.makedirs(os.path.dirname(sanitized_out), exist_ok=True)
+                        with open(sanitized_out, "w", encoding="utf-8") as f:
+                            json.dump(report, f, indent=2)
+                        if not args.json:
+                            print(f"Investigation report saved to {sanitized_out}")
+                    except OSError as os_err:
+                        print(f"WARNING: Failed to write report to {sanitized_out}: {os_err}", file=sys.stderr)
 
             if getattr(args, "report_html_path", None) and report.get("report_html"):
-                html_p = os.path.abspath(args.report_html_path)
-                forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
-                if any(html_p.startswith(fp) or html_p == fp.rstrip("/") for fp in forbidden_prefixes):
-                    print(f"WARNING: Refusing to write HTML report to protected system path: {html_p}", file=sys.stderr)
-                else:
-                    try:
-                        os.makedirs(os.path.dirname(html_p), exist_ok=True)
-                        with open(html_p, "w", encoding="utf-8") as f:
-                            f.write(report["report_html"])
-                        if not args.json:
-                            print(f"HTML investigation report saved to {html_p}")
-                    except OSError as os_err:
-                        print(f"WARNING: Failed to write HTML report to {html_p}: {os_err}", file=sys.stderr)
+                sanitized_html, html_err = sanitize_report_output_path(args.report_html_path, file_type="HTML report")
+                if html_err:
+                    print(f"WARNING: {html_err}", file=sys.stderr)
+                elif sanitized_html:
+                    if sanitized_out and os.path.realpath(sanitized_out) == os.path.realpath(sanitized_html):
+                        print(
+                            f"WARNING: Refusing to overwrite JSON output path '{sanitized_out}' with HTML report. Specify distinct paths.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        try:
+                            os.makedirs(os.path.dirname(sanitized_html), exist_ok=True)
+                            with open(sanitized_html, "w", encoding="utf-8") as f:
+                                f.write(report["report_html"])
+                            if not args.json:
+                                print(f"HTML investigation report saved to {sanitized_html}")
+                        except OSError as os_err:
+                            print(f"WARNING: Failed to write HTML report to {sanitized_html}: {os_err}", file=sys.stderr)
 
             if args.json:
                 print(json.dumps(report, indent=2, ensure_ascii=False))

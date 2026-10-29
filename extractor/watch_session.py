@@ -32,9 +32,10 @@ from .debug_image import BinaryIdentity, inspect_elf
 from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
 from .verdict_engine import (
-    VerdictEngine, ZeroCdnReporter,
+    VerdictEngine, ZeroCdnReporter, sanitize_report_output_path, DiagnosticVerdict,
     ASSERTION_PASS, ASSERTION_FAIL, ASSERTION_ABSTAIN,
-    DIAG_CONFIRMED, DIAG_SUSPECTED, DIAG_NO_ISSUE_DETECTED, DIAG_INCONCLUSIVE
+    DIAG_CONFIRMED, DIAG_SUSPECTED, DIAG_PARTIALLY_CONFIRMED, DIAG_REFUTED, DIAG_NO_ISSUE_DETECTED, DIAG_INCONCLUSIVE,
+    HYP_STATE_SUPPORTED, HYP_STATE_PROPOSED
 )
 from .evidence_adapter import EvidenceAdapter
 from .observation_budget import ObservationBudgetTracker, ObservationBudgetLimits
@@ -11260,19 +11261,17 @@ class WatchSessionManager:
 
         saved_html_path = None
         save_html_error = None
-        if report_html_path and str(report_html_path).strip():
-            abs_html = os.path.abspath(str(report_html_path).strip())
-            forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
-            if any(abs_html.startswith(fp) or abs_html == fp.rstrip("/") for fp in forbidden_prefixes):
-                save_html_error = f"Refusing to write HTML report to protected system path: {abs_html}"
-            else:
-                try:
-                    os.makedirs(os.path.dirname(abs_html), exist_ok=True)
-                    with open(abs_html, "w", encoding="utf-8") as hf:
-                        hf.write(report_html)
-                    saved_html_path = abs_html
-                except OSError as os_err:
-                    save_html_error = f"Failed to write HTML report to {abs_html}: {os_err}"
+        sanitized_html, html_path_err = sanitize_report_output_path(report_html_path, file_type="HTML report")
+        if html_path_err:
+            save_html_error = html_path_err
+        elif sanitized_html:
+            try:
+                os.makedirs(os.path.dirname(sanitized_html), exist_ok=True)
+                with open(sanitized_html, "w", encoding="utf-8") as hf:
+                    hf.write(report_html)
+                saved_html_path = sanitized_html
+            except OSError as os_err:
+                save_html_error = f"Failed to write HTML report to {sanitized_html}: {os_err}"
 
         return {
             "pid": eff_pid,
@@ -11447,51 +11446,82 @@ class WatchSessionManager:
                 ))
 
         hyp_text = hypothesis or title
-        synth_verdict = VerdictEngine.synthesize_verdict(
-            hypothesis=hyp_text,
-            evaluations=diag_evals,
-            target_identity={"pid": eff_pid, "companion_elf": eff_elf},
-            causal_attribution_verified=False,
-            budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": latency_us}},
-        )
+        if hyp_res and hyp_res.get("assertion_results"):
+            synth_verdict = VerdictEngine.synthesize_verdict(
+                hypothesis=hyp_text,
+                evaluations=diag_evals,
+                target_identity={"pid": eff_pid, "companion_elf": eff_elf},
+                causal_attribution_verified=False,
+                budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": latency_us}},
+            )
+        else:
+            # Triage-driven incident verdict when no assertion evaluations are requested
+            if findings:
+                is_crit = any(f.get("severity") in ("CRITICAL", "HIGH") for f in findings)
+                diag_state = DIAG_CONFIRMED if is_crit else DIAG_SUSPECTED
+                h_state = HYP_STATE_SUPPORTED
+                conf = 0.85
+            else:
+                diag_state = DIAG_NO_ISSUE_DETECTED
+                h_state = HYP_STATE_SUPPORTED
+                conf = 1.0
+
+            synth_verdict = DiagnosticVerdict(
+                hypothesis=hyp_text,
+                final_diagnosis=diag_state,
+                hypothesis_state=h_state,
+                confidence_score=conf,
+                total_assertions=0,
+                passed_count=0,
+                failed_count=0,
+                abstain_count=0,
+                assertion_evaluations=[],
+                causal_attribution_verified=False,
+                attribution_basis=None,
+                provenance_class="LIVE_RUNTIME_CAPTURE",
+                target_identity={"pid": eff_pid, "companion_elf": eff_elf},
+                limitations=[],
+                budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": latency_us}},
+            )
+
         report_html = ZeroCdnReporter.render_html(synth_verdict, title=title, remediation_checklist=remediation_checklist)
         report_json = ZeroCdnReporter.render_json(synth_verdict)
 
         # Handle primary output_path (markdown or html based on extension)
         saved_path = None
         save_error = None
-        if output_path and str(output_path).strip():
-            abs_out = os.path.abspath(str(output_path).strip())
-            forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
-            if any(abs_out.startswith(fp) or abs_out == fp.rstrip("/") for fp in forbidden_prefixes):
-                save_error = f"Refusing to write incident report to protected system path: {abs_out}"
-            else:
-                try:
-                    os.makedirs(os.path.dirname(abs_out), exist_ok=True)
-                    is_html_out = abs_out.lower().endswith((".html", ".htm"))
-                    to_write = report_html if is_html_out else report_markdown
-                    with open(abs_out, "w", encoding="utf-8") as rf:
-                        rf.write(to_write)
-                    saved_path = abs_out
-                except OSError as os_err:
-                    save_error = f"Failed to write report to {abs_out}: {os_err}"
+        sanitized_out, out_path_err = sanitize_report_output_path(output_path, file_type="incident report")
+        if out_path_err:
+            save_error = out_path_err
+        elif sanitized_out:
+            try:
+                os.makedirs(os.path.dirname(sanitized_out), exist_ok=True)
+                is_html_out = sanitized_out.lower().endswith((".html", ".htm"))
+                to_write = report_html if is_html_out else report_markdown
+                with open(sanitized_out, "w", encoding="utf-8") as rf:
+                    rf.write(to_write)
+                saved_path = sanitized_out
+            except OSError as os_err:
+                save_error = f"Failed to write report to {sanitized_out}: {os_err}"
 
         # Handle explicit report_html_path if provided
         saved_html_path = None
         save_html_error = None
-        if report_html_path and str(report_html_path).strip():
-            abs_html = os.path.abspath(str(report_html_path).strip())
-            forbidden_prefixes = ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/bin/", "/sbin/", "/usr/")
-            if any(abs_html.startswith(fp) or abs_html == fp.rstrip("/") for fp in forbidden_prefixes):
-                save_html_error = f"Refusing to write HTML report to protected system path: {abs_html}"
+        sanitized_html, html_path_err = sanitize_report_output_path(report_html_path, file_type="HTML report")
+        if html_path_err:
+            save_html_error = html_path_err
+        elif sanitized_html:
+            # Prevent accidental collision/clobbering of primary output path
+            if sanitized_out and os.path.realpath(sanitized_out) == os.path.realpath(sanitized_html):
+                save_html_error = f"Refusing to overwrite primary output path '{sanitized_out}' with HTML report. Specify distinct paths."
             else:
                 try:
-                    os.makedirs(os.path.dirname(abs_html), exist_ok=True)
-                    with open(abs_html, "w", encoding="utf-8") as hf:
+                    os.makedirs(os.path.dirname(sanitized_html), exist_ok=True)
+                    with open(sanitized_html, "w", encoding="utf-8") as hf:
                         hf.write(report_html)
-                    saved_html_path = abs_html
+                    saved_html_path = sanitized_html
                 except OSError as os_err:
-                    save_html_error = f"Failed to write HTML report to {abs_html}: {os_err}"
+                    save_html_error = f"Failed to write HTML report to {sanitized_html}: {os_err}"
 
         return {
             "pid": eff_pid,

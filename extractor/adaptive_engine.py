@@ -39,6 +39,8 @@ from .verdict_engine import (
     DIAG_CONFIRMED,
     DIAG_INCONCLUSIVE,
     DIAG_NO_ISSUE_DETECTED,
+    DIAG_PARTIALLY_CONFIRMED,
+    DIAG_REFUTED,
     DIAG_SUSPECTED,
     AssertionEvaluation,
     DiagnosticVerdict,
@@ -210,7 +212,7 @@ class AdaptiveTerminationPolicy:
 
         # 2. Conclusive diagnostic confidence
         if current_verdict:
-            if current_verdict.final_diagnosis in (DIAG_CONFIRMED, DIAG_NO_ISSUE_DETECTED) and current_verdict.confidence_score >= 1.0:
+            if current_verdict.final_diagnosis in (DIAG_CONFIRMED, DIAG_REFUTED, DIAG_NO_ISSUE_DETECTED) and current_verdict.confidence_score >= 1.0:
                 return True, f"Conclusive diagnosis reached: {current_verdict.final_diagnosis} (100% confidence)"
 
         # 3. Diminishing returns (3 steps without new evidence)

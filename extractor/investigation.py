@@ -2884,6 +2884,34 @@ class InvestigationManager:
             ),
         }
 
+        # Synthesize verdict once for both zero-CDN HTML and JSON representations
+        investigation_evaluations = [
+            AssertionEvaluation(
+                raw_assertion=h.title,
+                lhs_expression=h.title,
+                resolved_expression=h.title,
+                operator="VALIDATED",
+                expected="TRUE",
+                observed_value=h.validation_status,
+                observation_status="OBSERVED",
+                verdict=ASSERTION_PASS if h.validation_status == HYPOTHESIS_STATUS_VALIDATED else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN),
+                reason=h.claim,
+            )
+            for h in session.hypotheses
+        ]
+        synth_report_verdict = VerdictEngine.synthesize_verdict(
+            hypothesis=session.goal,
+            evaluations=investigation_evaluations,
+            target_identity=session.stages.get("target_identity", {}).get("details", {}),
+            causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
+        )
+        report_html_rendered = ZeroCdnReporter.render_html(
+            synth_report_verdict,
+            title=f"dynamicState Investigation: {session.goal[:40]}",
+            remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
+        )
+        report_json_rendered = ZeroCdnReporter.render_json(synth_report_verdict)
+
         return {
             "investigation_id": session.investigation_id,
             "goal": session.goal,
@@ -2920,50 +2948,8 @@ class InvestigationManager:
             "evidence_ledger": session.ledger.to_dict(),
             "timeline": list(session.timeline),
             "timeline_count": len(session.timeline),
-            "report_html": ZeroCdnReporter.render_html(
-                VerdictEngine.synthesize_verdict(
-                    hypothesis=session.goal,
-                    evaluations=[
-                        AssertionEvaluation(
-                            raw_assertion=h.title,
-                            lhs_expression=h.title,
-                            resolved_expression=h.title,
-                            operator="VALIDATED",
-                            expected="TRUE",
-                            observed_value=h.validation_status,
-                            observation_status="OBSERVED",
-                            verdict=ASSERTION_PASS if h.validation_status == HYPOTHESIS_STATUS_VALIDATED else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN),
-                            reason=h.claim,
-                        )
-                        for h in session.hypotheses
-                    ],
-                    target_identity=session.stages.get("target_identity", {}).get("details", {}),
-                    causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
-                ),
-                title=f"dynamicState Investigation: {session.goal[:40]}",
-                remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
-            ),
-            "report_json": ZeroCdnReporter.render_json(
-                VerdictEngine.synthesize_verdict(
-                    hypothesis=session.goal,
-                    evaluations=[
-                        AssertionEvaluation(
-                            raw_assertion=h.title,
-                            lhs_expression=h.title,
-                            resolved_expression=h.title,
-                            operator="VALIDATED",
-                            expected="TRUE",
-                            observed_value=h.validation_status,
-                            observation_status="OBSERVED",
-                            verdict=ASSERTION_PASS if h.validation_status == HYPOTHESIS_STATUS_VALIDATED else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN),
-                            reason=h.claim,
-                        )
-                        for h in session.hypotheses
-                    ],
-                    target_identity=session.stages.get("target_identity", {}).get("details", {}),
-                    causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
-                )
-            ),
+            "report_html": report_html_rendered,
+            "report_json": report_json_rendered,
         }
 
     def get_investigation_timeline(self, investigation_id: str) -> Dict[str, Any]:
