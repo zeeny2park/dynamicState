@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Phase 16 — Hardened Real-Target Validation Runner for DynamicState MCP.
+"""Phase 17 — Hardened Real-Target Validation Runner for DynamicState MCP.
 
-Audits and proves real-target prerequisites against a live multithreaded stripped C++ process:
+Audits, proves, and hardens real-target validation integrity:
 1. GNU Build ID verification between stripped production binary and non-stripped companion ELF.
 2. Dynamic ASLR / PIE load bias address resolution.
 3. Live memory extraction of scalars, enums, and nested struct pointer dereferences.
 4. Non-intrusive zero-stop observation: process_vm_readv capture without debugger attachment.
-5. Statistical latency benchmarking (min, median, p95, max) against configurable SLA threshold.
+5. Latency SLA contract: configurable metric (median, p95, max) with strict threshold enforcement.
 6. Target concurrent progress verification across observation intervals.
 7. Deliberate Build ID mismatch rejection with structured error envelope.
-8. Safe lifecycle management, SIGTERM-to-SIGKILL escalation, stdout pipe drainage, and context reset.
+8. Non-blocking READY handshake: timeout deadline immunity against hanging children.
+9. Strict cleanup semantics: process termination, SIGTERM/SIGKILL escalation, context reset,
+   tmpdir release, dual-failure preservation, and consistent exit codes.
+10. Explicit distinction between API zero-stop metadata, observed worker progress, and
+    non-atomic consistency semantics without unverified zero-pause claims.
 """
 
 import argparse
@@ -18,6 +22,8 @@ import json
 import math
 import os
 import platform
+import re
+import select
 import signal
 import subprocess
 import sys
@@ -97,14 +103,101 @@ def cleanup_target_process(
         proc.kill()
         proc.wait(timeout=kill_timeout)
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"Child process PID {proc.pid} refused to exit after SIGKILL") from e
+        raise RuntimeError(f"Child process PID {proc.pid} refused to exit after SIGKILL within {kill_timeout}s") from e
 
     if proc.poll() is None:
         raise RuntimeError(f"Child process PID {proc.pid} still alive after SIGKILL escalation")
 
 
-def calculate_latency_stats(samples_ms: List[float], threshold_ms: float) -> Dict[str, Any]:
-    """Calculates statistical distribution for a list of latency samples."""
+def read_ready_handshake(proc: subprocess.Popen, timeout: float = 5.0) -> Tuple[int, str]:
+    """Reads READY handshake from target process stdout with non-blocking I/O.
+
+    Guarantees that a blocking readline() cannot defeat the deadline even if the child hangs.
+    Validates format 'READY: PID=(\\d+)' and verifies PID matches proc.pid.
+    """
+    if proc.stdout:
+        os.set_blocking(proc.stdout.fileno(), False)
+    if proc.stderr:
+        os.set_blocking(proc.stderr.fileno(), False)
+
+    start = time.time()
+    stdout_buf = ""
+    stderr_buf = ""
+
+    while time.time() - start < timeout:
+        # Check if process has terminated
+        if proc.poll() is not None:
+            try:
+                if proc.stdout:
+                    stdout_buf += proc.stdout.read() or ""
+                if proc.stderr:
+                    stderr_buf += proc.stderr.read() or ""
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Target process exited prematurely with returncode {proc.returncode}: "
+                f"stderr='{stderr_buf.strip()}', stdout='{stdout_buf.strip()}'"
+            )
+
+        # Non-blocking wait for stdout readability
+        if proc.stdout:
+            rlist, _, _ = select.select([proc.stdout], [], [], 0.05)
+            if rlist:
+                try:
+                    chunk = proc.stdout.read()
+                    if chunk:
+                        stdout_buf += chunk
+                        if "\n" in stdout_buf:
+                            break
+                except (BlockingIOError, OSError):
+                    pass
+
+        time.sleep(0.01)
+
+    # Drain any stderr output
+    try:
+        if proc.stderr:
+            stderr_buf += proc.stderr.read() or ""
+    except Exception:
+        pass
+
+    if "\n" not in stdout_buf:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"Target process exited prematurely with returncode {proc.returncode}: "
+                f"stderr='{stderr_buf.strip()}', stdout='{stdout_buf.strip()}'"
+            )
+        raise TimeoutError(
+            f"Timed out after {timeout}s waiting for READY handshake from PID {proc.pid}. "
+            f"Received stdout='{stdout_buf.strip()}', stderr='{stderr_buf.strip()}'"
+        )
+
+    line = stdout_buf.split("\n", 1)[0].strip()
+    match = re.search(r"^READY:\s*PID=(\S+)", line)
+    if not match:
+        raise RuntimeError(f"Missing or malformed READY handshake: received '{line}'")
+
+    pid_str = match.group(1)
+    try:
+        parsed_pid = int(pid_str)
+    except ValueError:
+        raise RuntimeError(f"Malformed non-integer PID in READY handshake: '{pid_str}' in line '{line}'")
+
+    if parsed_pid != proc.pid:
+        raise RuntimeError(f"Handshake PID mismatch: target reported PID {parsed_pid}, but Popen PID is {proc.pid}")
+
+    return parsed_pid, line
+
+
+def calculate_latency_stats(
+    samples_ms: List[float],
+    threshold_ms: float,
+    sla_metric: str = "median",
+) -> Dict[str, Any]:
+    """Calculates statistical distribution for a list of latency samples against SLA."""
+    if sla_metric not in ("median", "p95", "max"):
+        raise ValueError(f"Invalid sla_metric: '{sla_metric}'. Must be one of ('median', 'p95', 'max').")
+
     if not samples_ms:
         return {
             "sample_count": 0,
@@ -113,7 +206,9 @@ def calculate_latency_stats(samples_ms: List[float], threshold_ms: float) -> Dic
             "p95_ms": 0.0,
             "max_ms": 0.0,
             "mean_ms": 0.0,
-            "threshold_ms": threshold_ms,
+            "sla_metric": sla_metric,
+            "sla_threshold_ms": round(threshold_ms, 3),
+            "sla_value_ms": 0.0,
             "within_sla": False,
         }
 
@@ -133,6 +228,14 @@ def calculate_latency_stats(samples_ms: List[float], threshold_ms: float) -> Dic
     p95_idx = max(0, min(n - 1, math.ceil(0.95 * n) - 1))
     p95_ms = sorted_samples[p95_idx]
 
+    metric_lookup = {
+        "median": median_ms,
+        "p95": p95_ms,
+        "max": max_ms,
+    }
+    sla_val = metric_lookup[sla_metric]
+    within_sla = sla_val <= threshold_ms
+
     return {
         "sample_count": n,
         "min_ms": round(min_ms, 3),
@@ -140,14 +243,17 @@ def calculate_latency_stats(samples_ms: List[float], threshold_ms: float) -> Dic
         "p95_ms": round(p95_ms, 3),
         "max_ms": round(max_ms, 3),
         "mean_ms": round(mean_ms, 3),
-        "threshold_ms": round(threshold_ms, 3),
-        "within_sla": median_ms <= threshold_ms,
+        "sla_metric": sla_metric,
+        "sla_threshold_ms": round(threshold_ms, 3),
+        "sla_value_ms": round(sla_val, 3),
+        "within_sla": within_sla,
     }
 
 
 def run_real_target_validation(
     samples: int = 10,
     max_latency_ms: float = 15.0,
+    sla_metric: str = "median",
     verbose: bool = True,
     output_json_path: Optional[str] = None,
 ) -> Tuple[int, Dict[str, Any]]:
@@ -176,9 +282,27 @@ def run_real_target_validation(
             pass
     summary["ptrace_scope"] = ptrace_scope
 
+    # Strict numeric configuration validation
+    if not isinstance(samples, int) or samples <= 0:
+        err = f"Invalid samples count: {samples}. Must be a positive integer >= 1."
+        summary["failures"].append(err)
+        return 1, summary
+
+    if not isinstance(max_latency_ms, (int, float)) or max_latency_ms <= 0:
+        err = f"Invalid max_latency_ms: {max_latency_ms}. Must be a positive number > 0."
+        summary["failures"].append(err)
+        return 1, summary
+
+    if sla_metric not in ("median", "p95", "max"):
+        err = f"Invalid sla_metric: '{sla_metric}'. Must be one of ('median', 'p95', 'max')."
+        summary["failures"].append(err)
+        return 1, summary
+
     tmpdir = tempfile.TemporaryDirectory(prefix="real_target_val_")
     proc: Optional[subprocess.Popen] = None
     cleanup_errors: List[str] = []
+    validation_error: Optional[Exception] = None
+    exit_code = 0
 
     try:
         debug_elf = os.path.join(tmpdir.name, "sample_debug.elf")
@@ -232,24 +356,9 @@ def run_real_target_validation(
             print("[4/7] Spawning live production stripped target process...")
         proc = subprocess.Popen([stripped_elf, "20"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        # Read ready handshake with bounded poll loop to avoid indefinite blocking
-        ready_line = ""
-        handshake_start = time.time()
-        while time.time() - handshake_start < 5.0:
-            if proc.poll() is not None:
-                stderr_out = proc.stderr.read() if proc.stderr else ""
-                raise RuntimeError(f"Target process exited prematurely (code {proc.returncode}): {stderr_out}")
-            line = proc.stdout.readline() if proc.stdout else ""
-            if line:
-                ready_line = line.strip()
-                break
-            time.sleep(0.01)
-
-        if not ready_line or "READY: PID=" not in ready_line:
-            raise RuntimeError(f"Failed to receive READY handshake from target process: '{ready_line}'")
-
-        expected_pid_str = f"PID={proc.pid}"
-        assert expected_pid_str in ready_line, f"Handshake PID mismatch: {ready_line} vs {proc.pid}"
+        # Read ready handshake with non-blocking I/O
+        parsed_pid, ready_line = read_ready_handshake(proc, timeout=5.0)
+        assert parsed_pid == proc.pid, f"Handshake PID mismatch: {parsed_pid} vs {proc.pid}"
         summary["assertions_passed"] += 1
         if verbose:
             print(f"      Target ready signal: {ready_line}")
@@ -290,7 +399,7 @@ def run_real_target_validation(
 
         # Step 6: Multi-sample zero-stop memory observation & latency benchmarking
         if verbose:
-            print(f"[6/7] Performing {samples} live zero-stop memory observations...")
+            print(f"[6/7] Performing {samples} live zero-stop memory observations (SLA metric: {sla_metric})...")
 
         target_expressions = [
             "global_session->packet_count",
@@ -317,12 +426,13 @@ def run_real_target_validation(
             last_eval_res = json.loads(raw_eval)
             assert last_eval_res.get("success") is True, f"Sample evaluation failed: {last_eval_res}"
 
-        latency_stats = calculate_latency_stats(eval_samples_ms, threshold_ms=max_latency_ms)
+        latency_stats = calculate_latency_stats(eval_samples_ms, threshold_ms=max_latency_ms, sla_metric=sla_metric)
         summary["latency_benchmark"] = latency_stats
 
-        # Assert SLA threshold on median latency
+        # Assert SLA threshold on specified metric
         assert latency_stats["within_sla"], (
-            f"Median evaluation latency {latency_stats['median_ms']}ms exceeded SLA threshold {max_latency_ms}ms"
+            f"Latency SLA violation: {sla_metric} latency {latency_stats['sla_value_ms']}ms "
+            f"exceeded SLA threshold {max_latency_ms}ms"
         )
         summary["assertions_passed"] += 1
 
@@ -332,7 +442,7 @@ def run_real_target_validation(
                   f"median={latency_stats['median_ms']}ms, "
                   f"p95={latency_stats['p95_ms']}ms, "
                   f"max={latency_stats['max_ms']}ms "
-                  f"(SLA threshold: {max_latency_ms}ms)")
+                  f"(SLA metric: {sla_metric}={latency_stats['sla_value_ms']}ms <= {max_latency_ms}ms)")
 
         # Validate result set contents and invariant bounds
         assert last_eval_res is not None
@@ -407,6 +517,34 @@ def run_real_target_validation(
             "mechanism": consistency.get("mechanism"),
         }
 
+        # Structured partition of distinct evidence types
+        summary["evidence"] = {
+            "api_metadata": {
+                "process_stopped": consistency.get("process_stopped"),
+                "mechanism": consistency.get("mechanism"),
+                "interpretation": "dynamicState did not attach a debugger (ptrace) or issue SIGSTOP during memory reads",
+            },
+            "worker_progress": {
+                "initial_packet_count": val_packet,
+                "followup_packet_count": followup_packet,
+                "delta": progress_delta,
+                "continued_execution": True,
+                "interpretation": "Target worker thread actively incremented packet_count across observation interval",
+            },
+            "consistency_semantics": {
+                "level": consistency.get("level", "NON_ATOMIC"),
+                "is_atomic_read": consistency.get("is_atomic_read"),
+                "causal_guarantee": consistency.get("causal_guarantee"),
+                "has_causal_guarantee": consistency.get("has_causal_guarantee", False),
+                "data_completeness": consistency.get("data_completeness", "BEST_EFFORT_NON_ATOMIC"),
+                "warning": consistency.get("warning", ""),
+                "disclaimer": (
+                    "User-space observation cannot prove absolute 0.00ns pause against OS kernel interrupts "
+                    "or scheduler descheduling; non-atomic reads do not guarantee causal ordering."
+                ),
+            },
+        }
+
         # Step 7: Test deliberate Build ID mismatch rejection
         if verbose:
             print("[7/7] Testing deliberate Build ID mismatch rejection...")
@@ -437,37 +575,42 @@ def run_real_target_validation(
             print("\n=== REAL-TARGET CONTROLLED VALIDATION: ALL CHECKS PASSED ===")
 
         summary["status"] = "PASSED"
-        return 0, summary
+        exit_code = 0
 
     except Exception as e:
+        validation_error = e
+        exit_code = 1
         summary["status"] = "FAILED"
         summary["failures"].append(f"{type(e).__name__}: {e}")
         if verbose:
             print(f"\nERROR: Validation failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return 1, summary
 
     finally:
         # Structured, isolated cleanup guaranteed on both success and every failure path
         try:
             cleanup_target_process(proc)
         except Exception as e:
-            cleanup_errors.append(f"Process cleanup failed: {e}")
+            cleanup_errors.append(f"Process cleanup failed: {type(e).__name__}: {e}")
 
         try:
             reset_target_context(mcp_srv.runtime.watch_session_manager)
         except Exception as e:
-            cleanup_errors.append(f"Context reset failed: {e}")
+            cleanup_errors.append(f"Context reset failed: {type(e).__name__}: {e}")
 
         try:
             tmpdir.cleanup()
         except Exception as e:
-            cleanup_errors.append(f"Temporary directory cleanup failed: {e}")
+            cleanup_errors.append(f"Temporary directory cleanup failed: {type(e).__name__}: {e}")
 
         if cleanup_errors:
+            exit_code = 1
+            summary["status"] = "FAILED"
             summary["cleanup_errors"] = cleanup_errors
+            for ce in cleanup_errors:
+                summary["failures"].append(f"Cleanup failure: {ce}")
             if verbose:
                 for ce in cleanup_errors:
-                    print(f"WARNING during cleanup: {ce}", file=sys.stderr)
+                    print(f"ERROR during cleanup: {ce}", file=sys.stderr)
 
         if output_json_path:
             try:
@@ -476,11 +619,20 @@ def run_real_target_validation(
             except Exception as e:
                 print(f"Failed to write output JSON to {output_json_path}: {e}", file=sys.stderr)
 
+    return exit_code, summary
+
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="dynamicState Phase 16 Real-Target Validation Runner")
+    parser = argparse.ArgumentParser(description="dynamicState Phase 17 Real-Target Validation Runner")
     parser.add_argument("--samples", type=int, default=10, help="Number of benchmark samples (default: 10)")
-    parser.add_argument("--max-latency-ms", type=float, default=15.0, help="Max median latency SLA in ms (default: 15.0)")
+    parser.add_argument("--max-latency-ms", type=float, default=15.0, help="Max latency SLA in ms (default: 15.0)")
+    parser.add_argument(
+        "--sla-metric",
+        type=str,
+        default="median",
+        choices=["median", "p95", "max"],
+        help="Latency SLA statistic to evaluate (default: median)",
+    )
     parser.add_argument("--json", type=str, default=None, help="Optional output path for machine-readable JSON summary")
     parser.add_argument("--quiet", "-q", action="store_true", help="Quiet mode")
     args = parser.parse_args()
@@ -488,6 +640,7 @@ def main() -> int:
     exit_code, summary = run_real_target_validation(
         samples=args.samples,
         max_latency_ms=args.max_latency_ms,
+        sla_metric=args.sla_metric,
         verbose=not args.quiet,
         output_json_path=args.json,
     )
