@@ -18,6 +18,8 @@ static void print_usage(const char *prog) {
         "      --max-region <MB>   Maximum per-region bytes in MB (default: 32)\n"
         "      --policy <POLICY>   all (default), heap_stack, writable\n"
         "      --backend <NAME>    auto (default), pread, process_vm_readv\n"
+        "  -t, --timeout-ms <MS>   Maximum capture wall-clock timeout in ms (default: unlimited)\n"
+        "  -j, --json              Output machine-readable JSON metadata to stdout\n"
         "  -v, --verbose           Enable verbose progress logging\n"
         "  -h, --help              Show this help message\n\n"
         "Example:\n"
@@ -38,6 +40,8 @@ int main(int argc, char *argv[]) {
         {"backend", required_argument, 0, 'B'},
         {"read-slices", required_argument, 0, 's'},
         {"daemon", no_argument, 0, 'd'},
+        {"timeout-ms", required_argument, 0, 't'},
+        {"json", no_argument, 0, 'j'},
         {"verbose", no_argument, 0, 'v'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -47,7 +51,7 @@ int main(int argc, char *argv[]) {
     int daemon_mode = 0;
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "p:o:m:r:s:dvh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:o:m:r:P:B:s:dt:jvh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 cfg.pid = (pid_t)atoi(optarg);
@@ -84,6 +88,12 @@ int main(int argc, char *argv[]) {
                 break;
             case 'd':
                 daemon_mode = 1;
+                break;
+            case 't':
+                cfg.timeout_ms = (uint32_t)atoi(optarg);
+                break;
+            case 'j':
+                cfg.json_output = 1;
                 break;
             case 'v':
                 cfg.verbose = 1;
@@ -125,13 +135,44 @@ int main(int argc, char *argv[]) {
     }
     snprintf(cfg.snapshot_id, sizeof(cfg.snapshot_id), "SNAP_%d", (int)cfg.pid);
 
-    printf("[dynamicState-collector] Capturing target PID %d to directory '%s'...\n", (int)cfg.pid, cfg.output_dir);
+    if (!cfg.json_output) {
+        printf("[dynamicState-collector] Capturing target PID %d to directory '%s'...\n", (int)cfg.pid, cfg.output_dir);
+    } else if (cfg.verbose) {
+        fprintf(stderr, "[dynamicState-collector] Capturing target PID %d to directory '%s'...\n", (int)cfg.pid, cfg.output_dir);
+    }
 
     collector_stats_t stats;
     int res = collector_run(&cfg, &stats);
     if (res != 0) {
-        fprintf(stderr, "[dynamicState-collector] Error: Failed to capture memory for PID %d.\n", (int)cfg.pid);
+        fprintf(stderr, "[dynamicState-collector] Error: Failed to capture memory for PID %d (status: %s).\n",
+                (int)cfg.pid, stats.status[0] ? stats.status : "FAILED");
+        if (cfg.json_output) {
+            fprintf(stdout, "{\"success\":false,\"error\":\"%s\",\"pid\":%d,\"status\":\"%s\"}\n",
+                    stats.status[0] ? stats.status : "FAILED", (int)cfg.pid, stats.status[0] ? stats.status : "FAILED");
+            fflush(stdout);
+        }
         return 1;
+    }
+
+    if (cfg.json_output) {
+        char meta_path[2048];
+        snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", cfg.output_dir);
+        FILE *mf = fopen(meta_path, "r");
+        if (mf) {
+            char fbuf[4096];
+            size_t n;
+            while ((n = fread(fbuf, 1, sizeof(fbuf), mf)) > 0) {
+                if (fwrite(fbuf, 1, n, stdout) != n) break;
+            }
+            fclose(mf);
+        } else {
+            fprintf(stdout, "{\"success\":true,\"pid\":%d,\"status\":\"%s\"}\n", (int)cfg.pid, stats.status);
+        }
+        fflush(stdout);
+        if (strcmp(stats.status, "FAILED") == 0 || strcmp(stats.status, "PROCESS_EXITED") == 0 || strcmp(stats.status, "PERMISSION_DENIED") == 0) {
+            return 1;
+        }
+        return 0;
     }
 
     printf("[dynamicState-collector] Capture finished: %s\n", stats.status);
@@ -142,5 +183,8 @@ int main(int argc, char *argv[]) {
     printf("  Architecture:     %s (%s)\n", stats.arch, stats.elf_class);
     printf("  Artifacts stored in: %s\n", cfg.output_dir);
 
+    if (strcmp(stats.status, "FAILED") == 0 || strcmp(stats.status, "PROCESS_EXITED") == 0 || strcmp(stats.status, "PERMISSION_DENIED") == 0) {
+        return 1;
+    }
     return 0;
 }

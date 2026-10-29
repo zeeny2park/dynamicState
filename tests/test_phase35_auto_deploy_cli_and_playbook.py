@@ -105,12 +105,15 @@ __attribute__((constructor)) static void _enable_sibling_cli_ptracer() {
         self.assertEqual(adapter_ready.collector_path, "/tmp/dynamicstate-collector")
 
         # Case B: Missing on target, matching arch -> deployed via base64 stream
+        from extractor.debug_image import inspect_elf
+        target_arch = (inspect_elf(self.stripped_bin).architecture or "x86_64").lower()
+
         def mock_deploy_runner(cmd_args, timeout):
             cmd = cmd_args[-1]
             if "echo READY || echo MISSING" in cmd:
                 return 0, "MISSING\n", ""
             if "uname -m" in cmd:
-                return 0, "x86_64\n", ""
+                return 0, f"{target_arch}\n", ""
             if "DEPLOY_OK" in cmd:
                 return 0, "DEPLOY_OK\n", ""
             return 0, "", ""

@@ -53,6 +53,8 @@ void collector_init_config(collector_config_t *cfg) {
     cfg->policy = POLICY_ALL_READABLE;
     cfg->backend = BACKEND_AUTO;
     cfg->verbose = 0;
+    cfg->timeout_ms = 0;                       /* 0 = unlimited */
+    cfg->json_output = 0;
 }
 
 int collector_get_exe_path(pid_t pid, char *buf, size_t buf_size) {
@@ -382,6 +384,15 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     parsed_region_t *regions = NULL;
     int region_count = 0;
     if (collector_parse_maps(cfg->pid, exe_path, &regions, &region_count) < 0) {
+        if (errno == EACCES || errno == EPERM) {
+            snprintf(stats.status, sizeof(stats.status), "PERMISSION_DENIED");
+        } else if (errno == ENOENT) {
+            stats.process_exited = 1;
+            snprintf(stats.status, sizeof(stats.status), "PROCESS_EXITED");
+        } else {
+            snprintf(stats.status, sizeof(stats.status), "FAILED");
+        }
+        if (stats_out) *stats_out = stats;
         return -1;
     }
     stats.regions_found = region_count;
@@ -438,6 +449,20 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         parsed_region_t *r = &regions[i];
         if (!r->is_selected) continue;
 
+        /* Enforce timeout if configured */
+        if (cfg->timeout_ms > 0) {
+            int64_t now_ns = get_time_ns();
+            int64_t elapsed_ms = (now_ns - stats.capture_start_ns) / 1000000LL;
+            if (elapsed_ms >= (int64_t)cfg->timeout_ms) {
+                stats.timed_out = 1;
+                if (cfg->verbose) {
+                    fprintf(stderr, "[debug] Timeout of %u ms reached during capture (elapsed: %lld ms)\n",
+                            cfg->timeout_ms, (long long)elapsed_ms);
+                }
+                break;
+            }
+        }
+
         size_t to_read = (size_t)r->size;
         if (cfg->max_region_bytes > 0 && to_read > cfg->max_region_bytes) {
             to_read = cfg->max_region_bytes;
@@ -458,8 +483,8 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         size_t nread = 0;
         int res = collector_read_region(cfg->pid, mem_fd, cfg->backend, r->start, to_read, buf, &nread);
         if (cfg->verbose && manifest_idx < 3) {
-            printf("[debug] region 0x%lx-0x%lx to_read=%zu res=%d nread=%zu errno=%d (%s)\n",
-                   (unsigned long)r->start, (unsigned long)r->end, to_read, res, nread, errno, strerror(errno));
+            printf("[debug] region 0x%llx-0x%llx to_read=%zu res=%d nread=%zu errno=%d (%s)\n",
+                   (unsigned long long)r->start, (unsigned long long)r->end, to_read, res, nread, errno, strerror(errno));
         }
 
         manifest_idx++;
@@ -511,16 +536,16 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
 
             fprintf(f_manifest, "%s    {\n", (manifest_idx > 1) ? ",\n" : "");
             fprintf(f_manifest, "      \"region_id\": \"R%06d\",\n", manifest_idx);
-            fprintf(f_manifest, "      \"start\": \"0x%lx\",\n", (unsigned long)r->start);
-            fprintf(f_manifest, "      \"end\": \"0x%lx\",\n", (unsigned long)r->end);
-            fprintf(f_manifest, "      \"start_addr\": %lu,\n", (unsigned long)r->start);
-            fprintf(f_manifest, "      \"end_addr\": %lu,\n", (unsigned long)r->end);
-            fprintf(f_manifest, "      \"size\": %lu,\n", (unsigned long)r->size);
+            fprintf(f_manifest, "      \"start\": \"0x%llx\",\n", (unsigned long long)r->start);
+            fprintf(f_manifest, "      \"end\": \"0x%llx\",\n", (unsigned long long)r->end);
+            fprintf(f_manifest, "      \"start_addr\": %llu,\n", (unsigned long long)r->start);
+            fprintf(f_manifest, "      \"end_addr\": %llu,\n", (unsigned long long)r->end);
+            fprintf(f_manifest, "      \"size\": %llu,\n", (unsigned long long)r->size);
             fprintf(f_manifest, "      \"permissions\": \"%s\",\n", r->perms);
             fprintf(f_manifest, "      \"category\": \"%s\",\n", r->category);
             fprintf(f_manifest, "      \"pathname\": \"%s\",\n", esc_path);
-            fprintf(f_manifest, "      \"requested\": %lu,\n", (unsigned long)to_read);
-            fprintf(f_manifest, "      \"captured\": %lu,\n", (unsigned long)nread);
+            fprintf(f_manifest, "      \"requested\": %llu,\n", (unsigned long long)to_read);
+            fprintf(f_manifest, "      \"captured\": %llu,\n", (unsigned long long)nread);
             fprintf(f_manifest, "      \"status\": \"%s\",\n", status_str);
             fprintf(f_manifest, "      \"filename\": \"%s\",\n", (nread > 0) ? rel_bin_file : "");
             fprintf(f_manifest, "      \"error\": %s\n", error_str);
@@ -536,7 +561,9 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     stats.capture_end_ns = get_time_ns();
     stats.duration_us = (double)(stats.capture_end_ns - stats.capture_start_ns) / 1000.0;
 
-    if (stats.failed_reads == stats.regions_requested && stats.regions_requested > 0) {
+    if (stats.timed_out) {
+        snprintf(stats.status, sizeof(stats.status), (stats.regions_captured > 0) ? "PARTIAL" : "TIMEOUT");
+    } else if (stats.failed_reads == stats.regions_requested && stats.regions_requested > 0) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
     } else if (stats.partial_reads > 0 || stats.failed_reads > 0) {
         snprintf(stats.status, sizeof(stats.status), "PARTIAL");
@@ -582,15 +609,15 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             escape_json_string(r->pathname, esc_path, sizeof(esc_path));
 
             fprintf(f_maps, "%s    {\n", (i > 0) ? ",\n" : "");
-            fprintf(f_maps, "      \"start\": \"0x%lx\",\n", (unsigned long)r->start);
-            fprintf(f_maps, "      \"end\": \"0x%lx\",\n", (unsigned long)r->end);
-            fprintf(f_maps, "      \"start_addr\": %lu,\n", (unsigned long)r->start);
-            fprintf(f_maps, "      \"end_addr\": %lu,\n", (unsigned long)r->end);
-            fprintf(f_maps, "      \"size\": %lu,\n", (unsigned long)r->size);
+            fprintf(f_maps, "      \"start\": \"0x%llx\",\n", (unsigned long long)r->start);
+            fprintf(f_maps, "      \"end\": \"0x%llx\",\n", (unsigned long long)r->end);
+            fprintf(f_maps, "      \"start_addr\": %llu,\n", (unsigned long long)r->start);
+            fprintf(f_maps, "      \"end_addr\": %llu,\n", (unsigned long long)r->end);
+            fprintf(f_maps, "      \"size\": %llu,\n", (unsigned long long)r->size);
             fprintf(f_maps, "      \"permissions\": \"%s\",\n", r->perms);
-            fprintf(f_maps, "      \"offset\": %lu,\n", (unsigned long)r->offset);
+            fprintf(f_maps, "      \"offset\": %llu,\n", (unsigned long long)r->offset);
             fprintf(f_maps, "      \"device\": \"%s\",\n", r->device);
-            fprintf(f_maps, "      \"inode\": %lu,\n", (unsigned long)r->inode);
+            fprintf(f_maps, "      \"inode\": %llu,\n", (unsigned long long)r->inode);
             fprintf(f_maps, "      \"pathname\": \"%s\",\n", esc_path);
             fprintf(f_maps, "      \"readable\": %s,\n", r->readable ? "true" : "false");
             fprintf(f_maps, "      \"writable\": %s,\n", r->writable ? "true" : "false");
@@ -624,6 +651,8 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         fprintf(f_meta, "  \"elf_class\": \"%s\",\n", stats.elf_class);
         fprintf(f_meta, "  \"page_size\": %ld,\n", stats.page_size);
         fprintf(f_meta, "  \"status\": \"%s\",\n", stats.status);
+        fprintf(f_meta, "  \"timed_out\": %s,\n", stats.timed_out ? "true" : "false");
+        fprintf(f_meta, "  \"timeout_ms\": %u,\n", cfg->timeout_ms);
         fprintf(f_meta, "  \"mapping_race_detected\": %s,\n", stats.mapping_race_detected ? "true" : "false");
         fprintf(f_meta, "  \"process_exited\": %s,\n", stats.process_exited ? "true" : "false");
         fprintf(f_meta, "  \"process_starttime\": %llu,\n", (unsigned long long)stats.process_starttime);

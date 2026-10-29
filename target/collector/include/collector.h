@@ -28,6 +28,8 @@ typedef struct {
     int policy;
     int backend;
     int verbose;
+    uint32_t timeout_ms;
+    int json_output;
 } collector_config_t;
 
 typedef struct {
@@ -54,10 +56,11 @@ typedef struct {
     size_t bytes_captured;
     int partial_reads;
     int failed_reads;
+    int timed_out;
     int64_t capture_start_ns;
     int64_t capture_end_ns;
     double duration_us;
-    char status[32];          /* "COMPLETE", "PARTIAL", "FAILED", "PROCESS_EXITED" */
+    char status[32];          /* "COMPLETE", "PARTIAL", "FAILED", "PROCESS_EXITED", "TIMEOUT", "PERMISSION_DENIED" */
     char backend_used[32];    /* "process_vm_readv", "pread" */
     char arch[65];
     char endianness[16];

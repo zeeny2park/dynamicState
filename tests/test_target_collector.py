@@ -131,6 +131,163 @@ int main() {
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("Error:", res.stderr)
 
+    def test_05_json_flag_stdout_contract(self):
+        """When --json is passed, stdout contains pure JSON metadata and diagnostics go to stderr."""
+        target_src = os.path.join(self.tmp_dir, "target_json.c")
+        target_bin = os.path.join(self.tmp_dir, "target_json_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) { pause(); }
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        out_snap_dir = os.path.join(self.tmp_dir, "snap_json")
+        try:
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}")
+            import json as _json
+            payload = _json.loads(res.stdout)
+            self.assertEqual(payload.get("pid"), proc.pid)
+            self.assertIn(payload.get("status"), ("COMPLETE", "PARTIAL"))
+            self.assertEqual(payload.get("capture_mode"), "LOW_IMPACT_NATIVE_COLLECTOR")
+            self.assertIn("duration_ms", payload)
+            # Verify stdout does not contain progress log strings
+            self.assertNotIn("[dynamicState-collector]", res.stdout)
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_06_timeout_ms_contract(self):
+        """When --timeout-ms is reached, capture breaks gracefully and records timeout in metadata."""
+        target_src = os.path.join(self.tmp_dir, "target_to.c")
+        target_bin = os.path.join(self.tmp_dir, "target_to_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) { pause(); }
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        out_snap_dir = os.path.join(self.tmp_dir, "snap_timeout")
+        try:
+            # Pass ultra-low timeout of 0 ms (or 1 ms) to ensure timeout enforcement path
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--timeout-ms", "1", "--json"],
+                capture_output=True,
+                text=True,
+            )
+            # Either it succeeded within 1ms or triggered TIMEOUT / PARTIAL
+            import json as _json
+            payload = _json.loads(res.stdout)
+            self.assertEqual(payload.get("timeout_ms"), 1)
+            self.assertIn("timed_out", payload)
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_07_permission_denied_or_restricted_pid(self):
+        """Inaccessible or invalid PID produces exit code 1 and error envelope."""
+        out_snap_dir = os.path.join(self.tmp_dir, "snap_perm")
+        # Try capturing PID 1 (system init, usually EPERM for unprivileged process_vm_readv) or non-existent
+        res = subprocess.run(
+            [self.collector_bin, "-p", "-99", "-o", out_snap_dir, "--json"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 1)
+
+    def test_08_cross_compilation_verification(self):
+        """Cross-compilation for x86_64 and arm32 produces valid ELF binaries with correct machine architecture."""
+        from extractor.debug_image import inspect_elf
+
+        # 1. Cross-compile x86_64
+        x86_bin = os.path.join(self.tmp_dir, "collector_x86_64")
+        res_x86 = subprocess.run(
+            ["x86_64-linux-gnu-gcc", "-O2", "-Wall", "-Wextra", "-std=c99", "-D_GNU_SOURCE",
+             "-I" + os.path.join(self.collector_dir, "include"),
+             os.path.join(self.collector_dir, "src", "collector.c"),
+             os.path.join(self.collector_dir, "src", "main.c"),
+             "-o", x86_bin],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_x86.returncode, 0, f"x86_64 compilation failed: {res_x86.stderr}")
+        self.assertTrue(os.path.isfile(x86_bin))
+        ident_x86 = inspect_elf(x86_bin)
+        self.assertEqual(ident_x86.architecture, "x86_64")
+
+        # 2. Cross-compile arm32
+        arm32_bin = os.path.join(self.tmp_dir, "collector_arm32")
+        res_arm = subprocess.run(
+            ["arm-linux-gnueabihf-gcc", "-O2", "-Wall", "-Wextra", "-std=c99", "-D_GNU_SOURCE",
+             "-I" + os.path.join(self.collector_dir, "include"),
+             os.path.join(self.collector_dir, "src", "collector.c"),
+             os.path.join(self.collector_dir, "src", "main.c"),
+             "-o", arm32_bin],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_arm.returncode, 0, f"arm32 compilation failed: {res_arm.stderr}")
+        self.assertTrue(os.path.isfile(arm32_bin))
+        ident_arm = inspect_elf(arm32_bin)
+        self.assertEqual(ident_arm.architecture, "arm")
+
+    def test_09_remote_execution_run_to_completion_contract(self):
+        """Collector runs on-demand and immediately exits with 0 or 1 without lingering background processes."""
+        target_src = os.path.join(self.tmp_dir, "target_run.c")
+        target_bin = os.path.join(self.tmp_dir, "target_run_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) { pause(); }
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        out_snap_dir = os.path.join(self.tmp_dir, "snap_run")
+        try:
+            t0 = time.time()
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--json"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,  # Strict timeout guard
+            )
+            elapsed = time.time() - t0
+            self.assertEqual(res.returncode, 0)
+            self.assertLess(elapsed, 3.0, "Collector execution took too long")
+            # Verify process exited cleanly
+            ps_check = subprocess.run(["pgrep", "-f", f"{self.collector_bin}.*{proc.pid}"], capture_output=True)
+            self.assertNotEqual(ps_check.returncode, 0, "Collector process is still running after completion")
+        finally:
+            proc.terminate()
+            proc.wait()
+
 
 if __name__ == "__main__":
     unittest.main()
