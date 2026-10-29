@@ -31,6 +31,13 @@ import ctypes
 from .debug_image import BinaryIdentity, inspect_elf
 from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
+from .verdict_engine import (
+    VerdictEngine, ZeroCdnReporter,
+    ASSERTION_PASS, ASSERTION_FAIL, ASSERTION_ABSTAIN,
+    DIAG_CONFIRMED, DIAG_SUSPECTED, DIAG_NO_ISSUE_DETECTED, DIAG_INCONCLUSIVE
+)
+from .evidence_adapter import EvidenceAdapter
+from .observation_budget import ObservationBudgetTracker, ObservationBudgetLimits
 
 
 ZERO_STOP_NON_ATOMIC_CONSISTENCY: Dict[str, Any] = {
@@ -11144,6 +11151,8 @@ class WatchSessionManager:
 
         assertion_results: List[Dict[str, Any]] = []
         passed_count = 0
+        failed_count = 0
+        abstain_count = 0
         slot_expressions_to_correlate: List[str] = []
 
         for p_item in parsed_list:
@@ -11157,14 +11166,21 @@ class WatchSessionManager:
 
             if st == "OBSERVED":
                 passed, expected_val = self._compare_assertion_values(obs_val, op, rhs_raw)
+                ast_verdict = ASSERTION_PASS if passed else ASSERTION_FAIL
             elif st == "NULL_POINTER" and op in ("IS_NULL", "=="):
                 passed, expected_val = self._compare_assertion_values(0, op, rhs_raw)
+                ast_verdict = ASSERTION_PASS if passed else ASSERTION_FAIL
             else:
                 passed = False
                 expected_val = rhs_raw
+                ast_verdict = ASSERTION_ABSTAIN
 
             if passed:
                 passed_count += 1
+            elif ast_verdict == ASSERTION_FAIL:
+                failed_count += 1
+            else:
+                abstain_count += 1
 
             # Check if expression references an indexed slot like `gpMem->buffers[5].seq`
             m_slot = re.match(r"^(.+?\[\s*\d+\s*\])", res_expr)
@@ -11184,6 +11200,7 @@ class WatchSessionManager:
                 "evaluation_status": st,
                 "runtime_address": ev.get("runtime_address"),
                 "passed": passed,
+                "verdict": ast_verdict,
                 "self_repair": ev.get("self_repair"),
             })
 
@@ -11210,6 +11227,8 @@ class WatchSessionManager:
             verdict = "CONFIRMED"
         elif passed_count > 0:
             verdict = "PARTIALLY_CONFIRMED"
+        elif abstain_count > 0 and failed_count == 0:
+            verdict = "INCONCLUSIVE"
         else:
             verdict = "REFUTED"
 
@@ -11224,7 +11243,8 @@ class WatchSessionManager:
             "confidence_score": round(pass_ratio, 3),
             "total_assertions": total_cnt,
             "passed_assertions": passed_count,
-            "failed_assertions": total_cnt - passed_count,
+            "failed_assertions": failed_count,
+            "abstain_assertions": abstain_count,
             "assertion_results": assertion_results,
             "correlated_slot_owners": correlated_slot_owners,
             "llm_next_step_hint": (
@@ -11381,6 +11401,32 @@ class WatchSessionManager:
                     save_error = f"Failed to write report to {abs_out}: {os_err}" 
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
+
+        # Generate zero-CDN HTML & normalized JSON deliverables
+        diag_evals = []
+        if hyp_res and hyp_res.get("assertion_results"):
+            for a_item in hyp_res.get("assertion_results", []):
+                diag_evals.append(VerdictEngine.evaluate_assertion(
+                    raw_assertion=a_item.get("assertion", ""),
+                    lhs=a_item.get("lhs_expression", ""),
+                    op=a_item.get("operator", "=="),
+                    rhs_raw=str(a_item.get("expected")) if a_item.get("expected") is not None else None,
+                    observed_value=a_item.get("observed_value"),
+                    obs_status=a_item.get("evaluation_status", "OBSERVED"),
+                    res_expr=a_item.get("resolved_expression", ""),
+                ))
+
+        hyp_text = hypothesis or title
+        synth_verdict = VerdictEngine.synthesize_verdict(
+            hypothesis=hyp_text,
+            evaluations=diag_evals,
+            target_identity={"pid": eff_pid, "companion_elf": eff_elf},
+            causal_attribution_verified=False,
+            budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": latency_us}},
+        )
+        report_html = ZeroCdnReporter.render_html(synth_verdict, title=title, remediation_checklist=remediation_checklist)
+        report_json = ZeroCdnReporter.render_json(synth_verdict)
+
         return {
             "pid": eff_pid,
             "companion_elf": eff_elf,
@@ -11395,6 +11441,8 @@ class WatchSessionManager:
             "hypothesis_verification": hyp_res,
             "remediation_checklist": remediation_checklist,
             "report_markdown": report_markdown,
+            "report_html": report_html,
+            "report_json": report_json,
             "saved_path": saved_path,
             "save_error": save_error,
             "llm_next_step_hint": (

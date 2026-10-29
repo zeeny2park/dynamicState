@@ -10,6 +10,10 @@ __pycache__/
 sample
 examples/sample_multithread
 examples/sample_multithread_nondet
+examples/deadlock_demo
+examples/pool_demo
+examples/sample_low_impact
+examples/sample_prod
 target/collector/dynamicstate-collector
 
 # Temporary build / debug artifacts

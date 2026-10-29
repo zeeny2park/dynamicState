@@ -59,6 +59,14 @@ from .evidence_ledger import (
     CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
     ALL_TRUST_CLAIMS,
 )
+from .verdict_engine import (
+    VerdictEngine,
+    ZeroCdnReporter,
+    AssertionEvaluation,
+    ASSERTION_PASS,
+    ASSERTION_FAIL,
+    ASSERTION_ABSTAIN,
+)
 from .hypothesis import (
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
@@ -2912,6 +2920,50 @@ class InvestigationManager:
             "evidence_ledger": session.ledger.to_dict(),
             "timeline": list(session.timeline),
             "timeline_count": len(session.timeline),
+            "report_html": ZeroCdnReporter.render_html(
+                VerdictEngine.synthesize_verdict(
+                    hypothesis=session.goal,
+                    evaluations=[
+                        AssertionEvaluation(
+                            raw_assertion=h.title,
+                            lhs_expression=h.title,
+                            resolved_expression=h.title,
+                            operator="VALIDATED",
+                            expected="TRUE",
+                            observed_value=h.validation_status,
+                            observation_status="OBSERVED",
+                            verdict=ASSERTION_PASS if h.validation_status == HYPOTHESIS_STATUS_VALIDATED else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN),
+                            reason=h.claim,
+                        )
+                        for h in session.hypotheses
+                    ],
+                    target_identity=session.stages.get("target_identity", {}).get("details", {}),
+                    causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
+                ),
+                title=f"dynamicState Investigation: {session.goal[:40]}",
+                remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
+            ),
+            "report_json": ZeroCdnReporter.render_json(
+                VerdictEngine.synthesize_verdict(
+                    hypothesis=session.goal,
+                    evaluations=[
+                        AssertionEvaluation(
+                            raw_assertion=h.title,
+                            lhs_expression=h.title,
+                            resolved_expression=h.title,
+                            operator="VALIDATED",
+                            expected="TRUE",
+                            observed_value=h.validation_status,
+                            observation_status="OBSERVED",
+                            verdict=ASSERTION_PASS if h.validation_status == HYPOTHESIS_STATUS_VALIDATED else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN),
+                            reason=h.claim,
+                        )
+                        for h in session.hypotheses
+                    ],
+                    target_identity=session.stages.get("target_identity", {}).get("details", {}),
+                    causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
+                )
+            ),
         }
 
     def get_investigation_timeline(self, investigation_id: str) -> Dict[str, Any]:
