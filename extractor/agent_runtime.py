@@ -1074,10 +1074,22 @@ class AgentRuntime:
             self.memory_snapshots[sid] = raw_snap
             elapsed = round((time.monotonic() - t0) * 1000, 3)
 
+            if raw_snap.status in ("FAILED", "PROCESS_EXITED", "TIMEOUT"):
+                return self._error(
+                    raw_snap.status,
+                    f"Memory capture {raw_snap.status.lower()}: status is {raw_snap.status}",
+                    "MEMORY_SNAPSHOT",
+                    t0,
+                )
+
+            data = raw_snap.to_metadata()
+            if raw_snap.status == "PARTIAL":
+                data["quality_warning"] = "PARTIAL_CAPTURE: Some memory regions could not be captured or capture timed out"
+
             return AgentActionResult(
                 success=True,
                 action="MEMORY_SNAPSHOT",
-                data=raw_snap.to_metadata(),
+                data=data,
                 performance={"total_ms": elapsed, "capture_duration_us": raw_snap.duration_us}
             )
         except ProcessLookupError as exc:

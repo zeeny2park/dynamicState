@@ -408,11 +408,27 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     } else {
         snprintf(out_dir, sizeof(out_dir), "raw_snapshot_%d", (int)cfg->pid);
     }
-    mkdir(out_dir, 0755);
+    if (mkdir(out_dir, 0755) != 0 && errno != EEXIST) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] Failed to create output directory '%s': %s\n", out_dir, strerror(errno));
+        }
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
+    }
 
     char mem_dir[2048];
     snprintf(mem_dir, sizeof(mem_dir), "%s/memory", out_dir);
-    mkdir(mem_dir, 0755);
+    if (mkdir(mem_dir, 0755) != 0 && errno != EEXIST) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] Failed to create memory directory '%s': %s\n", mem_dir, strerror(errno));
+        }
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
+    }
 
     copy_maps_file(cfg->pid, out_dir);
 
@@ -421,7 +437,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", (int)cfg->pid);
     int mem_fd = open(mem_path, O_RDONLY);
     if (cfg->verbose) {
-        printf("[debug] open(%s) = %d (errno=%d: %s)\n", mem_path, mem_fd, errno, strerror(errno));
+        fprintf(stderr, "[debug] open(%s) = %d (errno=%d: %s)\n", mem_path, mem_fd, errno, strerror(errno));
     }
 
     stats.capture_start_ns = get_time_ns();
@@ -429,7 +445,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
              (cfg->backend == BACKEND_PROC_MEM) ? "pread" : "process_vm_readv");
 
     /* Allocate buffer for reading */
-    size_t chunk_buf_size = 4 * 1024 * 1024; /* 4 MB buffer */
+    size_t chunk_buf_size = 4 * 1024 * 1024; /* 4 MB initial buffer */
     void *buf = malloc(chunk_buf_size);
     if (!buf) {
         if (mem_fd >= 0) close(mem_fd);
@@ -440,9 +456,15 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     char manifest_path[2048];
     snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", out_dir);
     FILE *f_manifest = fopen(manifest_path, "w");
-    if (f_manifest) {
-        fprintf(f_manifest, "[\n");
+    if (!f_manifest) {
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (mem_fd >= 0) close(mem_fd);
+        free(buf);
+        free(regions);
+        if (stats_out) *stats_out = stats;
+        return -1;
     }
+    fprintf(f_manifest, "[\n");
 
     int manifest_idx = 0;
     for (int i = 0; i < region_count; i++) {
@@ -480,11 +502,46 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             }
         }
 
-        size_t nread = 0;
-        int res = collector_read_region(cfg->pid, mem_fd, cfg->backend, r->start, to_read, buf, &nread);
+        /* Read region in 1MB chunks to ensure timeout enforcement during large region reads */
+        const size_t step_limit = 1024 * 1024; /* 1 MB */
+        size_t total_nread = 0;
+        int read_error = 0;
+
+        while (total_nread < to_read) {
+            if (cfg->timeout_ms > 0) {
+                int64_t now_ns = get_time_ns();
+                int64_t elapsed_ms = (now_ns - stats.capture_start_ns) / 1000000LL;
+                if (elapsed_ms >= (int64_t)cfg->timeout_ms) {
+                    stats.timed_out = 1;
+                    if (cfg->verbose) {
+                        fprintf(stderr, "[debug] Timeout of %u ms reached during chunk read (elapsed: %lld ms)\n",
+                                cfg->timeout_ms, (long long)elapsed_ms);
+                    }
+                    break;
+                }
+            }
+
+            size_t step = to_read - total_nread;
+            if (step > step_limit) {
+                step = step_limit;
+            }
+
+            size_t chunk_nread = 0;
+            int step_res = collector_read_region(cfg->pid, mem_fd, cfg->backend, r->start + total_nread, step, (char *)buf + total_nread, &chunk_nread);
+            if (step_res < 0 || chunk_nread == 0) {
+                read_error = 1;
+                break;
+            }
+            total_nread += chunk_nread;
+            if (chunk_nread < step) {
+                /* Partial read inside chunk */
+                break;
+            }
+        }
+
         if (cfg->verbose && manifest_idx < 3) {
-            printf("[debug] region 0x%llx-0x%llx to_read=%zu res=%d nread=%zu errno=%d (%s)\n",
-                   (unsigned long long)r->start, (unsigned long long)r->end, to_read, res, nread, errno, strerror(errno));
+            fprintf(stderr, "[debug] region 0x%llx-0x%llx to_read=%zu total_nread=%zu read_error=%d errno=%d (%s)\n",
+                   (unsigned long long)r->start, (unsigned long long)r->end, to_read, total_nread, read_error, errno, strerror(errno));
         }
 
         manifest_idx++;
@@ -495,28 +552,28 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         const char *error_str = "null";
         char err_buf[64] = {0};
 
-        if (res < 0 || nread == 0) {
+        if (total_nread == 0) {
             stats.failed_reads++;
             status_str = "FAILED";
             snprintf(err_buf, sizeof(err_buf), "\"EFAULT_OR_READ_ERROR\"");
             error_str = err_buf;
-        } else if (nread < to_read) {
+        } else if (total_nread < to_read) {
             stats.partial_reads++;
-            stats.bytes_captured += nread;
+            stats.bytes_captured += total_nread;
             stats.regions_captured++;
             status_str = "PARTIAL";
-            snprintf(err_buf, sizeof(err_buf), "\"PARTIAL_READ_%zu_OF_%zu\"", nread, to_read);
+            snprintf(err_buf, sizeof(err_buf), "\"PARTIAL_READ_%zu_OF_%zu\"", total_nread, to_read);
             error_str = err_buf;
 
             char full_bin_path[2048];
             snprintf(full_bin_path, sizeof(full_bin_path), "%s/%s", out_dir, rel_bin_file);
             FILE *f_bin = fopen(full_bin_path, "wb");
             if (f_bin) {
-                fwrite(buf, 1, nread, f_bin);
+                fwrite(buf, 1, total_nread, f_bin);
                 fclose(f_bin);
             }
         } else {
-            stats.bytes_captured += nread;
+            stats.bytes_captured += total_nread;
             stats.regions_captured++;
             status_str = "COMPLETE";
             error_str = "null";
@@ -525,7 +582,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             snprintf(full_bin_path, sizeof(full_bin_path), "%s/%s", out_dir, rel_bin_file);
             FILE *f_bin = fopen(full_bin_path, "wb");
             if (f_bin) {
-                fwrite(buf, 1, nread, f_bin);
+                fwrite(buf, 1, total_nread, f_bin);
                 fclose(f_bin);
             }
         }
@@ -545,11 +602,15 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             fprintf(f_manifest, "      \"category\": \"%s\",\n", r->category);
             fprintf(f_manifest, "      \"pathname\": \"%s\",\n", esc_path);
             fprintf(f_manifest, "      \"requested\": %llu,\n", (unsigned long long)to_read);
-            fprintf(f_manifest, "      \"captured\": %llu,\n", (unsigned long long)nread);
+            fprintf(f_manifest, "      \"captured\": %llu,\n", (unsigned long long)total_nread);
             fprintf(f_manifest, "      \"status\": \"%s\",\n", status_str);
-            fprintf(f_manifest, "      \"filename\": \"%s\",\n", (nread > 0) ? rel_bin_file : "");
+            fprintf(f_manifest, "      \"filename\": \"%s\",\n", (total_nread > 0) ? rel_bin_file : "");
             fprintf(f_manifest, "      \"error\": %s\n", error_str);
             fprintf(f_manifest, "    }");
+        }
+
+        if (stats.timed_out) {
+            break;
         }
     }
 
@@ -634,52 +695,61 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     char meta_json_path[2048];
     snprintf(meta_json_path, sizeof(meta_json_path), "%s/metadata.json", out_dir);
     FILE *f_meta = fopen(meta_json_path, "w");
-    if (f_meta) {
-        char esc_bin[1024] = {0};
-        escape_json_string(exe_path, esc_bin, sizeof(esc_bin));
-        const char *snap_id = cfg->snapshot_id[0] ? cfg->snapshot_id : "RAW_CAPTURE";
-
-        fprintf(f_meta, "{\n");
-        fprintf(f_meta, "  \"snapshot_id\": \"%s\",\n", snap_id);
-        fprintf(f_meta, "  \"pid\": %d,\n", (int)cfg->pid);
-        fprintf(f_meta, "  \"binary\": \"%s\",\n", esc_bin);
-        fprintf(f_meta, "  \"timestamp_ns\": %lld,\n", (long long)stats.capture_start_ns);
-        fprintf(f_meta, "  \"capture_mode\": \"LOW_IMPACT_NATIVE_COLLECTOR\",\n");
-        fprintf(f_meta, "  \"backend\": \"%s\",\n", stats.backend_used);
-        fprintf(f_meta, "  \"architecture\": \"%s\",\n", stats.arch);
-        fprintf(f_meta, "  \"endianness\": \"%s\",\n", stats.endianness);
-        fprintf(f_meta, "  \"elf_class\": \"%s\",\n", stats.elf_class);
-        fprintf(f_meta, "  \"page_size\": %ld,\n", stats.page_size);
-        fprintf(f_meta, "  \"status\": \"%s\",\n", stats.status);
-        fprintf(f_meta, "  \"timed_out\": %s,\n", stats.timed_out ? "true" : "false");
-        fprintf(f_meta, "  \"timeout_ms\": %u,\n", cfg->timeout_ms);
-        fprintf(f_meta, "  \"mapping_race_detected\": %s,\n", stats.mapping_race_detected ? "true" : "false");
-        fprintf(f_meta, "  \"process_exited\": %s,\n", stats.process_exited ? "true" : "false");
-        fprintf(f_meta, "  \"process_starttime\": %llu,\n", (unsigned long long)stats.process_starttime);
-        fprintf(f_meta, "  \"capture\": {\n");
-        fprintf(f_meta, "    \"backend\": \"%s\",\n", stats.backend_used);
-        fprintf(f_meta, "    \"process_stop\": false,\n");
-        fprintf(f_meta, "    \"ptrace\": false,\n");
-        fprintf(f_meta, "    \"sigstop\": false,\n");
-        fprintf(f_meta, "    \"sigcont\": false\n");
-        fprintf(f_meta, "  },\n");
-        fprintf(f_meta, "  \"regions\": %d,\n", stats.regions_captured);
-        fprintf(f_meta, "  \"regions_requested\": %d,\n", stats.regions_requested);
-        fprintf(f_meta, "  \"bytes_requested\": %zu,\n", stats.bytes_requested);
-        fprintf(f_meta, "  \"bytes_captured\": %zu,\n", stats.bytes_captured);
-        fprintf(f_meta, "  \"partial_reads\": %d,\n", stats.partial_reads);
-        fprintf(f_meta, "  \"failed_reads\": %d,\n", stats.failed_reads);
-        fprintf(f_meta, "  \"duration_us\": %.2f,\n", stats.duration_us);
-        fprintf(f_meta, "  \"duration_ms\": %.3f,\n", stats.duration_us / 1000.0);
-        fprintf(f_meta, "  \"capture_start_ns\": %lld,\n", (long long)stats.capture_start_ns);
-        fprintf(f_meta, "  \"capture_end_ns\": %lld,\n", (long long)stats.capture_end_ns);
-        fprintf(f_meta, "  \"consistency\": {\n");
-        fprintf(f_meta, "    \"level\": \"NON_ATOMIC\"\n");
-        fprintf(f_meta, "  },\n");
-        fprintf(f_meta, "  \"modules\": []\n");
-        fprintf(f_meta, "}\n");
-        fclose(f_meta);
+    if (!f_meta) {
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (mem_fd >= 0) close(mem_fd);
+        free(buf);
+        free(regions);
+        if (stats_out) *stats_out = stats;
+        return -1;
     }
+
+    char esc_bin[1024] = {0};
+    escape_json_string(exe_path, esc_bin, sizeof(esc_bin));
+    const char *snap_id = cfg->snapshot_id[0] ? cfg->snapshot_id : "RAW_CAPTURE";
+    int is_success = (strcmp(stats.status, "COMPLETE") == 0 || strcmp(stats.status, "PARTIAL") == 0);
+
+    fprintf(f_meta, "{\n");
+    fprintf(f_meta, "  \"success\": %s,\n", is_success ? "true" : "false");
+    fprintf(f_meta, "  \"snapshot_id\": \"%s\",\n", snap_id);
+    fprintf(f_meta, "  \"pid\": %d,\n", (int)cfg->pid);
+    fprintf(f_meta, "  \"binary\": \"%s\",\n", esc_bin);
+    fprintf(f_meta, "  \"timestamp_ns\": %lld,\n", (long long)stats.capture_start_ns);
+    fprintf(f_meta, "  \"capture_mode\": \"LOW_IMPACT_NATIVE_COLLECTOR\",\n");
+    fprintf(f_meta, "  \"backend\": \"%s\",\n", stats.backend_used);
+    fprintf(f_meta, "  \"architecture\": \"%s\",\n", stats.arch);
+    fprintf(f_meta, "  \"endianness\": \"%s\",\n", stats.endianness);
+    fprintf(f_meta, "  \"elf_class\": \"%s\",\n", stats.elf_class);
+    fprintf(f_meta, "  \"page_size\": %ld,\n", stats.page_size);
+    fprintf(f_meta, "  \"status\": \"%s\",\n", stats.status);
+    fprintf(f_meta, "  \"timed_out\": %s,\n", stats.timed_out ? "true" : "false");
+    fprintf(f_meta, "  \"timeout_ms\": %u,\n", cfg->timeout_ms);
+    fprintf(f_meta, "  \"mapping_race_detected\": %s,\n", stats.mapping_race_detected ? "true" : "false");
+    fprintf(f_meta, "  \"process_exited\": %s,\n", stats.process_exited ? "true" : "false");
+    fprintf(f_meta, "  \"process_starttime\": %llu,\n", (unsigned long long)stats.process_starttime);
+    fprintf(f_meta, "  \"capture\": {\n");
+    fprintf(f_meta, "    \"backend\": \"%s\",\n", stats.backend_used);
+    fprintf(f_meta, "    \"process_stop\": false,\n");
+    fprintf(f_meta, "    \"ptrace\": false,\n");
+    fprintf(f_meta, "    \"sigstop\": false,\n");
+    fprintf(f_meta, "    \"sigcont\": false\n");
+    fprintf(f_meta, "  },\n");
+    fprintf(f_meta, "  \"regions\": %d,\n", stats.regions_captured);
+    fprintf(f_meta, "  \"regions_requested\": %d,\n", stats.regions_requested);
+    fprintf(f_meta, "  \"bytes_requested\": %zu,\n", stats.bytes_requested);
+    fprintf(f_meta, "  \"bytes_captured\": %zu,\n", stats.bytes_captured);
+    fprintf(f_meta, "  \"partial_reads\": %d,\n", stats.partial_reads);
+    fprintf(f_meta, "  \"failed_reads\": %d,\n", stats.failed_reads);
+    fprintf(f_meta, "  \"duration_us\": %.2f,\n", stats.duration_us);
+    fprintf(f_meta, "  \"duration_ms\": %.3f,\n", stats.duration_us / 1000.0);
+    fprintf(f_meta, "  \"capture_start_ns\": %lld,\n", (long long)stats.capture_start_ns);
+    fprintf(f_meta, "  \"capture_end_ns\": %lld,\n", (long long)stats.capture_end_ns);
+    fprintf(f_meta, "  \"consistency\": {\n");
+    fprintf(f_meta, "    \"level\": \"NON_ATOMIC\"\n");
+    fprintf(f_meta, "  },\n");
+    fprintf(f_meta, "  \"modules\": []\n");
+    fprintf(f_meta, "}\n");
+    fclose(f_meta);
 
     if (mem_fd >= 0) close(mem_fd);
     free(buf);
@@ -701,7 +771,11 @@ int collector_read_slices(pid_t pid, int backend, const char *slices_spec, void 
 
     uint64_t st_before = 0;
     if (collector_get_process_starttime(pid, &st_before) < 0) {
-        fprintf(out, "{\"success\":false,\"error\":\"TARGET_TERMINATED\",\"pid\":%d}\n", (int)pid);
+        if (errno == EPERM || errno == EACCES) {
+            fprintf(out, "{\"success\":false,\"error\":\"PERMISSION_DENIED\",\"pid\":%d}\n", (int)pid);
+        } else {
+            fprintf(out, "{\"success\":false,\"error\":\"TARGET_TERMINATED\",\"pid\":%d}\n", (int)pid);
+        }
         fflush(out);
         return -1;
     }

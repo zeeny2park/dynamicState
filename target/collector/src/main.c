@@ -5,6 +5,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <errno.h>
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -47,23 +48,28 @@ int main(int argc, char *argv[]) {
         {0, 0, 0, 0}
     };
 
+    const char *pid_str = NULL;
+    const char *timeout_str = NULL;
+    const char *max_mb_str = NULL;
+    const char *max_region_str = NULL;
     const char *read_slices_spec = NULL;
     int daemon_mode = 0;
     int opt;
     int option_index = 0;
+
     while ((opt = getopt_long(argc, argv, "p:o:m:r:P:B:s:dt:jvh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
-                cfg.pid = (pid_t)atoi(optarg);
+                pid_str = optarg;
                 break;
             case 'o':
                 strncpy(cfg.output_dir, optarg, sizeof(cfg.output_dir) - 1);
                 break;
             case 'm':
-                cfg.max_total_bytes = (size_t)atoi(optarg) * 1024 * 1024;
+                max_mb_str = optarg;
                 break;
             case 'r':
-                cfg.max_region_bytes = (size_t)atoi(optarg) * 1024 * 1024;
+                max_region_str = optarg;
                 break;
             case 'P':
                 if (strcmp(optarg, "heap_stack") == 0) {
@@ -90,7 +96,7 @@ int main(int argc, char *argv[]) {
                 daemon_mode = 1;
                 break;
             case 't':
-                cfg.timeout_ms = (uint32_t)atoi(optarg);
+                timeout_str = optarg;
                 break;
             case 'j':
                 cfg.json_output = 1;
@@ -112,22 +118,84 @@ int main(int argc, char *argv[]) {
     }
 
     /* Positional PID argument if not supplied via -p */
-    if (cfg.pid <= 0 && optind < argc) {
-        cfg.pid = (pid_t)atoi(argv[optind]);
+    if (!pid_str && optind < argc) {
+        pid_str = argv[optind];
+    }
+
+    /* Validate timeout argument */
+    if (timeout_str != NULL) {
+        char *endptr = NULL;
+        errno = 0;
+        long long t_val = strtoll(timeout_str, &endptr, 10);
+        if (errno != 0 || endptr == timeout_str || *endptr != '\0' || t_val < 0 || t_val > 3600000LL) {
+            fprintf(stderr, "Error: Invalid timeout-ms '%s' (must be integer between 0 and 3600000 ms).\n", timeout_str);
+            if (cfg.json_output) {
+                fprintf(stdout, "{\"success\":false,\"error\":\"INVALID_TIMEOUT\",\"pid\":0,\"status\":\"FAILED\"}\n");
+                fflush(stdout);
+            }
+            return 1;
+        }
+        cfg.timeout_ms = (uint32_t)t_val;
+    }
+
+    /* Validate max_mb argument */
+    if (max_mb_str != NULL) {
+        char *endptr = NULL;
+        errno = 0;
+        long long mb_val = strtoll(max_mb_str, &endptr, 10);
+        if (errno != 0 || endptr == max_mb_str || *endptr != '\0' || mb_val <= 0 || mb_val > 16384LL) {
+            fprintf(stderr, "Error: Invalid max-mb '%s'.\n", max_mb_str);
+            if (cfg.json_output) {
+                fprintf(stdout, "{\"success\":false,\"error\":\"INVALID_ARGUMENTS\",\"pid\":0,\"status\":\"FAILED\"}\n");
+                fflush(stdout);
+            }
+            return 1;
+        }
+        cfg.max_total_bytes = (size_t)mb_val * 1024 * 1024;
+    }
+
+    /* Validate max_region argument */
+    if (max_region_str != NULL) {
+        char *endptr = NULL;
+        errno = 0;
+        long long reg_val = strtoll(max_region_str, &endptr, 10);
+        if (errno != 0 || endptr == max_region_str || *endptr != '\0' || reg_val <= 0 || reg_val > 4096LL) {
+            fprintf(stderr, "Error: Invalid max-region '%s'.\n", max_region_str);
+            if (cfg.json_output) {
+                fprintf(stdout, "{\"success\":false,\"error\":\"INVALID_ARGUMENTS\",\"pid\":0,\"status\":\"FAILED\"}\n");
+                fflush(stdout);
+            }
+            return 1;
+        }
+        cfg.max_region_bytes = (size_t)reg_val * 1024 * 1024;
+    }
+
+    /* Validate PID */
+    if (pid_str != NULL) {
+        char *endptr = NULL;
+        errno = 0;
+        long long p_val = strtoll(pid_str, &endptr, 10);
+        if (errno != 0 || endptr == pid_str || *endptr != '\0' || p_val <= 0 || p_val > 4194304LL) {
+            fprintf(stderr, "Error: Invalid PID '%s' (must be integer > 0).\n", pid_str);
+            if (cfg.json_output) {
+                fprintf(stdout, "{\"success\":false,\"error\":\"INVALID_PID\",\"pid\":0,\"status\":\"FAILED\"}\n");
+                fflush(stdout);
+            }
+            return 1;
+        }
+        cfg.pid = (pid_t)p_val;
+    } else {
+        fprintf(stderr, "Error: Valid PID required.\n");
+        print_usage(argv[0]);
+        if (cfg.json_output) {
+            fprintf(stdout, "{\"success\":false,\"error\":\"MISSING_PID\",\"pid\":0,\"status\":\"FAILED\"}\n");
+            fflush(stdout);
+        }
+        return 1;
     }
 
     if (read_slices_spec != NULL) {
-        if (cfg.pid <= 0) {
-            fprintf(stderr, "Error: Valid PID required for --read-slices.\n");
-            return 1;
-        }
         return (collector_read_slices(cfg.pid, cfg.backend, read_slices_spec, stdout) == 0) ? 0 : 1;
-    }
-
-    if (cfg.pid <= 0) {
-        fprintf(stderr, "Error: Valid PID required.\n");
-        print_usage(argv[0]);
-        return 1;
     }
 
     if (cfg.output_dir[0] == '\0') {
@@ -166,10 +234,16 @@ int main(int argc, char *argv[]) {
             }
             fclose(mf);
         } else {
-            fprintf(stdout, "{\"success\":true,\"pid\":%d,\"status\":\"%s\"}\n", (int)cfg.pid, stats.status);
+            fprintf(stdout, "{\"success\":false,\"error\":\"METADATA_READ_FAILED\",\"pid\":%d,\"status\":\"%s\"}\n",
+                    (int)cfg.pid, stats.status);
+            fflush(stdout);
+            return 1;
         }
         fflush(stdout);
-        if (strcmp(stats.status, "FAILED") == 0 || strcmp(stats.status, "PROCESS_EXITED") == 0 || strcmp(stats.status, "PERMISSION_DENIED") == 0) {
+        if (strcmp(stats.status, "FAILED") == 0 ||
+            strcmp(stats.status, "PROCESS_EXITED") == 0 ||
+            strcmp(stats.status, "PERMISSION_DENIED") == 0 ||
+            strcmp(stats.status, "TIMEOUT") == 0) {
             return 1;
         }
         return 0;
@@ -183,7 +257,10 @@ int main(int argc, char *argv[]) {
     printf("  Architecture:     %s (%s)\n", stats.arch, stats.elf_class);
     printf("  Artifacts stored in: %s\n", cfg.output_dir);
 
-    if (strcmp(stats.status, "FAILED") == 0 || strcmp(stats.status, "PROCESS_EXITED") == 0 || strcmp(stats.status, "PERMISSION_DENIED") == 0) {
+    if (strcmp(stats.status, "FAILED") == 0 ||
+        strcmp(stats.status, "PROCESS_EXITED") == 0 ||
+        strcmp(stats.status, "PERMISSION_DENIED") == 0 ||
+        strcmp(stats.status, "TIMEOUT") == 0) {
         return 1;
     }
     return 0;

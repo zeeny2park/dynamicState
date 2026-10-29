@@ -869,13 +869,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         spec = ",".join(f"0x{int(addr):x}:{max(0, int(sz))}" for addr, sz in slices)
         cmd = f"{shlex.quote(self.collector_path)} -p {int(pid)} --read-slices {shlex.quote(spec)} 2>/dev/null"
         rc, stdout, _ = self.run_ssh(cmd)
-        if rc != 0 or not stdout.strip():
+        if not stdout.strip():
             return None
         try:
             payload = _json.loads(stdout.strip().splitlines()[-1])
             if not payload.get("success") or "slices" not in payload:
-                if payload.get("error") == "TARGET_TERMINATED":
+                err_code = payload.get("error")
+                if err_code == "TARGET_TERMINATED":
                     return [(None, "TARGET_TERMINATED", "Remote process terminated") for _ in slices]
+                if err_code == "PERMISSION_DENIED":
+                    return [(None, "PERMISSION_DENIED", "Permission denied accessing remote process memory") for _ in slices]
                 return None
             out_list: List[Tuple[Optional[bytes], str, Optional[str]]] = []
             raw_slices = payload.get("slices", [])
@@ -1187,3 +1190,40 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "collector_path": None,
             "reason": f"Failed deploying collector to {dest}: {err_up.strip() or out_up.strip()}",
         }
+
+    def capture_snapshot_via_collector(
+        self,
+        pid: int,
+        remote_output_dir: str,
+        timeout_ms: int = 2000,
+        policy: str = "all",
+        max_mb: int = 64,
+        max_region_mb: int = 32,
+    ) -> Dict[str, Any]:
+        """Runs dynamicstate-collector --json on remote target to capture memory snapshot bundle."""
+        if not self.collector_path:
+            return {"success": False, "status": "FAILED", "error": "Collector binary not configured on remote adapter"}
+        cmd = (
+            f"{shlex.quote(self.collector_path)} -p {int(pid)} -o {shlex.quote(remote_output_dir)} "
+            f"-t {int(timeout_ms)} --policy {shlex.quote(policy)} -m {int(max_mb)} -r {int(max_region_mb)} --json"
+        )
+        rc, stdout, stderr = self.run_ssh(cmd, timeout=(timeout_ms / 1000.0) + self.timeout_sec)
+        if not stdout.strip():
+            return {
+                "success": False,
+                "status": "SSH_FAILURE" if rc != 0 else "FAILED",
+                "error": stderr.strip() or f"Collector exited with rc {rc} but produced empty stdout",
+            }
+        import json as _json
+        try:
+            payload = _json.loads(stdout.strip().splitlines()[-1])
+            if payload.get("status") == "PARTIAL":
+                payload["quality_warning"] = "PARTIAL_CAPTURE: Some regions failed or timed out during capture"
+            return payload
+        except Exception as e:
+            return {
+                "success": False,
+                "status": "FAILED",
+                "error": f"Failed to parse collector JSON output: {e}",
+                "raw_stdout": stdout,
+            }

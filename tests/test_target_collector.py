@@ -288,6 +288,153 @@ int main() {
             proc.terminate()
             proc.wait()
 
+    def test_10_json_verbose_stdout_purity(self):
+        """When --json and --verbose are passed together, stdout contains ONLY valid JSON and all debug messages go to stderr."""
+        target_src = os.path.join(self.tmp_dir, "target_verb.c")
+        target_bin = os.path.join(self.tmp_dir, "target_verb_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) { pause(); }
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        out_snap_dir = os.path.join(self.tmp_dir, "snap_verb")
+        try:
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--json", "--verbose"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, f"Verbose execution failed: {res.stderr}")
+            # stdout must parse as valid JSON
+            import json as _json
+            payload = _json.loads(res.stdout)
+            self.assertTrue(payload.get("success"))
+            self.assertEqual(payload.get("status"), "COMPLETE")
+            self.assertEqual(payload.get("pid"), proc.pid)
+            # stderr must contain the [debug] log messages
+            self.assertIn("[debug]", res.stderr)
+            # stdout must not contain [debug]
+            self.assertNotIn("[debug]", res.stdout)
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_11_output_directory_failure(self):
+        """Failure to create or write to output directory returns exit code 1 and valid JSON error envelope on stdout."""
+        target_src = os.path.join(self.tmp_dir, "target_outfail.c")
+        target_bin = os.path.join(self.tmp_dir, "target_outfail_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) { pause(); }
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        try:
+            # Unwritable directory path (e.g. inside /proc or /nonexistent_root_dir)
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", "/proc/unwritable_snap_test", "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 1)
+            import json as _json
+            payload = _json.loads(res.stdout)
+            self.assertFalse(payload.get("success"))
+            self.assertEqual(payload.get("status"), "FAILED")
+            self.assertIn("[dynamicState-collector] Error:", res.stderr)
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_12_timeout_validation_variants(self):
+        """Negative, non-numeric, or out-of-range timeout values are rejected with exit code 1 and JSON error."""
+        import json as _json
+        for bad_to in ["-50", "abc", "99999999999999"]:
+            res = subprocess.run(
+                [self.collector_bin, "-p", "1234", "-t", bad_to, "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 1)
+            payload = _json.loads(res.stdout)
+            self.assertFalse(payload.get("success"))
+            self.assertEqual(payload.get("error"), "INVALID_TIMEOUT")
+            self.assertIn("Error: Invalid timeout-ms", res.stderr)
+
+    def test_13_pid_validation_variants(self):
+        """Negative, non-numeric, or missing PIDs are rejected with exit code 1 and JSON error."""
+        import json as _json
+        for bad_pid_args in [["-p", "-1", "--json"], ["-p", "abc", "--json"], ["--json"]]:
+            res = subprocess.run(
+                [self.collector_bin] + bad_pid_args,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 1)
+            payload = _json.loads(res.stdout)
+            self.assertFalse(payload.get("success"))
+            self.assertIn(payload.get("error"), ("INVALID_PID", "MISSING_PID"))
+
+    def test_14_remote_adapter_capture_snapshot_and_quality_warning(self):
+        """RemoteSshTargetAdapter.capture_snapshot_via_collector parses JSON stdout and flags partial capture."""
+        from extractor.target_adapter import RemoteSshTargetAdapter
+
+        # Case 1: Collector binary not set
+        no_coll_adapter = RemoteSshTargetAdapter(host="10.0.0.1", collector_path=None)
+        res_no = no_coll_adapter.capture_snapshot_via_collector(pid=1234, remote_output_dir="/tmp/snap")
+        self.assertFalse(res_no["success"])
+        self.assertEqual(res_no["status"], "FAILED")
+
+        # Case 2: Mock SSH runner returning partial capture
+        mock_partial_json = (
+            '{"success":true,"status":"PARTIAL","timed_out":true,"timeout_ms":50,'
+            '"regions":2,"regions_requested":5,"bytes_captured":8192}\n'
+        )
+        def mock_runner_partial(cmd, timeout):
+            return 0, mock_partial_json, ""
+
+        part_adapter = RemoteSshTargetAdapter(
+            host="10.0.0.1",
+            collector_path="/tmp/collector",
+            command_runner=mock_runner_partial,
+        )
+        res_part = part_adapter.capture_snapshot_via_collector(pid=1234, remote_output_dir="/tmp/snap")
+        self.assertTrue(res_part["success"])
+        self.assertEqual(res_part["status"], "PARTIAL")
+        self.assertIn("quality_warning", res_part)
+        self.assertIn("PARTIAL_CAPTURE", res_part["quality_warning"])
+
+        # Case 3: Mock SSH runner with transport failure / connection drop
+        def mock_runner_fail(cmd, timeout):
+            return 255, "", "ssh: connect to host 10.0.0.1 port 22: Connection refused"
+
+        fail_adapter = RemoteSshTargetAdapter(
+            host="10.0.0.1",
+            collector_path="/tmp/collector",
+            command_runner=mock_runner_fail,
+        )
+        res_fail = fail_adapter.capture_snapshot_via_collector(pid=1234, remote_output_dir="/tmp/snap")
+        self.assertFalse(res_fail["success"])
+        self.assertEqual(res_fail["status"], "SSH_FAILURE")
+        self.assertIn("Connection refused", res_fail["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
