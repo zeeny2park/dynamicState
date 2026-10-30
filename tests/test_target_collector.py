@@ -1396,6 +1396,182 @@ int main() {
         self.assertEqual(snap_c2.snapshot_id, "SNAP_RT")
         self.assertEqual(snap_c2.bytes_captured, 2048)
 
+    def test_36_deterministic_thread_overlap_save_rejection(self):
+        """Two Python threads entering save() for the exact same directory overlap deterministically via barrier."""
+        import threading
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_thread_overlap")
+        os.makedirs(snap_dir, exist_ok=True)
+        barrier = threading.Barrier(2)
+
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+
+        outcomes = []
+        errors = []
+
+        def worker(tid):
+            raw = RawMemorySnapshot(
+                snapshot_id=f"SNAP_{tid}",
+                pid=1000 + tid,
+                binary="/app",
+                timestamp_ns=1000,
+                status="COMPLETE",
+                output_dir=snap_dir,
+                regions=[reg],
+                maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+            )
+            # Synchronize both threads right before calling save()
+            try:
+                barrier.wait(timeout=2)
+            except Exception:
+                pass
+            try:
+                raw.save()
+                outcomes.append(tid)
+            except BlockingIOError as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=worker, args=(1,))
+        t2 = threading.Thread(target=worker, args=(2,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=3)
+        t2.join(timeout=3)
+
+        # Process-local thread synchronization guarantees that exactly one thread succeeds
+        # while the concurrent overlapping thread is immediately rejected with BlockingIOError
+        self.assertEqual(len(outcomes), 1, f"Expected exactly 1 thread to win, got {outcomes}")
+        self.assertEqual(len(errors), 1, f"Expected 1 thread to get BlockingIOError, got {errors}")
+        self.assertIn("locked by another thread", str(errors[0]))
+
+    def test_37_process_termination_lock_recovery(self):
+        """POSIX advisory locks are released upon process termination, allowing subsequent writers to succeed."""
+        import fcntl
+        import sys
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        snap_dir = os.path.join(self.tmp_dir, "snap_proc_term")
+        os.makedirs(snap_dir, exist_ok=True)
+        lock_file = os.path.join(snap_dir, ".collector.lock")
+
+        # Start a child process holding lockf on the directory and then sleeping
+        code = f"""
+import os, fcntl, time
+fd = os.open({repr(lock_file)}, os.O_CREAT | os.O_RDWR, 0o644)
+fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("LOCKED", flush=True)
+time.sleep(10)
+"""
+        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        line = proc.stdout.readline().strip()
+        self.assertEqual(line, "LOCKED")
+
+        # While child is running, attempting save() must fail
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_RECOVER",
+            pid=8888,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        with self.assertRaises(BlockingIOError):
+            raw.save()
+
+        # Terminate child process (simulating abnormal crash/kill)
+        proc.terminate()
+        proc.wait(timeout=2)
+
+        # Kernel automatically releases lock; new save must now succeed
+        saved = raw.save()
+        self.assertEqual(saved, snap_dir)
+
+    def test_38_disk_manifest_verification_and_unverified_propagation(self):
+        """Discrepancies in actual on-disk manifest entries degrade snapshot to INVALID, and UNVERIFIED evidence is propagated."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        from extractor.offline_analyzer import OfflineMemoryAnalyzer
+        from extractor.verdict_engine import VerdictEngine, AssertionEvaluation, ASSERTION_PASS
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_disk_manifest_test")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        with open(os.path.join(snap_dir, "memory/r1.bin"), "wb") as bf:
+            bf.write(b"A" * 4096)
+
+        reg1 = CapturedRegion("R000001", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_TEST_38",
+            pid=9999,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # Tamper directly with on-disk manifest.json (e.g. change status to FAILED or ID)
+        manifest_path = os.path.join(snap_dir, "manifest.json")
+        with open(manifest_path, "r") as mf:
+            m_entries = json.load(mf)
+        m_entries[0]["status"] = "FAILED"
+        with open(manifest_path, "w") as mf:
+            json.dump(m_entries, mf)
+
+        # Checking integrity on the existing in-memory snapshot with tampered disk manifest
+        # verifies that disk contents are the authority, detecting the discrepancy
+        is_val, warns = raw.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertEqual(raw.validation_verdict, "INVALID")
+        self.assertTrue(any("status mismatch" in w for w in warns))
+
+        # Reloading also reflects disk manifest entries (status=FAILED, captured size=4096 is inconsistent for FAILED)
+        loaded_tampered = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(loaded_tampered.validation_verdict, "INVALID")
+        self.assertTrue(any("status is FAILED but reports captured" in w for w in loaded_tampered.integrity_warnings))
+
+        # Test legacy missing 'committed' field sets UNVERIFIED and propagates through VerdictEngine
+        raw.save()
+        meta_path = os.path.join(snap_dir, "metadata.json")
+        with open(meta_path, "r") as mf:
+            meta_json = json.load(mf)
+        del meta_json["committed"]  # simulate historical pre-committed snapshot
+        with open(meta_path, "w") as mf:
+            json.dump(meta_json, mf)
+
+        legacy_snap = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(legacy_snap.validation_verdict, "UNVERIFIED")
+
+        analyzer = OfflineMemoryAnalyzer()
+        semantic_snap = analyzer.analyze(legacy_snap, optional_symbol_context={"types": {}, "globals": {}})
+        self.assertEqual(semantic_snap.provenance["provenance_class"], "IMPORTED_UNVERIFIED")
+        self.assertEqual(semantic_snap.provenance["validation_verdict"], "UNVERIFIED")
+
+        # Synthesize verdict using UNVERIFIED evidence -> diagnosis must be capped at SUSPECTED
+        eval1 = AssertionEvaluation(
+            raw_assertion="val == 42",
+            lhs_expression="val",
+            resolved_expression="val",
+            operator="==",
+            expected=42,
+            observed_value=42,
+            observation_status="OBSERVED",
+            verdict=ASSERTION_PASS,
+        )
+        verdict = VerdictEngine.synthesize_verdict(
+            hypothesis="Target value is 42",
+            evaluations=[eval1],
+            target_identity={"pid": 9999},
+            causal_attribution_verified=True,
+            provenance_class=semantic_snap.provenance["provenance_class"],
+        )
+        # Provenance is IMPORTED_UNVERIFIED -> must NOT be CONFIRMED, capped at SUSPECTED
+        self.assertEqual(verdict.final_diagnosis, "SUSPECTED")
+        self.assertTrue(any("synthetic/unverified" in lim for lim in verdict.limitations))
+
 
 if __name__ == "__main__":
     unittest.main()

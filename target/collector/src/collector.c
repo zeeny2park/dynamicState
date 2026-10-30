@@ -454,29 +454,46 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         return -1;
     }
 
-    /* Acquire exclusive advisory lock on output directory to prevent concurrent collision */
+    /* Acquire exclusive advisory lock on output directory to prevent concurrent collision (Fail-closed) */
     char lock_path[2048] = {0};
     int lock_fd = -1;
-    if (snprintf(lock_path, sizeof(lock_path), "%s/.collector.lock", out_dir) < (int)sizeof(lock_path)) {
-        lock_fd = open(lock_path, O_CREAT | O_RDWR, 0644);
-        if (lock_fd >= 0) {
-            struct flock fl;
-            memset(&fl, 0, sizeof(fl));
-            fl.l_type = F_WRLCK;
-            fl.l_whence = SEEK_SET;
-            fl.l_start = 0;
-            fl.l_len = 0;
-            if (fcntl(lock_fd, F_SETLK, &fl) < 0) {
-                if (cfg->verbose) {
-                    fprintf(stderr, "[debug] Output directory '%s' is locked by another collector process\n", out_dir);
-                }
-                close(lock_fd);
-                snprintf(stats.status, sizeof(stats.status), "FAILED");
-                if (stats_out) *stats_out = stats;
-                free(regions);
-                return -1;
-            }
+    if (snprintf(lock_path, sizeof(lock_path), "%s/.collector.lock", out_dir) >= (int)sizeof(lock_path)) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] Lock path construction truncated: %s\n", out_dir);
         }
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
+    }
+
+    /* Open lock file with O_NOFOLLOW to reject symlink redirection */
+    lock_fd = open(lock_path, O_CREAT | O_RDWR | O_NOFOLLOW, 0644);
+    if (lock_fd < 0) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] Failed opening lock file '%s': %s\n", lock_path, strerror(errno));
+        }
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
+    }
+
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    if (fcntl(lock_fd, F_SETLK, &fl) < 0) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] Output directory '%s' is locked by another collector process: %s\n", out_dir, strerror(errno));
+        }
+        close(lock_fd);
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
     }
 
     /* Invalidate any existing metadata.json from a prior snapshot to prevent stale reads if interrupted */

@@ -11,10 +11,21 @@ from dataclasses import asdict, dataclass, field
 import fcntl
 import json
 import os
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from .snapshot_consistency import NON_ATOMIC, SnapshotConsistency
+
+# Process-local lock registry for canonical directory mutual exclusion across threads
+_DIR_LOCK_REGISTRY_LOCK = threading.Lock()
+_DIR_LOCK_REGISTRY: Dict[str, threading.Lock] = {}
+
+def _get_process_dir_lock(canonical_path: str) -> threading.Lock:
+    with _DIR_LOCK_REGISTRY_LOCK:
+        if canonical_path not in _DIR_LOCK_REGISTRY:
+            _DIR_LOCK_REGISTRY[canonical_path] = threading.Lock()
+        return _DIR_LOCK_REGISTRY[canonical_path]
 
 # Snapshot commit lifecycle states
 STATE_CAPTURE_IN_PROGRESS = "CAPTURE_IN_PROGRESS"
@@ -199,82 +210,101 @@ class RawMemorySnapshot:
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "memory"), exist_ok=True)
 
-        lock_path = os.path.join(self.output_dir, ".collector.lock")
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        # 1. Process-local thread synchronization on canonical path
+        canonical_dir = os.path.realpath(self.output_dir)
+        thread_lock = _get_process_dir_lock(canonical_dir)
+        acquired_thread_lock = thread_lock.acquire(blocking=False)
+        if not acquired_thread_lock:
+            raise BlockingIOError(f"Output directory '{self.output_dir}' is locked by another thread in this process")
+
         try:
+            # 2. Cross-process mutual exclusion via .collector.lock
+            lock_path = os.path.join(self.output_dir, ".collector.lock")
+            # Refuse to follow symlinks when opening lock_path
+            open_flags = os.O_CREAT | os.O_RDWR
+            if hasattr(os, "O_NOFOLLOW"):
+                open_flags |= os.O_NOFOLLOW
             try:
-                fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except (IOError, OSError) as e:
-                raise BlockingIOError(f"Output directory '{self.output_dir}' is locked by another writer: {e}")
+                lock_fd = os.open(lock_path, open_flags, 0o644)
+            except OSError as e:
+                raise BlockingIOError(f"Failed opening lock file in '{self.output_dir}' (symlink or permission error): {e}")
 
-            # Safe per-call unique suffix to prevent collisions across threads and processes
-            unique_suffix = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
-
-            # Invalidate any pre-existing metadata.json to ensure stale commits never certify partial writes
-            meta_path = os.path.join(self.output_dir, "metadata.json")
-            if os.path.exists(meta_path):
+            try:
                 try:
-                    os.unlink(meta_path)
+                    fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (IOError, OSError) as e:
+                    raise BlockingIOError(f"Output directory '{self.output_dir}' is locked by another process: {e}")
+
+                # Safe per-call unique suffix to prevent collisions across threads and processes
+                unique_suffix = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
+                # Invalidate any pre-existing metadata.json to ensure stale commits never certify partial writes
+                meta_path = os.path.join(self.output_dir, "metadata.json")
+                if os.path.exists(meta_path):
+                    try:
+                        os.unlink(meta_path)
+                    except OSError:
+                        pass
+
+                # 1. manifest.json atomically
+                manifest_path = os.path.join(self.output_dir, "manifest.json")
+                manifest_tmp = os.path.join(self.output_dir, f"manifest.json.tmp.{unique_suffix}")
+                with open(manifest_tmp, "w", encoding="utf-8") as f:
+                    json.dump([r.to_dict() for r in self.regions], f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(manifest_tmp, manifest_path)
+
+                # 2. maps.json atomically
+                maps_path = os.path.join(self.output_dir, "maps.json")
+                maps_tmp = os.path.join(self.output_dir, f"maps.json.tmp.{unique_suffix}")
+                with open(maps_tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.maps, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(maps_tmp, maps_path)
+
+                # 3. modules.json atomically
+                modules_path = os.path.join(self.output_dir, "modules.json")
+                modules_tmp = os.path.join(self.output_dir, f"modules.json.tmp.{unique_suffix}")
+                mods_data = [m.to_dict() if hasattr(m, "to_dict") else m for m in self.modules]
+                with open(modules_tmp, "w", encoding="utf-8") as f:
+                    json.dump(mods_data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(modules_tmp, modules_path)
+
+                # 4. metadata.json atomically as the final commit barrier
+                self.committed = True
+                self.commit_state = STATE_COMMITTED
+                if self.commit_timestamp_ns <= 0:
+                    self.commit_timestamp_ns = time.time_ns()
+                meta_tmp = os.path.join(self.output_dir, f"metadata.json.tmp.{unique_suffix}")
+                with open(meta_tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.to_metadata(), f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(meta_tmp, meta_path)
+
+                # Flush directory entries to disk for durability where supported
+                try:
+                    dir_fd = os.open(self.output_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
                 except OSError:
                     pass
 
-            # 1. manifest.json atomically
-            manifest_path = os.path.join(self.output_dir, "manifest.json")
-            manifest_tmp = os.path.join(self.output_dir, f"manifest.json.tmp.{unique_suffix}")
-            with open(manifest_tmp, "w", encoding="utf-8") as f:
-                json.dump([r.to_dict() for r in self.regions], f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(manifest_tmp, manifest_path)
-
-            # 2. maps.json atomically
-            maps_path = os.path.join(self.output_dir, "maps.json")
-            maps_tmp = os.path.join(self.output_dir, f"maps.json.tmp.{unique_suffix}")
-            with open(maps_tmp, "w", encoding="utf-8") as f:
-                json.dump(self.maps, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(maps_tmp, maps_path)
-
-            # 3. modules.json atomically
-            modules_path = os.path.join(self.output_dir, "modules.json")
-            modules_tmp = os.path.join(self.output_dir, f"modules.json.tmp.{unique_suffix}")
-            mods_data = [m.to_dict() if hasattr(m, "to_dict") else m for m in self.modules]
-            with open(modules_tmp, "w", encoding="utf-8") as f:
-                json.dump(mods_data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(modules_tmp, modules_path)
-
-            # 4. metadata.json atomically as the final commit barrier
-            self.committed = True
-            self.commit_state = STATE_COMMITTED
-            if self.commit_timestamp_ns <= 0:
-                self.commit_timestamp_ns = time.time_ns()
-            meta_tmp = os.path.join(self.output_dir, f"metadata.json.tmp.{unique_suffix}")
-            with open(meta_tmp, "w", encoding="utf-8") as f:
-                json.dump(self.to_metadata(), f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(meta_tmp, meta_path)
-
-            # Flush directory entries to disk for durability where supported
-            try:
-                dir_fd = os.open(self.output_dir, os.O_RDONLY)
+                return self.output_dir
+            finally:
                 try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
-
-            return self.output_dir
+                    fcntl.lockf(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(lock_fd)
         finally:
-            try:
-                fcntl.lockf(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(lock_fd)
+            thread_lock.release()
 
     def validate_integrity(self) -> Tuple[bool, List[str]]:
         """Validates disk artifact integrity (commit status, region files, byte sizes, bounds)."""
@@ -336,6 +366,22 @@ class RawMemorySnapshot:
                     if not isinstance(manifest_raw, list):
                         is_valid = False
                         warnings.append("manifest.json root is not a JSON list")
+                    else:
+                        # Cross-check disk manifest entries with in-memory regions if present
+                        if self.regions and len(manifest_raw) != len(self.regions):
+                            is_valid = False
+                            warnings.append(
+                                f"Manifest entry count mismatch: disk has {len(manifest_raw)}, memory has {len(self.regions)}"
+                            )
+                        elif self.regions:
+                            for idx, (m_entry, r_obj) in enumerate(zip(manifest_raw, self.regions)):
+                                if isinstance(m_entry, dict):
+                                    if m_entry.get("region_id") != r_obj.region_id:
+                                        is_valid = False
+                                        warnings.append(f"Manifest region {idx} ID mismatch: disk '{m_entry.get('region_id')}' != memory '{r_obj.region_id}'")
+                                    if m_entry.get("status") != r_obj.status:
+                                        is_valid = False
+                                        warnings.append(f"Manifest region {idx} status mismatch: disk '{m_entry.get('status')}' != memory '{r_obj.status}'")
             except Exception as e:
                 is_valid = False
                 warnings.append(f"manifest.json is malformed or invalid JSON: {e}")

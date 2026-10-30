@@ -146,12 +146,22 @@ class SnapshotMemoryReader:
         if mod and (address + size) > mod.runtime_end:
             return None
 
-        # Load region file (cache into memory)
+        # Load region file (cache into memory) with secure no-follow check
         if fpath not in self._cache:
-            if not os.path.exists(fpath):
+            if not os.path.exists(fpath) or os.path.islink(fpath):
                 return None
-            with open(fpath, "rb") as f:
-                self._cache[fpath] = f.read()
+            try:
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(fpath, flags)
+                try:
+                    with os.fdopen(fd, "rb") as f:
+                        self._cache[fpath] = f.read()
+                except Exception:
+                    return None
+            except OSError:
+                return None
 
         data = self._cache[fpath]
         offset = address - start
@@ -719,7 +729,12 @@ class OfflineMemoryAnalyzer:
         )
 
         # 9. Provenance metadata
+        raw_verdict = getattr(raw_snap, "validation_verdict", "VALIDATED")
+        prov_class = "LIVE_RUNTIME_CAPTURE" if raw_verdict == "VALIDATED" else "IMPORTED_UNVERIFIED"
+
         provenance = {
+            "provenance_class": prov_class,
+            "validation_verdict": raw_verdict,
             "runtime_binary": {
                 "path": raw_snap.binary,
                 "architecture": raw_snap.architecture,
@@ -744,6 +759,7 @@ class OfflineMemoryAnalyzer:
             "quality_warning": (
                 "; ".join(
                     ([f"PARTIAL_CAPTURE: Some regions failed or timed out during capture"] if getattr(raw_snap, "status", "") == "PARTIAL" else []) +
+                    ([f"UNVERIFIED_EVIDENCE: Legacy snapshot missing verified commit markers"] if raw_verdict == "UNVERIFIED" else []) +
                     list(getattr(raw_snap, "integrity_warnings", []))
                 ) or None
             ),
@@ -754,6 +770,8 @@ class OfflineMemoryAnalyzer:
         metadata = {
             "offline_analysis_duration_ms": t_elapsed_ms,
             "raw_snapshot_id": raw_snap.snapshot_id,
+            "provenance_class": prov_class,
+            "validation_verdict": raw_verdict,
             "capture_status": getattr(raw_snap, "status", "COMPLETE"),
             "committed": getattr(raw_snap, "committed", True),
             "capture_duration_us": raw_snap.duration_us,
