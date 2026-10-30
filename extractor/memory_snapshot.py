@@ -120,6 +120,16 @@ class RawMemorySnapshot:
     integrity_warnings: List[str] = field(default_factory=list)
 
     def to_metadata(self) -> Dict[str, Any]:
+        actual_captured_cnt = sum(1 for r in self.regions if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0)
+        actual_captured_sz = sum(r.captured for r in self.regions)
+        actual_requested_cnt = len(self.regions)
+        actual_requested_sz = sum(r.requested for r in self.regions)
+
+        reg_captured = self.regions_captured if self.regions_captured > 0 else actual_captured_cnt
+        b_captured = self.bytes_captured if self.bytes_captured > 0 else actual_captured_sz
+        reg_requested = self.regions_requested if self.regions_requested > 0 else actual_requested_cnt
+        b_requested = self.bytes_requested if self.bytes_requested > 0 else actual_requested_sz
+
         return {
             "snapshot_id": self.snapshot_id,
             "pid": self.pid,
@@ -141,10 +151,10 @@ class RawMemorySnapshot:
             "process_exited": self.process_exited,
             "process_starttime": self.process_starttime,
             "capture": self.capture,
-            "regions": self.regions_captured,
-            "regions_requested": self.regions_requested,
-            "bytes_requested": self.bytes_requested,
-            "bytes_captured": self.bytes_captured,
+            "regions": reg_captured,
+            "regions_requested": reg_requested,
+            "bytes_requested": b_requested,
+            "bytes_captured": b_captured,
             "partial_reads": self.partial_reads,
             "failed_reads": self.failed_reads,
             "duration_us": round(self.duration_us, 3),
@@ -162,7 +172,7 @@ class RawMemorySnapshot:
         return res
 
     def save(self, output_dir: Optional[str] = None) -> str:
-        """Persist metadata, manifest, and maps to the output directory."""
+        """Persist metadata, manifest, and maps to the output directory atomically."""
         target_dir = output_dir or self.output_dir
         if not target_dir:
             raise ValueError("output_dir must be specified")
@@ -170,65 +180,140 @@ class RawMemorySnapshot:
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "memory"), exist_ok=True)
 
-        # 1. metadata.json
-        meta_path = os.path.join(self.output_dir, "metadata.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_metadata(), f, indent=2)
+        pid_suffix = str(os.getpid())
 
-        # 2. manifest.json
+        # 1. manifest.json atomically
         manifest_path = os.path.join(self.output_dir, "manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as f:
+        manifest_tmp = os.path.join(self.output_dir, f"manifest.json.tmp.{pid_suffix}")
+        with open(manifest_tmp, "w", encoding="utf-8") as f:
             json.dump([r.to_dict() for r in self.regions], f, indent=2)
+        os.replace(manifest_tmp, manifest_path)
 
-        # 3. maps.json
+        # 2. maps.json atomically
         maps_path = os.path.join(self.output_dir, "maps.json")
-        with open(maps_path, "w", encoding="utf-8") as f:
+        maps_tmp = os.path.join(self.output_dir, f"maps.json.tmp.{pid_suffix}")
+        with open(maps_tmp, "w", encoding="utf-8") as f:
             json.dump(self.maps, f, indent=2)
+        os.replace(maps_tmp, maps_path)
 
-        # 4. modules.json
+        # 3. modules.json atomically
         modules_path = os.path.join(self.output_dir, "modules.json")
+        modules_tmp = os.path.join(self.output_dir, f"modules.json.tmp.{pid_suffix}")
         mods_data = [m.to_dict() if hasattr(m, "to_dict") else m for m in self.modules]
-        with open(modules_path, "w", encoding="utf-8") as f:
+        with open(modules_tmp, "w", encoding="utf-8") as f:
             json.dump(mods_data, f, indent=2)
+        os.replace(modules_tmp, modules_path)
+
+        # 4. metadata.json atomically as the final commit barrier
+        meta_path = os.path.join(self.output_dir, "metadata.json")
+        meta_tmp = os.path.join(self.output_dir, f"metadata.json.tmp.{pid_suffix}")
+        with open(meta_tmp, "w", encoding="utf-8") as f:
+            json.dump(self.to_metadata(), f, indent=2)
+        os.replace(meta_tmp, meta_path)
 
         return self.output_dir
 
     def validate_integrity(self) -> Tuple[bool, List[str]]:
-        """Validates disk artifact integrity (commit status, region files, byte sizes)."""
+        """Validates disk artifact integrity (commit status, region files, byte sizes, bounds)."""
         warnings: List[str] = []
         is_valid = True
 
-        if not self.committed:
-            is_valid = False
-            warnings.append("Snapshot was not cleanly committed (missing or false 'committed' marker in metadata.json).")
+        if not self.output_dir:
+            return False, ["Snapshot output_dir is not specified."]
 
-        if self.output_dir and not os.path.isdir(self.output_dir):
+        if not os.path.isdir(self.output_dir):
             return False, [f"Snapshot directory does not exist: {self.output_dir}"]
 
-        if self.output_dir:
-            # Verify manifest.json exists
-            manifest_file = os.path.join(self.output_dir, "manifest.json")
-            if not os.path.exists(manifest_file):
-                is_valid = False
-                warnings.append(f"Missing manifest.json in {self.output_dir}")
+        real_out = os.path.abspath(self.output_dir)
 
-            # Verify maps.json exists
-            maps_file = os.path.join(self.output_dir, "maps.json")
-            if not os.path.exists(maps_file):
-                is_valid = False
-                warnings.append(f"Missing maps.json in {self.output_dir}")
-
-            # Check binary region files
-            for r in self.regions:
-                if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0:
-                    if not r.filename:
+        # 1. Validate metadata.json
+        meta_file = os.path.join(real_out, "metadata.json")
+        if not os.path.exists(meta_file):
+            is_valid = False
+            warnings.append(f"Missing metadata.json in {real_out}")
+        else:
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta_raw = json.load(f)
+                    if not isinstance(meta_raw, dict):
                         is_valid = False
-                        warnings.append(f"Region {r.region_id} status is {r.status} but filename is missing.")
+                        warnings.append("metadata.json root is not a JSON object")
+            except Exception as e:
+                is_valid = False
+                warnings.append(f"metadata.json is malformed or invalid JSON: {e}")
+
+        # Check committed marker
+        if self.committed is False:
+            is_valid = False
+            warnings.append("Snapshot was not cleanly committed (metadata 'committed' is false).")
+
+        # 2. Validate manifest.json exists and is valid JSON list
+        manifest_file = os.path.join(real_out, "manifest.json")
+        if not os.path.exists(manifest_file):
+            is_valid = False
+            warnings.append(f"Missing manifest.json in {real_out}")
+        else:
+            try:
+                with open(manifest_file, "r", encoding="utf-8") as f:
+                    manifest_raw = json.load(f)
+                    if not isinstance(manifest_raw, list):
+                        is_valid = False
+                        warnings.append("manifest.json root is not a JSON list")
+            except Exception as e:
+                is_valid = False
+                warnings.append(f"manifest.json is malformed or invalid JSON: {e}")
+
+        # 3. Validate maps.json exists and is valid JSON list
+        maps_file = os.path.join(real_out, "maps.json")
+        if not os.path.exists(maps_file):
+            is_valid = False
+            warnings.append(f"Missing maps.json in {real_out}")
+        else:
+            try:
+                with open(maps_file, "r", encoding="utf-8") as f:
+                    maps_raw = json.load(f)
+                    if not isinstance(maps_raw, list):
+                        is_valid = False
+                        warnings.append("maps.json root is not a JSON list")
+            except Exception as e:
+                is_valid = False
+                warnings.append(f"maps.json is malformed or invalid JSON: {e}")
+
+        # 4. Validate regions, file paths, traversal, actual sizes, and statuses
+        for r in self.regions:
+            # Check path traversal
+            if r.filename:
+                norm_rel = os.path.normpath(r.filename)
+                if os.path.isabs(norm_rel) or norm_rel.startswith("..") or (".." in norm_rel.split(os.path.sep)):
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} filename attempts path traversal: '{r.filename}' (escapes snapshot directory)")
+                    continue
+
+                full_bin = os.path.abspath(os.path.join(real_out, norm_rel))
+                try:
+                    common = os.path.commonpath([real_out, full_bin])
+                    if common != real_out:
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} path escapes snapshot directory: '{r.filename}'")
                         continue
-                    bin_path = os.path.join(self.output_dir, r.filename)
+                except ValueError:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} path drive mismatch: '{r.filename}'")
+                    continue
+
+            # Check region file and sizes
+            if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0:
+                if not r.filename:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} status is {r.status} ({r.captured} bytes) but filename is missing.")
+                else:
+                    bin_path = os.path.join(real_out, r.filename)
                     if not os.path.exists(bin_path):
                         is_valid = False
                         warnings.append(f"Region {r.region_id} binary file missing on disk: {r.filename}")
+                    elif os.path.islink(bin_path):
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} binary file is a symbolic link: {r.filename}")
                     else:
                         try:
                             actual_sz = os.path.getsize(bin_path)
@@ -241,6 +326,57 @@ class RawMemorySnapshot:
                         except OSError as e:
                             is_valid = False
                             warnings.append(f"Failed inspecting region file {bin_path}: {e}")
+            elif r.status == "FAILED":
+                if r.captured != 0:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} status is FAILED but reports captured={r.captured} != 0")
+
+            # Region status and size consistency
+            if r.status == "COMPLETE":
+                if r.requested > 0 and r.captured != r.requested:
+                    is_valid = False
+                    warnings.append(
+                        f"Region {r.region_id} status is COMPLETE but captured bytes ({r.captured}) != requested bytes ({r.requested})"
+                    )
+            elif r.status == "PARTIAL":
+                if r.captured <= 0 or (r.requested > 0 and r.captured >= r.requested):
+                    is_valid = False
+                    warnings.append(
+                        f"Region {r.region_id} status is PARTIAL but captured bytes ({r.captured}) is inconsistent with requested ({r.requested})"
+                    )
+
+        # 5. Manifest and metadata region counts agreement
+        actual_captured_count = sum(1 for r in self.regions if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0)
+        if self.regions_captured != actual_captured_count:
+            is_valid = False
+            warnings.append(
+                f"Region count mismatch: metadata reports regions_captured={self.regions_captured}, "
+                f"but manifest contains {actual_captured_count} captured regions"
+            )
+
+        if self.regions_requested > 0 and len(self.regions) != self.regions_requested:
+            is_valid = False
+            warnings.append(
+                f"Total region count mismatch: metadata reports regions_requested={self.regions_requested}, "
+                f"but manifest contains {len(self.regions)} regions"
+            )
+
+        # 6. Requested/captured byte counts agreement
+        actual_captured_bytes = sum(r.captured for r in self.regions)
+        if self.bytes_captured != actual_captured_bytes:
+            is_valid = False
+            warnings.append(
+                f"Captured bytes mismatch: metadata reports bytes_captured={self.bytes_captured}, "
+                f"but sum of manifest regions is {actual_captured_bytes}"
+            )
+
+        actual_requested_bytes = sum(r.requested for r in self.regions)
+        if self.bytes_requested > 0 and self.bytes_requested != actual_requested_bytes:
+            is_valid = False
+            warnings.append(
+                f"Requested bytes mismatch: metadata reports bytes_requested={self.bytes_requested}, "
+                f"but sum of manifest regions is {actual_requested_bytes}"
+            )
 
         return is_valid, warnings
 
@@ -261,19 +397,28 @@ class RawMemorySnapshot:
 
         regions = []
         if os.path.exists(manifest_path):
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                manifest_data = json.load(f)
-                regions = [CapturedRegion.from_dict(r) for r in manifest_data]
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    manifest_data = json.load(f)
+                    regions = [CapturedRegion.from_dict(r) for r in manifest_data]
+            except Exception:
+                pass
 
         maps = []
         if os.path.exists(maps_path):
-            with open(maps_path, "r", encoding="utf-8") as f:
-                maps = json.load(f)
+            try:
+                with open(maps_path, "r", encoding="utf-8") as f:
+                    maps = json.load(f)
+            except Exception:
+                pass
 
         modules = []
         if os.path.exists(modules_path):
-            with open(modules_path, "r", encoding="utf-8") as f:
-                modules = json.load(f)
+            try:
+                with open(modules_path, "r", encoding="utf-8") as f:
+                    modules = json.load(f)
+            except Exception:
+                pass
         elif "modules" in meta:
             modules = meta["modules"]
 

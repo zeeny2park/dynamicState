@@ -689,23 +689,47 @@ int main() {
         time.sleep(0.1)
 
         out_dir = os.path.join(self.tmp_dir, "snap_iso")
+        os.makedirs(out_dir, exist_ok=True)
+        lock_file = os.path.join(out_dir, ".collector.lock")
         try:
-            # Run two collectors in parallel to the same output directory
-            cmd1 = [self.collector_bin, "-p", str(p1.pid), "-o", out_dir, "--json"]
-            cmd2 = [self.collector_bin, "-p", str(p2.pid), "-o", out_dir, "--json"]
-            sub1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            sub2 = subprocess.Popen(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            import fcntl
+            # 19A: Verify deterministic rejection when output directory is locked by a competing collector.
+            with open(lock_file, "w") as lf:
+                fcntl.lockf(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                res_locked = subprocess.run(
+                    [self.collector_bin, "-p", str(p1.pid), "-o", out_dir, "--json"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(res_locked.returncode, 1)
+                self.assertIn('"status":"FAILED"', res_locked.stdout)
 
-            out1, _ = sub1.communicate(timeout=5)
-            out2, _ = sub2.communicate(timeout=5)
-
-            # Both should finish without crashing or leaving dangling temporary files
-            self.assertEqual(sub1.returncode, 0)
-            self.assertEqual(sub2.returncode, 0)
+            # When the lock is released, the collector succeeds cleanly
+            res_free = subprocess.run(
+                [self.collector_bin, "-p", str(p1.pid), "-o", out_dir, "--json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(res_free.returncode, 0)
 
             # Check that no .tmp.* files remain in output directory
             remaining_tmps = [f for f in os.listdir(out_dir) if ".tmp" in f]
             self.assertEqual(remaining_tmps, [], f"Found lingering temporary files: {remaining_tmps}")
+
+            # 19B: Run two collectors targeting DISTINCT output directories in parallel.
+            # Both must succeed independently without interference.
+            out_dir1 = os.path.join(self.tmp_dir, "snap_iso_1")
+            out_dir2 = os.path.join(self.tmp_dir, "snap_iso_2")
+            cmd_d1 = [self.collector_bin, "-p", str(p1.pid), "-o", out_dir1, "--json"]
+            cmd_d2 = [self.collector_bin, "-p", str(p2.pid), "-o", out_dir2, "--json"]
+            sub_d1 = subprocess.Popen(cmd_d1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            sub_d2 = subprocess.Popen(cmd_d2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            sub_d1.communicate(timeout=5)
+            sub_d2.communicate(timeout=5)
+            self.assertEqual(sub_d1.returncode, 0)
+            self.assertEqual(sub_d2.returncode, 0)
         finally:
             p1.terminate()
             p2.terminate()
@@ -901,6 +925,230 @@ int main() {
         # Reading out of bounds must return None, not zeroes
         self.assertIsNone(reader.read(0x400400, 4))
         self.assertIsNone(reader.read(0x999999, 4))
+
+    def test_23_path_construction_failure_no_unlink_or_corruption(self):
+        """Verifies that path construction failures (e.g., path buffer overflow) fail safely without unlinking."""
+        target_src = os.path.join(self.tmp_dir, "target_path.c")
+        target_bin = os.path.join(self.tmp_dir, "target_path_app")
+        with open(target_src, "w") as f:
+            f.write("int main() { while (1); return 0; }\n")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        p = subprocess.Popen([target_bin])
+        try:
+            # Create a path string exceeding internal 2048-byte buffers
+            huge_dir = os.path.join(self.tmp_dir, "a" * 2100)
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(p.pid), "-o", huge_dir, "--json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            # Should output structured error JSON or stderr diagnostic without segfault
+            self.assertIn("FAILED", res.stdout + res.stderr)
+        finally:
+            p.terminate()
+            p.wait()
+
+    def test_24_maps_txt_write_failure_aborts_cleanly(self):
+        """Verifies that failure copying maps.txt aborts capture cleanly and releases resources."""
+        target_src = os.path.join(self.tmp_dir, "target_maps_fail.c")
+        target_bin = os.path.join(self.tmp_dir, "target_maps_fail_app")
+        with open(target_src, "w") as f:
+            f.write("int main() { while (1); return 0; }\n")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        p = subprocess.Popen([target_bin])
+        try:
+            read_only_dir = os.path.join(self.tmp_dir, "ro_snap_dir")
+            os.makedirs(read_only_dir, exist_ok=True)
+            # Make dir read-only so copy_maps_file fails when creating maps.txt
+            os.chmod(read_only_dir, 0o555)
+
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(p.pid), "-o", read_only_dir, "--json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            os.chmod(read_only_dir, 0o755)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("FAILED", res.stdout + res.stderr)
+        finally:
+            if os.path.exists(read_only_dir):
+                os.chmod(read_only_dir, 0o755)
+            p.terminate()
+            p.wait()
+
+    def test_25_stale_metadata_invalidation(self):
+        """Verifies that starting a capture unlinks stale metadata.json from previous runs."""
+        target_src = os.path.join(self.tmp_dir, "target_stale.c")
+        target_bin = os.path.join(self.tmp_dir, "target_stale_app")
+        with open(target_src, "w") as f:
+            f.write("int main() { while (1); return 0; }\n")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        p = subprocess.Popen([target_bin])
+        out_dir = os.path.join(self.tmp_dir, "stale_snap_dir")
+        os.makedirs(out_dir, exist_ok=True)
+        stale_meta = os.path.join(out_dir, "metadata.json")
+        try:
+            with open(stale_meta, "w") as f:
+                json.dump({"snapshot_id": "OLD_STALE", "status": "COMPLETE", "committed": True}, f)
+            self.assertTrue(os.path.exists(stale_meta))
+
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(p.pid), "-o", out_dir, "--json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0)
+            with open(stale_meta, "r") as f:
+                new_data = json.load(f)
+            self.assertNotEqual(new_data.get("snapshot_id"), "OLD_STALE")
+        finally:
+            p.terminate()
+            p.wait()
+
+    def test_26_snapshot_integrity_path_traversal_rejection(self):
+        """Verifies validate_integrity detects path traversal in region filenames and symlink escapes."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_traversal_test")
+        os.makedirs(snap_dir, exist_ok=True)
+
+        # Region attempting traversal via relative path
+        reg_trav = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "../escape.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_TRAV",
+            pid=7777,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg_trav],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        is_val, warns = raw.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertTrue(any("escapes snapshot directory" in w for w in warns))
+
+        # Absolute path outside snap_dir
+        reg_abs = CapturedRegion("R02", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "/etc/passwd")
+        raw.regions = [reg_abs]
+        is_val, warns = raw.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertTrue(any("escapes snapshot directory" in w for w in warns))
+
+    def test_27_snapshot_integrity_malformed_json_and_count_mismatch(self):
+        """Verifies that malformed json files or count/byte mismatches invalidate COMPLETE status."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_malformed_test")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+
+        bin_file = "memory/reg_m.bin"
+        with open(os.path.join(snap_dir, bin_file), "wb") as f:
+            f.write(b"M" * 4096)
+
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "code", "/app", 4096, 4096, "COMPLETE", bin_file)
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_MALFORMED",
+            pid=6666,
+            binary="/app",
+            timestamp_ns=2000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # Corrupt manifest.json with invalid JSON syntax
+        manifest_path = os.path.join(snap_dir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            f.write('{"unclosed_json": ')
+
+        corrupted_snap = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(corrupted_snap.status, "PARTIAL")
+        self.assertTrue(any("malformed" in w and "JSON" in w for w in corrupted_snap.integrity_warnings))
+
+        # Restore valid manifest but induce region count mismatch in metadata
+        raw.save()
+        meta_path = os.path.join(snap_dir, "metadata.json")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        meta["regions"] = 999  # Mismatch: manifest has 1 region
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+
+        mismatch_snap = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(mismatch_snap.status, "PARTIAL")
+        self.assertTrue(any("Region count mismatch" in w for w in mismatch_snap.integrity_warnings))
+
+    def test_28_python_save_atomic_commit_barrier(self):
+        """Verifies RawMemorySnapshot.save() writes atomically via temporary files and leaves no leftovers."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_atomic_test")
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_ATOMIC",
+            pid=5555,
+            binary="/app",
+            timestamp_ns=3000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # All temporary files (.tmp.<pid>) must be replaced into final files
+        all_files = os.listdir(snap_dir)
+        tmp_files = [f for f in all_files if ".tmp" in f]
+        self.assertEqual(tmp_files, [])
+        self.assertIn("metadata.json", all_files)
+        self.assertIn("manifest.json", all_files)
+        self.assertIn("maps.json", all_files)
+
+    def test_29_ssh_adapter_partial_zero_evidence_degrades_to_failed(self):
+        """Verifies RemoteSshTargetAdapter degrades PARTIAL with 0 regions/bytes to FAILED."""
+        from extractor.target_adapter import RemoteSshTargetAdapter
+
+        # Case A: PARTIAL with 0 regions and 0 bytes captured -> degraded to FAILED
+        def runner_empty_partial(cmd, t):
+            payload = json.dumps({
+                "success": False,
+                "status": "PARTIAL",
+                "regions": 0,
+                "bytes_captured": 0,
+                "regions_requested": 5,
+                "bytes_requested": 20480,
+                "error": "TIMEOUT",
+            })
+            return 0, payload + "\n", ""
+
+        adapter = RemoteSshTargetAdapter("192.168.1.100", collector_path="/collector", command_runner=runner_empty_partial)
+        res = adapter.capture_snapshot_via_collector(4321, "/tmp/snap_dest")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+        self.assertEqual(res["error"], "TIMEOUT")
+
+        # Case B: COMPLETE with 0 regions when 5 requested -> degraded to INCONSISTENT_STATUS
+        def runner_empty_complete(cmd, t):
+            payload = json.dumps({
+                "success": True,
+                "status": "COMPLETE",
+                "regions": 0,
+                "bytes_captured": 0,
+                "regions_requested": 5,
+            })
+            return 0, payload + "\n", ""
+
+        adapter2 = RemoteSshTargetAdapter("192.168.1.100", collector_path="/collector", command_runner=runner_empty_complete)
+        res2 = adapter2.capture_snapshot_via_collector(4321, "/tmp/snap_dest")
+        self.assertFalse(res2["success"])
+        self.assertEqual(res2["status"], "INCONSISTENT_STATUS")
 
 
 if __name__ == "__main__":

@@ -1245,20 +1245,37 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             payload["status"] = "UNKNOWN"
 
         regions_count = payload.get("regions", 0)
+        bytes_captured = payload.get("bytes_captured", 0)
+        regions_requested = payload.get("regions_requested", 0)
+        has_usable_evidence = (regions_count > 0 and bytes_captured > 0)
 
         # State transition matrix reconciling returncode and JSON status:
         if rc != 0:
             if st == "COMPLETE":
                 # Contradiction: rc non-zero contradicts COMPLETE status
-                has_regions = regions_count > 0
-                payload["status"] = "PARTIAL" if has_regions else "FAILED"
-                payload["success"] = has_regions
-                warn = f"Process exit code {rc} contradicts COMPLETE status; downgraded to {payload['status']}"
+                if has_usable_evidence:
+                    payload["status"] = "PARTIAL"
+                    payload["success"] = True
+                    warn = f"Process exit code {rc} contradicts COMPLETE status; downgraded to PARTIAL with valid evidence"
+                else:
+                    payload["status"] = "FAILED"
+                    payload["success"] = False
+                    warn = f"Process exit code {rc} contradicts COMPLETE status with no usable regions; downgraded to FAILED"
                 payload["quality_warning"] = f"{payload.get('quality_warning', '')}; {warn}".strip("; ")
             elif st == "PARTIAL":
-                # Valid partial evidence is preserved
-                payload["success"] = True
-                warn = f"Remote collector exited with non-zero exit code {rc}; partial snapshot data preserved"
+                if has_usable_evidence:
+                    # Valid partial evidence is preserved
+                    payload["status"] = "PARTIAL"
+                    payload["success"] = True
+                    warn = f"Remote collector exited with non-zero exit code {rc}; partial snapshot data preserved"
+                else:
+                    # PARTIAL with no usable captured regions/bytes must not count as useful evidence
+                    payload["status"] = "FAILED"
+                    payload["success"] = False
+                    orig_err = payload.get("error")
+                    payload["error"] = orig_err if orig_err else f"Remote collector exited with code {rc} and PARTIAL status but 0 usable regions/bytes; degraded to FAILED"
+                    payload["degraded_reason"] = f"Remote collector exited with code {rc} and PARTIAL status but 0 usable regions/bytes; degraded to FAILED"
+                    warn = f"Remote collector exited with code {rc} and PARTIAL status but 0 usable regions/bytes; degraded to FAILED"
                 payload["quality_warning"] = f"{payload.get('quality_warning', '')}; {warn}".strip("; ")
             elif st in ("FAILED", "TIMEOUT", "PROCESS_EXITED", "PERMISSION_DENIED"):
                 payload["success"] = False
@@ -1270,17 +1287,29 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         else:
             # rc == 0
             if st == "COMPLETE":
-                # Check for contradiction between status and success flag
+                # Check for contradiction between status and success flag or region counts
                 if payload.get("success") is False:
                     payload["status"] = "INCONSISTENT_STATUS"
                     payload["success"] = False
                     payload["error"] = "Contradiction in collector output: status is COMPLETE but success is false"
+                elif regions_count == 0 and regions_requested > 0:
+                    payload["status"] = "INCONSISTENT_STATUS"
+                    payload["success"] = False
+                    payload["error"] = "Contradiction in collector output: status is COMPLETE but 0 regions were captured"
                 else:
                     payload["success"] = True
             elif st == "PARTIAL":
-                payload["success"] = True
-                if "quality_warning" not in payload or not payload["quality_warning"]:
-                    payload["quality_warning"] = "PARTIAL_CAPTURE: Some regions failed or timed out during capture"
+                if has_usable_evidence:
+                    payload["success"] = True
+                    if "quality_warning" not in payload or not payload["quality_warning"]:
+                        payload["quality_warning"] = "PARTIAL_CAPTURE: Some regions failed or timed out during capture"
+                else:
+                    # PARTIAL with 0 usable captured regions/bytes cannot be accepted as successful capture
+                    payload["status"] = "FAILED"
+                    payload["success"] = False
+                    orig_err = payload.get("error")
+                    payload["error"] = orig_err if orig_err else "PARTIAL capture produced 0 usable regions or bytes; degraded to FAILED"
+                    payload["degraded_reason"] = "PARTIAL capture produced 0 usable regions or bytes; degraded to FAILED"
             elif st in ("FAILED", "TIMEOUT", "PROCESS_EXITED", "PERMISSION_DENIED"):
                 payload["success"] = False
                 if "error" not in payload or not payload["error"]:

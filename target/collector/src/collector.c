@@ -417,13 +417,32 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     int selected_count = 0;
     collector_filter_regions(regions, region_count, cfg, &selected_count);
     stats.regions_requested = selected_count;
+    for (int i = 0; i < region_count; i++) {
+        if (regions[i].is_selected) {
+            size_t r_req = (size_t)regions[i].size;
+            if (cfg->max_region_bytes > 0 && r_req > cfg->max_region_bytes) {
+                r_req = cfg->max_region_bytes;
+            }
+            stats.bytes_requested += r_req;
+        }
+    }
 
     /* Setup output directory */
-    char out_dir[1024];
+    char out_dir[1024] = {0};
     if (cfg->output_dir[0]) {
-        snprintf(out_dir, sizeof(out_dir), "%s", cfg->output_dir);
+        if (snprintf(out_dir, sizeof(out_dir), "%s", cfg->output_dir) >= (int)sizeof(out_dir)) {
+            snprintf(stats.status, sizeof(stats.status), "FAILED");
+            if (stats_out) *stats_out = stats;
+            free(regions);
+            return -1;
+        }
     } else {
-        snprintf(out_dir, sizeof(out_dir), "raw_snapshot_%d", (int)cfg->pid);
+        if (snprintf(out_dir, sizeof(out_dir), "raw_snapshot_%d", (int)cfg->pid) >= (int)sizeof(out_dir)) {
+            snprintf(stats.status, sizeof(stats.status), "FAILED");
+            if (stats_out) *stats_out = stats;
+            free(regions);
+            return -1;
+        }
     }
     if (mkdir(out_dir, 0755) != 0 && errno != EEXIST) {
         if (cfg->verbose) {
@@ -435,29 +454,75 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         return -1;
     }
 
-    char mem_dir[2048];
-    snprintf(mem_dir, sizeof(mem_dir), "%s/memory", out_dir);
+    /* Acquire exclusive advisory lock on output directory to prevent concurrent collision */
+    char lock_path[2048] = {0};
+    int lock_fd = -1;
+    if (snprintf(lock_path, sizeof(lock_path), "%s/.collector.lock", out_dir) < (int)sizeof(lock_path)) {
+        lock_fd = open(lock_path, O_CREAT | O_RDWR, 0644);
+        if (lock_fd >= 0) {
+            struct flock fl;
+            memset(&fl, 0, sizeof(fl));
+            fl.l_type = F_WRLCK;
+            fl.l_whence = SEEK_SET;
+            fl.l_start = 0;
+            fl.l_len = 0;
+            if (fcntl(lock_fd, F_SETLK, &fl) < 0) {
+                if (cfg->verbose) {
+                    fprintf(stderr, "[debug] Output directory '%s' is locked by another collector process\n", out_dir);
+                }
+                close(lock_fd);
+                snprintf(stats.status, sizeof(stats.status), "FAILED");
+                if (stats_out) *stats_out = stats;
+                free(regions);
+                return -1;
+            }
+        }
+    }
+
+    /* Invalidate any existing metadata.json from a prior snapshot to prevent stale reads if interrupted */
+    char old_meta_path[2048] = {0};
+    if (snprintf(old_meta_path, sizeof(old_meta_path), "%s/metadata.json", out_dir) < (int)sizeof(old_meta_path)) {
+        unlink(old_meta_path);
+    }
+
+    char mem_dir[2048] = {0};
+    if (snprintf(mem_dir, sizeof(mem_dir), "%s/memory", out_dir) >= (int)sizeof(mem_dir)) {
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (lock_fd >= 0) close(lock_fd);
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
+    }
     if (mkdir(mem_dir, 0755) != 0 && errno != EEXIST) {
         if (cfg->verbose) {
             fprintf(stderr, "[debug] Failed to create memory directory '%s': %s\n", mem_dir, strerror(errno));
         }
         snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (lock_fd >= 0) close(lock_fd);
         if (stats_out) *stats_out = stats;
         free(regions);
         return -1;
     }
 
-    copy_maps_file(cfg->pid, out_dir);
+    if (copy_maps_file(cfg->pid, out_dir) != 0) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] Failed copying /proc/%d/maps to '%s/maps.txt'\n", (int)cfg->pid, out_dir);
+        }
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (lock_fd >= 0) close(lock_fd);
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
+    }
 
     /* Open /proc/<pid>/mem if pread is used */
-    char mem_path[128];
+    char mem_path[128] = {0};
     snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", (int)cfg->pid);
     int mem_fd = open(mem_path, O_RDONLY);
     if (cfg->verbose) {
         fprintf(stderr, "[debug] open(%s) = %d (errno=%d: %s)\n", mem_path, mem_fd, errno, strerror(errno));
     }
 
-    stats.capture_start_ns = get_time_ns();
     snprintf(stats.backend_used, sizeof(stats.backend_used), "%s",
              (cfg->backend == BACKEND_PROC_MEM) ? "pread" : "process_vm_readv");
 
@@ -466,16 +531,18 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     void *buf = malloc(chunk_buf_size);
     if (!buf) {
         if (mem_fd >= 0) close(mem_fd);
+        if (lock_fd >= 0) close(lock_fd);
         free(regions);
         return -1;
     }
 
-    char manifest_path[2048];
-    char manifest_tmp[2048];
+    char manifest_path[2048] = {0};
+    char manifest_tmp[2048] = {0};
     if (snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", out_dir) >= (int)sizeof(manifest_path) ||
         snprintf(manifest_tmp, sizeof(manifest_tmp), "%s/manifest.json.tmp.%d", out_dir, (int)getpid()) >= (int)sizeof(manifest_tmp)) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
+        if (lock_fd >= 0) close(lock_fd);
         free(buf);
         free(regions);
         if (stats_out) *stats_out = stats;
@@ -485,6 +552,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     if (!f_manifest) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
+        if (lock_fd >= 0) close(lock_fd);
         free(buf);
         free(regions);
         if (stats_out) *stats_out = stats;
@@ -492,6 +560,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     }
     int manifest_write_fail = (fprintf(f_manifest, "[\n") < 0);
 
+    stats.capture_start_ns = get_time_ns();
     int manifest_idx = 0;
     for (int i = 0; i < region_count; i++) {
         parsed_region_t *r = &regions[i];
@@ -515,8 +584,6 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         if (cfg->max_region_bytes > 0 && to_read > cfg->max_region_bytes) {
             to_read = cfg->max_region_bytes;
         }
-
-        stats.bytes_requested += to_read;
 
         if (to_read > chunk_buf_size) {
             void *new_buf = realloc(buf, to_read);
@@ -571,7 +638,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         }
 
         manifest_idx++;
-        char rel_bin_file[128];
+        char rel_bin_file[128] = {0};
         snprintf(rel_bin_file, sizeof(rel_bin_file), "memory/region_%06d.bin", manifest_idx);
 
         const char *status_str = "COMPLETE";
@@ -584,15 +651,26 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             snprintf(err_buf, sizeof(err_buf), "\"EFAULT_OR_READ_ERROR\"");
             error_str = err_buf;
         } else {
-            char full_bin_path[2048];
+            char full_bin_path[2048] = {0};
+            int path_constructed = 0;
             int bin_err = 0;
-            if (snprintf(full_bin_path, sizeof(full_bin_path), "%s/%s", out_dir, rel_bin_file) >= (int)sizeof(full_bin_path)) {
-                bin_err = 1;
+            int file_opened = 0;
+
+            if (snprintf(full_bin_path, sizeof(full_bin_path), "%s/%s", out_dir, rel_bin_file) < (int)sizeof(full_bin_path)) {
+                path_constructed = 1;
+            }
+
+            if (!path_constructed) {
+                stats.failed_reads++;
+                status_str = "FAILED";
+                snprintf(err_buf, sizeof(err_buf), "\"PATH_CONSTRUCTION_FAILED\"");
+                error_str = err_buf;
             } else {
                 FILE *f_bin = fopen(full_bin_path, "wb");
                 if (!f_bin) {
                     bin_err = 1;
                 } else {
+                    file_opened = 1;
                     size_t nw = fwrite(buf, 1, total_nread, f_bin);
                     int wr_fail = (nw != total_nread || ferror(f_bin));
                     int cl_fail = (fclose(f_bin) != 0);
@@ -600,26 +678,28 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                         bin_err = 1;
                     }
                 }
-            }
 
-            if (bin_err) {
-                unlink(full_bin_path);
-                stats.failed_reads++;
-                status_str = "FAILED";
-                snprintf(err_buf, sizeof(err_buf), "\"BIN_WRITE_FAILED\"");
-                error_str = err_buf;
-            } else if (total_nread < to_read) {
-                stats.partial_reads++;
-                stats.bytes_captured += total_nread;
-                stats.regions_captured++;
-                status_str = "PARTIAL";
-                snprintf(err_buf, sizeof(err_buf), "\"PARTIAL_READ_%zu_OF_%zu\"", total_nread, to_read);
-                error_str = err_buf;
-            } else {
-                stats.bytes_captured += total_nread;
-                stats.regions_captured++;
-                status_str = "COMPLETE";
-                error_str = "null";
+                if (bin_err) {
+                    if (file_opened) {
+                        unlink(full_bin_path);
+                    }
+                    stats.failed_reads++;
+                    status_str = "FAILED";
+                    snprintf(err_buf, sizeof(err_buf), "\"BIN_WRITE_FAILED\"");
+                    error_str = err_buf;
+                } else if (total_nread < to_read) {
+                    stats.partial_reads++;
+                    stats.bytes_captured += total_nread;
+                    stats.regions_captured++;
+                    status_str = "PARTIAL";
+                    snprintf(err_buf, sizeof(err_buf), "\"PARTIAL_READ_%zu_OF_%zu\"", total_nread, to_read);
+                    error_str = err_buf;
+                } else {
+                    stats.bytes_captured += total_nread;
+                    stats.regions_captured++;
+                    status_str = "COMPLETE";
+                    error_str = "null";
+                }
             }
         }
 
@@ -843,6 +923,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     if (manifest_err || maps_err || meta_err) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
+        if (lock_fd >= 0) close(lock_fd);
         free(buf);
         free(regions);
         if (stats_out) *stats_out = stats;
@@ -850,6 +931,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     }
 
     if (mem_fd >= 0) close(mem_fd);
+    if (lock_fd >= 0) close(lock_fd);
     free(buf);
     free(regions);
 
