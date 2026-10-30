@@ -170,36 +170,63 @@ int main() {
             proc.wait()
 
     def test_06_timeout_ms_contract(self):
-        """When --timeout-ms is reached, capture breaks gracefully and records timeout in metadata."""
+        """When --timeout-ms is reached on a memory-intensive target, capture deterministically breaks and records PARTIAL + timed_out."""
         target_src = os.path.join(self.tmp_dir, "target_to.c")
         target_bin = os.path.join(self.tmp_dir, "target_to_app")
         with open(target_src, "w") as f:
             f.write(r"""
 #include <sys/prctl.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 int main() {
     prctl(0x59616d61, -1, 0, 0, 0);
+    size_t sz = 64 * 1024 * 1024;
+    char *p = malloc(sz);
+    if (p) {
+        memset(p, 0x5a, sz);
+    }
     while (1) { pause(); }
     return 0;
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
         proc = subprocess.Popen([target_bin])
-        time.sleep(0.1)
+        time.sleep(0.15)
 
         out_snap_dir = os.path.join(self.tmp_dir, "snap_timeout")
         try:
-            # Pass ultra-low timeout of 0 ms (or 1 ms) to ensure timeout enforcement path
+            # Pass strict 1ms timeout on a 64MB memory capture
+            t0 = time.time()
             res = subprocess.run(
-                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--timeout-ms", "1", "--json"],
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--timeout-ms", "1", "--max-mb", "64", "--json"],
                 capture_output=True,
                 text=True,
             )
-            # Either it succeeded within 1ms or triggered TIMEOUT / PARTIAL
+            elapsed_sec = time.time() - t0
+            self.assertEqual(res.returncode, 0, f"Collector failed: {res.stderr}")
             import json as _json
             payload = _json.loads(res.stdout)
+            # Verify deterministic timeout occurrence
             self.assertEqual(payload.get("timeout_ms"), 1)
-            self.assertIn("timed_out", payload)
+            self.assertTrue(payload.get("timed_out"), "Collector should have marked timed_out=True")
+            self.assertEqual(payload.get("status"), "PARTIAL", "Partial memory should have status=PARTIAL")
+            self.assertGreater(payload.get("bytes_captured", 0), 0)
+            self.assertLess(payload.get("bytes_captured", 0), payload.get("bytes_requested", 0))
+            self.assertGreater(payload.get("partial_reads", 0), 0)
+
+            # Verify on-disk file integrity and manifest consistency
+            meta_file = os.path.join(out_snap_dir, "metadata.json")
+            manifest_file = os.path.join(out_snap_dir, "manifest.json")
+            self.assertTrue(os.path.isfile(meta_file))
+            self.assertTrue(os.path.isfile(manifest_file))
+            with open(manifest_file) as mf:
+                manifest_items = _json.load(mf)
+            self.assertGreater(len(manifest_items), 0)
+            # Find the partial chunk region
+            partial_items = [item for item in manifest_items if item.get("status") == "PARTIAL"]
+            self.assertGreater(len(partial_items), 0)
+            self.assertTrue(partial_items[0]["error"].startswith("PARTIAL_READ_"))
         finally:
             proc.terminate()
             proc.wait()
@@ -434,6 +461,168 @@ int main() {
         self.assertFalse(res_fail["success"])
         self.assertEqual(res_fail["status"], "SSH_FAILURE")
         self.assertIn("Connection refused", res_fail["error"])
+
+    def test_15_remote_termination_contract_combinations(self):
+        """Verifies all combinations of SSH returncode (0/1/255) and JSON status, reconciling contradictions."""
+        from extractor.target_adapter import RemoteSshTargetAdapter
+
+        # Subcase A: rc=0, status=COMPLETE -> success=True
+        def runner_c0(cmd, t):
+            return 0, '{"success":true,"status":"COMPLETE","regions":10,"bytes_captured":1024}\n', ""
+        a_c0 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_c0)
+        res = a_c0.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "COMPLETE")
+
+        # Subcase B: rc=0, status=PARTIAL -> success=True, quality_warning present
+        def runner_p0(cmd, t):
+            return 0, '{"success":true,"status":"PARTIAL","regions":3,"bytes_captured":512}\n', ""
+        a_p0 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_p0)
+        res = a_p0.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "PARTIAL")
+        self.assertIn("PARTIAL_CAPTURE", res.get("quality_warning", ""))
+
+        # Subcase C: rc=0, status=FAILED -> success=False
+        def runner_f0(cmd, t):
+            return 0, '{"success":false,"status":"FAILED","error":"EFAULT"}\n', ""
+        a_f0 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_f0)
+        res = a_f0.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+
+        # Subcase D: rc=1, status=TIMEOUT -> success=False
+        def runner_t1(cmd, t):
+            return 1, '{"success":false,"status":"TIMEOUT","timed_out":true,"regions":0}\n', ""
+        a_t1 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_t1)
+        res = a_t1.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "TIMEOUT")
+
+        # Subcase E: Contradiction! rc=1, but JSON says status=COMPLETE -> downgraded to PARTIAL/FAILED
+        def runner_c1(cmd, t):
+            return 1, '{"success":true,"status":"COMPLETE","regions":5,"bytes_captured":4096}\n', ""
+        a_c1 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_c1)
+        res = a_c1.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertEqual(res["status"], "PARTIAL")
+        self.assertIn("quality_warning", res)
+        self.assertIn("contradicts COMPLETE", res["quality_warning"])
+
+        # Subcase F: rc=1, status=PARTIAL with regions -> partial preserved with warning
+        def runner_p1(cmd, t):
+            return 1, '{"success":true,"status":"PARTIAL","regions":2,"bytes_captured":2048}\n', ""
+        a_p1 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_p1)
+        res = a_p1.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertEqual(res["status"], "PARTIAL")
+        self.assertIn("partial snapshot data preserved", res.get("quality_warning", ""))
+
+        # Subcase G: SSH Timeout (rc=-1) with empty stdout -> status=SSH_TIMEOUT
+        def runner_to(cmd, t):
+            return -1, "", "SSH command timed out after 5.0s"
+        a_to = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_to)
+        res = a_to.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "SSH_TIMEOUT")
+
+        # Subcase H: Malformed JSON output -> status=MALFORMED_OUTPUT
+        def runner_bad(cmd, t):
+            return 0, "Corrupted binary output without json\n", ""
+        a_bad = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_bad)
+        res = a_bad.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "MALFORMED_OUTPUT")
+
+    def test_16_atomic_json_file_integrity(self):
+        """Metadata, manifest, and maps are written atomically without leaving dangling .tmp files."""
+        target_src = os.path.join(self.tmp_dir, "target_atom.c")
+        target_bin = os.path.join(self.tmp_dir, "target_atom_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) { pause(); }
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        out_snap_dir = os.path.join(self.tmp_dir, "snap_atom")
+        try:
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0)
+            # Verify primary files exist
+            self.assertTrue(os.path.isfile(os.path.join(out_snap_dir, "metadata.json")))
+            self.assertTrue(os.path.isfile(os.path.join(out_snap_dir, "manifest.json")))
+            self.assertTrue(os.path.isfile(os.path.join(out_snap_dir, "maps.json")))
+            # Verify no temporary files are left over
+            self.assertFalse(os.path.exists(os.path.join(out_snap_dir, "metadata.json.tmp")))
+            self.assertFalse(os.path.exists(os.path.join(out_snap_dir, "manifest.json.tmp")))
+            self.assertFalse(os.path.exists(os.path.join(out_snap_dir, "maps.json.tmp")))
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_17_offline_analyzer_partial_snapshot_propagation(self):
+        """OfflineMemoryAnalyzer accurately reflects PARTIAL capture quality, missing regions, and warnings."""
+        from extractor.memory_snapshot import RawMemorySnapshot, CapturedRegion
+        from extractor.offline_analyzer import OfflineMemoryAnalyzer
+
+        # Create synthetic partial snapshot
+        snap_dir = os.path.join(self.tmp_dir, "synth_partial")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        # Write dummy region
+        bin_rel = "memory/region_000001.bin"
+        with open(os.path.join(snap_dir, bin_rel), "wb") as bf:
+            bf.write(b"\x00" * 4096)
+
+        reg1 = CapturedRegion("R000001", 0x1000, 0x2000, 4096, "r--p", "code", "/bin/app", 4096, 4096, "COMPLETE", bin_rel)
+        reg2 = CapturedRegion("R000002", 0x2000, 0x10000, 57344, "rw-p", "heap", "[heap]", 57344, 0, "FAILED", None, "EFAULT_OR_READ_ERROR")
+
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_SYNTH_PARTIAL",
+            pid=4242,
+            binary="/bin/app",
+            timestamp_ns=1000000,
+            status="PARTIAL",
+            regions_requested=2,
+            regions_captured=1,
+            bytes_requested=61440,
+            bytes_captured=4096,
+            partial_reads=0,
+            failed_reads=1,
+            output_dir=snap_dir,
+            regions=[reg1, reg2],
+        )
+
+        analyzer = OfflineMemoryAnalyzer()
+        semantic_snap = analyzer.analyze(raw, optional_symbol_context={"types": {}, "globals": {}})
+        meta = semantic_snap.metadata
+        prov = semantic_snap.provenance
+
+        # Assert full quality propagation
+        self.assertEqual(meta["capture_status"], "PARTIAL")
+        self.assertEqual(meta["regions_requested"], 2)
+        self.assertEqual(meta["regions_captured"], 1)
+        self.assertEqual(meta["bytes_requested"], 61440)
+        self.assertEqual(meta["bytes_captured"], 4096)
+        self.assertEqual(meta["failed_reads"], 1)
+        self.assertEqual(prov["capture_status"], "PARTIAL")
+        self.assertIn("PARTIAL_CAPTURE", prov.get("quality_warning", ""))
+
+        # Verify unmapped memory returns unreadable / None
+        from extractor.offline_analyzer import SnapshotMemoryReader
+        reader = SnapshotMemoryReader(raw)
+        self.assertTrue(reader.is_readable(0x1000, 4))
+        self.assertFalse(reader.is_readable(0x2000, 4))
+        self.assertIsNone(reader.read(0x2000, 4))
 
 
 if __name__ == "__main__":

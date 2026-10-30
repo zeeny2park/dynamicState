@@ -454,8 +454,10 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     }
 
     char manifest_path[2048];
+    char manifest_tmp[2048];
     snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", out_dir);
-    FILE *f_manifest = fopen(manifest_path, "w");
+    snprintf(manifest_tmp, sizeof(manifest_tmp), "%s/manifest.json.tmp", out_dir);
+    FILE *f_manifest = fopen(manifest_tmp, "w");
     if (!f_manifest) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
@@ -614,9 +616,17 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         }
     }
 
+    int manifest_err = 0;
     if (f_manifest) {
-        fprintf(f_manifest, "\n  ]\n");
-        fclose(f_manifest);
+        if (fprintf(f_manifest, "\n  ]\n") < 0 || ferror(f_manifest) || fclose(f_manifest) != 0) {
+            manifest_err = 1;
+            unlink(manifest_tmp);
+        } else {
+            if (rename(manifest_tmp, manifest_path) != 0) {
+                manifest_err = 1;
+                unlink(manifest_tmp);
+            }
+        }
     }
 
     stats.capture_end_ns = get_time_ns();
@@ -658,10 +668,13 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         }
     }
 
-    /* Write maps.json */
+    /* Write maps.json atomically */
     char maps_json_path[2048];
+    char maps_json_tmp[2048];
     snprintf(maps_json_path, sizeof(maps_json_path), "%s/maps.json", out_dir);
-    FILE *f_maps = fopen(maps_json_path, "w");
+    snprintf(maps_json_tmp, sizeof(maps_json_tmp), "%s/maps.json.tmp", out_dir);
+    FILE *f_maps = fopen(maps_json_tmp, "w");
+    int maps_err = 0;
     if (f_maps) {
         fprintf(f_maps, "[\n");
         for (int i = 0; i < region_count; i++) {
@@ -688,13 +701,23 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             fprintf(f_maps, "    }");
         }
         fprintf(f_maps, "\n  ]\n");
-        fclose(f_maps);
+        if (ferror(f_maps) || fclose(f_maps) != 0) {
+            maps_err = 1;
+            unlink(maps_json_tmp);
+        } else {
+            if (rename(maps_json_tmp, maps_json_path) != 0) {
+                maps_err = 1;
+                unlink(maps_json_tmp);
+            }
+        }
     }
 
-    /* Write metadata.json */
+    /* Write metadata.json atomically */
     char meta_json_path[2048];
+    char meta_json_tmp[2048];
     snprintf(meta_json_path, sizeof(meta_json_path), "%s/metadata.json", out_dir);
-    FILE *f_meta = fopen(meta_json_path, "w");
+    snprintf(meta_json_tmp, sizeof(meta_json_tmp), "%s/metadata.json.tmp", out_dir);
+    FILE *f_meta = fopen(meta_json_tmp, "w");
     if (!f_meta) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
@@ -749,7 +772,26 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     fprintf(f_meta, "  },\n");
     fprintf(f_meta, "  \"modules\": []\n");
     fprintf(f_meta, "}\n");
-    fclose(f_meta);
+    
+    int meta_err = 0;
+    if (ferror(f_meta) || fclose(f_meta) != 0) {
+        meta_err = 1;
+        unlink(meta_json_tmp);
+    } else {
+        if (rename(meta_json_tmp, meta_json_path) != 0) {
+            meta_err = 1;
+            unlink(meta_json_tmp);
+        }
+    }
+
+    if (manifest_err || maps_err || meta_err) {
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (mem_fd >= 0) close(mem_fd);
+        free(buf);
+        free(regions);
+        if (stats_out) *stats_out = stats;
+        return -1;
+    }
 
     if (mem_fd >= 0) close(mem_fd);
     free(buf);

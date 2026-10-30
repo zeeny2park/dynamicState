@@ -1207,23 +1207,56 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             f"{shlex.quote(self.collector_path)} -p {int(pid)} -o {shlex.quote(remote_output_dir)} "
             f"-t {int(timeout_ms)} --policy {shlex.quote(policy)} -m {int(max_mb)} -r {int(max_region_mb)} --json"
         )
-        rc, stdout, stderr = self.run_ssh(cmd, timeout=(timeout_ms / 1000.0) + self.timeout_sec)
+        ssh_timeout = (float(timeout_ms) / 1000.0) + self.timeout_sec
+        rc, stdout, stderr = self.run_ssh(cmd, timeout=ssh_timeout)
+
+        # Empty stdout: transport failure, connection dropped, or remote timeout
         if not stdout.strip():
+            is_to = (rc == -1 or "timed out" in stderr.lower())
+            status = "SSH_TIMEOUT" if is_to else ("SSH_FAILURE" if rc != 0 else "FAILED")
             return {
                 "success": False,
-                "status": "SSH_FAILURE" if rc != 0 else "FAILED",
+                "status": status,
                 "error": stderr.strip() or f"Collector exited with rc {rc} but produced empty stdout",
+                "returncode": rc,
             }
+
         import json as _json
         try:
             payload = _json.loads(stdout.strip().splitlines()[-1])
-            if payload.get("status") == "PARTIAL":
-                payload["quality_warning"] = "PARTIAL_CAPTURE: Some regions failed or timed out during capture"
-            return payload
         except Exception as e:
             return {
                 "success": False,
-                "status": "FAILED",
+                "status": "MALFORMED_OUTPUT",
                 "error": f"Failed to parse collector JSON output: {e}",
                 "raw_stdout": stdout,
+                "returncode": rc,
             }
+
+        payload["returncode"] = rc
+        st = payload.get("status", "UNKNOWN")
+
+        # Reconcile returncode and JSON status
+        if rc != 0:
+            if st == "COMPLETE":
+                # Exit code non-zero contradicts COMPLETE status
+                has_regions = payload.get("regions", 0) > 0
+                payload["status"] = "PARTIAL" if has_regions else "FAILED"
+                payload["success"] = has_regions
+                warn = f"Process exit code {rc} contradicts COMPLETE status; downgraded to {payload['status']}"
+                payload["quality_warning"] = f"{payload.get('quality_warning', '')}; {warn}".strip("; ")
+            elif st == "PARTIAL":
+                # Partial evidence is valid and preserved
+                warn = f"Remote collector exited with non-zero exit code {rc}; partial snapshot data preserved"
+                payload["quality_warning"] = f"{payload.get('quality_warning', '')}; {warn}".strip("; ")
+            elif st in ("FAILED", "TIMEOUT", "PROCESS_EXITED", "PERMISSION_DENIED"):
+                payload["success"] = False
+        else:
+            # rc == 0
+            if st in ("FAILED", "TIMEOUT", "PROCESS_EXITED", "PERMISSION_DENIED"):
+                payload["success"] = False
+            elif st == "PARTIAL":
+                if "quality_warning" not in payload:
+                    payload["quality_warning"] = "PARTIAL_CAPTURE: Some regions failed or timed out during capture"
+
+        return payload

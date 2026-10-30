@@ -724,6 +724,8 @@ class OfflineMemoryAnalyzer:
             "modules": [m.to_dict() if hasattr(m, "to_dict") else m for m in modules],
             "capture_mode": "LOW_IMPACT",
             "consistency": raw_snap.consistency,
+            "capture_status": getattr(raw_snap, "status", "COMPLETE"),
+            "quality_warning": "PARTIAL_CAPTURE: Some regions failed or timed out during capture" if getattr(raw_snap, "status", "") == "PARTIAL" else None,
         }
 
         # 10. Performance metadata
@@ -731,9 +733,16 @@ class OfflineMemoryAnalyzer:
         metadata = {
             "offline_analysis_duration_ms": t_elapsed_ms,
             "raw_snapshot_id": raw_snap.snapshot_id,
+            "capture_status": getattr(raw_snap, "status", "COMPLETE"),
             "capture_duration_us": raw_snap.duration_us,
             "bytes_captured": raw_snap.bytes_captured,
+            "bytes_requested": getattr(raw_snap, "bytes_requested", raw_snap.bytes_captured),
             "regions_captured": raw_snap.regions_captured,
+            "regions_requested": getattr(raw_snap, "regions_requested", raw_snap.regions_captured),
+            "partial_reads": getattr(raw_snap, "partial_reads", 0),
+            "failed_reads": getattr(raw_snap, "failed_reads", 0),
+            "timed_out": getattr(raw_snap, "timed_out", False),
+            "mapping_race_detected": getattr(raw_snap, "mapping_race_detected", False),
             "objects_discovered": len(objects),
             "roots_discovered": len(roots),
             "module_count": len(modules),
