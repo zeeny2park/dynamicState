@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from .snapshot_consistency import NON_ATOMIC, SnapshotConsistency
 
 
@@ -89,6 +89,10 @@ class RawMemorySnapshot:
     elf_class: Optional[str] = None
     page_size: int = 4096
     status: str = "COMPLETE"            # "COMPLETE", "PARTIAL", "FAILED"
+    timed_out: bool = False
+    timeout_ms: int = 0
+    committed: bool = True
+    commit_timestamp_ns: int = 0
     regions_requested: int = 0
     regions_captured: int = 0
     bytes_requested: int = 0
@@ -113,6 +117,7 @@ class RawMemorySnapshot:
     output_dir: str = ""
     regions: List[CapturedRegion] = field(default_factory=list)
     maps: List[Dict[str, Any]] = field(default_factory=list)
+    integrity_warnings: List[str] = field(default_factory=list)
 
     def to_metadata(self) -> Dict[str, Any]:
         return {
@@ -127,6 +132,11 @@ class RawMemorySnapshot:
             "elf_class": self.elf_class,
             "page_size": self.page_size,
             "status": self.status,
+            "timed_out": self.timed_out,
+            "timeout_ms": self.timeout_ms,
+            "committed": self.committed,
+            "commit_timestamp_ns": self.commit_timestamp_ns,
+            "integrity_warnings": list(self.integrity_warnings),
             "mapping_race_detected": self.mapping_race_detected,
             "process_exited": self.process_exited,
             "process_starttime": self.process_starttime,
@@ -183,6 +193,57 @@ class RawMemorySnapshot:
 
         return self.output_dir
 
+    def validate_integrity(self) -> Tuple[bool, List[str]]:
+        """Validates disk artifact integrity (commit status, region files, byte sizes)."""
+        warnings: List[str] = []
+        is_valid = True
+
+        if not self.committed:
+            is_valid = False
+            warnings.append("Snapshot was not cleanly committed (missing or false 'committed' marker in metadata.json).")
+
+        if self.output_dir and not os.path.isdir(self.output_dir):
+            return False, [f"Snapshot directory does not exist: {self.output_dir}"]
+
+        if self.output_dir:
+            # Verify manifest.json exists
+            manifest_file = os.path.join(self.output_dir, "manifest.json")
+            if not os.path.exists(manifest_file):
+                is_valid = False
+                warnings.append(f"Missing manifest.json in {self.output_dir}")
+
+            # Verify maps.json exists
+            maps_file = os.path.join(self.output_dir, "maps.json")
+            if not os.path.exists(maps_file):
+                is_valid = False
+                warnings.append(f"Missing maps.json in {self.output_dir}")
+
+            # Check binary region files
+            for r in self.regions:
+                if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0:
+                    if not r.filename:
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} status is {r.status} but filename is missing.")
+                        continue
+                    bin_path = os.path.join(self.output_dir, r.filename)
+                    if not os.path.exists(bin_path):
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} binary file missing on disk: {r.filename}")
+                    else:
+                        try:
+                            actual_sz = os.path.getsize(bin_path)
+                            if actual_sz != r.captured:
+                                is_valid = False
+                                warnings.append(
+                                    f"Region {r.region_id} binary file corrupted/truncated: {r.filename} "
+                                    f"(expected {r.captured} bytes, found {actual_sz} bytes)"
+                                )
+                        except OSError as e:
+                            is_valid = False
+                            warnings.append(f"Failed inspecting region file {bin_path}: {e}")
+
+        return is_valid, warnings
+
     @classmethod
     def load(cls, directory: str) -> "RawMemorySnapshot":
         """Load a persisted raw memory snapshot from a directory."""
@@ -216,7 +277,7 @@ class RawMemorySnapshot:
         elif "modules" in meta:
             modules = meta["modules"]
 
-        return cls(
+        snap = cls(
             snapshot_id=meta["snapshot_id"],
             pid=meta["pid"],
             binary=meta.get("binary", ""),
@@ -228,6 +289,11 @@ class RawMemorySnapshot:
             elf_class=meta.get("elf_class"),
             page_size=meta.get("page_size", 4096),
             status=meta.get("status", "COMPLETE"),
+            timed_out=meta.get("timed_out", False),
+            timeout_ms=meta.get("timeout_ms", 0),
+            committed=meta.get("committed", True),
+            commit_timestamp_ns=meta.get("commit_timestamp_ns", 0),
+            integrity_warnings=list(meta.get("integrity_warnings", [])),
             mapping_race_detected=meta.get("mapping_race_detected", False),
             process_exited=meta.get("process_exited", False),
             process_starttime=meta.get("process_starttime", 0),
@@ -253,3 +319,14 @@ class RawMemorySnapshot:
             regions=regions,
             maps=maps,
         )
+
+        is_valid, validation_warnings = snap.validate_integrity()
+        if validation_warnings:
+            for w in validation_warnings:
+                if w not in snap.integrity_warnings:
+                    snap.integrity_warnings.append(w)
+        if not is_valid and snap.status == "COMPLETE":
+            snap.status = "PARTIAL"
+            snap.integrity_warnings.append("Snapshot status degraded from COMPLETE to PARTIAL due to integrity check failures.")
+
+        return snap

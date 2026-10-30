@@ -323,26 +323,43 @@ int collector_read_region(pid_t pid, int mem_fd, int backend, uint64_t start, si
     return -1;
 }
 
-static void copy_maps_file(pid_t pid, const char *dest_dir) {
-    char src[128], dst[2048];
-    snprintf(src, sizeof(src), "/proc/%d/maps", (int)pid);
-    snprintf(dst, sizeof(dst), "%s/maps.txt", dest_dir);
+static int copy_maps_file(pid_t pid, const char *dest_dir) {
+    char src[128], dst[2048], tmp[2048];
+    if (snprintf(src, sizeof(src), "/proc/%d/maps", (int)pid) >= (int)sizeof(src)) return -1;
+    if (snprintf(dst, sizeof(dst), "%s/maps.txt", dest_dir) >= (int)sizeof(dst)) return -1;
+    if (snprintf(tmp, sizeof(tmp), "%s/maps.txt.tmp.%d", dest_dir, (int)getpid()) >= (int)sizeof(tmp)) return -1;
 
     FILE *in = fopen(src, "r");
-    if (!in) return;
-    FILE *out = fopen(dst, "w");
+    if (!in) return -1;
+    FILE *out = fopen(tmp, "w");
     if (!out) {
         fclose(in);
-        return;
+        return -1;
     }
 
     char buf[4096];
     size_t n;
+    int write_err = 0;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) break;
+        if (fwrite(buf, 1, n, out) != n) {
+            write_err = 1;
+            break;
+        }
     }
+    if (ferror(in)) write_err = 1;
     fclose(in);
-    fclose(out);
+    if (ferror(out)) write_err = 1;
+    if (fclose(out) != 0) write_err = 1;
+
+    if (write_err != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    if (rename(tmp, dst) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
 }
 
 int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
@@ -455,8 +472,15 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
 
     char manifest_path[2048];
     char manifest_tmp[2048];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", out_dir);
-    snprintf(manifest_tmp, sizeof(manifest_tmp), "%s/manifest.json.tmp", out_dir);
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", out_dir) >= (int)sizeof(manifest_path) ||
+        snprintf(manifest_tmp, sizeof(manifest_tmp), "%s/manifest.json.tmp.%d", out_dir, (int)getpid()) >= (int)sizeof(manifest_tmp)) {
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (mem_fd >= 0) close(mem_fd);
+        free(buf);
+        free(regions);
+        if (stats_out) *stats_out = stats;
+        return -1;
+    }
     FILE *f_manifest = fopen(manifest_tmp, "w");
     if (!f_manifest) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
@@ -466,7 +490,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         if (stats_out) *stats_out = stats;
         return -1;
     }
-    fprintf(f_manifest, "[\n");
+    int manifest_write_fail = (fprintf(f_manifest, "[\n") < 0);
 
     int manifest_idx = 0;
     for (int i = 0; i < region_count; i++) {
@@ -559,33 +583,43 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             status_str = "FAILED";
             snprintf(err_buf, sizeof(err_buf), "\"EFAULT_OR_READ_ERROR\"");
             error_str = err_buf;
-        } else if (total_nread < to_read) {
-            stats.partial_reads++;
-            stats.bytes_captured += total_nread;
-            stats.regions_captured++;
-            status_str = "PARTIAL";
-            snprintf(err_buf, sizeof(err_buf), "\"PARTIAL_READ_%zu_OF_%zu\"", total_nread, to_read);
-            error_str = err_buf;
-
-            char full_bin_path[2048];
-            snprintf(full_bin_path, sizeof(full_bin_path), "%s/%s", out_dir, rel_bin_file);
-            FILE *f_bin = fopen(full_bin_path, "wb");
-            if (f_bin) {
-                fwrite(buf, 1, total_nread, f_bin);
-                fclose(f_bin);
-            }
         } else {
-            stats.bytes_captured += total_nread;
-            stats.regions_captured++;
-            status_str = "COMPLETE";
-            error_str = "null";
-
             char full_bin_path[2048];
-            snprintf(full_bin_path, sizeof(full_bin_path), "%s/%s", out_dir, rel_bin_file);
-            FILE *f_bin = fopen(full_bin_path, "wb");
-            if (f_bin) {
-                fwrite(buf, 1, total_nread, f_bin);
-                fclose(f_bin);
+            int bin_err = 0;
+            if (snprintf(full_bin_path, sizeof(full_bin_path), "%s/%s", out_dir, rel_bin_file) >= (int)sizeof(full_bin_path)) {
+                bin_err = 1;
+            } else {
+                FILE *f_bin = fopen(full_bin_path, "wb");
+                if (!f_bin) {
+                    bin_err = 1;
+                } else {
+                    size_t nw = fwrite(buf, 1, total_nread, f_bin);
+                    int wr_fail = (nw != total_nread || ferror(f_bin));
+                    int cl_fail = (fclose(f_bin) != 0);
+                    if (wr_fail || cl_fail) {
+                        bin_err = 1;
+                    }
+                }
+            }
+
+            if (bin_err) {
+                unlink(full_bin_path);
+                stats.failed_reads++;
+                status_str = "FAILED";
+                snprintf(err_buf, sizeof(err_buf), "\"BIN_WRITE_FAILED\"");
+                error_str = err_buf;
+            } else if (total_nread < to_read) {
+                stats.partial_reads++;
+                stats.bytes_captured += total_nread;
+                stats.regions_captured++;
+                status_str = "PARTIAL";
+                snprintf(err_buf, sizeof(err_buf), "\"PARTIAL_READ_%zu_OF_%zu\"", total_nread, to_read);
+                error_str = err_buf;
+            } else {
+                stats.bytes_captured += total_nread;
+                stats.regions_captured++;
+                status_str = "COMPLETE";
+                error_str = "null";
             }
         }
 
@@ -593,22 +627,22 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             char esc_path[1024] = {0};
             escape_json_string(r->pathname, esc_path, sizeof(esc_path));
 
-            fprintf(f_manifest, "%s    {\n", (manifest_idx > 1) ? ",\n" : "");
-            fprintf(f_manifest, "      \"region_id\": \"R%06d\",\n", manifest_idx);
-            fprintf(f_manifest, "      \"start\": \"0x%llx\",\n", (unsigned long long)r->start);
-            fprintf(f_manifest, "      \"end\": \"0x%llx\",\n", (unsigned long long)r->end);
-            fprintf(f_manifest, "      \"start_addr\": %llu,\n", (unsigned long long)r->start);
-            fprintf(f_manifest, "      \"end_addr\": %llu,\n", (unsigned long long)r->end);
-            fprintf(f_manifest, "      \"size\": %llu,\n", (unsigned long long)r->size);
-            fprintf(f_manifest, "      \"permissions\": \"%s\",\n", r->perms);
-            fprintf(f_manifest, "      \"category\": \"%s\",\n", r->category);
-            fprintf(f_manifest, "      \"pathname\": \"%s\",\n", esc_path);
-            fprintf(f_manifest, "      \"requested\": %llu,\n", (unsigned long long)to_read);
-            fprintf(f_manifest, "      \"captured\": %llu,\n", (unsigned long long)total_nread);
-            fprintf(f_manifest, "      \"status\": \"%s\",\n", status_str);
-            fprintf(f_manifest, "      \"filename\": \"%s\",\n", (total_nread > 0) ? rel_bin_file : "");
-            fprintf(f_manifest, "      \"error\": %s\n", error_str);
-            fprintf(f_manifest, "    }");
+            if (fprintf(f_manifest, "%s    {\n", (manifest_idx > 1) ? ",\n" : "") < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"region_id\": \"R%06d\",\n", manifest_idx) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"start\": \"0x%llx\",\n", (unsigned long long)r->start) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"end\": \"0x%llx\",\n", (unsigned long long)r->end) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"start_addr\": %llu,\n", (unsigned long long)r->start) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"end_addr\": %llu,\n", (unsigned long long)r->end) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"size\": %llu,\n", (unsigned long long)r->size) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"permissions\": \"%s\",\n", r->perms) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"category\": \"%s\",\n", r->category) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"pathname\": \"%s\",\n", esc_path) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"requested\": %llu,\n", (unsigned long long)to_read) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"captured\": %llu,\n", (unsigned long long)((strcmp(status_str, "FAILED") == 0) ? 0 : total_nread)) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"status\": \"%s\",\n", status_str) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"filename\": \"%s\",\n", (strcmp(status_str, "FAILED") != 0 && total_nread > 0) ? rel_bin_file : "") < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "      \"error\": %s\n", error_str) < 0) manifest_write_fail = 1;
+            if (fprintf(f_manifest, "    }") < 0) manifest_write_fail = 1;
         }
 
         if (stats.timed_out) {
@@ -618,7 +652,10 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
 
     int manifest_err = 0;
     if (f_manifest) {
-        if (fprintf(f_manifest, "\n  ]\n") < 0 || ferror(f_manifest) || fclose(f_manifest) != 0) {
+        if (fprintf(f_manifest, "\n  ]\n") < 0) manifest_write_fail = 1;
+        int fr_err = (ferror(f_manifest) != 0);
+        int cl_err = (fclose(f_manifest) != 0);
+        if (manifest_write_fail || fr_err || cl_err) {
             manifest_err = 1;
             unlink(manifest_tmp);
         } else {
@@ -627,6 +664,8 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                 unlink(manifest_tmp);
             }
         }
+    } else {
+        manifest_err = 1;
     }
 
     stats.capture_end_ns = get_time_ns();
@@ -671,116 +710,133 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     /* Write maps.json atomically */
     char maps_json_path[2048];
     char maps_json_tmp[2048];
-    snprintf(maps_json_path, sizeof(maps_json_path), "%s/maps.json", out_dir);
-    snprintf(maps_json_tmp, sizeof(maps_json_tmp), "%s/maps.json.tmp", out_dir);
-    FILE *f_maps = fopen(maps_json_tmp, "w");
     int maps_err = 0;
-    if (f_maps) {
-        fprintf(f_maps, "[\n");
-        for (int i = 0; i < region_count; i++) {
-            parsed_region_t *r = &regions[i];
-            char esc_path[1024] = {0};
-            escape_json_string(r->pathname, esc_path, sizeof(esc_path));
-
-            fprintf(f_maps, "%s    {\n", (i > 0) ? ",\n" : "");
-            fprintf(f_maps, "      \"start\": \"0x%llx\",\n", (unsigned long long)r->start);
-            fprintf(f_maps, "      \"end\": \"0x%llx\",\n", (unsigned long long)r->end);
-            fprintf(f_maps, "      \"start_addr\": %llu,\n", (unsigned long long)r->start);
-            fprintf(f_maps, "      \"end_addr\": %llu,\n", (unsigned long long)r->end);
-            fprintf(f_maps, "      \"size\": %llu,\n", (unsigned long long)r->size);
-            fprintf(f_maps, "      \"permissions\": \"%s\",\n", r->perms);
-            fprintf(f_maps, "      \"offset\": %llu,\n", (unsigned long long)r->offset);
-            fprintf(f_maps, "      \"device\": \"%s\",\n", r->device);
-            fprintf(f_maps, "      \"inode\": %llu,\n", (unsigned long long)r->inode);
-            fprintf(f_maps, "      \"pathname\": \"%s\",\n", esc_path);
-            fprintf(f_maps, "      \"readable\": %s,\n", r->readable ? "true" : "false");
-            fprintf(f_maps, "      \"writable\": %s,\n", r->writable ? "true" : "false");
-            fprintf(f_maps, "      \"executable\": %s,\n", r->executable ? "true" : "false");
-            fprintf(f_maps, "      \"category\": \"%s\",\n", r->category);
-            fprintf(f_maps, "      \"kind\": \"%s\"\n", r->category);
-            fprintf(f_maps, "    }");
-        }
-        fprintf(f_maps, "\n  ]\n");
-        if (ferror(f_maps) || fclose(f_maps) != 0) {
+    int maps_write_fail = 0;
+    if (snprintf(maps_json_path, sizeof(maps_json_path), "%s/maps.json", out_dir) >= (int)sizeof(maps_json_path) ||
+        snprintf(maps_json_tmp, sizeof(maps_json_tmp), "%s/maps.json.tmp.%d", out_dir, (int)getpid()) >= (int)sizeof(maps_json_tmp)) {
+        maps_err = 1;
+    } else {
+        FILE *f_maps = fopen(maps_json_tmp, "w");
+        if (!f_maps) {
             maps_err = 1;
-            unlink(maps_json_tmp);
         } else {
-            if (rename(maps_json_tmp, maps_json_path) != 0) {
+            if (fprintf(f_maps, "[\n") < 0) maps_write_fail = 1;
+            for (int i = 0; i < region_count; i++) {
+                parsed_region_t *r = &regions[i];
+                char esc_path[1024] = {0};
+                escape_json_string(r->pathname, esc_path, sizeof(esc_path));
+
+                if (fprintf(f_maps, "%s    {\n", (i > 0) ? ",\n" : "") < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"start\": \"0x%llx\",\n", (unsigned long long)r->start) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"end\": \"0x%llx\",\n", (unsigned long long)r->end) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"start_addr\": %llu,\n", (unsigned long long)r->start) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"end_addr\": %llu,\n", (unsigned long long)r->end) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"size\": %llu,\n", (unsigned long long)r->size) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"permissions\": \"%s\",\n", r->perms) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"offset\": %llu,\n", (unsigned long long)r->offset) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"device\": \"%s\",\n", r->device) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"inode\": %llu,\n", (unsigned long long)r->inode) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"pathname\": \"%s\",\n", esc_path) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"readable\": %s,\n", r->readable ? "true" : "false") < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"writable\": %s,\n", r->writable ? "true" : "false") < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"executable\": %s,\n", r->executable ? "true" : "false") < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"category\": \"%s\",\n", r->category) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "      \"kind\": \"%s\"\n", r->category) < 0) maps_write_fail = 1;
+                if (fprintf(f_maps, "    }") < 0) maps_write_fail = 1;
+            }
+            if (fprintf(f_maps, "\n  ]\n") < 0) maps_write_fail = 1;
+            int fr_err = (ferror(f_maps) != 0);
+            int cl_err = (fclose(f_maps) != 0);
+            if (maps_write_fail || fr_err || cl_err) {
                 maps_err = 1;
                 unlink(maps_json_tmp);
+            } else {
+                if (rename(maps_json_tmp, maps_json_path) != 0) {
+                    maps_err = 1;
+                    unlink(maps_json_tmp);
+                }
             }
         }
     }
 
-    /* Write metadata.json atomically */
-    char meta_json_path[2048];
-    char meta_json_tmp[2048];
-    snprintf(meta_json_path, sizeof(meta_json_path), "%s/metadata.json", out_dir);
-    snprintf(meta_json_tmp, sizeof(meta_json_tmp), "%s/metadata.json.tmp", out_dir);
-    FILE *f_meta = fopen(meta_json_tmp, "w");
-    if (!f_meta) {
+    if (manifest_err || maps_err) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
-        if (mem_fd >= 0) close(mem_fd);
-        free(buf);
-        free(regions);
-        if (stats_out) *stats_out = stats;
-        return -1;
     }
 
-    char esc_bin[1024] = {0};
-    escape_json_string(exe_path, esc_bin, sizeof(esc_bin));
-    const char *snap_id = cfg->snapshot_id[0] ? cfg->snapshot_id : "RAW_CAPTURE";
-    int is_success = (strcmp(stats.status, "COMPLETE") == 0 || strcmp(stats.status, "PARTIAL") == 0);
-
-    fprintf(f_meta, "{\n");
-    fprintf(f_meta, "  \"success\": %s,\n", is_success ? "true" : "false");
-    fprintf(f_meta, "  \"snapshot_id\": \"%s\",\n", snap_id);
-    fprintf(f_meta, "  \"pid\": %d,\n", (int)cfg->pid);
-    fprintf(f_meta, "  \"binary\": \"%s\",\n", esc_bin);
-    fprintf(f_meta, "  \"timestamp_ns\": %lld,\n", (long long)stats.capture_start_ns);
-    fprintf(f_meta, "  \"capture_mode\": \"LOW_IMPACT_NATIVE_COLLECTOR\",\n");
-    fprintf(f_meta, "  \"backend\": \"%s\",\n", stats.backend_used);
-    fprintf(f_meta, "  \"architecture\": \"%s\",\n", stats.arch);
-    fprintf(f_meta, "  \"endianness\": \"%s\",\n", stats.endianness);
-    fprintf(f_meta, "  \"elf_class\": \"%s\",\n", stats.elf_class);
-    fprintf(f_meta, "  \"page_size\": %ld,\n", stats.page_size);
-    fprintf(f_meta, "  \"status\": \"%s\",\n", stats.status);
-    fprintf(f_meta, "  \"timed_out\": %s,\n", stats.timed_out ? "true" : "false");
-    fprintf(f_meta, "  \"timeout_ms\": %u,\n", cfg->timeout_ms);
-    fprintf(f_meta, "  \"mapping_race_detected\": %s,\n", stats.mapping_race_detected ? "true" : "false");
-    fprintf(f_meta, "  \"process_exited\": %s,\n", stats.process_exited ? "true" : "false");
-    fprintf(f_meta, "  \"process_starttime\": %llu,\n", (unsigned long long)stats.process_starttime);
-    fprintf(f_meta, "  \"capture\": {\n");
-    fprintf(f_meta, "    \"backend\": \"%s\",\n", stats.backend_used);
-    fprintf(f_meta, "    \"process_stop\": false,\n");
-    fprintf(f_meta, "    \"ptrace\": false,\n");
-    fprintf(f_meta, "    \"sigstop\": false,\n");
-    fprintf(f_meta, "    \"sigcont\": false\n");
-    fprintf(f_meta, "  },\n");
-    fprintf(f_meta, "  \"regions\": %d,\n", stats.regions_captured);
-    fprintf(f_meta, "  \"regions_requested\": %d,\n", stats.regions_requested);
-    fprintf(f_meta, "  \"bytes_requested\": %zu,\n", stats.bytes_requested);
-    fprintf(f_meta, "  \"bytes_captured\": %zu,\n", stats.bytes_captured);
-    fprintf(f_meta, "  \"partial_reads\": %d,\n", stats.partial_reads);
-    fprintf(f_meta, "  \"failed_reads\": %d,\n", stats.failed_reads);
-    fprintf(f_meta, "  \"duration_us\": %.2f,\n", stats.duration_us);
-    fprintf(f_meta, "  \"duration_ms\": %.3f,\n", stats.duration_us / 1000.0);
-    fprintf(f_meta, "  \"capture_start_ns\": %lld,\n", (long long)stats.capture_start_ns);
-    fprintf(f_meta, "  \"capture_end_ns\": %lld,\n", (long long)stats.capture_end_ns);
-    fprintf(f_meta, "  \"consistency\": {\n");
-    fprintf(f_meta, "    \"level\": \"NON_ATOMIC\"\n");
-    fprintf(f_meta, "  },\n");
-    fprintf(f_meta, "  \"modules\": []\n");
-    fprintf(f_meta, "}\n");
-    
+    /* Write metadata.json atomically as the final commit barrier */
+    char meta_json_path[2048];
+    char meta_json_tmp[2048];
     int meta_err = 0;
-    if (ferror(f_meta) || fclose(f_meta) != 0) {
+    int meta_write_fail = 0;
+    if (snprintf(meta_json_path, sizeof(meta_json_path), "%s/metadata.json", out_dir) >= (int)sizeof(meta_json_path) ||
+        snprintf(meta_json_tmp, sizeof(meta_json_tmp), "%s/metadata.json.tmp.%d", out_dir, (int)getpid()) >= (int)sizeof(meta_json_tmp)) {
         meta_err = 1;
-        unlink(meta_json_tmp);
     } else {
-        if (rename(meta_json_tmp, meta_json_path) != 0) {
+        FILE *f_meta = fopen(meta_json_tmp, "w");
+        if (!f_meta) {
             meta_err = 1;
-            unlink(meta_json_tmp);
+        } else {
+            char esc_bin[1024] = {0};
+            escape_json_string(exe_path, esc_bin, sizeof(esc_bin));
+            const char *snap_id = cfg->snapshot_id[0] ? cfg->snapshot_id : "RAW_CAPTURE";
+            int is_success = (strcmp(stats.status, "COMPLETE") == 0 || strcmp(stats.status, "PARTIAL") == 0);
+            int is_committed = (!manifest_err && !maps_err && is_success);
+            int64_t commit_ts = get_time_ns();
+
+            if (fprintf(f_meta, "{\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"success\": %s,\n", is_success ? "true" : "false") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"committed\": %s,\n", is_committed ? "true" : "false") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"commit_timestamp_ns\": %lld,\n", (long long)commit_ts) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"snapshot_id\": \"%s\",\n", snap_id) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"pid\": %d,\n", (int)cfg->pid) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"binary\": \"%s\",\n", esc_bin) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"timestamp_ns\": %lld,\n", (long long)stats.capture_start_ns) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"capture_mode\": \"LOW_IMPACT_NATIVE_COLLECTOR\",\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"backend\": \"%s\",\n", stats.backend_used) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"architecture\": \"%s\",\n", stats.arch) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"endianness\": \"%s\",\n", stats.endianness) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"elf_class\": \"%s\",\n", stats.elf_class) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"page_size\": %ld,\n", stats.page_size) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"status\": \"%s\",\n", stats.status) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"timed_out\": %s,\n", stats.timed_out ? "true" : "false") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"timeout_ms\": %u,\n", cfg->timeout_ms) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"mapping_race_detected\": %s,\n", stats.mapping_race_detected ? "true" : "false") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"process_exited\": %s,\n", stats.process_exited ? "true" : "false") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"process_starttime\": %llu,\n", (unsigned long long)stats.process_starttime) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"capture\": {\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "    \"backend\": \"%s\",\n", stats.backend_used) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "    \"process_stop\": false,\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "    \"ptrace\": false,\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "    \"sigstop\": false,\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "    \"sigcont\": false\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  },\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"regions\": %d,\n", stats.regions_captured) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"regions_requested\": %d,\n", stats.regions_requested) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"bytes_requested\": %zu,\n", stats.bytes_requested) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"bytes_captured\": %zu,\n", stats.bytes_captured) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"partial_reads\": %d,\n", stats.partial_reads) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"failed_reads\": %d,\n", stats.failed_reads) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"duration_us\": %.2f,\n", stats.duration_us) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"duration_ms\": %.3f,\n", stats.duration_us / 1000.0) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"capture_start_ns\": %lld,\n", (long long)stats.capture_start_ns) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"capture_end_ns\": %lld,\n", (long long)stats.capture_end_ns) < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"consistency\": {\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "    \"level\": \"NON_ATOMIC\"\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  },\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "  \"modules\": []\n") < 0) meta_write_fail = 1;
+            if (fprintf(f_meta, "}\n") < 0) meta_write_fail = 1;
+
+            int fr_err = (ferror(f_meta) != 0);
+            int cl_err = (fclose(f_meta) != 0);
+            if (meta_write_fail || fr_err || cl_err) {
+                meta_err = 1;
+                unlink(meta_json_tmp);
+            } else {
+                if (rename(meta_json_tmp, meta_json_path) != 0) {
+                    meta_err = 1;
+                    unlink(meta_json_tmp);
+                }
+            }
         }
     }
 

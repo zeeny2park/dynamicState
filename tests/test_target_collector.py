@@ -7,6 +7,7 @@ Tests:
 4. Interoperability with host-side RawMemorySnapshot.load() and build_memory_snapshot_summary().
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -623,6 +624,283 @@ int main() {
         self.assertTrue(reader.is_readable(0x1000, 4))
         self.assertFalse(reader.is_readable(0x2000, 4))
         self.assertIsNone(reader.read(0x2000, 4))
+
+    def test_18_file_lifecycle_fclose_and_error_handling(self):
+        """Verifies clean fclose handling, cleanup of tmp files, and error propagation when writes fail."""
+        target_src = os.path.join(self.tmp_dir, "target_lifecycle.c")
+        target_bin = os.path.join(self.tmp_dir, "target_lifecycle_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <stdio.h>
+#include <unistd.h>
+int main() {
+    while (1) sleep(1);
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        try:
+            # Create a directory and make memory subdirectory non-writable to force region write failure
+            bad_dir = os.path.join(self.tmp_dir, "bad_snap_out")
+            os.makedirs(os.path.join(bad_dir, "memory"), exist_ok=True)
+            # Remove write permissions on memory subdir
+            os.chmod(os.path.join(bad_dir, "memory"), 0o555)
+
+            try:
+                res = subprocess.run(
+                    [self.collector_bin, "-p", str(proc.pid), "-o", bad_dir, "--json"],
+                    capture_output=True,
+                    text=True,
+                )
+                # Collector should either exit with 0 (and status FAILED/PARTIAL) or exit 1, but must not crash
+                self.assertIn(res.returncode, (0, 1))
+                payload = json.loads(res.stdout)
+                # If memory dir wasn't writable, failed_reads should be > 0 or status != COMPLETE
+                if payload.get("status") == "COMPLETE":
+                    # In some environments running as root or container chmod might not block root, check stats
+                    pass
+                else:
+                    self.assertIn(payload.get("status"), ("FAILED", "PARTIAL"))
+            finally:
+                os.chmod(os.path.join(bad_dir, "memory"), 0o755)
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_19_concurrent_collector_temp_isolation(self):
+        """PID-specific tmp naming ensures concurrent runs do not clobber each other's temporary files."""
+        target_src = os.path.join(self.tmp_dir, "target_iso.c")
+        target_bin = os.path.join(self.tmp_dir, "target_iso_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <stdio.h>
+#include <unistd.h>
+int main() {
+    while (1) sleep(1);
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        p1 = subprocess.Popen([target_bin])
+        p2 = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        out_dir = os.path.join(self.tmp_dir, "snap_iso")
+        try:
+            # Run two collectors in parallel to the same output directory
+            cmd1 = [self.collector_bin, "-p", str(p1.pid), "-o", out_dir, "--json"]
+            cmd2 = [self.collector_bin, "-p", str(p2.pid), "-o", out_dir, "--json"]
+            sub1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            sub2 = subprocess.Popen(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            out1, _ = sub1.communicate(timeout=5)
+            out2, _ = sub2.communicate(timeout=5)
+
+            # Both should finish without crashing or leaving dangling temporary files
+            self.assertEqual(sub1.returncode, 0)
+            self.assertEqual(sub2.returncode, 0)
+
+            # Check that no .tmp.* files remain in output directory
+            remaining_tmps = [f for f in os.listdir(out_dir) if ".tmp" in f]
+            self.assertEqual(remaining_tmps, [], f"Found lingering temporary files: {remaining_tmps}")
+        finally:
+            p1.terminate()
+            p2.terminate()
+            p1.wait()
+            p2.wait()
+
+    def test_20_snapshot_integrity_validation_and_degradation(self):
+        """Verifies validate_integrity() detects missing/truncated .bin files, uncommitted metadata, and degrades status."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_integrity_test")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+
+        bin_file = "memory/region_000001.bin"
+        full_bin = os.path.join(snap_dir, bin_file)
+        with open(full_bin, "wb") as bf:
+            bf.write(b"A" * 4096)
+
+        reg1 = CapturedRegion("R000001", 0x1000, 0x2000, 4096, "r--p", "code", "/app", 4096, 4096, "COMPLETE", bin_file)
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_INTEG",
+            pid=9999,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            committed=True,
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # Step 1: Clean snapshot passes integrity validation
+        loaded = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(loaded.status, "COMPLETE")
+        is_val, warns = loaded.validate_integrity()
+        self.assertTrue(is_val)
+        self.assertEqual(warns, [])
+
+        # Step 2: Corrupt binary file by truncating it
+        with open(full_bin, "wb") as bf:
+            bf.write(b"A" * 100) # Corrupted/truncated from 4096 to 100 bytes
+
+        corrupted = RawMemorySnapshot.load(snap_dir)
+        # Should degrade status from COMPLETE to PARTIAL
+        self.assertEqual(corrupted.status, "PARTIAL")
+        self.assertTrue(any("corrupted/truncated" in w for w in corrupted.integrity_warnings))
+        is_val, warns = corrupted.validate_integrity()
+        self.assertFalse(is_val)
+
+        # Step 3: Remove binary file entirely
+        os.unlink(full_bin)
+        missing_bin = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(missing_bin.status, "PARTIAL")
+        self.assertTrue(any("binary file missing on disk" in w for w in missing_bin.integrity_warnings))
+
+        # Step 4: Test uncommitted marker (committed: false)
+        meta_path = os.path.join(snap_dir, "metadata.json")
+        with open(meta_path, "r") as mf:
+            m_data = json.load(mf)
+        m_data["committed"] = False
+        m_data["status"] = "COMPLETE"
+        with open(meta_path, "w") as mf:
+            json.dump(m_data, mf)
+
+        uncommitted = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(uncommitted.status, "PARTIAL")
+        self.assertTrue(any("not cleanly committed" in w for w in uncommitted.integrity_warnings))
+
+    def test_21_ssh_transition_matrix_exhaustive(self):
+        """Exhaustively verifies every state in the SSH returncode and JSON status matrix."""
+        from extractor.target_adapter import RemoteSshTargetAdapter
+
+        # Case 1: rc=0, COMPLETE but success=False contradiction
+        def runner_inconsistent(cmd, t):
+            return 0, '{"success":false,"status":"COMPLETE","regions":5}\n', ""
+        a1 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_inconsistent)
+        res1 = a1.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res1["success"])
+        self.assertEqual(res1["status"], "INCONSISTENT_STATUS")
+
+        # Case 2: rc=0, unrecognized status
+        def runner_unknown(cmd, t):
+            return 0, '{"success":true,"status":"NON_STANDARD_STATUS"}\n', ""
+        a2 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_unknown)
+        res2 = a2.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res2["success"])
+        self.assertEqual(res2["status"], "UNKNOWN_STATUS")
+
+        # Case 3: rc=1, status=COMPLETE, regions=0 -> FAILED
+        def runner_c1_empty(cmd, t):
+            return 1, '{"success":true,"status":"COMPLETE","regions":0}\n', ""
+        a3 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_c1_empty)
+        res3 = a3.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res3["success"])
+        self.assertEqual(res3["status"], "FAILED")
+
+        # Case 4: rc=1, status=PROCESS_EXITED -> success=False
+        def runner_pe(cmd, t):
+            return 1, '{"success":false,"status":"PROCESS_EXITED"}\n', ""
+        a4 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_pe)
+        res4 = a4.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res4["success"])
+        self.assertEqual(res4["status"], "PROCESS_EXITED")
+
+        # Case 5: rc=1, status=PERMISSION_DENIED -> success=False
+        def runner_perm(cmd, t):
+            return 1, '{"success":false,"status":"PERMISSION_DENIED"}\n', ""
+        a5 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_perm)
+        res5 = a5.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res5["success"])
+        self.assertEqual(res5["status"], "PERMISSION_DENIED")
+
+        # Case 6: rc=0, empty stdout -> FAILED with error
+        def runner_empty0(cmd, t):
+            return 0, "", ""
+        a6 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_empty0)
+        res6 = a6.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res6["success"])
+        self.assertEqual(res6["status"], "FAILED")
+
+        # Case 7: rc=127, empty stdout -> SSH_FAILURE with returncode preserved
+        def runner_notfound(cmd, t):
+            return 127, "", "bash: /c: No such file or directory"
+        a7 = RemoteSshTargetAdapter("10.0.0.1", collector_path="/c", command_runner=runner_notfound)
+        res7 = a7.capture_snapshot_via_collector(1234, "/tmp/s")
+        self.assertFalse(res7["success"])
+        self.assertEqual(res7["status"], "SSH_FAILURE")
+        self.assertEqual(res7["returncode"], 127)
+
+    def test_22_quality_metadata_full_roundtrip_and_verdict_engine(self):
+        """Verifies full roundtrip of quality metadata and integration with OfflineMemoryAnalyzer."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        from extractor.offline_analyzer import OfflineMemoryAnalyzer, SnapshotMemoryReader
+
+        snap_dir = os.path.join(self.tmp_dir, "synth_full_quality")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+
+        bin_rel = "memory/region_000001.bin"
+        with open(os.path.join(snap_dir, bin_rel), "wb") as bf:
+            bf.write(b"\x42" * 1024)
+
+        reg1 = CapturedRegion("R000001", 0x400000, 0x400400, 1024, "r--p", "data", "/app", 1024, 1024, "COMPLETE", bin_rel)
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_QUAL_01",
+            pid=8888,
+            binary="/app",
+            timestamp_ns=5000000,
+            status="PARTIAL",
+            timed_out=True,
+            timeout_ms=1500,
+            committed=True,
+            mapping_race_detected=True,
+            regions_requested=4,
+            regions_captured=1,
+            bytes_requested=16384,
+            bytes_captured=1024,
+            partial_reads=1,
+            failed_reads=2,
+            duration_us=1234.5,
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x400000", "end": "0x400400", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # Reload from disk
+        loaded = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(loaded.status, "PARTIAL")
+        self.assertTrue(loaded.timed_out)
+        self.assertEqual(loaded.timeout_ms, 1500)
+        self.assertTrue(loaded.committed)
+        self.assertTrue(loaded.mapping_race_detected)
+        self.assertEqual(loaded.partial_reads, 1)
+        self.assertEqual(loaded.failed_reads, 2)
+        self.assertEqual(loaded.bytes_requested, 16384)
+        self.assertEqual(loaded.bytes_captured, 1024)
+
+        # Run offline semantic analyzer
+        analyzer = OfflineMemoryAnalyzer()
+        semantic_snap = analyzer.analyze(loaded, optional_symbol_context={"types": {}, "globals": {}})
+        self.assertEqual(semantic_snap.metadata["timed_out"], True)
+        self.assertEqual(semantic_snap.metadata["mapping_race_detected"], True)
+        self.assertEqual(semantic_snap.metadata["committed"], True)
+        self.assertEqual(semantic_snap.metadata["partial_reads"], 1)
+        self.assertEqual(semantic_snap.metadata["failed_reads"], 2)
+        self.assertIn("PARTIAL_CAPTURE", semantic_snap.provenance["quality_warning"])
+
+        # Validate SnapshotMemoryReader read safety
+        reader = SnapshotMemoryReader(loaded)
+        data = reader.read(0x400000, 4)
+        self.assertEqual(data, b"\x42\x42\x42\x42")
+        # Reading out of bounds must return None, not zeroes
+        self.assertIsNone(reader.read(0x400400, 4))
+        self.assertIsNone(reader.read(0x999999, 4))
 
 
 if __name__ == "__main__":

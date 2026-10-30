@@ -725,7 +725,14 @@ class OfflineMemoryAnalyzer:
             "capture_mode": "LOW_IMPACT",
             "consistency": raw_snap.consistency,
             "capture_status": getattr(raw_snap, "status", "COMPLETE"),
-            "quality_warning": "PARTIAL_CAPTURE: Some regions failed or timed out during capture" if getattr(raw_snap, "status", "") == "PARTIAL" else None,
+            "committed": getattr(raw_snap, "committed", True),
+            "integrity_warnings": getattr(raw_snap, "integrity_warnings", []),
+            "quality_warning": (
+                "; ".join(
+                    ([f"PARTIAL_CAPTURE: Some regions failed or timed out during capture"] if getattr(raw_snap, "status", "") == "PARTIAL" else []) +
+                    list(getattr(raw_snap, "integrity_warnings", []))
+                ) or None
+            ),
         }
 
         # 10. Performance metadata
@@ -734,6 +741,7 @@ class OfflineMemoryAnalyzer:
             "offline_analysis_duration_ms": t_elapsed_ms,
             "raw_snapshot_id": raw_snap.snapshot_id,
             "capture_status": getattr(raw_snap, "status", "COMPLETE"),
+            "committed": getattr(raw_snap, "committed", True),
             "capture_duration_us": raw_snap.duration_us,
             "bytes_captured": raw_snap.bytes_captured,
             "bytes_requested": getattr(raw_snap, "bytes_requested", raw_snap.bytes_captured),

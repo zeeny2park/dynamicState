@@ -1219,44 +1219,76 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "status": status,
                 "error": stderr.strip() or f"Collector exited with rc {rc} but produced empty stdout",
                 "returncode": rc,
+                "raw_stderr": stderr,
             }
 
         import json as _json
         try:
             payload = _json.loads(stdout.strip().splitlines()[-1])
+            if not isinstance(payload, dict):
+                raise ValueError("Collector JSON output is not a dictionary object")
         except Exception as e:
             return {
                 "success": False,
                 "status": "MALFORMED_OUTPUT",
                 "error": f"Failed to parse collector JSON output: {e}",
                 "raw_stdout": stdout,
+                "raw_stderr": stderr,
                 "returncode": rc,
             }
 
         payload["returncode"] = rc
-        st = payload.get("status", "UNKNOWN")
+        payload["raw_stderr"] = stderr
+        st = payload.get("status")
+        if not st or not isinstance(st, str):
+            st = "UNKNOWN"
+            payload["status"] = "UNKNOWN"
 
-        # Reconcile returncode and JSON status
+        regions_count = payload.get("regions", 0)
+
+        # State transition matrix reconciling returncode and JSON status:
         if rc != 0:
             if st == "COMPLETE":
-                # Exit code non-zero contradicts COMPLETE status
-                has_regions = payload.get("regions", 0) > 0
+                # Contradiction: rc non-zero contradicts COMPLETE status
+                has_regions = regions_count > 0
                 payload["status"] = "PARTIAL" if has_regions else "FAILED"
                 payload["success"] = has_regions
                 warn = f"Process exit code {rc} contradicts COMPLETE status; downgraded to {payload['status']}"
                 payload["quality_warning"] = f"{payload.get('quality_warning', '')}; {warn}".strip("; ")
             elif st == "PARTIAL":
-                # Partial evidence is valid and preserved
+                # Valid partial evidence is preserved
+                payload["success"] = True
                 warn = f"Remote collector exited with non-zero exit code {rc}; partial snapshot data preserved"
                 payload["quality_warning"] = f"{payload.get('quality_warning', '')}; {warn}".strip("; ")
             elif st in ("FAILED", "TIMEOUT", "PROCESS_EXITED", "PERMISSION_DENIED"):
                 payload["success"] = False
+            else:
+                # Unknown or unrecognized status with rc!=0
+                payload["status"] = "UNKNOWN_STATUS"
+                payload["success"] = False
+                payload["error"] = f"Collector exited with rc {rc} and unrecognized status '{st}'"
         else:
             # rc == 0
-            if st in ("FAILED", "TIMEOUT", "PROCESS_EXITED", "PERMISSION_DENIED"):
-                payload["success"] = False
+            if st == "COMPLETE":
+                # Check for contradiction between status and success flag
+                if payload.get("success") is False:
+                    payload["status"] = "INCONSISTENT_STATUS"
+                    payload["success"] = False
+                    payload["error"] = "Contradiction in collector output: status is COMPLETE but success is false"
+                else:
+                    payload["success"] = True
             elif st == "PARTIAL":
-                if "quality_warning" not in payload:
+                payload["success"] = True
+                if "quality_warning" not in payload or not payload["quality_warning"]:
                     payload["quality_warning"] = "PARTIAL_CAPTURE: Some regions failed or timed out during capture"
+            elif st in ("FAILED", "TIMEOUT", "PROCESS_EXITED", "PERMISSION_DENIED"):
+                payload["success"] = False
+                if "error" not in payload or not payload["error"]:
+                    payload["error"] = f"Collector finished with failure status '{st}'"
+            else:
+                # Unknown status with rc==0
+                payload["status"] = "UNKNOWN_STATUS"
+                payload["success"] = False
+                payload["error"] = f"Collector finished with unrecognized status '{st}'"
 
         return payload
