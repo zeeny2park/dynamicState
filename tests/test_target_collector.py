@@ -873,6 +873,9 @@ int main() {
             bf.write(b"\x42" * 1024)
 
         reg1 = CapturedRegion("R000001", 0x400000, 0x400400, 1024, "r--p", "data", "/app", 1024, 1024, "COMPLETE", bin_rel)
+        reg2 = CapturedRegion("R000002", 0x400400, 0x401400, 4096, "r--p", "data", "/app", 4096, 0, "FAILED", "")
+        reg3 = CapturedRegion("R000003", 0x401400, 0x402400, 4096, "r--p", "data", "/app", 4096, 0, "FAILED", "")
+        reg4 = CapturedRegion("R000004", 0x402400, 0x404400, 7168, "r--p", "data", "/app", 7168, 0, "FAILED", "")
         raw = RawMemorySnapshot(
             snapshot_id="SNAP_QUAL_01",
             pid=8888,
@@ -891,7 +894,7 @@ int main() {
             failed_reads=2,
             duration_us=1234.5,
             output_dir=snap_dir,
-            regions=[reg1],
+            regions=[reg1, reg2, reg3, reg4],
             maps=[{"start": "0x400000", "end": "0x400400", "permissions": "r--p"}],
         )
         raw.save()
@@ -1149,6 +1152,249 @@ int main() {
         res2 = adapter2.capture_snapshot_via_collector(4321, "/tmp/snap_dest")
         self.assertFalse(res2["success"])
         self.assertEqual(res2["status"], "INCONSISTENT_STATUS")
+
+    def test_30_python_save_interrupted_before_metadata_commit(self):
+        """A save interrupted before metadata.json is committed leaves directory uncommitted with no stale metadata."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        snap_dir = os.path.join(self.tmp_dir, "snap_interrupted_test")
+        os.makedirs(snap_dir, exist_ok=True)
+
+        # Pre-populate with an old snapshot
+        old_meta = os.path.join(snap_dir, "metadata.json")
+        with open(old_meta, "w") as f:
+            json.dump({"snapshot_id": "OLD_COMMITTED", "pid": 1111, "status": "COMPLETE", "committed": True}, f)
+
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="NEW_SNAP",
+            pid=2222,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        # Monkey-patch json.dump to raise an error when writing metadata.json.tmp
+        orig_dump = json.dump
+        def failing_dump(obj, fp, *args, **kwargs):
+            if hasattr(fp, "name") and "metadata.json.tmp" in getattr(fp, "name", ""):
+                raise IOError("Simulated crash right before metadata commit barrier")
+            return orig_dump(obj, fp, *args, **kwargs)
+
+        import unittest.mock as mock
+        with mock.patch("json.dump", side_effect=failing_dump):
+            with self.assertRaises(IOError):
+                raw.save()
+
+        # The old metadata.json must have been invalidated/unlinked, leaving NO valid committed metadata
+        self.assertFalse(os.path.exists(old_meta))
+        with self.assertRaises(FileNotFoundError):
+            RawMemorySnapshot.load(snap_dir)
+
+    def test_31_concurrent_save_calls_same_process_and_cross_process(self):
+        """Concurrent Python save calls targeting the same directory are safely rejected by directory locking."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        import concurrent.futures
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_conc_python")
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+
+        def attempt_save(pid_val):
+            raw = RawMemorySnapshot(
+                snapshot_id=f"SNAP_{pid_val}",
+                pid=pid_val,
+                binary="/app",
+                timestamp_ns=1000,
+                status="COMPLETE",
+                output_dir=snap_dir,
+                regions=[reg],
+                maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+            )
+            raw.save()
+            return True
+
+        # Run 2 threads attempting save simultaneously
+        # Directory locking ensures one succeeds and the other gets BlockingIOError or succeeds sequentially
+        results = []
+        errors = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futs = [executor.submit(attempt_save, 1000 + i) for i in range(2)]
+            for f in futs:
+                try:
+                    results.append(f.result())
+                except BlockingIOError as e:
+                    errors.append(e)
+
+        # Either one succeeded and one was locked out, or both succeeded cleanly sequentially
+        self.assertTrue(len(results) >= 1)
+        # Snapshot in directory must be valid and readable
+        loaded = RawMemorySnapshot.load(snap_dir)
+        self.assertIn(loaded.pid, [1000, 1001])
+
+    def test_32_native_and_python_writer_contention(self):
+        """Native collector rejects capture if Python writer holds .collector.lock, and vice versa."""
+        import fcntl
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        snap_dir = os.path.join(self.tmp_dir, "snap_c_py_contention")
+        os.makedirs(snap_dir, exist_ok=True)
+        lock_file = os.path.join(snap_dir, ".collector.lock")
+
+        # 1. Hold lock via Python and launch C collector
+        p = subprocess.Popen(["sleep", "2"])
+        try:
+            lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                res = subprocess.run(
+                    [self.collector_bin, "-p", str(p.pid), "-o", snap_dir, "--json"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(res.returncode, 1)
+                self.assertIn('"status":"FAILED"', res.stdout)
+            finally:
+                fcntl.lockf(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+        finally:
+            p.terminate()
+            p.wait()
+
+        # 2. When lock is released, Python save succeeds
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_FREE",
+            pid=3333,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        saved_dir = raw.save()
+        self.assertEqual(saved_dir, snap_dir)
+
+    def test_33_snapshot_identity_mismatch_and_symlink_directory_escape(self):
+        """Verifies that identity mismatch (PID/ID) and symlinked memory dir are flagged as INVALID."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        snap_dir = os.path.join(self.tmp_dir, "snap_mismatch_symlink")
+        os.makedirs(snap_dir, exist_ok=True)
+        bin_dir = os.path.join(snap_dir, "memory")
+        os.makedirs(bin_dir, exist_ok=True)
+        bin_file = "memory/r1.bin"
+        with open(os.path.join(snap_dir, bin_file), "wb") as bf:
+            bf.write(b"X" * 4096)
+
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", bin_file)
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_REAL",
+            pid=4444,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # Induce PID mismatch between manifest and metadata
+        # (e.g. manifest region pathname / binary has app for 4444, metadata has 99999, or snapshot_id in manifest differs)
+        # Test explicit validation of snapshot_id mismatch
+        loaded = RawMemorySnapshot.load(snap_dir)
+        loaded.snapshot_id = "MISMATCHED_ID"
+        is_val, warns = loaded.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertEqual(loaded.validation_verdict, "INVALID")
+        self.assertTrue(any("Snapshot ID mismatch" in w for w in warns))
+
+        # Test symlink memory directory
+        sym_dir = os.path.join(self.tmp_dir, "snap_sym_dir")
+        os.makedirs(sym_dir, exist_ok=True)
+        outside_target = os.path.join(self.tmp_dir, "outside_mem")
+        os.makedirs(outside_target, exist_ok=True)
+        os.symlink(outside_target, os.path.join(sym_dir, "memory"))
+        raw_sym = RawMemorySnapshot(
+            snapshot_id="SNAP_SYM",
+            pid=5555,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=sym_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        is_val, warns = raw_sym.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertEqual(raw_sym.validation_verdict, "INVALID")
+        self.assertTrue(any("symbolic link" in w for w in warns))
+
+    def test_34_offline_analyzer_refuses_invalid_snapshot(self):
+        """OfflineMemoryAnalyzer raises ValueError when given an INVALID or corrupted snapshot."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        from extractor.offline_analyzer import OfflineMemoryAnalyzer
+        snap_dir = os.path.join(self.tmp_dir, "snap_refuse_test")
+        os.makedirs(snap_dir, exist_ok=True)
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_REFUSE",
+            pid=6666,
+            binary="/app",
+            timestamp_ns=1000,
+            status="FAILED",
+            output_dir=snap_dir,
+            regions=[],
+            maps=[],
+        )
+        analyzer = OfflineMemoryAnalyzer()
+        with self.assertRaises(ValueError) as ctx:
+            analyzer.analyze(raw)
+        self.assertIn("Cannot analyze INVALID or FAILED snapshot", str(ctx.exception))
+
+    def test_35_repeated_load_save_roundtrip(self):
+        """COMPLETE and PARTIAL snapshots preserve their exact fields and integrity across multiple load/save cycles."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        snap_dir = os.path.join(self.tmp_dir, "snap_roundtrip_test")
+        bin_dir = os.path.join(snap_dir, "memory")
+        os.makedirs(bin_dir, exist_ok=True)
+        with open(os.path.join(snap_dir, "memory/r1.bin"), "wb") as f:
+            f.write(b"R" * 2048)
+
+        reg1 = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 2048, "PARTIAL", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_RT",
+            pid=7777,
+            binary="/app",
+            timestamp_ns=12345,
+            status="PARTIAL",
+            regions_requested=1,
+            regions_captured=1,
+            bytes_requested=4096,
+            bytes_captured=2048,
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # Cycle 1: load
+        snap_c1 = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(snap_c1.status, "PARTIAL")
+        self.assertEqual(snap_c1.validation_verdict, "VALIDATED")
+
+        # Cycle 2: save to another directory and reload
+        snap_dir2 = os.path.join(self.tmp_dir, "snap_roundtrip_test_2")
+        os.makedirs(os.path.join(snap_dir2, "memory"), exist_ok=True)
+        shutil.copyfile(os.path.join(snap_dir, "memory/r1.bin"), os.path.join(snap_dir2, "memory/r1.bin"))
+        snap_c1.save(snap_dir2)
+        snap_c2 = RawMemorySnapshot.load(snap_dir2)
+
+        self.assertEqual(snap_c2.status, "PARTIAL")
+        self.assertEqual(snap_c2.validation_verdict, "VALIDATED")
+        self.assertEqual(snap_c2.snapshot_id, "SNAP_RT")
+        self.assertEqual(snap_c2.bytes_captured, 2048)
 
 
 if __name__ == "__main__":

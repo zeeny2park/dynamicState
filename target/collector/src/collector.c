@@ -726,6 +726,36 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         }
 
         if (stats.timed_out) {
+            /* Record remaining requested regions as TIMEOUT/FAILED in manifest so manifest contains all requested regions */
+            for (int k = i + 1; k < region_count; k++) {
+                parsed_region_t *rk = &regions[k];
+                if (!rk->is_selected) continue;
+                manifest_idx++;
+                size_t req_k = (size_t)rk->size;
+                if (cfg->max_region_bytes > 0 && req_k > cfg->max_region_bytes) {
+                    req_k = cfg->max_region_bytes;
+                }
+                char esc_path_k[1024] = {0};
+                escape_json_string(rk->pathname, esc_path_k, sizeof(esc_path_k));
+
+                if (fprintf(f_manifest, ",\n    {\n") < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"region_id\": \"R%06d\",\n", manifest_idx) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"start\": \"0x%llx\",\n", (unsigned long long)rk->start) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"end\": \"0x%llx\",\n", (unsigned long long)rk->end) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"start_addr\": %llu,\n", (unsigned long long)rk->start) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"end_addr\": %llu,\n", (unsigned long long)rk->end) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"size\": %llu,\n", (unsigned long long)rk->size) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"permissions\": \"%s\",\n", rk->perms) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"category\": \"%s\",\n", rk->category) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"pathname\": \"%s\",\n", esc_path_k) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"requested\": %llu,\n", (unsigned long long)req_k) < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"captured\": 0,\n") < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"status\": \"FAILED\",\n") < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"filename\": \"\",\n") < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "      \"error\": \"TIMEOUT\"\n") < 0) manifest_write_fail = 1;
+                if (fprintf(f_manifest, "    }") < 0) manifest_write_fail = 1;
+                stats.failed_reads++;
+            }
             break;
         }
     }

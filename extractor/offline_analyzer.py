@@ -45,8 +45,18 @@ class SnapshotMemoryReader:
         self._regions: List[Tuple[int, int, str, str, CapturedRegion]] = []
         self._cache: Dict[str, bytes] = {}
 
+        # If snapshot is marked INVALID, reader must refuse to expose corrupt regions
+        if getattr(raw_snapshot, "validation_verdict", None) == "INVALID" or getattr(raw_snapshot, "status", None) == "FAILED":
+            self.modules = []
+            self.endianness = None
+            self.ptr_size = None
+            return
+
         for r in raw_snapshot.regions:
             if r.captured > 0 and r.filename:
+                # Disallow regions with FAILED status from reading
+                if r.status == "FAILED":
+                    continue
                 full_path = os.path.join(raw_snapshot.output_dir, r.filename)
                 self._regions.append((r.start, r.start + r.captured, full_path, r.category, r))
 
@@ -362,6 +372,10 @@ class OfflineMemoryAnalyzer:
             raw_snap = RawMemorySnapshot.load(memory_snapshot)
         else:
             raw_snap = memory_snapshot
+
+        if getattr(raw_snap, "status", None) == "FAILED" or getattr(raw_snap, "validation_verdict", None) == "INVALID":
+            err_msg = f"Cannot analyze INVALID or FAILED snapshot '{raw_snap.snapshot_id}': {getattr(raw_snap, 'integrity_warnings', [])}"
+            raise ValueError(err_msg)
 
         # 2. Resolve runtime modules
         if raw_snap.modules:

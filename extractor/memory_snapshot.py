@@ -8,11 +8,24 @@ Stores binary memory dumps and metadata decoupled from DWARF semantic interpreta
 """
 
 from dataclasses import asdict, dataclass, field
+import fcntl
 import json
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from .snapshot_consistency import NON_ATOMIC, SnapshotConsistency
+
+# Snapshot commit lifecycle states
+STATE_CAPTURE_IN_PROGRESS = "CAPTURE_IN_PROGRESS"
+STATE_COMMITTED = "COMMITTED"
+STATE_INVALID = "INVALID"
+STATE_INCOMPLETE = "INCOMPLETE"
+
+# Validation verdicts
+VERDICT_VALIDATED = "VALIDATED"
+VERDICT_UNVERIFIED = "UNVERIFIED"
+VERDICT_INVALID = "INVALID"
 
 
 @dataclass
@@ -118,6 +131,9 @@ class RawMemorySnapshot:
     regions: List[CapturedRegion] = field(default_factory=list)
     maps: List[Dict[str, Any]] = field(default_factory=list)
     integrity_warnings: List[str] = field(default_factory=list)
+    validation_verdict: str = VERDICT_UNVERIFIED
+    commit_state: str = STATE_COMMITTED
+    schema_version: str = "1.0"
 
     def to_metadata(self) -> Dict[str, Any]:
         actual_captured_cnt = sum(1 for r in self.regions if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0)
@@ -135,6 +151,9 @@ class RawMemorySnapshot:
             "pid": self.pid,
             "binary": self.binary,
             "timestamp_ns": self.timestamp_ns,
+            "schema_version": getattr(self, "schema_version", "1.0"),
+            "commit_state": getattr(self, "commit_state", STATE_COMMITTED),
+            "validation_verdict": getattr(self, "validation_verdict", VERDICT_UNVERIFIED),
             "capture_mode": self.capture_mode,
             "backend": self.backend,
             "architecture": self.architecture,
@@ -172,7 +191,7 @@ class RawMemorySnapshot:
         return res
 
     def save(self, output_dir: Optional[str] = None) -> str:
-        """Persist metadata, manifest, and maps to the output directory atomically."""
+        """Persist metadata, manifest, and maps to the output directory atomically with directory locking."""
         target_dir = output_dir or self.output_dir
         if not target_dir:
             raise ValueError("output_dir must be specified")
@@ -180,54 +199,102 @@ class RawMemorySnapshot:
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "memory"), exist_ok=True)
 
-        pid_suffix = str(os.getpid())
+        lock_path = os.path.join(self.output_dir, ".collector.lock")
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            try:
+                fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (IOError, OSError) as e:
+                raise BlockingIOError(f"Output directory '{self.output_dir}' is locked by another writer: {e}")
 
-        # 1. manifest.json atomically
-        manifest_path = os.path.join(self.output_dir, "manifest.json")
-        manifest_tmp = os.path.join(self.output_dir, f"manifest.json.tmp.{pid_suffix}")
-        with open(manifest_tmp, "w", encoding="utf-8") as f:
-            json.dump([r.to_dict() for r in self.regions], f, indent=2)
-        os.replace(manifest_tmp, manifest_path)
+            # Safe per-call unique suffix to prevent collisions across threads and processes
+            unique_suffix = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
-        # 2. maps.json atomically
-        maps_path = os.path.join(self.output_dir, "maps.json")
-        maps_tmp = os.path.join(self.output_dir, f"maps.json.tmp.{pid_suffix}")
-        with open(maps_tmp, "w", encoding="utf-8") as f:
-            json.dump(self.maps, f, indent=2)
-        os.replace(maps_tmp, maps_path)
+            # Invalidate any pre-existing metadata.json to ensure stale commits never certify partial writes
+            meta_path = os.path.join(self.output_dir, "metadata.json")
+            if os.path.exists(meta_path):
+                try:
+                    os.unlink(meta_path)
+                except OSError:
+                    pass
 
-        # 3. modules.json atomically
-        modules_path = os.path.join(self.output_dir, "modules.json")
-        modules_tmp = os.path.join(self.output_dir, f"modules.json.tmp.{pid_suffix}")
-        mods_data = [m.to_dict() if hasattr(m, "to_dict") else m for m in self.modules]
-        with open(modules_tmp, "w", encoding="utf-8") as f:
-            json.dump(mods_data, f, indent=2)
-        os.replace(modules_tmp, modules_path)
+            # 1. manifest.json atomically
+            manifest_path = os.path.join(self.output_dir, "manifest.json")
+            manifest_tmp = os.path.join(self.output_dir, f"manifest.json.tmp.{unique_suffix}")
+            with open(manifest_tmp, "w", encoding="utf-8") as f:
+                json.dump([r.to_dict() for r in self.regions], f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(manifest_tmp, manifest_path)
 
-        # 4. metadata.json atomically as the final commit barrier
-        meta_path = os.path.join(self.output_dir, "metadata.json")
-        meta_tmp = os.path.join(self.output_dir, f"metadata.json.tmp.{pid_suffix}")
-        with open(meta_tmp, "w", encoding="utf-8") as f:
-            json.dump(self.to_metadata(), f, indent=2)
-        os.replace(meta_tmp, meta_path)
+            # 2. maps.json atomically
+            maps_path = os.path.join(self.output_dir, "maps.json")
+            maps_tmp = os.path.join(self.output_dir, f"maps.json.tmp.{unique_suffix}")
+            with open(maps_tmp, "w", encoding="utf-8") as f:
+                json.dump(self.maps, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(maps_tmp, maps_path)
 
-        return self.output_dir
+            # 3. modules.json atomically
+            modules_path = os.path.join(self.output_dir, "modules.json")
+            modules_tmp = os.path.join(self.output_dir, f"modules.json.tmp.{unique_suffix}")
+            mods_data = [m.to_dict() if hasattr(m, "to_dict") else m for m in self.modules]
+            with open(modules_tmp, "w", encoding="utf-8") as f:
+                json.dump(mods_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(modules_tmp, modules_path)
+
+            # 4. metadata.json atomically as the final commit barrier
+            self.committed = True
+            self.commit_state = STATE_COMMITTED
+            if self.commit_timestamp_ns <= 0:
+                self.commit_timestamp_ns = time.time_ns()
+            meta_tmp = os.path.join(self.output_dir, f"metadata.json.tmp.{unique_suffix}")
+            with open(meta_tmp, "w", encoding="utf-8") as f:
+                json.dump(self.to_metadata(), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(meta_tmp, meta_path)
+
+            # Flush directory entries to disk for durability where supported
+            try:
+                dir_fd = os.open(self.output_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+
+            return self.output_dir
+        finally:
+            try:
+                fcntl.lockf(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
 
     def validate_integrity(self) -> Tuple[bool, List[str]]:
         """Validates disk artifact integrity (commit status, region files, byte sizes, bounds)."""
         warnings: List[str] = []
         is_valid = True
+        has_legacy_unverified = False
 
         if not self.output_dir:
+            self.validation_verdict = VERDICT_INVALID
             return False, ["Snapshot output_dir is not specified."]
 
         if not os.path.isdir(self.output_dir):
+            self.validation_verdict = VERDICT_INVALID
             return False, [f"Snapshot directory does not exist: {self.output_dir}"]
 
         real_out = os.path.abspath(self.output_dir)
 
         # 1. Validate metadata.json
         meta_file = os.path.join(real_out, "metadata.json")
+        meta_raw = None
         if not os.path.exists(meta_file):
             is_valid = False
             warnings.append(f"Missing metadata.json in {real_out}")
@@ -238,13 +305,23 @@ class RawMemorySnapshot:
                     if not isinstance(meta_raw, dict):
                         is_valid = False
                         warnings.append("metadata.json root is not a JSON object")
+                    else:
+                        req_keys = ["snapshot_id", "pid", "status"]
+                        for k in req_keys:
+                            if k not in meta_raw:
+                                is_valid = False
+                                warnings.append(f"metadata.json missing required field '{k}'")
+                        if "committed" not in meta_raw:
+                            has_legacy_unverified = True
+                            warnings.append("metadata.json missing legacy 'committed' field; marked UNVERIFIED")
             except Exception as e:
                 is_valid = False
                 warnings.append(f"metadata.json is malformed or invalid JSON: {e}")
 
         # Check committed marker
-        if self.committed is False:
+        if self.committed is False or (meta_raw and meta_raw.get("committed") is False):
             is_valid = False
+            self.commit_state = STATE_INVALID
             warnings.append("Snapshot was not cleanly committed (metadata 'committed' is false).")
 
         # 2. Validate manifest.json exists and is valid JSON list
@@ -279,7 +356,24 @@ class RawMemorySnapshot:
                 is_valid = False
                 warnings.append(f"maps.json is malformed or invalid JSON: {e}")
 
+        # Check snapshot identity agreement between metadata and in-memory object
+        if meta_raw and isinstance(meta_raw, dict):
+            if meta_raw.get("snapshot_id") != self.snapshot_id:
+                is_valid = False
+                warnings.append(
+                    f"Snapshot ID mismatch: metadata.json reports '{meta_raw.get('snapshot_id')}', but memory object has '{self.snapshot_id}'"
+                )
+            if meta_raw.get("pid") != self.pid:
+                is_valid = False
+                warnings.append(
+                    f"PID mismatch: metadata.json reports {meta_raw.get('pid')}, but memory object has {self.pid}"
+                )
+
         # 4. Validate regions, file paths, traversal, actual sizes, and statuses
+        mem_dir = os.path.join(real_out, "memory")
+        if os.path.islink(mem_dir):
+            is_valid = False
+            warnings.append(f"Memory directory is a symbolic link: {mem_dir}")
         for r in self.regions:
             # Check path traversal
             if r.filename:
@@ -300,6 +394,15 @@ class RawMemorySnapshot:
                     is_valid = False
                     warnings.append(f"Region {r.region_id} path drive mismatch: '{r.filename}'")
                     continue
+
+                # Check if any parent component inside snapshot directory is a symlink
+                parent_check = os.path.dirname(full_bin)
+                while parent_check and parent_check != real_out:
+                    if os.path.islink(parent_check):
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} parent directory is a symbolic link: '{parent_check}'")
+                        break
+                    parent_check = os.path.dirname(parent_check)
 
             # Check region file and sizes
             if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0:
@@ -378,6 +481,13 @@ class RawMemorySnapshot:
                 f"but sum of manifest regions is {actual_requested_bytes}"
             )
 
+        if not is_valid:
+            self.validation_verdict = VERDICT_INVALID
+        elif has_legacy_unverified:
+            self.validation_verdict = VERDICT_UNVERIFIED
+        else:
+            self.validation_verdict = VERDICT_VALIDATED
+
         return is_valid, warnings
 
     @classmethod
@@ -396,29 +506,39 @@ class RawMemorySnapshot:
             meta = json.load(f)
 
         regions = []
+        manifest_err = None
         if os.path.exists(manifest_path):
             try:
                 with open(manifest_path, "r", encoding="utf-8") as f:
                     manifest_data = json.load(f)
-                    regions = [CapturedRegion.from_dict(r) for r in manifest_data]
-            except Exception:
-                pass
+                    if isinstance(manifest_data, list):
+                        regions = [CapturedRegion.from_dict(r) for r in manifest_data]
+                    else:
+                        manifest_err = "manifest.json root is not a list"
+            except Exception as e:
+                manifest_err = f"manifest.json is malformed: {e}"
 
         maps = []
+        maps_err = None
         if os.path.exists(maps_path):
             try:
                 with open(maps_path, "r", encoding="utf-8") as f:
-                    maps = json.load(f)
-            except Exception:
-                pass
+                    maps_data = json.load(f)
+                    if isinstance(maps_data, list):
+                        maps = maps_data
+                    else:
+                        maps_err = "maps.json root is not a list"
+            except Exception as e:
+                maps_err = f"maps.json is malformed: {e}"
 
         modules = []
+        modules_err = None
         if os.path.exists(modules_path):
             try:
                 with open(modules_path, "r", encoding="utf-8") as f:
                     modules = json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                modules_err = f"modules.json is malformed: {e}"
         elif "modules" in meta:
             modules = meta["modules"]
 
@@ -466,12 +586,25 @@ class RawMemorySnapshot:
         )
 
         is_valid, validation_warnings = snap.validate_integrity()
+        if manifest_err:
+            is_valid = False
+            validation_warnings.append(f"Corrupted artifact: {manifest_err}")
+        if maps_err:
+            is_valid = False
+            validation_warnings.append(f"Corrupted artifact: {maps_err}")
+        if modules_err:
+            is_valid = False
+            validation_warnings.append(f"Corrupted artifact: {modules_err}")
+
         if validation_warnings:
             for w in validation_warnings:
                 if w not in snap.integrity_warnings:
                     snap.integrity_warnings.append(w)
-        if not is_valid and snap.status == "COMPLETE":
-            snap.status = "PARTIAL"
-            snap.integrity_warnings.append("Snapshot status degraded from COMPLETE to PARTIAL due to integrity check failures.")
+        if not is_valid:
+            if snap.status == "COMPLETE":
+                snap.status = "PARTIAL"
+                snap.integrity_warnings.append("Snapshot status degraded from COMPLETE to PARTIAL due to integrity check failures.")
+            snap.commit_state = STATE_INVALID
+            snap.validation_verdict = VERDICT_INVALID
 
         return snap
