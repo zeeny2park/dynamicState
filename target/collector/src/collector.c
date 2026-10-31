@@ -44,6 +44,43 @@ static void escape_json_string(const char *in, char *out, size_t max_out) {
     out[j] = '\0';
 }
 
+static int secure_open_temp_file(int dir_fd, const char *dir, const char *prefix, char *out_path, size_t out_path_size, char *out_bname, size_t out_bname_size) {
+    for (int attempt = 0; attempt < 64; attempt++) {
+        uint64_t ns = get_time_ns();
+        int r = rand();
+        char bname[256];
+        if (snprintf(bname, sizeof(bname), "%s.tmp.%d_%llu_%x", prefix, (int)getpid(), (unsigned long long)ns, r) >= (int)sizeof(bname)) {
+            return -1;
+        }
+        if (snprintf(out_path, out_path_size, "%s/%s", dir, bname) >= (int)out_path_size) {
+            return -1;
+        }
+        if (out_bname && out_bname_size > 0) {
+            snprintf(out_bname, out_bname_size, "%s", bname);
+        }
+        int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        int fd = -1;
+        if (dir_fd >= 0) {
+            fd = openat(dir_fd, bname, flags, 0644);
+        } else {
+            fd = open(out_path, flags, 0644);
+        }
+        if (fd >= 0) {
+            return fd;
+        }
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
 void collector_init_config(collector_config_t *cfg) {
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
@@ -323,17 +360,25 @@ int collector_read_region(pid_t pid, int mem_fd, int backend, uint64_t start, si
     return -1;
 }
 
-static int copy_maps_file(pid_t pid, const char *dest_dir) {
-    char src[128], dst[2048], tmp[2048];
+static int copy_maps_file(int dir_fd, pid_t pid, const char *dest_dir) {
+    char src[128], dst[2048], tmp[2048], bname[256];
     if (snprintf(src, sizeof(src), "/proc/%d/maps", (int)pid) >= (int)sizeof(src)) return -1;
     if (snprintf(dst, sizeof(dst), "%s/maps.txt", dest_dir) >= (int)sizeof(dst)) return -1;
-    if (snprintf(tmp, sizeof(tmp), "%s/maps.txt.tmp.%d", dest_dir, (int)getpid()) >= (int)sizeof(tmp)) return -1;
+
+    int tmp_fd = secure_open_temp_file(dir_fd, dest_dir, "maps.txt", tmp, sizeof(tmp), bname, sizeof(bname));
+    if (tmp_fd < 0) return -1;
 
     FILE *in = fopen(src, "r");
-    if (!in) return -1;
-    FILE *out = fopen(tmp, "w");
+    if (!in) {
+        close(tmp_fd);
+        if (dir_fd >= 0) unlinkat(dir_fd, bname, 0); else unlink(tmp);
+        return -1;
+    }
+    FILE *out = fdopen(tmp_fd, "w");
     if (!out) {
         fclose(in);
+        close(tmp_fd);
+        if (dir_fd >= 0) unlinkat(dir_fd, bname, 0); else unlink(tmp);
         return -1;
     }
 
@@ -348,16 +393,25 @@ static int copy_maps_file(pid_t pid, const char *dest_dir) {
     }
     if (ferror(in)) write_err = 1;
     fclose(in);
+    if (fflush(out) != 0) write_err = 1;
+    if (fsync(tmp_fd) != 0) write_err = 1;
     if (ferror(out)) write_err = 1;
     if (fclose(out) != 0) write_err = 1;
 
     if (write_err != 0) {
-        unlink(tmp);
+        if (dir_fd >= 0) unlinkat(dir_fd, bname, 0); else unlink(tmp);
         return -1;
     }
-    if (rename(tmp, dst) != 0) {
-        unlink(tmp);
-        return -1;
+    if (dir_fd >= 0) {
+        if (renameat(dir_fd, bname, dir_fd, "maps.txt") != 0) {
+            unlinkat(dir_fd, bname, 0);
+            return -1;
+        }
+    } else {
+        if (rename(tmp, dst) != 0) {
+            unlink(tmp);
+            return -1;
+        }
     }
     return 0;
 }
@@ -496,24 +550,27 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         return -1;
     }
 
-    /* Invalidate any existing metadata.json from a prior snapshot to prevent stale reads if interrupted */
-    char old_meta_path[2048] = {0};
-    if (snprintf(old_meta_path, sizeof(old_meta_path), "%s/metadata.json", out_dir) >= (int)sizeof(old_meta_path)) {
+    /* Open output directory FD to pin directory identity against parent-replacement races */
+    int dir_fd = open(out_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) {
         if (cfg->verbose) {
-            fprintf(stderr, "[debug] Output path too long for metadata.json\n");
+            fprintf(stderr, "[debug] Failed opening snapshot directory '%s': %s\n", out_dir, strerror(errno));
         }
         snprintf(stats.status, sizeof(stats.status), "FAILED");
-        if (lock_fd >= 0) close(lock_fd);
+        close(lock_fd);
         if (stats_out) *stats_out = stats;
         free(regions);
         return -1;
     }
-    if (unlink(old_meta_path) != 0 && errno != ENOENT) {
+
+    /* Invalidate any existing metadata.json from a prior snapshot to prevent stale reads if interrupted */
+    if (unlinkat(dir_fd, "metadata.json", 0) != 0 && errno != ENOENT) {
         if (cfg->verbose) {
-            fprintf(stderr, "[debug] Failed invalidating existing metadata '%s': %s\n", old_meta_path, strerror(errno));
+            fprintf(stderr, "[debug] Failed invalidating existing metadata in '%s': %s\n", out_dir, strerror(errno));
         }
         snprintf(stats.status, sizeof(stats.status), "FAILED");
-        if (lock_fd >= 0) close(lock_fd);
+        close(dir_fd);
+        close(lock_fd);
         if (stats_out) *stats_out = stats;
         free(regions);
         return -1;
@@ -522,7 +579,8 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     char mem_dir[2048] = {0};
     if (snprintf(mem_dir, sizeof(mem_dir), "%s/memory", out_dir) >= (int)sizeof(mem_dir)) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
-        if (lock_fd >= 0) close(lock_fd);
+        close(dir_fd);
+        close(lock_fd);
         if (stats_out) *stats_out = stats;
         free(regions);
         return -1;
@@ -532,18 +590,20 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             fprintf(stderr, "[debug] Failed to create memory directory '%s': %s\n", mem_dir, strerror(errno));
         }
         snprintf(stats.status, sizeof(stats.status), "FAILED");
-        if (lock_fd >= 0) close(lock_fd);
+        close(dir_fd);
+        close(lock_fd);
         if (stats_out) *stats_out = stats;
         free(regions);
         return -1;
     }
 
-    if (copy_maps_file(cfg->pid, out_dir) != 0) {
+    if (copy_maps_file(dir_fd, cfg->pid, out_dir) != 0) {
         if (cfg->verbose) {
             fprintf(stderr, "[debug] Failed copying /proc/%d/maps to '%s/maps.txt'\n", (int)cfg->pid, out_dir);
         }
         snprintf(stats.status, sizeof(stats.status), "FAILED");
-        if (lock_fd >= 0) close(lock_fd);
+        close(dir_fd);
+        close(lock_fd);
         if (stats_out) *stats_out = stats;
         free(regions);
         return -1;
@@ -565,28 +625,33 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     void *buf = malloc(chunk_buf_size);
     if (!buf) {
         if (mem_fd >= 0) close(mem_fd);
-        if (lock_fd >= 0) close(lock_fd);
+        close(dir_fd);
+        close(lock_fd);
         free(regions);
         return -1;
     }
 
-    char manifest_path[2048] = {0};
     char manifest_tmp[2048] = {0};
-    if (snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", out_dir) >= (int)sizeof(manifest_path) ||
-        snprintf(manifest_tmp, sizeof(manifest_tmp), "%s/manifest.json.tmp.%d", out_dir, (int)getpid()) >= (int)sizeof(manifest_tmp)) {
+    char manifest_bname[256] = {0};
+    int manifest_tmp_fd = secure_open_temp_file(dir_fd, out_dir, "manifest.json", manifest_tmp, sizeof(manifest_tmp), manifest_bname, sizeof(manifest_bname));
+    if (manifest_tmp_fd < 0) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
-        if (lock_fd >= 0) close(lock_fd);
+        close(dir_fd);
+        close(lock_fd);
         free(buf);
         free(regions);
         if (stats_out) *stats_out = stats;
         return -1;
     }
-    FILE *f_manifest = fopen(manifest_tmp, "w");
+    FILE *f_manifest = fdopen(manifest_tmp_fd, "w");
     if (!f_manifest) {
+        close(manifest_tmp_fd);
+        unlinkat(dir_fd, manifest_bname, 0);
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
-        if (lock_fd >= 0) close(lock_fd);
+        close(dir_fd);
+        close(lock_fd);
         free(buf);
         free(regions);
         if (stats_out) *stats_out = stats;
@@ -700,15 +765,29 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                 snprintf(err_buf, sizeof(err_buf), "\"PATH_CONSTRUCTION_FAILED\"");
                 error_str = err_buf;
             } else {
-                FILE *f_bin = fopen(full_bin_path, "wb");
-                if (!f_bin) {
+                int bin_flags = O_WRONLY | O_CREAT | O_TRUNC;
+#ifdef O_NOFOLLOW
+                bin_flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+                bin_flags |= O_CLOEXEC;
+#endif
+                int bin_fd = open(full_bin_path, bin_flags, 0644);
+                if (bin_fd < 0) {
                     bin_err = 1;
                 } else {
                     file_opened = 1;
-                    size_t nw = fwrite(buf, 1, total_nread, f_bin);
-                    int wr_fail = (nw != total_nread || ferror(f_bin));
-                    int cl_fail = (fclose(f_bin) != 0);
-                    if (wr_fail || cl_fail) {
+                    size_t written = 0;
+                    while (written < total_nread) {
+                        ssize_t nw = write(bin_fd, (const char *)buf + written, total_nread - written);
+                        if (nw <= 0) {
+                            if (nw < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+                            bin_err = 1;
+                            break;
+                        }
+                        written += (size_t)nw;
+                    }
+                    if (close(bin_fd) != 0) {
                         bin_err = 1;
                     }
                 }
@@ -797,15 +876,17 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     int manifest_err = 0;
     if (f_manifest) {
         if (fprintf(f_manifest, "\n  ]\n") < 0) manifest_write_fail = 1;
+        if (fflush(f_manifest) != 0) manifest_write_fail = 1;
+        if (fsync(manifest_tmp_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) manifest_write_fail = 1;
         int fr_err = (ferror(f_manifest) != 0);
         int cl_err = (fclose(f_manifest) != 0);
         if (manifest_write_fail || fr_err || cl_err) {
             manifest_err = 1;
-            unlink(manifest_tmp);
+            unlinkat(dir_fd, manifest_bname, 0);
         } else {
-            if (rename(manifest_tmp, manifest_path) != 0) {
+            if (renameat(dir_fd, manifest_bname, dir_fd, "manifest.json") != 0) {
                 manifest_err = 1;
-                unlink(manifest_tmp);
+                unlinkat(dir_fd, manifest_bname, 0);
             }
         }
     } else {
@@ -852,16 +933,18 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     }
 
     /* Write maps.json atomically */
-    char maps_json_path[2048];
-    char maps_json_tmp[2048];
+    char maps_json_tmp[2048] = {0};
+    char maps_bname[256] = {0};
     int maps_err = 0;
     int maps_write_fail = 0;
-    if (snprintf(maps_json_path, sizeof(maps_json_path), "%s/maps.json", out_dir) >= (int)sizeof(maps_json_path) ||
-        snprintf(maps_json_tmp, sizeof(maps_json_tmp), "%s/maps.json.tmp.%d", out_dir, (int)getpid()) >= (int)sizeof(maps_json_tmp)) {
+    int maps_tmp_fd = secure_open_temp_file(dir_fd, out_dir, "maps.json", maps_json_tmp, sizeof(maps_json_tmp), maps_bname, sizeof(maps_bname));
+    if (maps_tmp_fd < 0) {
         maps_err = 1;
     } else {
-        FILE *f_maps = fopen(maps_json_tmp, "w");
+        FILE *f_maps = fdopen(maps_tmp_fd, "w");
         if (!f_maps) {
+            close(maps_tmp_fd);
+            unlinkat(dir_fd, maps_bname, 0);
             maps_err = 1;
         } else {
             if (fprintf(f_maps, "[\n") < 0) maps_write_fail = 1;
@@ -889,42 +972,62 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                 if (fprintf(f_maps, "    }") < 0) maps_write_fail = 1;
             }
             if (fprintf(f_maps, "\n  ]\n") < 0) maps_write_fail = 1;
+            if (fflush(f_maps) != 0) maps_write_fail = 1;
+            if (fsync(maps_tmp_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) maps_write_fail = 1;
             int fr_err = (ferror(f_maps) != 0);
             int cl_err = (fclose(f_maps) != 0);
             if (maps_write_fail || fr_err || cl_err) {
                 maps_err = 1;
-                unlink(maps_json_tmp);
+                unlinkat(dir_fd, maps_bname, 0);
             } else {
-                if (rename(maps_json_tmp, maps_json_path) != 0) {
+                if (renameat(dir_fd, maps_bname, dir_fd, "maps.json") != 0) {
                     maps_err = 1;
-                    unlink(maps_json_tmp);
+                    unlinkat(dir_fd, maps_bname, 0);
                 }
             }
         }
     }
 
-    if (manifest_err || maps_err) {
+    /* Artifact Directory Fsync: fsync dir_fd before publishing metadata.json */
+    int artifact_dir_fsync_err = 0;
+    if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS && errno != EACCES) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] fsync on directory '%s' before metadata publication failed: %s\n", out_dir, strerror(errno));
+        }
+        artifact_dir_fsync_err = 1;
+    }
+
+    if (manifest_err || maps_err || artifact_dir_fsync_err) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (mem_fd >= 0) close(mem_fd);
+        if (dir_fd >= 0) close(dir_fd);
+        if (lock_fd >= 0) close(lock_fd);
+        free(buf);
+        free(regions);
+        if (stats_out) *stats_out = stats;
+        return -1;
     }
 
     /* Write metadata.json atomically as the final commit barrier */
-    char meta_json_path[2048];
-    char meta_json_tmp[2048];
+    char meta_json_tmp[2048] = {0};
+    char meta_bname[256] = {0};
     int meta_err = 0;
     int meta_write_fail = 0;
-    if (snprintf(meta_json_path, sizeof(meta_json_path), "%s/metadata.json", out_dir) >= (int)sizeof(meta_json_path) ||
-        snprintf(meta_json_tmp, sizeof(meta_json_tmp), "%s/metadata.json.tmp.%d", out_dir, (int)getpid()) >= (int)sizeof(meta_json_tmp)) {
+    int meta_tmp_fd = secure_open_temp_file(dir_fd, out_dir, "metadata.json", meta_json_tmp, sizeof(meta_json_tmp), meta_bname, sizeof(meta_bname));
+    if (meta_tmp_fd < 0) {
         meta_err = 1;
     } else {
-        FILE *f_meta = fopen(meta_json_tmp, "w");
+        FILE *f_meta = fdopen(meta_tmp_fd, "w");
         if (!f_meta) {
+            close(meta_tmp_fd);
+            unlinkat(dir_fd, meta_bname, 0);
             meta_err = 1;
         } else {
             char esc_bin[1024] = {0};
             escape_json_string(exe_path, esc_bin, sizeof(esc_bin));
             const char *snap_id = cfg->snapshot_id[0] ? cfg->snapshot_id : "RAW_CAPTURE";
             int is_success = (strcmp(stats.status, "COMPLETE") == 0 || strcmp(stats.status, "PARTIAL") == 0);
-            int is_committed = (!manifest_err && !maps_err && is_success);
+            int is_committed = (!manifest_err && !maps_err && !artifact_dir_fsync_err && is_success);
             int64_t commit_ts = get_time_ns();
 
             if (fprintf(f_meta, "{\n") < 0) meta_write_fail = 1;
@@ -970,34 +1073,36 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             if (fprintf(f_meta, "  \"modules\": []\n") < 0) meta_write_fail = 1;
             if (fprintf(f_meta, "}\n") < 0) meta_write_fail = 1;
 
+            if (fflush(f_meta) != 0) meta_write_fail = 1;
+            if (fsync(meta_tmp_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) meta_write_fail = 1;
             int fr_err = (ferror(f_meta) != 0);
             int cl_err = (fclose(f_meta) != 0);
             if (meta_write_fail || fr_err || cl_err) {
                 meta_err = 1;
-                unlink(meta_json_tmp);
+                unlinkat(dir_fd, meta_bname, 0);
             } else {
-                if (rename(meta_json_tmp, meta_json_path) != 0) {
+                if (renameat(dir_fd, meta_bname, dir_fd, "metadata.json") != 0) {
                     meta_err = 1;
-                    unlink(meta_json_tmp);
+                    unlinkat(dir_fd, meta_bname, 0);
                 } else {
-                    int dir_fd = open(out_dir, O_RDONLY);
-                    if (dir_fd >= 0) {
-                        if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS && errno != EACCES) {
-                            if (cfg->verbose) {
-                                fprintf(stderr, "[debug] fsync on output directory '%s' failed: %s\n", out_dir, strerror(errno));
-                            }
-                            meta_err = 1;
+                    /* Final commit marker durability: fsync parent directory */
+                    if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS && errno != EACCES) {
+                        if (cfg->verbose) {
+                            fprintf(stderr, "[debug] fsync on output directory '%s' failed: %s\n", out_dir, strerror(errno));
                         }
-                        close(dir_fd);
+                        /* Invalidate metadata.json so readers fail closed */
+                        unlinkat(dir_fd, "metadata.json", 0);
+                        meta_err = 1;
                     }
                 }
             }
         }
     }
 
-    if (manifest_err || maps_err || meta_err) {
+    if (meta_err) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
+        if (dir_fd >= 0) close(dir_fd);
         if (lock_fd >= 0) close(lock_fd);
         free(buf);
         free(regions);
@@ -1006,9 +1111,15 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     }
 
     if (mem_fd >= 0) close(mem_fd);
+    if (dir_fd >= 0) close(dir_fd);
     if (lock_fd >= 0) close(lock_fd);
     free(buf);
     free(regions);
+
+    if (stats_out) {
+        *stats_out = stats;
+    }
+    return 0;
 
     if (stats_out) {
         *stats_out = stats;

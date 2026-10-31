@@ -1403,6 +1403,11 @@ class InvestigationManager:
                 session.summary["error"] = f"Live memory capture failed: {cap_exc}"
                 return session.to_dict()
 
+        # Enforce provenance bounds: external callers cannot forge LIVE_RUNTIME_CAPTURE without an active live process
+        if not session.target_ref.get("live_capture") and provenance_class == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+            provenance_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            session.target_ref["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
         if static_provider:
             session.static_provider = static_provider
         elif debug_image and os.path.exists(debug_image):
@@ -2904,11 +2909,14 @@ class InvestigationManager:
             )
             for h in session.hypotheses
         ]
-        report_prov_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        is_live_capture = bool(session.target_ref.get("live_capture"))
+        report_prov_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE if is_live_capture else PROVENANCE_CLASS_IMPORTED_UNVERIFIED
         if trust_level in ("UNTRUSTED", "UNVERIFIED") or cap_status in ("FAILED", "INVALID", "UNVERIFIED"):
             report_prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
         elif session.target_ref.get("provenance_class") in (PROVENANCE_CLASS_IMPORTED_UNVERIFIED, PROVENANCE_CLASS_SYNTHETIC_FIXTURE):
             report_prov_class = session.target_ref.get("provenance_class")
+        elif not is_live_capture:
+            report_prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
         synth_report_verdict = VerdictEngine.synthesize_verdict(
             hypothesis=session.goal,

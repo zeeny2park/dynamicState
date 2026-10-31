@@ -1679,7 +1679,7 @@ time.sleep(10)
         self.assertFalse(raw.committed)
 
     def test_40_native_collector_unlink_failure_aborts(self):
-        """Native collector must exit non-zero and fail closed if pre-existing metadata.json cannot be unlinked."""
+        """Native collector must exit non-zero and fail closed if pre-existing metadata.json cannot be unlinked (root-safe via LD_PRELOAD)."""
         # Start a target process
         target_src = os.path.join(self.tmp_dir, "target40.c")
         target_bin = os.path.join(self.tmp_dir, "target40_app")
@@ -1698,6 +1698,25 @@ int main() {
         proc = subprocess.Popen([target_bin])
         time.sleep(0.1)
 
+        # Compile a tiny LD_PRELOAD interceptor to guarantee unlink failure even when running as root
+        so_src = os.path.join(self.tmp_dir, "fail_unlink.c")
+        so_bin = os.path.join(self.tmp_dir, "fail_unlink.so")
+        with open(so_src, "w") as f:
+            f.write(r"""
+#include <errno.h>
+int unlink(const char *pathname) {
+    (void)pathname;
+    errno = EACCES;
+    return -1;
+}
+int unlinkat(int dirfd, const char *pathname, int flags) {
+    (void)dirfd; (void)pathname; (void)flags;
+    errno = EACCES;
+    return -1;
+}
+""")
+        subprocess.run(["gcc", "-shared", "-fPIC", so_src, "-o", so_bin], check=True)
+
         try:
             out_snap_dir = os.path.join(self.tmp_dir, "snap_c_inval_fail")
             os.makedirs(out_snap_dir, exist_ok=True)
@@ -1705,23 +1724,21 @@ int main() {
             with open(meta_file, "w") as f:
                 f.write('{"snapshot_id":"OLD_C","committed":true}')
 
-            # Make out_snap_dir read-only so unlink fails with EACCES / EPERM
-            os.chmod(out_snap_dir, 0o555)
+            env = os.environ.copy()
+            env["LD_PRELOAD"] = so_bin
 
-            try:
-                res = subprocess.run(
-                    [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--policy", "all", "--json"],
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertNotEqual(res.returncode, 0, "Collector must fail when unlink fails")
-                lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip().startswith("{")]
-                if lines:
-                    stats = json.loads(lines[-1])
-                    self.assertFalse(stats.get("success", False))
-                    self.assertEqual(stats.get("status"), "FAILED")
-            finally:
-                os.chmod(out_snap_dir, 0o755)
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--policy", "all", "--json"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertNotEqual(res.returncode, 0, "Collector must fail when unlink fails")
+            lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip().startswith("{")]
+            if lines:
+                stats = json.loads(lines[-1])
+                self.assertFalse(stats.get("success", False))
+                self.assertEqual(stats.get("status"), "FAILED")
         finally:
             proc.terminate()
             proc.wait(timeout=2)
@@ -2103,6 +2120,392 @@ int main() {
         # Diagnosis must be capped at SUSPECTED (never CONFIRMED)
         self.assertEqual(verdict_mixed.final_diagnosis, DIAG_SUSPECTED)
         self.assertTrue(any("synthetic/unverified" in lim for lim in verdict_mixed.limitations))
+
+    def test_48_artifact_file_fsync_failure(self):
+        """Simulated artifact file fsync failure aborts cleanly without publishing metadata.json."""
+        from unittest.mock import patch
+        import errno
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_art_fsync_fail")
+        os.makedirs(snap_dir, exist_ok=True)
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_FSYNC_FAIL",
+            pid=8001,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_fsync = os.fsync
+        def mock_fsync_fail_file(fd):
+            # Fail when fsyncing manifest file
+            raise OSError(errno.EIO, "I/O error during file fsync")
+
+        with patch("os.fsync", side_effect=mock_fsync_fail_file):
+            with self.assertRaises(OSError) as ctx:
+                raw.save()
+            self.assertIn("I/O error", str(ctx.exception))
+
+        self.assertFalse(os.path.exists(os.path.join(snap_dir, "metadata.json")))
+        self.assertFalse(raw.committed)
+        self.assertEqual(raw.commit_state, "INVALID")
+        # Load fails closed
+        with self.assertRaises(FileNotFoundError):
+            RawMemorySnapshot.load(snap_dir)
+
+    def test_49_artifact_dir_fsync_failure(self):
+        """Simulated directory fsync failure after artifact write prevents metadata publication."""
+        from unittest.mock import patch
+        import errno
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_art_dir_fsync_fail")
+        os.makedirs(snap_dir, exist_ok=True)
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_DIR_FSYNC_FAIL",
+            pid=8002,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_fsync = os.fsync
+        dir_fd_pinned = []
+
+        def mock_fsync_fail_dir(fd):
+            # Detect directory fd by fstat
+            st = os.fstat(fd)
+            import stat
+            if stat.S_ISDIR(st.st_mode):
+                raise OSError(errno.EIO, "Directory fsync failed")
+            return real_fsync(fd)
+
+        with patch("os.fsync", side_effect=mock_fsync_fail_dir):
+            with self.assertRaises(OSError) as ctx:
+                raw.save()
+            self.assertIn("Artifact directory fsync failed", str(ctx.exception))
+
+        self.assertFalse(os.path.exists(os.path.join(snap_dir, "metadata.json")))
+        self.assertFalse(raw.committed)
+        self.assertEqual(raw.commit_state, "INVALID")
+        with self.assertRaises(FileNotFoundError):
+            RawMemorySnapshot.load(snap_dir)
+
+    def test_50_metadata_file_fsync_failure(self):
+        """Simulated metadata.json.tmp fsync failure aborts and does NOT rename metadata."""
+        from unittest.mock import patch
+        import errno
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_meta_fsync_fail")
+        os.makedirs(snap_dir, exist_ok=True)
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_META_FSYNC_FAIL",
+            pid=8003,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_fsync = os.fsync
+        call_count = [0]
+
+        def mock_fsync_fail_meta(fd):
+            call_count[0] += 1
+            # 1: manifest, 2: maps, 3: modules, 4: dir_fd, 5: metadata.json.tmp
+            if call_count[0] == 5:
+                raise OSError(errno.EIO, "Metadata file fsync failed")
+            return real_fsync(fd)
+
+        with patch("os.fsync", side_effect=mock_fsync_fail_meta):
+            with self.assertRaises(OSError) as ctx:
+                raw.save()
+            self.assertIn("Metadata file fsync failed", str(ctx.exception))
+
+        self.assertFalse(os.path.exists(os.path.join(snap_dir, "metadata.json")))
+        self.assertFalse(raw.committed)
+        self.assertEqual(raw.commit_state, "INVALID")
+        with self.assertRaises(FileNotFoundError):
+            RawMemorySnapshot.load(snap_dir)
+
+    def test_51_final_dir_fsync_failure_unlinks_metadata(self):
+        """Simulated final directory fsync failure unlinks metadata.json and fails closed."""
+        from unittest.mock import patch
+        import errno
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_final_dir_fsync_fail")
+        os.makedirs(snap_dir, exist_ok=True)
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_FINAL_FSYNC_FAIL",
+            pid=8004,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_fsync = os.fsync
+        dir_sync_count = [0]
+
+        def mock_fsync_fail_final_dir(fd):
+            st = os.fstat(fd)
+            import stat
+            if stat.S_ISDIR(st.st_mode):
+                dir_sync_count[0] += 1
+                if dir_sync_count[0] == 2:
+                    # Fail on second (final) directory fsync
+                    raise OSError(errno.EIO, "Final directory fsync failed")
+            return real_fsync(fd)
+
+        with patch("os.fsync", side_effect=mock_fsync_fail_final_dir):
+            with self.assertRaises(OSError) as ctx:
+                raw.save()
+            self.assertIn("Final directory fsync failed", str(ctx.exception))
+
+        # Crucial invariant: metadata.json must be unlinked on final fsync failure
+        self.assertFalse(os.path.exists(os.path.join(snap_dir, "metadata.json")))
+        self.assertFalse(raw.committed)
+        self.assertEqual(raw.commit_state, "INVALID")
+        with self.assertRaises(FileNotFoundError):
+            RawMemorySnapshot.load(snap_dir)
+
+    def test_52_directory_open_failure_fails_closed(self):
+        """Directory open failure in Python save() and native collector fails closed immediately."""
+        from unittest.mock import patch
+        import errno
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        # 1. Python save() on an invalid / unopenable directory
+        snap_dir = os.path.join(self.tmp_dir, "snap_dir_open_fail")
+        os.makedirs(snap_dir, exist_ok=True)
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_NO_DIR",
+            pid=8005,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_open = os.open
+        def mock_open_fail_dir(path, flags, *args):
+            if flags & getattr(os, "O_DIRECTORY", 0):
+                raise OSError(errno.EACCES, "Permission denied opening directory FD")
+            return real_open(path, flags, *args)
+
+        with patch("os.open", side_effect=mock_open_fail_dir):
+            with self.assertRaises(OSError) as ctx:
+                raw.save()
+            self.assertIn("Failed opening snapshot directory", str(ctx.exception))
+        self.assertEqual(raw.commit_state, "INVALID")
+
+        # 2. Native collector on invalid directory
+        target_src = os.path.join(self.tmp_dir, "target52.c")
+        target_bin = os.path.join(self.tmp_dir, "target52_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) pause();
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+        try:
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", "/dev/null/impossible_dir", "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=2)
+
+    def test_53_toctou_symlink_substitution_atomic_protection(self):
+        """_secure_open_read and _secure_open_temp_write atomically refuse to follow symlinks."""
+        from extractor.memory_snapshot import _secure_open_read, _secure_open_temp_write
+
+        victim_file = os.path.join(self.tmp_dir, "victim53.txt")
+        with open(victim_file, "w") as f:
+            f.write("SECRET_DATA")
+
+        link_file = os.path.join(self.tmp_dir, "link53.txt")
+        os.symlink(victim_file, link_file)
+
+        # Atomic read refusal
+        with self.assertRaises(OSError):
+            with _secure_open_read(link_file) as f:
+                f.read()
+
+        # Atomic write refusal
+        with self.assertRaises(OSError):
+            with _secure_open_temp_write(link_file) as f:
+                f.write("ATTACK")
+
+        # Victim content unchanged
+        with open(victim_file, "r") as f:
+            self.assertEqual(f.read(), "SECRET_DATA")
+
+    def test_54_native_temp_file_symlink_and_collision_rejection(self):
+        """Native collector rejects symlinks planted at destination and uses unique temp files."""
+        target_src = os.path.join(self.tmp_dir, "target54.c")
+        target_bin = os.path.join(self.tmp_dir, "target54_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) pause();
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        try:
+            out_dir = os.path.join(self.tmp_dir, "snap_native_symlink_test")
+            os.makedirs(out_dir, exist_ok=True)
+            victim = os.path.join(self.tmp_dir, "victim54.txt")
+            with open(victim, "w") as f:
+                f.write("SAFE_CANARY")
+
+            # Plant symlink at maps.txt
+            os.symlink(victim, os.path.join(out_dir, "maps.txt"))
+
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_dir, "--policy", "all", "--json"],
+                capture_output=True,
+                text=True,
+            )
+            # Canary must NOT be overwritten
+            with open(victim, "r") as f:
+                self.assertEqual(f.read(), "SAFE_CANARY")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=2)
+
+    def test_55_writer_exclusion_thread_and_process(self):
+        """Cross-process and cross-thread exclusion prevents concurrent writers from corrupting output."""
+        import fcntl
+        import sys
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_mutual_excl")
+        os.makedirs(snap_dir, exist_ok=True)
+        lock_file = os.path.join(snap_dir, ".collector.lock")
+
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_EXCL",
+            pid=8006,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        # Acquire lock in a separate process
+        lock_holder = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import fcntl, time; f=open('{lock_file}', 'w'); fcntl.lockf(f.fileno(), fcntl.LOCK_EX); time.sleep(10)"],
+        )
+        time.sleep(0.15)
+        try:
+            # Python save must fail with BlockingIOError
+            with self.assertRaises(BlockingIOError):
+                raw.save()
+
+            # Native collector must also fail
+            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+            time.sleep(0.05)
+            try:
+                res = subprocess.run(
+                    [self.collector_bin, "-p", str(proc.pid), "-o", snap_dir, "--json"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(res.returncode, 1)
+            finally:
+                proc.terminate()
+                proc.wait(timeout=2)
+        finally:
+            lock_holder.terminate()
+            lock_holder.wait(timeout=2)
+
+    def test_56_reload_after_all_failure_modes_fails_closed(self):
+        """RawMemorySnapshot.load() and validate_integrity() fail closed on corrupted / incomplete snapshots."""
+        from extractor.memory_snapshot import RawMemorySnapshot
+
+        test_dir = os.path.join(self.tmp_dir, "snap_fail_closed_matrix")
+        os.makedirs(test_dir, exist_ok=True)
+
+        # 1. Empty directory
+        with self.assertRaises(FileNotFoundError):
+            RawMemorySnapshot.load(test_dir)
+
+        # 2. metadata.json exists but committed=false
+        with open(os.path.join(test_dir, "metadata.json"), "w") as f:
+            json.dump({"snapshot_id": "TEST", "committed": False, "status": "COMPLETE"}, f)
+        snap = RawMemorySnapshot.load(test_dir)
+        is_val, warns = snap.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertEqual(snap.validation_verdict, "INVALID")
+
+        # 3. metadata.json has committed=true, but missing manifest.json
+        with open(os.path.join(test_dir, "metadata.json"), "w") as f:
+            json.dump({
+                "snapshot_id": "TEST",
+                "committed": True,
+                "status": "COMPLETE",
+                "pid": 1234,
+                "binary": "/app",
+                "timestamp_ns": 1000,
+                "capture_mode": "test",
+                "backend": "test",
+                "architecture": "x86_64",
+                "endianness": "little",
+                "elf_class": "ELF64",
+                "page_size": 4096,
+                "regions": 1,
+                "regions_requested": 1,
+                "bytes_requested": 4096,
+                "bytes_captured": 4096,
+                "duration_us": 10.0,
+                "consistency": {"level": "NON_ATOMIC"},
+            }, f)
+        snap = RawMemorySnapshot.load(test_dir)
+        is_val, warns = snap.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertTrue(any("manifest.json" in w for w in warns))
 
 
 if __name__ == "__main__":

@@ -148,12 +148,14 @@ class SnapshotMemoryReader:
 
         # Load region file (cache into memory) with secure no-follow check
         if fpath not in self._cache:
-            if not os.path.exists(fpath) or os.path.islink(fpath):
+            if not fpath:
                 return None
             try:
                 flags = os.O_RDONLY
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
                 fd = os.open(fpath, flags)
                 try:
                     with os.fdopen(fd, "rb") as f:
