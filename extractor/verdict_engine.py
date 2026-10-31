@@ -26,6 +26,8 @@ from .evidence_ledger import (
     ATTRIBUTION_BASIS_SINGLE_WRITER,
     PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+    PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     TRUSTED_PROVENANCE_CLASSES,
 )
 
@@ -99,6 +101,7 @@ class AssertionEvaluation:
     runtime_address: Optional[int] = None
     was_coerced: bool = False
     evidence_id: Optional[str] = None
+    provenance_class: Optional[str] = None
 
 
 @dataclass
@@ -283,6 +286,14 @@ class VerdictEngine:
             hyp_state = HYP_STATE_INCONCLUSIVE
             confidence = round(passed / float(total), 3)
 
+        # Resolve effective provenance class (lowest trust level wins)
+        eff_provenance_class = provenance_class
+        for e in evaluations:
+            e_prov = getattr(e, "provenance_class", None)
+            if e_prov and e_prov not in TRUSTED_PROVENANCE_CLASSES:
+                eff_provenance_class = e_prov
+                break
+
         # 2. Final Diagnosis with Causal Invariant Gate
         if total == 0 or abstained == total:
             diagnosis = DIAG_INCONCLUSIVE
@@ -299,15 +310,24 @@ class VerdictEngine:
                 limitations.append(
                     "Function was observed on call stack (correlation), but causal link was not proven via single-writer reproduction or execution trace. Capped at SUSPECTED."
                 )
-            elif causal_attribution_verified and provenance_class in TRUSTED_PROVENANCE_CLASSES:
+            elif causal_attribution_verified and eff_provenance_class in TRUSTED_PROVENANCE_CLASSES:
                 diagnosis = DIAG_CONFIRMED
-            elif provenance_class not in TRUSTED_PROVENANCE_CLASSES:
+            elif eff_provenance_class not in TRUSTED_PROVENANCE_CLASSES:
                 diagnosis = DIAG_SUSPECTED
-                limitations.append(f"Provenance class '{provenance_class}' is synthetic/unverified; diagnosis capped at SUSPECTED.")
+                limitations.append(f"Provenance class '{eff_provenance_class}' is synthetic/unverified; diagnosis capped at SUSPECTED.")
             else:
                 diagnosis = DIAG_CONFIRMED
         else:
             diagnosis = DIAG_INCONCLUSIVE
+
+        # Invariant: UNVERIFIED / untrusted provenance must NEVER produce CONFIRMED or NO_ISSUE_DETECTED
+        if eff_provenance_class not in TRUSTED_PROVENANCE_CLASSES:
+            if diagnosis == DIAG_CONFIRMED:
+                diagnosis = DIAG_SUSPECTED
+                limitations.append(f"Provenance class '{eff_provenance_class}' is synthetic/unverified; diagnosis capped at SUSPECTED.")
+            elif diagnosis == DIAG_NO_ISSUE_DETECTED:
+                diagnosis = DIAG_INCONCLUSIVE
+                limitations.append(f"Provenance class '{eff_provenance_class}' is synthetic/unverified; cannot certify NO_ISSUE_DETECTED. Reclassified as INCONCLUSIVE.")
 
         return DiagnosticVerdict(
             hypothesis=hypothesis,
@@ -321,7 +341,7 @@ class VerdictEngine:
             assertion_evaluations=evaluations,
             causal_attribution_verified=causal_attribution_verified,
             attribution_basis=attribution_basis,
-            provenance_class=provenance_class,
+            provenance_class=eff_provenance_class,
             target_identity=target_identity,
             limitations=limitations,
             budget_usage=budget_usage or {},

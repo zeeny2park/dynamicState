@@ -498,8 +498,25 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
 
     /* Invalidate any existing metadata.json from a prior snapshot to prevent stale reads if interrupted */
     char old_meta_path[2048] = {0};
-    if (snprintf(old_meta_path, sizeof(old_meta_path), "%s/metadata.json", out_dir) < (int)sizeof(old_meta_path)) {
-        unlink(old_meta_path);
+    if (snprintf(old_meta_path, sizeof(old_meta_path), "%s/metadata.json", out_dir) >= (int)sizeof(old_meta_path)) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] Output path too long for metadata.json\n");
+        }
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (lock_fd >= 0) close(lock_fd);
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
+    }
+    if (unlink(old_meta_path) != 0 && errno != ENOENT) {
+        if (cfg->verbose) {
+            fprintf(stderr, "[debug] Failed invalidating existing metadata '%s': %s\n", old_meta_path, strerror(errno));
+        }
+        snprintf(stats.status, sizeof(stats.status), "FAILED");
+        if (lock_fd >= 0) close(lock_fd);
+        if (stats_out) *stats_out = stats;
+        free(regions);
+        return -1;
     }
 
     char mem_dir[2048] = {0};
@@ -962,6 +979,17 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                 if (rename(meta_json_tmp, meta_json_path) != 0) {
                     meta_err = 1;
                     unlink(meta_json_tmp);
+                } else {
+                    int dir_fd = open(out_dir, O_RDONLY);
+                    if (dir_fd >= 0) {
+                        if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS && errno != EACCES) {
+                            if (cfg->verbose) {
+                                fprintf(stderr, "[debug] fsync on output directory '%s' failed: %s\n", out_dir, strerror(errno));
+                            }
+                            meta_err = 1;
+                        }
+                        close(dir_fd);
+                    }
                 }
             }
         }

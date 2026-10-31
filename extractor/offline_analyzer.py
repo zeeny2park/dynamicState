@@ -383,7 +383,12 @@ class OfflineMemoryAnalyzer:
         else:
             raw_snap = memory_snapshot
 
-        if getattr(raw_snap, "status", None) == "FAILED" or getattr(raw_snap, "validation_verdict", None) == "INVALID":
+        if (
+            getattr(raw_snap, "status", None) == "FAILED"
+            or getattr(raw_snap, "validation_verdict", None) == "INVALID"
+            or getattr(raw_snap, "commit_state", None) == "INVALID"
+            or getattr(raw_snap, "committed", True) is False
+        ):
             err_msg = f"Cannot analyze INVALID or FAILED snapshot '{raw_snap.snapshot_id}': {getattr(raw_snap, 'integrity_warnings', [])}"
             raise ValueError(err_msg)
 

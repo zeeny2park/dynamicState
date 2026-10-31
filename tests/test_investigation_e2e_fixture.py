@@ -14,7 +14,7 @@ import tempfile
 import time
 import unittest
 
-from extractor.capture_backend import ProcessVmCaptureBackend, ProcfsCaptureBackend
+from extractor.capture_backend import ProcessVmCaptureBackend, ProcfsCaptureBackend, CaptureSafetyPolicy
 from extractor.debug_image import inspect_elf
 from extractor.investigation import InvestigationManager
 from extractor.raw_snapshot import RawRuntimeSnapshot
@@ -78,7 +78,8 @@ class TestInvestigationE2EFixture(unittest.TestCase):
         try:
             # 1. Capture first runtime memory snapshot (procfs fallback if process_vm_readv restricted)
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            cap_policy = CaptureSafetyPolicy(max_region_bytes=32 * 1024 * 1024)
+            snap1 = backend.capture(pid=proc.pid, policy=cap_policy)
             self.assertGreater(snap1.bytes_captured, 0)
 
             # Save snapshot to corpus
@@ -89,7 +90,7 @@ class TestInvestigationE2EFixture(unittest.TestCase):
             time.sleep(0.08)
 
             # Capture second snapshot for observation comparison
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, policy=cap_policy)
             snap2_dir = os.path.join(self.corpus_dir, "memory_snapshots", "snap_e2e_02")
             snap2.save(snap2_dir)
 

@@ -1194,44 +1194,83 @@ int main() {
             RawMemorySnapshot.load(snap_dir)
 
     def test_31_concurrent_save_calls_same_process_and_cross_process(self):
-        """Concurrent Python save calls targeting the same directory are safely rejected by directory locking."""
+        """Cross-process concurrent Python save calls targeting the same directory are deterministically serialized and rejected."""
+        import sys
         from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
-        import concurrent.futures
 
         snap_dir = os.path.join(self.tmp_dir, "snap_conc_python")
+        os.makedirs(snap_dir, exist_ok=True)
         reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
 
-        def attempt_save(pid_val):
-            raw = RawMemorySnapshot(
-                snapshot_id=f"SNAP_{pid_val}",
-                pid=pid_val,
-                binary="/app",
-                timestamp_ns=1000,
-                status="COMPLETE",
-                output_dir=snap_dir,
-                regions=[reg],
-                maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
-            )
-            raw.save()
-            return True
+        # Subprocess holds lock inside save() critical section
+        subproc_code = f"""
+import sys, os
+from unittest.mock import patch
+from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
 
-        # Run 2 threads attempting save simultaneously
-        # Directory locking ensures one succeeds and the other gets BlockingIOError or succeeds sequentially
-        results = []
-        errors = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futs = [executor.submit(attempt_save, 1000 + i) for i in range(2)]
-            for f in futs:
-                try:
-                    results.append(f.result())
-                except BlockingIOError as e:
-                    errors.append(e)
+snap_dir = {repr(snap_dir)}
+reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+raw = RawMemorySnapshot(
+    snapshot_id="SNAP_PROC1",
+    pid=9001,
+    binary="/app",
+    timestamp_ns=1000,
+    status="COMPLETE",
+    output_dir=snap_dir,
+    regions=[reg],
+    maps=[{{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}}],
+)
 
-        # Either one succeeded and one was locked out, or both succeeded cleanly sequentially
-        self.assertTrue(len(results) >= 1)
-        # Snapshot in directory must be valid and readable
+real_replace = os.replace
+def mock_replace(src, dst):
+    if "manifest.json" in dst:
+        sys.stdout.write("LOCKED\\n")
+        sys.stdout.flush()
+        # Wait for resume signal on stdin
+        sys.stdin.readline()
+    return real_replace(src, dst)
+
+with patch("os.replace", side_effect=mock_replace):
+    raw.save()
+sys.stdout.write("DONE\\n")
+sys.stdout.flush()
+"""
+        proc1 = subprocess.Popen(
+            [sys.executable, "-c", subproc_code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        line = proc1.stdout.readline().strip()
+        self.assertEqual(line, "LOCKED", "Subprocess must signal when locked")
+
+        # Process 2 (current process) attempts save on same directory while proc1 holds lock
+        raw2 = RawMemorySnapshot(
+            snapshot_id="SNAP_PROC2",
+            pid=9002,
+            binary="/app",
+            timestamp_ns=1001,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        with self.assertRaises(BlockingIOError) as ctx:
+            raw2.save()
+        self.assertIn("locked by another process", str(ctx.exception))
+
+        # Unblock subprocess 1
+        proc1.stdin.write("GO\n")
+        proc1.stdin.flush()
+        done_line = proc1.stdout.readline().strip()
+        self.assertEqual(done_line, "DONE")
+        proc1.wait(timeout=3)
+        self.assertEqual(proc1.returncode, 0)
+
+        # Valid snapshot from proc1 must now be on disk
         loaded = RawMemorySnapshot.load(snap_dir)
-        self.assertIn(loaded.pid, [1000, 1001])
+        self.assertEqual(loaded.pid, 9001)
+        self.assertEqual(loaded.snapshot_id, "SNAP_PROC1")
 
     def test_32_native_and_python_writer_contention(self):
         """Native collector rejects capture if Python writer holds .collector.lock, and vice versa."""
@@ -1397,23 +1436,25 @@ int main() {
         self.assertEqual(snap_c2.bytes_captured, 2048)
 
     def test_36_deterministic_thread_overlap_save_rejection(self):
-        """Two Python threads entering save() for the exact same directory overlap deterministically via barrier."""
+        """Two Python threads entering save() for the exact same directory overlap deterministically inside critical section."""
         import threading
+        from unittest.mock import patch
         from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
 
         snap_dir = os.path.join(self.tmp_dir, "snap_thread_overlap")
         os.makedirs(snap_dir, exist_ok=True)
-        barrier = threading.Barrier(2)
 
         reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
 
+        t1_in_cs = threading.Event()
+        t2_attempted = threading.Event()
         outcomes = []
         errors = []
 
-        def worker(tid):
-            raw = RawMemorySnapshot(
-                snapshot_id=f"SNAP_{tid}",
-                pid=1000 + tid,
+        def worker1():
+            raw1 = RawMemorySnapshot(
+                snapshot_id="SNAP_1",
+                pid=1001,
                 binary="/app",
                 timestamp_ns=1000,
                 status="COMPLETE",
@@ -1421,29 +1462,52 @@ int main() {
                 regions=[reg],
                 maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
             )
-            # Synchronize both threads right before calling save()
-            try:
-                barrier.wait(timeout=2)
-            except Exception:
-                pass
-            try:
-                raw.save()
-                outcomes.append(tid)
-            except BlockingIOError as e:
-                errors.append(e)
+            real_replace = os.replace
+            def replace_hook(src, dst):
+                if "manifest.json" in dst:
+                    t1_in_cs.set()
+                    t2_attempted.wait(timeout=5)
+                return real_replace(src, dst)
 
-        t1 = threading.Thread(target=worker, args=(1,))
-        t2 = threading.Thread(target=worker, args=(2,))
+            with patch("os.replace", side_effect=replace_hook):
+                try:
+                    raw1.save()
+                    outcomes.append(1)
+                except Exception as e:
+                    errors.append((1, e))
+
+        def worker2():
+            self.assertTrue(t1_in_cs.wait(timeout=5), "Thread 1 did not enter critical section")
+            raw2 = RawMemorySnapshot(
+                snapshot_id="SNAP_2",
+                pid=1002,
+                binary="/app",
+                timestamp_ns=1001,
+                status="COMPLETE",
+                output_dir=snap_dir,
+                regions=[reg],
+                maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+            )
+            try:
+                raw2.save()
+                outcomes.append(2)
+            except BlockingIOError as e:
+                errors.append((2, e))
+            finally:
+                t2_attempted.set()
+
+        t1 = threading.Thread(target=worker1)
+        t2 = threading.Thread(target=worker2)
         t1.start()
         t2.start()
-        t1.join(timeout=3)
-        t2.join(timeout=3)
+        t1.join(timeout=6)
+        t2.join(timeout=6)
 
-        # Process-local thread synchronization guarantees that exactly one thread succeeds
-        # while the concurrent overlapping thread is immediately rejected with BlockingIOError
-        self.assertEqual(len(outcomes), 1, f"Expected exactly 1 thread to win, got {outcomes}")
-        self.assertEqual(len(errors), 1, f"Expected 1 thread to get BlockingIOError, got {errors}")
-        self.assertIn("locked by another thread", str(errors[0]))
+        self.assertEqual(outcomes, [1], f"Expected thread 1 to win, got outcomes: {outcomes}")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][0], 2)
+        self.assertIsInstance(errors[0][1], BlockingIOError)
+        self.assertIn("locked", str(errors[0][1]).lower())
 
     def test_37_process_termination_lock_recovery(self):
         """POSIX advisory locks are released upon process termination, allowing subsequent writers to succeed."""
@@ -1571,6 +1635,474 @@ time.sleep(10)
         # Provenance is IMPORTED_UNVERIFIED -> must NOT be CONFIRMED, capped at SUSPECTED
         self.assertEqual(verdict.final_diagnosis, "SUSPECTED")
         self.assertTrue(any("synthetic/unverified" in lim for lim in verdict.limitations))
+
+    def test_39_metadata_invalidation_failure_aborts_save(self):
+        """If pre-existing metadata.json cannot be invalidated, save() must fail closed immediately."""
+        from unittest.mock import patch
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_inval_fail")
+        os.makedirs(snap_dir, exist_ok=True)
+        meta_file = os.path.join(snap_dir, "metadata.json")
+        with open(meta_file, "w") as f:
+            f.write('{"snapshot_id":"OLD","committed":true}')
+
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_NEW",
+            pid=1111,
+            binary="/app",
+            timestamp_ns=2000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_unlink = os.unlink
+        def mock_unlink(path):
+            if path == meta_file:
+                raise PermissionError("Permission denied: cannot unlink metadata.json")
+            return real_unlink(path)
+
+        with patch("os.unlink", side_effect=mock_unlink):
+            with self.assertRaises(OSError) as ctx:
+                raw.save()
+            self.assertIn("Failed invalidating stale metadata before save", str(ctx.exception))
+
+        # Ensure no manifest.json or new artifacts were written
+        self.assertFalse(os.path.exists(os.path.join(snap_dir, "manifest.json")))
+        # Old metadata.json is untouched
+        with open(meta_file, "r") as f:
+            old_data = json.load(f)
+        self.assertEqual(old_data.get("snapshot_id"), "OLD")
+        self.assertFalse(raw.committed)
+
+    def test_40_native_collector_unlink_failure_aborts(self):
+        """Native collector must exit non-zero and fail closed if pre-existing metadata.json cannot be unlinked."""
+        # Start a target process
+        target_src = os.path.join(self.tmp_dir, "target40.c")
+        target_bin = os.path.join(self.tmp_dir, "target40_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) pause();
+    return 0;
+}
+""")
+        comp = subprocess.run(["gcc", target_src, "-o", target_bin], capture_output=True, text=True)
+        self.assertEqual(comp.returncode, 0)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        try:
+            out_snap_dir = os.path.join(self.tmp_dir, "snap_c_inval_fail")
+            os.makedirs(out_snap_dir, exist_ok=True)
+            meta_file = os.path.join(out_snap_dir, "metadata.json")
+            with open(meta_file, "w") as f:
+                f.write('{"snapshot_id":"OLD_C","committed":true}')
+
+            # Make out_snap_dir read-only so unlink fails with EACCES / EPERM
+            os.chmod(out_snap_dir, 0o555)
+
+            try:
+                res = subprocess.run(
+                    [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--policy", "all", "--json"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(res.returncode, 0, "Collector must fail when unlink fails")
+                lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip().startswith("{")]
+                if lines:
+                    stats = json.loads(lines[-1])
+                    self.assertFalse(stats.get("success", False))
+                    self.assertEqual(stats.get("status"), "FAILED")
+            finally:
+                os.chmod(out_snap_dir, 0o755)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=2)
+
+    def test_41_manifest_deep_fields_validation(self):
+        """Verifies deep manifest field checks (duplicate IDs, inverted ranges, field-by-field mismatches)."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_deep_manifest")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        bin_file = "memory/r41.bin"
+        with open(os.path.join(snap_dir, bin_file), "wb") as bf:
+            bf.write(b"Z" * 4096)
+
+        reg1 = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", bin_file)
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_DEEP_01",
+            pid=2222,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # 1. Duplicate region ID in manifest
+        manifest_path = os.path.join(snap_dir, "manifest.json")
+        with open(manifest_path, "r") as mf:
+            m_entries = json.load(mf)
+        dup_entries = m_entries + [dict(m_entries[0])]
+        with open(manifest_path, "w") as mf:
+            json.dump(dup_entries, mf)
+
+        is_val, warns = raw.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertEqual(raw.validation_verdict, "INVALID")
+        self.assertTrue(any("Duplicate region_id" in w for w in warns))
+
+        # 2. Inverted address range (start >= end)
+        m_bad_range = [dict(m_entries[0])]
+        m_bad_range[0]["start_addr"] = 0x2000
+        m_bad_range[0]["end_addr"] = 0x1000
+        with open(manifest_path, "w") as mf:
+            json.dump(m_bad_range, mf)
+
+        is_val, warns = raw.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertTrue(any("inverted/empty address range" in w for w in warns))
+
+        # 3. Negative address and non-positive size
+        m_neg = [dict(m_entries[0])]
+        m_neg[0]["size"] = -100
+        with open(manifest_path, "w") as mf:
+            json.dump(m_neg, mf)
+
+        is_val, warns = raw.validate_integrity()
+        self.assertFalse(is_val)
+        self.assertTrue(any("non-positive size" in w for w in warns))
+
+        # 4. Field-by-field mismatch tests: permissions, pathname, category, requested, captured, filename, error
+        fields_to_test = [
+            ("permissions", "rwxp", "permissions mismatch"),
+            ("category", "heap", "category mismatch"),
+            ("pathname", "/other_binary", "pathname mismatch"),
+            ("requested", 8192, "requested mismatch"),
+            ("captured", 2048, "captured mismatch"),
+            ("filename", "memory/other.bin", "filename mismatch"),
+            ("error", "CUSTOM_ERROR", "error mismatch"),
+        ]
+        for field_name, bad_value, expected_msg in fields_to_test:
+            m_tamper = [dict(m_entries[0])]
+            m_tamper[0][field_name] = bad_value
+            with open(manifest_path, "w") as mf:
+                json.dump(m_tamper, mf)
+
+            is_val, warns = raw.validate_integrity()
+            self.assertFalse(is_val, f"Validation should fail for {field_name} mismatch")
+            self.assertTrue(any(expected_msg in w for w in warns), f"Expected '{expected_msg}' in warnings for {field_name}")
+
+    def test_42_deterministic_concurrent_overlap_during_write(self):
+        """Two writers targeting the exact same directory must serialize deterministically; second writer fails closed."""
+        import threading
+        from unittest.mock import patch
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_det_concur")
+        os.makedirs(snap_dir, exist_ok=True)
+
+        reg1 = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw1 = RawMemorySnapshot(
+            snapshot_id="SNAP_TH1",
+            pid=3001,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw2 = RawMemorySnapshot(
+            snapshot_id="SNAP_TH2",
+            pid=3002,
+            binary="/app",
+            timestamp_ns=1001,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        in_critical_section = threading.Event()
+        release_critical_section = threading.Event()
+        th2_result = {}
+
+        def thread2_worker():
+            in_critical_section.wait(timeout=5)
+            try:
+                raw2.save()
+                th2_result["status"] = "SUCCESS"
+            except BlockingIOError as e:
+                th2_result["status"] = "BLOCKED"
+                th2_result["error"] = str(e)
+            except Exception as e:
+                th2_result["status"] = "ERROR"
+                th2_result["error"] = str(e)
+            finally:
+                release_critical_section.set()
+
+        # Thread 1 enters save, hooks after locking before metadata.json is replaced
+        real_replace = os.replace
+        def mock_replace(src, dst):
+            if "manifest.json" in dst:
+                in_critical_section.set()
+                release_critical_section.wait(timeout=5)
+            return real_replace(src, dst)
+
+        t2 = threading.Thread(target=thread2_worker)
+        t2.start()
+
+        with patch("os.replace", side_effect=mock_replace):
+            saved = raw1.save()
+
+        t2.join(timeout=5)
+        self.assertEqual(saved, snap_dir)
+        self.assertEqual(th2_result.get("status"), "BLOCKED")
+        self.assertIn("locked", th2_result.get("error", "").lower())
+
+    def test_43_crash_before_metadata_publish_leaves_no_stale_commit(self):
+        """Crash right before metadata.json publish leaves directory uncommitted, and load() fails closed."""
+        from unittest.mock import patch
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_crash_before_meta")
+        os.makedirs(snap_dir, exist_ok=True)
+
+        reg1 = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw_initial = RawMemorySnapshot(
+            snapshot_id="SNAP_INIT",
+            pid=4001,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw_initial.save()
+        self.assertTrue(os.path.exists(os.path.join(snap_dir, "metadata.json")))
+
+        # Second save with updated PID, but crash before metadata.json can be published
+        raw_crash = RawMemorySnapshot(
+            snapshot_id="SNAP_CRASHED",
+            pid=4002,
+            binary="/app",
+            timestamp_ns=2000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_replace = os.replace
+        def crash_on_metadata_replace(src, dst):
+            if "metadata.json" in dst:
+                raise RuntimeError("Simulated crash before publishing metadata.json")
+            return real_replace(src, dst)
+
+        with patch("os.replace", side_effect=crash_on_metadata_replace):
+            with self.assertRaises(RuntimeError):
+                raw_crash.save()
+
+        # Crucial invariant: stale metadata was invalidated at start of save,
+        # so crash before new metadata publish leaves NO metadata.json certifying mixed state
+        self.assertFalse(os.path.exists(os.path.join(snap_dir, "metadata.json")))
+
+        # Attempting load() must fail closed with FileNotFoundError
+        with self.assertRaises(FileNotFoundError):
+            RawMemorySnapshot.load(snap_dir)
+
+    def test_44_investigation_end_to_end_unverified_provenance(self):
+        """UNVERIFIED snapshot propagates through OfflineMemoryAnalyzer and InvestigationManager, capping final diagnosis at SUSPECTED."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        from extractor.offline_analyzer import OfflineMemoryAnalyzer
+        from extractor.investigation import InvestigationManager, HYPOTHESIS_STATUS_VALIDATED
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_unverified_e2e")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        bin_file = "memory/r44.bin"
+        with open(os.path.join(snap_dir, bin_file), "wb") as bf:
+            bf.write(b"\x00" * 4096)
+
+        reg1 = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", bin_file)
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_UNVERIFIED_E2E",
+            pid=5555,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg1],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+        raw.save()
+
+        # Remove 'committed' field in metadata.json to simulate legacy UNVERIFIED snapshot
+        meta_path = os.path.join(snap_dir, "metadata.json")
+        with open(meta_path, "r") as mf:
+            meta_json = json.load(mf)
+        del meta_json["committed"]
+        with open(meta_path, "w") as mf:
+            json.dump(meta_json, mf)
+
+        loaded = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(loaded.validation_verdict, "UNVERIFIED")
+
+        analyzer = OfflineMemoryAnalyzer()
+        semantic_snap = analyzer.analyze(loaded, optional_symbol_context={"types": {}, "globals": {}})
+        self.assertEqual(semantic_snap.provenance["provenance_class"], "IMPORTED_UNVERIFIED")
+        self.assertEqual(semantic_snap.provenance["validation_verdict"], "UNVERIFIED")
+
+        # Set up InvestigationManager session using this snapshot
+        mgr = InvestigationManager()
+        session_info = mgr.start_investigation(
+            goal="Test unverified snapshot trust boundary",
+            memory_snapshot_path=snap_dir,
+            provenance_class=semantic_snap.provenance["provenance_class"],
+        )
+        inv_id = session_info["investigation_id"]
+        session = mgr.sessions[inv_id]
+
+        # Propose a hypothesis and mark it VALIDATED to verify if it can become CONFIRMED
+        mgr.propose_hypothesis(inv_id, {
+            "title": "Hypothesis tested on unverified data",
+            "claim": "State was modified",
+        })
+        session.hypotheses[-1].validation_status = HYPOTHESIS_STATUS_VALIDATED
+
+        # Generate report
+        report = mgr.generate_report(inv_id)
+
+        # Trust boundary check: capture_quality trust_level is UNVERIFIED
+        self.assertEqual(report["capture_quality_assessment"]["trust_level"], "UNVERIFIED")
+
+        # Final diagnosis in report HTML and JSON must be capped at SUSPECTED or INCONCLUSIVE (never CONFIRMED)
+        html_report = report["report_html"]
+        json_report = json.loads(report["report_json"])
+
+        self.assertIn(json_report["final_diagnosis"], ("SUSPECTED", "INCONCLUSIVE"))
+        self.assertNotEqual(json_report["final_diagnosis"], "CONFIRMED")
+        self.assertTrue("SUSPECTED" in html_report or "INCONCLUSIVE" in html_report)
+        self.assertNotIn("CONFIRMED", json_report["final_diagnosis"])
+
+    def test_45_artifact_failure_aborts_without_publishing_metadata(self):
+        """Failure during manifest, maps, or modules write/rename/fsync aborts and leaves NO metadata.json."""
+        from unittest.mock import patch
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_art_fail")
+        os.makedirs(snap_dir, exist_ok=True)
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_FAIL_ART",
+            pid=7001,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_replace = os.replace
+        def mock_replace_fail_maps(src, dst):
+            if "maps.json" in dst:
+                raise OSError("Disk full: failed renaming maps.json")
+            return real_replace(src, dst)
+
+        with patch("os.replace", side_effect=mock_replace_fail_maps):
+            with self.assertRaises(OSError) as ctx:
+                raw.save()
+            self.assertIn("Disk full", str(ctx.exception))
+
+        # metadata.json must NOT be published
+        self.assertFalse(os.path.exists(os.path.join(snap_dir, "metadata.json")))
+        # All temporary files must be cleaned up
+        temp_files = [f for f in os.listdir(snap_dir) if ".tmp." in f]
+        self.assertEqual(temp_files, [], f"Expected all temp files cleaned up, found: {temp_files}")
+        self.assertFalse(raw.committed)
+        self.assertEqual(raw.commit_state, "INVALID")
+
+    def test_46_toctou_symlink_injection_prevented(self):
+        """Attempting to redirect temporary files via pre-created symlinks fails closed with O_NOFOLLOW."""
+        from extractor.memory_snapshot import _secure_open_write
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_toctou_symlink")
+        os.makedirs(snap_dir, exist_ok=True)
+        target_file = os.path.join(self.tmp_dir, "victim.txt")
+        with open(target_file, "w") as f:
+            f.write("ORIGINAL_CONTENT")
+
+        symlink_path = os.path.join(snap_dir, "symlink_tmp.json")
+        os.symlink(target_file, symlink_path)
+
+        # _secure_open_write on symlink must raise OSError (O_NOFOLLOW)
+        with self.assertRaises(OSError):
+            _secure_open_write(symlink_path)
+
+        # Victim content must be untouched
+        with open(target_file, "r") as f:
+            self.assertEqual(f.read(), "ORIGINAL_CONTENT")
+
+    def test_47_mixed_provenance_degraded_to_lowest_trust(self):
+        """Mixed provenance evaluates to lowest trust level; UNVERIFIED cannot certify CONFIRMED or NO_ISSUE_DETECTED."""
+        from extractor.verdict_engine import (
+            VerdictEngine,
+            AssertionEvaluation,
+            ASSERTION_PASS,
+            PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+            PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+            DIAG_SUSPECTED,
+        )
+
+        # 1. Mixed evaluations: one LIVE_RUNTIME_CAPTURE, one IMPORTED_UNVERIFIED
+        eval_trusted = AssertionEvaluation(
+            raw_assertion="a == 1",
+            lhs_expression="a",
+            resolved_expression="a",
+            operator="==",
+            expected=1,
+            observed_value=1,
+            observation_status="OBSERVED",
+            verdict=ASSERTION_PASS,
+            provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        )
+        eval_untrusted = AssertionEvaluation(
+            raw_assertion="b == 2",
+            lhs_expression="b",
+            resolved_expression="b",
+            operator="==",
+            expected=2,
+            observed_value=2,
+            observation_status="OBSERVED",
+            verdict=ASSERTION_PASS,
+            provenance_class=PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+        )
+
+        verdict_mixed = VerdictEngine.synthesize_verdict(
+            hypothesis="Both values match expected",
+            evaluations=[eval_trusted, eval_untrusted],
+            target_identity={"pid": 1234},
+            causal_attribution_verified=True,
+            provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        )
+
+        # Effective provenance must be demoted to lowest trust level (IMPORTED_UNVERIFIED)
+        self.assertEqual(verdict_mixed.provenance_class, PROVENANCE_CLASS_IMPORTED_UNVERIFIED)
+        # Diagnosis must be capped at SUSPECTED (never CONFIRMED)
+        self.assertEqual(verdict_mixed.final_diagnosis, DIAG_SUSPECTED)
+        self.assertTrue(any("synthetic/unverified" in lim for lim in verdict_mixed.limitations))
 
 
 if __name__ == "__main__":

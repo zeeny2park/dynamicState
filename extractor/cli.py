@@ -128,6 +128,7 @@ def main():
     cmp_parser.add_argument("--debug-image", type=str, default=None, help="Optional external debug image")
     cmp_parser.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (default: corpus)")
     cmp_parser.add_argument("--output", type=str, default=None, help="Path to save comparison JSON")
+    cmp_parser.add_argument("--json", action="store_true", default=False, help="Print comparison results in JSON format")
     # 10. trace-function
     trace_parser = subparsers.add_parser("trace-function", help="Trace function entry and return using eBPF uprobes (Phase 1 PoC)")
     trace_parser.add_argument("--pid", type=int, required=True, help="Target process PID")
