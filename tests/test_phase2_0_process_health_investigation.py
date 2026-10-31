@@ -53,11 +53,13 @@ from extractor.evidence_ledger import (
     EVIDENCE_TYPE_HYPOTHESIS,
     EvidenceLedger,
     EvidenceRecord,
+    LiveCaptureReceipt,
     NATURE_HYPOTHESIS,
     NATURE_OBSERVATION,
     PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+    issue_live_capture_receipt,
 )
 from extractor.hypothesis import (
     HYPOTHESIS_STATUS_CONTRADICTED,
@@ -149,11 +151,19 @@ class TestPhase20ProcessHealthInvestigation(unittest.TestCase):
             ],
         }
 
+        # Positive control with authenticated live capture receipt
+        rcpt = issue_live_capture_receipt(
+            session_id="test_sess_healthy",
+            pid=4100,
+            executable_path="/bin/app_healthy",
+            build_id="abc12345",
+        )
         res = engine.investigate_process_health(
             goal="이 프로세스에 문제가 있는지 검사해주세요.",
             pid=4100,
             companion_elf_path="/bin/app_healthy",
             fixture_data=fixture,
+            capture_receipt=rcpt,
         )
 
         self.assertTrue(res["success"])
@@ -218,12 +228,18 @@ class TestPhase20ProcessHealthInvestigation(unittest.TestCase):
                 "observation": "Lock 0x7f800010 is held by TID 4201 which is waiting on 0x7f800020 held by TID 4202.",
             }
 
+        rcpt = issue_live_capture_receipt(
+            session_id="test_sess_locks",
+            pid=4200,
+            executable_path="/bin/app_locks",
+        )
         res = engine.investigate_process_health(
             goal="이 프로세스에 문제가 있는지 검사해주세요.",
             pid=4200,
             companion_elf_path="/bin/app_locks",
             fixture_data=fixture,
             follow_up_executor=follow_up_exec,
+            capture_receipt=rcpt,
         )
 
         self.assertEqual(res["lifecycle_state"], STATE_COMPLETED)
@@ -312,12 +328,18 @@ class TestPhase20ProcessHealthInvestigation(unittest.TestCase):
                 "observation": "Second sample shows g_packet_pool usage dropped from 950 to 120 slots as workers drained burst.",
             }
 
+        rcpt_multi = issue_live_capture_receipt(
+            session_id="test_sess_mem",
+            pid=4300,
+            executable_path="/bin/app_mem",
+        )
         res_workload = engine.investigate_process_health(
             goal="메모리 누수가 있는지 확인해주세요.",
             pid=4300,
             companion_elf_path="/bin/app_mem",
             fixture_data=fixture_multi,
             follow_up_executor=follow_up_workload,
+            capture_receipt=rcpt_multi,
         )
 
         self.assertEqual(res_workload["verdict"], DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE)
@@ -849,11 +871,17 @@ class TestPhase20ProcessHealthInvestigation(unittest.TestCase):
                 }
             ],
         }
+        rcpt_mgr = issue_live_capture_receipt(
+            session_id="test_sess_mgr",
+            pid=5100,
+            executable_path="/bin/app_mgr",
+        )
         res = mgr.investigate_process_health(
             goal="이 프로세스에 문제가 있는지 검사해주세요.",
             pid=5100,
             debug_image="/bin/app_mgr",
             fixture_data=fixture,
+            capture_receipt=rcpt_mgr,
         )
         inv_id = res["session_id"]
         self.assertIn(inv_id, mgr.sessions)

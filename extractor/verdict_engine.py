@@ -328,7 +328,7 @@ class VerdictEngine:
         target_identity: Dict[str, Any],
         causal_attribution_verified: bool = False,
         attribution_basis: Optional[str] = None,
-        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
         budget_usage: Optional[Dict[str, Any]] = None,
         extra_limitations: Optional[List[str]] = None,
         inspected_scope: Optional[Dict[str, Any]] = None,
@@ -500,7 +500,7 @@ class VerdictEngine:
         budget_usage: Dict[str, Any],
         stop_reason: str,
         stop_explanation: str,
-        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
         capture_quality: Optional[Dict[str, Any]] = None,
         assertion_evaluations: Optional[List[AssertionEvaluation]] = None,
         temporal_samples_count: int = 1,
@@ -601,6 +601,41 @@ class VerdictEngine:
                 if eid not in all_contra_ids:
                     all_contra_ids.append(eid)
 
+        # ---------------------------------------------------------------------
+        # Strict Trust Gate for NO_ISSUE_DETECTED_WITHIN_SCOPE
+        # ---------------------------------------------------------------------
+        healthy_blockers: List[str] = []
+        if eff_prov != PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+            healthy_blockers.append("UNVERIFIED_PROVENANCE_CANNOT_PROVE_HEALTH")
+        if cq_status != "COMPLETE" or is_partial_capture or is_untrusted_capture:
+            healthy_blockers.append("PARTIAL_CAPTURE_CANNOT_PROVE_HEALTH")
+        if len(failed_or_abstain_obs) > 0:
+            healthy_blockers.append("RESTRICTED_OBSERVATION_CANNOT_PROVE_HEALTH")
+        unavail_caps = (uninspected_scope or {}).get("unavailable_capabilities", {})
+        core_caps = {"process_alive", "memory_read_available", "memory_maps_available"}
+        if (set(unavail_caps.keys()) & core_caps) or stop_reason == STOP_CAPABILITY_UNAVAILABLE:
+            healthy_blockers.append("RESTRICTED_OBSERVATION_CANNOT_PROVE_HEALTH")
+        if stop_reason in (
+            STOP_BUDGET_EXHAUSTED,
+            STOP_CAPABILITY_UNAVAILABLE,
+            STOP_REPEATED_FAILURE,
+            STOP_USER_CANCELED,
+        ) or budget_usage.get("budget_ok") is False:
+            healthy_blockers.append("RESTRICTED_OBSERVATION_CANNOT_PROVE_HEALTH")
+        if len(collected_obs) == 0:
+            healthy_blockers.append("RESTRICTED_OBSERVATION_CANNOT_PROVE_HEALTH")
+
+        # Required limitation tag
+        if "UNINSPECTED_SCOPE_EXCLUDED" not in limitations:
+            limitations.append("UNINSPECTED_SCOPE_EXCLUDED")
+        for b in healthy_blockers:
+            if b not in limitations:
+                limitations.append(b)
+            if b not in prov_limitations:
+                prov_limitations.append(b)
+
+        can_certify_healthy = len(healthy_blockers) == 0
+
         # Evaluate verdict state
         if is_untrusted_capture or stop_reason in (STOP_CAPABILITY_UNAVAILABLE, STOP_REPEATED_FAILURE):
             final_diag = DIAG_INCONCLUSIVE
@@ -675,13 +710,13 @@ class VerdictEngine:
                 )
         elif defect_hypos and len(contradicted_defects) == len(defect_hypos):
             # All material defect hypotheses were refuted!
-            if is_unverified_prov or is_partial_capture:
-                final_diag = DIAG_INCONCLUSIVE if not supported_benign else DIAG_REFUTED
-                hyp_state = HYP_STATE_CONTRADICTED
-                conf_score = 0.65
+            if not can_certify_healthy:
+                final_diag = DIAG_INCONCLUSIVE
+                hyp_state = HYP_STATE_INCONCLUSIVE
+                conf_score = 0.4
                 conf_rationale = (
-                    f"All {len(contradicted_defects)} defect hypothesis(es) were contradicted within inspected scope, "
-                    f"subject to provenance/capture limitations."
+                    f"All {len(contradicted_defects)} candidate defect hypothesis(es) were contradicted within inspected scope, "
+                    f"but cannot certify NO_ISSUE_DETECTED_WITHIN_SCOPE due to: {', '.join(sorted(set(healthy_blockers)))}."
                 )
             elif supported_benign:
                 final_diag = DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE
@@ -707,13 +742,13 @@ class VerdictEngine:
             )
         else:
             # No defect hypotheses generated after initial triage
-            if is_unverified_prov or is_partial_capture or len(failed_or_abstain_obs) > 0 or stop_reason == STOP_BUDGET_EXHAUSTED:
+            if not can_certify_healthy:
                 final_diag = DIAG_INCONCLUSIVE
                 hyp_state = HYP_STATE_INCONCLUSIVE
                 conf_score = 0.25
                 conf_rationale = (
-                    "No defect was observed, but inspection was incomplete, restricted, budget-limited, or from unverified provenance; "
-                    "cannot certify NO_ISSUE_DETECTED_WITHIN_SCOPE."
+                    f"No defect was observed, but cannot certify NO_ISSUE_DETECTED_WITHIN_SCOPE due to: "
+                    f"{', '.join(sorted(set(healthy_blockers)))}."
                 )
             else:
                 final_diag = DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE

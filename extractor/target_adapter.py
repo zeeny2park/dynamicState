@@ -143,6 +143,95 @@ class TargetExecutionAdapter(ABC):
         pass
 
 
+class ReadOnlyTargetAdapter(TargetExecutionAdapter):
+    """Strict capability boundary wrapping TargetExecutionAdapter.
+
+    Exposes ONLY pre-approved read-only query methods.
+    Blocks any mutating methods, arbitrary command runners, or write operations with PermissionError.
+    """
+    PERMITTED_READ_METHODS = {
+        "check_liveness",
+        "get_process_identity",
+        "get_proc_maps",
+        "get_memory_mappings",
+        "get_threads",
+        "read_memory",
+        "read_memory_batch",
+        "is_remote",
+        "target_host",
+        "find_processes",
+        "close",
+    }
+
+    def __init__(self, inner: TargetExecutionAdapter):
+        if isinstance(inner, ReadOnlyTargetAdapter):
+            self._inner = inner._inner
+        else:
+            self._inner = inner
+
+    def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
+        return self._inner.check_liveness(pid)
+
+    def get_process_identity(self, pid: int) -> Dict[str, Any]:
+        return self._inner.get_process_identity(pid)
+
+    def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
+        return self._inner.get_proc_maps(pid)
+
+    def get_memory_mappings(self, pid: int) -> List[Dict[str, Any]]:
+        return self._inner.get_memory_mappings(pid)
+
+    def get_threads(self, pid: int) -> List[Dict[str, Any]]:
+        return self._inner.get_threads(pid)
+
+    def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
+        return self._inner.read_memory(pid, address, size)
+
+    def read_memory_batch(
+        self,
+        pid: int,
+        requests: List[Tuple[int, int]],
+    ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
+        return self._inner.read_memory_batch(pid, requests)
+
+    def is_remote(self) -> bool:
+        return self._inner.is_remote()
+
+    def target_host(self) -> str:
+        return self._inner.target_host()
+
+    def find_processes(
+        self,
+        process_name: Optional[str] = None,
+        companion_build_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        return self._inner.find_processes(
+            process_name=process_name,
+            companion_build_id=companion_build_id,
+            limit=limit,
+        )
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self.PERMITTED_READ_METHODS:
+            return getattr(self._inner, name)
+        raise PermissionError(
+            f"Access to capability or attribute '{name}' is strictly denied: "
+            "ReadOnlyTargetAdapter allows only permitted read-only target queries."
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("_inner",):
+            super().__setattr__(name, value)
+        else:
+            raise PermissionError(
+                f"Modifying attribute '{name}' on ReadOnlyTargetAdapter is forbidden."
+            )
+
+
 class LocalTargetAdapter(TargetExecutionAdapter):
     """Execution adapter for local Linux processes using direct /proc and process_vm_readv."""
 

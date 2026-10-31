@@ -248,6 +248,7 @@ class TestAdaptiveInvestigationEngine(unittest.TestCase):
             hypothesis="System normal",
             evaluations=[eval_item],
             target_identity={"pid": 111, "companion_elf": "/tmp/test.elf"},
+            provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
             budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": 120.5, "bytes_read": 64}},
         )
 

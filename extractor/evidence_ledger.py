@@ -54,6 +54,162 @@ ALL_TRUST_CLAIMS = {
 
 
 @dataclass(frozen=True)
+class LiveCaptureReceipt:
+    """Authentic cryptographic receipt establishing verified live runtime capture.
+    
+    Binds target identity, session/capture ID, build ID, capture source, and integrity validation.
+    """
+    receipt_id: str
+    session_id: str
+    pid: int
+    executable_path: str
+    build_id: Optional[str]
+    capture_source: str
+    integrity_validated: bool
+    issued_at: str
+    signature: str = ""
+    key_id: str = "default"
+    provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+
+    def verify_authenticity(self, secret: Optional[str] = None) -> bool:
+        """Verify HMAC signature against session secret or default secret."""
+        if not self.signature:
+            return False
+        sec = secret or "dynamicstate_live_capture_secret_key"
+        expected = compute_live_receipt_signature(
+            secret=sec,
+            receipt_id=self.receipt_id,
+            session_id=self.session_id,
+            pid=self.pid,
+            executable_path=self.executable_path,
+            build_id=self.build_id,
+            capture_source=self.capture_source,
+            integrity_validated=self.integrity_validated,
+            issued_at=self.issued_at,
+        )
+        return hmac.compare_digest(self.signature, expected)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LiveCaptureReceipt":
+        return cls(
+            receipt_id=str(data.get("receipt_id", "")),
+            session_id=str(data.get("session_id", "")),
+            pid=int(data.get("pid", 0)),
+            executable_path=str(data.get("executable_path", "")),
+            build_id=data.get("build_id"),
+            capture_source=str(data.get("capture_source", "live_collector")),
+            integrity_validated=bool(data.get("integrity_validated", False)),
+            issued_at=str(data.get("issued_at", "")),
+            signature=str(data.get("signature", "")),
+            key_id=str(data.get("key_id", "default")),
+            provenance_class=str(data.get("provenance_class", PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE)),
+        )
+
+
+def compute_live_receipt_signature(
+    secret: str,
+    receipt_id: str,
+    session_id: str,
+    pid: int,
+    executable_path: str,
+    build_id: Optional[str],
+    capture_source: str,
+    integrity_validated: bool,
+    issued_at: str,
+) -> str:
+    raw = (
+        f"LIVE_RECEIPT|v1|{receipt_id}|{session_id}|{pid}|"
+        f"{executable_path}|{build_id or ''}|{capture_source}|"
+        f"{'TRUE' if integrity_validated else 'FALSE'}|{issued_at}"
+    )
+    return hmac.new(secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def issue_live_capture_receipt(
+    session_id: str,
+    pid: int,
+    executable_path: str,
+    build_id: Optional[str] = None,
+    capture_source: str = "live_collector",
+    integrity_validated: bool = True,
+    secret: Optional[str] = None,
+    receipt_id: Optional[str] = None,
+) -> LiveCaptureReceipt:
+    sec = secret or "dynamicstate_live_capture_secret_key"
+    rcpt_id = receipt_id or f"lrcpt_{uuid.uuid4().hex[:12]}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sig = compute_live_receipt_signature(
+        secret=sec,
+        receipt_id=rcpt_id,
+        session_id=session_id,
+        pid=pid,
+        executable_path=executable_path,
+        build_id=build_id,
+        capture_source=capture_source,
+        integrity_validated=integrity_validated,
+        issued_at=now_iso,
+    )
+    return LiveCaptureReceipt(
+        receipt_id=rcpt_id,
+        session_id=session_id,
+        pid=pid,
+        executable_path=executable_path,
+        build_id=build_id,
+        capture_source=capture_source,
+        integrity_validated=integrity_validated,
+        issued_at=now_iso,
+        signature=sig,
+    )
+
+
+def verify_live_capture_receipt(
+    receipt: Any,
+    secret: Optional[str] = None,
+    expected_session_id: Optional[str] = None,
+    expected_pid: Optional[int] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Validates that a receipt is authentic, unmodified, and bound to the expected target."""
+    if receipt is None:
+        return False, "NO_RECEIPT: No capture or session receipt provided"
+
+    # Support CaptureReceipt from capture_backend.py
+    if hasattr(receipt, "backend_name") and hasattr(receipt, "artifact_manifest"):
+        ok = receipt.verify_signature(secret)
+        if not ok:
+            return False, "SIGNATURE_INVALID: CaptureReceipt signature verification failed"
+        if expected_pid is not None and receipt.pid != expected_pid:
+            return False, f"PID_MISMATCH: CaptureReceipt PID {receipt.pid} != expected {expected_pid}"
+        return True, None
+
+    # Support LiveCaptureReceipt
+    if isinstance(receipt, dict):
+        try:
+            receipt = LiveCaptureReceipt.from_dict(receipt)
+        except Exception as exc:
+            return False, f"MALFORMED_RECEIPT: {exc}"
+
+    if not isinstance(receipt, LiveCaptureReceipt):
+        return False, f"UNRECOGNIZED_RECEIPT_TYPE: {type(receipt).__name__}"
+
+    if not receipt.integrity_validated:
+        return False, "INTEGRITY_NOT_VALIDATED: Receipt indicates integrity validation failed or was skipped"
+
+    if expected_session_id and receipt.session_id and receipt.session_id != expected_session_id:
+        return False, f"SESSION_MISMATCH: Receipt session '{receipt.session_id}' != expected '{expected_session_id}'"
+
+    if expected_pid is not None and receipt.pid != expected_pid:
+        return False, f"PID_MISMATCH: Receipt PID {receipt.pid} != expected {expected_pid}"
+
+    if not receipt.verify_authenticity(secret):
+        return False, "SIGNATURE_INVALID: LiveCaptureReceipt signature verification failed"
+
+    return True, None
+
+
+@dataclass(frozen=True)
 class ControlledExecutionResult:
     """Authentic execution receipt produced by a verified runtime execution or controlled reproduction."""
     execution_id: str
@@ -520,11 +676,34 @@ class EvidenceRecord:
 
     @property
     def provenance_class(self) -> str:
-        if isinstance(self.provenance, dict) and self.provenance.get("provenance_class"):
-            return str(self.provenance["provenance_class"])
-        if isinstance(self.details, dict) and self.details.get("provenance_class"):
-            return str(self.details["provenance_class"])
-        return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        if isinstance(self.provenance, dict):
+            if self.provenance.get("is_synthetic") is True:
+                return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+            p_cls = self.provenance.get("provenance_class")
+            if p_cls in (PROVENANCE_CLASS_SYNTHETIC_FIXTURE, PROVENANCE_CLASS_IMPORTED_UNVERIFIED):
+                return str(p_cls)
+            if p_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
+                return PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+            if p_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+                rcpt = self.provenance.get("capture_receipt") or self.provenance.get("live_receipt")
+                if rcpt is not None:
+                    ok, _ = verify_live_capture_receipt(rcpt, expected_session_id=self.session_id)
+                    if ok:
+                        return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+                if self.provenance.get("verified_live_capture") is True:
+                    return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+        if isinstance(self.details, dict):
+            if self.details.get("is_synthetic") is True:
+                return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+            d_cls = self.details.get("provenance_class")
+            if d_cls in (PROVENANCE_CLASS_SYNTHETIC_FIXTURE, PROVENANCE_CLASS_IMPORTED_UNVERIFIED):
+                return str(d_cls)
+            if d_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE and self.details.get("verified_live_capture") is True:
+                return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+
+        return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
     @property
     def attribution_level(self) -> str:
@@ -664,11 +843,13 @@ class EvidenceLedger:
         schema_version: str = EVIDENCE_SCHEMA_VERSION,
         session_secret: Optional[str] = None,
         capability_key: Optional[str] = None,
+        live_capture_receipt: Optional[Any] = None,
     ):
         self.session_id: str = session_id or f"inv_sess_{uuid.uuid4().hex[:8]}"
         self.schema_version: str = schema_version
         self.session_secret: str = session_secret or uuid.uuid4().hex
         self._capability_key: str = capability_key or uuid.uuid4().hex
+        self.live_capture_receipt: Optional[Any] = live_capture_receipt
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self._records: List[EvidenceRecord] = []
         self._by_id: Dict[str, EvidenceRecord] = {}
@@ -687,7 +868,7 @@ class EvidenceLedger:
         self,
         module_id: str,
         domain: str = "GENERIC",
-        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
         attribution_basis: Optional[str] = None,
         evidence_payload: Optional[Dict[str, Any]] = None,
         nature: str = NATURE_OBSERVATION,
@@ -913,6 +1094,37 @@ class EvidenceLedger:
             record = EvidenceRecord.from_dict(record)
         if not record.session_id:
             record.session_id = self.session_id
+
+        # Provenance Invariant Gate:
+        # Caller-supplied LIVE_RUNTIME_CAPTURE must be backed by an authentic verified receipt.
+        p_dict = record.provenance if isinstance(record.provenance, dict) else {}
+        d_dict = record.details if isinstance(record.details, dict) else {}
+
+        if p_dict.get("is_synthetic") is True or d_dict.get("is_synthetic") is True or record.source in ("synthetic", "synthetic_adversarial_fixture"):
+            if record.provenance:
+                record.provenance["provenance_class"] = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+            if record.details:
+                record.details["provenance_class"] = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+        else:
+            claimed_prov = p_dict.get("provenance_class") or d_dict.get("provenance_class")
+            if claimed_prov == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+                rcpt = p_dict.get("capture_receipt") or p_dict.get("live_receipt") or self.live_capture_receipt
+                rcpt_ok, rcpt_err = verify_live_capture_receipt(
+                    rcpt,
+                    expected_session_id=self.session_id,
+                    expected_pid=record.target_identity.get("pid") if record.target_identity else None,
+                )
+                if not rcpt_ok:
+                    if record.provenance:
+                        record.provenance["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                        record.provenance["unverified_reason"] = rcpt_err
+                    if record.details and "provenance_class" in record.details:
+                        record.details["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                else:
+                    if record.provenance:
+                        record.provenance["verified_live_capture"] = True
+                    if record.details:
+                        record.details["verified_live_capture"] = True
 
         # Schema validation
         self.validate_record(record)

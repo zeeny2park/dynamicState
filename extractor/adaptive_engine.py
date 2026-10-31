@@ -52,6 +52,7 @@ from .evidence_ledger import (
     EVIDENCE_TYPE_RUNTIME_IDENTITY,
     EvidenceLedger,
     EvidenceRecord,
+    LiveCaptureReceipt,
     NATURE_HYPOTHESIS,
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
@@ -60,6 +61,7 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     TRUSTED_PROVENANCE_CLASSES,
+    verify_live_capture_receipt,
 )
 from .hypothesis import (
     CONFIDENCE_HIGH,
@@ -99,7 +101,7 @@ from .inspection_module import (
     InspectionProfile,
 )
 from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
-from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter
+from .target_adapter import LocalTargetAdapter, ReadOnlyTargetAdapter, TargetExecutionAdapter
 from .verdict_engine import (
     ASSERTION_ABSTAIN,
     ASSERTION_FAIL,
@@ -1113,7 +1115,8 @@ class AdaptiveInvestigationEngine:
         budget_limits: Optional[ObservationBudgetLimits] = None,
         target_adapter: Optional[TargetExecutionAdapter] = None,
         session_id: Optional[str] = None,
-        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        provenance_class: Optional[str] = None,
+        capture_receipt: Optional[Any] = None,
         fixture_data: Optional[Dict[str, Any]] = None,
         follow_up_executor: Optional[Callable[[FollowUpObservation, int], Dict[str, Any]]] = None,
         existing_state_machine: Optional[InvestigationStateMachine] = None,
@@ -1123,13 +1126,63 @@ class AdaptiveInvestigationEngine:
         """Executes an evidence-grounded, budget-bounded Process Health Investigation
         through the single explicit investigation state machine.
         """
-        sess_id = session_id or f"inv_health_{uuid.uuid4().hex[:8]}"
+        rcpt_sess = None
+        if capture_receipt:
+            rcpt_sess = getattr(capture_receipt, "session_id", None)
+            if isinstance(capture_receipt, dict):
+                rcpt_sess = capture_receipt.get("session_id")
+        sess_id = session_id or rcpt_sess or f"inv_health_{uuid.uuid4().hex[:8]}"
         limits = budget_limits or self.default_limits
         budget_tracker = ObservationBudgetTracker(limits)
         budget_tracker.start()
 
-        eff_adapter = target_adapter or LocalTargetAdapter()
-        ledger = self.ledger if self.ledger is not None else EvidenceLedger(session_id=sess_id)
+        # Wrap adapter in strictly read-only execution boundary
+        raw_adapter = target_adapter or LocalTargetAdapter()
+        eff_adapter = (
+            raw_adapter
+            if isinstance(raw_adapter, ReadOnlyTargetAdapter)
+            else ReadOnlyTargetAdapter(raw_adapter)
+        )
+
+        # Determine provenance
+        # LIVE_RUNTIME_CAPTURE strictly requires an authentic, verified LiveCaptureReceipt
+        eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        verified_receipt = None
+        if capture_receipt is not None:
+            ok_rcpt, rcpt_err = verify_live_capture_receipt(capture_receipt)
+            if ok_rcpt:
+                rcpt_pid = getattr(capture_receipt, "pid", None)
+                if isinstance(capture_receipt, dict):
+                    rcpt_pid = capture_receipt.get("pid")
+                if pid is None or rcpt_pid is None or str(rcpt_pid) == str(pid):
+                    eff_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+                    verified_receipt = capture_receipt
+                else:
+                    eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            else:
+                eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        elif provenance_class == PROVENANCE_CLASS_IMPORTED_UNVERIFIED or (
+            fixture_data and fixture_data.get("provenance_class") == PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        ):
+            eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        elif fixture_data is not None:
+            eff_prov = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+        elif provenance_class == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+            # Caller attempted to assert LIVE without verified receipt -> force unverified
+            eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        elif provenance_class:
+            eff_prov = provenance_class
+
+        ledger = self.ledger if self.ledger is not None else EvidenceLedger(
+            session_id=sess_id,
+            live_capture_receipt=verified_receipt,
+        )
+        if self.ledger is not None:
+            self.ledger.live_capture_receipt = verified_receipt
+            self.ledger.session_id = sess_id
+        self.adapter.default_provenance_class = eff_prov
+        self.adapter.live_capture_receipt = verified_receipt
+
         sm = existing_state_machine or InvestigationStateMachine(initial_state=STATE_CREATED)
         executed_keys: Set[str] = set(existing_executed_keys or set())
         observation_log: List[Dict[str, Any]] = []
@@ -1158,13 +1211,6 @@ class AdaptiveInvestigationEngine:
             STATE_TARGET_VALIDATION,
             f"Validating target identity (pid={pid}) and probing available read-only observation capabilities.",
         )
-
-        # Prevent untrusted imported data from forging LIVE_RUNTIME_CAPTURE
-        eff_prov = provenance_class
-        if fixture_data and fixture_data.get("provenance_class"):
-            if fixture_data["provenance_class"] not in TRUSTED_PROVENANCE_CLASSES:
-                eff_prov = fixture_data["provenance_class"]
-        self.adapter.default_provenance_class = eff_prov
 
         target_identity, capabilities, capture_quality = self._probe_target_and_capabilities(
             pid=pid,
@@ -1478,6 +1524,19 @@ class AdaptiveInvestigationEngine:
 
         max_loop_steps = 12
         for step_idx in range(max_loop_steps):
+            if not budget_tracker.can_continue():
+                should_stop, s_code, s_exp = AdaptiveTerminationPolicy.evaluate_stopping_policy(
+                    budget_tracker=budget_tracker,
+                    hypotheses=hypotheses,
+                    remaining_observations_count=0,
+                    consecutive_non_novel_steps=consecutive_non_novel,
+                    consecutive_failures=consecutive_failures,
+                    temporal_samples_count=temporal_samples_count,
+                )
+                stop_reason = s_code or STOP_BUDGET_EXHAUSTED
+                stop_explanation = s_exp or "Observation budget exhausted."
+                break
+
             sm.transition(
                 STATE_FOLLOW_UP_PLANNING,
                 f"Planning discriminating follow-up observation (iteration {step_idx + 1}).",
@@ -1529,23 +1588,44 @@ class AdaptiveInvestigationEngine:
             executed_keys.add(epoch_key)
 
             t_obs_0 = time.monotonic_ns()
+            prof_ceil = None
+            if selected_obs.profile_id and self.registry.get(selected_obs.profile_id):
+                prof_ceil = getattr(self.registry.get(selected_obs.profile_id), "budget_ceiling", None)
+
             if follow_up_executor is not None:
-                raw_obs_res = follow_up_executor(selected_obs, self.cache.current_epoch)
-                lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
-                is_fail = (
-                    raw_obs_res.get("success") is False
-                    or raw_obs_res.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
+                can_run, pre_reason, eff_est_bytes = budget_tracker.check_pre_execution(
+                    profile_id=selected_obs.profile_id,
+                    profile_ceiling=prof_ceil,
+                    estimated_bytes=selected_obs.estimated_bytes,
+                    estimated_latency_ms=selected_obs.estimated_latency_ms,
+                    estimated_samples=1,
                 )
-                meas_b = raw_obs_res.get("bytes_read") if isinstance(raw_obs_res.get("bytes_read"), int) else None
-                budget_tracker.record_read(
-                    bytes_read=meas_b,
-                    latency_us=lat_us,
-                    stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
-                    is_failure=is_fail,
-                    conservative_estimate_bytes=selected_obs.estimated_bytes,
-                    profile_id=selected_obs.profile_id or selected_obs.observation_id,
-                )
-                budget_tracker.record_sample(profile_id=selected_obs.profile_id or selected_obs.observation_id)
+                if not can_run:
+                    budget_tracker.record_rejection(selected_obs.profile_id, pre_reason or "BUDGET_EXCEEDED")
+                    raw_obs_res = {
+                        "success": False,
+                        "result_category": RESULT_BUDGET_REJECTED,
+                        "error": pre_reason,
+                        "bytes_read": None,
+                    }
+                else:
+                    raw_obs_res = follow_up_executor(selected_obs, self.cache.current_epoch)
+                    lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
+                    is_fail = (
+                        raw_obs_res.get("success") is False
+                        or raw_obs_res.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
+                    )
+                    meas_b = raw_obs_res.get("bytes_read") if isinstance(raw_obs_res.get("bytes_read"), int) else None
+                    budget_tracker.record_read(
+                        bytes_read=meas_b,
+                        latency_us=lat_us,
+                        stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
+                        is_failure=is_fail,
+                        conservative_estimate_bytes=selected_obs.estimated_bytes,
+                        profile_id=selected_obs.profile_id or selected_obs.observation_id,
+                        profile_ceiling=prof_ceil,
+                    )
+                    budget_tracker.record_sample(profile_id=selected_obs.profile_id or selected_obs.observation_id)
             elif selected_obs.profile_id and self.registry.get(selected_obs.profile_id):
                 mod = self.registry.get(selected_obs.profile_id)
                 ctx = InspectionContext(
@@ -1602,7 +1682,7 @@ class AdaptiveInvestigationEngine:
                         outcomes_map[hid] = h_map[cond]
                 ev_rec.details["outcomes_by_hypothesis"] = outcomes_map
 
-            if res_cat != RESULT_DUPLICATE_EVIDENCE:
+            if res_cat not in (RESULT_DUPLICATE_EVIDENCE, RESULT_NO_NEW_EVIDENCE):
                 self.adapter.record_into_ledger(ev_rec, ledger)
 
             selected_obs.result_category = res_cat
@@ -1976,7 +2056,7 @@ class AdaptiveInvestigationEngine:
                 rec = ledger.record_evidence(
                     module_id=mod.module_id,
                     domain=mod.domain,
-                    provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+                    provenance_class=PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
                     evidence_payload=res,
                 )
         lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
@@ -2099,7 +2179,7 @@ class AdaptiveInvestigationEngine:
             assertion_evaluations=[],
             causal_attribution_verified=False,
             attribution_basis=None,
-            provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+            provenance_class=PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
             target_identity={"pid": "N/A", "companion_elf": "N/A"},
             limitations=[],
             budget_usage={},

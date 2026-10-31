@@ -13,7 +13,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from .observation_budget import ObservationBudgetTracker
-from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
+from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter, ReadOnlyTargetAdapter
 
 
 # Inspection Domains
@@ -61,6 +61,58 @@ class InspectionProfile:
             }
 
 
+class ReadOnlyWatchManager:
+    """Strict capability boundary wrapping WatchSessionManager for inspection modules.
+
+    Exposes ONLY approved diagnostic and read-only query methods.
+    Blocks any mutation, process management, batch execution, or session deletion.
+    """
+    PERMITTED_DIAGNOSTIC_METHODS = {
+        "auto_triage_incident",
+        "inspect_thread_callstacks_and_locks",
+        "inspect_thread_locals_and_frame_vars",
+        "evaluate_symbol_paths",
+        "find_symbol_owners_and_threads",
+        "audit_memory_integrity",
+        "verify_runtime_hypothesis",
+        "export_incident_report",
+        "resolve_target_context",
+        "get_memory_mappings",
+        "read_process_memory",
+        "scan_memory_pool",
+        "trace_ipc_pipeline",
+        "verify_concurrent_read_consistency",
+        "sample_statistical_hotspots",
+        "flight_recorder_time_machine",
+        "detect_behavioral_drift",
+        "inspect_thread_local_storage",
+        "inspect_dpdk_lcores_and_rings",
+        "inspect_shared_memory_ipc",
+        "scan_heap_objects",
+        "build_dependency_graph",
+    }
+
+    def __init__(self, inner: Any):
+        if isinstance(inner, ReadOnlyWatchManager):
+            self._inner = inner._inner
+        else:
+            self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self.PERMITTED_DIAGNOSTIC_METHODS:
+            return getattr(self._inner, name)
+        raise PermissionError(
+            f"Method '{name}' is not an authorized read-only diagnostic capability. "
+            "Target mutation, arbitrary macro execution, and session manipulation are strictly blocked."
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("_inner",):
+            super().__setattr__(name, value)
+        else:
+            raise PermissionError(f"Modifying attribute '{name}' on ReadOnlyWatchManager is forbidden.")
+
+
 @dataclass
 class InspectionContext:
     """Read-only execution context provided to an inspection module."""
@@ -74,10 +126,26 @@ class InspectionContext:
     available_symbols: Optional[Set[str]] = None
     capabilities: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.adapter, ReadOnlyTargetAdapter):
+            self.adapter = ReadOnlyTargetAdapter(self.adapter)
+        self.enforce_read_only()
+
     def enforce_read_only(self) -> None:
-        """Verifies that the context and parameters are strictly read-only."""
-        if self.parameters.get("allow_mutation") or self.parameters.get("write_memory"):
-            raise PermissionError("InspectionContext strictly forbids target memory or state mutation.")
+        """Enforces that the execution context and all exposed handles are strictly read-only."""
+        # 1. Parameter safety check
+        for param_key in ("allow_mutation", "write_memory", "write_process_memory", "apply_mutation", "mutate", "inject", "kill"):
+            if self.parameters.get(param_key):
+                raise PermissionError(f"InspectionContext forbids parameter '{param_key}' requesting target mutation.")
+
+        # 2. Adapter capability boundary verification
+        if not isinstance(self.adapter, ReadOnlyTargetAdapter):
+            self.adapter = ReadOnlyTargetAdapter(self.adapter)
+
+        # 3. extra_context sanitization
+        for k in list(self.extra_context.keys()):
+            if any(forbidden in k.lower() for forbidden in ("mutate", "write", "kill", "inject", "exec")):
+                raise PermissionError(f"InspectionContext extra_context contains forbidden mutating key '{k}'")
 
 
 class InspectionModule(ABC):
@@ -223,12 +291,13 @@ class FunctionalInspectionModule(InspectionModule):
         for meta_key in ("estimated_bytes", "estimated_latency_ms", "estimated_samples", "estimated_stop_ms"):
             kwargs.pop(meta_key, None)
 
+        safe_wm = ReadOnlyWatchManager(watch_manager) if watch_manager is not None else None
         try:
             if self._func is None:
                 raise RuntimeError(f"No callable bound to InspectionModule '{self.profile.profile_id}'")
 
             try:
-                result = self._func(watch_manager, **kwargs)
+                result = self._func(safe_wm, **kwargs)
             except TypeError:
                 try:
                     result = self._func(**kwargs)
@@ -298,11 +367,12 @@ class FunctionalInspectionModule(InspectionModule):
             return out
         except Exception as exc:
             lat_us = (time.monotonic_ns() - t0_ns) / 1000.0
-            ctx.budget_tracker.record_read(
-                bytes_read=0,
+            fail_charge_b = eff_est_bytes if (eff_est_bytes is not None and eff_est_bytes > 0) else ctx.budget_tracker.limits.conservative_unknown_bytes
+            read_acct = ctx.budget_tracker.record_read(
+                bytes_read=None,
                 latency_us=lat_us,
                 is_failure=True,
-                conservative_estimate_bytes=0,
+                conservative_estimate_bytes=fail_charge_b,
                 profile_id=self.profile.profile_id,
                 profile_ceiling=self.profile.budget_ceiling,
             )
@@ -314,6 +384,9 @@ class FunctionalInspectionModule(InspectionModule):
                 "error_code": type(exc).__name__,
                 "abstained": True,
                 "profile_id": self.profile.profile_id,
+                "measured_bytes_read": None,
+                "charged_bytes": read_acct["charged_bytes"],
+                "used_conservative_byte_estimate": True,
             }
 
 

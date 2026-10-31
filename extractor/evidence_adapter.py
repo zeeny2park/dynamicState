@@ -29,6 +29,7 @@ from .evidence_ledger import (
     EVIDENCE_TYPE_STATIC_LINK,
     EvidenceLedger,
     EvidenceRecord,
+    LiveCaptureReceipt,
     NATURE_HYPOTHESIS,
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
@@ -38,6 +39,7 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     TRUSTED_PROVENANCE_CLASSES,
     VALID_EVIDENCE_TYPES,
+    verify_live_capture_receipt,
 )
 
 
@@ -134,36 +136,68 @@ def compute_semantic_evidence_digest(
 class EvidenceAdapter:
     """Non-intrusive adapter for transforming tool output dicts into EvidenceRecords."""
 
-    def __init__(self, default_provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE):
+    def __init__(
+        self,
+        default_provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+        receipt: Optional[Any] = None,
+        session_secret: Optional[str] = None,
+    ):
         self.default_provenance_class = default_provenance_class
+        self.receipt = receipt
+        self.session_secret = session_secret
 
     def _resolve_provenance_class(
         self,
         payload: Optional[Dict[str, Any]] = None,
         target_identity: Optional[Dict[str, Any]] = None,
         override_provenance: Optional[str] = None,
+        receipt: Optional[Any] = None,
     ) -> str:
-        """Resolves provenance class while preventing untrusted/imported data from upgrading to live capture."""
-        candidates = []
-        if override_provenance:
-            candidates.append(override_provenance)
+        """Resolves provenance class ensuring LIVE_RUNTIME_CAPTURE requires an authentic receipt."""
+        # 1. Synthetic fixture check: fixtures remain synthetic
         if isinstance(payload, dict):
-            if payload.get("provenance_class"):
-                candidates.append(payload["provenance_class"])
-            prov_dict = payload.get("provenance")
-            if isinstance(prov_dict, dict) and prov_dict.get("provenance_class"):
-                candidates.append(prov_dict["provenance_class"])
-        if isinstance(target_identity, dict) and target_identity.get("provenance_class"):
-            candidates.append(target_identity["provenance_class"])
-        candidates.append(self.default_provenance_class)
-
-        # Invariant: If any source marks the data as IMPORTED_UNVERIFIED or SYNTHETIC_FIXTURE,
-        # it can never be upgraded to LIVE_RUNTIME_CAPTURE.
-        if PROVENANCE_CLASS_IMPORTED_UNVERIFIED in candidates:
-            return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        if PROVENANCE_CLASS_SYNTHETIC_FIXTURE in candidates:
+            if payload.get("is_synthetic") is True or (payload.get("provenance") or {}).get("is_synthetic") is True:
+                return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+            if payload.get("provenance_class") == PROVENANCE_CLASS_SYNTHETIC_FIXTURE:
+                return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+        if isinstance(target_identity, dict):
+            if target_identity.get("is_synthetic") is True or target_identity.get("provenance_class") == PROVENANCE_CLASS_SYNTHETIC_FIXTURE:
+                return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+        if override_provenance == PROVENANCE_CLASS_SYNTHETIC_FIXTURE or self.default_provenance_class == PROVENANCE_CLASS_SYNTHETIC_FIXTURE:
             return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-        return candidates[0] if candidates else self.default_provenance_class
+
+        # 2. Check for imported / unverified flags
+        if override_provenance == PROVENANCE_CLASS_IMPORTED_UNVERIFIED:
+            return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        if isinstance(payload, dict) and payload.get("provenance_class") == PROVENANCE_CLASS_IMPORTED_UNVERIFIED:
+            return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        if isinstance(target_identity, dict) and target_identity.get("provenance_class") == PROVENANCE_CLASS_IMPORTED_UNVERIFIED:
+            return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+        # 3. Controlled reproduction check
+        if override_provenance == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
+            return PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+
+        # 4. Check for authentic live capture receipt
+        active_rcpt = receipt or getattr(self, "receipt", None) or getattr(self, "live_capture_receipt", None)
+        if isinstance(payload, dict):
+            active_rcpt = active_rcpt or payload.get("capture_receipt") or payload.get("live_receipt")
+            prov_d = payload.get("provenance")
+            if isinstance(prov_d, dict):
+                active_rcpt = active_rcpt or prov_d.get("capture_receipt") or prov_d.get("live_receipt")
+
+        exp_pid = target_identity.get("pid") if isinstance(target_identity, dict) else (payload.get("pid") if isinstance(payload, dict) else None)
+        rcpt_ok, _ = verify_live_capture_receipt(
+            active_rcpt,
+            secret=self.session_secret,
+            expected_pid=exp_pid,
+        )
+        if rcpt_ok:
+            return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+
+        # Without an authentic verified receipt, live capture CANNOT be granted.
+        # Fall back to unverified imported provenance.
+        return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
     def adapt_raw_observation(
         self,
@@ -624,14 +658,20 @@ class EvidenceAdapter:
         records: Union[EvidenceRecord, List[EvidenceRecord]],
         ledger: Optional[EvidenceLedger],
     ) -> List[EvidenceRecord]:
-        """Safely appends one or more non-duplicate records into an EvidenceLedger."""
+        """Safely appends one or more non-duplicate, non-empty records into an EvidenceLedger."""
         if not ledger:
             return records if isinstance(records, list) else [records]
 
         added: List[EvidenceRecord] = []
         rec_list = records if isinstance(records, list) else [records]
         for r in rec_list:
-            sem_dig = (r.details or {}).get("semantic_digest")
+            r_details = r.details if hasattr(r, "details") else (r.get("details") if isinstance(r, dict) and "details" in r else (r if isinstance(r, dict) else {}))
+            res_cat = r_details.get("result_category")
+            # Invariant: Empty responses and duplicates must not increase evidence count
+            if res_cat in (RESULT_NO_NEW_EVIDENCE, RESULT_DUPLICATE_EVIDENCE):
+                continue
+
+            sem_dig = r_details.get("semantic_digest")
             if sem_dig:
                 dup = next(
                     (ex for ex in ledger._records if (ex.details or {}).get("semantic_digest") == sem_dig),
@@ -640,8 +680,8 @@ class EvidenceAdapter:
                 if dup is not None:
                     continue
             try:
-                ledger.add_record(r)
-                added.append(r)
+                rec_obj = ledger.add_record(r)
+                added.append(rec_obj)
             except Exception:
                 pass
         return added

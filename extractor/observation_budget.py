@@ -289,24 +289,21 @@ class ObservationBudgetTracker:
         Never fabricates a measured byte count when bytes_read is None. Instead, tracks
         measured_bytes_read separately from conservative_estimated_bytes charged to the budget.
         """
-        measured = bytes_read is not None and isinstance(bytes_read, (int, float)) and bytes_read >= 0
+        measured = bytes_read is not None and isinstance(bytes_read, (int, float)) and bytes_read > 0
         if measured:
             actual_b = int(bytes_read)
+            charged_b = max(actual_b, int(conservative_estimate_bytes or 0)) if is_failure else actual_b
             self.metrics.measured_bytes_read += actual_b
-            self.metrics.bytes_read += actual_b
-            charged_b = actual_b
-            used_conservative = False
+            self.metrics.bytes_read += charged_b
+            used_conservative = is_failure and (charged_b > actual_b)
         else:
             self.metrics.unmeasured_reads_count += 1
-            if is_failure:
-                charged_b = max(0, int(conservative_estimate_bytes or 0))
-            else:
-                fallback = (
-                    conservative_estimate_bytes
-                    if (conservative_estimate_bytes is not None and conservative_estimate_bytes > 0)
-                    else self.limits.conservative_unknown_bytes
-                )
-                charged_b = max(1, int(fallback))
+            fallback = (
+                conservative_estimate_bytes
+                if (conservative_estimate_bytes is not None and conservative_estimate_bytes > 0)
+                else self.limits.conservative_unknown_bytes
+            )
+            charged_b = max(1, int(fallback))
             self.metrics.conservative_estimated_bytes += charged_b
             self.metrics.bytes_read += charged_b
             used_conservative = True
@@ -460,6 +457,11 @@ class ObservationBudgetTracker:
             )
             return False, self.metrics.exhaustion_reason
 
+        if profile_id and profile_ceiling:
+            prof_ok, prof_reason = self.check_profile_ceiling(profile_id, profile_ceiling)
+            if not prof_ok:
+                return False, prof_reason
+
         return True, None
 
     def check_profile_ceiling(
@@ -482,9 +484,13 @@ class ObservationBudgetTracker:
             return False, f"PROFILE_WALL_CLOCK_CEILING_EXCEEDED: {p_usage['wall_clock_ms']:.1f}ms > {float(p_max_ms):.1f}ms"
         return True, None
 
-    def can_continue(self) -> bool:
+    def can_continue(
+        self,
+        profile_id: Optional[str] = None,
+        profile_ceiling: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Convenience boolean check."""
-        ok, _ = self.check_budget()
+        ok, _ = self.check_budget(profile_id=profile_id, profile_ceiling=profile_ceiling)
         return ok
 
     def to_dict(self) -> Dict[str, Any]:

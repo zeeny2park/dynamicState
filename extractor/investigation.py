@@ -3062,6 +3062,10 @@ class InvestigationManager:
             },
             "stages": session.stages,
             "summary": session.summary,
+            "inspected_scope": session.summary.get("inspected_scope", {}),
+            "uninspected_scope": session.summary.get("uninspected_scope", {}),
+            "limitations": session.summary.get("limitations", []),
+            "provenance_limitations": session.summary.get("provenance_limitations", []),
             "findings_summary": {
                 "total": len(session.findings),
                 "facts_count": len(facts),
@@ -3123,10 +3127,16 @@ class InvestigationManager:
         fixture_data: Optional[Dict[str, Any]] = None,
         follow_up_executor: Optional[Any] = None,
         watch_manager: Optional[Any] = None,
-        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        provenance_class: Optional[str] = None,
+        capture_receipt: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Runs an evidence-grounded, budget-bounded Process Health Investigation and registers the session."""
-        inv_id = f"inv_{uuid.uuid4().hex[:10]}"
+        rcpt_sess = (
+            getattr(capture_receipt, "session_id", None)
+            if capture_receipt and hasattr(capture_receipt, "session_id")
+            else (capture_receipt.get("session_id") if isinstance(capture_receipt, dict) else None)
+        )
+        inv_id = rcpt_sess or f"inv_{uuid.uuid4().hex[:10]}"
         session = InvestigationSession(
             investigation_id=inv_id,
             goal=goal,
@@ -3148,6 +3158,7 @@ class InvestigationManager:
             budget_limits=ObservationBudgetLimits.from_dict(budgets),
             session_id=inv_id,
             provenance_class=provenance_class,
+            capture_receipt=capture_receipt,
             fixture_data=fixture_data,
             follow_up_executor=follow_up_executor,
             existing_state_machine=session.state_machine,
@@ -3169,6 +3180,8 @@ class InvestigationManager:
             "inspected_scope": res.get("inspected_scope"),
             "uninspected_scope": res.get("uninspected_scope"),
             "evidence_coverage": res.get("evidence_coverage"),
+            "limitations": res.get("limitations", []),
+            "provenance_limitations": res.get("provenance_limitations", []),
         })
         return res
 
