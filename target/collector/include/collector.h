@@ -33,6 +33,8 @@ typedef struct {
     char signing_key[256];
     char signing_key_id[64];
     char session_id[128];
+    char key_file[1024];
+    int key_fd;
 } collector_config_t;
 
 typedef struct {

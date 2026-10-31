@@ -6,6 +6,103 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+static int load_key_from_file(const char *path, char *out_key, size_t max_len) {
+    if (!path || path[0] == '\0' || !out_key || max_len == 0) return -1;
+    int flags = O_RDONLY | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, flags);
+    if (fd < 0) {
+        fprintf(stderr, "Error: Failed to open key file '%s': %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "Error: Key file '%s' is not a regular file.\n", path);
+        close(fd);
+        return -1;
+    }
+
+    /* Reject any group or world access permissions (must be 0600 or 0400) */
+    if ((st.st_mode & 0077) != 0) {
+        fprintf(stderr, "Error: Key file '%s' has insecure permissions (mode 0%o). Must be 0600 or 0400.\n",
+                path, (unsigned int)(st.st_mode & 0777));
+        close(fd);
+        return -1;
+    }
+
+    /* Verify ownership matches current user or root */
+    if (st.st_uid != geteuid() && st.st_uid != 0) {
+        fprintf(stderr, "Error: Key file '%s' UID (%u) does not match process UID (%u).\n",
+                path, (unsigned int)st.st_uid, (unsigned int)geteuid());
+        close(fd);
+        return -1;
+    }
+
+    char buf[512];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0) {
+        fprintf(stderr, "Error: Failed to read key file '%s'.\n", path);
+        return -1;
+    }
+
+    /* Trim trailing newline and carriage return */
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
+        buf[n - 1] = '\0';
+        n--;
+    }
+
+    if (n < 16) {
+        fprintf(stderr, "Error: Key in '%s' is too short (%zd bytes; minimum is 16 bytes).\n", path, n);
+        memset(buf, 0, sizeof(buf));
+        return -1;
+    }
+
+    snprintf(out_key, max_len, "%s", buf);
+    memset(buf, 0, sizeof(buf));
+    return 0;
+}
+
+static int load_key_from_fd(int fd, char *out_key, size_t max_len) {
+    if (fd < 0 || !out_key || max_len == 0) return -1;
+    char buf[512];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0) {
+        fprintf(stderr, "Error: Failed to read key from FD %d.\n", fd);
+        return -1;
+    }
+
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
+        buf[n - 1] = '\0';
+        n--;
+    }
+
+    if (n < 16) {
+        fprintf(stderr, "Error: Key from FD %d is too short (%zd bytes; minimum is 16 bytes).\n", fd, n);
+        memset(buf, 0, sizeof(buf));
+        return -1;
+    }
+
+    snprintf(out_key, max_len, "%s", buf);
+    memset(buf, 0, sizeof(buf));
+    return 0;
+}
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -22,6 +119,11 @@ static void print_usage(const char *prog) {
         "  -t, --timeout-ms <MS>   Maximum capture wall-clock timeout in ms (default: unlimited)\n"
         "  -j, --json              Output machine-readable JSON metadata to stdout\n"
         "  -v, --verbose           Enable verbose progress logging\n"
+        "  -K, --signing-key <KEY> Signing secret for LiveCaptureReceipt\n"
+        "  -F, --key-file <PATH>   Path to secure file containing signing key (0600/0400 mode)\n"
+        "  -D, --key-fd <FD>       Inherited file descriptor containing signing key\n"
+        "  -I, --key-id <ID>       Key ID for attestation (default: default)\n"
+        "  -S, --session-id <ID>   Investigation session ID\n"
         "  -h, --help              Show this help message\n\n"
         "Example:\n"
         "  %s -o /tmp/snapshot_1234 1234\n",
@@ -45,6 +147,8 @@ int main(int argc, char *argv[]) {
         {"json", no_argument, 0, 'j'},
         {"verbose", no_argument, 0, 'v'},
         {"signing-key", required_argument, 0, 'K'},
+        {"key-file", required_argument, 0, 'F'},
+        {"key-fd", required_argument, 0, 'D'},
         {"key-id", required_argument, 0, 'I'},
         {"session-id", required_argument, 0, 'S'},
         {"help", no_argument, 0, 'h'},
@@ -60,7 +164,7 @@ int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:o:m:r:P:B:s:dt:jvK:I:S:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:o:m:r:P:B:s:dt:jvK:F:D:I:S:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 pid_str = optarg;
@@ -76,6 +180,14 @@ int main(int argc, char *argv[]) {
                 break;
             case 'K':
                 strncpy(cfg.signing_key, optarg, sizeof(cfg.signing_key) - 1);
+                /* Immediately scrub optarg memory in argv so /proc/<pid>/cmdline does not leak key */
+                memset(optarg, 0, strlen(optarg));
+                break;
+            case 'F':
+                strncpy(cfg.key_file, optarg, sizeof(cfg.key_file) - 1);
+                break;
+            case 'D':
+                cfg.key_fd = atoi(optarg);
                 break;
             case 'I':
                 strncpy(cfg.signing_key_id, optarg, sizeof(cfg.signing_key_id) - 1);
@@ -127,6 +239,21 @@ int main(int argc, char *argv[]) {
 
     if (daemon_mode) {
         return collector_daemon_loop(cfg.backend, stdin, stdout);
+    }
+
+    /* Load key from file or FD if specified */
+    if (cfg.key_file[0] != '\0') {
+        if (load_key_from_file(cfg.key_file, cfg.signing_key, sizeof(cfg.signing_key)) != 0) {
+            fprintf(stderr, "Error: Failed to load signing key from file '%s'.\n", cfg.key_file);
+            memset(cfg.signing_key, 0, sizeof(cfg.signing_key));
+            return 1;
+        }
+    } else if (cfg.key_fd >= 0) {
+        if (load_key_from_fd(cfg.key_fd, cfg.signing_key, sizeof(cfg.signing_key)) != 0) {
+            fprintf(stderr, "Error: Failed to load signing key from FD %d.\n", cfg.key_fd);
+            memset(cfg.signing_key, 0, sizeof(cfg.signing_key));
+            return 1;
+        }
     }
 
     /* Fallback to environment variables for cryptographic attestation */
@@ -245,6 +372,8 @@ int main(int argc, char *argv[]) {
 
     collector_stats_t stats;
     int res = collector_run(&cfg, &stats);
+    /* Memory scrub sensitive signing key immediately after capture */
+    memset(cfg.signing_key, 0, sizeof(cfg.signing_key));
     if (res != 0) {
         fprintf(stderr, "[dynamicState-collector] Error: Failed to capture memory for PID %d (status: %s).\n",
                 (int)cfg.pid, stats.status[0] ? stats.status : "FAILED");

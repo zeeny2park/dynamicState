@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import stat
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -24,6 +25,19 @@ PROVENANCE_CLASS_IMPORTED_UNVERIFIED = "IMPORTED_UNVERIFIED"
 TRUSTED_PROVENANCE_CLASSES = {
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+}
+
+# Trust State Model (Explicit trust evaluation decoupled from memory consistency)
+TRUST_STATE_LIVE_VERIFIED = "LIVE_VERIFIED"
+TRUST_STATE_IMPORTED_UNVERIFIED = "IMPORTED_UNVERIFIED"
+TRUST_STATE_INVALID_OR_TAMPERED = "INVALID_OR_TAMPERED"
+TRUST_STATE_VERIFICATION_UNAVAILABLE = "VERIFICATION_UNAVAILABLE"
+
+ALL_TRUST_STATES = {
+    TRUST_STATE_LIVE_VERIFIED,
+    TRUST_STATE_IMPORTED_UNVERIFIED,
+    TRUST_STATE_INVALID_OR_TAMPERED,
+    TRUST_STATE_VERIFICATION_UNAVAILABLE,
 }
 
 # Genuine supported function attribution mechanisms
@@ -54,6 +68,80 @@ ALL_TRUST_CLAIMS = {
 }
 
 
+def load_secure_key_file(path: str) -> Dict[str, str]:
+    """Loads capture signing/verification keys from a secured file.
+    
+    Enforces strict security constraints:
+    - Path must exist and not be a symlink.
+    - Path must be a regular file.
+    - Owner must match current user UID or root.
+    - File permissions must not permit group or others access (mode & 0o077 == 0, e.g. 0600 or 0400).
+    - Secret length must be >= 16 bytes.
+    """
+    if not path or not isinstance(path, str):
+        raise ValueError("Key file path must be a non-empty string")
+    
+    if os.path.islink(path):
+        raise PermissionError(f"Insecure key file '{path}': symlinks are forbidden")
+    
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Key file '{path}' does not exist")
+        
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise PermissionError(f"Insecure key file '{path}': must be a regular file")
+        
+    # Check permissions: no group or world access permitted
+    if (st.st_mode & 0o077) != 0:
+        raise PermissionError(
+            f"Insecure key file '{path}': permissions ({oct(st.st_mode & 0o777)}) permit group/world access. Must be 0600 or 0400."
+        )
+        
+    # Check ownership: current UID or root
+    curr_uid = os.geteuid() if hasattr(os, "geteuid") else 0
+    if st.st_uid != curr_uid and st.st_uid != 0:
+        raise PermissionError(
+            f"Insecure key file '{path}': owner UID {st.st_uid} does not match process UID {curr_uid}"
+        )
+        
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+        
+    keys: Dict[str, str] = {}
+    if content.startswith("{"):
+        data = json.loads(content)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    if len(v) < 16:
+                        raise ValueError(f"Key '{k}' in '{path}' is too short ({len(v)} chars; min 16 required)")
+                    keys[k] = v
+    elif content:
+        if len(content) < 16:
+            raise ValueError(f"Key in '{path}' is too short ({len(content)} chars; min 16 required)")
+        keys["file_default"] = content
+    else:
+        raise ValueError(f"Key file '{path}' is empty")
+        
+    return keys
+
+
+def load_secure_key_fd(fd: int) -> str:
+    """Reads capture signing/verification key from an open file descriptor."""
+    if not isinstance(fd, int) or fd < 0:
+        raise ValueError(f"Invalid file descriptor: {fd}")
+    try:
+        st = os.fstat(fd)
+    except OSError as exc:
+        raise ValueError(f"Cannot stat key file descriptor {fd}: {exc}")
+        
+    with os.fdopen(os.dup(fd), "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    if len(content) < 16:
+        raise ValueError(f"Key from FD {fd} is too short ({len(content)} chars; min 16 required)")
+    return content
+
+
 class CaptureVerificationAuthority:
     """Authority for verifying capture receipts against trusted keys.
     
@@ -70,6 +158,21 @@ class CaptureVerificationAuthority:
             raise ValueError("key_id and secret must be non-empty strings")
         self._keys[key_id] = secret
         self._revoked_keys.discard(key_id)
+
+    def register_key_file(self, path: str, default_key_id: str = "file_default") -> int:
+        """Loads and registers keys from a secure file (0600 or 0400 mode)."""
+        keys = load_secure_key_file(path)
+        count = 0
+        for k, v in keys.items():
+            eff_k = default_key_id if k == "file_default" else k
+            self.register_key(eff_k, v)
+            count += 1
+        return count
+
+    def register_key_fd(self, fd: int, key_id: str = "fd_default") -> None:
+        """Loads and registers a key from an inherited file descriptor."""
+        key = load_secure_key_fd(fd)
+        self.register_key(key_id, key)
 
     def revoke_key(self, key_id: str) -> None:
         if not key_id:
@@ -96,20 +199,11 @@ class CaptureVerificationAuthority:
         if env_secret:
             auth.register_key(key_id, env_secret)
 
-        # 2. DYNAMICSTATE_CAPTURE_KEY_FILE
+        # 2. DYNAMICSTATE_CAPTURE_KEY_FILE (Strict secure file validation)
         key_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
         if key_file and os.path.exists(key_file):
             try:
-                with open(key_file, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                if content.startswith("{"):
-                    data = json.loads(content)
-                    if isinstance(data, dict):
-                        for k, v in data.items():
-                            if isinstance(k, str) and isinstance(v, str):
-                                auth.register_key(k, v)
-                elif content:
-                    auth.register_key("file_default", content)
+                auth.register_key_file(key_file)
             except Exception:
                 pass
 
@@ -231,6 +325,7 @@ class LiveCaptureReceipt:
     manifest_digest: str
     integrity_validated: bool
     issued_at: str
+    version: str = "v2"
     process_start_time: str = "0"
     signature: str = ""
     key_id: str = "default"
@@ -254,6 +349,9 @@ class LiveCaptureReceipt:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LiveCaptureReceipt":
+        v = str(data.get("version", "v2"))
+        if v != "v2":
+            raise ValueError(f"UNSUPPORTED_RECEIPT_VERSION: Receipt version '{v}' is not supported")
         return cls(
             receipt_id=str(data.get("receipt_id", "")),
             session_id=str(data.get("session_id", "")),
@@ -264,6 +362,7 @@ class LiveCaptureReceipt:
             manifest_digest=str(data.get("manifest_digest", "")),
             integrity_validated=bool(data.get("integrity_validated", False)),
             issued_at=str(data.get("issued_at", "")),
+            version=v,
             process_start_time=str(data.get("process_start_time", "0")),
             signature=str(data.get("signature", "")),
             key_id=str(data.get("key_id", "default")),
@@ -404,6 +503,10 @@ def verify_live_capture_receipt(
     if not isinstance(receipt, LiveCaptureReceipt):
         return False, f"UNRECOGNIZED_RECEIPT_TYPE: {type(receipt).__name__}"
 
+    rcpt_ver = getattr(receipt, "version", "v2")
+    if rcpt_ver != "v2":
+        return False, f"UNSUPPORTED_RECEIPT_VERSION: Receipt version '{rcpt_ver}' is not supported"
+
     if not receipt.signature:
         return False, "UNSIGNED_RECEIPT: Receipt has no HMAC signature"
 
@@ -490,16 +593,21 @@ def verify_live_capture_receipt(
 
     # Companion ELF check
     if companion_elf_path:
+        if not os.path.exists(companion_elf_path):
+            return False, f"COMPANION_ELF_NOT_FOUND: Companion ELF file not found at '{companion_elf_path}'"
         try:
             from .debug_image import inspect_elf
             c_ident = inspect_elf(companion_elf_path)
-            if c_ident and c_ident.build_id:
-                if not receipt.build_id:
-                    return False, f"MISSING_BUILD_ID: Companion ELF requires build ID {c_ident.build_id} but receipt has no build ID"
-                if receipt.build_id.lower() != c_ident.build_id.lower():
-                    return False, f"BUILD_ID_MISMATCH: Receipt build ID {receipt.build_id} != companion ELF {c_ident.build_id}"
-        except Exception:
-            pass
+        except Exception as exc:
+            return False, f"COMPANION_ELF_INVALID: Failed to parse companion ELF '{companion_elf_path}': {exc}"
+        if not c_ident:
+            return False, f"COMPANION_ELF_INVALID: Failed to parse companion ELF '{companion_elf_path}'"
+        if not c_ident.build_id:
+            return False, f"COMPANION_ELF_MISSING_BUILD_ID: Companion ELF '{companion_elf_path}' does not contain an ELF Build ID note"
+        if not receipt.build_id:
+            return False, f"MISSING_BUILD_ID: Companion ELF requires build ID {c_ident.build_id} but receipt has no build ID"
+        if receipt.build_id.lower() != c_ident.build_id.lower():
+            return False, f"BUILD_ID_MISMATCH: Receipt build ID {receipt.build_id} != companion ELF {c_ident.build_id}"
 
     if expected_executable_path:
         norm_exp = os.path.realpath(expected_executable_path) if os.path.exists(expected_executable_path) else os.path.abspath(expected_executable_path)
@@ -532,13 +640,15 @@ def verify_live_capture_receipt(
 
         disk_digest = None
         snap_out = getattr(snapshot, "output_dir", None)
-        if snap_out and os.path.isdir(snap_out):
+        if snap_out:
+            if not os.path.isdir(snap_out):
+                return False, f"SNAPSHOT_DIR_NOT_FOUND: Snapshot output directory '{snap_out}' does not exist"
             mpath = os.path.join(snap_out, "manifest.json")
-            if os.path.isfile(mpath) and not os.path.islink(mpath):
-                with open(mpath, "rb") as mf:
-                    disk_digest = hashlib.sha256(mf.read()).hexdigest()
-
-        if not disk_digest and hasattr(snapshot, "compute_manifest_digest"):
+            if not os.path.isfile(mpath) or os.path.islink(mpath):
+                return False, "MISSING_MANIFEST: manifest.json is missing or a symlink in snapshot directory"
+            with open(mpath, "rb") as mf:
+                disk_digest = hashlib.sha256(mf.read()).hexdigest()
+        elif hasattr(snapshot, "compute_manifest_digest"):
             disk_digest = snapshot.compute_manifest_digest()
 
         if not disk_digest:
@@ -564,6 +674,47 @@ def verify_live_capture_receipt(
             return False, f"MISSING_BUILD_ID: Snapshot has build ID {snap_bid} but receipt has none"
 
     return True, None
+
+
+def determine_snapshot_trust_state(
+    receipt: Any,
+    secret: Optional[str] = None,
+    verification_authority: Optional[CaptureVerificationAuthority] = None,
+    expected_session_id: Optional[str] = None,
+    expected_pid: Optional[int] = None,
+    expected_manifest_digest: Optional[str] = None,
+    expected_build_id: Optional[str] = None,
+    expected_executable_path: Optional[str] = None,
+    companion_elf_path: Optional[str] = None,
+    snapshot: Optional[Any] = None,
+) -> Tuple[str, Optional[str]]:
+    """Determine snapshot trust state: LIVE_VERIFIED, IMPORTED_UNVERIFIED, INVALID_OR_TAMPERED, or VERIFICATION_UNAVAILABLE.
+    
+    Explicitly decoupled from target memory consistency (NON_ATOMIC, STOPPED, ATOMIC).
+    """
+    if receipt is None:
+        return TRUST_STATE_IMPORTED_UNVERIFIED, "NO_RECEIPT: No capture or session receipt provided"
+
+    ok, reason = verify_live_capture_receipt(
+        receipt,
+        secret=secret,
+        verification_authority=verification_authority,
+        expected_session_id=expected_session_id,
+        expected_pid=expected_pid,
+        expected_manifest_digest=expected_manifest_digest,
+        expected_build_id=expected_build_id,
+        expected_executable_path=expected_executable_path,
+        companion_elf_path=companion_elf_path,
+        snapshot=snapshot,
+    )
+
+    if ok:
+        return TRUST_STATE_LIVE_VERIFIED, None
+
+    if reason and ("VERIFICATION_KEY_UNAVAILABLE" in reason or "NO_VERIFICATION_KEY" in reason):
+        return TRUST_STATE_VERIFICATION_UNAVAILABLE, reason
+
+    return TRUST_STATE_INVALID_OR_TAMPERED, reason
 
 
 def create_receipt_from_snapshot(
@@ -1260,6 +1411,8 @@ class EvidenceLedger:
         self._capability_key: str = capability_key or uuid.uuid4().hex
         self.live_capture_receipt: Optional[Any] = live_capture_receipt
         self.verification_authority: Optional[CaptureVerificationAuthority] = verification_authority
+        self.trust_state: str = TRUST_STATE_IMPORTED_UNVERIFIED
+        self.trust_error: Optional[str] = None
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self._records: List[EvidenceRecord] = []
         self._by_id: Dict[str, EvidenceRecord] = {}
@@ -1796,6 +1949,8 @@ class EvidenceLedger:
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "created_at": self.created_at,
+            "trust_state": self.trust_state,
+            "trust_error": self.trust_error,
             "live_capture_receipt": rcpt_dict,
             "record_count": len(self._records),
             "records": [r.to_dict() for r in self._records],

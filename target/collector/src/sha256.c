@@ -2,6 +2,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 /* SHA-256 implementation according to FIPS 180-4 */
 
@@ -157,27 +159,45 @@ void sha256_hex(const void *data, size_t len, char hex_out[65]) {
 
 int sha256_file_fd(int fd, char hex_out[65]) {
     if (fd < 0) return -1;
-    off_t orig = lseek(fd, 0, SEEK_SET);
-    if (orig == (off_t)-1) {
-        /* Not seekable or error; if it's not seekable, we still try reading from current pos */
+
+    struct stat st;
+    off_t expected_size = -1;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        expected_size = st.st_size;
     }
+
+    off_t orig = lseek(fd, 0, SEEK_SET);
+    (void)orig;
 
     sha256_ctx ctx;
     sha256_init(&ctx);
     uint8_t buf[8192];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+    size_t total_read = 0;
+
+    while (1) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            memset(buf, 0, sizeof(buf));
+            return -1;
+        }
+        if (n == 0) break;
         sha256_update(&ctx, buf, (size_t)n);
+        total_read += (size_t)n;
     }
-    if (n < 0) {
+    memset(buf, 0, sizeof(buf));
+
+    if (expected_size >= 0 && (off_t)total_read != expected_size) {
         return -1;
     }
+
     uint8_t hash[32];
     sha256_final(&ctx, hash);
     for (int i = 0; i < 32; ++i) {
         sprintf(&hex_out[i * 2], "%02x", hash[i]);
     }
     hex_out[64] = '\0';
+    memset(hash, 0, sizeof(hash));
     return 0;
 }
 
@@ -216,6 +236,13 @@ void hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_
     sha256_update(&ctx, k_opad, 64);
     sha256_update(&ctx, inner_hash, 32);
     sha256_final(&ctx, out);
+
+    /* Memory scrub sensitive keying material and intermediate states */
+    memset(k, 0, sizeof(k));
+    memset(k_ipad, 0, sizeof(k_ipad));
+    memset(k_opad, 0, sizeof(k_opad));
+    memset(inner_hash, 0, sizeof(inner_hash));
+    memset(&ctx, 0, sizeof(ctx));
 }
 
 void hmac_sha256_hex(const void *key, size_t key_len, const void *data, size_t data_len, char hex_out[65]) {
@@ -225,4 +252,5 @@ void hmac_sha256_hex(const void *key, size_t key_len, const void *data, size_t d
         sprintf(&hex_out[i * 2], "%02x", out[i]);
     }
     hex_out[64] = '\0';
+    memset(out, 0, sizeof(out));
 }

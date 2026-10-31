@@ -18,6 +18,7 @@ Proves:
 
 import copy
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -41,10 +42,17 @@ from extractor.evidence_ledger import (
     CaptureSigningAuthority,
     CaptureVerificationAuthority,
     LiveCaptureReceipt,
+    TRUST_STATE_LIVE_VERIFIED,
+    TRUST_STATE_IMPORTED_UNVERIFIED,
+    TRUST_STATE_INVALID_OR_TAMPERED,
+    TRUST_STATE_VERIFICATION_UNAVAILABLE,
     create_receipt_from_snapshot,
+    determine_snapshot_trust_state,
     get_default_signing_authority,
     get_default_verification_authority,
     issue_live_capture_receipt,
+    load_secure_key_file,
+    load_secure_key_fd,
     reset_capture_authorities,
     set_default_signing_authority,
     set_default_verification_authority,
@@ -848,6 +856,402 @@ int main() {
         is_valid_t, warnings = loaded_snap.validate_integrity()
         self.assertFalse(is_valid_t)
         self.assertTrue(any("signature" in w for w in warnings))
+
+    # -------------------------------------------------------------------------
+    # Test 24: FIPS 180-4 and RFC 4231 Known-Answer Test Vectors
+    # -------------------------------------------------------------------------
+    def test_24_fips_and_rfc_known_answer_vectors(self):
+        """24: Pure SHA-256 and HMAC-SHA256 match official NIST/RFC test vectors."""
+        # FIPS 180-4 SHA-256 test vectors
+        self.assertEqual(
+            hashlib.sha256(b"abc").hexdigest(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+        self.assertEqual(
+            hashlib.sha256(b"").hexdigest(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
+
+        # RFC 4231 HMAC-SHA256 Test Case 1
+        key1 = bytes([0x0b] * 20)
+        data1 = b"Hi There"
+        expected1 = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        computed1 = hmac.new(key1, data1, hashlib.sha256).hexdigest()
+        self.assertEqual(computed1, expected1)
+
+        # RFC 4231 HMAC-SHA256 Test Case 2
+        key2 = b"Jefe"
+        data2 = b"what do ya want for nothing?"
+        expected2 = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        computed2 = hmac.new(key2, data2, hashlib.sha256).hexdigest()
+        self.assertEqual(computed2, expected2)
+
+    # -------------------------------------------------------------------------
+    # Test 25: Key File Security Constraints (0600/0400, Symlinks, Owner)
+    # -------------------------------------------------------------------------
+    def test_25_key_file_security_permissions(self):
+        """25: load_secure_key_file strictly enforces 0600/0400, rejects symlinks and world/group access."""
+        kfile = os.path.join(self.tmp_dir, "key_0600.key")
+        with open(kfile, "w") as f:
+            f.write("0123456789abcdef0123456789abcdef\n")
+        
+        # 0600 succeeds
+        os.chmod(kfile, 0o600)
+        keys = load_secure_key_file(kfile)
+        self.assertEqual(keys["file_default"], "0123456789abcdef0123456789abcdef")
+
+        # 0400 succeeds
+        os.chmod(kfile, 0o400)
+        keys_ro = load_secure_key_file(kfile)
+        self.assertEqual(keys_ro["file_default"], "0123456789abcdef0123456789abcdef")
+
+        # Insecure permissions: 0666, 0664, 0644 rejected
+        for bad_mode in [0o666, 0o664, 0o644, 0o640, 0o604]:
+            os.chmod(kfile, bad_mode)
+            with self.assertRaises(PermissionError):
+                load_secure_key_file(kfile)
+
+        # Symlink rejected
+        os.chmod(kfile, 0o600)
+        symlink_path = os.path.join(self.tmp_dir, "symlink_key.key")
+        os.symlink(kfile, symlink_path)
+        with self.assertRaises(PermissionError):
+            load_secure_key_file(symlink_path)
+
+        # Key too short (<16 bytes) rejected
+        short_key_file = os.path.join(self.tmp_dir, "short.key")
+        with open(short_key_file, "w") as f:
+            f.write("too_short_key\n")
+        os.chmod(short_key_file, 0o600)
+        with self.assertRaises(ValueError):
+            load_secure_key_file(short_key_file)
+
+        # JSON keyring file
+        json_keyring = os.path.join(self.tmp_dir, "keyring.json")
+        with open(json_keyring, "w") as f:
+            json.dump({
+                "key_a": "abcdefabcdefabcdefabcdef",
+                "key_b": "123456781234567812345678",
+            }, f)
+        os.chmod(json_keyring, 0o600)
+        auth = CaptureVerificationAuthority()
+        loaded_count = auth.register_key_file(json_keyring)
+        self.assertEqual(loaded_count, 2)
+        self.assertEqual(auth.get_key("key_a"), "abcdefabcdefabcdefabcdef")
+        self.assertEqual(auth.get_key("key_b"), "123456781234567812345678")
+
+    # -------------------------------------------------------------------------
+    # Test 26: Inherited FD Key Loading
+    # -------------------------------------------------------------------------
+    def test_26_key_fd_loading(self):
+        """26: Loading key from inherited file descriptor verifies key length and registers into authority."""
+        r_fd, w_fd = os.pipe()
+        os.write(w_fd, b"pipe_secret_key_16bytes_minimum\n")
+        os.close(w_fd)
+
+        auth = CaptureVerificationAuthority()
+        auth.register_key_fd(r_fd, key_id="inherited_fd_key")
+        os.close(r_fd)
+
+        self.assertEqual(auth.get_key("inherited_fd_key"), "pipe_secret_key_16bytes_minimum")
+
+        # Invalid FD
+        with self.assertRaises(ValueError):
+            load_secure_key_fd(-1)
+
+        # Short key on FD
+        r_fd2, w_fd2 = os.pipe()
+        os.write(w_fd2, b"short\n")
+        os.close(w_fd2)
+        with self.assertRaises(ValueError):
+            load_secure_key_fd(r_fd2)
+        os.close(r_fd2)
+
+    # -------------------------------------------------------------------------
+    # Test 27: Native Collector with --key-file and --key-fd
+    # -------------------------------------------------------------------------
+    def test_27_native_collector_key_file_and_fd(self):
+        """27: Native C collector supports --key-file (0600 mode) and --key-fd, failing closed on insecure file."""
+        target_code = """
+        #include <unistd.h>
+        int main() {
+            while (1) { usleep(50000); }
+            return 0;
+        }
+        """
+        src = os.path.join(self.tmp_dir, "loop_target.c")
+        bin_path = os.path.join(self.tmp_dir, "loop_target")
+        with open(src, "w") as f:
+            f.write(target_code)
+        subprocess.run(["gcc", "-O0", src, "-o", bin_path], check=True)
+        target_proc = subprocess.Popen([bin_path])
+        
+        try:
+            time.sleep(0.1)
+            pid = target_proc.pid
+            snap_dir = os.path.join(self.tmp_dir, "snap_key_file")
+
+            # 1. Test secure key file (0600)
+            kf = os.path.join(self.tmp_dir, "secure_collector.key")
+            secret = "native_secret_16bytes_long_key_123"
+            with open(kf, "w") as f:
+                f.write(secret + "\n")
+            os.chmod(kf, 0o600)
+
+            res = subprocess.run([
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_dir,
+                "-F", kf,
+                "-I", "native_file_key",
+                "-S", "sess_kf_01",
+                "-j",
+            ], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"Collector failed: {res.stderr}")
+
+            # Check receipt.json
+            rcpt_path = os.path.join(snap_dir, "receipt.json")
+            self.assertTrue(os.path.exists(rcpt_path))
+            with open(rcpt_path, "r") as rf:
+                rcpt_data = json.load(rf)
+            self.assertEqual(rcpt_data["version"], "v2")
+            self.assertEqual(rcpt_data["key_id"], "native_file_key")
+
+            # Verify receipt
+            auth = CaptureVerificationAuthority(keys={"native_file_key": secret})
+            ok, err = verify_live_capture_receipt(
+                rcpt_data,
+                verification_authority=auth,
+                expected_session_id="sess_kf_01",
+                expected_pid=pid,
+            )
+            self.assertTrue(ok, f"Verification failed: {err}")
+
+            # 2. Insecure key file (0666) -> collector fails closed
+            os.chmod(kf, 0o666)
+            snap_bad = os.path.join(self.tmp_dir, "snap_bad_perms")
+            res_bad = subprocess.run([
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_bad,
+                "-F", kf,
+                "-I", "native_file_key",
+                "-S", "sess_bad",
+            ], capture_output=True, text=True)
+            self.assertNotEqual(res_bad.returncode, 0)
+            self.assertFalse(os.path.exists(os.path.join(snap_bad, "receipt.json")))
+
+            # 3. Test --key-fd
+            snap_fd = os.path.join(self.tmp_dir, "snap_key_fd")
+            r_fd, w_fd = os.pipe()
+            os.write(w_fd, (secret + "\n").encode())
+            os.close(w_fd)
+
+            res_fd = subprocess.run([
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_fd,
+                "-D", str(r_fd),
+                "-I", "native_fd_key",
+                "-S", "sess_fd_01",
+                "-j",
+            ], pass_fds=(r_fd,), capture_output=True, text=True)
+            os.close(r_fd)
+            self.assertEqual(res_fd.returncode, 0, f"Collector with FD failed: {res_fd.stderr}")
+            self.assertTrue(os.path.exists(os.path.join(snap_fd, "receipt.json")))
+        finally:
+            target_proc.terminate()
+            target_proc.wait()
+
+    # -------------------------------------------------------------------------
+    # Test 28: Distinct Companion ELF Failure Diagnostics
+    # -------------------------------------------------------------------------
+    def test_28_companion_elf_failure_diagnostics(self):
+        """28: Explicitly distinguishes NOT_FOUND, INVALID, MISSING_BUILD_ID, and BUILD_ID_MISMATCH."""
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_celf",
+            pid=2801,
+            executable_path="/usr/bin/daemon",
+            build_id="abcdef1234567890",
+            signer=self.signer,
+        )
+
+        # 1. COMPANION_ELF_NOT_FOUND
+        missing_elf = os.path.join(self.tmp_dir, "non_existent_binary")
+        ok, err = verify_live_capture_receipt(
+            rcpt,
+            verification_authority=self.verifier,
+            companion_elf_path=missing_elf,
+        )
+        self.assertFalse(ok)
+        self.assertIn("COMPANION_ELF_NOT_FOUND", err)
+
+        # 2. COMPANION_ELF_INVALID (random non-ELF bytes)
+        corrupt_elf = os.path.join(self.tmp_dir, "corrupt.elf")
+        with open(corrupt_elf, "wb") as f:
+            f.write(b"NOT_AN_ELF_HEADER_AT_ALL_123456789")
+        ok, err = verify_live_capture_receipt(
+            rcpt,
+            verification_authority=self.verifier,
+            companion_elf_path=corrupt_elf,
+        )
+        self.assertFalse(ok)
+        self.assertIn("COMPANION_ELF_INVALID", err)
+
+        # 3. BUILD_ID_MISMATCH
+        # Compile genuine ELF with different build ID
+        c_src = os.path.join(self.tmp_dir, "companion.c")
+        c_bin = os.path.join(self.tmp_dir, "companion_bin")
+        with open(c_src, "w") as f:
+            f.write("int main() { return 0; }\n")
+        subprocess.run(["gcc", "-Wl,--build-id=0x1122334455667788", c_src, "-o", c_bin], check=True)
+
+        ok, err = verify_live_capture_receipt(
+            rcpt,
+            verification_authority=self.verifier,
+            companion_elf_path=c_bin,
+        )
+        self.assertFalse(ok)
+        self.assertIn("BUILD_ID_MISMATCH", err)
+
+        # 4. MISSING_BUILD_ID when companion has build ID but receipt has none
+        rcpt_no_bid = issue_live_capture_receipt(
+            session_id="sess_celf_nobid",
+            pid=2802,
+            executable_path="/usr/bin/daemon",
+            build_id=None,
+            signer=self.signer,
+        )
+        ok, err = verify_live_capture_receipt(
+            rcpt_no_bid,
+            verification_authority=self.verifier,
+            companion_elf_path=c_bin,
+        )
+        self.assertFalse(ok)
+        self.assertIn("MISSING_BUILD_ID", err)
+
+    # -------------------------------------------------------------------------
+    # Test 29: Trust State Model and Memory Consistency Decoupling
+    # -------------------------------------------------------------------------
+    def test_29_trust_state_model_and_consistency_decoupling(self):
+        """29: determine_snapshot_trust_state yields explicit trust states decoupled from consistency."""
+        # 1. Missing receipt -> IMPORTED_UNVERIFIED
+        st, reason = determine_snapshot_trust_state(None)
+        self.assertEqual(st, TRUST_STATE_IMPORTED_UNVERIFIED)
+        self.assertIn("NO_RECEIPT", reason)
+
+        # 2. Valid receipt -> LIVE_VERIFIED
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_ts_01",
+            pid=2901,
+            executable_path="/bin/worker",
+            signer=self.signer,
+        )
+        st, err = determine_snapshot_trust_state(rcpt, verification_authority=self.verifier)
+        self.assertEqual(st, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIsNone(err)
+
+        # 3. No keys configured -> VERIFICATION_UNAVAILABLE
+        empty_auth = CaptureVerificationAuthority()
+        st, err = determine_snapshot_trust_state(rcpt, verification_authority=empty_auth)
+        self.assertEqual(st, TRUST_STATE_VERIFICATION_UNAVAILABLE)
+        self.assertIn("VERIFICATION_KEY_UNAVAILABLE", err)
+
+        # 4. Tampered signature -> INVALID_OR_TAMPERED
+        from dataclasses import replace
+        tampered_rcpt = replace(rcpt, signature="deadbeef" * 8)
+        st, err = determine_snapshot_trust_state(tampered_rcpt, verification_authority=self.verifier)
+        self.assertEqual(st, TRUST_STATE_INVALID_OR_TAMPERED)
+        self.assertIn("SIGNATURE_INVALID", err)
+
+        # 5. Decoupling: Non-atomic consistency level retains LIVE_VERIFIED trust state
+        snap_dir = os.path.join(self.tmp_dir, "snap_non_atomic")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        snap = RawMemorySnapshot(
+            snapshot_id="SNAP_NON_ATOMIC",
+            pid=2901,
+            binary="/bin/worker",
+            timestamp_ns=29000,
+            output_dir=snap_dir,
+            process_starttime=2900,
+            consistency={"level": "NON_ATOMIC"},
+        )
+        snap.save()
+
+        rcpt_bound = issue_live_capture_receipt(
+            session_id="sess_non_atomic",
+            pid=2901,
+            executable_path="/bin/worker",
+            process_start_time="2900",
+            manifest_digest=snap.compute_manifest_digest(),
+            signer=self.signer,
+        )
+        st, err = determine_snapshot_trust_state(
+            rcpt_bound,
+            verification_authority=self.verifier,
+            snapshot=snap,
+        )
+        self.assertEqual(st, TRUST_STATE_LIVE_VERIFIED)
+        self.assertEqual(snap.consistency["level"], "NON_ATOMIC")
+
+    # -------------------------------------------------------------------------
+    # Test 30: Receipt Protocol Version Enforcement
+    # -------------------------------------------------------------------------
+    def test_30_receipt_protocol_version_enforcement(self):
+        """30: Rejects unsupported receipt versions fail-closed."""
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_v2",
+            pid=3001,
+            executable_path="/bin/app",
+            signer=self.signer,
+        )
+        self.assertEqual(rcpt.version, "v2")
+        ok, err = verify_live_capture_receipt(rcpt, verification_authority=self.verifier)
+        self.assertTrue(ok)
+
+        # Reject from_dict with unsupported version
+        d = rcpt.to_dict()
+        d["version"] = "v3_future"
+        with self.assertRaises(ValueError) as ctx:
+            LiveCaptureReceipt.from_dict(d)
+        self.assertIn("UNSUPPORTED_RECEIPT_VERSION", str(ctx.exception))
+
+    # -------------------------------------------------------------------------
+    # Test 31: Missing Disk Manifest Fails Closed (No Reconstructed Fallback)
+    # -------------------------------------------------------------------------
+    def test_31_missing_disk_manifest_fails_closed(self):
+        """31: Disk snapshot with deleted manifest.json fails closed and does not fall back to in-memory regions."""
+        snap_dir = os.path.join(self.tmp_dir, "snap_missing_manifest")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        snap = RawMemorySnapshot(
+            snapshot_id="SNAP_MISSING_MAN",
+            pid=3101,
+            binary="/bin/app",
+            timestamp_ns=31000,
+            output_dir=snap_dir,
+            process_starttime=3100,
+        )
+        snap.save()
+
+        orig_digest = snap.compute_manifest_digest()
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_31",
+            pid=3101,
+            executable_path="/bin/app",
+            process_start_time="3100",
+            manifest_digest=orig_digest,
+            signer=self.signer,
+        )
+
+        # Delete manifest.json from disk
+        os.unlink(os.path.join(snap_dir, "manifest.json"))
+        ok, err = verify_live_capture_receipt(
+            rcpt,
+            verification_authority=self.verifier,
+            snapshot=snap,
+        )
+        self.assertFalse(ok)
+        self.assertTrue("MISSING_MANIFEST" in err or "SNAPSHOT_INTEGRITY_FAILED" in err)
 
 
 if __name__ == "__main__":

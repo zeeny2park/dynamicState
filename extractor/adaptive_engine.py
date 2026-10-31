@@ -61,6 +61,11 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     TRUSTED_PROVENANCE_CLASSES,
+    TRUST_STATE_LIVE_VERIFIED,
+    TRUST_STATE_IMPORTED_UNVERIFIED,
+    TRUST_STATE_INVALID_OR_TAMPERED,
+    TRUST_STATE_VERIFICATION_UNAVAILABLE,
+    determine_snapshot_trust_state,
     verify_live_capture_receipt,
 )
 from .hypothesis import (
@@ -1165,22 +1170,29 @@ class AdaptiveInvestigationEngine:
         if effective_receipt is None and snapshot is not None:
             effective_receipt = getattr(snapshot, "receipt", None)
 
+        snap_trust_state = TRUST_STATE_IMPORTED_UNVERIFIED
+        snap_trust_error = None
+
         if is_synthetic:
             eff_prov = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+            snap_trust_state = TRUST_STATE_IMPORTED_UNVERIFIED
         elif effective_receipt is not None:
             runtime_bin = getattr(snapshot, "binary", None) if snapshot is not None else None
             expected_build_id = getattr(snapshot, "build_id", None) if snapshot is not None else None
-            ok_rcpt, rcpt_err = verify_live_capture_receipt(
+            eff_companion_elf = companion_elf_path
+            if fixture_data is not None and companion_elf_path and not os.path.exists(companion_elf_path):
+                eff_companion_elf = None
+            snap_trust_state, snap_trust_error = determine_snapshot_trust_state(
                 effective_receipt,
                 verification_authority=verification_authority,
                 expected_session_id=sess_id,
                 expected_pid=pid if pid and pid > 0 else None,
                 expected_executable_path=runtime_bin,
-                companion_elf_path=companion_elf_path,
+                companion_elf_path=eff_companion_elf,
                 expected_build_id=expected_build_id,
                 snapshot=snapshot,
             )
-            if ok_rcpt:
+            if snap_trust_state == TRUST_STATE_LIVE_VERIFIED:
                 eff_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
                 verified_receipt = effective_receipt
             else:
@@ -1202,6 +1214,8 @@ class AdaptiveInvestigationEngine:
             live_capture_receipt=verified_receipt,
             verification_authority=verification_authority,
         )
+        ledger.trust_state = snap_trust_state
+        ledger.trust_error = snap_trust_error
         if self.ledger is not None:
             self.ledger.live_capture_receipt = verified_receipt
             self.ledger.verification_authority = verification_authority

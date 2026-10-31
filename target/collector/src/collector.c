@@ -93,6 +93,8 @@ void collector_init_config(collector_config_t *cfg) {
     cfg->verbose = 0;
     cfg->timeout_ms = 0;                       /* 0 = unlimited */
     cfg->json_output = 0;
+    cfg->key_file[0] = '\0';
+    cfg->key_fd = -1;
 }
 
 int collector_get_exe_path(pid_t pid, char *buf, size_t buf_size) {
@@ -1011,8 +1013,13 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             } else {
                 int man_fd = openat(dir_fd, "manifest.json", O_RDONLY | O_CLOEXEC);
                 if (man_fd >= 0) {
-                    sha256_file_fd(man_fd, stats.manifest_digest);
+                    if (sha256_file_fd(man_fd, stats.manifest_digest) != 0) {
+                        manifest_err = 1;
+                        unlinkat(dir_fd, "manifest.json", 0);
+                    }
                     close(man_fd);
+                } else {
+                    manifest_err = 1;
                 }
                 collector_read_elf_build_id(exe_path, stats.elf_build_id, sizeof(stats.elf_build_id));
             }
@@ -1168,6 +1175,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                 escape_json_string(exe_path, esc_rcpt_exe, sizeof(esc_rcpt_exe));
 
                 if (fprintf(f_rcpt, "{\n") < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"version\": \"v2\",\n") < 0) receipt_write_fail = 1;
                 if (fprintf(f_rcpt, "  \"receipt_id\": \"%s\",\n", stats.receipt_id) < 0) receipt_write_fail = 1;
                 if (fprintf(f_rcpt, "  \"session_id\": \"%s\",\n", sess_id) < 0) receipt_write_fail = 1;
                 if (fprintf(f_rcpt, "  \"pid\": %d,\n", (int)cfg->pid) < 0) receipt_write_fail = 1;
@@ -1202,6 +1210,8 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                         stats.receipt_issued = 1;
                     }
                 }
+                memset(canonical, 0, sizeof(canonical));
+                memset(sig, 0, sizeof(sig));
             }
         }
     }
