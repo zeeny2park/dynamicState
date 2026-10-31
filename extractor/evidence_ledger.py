@@ -518,6 +518,27 @@ class EvidenceRecord:
     def summary(self, val: str) -> None:
         self.observation = val
 
+    @property
+    def provenance_class(self) -> str:
+        if isinstance(self.provenance, dict) and self.provenance.get("provenance_class"):
+            return str(self.provenance["provenance_class"])
+        if isinstance(self.details, dict) and self.details.get("provenance_class"):
+            return str(self.details["provenance_class"])
+        return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+
+    @property
+    def attribution_level(self) -> str:
+        if isinstance(self.details, dict) and self.details.get("attribution_level"):
+            return str(self.details["attribution_level"])
+        basis = None
+        if isinstance(self.provenance, dict):
+            basis = self.provenance.get("attribution_basis")
+        if not basis and isinstance(self.details, dict):
+            basis = self.details.get("attribution_basis")
+        if basis == ATTRIBUTION_BASIS_SINGLE_WRITER and self.provenance_class in TRUSTED_PROVENANCE_CLASSES:
+            return "CONFIRMED"
+        return "SUSPECTED"
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary without None values for optional fields."""
         prov_copy = dict(self.provenance) if self.provenance else {}
@@ -657,6 +678,50 @@ class EvidenceLedger:
     @property
     def capability_key(self) -> str:
         return self._capability_key
+
+    @property
+    def records(self) -> List[EvidenceRecord]:
+        return list(self._records)
+
+    def record_evidence(
+        self,
+        module_id: str,
+        domain: str = "GENERIC",
+        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        attribution_basis: Optional[str] = None,
+        evidence_payload: Optional[Dict[str, Any]] = None,
+        nature: str = NATURE_OBSERVATION,
+        observation: Optional[str] = None,
+    ) -> EvidenceRecord:
+        """Records an observation with explicit provenance class and causal attribution level."""
+        attr_level = (
+            "CONFIRMED"
+            if (attribution_basis == ATTRIBUTION_BASIS_SINGLE_WRITER and provenance_class in TRUSTED_PROVENANCE_CLASSES)
+            else "SUSPECTED"
+        )
+        details = dict(evidence_payload or {})
+        details.update({
+            "module_id": module_id,
+            "domain": domain,
+            "provenance_class": provenance_class,
+            "attribution_basis": attribution_basis,
+            "attribution_level": attr_level,
+        })
+        rec = EvidenceRecord(
+            evidence_id=f"ev_{uuid.uuid4().hex[:10]}",
+            evidence_type=EVIDENCE_TYPE_DIAGNOSTIC,
+            nature=nature,
+            source=module_id,
+            session_id=self.session_id,
+            observation=observation or f"Evidence from {module_id} ({domain})",
+            provenance={
+                "provenance_class": provenance_class,
+                "attribution_basis": attribution_basis,
+                "module_id": module_id,
+            },
+            details=details,
+        )
+        return self.add_record(rec)
 
     def issue_verification_capability(
         self,

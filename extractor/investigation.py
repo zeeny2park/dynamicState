@@ -59,6 +59,33 @@ from .evidence_ledger import (
     CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
     ALL_TRUST_CLAIMS,
 )
+from .adaptive_engine import (
+    STATE_BUDGET_EXHAUSTED,
+    STATE_CANCELED,
+    STATE_COMPLETED,
+    STATE_CREATED,
+    STATE_FAILED,
+    STATE_FINALIZATION,
+    STATE_FOLLOW_UP_PLANNING,
+    STATE_HYPOTHESIS_FORMATION,
+    STATE_HYPOTHESIS_UPDATE,
+    STATE_INCONCLUSIVE,
+    STATE_INITIAL_TRIAGE,
+    STATE_OBSERVATION,
+    STATE_TARGET_VALIDATION,
+    AdaptiveInvestigationEngine,
+    InvestigationStateMachine,
+)
+from .evidence_adapter import (
+    COLLECTION_STATUS_ABSTAIN,
+    COLLECTION_STATUS_COLLECTED,
+    RESULT_BUDGET_REJECTED,
+    RESULT_DUPLICATE_EVIDENCE,
+    RESULT_NEW_EVIDENCE,
+    RESULT_OBSERVATION_FAILED,
+    RESULT_OBSERVATION_UNAVAILABLE,
+)
+from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
 from .verdict_engine import (
     VerdictEngine,
     ZeroCdnReporter,
@@ -66,6 +93,7 @@ from .verdict_engine import (
     ASSERTION_PASS,
     ASSERTION_FAIL,
     ASSERTION_ABSTAIN,
+    sanitize_report_output_path,
 )
 from .hypothesis import (
     CONFIDENCE_HIGH,
@@ -276,11 +304,44 @@ class InvestigationSession:
         self.persistence: str = "EPHEMERAL_PROCESS_LOCAL"
         self.timeline: List[Dict[str, Any]] = []
         self.chat_history: List[Dict[str, Any]] = []
+        self.state_machine: InvestigationStateMachine = InvestigationStateMachine(initial_state=STATE_CREATED)
+        self.executed_observation_keys: Set[str] = set()
+        self.budget_tracker: ObservationBudgetTracker = ObservationBudgetTracker(
+            ObservationBudgetLimits.from_dict(self.budgets)
+        )
 
     @property
     def session_secret(self) -> str:
         """Internal session secret for signing and authenticity validation."""
         return self._session_secret
+
+    @property
+    def lifecycle_state(self) -> str:
+        return self.state_machine.state
+
+    @property
+    def state_transitions(self) -> List[Dict[str, Any]]:
+        return self.state_machine.transitions
+
+    def transition_lifecycle(
+        self,
+        to_state: str,
+        reason: str,
+        timestamp: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Transitions the session lifecycle state machine and records a timeline event."""
+        prev = self.state_machine.state
+        entry = self.state_machine.transition(to_state, reason=reason, timestamp=timestamp, metadata=metadata)
+        self.add_timeline_event(
+            event_type="LIFECYCLE_TRANSITION",
+            title=f"State Transition: {prev} -> {to_state}",
+            summary=reason,
+            status_before=prev,
+            status_after=to_state,
+            details=entry,
+        )
+        return entry
 
     def issue_verification_capability(
         self,
@@ -417,6 +478,10 @@ class InvestigationSession:
             "chat_history": list(getattr(self, "chat_history", [])),
             "target_identity": self.stages.get("target_identity", {}).get("details", self.target_ref),
             "capture_quality": self.stages.get("capture_quality", {}).get("details", {}),
+            "lifecycle_state": self.state_machine.state,
+            "state_transitions": self.state_machine.transitions,
+            "executed_observation_keys": sorted(self.executed_observation_keys),
+            "budget_usage": self.budget_tracker.to_dict(),
         }
 
     @classmethod
@@ -496,6 +561,18 @@ class InvestigationSession:
         session.follow_up_observations = [
             obs for h in session.hypotheses for obs in h.suggested_observations
         ]
+        # Reconstruct state machine and executed observation keys for duplicate-free resume/replay
+        if "lifecycle_state" in data or "state_transitions" in data:
+            session.state_machine = InvestigationStateMachine(
+                initial_state=data.get("lifecycle_state", STATE_CREATED),
+                transitions=list(data.get("state_transitions", [])),
+            )
+        session.executed_observation_keys = set(data.get("executed_observation_keys", []))
+        for obs in session.follow_up_observations:
+            if obs.executed or obs.status in (OBSERVATION_STATUS_EXECUTED, OBSERVATION_STATUS_VERIFIED):
+                session.executed_observation_keys.add(obs.observation_id)
+                if getattr(obs, "semantic_key", ""):
+                    session.executed_observation_keys.add(obs.semantic_key)
 
         session.status = data.get("status", session.status)
         return session
@@ -2561,12 +2638,18 @@ class InvestigationManager:
         if not target_obs:
             return {"success": False, "error": f"Observation '{observation_id}' not found in investigation '{investigation_id}'"}
 
-        # Prevent duplicate execution
-        if target_obs.executed or target_obs.status in (OBSERVATION_STATUS_EXECUTED, OBSERVATION_STATUS_VERIFIED):
+        # Prevent duplicate execution on resume/replay or equivalent observation
+        if (
+            target_obs.executed
+            or target_obs.status in (OBSERVATION_STATUS_EXECUTED, OBSERVATION_STATUS_VERIFIED)
+            or observation_id in session.executed_observation_keys
+            or (getattr(target_obs, "semantic_key", "") and target_obs.semantic_key in session.executed_observation_keys)
+        ):
             return {
                 "success": False,
                 "error": f"Observation '{observation_id}' has already been executed.",
                 "already_executed": True,
+                "result_category": RESULT_DUPLICATE_EVIDENCE,
                 "observation": target_obs.to_dict(),
             }
 
@@ -2655,6 +2738,15 @@ class InvestigationManager:
         details["hypothesis_id"] = target_hypo.hypothesis_id
         details["outcome"] = outcome
 
+        is_failed_obs = bool(
+            result_data and (
+                result_data.get("failed") is True
+                or outcome in ("FAILED", "ERROR", "READ_ERROR", "TIMEOUT", "RESTRICTED")
+            )
+        )
+        details["collection_status"] = COLLECTION_STATUS_ABSTAIN if is_failed_obs else COLLECTION_STATUS_COLLECTED
+        details["result_category"] = RESULT_OBSERVATION_FAILED if is_failed_obs else RESULT_NEW_EVIDENCE
+
         ev_record = EvidenceRecord(
             evidence_id=ev_id,
             evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION if target_obs.target_kind == TARGET_KIND_FIELD else EVIDENCE_TYPE_OBJECT_STATE,
@@ -2666,12 +2758,17 @@ class InvestigationManager:
             parent_evidence_ids=[e for e in target_hypo.supporting_evidence_ids if session.ledger.get_record(e)],
             details=details,
             provenance={"submission_channel": "external_caller" if result_data else "internal_observer"},
-            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
+            capture_quality={
+                "completeness": "FAILED" if is_failed_obs else "COMPLETE",
+                "consistency_level": "STOPPED",
+            },
         )
         session.ledger.add_record(ev_record)
 
-        if result_data and (result_data.get("failed") is True or outcome in ("FAILED", "ERROR")):
+        if is_failed_obs:
+            target_obs.executed = False
             target_obs.status = OBSERVATION_STATUS_FAILED
+            target_obs.result_category = RESULT_OBSERVATION_FAILED
             target_obs.execution_error = result_data.get("error") or f"Observation execution failed: {obs_text}"
             target_obs.is_suggestion = False
             session.add_timeline_event(
@@ -2687,11 +2784,16 @@ class InvestigationManager:
                 "success": False,
                 "error": target_obs.execution_error,
                 "failed": True,
+                "result_category": RESULT_OBSERVATION_FAILED,
                 "observation": target_obs.to_dict(),
             }
 
-        # Mark observation executed
+        # Mark observation executed and record semantic key for duplicate-free resume/replay
         target_obs.executed = True
+        target_obs.result_category = RESULT_NEW_EVIDENCE
+        session.executed_observation_keys.add(observation_id)
+        if getattr(target_obs, "semantic_key", ""):
+            session.executed_observation_keys.add(target_obs.semantic_key)
         if result_data and (result_data.get("verified") is True or result_data.get("outcome") in ("CONFIRMED", "VERIFIED")):
             target_obs.status = OBSERVATION_STATUS_VERIFIED
         else:
@@ -2983,9 +3085,92 @@ class InvestigationManager:
             "evidence_count": len(session.ledger._records),
             "timeline": list(session.timeline),
             "timeline_count": len(session.timeline),
+            "lifecycle_state": session.lifecycle_state,
+            "state_transitions": session.state_transitions,
+            "executed_observation_keys": sorted(session.executed_observation_keys),
+            "adaptive_investigation": {
+                "enabled": True,
+                "verdict": session.summary.get("verdict", session.status),
+                "confidence": session.summary.get("confidence_score", 0.5),
+                "budget_summary": session.budget_tracker.to_dict(),
+            },
             "report_html": report_html_rendered,
             "report_json": report_json_rendered,
         }
+
+    def export_html_report(self, investigation_id: str, output_path: str) -> bool:
+        """Exports the Zero-CDN standalone HTML investigation report to a validated disk path."""
+        report = self.generate_report(investigation_id)
+        if not report or "report_html" not in report:
+            return False
+        sanitized_path, err = sanitize_report_output_path(output_path, file_type="HTML report")
+        if err or not sanitized_path:
+            return False
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(sanitized_path)), exist_ok=True)
+            with open(sanitized_path, "w", encoding="utf-8") as f:
+                f.write(report["report_html"])
+            return True
+        except Exception:
+            return False
+
+    def investigate_process_health(
+        self,
+        goal: str = "이 프로세스에 문제가 있는지 검사해주세요.",
+        pid: int = 0,
+        debug_image: str = "",
+        budgets: Optional[Dict[str, Any]] = None,
+        fixture_data: Optional[Dict[str, Any]] = None,
+        follow_up_executor: Optional[Any] = None,
+        watch_manager: Optional[Any] = None,
+        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    ) -> Dict[str, Any]:
+        """Runs an evidence-grounded, budget-bounded Process Health Investigation and registers the session."""
+        inv_id = f"inv_{uuid.uuid4().hex[:10]}"
+        session = InvestigationSession(
+            investigation_id=inv_id,
+            goal=goal,
+            corpus_dir=self.corpus_dir,
+            budgets=budgets,
+            corpus=self.corpus,
+        )
+        self.sessions[inv_id] = session
+
+        engine = AdaptiveInvestigationEngine(
+            watch_manager=watch_manager,
+            default_limits=ObservationBudgetLimits.from_dict(budgets),
+            ledger=session.ledger,
+        )
+        res = engine.investigate_process_health(
+            goal=goal,
+            pid=pid,
+            companion_elf_path=debug_image,
+            budget_limits=ObservationBudgetLimits.from_dict(budgets),
+            session_id=inv_id,
+            provenance_class=provenance_class,
+            fixture_data=fixture_data,
+            follow_up_executor=follow_up_executor,
+            existing_state_machine=session.state_machine,
+            existing_executed_keys=session.executed_observation_keys,
+        )
+        session.status = res.get("lifecycle_state", STATE_COMPLETED)
+        session.executed_observation_keys = set(res.get("executed_observation_keys", []))
+        session.hypotheses = [
+            InvestigationHypothesis.from_dict(h) if isinstance(h, dict) else h
+            for h in res.get("competing_hypotheses", [])
+        ]
+        session.summary.update({
+            "verdict": res.get("verdict"),
+            "final_diagnosis": res.get("final_diagnosis"),
+            "confidence_score": res.get("confidence_score"),
+            "confidence_rationale": res.get("confidence_rationale"),
+            "stop_reason": res.get("stop_reason"),
+            "stop_explanation": res.get("stop_explanation"),
+            "inspected_scope": res.get("inspected_scope"),
+            "uninspected_scope": res.get("uninspected_scope"),
+            "evidence_coverage": res.get("evidence_coverage"),
+        })
+        return res
 
     def get_investigation_timeline(self, investigation_id: str) -> Dict[str, Any]:
         """Retrieve the auditable, sequential timeline of events for an investigation."""

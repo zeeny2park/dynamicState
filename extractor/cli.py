@@ -514,6 +514,7 @@ def main():
     er_p.add_argument("-a", "--assertions", type=str, default=None)
     er_p.add_argument("-o", "--output", dest="output_path", type=str, default=None)
     er_p.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional output path for standalone Zero-CDN HTML incident report")
+    er_p.add_argument("--template", dest="template_path", type=str, default=None, help="Optional custom HTML template path")
     er_p.add_argument("-p", "--pid", type=int, default=None)
     er_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
     er_p.add_argument("--corpus", type=str, default="corpus")
@@ -1696,6 +1697,7 @@ def main():
             assertions=a_list,
             output_path=args.output_path,
             report_html_path=getattr(args, "report_html_path", None),
+            template_path=getattr(args, "template_path", None),
             pid=args.pid,
             companion_elf_path=args.debug_image,
         )
@@ -1703,7 +1705,9 @@ def main():
             print(f"WARNING: {res['save_error']}", file=sys.stderr)
         if res.get("save_html_error"):
             print(f"WARNING: {res['save_html_error']}", file=sys.stderr)
-        print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
+        out_payload = dict(res)
+        out_payload.setdefault("success", True)
+        print(json.dumps(out_payload, indent=2, ensure_ascii=False))
         sys.exit(0)
 
 
