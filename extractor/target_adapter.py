@@ -462,6 +462,18 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     is_single_core_pinned = (len(pinned_cpus) == 1)
 
                     syscall_sp = 0
+                    syscall_nr = None
+                    syscall_name = None
+                    syscall_arg0 = None
+                    wchan = ""
+                    wchan_file = os.path.join(task_dir, tid_entry, "wchan")
+                    if os.path.exists(wchan_file):
+                        try:
+                            with open(wchan_file, "r", encoding="utf-8", errors="replace") as wf:
+                                wchan = wf.read().strip()
+                        except Exception:
+                            pass
+
                     is_running_user_space = (state == "R")
                     syscall_file = os.path.join(task_dir, tid_entry, "syscall")
                     if os.path.exists(syscall_file):
@@ -472,10 +484,30 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                                     is_running_user_space = True
                                 else:
                                     sy_parts = sy_raw.split()
+                                    if len(sy_parts) >= 1 and sy_parts[0].isdigit():
+                                        syscall_nr = int(sy_parts[0])
+                                        # Support both x86_64 (202) and aarch64 (98) futex syscalls
+                                        if syscall_nr in (98, 202):
+                                            syscall_name = "futex"
+                                        elif syscall_nr == 422:
+                                            syscall_name = "futex_time64"
+                                        elif syscall_nr == 449:
+                                            syscall_name = "futex_waitv"
+                                    if len(sy_parts) >= 2 and sy_parts[1].startswith("0x"):
+                                        try:
+                                            syscall_arg0 = int(sy_parts[1], 16)
+                                        except ValueError:
+                                            pass
                                     if len(sy_parts) >= 2 and sy_parts[-2].startswith("0x"):
                                         syscall_sp = int(sy_parts[-2], 16)
                         except Exception:
                             pass
+
+                    is_futex = bool(
+                        (syscall_name and "futex" in syscall_name)
+                        or ("futex" in wchan.lower())
+                        or (syscall_nr in (98, 202, 422, 449))
+                    )
 
                     sp_int = syscall_sp or kstkesp
 
@@ -521,6 +553,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         "tid": tid,
                         "name": comm,
                         "state": state,
+                        "syscall_nr": syscall_nr,
+                        "syscall_name": syscall_name,
+                        "syscall_arg0": f"0x{syscall_arg0:x}" if syscall_arg0 is not None else None,
+                        "syscall_arg0_int": syscall_arg0,
+                        "wchan": wchan,
+                        "is_futex_wait": is_futex,
                         "cpu_id": cpu_id,
                         "cpus_allowed_list": cpus_allowed_list,
                         "pinned_cpus": pinned_cpus,

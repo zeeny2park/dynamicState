@@ -31,6 +31,7 @@ import time
 import unittest
 import uuid
 import warnings
+import socket
 from typing import Any, Dict
 
 from extractor.adaptive_engine import AdaptiveInvestigationEngine
@@ -2005,7 +2006,7 @@ int main() {
         self.assertIn("SNAPSHOT_DIR_SUBSTITUTION", err_sub)
 
     def test_46_c_collector_eintr_and_eof_resilience(self):
-        """46: Native C collector load_key_from_fd handles EOF, bounds, and invalid key data."""
+        """46: Native C collector load_key_from_fd handles EOF, bounds, invalid key data, and EINTR retry."""
         target_src = os.path.join(self.tmp_dir, "test46_target.c")
         target_bin = os.path.join(self.tmp_dir, "test46_target")
         with open(target_src, "w") as f:
@@ -2067,12 +2068,56 @@ int main() {
             self.assertNotEqual(res3.returncode, 0)
             self.assertIn("delimiter", res3.stderr)
 
+            # 4. Actual EINTR injection into load_key_from_fd read() path
+            shim_src = os.path.join(self.tmp_dir, "eintr_shim.c")
+            shim_so = os.path.join(self.tmp_dir, "eintr_shim.so")
+            with open(shim_src, "w") as f:
+                f.write(
+                    "#define _GNU_SOURCE\n"
+                    "#include <dlfcn.h>\n"
+                    "#include <unistd.h>\n"
+                    "#include <errno.h>\n"
+                    "static ssize_t (*real_read)(int, void *, size_t) = NULL;\n"
+                    "static int eintr_injected = 0;\n"
+                    "ssize_t read(int fd, void *buf, size_t count) {\n"
+                    "    if (!real_read) { real_read = (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, \"read\"); }\n"
+                    "    if (fd > 2 && eintr_injected < 2) {\n"
+                    "        eintr_injected++;\n"
+                    "        errno = EINTR;\n"
+                    "        return -1;\n"
+                    "    }\n"
+                    "    return real_read(fd, buf, count);\n"
+                    "}\n"
+                )
+            subprocess.run(["gcc", "-shared", "-fPIC", shim_src, "-o", shim_so, "-ldl"], check=True)
+
+            r4, w4 = os.pipe()
+            eintr_key = b"eintr_injection_secret_32bytes!!\n"
+            os.write(w4, eintr_key)
+            os.close(w4)
+            snap_dir4 = os.path.join(self.tmp_dir, "c_snap_eintr")
+            env_eintr = {**os.environ, "LD_PRELOAD": shim_so}
+            res4 = subprocess.run([
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_dir4,
+                "-D", str(r4),
+                "-I", "key46_eintr",
+                "-S", "sess46_eintr",
+                "-j",
+            ], capture_output=True, text=True, pass_fds=(r4,), env=env_eintr)
+            self.assertEqual(res4.returncode, 0, f"Collector failed under EINTR injection: {res4.stderr}")
+            snap4 = RawMemorySnapshot.load(snap_dir4)
+            v_ok, _ = snap4.validate_integrity()
+            self.assertTrue(v_ok)
+            self.assertIsNotNone(snap4.receipt)
+
         finally:
             target_proc.terminate()
             target_proc.wait()
 
     def test_47_c_collector_fd_ownership_contract(self):
-        """47: Collector takes ownership and closes inherited --key-fd descriptor on all exit paths."""
+        """47: Collector takes ownership and directly closes inherited --key-fd descriptor on all exit paths."""
         target_src = os.path.join(self.tmp_dir, "test47_target.c")
         target_bin = os.path.join(self.tmp_dir, "test47_target")
         with open(target_src, "w") as f:
@@ -2084,42 +2129,63 @@ int main() {
             time.sleep(0.1)
             pid = target_proc.pid
 
-            # Python helper script to verify descriptor closure in child process
-            test_script = f"""
-import os, subprocess, json
+            # Part 1: Success exit path - directly verify peer EOF proving collector closed key_fd
+            s_child1, s_parent1 = socket.socketpair()
+            s_parent1.sendall(b"fd_ownership_test_secret_32bytes\n")
+            s_parent1.shutdown(socket.SHUT_WR)
+            child_fd1 = s_child1.fileno()
 
-r, w = os.pipe()
-sentinel_r, sentinel_w = os.pipe()
-os.write(w, b"fd_ownership_test_secret_32bytes\\n")
-os.close(w)
+            snap_dir1 = os.path.join(self.tmp_dir, "c_snap_fd_own_success")
+            collector_cmd1 = [
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_dir1,
+                "-D", str(child_fd1),
+                "-I", "own_key",
+                "-S", "own_sess",
+                "-j",
+            ]
+            proc1 = subprocess.Popen(collector_cmd1, pass_fds=(child_fd1,))
+            s_child1.close()  # Parent closes its copy of child_fd
 
-collector_cmd = [
-    {repr(self.collector_bin)},
-    "-p", str({pid}),
-    "-o", {repr(os.path.join(self.tmp_dir, 'c_snap_fd_own'))},
-    "-D", str(r),
-    "-I", "own_key",
-    "-S", "own_sess",
-    "-j",
-]
-proc = subprocess.run(collector_cmd, pass_fds=(r, sentinel_r))
-assert proc.returncode == 0, f"Collector failed: {{proc.stderr}}"
+            # In parent, read from s_parent1. Once the collector executes close(fd),
+            # all descriptors for s_child1 are gone, so recv() returns EOF (b"")
+            s_parent1.settimeout(3.0)
+            eof_signal1 = s_parent1.recv(1)
+            self.assertEqual(eof_signal1, b"", "Expected EOF signal on parent socket indicating child closed key FD")
+            s_parent1.close()
 
-# Verify sentinel remains open and valid in parent
-os.write(sentinel_w, b"sentinel_ok")
-os.close(sentinel_w)
-msg = os.read(sentinel_r, 32)
-os.close(sentinel_r)
-assert msg == b"sentinel_ok"
-print("FD_OWNERSHIP_SUCCESS")
-"""
-            runner_res = subprocess.run(
-                [sys.executable, "-c", test_script],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(runner_res.returncode, 0, f"FD ownership script failed: {runner_res.stderr}")
-            self.assertIn("FD_OWNERSHIP_SUCCESS", runner_res.stdout)
+            proc1.wait()
+            self.assertEqual(proc1.returncode, 0)
+            snap1 = RawMemorySnapshot.load(snap_dir1)
+            self.assertIsNotNone(snap1.receipt)
+
+            # Part 2: Error exit path - directly verify peer EOF proving collector closed key_fd on error
+            s_child2, s_parent2 = socket.socketpair()
+            s_parent2.sendall(b"too_short\n")  # Key < 16 bytes triggers immediate error exit
+            s_parent2.shutdown(socket.SHUT_WR)
+            child_fd2 = s_child2.fileno()
+
+            snap_dir2 = os.path.join(self.tmp_dir, "c_snap_fd_own_err")
+            collector_cmd2 = [
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_dir2,
+                "-D", str(child_fd2),
+                "-I", "own_key",
+                "-S", "own_sess",
+                "-j",
+            ]
+            proc2 = subprocess.Popen(collector_cmd2, pass_fds=(child_fd2,))
+            s_child2.close()
+
+            s_parent2.settimeout(3.0)
+            eof_signal2 = s_parent2.recv(1)
+            self.assertEqual(eof_signal2, b"", "Expected EOF on error path proving child closed key FD on error")
+            s_parent2.close()
+
+            proc2.wait()
+            self.assertNotEqual(proc2.returncode, 0)
 
         finally:
             target_proc.terminate()

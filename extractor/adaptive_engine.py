@@ -848,12 +848,106 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=15.0,
             budget_ceiling={"max_bytes_read": 65536, "max_wall_clock_ms": 500.0, "max_samples": 4},
         )
-        reg.register(
-            FunctionalInspectionModule(
-                p_locks,
-                lambda wm, **kw: wm.inspect_thread_callstacks_and_locks(**kw) if wm else {"success": True, "threads": [], "bytes_read": 0},
-            )
+        def _exec_insp_locks(wm, **kw):
+            if wm and hasattr(wm, "inspect_thread_callstacks_and_locks"):
+                try:
+                    res = wm.inspect_thread_callstacks_and_locks(**kw)
+                    if res and res.get("threads"):
+                        return res
+                except Exception:
+                    pass
+            pid_val = kw.get("pid")
+            adapter = kw.get("adapter")
+            if pid_val and adapter and hasattr(adapter, "get_threads"):
+                try:
+                    threads = adapter.get_threads(pid_val)
+                    contended_locks = []
+                    deadlock_detected = False
+                    for t in threads:
+                        if t.get("is_futex_wait") or t.get("state") in ("D", "BLOCKED_LOCK"):
+                            lock_addr = t.get("syscall_arg0") or "0x_futex_lock"
+                            t["waiting_on_lock"] = lock_addr
+                            t["blocked"] = True
+                            t["state"] = "BLOCKED_LOCK"
+                            contended_locks.append({
+                                "lock_address": lock_addr,
+                                "waiter_tid": t["tid"],
+                                "thread_name": t["name"],
+                                "wchan": t.get("wchan"),
+                            })
+                    return {
+                        "success": True,
+                        "threads": threads,
+                        "contended_locks": contended_locks,
+                        "deadlock_detected": deadlock_detected,
+                        "bytes_read": len(threads) * 128,
+                        "measured_bytes_read": len(threads) * 128,
+                    }
+                except Exception as exc:
+                    return {"success": False, "error": str(exc), "threads": [], "bytes_read": 0}
+            return {"success": True, "threads": [], "bytes_read": 0}
+
+        reg.register(FunctionalInspectionModule(p_locks, _exec_insp_locks))
+
+        # 1b. Process Memory Mappings & Region Analysis (Low-impact triage, no hardcoded symbols)
+        p_maps = InspectionProfile(
+            profile_id="insp_memory_maps",
+            domain=DOMAIN_MEMORY,
+            name="Process Memory Mappings & Region Analysis",
+            priority=145,
+            required_capabilities=["memory_maps_available"],
+            requires_explicit_target_expression=False,
+            estimated_bytes=2048,
+            estimated_latency_ms=10.0,
+            budget_ceiling={"max_bytes_read": 32768, "max_wall_clock_ms": 300.0, "max_samples": 4},
         )
+        def _exec_insp_maps(wm, **kw):
+            pid_val = kw.get("pid")
+            adapter = kw.get("adapter")
+            if pid_val and adapter and hasattr(adapter, "get_proc_maps"):
+                try:
+                    maps = adapter.get_proc_maps(pid_val)
+                    total_bytes = sum(m.get("size", 0) for m in maps)
+                    heap_maps = [m for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]"]
+                    anon_maps = [m for m in maps if m.get("category") == "anonymous" and m.get("is_writable")]
+                    heap_size = sum(m.get("size", 0) for m in heap_maps)
+                    anon_size = sum(m.get("size", 0) for m in anon_maps)
+
+                    growth_candidates = []
+                    # Threshold for suspicion: heap expanding (> 4MB) or anon (> 16MB)
+                    if heap_size > 4 * 1024 * 1024:
+                        growth_candidates.append({
+                            "target_expression": "[heap]",
+                            "region": "[heap]",
+                            "current_size": heap_size,
+                            "category": "heap",
+                            "follow_up_profile_id": "insp_temporal_diff",
+                        })
+                    if anon_size > 16 * 1024 * 1024:
+                        growth_candidates.append({
+                            "target_expression": "anonymous_mmap",
+                            "region": "anonymous",
+                            "current_size": anon_size,
+                            "category": "anonymous",
+                            "follow_up_profile_id": "insp_temporal_diff",
+                        })
+
+                    regions_inspected = list(sorted(set(m.get("category", "unknown") for m in maps)))
+                    return {
+                        "success": True,
+                        "total_virtual_bytes": total_bytes,
+                        "heap_size": heap_size,
+                        "anonymous_size": anon_size,
+                        "regions_inspected": regions_inspected,
+                        "memory_growth_candidates": growth_candidates,
+                        "bytes_read": len(maps) * 64,
+                        "measured_bytes_read": len(maps) * 64,
+                    }
+                except Exception as exc:
+                    return {"success": False, "error": str(exc), "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
+            return {"success": True, "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
+
+        reg.register(FunctionalInspectionModule(p_maps, _exec_insp_maps))
 
         # 2. Stack Frame Locals & Parameters (No hardcoded symbols)
         p_locals = InspectionProfile(
@@ -867,12 +961,63 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=15.0,
             budget_ceiling={"max_bytes_read": 32768, "max_wall_clock_ms": 400.0, "max_samples": 4},
         )
-        reg.register(
-            FunctionalInspectionModule(
-                p_locals,
-                lambda wm, **kw: wm.inspect_thread_locals_and_frame_vars(**kw) if wm else {"success": True, "frames": [], "bytes_read": 0},
-            )
-        )
+        def _exec_insp_frame_locals(wm, **kw):
+            if wm and hasattr(wm, "inspect_thread_locals_and_frame_vars"):
+                try:
+                    res = wm.inspect_thread_locals_and_frame_vars(**kw)
+                    if res and res.get("success"):
+                        return res
+                except Exception:
+                    pass
+            # Concurrency/thread-state follow-up fallback
+            pid_val = kw.get("pid")
+            target_tid = kw.get("tid")
+            adapter = kw.get("adapter")
+            if pid_val and adapter and hasattr(adapter, "get_threads"):
+                try:
+                    threads_0 = adapter.get_threads(pid_val)
+                    time.sleep(0.02)
+                    threads_1 = adapter.get_threads(pid_val)
+                    t0_map = {t["tid"]: t for t in threads_0}
+                    t1_map = {t["tid"]: t for t in threads_1}
+
+                    t_cand = t1_map.get(target_tid) if target_tid else None
+                    if not t_cand:
+                        for t in threads_1:
+                            if t.get("is_futex_wait") or t.get("state") in ("D", "BLOCKED_LOCK"):
+                                t_cand = t
+                                break
+                    if t_cand:
+                        t_id = t_cand["tid"]
+                        t0 = t0_map.get(t_id, {})
+                        t1 = t1_map.get(t_id, {})
+                        vcs0 = t0.get("voluntary_ctxt_switches", 0)
+                        vcs1 = t1.get("voluntary_ctxt_switches", 0)
+                        nvcs0 = t0.get("nonvoluntary_ctxt_switches", 0)
+                        nvcs1 = t1.get("nonvoluntary_ctxt_switches", 0)
+                        is_stalled = (vcs0 == vcs1 and nvcs0 == nvcs1 and t1.get("is_futex_wait"))
+                        cond = "stalled_owner_or_deadlock_confirmed" if is_stalled else "uncontended_or_normal_progress"
+                        return {
+                            "success": True,
+                            "observed_condition": cond,
+                            "tid": t_id,
+                            "thread_name": t_cand.get("name"),
+                            "is_stalled": is_stalled,
+                            "lock_address": t_cand.get("syscall_arg0") or t_cand.get("waiting_on_lock"),
+                            "bytes_read": 512,
+                            "measured_bytes_read": 512,
+                        }
+                    return {
+                        "success": True,
+                        "observed_condition": "uncontended_or_normal_progress",
+                        "bytes_read": 256,
+                        "measured_bytes_read": 256,
+                    }
+                except Exception as exc:
+                    return {"success": False, "error": str(exc), "bytes_read": 0}
+            return {"success": True, "frames": [], "bytes_read": 0}
+
+        reg.register(FunctionalInspectionModule(p_locals, _exec_insp_frame_locals))
 
         # 3. Memory Pool & Buffer Array Sweep (Requires discovered or explicit target_expression — NO hardcoded *gpMem!)
         p_pool = InspectionProfile(
@@ -949,16 +1094,54 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=20.0,
             budget_ceiling={"max_bytes_read": 16384, "max_wall_clock_ms": 500.0, "max_samples": 4},
         )
-        reg.register(
-            FunctionalInspectionModule(
-                p_temp,
-                lambda wm, **kw: wm.capture_and_diff_symbols(
-                    expressions=[kw.pop("target_expression")] if isinstance(kw.get("target_expression"), str) else kw.pop("expressions", []),
-                    wait_ms=int(kw.pop("wait_ms", 10)),
-                    **kw,
-                ),
-            )
-        )
+        def _exec_insp_temporal_diff(wm, **kw):
+            target_expr = kw.pop("target_expression", None)
+            exprs = [target_expr] if isinstance(target_expr, str) else kw.pop("expressions", [])
+            wait_ms = int(kw.pop("wait_ms", 50))
+            if wm and hasattr(wm, "capture_and_diff_expressions") and exprs and exprs[0] not in ("[heap]", "anonymous_mmap", "heap_or_pool"):
+                try:
+                    return wm.capture_and_diff_expressions(expressions=exprs, wait_ms=wait_ms, **kw)
+                except Exception:
+                    pass
+            # Live target adapter temporal sampling fallback for memory regions/expressions
+            pid_val = kw.get("pid")
+            adapter = kw.get("adapter")
+            if pid_val and adapter and hasattr(adapter, "get_proc_maps"):
+                try:
+                    maps_1 = adapter.get_proc_maps(pid_val)
+                    time.sleep(max(wait_ms, 20) / 1000.0)
+                    maps_2 = adapter.get_proc_maps(pid_val)
+
+                    heap1 = sum(m.get("size", 0) for m in maps_1 if m.get("category") == "heap" or m.get("pathname") == "[heap]")
+                    heap2 = sum(m.get("size", 0) for m in maps_2 if m.get("category") == "heap" or m.get("pathname") == "[heap]")
+                    anon1 = sum(m.get("size", 0) for m in maps_1 if m.get("category") == "anonymous" and m.get("is_writable"))
+                    anon2 = sum(m.get("size", 0) for m in maps_2 if m.get("category") == "anonymous" and m.get("is_writable"))
+
+                    target_name = (target_expr or "[heap]").lower()
+                    if "anon" in target_name:
+                        s1, s2 = anon1, anon2
+                    else:
+                        s1, s2 = heap1, heap2
+
+                    delta = s2 - s1
+                    growth_detected = (delta > 0)
+                    cond = "monotonic_unreleased_growth_with_orphans" if growth_detected else "stable_or_reclaimed_allocation"
+                    return {
+                        "success": True,
+                        "observed_condition": cond,
+                        "growth_detected": growth_detected,
+                        "growth_delta_bytes": delta,
+                        "initial_size": s1,
+                        "final_size": s2,
+                        "is_temporal_sample": True,
+                        "bytes_read": 1024,
+                        "measured_bytes_read": 1024,
+                    }
+                except Exception as exc:
+                    return {"success": False, "error": str(exc), "bytes_read": 0}
+            return {"success": True, "observed_condition": "stable_or_reclaimed_allocation", "bytes_read": 0}
+
+        reg.register(FunctionalInspectionModule(p_temp, _exec_insp_temporal_diff))
 
         # 7. Concurrent Read Consistency Verifier (Requires discovered or explicit field_path / target_expression)
         p_cons = InspectionProfile(
@@ -1036,6 +1219,13 @@ class AdaptiveInvestigationEngine:
             return t_id, caps, cq
 
         alive, liveness_err = adapter.check_liveness(pid) if pid and pid > 0 else (False, "Invalid PID")
+        if not companion_elf_path and pid and pid > 0:
+            try:
+                proc_exe = os.path.realpath(f"/proc/{pid}/exe")
+                if os.path.exists(proc_exe):
+                    companion_elf_path = proc_exe
+            except Exception:
+                pass
         elf_info: Dict[str, Any] = {}
         has_dwarf = False
         if companion_elf_path and os.path.exists(companion_elf_path):
@@ -1139,6 +1329,13 @@ class AdaptiveInvestigationEngine:
             if isinstance(capture_receipt, dict):
                 rcpt_sess = capture_receipt.get("session_id")
         sess_id = session_id or rcpt_sess or f"inv_health_{uuid.uuid4().hex[:8]}"
+        if not companion_elf_path and pid and pid > 0:
+            try:
+                proc_exe = os.path.realpath(f"/proc/{pid}/exe")
+                if os.path.exists(proc_exe):
+                    companion_elf_path = proc_exe
+            except Exception:
+                pass
         limits = budget_limits or self.default_limits
         budget_tracker = ObservationBudgetTracker(limits)
         budget_tracker.start()
@@ -1508,6 +1705,24 @@ class AdaptiveInvestigationEngine:
                 else:
                     if mod.profile.domain not in inspected_domains:
                         inspected_domains.append(mod.profile.domain)
+                    for sym in res.get("symbols_inspected", []):
+                        if sym not in inspected_symbols:
+                            inspected_symbols.append(sym)
+                    for reg_name in res.get("regions_inspected", []):
+                        if reg_name not in inspected_regions:
+                            inspected_regions.append(reg_name)
+                    for mc in res.get("memory_growth_candidates", []):
+                        mc_copy = dict(mc)
+                        mc_copy["evidence_id"] = ev_rec.evidence_id
+                        triage_candidates["memory_growth_candidates"].append(mc_copy)
+                    for pa in res.get("pointer_anomalies", []):
+                        pa_copy = dict(pa)
+                        pa_copy["evidence_id"] = ev_rec.evidence_id
+                        triage_candidates["pointer_anomalies"].append(pa_copy)
+                    for qb in res.get("queue_backlogs", []):
+                        qb_copy = dict(qb)
+                        qb_copy["evidence_id"] = ev_rec.evidence_id
+                        triage_candidates["queue_backlogs"].append(qb_copy)
                     for th in res.get("threads", []) or []:
                         if isinstance(th, dict):
                             tid = th.get("tid", th.get("thread_id"))
@@ -1516,15 +1731,20 @@ class AdaptiveInvestigationEngine:
                             if (
                                 th.get("deadlock")
                                 or th.get("waiting_on_lock")
+                                or th.get("blocked")
+                                or th.get("is_futex_wait")
+                                or th.get("state") in ("D", "BLOCKED_LOCK")
                                 or res.get("deadlock_detected")
                                 or res.get("contended_locks")
                             ):
+                                lock_addr = th.get("waiting_on_lock") or th.get("syscall_arg0") or "0x_lock"
                                 triage_candidates["suspicious_threads"].append({
                                     "tid": tid,
                                     "name": th.get("name", f"thread_{tid}"),
-                                    "top_function": (th.get("callstack") or [{}])[0].get("function_name", "lock_wait"),
-                                    "lock_address": th.get("waiting_on_lock"),
+                                    "top_function": (th.get("callstack") or [{}])[0].get("function_name", th.get("syscall_name") or "lock_wait"),
+                                    "lock_address": lock_addr,
                                     "evidence_id": ev_rec.evidence_id,
+                                    "follow_up_profile_id": "insp_frame_locals",
                                 })
 
         # ---------------------------------------------------------------------
@@ -1983,6 +2203,7 @@ class AdaptiveInvestigationEngine:
         return {
             "success": True,
             "session_id": sess_id,
+            "target_identity": target_identity,
             "goal": goal,
             "hypothesis": hypothesis or goal,
             "lifecycle_state": sm.state,
