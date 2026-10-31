@@ -60,6 +60,8 @@ from extractor.evidence_ledger import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     issue_live_capture_receipt,
+    setup_test_capture_authorities,
+    reset_capture_authorities,
 )
 from extractor.hypothesis import (
     HYPOTHESIS_STATUS_CONTRADICTED,
@@ -100,6 +102,14 @@ from extractor.verdict_engine import (
 
 
 class TestPhase20ProcessHealthInvestigation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.signer, cls.verifier = setup_test_capture_authorities()
+
+    @classmethod
+    def tearDownClass(cls):
+        reset_capture_authorities()
+
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="dynstate_phase20_")
 

@@ -93,6 +93,8 @@ from .verdict_engine import (
     ASSERTION_PASS,
     ASSERTION_FAIL,
     ASSERTION_ABSTAIN,
+    DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE,
+    DIAG_INCONCLUSIVE,
     sanitize_report_output_path,
 )
 from .hypothesis import (
@@ -575,6 +577,24 @@ class InvestigationSession:
                     session.executed_observation_keys.add(obs.semantic_key)
 
         session.status = data.get("status", session.status)
+
+        # Re-verify provenance integrity upon deserialization:
+        # If ledger does not have verified live capture, never allow session summary/target_ref to claim LIVE_RUNTIME_CAPTURE
+        if not getattr(session.ledger, "verified_live_capture", False):
+            if session.summary.get("provenance_class") == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+                session.summary["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            if session.target_ref.get("provenance_class") == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+                session.target_ref["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            if session.target_ref.get("live_capture") is True:
+                session.target_ref["live_capture"] = False
+            if session.summary.get("final_diagnosis") == DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE:
+                session.summary["final_diagnosis"] = DIAG_INCONCLUSIVE
+                session.summary["verdict"] = DIAG_INCONCLUSIVE
+                lims = list(session.summary.get("limitations", []))
+                if "UNVERIFIED_PROVENANCE_CANNOT_PROVE_HEALTH" not in lims:
+                    lims.append("UNVERIFIED_PROVENANCE_CANNOT_PROVE_HEALTH")
+                session.summary["limitations"] = lims
+
         return session
 
 
@@ -3050,6 +3070,8 @@ class InvestigationManager:
             "investigation_id": session.investigation_id,
             "goal": session.goal,
             "status": session.status,
+            "verdict": session.summary.get("verdict") or synth_report_verdict.final_diagnosis,
+            "final_diagnosis": session.summary.get("final_diagnosis") or synth_report_verdict.final_diagnosis,
             "provenance_class": report_prov_class,
             "created_at": session.created_at,
             "target_identity": session.stages["target_identity"].get("details", {}),
@@ -3129,6 +3151,8 @@ class InvestigationManager:
         watch_manager: Optional[Any] = None,
         provenance_class: Optional[str] = None,
         capture_receipt: Optional[Any] = None,
+        verification_authority: Optional[Any] = None,
+        snapshot: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Runs an evidence-grounded, budget-bounded Process Health Investigation and registers the session."""
         rcpt_sess = (
@@ -3163,6 +3187,8 @@ class InvestigationManager:
             follow_up_executor=follow_up_executor,
             existing_state_machine=session.state_machine,
             existing_executed_keys=session.executed_observation_keys,
+            verification_authority=verification_authority,
+            snapshot=snapshot,
         )
         session.status = res.get("lifecycle_state", STATE_COMPLETED)
         session.executed_observation_keys = set(res.get("executed_observation_keys", []))

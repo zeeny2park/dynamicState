@@ -10,6 +10,7 @@ Stores binary memory dumps and metadata decoupled from DWARF semantic interpreta
 from dataclasses import asdict, dataclass, field
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import stat
@@ -232,7 +233,23 @@ class RawMemorySnapshot:
     integrity_warnings: List[str] = field(default_factory=list)
     validation_verdict: str = VERDICT_UNVERIFIED
     commit_state: str = STATE_COMMITTED
+    manifest_digest: Optional[str] = None
+    build_id: Optional[str] = None
     schema_version: str = "1.0"
+
+    def compute_manifest_digest(self) -> str:
+        """Compute SHA-256 digest over the manifest regions."""
+        if self.output_dir:
+            mpath = os.path.join(self.output_dir, "manifest.json")
+            if os.path.isfile(mpath) and not os.path.islink(mpath):
+                try:
+                    with open(mpath, "rb") as mf:
+                        return hashlib.sha256(mf.read()).hexdigest()
+                except Exception:
+                    pass
+        canonical_regions = [r.to_dict() for r in self.regions]
+        canonical_json = json.dumps(canonical_regions, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
     def to_metadata(self) -> Dict[str, Any]:
         actual_captured_cnt = sum(1 for r in self.regions if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0)
@@ -253,6 +270,8 @@ class RawMemorySnapshot:
             "schema_version": getattr(self, "schema_version", "1.0"),
             "commit_state": getattr(self, "commit_state", STATE_COMMITTED),
             "validation_verdict": getattr(self, "validation_verdict", VERDICT_UNVERIFIED),
+            "manifest_digest": getattr(self, "manifest_digest", None),
+            "build_id": getattr(self, "build_id", None),
             "capture_mode": self.capture_mode,
             "backend": self.backend,
             "architecture": self.architecture,
@@ -359,8 +378,10 @@ class RawMemorySnapshot:
                         manifest_tmp = f"manifest.json.tmp.{unique_suffix}"
                         _validate_single_component(manifest_tmp)
                         created_tmps.append(manifest_tmp)
+                        manifest_content = json.dumps([r.to_dict() for r in self.regions], indent=2)
+                        self.manifest_digest = hashlib.sha256(manifest_content.encode("utf-8")).hexdigest()
                         with _secure_open_temp_write(manifest_tmp, dir_fd=dir_fd) as f:
-                            json.dump([r.to_dict() for r in self.regions], f, indent=2)
+                            f.write(manifest_content)
                             f.flush()
                             os.fsync(f.fileno())
                         os.rename(manifest_tmp, manifest_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
@@ -894,6 +915,21 @@ class RawMemorySnapshot:
                     f"Requested bytes mismatch: metadata reports bytes_requested={self.bytes_requested}, "
                     f"but sum of manifest regions is {actual_requested_bytes}"
                 )
+
+            # 7. Manifest digest verification (if recorded in metadata)
+            if self.manifest_digest:
+                try:
+                    with _secure_open_read("manifest.json", dir_fd=dir_fd) as f:
+                        cur_raw = f.read()
+                        cur_digest = hashlib.sha256(cur_raw.encode("utf-8")).hexdigest()
+                        if cur_digest.lower() != self.manifest_digest.lower():
+                            is_valid = False
+                            warnings.append(
+                                f"Manifest digest mismatch: recorded {self.manifest_digest} != computed {cur_digest}"
+                            )
+                except Exception as e:
+                    is_valid = False
+                    warnings.append(f"Cannot verify manifest digest: {e}")
         finally:
             os.close(dir_fd)
 
@@ -953,9 +989,12 @@ class RawMemorySnapshot:
 
             regions = []
             manifest_err = None
+            file_manifest_digest = None
             try:
                 with _secure_open_read("manifest.json", dir_fd=dir_fd) as f:
-                    manifest_data = json.load(f)
+                    manifest_raw = f.read()
+                    file_manifest_digest = hashlib.sha256(manifest_raw.encode("utf-8")).hexdigest()
+                    manifest_data = json.loads(manifest_raw)
                     if isinstance(manifest_data, list):
                         regions = [CapturedRegion.from_dict(r) for r in manifest_data]
                     else:
@@ -1035,6 +1074,8 @@ class RawMemorySnapshot:
             maps=maps,
             commit_state=meta.get("commit_state", STATE_COMMITTED),
             validation_verdict=meta.get("validation_verdict", VERDICT_UNVERIFIED),
+            manifest_digest=meta.get("manifest_digest") or file_manifest_digest,
+            build_id=meta.get("build_id") or (modules[0].get("build_id") if modules and isinstance(modules[0], dict) else None),
         )
 
         is_valid, validation_warnings = snap.validate_integrity()

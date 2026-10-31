@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -53,11 +54,173 @@ ALL_TRUST_CLAIMS = {
 }
 
 
+class CaptureVerificationAuthority:
+    """Authority for verifying capture receipts against trusted keys.
+    
+    Operates fail-closed: if no keys are registered or loaded from the environment,
+    verification requests fail immediately. Secrets are never exposed in string representations,
+    logs, or serialized outputs.
+    """
+    def __init__(self, keys: Optional[Dict[str, str]] = None):
+        self._keys: Dict[str, str] = dict(keys or {})
+        self._revoked_keys: Set[str] = set()
+
+    def register_key(self, key_id: str, secret: str) -> None:
+        if not key_id or not secret:
+            raise ValueError("key_id and secret must be non-empty strings")
+        self._keys[key_id] = secret
+        self._revoked_keys.discard(key_id)
+
+    def revoke_key(self, key_id: str) -> None:
+        if not key_id:
+            raise ValueError("key_id must be a non-empty string")
+        self._revoked_keys.add(key_id)
+
+    def get_key(self, key_id: str) -> Optional[str]:
+        if key_id in self._revoked_keys:
+            return None
+        return self._keys.get(key_id)
+
+    def has_keys(self) -> bool:
+        return bool(self._keys)
+
+    def is_revoked(self, key_id: str) -> bool:
+        return key_id in self._revoked_keys
+
+    @classmethod
+    def from_environment(cls) -> "CaptureVerificationAuthority":
+        auth = cls()
+        # 1. DYNAMICSTATE_CAPTURE_SECRET & DYNAMICSTATE_CAPTURE_KEY_ID
+        env_secret = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
+        key_id = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_ID", "default")
+        if env_secret:
+            auth.register_key(key_id, env_secret)
+
+        # 2. DYNAMICSTATE_CAPTURE_KEY_FILE
+        key_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
+        if key_file and os.path.exists(key_file):
+            try:
+                with open(key_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content.startswith("{"):
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        for k, v in data.items():
+                            if isinstance(k, str) and isinstance(v, str):
+                                auth.register_key(k, v)
+                elif content:
+                    auth.register_key("file_default", content)
+            except Exception:
+                pass
+
+        # 3. DYNAMICSTATE_CAPTURE_KEYRING
+        keyring_spec = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
+        if keyring_spec:
+            try:
+                if os.path.exists(keyring_spec):
+                    with open(keyring_spec, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                else:
+                    data = json.loads(keyring_spec)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(k, str) and isinstance(v, str):
+                            auth.register_key(k, v)
+            except Exception:
+                pass
+
+        return auth
+
+    def __repr__(self) -> str:
+        # Never expose secrets!
+        registered = sorted(self._keys.keys())
+        revoked = sorted(self._revoked_keys)
+        return f"<CaptureVerificationAuthority keys={registered} revoked={revoked}>"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class CaptureSigningAuthority:
+    """Authority for signing authentic LiveCaptureReceipts using a dedicated key."""
+    def __init__(self, key_id: str, secret: str):
+        if not key_id or not secret:
+            raise ValueError("CaptureSigningAuthority requires non-empty key_id and secret")
+        if not isinstance(key_id, str) or not isinstance(secret, str):
+            raise TypeError("key_id and secret must be strings")
+        self._key_id = key_id
+        self._secret = secret
+
+    @property
+    def key_id(self) -> str:
+        return self._key_id
+
+    def sign(self, payload: str) -> str:
+        return hmac.new(self._secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def __repr__(self) -> str:
+        return f"<CaptureSigningAuthority key_id={self._key_id!r}>"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+_DEFAULT_VERIFICATION_AUTHORITY: Optional[CaptureVerificationAuthority] = None
+_DEFAULT_SIGNING_AUTHORITY: Optional[CaptureSigningAuthority] = None
+
+
+def get_default_verification_authority() -> CaptureVerificationAuthority:
+    global _DEFAULT_VERIFICATION_AUTHORITY
+    if _DEFAULT_VERIFICATION_AUTHORITY is None:
+        _DEFAULT_VERIFICATION_AUTHORITY = CaptureVerificationAuthority.from_environment()
+    return _DEFAULT_VERIFICATION_AUTHORITY
+
+
+def set_default_verification_authority(auth: Optional[CaptureVerificationAuthority]) -> None:
+    global _DEFAULT_VERIFICATION_AUTHORITY
+    _DEFAULT_VERIFICATION_AUTHORITY = auth
+
+
+def get_default_signing_authority() -> Optional[CaptureSigningAuthority]:
+    global _DEFAULT_SIGNING_AUTHORITY
+    if _DEFAULT_SIGNING_AUTHORITY is None:
+        env_secret = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
+        key_id = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_ID", "default")
+        if env_secret:
+            _DEFAULT_SIGNING_AUTHORITY = CaptureSigningAuthority(key_id=key_id, secret=env_secret)
+    return _DEFAULT_SIGNING_AUTHORITY
+
+
+def set_default_signing_authority(auth: Optional[CaptureSigningAuthority]) -> None:
+    global _DEFAULT_SIGNING_AUTHORITY
+    _DEFAULT_SIGNING_AUTHORITY = auth
+
+
+def setup_test_capture_authorities(
+    key_id: str = "test_key_phase2_0_a2",
+    secret: str = "test_secret_32bytes_deterministic_12345",
+) -> Tuple[CaptureSigningAuthority, CaptureVerificationAuthority]:
+    """Helper for test suites to inject deterministic test-only keys without polluting production."""
+    signer = CaptureSigningAuthority(key_id=key_id, secret=secret)
+    verifier = CaptureVerificationAuthority(keys={key_id: secret, "default": secret})
+    set_default_signing_authority(signer)
+    set_default_verification_authority(verifier)
+    return signer, verifier
+
+
+def reset_capture_authorities() -> None:
+    """Reset global authorities back to unconfigured state."""
+    global _DEFAULT_VERIFICATION_AUTHORITY, _DEFAULT_SIGNING_AUTHORITY
+    _DEFAULT_VERIFICATION_AUTHORITY = None
+    _DEFAULT_SIGNING_AUTHORITY = None
+
+
 @dataclass(frozen=True)
 class LiveCaptureReceipt:
     """Authentic cryptographic receipt establishing verified live runtime capture.
     
-    Binds target identity, session/capture ID, build ID, capture source, and integrity validation.
+    Binds target identity, session/capture ID, build ID, capture source,
+    manifest digest, start time, and integrity validation.
     """
     receipt_id: str
     session_id: str
@@ -65,29 +228,26 @@ class LiveCaptureReceipt:
     executable_path: str
     build_id: Optional[str]
     capture_source: str
+    manifest_digest: str
     integrity_validated: bool
     issued_at: str
+    process_start_time: str = "0"
     signature: str = ""
     key_id: str = "default"
     provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
 
-    def verify_authenticity(self, secret: Optional[str] = None) -> bool:
-        """Verify HMAC signature against session secret or default secret."""
-        if not self.signature:
-            return False
-        sec = secret or "dynamicstate_live_capture_secret_key"
-        expected = compute_live_receipt_signature(
-            secret=sec,
-            receipt_id=self.receipt_id,
-            session_id=self.session_id,
-            pid=self.pid,
-            executable_path=self.executable_path,
-            build_id=self.build_id,
-            capture_source=self.capture_source,
-            integrity_validated=self.integrity_validated,
-            issued_at=self.issued_at,
+    def verify_authenticity(
+        self,
+        secret: Optional[str] = None,
+        verification_authority: Optional[CaptureVerificationAuthority] = None,
+    ) -> bool:
+        """Verify HMAC signature against secret or verification authority."""
+        ok, _ = verify_live_capture_receipt(
+            self,
+            secret=secret,
+            verification_authority=verification_authority,
         )
-        return hmac.compare_digest(self.signature, expected)
+        return ok
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -101,8 +261,10 @@ class LiveCaptureReceipt:
             executable_path=str(data.get("executable_path", "")),
             build_id=data.get("build_id"),
             capture_source=str(data.get("capture_source", "live_collector")),
+            manifest_digest=str(data.get("manifest_digest", "")),
             integrity_validated=bool(data.get("integrity_validated", False)),
             issued_at=str(data.get("issued_at", "")),
+            process_start_time=str(data.get("process_start_time", "0")),
             signature=str(data.get("signature", "")),
             key_id=str(data.get("key_id", "default")),
             provenance_class=str(data.get("provenance_class", PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE)),
@@ -110,7 +272,7 @@ class LiveCaptureReceipt:
 
 
 def compute_live_receipt_signature(
-    secret: str,
+    secret_or_signer: Union[CaptureSigningAuthority, str],
     receipt_id: str,
     session_id: str,
     pid: int,
@@ -119,13 +281,19 @@ def compute_live_receipt_signature(
     capture_source: str,
     integrity_validated: bool,
     issued_at: str,
+    process_start_time: Union[str, int] = "0",
+    manifest_digest: str = "",
+    key_id: str = "default",
 ) -> str:
     raw = (
-        f"LIVE_RECEIPT|v1|{receipt_id}|{session_id}|{pid}|"
-        f"{executable_path}|{build_id or ''}|{capture_source}|"
-        f"{'TRUE' if integrity_validated else 'FALSE'}|{issued_at}"
+        f"LIVE_RECEIPT|v2|{receipt_id}|{session_id}|{pid}|"
+        f"{process_start_time}|{executable_path}|{build_id or ''}|"
+        f"{capture_source}|{manifest_digest}|{'TRUE' if integrity_validated else 'FALSE'}|"
+        f"{issued_at}|{key_id}"
     )
-    return hmac.new(secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+    if isinstance(secret_or_signer, CaptureSigningAuthority):
+        return secret_or_signer.sign(raw)
+    return hmac.new(secret_or_signer.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def issue_live_capture_receipt(
@@ -133,25 +301,58 @@ def issue_live_capture_receipt(
     pid: int,
     executable_path: str,
     build_id: Optional[str] = None,
+    process_start_time: Union[str, int] = "100000",
+    manifest_digest: Optional[str] = None,
     capture_source: str = "live_collector",
     integrity_validated: bool = True,
+    signer: Optional[Union[CaptureSigningAuthority, str]] = None,
     secret: Optional[str] = None,
+    key_id: Optional[str] = None,
     receipt_id: Optional[str] = None,
+    issued_at: Optional[str] = None,
 ) -> LiveCaptureReceipt:
-    sec = secret or "dynamicstate_live_capture_secret_key"
+    """Issue a signed LiveCaptureReceipt. Fails closed if no signing key is configured."""
+    eff_signer = signer or secret
+    eff_key_id = key_id
+
+    if eff_signer is None:
+        active_signer = get_default_signing_authority()
+        if active_signer is None:
+            raise ValueError(
+                "No capture signing key configured. Cannot issue live capture receipt without explicit signing authority."
+            )
+        eff_signer = active_signer
+        eff_key_id = active_signer.key_id
+    elif isinstance(eff_signer, CaptureSigningAuthority):
+        eff_key_id = eff_signer.key_id
+    elif isinstance(eff_signer, str):
+        eff_key_id = eff_key_id or "default"
+
     rcpt_id = receipt_id or f"lrcpt_{uuid.uuid4().hex[:12]}"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = issued_at or datetime.now(timezone.utc).isoformat()
+    start_time_str = str(process_start_time)
+
+    # Derive deterministic manifest digest placeholder if none provided
+    if manifest_digest is None:
+        manifest_digest = hashlib.sha256(
+            f"MANIFEST_MOCK_{pid}_{executable_path}_{start_time_str}".encode("utf-8")
+        ).hexdigest()
+
     sig = compute_live_receipt_signature(
-        secret=sec,
+        secret_or_signer=eff_signer,
         receipt_id=rcpt_id,
         session_id=session_id,
         pid=pid,
         executable_path=executable_path,
         build_id=build_id,
         capture_source=capture_source,
+        manifest_digest=manifest_digest,
         integrity_validated=integrity_validated,
         issued_at=now_iso,
+        process_start_time=start_time_str,
+        key_id=eff_key_id or "default",
     )
+
     return LiveCaptureReceipt(
         receipt_id=rcpt_id,
         session_id=session_id,
@@ -159,19 +360,27 @@ def issue_live_capture_receipt(
         executable_path=executable_path,
         build_id=build_id,
         capture_source=capture_source,
+        manifest_digest=manifest_digest,
         integrity_validated=integrity_validated,
         issued_at=now_iso,
+        process_start_time=start_time_str,
         signature=sig,
+        key_id=eff_key_id or "default",
     )
 
 
 def verify_live_capture_receipt(
     receipt: Any,
     secret: Optional[str] = None,
+    verification_authority: Optional[CaptureVerificationAuthority] = None,
     expected_session_id: Optional[str] = None,
     expected_pid: Optional[int] = None,
+    expected_manifest_digest: Optional[str] = None,
+    expected_build_id: Optional[str] = None,
+    expected_executable_path: Optional[str] = None,
+    snapshot: Optional[Any] = None,
 ) -> Tuple[bool, Optional[str]]:
-    """Validates that a receipt is authentic, unmodified, and bound to the expected target."""
+    """Validates that a receipt is authentic, unmodified, and bound to the expected target and snapshot."""
     if receipt is None:
         return False, "NO_RECEIPT: No capture or session receipt provided"
 
@@ -194,19 +403,170 @@ def verify_live_capture_receipt(
     if not isinstance(receipt, LiveCaptureReceipt):
         return False, f"UNRECOGNIZED_RECEIPT_TYPE: {type(receipt).__name__}"
 
-    if not receipt.integrity_validated:
-        return False, "INTEGRITY_NOT_VALIDATED: Receipt indicates integrity validation failed or was skipped"
+    if not receipt.signature:
+        return False, "UNSIGNED_RECEIPT: Receipt has no HMAC signature"
 
-    if expected_session_id and receipt.session_id and receipt.session_id != expected_session_id:
-        return False, f"SESSION_MISMATCH: Receipt session '{receipt.session_id}' != expected '{expected_session_id}'"
+    if not receipt.key_id:
+        return False, "MISSING_MANDATORY_FIELD: key_id is missing or empty"
 
-    if expected_pid is not None and receipt.pid != expected_pid:
-        return False, f"PID_MISMATCH: Receipt PID {receipt.pid} != expected {expected_pid}"
+    # Resolve verification key fail-closed
+    auth = verification_authority or get_default_verification_authority()
+    resolved_secret = secret
 
-    if not receipt.verify_authenticity(secret):
+    if resolved_secret is None:
+        if not auth.has_keys():
+            return (
+                False,
+                "VERIFICATION_KEY_UNAVAILABLE: No capture verification keys configured in authority or environment",
+            )
+        if auth.is_revoked(receipt.key_id):
+            return False, f"KEY_REVOKED: Key ID '{receipt.key_id}' has been revoked"
+        resolved_secret = auth.get_key(receipt.key_id)
+        if not resolved_secret:
+            return False, f"UNKNOWN_KEY_ID: Key ID '{receipt.key_id}' not found in verification authority"
+
+    # Cryptographic HMAC verification
+    expected_sig = compute_live_receipt_signature(
+        secret_or_signer=resolved_secret,
+        receipt_id=receipt.receipt_id,
+        session_id=receipt.session_id,
+        pid=receipt.pid,
+        executable_path=receipt.executable_path,
+        build_id=receipt.build_id,
+        capture_source=receipt.capture_source,
+        manifest_digest=receipt.manifest_digest,
+        integrity_validated=receipt.integrity_validated,
+        issued_at=receipt.issued_at,
+        process_start_time=receipt.process_start_time,
+        key_id=receipt.key_id,
+    )
+    if not hmac.compare_digest(receipt.signature, expected_sig):
         return False, "SIGNATURE_INVALID: LiveCaptureReceipt signature verification failed"
 
+    # Check mandatory fields
+    if not receipt.receipt_id:
+        return False, "MISSING_MANDATORY_FIELD: receipt_id is missing or empty"
+    if not receipt.session_id:
+        return False, "MISSING_MANDATORY_FIELD: session_id is missing or empty"
+    if not receipt.pid or receipt.pid <= 0:
+        return False, "MISSING_MANDATORY_FIELD: pid is missing or non-positive"
+    if receipt.process_start_time is None or str(receipt.process_start_time) == "":
+        return False, "MISSING_MANDATORY_FIELD: process_start_time is missing or empty"
+    if not receipt.executable_path:
+        return False, "MISSING_MANDATORY_FIELD: executable_path is missing or empty"
+    if not receipt.manifest_digest:
+        return False, "MISSING_MANDATORY_FIELD: manifest_digest is missing or empty"
+    if not receipt.issued_at:
+        return False, "MISSING_MANDATORY_FIELD: issued_at is missing or empty"
+    if not receipt.key_id:
+        return False, "MISSING_MANDATORY_FIELD: key_id is missing or empty"
+
+    if not receipt.integrity_validated:
+        return False, "INTEGRITY_CHECK_FAILED: Receipt indicates integrity validation failed or was skipped"
+
+    # Session binding
+    if expected_session_id and receipt.session_id != expected_session_id:
+        return False, f"SESSION_MISMATCH: Receipt session '{receipt.session_id}' != expected '{expected_session_id}'"
+
+    # Target identity bindings
+    if expected_pid is not None and int(receipt.pid) != int(expected_pid):
+        return False, f"PID_MISMATCH: Receipt PID {receipt.pid} != expected {expected_pid}"
+
+    if expected_manifest_digest and receipt.manifest_digest.lower() != expected_manifest_digest.lower():
+        return (
+            False,
+            f"MANIFEST_DIGEST_MISMATCH: Receipt manifest digest {receipt.manifest_digest} != expected {expected_manifest_digest}",
+        )
+
+    if expected_build_id and receipt.build_id and receipt.build_id.lower() != expected_build_id.lower():
+        return False, f"BUILD_ID_MISMATCH: Receipt build ID {receipt.build_id} != expected {expected_build_id}"
+
+    if expected_executable_path:
+        base_expected = os.path.basename(expected_executable_path)
+        base_rcpt = os.path.basename(receipt.executable_path)
+        if base_expected != base_rcpt:
+            return False, f"EXECUTABLE_PATH_MISMATCH: Receipt exe '{receipt.executable_path}' != expected '{expected_executable_path}'"
+
+    # Exact Snapshot binding (if provided)
+    if snapshot is not None:
+        snap_verdict = getattr(snapshot, "validation_verdict", None)
+        if snap_verdict not in ("VALIDATED", None):
+            return False, f"SNAPSHOT_NOT_VALIDATED: Referenced snapshot validation verdict is '{snap_verdict}'"
+
+        if getattr(snapshot, "pid", None) and int(snapshot.pid) != int(receipt.pid):
+            return False, f"PID_MISMATCH: Snapshot PID {snapshot.pid} != receipt PID {receipt.pid}"
+
+        snap_st = getattr(snapshot, "process_starttime", None)
+        if snap_st and str(snap_st) != str(receipt.process_start_time):
+            return (
+                False,
+                f"PROCESS_START_TIME_MISMATCH: Snapshot start time {snap_st} != receipt start time {receipt.process_start_time}",
+            )
+
+        snap_digest = getattr(snapshot, "manifest_digest", None)
+        if not snap_digest and hasattr(snapshot, "compute_manifest_digest"):
+            snap_digest = snapshot.compute_manifest_digest()
+        if snap_digest and snap_digest.lower() != receipt.manifest_digest.lower():
+            return (
+                False,
+                f"MANIFEST_DIGEST_MISMATCH: Snapshot manifest digest {snap_digest} != receipt manifest digest {receipt.manifest_digest}",
+            )
+
+        snap_bin = getattr(snapshot, "binary", None)
+        if snap_bin and os.path.basename(snap_bin) != os.path.basename(receipt.executable_path):
+            return False, f"EXECUTABLE_PATH_MISMATCH: Snapshot binary '{snap_bin}' != receipt exe '{receipt.executable_path}'"
+
+        snap_bid = getattr(snapshot, "build_id", None)
+        if snap_bid and receipt.build_id and snap_bid.lower() != receipt.build_id.lower():
+            return False, f"BUILD_ID_MISMATCH: Snapshot build ID {snap_bid} != receipt build ID {receipt.build_id}"
+
     return True, None
+
+
+def create_receipt_from_snapshot(
+    snapshot: Any,
+    session_id: str,
+    signing_authority: Optional[CaptureSigningAuthority] = None,
+    secret: Optional[str] = None,
+    key_id: Optional[str] = None,
+    companion_elf: Optional[str] = None,
+    receipt_id: Optional[str] = None,
+) -> LiveCaptureReceipt:
+    """Generate an authentic LiveCaptureReceipt bound to a validated RawMemorySnapshot."""
+    is_valid = True
+    if hasattr(snapshot, "validate_integrity"):
+        is_valid, _ = snapshot.validate_integrity()
+    if getattr(snapshot, "validation_verdict", "VALIDATED") != "VALIDATED":
+        is_valid = False
+
+    build_id = getattr(snapshot, "build_id", None)
+    if companion_elf and not build_id:
+        try:
+            from .debug_image import inspect_elf
+            ident = inspect_elf(companion_elf)
+            build_id = ident.build_id
+        except Exception:
+            pass
+
+    manifest_digest = getattr(snapshot, "manifest_digest", None)
+    if not manifest_digest and hasattr(snapshot, "compute_manifest_digest"):
+        manifest_digest = snapshot.compute_manifest_digest()
+    if not manifest_digest:
+        manifest_digest = hashlib.sha256(b"EMPTY_MANIFEST").hexdigest()
+
+    return issue_live_capture_receipt(
+        session_id=session_id,
+        pid=int(getattr(snapshot, "pid", 0)),
+        executable_path=str(getattr(snapshot, "binary", "")),
+        build_id=build_id,
+        process_start_time=str(getattr(snapshot, "process_starttime", "0")),
+        manifest_digest=manifest_digest,
+        capture_source=str(getattr(snapshot, "backend", "native_collector")),
+        integrity_validated=is_valid,
+        signer=signing_authority or secret,
+        key_id=key_id,
+        receipt_id=receipt_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -844,12 +1204,14 @@ class EvidenceLedger:
         session_secret: Optional[str] = None,
         capability_key: Optional[str] = None,
         live_capture_receipt: Optional[Any] = None,
+        verification_authority: Optional[CaptureVerificationAuthority] = None,
     ):
         self.session_id: str = session_id or f"inv_sess_{uuid.uuid4().hex[:8]}"
         self.schema_version: str = schema_version
         self.session_secret: str = session_secret or uuid.uuid4().hex
         self._capability_key: str = capability_key or uuid.uuid4().hex
         self.live_capture_receipt: Optional[Any] = live_capture_receipt
+        self.verification_authority: Optional[CaptureVerificationAuthority] = verification_authority
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self._records: List[EvidenceRecord] = []
         self._by_id: Dict[str, EvidenceRecord] = {}
@@ -859,6 +1221,21 @@ class EvidenceLedger:
     @property
     def capability_key(self) -> str:
         return self._capability_key
+
+    @property
+    def verified_live_capture(self) -> bool:
+        """Indicates whether this ledger holds authenticated live capture evidence."""
+        if self.live_capture_receipt is not None:
+            ok, _ = verify_live_capture_receipt(
+                self.live_capture_receipt,
+                verification_authority=self.verification_authority,
+                expected_session_id=self.session_id,
+            )
+            return ok
+        return any(
+            (isinstance(r.provenance, dict) and r.provenance.get("verified_live_capture") is True)
+            for r in self._records
+        )
 
     @property
     def records(self) -> List[EvidenceRecord]:
@@ -1111,6 +1488,7 @@ class EvidenceLedger:
                 rcpt = p_dict.get("capture_receipt") or p_dict.get("live_receipt") or self.live_capture_receipt
                 rcpt_ok, rcpt_err = verify_live_capture_receipt(
                     rcpt,
+                    verification_authority=self.verification_authority,
                     expected_session_id=self.session_id,
                     expected_pid=record.target_identity.get("pid") if record.target_identity else None,
                 )
@@ -1358,11 +1736,19 @@ class EvidenceLedger:
         return []
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize full ledger to dictionary."""
+        """Serialize full ledger to dictionary (without exposing secrets)."""
+        rcpt_dict = None
+        if self.live_capture_receipt:
+            if hasattr(self.live_capture_receipt, "to_dict"):
+                rcpt_dict = self.live_capture_receipt.to_dict()
+            elif isinstance(self.live_capture_receipt, dict):
+                rcpt_dict = dict(self.live_capture_receipt)
+
         return {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "created_at": self.created_at,
+            "live_capture_receipt": rcpt_dict,
             "record_count": len(self._records),
             "records": [r.to_dict() for r in self._records],
         }
@@ -1372,11 +1758,25 @@ class EvidenceLedger:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "EvidenceLedger":
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        verification_authority: Optional[CaptureVerificationAuthority] = None,
+    ) -> "EvidenceLedger":
         """Reconstruct EvidenceLedger from serialized dictionary."""
+        rcpt_data = data.get("live_capture_receipt")
+        rcpt = None
+        if rcpt_data and isinstance(rcpt_data, dict):
+            try:
+                rcpt = LiveCaptureReceipt.from_dict(rcpt_data)
+            except Exception:
+                rcpt = None
+
         ledger = cls(
             session_id=data.get("session_id"),
             schema_version=data.get("schema_version", EVIDENCE_SCHEMA_VERSION),
+            live_capture_receipt=rcpt,
+            verification_authority=verification_authority,
         )
         ledger.created_at = data.get("created_at", ledger.created_at)
         for rec_data in data.get("records", []):

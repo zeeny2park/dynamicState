@@ -1122,6 +1122,8 @@ class AdaptiveInvestigationEngine:
         existing_state_machine: Optional[InvestigationStateMachine] = None,
         existing_executed_keys: Optional[Set[str]] = None,
         cancel_requested: bool = False,
+        verification_authority: Optional[Any] = None,
+        snapshot: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Executes an evidence-grounded, budget-bounded Process Health Investigation
         through the single explicit investigation state machine.
@@ -1146,19 +1148,33 @@ class AdaptiveInvestigationEngine:
 
         # Determine provenance
         # LIVE_RUNTIME_CAPTURE strictly requires an authentic, verified LiveCaptureReceipt
+        is_synthetic = False
+        if fixture_data is not None:
+            target_ident = fixture_data.get("target_identity", {})
+            if (
+                target_ident.get("is_synthetic") is True
+                or target_ident.get("provenance_class") == PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+                or fixture_data.get("provenance_class") == PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+                or provenance_class == PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+            ):
+                is_synthetic = True
+
         eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
         verified_receipt = None
-        if capture_receipt is not None:
-            ok_rcpt, rcpt_err = verify_live_capture_receipt(capture_receipt)
+        if is_synthetic:
+            eff_prov = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+        elif capture_receipt is not None:
+            ok_rcpt, rcpt_err = verify_live_capture_receipt(
+                capture_receipt,
+                verification_authority=verification_authority,
+                expected_session_id=sess_id,
+                expected_pid=pid if pid and pid > 0 else None,
+                expected_executable_path=companion_elf_path if companion_elf_path else None,
+                snapshot=snapshot,
+            )
             if ok_rcpt:
-                rcpt_pid = getattr(capture_receipt, "pid", None)
-                if isinstance(capture_receipt, dict):
-                    rcpt_pid = capture_receipt.get("pid")
-                if pid is None or rcpt_pid is None or str(rcpt_pid) == str(pid):
-                    eff_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-                    verified_receipt = capture_receipt
-                else:
-                    eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                eff_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+                verified_receipt = capture_receipt
             else:
                 eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
         elif provenance_class == PROVENANCE_CLASS_IMPORTED_UNVERIFIED or (
@@ -1176,12 +1192,15 @@ class AdaptiveInvestigationEngine:
         ledger = self.ledger if self.ledger is not None else EvidenceLedger(
             session_id=sess_id,
             live_capture_receipt=verified_receipt,
+            verification_authority=verification_authority,
         )
         if self.ledger is not None:
             self.ledger.live_capture_receipt = verified_receipt
+            self.ledger.verification_authority = verification_authority
             self.ledger.session_id = sess_id
         self.adapter.default_provenance_class = eff_prov
         self.adapter.live_capture_receipt = verified_receipt
+        self.adapter.verification_authority = verification_authority
 
         sm = existing_state_machine or InvestigationStateMachine(initial_state=STATE_CREATED)
         executed_keys: Set[str] = set(existing_executed_keys or set())

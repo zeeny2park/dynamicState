@@ -46,6 +46,8 @@ from extractor.evidence_ledger import (
     TRUSTED_PROVENANCE_CLASSES,
     issue_live_capture_receipt,
     verify_live_capture_receipt,
+    setup_test_capture_authorities,
+    reset_capture_authorities,
 )
 from extractor.hypothesis import FollowUpObservation, InvestigationHypothesis
 from extractor.inspection_module import (
@@ -77,6 +79,14 @@ from extractor.verdict_engine import (
 
 
 class TestPhase20A1TrustBoundaryHardening(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.signer, cls.verifier = setup_test_capture_authorities()
+
+    @classmethod
+    def tearDownClass(cls):
+        reset_capture_authorities()
+
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="dynstate_phase20_a1_")
 

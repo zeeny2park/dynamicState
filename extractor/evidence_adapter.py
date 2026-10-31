@@ -187,9 +187,11 @@ class EvidenceAdapter:
                 active_rcpt = active_rcpt or prov_d.get("capture_receipt") or prov_d.get("live_receipt")
 
         exp_pid = target_identity.get("pid") if isinstance(target_identity, dict) else (payload.get("pid") if isinstance(payload, dict) else None)
+        active_auth = getattr(self, "verification_authority", None)
         rcpt_ok, _ = verify_live_capture_receipt(
             active_rcpt,
             secret=self.session_secret,
+            verification_authority=active_auth,
             expected_pid=exp_pid,
         )
         if rcpt_ok:
