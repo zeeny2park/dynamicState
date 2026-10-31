@@ -23,6 +23,12 @@ int sha256_file_fd(int fd, char hex_out[65]);
 void hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len, uint8_t out[32]);
 void hmac_sha256_hex(const void *key, size_t key_len, const void *data, size_t data_len, char hex_out[65]);
 
+/* Secure zeroing with compiler-barrier semantics */
+void secure_memzero(void *v, size_t n);
+
+/* Cryptographic self-test verifying FIPS 180-4 and RFC 4231 vectors */
+int collector_crypto_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif

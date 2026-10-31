@@ -5,17 +5,21 @@ LDFLAGS ?=
 SRCS = src/collector.c src/main.c src/sha256.c
 OBJS = $(SRCS:.c=.o)
 TARGET = dynamicstate-collector
+TEST_CRYPTO = test_crypto
 
-all: $(TARGET)
+all: $(TARGET) $(TEST_CRYPTO)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+$(TEST_CRYPTO): src/test_crypto.o src/sha256.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) src/test_crypto.o $(TARGET) $(TEST_CRYPTO)
 
 install: $(TARGET)
 	install -d $(DESTDIR)/usr/local/bin

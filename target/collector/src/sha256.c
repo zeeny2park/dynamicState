@@ -178,14 +178,14 @@ int sha256_file_fd(int fd, char hex_out[65]) {
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0) {
             if (errno == EINTR) continue;
-            memset(buf, 0, sizeof(buf));
+            secure_memzero(buf, sizeof(buf));
             return -1;
         }
         if (n == 0) break;
         sha256_update(&ctx, buf, (size_t)n);
         total_read += (size_t)n;
     }
-    memset(buf, 0, sizeof(buf));
+    secure_memzero(buf, sizeof(buf));
 
     if (expected_size >= 0 && (off_t)total_read != expected_size) {
         return -1;
@@ -197,7 +197,7 @@ int sha256_file_fd(int fd, char hex_out[65]) {
         sprintf(&hex_out[i * 2], "%02x", hash[i]);
     }
     hex_out[64] = '\0';
-    memset(hash, 0, sizeof(hash));
+    secure_memzero(hash, sizeof(hash));
     return 0;
 }
 
@@ -238,11 +238,11 @@ void hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_
     sha256_final(&ctx, out);
 
     /* Memory scrub sensitive keying material and intermediate states */
-    memset(k, 0, sizeof(k));
-    memset(k_ipad, 0, sizeof(k_ipad));
-    memset(k_opad, 0, sizeof(k_opad));
-    memset(inner_hash, 0, sizeof(inner_hash));
-    memset(&ctx, 0, sizeof(ctx));
+    secure_memzero(k, sizeof(k));
+    secure_memzero(k_ipad, sizeof(k_ipad));
+    secure_memzero(k_opad, sizeof(k_opad));
+    secure_memzero(inner_hash, sizeof(inner_hash));
+    secure_memzero(&ctx, sizeof(ctx));
 }
 
 void hmac_sha256_hex(const void *key, size_t key_len, const void *data, size_t data_len, char hex_out[65]) {
@@ -252,5 +252,132 @@ void hmac_sha256_hex(const void *key, size_t key_len, const void *data, size_t d
         sprintf(&hex_out[i * 2], "%02x", out[i]);
     }
     hex_out[64] = '\0';
-    memset(out, 0, sizeof(out));
+    secure_memzero(out, sizeof(out));
+}
+
+void secure_memzero(void *v, size_t n) {
+    if (!v || n == 0) return;
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
+    explicit_bzero(v, n);
+#else
+    volatile unsigned char *p = (volatile unsigned char *)v;
+    while (n--) *p++ = 0;
+#endif
+}
+
+int collector_crypto_selftest(void) {
+    int failed = 0;
+    char hex[65];
+
+    /* 1. FIPS 180-4 SHA-256 Vector 1: Empty string */
+    sha256_hex("", 0, hex);
+    if (strcmp(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: FIPS 180-4 SHA-256 empty string mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 2. FIPS 180-4 SHA-256 Vector 2: 'abc' */
+    sha256_hex("abc", 3, hex);
+    if (strcmp(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: FIPS 180-4 SHA-256 'abc' mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 3. FIPS 180-4 SHA-256 Vector 3: 56-byte message */
+    const char *msg56 = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    sha256_hex(msg56, strlen(msg56), hex);
+    if (strcmp(hex, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: FIPS 180-4 SHA-256 56-byte message mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 4. RFC 4231 HMAC-SHA256 Test Case 1 */
+    uint8_t k1[20];
+    memset(k1, 0x0b, sizeof(k1));
+    hmac_sha256_hex(k1, sizeof(k1), "Hi There", 8, hex);
+    if (strcmp(hex, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: RFC 4231 HMAC Case 1 mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 5. RFC 4231 HMAC-SHA256 Test Case 2 */
+    hmac_sha256_hex("Jefe", 4, "what do ya want for nothing?", 28, hex);
+    if (strcmp(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: RFC 4231 HMAC Case 2 mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 6. RFC 4231 HMAC-SHA256 Test Case 3 */
+    uint8_t k3[20], d3[50];
+    memset(k3, 0xaa, sizeof(k3));
+    memset(d3, 0xdd, sizeof(d3));
+    hmac_sha256_hex(k3, sizeof(k3), d3, sizeof(d3), hex);
+    if (strcmp(hex, "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: RFC 4231 HMAC Case 3 mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 7. RFC 4231 HMAC-SHA256 Test Case 4 */
+    uint8_t k4[25];
+    for (int i = 0; i < 25; ++i) k4[i] = (uint8_t)(i + 1);
+    uint8_t d4[50];
+    memset(d4, 0xcd, sizeof(d4));
+    hmac_sha256_hex(k4, sizeof(k4), d4, sizeof(d4), hex);
+    if (strcmp(hex, "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: RFC 4231 HMAC Case 4 mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 8. RFC 4231 HMAC-SHA256 Test Case 5 (full 32-byte hash) */
+    uint8_t k5[20];
+    memset(k5, 0x0c, sizeof(k5));
+    hmac_sha256_hex(k5, sizeof(k5), "Test With Truncation", 20, hex);
+    if (strcmp(hex, "a3b6167473100ee06e0c796c2955552bfa6f7c0a6a8aef8b93f860aab0cd20c5") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: RFC 4231 HMAC Case 5 mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 9. RFC 4231 HMAC-SHA256 Test Case 6 (key larger than 64-byte block size: 131 bytes) */
+    uint8_t k6[131];
+    memset(k6, 0xaa, sizeof(k6));
+    const char *d6 = "Test Using Larger Than Block-Size Key - Hash Key First";
+    hmac_sha256_hex(k6, sizeof(k6), d6, strlen(d6), hex);
+    if (strcmp(hex, "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: RFC 4231 HMAC Case 6 mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 10. RFC 4231 HMAC-SHA256 Test Case 7 (large key and large data) */
+    const char *d7 = "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.";
+    hmac_sha256_hex(k6, sizeof(k6), d7, strlen(d7), hex);
+    if (strcmp(hex, "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2") != 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: RFC 4231 HMAC Case 7 mismatch: got %s\n", hex);
+        failed++;
+    }
+
+    /* 11. Binary input with embedded zeroes */
+    const uint8_t binary_data[8] = {'A', 0x00, 'B', 0x00, 'C', 0x00, 'D', 0x00};
+    sha256_hex(binary_data, sizeof(binary_data), hex);
+    if (strlen(hex) != 64) {
+        fprintf(stderr, "Crypto SelfTest Failed: binary data SHA-256 failed\n");
+        failed++;
+    }
+
+    /* 12. Incorrect signature rejection */
+    char wrong_sig[65];
+    hmac_sha256_hex("wrong_secret_key_12345", 22, "Hi There", 8, wrong_sig);
+    if (strcmp(hex, wrong_sig) == 0) {
+        fprintf(stderr, "Crypto SelfTest Failed: different keys produced identical HMAC\n");
+        failed++;
+    }
+
+    secure_memzero(k1, sizeof(k1));
+    secure_memzero(k3, sizeof(k3));
+    secure_memzero(k4, sizeof(k4));
+    secure_memzero(k5, sizeof(k5));
+    secure_memzero(k6, sizeof(k6));
+    secure_memzero(hex, sizeof(hex));
+    secure_memzero(wrong_sig, sizeof(wrong_sig));
+
+    return (failed == 0) ? 0 : -1;
 }

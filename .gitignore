@@ -15,6 +15,7 @@ examples/pool_demo
 examples/sample_low_impact
 examples/sample_prod
 target/collector/dynamicstate-collector
+target/collector/test_crypto
 
 # Temporary build / debug artifacts
 .phase*

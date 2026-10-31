@@ -239,15 +239,34 @@ class RawMemorySnapshot:
     schema_version: str = "1.0"
 
     def compute_manifest_digest(self) -> str:
-        """Compute SHA-256 digest over the manifest regions."""
+        """Compute SHA-256 digest over the manifest regions.
+        
+        For committed disk snapshots (output_dir is set), securely reads the exact
+        committed disk manifest via pinned directory FD without falling back to
+        reconstructed in-memory data.
+        """
         if self.output_dir:
-            mpath = os.path.join(self.output_dir, "manifest.json")
-            if os.path.isfile(mpath) and not os.path.islink(mpath):
+            dir_open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_DIRECTORY"):
+                dir_open_flags |= os.O_DIRECTORY
+            dir_fd = os.open(self.output_dir, dir_open_flags)
+            try:
+                manifest_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                if hasattr(os, "O_NOFOLLOW"):
+                    manifest_flags |= os.O_NOFOLLOW
+                mfd = os.open("manifest.json", manifest_flags, dir_fd=dir_fd)
                 try:
-                    with open(mpath, "rb") as mf:
-                        return hashlib.sha256(mf.read()).hexdigest()
-                except Exception:
-                    pass
+                    mst = os.fstat(mfd)
+                    if not stat.S_ISREG(mst.st_mode):
+                        raise OSError(errno.EINVAL, f"manifest.json is not a regular file (mode {oct(mst.st_mode)})")
+                    raw = os.read(mfd, mst.st_size + 1)
+                    if len(raw) != mst.st_size:
+                        raise OSError(errno.EIO, "manifest.json size read mismatch")
+                    return hashlib.sha256(raw).hexdigest()
+                finally:
+                    os.close(mfd)
+            finally:
+                os.close(dir_fd)
         canonical_regions = [r.to_dict() for r in self.regions]
         canonical_json = json.dumps(canonical_regions, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()

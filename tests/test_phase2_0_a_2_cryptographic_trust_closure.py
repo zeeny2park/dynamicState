@@ -46,6 +46,7 @@ from extractor.evidence_ledger import (
     TRUST_STATE_IMPORTED_UNVERIFIED,
     TRUST_STATE_INVALID_OR_TAMPERED,
     TRUST_STATE_VERIFICATION_UNAVAILABLE,
+    compute_live_receipt_signature,
     create_receipt_from_snapshot,
     determine_snapshot_trust_state,
     get_default_signing_authority,
@@ -74,6 +75,7 @@ class TestPhase20A2CryptographicTrustClosure(unittest.TestCase):
         cls.repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         cls.collector_dir = os.path.join(cls.repo_root, "target", "collector")
         cls.collector_bin = os.path.join(cls.collector_dir, "dynamicstate-collector")
+        cls.test_crypto_bin = os.path.join(cls.collector_dir, "test_crypto")
 
         # Compile collector binary if needed
         res = subprocess.run(["make", "-C", cls.collector_dir], capture_output=True, text=True)
@@ -594,13 +596,18 @@ int main() {
         try:
             session_id = f"real_sess_{real_pid}_{uuid.uuid4().hex[:6]}"
             # 3. Capture real process memory via native C99 collector binary with attestation
+            kf_path = os.path.join(self.tmp_dir, "test17_collector.key")
+            with open(kf_path, "w") as kf:
+                kf.write(self.test_secret + "\n")
+            os.chmod(kf_path, 0o600)
+
             col_res = subprocess.run(
                 [
                     self.collector_bin,
                     "-p", str(real_pid),
                     "-o", out_snap_dir,
                     "--policy", "all",
-                    "--signing-key", self.test_secret,
+                    "-F", kf_path,
                     "--key-id", self.test_key_id,
                     "--session-id", session_id,
                 ],
@@ -1252,6 +1259,479 @@ int main() {
         )
         self.assertFalse(ok)
         self.assertTrue("MISSING_MANIFEST" in err or "SNAPSHOT_INTEGRITY_FAILED" in err)
+
+    # -------------------------------------------------------------------------
+    # Test 32: Direct Execution of Native C Cryptographic Self-Test
+    # -------------------------------------------------------------------------
+    def test_32_native_c_crypto_selftest_kat_vectors(self):
+        """32: dynamicstate-collector --test-crypto and test_crypto --selftest pass FIPS 180-4 and RFC 4231 vectors."""
+        # 1. Collector binary --test-crypto
+        res_col = subprocess.run(
+            [self.collector_bin, "--test-crypto"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_col.returncode, 0, f"Collector crypto test failed: {res_col.stderr}")
+        self.assertIn("PASS: All FIPS 180-4 and RFC 4231 vectors validated in C.", res_col.stdout)
+
+        # 2. Standalone test_crypto --selftest
+        res_tc = subprocess.run(
+            [self.test_crypto_bin, "--selftest"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_tc.returncode, 0, f"test_crypto failed: {res_tc.stderr}")
+        self.assertIn("PASS: All FIPS 180-4 and RFC 4231 vectors validated in C.", res_tc.stdout)
+
+    # -------------------------------------------------------------------------
+    # Test 33: Direct C and Python Cryptographic Cross-Validation
+    # -------------------------------------------------------------------------
+    def test_33_c_python_cryptographic_cross_validation(self):
+        """33: Cross-validate pure C SHA-256 and HMAC-SHA256 against Python hashlib/hmac for edge cases."""
+        # 1. Empty input SHA-256
+        c_res = subprocess.run(
+            [self.test_crypto_bin, "--sha256-hex", ""],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(c_res.returncode, 0)
+        self.assertEqual(c_res.stdout.strip(), hashlib.sha256(b"").hexdigest())
+
+        # 2. Long key (131 bytes > 64B block size) HMAC-SHA256
+        long_key = bytes([0xaa] * 131)
+        data = b"Phase 2.0-A.2.2.1 Trust Verification Closure Long Key Validation"
+        c_res = subprocess.run(
+            [self.test_crypto_bin, "--hmac-hex", long_key.hex(), data.hex()],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(c_res.returncode, 0)
+        py_expected = hmac.new(long_key, data, hashlib.sha256).hexdigest()
+        self.assertEqual(c_res.stdout.strip(), py_expected)
+
+        # 3. Long message (10,000 bytes) HMAC-SHA256
+        key = b"0123456789abcdef0123456789abcdef"
+        long_msg = b"DYNAMICSTATE_LONG_MESSAGE_BYTE_" * 320
+        c_res = subprocess.run(
+            [self.test_crypto_bin, "--hmac-hex", key.hex(), long_msg.hex()],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(c_res.returncode, 0)
+        py_long_expected = hmac.new(key, long_msg, hashlib.sha256).hexdigest()
+        self.assertEqual(c_res.stdout.strip(), py_long_expected)
+
+        # 4. Binary input with embedded zero bytes
+        bin_key = b"key\x00with\x00zero\x00bytes\x00123"
+        bin_data = b"\x00\x01\x00\x02\x03\x00\x04\x05\x00"
+        c_res = subprocess.run(
+            [self.test_crypto_bin, "--hmac-hex", bin_key.hex(), bin_data.hex()],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(c_res.returncode, 0)
+        py_bin_expected = hmac.new(bin_key, bin_data, hashlib.sha256).hexdigest()
+        self.assertEqual(c_res.stdout.strip(), py_bin_expected)
+
+        # 5. Altering 1 bit in data or key changes the HMAC output
+        tampered_key = bytearray(bin_key)
+        tampered_key[0] ^= 0x01
+        c_tampered = subprocess.run(
+            [self.test_crypto_bin, "--hmac-hex", bytes(tampered_key).hex(), bin_data.hex()],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(c_tampered.returncode, 0)
+        self.assertNotEqual(c_res.stdout.strip(), c_tampered.stdout.strip())
+
+    # -------------------------------------------------------------------------
+    # Test 34: CaptureReceipt Early-Return Bypass Closure
+    # -------------------------------------------------------------------------
+    def test_34_capture_receipt_bypass_prevention(self):
+        """34: Alternate receipt types like CaptureReceipt cannot establish LIVE_VERIFIED and cannot bypass checks."""
+        from extractor.capture_backend import CaptureReceipt
+
+        secret = "test_secret_for_legacy_capture_receipt_32b"
+        # Create a CaptureReceipt with valid HMAC signature under its own scheme
+        cap_rcpt = CaptureReceipt(
+            receipt_id="cap_rcpt_12345",
+            backend_name="process_vm_readv",
+            pid=3401,
+            process_start_time="34000",
+            executable_path="/bin/target",
+            executable_build_id="build_id_12345",
+            capture_time="2026-10-31T20:00:00Z",
+            capture_duration_us=125.0,
+            completeness="COMPLETE",
+            consistency_level="ATOMIC",
+            artifact_manifest={"heap": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+            key_id="default",
+        )
+        from extractor.capture_backend import compute_capture_receipt_signature
+        valid_sig = compute_capture_receipt_signature(
+            backend_name=cap_rcpt.backend_name,
+            pid=cap_rcpt.pid,
+            process_start_time=cap_rcpt.process_start_time,
+            executable_path=cap_rcpt.executable_path,
+            executable_build_id=cap_rcpt.executable_build_id,
+            capture_time=cap_rcpt.capture_time,
+            completeness=cap_rcpt.completeness,
+            consistency_level=cap_rcpt.consistency_level,
+            artifact_manifest=cap_rcpt.artifact_manifest,
+            secret=secret,
+            receipt_id=cap_rcpt.receipt_id,
+            capture_duration_us=cap_rcpt.capture_duration_us,
+            key_id=cap_rcpt.key_id,
+            schema_version="2.0.0",
+        )
+        from dataclasses import replace
+        signed_cap_rcpt = replace(cap_rcpt, signature=valid_sig)
+
+        # 1. Attempting to verify CaptureReceipt in verify_live_capture_receipt fails closed
+        ok, err = verify_live_capture_receipt(
+            signed_cap_rcpt,
+            secret=secret,
+            expected_session_id="sess_3401",
+            expected_pid=3401,
+        )
+        self.assertFalse(ok)
+        self.assertIn("UNSUPPORTED_RECEIPT_TYPE", err)
+
+        # 2. determine_snapshot_trust_state must yield IMPORTED_UNVERIFIED
+        st, reason = determine_snapshot_trust_state(
+            signed_cap_rcpt,
+            secret=secret,
+            expected_session_id="sess_3401",
+            expected_pid=3401,
+        )
+        self.assertEqual(st, TRUST_STATE_IMPORTED_UNVERIFIED)
+        self.assertIn("UNSUPPORTED_RECEIPT_TYPE", reason)
+
+        # 3. LiveCaptureReceipt with valid signature cannot bypass mismatched session
+        valid_lrcpt = issue_live_capture_receipt(
+            session_id="session_A",
+            pid=3401,
+            executable_path="/bin/target",
+            signer=self.signer,
+        )
+        ok_sess, err_sess = verify_live_capture_receipt(
+            valid_lrcpt,
+            verification_authority=self.verifier,
+            expected_session_id="session_B",
+        )
+        self.assertFalse(ok_sess)
+        self.assertIn("SESSION_MISMATCH", err_sess)
+
+    # -------------------------------------------------------------------------
+    # Test 35: Canonical Receipt Payload Delimiter Hardening
+    # -------------------------------------------------------------------------
+    def test_35_canonical_payload_delimiter_hardening(self):
+        """35: Fields containing delimiter '|' or control characters are rejected by Python and Native C."""
+        # 1. Python compute_live_receipt_signature rejects pipe in fields
+        with self.assertRaises(ValueError):
+            compute_live_receipt_signature(
+                secret_or_signer=self.signer,
+                receipt_id="rcpt_001",
+                session_id="sess_001",
+                pid=3501,
+                executable_path="/bin/target|injection",
+                build_id="b1",
+                capture_source="live_collector",
+                integrity_validated=True,
+                issued_at="2026-10-31T20:00:00Z",
+            )
+
+        with self.assertRaises(ValueError):
+            compute_live_receipt_signature(
+                secret_or_signer=self.signer,
+                receipt_id="rcpt\n001",
+                session_id="sess_001",
+                pid=3501,
+                executable_path="/bin/target",
+                build_id="b1",
+                capture_source="live_collector",
+                integrity_validated=True,
+                issued_at="2026-10-31T20:00:00Z",
+            )
+
+        # 2. verify_live_capture_receipt rejects pipe in fields
+        raw_dict = {
+            "version": "v2",
+            "receipt_id": "rcpt_001",
+            "session_id": "sess|attack",
+            "pid": 3501,
+            "executable_path": "/bin/target",
+            "build_id": "b1",
+            "capture_source": "live_collector",
+            "manifest_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "integrity_validated": True,
+            "issued_at": "2026-10-31T20:00:00Z",
+            "process_start_time": "12345",
+            "signature": "abcdef0123456789" * 4,
+            "key_id": "default",
+        }
+        ok, err = verify_live_capture_receipt(raw_dict, verification_authority=self.verifier)
+        self.assertFalse(ok)
+        self.assertIn("MALFORMED_RECEIPT", err)
+
+    # -------------------------------------------------------------------------
+    # Test 36: Key File and FD Loading Security Hardening
+    # -------------------------------------------------------------------------
+    def test_36_key_file_and_fd_security_hardening(self):
+        """36: Python and Native C reject oversized keys, embedded NULs, delimiters, and invalid FDs."""
+        # 1. Python load_secure_key_file rejects oversized file (> 4096 bytes)
+        big_file = os.path.join(self.tmp_dir, "oversized.key")
+        with open(big_file, "w") as f:
+            f.write("A" * 5000)
+        os.chmod(big_file, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(big_file)
+        self.assertIn("oversized", str(ctx.exception))
+
+        # 2. Python load_secure_key_file rejects embedded NUL bytes
+        nul_file = os.path.join(self.tmp_dir, "embedded_nul.key")
+        with open(nul_file, "wb") as f:
+            f.write(b"0123456789abcdef\x00extra_nul_data")
+        os.chmod(nul_file, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(nul_file)
+        self.assertIn("embedded NUL", str(ctx.exception))
+
+        # 3. Python load_secure_key_file rejects delimiter '|'
+        pipe_file = os.path.join(self.tmp_dir, "pipe_delim.key")
+        with open(pipe_file, "w") as f:
+            f.write("0123456789abcdef|attacker_key\n")
+        os.chmod(pipe_file, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(pipe_file)
+        self.assertIn("forbidden delimiter", str(ctx.exception))
+
+        # 4. Python load_secure_key_fd rejects negative or invalid descriptor
+        with self.assertRaises(ValueError):
+            load_secure_key_fd(-1)
+
+        # 5. Native C collector rejects --signing-key / -K
+        res_k = subprocess.run(
+            [self.collector_bin, "-K", "some_secret_key_12345", "1"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(res_k.returncode, 0)
+
+        # 6. Native C collector rejects invalid --key-fd arguments (strtol validation)
+        for invalid_fd in ["12abc", "-1", "abc", "99999999999"]:
+            res_bad_fd = subprocess.run(
+                [self.collector_bin, "-D", invalid_fd, "-j", "1"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res_bad_fd.returncode, 0)
+            self.assertTrue("INVALID_KEY_FD" in res_bad_fd.stdout or "INVALID_KEY_FD" in res_bad_fd.stderr or res_bad_fd.returncode != 0)
+
+    # -------------------------------------------------------------------------
+    # Test 37: Production Key Authority Explicit Initialization & Exception Visibility
+    # -------------------------------------------------------------------------
+    def test_37_production_key_authority_explicit_init(self):
+        """37: Default authority fails closed without keys; from_environment does not silently swallow errors."""
+        # 1. Reset authorities to unconfigured state
+        reset_capture_authorities()
+        def_auth = get_default_verification_authority()
+        self.assertFalse(def_auth.has_keys())
+
+        # Unconfigured verification fails closed
+        dummy_rcpt = issue_live_capture_receipt(
+            session_id="sess_fail_closed",
+            pid=3701,
+            executable_path="/bin/app",
+            signer=self.signer,
+        )
+        ok, err = verify_live_capture_receipt(dummy_rcpt)
+        self.assertFalse(ok)
+        self.assertIn("VERIFICATION_KEY_UNAVAILABLE", err)
+
+        # 2. from_environment does not swallow exceptions on invalid key file
+        old_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
+        try:
+            os.environ["DYNAMICSTATE_CAPTURE_KEY_FILE"] = "/nonexistent/path/for/key.key"
+            with self.assertRaises(FileNotFoundError):
+                CaptureVerificationAuthority.from_environment()
+        finally:
+            if old_file:
+                os.environ["DYNAMICSTATE_CAPTURE_KEY_FILE"] = old_file
+            else:
+                os.environ.pop("DYNAMICSTATE_CAPTURE_KEY_FILE", None)
+
+        # 3. from_environment does not swallow exceptions on malformed keyring JSON
+        old_ring = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
+        try:
+            os.environ["DYNAMICSTATE_CAPTURE_KEYRING"] = "{malformed_json_not_valid"
+            with self.assertRaises(ValueError):
+                CaptureVerificationAuthority.from_environment()
+        finally:
+            if old_ring:
+                os.environ["DYNAMICSTATE_CAPTURE_KEYRING"] = old_ring
+            else:
+                os.environ.pop("DYNAMICSTATE_CAPTURE_KEYRING", None)
+
+        # Restore test authorities
+        set_default_signing_authority(self.signer)
+        set_default_verification_authority(self.verifier)
+
+    # -------------------------------------------------------------------------
+    # Test 38: Unified Snapshot Disk Verification via Pinned DirFD
+    # -------------------------------------------------------------------------
+    def test_38_unified_snapshot_disk_verification_dirfd(self):
+        """38: Disk manifest verification uses pinned dirfd with O_NOFOLLOW; symlinked manifest rejected."""
+        snap_dir = os.path.join(self.tmp_dir, "snap_dirfd_test")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        snap = RawMemorySnapshot(
+            snapshot_id="SNAP_DIRFD",
+            pid=3801,
+            binary="/bin/target",
+            timestamp_ns=38000,
+            output_dir=snap_dir,
+            process_starttime=3800,
+        )
+        snap.save()
+
+        orig_digest = snap.compute_manifest_digest()
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_38",
+            pid=3801,
+            executable_path="/bin/target",
+            process_start_time="3800",
+            manifest_digest=orig_digest,
+            signer=self.signer,
+        )
+
+        # Valid verification succeeds
+        ok, err = verify_live_capture_receipt(rcpt, verification_authority=self.verifier, snapshot=snap)
+        self.assertTrue(ok, f"Verification failed: {err}")
+
+        # Replace manifest.json with symlink -> O_NOFOLLOW must reject it
+        mpath = os.path.join(snap_dir, "manifest.json")
+        target_f = os.path.join(self.tmp_dir, "external_manifest.json")
+        with open(target_f, "w") as f:
+            f.write("[]")
+        os.unlink(mpath)
+        os.symlink(target_f, mpath)
+
+        ok_sym, err_sym = verify_live_capture_receipt(rcpt, verification_authority=self.verifier, snapshot=snap)
+        self.assertFalse(ok_sym)
+        self.assertTrue("MISSING_MANIFEST" in err_sym or "SNAPSHOT_INTEGRITY_FAILED" in err_sym)
+
+    # -------------------------------------------------------------------------
+    # Test 39: Trust State Model Completeness Across All Four States
+    # -------------------------------------------------------------------------
+    def test_39_trust_state_model_full_matrix(self):
+        """39: Exhaustively assert LIVE_VERIFIED, IMPORTED_UNVERIFIED, INVALID_OR_TAMPERED, and VERIFICATION_UNAVAILABLE."""
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_39",
+            pid=3901,
+            executable_path="/bin/test",
+            signer=self.signer,
+        )
+
+        # 1. LIVE_VERIFIED
+        st, err = determine_snapshot_trust_state(rcpt, verification_authority=self.verifier)
+        self.assertEqual(st, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIsNone(err)
+
+        # 2. IMPORTED_UNVERIFIED (missing receipt or unsupported receipt type)
+        st_no, err_no = determine_snapshot_trust_state(None)
+        self.assertEqual(st_no, TRUST_STATE_IMPORTED_UNVERIFIED)
+        self.assertIn("NO_RECEIPT", err_no)
+
+        # 3. VERIFICATION_UNAVAILABLE (no keys in authority)
+        empty_auth = CaptureVerificationAuthority()
+        st_unavail, err_unavail = determine_snapshot_trust_state(rcpt, verification_authority=empty_auth)
+        self.assertEqual(st_unavail, TRUST_STATE_VERIFICATION_UNAVAILABLE)
+        self.assertIn("VERIFICATION_KEY_UNAVAILABLE", err_unavail)
+
+        # 4. INVALID_OR_TAMPERED (tampered signature)
+        from dataclasses import replace
+        tampered_sig_rcpt = replace(rcpt, signature="0123456789abcdef" * 4)
+        st_tamp, err_tamp = determine_snapshot_trust_state(tampered_sig_rcpt, verification_authority=self.verifier)
+        self.assertEqual(st_tamp, TRUST_STATE_INVALID_OR_TAMPERED)
+        self.assertIn("SIGNATURE_INVALID", err_tamp)
+
+        # 5. INVALID_OR_TAMPERED (revoked key)
+        revoked_auth = CaptureVerificationAuthority(keys={self.signer.key_id: "test_secret_32bytes_deterministic_12345"})
+        revoked_auth.revoke_key(self.signer.key_id)
+        st_rev, err_rev = determine_snapshot_trust_state(rcpt, verification_authority=revoked_auth)
+        self.assertEqual(st_rev, TRUST_STATE_INVALID_OR_TAMPERED)
+        self.assertIn("KEY_REVOKED", err_rev)
+
+    # -------------------------------------------------------------------------
+    # Test 40: Real End-to-End Native Collector with Hardened Keys and Tamper Detection
+    # -------------------------------------------------------------------------
+    def test_40_real_e2e_native_collector_and_host_verifier(self):
+        """40: Native C collector with key-file, pipe FD, tamper detection, and fail-closed security gates."""
+        target_src = os.path.join(self.tmp_dir, "e2e_target.c")
+        target_bin = os.path.join(self.tmp_dir, "e2e_target")
+        with open(target_src, "w") as f:
+            f.write("#include <unistd.h>\nint main() { while(1) { usleep(10000); } return 0; }\n")
+        subprocess.run(["gcc", "-O0", target_src, "-o", target_bin], check=True)
+        target_proc = subprocess.Popen([target_bin])
+
+        try:
+            time.sleep(0.1)
+            pid = target_proc.pid
+
+            # A. Key file capture
+            kf = os.path.join(self.tmp_dir, "e2e_valid.key")
+            secret = "production_secret_32bytes_long_key_123"
+            with open(kf, "w") as f:
+                f.write(secret + "\n")
+            os.chmod(kf, 0o600)
+
+            snap_dir = os.path.join(self.tmp_dir, "e2e_snap")
+            res = subprocess.run([
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_dir,
+                "-F", kf,
+                "-I", "e2e_key_01",
+                "-S", "e2e_session_01",
+                "-j",
+            ], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"Collector failed: {res.stderr}")
+
+            # Verify receipt on disk
+            with open(os.path.join(snap_dir, "receipt.json"), "r") as rf:
+                rcpt_data = json.load(rf)
+            self.assertEqual(rcpt_data["version"], "v2")
+            self.assertEqual(rcpt_data["session_id"], "e2e_session_01")
+
+            verifier = CaptureVerificationAuthority(keys={"e2e_key_01": secret})
+            snap = RawMemorySnapshot.load(snap_dir)
+            ok, err = verify_live_capture_receipt(
+                rcpt_data,
+                verification_authority=verifier,
+                expected_session_id="e2e_session_01",
+                expected_pid=pid,
+                snapshot=snap,
+            )
+            self.assertTrue(ok, f"E2E verification failed: {err}")
+
+            # B. Disk manifest tampering detected
+            mpath = os.path.join(snap_dir, "manifest.json")
+            with open(mpath, "a") as f:
+                f.write(" ")  # Change file content by 1 byte
+            snap_tampered = RawMemorySnapshot.load(snap_dir)
+            ok_tamp, err_tamp = verify_live_capture_receipt(
+                rcpt_data,
+                verification_authority=verifier,
+                expected_session_id="e2e_session_01",
+                expected_pid=pid,
+                snapshot=snap_tampered,
+            )
+            self.assertFalse(ok_tamp)
+            self.assertTrue("MANIFEST_DIGEST_MISMATCH" in err_tamp or "SNAPSHOT_INTEGRITY_FAILED" in err_tamp)
+
+        finally:
+            target_proc.terminate()
+            target_proc.wait()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 #include "../include/collector.h"
+#include "../include/sha256.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,58 +50,157 @@ static int load_key_from_file(const char *path, char *out_key, size_t max_len) {
         return -1;
     }
 
-    char buf[512];
-    memset(buf, 0, sizeof(buf));
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-
-    if (n <= 0) {
-        fprintf(stderr, "Error: Failed to read key file '%s'.\n", path);
+    /* Reject oversized files early */
+    if (st.st_size > 512) {
+        fprintf(stderr, "Error: Key file '%s' is oversized (%lld bytes; maximum is 512 bytes).\n",
+                path, (long long)st.st_size);
+        close(fd);
         return -1;
+    }
+
+    char buf[512];
+    secure_memzero(buf, sizeof(buf));
+    size_t total_read = 0;
+
+    while (total_read < sizeof(buf) - 1) {
+        ssize_t n = read(fd, buf + total_read, sizeof(buf) - 1 - total_read);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "Error: Failed to read key file '%s': %s\n", path, strerror(errno));
+            close(fd);
+            secure_memzero(buf, sizeof(buf));
+            return -1;
+        }
+        if (n == 0) break;
+        total_read += (size_t)n;
+    }
+
+    char extra[1];
+    ssize_t extra_n = read(fd, extra, sizeof(extra));
+    close(fd);
+    if (extra_n > 0) {
+        fprintf(stderr, "Error: Key file '%s' is oversized (exceeds buffer limit).\n", path);
+        secure_memzero(buf, sizeof(buf));
+        return -1;
+    }
+
+    /* Reject embedded NUL bytes */
+    for (size_t i = 0; i < total_read; ++i) {
+        if (buf[i] == '\0') {
+            fprintf(stderr, "Error: Key in '%s' contains forbidden embedded NUL byte.\n", path);
+            secure_memzero(buf, sizeof(buf));
+            return -1;
+        }
     }
 
     /* Trim trailing newline and carriage return */
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
-        buf[n - 1] = '\0';
-        n--;
+    size_t len = total_read;
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+        buf[len - 1] = '\0';
+        len--;
     }
 
-    if (n < 16) {
-        fprintf(stderr, "Error: Key in '%s' is too short (%zd bytes; minimum is 16 bytes).\n", path, n);
-        memset(buf, 0, sizeof(buf));
+    if (len < 16) {
+        fprintf(stderr, "Error: Key in '%s' is too short (%zu bytes; minimum is 16 bytes).\n", path, len);
+        secure_memzero(buf, sizeof(buf));
         return -1;
     }
 
-    snprintf(out_key, max_len, "%s", buf);
-    memset(buf, 0, sizeof(buf));
+    if (len >= max_len) {
+        fprintf(stderr, "Error: Key in '%s' is oversized (%zu bytes; maximum is %zu bytes).\n", path, len, max_len - 1);
+        secure_memzero(buf, sizeof(buf));
+        return -1;
+    }
+
+    if (strchr(buf, '|') != NULL) {
+        fprintf(stderr, "Error: Key in '%s' contains forbidden delimiter '|'.\n", path);
+        secure_memzero(buf, sizeof(buf));
+        return -1;
+    }
+
+    memcpy(out_key, buf, len);
+    out_key[len] = '\0';
+    secure_memzero(buf, sizeof(buf));
     return 0;
 }
 
 static int load_key_from_fd(int fd, char *out_key, size_t max_len) {
     if (fd < 0 || !out_key || max_len == 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "Error: Failed to stat key FD %d: %s\n", fd, strerror(errno));
+        return -1;
+    }
+
+    if (!S_ISREG(st.st_mode) && !S_ISFIFO(st.st_mode) && !S_ISSOCK(st.st_mode)) {
+        fprintf(stderr, "Error: Key FD %d is not a regular file, pipe, or socket.\n", fd);
+        close(fd);
+        return -1;
+    }
+
     char buf[512];
-    memset(buf, 0, sizeof(buf));
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    secure_memzero(buf, sizeof(buf));
+    size_t total_read = 0;
+
+    while (total_read < sizeof(buf) - 1) {
+        ssize_t n = read(fd, buf + total_read, sizeof(buf) - 1 - total_read);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "Error: Failed to read key from FD %d: %s\n", fd, strerror(errno));
+            close(fd);
+            secure_memzero(buf, sizeof(buf));
+            return -1;
+        }
+        if (n == 0) break;
+        total_read += (size_t)n;
+    }
+
+    char extra[1];
+    ssize_t extra_n = read(fd, extra, sizeof(extra));
     close(fd);
-
-    if (n <= 0) {
-        fprintf(stderr, "Error: Failed to read key from FD %d.\n", fd);
+    if (extra_n > 0) {
+        fprintf(stderr, "Error: Key from FD %d is oversized (exceeds buffer limit).\n", fd);
+        secure_memzero(buf, sizeof(buf));
         return -1;
     }
 
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
-        buf[n - 1] = '\0';
-        n--;
+    /* Reject embedded NUL bytes */
+    for (size_t i = 0; i < total_read; ++i) {
+        if (buf[i] == '\0') {
+            fprintf(stderr, "Error: Key from FD %d contains forbidden embedded NUL byte.\n", fd);
+            secure_memzero(buf, sizeof(buf));
+            return -1;
+        }
     }
 
-    if (n < 16) {
-        fprintf(stderr, "Error: Key from FD %d is too short (%zd bytes; minimum is 16 bytes).\n", fd, n);
-        memset(buf, 0, sizeof(buf));
+    size_t len = total_read;
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+        buf[len - 1] = '\0';
+        len--;
+    }
+
+    if (len < 16) {
+        fprintf(stderr, "Error: Key from FD %d is too short (%zu bytes; minimum is 16 bytes).\n", fd, len);
+        secure_memzero(buf, sizeof(buf));
         return -1;
     }
 
-    snprintf(out_key, max_len, "%s", buf);
-    memset(buf, 0, sizeof(buf));
+    if (len >= max_len) {
+        fprintf(stderr, "Error: Key from FD %d is oversized (%zu bytes; maximum is %zu bytes).\n", fd, len, max_len - 1);
+        secure_memzero(buf, sizeof(buf));
+        return -1;
+    }
+
+    if (strchr(buf, '|') != NULL) {
+        fprintf(stderr, "Error: Key from FD %d contains forbidden delimiter '|'.\n", fd);
+        secure_memzero(buf, sizeof(buf));
+        return -1;
+    }
+
+    memcpy(out_key, buf, len);
+    out_key[len] = '\0';
+    secure_memzero(buf, sizeof(buf));
     return 0;
 }
 
@@ -119,11 +219,11 @@ static void print_usage(const char *prog) {
         "  -t, --timeout-ms <MS>   Maximum capture wall-clock timeout in ms (default: unlimited)\n"
         "  -j, --json              Output machine-readable JSON metadata to stdout\n"
         "  -v, --verbose           Enable verbose progress logging\n"
-        "  -K, --signing-key <KEY> Signing secret for LiveCaptureReceipt\n"
         "  -F, --key-file <PATH>   Path to secure file containing signing key (0600/0400 mode)\n"
         "  -D, --key-fd <FD>       Inherited file descriptor containing signing key\n"
         "  -I, --key-id <ID>       Key ID for attestation (default: default)\n"
         "  -S, --session-id <ID>   Investigation session ID\n"
+        "      --test-crypto       Run cryptographic self-test against FIPS/RFC vectors\n"
         "  -h, --help              Show this help message\n\n"
         "Example:\n"
         "  %s -o /tmp/snapshot_1234 1234\n",
@@ -146,11 +246,11 @@ int main(int argc, char *argv[]) {
         {"timeout-ms", required_argument, 0, 't'},
         {"json", no_argument, 0, 'j'},
         {"verbose", no_argument, 0, 'v'},
-        {"signing-key", required_argument, 0, 'K'},
         {"key-file", required_argument, 0, 'F'},
         {"key-fd", required_argument, 0, 'D'},
         {"key-id", required_argument, 0, 'I'},
         {"session-id", required_argument, 0, 'S'},
+        {"test-crypto", no_argument, 0, 1001},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -164,7 +264,7 @@ int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:o:m:r:P:B:s:dt:jvK:F:D:I:S:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:o:m:r:P:B:s:dt:jvF:D:I:S:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 pid_str = optarg;
@@ -178,23 +278,40 @@ int main(int argc, char *argv[]) {
             case 'r':
                 max_region_str = optarg;
                 break;
-            case 'K':
-                strncpy(cfg.signing_key, optarg, sizeof(cfg.signing_key) - 1);
-                /* Immediately scrub optarg memory in argv so /proc/<pid>/cmdline does not leak key */
-                memset(optarg, 0, strlen(optarg));
-                break;
             case 'F':
                 strncpy(cfg.key_file, optarg, sizeof(cfg.key_file) - 1);
                 break;
-            case 'D':
-                cfg.key_fd = atoi(optarg);
+            case 'D': {
+                char *endptr = NULL;
+                errno = 0;
+                long val = strtol(optarg, &endptr, 10);
+                if (errno != 0 || endptr == optarg || *endptr != '\0' || val < 0 || val > 1048576L) {
+                    fprintf(stderr, "Error: Invalid --key-fd '%s' (must be integer between 0 and 1048576).\n", optarg);
+                    if (cfg.json_output) {
+                        fprintf(stdout, "{\"success\":false,\"error\":\"INVALID_KEY_FD\",\"pid\":0,\"status\":\"FAILED\"}\n");
+                        fflush(stdout);
+                    }
+                    return 1;
+                }
+                cfg.key_fd = (int)val;
                 break;
+            }
             case 'I':
                 strncpy(cfg.signing_key_id, optarg, sizeof(cfg.signing_key_id) - 1);
                 break;
             case 'S':
                 strncpy(cfg.session_id, optarg, sizeof(cfg.session_id) - 1);
                 break;
+            case 1001: {
+                int selftest_res = collector_crypto_selftest();
+                if (selftest_res == 0) {
+                    printf("PASS: All FIPS 180-4 and RFC 4231 vectors validated in C.\n");
+                    return 0;
+                } else {
+                    fprintf(stderr, "FAIL: Cryptographic self-test failed in C.\n");
+                    return 1;
+                }
+            }
             case 'P':
                 if (strcmp(optarg, "heap_stack") == 0) {
                     cfg.policy = POLICY_HEAP_STACK;
@@ -245,25 +362,18 @@ int main(int argc, char *argv[]) {
     if (cfg.key_file[0] != '\0') {
         if (load_key_from_file(cfg.key_file, cfg.signing_key, sizeof(cfg.signing_key)) != 0) {
             fprintf(stderr, "Error: Failed to load signing key from file '%s'.\n", cfg.key_file);
-            memset(cfg.signing_key, 0, sizeof(cfg.signing_key));
+            secure_memzero(cfg.signing_key, sizeof(cfg.signing_key));
             return 1;
         }
     } else if (cfg.key_fd >= 0) {
         if (load_key_from_fd(cfg.key_fd, cfg.signing_key, sizeof(cfg.signing_key)) != 0) {
             fprintf(stderr, "Error: Failed to load signing key from FD %d.\n", cfg.key_fd);
-            memset(cfg.signing_key, 0, sizeof(cfg.signing_key));
+            secure_memzero(cfg.signing_key, sizeof(cfg.signing_key));
             return 1;
         }
     }
 
-    /* Fallback to environment variables for cryptographic attestation */
-    if (cfg.signing_key[0] == '\0') {
-        const char *env_k = getenv("DYNAMICSTATE_COLLECTOR_KEY");
-        if (!env_k) env_k = getenv("DYNAMICSTATE_CAPTURE_SECRET");
-        if (env_k && env_k[0] != '\0') {
-            strncpy(cfg.signing_key, env_k, sizeof(cfg.signing_key) - 1);
-        }
-    }
+    /* Key ID and Session ID non-secret metadata fallbacks */
     if (cfg.signing_key_id[0] == '\0') {
         const char *env_kid = getenv("DYNAMICSTATE_COLLECTOR_KEY_ID");
         if (!env_kid) env_kid = getenv("DYNAMICSTATE_CAPTURE_KEY_ID");
@@ -373,7 +483,7 @@ int main(int argc, char *argv[]) {
     collector_stats_t stats;
     int res = collector_run(&cfg, &stats);
     /* Memory scrub sensitive signing key immediately after capture */
-    memset(cfg.signing_key, 0, sizeof(cfg.signing_key));
+    secure_memzero(cfg.signing_key, sizeof(cfg.signing_key));
     if (res != 0) {
         fprintf(stderr, "[dynamicState-collector] Error: Failed to capture memory for PID %d (status: %s).\n",
                 (int)cfg.pid, stats.status[0] ? stats.status : "FAILED");

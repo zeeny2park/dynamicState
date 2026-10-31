@@ -548,6 +548,15 @@ static int copy_maps_file(int dir_fd, pid_t pid, const char *dest_dir) {
     return 0;
 }
 
+static int contains_forbidden_receipt_chars(const char *s) {
+    if (!s) return 0;
+    while (*s) {
+        if (*s == '|' || *s == '\n' || *s == '\r') return 1;
+        s++;
+    }
+    return 0;
+}
+
 int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
     if (!cfg || cfg->pid <= 0) return -1;
 
@@ -1153,65 +1162,80 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                 char start_time_str[32];
                 snprintf(start_time_str, sizeof(start_time_str), "%llu", (unsigned long long)stats.process_starttime);
 
-                char canonical[4096];
-                snprintf(canonical, sizeof(canonical),
-                         "LIVE_RECEIPT|v2|%s|%s|%d|%s|%s|%s|%s|%s|%s|%s|%s",
-                         stats.receipt_id,
-                         sess_id,
-                         (int)cfg->pid,
-                         start_time_str,
-                         exe_path,
-                         stats.elf_build_id,
-                         "live_collector",
-                         stats.manifest_digest,
-                         "TRUE",
-                         issued_at,
-                         key_id);
-
-                char sig[65];
-                hmac_sha256_hex(cfg->signing_key, strlen(cfg->signing_key), canonical, strlen(canonical), sig);
-
-                char esc_rcpt_exe[1024] = {0};
-                escape_json_string(exe_path, esc_rcpt_exe, sizeof(esc_rcpt_exe));
-
-                if (fprintf(f_rcpt, "{\n") < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"version\": \"v2\",\n") < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"receipt_id\": \"%s\",\n", stats.receipt_id) < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"session_id\": \"%s\",\n", sess_id) < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"pid\": %d,\n", (int)cfg->pid) < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"executable_path\": \"%s\",\n", esc_rcpt_exe) < 0) receipt_write_fail = 1;
-                if (stats.elf_build_id[0]) {
-                    if (fprintf(f_rcpt, "  \"build_id\": \"%s\",\n", stats.elf_build_id) < 0) receipt_write_fail = 1;
-                } else {
-                    if (fprintf(f_rcpt, "  \"build_id\": null,\n") < 0) receipt_write_fail = 1;
-                }
-                if (fprintf(f_rcpt, "  \"capture_source\": \"live_collector\",\n") < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"manifest_digest\": \"%s\",\n", stats.manifest_digest) < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"integrity_validated\": true,\n") < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"issued_at\": \"%s\",\n", issued_at) < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"process_start_time\": \"%s\",\n", start_time_str) < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"signature\": \"%s\",\n", sig) < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"key_id\": \"%s\",\n", key_id) < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "  \"provenance_class\": \"LIVE_RUNTIME_CAPTURE\"\n") < 0) receipt_write_fail = 1;
-                if (fprintf(f_rcpt, "}\n") < 0) receipt_write_fail = 1;
-
-                if (fflush(f_rcpt) != 0) receipt_write_fail = 1;
-                if (fsync(receipt_tmp_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) receipt_write_fail = 1;
-                int fr_err = (ferror(f_rcpt) != 0);
-                int cl_err = (fclose(f_rcpt) != 0);
-                if (receipt_write_fail || fr_err || cl_err) {
+                if (contains_forbidden_receipt_chars(exe_path) ||
+                    contains_forbidden_receipt_chars(sess_id) ||
+                    contains_forbidden_receipt_chars(stats.receipt_id) ||
+                    contains_forbidden_receipt_chars(stats.elf_build_id) ||
+                    contains_forbidden_receipt_chars(stats.manifest_digest) ||
+                    contains_forbidden_receipt_chars(key_id) ||
+                    contains_forbidden_receipt_chars(start_time_str)) {
+                    if (cfg->verbose) {
+                        fprintf(stderr, "[debug] receipt field contains forbidden delimiter; refusing receipt generation\n");
+                    }
                     receipt_err = 1;
+                    fclose(f_rcpt);
                     unlinkat(dir_fd, receipt_bname, 0);
                 } else {
-                    if (renameat(dir_fd, receipt_bname, dir_fd, "receipt.json") != 0) {
+                    char canonical[4096];
+                    snprintf(canonical, sizeof(canonical),
+                             "LIVE_RECEIPT|v2|%s|%s|%d|%s|%s|%s|%s|%s|%s|%s|%s",
+                             stats.receipt_id,
+                             sess_id,
+                             (int)cfg->pid,
+                             start_time_str,
+                             exe_path,
+                             stats.elf_build_id,
+                             "live_collector",
+                             stats.manifest_digest,
+                             "TRUE",
+                             issued_at,
+                             key_id);
+
+                    char sig[65];
+                    hmac_sha256_hex(cfg->signing_key, strlen(cfg->signing_key), canonical, strlen(canonical), sig);
+
+                    char esc_rcpt_exe[1024] = {0};
+                    escape_json_string(exe_path, esc_rcpt_exe, sizeof(esc_rcpt_exe));
+
+                    if (fprintf(f_rcpt, "{\n") < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"version\": \"v2\",\n") < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"receipt_id\": \"%s\",\n", stats.receipt_id) < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"session_id\": \"%s\",\n", sess_id) < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"pid\": %d,\n", (int)cfg->pid) < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"executable_path\": \"%s\",\n", esc_rcpt_exe) < 0) receipt_write_fail = 1;
+                    if (stats.elf_build_id[0]) {
+                        if (fprintf(f_rcpt, "  \"build_id\": \"%s\",\n", stats.elf_build_id) < 0) receipt_write_fail = 1;
+                    } else {
+                        if (fprintf(f_rcpt, "  \"build_id\": null,\n") < 0) receipt_write_fail = 1;
+                    }
+                    if (fprintf(f_rcpt, "  \"capture_source\": \"live_collector\",\n") < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"manifest_digest\": \"%s\",\n", stats.manifest_digest) < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"integrity_validated\": true,\n") < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"issued_at\": \"%s\",\n", issued_at) < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"process_start_time\": \"%s\",\n", start_time_str) < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"signature\": \"%s\",\n", sig) < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"key_id\": \"%s\",\n", key_id) < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "  \"provenance_class\": \"LIVE_RUNTIME_CAPTURE\"\n") < 0) receipt_write_fail = 1;
+                    if (fprintf(f_rcpt, "}\n") < 0) receipt_write_fail = 1;
+
+                    if (fflush(f_rcpt) != 0) receipt_write_fail = 1;
+                    if (fsync(receipt_tmp_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) receipt_write_fail = 1;
+                    int fr_err = (ferror(f_rcpt) != 0);
+                    int cl_err = (fclose(f_rcpt) != 0);
+                    if (receipt_write_fail || fr_err || cl_err) {
                         receipt_err = 1;
                         unlinkat(dir_fd, receipt_bname, 0);
                     } else {
-                        stats.receipt_issued = 1;
+                        if (renameat(dir_fd, receipt_bname, dir_fd, "receipt.json") != 0) {
+                            receipt_err = 1;
+                            unlinkat(dir_fd, receipt_bname, 0);
+                        } else {
+                            stats.receipt_issued = 1;
+                        }
                     }
+                    secure_memzero(canonical, sizeof(canonical));
+                    secure_memzero(sig, sizeof(sig));
                 }
-                memset(canonical, 0, sizeof(canonical));
-                memset(sig, 0, sizeof(sig));
             }
         }
     }
@@ -1369,11 +1393,6 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         *stats_out = stats;
     }
     return 0;
-
-    if (stats_out) {
-        *stats_out = stats;
-    }
-    return 0;
 }
 
 int collector_read_slices(pid_t pid, int backend, const char *slices_spec, void *out_file) {
@@ -1506,7 +1525,15 @@ int collector_daemon_loop(int backend, void *in_file, void *out_file) {
                 continue;
             }
             *space = '\0';
-            pid_t pid = (pid_t)atoi(rest);
+            char *endp = NULL;
+            errno = 0;
+            long p_val = strtol(rest, &endp, 10);
+            if (errno != 0 || endp == rest || *endp != '\0' || p_val <= 0 || p_val > 4194304L) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_PID\"}\n");
+                fflush(out);
+                continue;
+            }
+            pid_t pid = (pid_t)p_val;
             char *spec = space + 1;
             while (*spec == ' ') spec++;
             collector_read_slices(pid, backend, spec, out);

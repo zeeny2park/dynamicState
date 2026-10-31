@@ -68,77 +68,152 @@ ALL_TRUST_CLAIMS = {
 }
 
 
-def load_secure_key_file(path: str) -> Dict[str, str]:
-    """Loads capture signing/verification keys from a secured file.
+def load_secure_key_file(path: str, max_size: int = 4096) -> Dict[str, str]:
+    """Loads capture signing/verification keys from a secured file without TOCTOU races.
     
     Enforces strict security constraints:
-    - Path must exist and not be a symlink.
-    - Path must be a regular file.
+    - Path must exist and not be a symlink (opened with O_NOFOLLOW).
+    - Opened FD validated with fstat: regular file only, mode 0600 or 0400 (no group/world access).
     - Owner must match current user UID or root.
-    - File permissions must not permit group or others access (mode & 0o077 == 0, e.g. 0600 or 0400).
-    - Secret length must be >= 16 bytes.
+    - Read directly from the validated FD; rejects empty, malformed, or oversized keys (> 4096 bytes).
+    - Rejects embedded NUL bytes and delimiter characters ('|').
+    - Secret length must be >= 16 bytes and <= 256 bytes.
     """
     if not path or not isinstance(path, str):
         raise ValueError("Key file path must be a non-empty string")
-    
-    if os.path.islink(path):
-        raise PermissionError(f"Insecure key file '{path}': symlinks are forbidden")
-    
-    if not os.path.exists(path):
+
+    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+
+    try:
+        fd = os.open(path, open_flags)
+    except FileNotFoundError:
         raise FileNotFoundError(f"Key file '{path}' does not exist")
-        
-    st = os.stat(path)
-    if not stat.S_ISREG(st.st_mode):
-        raise PermissionError(f"Insecure key file '{path}': must be a regular file")
-        
-    # Check permissions: no group or world access permitted
-    if (st.st_mode & 0o077) != 0:
-        raise PermissionError(
-            f"Insecure key file '{path}': permissions ({oct(st.st_mode & 0o777)}) permit group/world access. Must be 0600 or 0400."
-        )
-        
-    # Check ownership: current UID or root
-    curr_uid = os.geteuid() if hasattr(os, "geteuid") else 0
-    if st.st_uid != curr_uid and st.st_uid != 0:
-        raise PermissionError(
-            f"Insecure key file '{path}': owner UID {st.st_uid} does not match process UID {curr_uid}"
-        )
-        
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-        
+    except OSError as err:
+        import errno
+        if err.errno in (errno.ELOOP, errno.EMLINK) or os.path.islink(path):
+            raise PermissionError(f"Insecure key file '{path}': symlinks are forbidden")
+        raise PermissionError(f"Cannot open key file '{path}': {err}")
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"Insecure key file '{path}': must be a regular file")
+
+        # Reject any group or world access permissions (must be 0600 or 0400)
+        if (st.st_mode & 0o077) != 0:
+            raise PermissionError(
+                f"Insecure key file '{path}': permissions ({oct(st.st_mode & 0o777)}) permit group/world access. Must be 0600 or 0400."
+            )
+
+        # Check ownership: current UID or root
+        curr_uid = os.geteuid() if hasattr(os, "geteuid") else 0
+        if st.st_uid != curr_uid and st.st_uid != 0:
+            raise PermissionError(
+                f"Insecure key file '{path}': owner UID {st.st_uid} does not match process UID {curr_uid}"
+            )
+
+        # Check file size (reject oversized key file)
+        if st.st_size > max_size:
+            raise ValueError(f"Key file '{path}' is oversized ({st.st_size} bytes; max {max_size} bytes allowed)")
+        if st.st_size == 0:
+            raise ValueError(f"Key file '{path}' is empty")
+
+        raw_bytes = os.read(fd, max_size + 1)
+        if len(raw_bytes) > max_size:
+            raise ValueError(f"Key file '{path}' exceeds maximum size of {max_size} bytes")
+    finally:
+        os.close(fd)
+
+    # Check for embedded NUL bytes
+    if b"\x00" in raw_bytes:
+        raise ValueError(f"Insecure key file '{path}': embedded NUL bytes are forbidden")
+
+    try:
+        content = raw_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Key file '{path}' is not valid UTF-8: {exc}")
+
+    if not content:
+        raise ValueError(f"Key file '{path}' is empty")
+
     keys: Dict[str, str] = {}
     if content.startswith("{"):
-        data = json.loads(content)
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(k, str) and isinstance(v, str):
-                    if len(v) < 16:
-                        raise ValueError(f"Key '{k}' in '{path}' is too short ({len(v)} chars; min 16 required)")
-                    keys[k] = v
-    elif content:
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Malformed JSON keyring in '{path}': {exc}")
+        if not isinstance(data, dict):
+            raise ValueError(f"Keyring in '{path}' must be a JSON object")
+        if not data:
+            raise ValueError(f"Keyring in '{path}' is empty")
+        for k, v in data.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ValueError(f"Invalid key entry in '{path}': keys and secrets must be strings")
+            if len(v) < 16:
+                raise ValueError(f"Key '{k}' in '{path}' is too short ({len(v)} chars; min 16 required)")
+            if len(v) > 256:
+                raise ValueError(f"Key '{k}' in '{path}' is oversized ({len(v)} chars; max 256 allowed)")
+            if "\x00" in v or "|" in v:
+                raise ValueError(f"Key '{k}' in '{path}' contains forbidden delimiter or NUL character")
+            keys[k] = v
+    else:
         if len(content) < 16:
             raise ValueError(f"Key in '{path}' is too short ({len(content)} chars; min 16 required)")
+        if len(content) > 256:
+            raise ValueError(f"Key in '{path}' is oversized ({len(content)} chars; max 256 allowed)")
+        if "|" in content:
+            raise ValueError(f"Key in '{path}' contains forbidden delimiter '|'")
         keys["file_default"] = content
-    else:
-        raise ValueError(f"Key file '{path}' is empty")
-        
+
     return keys
 
 
-def load_secure_key_fd(fd: int) -> str:
-    """Reads capture signing/verification key from an open file descriptor."""
+def load_secure_key_fd(fd: int, max_size: int = 4096) -> str:
+    """Reads capture signing/verification key from an open file descriptor with strict validation."""
     if not isinstance(fd, int) or fd < 0:
         raise ValueError(f"Invalid file descriptor: {fd}")
     try:
         st = os.fstat(fd)
     except OSError as exc:
         raise ValueError(f"Cannot stat key file descriptor {fd}: {exc}")
-        
-    with os.fdopen(os.dup(fd), "r", encoding="utf-8") as f:
-        content = f.read().strip()
+
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode)):
+        raise ValueError(f"Key descriptor {fd} is not a regular file, pipe, or socket")
+
+    raw_chunks: List[bytes] = []
+    total_read = 0
+    dup_fd = os.dup(fd)
+    try:
+        while total_read <= max_size:
+            chunk = os.read(dup_fd, min(4096, max_size - total_read + 1))
+            if not chunk:
+                break
+            raw_chunks.append(chunk)
+            total_read += len(chunk)
+    finally:
+        os.close(dup_fd)
+
+    raw_bytes = b"".join(raw_chunks)
+    if len(raw_bytes) > max_size:
+        raise ValueError(f"Key from FD {fd} is oversized (exceeds {max_size} bytes)")
+
+    if b"\x00" in raw_bytes:
+        raise ValueError(f"Key from FD {fd} contains forbidden embedded NUL byte")
+
+    try:
+        content = raw_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Key from FD {fd} is not valid UTF-8: {exc}")
+
     if len(content) < 16:
         raise ValueError(f"Key from FD {fd} is too short ({len(content)} chars; min 16 required)")
+    if len(content) > 256:
+        raise ValueError(f"Key from FD {fd} is oversized ({len(content)} chars; max 256 allowed)")
+    if "|" in content:
+        raise ValueError(f"Key from FD {fd} contains forbidden delimiter '|'")
+
     return content
 
 
@@ -191,7 +266,26 @@ class CaptureVerificationAuthority:
         return key_id in self._revoked_keys
 
     @classmethod
+    def from_key_file(cls, path: str, default_key_id: str = "file_default") -> "CaptureVerificationAuthority":
+        """Explicit production factory to load verification keys from a secure file."""
+        auth = cls()
+        auth.register_key_file(path, default_key_id=default_key_id)
+        return auth
+
+    @classmethod
+    def from_key_fd(cls, fd: int, key_id: str = "fd_default") -> "CaptureVerificationAuthority":
+        """Explicit production factory to load verification key from an inherited file descriptor."""
+        auth = cls()
+        auth.register_key_fd(fd, key_id=key_id)
+        return auth
+
+    @classmethod
     def from_environment(cls) -> "CaptureVerificationAuthority":
+        """Loads verification keys from explicit environment configuration.
+        
+        Strict error visibility: Invalid configuration raises visible, actionable errors
+        instead of silently swallowing exceptions.
+        """
         auth = cls()
         # 1. DYNAMICSTATE_CAPTURE_SECRET & DYNAMICSTATE_CAPTURE_KEY_ID
         env_secret = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
@@ -199,29 +293,27 @@ class CaptureVerificationAuthority:
         if env_secret:
             auth.register_key(key_id, env_secret)
 
-        # 2. DYNAMICSTATE_CAPTURE_KEY_FILE (Strict secure file validation)
+        # 2. DYNAMICSTATE_CAPTURE_KEY_FILE (Strict secure file validation - no silent swallowing)
         key_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
-        if key_file and os.path.exists(key_file):
-            try:
-                auth.register_key_file(key_file)
-            except Exception:
-                pass
+        if key_file:
+            auth.register_key_file(key_file)
 
         # 3. DYNAMICSTATE_CAPTURE_KEYRING
         keyring_spec = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
         if keyring_spec:
-            try:
-                if os.path.exists(keyring_spec):
-                    with open(keyring_spec, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                else:
+            if os.path.exists(keyring_spec):
+                auth.register_key_file(keyring_spec)
+            else:
+                try:
                     data = json.loads(keyring_spec)
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if isinstance(k, str) and isinstance(v, str):
-                            auth.register_key(k, v)
-            except Exception:
-                pass
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"DYNAMICSTATE_CAPTURE_KEYRING contains invalid JSON: {exc}")
+                if not isinstance(data, dict):
+                    raise ValueError("DYNAMICSTATE_CAPTURE_KEYRING must be a JSON object mapping key_id to secret")
+                for k, v in data.items():
+                    if not isinstance(k, str) or not isinstance(v, str):
+                        raise ValueError("Invalid key entry in keyring: keys and secrets must be strings")
+                    auth.register_key(k, v)
 
         return auth
 
@@ -242,6 +334,8 @@ class CaptureSigningAuthority:
             raise ValueError("CaptureSigningAuthority requires non-empty key_id and secret")
         if not isinstance(key_id, str) or not isinstance(secret, str):
             raise TypeError("key_id and secret must be strings")
+        if "|" in key_id or "\0" in key_id:
+            raise ValueError("key_id contains forbidden delimiter or control character")
         self._key_id = key_id
         self._secret = secret
 
@@ -264,9 +358,14 @@ _DEFAULT_SIGNING_AUTHORITY: Optional[CaptureSigningAuthority] = None
 
 
 def get_default_verification_authority() -> CaptureVerificationAuthority:
+    """Returns the globally configured verification authority, or unconfigured authority (fail-closed).
+    
+    Production callers must explicitly initialize the authority using
+    set_default_verification_authority() or CaptureVerificationAuthority.from_key_file().
+    """
     global _DEFAULT_VERIFICATION_AUTHORITY
     if _DEFAULT_VERIFICATION_AUTHORITY is None:
-        _DEFAULT_VERIFICATION_AUTHORITY = CaptureVerificationAuthority.from_environment()
+        _DEFAULT_VERIFICATION_AUTHORITY = CaptureVerificationAuthority()
     return _DEFAULT_VERIFICATION_AUTHORITY
 
 
@@ -276,12 +375,11 @@ def set_default_verification_authority(auth: Optional[CaptureVerificationAuthori
 
 
 def get_default_signing_authority() -> Optional[CaptureSigningAuthority]:
+    """Returns the globally configured signing authority.
+    
+    Production callers must explicitly configure the signing authority.
+    """
     global _DEFAULT_SIGNING_AUTHORITY
-    if _DEFAULT_SIGNING_AUTHORITY is None:
-        env_secret = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
-        key_id = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_ID", "default")
-        if env_secret:
-            _DEFAULT_SIGNING_AUTHORITY = CaptureSigningAuthority(key_id=key_id, secret=env_secret)
     return _DEFAULT_SIGNING_AUTHORITY
 
 
@@ -370,6 +468,14 @@ class LiveCaptureReceipt:
         )
 
 
+def _validate_receipt_field(name: str, val: Any) -> None:
+    if val is None:
+        return
+    s = str(val)
+    if "|" in s or "\n" in s or "\r" in s or "\x00" in s:
+        raise ValueError(f"Field '{name}' contains forbidden delimiter or control character: {val!r}")
+
+
 def compute_live_receipt_signature(
     secret_or_signer: Union[CaptureSigningAuthority, str],
     receipt_id: str,
@@ -384,6 +490,16 @@ def compute_live_receipt_signature(
     manifest_digest: str = "",
     key_id: str = "default",
 ) -> str:
+    _validate_receipt_field("receipt_id", receipt_id)
+    _validate_receipt_field("session_id", session_id)
+    _validate_receipt_field("executable_path", executable_path)
+    _validate_receipt_field("build_id", build_id)
+    _validate_receipt_field("capture_source", capture_source)
+    _validate_receipt_field("manifest_digest", manifest_digest)
+    _validate_receipt_field("issued_at", issued_at)
+    _validate_receipt_field("process_start_time", process_start_time)
+    _validate_receipt_field("key_id", key_id)
+
     raw = (
         f"LIVE_RECEIPT|v2|{receipt_id}|{session_id}|{pid}|"
         f"{process_start_time}|{executable_path}|{build_id or ''}|"
@@ -484,14 +600,15 @@ def verify_live_capture_receipt(
     if receipt is None:
         return False, "NO_RECEIPT: No capture or session receipt provided"
 
-    # Support CaptureReceipt from capture_backend.py
+    # Explicitly reject alternate receipt types: CaptureReceipt from capture_backend.py
+    # cannot establish LIVE_VERIFIED because it lacks mandatory session binding, manifest digest,
+    # and Phase 2.0 v2 trust contract.
     if hasattr(receipt, "backend_name") and hasattr(receipt, "artifact_manifest"):
-        ok = receipt.verify_signature(secret)
-        if not ok:
-            return False, "SIGNATURE_INVALID: CaptureReceipt signature verification failed"
-        if expected_pid is not None and receipt.pid != expected_pid:
-            return False, f"PID_MISMATCH: CaptureReceipt PID {receipt.pid} != expected {expected_pid}"
-        return True, None
+        return (
+            False,
+            "UNSUPPORTED_RECEIPT_TYPE: CaptureReceipt cannot establish LIVE_VERIFIED "
+            "(lacks mandatory session binding, manifest digest, and Phase 2.0 v2 trust contract)",
+        )
 
     # Support LiveCaptureReceipt
     if isinstance(receipt, dict):
@@ -506,6 +623,22 @@ def verify_live_capture_receipt(
     rcpt_ver = getattr(receipt, "version", "v2")
     if rcpt_ver != "v2":
         return False, f"UNSUPPORTED_RECEIPT_VERSION: Receipt version '{rcpt_ver}' is not supported"
+
+    # Canonical field character and delimiter validation
+    for field_name in (
+        "receipt_id",
+        "session_id",
+        "executable_path",
+        "build_id",
+        "capture_source",
+        "manifest_digest",
+        "issued_at",
+        "key_id",
+        "process_start_time",
+    ):
+        f_val = getattr(receipt, field_name, None)
+        if f_val is not None and any(c in str(f_val) for c in ("|", "\n", "\r", "\x00")):
+            return False, f"MALFORMED_RECEIPT: Field '{field_name}' contains forbidden delimiter or control character"
 
     if not receipt.signature:
         return False, "UNSIGNED_RECEIPT: Receipt has no HMAC signature"
@@ -643,11 +776,33 @@ def verify_live_capture_receipt(
         if snap_out:
             if not os.path.isdir(snap_out):
                 return False, f"SNAPSHOT_DIR_NOT_FOUND: Snapshot output directory '{snap_out}' does not exist"
-            mpath = os.path.join(snap_out, "manifest.json")
-            if not os.path.isfile(mpath) or os.path.islink(mpath):
-                return False, "MISSING_MANIFEST: manifest.json is missing or a symlink in snapshot directory"
-            with open(mpath, "rb") as mf:
-                disk_digest = hashlib.sha256(mf.read()).hexdigest()
+            dir_open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_DIRECTORY"):
+                dir_open_flags |= os.O_DIRECTORY
+            try:
+                dir_fd = os.open(snap_out, dir_open_flags)
+            except OSError as err:
+                return False, f"SNAPSHOT_DIR_INACCESSIBLE: Cannot open snapshot dir '{snap_out}': {err}"
+            try:
+                manifest_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                if hasattr(os, "O_NOFOLLOW"):
+                    manifest_flags |= os.O_NOFOLLOW
+                try:
+                    mfd = os.open("manifest.json", manifest_flags, dir_fd=dir_fd)
+                except OSError as err:
+                    return False, f"MISSING_MANIFEST: manifest.json is missing or inaccessible in snapshot directory: {err}"
+                try:
+                    mst = os.fstat(mfd)
+                    if not stat.S_ISREG(mst.st_mode):
+                        return False, f"MISSING_MANIFEST: manifest.json in snapshot directory is not a regular file (mode {oct(mst.st_mode)})"
+                    raw_bytes = os.read(mfd, mst.st_size + 1)
+                    if len(raw_bytes) != mst.st_size:
+                        return False, "SNAPSHOT_INTEGRITY_FAILED: manifest.json read size mismatch during digest computation"
+                    disk_digest = hashlib.sha256(raw_bytes).hexdigest()
+                finally:
+                    os.close(mfd)
+            finally:
+                os.close(dir_fd)
         elif hasattr(snapshot, "compute_manifest_digest"):
             disk_digest = snapshot.compute_manifest_digest()
 
@@ -713,6 +868,9 @@ def determine_snapshot_trust_state(
 
     if reason and ("VERIFICATION_KEY_UNAVAILABLE" in reason or "NO_VERIFICATION_KEY" in reason):
         return TRUST_STATE_VERIFICATION_UNAVAILABLE, reason
+
+    if reason and ("UNSUPPORTED_RECEIPT_TYPE" in reason or "UNRECOGNIZED_RECEIPT_TYPE" in reason):
+        return TRUST_STATE_IMPORTED_UNVERIFIED, reason
 
     return TRUST_STATE_INVALID_OR_TAMPERED, reason
 
