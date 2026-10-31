@@ -1200,15 +1200,21 @@ class InvestigationManager:
         )
         self.sessions[inv_id] = session
 
+        # Sanitize constraints and prevent external callers from forging live capture or trusted provenance
+        sanitized_constraints = dict(constraints or {})
+        sanitized_constraints.pop("live_capture", None)
+        sanitized_constraints.pop("provenance_class", None)
+
         session.target_ref = {
             "snapshot_id": snapshot_id,
             "memory_snapshot_path": memory_snapshot_path,
             "pid": pid,
             "debug_image": debug_image,
-            "constraints": constraints or {},
+            "constraints": sanitized_constraints,
             "watch_session_id": watch_session_id,
             "observation_window": observation_window or {},
-            "provenance_class": provenance_class,
+            "provenance_class": PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+            "live_capture": False,
         }
 
         # Check for temporal investigation routing (Phase 24)
@@ -1384,6 +1390,8 @@ class InvestigationManager:
                 session.target_ref["memory_snapshot_path"] = snap_dir
                 session.target_ref["live_capture"] = True
                 session.target_ref["capture_source"] = "LIVE_PROCESS"
+                session.target_ref["provenance_class"] = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+                provenance_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
             except ProcessLookupError as proc_err:
                 session.status = "FAILED"
                 session.stages["capture_quality"] = {
@@ -1403,10 +1411,14 @@ class InvestigationManager:
                 session.summary["error"] = f"Live memory capture failed: {cap_exc}"
                 return session.to_dict()
 
-        # Enforce provenance bounds: external callers cannot forge LIVE_RUNTIME_CAPTURE without an active live process
-        if not session.target_ref.get("live_capture") and provenance_class == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
-            provenance_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        # Enforce provenance bounds: external callers cannot forge LIVE_RUNTIME_CAPTURE without an authentic runtime capture
+        if not session.target_ref.get("live_capture"):
+            session.target_ref["live_capture"] = False
             session.target_ref["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            provenance_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        else:
+            session.target_ref["provenance_class"] = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+            provenance_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
 
         if static_provider:
             session.static_provider = static_provider
@@ -2936,6 +2948,7 @@ class InvestigationManager:
             "investigation_id": session.investigation_id,
             "goal": session.goal,
             "status": session.status,
+            "provenance_class": report_prov_class,
             "created_at": session.created_at,
             "target_identity": session.stages["target_identity"].get("details", {}),
             "capture_quality": session.stages["capture_quality"].get("details", {}),

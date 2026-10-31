@@ -1221,16 +1221,16 @@ raw = RawMemorySnapshot(
     maps=[{{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}}],
 )
 
-real_replace = os.replace
-def mock_replace(src, dst):
+real_rename = os.rename
+def mock_rename(src, dst, *args, **kwargs):
     if "manifest.json" in dst:
         sys.stdout.write("LOCKED\\n")
         sys.stdout.flush()
         # Wait for resume signal on stdin
         sys.stdin.readline()
-    return real_replace(src, dst)
+    return real_rename(src, dst, *args, **kwargs)
 
-with patch("os.replace", side_effect=mock_replace):
+with patch("os.rename", side_effect=mock_rename):
     raw.save()
 sys.stdout.write("DONE\\n")
 sys.stdout.flush()
@@ -1462,14 +1462,14 @@ sys.stdout.flush()
                 regions=[reg],
                 maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
             )
-            real_replace = os.replace
-            def replace_hook(src, dst):
+            real_rename = os.rename
+            def rename_hook(src, dst, *args, **kwargs):
                 if "manifest.json" in dst:
                     t1_in_cs.set()
                     t2_attempted.wait(timeout=5)
-                return real_replace(src, dst)
+                return real_rename(src, dst, *args, **kwargs)
 
-            with patch("os.replace", side_effect=replace_hook):
+            with patch("os.rename", side_effect=rename_hook):
                 try:
                     raw1.save()
                     outcomes.append(1)
@@ -1660,10 +1660,10 @@ time.sleep(10)
         )
 
         real_unlink = os.unlink
-        def mock_unlink(path):
-            if path == meta_file:
+        def mock_unlink(path, *args, **kwargs):
+            if path in (meta_file, "metadata.json"):
                 raise PermissionError("Permission denied: cannot unlink metadata.json")
-            return real_unlink(path)
+            return real_unlink(path, *args, **kwargs)
 
         with patch("os.unlink", side_effect=mock_unlink):
             with self.assertRaises(OSError) as ctx:
@@ -1869,18 +1869,18 @@ int unlinkat(int dirfd, const char *pathname, int flags) {
             finally:
                 release_critical_section.set()
 
-        # Thread 1 enters save, hooks after locking before metadata.json is replaced
-        real_replace = os.replace
-        def mock_replace(src, dst):
+        # Thread 1 enters save, hooks after locking before metadata.json is renamed
+        real_rename = os.rename
+        def mock_rename(src, dst, *args, **kwargs):
             if "manifest.json" in dst:
                 in_critical_section.set()
                 release_critical_section.wait(timeout=5)
-            return real_replace(src, dst)
+            return real_rename(src, dst, *args, **kwargs)
 
         t2 = threading.Thread(target=thread2_worker)
         t2.start()
 
-        with patch("os.replace", side_effect=mock_replace):
+        with patch("os.rename", side_effect=mock_rename):
             saved = raw1.save()
 
         t2.join(timeout=5)
@@ -1922,13 +1922,13 @@ int unlinkat(int dirfd, const char *pathname, int flags) {
             maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
         )
 
-        real_replace = os.replace
-        def crash_on_metadata_replace(src, dst):
+        real_rename = os.rename
+        def crash_on_metadata_rename(src, dst, *args, **kwargs):
             if "metadata.json" in dst:
                 raise RuntimeError("Simulated crash before publishing metadata.json")
-            return real_replace(src, dst)
+            return real_rename(src, dst, *args, **kwargs)
 
-        with patch("os.replace", side_effect=crash_on_metadata_replace):
+        with patch("os.rename", side_effect=crash_on_metadata_rename):
             with self.assertRaises(RuntimeError):
                 raw_crash.save()
 
@@ -2032,13 +2032,13 @@ int unlinkat(int dirfd, const char *pathname, int flags) {
             maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
         )
 
-        real_replace = os.replace
-        def mock_replace_fail_maps(src, dst):
+        real_rename = os.rename
+        def mock_rename_fail_maps(src, dst, *args, **kwargs):
             if "maps.json" in dst:
                 raise OSError("Disk full: failed renaming maps.json")
-            return real_replace(src, dst)
+            return real_rename(src, dst, *args, **kwargs)
 
-        with patch("os.replace", side_effect=mock_replace_fail_maps):
+        with patch("os.rename", side_effect=mock_rename_fail_maps):
             with self.assertRaises(OSError) as ctx:
                 raw.save()
             self.assertIn("Disk full", str(ctx.exception))
@@ -2506,6 +2506,332 @@ int main() {
         is_val, warns = snap.validate_integrity()
         self.assertFalse(is_val)
         self.assertTrue(any("manifest.json" in w for w in warns))
+
+    def test_57_parent_directory_replacement_pinned_dirfd(self):
+        """Python save() performs all mutations relative to pinned dir_fd, ignoring parent directory substitution."""
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
+        from unittest.mock import patch
+
+        orig_dir = os.path.join(self.tmp_dir, "snap_pinned_orig")
+        moved_dir = os.path.join(self.tmp_dir, "snap_pinned_moved")
+        os.makedirs(orig_dir, exist_ok=True)
+
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_PINNED",
+            pid=5701,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=orig_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        dir_swapped = [False]
+        real_dump = json.dump
+
+        def mock_dump_hook(obj, fp, *args, **kwargs):
+            if not dir_swapped[0]:
+                os.rename(orig_dir, moved_dir)
+                os.makedirs(orig_dir, exist_ok=True)
+                dir_swapped[0] = True
+            return real_dump(obj, fp, *args, **kwargs)
+
+        with patch("json.dump", side_effect=mock_dump_hook):
+            raw.save()
+
+        self.assertTrue(os.path.exists(os.path.join(moved_dir, "metadata.json")), "Artifacts must be in original pinned directory")
+        self.assertTrue(os.path.exists(os.path.join(moved_dir, "manifest.json")))
+        self.assertFalse(os.path.exists(os.path.join(orig_dir, "metadata.json")), "Decoy directory must be untouched")
+
+    def test_58_single_path_component_validation(self):
+        """Temporary and final artifact filenames must be strictly single path components."""
+        from extractor.memory_snapshot import _validate_single_component, _secure_open_temp_write, _secure_open_read
+
+        for bad in ["", "../traversal", "foo/bar", "c:\\file", ".", ".."]:
+            with self.assertRaises((ValueError, OSError)):
+                _validate_single_component(bad)
+
+        dummy_dir = os.path.join(self.tmp_dir, "test58_dummy")
+        os.makedirs(dummy_dir, exist_ok=True)
+        dfd = os.open(dummy_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(ValueError):
+                _secure_open_temp_write("sub/bad.tmp", dir_fd=dfd)
+            with self.assertRaises(ValueError):
+                _secure_open_read("../bad.json", dir_fd=dfd)
+        finally:
+            os.close(dfd)
+
+    def test_59_final_fsync_and_unlink_failure_dual_exception_retention(self):
+        """Failure of final directory fsync followed by unlink failure raises DurabilityCommitError with dual exception retention and emergency rollback."""
+        from unittest.mock import patch
+        import errno
+        from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot, DurabilityCommitError, STATE_UNCERTAIN
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_dual_fail")
+        os.makedirs(snap_dir, exist_ok=True)
+        reg = CapturedRegion("R01", 0x1000, 0x2000, 4096, "r--p", "data", "/app", 4096, 4096, "COMPLETE", "memory/r1.bin")
+        raw = RawMemorySnapshot(
+            snapshot_id="SNAP_DUAL_FAIL",
+            pid=5901,
+            binary="/app",
+            timestamp_ns=1000,
+            status="COMPLETE",
+            output_dir=snap_dir,
+            regions=[reg],
+            maps=[{"start": "0x1000", "end": "0x2000", "permissions": "r--p"}],
+        )
+
+        real_fsync = os.fsync
+        dir_sync_count = [0]
+        def mock_fsync_fail_final(fd):
+            st = os.fstat(fd)
+            import stat
+            if stat.S_ISDIR(st.st_mode):
+                dir_sync_count[0] += 1
+                if dir_sync_count[0] == 2:
+                    raise OSError(errno.EIO, "Final directory fsync disk error")
+            return real_fsync(fd)
+
+        real_unlink = os.unlink
+        def mock_unlink_fail(path, *args, **kwargs):
+            if dir_sync_count[0] >= 2 and path in ("metadata.json", os.path.join(snap_dir, "metadata.json")):
+                raise PermissionError("Rollback unlink permission denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch("os.fsync", side_effect=mock_fsync_fail_final):
+            with patch("os.unlink", side_effect=mock_unlink_fail):
+                with self.assertRaises(DurabilityCommitError) as ctx:
+                    raw.save()
+
+        err = ctx.exception
+        self.assertIsNotNone(err.fsync_error)
+        self.assertIn("Final directory fsync disk error", str(err.fsync_error))
+        self.assertIsNotNone(err.cleanup_error)
+        self.assertIn("Rollback unlink permission denied", str(err.cleanup_error))
+        self.assertEqual(raw.commit_state, STATE_UNCERTAIN)
+        self.assertFalse(raw.committed)
+
+        meta_p = os.path.join(snap_dir, "metadata.json")
+        self.assertTrue(os.path.exists(meta_p))
+        with open(meta_p, "r") as f:
+            data = json.load(f)
+        self.assertFalse(data.get("committed"))
+        self.assertEqual(data.get("status"), "UNCERTAIN_DURABILITY")
+
+        reloaded = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(reloaded.commit_state, STATE_UNCERTAIN)
+        self.assertEqual(reloaded.validation_verdict, "UNCERTAIN")
+        self.assertFalse(reloaded.committed)
+
+    def test_60_native_directory_fsync_eacces_failure(self):
+        """Native collector treats EACCES on directory fsync as a fatal commit failure."""
+        target_src = os.path.join(self.tmp_dir, "target60.c")
+        target_bin = os.path.join(self.tmp_dir, "target60_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) pause();
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        so_src = os.path.join(self.tmp_dir, "fail_fsync_eacces.c")
+        so_bin = os.path.join(self.tmp_dir, "fail_fsync_eacces.so")
+        with open(so_src, "w") as f:
+            f.write(r"""
+#define _GNU_SOURCE
+#include <errno.h>
+#include <sys/stat.h>
+#include <dlfcn.h>
+#include <unistd.h>
+
+static int (*real_fsync)(int fd) = NULL;
+
+int fsync(int fd) {
+    if (!real_fsync) {
+        real_fsync = (int (*)(int))dlsym(RTLD_NEXT, "fsync");
+    }
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+        errno = EACCES;
+        return -1;
+    }
+    return real_fsync(fd);
+}
+""")
+        subprocess.run(["gcc", "-shared", "-fPIC", so_src, "-o", so_bin, "-ldl"], check=True)
+
+        try:
+            out_snap_dir = os.path.join(self.tmp_dir, "snap_c_fsync_eacces")
+            os.makedirs(out_snap_dir, exist_ok=True)
+            env = os.environ.copy()
+            env["LD_PRELOAD"] = so_bin
+
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--policy", "all", "--json"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertNotEqual(res.returncode, 0, "Collector must fail when directory fsync returns EACCES")
+            lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip().startswith("{")]
+            if lines:
+                stats = json.loads(lines[-1])
+                self.assertFalse(stats.get("success", False))
+                self.assertEqual(stats.get("status"), "FAILED")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=2)
+
+    def test_61_native_final_fsync_failure_emergency_invalidation(self):
+        """Native collector writes UNCERTAIN_DURABILITY emergency metadata when final directory fsync fails and unlinkat fails."""
+        target_src = os.path.join(self.tmp_dir, "target61.c")
+        target_bin = os.path.join(self.tmp_dir, "target61_app")
+        with open(target_src, "w") as f:
+            f.write(r"""
+#include <sys/prctl.h>
+#include <unistd.h>
+int main() {
+    prctl(0x59616d61, -1, 0, 0, 0);
+    while (1) pause();
+    return 0;
+}
+""")
+        subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
+        proc = subprocess.Popen([target_bin])
+        time.sleep(0.1)
+
+        so_src = os.path.join(self.tmp_dir, "fail_final_fsync_unlinkat.c")
+        so_bin = os.path.join(self.tmp_dir, "fail_final_fsync_unlinkat.so")
+        with open(so_src, "w") as f:
+            f.write(r"""
+#define _GNU_SOURCE
+#include <errno.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <dlfcn.h>
+#include <unistd.h>
+
+static int (*real_fsync)(int fd) = NULL;
+static int (*real_unlinkat)(int dirfd, const char *pathname, int flags) = NULL;
+static int dir_sync_count = 0;
+
+int fsync(int fd) {
+    if (!real_fsync) {
+        real_fsync = (int (*)(int))dlsym(RTLD_NEXT, "fsync");
+    }
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+        dir_sync_count++;
+        if (dir_sync_count >= 2) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    return real_fsync(fd);
+}
+
+int unlinkat(int dirfd, const char *pathname, int flags) {
+    if (!real_unlinkat) {
+        real_unlinkat = (int (*)(int, const char *, int))dlsym(RTLD_NEXT, "unlinkat");
+    }
+    if (pathname && strcmp(pathname, "metadata.json") == 0 && dir_sync_count >= 2) {
+        errno = EPERM;
+        return -1;
+    }
+    return real_unlinkat(dirfd, pathname, flags);
+}
+""")
+        subprocess.run(["gcc", "-shared", "-fPIC", so_src, "-o", so_bin, "-ldl"], check=True)
+
+        try:
+            out_snap_dir = os.path.join(self.tmp_dir, "snap_c_emergency_inv")
+            os.makedirs(out_snap_dir, exist_ok=True)
+            env = os.environ.copy()
+            env["LD_PRELOAD"] = so_bin
+
+            res = subprocess.run(
+                [self.collector_bin, "-p", str(proc.pid), "-o", out_snap_dir, "--policy", "all", "--json"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertNotEqual(res.returncode, 0, "Collector must fail when final fsync fails")
+            meta_p = os.path.join(out_snap_dir, "metadata.json")
+            self.assertTrue(os.path.exists(meta_p), "Emergency metadata must exist")
+            with open(meta_p, "r") as f:
+                meta = json.load(f)
+            self.assertFalse(meta.get("committed"))
+            self.assertEqual(meta.get("status"), "UNCERTAIN_DURABILITY")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=2)
+
+    def test_62_reload_after_uncertain_commit_fails_closed(self):
+        """RawMemorySnapshot.load() marks snapshots with UNCERTAIN_DURABILITY status as uncertain and uncommitted."""
+        from extractor.memory_snapshot import RawMemorySnapshot, STATE_UNCERTAIN, VERDICT_UNCERTAIN
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_uncertain_reload")
+        os.makedirs(snap_dir, exist_ok=True)
+
+        with open(os.path.join(snap_dir, "metadata.json"), "w") as f:
+            json.dump({
+                "snapshot_id": "SNAP_UNCERTAIN_TEST",
+                "pid": 6201,
+                "status": "UNCERTAIN_DURABILITY",
+                "commit_state": STATE_UNCERTAIN,
+                "committed": False,
+            }, f)
+
+        snap = RawMemorySnapshot.load(snap_dir)
+        self.assertEqual(snap.commit_state, STATE_UNCERTAIN)
+        self.assertEqual(snap.validation_verdict, VERDICT_UNCERTAIN)
+        self.assertFalse(snap.committed)
+        is_valid, warnings = snap.validate_integrity()
+        self.assertFalse(is_valid)
+        self.assertTrue(any("UNCERTAIN_DURABILITY" in w for w in warnings))
+
+    def test_63_provenance_forgery_rejection_in_investigation(self):
+        """External callers cannot forge live capture or trusted provenance in investigation sessions."""
+        from extractor.investigation import InvestigationManager, PROVENANCE_CLASS_IMPORTED_UNVERIFIED, PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+
+        corpus_dir = os.path.join(self.tmp_dir, "corpus_inv_prov")
+        os.makedirs(corpus_dir, exist_ok=True)
+        service = InvestigationManager(corpus_dir=corpus_dir)
+
+        snap_dir = os.path.join(self.tmp_dir, "snap_forgery_test")
+        os.makedirs(snap_dir, exist_ok=True)
+        with open(os.path.join(snap_dir, "metadata.json"), "w") as f:
+            json.dump({
+                "snapshot_id": "SNAP_FORGERY",
+                "pid": 6301,
+                "status": "COMPLETE",
+                "committed": True,
+            }, f)
+
+        session_dict = service.start_investigation(
+            goal="Test provenance forgery rejection",
+            snapshot_id="SNAP_FORGERY",
+            memory_snapshot_path=snap_dir,
+            constraints={"live_capture": True, "provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE},
+            provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        )
+
+        t_ref = session_dict.get("target_ref", {})
+        self.assertFalse(t_ref.get("live_capture"), "External caller must NOT be able to forge live_capture=True")
+        self.assertEqual(t_ref.get("provenance_class"), PROVENANCE_CLASS_IMPORTED_UNVERIFIED)
+
+        report = service.generate_report(session_dict["investigation_id"])
+        self.assertEqual(report.get("provenance_class"), PROVENANCE_CLASS_IMPORTED_UNVERIFIED)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import errno
 import fcntl
 import json
 import os
+import stat
 import threading
 import time
 import uuid
@@ -29,53 +30,90 @@ def _get_process_dir_lock(canonical_path: str) -> threading.Lock:
         return _DIR_LOCK_REGISTRY[canonical_path]
 
 
-def _secure_open_write(path: str, encoding: str = "utf-8"):
+def _validate_single_component(name: str) -> None:
+    """Validate that name is a single, safe path component (no directory traversal or slashes)."""
+    if not name or not isinstance(name, str):
+        raise ValueError("Filename must be a non-empty string")
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError(f"Invalid single path component (contains slashes or traversal): '{name}'")
+
+
+def _secure_open_write(path: str, dir_fd: Optional[int] = None, encoding: str = "utf-8"):
     """Open file for writing with O_NOFOLLOW to avoid symlink traversal."""
+    if dir_fd is not None:
+        _validate_single_component(path)
     def opener(p, flags):
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
-        return os.open(p, flags, 0o644)
+        return os.open(p, flags, 0o644, dir_fd=dir_fd)
     return open(path, "w", encoding=encoding, opener=opener)
 
 
-def _secure_open_temp_write(path: str, encoding: str = "utf-8"):
+def _secure_open_temp_write(path: str, dir_fd: Optional[int] = None, encoding: str = "utf-8"):
     """Open temporary file for exclusive writing with O_CREAT | O_EXCL | O_NOFOLLOW to avoid symlink hijacking."""
+    if dir_fd is not None:
+        _validate_single_component(path)
     def opener(p, flags):
         flags |= os.O_CREAT | os.O_EXCL | os.O_WRONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
-        return os.open(p, flags, 0o644)
+        return os.open(p, flags, 0o644, dir_fd=dir_fd)
     return open(path, "w", encoding=encoding, opener=opener)
 
 
-def _secure_open_read(path: str, encoding: str = "utf-8"):
-    """Open file for reading with O_NOFOLLOW | O_CLOEXEC to prevent following symlinks atomically."""
+def _secure_open_read(path: str, dir_fd: Optional[int] = None, encoding: str = "utf-8"):
+    """Open file for reading with O_NOFOLLOW | O_CLOEXEC, rejecting symlinks and non-regular files."""
+    if dir_fd is not None:
+        _validate_single_component(path)
     def opener(p, flags):
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
-        fd = os.open(p, flags)
-        if not hasattr(os, "O_NOFOLLOW") and os.path.islink(p):
+        fd = os.open(p, flags, dir_fd=dir_fd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(errno.EINVAL, f"Refusing to read non-regular file: '{p}' (mode: {oct(st.st_mode)})")
+        except Exception:
             os.close(fd)
-            raise OSError(f"Refusing to read symbolic link: {p}")
+            raise
         return fd
     return open(path, "r", encoding=encoding, opener=opener)
+
+
+class DurabilityCommitError(OSError):
+    """Raised when final directory fsync fails during snapshot commit.
+
+    Retains both the original fsync failure and any subsequent rollback/cleanup failure.
+    """
+    def __init__(
+        self,
+        message: str,
+        fsync_error: Optional[Exception] = None,
+        cleanup_error: Optional[Exception] = None,
+    ):
+        super().__init__(message)
+        self.fsync_error = fsync_error
+        self.cleanup_error = cleanup_error
+
 
 # Snapshot commit lifecycle states
 STATE_CAPTURE_IN_PROGRESS = "CAPTURE_IN_PROGRESS"
 STATE_COMMITTED = "COMMITTED"
 STATE_INVALID = "INVALID"
 STATE_INCOMPLETE = "INCOMPLETE"
+STATE_UNCERTAIN = "UNCERTAIN"
 
 # Validation verdicts
 VERDICT_VALIDATED = "VALIDATED"
 VERDICT_UNVERIFIED = "UNVERIFIED"
 VERDICT_INVALID = "INVALID"
+VERDICT_UNCERTAIN = "UNCERTAIN"
 
 PROVENANCE_CLASS_IMPORTED_UNVERIFIED = "IMPORTED_UNVERIFIED"
 PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE = "LIVE_RUNTIME_CAPTURE"
@@ -306,50 +344,51 @@ class RawMemorySnapshot:
                     self.commit_state = STATE_CAPTURE_IN_PROGRESS
 
                     # Invalidate any pre-existing metadata.json to ensure stale commits never certify partial writes
-                    meta_path = os.path.join(self.output_dir, "metadata.json")
-                    if os.path.exists(meta_path):
-                        try:
-                            os.unlink(meta_path)
-                        except OSError as e:
-                            if e.errno != errno.ENOENT:
-                                self.commit_state = STATE_INVALID
-                                raise OSError(f"Failed invalidating stale metadata before save: {e}") from e
+                    try:
+                        os.unlink("metadata.json", dir_fd=dir_fd)
+                    except OSError as e:
+                        if e.errno != errno.ENOENT:
+                            self.commit_state = STATE_INVALID
+                            raise OSError(f"Failed invalidating stale metadata before save: {e}") from e
 
                     # Track created temporary files to ensure cleanup if writing/fsync fails
                     created_tmps: List[str] = []
                     try:
-                        # 1. manifest.json atomically with O_CREAT|O_EXCL
-                        manifest_path = os.path.join(self.output_dir, "manifest.json")
-                        manifest_tmp = os.path.join(self.output_dir, f"manifest.json.tmp.{unique_suffix}")
+                        # 1. manifest.json atomically with O_CREAT|O_EXCL via dir_fd
+                        manifest_name = "manifest.json"
+                        manifest_tmp = f"manifest.json.tmp.{unique_suffix}"
+                        _validate_single_component(manifest_tmp)
                         created_tmps.append(manifest_tmp)
-                        with _secure_open_temp_write(manifest_tmp) as f:
+                        with _secure_open_temp_write(manifest_tmp, dir_fd=dir_fd) as f:
                             json.dump([r.to_dict() for r in self.regions], f, indent=2)
                             f.flush()
                             os.fsync(f.fileno())
-                        os.replace(manifest_tmp, manifest_path)
+                        os.rename(manifest_tmp, manifest_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
                         created_tmps.remove(manifest_tmp)
 
-                        # 2. maps.json atomically with O_CREAT|O_EXCL
-                        maps_path = os.path.join(self.output_dir, "maps.json")
-                        maps_tmp = os.path.join(self.output_dir, f"maps.json.tmp.{unique_suffix}")
+                        # 2. maps.json atomically with O_CREAT|O_EXCL via dir_fd
+                        maps_name = "maps.json"
+                        maps_tmp = f"maps.json.tmp.{unique_suffix}"
+                        _validate_single_component(maps_tmp)
                         created_tmps.append(maps_tmp)
-                        with _secure_open_temp_write(maps_tmp) as f:
+                        with _secure_open_temp_write(maps_tmp, dir_fd=dir_fd) as f:
                             json.dump(self.maps, f, indent=2)
                             f.flush()
                             os.fsync(f.fileno())
-                        os.replace(maps_tmp, maps_path)
+                        os.rename(maps_tmp, maps_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
                         created_tmps.remove(maps_tmp)
 
-                        # 3. modules.json atomically with O_CREAT|O_EXCL
-                        modules_path = os.path.join(self.output_dir, "modules.json")
-                        modules_tmp = os.path.join(self.output_dir, f"modules.json.tmp.{unique_suffix}")
+                        # 3. modules.json atomically with O_CREAT|O_EXCL via dir_fd
+                        modules_name = "modules.json"
+                        modules_tmp = f"modules.json.tmp.{unique_suffix}"
+                        _validate_single_component(modules_tmp)
                         created_tmps.append(modules_tmp)
                         mods_data = [m.to_dict() if hasattr(m, "to_dict") else m for m in self.modules]
-                        with _secure_open_temp_write(modules_tmp) as f:
+                        with _secure_open_temp_write(modules_tmp, dir_fd=dir_fd) as f:
                             json.dump(mods_data, f, indent=2)
                             f.flush()
                             os.fsync(f.fileno())
-                        os.replace(modules_tmp, modules_path)
+                        os.rename(modules_tmp, modules_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
                         created_tmps.remove(modules_tmp)
 
                         # 4. Flush output directory to persist artifact directory entries BEFORE publishing metadata
@@ -360,20 +399,22 @@ class RawMemorySnapshot:
                             if e.errno not in unsupported_errs:
                                 raise OSError(f"Artifact directory fsync failed on '{self.output_dir}': {e}") from e
 
-                        # 5. Write and fsync metadata temporary file
+                        # 5. Write and fsync metadata temporary file via dir_fd
                         if self.commit_timestamp_ns <= 0:
                             self.commit_timestamp_ns = time.time_ns()
-                        meta_tmp = os.path.join(self.output_dir, f"metadata.json.tmp.{unique_suffix}")
+                        meta_name = "metadata.json"
+                        meta_tmp = f"metadata.json.tmp.{unique_suffix}"
+                        _validate_single_component(meta_tmp)
                         created_tmps.append(meta_tmp)
                         meta_dict = self.to_metadata()
                         meta_dict["committed"] = True
-                        with _secure_open_temp_write(meta_tmp) as f:
+                        with _secure_open_temp_write(meta_tmp, dir_fd=dir_fd) as f:
                             json.dump(meta_dict, f, indent=2)
                             f.flush()
                             os.fsync(f.fileno())
 
                         # 6. Atomically rename metadata.json as the final commit marker
-                        os.replace(meta_tmp, meta_path)
+                        os.rename(meta_tmp, meta_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
                         created_tmps.remove(meta_tmp)
 
                         # 7. Final directory fsync to persist metadata.json directory entry
@@ -383,25 +424,54 @@ class RawMemorySnapshot:
                             unsupported_errs = {errno.EINVAL, getattr(errno, "ENOTSUP", 95), getattr(errno, "EOPNOTSUPP", 95), getattr(errno, "ENOSYS", 38)}
                             if e.errno not in unsupported_errs:
                                 # Safe failure semantics: unpublish metadata immediately so incomplete durability cannot certify uncertain commit
+                                cleanup_exc = None
                                 try:
-                                    os.unlink(meta_path)
-                                except OSError:
-                                    pass
+                                    os.unlink("metadata.json", dir_fd=dir_fd)
+                                except OSError as ce:
+                                    cleanup_exc = ce
+                                    try:
+                                        emergency_payload = json.dumps({
+                                            "snapshot_id": self.snapshot_id,
+                                            "pid": self.pid,
+                                            "committed": False,
+                                            "status": "UNCERTAIN_DURABILITY",
+                                            "commit_state": STATE_UNCERTAIN,
+                                        }, indent=2).encode("utf-8")
+                                        efd = os.open("metadata.json", os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0), dir_fd=dir_fd)
+                                        try:
+                                            os.write(efd, emergency_payload)
+                                            try:
+                                                os.fsync(efd)
+                                            except OSError:
+                                                pass
+                                        finally:
+                                            os.close(efd)
+                                    except Exception:
+                                        pass
+
                                 self.committed = False
-                                self.commit_state = STATE_INVALID
-                                raise OSError(f"Final directory fsync failed; metadata unlinked to prevent uncertain commit: {e}") from e
+                                if cleanup_exc is not None:
+                                    self.commit_state = STATE_UNCERTAIN
+                                    raise DurabilityCommitError(
+                                        f"Final directory fsync failed ({e}) and metadata rollback unlink failed ({cleanup_exc})",
+                                        fsync_error=e,
+                                        cleanup_error=cleanup_exc,
+                                    ) from cleanup_exc
+                                else:
+                                    self.commit_state = STATE_INVALID
+                                    raise OSError(f"Final directory fsync failed; metadata unlinked to prevent uncertain commit: {e}") from e
 
                         # 8. Report COMMITTED only when all required durability operations have succeeded
                         self.committed = True
                         self.commit_state = STATE_COMMITTED
                         return self.output_dir
                     except Exception:
-                        self.committed = False
-                        self.commit_state = STATE_INVALID
+                        if self.commit_state != STATE_UNCERTAIN:
+                            self.committed = False
+                            self.commit_state = STATE_INVALID
                         for tmp_p in created_tmps:
                             try:
-                                if os.path.exists(tmp_p):
-                                    os.unlink(tmp_p)
+                                os.unlink(tmp_p, dir_fd=dir_fd)
                             except OSError:
                                 pass
                         raise
@@ -421,6 +491,7 @@ class RawMemorySnapshot:
         warnings: List[str] = []
         is_valid = True
         has_legacy_unverified = False
+        is_uncertain = (getattr(self, "commit_state", "") == STATE_UNCERTAIN)
 
         if not self.output_dir:
             self.validation_verdict = VERDICT_INVALID
@@ -436,371 +507,403 @@ class RawMemorySnapshot:
 
         real_out = os.path.abspath(self.output_dir)
 
-        # 1. Validate metadata.json
-        meta_file = os.path.join(real_out, "metadata.json")
-        meta_raw = None
+        # Pin directory FD to secure against parent-directory replacement/traversal
+        dir_open_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            dir_open_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_CLOEXEC"):
+            dir_open_flags |= os.O_CLOEXEC
+
         try:
-            with _secure_open_read(meta_file) as f:
-                meta_raw = json.load(f)
-                if not isinstance(meta_raw, dict):
-                    is_valid = False
-                    warnings.append("metadata.json root is not a JSON object")
-                else:
-                    req_keys = ["snapshot_id", "pid", "status"]
-                    for k in req_keys:
-                        if k not in meta_raw:
-                            is_valid = False
-                            warnings.append(f"metadata.json missing required field '{k}'")
-                    if "committed" not in meta_raw:
-                        has_legacy_unverified = True
-                        warnings.append("metadata.json missing legacy 'committed' field; marked UNVERIFIED")
-        except FileNotFoundError:
-            is_valid = False
-            warnings.append(f"Missing metadata.json in {real_out}")
+            dir_fd = os.open(real_out, dir_open_flags)
         except OSError as e:
-            is_valid = False
-            warnings.append(f"metadata.json cannot be securely read or is a symbolic link in {real_out}: {e}")
-        except Exception as e:
-            is_valid = False
-            warnings.append(f"metadata.json is malformed or invalid JSON: {e}")
+            self.validation_verdict = VERDICT_INVALID
+            return False, [f"Cannot open snapshot directory '{real_out}': {e}"]
 
-        # Check committed marker
-        if self.committed is False or (meta_raw and meta_raw.get("committed") is False):
-            is_valid = False
-            self.commit_state = STATE_INVALID
-            warnings.append("Snapshot was not cleanly committed (metadata 'committed' is false).")
-
-        # 2. Validate manifest.json exists and is valid JSON list
-        manifest_file = os.path.join(real_out, "manifest.json")
-        manifest_raw = None
         try:
-            with _secure_open_read(manifest_file) as f:
-                manifest_raw = json.load(f)
-                if not isinstance(manifest_raw, list):
-                    is_valid = False
-                    warnings.append("manifest.json root is not a JSON list")
-                else:
-                    seen_manifest_ids = set()
-                    for m_idx, m_entry in enumerate(manifest_raw):
-                        if not isinstance(m_entry, dict):
-                            is_valid = False
-                            warnings.append(f"Manifest entry {m_idx} is not a JSON object")
-                            continue
+            dir_st = os.fstat(dir_fd)
+            if not stat.S_ISDIR(dir_st.st_mode):
+                self.validation_verdict = VERDICT_INVALID
+                return False, [f"Snapshot path '{real_out}' is not a directory"]
 
-                        m_id = m_entry.get("region_id")
-                        if not m_id:
-                            is_valid = False
-                            warnings.append(f"Manifest entry {m_idx} missing region_id")
-                        elif m_id in seen_manifest_ids:
-                            is_valid = False
-                            warnings.append(f"Duplicate region_id '{m_id}' in manifest.json")
-                        else:
-                            seen_manifest_ids.add(m_id)
-
-                        # Range and size validation on disk manifest entry
-                        start_val = m_entry.get("start_addr")
-                        end_val = m_entry.get("end_addr")
-                        sz_val = m_entry.get("size")
-                        req_val = m_entry.get("requested", 0)
-                        cap_val = m_entry.get("captured", 0)
-
-                        if start_val is None and "start" in m_entry:
-                            try:
-                                start_val = int(str(m_entry["start"]), 0)
-                            except Exception:
-                                pass
-                        if end_val is None and "end" in m_entry:
-                            try:
-                                end_val = int(str(m_entry["end"]), 0)
-                            except Exception:
-                                pass
-
-                        if start_val is not None and end_val is not None:
-                            if start_val < 0 or end_val < 0:
-                                is_valid = False
-                                warnings.append(f"Manifest entry {m_id} has negative address: start={start_val}, end={end_val}")
-                            elif start_val >= end_val:
-                                is_valid = False
-                                warnings.append(f"Manifest entry {m_id} has inverted/empty address range: start 0x{start_val:x} >= end 0x{end_val:x}")
-                            if sz_val is not None and sz_val > 0 and sz_val > (end_val - start_val):
-                                is_valid = False
-                                warnings.append(f"Manifest entry {m_id} size exceeds address range: size={sz_val} > end-start={end_val - start_val}")
-
-                        if sz_val is not None and sz_val <= 0:
-                            is_valid = False
-                            warnings.append(f"Manifest entry {m_id} has non-positive size: {sz_val}")
-
-                        if req_val is not None and req_val < 0:
-                            is_valid = False
-                            warnings.append(f"Manifest entry {m_id} has negative requested bytes: {req_val}")
-
-                        if cap_val is not None and cap_val < 0:
-                            is_valid = False
-                            warnings.append(f"Manifest entry {m_id} has negative captured bytes: {cap_val}")
-
-                        if req_val is not None and cap_val is not None and req_val > 0 and cap_val > req_val:
-                            is_valid = False
-                            warnings.append(f"Manifest entry {m_id} captured ({cap_val}) exceeds requested ({req_val})")
-
-                        # Cross-check disk manifest entries with in-memory regions if present
-                        if self.regions and len(manifest_raw) != len(self.regions):
-                            is_valid = False
-                            warnings.append(
-                                f"Manifest entry count mismatch: disk has {len(manifest_raw)}, memory has {len(self.regions)}"
-                            )
-                        elif self.regions:
-                            for idx, (m_entry, r_obj) in enumerate(zip(manifest_raw, self.regions)):
-                                if isinstance(m_entry, dict):
-                                    if m_entry.get("region_id") != r_obj.region_id:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} ID mismatch: disk '{m_entry.get('region_id')}' != memory '{r_obj.region_id}'")
-                                    if m_entry.get("status") != r_obj.status:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} status mismatch: disk '{m_entry.get('status')}' != memory '{r_obj.status}'")
-
-                                    # Address checks
-                                    m_s = m_entry.get("start_addr")
-                                    if m_s is None and "start" in m_entry:
-                                        try:
-                                            m_s = int(str(m_entry["start"]), 0)
-                                        except Exception:
-                                            pass
-                                    if m_s is not None and m_s != r_obj.start_addr:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} start_addr mismatch: disk {m_s} != memory {r_obj.start_addr}")
-
-                                    m_e = m_entry.get("end_addr")
-                                    if m_e is None and "end" in m_entry:
-                                        try:
-                                            m_e = int(str(m_entry["end"]), 0)
-                                        except Exception:
-                                            pass
-                                    if m_e is not None and m_e != r_obj.end_addr:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} end_addr mismatch: disk {m_e} != memory {r_obj.end_addr}")
-
-                                    if m_entry.get("size") is not None and m_entry.get("size") != r_obj.size:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} size mismatch: disk {m_entry.get('size')} != memory {r_obj.size}")
-                                    if m_entry.get("permissions") is not None and m_entry.get("permissions") != r_obj.permissions:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} permissions mismatch: disk '{m_entry.get('permissions')}' != memory '{r_obj.permissions}'")
-                                    if m_entry.get("category") is not None and m_entry.get("category") != r_obj.category:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} category mismatch: disk '{m_entry.get('category')}' != memory '{r_obj.category}'")
-                                    if m_entry.get("pathname") is not None and m_entry.get("pathname") != r_obj.pathname:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} pathname mismatch: disk '{m_entry.get('pathname')}' != memory '{r_obj.pathname}'")
-                                    if m_entry.get("requested") is not None and m_entry.get("requested") != r_obj.requested:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} requested mismatch: disk {m_entry.get('requested')} != memory {r_obj.requested}")
-                                    if m_entry.get("captured") is not None and m_entry.get("captured") != r_obj.captured:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} captured mismatch: disk {m_entry.get('captured')} != memory {r_obj.captured}")
-                                    if m_entry.get("filename") is not None and m_entry.get("filename") != (r_obj.filename or ""):
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} filename mismatch: disk '{m_entry.get('filename')}' != memory '{r_obj.filename}'")
-                                    if "error" in m_entry and m_entry.get("error") != r_obj.error:
-                                        is_valid = False
-                                        warnings.append(f"Manifest region {idx} error mismatch: disk '{m_entry.get('error')}' != memory '{r_obj.error}'")
-        except FileNotFoundError:
-            is_valid = False
-            warnings.append(f"Missing manifest.json in {real_out}")
-        except OSError as e:
-            is_valid = False
-            warnings.append(f"manifest.json cannot be securely read or is a symbolic link in {real_out}: {e}")
-        except Exception as e:
-            is_valid = False
-            warnings.append(f"manifest.json is malformed or invalid JSON: {e}")
-
-        # 3. Validate maps.json exists and is valid JSON list
-        maps_file = os.path.join(real_out, "maps.json")
-        try:
-            with _secure_open_read(maps_file) as f:
-                maps_raw = json.load(f)
-                if not isinstance(maps_raw, list):
-                    is_valid = False
-                    warnings.append("maps.json root is not a JSON list")
-        except FileNotFoundError:
-            is_valid = False
-            warnings.append(f"Missing maps.json in {real_out}")
-        except OSError as e:
-            is_valid = False
-            warnings.append(f"maps.json cannot be securely read or is a symbolic link in {real_out}: {e}")
-        except Exception as e:
-            is_valid = False
-            warnings.append(f"maps.json is malformed or invalid JSON: {e}")
-
-        # Check snapshot identity agreement between metadata and in-memory object
-        if meta_raw and isinstance(meta_raw, dict):
-            if meta_raw.get("snapshot_id") != self.snapshot_id:
-                is_valid = False
-                warnings.append(
-                    f"Snapshot ID mismatch: metadata.json reports '{meta_raw.get('snapshot_id')}', but memory object has '{self.snapshot_id}'"
-                )
-            if meta_raw.get("pid") != self.pid:
-                is_valid = False
-                warnings.append(
-                    f"PID mismatch: metadata.json reports {meta_raw.get('pid')}, but memory object has {self.pid}"
-                )
-
-        # 4. Validate regions, file paths, traversal, actual sizes, and statuses
-        mem_dir = os.path.join(real_out, "memory")
-        if os.path.islink(mem_dir):
-            is_valid = False
-            warnings.append(f"Memory directory is a symbolic link: {mem_dir}")
-
-        seen_region_ids = set()
-        for r in self.regions:
-            # Check duplicate region_id in memory regions
-            if not r.region_id:
-                is_valid = False
-                warnings.append("Memory region has empty region_id")
-            elif r.region_id in seen_region_ids:
-                is_valid = False
-                warnings.append(f"Duplicate region_id '{r.region_id}' in memory regions")
-            else:
-                seen_region_ids.add(r.region_id)
-
-            # Check address bounds and ranges
-            if r.start_addr < 0 or r.end_addr < 0:
-                is_valid = False
-                warnings.append(f"Region {r.region_id} has negative address: start={r.start_addr}, end={r.end_addr}")
-            elif r.start_addr >= r.end_addr:
-                is_valid = False
-                warnings.append(f"Region {r.region_id} has inverted/empty address range: start 0x{r.start_addr:x} >= end 0x{r.end_addr:x}")
-
-            if r.size <= 0:
-                is_valid = False
-                warnings.append(f"Region {r.region_id} has non-positive size: {r.size}")
-            elif r.start_addr < r.end_addr and r.size > (r.end_addr - r.start_addr):
-                is_valid = False
-                warnings.append(f"Region {r.region_id} size exceeds address range: size={r.size} > end-start={r.end_addr - r.start_addr}")
-
-            if r.requested < 0:
-                is_valid = False
-                warnings.append(f"Region {r.region_id} has negative requested bytes: {r.requested}")
-            if r.captured < 0:
-                is_valid = False
-                warnings.append(f"Region {r.region_id} has negative captured bytes: {r.captured}")
-            if r.requested > 0 and r.captured > r.requested:
-                is_valid = False
-                warnings.append(f"Region {r.region_id} captured ({r.captured}) exceeds requested ({r.requested})")
-
-            # Check path traversal
-            if r.filename:
-                norm_rel = os.path.normpath(r.filename)
-                if os.path.isabs(norm_rel) or norm_rel.startswith("..") or (".." in norm_rel.split(os.path.sep)):
-                    is_valid = False
-                    warnings.append(f"Region {r.region_id} filename attempts path traversal: '{r.filename}' (escapes snapshot directory)")
-                    continue
-
-                full_bin = os.path.abspath(os.path.join(real_out, norm_rel))
-                try:
-                    common = os.path.commonpath([real_out, full_bin])
-                    if common != real_out:
+            # 1. Validate metadata.json
+            meta_raw = None
+            try:
+                with _secure_open_read("metadata.json", dir_fd=dir_fd) as f:
+                    meta_raw = json.load(f)
+                    if not isinstance(meta_raw, dict):
                         is_valid = False
-                        warnings.append(f"Region {r.region_id} path escapes snapshot directory: '{r.filename}'")
-                        continue
-                except ValueError:
-                    is_valid = False
-                    warnings.append(f"Region {r.region_id} path drive mismatch: '{r.filename}'")
-                    continue
+                        warnings.append("metadata.json root is not a JSON object")
+                    else:
+                        req_keys = ["snapshot_id", "pid", "status"]
+                        for k in req_keys:
+                            if k not in meta_raw:
+                                is_valid = False
+                                warnings.append(f"metadata.json missing required field '{k}'")
+                        if "committed" not in meta_raw:
+                            has_legacy_unverified = True
+                            warnings.append("metadata.json missing legacy 'committed' field; marked UNVERIFIED")
+            except FileNotFoundError:
+                is_valid = False
+                warnings.append(f"Missing metadata.json in {real_out}")
+            except OSError as e:
+                is_valid = False
+                warnings.append(f"metadata.json cannot be securely read or is a symbolic link in {real_out}: {e}")
+            except Exception as e:
+                is_valid = False
+                warnings.append(f"metadata.json is malformed or invalid JSON: {e}")
 
-                # Check if any parent component inside snapshot directory is a symlink
-                parent_check = os.path.dirname(full_bin)
-                while parent_check and parent_check != real_out:
-                    if os.path.islink(parent_check):
+            # Check committed marker and durability certainty
+            if meta_raw and isinstance(meta_raw, dict):
+                if meta_raw.get("status") == "UNCERTAIN_DURABILITY" or meta_raw.get("commit_state") == STATE_UNCERTAIN:
+                    is_valid = False
+                    is_uncertain = True
+                    self.commit_state = STATE_UNCERTAIN
+                    warnings.append("Snapshot commit durability is uncertain (metadata reports UNCERTAIN_DURABILITY).")
+                elif self.committed is False or meta_raw.get("committed") is False:
+                    is_valid = False
+                    self.commit_state = STATE_INVALID
+                    warnings.append("Snapshot was not cleanly committed (metadata 'committed' is false).")
+
+            # 2. Validate manifest.json exists and is valid JSON list
+            manifest_raw = None
+            try:
+                with _secure_open_read("manifest.json", dir_fd=dir_fd) as f:
+                    manifest_raw = json.load(f)
+                    if not isinstance(manifest_raw, list):
                         is_valid = False
-                        warnings.append(f"Region {r.region_id} parent directory is a symbolic link: '{parent_check}'")
-                        break
-                    parent_check = os.path.dirname(parent_check)
+                        warnings.append("manifest.json root is not a JSON list")
+                    else:
+                        seen_manifest_ids = set()
+                        for m_idx, m_entry in enumerate(manifest_raw):
+                            if not isinstance(m_entry, dict):
+                                is_valid = False
+                                warnings.append(f"Manifest entry {m_idx} is not a JSON object")
+                                continue
 
-            # Check region file and sizes
-            if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0:
-                if not r.filename:
-                    is_valid = False
-                    warnings.append(f"Region {r.region_id} status is {r.status} ({r.captured} bytes) but filename is missing.")
-                else:
-                    bin_path = os.path.join(real_out, r.filename)
-                    open_flags = os.O_RDONLY
-                    if hasattr(os, "O_NOFOLLOW"):
-                        open_flags |= os.O_NOFOLLOW
-                    if hasattr(os, "O_CLOEXEC"):
-                        open_flags |= os.O_CLOEXEC
-                    try:
-                        fd = os.open(bin_path, open_flags)
-                        try:
-                            actual_sz = os.fstat(fd).st_size
-                            if actual_sz != r.captured:
+                            m_id = m_entry.get("region_id")
+                            if not m_id:
+                                is_valid = False
+                                warnings.append(f"Manifest entry {m_idx} missing region_id")
+                            elif m_id in seen_manifest_ids:
+                                is_valid = False
+                                warnings.append(f"Duplicate region_id '{m_id}' in manifest.json")
+                            else:
+                                seen_manifest_ids.add(m_id)
+
+                            # Range and size validation on disk manifest entry
+                            start_val = m_entry.get("start_addr")
+                            end_val = m_entry.get("end_addr")
+                            sz_val = m_entry.get("size")
+                            req_val = m_entry.get("requested", 0)
+                            cap_val = m_entry.get("captured", 0)
+
+                            if start_val is None and "start" in m_entry:
+                                try:
+                                    start_val = int(str(m_entry["start"]), 0)
+                                except Exception:
+                                    pass
+                            if end_val is None and "end" in m_entry:
+                                try:
+                                    end_val = int(str(m_entry["end"]), 0)
+                                except Exception:
+                                    pass
+
+                            if start_val is not None and end_val is not None:
+                                if start_val < 0 or end_val < 0:
+                                    is_valid = False
+                                    warnings.append(f"Manifest entry {m_id} has negative address: start={start_val}, end={end_val}")
+                                elif start_val >= end_val:
+                                    is_valid = False
+                                    warnings.append(f"Manifest entry {m_id} has inverted/empty address range: start 0x{start_val:x} >= end 0x{end_val:x}")
+                                if sz_val is not None and sz_val > 0 and sz_val > (end_val - start_val):
+                                    is_valid = False
+                                    warnings.append(f"Manifest entry {m_id} size exceeds address range: size={sz_val} > end-start={end_val - start_val}")
+
+                            if sz_val is not None and sz_val <= 0:
+                                is_valid = False
+                                warnings.append(f"Manifest entry {m_id} has non-positive size: {sz_val}")
+
+                            if req_val is not None and req_val < 0:
+                                is_valid = False
+                                warnings.append(f"Manifest entry {m_id} has negative requested bytes: {req_val}")
+
+                            if cap_val is not None and cap_val < 0:
+                                is_valid = False
+                                warnings.append(f"Manifest entry {m_id} has negative captured bytes: {cap_val}")
+
+                            if req_val is not None and cap_val is not None and req_val > 0 and cap_val > req_val:
+                                is_valid = False
+                                warnings.append(f"Manifest entry {m_id} captured ({cap_val}) exceeds requested ({req_val})")
+
+                            # Cross-check disk manifest entries with in-memory regions if present
+                            if self.regions and len(manifest_raw) != len(self.regions):
                                 is_valid = False
                                 warnings.append(
-                                    f"Region {r.region_id} binary file corrupted/truncated: {r.filename} "
-                                    f"(expected {r.captured} bytes, found {actual_sz} bytes)"
+                                    f"Manifest entry count mismatch: disk has {len(manifest_raw)}, memory has {len(self.regions)}"
                                 )
-                        finally:
-                            os.close(fd)
-                    except FileNotFoundError:
-                        is_valid = False
-                        warnings.append(f"Region {r.region_id} binary file missing on disk: {r.filename}")
-                    except OSError as e:
-                        is_valid = False
-                        warnings.append(f"Region {r.region_id} binary file cannot be securely read or is a symbolic link: {r.filename} ({e})")
-            elif r.status == "FAILED":
-                if r.captured != 0:
-                    is_valid = False
-                    warnings.append(f"Region {r.region_id} status is FAILED but reports captured={r.captured} != 0")
+                            elif self.regions:
+                                for idx, (m_entry, r_obj) in enumerate(zip(manifest_raw, self.regions)):
+                                    if isinstance(m_entry, dict):
+                                        if m_entry.get("region_id") != r_obj.region_id:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} ID mismatch: disk '{m_entry.get('region_id')}' != memory '{r_obj.region_id}'")
+                                        if m_entry.get("status") != r_obj.status:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} status mismatch: disk '{m_entry.get('status')}' != memory '{r_obj.status}'")
 
-            # Region status and size consistency
-            if r.status == "COMPLETE":
-                if r.requested > 0 and r.captured != r.requested:
+                                        # Address checks
+                                        m_s = m_entry.get("start_addr")
+                                        if m_s is None and "start" in m_entry:
+                                            try:
+                                                m_s = int(str(m_entry["start"]), 0)
+                                            except Exception:
+                                                pass
+                                        if m_s is not None and m_s != r_obj.start_addr:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} start_addr mismatch: disk {m_s} != memory {r_obj.start_addr}")
+
+                                        m_e = m_entry.get("end_addr")
+                                        if m_e is None and "end" in m_entry:
+                                            try:
+                                                m_e = int(str(m_entry["end"]), 0)
+                                            except Exception:
+                                                pass
+                                        if m_e is not None and m_e != r_obj.end_addr:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} end_addr mismatch: disk {m_e} != memory {r_obj.end_addr}")
+
+                                        if m_entry.get("size") is not None and m_entry.get("size") != r_obj.size:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} size mismatch: disk {m_entry.get('size')} != memory {r_obj.size}")
+                                        if m_entry.get("permissions") is not None and m_entry.get("permissions") != r_obj.permissions:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} permissions mismatch: disk '{m_entry.get('permissions')}' != memory '{r_obj.permissions}'")
+                                        if m_entry.get("category") is not None and m_entry.get("category") != r_obj.category:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} category mismatch: disk '{m_entry.get('category')}' != memory '{r_obj.category}'")
+                                        if m_entry.get("pathname") is not None and m_entry.get("pathname") != r_obj.pathname:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} pathname mismatch: disk '{m_entry.get('pathname')}' != memory '{r_obj.pathname}'")
+                                        if m_entry.get("requested") is not None and m_entry.get("requested") != r_obj.requested:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} requested mismatch: disk {m_entry.get('requested')} != memory {r_obj.requested}")
+                                        if m_entry.get("captured") is not None and m_entry.get("captured") != r_obj.captured:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} captured mismatch: disk {m_entry.get('captured')} != memory {r_obj.captured}")
+                                        if m_entry.get("filename") is not None and m_entry.get("filename") != (r_obj.filename or ""):
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} filename mismatch: disk '{m_entry.get('filename')}' != memory '{r_obj.filename}'")
+                                        if "error" in m_entry and m_entry.get("error") != r_obj.error:
+                                            is_valid = False
+                                            warnings.append(f"Manifest region {idx} error mismatch: disk '{m_entry.get('error')}' != memory '{r_obj.error}'")
+            except FileNotFoundError:
+                is_valid = False
+                warnings.append(f"Missing manifest.json in {real_out}")
+            except OSError as e:
+                is_valid = False
+                warnings.append(f"manifest.json cannot be securely read or is a symbolic link in {real_out}: {e}")
+            except Exception as e:
+                is_valid = False
+                warnings.append(f"manifest.json is malformed or invalid JSON: {e}")
+
+            # 3. Validate maps.json exists and is valid JSON list
+            maps_raw = None
+            try:
+                with _secure_open_read("maps.json", dir_fd=dir_fd) as f:
+                    maps_raw = json.load(f)
+                    if not isinstance(maps_raw, list):
+                        is_valid = False
+                        warnings.append("maps.json root is not a JSON list")
+            except FileNotFoundError:
+                is_valid = False
+                warnings.append(f"Missing maps.json in {real_out}")
+            except OSError as e:
+                is_valid = False
+                warnings.append(f"maps.json cannot be securely read or is a symbolic link in {real_out}: {e}")
+            except Exception as e:
+                is_valid = False
+                warnings.append(f"maps.json is malformed or invalid JSON: {e}")
+
+            # Check snapshot identity agreement between metadata and in-memory object
+            if meta_raw and isinstance(meta_raw, dict):
+                if meta_raw.get("snapshot_id") != self.snapshot_id:
                     is_valid = False
                     warnings.append(
-                        f"Region {r.region_id} status is COMPLETE but captured bytes ({r.captured}) != requested bytes ({r.requested})"
+                        f"Snapshot ID mismatch: metadata.json reports '{meta_raw.get('snapshot_id')}', but memory object has '{self.snapshot_id}'"
                     )
-            elif r.status == "PARTIAL":
-                if r.captured <= 0 or (r.requested > 0 and r.captured >= r.requested):
+                if meta_raw.get("pid") != self.pid:
                     is_valid = False
                     warnings.append(
-                        f"Region {r.region_id} status is PARTIAL but captured bytes ({r.captured}) is inconsistent with requested ({r.requested})"
+                        f"PID mismatch: metadata.json reports {meta_raw.get('pid')}, but memory object has {self.pid}"
                     )
 
-        # 5. Manifest and metadata region counts agreement
-        actual_captured_count = sum(1 for r in self.regions if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0)
-        if self.regions_captured != actual_captured_count:
-            is_valid = False
-            warnings.append(
-                f"Region count mismatch: metadata reports regions_captured={self.regions_captured}, "
-                f"but manifest contains {actual_captured_count} captured regions"
-            )
+            # 4. Validate regions, file paths, traversal, actual sizes, and statuses
+            mem_dir = os.path.join(real_out, "memory")
+            if os.path.islink(mem_dir):
+                is_valid = False
+                warnings.append(f"Memory directory is a symbolic link: {mem_dir}")
 
-        if self.regions_requested > 0 and len(self.regions) != self.regions_requested:
-            is_valid = False
-            warnings.append(
-                f"Total region count mismatch: metadata reports regions_requested={self.regions_requested}, "
-                f"but manifest contains {len(self.regions)} regions"
-            )
+            seen_region_ids = set()
+            for r in self.regions:
+                # Check duplicate region_id in memory regions
+                if not r.region_id:
+                    is_valid = False
+                    warnings.append("Memory region has empty region_id")
+                elif r.region_id in seen_region_ids:
+                    is_valid = False
+                    warnings.append(f"Duplicate region_id '{r.region_id}' in memory regions")
+                else:
+                    seen_region_ids.add(r.region_id)
 
-        # 6. Requested/captured byte counts agreement
-        actual_captured_bytes = sum(r.captured for r in self.regions)
-        if self.bytes_captured != actual_captured_bytes:
-            is_valid = False
-            warnings.append(
-                f"Captured bytes mismatch: metadata reports bytes_captured={self.bytes_captured}, "
-                f"but sum of manifest regions is {actual_captured_bytes}"
-            )
+                # Check address bounds and ranges
+                if r.start_addr < 0 or r.end_addr < 0:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} has negative address: start={r.start_addr}, end={r.end_addr}")
+                elif r.start_addr >= r.end_addr:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} has inverted/empty address range: start 0x{r.start_addr:x} >= end 0x{r.end_addr:x}")
 
-        actual_requested_bytes = sum(r.requested for r in self.regions)
-        if self.bytes_requested > 0 and self.bytes_requested != actual_requested_bytes:
-            is_valid = False
-            warnings.append(
-                f"Requested bytes mismatch: metadata reports bytes_requested={self.bytes_requested}, "
-                f"but sum of manifest regions is {actual_requested_bytes}"
-            )
+                if r.size <= 0:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} has non-positive size: {r.size}")
+                elif r.start_addr < r.end_addr and r.size > (r.end_addr - r.start_addr):
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} size exceeds address range: size={r.size} > end-start={r.end_addr - r.start_addr}")
+
+                if r.requested < 0:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} has negative requested bytes: {r.requested}")
+                if r.captured < 0:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} has negative captured bytes: {r.captured}")
+                if r.requested > 0 and r.captured > r.requested:
+                    is_valid = False
+                    warnings.append(f"Region {r.region_id} captured ({r.captured}) exceeds requested ({r.requested})")
+
+                # Check path traversal
+                if r.filename:
+                    norm_rel = os.path.normpath(r.filename)
+                    if os.path.isabs(norm_rel) or norm_rel.startswith("..") or (".." in norm_rel.split(os.path.sep)):
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} filename attempts path traversal: '{r.filename}' (escapes snapshot directory)")
+                        continue
+
+                    full_bin = os.path.abspath(os.path.join(real_out, norm_rel))
+                    try:
+                        common = os.path.commonpath([real_out, full_bin])
+                        if common != real_out:
+                            is_valid = False
+                            warnings.append(f"Region {r.region_id} path escapes snapshot directory: '{r.filename}'")
+                            continue
+                    except ValueError:
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} path drive mismatch: '{r.filename}'")
+                        continue
+
+                    # Check if any parent component inside snapshot directory is a symlink
+                    parent_check = os.path.dirname(full_bin)
+                    while parent_check and parent_check != real_out:
+                        if os.path.islink(parent_check):
+                            is_valid = False
+                            warnings.append(f"Region {r.region_id} parent directory is a symbolic link: '{parent_check}'")
+                            break
+                        parent_check = os.path.dirname(parent_check)
+
+                # Check region file and sizes
+                if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0:
+                    if not r.filename:
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} status is {r.status} ({r.captured} bytes) but filename is missing.")
+                    else:
+                        norm_bin = os.path.normpath(r.filename)
+                        open_flags = os.O_RDONLY
+                        if hasattr(os, "O_NOFOLLOW"):
+                            open_flags |= os.O_NOFOLLOW
+                        if hasattr(os, "O_CLOEXEC"):
+                            open_flags |= os.O_CLOEXEC
+                        try:
+                            fd = os.open(norm_bin, open_flags, dir_fd=dir_fd)
+                            try:
+                                bin_st = os.fstat(fd)
+                                if not stat.S_ISREG(bin_st.st_mode):
+                                    is_valid = False
+                                    warnings.append(f"Region {r.region_id} binary file is not a regular file: {r.filename}")
+                                elif bin_st.st_size != r.captured:
+                                    is_valid = False
+                                    warnings.append(
+                                        f"Region {r.region_id} binary file corrupted/truncated: {r.filename} "
+                                        f"(expected {r.captured} bytes, found {bin_st.st_size} bytes)"
+                                    )
+                            finally:
+                                os.close(fd)
+                        except FileNotFoundError:
+                            is_valid = False
+                            warnings.append(f"Region {r.region_id} binary file missing on disk: {r.filename}")
+                        except OSError as e:
+                            is_valid = False
+                            warnings.append(f"Region {r.region_id} binary file cannot be securely read or is a symbolic link: {r.filename} ({e})")
+                elif r.status == "FAILED":
+                    if r.captured != 0:
+                        is_valid = False
+                        warnings.append(f"Region {r.region_id} status is FAILED but reports captured={r.captured} != 0")
+
+                # Region status and size consistency
+                if r.status == "COMPLETE":
+                    if r.requested > 0 and r.captured != r.requested:
+                        is_valid = False
+                        warnings.append(
+                            f"Region {r.region_id} status is COMPLETE but captured bytes ({r.captured}) != requested bytes ({r.requested})"
+                        )
+                elif r.status == "PARTIAL":
+                    if r.captured <= 0 or (r.requested > 0 and r.captured >= r.requested):
+                        is_valid = False
+                        warnings.append(
+                            f"Region {r.region_id} status is PARTIAL but captured bytes ({r.captured}) is inconsistent with requested ({r.requested})"
+                        )
+
+            # 5. Manifest and metadata region counts agreement
+            actual_captured_count = sum(1 for r in self.regions if r.status in ("COMPLETE", "PARTIAL") and r.captured > 0)
+            if self.regions_captured != actual_captured_count:
+                is_valid = False
+                warnings.append(
+                    f"Region count mismatch: metadata reports regions_captured={self.regions_captured}, "
+                    f"but manifest contains {actual_captured_count} captured regions"
+                )
+
+            if self.regions_requested > 0 and len(self.regions) != self.regions_requested:
+                is_valid = False
+                warnings.append(
+                    f"Total region count mismatch: metadata reports regions_requested={self.regions_requested}, "
+                    f"but manifest contains {len(self.regions)} regions"
+                )
+
+            # 6. Requested/captured byte counts agreement
+            actual_captured_bytes = sum(r.captured for r in self.regions)
+            if self.bytes_captured != actual_captured_bytes:
+                is_valid = False
+                warnings.append(
+                    f"Captured bytes mismatch: metadata reports bytes_captured={self.bytes_captured}, "
+                    f"but sum of manifest regions is {actual_captured_bytes}"
+                )
+
+            actual_requested_bytes = sum(r.requested for r in self.regions)
+            if self.bytes_requested > 0 and self.bytes_requested != actual_requested_bytes:
+                is_valid = False
+                warnings.append(
+                    f"Requested bytes mismatch: metadata reports bytes_requested={self.bytes_requested}, "
+                    f"but sum of manifest regions is {actual_requested_bytes}"
+                )
+        finally:
+            os.close(dir_fd)
 
         if not is_valid:
-            self.validation_verdict = VERDICT_INVALID
-            self.commit_state = STATE_INVALID
+            if is_uncertain or self.commit_state == STATE_UNCERTAIN:
+                self.validation_verdict = VERDICT_UNCERTAIN
+                self.commit_state = STATE_UNCERTAIN
+            else:
+                self.validation_verdict = VERDICT_INVALID
+                self.commit_state = STATE_INVALID
             if self.status == "COMPLETE":
                 self.status = "PARTIAL"
         elif has_legacy_unverified:
@@ -824,57 +927,70 @@ class RawMemorySnapshot:
             raise ValueError(f"Snapshot directory '{directory}' is a symbolic link; symlinks are rejected")
 
         dir_path = os.path.abspath(directory)
-        meta_path = os.path.join(dir_path, "metadata.json")
-        manifest_path = os.path.join(dir_path, "manifest.json")
-        maps_path = os.path.join(dir_path, "maps.json")
-        modules_path = os.path.join(dir_path, "modules.json")
+        dir_open_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            dir_open_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_CLOEXEC"):
+            dir_open_flags |= os.O_CLOEXEC
 
         try:
-            with _secure_open_read(meta_path) as f:
-                meta = json.load(f)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Missing metadata.json in {dir_path}")
+            dir_fd = os.open(dir_path, dir_open_flags)
         except OSError as e:
-            raise OSError(f"Cannot securely read metadata.json in {dir_path} (symlink or unreadable): {e}") from e
+            raise OSError(f"Cannot open snapshot directory '{dir_path}': {e}") from e
 
-        regions = []
-        manifest_err = None
         try:
-            with _secure_open_read(manifest_path) as f:
-                manifest_data = json.load(f)
-                if isinstance(manifest_data, list):
-                    regions = [CapturedRegion.from_dict(r) for r in manifest_data]
-                else:
-                    manifest_err = "manifest.json root is not a list"
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            manifest_err = f"manifest.json is malformed: {e}"
+            dir_st = os.fstat(dir_fd)
+            if not stat.S_ISDIR(dir_st.st_mode):
+                raise ValueError(f"Snapshot path '{dir_path}' is not a directory")
 
-        maps = []
-        maps_err = None
-        try:
-            with _secure_open_read(maps_path) as f:
-                maps_data = json.load(f)
-                if isinstance(maps_data, list):
-                    maps = maps_data
-                else:
-                    maps_err = "maps.json root is not a list"
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            maps_err = f"maps.json is malformed: {e}"
+            try:
+                with _secure_open_read("metadata.json", dir_fd=dir_fd) as f:
+                    meta = json.load(f)
+            except FileNotFoundError:
+                raise FileNotFoundError(f"Missing metadata.json in {dir_path}")
+            except OSError as e:
+                raise OSError(f"Cannot securely read metadata.json in {dir_path} (symlink or unreadable): {e}") from e
 
-        modules = []
-        modules_err = None
-        try:
-            with _secure_open_read(modules_path) as f:
-                modules = json.load(f)
-        except FileNotFoundError:
-            if "modules" in meta:
-                modules = meta["modules"]
-        except Exception as e:
-            modules_err = f"modules.json is malformed: {e}"
+            regions = []
+            manifest_err = None
+            try:
+                with _secure_open_read("manifest.json", dir_fd=dir_fd) as f:
+                    manifest_data = json.load(f)
+                    if isinstance(manifest_data, list):
+                        regions = [CapturedRegion.from_dict(r) for r in manifest_data]
+                    else:
+                        manifest_err = "manifest.json root is not a list"
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                manifest_err = f"manifest.json is malformed: {e}"
+
+            maps = []
+            maps_err = None
+            try:
+                with _secure_open_read("maps.json", dir_fd=dir_fd) as f:
+                    maps_data = json.load(f)
+                    if isinstance(maps_data, list):
+                        maps = maps_data
+                    else:
+                        maps_err = "maps.json root is not a list"
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                maps_err = f"maps.json is malformed: {e}"
+
+            modules = []
+            modules_err = None
+            try:
+                with _secure_open_read("modules.json", dir_fd=dir_fd) as f:
+                    modules = json.load(f)
+            except FileNotFoundError:
+                if "modules" in meta:
+                    modules = meta["modules"]
+            except Exception as e:
+                modules_err = f"modules.json is malformed: {e}"
+        finally:
+            os.close(dir_fd)
 
         snap = cls(
             snapshot_id=meta.get("snapshot_id", "UNKNOWN"),
@@ -917,6 +1033,8 @@ class RawMemorySnapshot:
             output_dir=dir_path,
             regions=regions,
             maps=maps,
+            commit_state=meta.get("commit_state", STATE_COMMITTED),
+            validation_verdict=meta.get("validation_verdict", VERDICT_UNVERIFIED),
         )
 
         is_valid, validation_warnings = snap.validate_integrity()
@@ -938,7 +1056,10 @@ class RawMemorySnapshot:
             if snap.status == "COMPLETE":
                 snap.status = "PARTIAL"
                 snap.integrity_warnings.append("Snapshot status degraded from COMPLETE to PARTIAL due to integrity check failures.")
-            snap.commit_state = STATE_INVALID
-            snap.validation_verdict = VERDICT_INVALID
+            if snap.commit_state != STATE_UNCERTAIN:
+                snap.commit_state = STATE_INVALID
+                snap.validation_verdict = VERDICT_INVALID
+            else:
+                snap.validation_verdict = VERDICT_UNCERTAIN
 
         return snap

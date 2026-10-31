@@ -576,18 +576,9 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         return -1;
     }
 
-    char mem_dir[2048] = {0};
-    if (snprintf(mem_dir, sizeof(mem_dir), "%s/memory", out_dir) >= (int)sizeof(mem_dir)) {
-        snprintf(stats.status, sizeof(stats.status), "FAILED");
-        close(dir_fd);
-        close(lock_fd);
-        if (stats_out) *stats_out = stats;
-        free(regions);
-        return -1;
-    }
-    if (mkdir(mem_dir, 0755) != 0 && errno != EEXIST) {
+    if (mkdirat(dir_fd, "memory", 0755) != 0 && errno != EEXIST) {
         if (cfg->verbose) {
-            fprintf(stderr, "[debug] Failed to create memory directory '%s': %s\n", mem_dir, strerror(errno));
+            fprintf(stderr, "[debug] Failed to create memory directory in '%s': %s\n", out_dir, strerror(errno));
         }
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         close(dir_fd);
@@ -772,7 +763,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
 #ifdef O_CLOEXEC
                 bin_flags |= O_CLOEXEC;
 #endif
-                int bin_fd = open(full_bin_path, bin_flags, 0644);
+                int bin_fd = openat(dir_fd, rel_bin_file, bin_flags, 0644);
                 if (bin_fd < 0) {
                     bin_err = 1;
                 } else {
@@ -794,7 +785,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
 
                 if (bin_err) {
                     if (file_opened) {
-                        unlink(full_bin_path);
+                        unlinkat(dir_fd, rel_bin_file, 0);
                     }
                     stats.failed_reads++;
                     status_str = "FAILED";
@@ -990,7 +981,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
 
     /* Artifact Directory Fsync: fsync dir_fd before publishing metadata.json */
     int artifact_dir_fsync_err = 0;
-    if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS && errno != EACCES) {
+    if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) {
         if (cfg->verbose) {
             fprintf(stderr, "[debug] fsync on directory '%s' before metadata publication failed: %s\n", out_dir, strerror(errno));
         }
@@ -1086,13 +1077,25 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
                     unlinkat(dir_fd, meta_bname, 0);
                 } else {
                     /* Final commit marker durability: fsync parent directory */
-                    if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS && errno != EACCES) {
+                    if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) {
                         if (cfg->verbose) {
                             fprintf(stderr, "[debug] fsync on output directory '%s' failed: %s\n", out_dir, strerror(errno));
                         }
-                        /* Invalidate metadata.json so readers fail closed */
-                        unlinkat(dir_fd, "metadata.json", 0);
                         meta_err = 1;
+                        /* Invalidate metadata.json so readers fail closed */
+                        if (unlinkat(dir_fd, "metadata.json", 0) != 0) {
+                            if (cfg->verbose) {
+                                fprintf(stderr, "[debug] Failed to unlink metadata.json after fsync failure: %s; attempting emergency invalidation\n", strerror(errno));
+                            }
+                            int em_fd = openat(dir_fd, "metadata.json", O_WRONLY | O_TRUNC | O_CLOEXEC);
+                            if (em_fd >= 0) {
+                                const char *em_json = "{\n  \"committed\": false,\n  \"status\": \"UNCERTAIN_DURABILITY\"\n}\n";
+                                ssize_t w_res = write(em_fd, em_json, strlen(em_json));
+                                (void)w_res;
+                                (void)fsync(em_fd);
+                                close(em_fd);
+                            }
+                        }
                     }
                 }
             }
