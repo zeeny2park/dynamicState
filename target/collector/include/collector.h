@@ -30,6 +30,9 @@ typedef struct {
     int verbose;
     uint32_t timeout_ms;
     int json_output;
+    char signing_key[256];
+    char signing_key_id[64];
+    char session_id[128];
 } collector_config_t;
 
 typedef struct {
@@ -69,11 +72,16 @@ typedef struct {
     int mapping_race_detected;
     int process_exited;
     uint64_t process_starttime;
+    char manifest_digest[65];
+    char elf_build_id[128];
+    int receipt_issued;
+    char receipt_id[64];
 } collector_stats_t;
 
 void collector_init_config(collector_config_t *cfg);
 int collector_get_exe_path(pid_t pid, char *buf, size_t buf_size);
 int collector_get_process_starttime(pid_t pid, uint64_t *starttime_out);
+int collector_read_elf_build_id(const char *exe_path, char *build_id_out, size_t max_len);
 int collector_parse_maps(pid_t pid, const char *exe_path, parsed_region_t **regions_out, int *count_out);
 int collector_compare_maps(const parsed_region_t *before, int count_before, const parsed_region_t *after, int count_after);
 void collector_classify_region(parsed_region_t *r, const char *exe_path);

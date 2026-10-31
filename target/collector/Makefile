@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude
 LDFLAGS ?=
 
-SRCS = src/collector.c src/main.c
+SRCS = src/collector.c src/main.c src/sha256.c
 OBJS = $(SRCS:.c=.o)
 TARGET = dynamicstate-collector
 

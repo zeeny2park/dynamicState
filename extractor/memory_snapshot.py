@@ -235,6 +235,7 @@ class RawMemorySnapshot:
     commit_state: str = STATE_COMMITTED
     manifest_digest: Optional[str] = None
     build_id: Optional[str] = None
+    receipt: Optional[Any] = None
     schema_version: str = "1.0"
 
     def compute_manifest_digest(self) -> str:
@@ -916,20 +917,55 @@ class RawMemorySnapshot:
                     f"but sum of manifest regions is {actual_requested_bytes}"
                 )
 
-            # 7. Manifest digest verification (if recorded in metadata)
-            if self.manifest_digest:
-                try:
-                    with _secure_open_read("manifest.json", dir_fd=dir_fd) as f:
-                        cur_raw = f.read()
-                        cur_digest = hashlib.sha256(cur_raw.encode("utf-8")).hexdigest()
-                        if cur_digest.lower() != self.manifest_digest.lower():
+            # 7. Manifest digest verification
+            cur_digest = None
+            try:
+                with _secure_open_read("manifest.json", dir_fd=dir_fd) as f:
+                    cur_raw = f.read()
+                    cur_digest = hashlib.sha256(cur_raw.encode("utf-8")).hexdigest()
+                    if self.manifest_digest and cur_digest.lower() != self.manifest_digest.lower():
+                        is_valid = False
+                        warnings.append(
+                            f"Manifest digest mismatch: recorded {self.manifest_digest} != computed {cur_digest}"
+                        )
+            except Exception as e:
+                is_valid = False
+                warnings.append(f"Cannot verify manifest digest: {e}")
+
+            # 8. Receipt verification (if receipt.json exists on disk)
+            try:
+                with _secure_open_read("receipt.json", dir_fd=dir_fd) as f:
+                    rcpt_data = json.load(f)
+                    if isinstance(rcpt_data, dict):
+                        if cur_digest and rcpt_data.get("manifest_digest", "").lower() != cur_digest.lower():
                             is_valid = False
                             warnings.append(
-                                f"Manifest digest mismatch: recorded {self.manifest_digest} != computed {cur_digest}"
+                                f"Receipt manifest digest mismatch: receipt {rcpt_data.get('manifest_digest')} != disk manifest {cur_digest}"
                             )
-                except Exception as e:
+                        if rcpt_data.get("pid") is not None and int(rcpt_data.get("pid", 0)) != int(self.pid):
+                            is_valid = False
+                            warnings.append(
+                                f"Receipt PID mismatch: receipt {rcpt_data.get('pid')} != snapshot {self.pid}"
+                            )
+                        if self.receipt is not None:
+                            # In-memory tampering detection
+                            mem_sig = getattr(self.receipt, "signature", "")
+                            disk_sig = rcpt_data.get("signature", "")
+                            if mem_sig != disk_sig:
+                                is_valid = False
+                                warnings.append("Receipt in-memory signature does not match disk receipt.json signature")
+                            mem_digest = getattr(self.receipt, "manifest_digest", "")
+                            if mem_digest and cur_digest and mem_digest.lower() != cur_digest.lower():
+                                is_valid = False
+                                warnings.append("Receipt in-memory manifest_digest does not match disk manifest.json")
+            except FileNotFoundError:
+                if self.receipt is not None:
+                    # In-memory claims receipt but receipt.json is missing on disk
                     is_valid = False
-                    warnings.append(f"Cannot verify manifest digest: {e}")
+                    warnings.append("Snapshot has in-memory receipt but receipt.json is missing on disk")
+            except Exception as e:
+                is_valid = False
+                warnings.append(f"Cannot read or verify disk receipt.json: {e}")
         finally:
             os.close(dir_fd)
 
@@ -1028,6 +1064,16 @@ class RawMemorySnapshot:
                     modules = meta["modules"]
             except Exception as e:
                 modules_err = f"modules.json is malformed: {e}"
+
+            receipt = None
+            try:
+                with _secure_open_read("receipt.json", dir_fd=dir_fd) as f:
+                    rcpt_raw = json.load(f)
+                    if isinstance(rcpt_raw, dict):
+                        from .evidence_ledger import LiveCaptureReceipt
+                        receipt = LiveCaptureReceipt.from_dict(rcpt_raw)
+            except Exception:
+                receipt = None
         finally:
             os.close(dir_fd)
 
@@ -1076,6 +1122,7 @@ class RawMemorySnapshot:
             validation_verdict=meta.get("validation_verdict", VERDICT_UNVERIFIED),
             manifest_digest=meta.get("manifest_digest") or file_manifest_digest,
             build_id=meta.get("build_id") or (modules[0].get("build_id") if modules and isinstance(modules[0], dict) else None),
+            receipt=receipt,
         )
 
         is_valid, validation_warnings = snap.validate_integrity()

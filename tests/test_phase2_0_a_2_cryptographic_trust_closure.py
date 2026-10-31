@@ -352,6 +352,7 @@ class TestPhase20A2CryptographicTrustClosure(unittest.TestCase):
             snap_a,
             session_id="sess_replay",
             signing_authority=self.signer,
+            allow_host_signing=True,
         )
 
         # Verifying against snap_a succeeds
@@ -583,18 +584,28 @@ int main() {
 
         out_snap_dir = os.path.join(self.tmp_dir, f"raw_snap_{real_pid}")
         try:
-            # 3. Capture real process memory via native C99 collector binary
+            session_id = f"real_sess_{real_pid}_{uuid.uuid4().hex[:6]}"
+            # 3. Capture real process memory via native C99 collector binary with attestation
             col_res = subprocess.run(
-                [self.collector_bin, "-p", str(real_pid), "-o", out_snap_dir, "--policy", "all"],
+                [
+                    self.collector_bin,
+                    "-p", str(real_pid),
+                    "-o", out_snap_dir,
+                    "--policy", "all",
+                    "--signing-key", self.test_secret,
+                    "--key-id", self.test_key_id,
+                    "--session-id", session_id,
+                ],
                 capture_output=True,
                 text=True,
             )
             self.assertEqual(col_res.returncode, 0, f"Collector failed: {col_res.stderr}\nStdout: {col_res.stdout}")
 
-            # Verify snapshot files on disk
+            # Verify snapshot files on disk including collector-issued receipt.json
             self.assertTrue(os.path.isfile(os.path.join(out_snap_dir, "metadata.json")))
             self.assertTrue(os.path.isfile(os.path.join(out_snap_dir, "manifest.json")))
             self.assertTrue(os.path.isfile(os.path.join(out_snap_dir, "maps.json")))
+            self.assertTrue(os.path.isfile(os.path.join(out_snap_dir, "receipt.json")))
             self.assertTrue(os.path.isdir(os.path.join(out_snap_dir, "memory")))
 
             # 4. Load snapshot via host-side RawMemorySnapshot
@@ -605,14 +616,9 @@ int main() {
             self.assertGreater(len(snap.regions), 0)
             self.assertIsNotNone(snap.manifest_digest)
 
-            # 5. Issue cryptographic LiveCaptureReceipt bound to the real capture
-            session_id = f"real_sess_{real_pid}_{uuid.uuid4().hex[:6]}"
-            receipt = create_receipt_from_snapshot(
-                snapshot=snap,
-                session_id=session_id,
-                signing_authority=self.signer,
-                companion_elf=cpp_bin,
-            )
+            # 5. Extract genuine collector-originated receipt loaded directly with snapshot
+            self.assertIsNotNone(snap.receipt, "Snapshot must have loaded collector-originated receipt")
+            receipt = snap.receipt
             self.assertEqual(receipt.pid, real_pid)
             self.assertEqual(receipt.session_id, session_id)
             self.assertEqual(receipt.build_id, real_build_id)
@@ -628,6 +634,7 @@ int main() {
                 expected_pid=real_pid,
                 expected_executable_path=cpp_bin,
                 expected_build_id=real_build_id,
+                companion_elf_path=cpp_bin,
             )
             self.assertTrue(ok_rcpt, f"Independent verification failed: {err_rcpt}")
 
@@ -682,8 +689,8 @@ int main() {
             )
             self.assertFalse(ok_tampered, "Verification MUST fail against tampered snapshot on disk")
             self.assertTrue(
-                "SNAPSHOT_NOT_VALIDATED" in err_tampered or "MANIFEST_DIGEST_MISMATCH" in err_tampered,
-                f"Expected SNAPSHOT_NOT_VALIDATED or MANIFEST_DIGEST_MISMATCH, got: {err_tampered}",
+                "SNAPSHOT_NOT_VALIDATED" in err_tampered or "MANIFEST_DIGEST_MISMATCH" in err_tampered or "SNAPSHOT_INTEGRITY_FAILED" in err_tampered,
+                f"Expected SNAPSHOT_NOT_VALIDATED, MANIFEST_DIGEST_MISMATCH, or SNAPSHOT_INTEGRITY_FAILED, got: {err_tampered}",
             )
         finally:
             proc.terminate()
@@ -691,6 +698,156 @@ int main() {
                 proc.wait(timeout=2)
             except Exception:
                 proc.kill()
+
+    # -------------------------------------------------------------------------
+    # Test 18: Host-side Signing Rejected Without Explicit Authorization
+    # -------------------------------------------------------------------------
+    def test_18_host_signing_rejected_without_authorization(self):
+        """18: Calling create_receipt_from_snapshot without allow_host_signing=True fails closed."""
+        snap_dir = os.path.join(self.tmp_dir, "snap_test_18")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        snap = RawMemorySnapshot(
+            snapshot_id="SNAP_18",
+            pid=1801,
+            binary="/bin/app",
+            timestamp_ns=18000,
+            output_dir=snap_dir,
+            process_starttime=1800,
+        )
+        snap.save()
+        with self.assertRaises(PermissionError):
+            create_receipt_from_snapshot(
+                snap,
+                session_id="sess_unauth",
+                signing_authority=self.signer,
+                allow_host_signing=False,
+            )
+
+    # -------------------------------------------------------------------------
+    # Test 19: Identical Basenames in Different Directories Rejected
+    # -------------------------------------------------------------------------
+    def test_19_identical_basenames_in_different_directories_rejected(self):
+        """19: Target identity check rejects identical basenames in differing directory paths."""
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_19",
+            pid=1901,
+            executable_path="/usr/bin/worker",
+            process_start_time="19000",
+            signer=self.signer,
+        )
+        ok, err = verify_live_capture_receipt(
+            rcpt,
+            verification_authority=self.verifier,
+            expected_executable_path="/tmp/evil/worker",
+        )
+        self.assertFalse(ok)
+        self.assertIn("EXECUTABLE_PATH_MISMATCH", err)
+
+    # -------------------------------------------------------------------------
+    # Test 20: Missing Build ID Rejected When Expected
+    # -------------------------------------------------------------------------
+    def test_20_missing_build_id_rejected_when_expected(self):
+        """20: Verification fails closed if target identity expects a Build ID but receipt lacks one."""
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_20",
+            pid=2001,
+            executable_path="/usr/bin/worker",
+            build_id=None,
+            process_start_time="20000",
+            signer=self.signer,
+        )
+        ok, err = verify_live_capture_receipt(
+            rcpt,
+            verification_authority=self.verifier,
+            expected_build_id="0123456789abcdef0123456789abcdef",
+        )
+        self.assertFalse(ok)
+        self.assertIn("MISSING_BUILD_ID", err)
+
+    # -------------------------------------------------------------------------
+    # Test 21: Revocation Bypass Attempt With Direct Secret Rejected
+    # -------------------------------------------------------------------------
+    def test_21_revocation_bypass_attempt_with_direct_secret_rejected(self):
+        """21: Supplying direct secret argument cannot bypass authority key revocation."""
+        revoked_auth = CaptureVerificationAuthority(keys={self.test_key_id: self.test_secret})
+        revoked_auth.revoke_key(self.test_key_id)
+
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_21",
+            pid=2101,
+            executable_path="/usr/bin/worker",
+            build_id="build_21",
+            process_start_time="21000",
+            key_id=self.test_key_id,
+            signer=self.signer,
+        )
+        # Attempt to bypass by passing secret directly
+        ok, err = verify_live_capture_receipt(
+            rcpt,
+            secret=self.test_secret,
+            verification_authority=revoked_auth,
+        )
+        self.assertFalse(ok)
+        self.assertIn("KEY_REVOKED", err)
+
+    # -------------------------------------------------------------------------
+    # Test 22: Missing Process Start Time Rejected
+    # -------------------------------------------------------------------------
+    def test_22_missing_process_start_time_rejected(self):
+        """22: Receipts with missing, empty, or zero process_start_time fail closed."""
+        for bad_st in ["0", "", "   "]:
+            rcpt = issue_live_capture_receipt(
+                session_id="sess_22",
+                pid=2201,
+                executable_path="/usr/bin/worker",
+                build_id="build_22",
+                process_start_time=bad_st,
+                signer=self.signer,
+            )
+            ok, err = verify_live_capture_receipt(rcpt, verification_authority=self.verifier)
+            self.assertFalse(ok)
+            self.assertIn("MISSING_PROCESS_START_TIME", err)
+
+    # -------------------------------------------------------------------------
+    # Test 23: In-Memory Receipt Tampering Detected by Snapshot Integrity
+    # -------------------------------------------------------------------------
+    def test_23_in_memory_receipt_tampering_detected(self):
+        """23: Modifying in-memory snapshot receipt signature or digest fails validate_integrity."""
+        snap_dir = os.path.join(self.tmp_dir, "snap_test_23")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        snap = RawMemorySnapshot(
+            snapshot_id="SNAP_23",
+            pid=2301,
+            binary="/bin/app",
+            timestamp_ns=23000,
+            output_dir=snap_dir,
+            process_starttime=2300,
+        )
+        snap.save()
+
+        # Write disk receipt.json
+        rcpt = issue_live_capture_receipt(
+            session_id="sess_23",
+            pid=2301,
+            executable_path="/bin/app",
+            process_start_time="2300",
+            manifest_digest=snap.compute_manifest_digest(),
+            signer=self.signer,
+        )
+        with open(os.path.join(snap_dir, "receipt.json"), "w") as f:
+            json.dump(rcpt.to_dict(), f, indent=2)
+
+        loaded_snap = RawMemorySnapshot.load(snap_dir)
+        self.assertIsNotNone(loaded_snap.receipt)
+        is_valid_orig, _ = loaded_snap.validate_integrity()
+        self.assertTrue(is_valid_orig)
+
+        # Tamper in-memory signature
+        from dataclasses import replace
+        loaded_snap.receipt = replace(loaded_snap.receipt, signature="forged_signature_hex_0000")
+        is_valid_t, warnings = loaded_snap.validate_integrity()
+        self.assertFalse(is_valid_t)
+        self.assertTrue(any("signature" in w for w in warnings))
 
 
 if __name__ == "__main__":

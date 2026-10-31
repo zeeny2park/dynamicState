@@ -378,6 +378,7 @@ def verify_live_capture_receipt(
     expected_manifest_digest: Optional[str] = None,
     expected_build_id: Optional[str] = None,
     expected_executable_path: Optional[str] = None,
+    companion_elf_path: Optional[str] = None,
     snapshot: Optional[Any] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Validates that a receipt is authentic, unmodified, and bound to the expected target and snapshot."""
@@ -411,16 +412,19 @@ def verify_live_capture_receipt(
 
     # Resolve verification key fail-closed
     auth = verification_authority or get_default_verification_authority()
+
+    # Revocation must be checked immediately regardless of explicit secret argument
+    if auth and auth.is_revoked(receipt.key_id):
+        return False, f"KEY_REVOKED: Key ID '{receipt.key_id}' has been revoked"
+
     resolved_secret = secret
 
     if resolved_secret is None:
-        if not auth.has_keys():
+        if not auth or not auth.has_keys():
             return (
                 False,
                 "VERIFICATION_KEY_UNAVAILABLE: No capture verification keys configured in authority or environment",
             )
-        if auth.is_revoked(receipt.key_id):
-            return False, f"KEY_REVOKED: Key ID '{receipt.key_id}' has been revoked"
         resolved_secret = auth.get_key(receipt.key_id)
         if not resolved_secret:
             return False, f"UNKNOWN_KEY_ID: Key ID '{receipt.key_id}' not found in verification authority"
@@ -450,8 +454,8 @@ def verify_live_capture_receipt(
         return False, "MISSING_MANDATORY_FIELD: session_id is missing or empty"
     if not receipt.pid or receipt.pid <= 0:
         return False, "MISSING_MANDATORY_FIELD: pid is missing or non-positive"
-    if receipt.process_start_time is None or str(receipt.process_start_time) == "":
-        return False, "MISSING_MANDATORY_FIELD: process_start_time is missing or empty"
+    if receipt.process_start_time is None or str(receipt.process_start_time).strip() in ("", "0"):
+        return False, "MISSING_PROCESS_START_TIME: process_start_time is missing, empty, or zero"
     if not receipt.executable_path:
         return False, "MISSING_MANDATORY_FIELD: executable_path is missing or empty"
     if not receipt.manifest_digest:
@@ -478,47 +482,86 @@ def verify_live_capture_receipt(
             f"MANIFEST_DIGEST_MISMATCH: Receipt manifest digest {receipt.manifest_digest} != expected {expected_manifest_digest}",
         )
 
-    if expected_build_id and receipt.build_id and receipt.build_id.lower() != expected_build_id.lower():
-        return False, f"BUILD_ID_MISMATCH: Receipt build ID {receipt.build_id} != expected {expected_build_id}"
+    if expected_build_id:
+        if not receipt.build_id:
+            return False, f"MISSING_BUILD_ID: Expected build ID {expected_build_id} but receipt has no build ID"
+        if receipt.build_id.lower() != expected_build_id.lower():
+            return False, f"BUILD_ID_MISMATCH: Receipt build ID {receipt.build_id} != expected {expected_build_id}"
+
+    # Companion ELF check
+    if companion_elf_path:
+        try:
+            from .debug_image import inspect_elf
+            c_ident = inspect_elf(companion_elf_path)
+            if c_ident and c_ident.build_id:
+                if not receipt.build_id:
+                    return False, f"MISSING_BUILD_ID: Companion ELF requires build ID {c_ident.build_id} but receipt has no build ID"
+                if receipt.build_id.lower() != c_ident.build_id.lower():
+                    return False, f"BUILD_ID_MISMATCH: Receipt build ID {receipt.build_id} != companion ELF {c_ident.build_id}"
+        except Exception:
+            pass
 
     if expected_executable_path:
-        base_expected = os.path.basename(expected_executable_path)
-        base_rcpt = os.path.basename(receipt.executable_path)
-        if base_expected != base_rcpt:
+        norm_exp = os.path.realpath(expected_executable_path) if os.path.exists(expected_executable_path) else os.path.abspath(expected_executable_path)
+        norm_rcpt = os.path.realpath(receipt.executable_path) if os.path.exists(receipt.executable_path) else os.path.abspath(receipt.executable_path)
+        if norm_exp != norm_rcpt:
             return False, f"EXECUTABLE_PATH_MISMATCH: Receipt exe '{receipt.executable_path}' != expected '{expected_executable_path}'"
 
     # Exact Snapshot binding (if provided)
     if snapshot is not None:
+        if hasattr(snapshot, "validate_integrity"):
+            val_ok, val_errs = snapshot.validate_integrity()
+            if not val_ok:
+                return False, f"SNAPSHOT_INTEGRITY_FAILED: Snapshot failed integrity validation: {val_errs}"
+
         snap_verdict = getattr(snapshot, "validation_verdict", None)
-        if snap_verdict not in ("VALIDATED", None):
+        if snap_verdict != "VALIDATED":
             return False, f"SNAPSHOT_NOT_VALIDATED: Referenced snapshot validation verdict is '{snap_verdict}'"
 
         if getattr(snapshot, "pid", None) and int(snapshot.pid) != int(receipt.pid):
             return False, f"PID_MISMATCH: Snapshot PID {snapshot.pid} != receipt PID {receipt.pid}"
 
         snap_st = getattr(snapshot, "process_starttime", None)
-        if snap_st and str(snap_st) != str(receipt.process_start_time):
+        if not snap_st or str(snap_st).strip() in ("", "0"):
+            return False, "MISSING_PROCESS_START_TIME: Snapshot start time is missing, empty, or zero"
+        if str(snap_st) != str(receipt.process_start_time):
             return (
                 False,
                 f"PROCESS_START_TIME_MISMATCH: Snapshot start time {snap_st} != receipt start time {receipt.process_start_time}",
             )
 
-        snap_digest = getattr(snapshot, "manifest_digest", None)
-        if not snap_digest and hasattr(snapshot, "compute_manifest_digest"):
-            snap_digest = snapshot.compute_manifest_digest()
-        if snap_digest and snap_digest.lower() != receipt.manifest_digest.lower():
+        disk_digest = None
+        snap_out = getattr(snapshot, "output_dir", None)
+        if snap_out and os.path.isdir(snap_out):
+            mpath = os.path.join(snap_out, "manifest.json")
+            if os.path.isfile(mpath) and not os.path.islink(mpath):
+                with open(mpath, "rb") as mf:
+                    disk_digest = hashlib.sha256(mf.read()).hexdigest()
+
+        if not disk_digest and hasattr(snapshot, "compute_manifest_digest"):
+            disk_digest = snapshot.compute_manifest_digest()
+
+        if not disk_digest:
+            return False, "MISSING_MANIFEST: Cannot compute disk manifest digest for snapshot"
+
+        if disk_digest.lower() != receipt.manifest_digest.lower():
             return (
                 False,
-                f"MANIFEST_DIGEST_MISMATCH: Snapshot manifest digest {snap_digest} != receipt manifest digest {receipt.manifest_digest}",
+                f"MANIFEST_DIGEST_MISMATCH: Snapshot manifest digest {disk_digest} != receipt manifest digest {receipt.manifest_digest}",
             )
 
         snap_bin = getattr(snapshot, "binary", None)
-        if snap_bin and os.path.basename(snap_bin) != os.path.basename(receipt.executable_path):
-            return False, f"EXECUTABLE_PATH_MISMATCH: Snapshot binary '{snap_bin}' != receipt exe '{receipt.executable_path}'"
+        if snap_bin:
+            norm_snap = os.path.realpath(snap_bin) if os.path.exists(snap_bin) else os.path.abspath(snap_bin)
+            norm_rcpt = os.path.realpath(receipt.executable_path) if os.path.exists(receipt.executable_path) else os.path.abspath(receipt.executable_path)
+            if norm_snap != norm_rcpt:
+                return False, f"EXECUTABLE_PATH_MISMATCH: Snapshot binary '{snap_bin}' != receipt exe '{receipt.executable_path}'"
 
         snap_bid = getattr(snapshot, "build_id", None)
         if snap_bid and receipt.build_id and snap_bid.lower() != receipt.build_id.lower():
             return False, f"BUILD_ID_MISMATCH: Snapshot build ID {snap_bid} != receipt build ID {receipt.build_id}"
+        if snap_bid and not receipt.build_id:
+            return False, f"MISSING_BUILD_ID: Snapshot has build ID {snap_bid} but receipt has none"
 
     return True, None
 
@@ -531,8 +574,13 @@ def create_receipt_from_snapshot(
     key_id: Optional[str] = None,
     companion_elf: Optional[str] = None,
     receipt_id: Optional[str] = None,
+    allow_host_signing: bool = False,
 ) -> LiveCaptureReceipt:
-    """Generate an authentic LiveCaptureReceipt bound to a validated RawMemorySnapshot."""
+    """Generate a LiveCaptureReceipt bound to a validated RawMemorySnapshot (restricted to authorized test harnesses)."""
+    if not allow_host_signing and not os.environ.get("DYNAMICSTATE_ALLOW_HOST_SIGNING"):
+        raise PermissionError(
+            "Host-side receipt signing is restricted to test environments; live capture receipts must originate from the trusted capture component (dynamicstate-collector)."
+        )
     is_valid = True
     if hasattr(snapshot, "validate_integrity"):
         is_valid, _ = snapshot.validate_integrity()

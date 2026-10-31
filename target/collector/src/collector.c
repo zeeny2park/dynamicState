@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "../include/collector.h"
+#include "../include/sha256.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,6 +141,135 @@ int collector_get_process_starttime(pid_t pid, uint64_t *starttime_out) {
 
     *starttime_out = st;
     return 0;
+}
+
+int collector_read_elf_build_id(const char *exe_path, char *build_id_out, size_t max_len) {
+    if (!exe_path || !build_id_out || max_len < 2) return -1;
+    build_id_out[0] = '\0';
+
+    int fd = open(exe_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+
+    unsigned char e_ident[16];
+    if (pread(fd, e_ident, sizeof(e_ident), 0) != sizeof(e_ident)) {
+        close(fd);
+        return -1;
+    }
+    if (memcmp(e_ident, "\x7f\x45\x4c\x46", 4) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    int is_64 = (e_ident[4] == 2);
+
+    /* First attempt: Scan PT_NOTE in Program Headers (present even in stripped binaries) */
+    if (is_64) {
+        unsigned char ehdr[64];
+        if (pread(fd, ehdr, sizeof(ehdr), 0) == sizeof(ehdr)) {
+            uint64_t phoff = *(uint64_t *)(ehdr + 32);
+            uint16_t phentsize = *(uint16_t *)(ehdr + 54);
+            uint16_t phnum = *(uint16_t *)(ehdr + 56);
+            if (phentsize >= 56 && phnum > 0 && phnum < 1024) {
+                for (uint16_t i = 0; i < phnum; i++) {
+                    unsigned char phdr[56];
+                    if (pread(fd, phdr, sizeof(phdr), (off_t)(phoff + (uint64_t)i * phentsize)) != sizeof(phdr)) {
+                        break;
+                    }
+                    uint32_t p_type = *(uint32_t *)phdr;
+                    if (p_type == 4) { /* PT_NOTE */
+                        uint64_t p_offset = *(uint64_t *)(phdr + 8);
+                        uint64_t p_filesz = *(uint64_t *)(phdr + 32);
+                        if (p_filesz > 0 && p_filesz <= 65536) {
+                            unsigned char *notes = (unsigned char *)malloc((size_t)p_filesz);
+                            if (notes) {
+                                if (pread(fd, notes, (size_t)p_filesz, (off_t)p_offset) == (ssize_t)p_filesz) {
+                                    size_t no = 0;
+                                    while (no + 12 <= p_filesz) {
+                                        uint32_t namesz = *(uint32_t *)(notes + no);
+                                        uint32_t descsz = *(uint32_t *)(notes + no + 4);
+                                        uint32_t ntype  = *(uint32_t *)(notes + no + 8);
+                                        no += 12;
+                                        size_t pnamesz = (namesz + 3) & ~3;
+                                        size_t pdescsz = (descsz + 3) & ~3;
+                                        if (no + pnamesz + descsz > p_filesz) break;
+                                        if (ntype == 3 && namesz >= 3 && memcmp(notes + no, "GNU", 3) == 0) {
+                                            const unsigned char *desc = notes + no + pnamesz;
+                                            if (descsz * 2 + 1 <= max_len) {
+                                                for (uint32_t b = 0; b < descsz; b++) {
+                                                    sprintf(&build_id_out[b * 2], "%02x", desc[b]);
+                                                }
+                                                build_id_out[descsz * 2] = '\0';
+                                                free(notes);
+                                                close(fd);
+                                                return 0;
+                                            }
+                                        }
+                                        no += pnamesz + pdescsz;
+                                    }
+                                }
+                                free(notes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        /* 32-bit ELF */
+        unsigned char ehdr[52];
+        if (pread(fd, ehdr, sizeof(ehdr), 0) == sizeof(ehdr)) {
+            uint32_t phoff = *(uint32_t *)(ehdr + 28);
+            uint16_t phentsize = *(uint16_t *)(ehdr + 42);
+            uint16_t phnum = *(uint16_t *)(ehdr + 44);
+            if (phentsize >= 32 && phnum > 0 && phnum < 1024) {
+                for (uint16_t i = 0; i < phnum; i++) {
+                    unsigned char phdr[32];
+                    if (pread(fd, phdr, sizeof(phdr), (off_t)(phoff + (uint32_t)i * phentsize)) != sizeof(phdr)) {
+                        break;
+                    }
+                    uint32_t p_type = *(uint32_t *)phdr;
+                    if (p_type == 4) { /* PT_NOTE */
+                        uint32_t p_offset = *(uint32_t *)(phdr + 4);
+                        uint32_t p_filesz = *(uint32_t *)(phdr + 16);
+                        if (p_filesz > 0 && p_filesz <= 65536) {
+                            unsigned char *notes = (unsigned char *)malloc((size_t)p_filesz);
+                            if (notes) {
+                                if (pread(fd, notes, (size_t)p_filesz, (off_t)p_offset) == (ssize_t)p_filesz) {
+                                    size_t no = 0;
+                                    while (no + 12 <= p_filesz) {
+                                        uint32_t namesz = *(uint32_t *)(notes + no);
+                                        uint32_t descsz = *(uint32_t *)(notes + no + 4);
+                                        uint32_t ntype  = *(uint32_t *)(notes + no + 8);
+                                        no += 12;
+                                        size_t pnamesz = (namesz + 3) & ~3;
+                                        size_t pdescsz = (descsz + 3) & ~3;
+                                        if (no + pnamesz + descsz > p_filesz) break;
+                                        if (ntype == 3 && namesz >= 3 && memcmp(notes + no, "GNU", 3) == 0) {
+                                            const unsigned char *desc = notes + no + pnamesz;
+                                            if (descsz * 2 + 1 <= max_len) {
+                                                for (uint32_t b = 0; b < descsz; b++) {
+                                                    sprintf(&build_id_out[b * 2], "%02x", desc[b]);
+                                                }
+                                                build_id_out[descsz * 2] = '\0';
+                                                free(notes);
+                                                close(fd);
+                                                return 0;
+                                            }
+                                        }
+                                        no += pnamesz + pdescsz;
+                                    }
+                                }
+                                free(notes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    close(fd);
+    return -1;
 }
 
 int collector_compare_maps(const parsed_region_t *before, int count_before, const parsed_region_t *after, int count_after) {
@@ -878,6 +1008,13 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             if (renameat(dir_fd, manifest_bname, dir_fd, "manifest.json") != 0) {
                 manifest_err = 1;
                 unlinkat(dir_fd, manifest_bname, 0);
+            } else {
+                int man_fd = openat(dir_fd, "manifest.json", O_RDONLY | O_CLOEXEC);
+                if (man_fd >= 0) {
+                    sha256_file_fd(man_fd, stats.manifest_digest);
+                    close(man_fd);
+                }
+                collector_read_elf_build_id(exe_path, stats.elf_build_id, sizeof(stats.elf_build_id));
             }
         }
     } else {
@@ -979,6 +1116,96 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         }
     }
 
+    /* Write receipt.json atomically if signing key is provided */
+    int receipt_err = 0;
+    if (cfg->signing_key[0] != '\0' && !manifest_err && !maps_err) {
+        char receipt_json_tmp[2048] = {0};
+        char receipt_bname[256] = {0};
+        int receipt_write_fail = 0;
+        int receipt_tmp_fd = secure_open_temp_file(dir_fd, out_dir, "receipt.json", receipt_json_tmp, sizeof(receipt_json_tmp), receipt_bname, sizeof(receipt_bname));
+        if (receipt_tmp_fd < 0) {
+            receipt_err = 1;
+        } else {
+            FILE *f_rcpt = fdopen(receipt_tmp_fd, "w");
+            if (!f_rcpt) {
+                close(receipt_tmp_fd);
+                unlinkat(dir_fd, receipt_bname, 0);
+                receipt_err = 1;
+            } else {
+                time_t now_sec = time(NULL);
+                struct tm tm_utc;
+                gmtime_r(&now_sec, &tm_utc);
+                char issued_at[64];
+                strftime(issued_at, sizeof(issued_at), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+                snprintf(stats.receipt_id, sizeof(stats.receipt_id), "lrcpt_%llx%04x",
+                         (unsigned long long)get_time_ns(), (unsigned int)(rand() & 0xffff));
+
+                const char *key_id = cfg->signing_key_id[0] ? cfg->signing_key_id : "default";
+                const char *sess_id = cfg->session_id[0] ? cfg->session_id : (cfg->snapshot_id[0] ? cfg->snapshot_id : "SESSION_0");
+                char start_time_str[32];
+                snprintf(start_time_str, sizeof(start_time_str), "%llu", (unsigned long long)stats.process_starttime);
+
+                char canonical[4096];
+                snprintf(canonical, sizeof(canonical),
+                         "LIVE_RECEIPT|v2|%s|%s|%d|%s|%s|%s|%s|%s|%s|%s|%s",
+                         stats.receipt_id,
+                         sess_id,
+                         (int)cfg->pid,
+                         start_time_str,
+                         exe_path,
+                         stats.elf_build_id,
+                         "live_collector",
+                         stats.manifest_digest,
+                         "TRUE",
+                         issued_at,
+                         key_id);
+
+                char sig[65];
+                hmac_sha256_hex(cfg->signing_key, strlen(cfg->signing_key), canonical, strlen(canonical), sig);
+
+                char esc_rcpt_exe[1024] = {0};
+                escape_json_string(exe_path, esc_rcpt_exe, sizeof(esc_rcpt_exe));
+
+                if (fprintf(f_rcpt, "{\n") < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"receipt_id\": \"%s\",\n", stats.receipt_id) < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"session_id\": \"%s\",\n", sess_id) < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"pid\": %d,\n", (int)cfg->pid) < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"executable_path\": \"%s\",\n", esc_rcpt_exe) < 0) receipt_write_fail = 1;
+                if (stats.elf_build_id[0]) {
+                    if (fprintf(f_rcpt, "  \"build_id\": \"%s\",\n", stats.elf_build_id) < 0) receipt_write_fail = 1;
+                } else {
+                    if (fprintf(f_rcpt, "  \"build_id\": null,\n") < 0) receipt_write_fail = 1;
+                }
+                if (fprintf(f_rcpt, "  \"capture_source\": \"live_collector\",\n") < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"manifest_digest\": \"%s\",\n", stats.manifest_digest) < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"integrity_validated\": true,\n") < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"issued_at\": \"%s\",\n", issued_at) < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"process_start_time\": \"%s\",\n", start_time_str) < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"signature\": \"%s\",\n", sig) < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"key_id\": \"%s\",\n", key_id) < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "  \"provenance_class\": \"LIVE_RUNTIME_CAPTURE\"\n") < 0) receipt_write_fail = 1;
+                if (fprintf(f_rcpt, "}\n") < 0) receipt_write_fail = 1;
+
+                if (fflush(f_rcpt) != 0) receipt_write_fail = 1;
+                if (fsync(receipt_tmp_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) receipt_write_fail = 1;
+                int fr_err = (ferror(f_rcpt) != 0);
+                int cl_err = (fclose(f_rcpt) != 0);
+                if (receipt_write_fail || fr_err || cl_err) {
+                    receipt_err = 1;
+                    unlinkat(dir_fd, receipt_bname, 0);
+                } else {
+                    if (renameat(dir_fd, receipt_bname, dir_fd, "receipt.json") != 0) {
+                        receipt_err = 1;
+                        unlinkat(dir_fd, receipt_bname, 0);
+                    } else {
+                        stats.receipt_issued = 1;
+                    }
+                }
+            }
+        }
+    }
+
     /* Artifact Directory Fsync: fsync dir_fd before publishing metadata.json */
     int artifact_dir_fsync_err = 0;
     if (fsync(dir_fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP && errno != ENOSYS) {
@@ -988,7 +1215,7 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         artifact_dir_fsync_err = 1;
     }
 
-    if (manifest_err || maps_err || artifact_dir_fsync_err) {
+    if (manifest_err || maps_err || receipt_err || artifact_dir_fsync_err) {
         snprintf(stats.status, sizeof(stats.status), "FAILED");
         if (mem_fd >= 0) close(mem_fd);
         if (dir_fd >= 0) close(dir_fd);
@@ -1041,6 +1268,15 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
             if (fprintf(f_meta, "  \"mapping_race_detected\": %s,\n", stats.mapping_race_detected ? "true" : "false") < 0) meta_write_fail = 1;
             if (fprintf(f_meta, "  \"process_exited\": %s,\n", stats.process_exited ? "true" : "false") < 0) meta_write_fail = 1;
             if (fprintf(f_meta, "  \"process_starttime\": %llu,\n", (unsigned long long)stats.process_starttime) < 0) meta_write_fail = 1;
+            if (stats.manifest_digest[0]) {
+                if (fprintf(f_meta, "  \"manifest_digest\": \"%s\",\n", stats.manifest_digest) < 0) meta_write_fail = 1;
+            }
+            if (stats.elf_build_id[0]) {
+                if (fprintf(f_meta, "  \"build_id\": \"%s\",\n", stats.elf_build_id) < 0) meta_write_fail = 1;
+            }
+            if (stats.receipt_issued) {
+                if (fprintf(f_meta, "  \"receipt_issued\": true,\n") < 0) meta_write_fail = 1;
+            }
             if (fprintf(f_meta, "  \"capture\": {\n") < 0) meta_write_fail = 1;
             if (fprintf(f_meta, "    \"backend\": \"%s\",\n", stats.backend_used) < 0) meta_write_fail = 1;
             if (fprintf(f_meta, "    \"process_stop\": false,\n") < 0) meta_write_fail = 1;

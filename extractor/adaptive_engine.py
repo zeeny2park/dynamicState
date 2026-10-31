@@ -1161,20 +1161,28 @@ class AdaptiveInvestigationEngine:
 
         eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
         verified_receipt = None
+        effective_receipt = capture_receipt
+        if effective_receipt is None and snapshot is not None:
+            effective_receipt = getattr(snapshot, "receipt", None)
+
         if is_synthetic:
             eff_prov = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-        elif capture_receipt is not None:
+        elif effective_receipt is not None:
+            runtime_bin = getattr(snapshot, "binary", None) if snapshot is not None else None
+            expected_build_id = getattr(snapshot, "build_id", None) if snapshot is not None else None
             ok_rcpt, rcpt_err = verify_live_capture_receipt(
-                capture_receipt,
+                effective_receipt,
                 verification_authority=verification_authority,
                 expected_session_id=sess_id,
                 expected_pid=pid if pid and pid > 0 else None,
-                expected_executable_path=companion_elf_path if companion_elf_path else None,
+                expected_executable_path=runtime_bin,
+                companion_elf_path=companion_elf_path,
+                expected_build_id=expected_build_id,
                 snapshot=snapshot,
             )
             if ok_rcpt:
                 eff_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-                verified_receipt = capture_receipt
+                verified_receipt = effective_receipt
             else:
                 eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
         elif provenance_class == PROVENANCE_CLASS_IMPORTED_UNVERIFIED or (

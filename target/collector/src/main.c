@@ -44,6 +44,9 @@ int main(int argc, char *argv[]) {
         {"timeout-ms", required_argument, 0, 't'},
         {"json", no_argument, 0, 'j'},
         {"verbose", no_argument, 0, 'v'},
+        {"signing-key", required_argument, 0, 'K'},
+        {"key-id", required_argument, 0, 'I'},
+        {"session-id", required_argument, 0, 'S'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -57,7 +60,7 @@ int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:o:m:r:P:B:s:dt:jvh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:o:m:r:P:B:s:dt:jvK:I:S:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 pid_str = optarg;
@@ -70,6 +73,15 @@ int main(int argc, char *argv[]) {
                 break;
             case 'r':
                 max_region_str = optarg;
+                break;
+            case 'K':
+                strncpy(cfg.signing_key, optarg, sizeof(cfg.signing_key) - 1);
+                break;
+            case 'I':
+                strncpy(cfg.signing_key_id, optarg, sizeof(cfg.signing_key_id) - 1);
+                break;
+            case 'S':
+                strncpy(cfg.session_id, optarg, sizeof(cfg.session_id) - 1);
                 break;
             case 'P':
                 if (strcmp(optarg, "heap_stack") == 0) {
@@ -115,6 +127,28 @@ int main(int argc, char *argv[]) {
 
     if (daemon_mode) {
         return collector_daemon_loop(cfg.backend, stdin, stdout);
+    }
+
+    /* Fallback to environment variables for cryptographic attestation */
+    if (cfg.signing_key[0] == '\0') {
+        const char *env_k = getenv("DYNAMICSTATE_COLLECTOR_KEY");
+        if (!env_k) env_k = getenv("DYNAMICSTATE_CAPTURE_SECRET");
+        if (env_k && env_k[0] != '\0') {
+            strncpy(cfg.signing_key, env_k, sizeof(cfg.signing_key) - 1);
+        }
+    }
+    if (cfg.signing_key_id[0] == '\0') {
+        const char *env_kid = getenv("DYNAMICSTATE_COLLECTOR_KEY_ID");
+        if (!env_kid) env_kid = getenv("DYNAMICSTATE_CAPTURE_KEY_ID");
+        if (env_kid && env_kid[0] != '\0') {
+            strncpy(cfg.signing_key_id, env_kid, sizeof(cfg.signing_key_id) - 1);
+        }
+    }
+    if (cfg.session_id[0] == '\0') {
+        const char *env_sid = getenv("DYNAMICSTATE_COLLECTOR_SESSION_ID");
+        if (env_sid && env_sid[0] != '\0') {
+            strncpy(cfg.session_id, env_sid, sizeof(cfg.session_id) - 1);
+        }
     }
 
     /* Positional PID argument if not supplied via -p */
