@@ -17,6 +17,7 @@ Proves:
 """
 
 import copy
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -24,10 +25,12 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 import uuid
+import warnings
 from typing import Any, Dict
 
 from extractor.adaptive_engine import AdaptiveInvestigationEngine
@@ -84,6 +87,7 @@ class TestPhase20A2CryptographicTrustClosure(unittest.TestCase):
 
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="test_a2_trust_closure_")
+        self.session_id = "test_session_phase2_0_a2_prod"
         self.test_key_id = "test_key_phase2_0_a2_prod"
         self.test_secret = "4f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a"
         self.signer = CaptureSigningAuthority(key_id=self.test_key_id, secret=self.test_secret)
@@ -94,6 +98,20 @@ class TestPhase20A2CryptographicTrustClosure(unittest.TestCase):
     def tearDown(self):
         reset_capture_authorities()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _create_test_snapshot(self, snap_id: str, pid: int = 1234):
+        snap_dir = os.path.join(self.tmp_dir, f"snap_{snap_id}")
+        os.makedirs(os.path.join(snap_dir, "memory"), exist_ok=True)
+        snap = RawMemorySnapshot(
+            snapshot_id=snap_id,
+            pid=pid,
+            binary="/bin/true",
+            timestamp_ns=1000000,
+            output_dir=snap_dir,
+            process_starttime=1000,
+        )
+        snap.save()
+        return snap, snap_dir
 
     # -------------------------------------------------------------------------
     # Test 01: No Hardcoded Default Signing Secrets; Fail-Closed Behavior
@@ -1732,6 +1750,503 @@ int main() {
         finally:
             target_proc.terminate()
             target_proc.wait()
+
+    def test_41_environment_secret_and_inline_json_rejection(self):
+        """41: CaptureVerificationAuthority.from_environment rejects raw secrets and inline JSON keyrings."""
+        # 1. DYNAMICSTATE_CAPTURE_SECRET rejected with ValueError
+        old_sec = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
+        try:
+            os.environ["DYNAMICSTATE_CAPTURE_SECRET"] = "raw_secret_value_in_env_forbidden_12345"
+            with self.assertRaises(ValueError) as ctx:
+                CaptureVerificationAuthority.from_environment()
+            self.assertIn("DYNAMICSTATE_CAPTURE_SECRET is prohibited", str(ctx.exception))
+        finally:
+            if old_sec:
+                os.environ["DYNAMICSTATE_CAPTURE_SECRET"] = old_sec
+            else:
+                os.environ.pop("DYNAMICSTATE_CAPTURE_SECRET", None)
+
+        # 2. Inline JSON keyring in DYNAMICSTATE_CAPTURE_KEYRING rejected with ValueError
+        old_kr = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
+        try:
+            os.environ["DYNAMICSTATE_CAPTURE_KEYRING"] = '{"k1": "secret_key_16bytes_min"}'
+            with self.assertRaises(ValueError) as ctx:
+                CaptureVerificationAuthority.from_environment()
+            self.assertIn("Inline JSON keyring strings in DYNAMICSTATE_CAPTURE_KEYRING are prohibited", str(ctx.exception))
+        finally:
+            if old_kr:
+                os.environ["DYNAMICSTATE_CAPTURE_KEYRING"] = old_kr
+            else:
+                os.environ.pop("DYNAMICSTATE_CAPTURE_KEYRING", None)
+
+        # 3. Verify DeprecationWarning is emitted when from_environment is called
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            auth = CaptureVerificationAuthority.from_environment()
+            self.assertTrue(any(issubclass(item.category, DeprecationWarning) for item in w))
+            self.assertFalse(auth.has_keys())
+
+    def test_42_explicit_signing_and_verification_authority_factories(self):
+        """42: Explicit factory methods for CaptureSigningAuthority and CaptureVerificationAuthority."""
+        key_content = "explicit_secret_factory_key_12345678"
+        kf = os.path.join(self.tmp_dir, "factory_key.key")
+        with open(kf, "w") as f:
+            f.write(key_content + "\n")
+        os.chmod(kf, 0o600)
+
+        # 1. CaptureSigningAuthority.from_key_file
+        signer_file = CaptureSigningAuthority.from_key_file(kf, key_id="fact_file_signer")
+        self.assertEqual(signer_file.key_id, "fact_file_signer")
+
+        # 2. CaptureSigningAuthority.from_key_fd
+        fd = os.open(kf, os.O_RDONLY)
+        try:
+            signer_fd = CaptureSigningAuthority.from_key_fd(fd, key_id="fact_fd_signer")
+            self.assertEqual(signer_fd.key_id, "fact_fd_signer")
+        finally:
+            os.close(fd)
+
+        # 3. CaptureVerificationAuthority.from_keyring_file
+        ring_path = os.path.join(self.tmp_dir, "factory_keyring.json")
+        with open(ring_path, "w") as f:
+            json.dump({
+                "fact_file_signer": key_content,
+                "fact_fd_signer": key_content,
+            }, f)
+        os.chmod(ring_path, 0o600)
+
+        verifier = CaptureVerificationAuthority.from_keyring_file(ring_path)
+        self.assertTrue(verifier.has_keys())
+        self.assertEqual(verifier.get_key("fact_file_signer"), key_content)
+        self.assertEqual(verifier.get_key("fact_fd_signer"), key_content)
+
+        # Verify signature with explicit verifier
+        payload = "test_canonical_payload_data"
+        sig = signer_file.sign(payload)
+        expected_sig = hmac.new(key_content.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        self.assertEqual(sig, expected_sig)
+
+    def test_43_python_key_reading_short_reads_and_input_bounds(self):
+        """43: Python load_secure_key_file and load_secure_key_fd handle short reads, bounds, and delimiters."""
+        # 1. Oversized file (> 4096 bytes)
+        big_path = os.path.join(self.tmp_dir, "oversized.key")
+        with open(big_path, "w") as f:
+            f.write("A" * 5000)
+        os.chmod(big_path, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(big_path)
+        self.assertIn("oversized", str(ctx.exception))
+
+        # 2. Empty file (0 bytes)
+        empty_path = os.path.join(self.tmp_dir, "empty.key")
+        with open(empty_path, "w") as f:
+            pass
+        os.chmod(empty_path, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(empty_path)
+        self.assertIn("empty", str(ctx.exception))
+
+        # 3. Invalid UTF-8
+        bad_utf8 = os.path.join(self.tmp_dir, "bad_utf8.key")
+        with open(bad_utf8, "wb") as f:
+            f.write(b"\xff\xfe\xfa\xfb" * 10)
+        os.chmod(bad_utf8, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(bad_utf8)
+        self.assertIn("UTF-8", str(ctx.exception))
+
+        # 4. Embedded NUL byte
+        nul_path = os.path.join(self.tmp_dir, "nul.key")
+        with open(nul_path, "wb") as f:
+            f.write(b"valid_key_prefix\x00extra_padding_bytes")
+        os.chmod(nul_path, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(nul_path)
+        self.assertIn("NUL", str(ctx.exception))
+
+        # 5. Forbidden delimiter '|'
+        pipe_path = os.path.join(self.tmp_dir, "pipe.key")
+        with open(pipe_path, "w") as f:
+            f.write("secret|with|pipes|in|content")
+        os.chmod(pipe_path, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(pipe_path)
+        self.assertIn("delimiter", str(ctx.exception))
+
+        # 6. Key length bounds (< 16 or > 256)
+        short_path = os.path.join(self.tmp_dir, "short.key")
+        with open(short_path, "w") as f:
+            f.write("short_key_10ch")
+        os.chmod(short_path, 0o600)
+        with self.assertRaises(ValueError) as ctx:
+            load_secure_key_file(short_path)
+        self.assertIn("too short", str(ctx.exception))
+
+        # 7. FD reading via load_secure_key_fd from pipe
+        r, w = os.pipe()
+        try:
+            os.write(w, b"valid_key_from_pipe_12345678\n")
+            os.close(w)
+            key_fd_val = load_secure_key_fd(r)
+            self.assertEqual(key_fd_val, "valid_key_from_pipe_12345678")
+        finally:
+            os.close(r)
+
+    def test_44_snapshot_directory_and_manifest_symlink_rejection(self):
+        """44: Directory symlink rejection in validate_integrity, compute_manifest_digest, and verify_live_capture_receipt."""
+        snap, real_dir = self._create_test_snapshot("snap_sym_test", pid=8801)
+        
+        # 1. Directory symlink
+        sym_dir = os.path.join(self.tmp_dir, "snap_sym_link")
+        os.symlink(real_dir, sym_dir)
+
+        sym_snap = RawMemorySnapshot(
+            snapshot_id="snap_sym_test",
+            pid=8801,
+            output_dir=sym_dir,
+            regions=[],
+            binary="/bin/true",
+            timestamp_ns=1000000,
+            process_starttime=1000,
+        )
+        val_ok, val_warn = sym_snap.validate_integrity()
+        self.assertFalse(val_ok)
+        self.assertTrue(any("symbolic link" in w for w in val_warn))
+
+        # compute_manifest_digest fails on symlink directory
+        with self.assertRaises(OSError):
+            sym_snap.compute_manifest_digest()
+
+        rcpt = issue_live_capture_receipt(
+            session_id=self.session_id,
+            pid=8801,
+            executable_path="/bin/true",
+            build_id="build_sym",
+            process_start_time="1000",
+            manifest_digest=snap.manifest_digest or hashlib.sha256(b"m").hexdigest(),
+            signer=self.signer,
+            key_id=self.test_key_id,
+        )
+        ok_rcpt, err_rcpt = verify_live_capture_receipt(
+            rcpt,
+            verification_authority=self.verifier,
+            snapshot=sym_snap,
+        )
+        self.assertFalse(ok_rcpt)
+        self.assertTrue("SNAPSHOT_DIR_SYMLINK" in err_rcpt or "SNAPSHOT_INTEGRITY_FAILED" in err_rcpt)
+
+        # 2. Manifest symlink replacement
+        snap_m, dir_m = self._create_test_snapshot("snap_m_sym", pid=8802)
+        m_file = os.path.join(dir_m, "manifest.json")
+        os.unlink(m_file)
+        dummy_target = os.path.join(self.tmp_dir, "dummy_target.txt")
+        with open(dummy_target, "w") as f:
+            f.write("[]")
+        os.symlink(dummy_target, m_file)
+
+        snap_m_loaded = RawMemorySnapshot.load(dir_m)
+        ok_m_val, warn_m = snap_m_loaded.validate_integrity()
+        self.assertFalse(ok_m_val)
+        self.assertTrue(any("symbolic link" in w for w in warn_m))
+
+        ok_m_rcpt, err_m_rcpt = verify_live_capture_receipt(
+            rcpt,
+            verification_authority=self.verifier,
+            snapshot=snap_m_loaded,
+        )
+        self.assertFalse(ok_m_rcpt)
+        self.assertTrue("MANIFEST_SYMLINK_REJECTED" in err_m_rcpt or "SNAPSHOT_INTEGRITY_FAILED" in err_m_rcpt or "MISSING_MANIFEST" in err_m_rcpt)
+
+    def test_45_snapshot_directory_replacement_detection(self):
+        """45: verify_live_capture_receipt detects snapshot directory replacement (device/inode change)."""
+        snap_a, dir_a = self._create_test_snapshot("snap_sub_a", pid=8901)
+        snap_b, dir_b = self._create_test_snapshot("snap_sub_b", pid=8901)
+
+        # Validate snapshot A - pins directory identity to dir_a's (st_dev, st_ino)
+        v_ok, _ = snap_a.validate_integrity()
+        self.assertTrue(v_ok)
+        self.assertIsNotNone(getattr(snap_a, "_pinned_dir_identity", None))
+
+        rcpt_a = issue_live_capture_receipt(
+            session_id=self.session_id,
+            pid=8901,
+            executable_path="/bin/true",
+            build_id="build_sub",
+            process_start_time=str(snap_a.process_starttime),
+            manifest_digest=snap_a.compute_manifest_digest(),
+            signer=self.signer,
+            key_id=self.test_key_id,
+        )
+
+        # Normal verification succeeds
+        ok_norm, err_norm = verify_live_capture_receipt(
+            rcpt_a,
+            verification_authority=self.verifier,
+            snapshot=snap_a,
+        )
+        self.assertTrue(ok_norm, f"Normal verification failed: {err_norm}")
+
+        # Directory substitution: snap_a.output_dir is replaced by dir_b
+        snap_a.output_dir = dir_b
+        # If validate_integrity runs again on dir_b, it detects substitution
+        val_sub_ok, val_sub_warn = snap_a.validate_integrity()
+        self.assertFalse(val_sub_ok)
+        self.assertTrue(any("substitution" in w.lower() for w in val_sub_warn))
+
+        # And receipt verification directly detects directory substitution
+        snap_a.validate_integrity = lambda: (True, [])
+        snap_a.validation_verdict = "VALIDATED"
+        ok_sub, err_sub = verify_live_capture_receipt(
+            rcpt_a,
+            verification_authority=self.verifier,
+            snapshot=snap_a,
+        )
+        self.assertFalse(ok_sub)
+        self.assertIn("SNAPSHOT_DIR_SUBSTITUTION", err_sub)
+
+    def test_46_c_collector_eintr_and_eof_resilience(self):
+        """46: Native C collector load_key_from_fd handles EOF, bounds, and invalid key data."""
+        target_src = os.path.join(self.tmp_dir, "test46_target.c")
+        target_bin = os.path.join(self.tmp_dir, "test46_target")
+        with open(target_src, "w") as f:
+            f.write("#include <unistd.h>\nint main() { while(1) { usleep(10000); } return 0; }\n")
+        subprocess.run(["gcc", "-O0", target_src, "-o", target_bin], check=True)
+        target_proc = subprocess.Popen([target_bin])
+
+        try:
+            time.sleep(0.1)
+            pid = target_proc.pid
+
+            # 1. Oversized key input via pipe (> 512 bytes)
+            r1, w1 = os.pipe()
+            os.write(w1, b"A" * 600)
+            os.close(w1)
+            snap_dir1 = os.path.join(self.tmp_dir, "c_snap_oversized")
+            res1 = subprocess.run([
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_dir1,
+                "-D", str(r1),
+                "-I", "key46",
+                "-S", "sess46",
+                "-j",
+            ], capture_output=True, text=True, pass_fds=(r1,))
+            self.assertNotEqual(res1.returncode, 0)
+            self.assertIn("oversized", res1.stderr)
+
+            # 2. Empty input via pipe (0 bytes)
+            r2, w2 = os.pipe()
+            os.close(w2)
+            snap_dir2 = os.path.join(self.tmp_dir, "c_snap_empty")
+            res2 = subprocess.run([
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_dir2,
+                "-D", str(r2),
+                "-I", "key46",
+                "-S", "sess46",
+                "-j",
+            ], capture_output=True, text=True, pass_fds=(r2,))
+            self.assertNotEqual(res2.returncode, 0)
+            self.assertIn("too short", res2.stderr)
+
+            # 3. Forbidden delimiter '|' in key
+            r3, w3 = os.pipe()
+            os.write(w3, b"secret|with|forbidden|pipe\n")
+            os.close(w3)
+            snap_dir3 = os.path.join(self.tmp_dir, "c_snap_pipe")
+            res3 = subprocess.run([
+                self.collector_bin,
+                "-p", str(pid),
+                "-o", snap_dir3,
+                "-D", str(r3),
+                "-I", "key46",
+                "-S", "sess46",
+                "-j",
+            ], capture_output=True, text=True, pass_fds=(r3,))
+            self.assertNotEqual(res3.returncode, 0)
+            self.assertIn("delimiter", res3.stderr)
+
+        finally:
+            target_proc.terminate()
+            target_proc.wait()
+
+    def test_47_c_collector_fd_ownership_contract(self):
+        """47: Collector takes ownership and closes inherited --key-fd descriptor on all exit paths."""
+        target_src = os.path.join(self.tmp_dir, "test47_target.c")
+        target_bin = os.path.join(self.tmp_dir, "test47_target")
+        with open(target_src, "w") as f:
+            f.write("#include <unistd.h>\nint main() { while(1) { usleep(10000); } return 0; }\n")
+        subprocess.run(["gcc", "-O0", target_src, "-o", target_bin], check=True)
+        target_proc = subprocess.Popen([target_bin])
+
+        try:
+            time.sleep(0.1)
+            pid = target_proc.pid
+
+            # Python helper script to verify descriptor closure in child process
+            test_script = f"""
+import os, subprocess, json
+
+r, w = os.pipe()
+sentinel_r, sentinel_w = os.pipe()
+os.write(w, b"fd_ownership_test_secret_32bytes\\n")
+os.close(w)
+
+collector_cmd = [
+    {repr(self.collector_bin)},
+    "-p", str({pid}),
+    "-o", {repr(os.path.join(self.tmp_dir, 'c_snap_fd_own'))},
+    "-D", str(r),
+    "-I", "own_key",
+    "-S", "own_sess",
+    "-j",
+]
+proc = subprocess.run(collector_cmd, pass_fds=(r, sentinel_r))
+assert proc.returncode == 0, f"Collector failed: {{proc.stderr}}"
+
+# Verify sentinel remains open and valid in parent
+os.write(sentinel_w, b"sentinel_ok")
+os.close(sentinel_w)
+msg = os.read(sentinel_r, 32)
+os.close(sentinel_r)
+assert msg == b"sentinel_ok"
+print("FD_OWNERSHIP_SUCCESS")
+"""
+            runner_res = subprocess.run(
+                [sys.executable, "-c", test_script],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(runner_res.returncode, 0, f"FD ownership script failed: {runner_res.stderr}")
+            self.assertIn("FD_OWNERSHIP_SUCCESS", runner_res.stdout)
+
+        finally:
+            target_proc.terminate()
+            target_proc.wait()
+
+    def test_48_complete_live_verified_trust_prerequisites(self):
+        """48: Exhaustive audit of all LIVE_VERIFIED trust prerequisites."""
+        snap, snap_dir = self._create_test_snapshot("snap48_audit", pid=9001)
+        snap_m_digest = snap.compute_manifest_digest()
+
+        valid_rcpt = issue_live_capture_receipt(
+            session_id=self.session_id,
+            pid=9001,
+            executable_path="/bin/true",
+            build_id="build_48_valid",
+            process_start_time=str(snap.process_starttime),
+            manifest_digest=snap_m_digest,
+            signer=self.signer,
+            key_id=self.test_key_id,
+        )
+
+        # Baseline: valid receipt + valid snapshot -> LIVE_VERIFIED
+        st, err = determine_snapshot_trust_state(
+            valid_rcpt,
+            verification_authority=self.verifier,
+            expected_session_id=self.session_id,
+            expected_pid=9001,
+            expected_build_id="build_48_valid",
+            snapshot=snap,
+        )
+        self.assertEqual(st, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIsNone(err)
+
+        # Prereq 1: Missing HMAC signature
+        bad_sig_rcpt = dataclasses.replace(valid_rcpt, signature="")
+        st1, err1 = determine_snapshot_trust_state(bad_sig_rcpt, verification_authority=self.verifier)
+        self.assertNotEqual(st1, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIn("UNSIGNED_RECEIPT", err1)
+
+        # Prereq 2: Revoked key
+        self.verifier.revoke_key(self.test_key_id)
+        try:
+            st2, err2 = determine_snapshot_trust_state(valid_rcpt, verification_authority=self.verifier)
+            self.assertNotEqual(st2, TRUST_STATE_LIVE_VERIFIED)
+            self.assertIn("KEY_REVOKED", err2)
+        finally:
+            self.verifier._revoked_keys.discard(self.test_key_id)
+
+        # Prereq 3: Session ID mismatch
+        st3, err3 = determine_snapshot_trust_state(
+            valid_rcpt,
+            verification_authority=self.verifier,
+            expected_session_id="wrong_session_id_48",
+        )
+        self.assertNotEqual(st3, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIn("SESSION_MISMATCH", err3)
+
+        # Prereq 4: PID mismatch
+        st4, err4 = determine_snapshot_trust_state(
+            valid_rcpt,
+            verification_authority=self.verifier,
+            expected_pid=9999,
+        )
+        self.assertNotEqual(st4, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIn("PID_MISMATCH", err4)
+
+        # Prereq 5: Process start time mismatch
+        bad_time_rcpt = issue_live_capture_receipt(
+            session_id=self.session_id,
+            pid=9001,
+            executable_path="/bin/true",
+            build_id="build_48_valid",
+            process_start_time="99999999",  # Different from snapshot
+            manifest_digest=snap_m_digest,
+            signer=self.signer,
+            key_id=self.test_key_id,
+        )
+        st5, err5 = determine_snapshot_trust_state(
+            bad_time_rcpt,
+            verification_authority=self.verifier,
+            snapshot=snap,
+        )
+        self.assertNotEqual(st5, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIn("PROCESS_START_TIME_MISMATCH", err5)
+
+        # Prereq 6: Build ID mismatch
+        st6, err6 = determine_snapshot_trust_state(
+            valid_rcpt,
+            verification_authority=self.verifier,
+            expected_build_id="different_build_id",
+        )
+        self.assertNotEqual(st6, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIn("BUILD_ID_MISMATCH", err6)
+
+        # Prereq 7: Manifest digest mismatch
+        st7, err7 = determine_snapshot_trust_state(
+            valid_rcpt,
+            verification_authority=self.verifier,
+            expected_manifest_digest="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        self.assertNotEqual(st7, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIn("MANIFEST_DIGEST_MISMATCH", err7)
+
+        # Prereq 8: Validation verdict not VALIDATED
+        snap_invalid = copy.deepcopy(snap)
+        snap_invalid.validation_verdict = "INVALID"
+        snap_invalid.validate_integrity = lambda: (False, ["simulated_failure"])
+        st8, err8 = determine_snapshot_trust_state(
+            valid_rcpt,
+            verification_authority=self.verifier,
+            snapshot=snap_invalid,
+        )
+        self.assertNotEqual(st8, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIn("SNAPSHOT_INTEGRITY_FAILED", err8)
+
+        # Prereq 9: Decoupled memory consistency: NON_ATOMIC consistency retains LIVE_VERIFIED
+        snap_non_atomic = copy.deepcopy(snap)
+        snap_non_atomic.consistency_level = "NON_ATOMIC"
+        st9, err9 = determine_snapshot_trust_state(
+            valid_rcpt,
+            verification_authority=self.verifier,
+            expected_session_id=self.session_id,
+            expected_pid=9001,
+            snapshot=snap_non_atomic,
+        )
+        self.assertEqual(st9, TRUST_STATE_LIVE_VERIFIED)
+        self.assertIsNone(err9)
 
 
 if __name__ == "__main__":

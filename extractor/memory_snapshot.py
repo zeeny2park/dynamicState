@@ -249,8 +249,19 @@ class RawMemorySnapshot:
             dir_open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
             if hasattr(os, "O_DIRECTORY"):
                 dir_open_flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                dir_open_flags |= os.O_NOFOLLOW
             dir_fd = os.open(self.output_dir, dir_open_flags)
             try:
+                dir_st = os.fstat(dir_fd)
+                if not stat.S_ISDIR(dir_st.st_mode):
+                    raise OSError(errno.ENOTDIR, f"Snapshot output_dir '{self.output_dir}' is not a directory")
+                pinned = getattr(self, "_pinned_dir_identity", None)
+                if pinned is not None and (dir_st.st_dev, dir_st.st_ino) != pinned:
+                    raise OSError(
+                        errno.EACCES,
+                        f"Snapshot directory identity mismatch: expected {pinned}, got {(dir_st.st_dev, dir_st.st_ino)}",
+                    )
                 manifest_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                 if hasattr(os, "O_NOFOLLOW"):
                     manifest_flags |= os.O_NOFOLLOW
@@ -259,9 +270,17 @@ class RawMemorySnapshot:
                     mst = os.fstat(mfd)
                     if not stat.S_ISREG(mst.st_mode):
                         raise OSError(errno.EINVAL, f"manifest.json is not a regular file (mode {oct(mst.st_mode)})")
-                    raw = os.read(mfd, mst.st_size + 1)
+                    chunks: List[bytes] = []
+                    total_read = 0
+                    while True:
+                        chunk = os.read(mfd, min(4096, mst.st_size - total_read + 1))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total_read += len(chunk)
+                    raw = b"".join(chunks)
                     if len(raw) != mst.st_size:
-                        raise OSError(errno.EIO, "manifest.json size read mismatch")
+                        raise OSError(errno.EIO, f"manifest.json size read mismatch (stat {mst.st_size} != read {len(raw)})")
                     return hashlib.sha256(raw).hexdigest()
                 finally:
                     os.close(mfd)
@@ -552,6 +571,8 @@ class RawMemorySnapshot:
         dir_open_flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             dir_open_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            dir_open_flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             dir_open_flags |= os.O_CLOEXEC
 
@@ -559,6 +580,9 @@ class RawMemorySnapshot:
             dir_fd = os.open(real_out, dir_open_flags)
         except OSError as e:
             self.validation_verdict = VERDICT_INVALID
+            if getattr(e, "errno", None) in (errno.ELOOP, errno.EMLINK) or os.path.islink(self.output_dir):
+                warnings.append(f"Snapshot directory is a symbolic link: {self.output_dir}")
+                return False, warnings
             return False, [f"Cannot open snapshot directory '{real_out}': {e}"]
 
         try:
@@ -566,6 +590,16 @@ class RawMemorySnapshot:
             if not stat.S_ISDIR(dir_st.st_mode):
                 self.validation_verdict = VERDICT_INVALID
                 return False, [f"Snapshot path '{real_out}' is not a directory"]
+
+            # Pin directory identity (device, inode) for subsequent receipt verification
+            if getattr(self, "_pinned_dir_identity", None) is not None:
+                if (dir_st.st_dev, dir_st.st_ino) != self._pinned_dir_identity:
+                    is_valid = False
+                    warnings.append(
+                        f"Snapshot directory identity substitution detected: pinned {self._pinned_dir_identity} != current {(dir_st.st_dev, dir_st.st_ino)}"
+                    )
+            else:
+                self._pinned_dir_identity = (dir_st.st_dev, dir_st.st_ino)
 
             # 1. Validate metadata.json
             meta_raw = None

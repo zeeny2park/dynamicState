@@ -34,7 +34,7 @@ typedef struct {
     char signing_key_id[64];
     char session_id[128];
     char key_file[1024];
-    int key_fd;
+    int key_fd; /* Inherited FD for signing key; Collector takes ownership and closes on all paths */
 } collector_config_t;
 
 typedef struct {

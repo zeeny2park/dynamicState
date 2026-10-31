@@ -120,9 +120,22 @@ def load_secure_key_file(path: str, max_size: int = 4096) -> Dict[str, str]:
         if st.st_size == 0:
             raise ValueError(f"Key file '{path}' is empty")
 
-        raw_bytes = os.read(fd, max_size + 1)
-        if len(raw_bytes) > max_size:
-            raise ValueError(f"Key file '{path}' exceeds maximum size of {max_size} bytes")
+        chunks: List[bytes] = []
+        total_read = 0
+        while True:
+            chunk = os.read(fd, min(4096, max_size - total_read + 1))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total_read += len(chunk)
+            if total_read > max_size:
+                raise ValueError(f"Key file '{path}' exceeds maximum size of {max_size} bytes")
+
+        raw_bytes = b"".join(chunks)
+        if total_read == 0:
+            raise ValueError(f"Key file '{path}' is empty")
+        if st.st_size > 0 and len(raw_bytes) != st.st_size:
+            raise ValueError(f"Key file '{path}' size mismatch (stat reported {st.st_size} bytes, read {len(raw_bytes)} bytes)")
     finally:
         os.close(fd)
 
@@ -151,6 +164,8 @@ def load_secure_key_file(path: str, max_size: int = 4096) -> Dict[str, str]:
         for k, v in data.items():
             if not isinstance(k, str) or not isinstance(v, str):
                 raise ValueError(f"Invalid key entry in '{path}': keys and secrets must be strings")
+            if "\x00" in k or "|" in k:
+                raise ValueError(f"Key ID '{k}' in '{path}' contains forbidden delimiter or NUL character")
             if len(v) < 16:
                 raise ValueError(f"Key '{k}' in '{path}' is too short ({len(v)} chars; min 16 required)")
             if len(v) > 256:
@@ -273,6 +288,13 @@ class CaptureVerificationAuthority:
         return auth
 
     @classmethod
+    def from_keyring_file(cls, path: str) -> "CaptureVerificationAuthority":
+        """Explicit production factory to load verification keyring from a secure JSON file."""
+        auth = cls()
+        auth.register_key_file(path)
+        return auth
+
+    @classmethod
     def from_key_fd(cls, fd: int, key_id: str = "fd_default") -> "CaptureVerificationAuthority":
         """Explicit production factory to load verification key from an inherited file descriptor."""
         auth = cls()
@@ -285,35 +307,40 @@ class CaptureVerificationAuthority:
         
         Strict error visibility: Invalid configuration raises visible, actionable errors
         instead of silently swallowing exceptions.
+
+        DEPRECATED: Use explicit CaptureVerificationAuthority.from_key_file() or from_key_fd().
+        Raw environment secrets (DYNAMICSTATE_CAPTURE_SECRET) and inline JSON keyrings are prohibited.
         """
+        import warnings
+        warnings.warn(
+            "CaptureVerificationAuthority.from_environment() is deprecated and will be removed in a future release. "
+            "Use explicit CaptureVerificationAuthority.from_key_file() or from_key_fd().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         auth = cls()
-        # 1. DYNAMICSTATE_CAPTURE_SECRET & DYNAMICSTATE_CAPTURE_KEY_ID
-        env_secret = os.environ.get("DYNAMICSTATE_CAPTURE_SECRET")
-        key_id = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_ID", "default")
-        if env_secret:
-            auth.register_key(key_id, env_secret)
+
+        # 1. Reject raw secrets in environment
+        if "DYNAMICSTATE_CAPTURE_SECRET" in os.environ and os.environ["DYNAMICSTATE_CAPTURE_SECRET"]:
+            raise ValueError(
+                "Insecure key provisioning: Passing raw secrets via DYNAMICSTATE_CAPTURE_SECRET is prohibited. "
+                "Use explicit key files (from_key_file) or inherited file descriptors (from_key_fd)."
+            )
 
         # 2. DYNAMICSTATE_CAPTURE_KEY_FILE (Strict secure file validation - no silent swallowing)
         key_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
         if key_file:
             auth.register_key_file(key_file)
 
-        # 3. DYNAMICSTATE_CAPTURE_KEYRING
+        # 3. DYNAMICSTATE_CAPTURE_KEYRING: Only secure file paths allowed; inline JSON strings prohibited
         keyring_spec = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
         if keyring_spec:
-            if os.path.exists(keyring_spec):
-                auth.register_key_file(keyring_spec)
-            else:
-                try:
-                    data = json.loads(keyring_spec)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"DYNAMICSTATE_CAPTURE_KEYRING contains invalid JSON: {exc}")
-                if not isinstance(data, dict):
-                    raise ValueError("DYNAMICSTATE_CAPTURE_KEYRING must be a JSON object mapping key_id to secret")
-                for k, v in data.items():
-                    if not isinstance(k, str) or not isinstance(v, str):
-                        raise ValueError("Invalid key entry in keyring: keys and secrets must be strings")
-                    auth.register_key(k, v)
+            if not os.path.exists(keyring_spec):
+                raise ValueError(
+                    "Insecure key provisioning: Inline JSON keyring strings in DYNAMICSTATE_CAPTURE_KEYRING are prohibited. "
+                    "Use a secure key file path or explicit key authority registration."
+                )
+            auth.register_key_file(keyring_spec)
 
         return auth
 
@@ -338,6 +365,26 @@ class CaptureSigningAuthority:
             raise ValueError("key_id contains forbidden delimiter or control character")
         self._key_id = key_id
         self._secret = secret
+
+    @classmethod
+    def from_key_file(cls, path: str, key_id: str = "collector_key") -> "CaptureSigningAuthority":
+        """Explicit production factory to load signing key from a secure file."""
+        keys = load_secure_key_file(path)
+        if key_id in keys:
+            sec = keys[key_id]
+        elif "file_default" in keys:
+            sec = keys["file_default"]
+        elif len(keys) == 1:
+            key_id, sec = next(iter(keys.items()))
+        else:
+            raise ValueError(f"Key '{key_id}' not found in key file '{path}'")
+        return cls(key_id=key_id, secret=sec)
+
+    @classmethod
+    def from_key_fd(cls, fd: int, key_id: str = "collector_key") -> "CaptureSigningAuthority":
+        """Explicit production factory to load signing key from an inherited file descriptor."""
+        sec = load_secure_key_fd(fd)
+        return cls(key_id=key_id, secret=sec)
 
     @property
     def key_id(self) -> str:
@@ -779,25 +826,54 @@ def verify_live_capture_receipt(
             dir_open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
             if hasattr(os, "O_DIRECTORY"):
                 dir_open_flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                dir_open_flags |= os.O_NOFOLLOW
             try:
                 dir_fd = os.open(snap_out, dir_open_flags)
             except OSError as err:
+                if getattr(err, "errno", None) in (errno.ELOOP, errno.EMLINK):
+                    return False, f"SNAPSHOT_DIR_SYMLINK: Snapshot directory '{snap_out}' is a symbolic link"
                 return False, f"SNAPSHOT_DIR_INACCESSIBLE: Cannot open snapshot dir '{snap_out}': {err}"
             try:
+                dir_st = os.fstat(dir_fd)
+                if not stat.S_ISDIR(dir_st.st_mode):
+                    return False, f"SNAPSHOT_DIR_NOT_DIRECTORY: Snapshot path '{snap_out}' is not a directory"
+
+                # Verify pinned directory identity consistency
+                pinned = getattr(snapshot, "_pinned_dir_identity", None)
+                if pinned is not None:
+                    current_ident = (dir_st.st_dev, dir_st.st_ino)
+                    if current_ident != pinned:
+                        return (
+                            False,
+                            f"SNAPSHOT_DIR_SUBSTITUTION: Snapshot directory identity changed after integrity validation "
+                            f"(pinned {pinned} != current {current_ident})",
+                        )
+
                 manifest_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                 if hasattr(os, "O_NOFOLLOW"):
                     manifest_flags |= os.O_NOFOLLOW
                 try:
                     mfd = os.open("manifest.json", manifest_flags, dir_fd=dir_fd)
                 except OSError as err:
+                    if getattr(err, "errno", None) in (errno.ELOOP, errno.EMLINK):
+                        return False, "MANIFEST_SYMLINK_REJECTED: manifest.json is a symbolic link"
                     return False, f"MISSING_MANIFEST: manifest.json is missing or inaccessible in snapshot directory: {err}"
                 try:
                     mst = os.fstat(mfd)
                     if not stat.S_ISREG(mst.st_mode):
                         return False, f"MISSING_MANIFEST: manifest.json in snapshot directory is not a regular file (mode {oct(mst.st_mode)})"
-                    raw_bytes = os.read(mfd, mst.st_size + 1)
+                    chunks = []
+                    total_read = 0
+                    while True:
+                        chunk = os.read(mfd, min(4096, mst.st_size - total_read + 1))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total_read += len(chunk)
+                    raw_bytes = b"".join(chunks)
                     if len(raw_bytes) != mst.st_size:
-                        return False, "SNAPSHOT_INTEGRITY_FAILED: manifest.json read size mismatch during digest computation"
+                        return False, f"SNAPSHOT_INTEGRITY_FAILED: manifest.json read size mismatch during digest computation (stat {mst.st_size} != read {len(raw_bytes)})"
                     disk_digest = hashlib.sha256(raw_bytes).hexdigest()
                 finally:
                     os.close(mfd)

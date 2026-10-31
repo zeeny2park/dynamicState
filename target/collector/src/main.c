@@ -75,8 +75,16 @@ static int load_key_from_file(const char *path, char *out_key, size_t max_len) {
         total_read += (size_t)n;
     }
 
+    /* Verify EOF and detect oversized input, retrying on EINTR */
     char extra[1];
-    ssize_t extra_n = read(fd, extra, sizeof(extra));
+    ssize_t extra_n;
+    while ((extra_n = read(fd, extra, sizeof(extra))) < 0) {
+        if (errno == EINTR) continue;
+        fprintf(stderr, "Error: Failed to verify EOF for key file '%s': %s\n", path, strerror(errno));
+        close(fd);
+        secure_memzero(buf, sizeof(buf));
+        return -1;
+    }
     close(fd);
     if (extra_n > 0) {
         fprintf(stderr, "Error: Key file '%s' is oversized (exceeds buffer limit).\n", path);
@@ -124,12 +132,25 @@ static int load_key_from_file(const char *path, char *out_key, size_t max_len) {
     return 0;
 }
 
+/*
+ * load_key_from_fd:
+ * Ingests a signing key from an inherited file descriptor.
+ *
+ * FD OWNERSHIP CONTRACT:
+ * The Collector takes immediate ownership of the passed descriptor (fd).
+ * In all return paths (error or success), the descriptor is guaranteed to be closed
+ * by this function, ensuring no resource leak or descriptor retention in the process.
+ */
 static int load_key_from_fd(int fd, char *out_key, size_t max_len) {
-    if (fd < 0 || !out_key || max_len == 0) return -1;
+    if (fd < 0 || !out_key || max_len == 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
 
     struct stat st;
     if (fstat(fd, &st) != 0) {
         fprintf(stderr, "Error: Failed to stat key FD %d: %s\n", fd, strerror(errno));
+        close(fd);
         return -1;
     }
 
@@ -156,8 +177,16 @@ static int load_key_from_fd(int fd, char *out_key, size_t max_len) {
         total_read += (size_t)n;
     }
 
+    /* Verify EOF and detect oversized input, retrying on EINTR */
     char extra[1];
-    ssize_t extra_n = read(fd, extra, sizeof(extra));
+    ssize_t extra_n;
+    while ((extra_n = read(fd, extra, sizeof(extra))) < 0) {
+        if (errno == EINTR) continue;
+        fprintf(stderr, "Error: Failed to verify EOF for key FD %d: %s\n", fd, strerror(errno));
+        close(fd);
+        secure_memzero(buf, sizeof(buf));
+        return -1;
+    }
     close(fd);
     if (extra_n > 0) {
         fprintf(stderr, "Error: Key from FD %d is oversized (exceeds buffer limit).\n", fd);
