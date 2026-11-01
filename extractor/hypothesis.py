@@ -943,17 +943,29 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                     f"Inspect lock ownership, owner thread progress, and stack frame locals for thread {tid}."
                 ),
                 expected_outcomes={
+                    "thread_contention_stall_observed": "SUPPORTED",
+                    "stalled_lock_owner_identified": "SUPPORTED",
+                    "circular_deadlock_confirmed": "SUPPORTED",
                     "stalled_owner_or_deadlock_confirmed": "SUPPORTED",
                     "uncontended_or_normal_progress": "CONTRADICTED",
+                    "normal_condition_variable_wait": "CONTRADICTED",
                 },
                 expected_outcomes_by_hypothesis={
                     h1_id: {
+                        "thread_contention_stall_observed": "SUPPORTED",
+                        "stalled_lock_owner_identified": "SUPPORTED",
+                        "circular_deadlock_confirmed": "SUPPORTED",
                         "stalled_owner_or_deadlock_confirmed": "SUPPORTED",
                         "uncontended_or_normal_progress": "CONTRADICTED",
+                        "normal_condition_variable_wait": "CONTRADICTED",
                     },
                     h2_id: {
+                        "thread_contention_stall_observed": "CONTRADICTED",
+                        "stalled_lock_owner_identified": "CONTRADICTED",
+                        "circular_deadlock_confirmed": "CONTRADICTED",
                         "stalled_owner_or_deadlock_confirmed": "CONTRADICTED",
                         "uncontended_or_normal_progress": "SUPPORTED",
+                        "normal_condition_variable_wait": "SUPPORTED",
                     },
                 },
                 discriminating_power="HIGH",
@@ -1070,16 +1082,28 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                 target_ref={"target_expression": target_expr, "region": region},
                 discriminating_criteria=f"Compare allocation metrics for '{target_expr}' across consecutive runtime epochs.",
                 expected_outcomes={
+                    "sustained_monotonic_growth": "SUPPORTED",
                     "monotonic_unreleased_growth_with_orphans": "SUPPORTED",
+                    "temporary_workload_buffering": "CONTRADICTED",
+                    "allocator_retention": "CONTRADICTED",
+                    "mapping_expansion_without_allocation": "CONTRADICTED",
                     "stable_or_reclaimed_allocation": "CONTRADICTED",
                 },
                 expected_outcomes_by_hypothesis={
                     h1_id: {
+                        "sustained_monotonic_growth": "SUPPORTED",
                         "monotonic_unreleased_growth_with_orphans": "SUPPORTED",
+                        "temporary_workload_buffering": "CONTRADICTED",
+                        "allocator_retention": "CONTRADICTED",
+                        "mapping_expansion_without_allocation": "CONTRADICTED",
                         "stable_or_reclaimed_allocation": "CONTRADICTED",
                     },
                     h2_id: {
+                        "sustained_monotonic_growth": "CONTRADICTED",
                         "monotonic_unreleased_growth_with_orphans": "CONTRADICTED",
+                        "temporary_workload_buffering": "SUPPORTED",
+                        "allocator_retention": "SUPPORTED",
+                        "mapping_expansion_without_allocation": "SUPPORTED",
                         "stable_or_reclaimed_allocation": "SUPPORTED",
                     },
                 },

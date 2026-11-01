@@ -84,6 +84,21 @@ class TargetExecutionAdapter(ABC):
         """Discovers executable path, architecture, build ID, and ELF type."""
         pass
 
+    def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
+        """Reads detailed process memory metrics from /proc/<pid>/statm, /proc/<pid>/status,
+        and /proc/<pid>/smaps_rollup (bounded, low-impact).
+        
+        Strictly distinguishes:
+        - Virtual memory size (VSZ)
+        - Resident set size (RSS)
+        - Mapping size
+        - Writable anonymous mapping size
+        - Heap mapping size
+        - Actual allocation evidence (documented procfs limitation)
+        - Object lifetime / release evidence (documented procfs limitation)
+        """
+        return {"status": "UNAVAILABLE", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}}
+
     @abstractmethod
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         """Reads /proc/<pid>/maps and returns structured memory mappings."""
@@ -152,6 +167,7 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
     PERMITTED_READ_METHODS = {
         "check_liveness",
         "get_process_identity",
+        "get_process_memory_info",
         "get_proc_maps",
         "get_memory_mappings",
         "get_threads",
@@ -174,6 +190,9 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
 
     def get_process_identity(self, pid: int) -> Dict[str, Any]:
         return self._inner.get_process_identity(pid)
+
+    def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
+        return self._inner.get_process_memory_info(pid)
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         return self._inner.get_proc_maps(pid)
@@ -261,28 +280,341 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             return False, f"Liveness check failed for PID {pid}: {e}"
 
     def get_process_identity(self, pid: int) -> Dict[str, Any]:
-        runtime_exe = ""
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return {
+                "pid": pid,
+                "status": "FAILED",
+                "executable": "",
+                "architecture": "unknown",
+                "elf_type": "unknown",
+                "build_id": None,
+                "is_deleted": False,
+                "process_start_time": None,
+                "has_debug_info": False,
+                "is_remote": False,
+                "host": self.target_host(),
+                "error": f"Invalid PID {pid}",
+            }
+
+        # Check process liveness
         try:
-            runtime_exe = os.path.realpath(f"/proc/{pid}/exe")
-        except Exception:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return {
+                "pid": pid,
+                "status": "TARGET_TERMINATED",
+                "executable": "",
+                "architecture": "unknown",
+                "elf_type": "unknown",
+                "build_id": None,
+                "is_deleted": False,
+                "process_start_time": None,
+                "has_debug_info": False,
+                "is_remote": False,
+                "host": self.target_host(),
+                "error": f"Target PID {pid} was not found (ESRCH)",
+            }
+        except PermissionError:
             pass
 
-        runtime_identity: Optional[BinaryIdentity] = None
-        if runtime_exe and os.path.exists(runtime_exe):
+        # 1. Inspect /proc/<pid>/exe link
+        runtime_exe = ""
+        is_deleted = False
+        link_status = "OBSERVED"
+        link_err = None
+        raw_link = ""
+        try:
+            raw_link = os.readlink(f"/proc/{pid}/exe")
+            if raw_link.endswith(" (deleted)"):
+                is_deleted = True
+                runtime_exe = raw_link[:-len(" (deleted)")]
+            else:
+                runtime_exe = raw_link
+        except PermissionError:
+            link_status = "PERMISSION_DENIED"
+            link_err = f"Permission denied reading /proc/{pid}/exe"
+        except FileNotFoundError:
+            link_status = "NOT_FOUND"
+            link_err = f"/proc/{pid}/exe does not exist"
+        except Exception as e:
+            link_status = "FAILED"
+            link_err = str(e)
+
+        # 2. Extract process start time from /proc/<pid>/stat (field 22, 1-based)
+        start_time = None
+        stat_path = f"/proc/{pid}/stat"
+        if os.path.exists(stat_path):
             try:
-                runtime_identity = inspect_elf(runtime_exe)
+                with open(stat_path, "r", encoding="utf-8", errors="replace") as f:
+                    stat_content = f.read()
+                r_paren = stat_content.rfind(")")
+                if r_paren != -1:
+                    rest_fields = stat_content[r_paren + 1:].split()
+                    if len(rest_fields) >= 20:
+                        start_time = int(rest_fields[19])
+            except Exception:
+                pass
+
+        # 3. Read ELF identity from /proc/<pid>/exe or runtime_exe
+        runtime_identity: Optional[BinaryIdentity] = None
+        elf_target = f"/proc/{pid}/exe" if os.path.exists(f"/proc/{pid}/exe") else (runtime_exe if os.path.exists(runtime_exe) else "")
+        if elf_target:
+            try:
+                runtime_identity = inspect_elf(elf_target)
             except Exception:
                 pass
 
         return {
             "pid": pid,
             "executable": runtime_exe,
+            "raw_link": raw_link,
+            "is_deleted": is_deleted,
+            "process_start_time": start_time,
             "architecture": runtime_identity.architecture if runtime_identity else "unknown",
             "elf_type": runtime_identity.elf_type if runtime_identity else "unknown",
             "build_id": runtime_identity.build_id if runtime_identity else None,
             "pt_loads": runtime_identity.pt_loads if runtime_identity else [],
+            "has_debug_info": bool(getattr(runtime_identity, "has_debug_info", False)) if runtime_identity else False,
+            "status": link_status,
+            "error": link_err,
             "is_remote": False,
             "host": self.target_host(),
+        }
+
+    def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
+        """Reads detailed process memory metrics from /proc/<pid>/statm, /proc/<pid>/status,
+        and /proc/<pid>/smaps_rollup (bounded, low-impact).
+        
+        Strictly distinguishes:
+        - Virtual memory size (VSZ)
+        - Resident set size (RSS)
+        - Mapping size
+        - Writable anonymous mapping size
+        - Heap mapping size
+        - Actual allocation evidence (procfs limitation documented)
+        - Object lifetime / release evidence (procfs limitation documented)
+        """
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return {
+                "status": "FAILED",
+                "pid": pid,
+                "error": f"Invalid PID {pid}",
+                "metrics": {},
+                "mappings_summary": {},
+                "metadata": {},
+            }
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return {
+                "status": "TARGET_TERMINATED",
+                "pid": pid,
+                "error": f"Target PID {pid} was not found (ESRCH)",
+                "metrics": {},
+                "mappings_summary": {},
+                "metadata": {},
+            }
+        except PermissionError:
+            pass
+
+        t_start = time.time()
+        page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        actual_costs: Dict[str, int] = {}
+
+        # 1. Read /proc/<pid>/statm
+        statm_path = f"/proc/{pid}/statm"
+        statm_vsz = None
+        statm_rss = None
+        statm_shared = None
+        statm_data = None
+        if os.path.exists(statm_path):
+            try:
+                with open(statm_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                    actual_costs["statm"] = len(content.encode("utf-8"))
+                    parts = content.strip().split()
+                    if len(parts) >= 6:
+                        statm_vsz = int(parts[0]) * page_size
+                        statm_rss = int(parts[1]) * page_size
+                        statm_shared = int(parts[2]) * page_size
+                        statm_data = int(parts[5]) * page_size
+            except PermissionError:
+                return {
+                    "status": "PERMISSION_DENIED",
+                    "pid": pid,
+                    "error": f"Permission denied reading {statm_path}",
+                    "metrics": {},
+                    "mappings_summary": {},
+                    "metadata": {},
+                }
+            except Exception:
+                pass
+
+        # 2. Read /proc/<pid>/status
+        status_path = f"/proc/{pid}/status"
+        status_vsz = None
+        status_rss = None
+        rss_anon = None
+        rss_file = None
+        rss_shmem = None
+        vm_peak = None
+        vm_hwm = None
+        vm_data = None
+        vm_swap = None
+        if os.path.exists(status_path):
+            try:
+                with open(status_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                    actual_costs["status"] = len(content.encode("utf-8"))
+                    for line in content.splitlines():
+                        line_s = line.strip()
+                        if line_s.startswith("VmSize:"):
+                            status_vsz = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("VmRSS:"):
+                            status_rss = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("RssAnon:"):
+                            rss_anon = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("RssFile:"):
+                            rss_file = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("RssShmem:"):
+                            rss_shmem = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("VmPeak:"):
+                            vm_peak = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("VmHWM:"):
+                            vm_hwm = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("VmData:"):
+                            vm_data = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("VmSwap:"):
+                            vm_swap = int(line_s.split()[1]) * 1024
+            except PermissionError:
+                return {
+                    "status": "PERMISSION_DENIED",
+                    "pid": pid,
+                    "error": f"Permission denied reading {status_path}",
+                    "metrics": {},
+                    "mappings_summary": {},
+                    "metadata": {},
+                }
+            except Exception:
+                pass
+
+        # 3. Read /proc/<pid>/smaps_rollup (bounded to 4096 bytes)
+        smaps_rollup_path = f"/proc/{pid}/smaps_rollup"
+        pss = None
+        private_dirty = None
+        private_clean = None
+        shared_dirty = None
+        shared_clean = None
+        if os.path.exists(smaps_rollup_path):
+            try:
+                with open(smaps_rollup_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read(4096)
+                    actual_costs["smaps_rollup"] = len(content.encode("utf-8"))
+                    for line in content.splitlines():
+                        line_s = line.strip()
+                        if line_s.startswith("Pss:"):
+                            pss = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("Private_Dirty:"):
+                            private_dirty = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("Private_Clean:"):
+                            private_clean = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("Shared_Dirty:"):
+                            shared_dirty = int(line_s.split()[1]) * 1024
+                        elif line_s.startswith("Shared_Clean:"):
+                            shared_clean = int(line_s.split()[1]) * 1024
+            except PermissionError:
+                pass
+            except Exception:
+                pass
+
+        # 4. Mappings summary from /proc/<pid>/maps
+        maps = self.get_proc_maps(pid)
+        total_mapping_size = sum(m.get("size", 0) for m in maps)
+        heap_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]")
+        anon_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "anonymous" and m.get("is_writable"))
+        stack_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "stack")
+
+        vsz_eff = status_vsz if status_vsz is not None else (statm_vsz if statm_vsz is not None else total_mapping_size)
+        rss_eff = status_rss if status_rss is not None else statm_rss
+
+        metrics = {
+            "vsz_bytes": vsz_eff,
+            "rss_bytes": rss_eff,
+            "rss_anon_bytes": rss_anon,
+            "rss_file_bytes": rss_file,
+            "rss_shmem_bytes": rss_shmem,
+            "vm_peak_bytes": vm_peak,
+            "vm_hwm_bytes": vm_hwm,
+            "vm_data_bytes": vm_data if vm_data is not None else statm_data,
+            "vm_swap_bytes": vm_swap,
+            "pss_bytes": pss,
+            "private_dirty_bytes": private_dirty,
+            "private_clean_bytes": private_clean,
+            "shared_dirty_bytes": shared_dirty,
+            "shared_clean_bytes": shared_clean,
+        }
+
+        mappings_summary = {
+            "mapping_count": len(maps),
+            "total_mapping_size_bytes": total_mapping_size,
+            "heap_mapping_size_bytes": heap_mapping_size,
+            "writable_anon_mapping_size_bytes": anon_mapping_size,
+            "stack_mapping_size_bytes": stack_mapping_size,
+        }
+
+        metadata = {
+            "vsz": {
+                "source": "/proc/<pid>/status (VmSize) / /proc/<pid>/statm",
+                "method": "Procfs virtual memory space counters",
+                "limitations": "Measures total reserved virtual address space. Mapping expansion does NOT indicate RAM usage or page allocation.",
+                "estimated_cost_bytes": 1024,
+                "actual_cost_bytes": actual_costs.get("status", actual_costs.get("statm", 1024)),
+            },
+            "rss": {
+                "source": "/proc/<pid>/status (VmRSS) / /proc/<pid>/statm",
+                "method": "Kernel MM task_struct RSS counters",
+                "limitations": "Measures physical pages currently resident in RAM. Subject to OS page cache reclamation, lazy faults, and swapping. Does not distinguish allocated vs retained memory.",
+                "estimated_cost_bytes": 1024,
+                "actual_cost_bytes": actual_costs.get("status", actual_costs.get("statm", 1024)),
+            },
+            "mapping_size": {
+                "source": "/proc/<pid>/maps",
+                "method": "Sequential VMA interval scan",
+                "limitations": "Virtual segment intervals only; a mapped region does not guarantee that physical pages are committed.",
+                "estimated_cost_bytes": 4096,
+                "actual_cost_bytes": len(maps) * 64,
+            },
+            "private_dirty": {
+                "source": "/proc/<pid>/smaps_rollup",
+                "method": "Kernel aggregated rollup",
+                "limitations": "Unshared modified pages in RAM. Available on Linux 4.14+; bounded read.",
+                "estimated_cost_bytes": 1024,
+                "actual_cost_bytes": actual_costs.get("smaps_rollup", 0),
+            },
+            "allocation_evidence": {
+                "source": "None in /proc",
+                "method": "N/A",
+                "limitations": "Procfs metrics only reflect kernel-level virtual memory and page tables. Individual heap chunks (malloc/free, arenas, pools, slab) and object lifetimes cannot be proven by procfs alone without heap introspection or allocator tracing.",
+                "estimated_cost_bytes": 0,
+                "actual_cost_bytes": 0,
+            },
+            "object_lifetime_evidence": {
+                "source": "None in /proc",
+                "method": "N/A",
+                "limitations": "Object creation, references, and destruction are application-level events invisible to procfs without runtime tracing or active debugger unwinding.",
+                "estimated_cost_bytes": 0,
+                "actual_cost_bytes": 0,
+            },
+        }
+
+        return {
+            "status": "OBSERVED",
+            "timestamp": t_start,
+            "pid": pid,
+            "metrics": metrics,
+            "mappings_summary": mappings_summary,
+            "metadata": metadata,
         }
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
@@ -549,14 +881,28 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                             "tcb_address_int": None,
                         }
 
+                    lock_addr_hex = f"0x{syscall_arg0:x}" if (syscall_arg0 is not None and syscall_arg0 > 0) else None
+
+                    concurrency_state = (
+                        "WAITING_IN_FUTEX" if is_futex
+                        else ("SLEEPING" if state == "S"
+                        else ("BLOCKED_IO" if state == "D"
+                        else ("RUNNING" if state == "R" else state)))
+                    )
+
                     threads.append({
                         "tid": tid,
                         "name": comm,
                         "state": state,
+                        "concurrency_state": concurrency_state,
+                        "is_sleeping": (state == "S"),
+                        "is_blocked_uninterruptible": (state == "D"),
                         "syscall_nr": syscall_nr,
                         "syscall_name": syscall_name,
-                        "syscall_arg0": f"0x{syscall_arg0:x}" if syscall_arg0 is not None else None,
-                        "syscall_arg0_int": syscall_arg0,
+                        "syscall_arg0": lock_addr_hex,
+                        "syscall_arg0_int": syscall_arg0 if (syscall_arg0 and syscall_arg0 > 0) else None,
+                        "waiting_on_lock": lock_addr_hex,
+                        "lock_address_status": "OBSERVED" if lock_addr_hex else "UNAVAILABLE",
                         "wchan": wchan,
                         "is_futex_wait": is_futex,
                         "cpu_id": cpu_id,
@@ -890,6 +1236,129 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "pt_loads": pt_loads,
             "is_remote": True,
             "host": self.target_host(),
+        }
+
+    def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
+        """Reads detailed process memory metrics from remote /proc/<pid>/statm, status, and smaps_rollup."""
+        alive, _ = self.check_liveness(pid)
+        if not alive:
+            return {"status": "TARGET_TERMINATED", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}}
+
+        cmd = (
+            f"cat /proc/{int(pid)}/statm 2>/dev/null; "
+            f"echo '---DELIM_STATUS---'; cat /proc/{int(pid)}/status 2>/dev/null; "
+            f"echo '---DELIM_SMAPS---'; head -c 4096 /proc/{int(pid)}/smaps_rollup 2>/dev/null"
+        )
+        rc, stdout, stderr = self.run_ssh(cmd)
+        if rc != 0 or not stdout:
+            return {"status": "UNAVAILABLE", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}}
+
+        parts = stdout.split("---DELIM_STATUS---")
+        raw_statm = parts[0].strip() if len(parts) > 0 else ""
+        rest = parts[1] if len(parts) > 1 else ""
+        subparts = rest.split("---DELIM_SMAPS---")
+        raw_status = subparts[0].strip() if len(subparts) > 0 else ""
+        raw_smaps = subparts[1].strip() if len(subparts) > 1 else ""
+
+        page_size = 4096
+        statm_vsz = None
+        statm_rss = None
+        statm_shared = None
+        statm_data = None
+        if raw_statm:
+            sm_parts = raw_statm.split()
+            if len(sm_parts) >= 6:
+                try:
+                    statm_vsz = int(sm_parts[0]) * page_size
+                    statm_rss = int(sm_parts[1]) * page_size
+                    statm_shared = int(sm_parts[2]) * page_size
+                    statm_data = int(sm_parts[5]) * page_size
+                except ValueError:
+                    pass
+
+        status_vsz = None
+        status_rss = None
+        rss_anon = None
+        rss_file = None
+        rss_shmem = None
+        vm_peak = None
+        vm_hwm = None
+        vm_data = None
+        vm_swap = None
+        for line in raw_status.splitlines():
+            line_s = line.strip()
+            try:
+                if line_s.startswith("VmSize:"):
+                    status_vsz = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("VmRSS:"):
+                    status_rss = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("RssAnon:"):
+                    rss_anon = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("RssFile:"):
+                    rss_file = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("RssShmem:"):
+                    rss_shmem = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("VmPeak:"):
+                    vm_peak = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("VmHWM:"):
+                    vm_hwm = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("VmData:"):
+                    vm_data = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("VmSwap:"):
+                    vm_swap = int(line_s.split()[1]) * 1024
+            except (IndexError, ValueError):
+                pass
+
+        pss = None
+        private_dirty = None
+        for line in raw_smaps.splitlines():
+            line_s = line.strip()
+            try:
+                if line_s.startswith("Pss:"):
+                    pss = int(line_s.split()[1]) * 1024
+                elif line_s.startswith("Private_Dirty:"):
+                    private_dirty = int(line_s.split()[1]) * 1024
+            except (IndexError, ValueError):
+                pass
+
+        maps = self.get_proc_maps(pid)
+        total_mapping_size = sum(m.get("size", 0) for m in maps)
+        heap_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]")
+        anon_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "anonymous" and m.get("is_writable"))
+        stack_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "stack")
+
+        vsz_eff = status_vsz if status_vsz is not None else (statm_vsz if statm_vsz is not None else total_mapping_size)
+        rss_eff = status_rss if status_rss is not None else statm_rss
+
+        return {
+            "status": "OBSERVED",
+            "timestamp": time.time(),
+            "pid": pid,
+            "metrics": {
+                "vsz_bytes": vsz_eff,
+                "rss_bytes": rss_eff,
+                "rss_anon_bytes": rss_anon,
+                "rss_file_bytes": rss_file,
+                "rss_shmem_bytes": rss_shmem,
+                "vm_peak_bytes": vm_peak,
+                "vm_hwm_bytes": vm_hwm,
+                "vm_data_bytes": vm_data if vm_data is not None else statm_data,
+                "vm_swap_bytes": vm_swap,
+                "pss_bytes": pss,
+                "private_dirty_bytes": private_dirty,
+            },
+            "mappings_summary": {
+                "mapping_count": len(maps),
+                "total_mapping_size_bytes": total_mapping_size,
+                "heap_mapping_size_bytes": heap_mapping_size,
+                "writable_anon_mapping_size_bytes": anon_mapping_size,
+                "stack_mapping_size_bytes": stack_mapping_size,
+            },
+            "metadata": {
+                "vsz": {"source": "remote /proc/<pid>/status", "limitations": "Virtual address space only"},
+                "rss": {"source": "remote /proc/<pid>/status", "limitations": "Physical pages in RAM"},
+                "allocation_evidence": {"source": "None in /proc", "limitations": "Individual heap chunk lifetimes cannot be proven by procfs alone"},
+            },
         }
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:

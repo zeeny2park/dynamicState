@@ -863,28 +863,51 @@ class AdaptiveInvestigationEngine:
                     threads = adapter.get_threads(pid_val)
                     contended_locks = []
                     deadlock_detected = False
+                    waiters_by_lock: Dict[str, List[int]] = {}
+
                     for t in threads:
                         if t.get("is_futex_wait") or t.get("state") in ("D", "BLOCKED_LOCK"):
-                            lock_addr = t.get("syscall_arg0") or "0x_futex_lock"
-                            t["waiting_on_lock"] = lock_addr
+                            lock_addr = t.get("syscall_arg0") or t.get("waiting_on_lock")
+                            if lock_addr and isinstance(lock_addr, str) and lock_addr.startswith("0x") and lock_addr not in ("0x_lock", "0x_futex_lock", "0x0"):
+                                t["waiting_on_lock"] = lock_addr
+                                t["lock_address_status"] = "OBSERVED"
+                                waiters_by_lock.setdefault(lock_addr, []).append(t["tid"])
+                            else:
+                                lock_addr = None
+                                t["waiting_on_lock"] = None
+                                t["lock_address_status"] = "UNAVAILABLE"
+
                             t["blocked"] = True
-                            t["state"] = "BLOCKED_LOCK"
-                            contended_locks.append({
-                                "lock_address": lock_addr,
-                                "waiter_tid": t["tid"],
-                                "thread_name": t["name"],
-                                "wchan": t.get("wchan"),
-                            })
+                            t["state"] = "BLOCKED_LOCK" if lock_addr else t.get("state", "S")
+
+                            if lock_addr:
+                                contended_locks.append({
+                                    "lock_address": lock_addr,
+                                    "waiter_tid": t["tid"],
+                                    "thread_name": t.get("name"),
+                                    "wchan": t.get("wchan"),
+                                    "status": "OBSERVED",
+                                })
+
+                    # Lock contention is observed when multiple threads wait on the same identified lock address
+                    lock_contention_observed = any(len(w_tids) > 1 for w_tids in waiters_by_lock.values())
+
                     return {
                         "success": True,
+                        "status": "OBSERVED",
                         "threads": threads,
                         "contended_locks": contended_locks,
+                        "lock_contention_observed": lock_contention_observed,
                         "deadlock_detected": deadlock_detected,
                         "bytes_read": len(threads) * 128,
                         "measured_bytes_read": len(threads) * 128,
                     }
+                except PermissionError as exc:
+                    return {"success": False, "status": "PERMISSION_DENIED", "error": f"Permission denied reading thread tasks: {exc}", "threads": [], "bytes_read": 0}
+                except ProcessLookupError:
+                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "threads": [], "bytes_read": 0}
                 except Exception as exc:
-                    return {"success": False, "error": str(exc), "threads": [], "bytes_read": 0}
+                    return {"success": False, "status": "FAILED", "error": str(exc), "threads": [], "bytes_read": 0}
             return {"success": True, "threads": [], "bytes_read": 0}
 
         reg.register(FunctionalInspectionModule(p_locks, _exec_insp_locks))
@@ -904,48 +927,93 @@ class AdaptiveInvestigationEngine:
         def _exec_insp_maps(wm, **kw):
             pid_val = kw.get("pid")
             adapter = kw.get("adapter")
-            if pid_val and adapter and hasattr(adapter, "get_proc_maps"):
+            if pid_val and adapter:
                 try:
-                    maps = adapter.get_proc_maps(pid_val)
+                    mem_info = adapter.get_process_memory_info(pid_val) if hasattr(adapter, "get_process_memory_info") else {}
+                    st = mem_info.get("status", "OBSERVED")
+                    if st in ("PERMISSION_DENIED", "TARGET_TERMINATED", "FAILED"):
+                        return {
+                            "success": False,
+                            "status": st,
+                            "error": mem_info.get("error", f"Process memory inspection failed: {st}"),
+                            "regions_inspected": [],
+                            "memory_growth_candidates": [],
+                            "bytes_read": 0,
+                        }
+
+                    maps = adapter.get_proc_maps(pid_val) if hasattr(adapter, "get_proc_maps") else []
                     total_bytes = sum(m.get("size", 0) for m in maps)
                     heap_maps = [m for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]"]
                     anon_maps = [m for m in maps if m.get("category") == "anonymous" and m.get("is_writable")]
                     heap_size = sum(m.get("size", 0) for m in heap_maps)
                     anon_size = sum(m.get("size", 0) for m in anon_maps)
 
+                    metrics = mem_info.get("metrics", {})
+                    vsz_bytes = metrics.get("vsz_bytes", total_bytes)
+                    rss_bytes = metrics.get("rss_bytes")
+                    rss_anon_bytes = metrics.get("rss_anon_bytes")
+
+                    # Configurable screening criteria (screening flag != defect proof)
+                    heap_thresh = int(kw.get("screening_heap_size_bytes", 4 * 1024 * 1024))
+                    anon_thresh = int(kw.get("screening_anon_size_bytes", 16 * 1024 * 1024))
+
                     growth_candidates = []
-                    # Threshold for suspicion: heap expanding (> 4MB) or anon (> 16MB)
-                    if heap_size > 4 * 1024 * 1024:
+                    if heap_size > heap_thresh:
                         growth_candidates.append({
                             "target_expression": "[heap]",
                             "region": "[heap]",
                             "current_size": heap_size,
+                            "current_rss": rss_bytes,
                             "category": "heap",
+                            "screening_flag": "ANOMALY_CANDIDATE_SCREENING_FLAG",
+                            "screening_rationale": (
+                                f"Heap mapping size ({heap_size // (1024*1024)}MB) exceeds screening threshold "
+                                f"({heap_thresh // (1024*1024)}MB); screening criteria alone do NOT prove a memory leak. "
+                                f"Temporal observation required."
+                            ),
                             "follow_up_profile_id": "insp_temporal_diff",
                         })
-                    if anon_size > 16 * 1024 * 1024:
+                    if anon_size > anon_thresh:
                         growth_candidates.append({
                             "target_expression": "anonymous_mmap",
                             "region": "anonymous",
                             "current_size": anon_size,
+                            "current_rss": rss_anon_bytes or rss_bytes,
                             "category": "anonymous",
+                            "screening_flag": "ANOMALY_CANDIDATE_SCREENING_FLAG",
+                            "screening_rationale": (
+                                f"Writable anonymous mapping size ({anon_size // (1024*1024)}MB) exceeds screening threshold "
+                                f"({anon_thresh // (1024*1024)}MB); screening criteria alone do NOT prove a memory leak. "
+                                f"Temporal observation required."
+                            ),
                             "follow_up_profile_id": "insp_temporal_diff",
                         })
 
                     regions_inspected = list(sorted(set(m.get("category", "unknown") for m in maps)))
+                    meas_b = len(maps) * 64 + 1024
                     return {
                         "success": True,
+                        "status": "OBSERVED",
                         "total_virtual_bytes": total_bytes,
+                        "vsz_bytes": vsz_bytes,
+                        "rss_bytes": rss_bytes,
+                        "rss_anon_bytes": rss_anon_bytes,
                         "heap_size": heap_size,
                         "anonymous_size": anon_size,
+                        "memory_metrics": metrics,
+                        "metadata": mem_info.get("metadata", {}),
                         "regions_inspected": regions_inspected,
                         "memory_growth_candidates": growth_candidates,
-                        "bytes_read": len(maps) * 64,
-                        "measured_bytes_read": len(maps) * 64,
+                        "bytes_read": meas_b,
+                        "measured_bytes_read": meas_b,
                     }
+                except PermissionError as exc:
+                    return {"success": False, "status": "PERMISSION_DENIED", "error": str(exc), "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
+                except ProcessLookupError:
+                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
                 except Exception as exc:
-                    return {"success": False, "error": str(exc), "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
-            return {"success": True, "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
+                    return {"success": False, "status": "FAILED", "error": str(exc), "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
+            return {"success": True, "status": "OBSERVED", "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
 
         reg.register(FunctionalInspectionModule(p_maps, _exec_insp_maps))
 
@@ -996,26 +1064,46 @@ class AdaptiveInvestigationEngine:
                         nvcs0 = t0.get("nonvoluntary_ctxt_switches", 0)
                         nvcs1 = t1.get("nonvoluntary_ctxt_switches", 0)
                         is_stalled = (vcs0 == vcs1 and nvcs0 == nvcs1 and t1.get("is_futex_wait"))
-                        cond = "stalled_owner_or_deadlock_confirmed" if is_stalled else "uncontended_or_normal_progress"
+
+                        raw_lock = t_cand.get("syscall_arg0") or t_cand.get("waiting_on_lock")
+                        if raw_lock and isinstance(raw_lock, str) and raw_lock.startswith("0x") and raw_lock not in ("0x_lock", "0x_futex_lock", "0x0"):
+                            lock_addr = raw_lock
+                            lock_st = "OBSERVED"
+                        else:
+                            lock_addr = None
+                            lock_st = "UNAVAILABLE"
+
+                        # Distinguish: futex wait with unchanged context switches is thread contention stall, NOT deadlock confirmed
+                        cond = "thread_contention_stall_observed" if is_stalled else "uncontended_or_normal_progress"
                         return {
                             "success": True,
+                            "status": "OBSERVED",
                             "observed_condition": cond,
+                            "legacy_observed_condition": "stalled_owner_or_deadlock_confirmed" if is_stalled else "uncontended_or_normal_progress",
                             "tid": t_id,
                             "thread_name": t_cand.get("name"),
                             "is_stalled": is_stalled,
-                            "lock_address": t_cand.get("syscall_arg0") or t_cand.get("waiting_on_lock"),
+                            "lock_address": lock_addr,
+                            "lock_address_status": lock_st,
+                            "concurrency_state": t_cand.get("concurrency_state", "WAITING_IN_FUTEX" if t1.get("is_futex_wait") else "RUNNING"),
                             "bytes_read": 512,
                             "measured_bytes_read": 512,
                         }
                     return {
                         "success": True,
+                        "status": "OBSERVED",
                         "observed_condition": "uncontended_or_normal_progress",
+                        "legacy_observed_condition": "uncontended_or_normal_progress",
                         "bytes_read": 256,
                         "measured_bytes_read": 256,
                     }
+                except PermissionError as exc:
+                    return {"success": False, "status": "PERMISSION_DENIED", "error": f"Permission denied reading thread states: {exc}", "bytes_read": 0}
+                except ProcessLookupError:
+                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "bytes_read": 0}
                 except Exception as exc:
-                    return {"success": False, "error": str(exc), "bytes_read": 0}
-            return {"success": True, "frames": [], "bytes_read": 0}
+                    return {"success": False, "status": "FAILED", "error": str(exc), "bytes_read": 0}
+            return {"success": True, "status": "OBSERVED", "frames": [], "bytes_read": 0}
 
         reg.register(FunctionalInspectionModule(p_locals, _exec_insp_frame_locals))
 
@@ -1097,49 +1185,178 @@ class AdaptiveInvestigationEngine:
         def _exec_insp_temporal_diff(wm, **kw):
             target_expr = kw.pop("target_expression", None)
             exprs = [target_expr] if isinstance(target_expr, str) else kw.pop("expressions", [])
-            wait_ms = int(kw.pop("wait_ms", 50))
+            wait_ms = int(kw.pop("wait_ms", 30))
+            num_samples = int(kw.pop("num_samples", 3))
+            num_samples = max(2, min(4, num_samples))
+
             if wm and hasattr(wm, "capture_and_diff_expressions") and exprs and exprs[0] not in ("[heap]", "anonymous_mmap", "heap_or_pool"):
                 try:
                     return wm.capture_and_diff_expressions(expressions=exprs, wait_ms=wait_ms, **kw)
                 except Exception:
                     pass
-            # Live target adapter temporal sampling fallback for memory regions/expressions
+
+            # Live target adapter multi-sample temporal sequence
             pid_val = kw.get("pid")
             adapter = kw.get("adapter")
-            if pid_val and adapter and hasattr(adapter, "get_proc_maps"):
+            if pid_val and adapter:
                 try:
-                    maps_1 = adapter.get_proc_maps(pid_val)
-                    time.sleep(max(wait_ms, 20) / 1000.0)
-                    maps_2 = adapter.get_proc_maps(pid_val)
+                    alive, l_err = adapter.check_liveness(pid_val) if hasattr(adapter, "check_liveness") else (True, None)
+                    if not alive:
+                        return {"success": False, "status": "TARGET_TERMINATED", "error": l_err or f"Target PID {pid_val} is not running", "bytes_read": 0}
 
-                    heap1 = sum(m.get("size", 0) for m in maps_1 if m.get("category") == "heap" or m.get("pathname") == "[heap]")
-                    heap2 = sum(m.get("size", 0) for m in maps_2 if m.get("category") == "heap" or m.get("pathname") == "[heap]")
-                    anon1 = sum(m.get("size", 0) for m in maps_1 if m.get("category") == "anonymous" and m.get("is_writable"))
-                    anon2 = sum(m.get("size", 0) for m in maps_2 if m.get("category") == "anonymous" and m.get("is_writable"))
+                    samples = []
+                    t0 = time.time()
 
-                    target_name = (target_expr or "[heap]").lower()
-                    if "anon" in target_name:
-                        s1, s2 = anon1, anon2
+                    for s_idx in range(num_samples):
+                        if s_idx > 0:
+                            time.sleep(max(wait_ms, 20) / 1000.0)
+
+                        alive, _ = adapter.check_liveness(pid_val) if hasattr(adapter, "check_liveness") else (True, None)
+                        if not alive:
+                            return {
+                                "success": False,
+                                "status": "TARGET_TERMINATED",
+                                "error": f"Target process {pid_val} terminated during temporal sampling at sample {s_idx}",
+                                "samples_collected": len(samples),
+                                "bytes_read": len(samples) * 512,
+                            }
+
+                        mem_info = adapter.get_process_memory_info(pid_val) if hasattr(adapter, "get_process_memory_info") else {}
+                        st = mem_info.get("status", "OBSERVED")
+                        if st in ("PERMISSION_DENIED", "TARGET_TERMINATED"):
+                            return {
+                                "success": False,
+                                "status": st,
+                                "error": mem_info.get("error", f"Memory query failed: {st}"),
+                                "samples_collected": len(samples),
+                                "bytes_read": len(samples) * 512,
+                            }
+
+                        maps = adapter.get_proc_maps(pid_val) if hasattr(adapter, "get_proc_maps") else []
+                        heap_sz = sum(m.get("size", 0) for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]")
+                        anon_sz = sum(m.get("size", 0) for m in maps if m.get("category") == "anonymous" and m.get("is_writable"))
+                        total_map_sz = sum(m.get("size", 0) for m in maps)
+
+                        metrics = mem_info.get("metrics", {})
+                        vsz_val = metrics.get("vsz_bytes", total_map_sz)
+                        rss_val = metrics.get("rss_bytes", 0) or 0
+                        anon_rss_val = metrics.get("rss_anon_bytes", 0) or 0
+
+                        target_name = (target_expr or "[heap]").lower()
+                        if "anon" in target_name:
+                            target_metric = anon_rss_val if anon_rss_val > 0 else anon_sz
+                        else:
+                            target_metric = rss_val if rss_val > 0 else heap_sz
+
+                        now = time.time()
+                        samples.append({
+                            "sample_index": s_idx,
+                            "timestamp": now,
+                            "elapsed_ms": round((now - t0) * 1000.0, 2),
+                            "vsz_bytes": vsz_val,
+                            "rss_bytes": rss_val,
+                            "rss_anon_bytes": anon_rss_val,
+                            "heap_mapping_size": heap_sz,
+                            "anon_mapping_size": anon_sz,
+                            "total_mapping_size": total_map_sz,
+                            "mapping_count": len(maps),
+                            "target_metric_bytes": target_metric,
+                        })
+
+                    deltas = [
+                        samples[i]["target_metric_bytes"] - samples[i - 1]["target_metric_bytes"]
+                        for i in range(1, len(samples))
+                    ]
+                    rss_deltas = [
+                        samples[i]["rss_bytes"] - samples[i - 1]["rss_bytes"]
+                        for i in range(1, len(samples))
+                    ]
+
+                    total_target_delta = samples[-1]["target_metric_bytes"] - samples[0]["target_metric_bytes"]
+                    total_rss_delta = samples[-1]["rss_bytes"] - samples[0]["rss_bytes"]
+                    total_map_delta = samples[-1]["total_mapping_size"] - samples[0]["total_mapping_size"]
+
+                    # 1. Temporary workload buffering: grew then dropped back
+                    is_burst_and_drop = (
+                        len(deltas) >= 2
+                        and deltas[0] > 0
+                        and deltas[1] < 0
+                        and total_target_delta <= (deltas[0] // 2)
+                    )
+
+                    # 2. Mapping expansion without allocation: mapping size expanded, but RSS remained flat
+                    is_mapping_only_expansion = (
+                        total_map_delta > 0
+                        and abs(total_rss_delta) < 65536
+                        and all(abs(rd) < 65536 for rd in rss_deltas)
+                    )
+
+                    # 3. Allocator retention: initial growth, then completely flat across remaining intervals
+                    is_allocator_retention = (
+                        len(deltas) >= 2
+                        and deltas[0] > 0
+                        and all(abs(d) < 32768 for d in deltas[1:])
+                    )
+
+                    # 4. Sustained monotonic growth: positive growth across all sample intervals
+                    is_sustained_growth = (
+                        all(d > 0 for d in deltas)
+                        and total_target_delta > 0
+                    )
+
+                    if is_burst_and_drop:
+                        observed_cond = "temporary_workload_buffering"
+                        cond_detail = "Memory burst occurred during workload activity followed by reclamation; workload buffering, not leak."
+                        growth_detected = False
+                    elif is_mapping_only_expansion:
+                        observed_cond = "mapping_expansion_without_allocation"
+                        cond_detail = "Virtual memory mappings expanded (VSZ growth) without corresponding physical page allocation or RSS growth."
+                        growth_detected = False
+                    elif is_allocator_retention:
+                        observed_cond = "allocator_retention"
+                        cond_detail = "Memory allocated and retained by runtime allocator/freelist pool; stable bounds across subsequent intervals."
+                        growth_detected = False
+                    elif is_sustained_growth:
+                        observed_cond = "sustained_monotonic_growth"
+                        cond_detail = (
+                            "Sustained monotonic memory growth observed across all temporal sampling intervals. "
+                            "Screening flag elevated; procfs measurements alone cannot certify a memory leak without allocation lifetime verification."
+                        )
+                        growth_detected = True
+                    elif total_target_delta <= 0:
+                        observed_cond = "stable_or_reclaimed_allocation"
+                        cond_detail = "Memory usage remained stable or was reclaimed across temporal samples."
+                        growth_detected = False
                     else:
-                        s1, s2 = heap1, heap2
+                        observed_cond = "sustained_monotonic_growth"
+                        cond_detail = "Net memory growth observed across temporal sampling sequence."
+                        growth_detected = True
 
-                    delta = s2 - s1
-                    growth_detected = (delta > 0)
-                    cond = "monotonic_unreleased_growth_with_orphans" if growth_detected else "stable_or_reclaimed_allocation"
+                    meas_bytes = len(samples) * 512
                     return {
                         "success": True,
-                        "observed_condition": cond,
+                        "status": "OBSERVED",
+                        "observed_condition": observed_cond,
+                        "legacy_observed_condition": "monotonic_unreleased_growth_with_orphans" if growth_detected else "stable_or_reclaimed_allocation",
+                        "condition_detail": cond_detail,
                         "growth_detected": growth_detected,
-                        "growth_delta_bytes": delta,
-                        "initial_size": s1,
-                        "final_size": s2,
+                        "growth_delta_bytes": total_target_delta,
+                        "initial_size": samples[0]["target_metric_bytes"],
+                        "final_size": samples[-1]["target_metric_bytes"],
+                        "samples": samples,
+                        "num_samples": len(samples),
+                        "sampling_interval_ms": wait_ms,
                         "is_temporal_sample": True,
-                        "bytes_read": 1024,
-                        "measured_bytes_read": 1024,
+                        "bytes_read": meas_bytes,
+                        "measured_bytes_read": meas_bytes,
                     }
+                except PermissionError as exc:
+                    return {"success": False, "status": "PERMISSION_DENIED", "error": str(exc), "bytes_read": 0}
+                except ProcessLookupError:
+                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "bytes_read": 0}
                 except Exception as exc:
-                    return {"success": False, "error": str(exc), "bytes_read": 0}
-            return {"success": True, "observed_condition": "stable_or_reclaimed_allocation", "bytes_read": 0}
+                    return {"success": False, "status": "FAILED", "error": str(exc), "bytes_read": 0}
+            return {"success": True, "status": "OBSERVED", "observed_condition": "stable_or_reclaimed_allocation", "bytes_read": 0}
 
         reg.register(FunctionalInspectionModule(p_temp, _exec_insp_temporal_diff))
 
@@ -1219,33 +1436,78 @@ class AdaptiveInvestigationEngine:
             return t_id, caps, cq
 
         alive, liveness_err = adapter.check_liveness(pid) if pid and pid > 0 else (False, "Invalid PID")
-        if not companion_elf_path and pid and pid > 0:
-            try:
-                proc_exe = os.path.realpath(f"/proc/{pid}/exe")
-                if os.path.exists(proc_exe):
-                    companion_elf_path = proc_exe
-            except Exception:
-                pass
-        elf_info: Dict[str, Any] = {}
+
+        # 1. Discover runtime process identity from adapter
+        proc_ident = adapter.get_process_identity(pid) if (pid and pid > 0) else {}
+        runtime_exe = proc_ident.get("executable") or ""
+        runtime_build_id = proc_ident.get("build_id")
+        is_deleted = proc_ident.get("is_deleted", False)
+        start_time = proc_ident.get("process_start_time")
+        ident_status = proc_ident.get("status", "OBSERVED" if alive else "FAILED")
+
+        unavail_reasons: Dict[str, str] = {}
+        if ident_status == "PERMISSION_DENIED":
+            unavail_reasons["target_identity"] = "Cannot inspect target identity: Permission denied accessing /proc/<pid>/exe"
+            unavail_reasons["procfs_accessible"] = "Permission denied accessing /proc/<pid>/"
+        elif ident_status == "TARGET_TERMINATED" or not alive:
+            unavail_reasons["process_alive"] = liveness_err or f"PID {pid} is not running"
+
+        if is_deleted:
+            unavail_reasons["executable_deleted"] = "Runtime executable was deleted on disk"
+
+        # 2. Companion ELF & DWARF capabilities verification
+        # /proc/<pid>/exe must NOT automatically be treated as a valid companion image.
+        companion_status = "NOT_PROVIDED"
+        companion_build_id = None
         has_dwarf = False
-        if companion_elf_path and os.path.exists(companion_elf_path):
-            try:
-                b_id = inspect_elf(companion_elf_path)
-                has_dwarf = bool(getattr(b_id, "has_debug_info", False))
-                elf_info = {
-                    "build_id": getattr(b_id, "build_id", None),
-                    "has_dwarf_info": has_dwarf,
-                    "arch": getattr(b_id, "machine", None),
-                }
-            except Exception as exc:
-                elf_info = {"elf_inspection_error": str(exc), "has_dwarf_info": False}
+        companion_rejection_reason = None
+
+        if companion_elf_path:
+            if not os.path.exists(companion_elf_path):
+                companion_status = "COMPANION_NOT_FOUND"
+                companion_rejection_reason = f"Companion ELF '{companion_elf_path}' does not exist on disk"
+                unavail_reasons["dwarf_symbols_available"] = companion_rejection_reason
+            else:
+                try:
+                    comp_ident = inspect_elf(companion_elf_path)
+                    companion_build_id = getattr(comp_ident, "build_id", None)
+                    comp_dwarf = bool(getattr(comp_ident, "has_debug_info", False))
+
+                    # Verify Build ID equality between runtime target and companion image
+                    if runtime_build_id and companion_build_id and runtime_build_id.lower() != companion_build_id.lower():
+                        companion_status = "BUILD_ID_MISMATCH"
+                        companion_rejection_reason = (
+                            f"Companion ELF Build ID ({companion_build_id}) does not match "
+                            f"runtime target Build ID ({runtime_build_id})"
+                        )
+                        unavail_reasons["dwarf_symbols_available"] = companion_rejection_reason
+                    else:
+                        companion_status = "MATCHED"
+                        if comp_dwarf:
+                            has_dwarf = True
+                        else:
+                            unavail_reasons["dwarf_symbols_available"] = (
+                                f"Matching companion ELF '{companion_elf_path}' contains no DWARF debug info (.debug_info)"
+                            )
+                except Exception as exc:
+                    companion_status = "COMPANION_INSPECTION_FAILED"
+                    companion_rejection_reason = f"Failed to inspect companion ELF: {exc}"
+                    unavail_reasons["dwarf_symbols_available"] = companion_rejection_reason
+        else:
+            companion_status = "NOT_PROVIDED"
+            # If no companion ELF was provided, inspect runtime executable itself
+            if proc_ident.get("has_debug_info"):
+                has_dwarf = True
+            else:
+                unavail_reasons["dwarf_symbols_available"] = (
+                    "No companion ELF supplied and runtime executable is stripped (lacks DWARF debug info)"
+                )
 
         maps_ok = False
         threads_ok = False
         mem_read_ok = False
-        unavail_reasons: Dict[str, str] = {}
 
-        if alive:
+        if alive and ident_status != "PERMISSION_DENIED":
             maps_path = f"/proc/{pid}/maps"
             task_path = f"/proc/{pid}/task"
             maps_ok = os.access(maps_path, os.R_OK)
@@ -1259,15 +1521,8 @@ class AdaptiveInvestigationEngine:
             mem_read_ok = os.access(mem_path, os.R_OK) or maps_ok
             if not mem_read_ok:
                 unavail_reasons["memory_read_available"] = "Process memory read restricted (EPERM / ptrace_scope)"
-        else:
+        elif not alive:
             unavail_reasons["process_alive"] = liveness_err or f"PID {pid} is not running"
-
-        if not has_dwarf:
-            unavail_reasons["dwarf_symbols_available"] = (
-                f"No DWARF debug info found in '{companion_elf_path}'"
-                if companion_elf_path
-                else "No companion ELF / debug image supplied"
-            )
 
         watch_hist_ok = False
         if self.watch_manager and hasattr(self.watch_manager, "list_sessions"):
@@ -1281,20 +1536,32 @@ class AdaptiveInvestigationEngine:
             "process_alive": alive,
             "memory_maps_available": maps_ok,
             "threads_available": threads_ok,
-            "dwarf_symbols_available": has_dwarf,
+            "dwarf_symbols_available": has_dwarf and (ident_status != "PERMISSION_DENIED"),
             "memory_read_available": mem_read_ok,
             "watch_history_available": watch_hist_ok,
+            "procfs_accessible": bool(alive and ident_status != "PERMISSION_DENIED"),
             "unavailable_reasons": unavail_reasons,
         }
         target_identity = {
             "pid": pid,
-            "companion_elf": companion_elf_path,
+            "executable": runtime_exe,
+            "runtime_build_id": runtime_build_id,
+            "build_id": runtime_build_id,
+            "is_deleted": is_deleted,
+            "process_start_time": start_time,
+            "companion_elf": companion_elf_path if companion_status == "MATCHED" else (runtime_exe if not companion_elf_path else None),
+            "companion_elf_path": companion_elf_path,
+            "companion_build_id": companion_build_id,
+            "companion_status": companion_status,
+            "companion_rejection_reason": companion_rejection_reason,
             "alive": alive,
-            **elf_info,
+            "architecture": proc_ident.get("architecture", "unknown"),
+            "elf_type": proc_ident.get("elf_type", "unknown"),
+            "has_dwarf_info": has_dwarf,
         }
         capture_quality = {
-            "completeness": "COMPLETE" if (alive and mem_read_ok) else ("FAILED" if not alive else "PARTIAL"),
-            "status": "COMPLETE" if (alive and mem_read_ok) else ("FAILED" if not alive else "PARTIAL"),
+            "completeness": "COMPLETE" if (alive and mem_read_ok and ident_status != "PERMISSION_DENIED") else ("FAILED" if not alive else "PARTIAL"),
+            "status": "COMPLETE" if (alive and mem_read_ok and ident_status != "PERMISSION_DENIED") else ("FAILED" if not alive else "PARTIAL"),
             "consistency_level": "ZERO_STOP_ATOMIC",
         }
         return target_identity, caps, capture_quality
@@ -1329,13 +1596,6 @@ class AdaptiveInvestigationEngine:
             if isinstance(capture_receipt, dict):
                 rcpt_sess = capture_receipt.get("session_id")
         sess_id = session_id or rcpt_sess or f"inv_health_{uuid.uuid4().hex[:8]}"
-        if not companion_elf_path and pid and pid > 0:
-            try:
-                proc_exe = os.path.realpath(f"/proc/{pid}/exe")
-                if os.path.exists(proc_exe):
-                    companion_elf_path = proc_exe
-            except Exception:
-                pass
         limits = budget_limits or self.default_limits
         budget_tracker = ObservationBudgetTracker(limits)
         budget_tracker.start()
@@ -1457,6 +1717,7 @@ class AdaptiveInvestigationEngine:
             fixture_data=fixture_data,
         )
         target_identity["provenance_class"] = eff_prov
+        target_identity["trust_state"] = snap_trust_state
 
         # Record target identity & capture quality in ledger
         id_rec = EvidenceRecord(
@@ -1737,12 +1998,20 @@ class AdaptiveInvestigationEngine:
                                 or res.get("deadlock_detected")
                                 or res.get("contended_locks")
                             ):
-                                lock_addr = th.get("waiting_on_lock") or th.get("syscall_arg0") or "0x_lock"
+                                raw_l = th.get("waiting_on_lock") or th.get("syscall_arg0")
+                                if raw_l and isinstance(raw_l, str) and raw_l.startswith("0x") and raw_l not in ("0x_lock", "0x_futex_lock", "0x0"):
+                                    lock_addr = raw_l
+                                    lock_st = "OBSERVED"
+                                else:
+                                    lock_addr = None
+                                    lock_st = "UNAVAILABLE"
+
                                 triage_candidates["suspicious_threads"].append({
                                     "tid": tid,
                                     "name": th.get("name", f"thread_{tid}"),
                                     "top_function": (th.get("callstack") or [{}])[0].get("function_name", th.get("syscall_name") or "lock_wait"),
                                     "lock_address": lock_addr,
+                                    "lock_address_status": lock_st,
                                     "evidence_id": ev_rec.evidence_id,
                                     "follow_up_profile_id": "insp_frame_locals",
                                 })
@@ -2222,6 +2491,8 @@ class AdaptiveInvestigationEngine:
             "contradicting_evidence_ids": verdict.contradicting_evidence_ids,
             "provenance_class": verdict.provenance_class,
             "provenance_limitations": verdict.provenance_limitations,
+            "trust_state": snap_trust_state,
+            "trust_error": snap_trust_error,
             "limitations": verdict.limitations,
             "competing_hypotheses": [h.to_dict() for h in hypotheses],
             "observed_facts": verdict.observed_facts,
