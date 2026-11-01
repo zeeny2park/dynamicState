@@ -67,6 +67,7 @@ from extractor.target_adapter import (
     ABI_ARCH_UNSUPPORTED,
     ABI_ELF_CLASS_UNSUPPORTED,
     ABI_ENDIANNESS_UNSUPPORTED,
+    IDENTITY_VERIFIED,
     LAYOUT_GLIBC_LP64,
     normalize_futex_address,
 )
@@ -130,6 +131,8 @@ class TestPhase20A341DeadlockEvidenceAndBudget(unittest.TestCase):
             "endianness": "little",
             "executable": "/usr/bin/app",
             "build_id": "0123456789abcdef",
+            "status": "OBSERVED",
+            "identity_status": IDENTITY_VERIFIED,
         }
 
     def _sample_valid_meta(self, owner_tid: int = 102, waiter_tid: int = 101) -> Dict[str, Any]:
@@ -442,6 +445,7 @@ class TestPhase20A341DeadlockEvidenceAndBudget(unittest.TestCase):
             observation_timestamp=t0,
             target_pid=100,
             process_identity=self._sample_valid_proc_identity(100),
+            sampling_epoch=1,
             metadata=self._sample_valid_meta(102, 101),
         ))
         graph.add_edge(WaitForEdge(
@@ -455,6 +459,7 @@ class TestPhase20A341DeadlockEvidenceAndBudget(unittest.TestCase):
             observation_timestamp=t1,
             target_pid=100,
             process_identity=self._sample_valid_proc_identity(100),
+            sampling_epoch=1,
             metadata=self._sample_valid_meta(101, 102),
         ))
         cycle, category, issues = graph.validate_and_analyze(max_temporal_skew_sec=2.0)

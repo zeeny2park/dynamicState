@@ -332,15 +332,24 @@ class FunctionalInspectionModule(InspectionModule):
                 else None
             )
 
-            read_accounting = ctx.budget_tracker.record_read(
-                bytes_read=measured_bytes,
-                latency_us=lat_us,
-                stop_ms=float(result.get("stop_duration_ms", 0.0)),
-                is_failure=is_fail,
-                conservative_estimate_bytes=eff_est_bytes,
-                profile_id=self.profile.profile_id,
-                profile_ceiling=self.profile.budget_ceiling,
-            )
+            # Prevent double-charging when the underlying module already performed granular accounting (Step 2)
+            if result.get("already_budget_accounted"):
+                meas_b = result.get("measured_bytes_read", measured_bytes)
+                read_accounting = {
+                    "measured_bytes_read": meas_b,
+                    "charged_bytes": int(result.get("bytes_read") or meas_b or 0),
+                    "used_conservative_byte_estimate": False,
+                }
+            else:
+                read_accounting = ctx.budget_tracker.record_read(
+                    bytes_read=measured_bytes,
+                    latency_us=lat_us,
+                    stop_ms=float(result.get("stop_duration_ms", 0.0)),
+                    is_failure=is_fail,
+                    conservative_estimate_bytes=eff_est_bytes,
+                    profile_id=self.profile.profile_id,
+                    profile_ceiling=self.profile.budget_ceiling,
+                )
             ctx.budget_tracker.record_sample(profile_id=self.profile.profile_id)
 
             out = dict(result)

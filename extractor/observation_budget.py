@@ -289,13 +289,14 @@ class ObservationBudgetTracker:
         Never fabricates a measured byte count when bytes_read is None. Instead, tracks
         measured_bytes_read separately from conservative_estimated_bytes charged to the budget.
         """
-        measured = bytes_read is not None and isinstance(bytes_read, (int, float)) and bytes_read > 0
+        # Measured reads: explicit integer >= 0 (partial reads use actual bytes obtained; 0 bytes obtained charged as 0 measured bytes)
+        measured = bytes_read is not None and isinstance(bytes_read, (int, float)) and bytes_read >= 0
         if measured:
-            actual_b = int(bytes_read)
-            charged_b = max(actual_b, int(conservative_estimate_bytes or 0)) if is_failure else actual_b
+            actual_b = max(0, int(bytes_read))
+            charged_b = actual_b
             self.metrics.measured_bytes_read += actual_b
             self.metrics.bytes_read += charged_b
-            used_conservative = is_failure and (charged_b > actual_b)
+            used_conservative = False
         else:
             self.metrics.unmeasured_reads_count += 1
             fallback = (

@@ -123,6 +123,12 @@ ABI_ARCH_UNSUPPORTED = "ARCHITECTURE_UNSUPPORTED"
 ABI_ELF_CLASS_UNSUPPORTED = "ELF_CLASS_UNSUPPORTED"
 ABI_ENDIANNESS_UNSUPPORTED = "ENDIANNESS_UNSUPPORTED"
 
+# Process Identity Verification Statuses
+IDENTITY_VERIFIED = "IDENTITY_VERIFIED"
+IDENTITY_UNAVAILABLE = "IDENTITY_UNAVAILABLE"
+IDENTITY_INCONSISTENT = "IDENTITY_INCONSISTENT"
+IDENTITY_UNVERIFIED = "IDENTITY_UNVERIFIED"
+
 LAYOUT_GLIBC_LP64 = "GLIBC_LP64_PTHREAD_MUTEX_V1"
 
 
@@ -442,8 +448,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             return {
                 "pid": pid,
                 "status": "FAILED",
+                "identity_status": IDENTITY_UNAVAILABLE,
                 "executable": "",
                 "architecture": "unknown",
+                "elf_class": "unknown",
+                "endianness": "unknown",
                 "elf_type": "unknown",
                 "build_id": None,
                 "is_deleted": False,
@@ -461,8 +470,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             return {
                 "pid": pid,
                 "status": "TARGET_TERMINATED",
+                "identity_status": IDENTITY_UNAVAILABLE,
                 "executable": "",
                 "architecture": "unknown",
+                "elf_class": "unknown",
+                "endianness": "unknown",
                 "elf_type": "unknown",
                 "build_id": None,
                 "is_deleted": False,
@@ -527,6 +539,16 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
         self._last_identity_bytes_read = total_ident_bytes
 
+        # Determine explicit verified identity status (Requirements Step 3)
+        if link_status == "PERMISSION_DENIED":
+            identity_status = IDENTITY_UNAVAILABLE
+        elif link_status == "OBSERVED" and not is_deleted and start_time is not None and start_time > 0 and runtime_identity is not None and runtime_identity.architecture != "unknown":
+            identity_status = IDENTITY_VERIFIED
+        elif link_status == "OBSERVED":
+            identity_status = IDENTITY_UNVERIFIED
+        else:
+            identity_status = IDENTITY_UNAVAILABLE
+
         return {
             "pid": pid,
             "executable": runtime_exe,
@@ -541,6 +563,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "pt_loads": runtime_identity.pt_loads if runtime_identity else [],
             "has_debug_info": bool(getattr(runtime_identity, "has_debug_info", False)) if runtime_identity else False,
             "status": link_status,
+            "identity_status": identity_status,
             "error": link_err,
             "is_remote": False,
             "host": self.target_host(),
@@ -1751,23 +1774,82 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         
         Reads the first 64KB of remote /proc/<pid>/exe and parses ELF header host-side.
         """
+        if pid <= 0:
+            return {
+                "pid": pid,
+                "status": "FAILED",
+                "identity_status": IDENTITY_UNAVAILABLE,
+                "executable": "",
+                "architecture": "unknown",
+                "elf_class": "unknown",
+                "endianness": "unknown",
+                "elf_type": "unknown",
+                "build_id": None,
+                "pt_loads": [],
+                "process_start_time": None,
+                "is_remote": True,
+                "host": self.target_host(),
+                "error": f"Invalid PID {pid}",
+            }
+
+        alive, live_err = self.check_liveness(pid)
+        if not alive:
+            return {
+                "pid": pid,
+                "status": "TARGET_TERMINATED",
+                "identity_status": IDENTITY_UNAVAILABLE,
+                "executable": "",
+                "architecture": "unknown",
+                "elf_class": "unknown",
+                "endianness": "unknown",
+                "elf_type": "unknown",
+                "build_id": None,
+                "pt_loads": [],
+                "process_start_time": None,
+                "is_remote": True,
+                "host": self.target_host(),
+                "error": live_err or f"Target PID {pid} is not running on {self.target_host()}",
+            }
+
+        total_ident_bytes = 0
+
         # 1. Resolve remote executable path
         cmd_exe = f"readlink -f /proc/{int(pid)}/exe 2>/dev/null || readlink /proc/{int(pid)}/exe 2>/dev/null"
         rc, stdout, _ = self.run_ssh(cmd_exe)
         remote_exe = stdout.strip() if rc == 0 else ""
+        total_ident_bytes += len(stdout.encode("utf-8", errors="replace"))
 
-        # 2. Extract first 64KB of executable via base64 to inspect ELF header on host
+        # 2. Extract remote process start time from /proc/<pid>/stat
+        cmd_stat = f"cat /proc/{int(pid)}/stat 2>/dev/null"
+        rc_stat, stdout_stat, _ = self.run_ssh(cmd_stat)
+        start_time = None
+        if rc_stat == 0 and stdout_stat:
+            total_ident_bytes += len(stdout_stat.encode("utf-8", errors="replace"))
+            r_paren = stdout_stat.rfind(")")
+            if r_paren != -1:
+                fields = stdout_stat[r_paren + 1:].split()
+                if len(fields) >= 20:
+                    try:
+                        start_time = int(fields[19])
+                    except ValueError:
+                        pass
+
+        # 3. Extract first 64KB of executable via base64 to inspect ELF header on host
         cmd_hdr = f"head -c 65536 /proc/{int(pid)}/exe 2>/dev/null | base64"
         rc, stdout_b64, stderr = self.run_ssh(cmd_hdr, timeout=self.timeout_sec * 1.5)
 
         arch = "unknown"
+        elf_class = "unknown"
+        endianness = "unknown"
         elf_type = "unknown"
         build_id = None
         pt_loads: List[Dict[str, Any]] = []
 
         if rc == 0 and stdout_b64.strip():
+            raw_b64 = stdout_b64.strip()
+            total_ident_bytes += len(raw_b64.encode("utf-8", errors="replace"))
             try:
-                raw_elf = base64.b64decode(stdout_b64.strip())
+                raw_elf = base64.b64decode(raw_b64)
                 if len(raw_elf) >= 64:
                     with tempfile.NamedTemporaryFile(prefix="rem_elf_", suffix=".tmp", delete=False) as tf:
                         tf.write(raw_elf)
@@ -1776,6 +1858,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     try:
                         ident = inspect_elf(tmp_name)
                         arch = ident.architecture
+                        elf_class = ident.elf_class
+                        endianness = ident.endianness
                         elf_type = ident.elf_type
                         build_id = ident.build_id
                         pt_loads = ident.pt_loads
@@ -1785,19 +1869,24 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             except Exception:
                 pass
 
-        # Fallback for architecture via remote uname -m if ELF parse didn't yield arch
-        if arch == "unknown":
-            rc, stdout_uname, _ = self.run_ssh("uname -m 2>/dev/null")
-            if rc == 0 and stdout_uname.strip():
-                arch = stdout_uname.strip()
+        self._last_identity_bytes_read = total_ident_bytes
+
+        # Strict verified identity check for remote targets
+        is_verified = bool(remote_exe and start_time and start_time > 0 and arch != "unknown")
+        identity_status = IDENTITY_VERIFIED if is_verified else (IDENTITY_UNVERIFIED if remote_exe else IDENTITY_UNAVAILABLE)
 
         return {
             "pid": pid,
             "executable": remote_exe,
+            "process_start_time": start_time,
             "architecture": arch,
+            "elf_class": elf_class,
+            "endianness": endianness,
             "elf_type": elf_type,
             "build_id": build_id,
             "pt_loads": pt_loads,
+            "status": "OBSERVED" if remote_exe else "FAILED",
+            "identity_status": identity_status,
             "is_remote": True,
             "host": self.target_host(),
         }

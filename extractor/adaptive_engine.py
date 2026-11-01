@@ -125,6 +125,10 @@ from .target_adapter import (
     ABI_ARCH_UNSUPPORTED,
     ABI_ELF_CLASS_UNSUPPORTED,
     ABI_ENDIANNESS_UNSUPPORTED,
+    IDENTITY_VERIFIED,
+    IDENTITY_UNAVAILABLE,
+    IDENTITY_INCONSISTENT,
+    IDENTITY_UNVERIFIED,
     LAYOUT_GLIBC_LP64,
 )
 from .verdict_engine import (
@@ -187,7 +191,7 @@ class WaitForEdge:
     observation_timestamp: float = field(default_factory=time.time)
     target_pid: Optional[int] = None
     process_identity: Optional[Dict[str, Any]] = None
-    sampling_epoch: int = 0
+    sampling_epoch: Optional[int] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     # Backward compatibility: legacy source and timestamp properties
     source: Optional[str] = None
@@ -274,6 +278,7 @@ class WaitForGraph:
         has_cross_process_pid = False
         has_cross_process_identity = False
         has_cross_epoch = False
+        has_missing_epoch = False
 
         for edge in self.edges:
             if edge.target_pid is not None and edge.target_pid > 0:
@@ -289,12 +294,14 @@ class WaitForGraph:
                         ref_proc_ident = edge.process_identity
                     elif st != ref_start_time:
                         has_cross_process_identity = True
-            ep = getattr(edge, "sampling_epoch", 0)
+            ep = getattr(edge, "sampling_epoch", None)
             if ep is not None:
                 if ref_epoch is None:
                     ref_epoch = ep
                 elif ep != ref_epoch:
                     has_cross_epoch = True
+            else:
+                has_missing_epoch = True
 
         if has_cross_process_pid:
             issues.append(f"REJECT_CROSS_PROCESS_PID_MISMATCH: Cross-process evidence detected; multiple target PIDs in wait-for graph")
@@ -302,6 +309,8 @@ class WaitForGraph:
             issues.append(f"REJECT_CROSS_PROCESS_IDENTITY_MISMATCH: Cross-process evidence detected; multiple process start identities in wait-for graph")
         if has_cross_epoch:
             issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Cross-epoch evidence detected; observations from different sampling epochs in wait-for graph")
+        if has_missing_epoch:
+            issues.append(f"REJECT_MISSING_SAMPLING_EPOCH: Edge missing explicit sampling_epoch detected in wait-for graph")
 
         # 2. Inspect and validate each edge
         for edge in self.edges:
@@ -319,20 +328,38 @@ class WaitForGraph:
             elif ref_pid is not None and edge.target_pid != ref_pid:
                 edge_issues.append(f"REJECT_CROSS_PROCESS_PID_MISMATCH: Edge target_pid {edge.target_pid} differs from graph reference {ref_pid}")
 
-            # Process identity validation
+            # Process identity validation (Requirements Step 3)
             if not edge.process_identity or not isinstance(edge.process_identity, dict):
                 edge_issues.append(f"REJECT_MISSING_PROCESS_IDENTITY: Edge waiter TID {edge.waiter_tid} missing process_identity")
             else:
+                ident_pid = edge.process_identity.get("pid")
+                if ident_pid is None or (edge.target_pid is not None and ident_pid != edge.target_pid):
+                    edge_issues.append(f"REJECT_IDENTITY_PID_MISMATCH: Identity PID {ident_pid} does not match edge target_pid {edge.target_pid}")
+
                 p_st = edge.process_identity.get("process_start_time") or edge.process_identity.get("start_time")
-                if p_st is None:
+                if p_st is None or not isinstance(p_st, (int, float)) or p_st <= 0:
                     edge_issues.append(f"REJECT_MISSING_PROCESS_START_TIME: Edge waiter TID {edge.waiter_tid} process_identity lacks stable process_start_time")
                 elif ref_start_time is not None and p_st != ref_start_time:
                     edge_issues.append(f"REJECT_CROSS_PROCESS_IDENTITY_MISMATCH: Edge process_start_time {p_st} differs from graph start_time {ref_start_time}")
 
-            # Sampling epoch validation
-            edge_epoch = getattr(edge, "sampling_epoch", 0)
-            if ref_epoch is not None and edge_epoch != ref_epoch:
+                p_ident_st = edge.process_identity.get("identity_status") or edge.process_identity.get("status")
+                if p_ident_st == IDENTITY_UNAVAILABLE:
+                    edge_issues.append(f"REJECT_IDENTITY_UNAVAILABLE: Process identity status is IDENTITY_UNAVAILABLE for waiter TID {edge.waiter_tid}")
+                elif p_ident_st == IDENTITY_INCONSISTENT:
+                    edge_issues.append(f"REJECT_IDENTITY_INCONSISTENT: Process identity status is IDENTITY_INCONSISTENT for waiter TID {edge.waiter_tid}")
+                elif p_ident_st not in (IDENTITY_VERIFIED, "IDENTITY_VERIFIED", "OBSERVED"):
+                    edge_issues.append(f"REJECT_IDENTITY_UNVERIFIED: Process identity status is unverified ({p_ident_st}) for waiter TID {edge.waiter_tid}; confirmed deadlock requires explicit verified identity")
+
+            # Sampling epoch validation (Requirements Step 4)
+            edge_epoch = getattr(edge, "sampling_epoch", None)
+            if edge_epoch is None:
+                edge_issues.append(f"REJECT_MISSING_SAMPLING_EPOCH: Edge waiter TID {edge.waiter_tid} missing explicit sampling_epoch")
+            elif not isinstance(edge_epoch, int) or edge_epoch < 0:
+                edge_issues.append(f"REJECT_INVALID_SAMPLING_EPOCH: Edge waiter TID {edge.waiter_tid} has invalid sampling_epoch {edge_epoch}")
+            elif ref_epoch is not None and edge_epoch != ref_epoch:
                 edge_issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Edge epoch {edge_epoch} differs from graph epoch {ref_epoch}")
+            if allowed_epoch is not None and edge_epoch is not None and edge_epoch != allowed_epoch:
+                edge_issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Edge epoch {edge_epoch} differs from allowed epoch {allowed_epoch}")
 
             # Waiter / Owner TID validation
             if edge.waiter_tid <= 0:
@@ -1201,7 +1228,7 @@ class AdaptiveInvestigationEngine:
                 cur_elapsed = budget_tracker.elapsed_ms
                 rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
                 rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
-                if rem_wall_ms <= 0.0 or rem_bytes < 256:
+                if rem_wall_ms <= 0.0 or rem_bytes < 40:
                     return {
                         "success": False,
                         "status": "BUDGET_EXHAUSTED",
@@ -1213,6 +1240,7 @@ class AdaptiveInvestigationEngine:
                         "bytes_read": 0,
                         "measured_bytes_read": 0,
                         "estimated_bytes_read": 0,
+                        "already_budget_accounted": True,
                     }
 
             # 2. WorkManager execution path (monitored and accounted for)
@@ -1220,24 +1248,58 @@ class AdaptiveInvestigationEngine:
                 t_wm_start = time.monotonic()
                 try:
                     res = wm.inspect_thread_callstacks_and_locks(**kw)
+                    wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
                     if res and res.get("threads"):
-                        wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
                         wm_meas_b = int(res.get("measured_bytes_read") or res.get("bytes_read") or 0)
                         if budget_tracker:
                             budget_tracker.record_read(
-                                bytes_read=wm_meas_b if wm_meas_b > 0 else None,
+                                bytes_read=wm_meas_b if wm_meas_b > 0 else 0,
                                 latency_us=wm_elapsed_us,
-                                conservative_estimate_bytes=2048 if wm_meas_b == 0 else None,
                                 profile_id="insp_locks",
                             )
+                        res["already_budget_accounted"] = True
                         return res
-                except Exception:
-                    pass
+                    else:
+                        if budget_tracker:
+                            budget_tracker.record_read(
+                                bytes_read=0,
+                                latency_us=wm_elapsed_us,
+                                is_failure=False,
+                                profile_id="insp_locks",
+                            )
+                except Exception as wm_exc:
+                    wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
+                    if budget_tracker:
+                        budget_tracker.record_read(
+                            bytes_read=0,
+                            latency_us=wm_elapsed_us,
+                            is_failure=True,
+                            profile_id="insp_locks",
+                        )
+
+                # Ensure fallback does not silently continue after global budget is exhausted (Step 2)
+                if budget_tracker:
+                    ok, rej_reason = budget_tracker.check_budget(profile_id="insp_locks")
+                    if not ok:
+                        return {
+                            "success": False,
+                            "status": "BUDGET_EXHAUSTED",
+                            "stop_reason": "BUDGET_EXHAUSTED",
+                            "error": f"Budget exhausted after initial attempt: {rej_reason}",
+                            "threads": [],
+                            "contended_locks": [],
+                            "deadlock_detected": False,
+                            "bytes_read": 0,
+                            "measured_bytes_read": 0,
+                            "estimated_bytes_read": 0,
+                            "already_budget_accounted": True,
+                        }
 
             pid_val = kw.get("pid")
             adapter = kw.get("adapter")
             target_identity = kw.get("target_identity") or kw.get("target_info")
-            sampling_epoch = int(kw.get("sampling_epoch") or kw.get("epoch") or 0)
+            raw_epoch = kw.get("sampling_epoch") if kw.get("sampling_epoch") is not None else kw.get("epoch")
+            sampling_epoch = int(raw_epoch) if raw_epoch is not None else 0
 
             if pid_val and adapter and hasattr(adapter, "get_threads"):
                 t_start_obs = time.monotonic()
@@ -1247,7 +1309,7 @@ class AdaptiveInvestigationEngine:
                         cur_elapsed = budget_tracker.elapsed_ms
                         rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
                         rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
-                        if rem_wall_ms <= 0.0 or rem_bytes < 256:
+                        if rem_wall_ms <= 0.0 or rem_bytes < 40:
                             return {
                                 "success": False,
                                 "status": "BUDGET_EXHAUSTED",
@@ -1259,6 +1321,7 @@ class AdaptiveInvestigationEngine:
                                 "bytes_read": 0,
                                 "measured_bytes_read": 0,
                                 "estimated_bytes_read": 0,
+                                "already_budget_accounted": True,
                             }
 
                     threads = adapter.get_threads(pid_val)
@@ -1271,17 +1334,33 @@ class AdaptiveInvestigationEngine:
                         )
 
                     target_tids = {t["tid"] for t in threads}
+                    is_partial_budget = False
+
                     if not target_identity and hasattr(adapter, "get_process_identity"):
-                        target_identity = adapter.get_process_identity(pid_val)
+                        if budget_tracker:
+                            can_id, _, _ = budget_tracker.check_pre_execution(estimated_bytes=64, profile_id="insp_locks")
+                            if not can_id:
+                                is_partial_budget = True
+                        if not is_partial_budget:
+                            t_id_start = time.monotonic()
+                            target_identity = adapter.get_process_identity(pid_val)
+                            id_meas = adapter.get_last_identity_bytes_read() if hasattr(adapter, "get_last_identity_bytes_read") else getattr(adapter, "_last_identity_bytes_read", 0)
+                            if budget_tracker and id_meas > 0:
+                                budget_tracker.record_read(
+                                    bytes_read=id_meas,
+                                    latency_us=(time.monotonic() - t_id_start) * 1_000_000.0,
+                                    profile_id="insp_locks",
+                                )
 
                     contended_locks = []
                     waiters_by_lock: Dict[str, List[int]] = {}
                     wait_for_graph = WaitForGraph()
-                    is_partial_budget = False
                     total_mutex_measured_bytes = 0
                     total_mutex_estimated_bytes = 0
 
                     for t in threads:
+                        if is_partial_budget:
+                            break
                         if t.get("is_futex_wait") or t.get("state") in ("D", "BLOCKED_LOCK"):
                             raw_lock = t.get("syscall_arg0") or t.get("syscall_arg0_int") or t.get("waiting_on_lock")
                             norm_hex, norm_int, addr_st, raw_arg = normalize_futex_address(raw_lock)
@@ -1318,7 +1397,18 @@ class AdaptiveInvestigationEngine:
 
                                     # Accurately account for all actual mutex memory reads, regardless of whether owner was identified
                                     read_b = int(meta.get("read_bytes_len", len(raw_b) if raw_b else 0))
+                                    read_lat = float(meta.get("latency_us", 0.0))
                                     total_mutex_measured_bytes += read_b
+                                    if budget_tracker:
+                                        budget_tracker.record_read(
+                                            bytes_read=read_b,
+                                            latency_us=read_lat,
+                                            is_failure=(owner_id_st in (STATUS_MEMORY_READ_UNAVAILABLE, STATUS_PERMISSION_DENIED)),
+                                            profile_id="insp_locks",
+                                        )
+                                        ok_cur, _ = budget_tracker.check_budget(profile_id="insp_locks")
+                                        if not ok_cur:
+                                            is_partial_budget = True
                                 elif isinstance(owner_res, int) and owner_res > 0:
                                     owner_tid = owner_res
                                     owner_id_st = STATUS_OWNER_IDENTIFIED
@@ -1328,6 +1418,12 @@ class AdaptiveInvestigationEngine:
                                     mem_read_st = "OBSERVED"
                                     evidence_src = "pthread_mutex_memory"
                                     total_mutex_estimated_bytes += 40
+                                    if budget_tracker:
+                                        budget_tracker.record_read(
+                                            bytes_read=None,
+                                            conservative_estimate_bytes=40,
+                                            profile_id="insp_locks",
+                                        )
                                 else:
                                     owner_tid = None
                                     owner_id_st = STATUS_OWNER_NOT_IDENTIFIED
@@ -1336,6 +1432,12 @@ class AdaptiveInvestigationEngine:
                                     meta = {}
                                     mem_read_st = "UNAVAILABLE"
                                     evidence_src = "procfs_syscall"
+                                    if budget_tracker:
+                                        budget_tracker.record_read(
+                                            bytes_read=0,
+                                            is_failure=True,
+                                            profile_id="insp_locks",
+                                        )
 
                                 meta["target_tids"] = list(target_tids)
                                 if raw_b:
@@ -1433,6 +1535,7 @@ class AdaptiveInvestigationEngine:
                         "bytes_read": total_bytes_read,
                         "measured_bytes_read": total_measured_bytes,
                         "estimated_bytes_read": total_estimated_bytes,
+                        "already_budget_accounted": True,
                         "observation_latency_us": round((time.monotonic() - t_start_obs) * 1_000_000.0, 2),
                     }
                 except PermissionError as exc:
@@ -2533,6 +2636,16 @@ class AdaptiveInvestigationEngine:
         target_identity["provenance_class"] = eff_prov
         target_identity["trust_state"] = snap_trust_state
 
+        # Account for process identity read in observation budget (Step 2 requirement)
+        id_bytes = eff_adapter.get_last_identity_bytes_read() if hasattr(eff_adapter, "get_last_identity_bytes_read") else getattr(eff_adapter, "_last_identity_bytes_read", 0)
+        if id_bytes > 0:
+            budget_tracker.record_read(
+                bytes_read=id_bytes,
+                latency_us=500.0,
+                profile_id="target_validation",
+            )
+            budget_tracker.record_sample(profile_id="target_validation")
+
         # Record target identity & capture quality in ledger
         id_rec = EvidenceRecord(
             evidence_id=f"evi_id_{hashlib.sha256(f'{sess_id}:{pid}:{companion_elf_path}'.encode()).hexdigest()[:10]}",
@@ -3323,6 +3436,7 @@ class AdaptiveInvestigationEngine:
             "observation_log": observation_log,
             "planner_decisions": planner_decisions,
             "budget_usage": budget_summary,
+            "budget_summary": budget_summary,
             "total_assertions": verdict.total_assertions,
             "passed_assertions": verdict.passed_count,
             "failed_assertions": verdict.failed_count,
