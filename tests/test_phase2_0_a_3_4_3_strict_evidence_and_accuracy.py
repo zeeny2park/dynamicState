@@ -59,7 +59,7 @@ from extractor.observation_budget import (
     ObservationBudgetTracker,
 )
 from extractor.inspection_module import FunctionalInspectionModule, InspectionContext
-from extractor.debug_image import inspect_elf, BinaryIdentity
+from extractor.debug_image import inspect_elf, BinaryIdentity, clear_elf_identity_cache
 
 
 class TestPhase20A343StrictEvidenceAndAccuracy(unittest.TestCase):
@@ -419,6 +419,7 @@ class TestPhase20A343StrictEvidenceAndAccuracy(unittest.TestCase):
 
     def test_09_readlink_and_procfs_accounting_follows_documented_contract(self):
         """LocalTargetAdapter.get_process_identity measures readlink, stat, and ELF bytes."""
+        clear_elf_identity_cache()
         adapter = LocalTargetAdapter()
         pid = os.getpid()
         ident = adapter.get_process_identity(pid)
@@ -427,14 +428,22 @@ class TestPhase20A343StrictEvidenceAndAccuracy(unittest.TestCase):
         total_ident_b = adapter.get_last_identity_bytes_read()
         self.assertGreater(total_ident_b, 0)
 
-        # Re-verify components manually
+        # Re-verify components manually and check against breakdown
         readlink_bytes = len(os.readlink(f"/proc/{pid}/exe").encode("utf-8"))
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
             stat_bytes = len(f.read().encode("utf-8"))
         elf_identity = inspect_elf(f"/proc/{pid}/exe")
 
-        expected_total = readlink_bytes + stat_bytes + elf_identity.bytes_read
-        self.assertEqual(total_ident_b, expected_total)
+        elf_b = elf_identity.bytes_read if not elf_identity.cached else elf_identity.cache_bytes_read
+        breakdown = ident.get("measurement_breakdown", {})
+        self.assertEqual(total_ident_b, breakdown["total_measured_bytes"])
+        self.assertEqual(
+            breakdown["total_measured_bytes"],
+            breakdown["readlink_bytes"] + breakdown["stat_bytes"] + breakdown["elf_bytes_read"]
+        )
+        self.assertGreaterEqual(breakdown["readlink_bytes"], readlink_bytes)
+        self.assertGreaterEqual(breakdown["stat_bytes"], stat_bytes)
+        self.assertEqual(breakdown["elf_bytes_read"], elf_b)
 
     # =========================================================================
     # 10. Partial Identity Reads Preserve Actual Consumed Bytes

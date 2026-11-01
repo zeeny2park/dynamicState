@@ -277,6 +277,7 @@ class FunctionalInspectionModule(InspectionModule):
             ctx.budget_tracker.record_rejection(self.profile.profile_id, reject_reason or "BUDGET_EXCEEDED")
             return {
                 "success": False,
+                "status": "BUDGET_EXHAUSTED",
                 "budget_rejected": True,
                 "result_category": "BUDGET_REJECTED",
                 "error": f"Inspection aborted before execution: observation budget exceeded ({reject_reason})",
@@ -333,7 +334,7 @@ class FunctionalInspectionModule(InspectionModule):
             )
 
             # Prevent double-charging when the underlying module already performed granular accounting (Step 2)
-            if result.get("already_budget_accounted"):
+            if result.get("accounting_owner") in ("MODULE_INTERNAL", "WORKMANAGER") or result.get("already_budget_accounted"):
                 meas_b = result.get("measured_bytes_read", measured_bytes)
                 read_accounting = {
                     "measured_bytes_read": meas_b,
@@ -377,15 +378,32 @@ class FunctionalInspectionModule(InspectionModule):
             return out
         except Exception as exc:
             lat_us = (time.monotonic_ns() - t0_ns) / 1000.0
-            fail_charge_b = eff_est_bytes if (eff_est_bytes is not None and eff_est_bytes > 0) else ctx.budget_tracker.limits.conservative_unknown_bytes
-            read_acct = ctx.budget_tracker.record_read(
-                bytes_read=None,
-                latency_us=lat_us,
-                is_failure=True,
-                conservative_estimate_bytes=fail_charge_b,
-                profile_id=self.profile.profile_id,
-                profile_ceiling=self.profile.budget_ceiling,
-            )
+            if getattr(exc, "already_budget_accounted", False):
+                read_acct = {
+                    "measured_bytes_read": getattr(exc, "measured_bytes_read", 0),
+                    "charged_bytes": getattr(exc, "bytes_read", 0),
+                    "used_conservative_byte_estimate": False,
+                }
+            else:
+                consumed_b = getattr(exc, "bytes_read", getattr(exc, "measured_bytes_read", None))
+                if consumed_b is not None and not isinstance(consumed_b, bool) and isinstance(consumed_b, (int, float)) and consumed_b >= 0:
+                    read_acct = ctx.budget_tracker.record_read(
+                        bytes_read=int(consumed_b),
+                        latency_us=lat_us,
+                        is_failure=True,
+                        profile_id=self.profile.profile_id,
+                        profile_ceiling=self.profile.budget_ceiling,
+                    )
+                else:
+                    fail_charge_b = eff_est_bytes if (eff_est_bytes is not None and eff_est_bytes > 0) else ctx.budget_tracker.limits.conservative_unknown_bytes
+                    read_acct = ctx.budget_tracker.record_read(
+                        bytes_read=None,
+                        latency_us=lat_us,
+                        is_failure=True,
+                        conservative_estimate_bytes=fail_charge_b,
+                        profile_id=self.profile.profile_id,
+                        profile_ceiling=self.profile.budget_ceiling,
+                    )
             ctx.budget_tracker.record_sample(profile_id=self.profile.profile_id)
             return {
                 "success": False,
@@ -394,9 +412,9 @@ class FunctionalInspectionModule(InspectionModule):
                 "error_code": type(exc).__name__,
                 "abstained": True,
                 "profile_id": self.profile.profile_id,
-                "measured_bytes_read": None,
+                "measured_bytes_read": read_acct["measured_bytes_read"],
                 "charged_bytes": read_acct["charged_bytes"],
-                "used_conservative_byte_estimate": True,
+                "used_conservative_byte_estimate": read_acct["used_conservative_byte_estimate"],
             }
 
 

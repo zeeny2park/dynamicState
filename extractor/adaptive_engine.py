@@ -1264,13 +1264,47 @@ class AdaptiveInvestigationEngine:
                     res = wm.inspect_thread_callstacks_and_locks(**kw)
                     wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
                     if res and res.get("threads"):
-                        wm_meas_b = int(res.get("measured_bytes_read") or res.get("bytes_read") or 0)
-                        if budget_tracker:
-                            budget_tracker.record_read(
-                                bytes_read=wm_meas_b if wm_meas_b > 0 else 0,
-                                latency_us=wm_elapsed_us,
-                                profile_id="insp_locks",
-                            )
+                        raw_meas_b = res.get("measured_bytes_read")
+                        raw_est_b = res.get("estimated_bytes_read")
+                        if raw_meas_b is not None and not isinstance(raw_meas_b, bool) and isinstance(raw_meas_b, (int, float)) and raw_meas_b >= 0:
+                            wm_meas_b = int(raw_meas_b)
+                            if budget_tracker:
+                                budget_tracker.record_read(
+                                    bytes_read=wm_meas_b,
+                                    latency_us=wm_elapsed_us,
+                                    profile_id="insp_locks",
+                                )
+                            res["measurement_type"] = "MEASURED"
+                        elif raw_est_b is not None and not isinstance(raw_est_b, bool) and isinstance(raw_est_b, (int, float)) and raw_est_b > 0:
+                            if budget_tracker:
+                                budget_tracker.record_read(
+                                    bytes_read=None,
+                                    conservative_estimate_bytes=int(raw_est_b),
+                                    latency_us=wm_elapsed_us,
+                                    profile_id="insp_locks",
+                                )
+                            res["measurement_type"] = "ESTIMATED"
+                        else:
+                            wm_raw_b = res.get("bytes_read")
+                            if wm_raw_b is not None and not isinstance(wm_raw_b, bool) and isinstance(wm_raw_b, (int, float)) and wm_raw_b > 0:
+                                if budget_tracker:
+                                    budget_tracker.record_read(
+                                        bytes_read=None,
+                                        conservative_estimate_bytes=int(wm_raw_b),
+                                        latency_us=wm_elapsed_us,
+                                        profile_id="insp_locks",
+                                    )
+                                res["measurement_type"] = "ESTIMATED"
+                            else:
+                                if budget_tracker:
+                                    budget_tracker.record_read(
+                                        bytes_read=0,
+                                        latency_us=wm_elapsed_us,
+                                        is_failure=False,
+                                        profile_id="insp_locks",
+                                    )
+                                res["measurement_type"] = "ZERO_BYTES"
+                        res["accounting_owner"] = "WORKMANAGER"
                         res["already_budget_accounted"] = True
                         return res
                     else:
@@ -1286,7 +1320,7 @@ class AdaptiveInvestigationEngine:
                     wm_consumed_b = getattr(wm_exc, "bytes_read", getattr(wm_exc, "measured_bytes_read", 0))
                     if budget_tracker:
                         budget_tracker.record_read(
-                            bytes_read=wm_consumed_b if (isinstance(wm_consumed_b, int) and wm_consumed_b > 0) else 0,
+                            bytes_read=wm_consumed_b if (isinstance(wm_consumed_b, (int, float)) and wm_consumed_b > 0) else 0,
                             latency_us=wm_elapsed_us,
                             is_failure=True,
                             profile_id="insp_locks",
@@ -1307,6 +1341,7 @@ class AdaptiveInvestigationEngine:
                             "bytes_read": 0,
                             "measured_bytes_read": 0,
                             "estimated_bytes_read": 0,
+                            "accounting_owner": "MODULE_INTERNAL",
                             "already_budget_accounted": True,
                         }
 
@@ -1563,7 +1598,9 @@ class AdaptiveInvestigationEngine:
                         "bytes_read": total_bytes_read,
                         "measured_bytes_read": total_measured_bytes,
                         "estimated_bytes_read": total_estimated_bytes,
+                        "accounting_owner": "MODULE_INTERNAL",
                         "already_budget_accounted": True,
+                        "fallback_executed": True,
                         "observation_latency_us": round((time.monotonic() - t_start_obs) * 1_000_000.0, 2),
                     }
                 except PermissionError as exc:

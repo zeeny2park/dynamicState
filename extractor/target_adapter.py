@@ -286,6 +286,22 @@ class TargetExecutionAdapter(ABC):
         """Returns the measured observation latency in microseconds during the last get_process_identity call."""
         return getattr(self, "_last_identity_latency_us", 0.0)
 
+    def get_last_identity_breakdown(self) -> Dict[str, Any]:
+        """Returns detailed breakdown of measured and cached bytes during last get_process_identity call."""
+        return getattr(self, "_last_identity_breakdown", {
+            "readlink_bytes": 0,
+            "stat_bytes": 0,
+            "elf_bytes_read": 0,
+            "elf_bytes_from_cache": 0,
+            "total_measured_bytes": 0,
+            "estimated_bytes_read": 0,
+            "measurement_status": "UNAVAILABLE",
+        })
+
+    def get_last_identity_status(self) -> str:
+        """Returns measurement status of last get_process_identity call."""
+        return getattr(self, "_last_identity_status", "UNAVAILABLE")
+
     def get_last_threads_breakdown(self) -> Dict[str, int]:
         """Returns breakdown of bytes read during last get_threads call."""
         return getattr(self, "_last_threads_breakdown", {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0})
@@ -320,11 +336,16 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         "get_last_maps_bytes_read",
         "get_last_identity_bytes_read",
         "get_last_identity_latency_us",
+        "get_last_identity_breakdown",
+        "get_last_identity_status",
         "get_last_threads_breakdown",
         "_last_threads_bytes_read",
         "_last_maps_bytes_read",
         "_last_identity_bytes_read",
         "_last_identity_latency_us",
+        "_last_identity_estimated_bytes",
+        "_last_identity_breakdown",
+        "_last_identity_status",
         "_last_threads_breakdown",
     }
 
@@ -376,6 +397,12 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
 
     def get_last_identity_latency_us(self) -> float:
         return self._inner.get_last_identity_latency_us()
+
+    def get_last_identity_breakdown(self) -> Dict[str, Any]:
+        return self._inner.get_last_identity_breakdown()
+
+    def get_last_identity_status(self) -> str:
+        return self._inner.get_last_identity_status()
 
     def get_last_threads_breakdown(self) -> Dict[str, int]:
         return self._inner.get_last_threads_breakdown()
@@ -429,8 +456,18 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         self._last_threads_bytes_read: int = 0
         self._last_maps_bytes_read: int = 0
         self._last_identity_bytes_read: int = 0
+        self._last_identity_estimated_bytes: int = 0
         self._last_identity_latency_us: float = 0.0
-        self._last_identity_latency_us: float = 0.0
+        self._last_identity_status: str = "UNAVAILABLE"
+        self._last_identity_breakdown: Dict[str, Any] = {
+            "readlink_bytes": 0,
+            "stat_bytes": 0,
+            "elf_bytes_read": 0,
+            "elf_bytes_from_cache": 0,
+            "total_measured_bytes": 0,
+            "estimated_bytes_read": 0,
+            "measurement_status": "UNAVAILABLE",
+        }
         self._last_threads_breakdown: Dict[str, int] = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
 
     def is_remote(self) -> bool:
@@ -464,8 +501,27 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         except Exception as e:
             return False, f"Liveness check failed for PID {pid}: {e}"
 
-    def get_process_identity(self, pid: int) -> Dict[str, Any]:
+    def get_process_identity(
+        self,
+        pid: int,
+        companion_build_id: Optional[str] = None,
+        companion_elf_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        empty_breakdown = {
+            "readlink_bytes": 0,
+            "stat_bytes": 0,
+            "elf_bytes_read": 0,
+            "elf_bytes_from_cache": 0,
+            "total_measured_bytes": 0,
+            "estimated_bytes_read": 0,
+            "measurement_status": "UNAVAILABLE",
+        }
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            self._last_identity_bytes_read = 0
+            self._last_identity_estimated_bytes = 0
+            self._last_identity_status = "UNAVAILABLE"
+            self._last_identity_breakdown = empty_breakdown
+            self._last_identity_latency_us = 0.0
             return {
                 "pid": pid,
                 "status": "FAILED",
@@ -482,12 +538,21 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "is_remote": False,
                 "host": self.target_host(),
                 "error": f"Invalid PID {pid}",
+                "measured_bytes_read": 0,
+                "estimated_bytes_read": 0,
+                "measurement_status": "UNAVAILABLE",
+                "measurement_breakdown": empty_breakdown,
             }
 
-        # Check process liveness
+        # Check process liveness (T0)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
+            self._last_identity_bytes_read = 0
+            self._last_identity_estimated_bytes = 0
+            self._last_identity_status = "UNAVAILABLE"
+            self._last_identity_breakdown = empty_breakdown
+            self._last_identity_latency_us = 0.0
             return {
                 "pid": pid,
                 "status": "TARGET_TERMINATED",
@@ -504,21 +569,52 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "is_remote": False,
                 "host": self.target_host(),
                 "error": f"Target PID {pid} was not found (ESRCH)",
+                "measured_bytes_read": 0,
+                "estimated_bytes_read": 0,
+                "measurement_status": "UNAVAILABLE",
+                "measurement_breakdown": empty_breakdown,
             }
         except PermissionError:
             pass
 
         t_id_start = time.monotonic()
-        # 1. Inspect /proc/<pid>/exe link
-        runtime_exe = ""
+        readlink_bytes = 0
+        stat_bytes = 0
+        elf_bytes_read = 0
+        elf_bytes_from_cache = 0
+        estimated_bytes_read = 0
         is_deleted = False
         link_status = "OBSERVED"
         link_err = None
         raw_link = ""
-        total_ident_bytes = 0
+        runtime_exe = ""
+        pid_reused = False
+        exe_changed = False
+        exe_inconsistent = False
+        terminated_during_inspection = False
+
+        # 1. Initial read of /proc/<pid>/stat (T0)
+        start_time_0 = None
+        stat_path = f"/proc/{pid}/stat"
+        if os.path.exists(stat_path):
+            try:
+                with open(stat_path, "r", encoding="utf-8", errors="replace") as f:
+                    stat_content_0 = f.read()
+                stat_bytes += len(stat_content_0.encode("utf-8", errors="replace"))
+                r_paren = stat_content_0.rfind(")")
+                if r_paren != -1:
+                    fields = stat_content_0[r_paren + 1:].split()
+                    if len(fields) >= 20:
+                        start_time_0 = int(fields[19])
+            except ProcessLookupError:
+                terminated_during_inspection = True
+            except Exception:
+                pass
+
+        # 2. Inspect /proc/<pid>/exe link
         try:
             raw_link = os.readlink(f"/proc/{pid}/exe")
-            total_ident_bytes += len(raw_link.encode("utf-8", errors="replace"))
+            readlink_bytes += len(raw_link.encode("utf-8", errors="replace"))
             if raw_link.endswith(" (deleted)"):
                 is_deleted = True
                 runtime_exe = raw_link[:-len(" (deleted)")]
@@ -530,69 +626,190 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         except FileNotFoundError:
             link_status = "NOT_FOUND"
             link_err = f"/proc/{pid}/exe does not exist"
+        except ProcessLookupError:
+            terminated_during_inspection = True
         except Exception as e:
             link_status = "FAILED"
             link_err = str(e)
 
-        # 2. Extract process start time from /proc/<pid>/stat (field 22, 1-based)
-        start_time = None
-        stat_path = f"/proc/{pid}/stat"
-        if os.path.exists(stat_path):
+        # 3. Stable executable inspection and ELF identity
+        runtime_identity: Optional[BinaryIdentity] = None
+        elf_error = None
+        elf_target = f"/proc/{pid}/exe" if os.path.exists(f"/proc/{pid}/exe") else (runtime_exe if os.path.exists(runtime_exe) else "")
+
+        if elf_target and link_status == "OBSERVED" and not terminated_during_inspection:
+            try:
+                # Open stable binary file descriptor to verify inode/device
+                with open(f"/proc/{pid}/exe", "rb") as fd:
+                    fd_stat = os.fstat(fd.fileno())
+                    if runtime_exe and os.path.exists(runtime_exe) and not is_deleted:
+                        try:
+                            exe_stat = os.stat(runtime_exe)
+                            if fd_stat.st_dev != exe_stat.st_dev or fd_stat.st_ino != exe_stat.st_ino:
+                                exe_inconsistent = True
+                        except Exception:
+                            pass
+                    # Perform ELF inspection
+                    runtime_identity = inspect_elf(f"/proc/{pid}/exe")
+            except FileNotFoundError:
+                if runtime_exe and os.path.exists(runtime_exe) and not is_deleted:
+                    try:
+                        runtime_identity = inspect_elf(runtime_exe)
+                    except Exception as exc:
+                        elf_error = str(exc)
+                        elf_bytes_read += getattr(exc, "bytes_read", 0)
+                else:
+                    terminated_during_inspection = True
+            except ProcessLookupError:
+                terminated_during_inspection = True
+            except Exception as exc:
+                elf_error = str(exc)
+                elf_bytes_read += getattr(exc, "bytes_read", 0)
+
+            if runtime_identity is not None:
+                if runtime_identity.cached:
+                    elf_bytes_from_cache += runtime_identity.cache_bytes_read
+                    elf_bytes_read += runtime_identity.bytes_read
+                else:
+                    elf_bytes_read += runtime_identity.bytes_read
+
+        # 4. Post-inspection verification (T1) to detect PID reuse or executable change
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            terminated_during_inspection = True
+
+        start_time_1 = None
+        if not terminated_during_inspection and os.path.exists(stat_path):
             try:
                 with open(stat_path, "r", encoding="utf-8", errors="replace") as f:
-                    stat_content = f.read()
-                total_ident_bytes += len(stat_content.encode("utf-8", errors="replace"))
-                r_paren = stat_content.rfind(")")
+                    stat_content_1 = f.read()
+                stat_bytes += len(stat_content_1.encode("utf-8", errors="replace"))
+                r_paren = stat_content_1.rfind(")")
                 if r_paren != -1:
-                    rest_fields = stat_content[r_paren + 1:].split()
-                    if len(rest_fields) >= 20:
-                        start_time = int(rest_fields[19])
+                    fields = stat_content_1[r_paren + 1:].split()
+                    if len(fields) >= 20:
+                        start_time_1 = int(fields[19])
+                if start_time_0 is not None and start_time_1 is not None and start_time_0 != start_time_1:
+                    pid_reused = True
+            except ProcessLookupError:
+                terminated_during_inspection = True
             except Exception:
                 pass
 
-        # 3. Read ELF identity from /proc/<pid>/exe or runtime_exe
-        runtime_identity: Optional[BinaryIdentity] = None
-        elf_target = f"/proc/{pid}/exe" if os.path.exists(f"/proc/{pid}/exe") else (runtime_exe if os.path.exists(runtime_exe) else "")
-        if elf_target:
+        if not terminated_during_inspection and link_status == "OBSERVED":
             try:
-                runtime_identity = inspect_elf(elf_target)
-                if runtime_identity is not None and getattr(runtime_identity, "bytes_read", 0) > 0:
-                    total_ident_bytes += runtime_identity.bytes_read
-                else:
-                    total_ident_bytes += 64  # Fallback estimate only if measured count is 0
+                raw_link_1 = os.readlink(f"/proc/{pid}/exe")
+                readlink_bytes += len(raw_link_1.encode("utf-8", errors="replace"))
+                if raw_link_1 != raw_link:
+                    exe_changed = True
+            except ProcessLookupError:
+                terminated_during_inspection = True
             except Exception:
                 pass
 
-        self._last_identity_bytes_read = total_ident_bytes
-        self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
-        self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
+        # 5. Companion Build ID validation if specified
+        build_id_val = runtime_identity.build_id if runtime_identity else None
+        build_id_status = "NOT_SPECIFIED"
+        build_id_mismatch = False
+        build_id_unavailable = False
 
-        # Determine explicit verified identity status (Requirements Step 3)
-        if link_status == "PERMISSION_DENIED":
+        target_comp_bid = companion_build_id
+        if not target_comp_bid and companion_elf_path and os.path.exists(companion_elf_path):
+            try:
+                comp_ident = inspect_elf(companion_elf_path)
+                target_comp_bid = comp_ident.build_id
+                if comp_ident.cached:
+                    elf_bytes_from_cache += comp_ident.cache_bytes_read
+                else:
+                    elf_bytes_read += comp_ident.bytes_read
+            except Exception as exc:
+                elf_bytes_read += getattr(exc, "bytes_read", 0)
+
+        if target_comp_bid:
+            if not build_id_val:
+                build_id_status = "BUILD_ID_UNAVAILABLE"
+                build_id_unavailable = True
+            elif build_id_val != target_comp_bid:
+                build_id_status = "BUILD_ID_MISMATCH"
+                build_id_mismatch = True
+            else:
+                build_id_status = "BUILD_ID_MATCHED"
+
+        # 6. Status determination adhering to strict identity verification contract
+        if terminated_during_inspection:
+            status_val = "TARGET_TERMINATED"
             identity_status = IDENTITY_UNAVAILABLE
-        elif link_status == "OBSERVED" and not is_deleted and start_time is not None and start_time > 0 and runtime_identity is not None and runtime_identity.architecture != "unknown":
+        elif link_status == "PERMISSION_DENIED":
+            status_val = "PERMISSION_DENIED"
+            identity_status = IDENTITY_UNAVAILABLE
+        elif pid_reused or exe_changed or exe_inconsistent or build_id_mismatch:
+            status_val = "INCONSISTENT"
+            identity_status = IDENTITY_INCONSISTENT
+        elif (
+            link_status == "OBSERVED"
+            and not is_deleted
+            and start_time_0 is not None
+            and start_time_0 > 0
+            and runtime_identity is not None
+            and runtime_identity.architecture != "unknown"
+            and not build_id_unavailable
+            and not build_id_mismatch
+        ):
+            status_val = "OBSERVED"
             identity_status = IDENTITY_VERIFIED
         elif link_status == "OBSERVED":
+            status_val = "OBSERVED"
             identity_status = IDENTITY_UNVERIFIED
         else:
+            status_val = "FAILED"
             identity_status = IDENTITY_UNAVAILABLE
+
+        # 7. Exact measurement accounting (NO synthetic byte additions!)
+        total_measured_bytes = readlink_bytes + stat_bytes + elf_bytes_read
+        meas_status = (
+            "EXACT_MEASURED" if (total_measured_bytes > 0 and elf_bytes_from_cache == 0)
+            else ("CACHE_HIT" if (elf_bytes_from_cache > 0 and elf_bytes_read == 0)
+            else ("MIXED_MEASURED_CACHE" if elf_bytes_from_cache > 0
+            else ("UNAVAILABLE" if identity_status == IDENTITY_UNAVAILABLE else "PARTIAL_READ")))
+        )
+        meas_breakdown = {
+            "readlink_bytes": readlink_bytes,
+            "stat_bytes": stat_bytes,
+            "elf_bytes_read": elf_bytes_read,
+            "elf_bytes_from_cache": elf_bytes_from_cache,
+            "total_measured_bytes": total_measured_bytes,
+            "estimated_bytes_read": estimated_bytes_read,
+            "measurement_status": meas_status,
+        }
+
+        self._last_identity_bytes_read = total_measured_bytes
+        self._last_identity_estimated_bytes = estimated_bytes_read
+        self._last_identity_status = meas_status
+        self._last_identity_breakdown = meas_breakdown
+        self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
 
         return {
             "pid": pid,
             "executable": runtime_exe,
             "raw_link": raw_link,
             "is_deleted": is_deleted,
-            "process_start_time": start_time,
+            "process_start_time": start_time_0,
             "architecture": runtime_identity.architecture if runtime_identity else "unknown",
             "elf_class": runtime_identity.elf_class if runtime_identity else "unknown",
             "endianness": runtime_identity.endianness if runtime_identity else "unknown",
             "elf_type": runtime_identity.elf_type if runtime_identity else "unknown",
             "build_id": runtime_identity.build_id if runtime_identity else None,
+            "build_id_status": build_id_status,
             "pt_loads": runtime_identity.pt_loads if runtime_identity else [],
             "has_debug_info": bool(getattr(runtime_identity, "has_debug_info", False)) if runtime_identity else False,
-            "status": link_status,
+            "status": status_val,
             "identity_status": identity_status,
-            "error": link_err,
+            "measured_bytes_read": total_measured_bytes,
+            "estimated_bytes_read": estimated_bytes_read,
+            "measurement_status": meas_status,
+            "measurement_breakdown": meas_breakdown,
+            "error": link_err or elf_error,
             "is_remote": False,
             "host": self.target_host(),
         }
@@ -1817,13 +2034,31 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return True, None
         return False, f"Target PID {pid} is not running on {self.target_host()}"
 
-    def get_process_identity(self, pid: int) -> Dict[str, Any]:
+    def get_process_identity(
+        self,
+        pid: int,
+        companion_build_id: Optional[str] = None,
+        companion_elf_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Discovers remote process executable, architecture, and Build ID.
         
         Reads the first 64KB of remote /proc/<pid>/exe and parses ELF header host-side.
         """
         t_id_start = time.monotonic()
+        empty_breakdown = {
+            "readlink_bytes": 0,
+            "stat_bytes": 0,
+            "elf_bytes_read": 0,
+            "elf_bytes_from_cache": 0,
+            "total_measured_bytes": 0,
+            "estimated_bytes_read": 0,
+            "measurement_status": "UNAVAILABLE",
+        }
         if pid <= 0:
+            self._last_identity_bytes_read = 0
+            self._last_identity_estimated_bytes = 0
+            self._last_identity_status = "UNAVAILABLE"
+            self._last_identity_breakdown = empty_breakdown
             self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
             return {
                 "pid": pid,
@@ -1840,10 +2075,19 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "is_remote": True,
                 "host": self.target_host(),
                 "error": f"Invalid PID {pid}",
+                "measured_bytes_read": 0,
+                "estimated_bytes_read": 0,
+                "measurement_status": "UNAVAILABLE",
+                "measurement_breakdown": empty_breakdown,
             }
 
         alive, live_err = self.check_liveness(pid)
         if not alive:
+            self._last_identity_bytes_read = 0
+            self._last_identity_estimated_bytes = 0
+            self._last_identity_status = "UNAVAILABLE"
+            self._last_identity_breakdown = empty_breakdown
+            self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
             return {
                 "pid": pid,
                 "status": "TARGET_TERMINATED",
@@ -1859,22 +2103,28 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "is_remote": True,
                 "host": self.target_host(),
                 "error": live_err or f"Target PID {pid} is not running on {self.target_host()}",
+                "measured_bytes_read": 0,
+                "estimated_bytes_read": 0,
+                "measurement_status": "UNAVAILABLE",
+                "measurement_breakdown": empty_breakdown,
             }
 
-        total_ident_bytes = 0
+        readlink_bytes = 0
+        stat_bytes = 0
+        elf_bytes_read = 0
 
         # 1. Resolve remote executable path
         cmd_exe = f"readlink -f /proc/{int(pid)}/exe 2>/dev/null || readlink /proc/{int(pid)}/exe 2>/dev/null"
         rc, stdout, _ = self.run_ssh(cmd_exe)
         remote_exe = stdout.strip() if rc == 0 else ""
-        total_ident_bytes += len(stdout.encode("utf-8", errors="replace"))
+        readlink_bytes += len(stdout.encode("utf-8", errors="replace"))
 
         # 2. Extract remote process start time from /proc/<pid>/stat
         cmd_stat = f"cat /proc/{int(pid)}/stat 2>/dev/null"
         rc_stat, stdout_stat, _ = self.run_ssh(cmd_stat)
         start_time = None
         if rc_stat == 0 and stdout_stat:
-            total_ident_bytes += len(stdout_stat.encode("utf-8", errors="replace"))
+            stat_bytes += len(stdout_stat.encode("utf-8", errors="replace"))
             r_paren = stdout_stat.rfind(")")
             if r_paren != -1:
                 fields = stdout_stat[r_paren + 1:].split()
@@ -1897,7 +2147,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         if rc == 0 and stdout_b64.strip():
             raw_b64 = stdout_b64.strip()
-            total_ident_bytes += len(raw_b64.encode("utf-8", errors="replace"))
+            elf_bytes_read += len(raw_b64.encode("utf-8", errors="replace"))
             try:
                 raw_elf = base64.b64decode(raw_b64)
                 if len(raw_elf) >= 64:
@@ -1919,7 +2169,22 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             except Exception:
                 pass
 
-        self._last_identity_bytes_read = total_ident_bytes
+        total_measured_bytes = readlink_bytes + stat_bytes + elf_bytes_read
+        meas_status = "EXACT_MEASURED" if total_measured_bytes > 0 else "UNAVAILABLE"
+        meas_breakdown = {
+            "readlink_bytes": readlink_bytes,
+            "stat_bytes": stat_bytes,
+            "elf_bytes_read": elf_bytes_read,
+            "elf_bytes_from_cache": 0,
+            "total_measured_bytes": total_measured_bytes,
+            "estimated_bytes_read": 0,
+            "measurement_status": meas_status,
+        }
+
+        self._last_identity_bytes_read = total_measured_bytes
+        self._last_identity_estimated_bytes = 0
+        self._last_identity_status = meas_status
+        self._last_identity_breakdown = meas_breakdown
         self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
 
         # Strict verified identity check for remote targets
@@ -1940,6 +2205,10 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "identity_status": identity_status,
             "is_remote": True,
             "host": self.target_host(),
+            "measured_bytes_read": total_measured_bytes,
+            "estimated_bytes_read": 0,
+            "measurement_status": meas_status,
+            "measurement_breakdown": meas_breakdown,
         }
 
     def get_process_memory_info(self, pid: int) -> Dict[str, Any]:

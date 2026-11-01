@@ -10,7 +10,7 @@ import os
 import struct
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 _ELF_IDENTITY_CACHE: Dict[Tuple[str, int, int], "BinaryIdentity"] = {}
 _ELF_CACHE_LOCK = threading.Lock()
@@ -18,8 +18,20 @@ _ELF_CACHE_LOCK = threading.Lock()
 
 def clear_elf_identity_cache() -> None:
     """Clear cached ELF BinaryIdentity records."""
+    global _LAST_ELF_BYTES_READ
     with _ELF_CACHE_LOCK:
         _ELF_IDENTITY_CACHE.clear()
+        _LAST_ELF_BYTES_READ = 0
+
+
+_LAST_ELF_BYTES_READ: int = 0
+
+
+def get_last_elf_bytes_read() -> int:
+    """Returns measured bytes read in last inspect_elf call (even if an exception was raised)."""
+    global _LAST_ELF_BYTES_READ
+    with _ELF_CACHE_LOCK:
+        return _LAST_ELF_BYTES_READ
 
 
 @dataclass
@@ -38,6 +50,9 @@ class BinaryIdentity:
     pt_loads: List[Dict[str, Any]] = field(default_factory=list)
     pt_tls: Optional[Dict[str, Any]] = None
     bytes_read: int = 0
+    cached: bool = False
+    cache_bytes_read: int = 0
+    measurement_status: str = "EXACT_MEASURED"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -84,20 +99,30 @@ class CountingReader:
         return self._raw.tell()
 
 
-def inspect_elf(path: str) -> BinaryIdentity:
+def inspect_elf(path: Union[str, Any]) -> BinaryIdentity:
     """Inspect an ELF binary file and extract its architecture, build ID, and debug sections.
 
     Pure-Python parser with zero external dependencies and stat-verified in-memory caching.
     """
-    if not os.path.exists(path):
-        raise FileNotFoundError("Binary file not found: {}".format(path))
+    global _LAST_ELF_BYTES_READ
 
-    abs_path = os.path.abspath(path)
-    try:
-        st = os.stat(abs_path)
-        cache_key = (abs_path, st.st_mtime_ns, st.st_size)
-    except OSError:
-        cache_key = None
+    is_path_str = isinstance(path, str)
+    if is_path_str:
+        if not os.path.exists(path):
+            raise FileNotFoundError("Binary file not found: {}".format(path))
+        abs_path = os.path.abspath(path)
+        try:
+            st = os.stat(abs_path)
+            cache_key = (abs_path, st.st_mtime_ns, st.st_size)
+        except OSError:
+            cache_key = None
+    else:
+        abs_path = getattr(path, "name", "<file_descriptor>")
+        try:
+            st = os.fstat(path.fileno())
+            cache_key = (abs_path, st.st_mtime_ns, st.st_size)
+        except Exception:
+            cache_key = None
 
     if cache_key is not None:
         with _ELF_CACHE_LOCK:
@@ -105,13 +130,20 @@ def inspect_elf(path: str) -> BinaryIdentity:
             if cached is not None:
                 res_copy = copy.copy(cached)
                 res_copy.path = abs_path
+                res_copy.cached = True
+                res_copy.cache_bytes_read = cached.cache_bytes_read or cached.bytes_read
+                res_copy.bytes_read = 0
+                res_copy.measurement_status = "CACHE_HIT"
+                _LAST_ELF_BYTES_READ = 0
                 return res_copy
 
-    with open(path, "rb") as raw_f:
-        f = CountingReader(raw_f)
+    raw_f = open(path, "rb") if is_path_str else path
+    close_raw = is_path_str
+    f = CountingReader(raw_f)
+    try:
         ident = f.read(16)
         if len(ident) < 16 or ident[:4] != b"\x7fELF":
-            raise ValueError("Invalid ELF magic: '{}' is not an ELF binary".format(path))
+            raise ValueError("Invalid ELF magic: '{}' is not an ELF binary".format(abs_path))
 
         ei_class = ident[4]
         if ei_class not in (1, 2):
@@ -127,14 +159,14 @@ def inspect_elf(path: str) -> BinaryIdentity:
         if is_64:
             hdr_bytes = f.read(48)
             if len(hdr_bytes) < 48:
-                raise ValueError("Truncated ELF64 header: {}".format(path))
+                raise ValueError("Truncated ELF64 header: {}".format(abs_path))
             e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = struct.unpack(
                 endian + "HHIQQQIHHHHHH", hdr_bytes
             )
         else:
             hdr_bytes = f.read(36)
             if len(hdr_bytes) < 36:
-                raise ValueError("Truncated ELF32 header: {}".format(path))
+                raise ValueError("Truncated ELF32 header: {}".format(abs_path))
             e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = struct.unpack(
                 endian + "HHIIIIIHHHHHH", hdr_bytes
             )
@@ -315,7 +347,7 @@ def inspect_elf(path: str) -> BinaryIdentity:
         endian_str = "little" if ei_data == 1 else ("big" if ei_data == 2 else "UNKNOWN")
 
         ident_obj = BinaryIdentity(
-            path=os.path.abspath(path),
+            path=abs_path,
             elf_class=elf_class_str,
             architecture=arch_name,
             endianness=endian_str,
@@ -328,13 +360,27 @@ def inspect_elf(path: str) -> BinaryIdentity:
             pt_loads=pt_loads,
             pt_tls=pt_tls,
             bytes_read=f.bytes_read,
+            cached=False,
+            cache_bytes_read=0,
+            measurement_status="EXACT_MEASURED",
         )
-        if cache_key is not None:
-            with _ELF_CACHE_LOCK:
+        with _ELF_CACHE_LOCK:
+            _LAST_ELF_BYTES_READ = f.bytes_read
+            if cache_key is not None:
                 if len(_ELF_IDENTITY_CACHE) > 256:
                     _ELF_IDENTITY_CACHE.clear()
-                _ELF_IDENTITY_CACHE[cache_key] = copy.copy(ident_obj)
+                cached_entry = copy.copy(ident_obj)
+                cached_entry.cache_bytes_read = f.bytes_read
+                _ELF_IDENTITY_CACHE[cache_key] = cached_entry
         return ident_obj
+    except Exception as exc:
+        with _ELF_CACHE_LOCK:
+            _LAST_ELF_BYTES_READ = f.bytes_read
+        setattr(exc, "bytes_read", f.bytes_read)
+        raise
+    finally:
+        if close_raw:
+            raw_f.close()
 
 
 class DebugImageProvider:
