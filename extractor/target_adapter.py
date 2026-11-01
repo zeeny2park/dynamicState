@@ -15,6 +15,7 @@ Enforces:
 
 from abc import ABC, abstractmethod
 import base64
+from dataclasses import dataclass, field
 import errno
 import os
 import re
@@ -106,6 +107,56 @@ def normalize_futex_address(val: Any) -> Tuple[Optional[str], Optional[int], str
     return None, None, "INVALID_ADDRESS", raw_arg
 
 
+STATUS_OWNER_IDENTIFIED = "OWNER_IDENTIFIED"
+STATUS_OWNER_NOT_IDENTIFIED = "OWNER_NOT_IDENTIFIED"
+STATUS_MUTEX_LAYOUT_UNSUPPORTED = "MUTEX_LAYOUT_UNSUPPORTED"
+STATUS_MUTEX_STATE_INVALID = "MUTEX_STATE_INVALID"
+STATUS_MEMORY_READ_UNAVAILABLE = "MEMORY_READ_UNAVAILABLE"
+STATUS_PERMISSION_DENIED = "PERMISSION_DENIED"
+
+LAYOUT_GLIBC_LP64 = "GLIBC_LP64_PTHREAD_MUTEX_V1"
+
+
+@dataclass
+class MutexOwnerResolutionResult:
+    """Detailed and auditable result of a pthread_mutex owner resolution attempt.
+    
+    Guarantees:
+    - Explicit verification status (OWNER_IDENTIFIED, OWNER_NOT_IDENTIFIED, etc.)
+    - Preserves raw bytes and interpretation metadata
+    - Gracefully backward compatible with integer TID checks
+    """
+    status: str
+    owner_tid: Optional[int] = None
+    layout_id: Optional[str] = None
+    raw_bytes: Optional[bytes] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.status == STATUS_OWNER_IDENTIFIED and self.owner_tid is not None
+
+    def __int__(self) -> int:
+        return int(self.owner_tid or 0)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, int):
+            return self.owner_tid == other
+        if isinstance(other, MutexOwnerResolutionResult):
+            return self.status == other.status and self.owner_tid == other.owner_tid
+        return False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "owner_tid": self.owner_tid,
+            "layout_id": self.layout_id,
+            "raw_bytes": self.raw_bytes.hex() if self.raw_bytes else None,
+            "metadata": self.metadata,
+            "error": self.error,
+        }
+
+
 class TargetExecutionAdapter(ABC):
     """Abstract interface for interacting with a local or remote target process."""
 
@@ -193,13 +244,24 @@ class TargetExecutionAdapter(ABC):
         """Discovers running processes on the target host, optionally filtered by name or Build ID."""
         return []
 
-    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> Optional[int]:
-        """Resolves mutex owner TID for given lock address if readable, or None."""
-        return None
+    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
+        """Resolves mutex owner TID for given lock address if readable and verified, or returns resolution result."""
+        return MutexOwnerResolutionResult(
+            status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+            error="Mutex owner resolution is not supported on this adapter type",
+        )
 
     def normalize_futex_address(self, val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
         """Normalize raw syscall arg0 or lock address into canonical hex string and int."""
         return normalize_futex_address(val)
+
+    def get_last_threads_bytes_read(self) -> int:
+        """Returns the measured byte count read during the last get_threads call."""
+        return getattr(self, "_last_threads_bytes_read", 0)
+
+    def get_last_maps_bytes_read(self) -> int:
+        """Returns the measured byte count read during the last get_proc_maps call."""
+        return getattr(self, "_last_maps_bytes_read", 0)
 
     def close(self) -> None:
         """Clean up any active connection or temporary resources."""
@@ -227,6 +289,10 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         "target_host",
         "find_processes",
         "close",
+        "get_last_threads_bytes_read",
+        "get_last_maps_bytes_read",
+        "_last_threads_bytes_read",
+        "_last_maps_bytes_read",
     }
 
     def __init__(self, inner: TargetExecutionAdapter):
@@ -263,8 +329,14 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
         return self._inner.read_memory_batch(pid, requests)
 
-    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> Optional[int]:
+    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
         return self._inner.resolve_mutex_owner(pid, lock_addr)
+
+    def get_last_threads_bytes_read(self) -> int:
+        return self._inner.get_last_threads_bytes_read()
+
+    def get_last_maps_bytes_read(self) -> int:
+        return self._inner.get_last_maps_bytes_read()
 
     def normalize_futex_address(self, val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
         return self._inner.normalize_futex_address(val)
@@ -596,6 +668,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         # 4. Mappings summary from /proc/<pid>/maps
         try:
             maps = self.get_proc_maps(pid)
+            maps_bytes = getattr(self, "_last_maps_bytes_read", 0)
+            actual_costs["maps"] = maps_bytes
             maps_status = "OBSERVED"
         except PermissionError:
             return {
@@ -636,7 +710,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         if statm_rss is None and status_rss is None:
             missing_required_metrics.append("rss_bytes")
 
-        actual_bytes_read = sum(actual_costs.values()) + (len(maps) * 64)
+        actual_bytes_read = sum(actual_costs.values())
 
         metrics = {
             "vsz_bytes": vsz_eff,
@@ -736,11 +810,14 @@ class LocalTargetAdapter(TargetExecutionAdapter):
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         maps_path = f"/proc/{pid}/maps"
         mappings: List[Dict[str, Any]] = []
+        self._last_maps_bytes_read = 0
         if not os.path.exists(maps_path):
             return mappings
 
         with open(maps_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+            content = f.read()
+            self._last_maps_bytes_read = len(content.encode("utf-8"))
+            for line in content.splitlines():
                 parts = line.strip().split(maxsplit=5)
                 if len(parts) >= 5:
                     addr_range = parts[0]
@@ -796,11 +873,14 @@ class LocalTargetAdapter(TargetExecutionAdapter):
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         import struct as _struct
         threads: List[Dict[str, Any]] = []
+        total_proc_bytes_read = 0
         task_dir = f"/proc/{pid}/task"
         if not os.path.exists(task_dir):
+            self._last_threads_bytes_read = 0
             return threads
 
         maps = self.get_proc_maps(pid)
+        total_proc_bytes_read += getattr(self, "_last_maps_bytes_read", 0)
         stack_maps = [m for m in maps if m.get("category") == "stack" or m.get("pathname", "").startswith("[stack")]
         kernel_isolated = set(_get_kernel_isolated_cpus())
         sched_policy_names = {
@@ -828,7 +908,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     if os.path.exists(comm_file):
                         try:
                             with open(comm_file, "r", encoding="utf-8", errors="replace") as cf:
-                                comm = cf.read().strip()
+                                raw_comm = cf.read()
+                                total_proc_bytes_read += len(raw_comm.encode("utf-8"))
+                                comm = raw_comm.strip()
                         except Exception:
                             pass
                     kstkesp = 0
@@ -836,7 +918,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     if os.path.exists(stat_file):
                         try:
                             with open(stat_file, "r", encoding="utf-8", errors="replace") as sf:
-                                raw_stat = sf.read().strip()
+                                raw_stat = sf.read()
+                                total_proc_bytes_read += len(raw_stat.encode("utf-8"))
+                                raw_stat = raw_stat.strip()
                                 rparen = raw_stat.rfind(")")
                                 if rparen != -1:
                                     rest = raw_stat[rparen + 1:].strip().split()
@@ -881,7 +965,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     if os.path.exists(status_file):
                         try:
                             with open(status_file, "r", encoding="utf-8", errors="replace") as stf:
-                                for sline in stf:
+                                stf_text = stf.read()
+                                total_proc_bytes_read += len(stf_text.encode("utf-8"))
+                                for sline in stf_text.splitlines():
                                     if sline.startswith("Cpus_allowed_list:"):
                                         cpus_allowed_list = sline.split(":", 1)[1].strip()
                                     elif sline.startswith("Mems_allowed_list:"):
@@ -918,7 +1004,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     if os.path.exists(wchan_file):
                         try:
                             with open(wchan_file, "r", encoding="utf-8", errors="replace") as wf:
-                                wchan = wf.read().strip()
+                                raw_wchan = wf.read()
+                                total_proc_bytes_read += len(raw_wchan.encode("utf-8"))
+                                wchan = raw_wchan.strip()
                         except Exception:
                             pass
 
@@ -927,7 +1015,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     if os.path.exists(syscall_file):
                         try:
                             with open(syscall_file, "r", encoding="utf-8", errors="replace") as syf:
-                                sy_raw = syf.read().strip()
+                                raw_sy = syf.read()
+                                total_proc_bytes_read += len(raw_sy.encode("utf-8"))
+                                sy_raw = raw_sy.strip()
                                 if sy_raw.startswith("running"):
                                     is_running_user_space = True
                                 else:
@@ -1116,6 +1206,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         except Exception:
             pass
 
+        self._last_threads_bytes_read = total_proc_bytes_read
         threads.sort(key=lambda t: t["tid"])
         return threads
 
@@ -1125,43 +1216,213 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         from .watch_session import read_process_memory_slice
         return read_process_memory_slice(pid, address, size)
 
-    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> Optional[int]:
-        """Inspects target memory at lock_addr to identify pthread_mutex owner TID if readable."""
+    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
+        """Inspects target memory at lock_addr to identify pthread_mutex owner TID if readable and valid.
+        
+        Strict Verification Requirements:
+        - Identify supported libc implementations and architectures (Linux LP64 x86_64, aarch64 glibc).
+        - Document and enforce the exact pthread_mutex_t ABI layout (LAYOUT_GLIBC_LP64).
+        - Reject unsupported libc (musl, non-glibc) and unsupported architectures.
+        - Validate mutex internal state (__kind, __lock, __count, __owner).
+        - Validate that owner TID belongs to the target process (/proc/<pid>/task/<tid>).
+        - Distinguish valid owner observation from coincidental integer memory matching an existing TID.
+        - Preserve raw memory evidence and interpretation metadata.
+        - Return explicit statuses:
+            OWNER_IDENTIFIED, OWNER_NOT_IDENTIFIED, MUTEX_LAYOUT_UNSUPPORTED,
+            MUTEX_STATE_INVALID, MEMORY_READ_UNAVAILABLE, PERMISSION_DENIED.
+        """
         if not lock_addr:
-            return None
+            return MutexOwnerResolutionResult(
+                status=STATUS_OWNER_NOT_IDENTIFIED,
+                error="Lock address is empty or zero",
+            )
         if isinstance(lock_addr, str):
             try:
                 lock_addr_int = int(lock_addr, 16) if lock_addr.startswith("0x") else int(lock_addr, 10)
             except ValueError:
-                return None
+                return MutexOwnerResolutionResult(
+                    status=STATUS_OWNER_NOT_IDENTIFIED,
+                    error=f"Malformed lock address string: {lock_addr}",
+                )
         else:
             lock_addr_int = int(lock_addr)
+
         if lock_addr_int <= 0:
-            return None
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_STATE_INVALID,
+                error=f"Invalid lock address integer: {lock_addr_int}",
+            )
 
-        raw, st, _ = self.read_memory(pid, lock_addr_int, 48)
-        if st != "OBSERVED" or not raw or len(raw) < 12:
-            return None
+        # 1. Architecture and Libc Validation
+        proc_ident = self.get_process_identity(pid) if hasattr(self, "get_process_identity") else {}
+        arch = (proc_ident.get("architecture") or os.uname().machine).lower()
+        if arch not in ("x86_64", "aarch64", "amd64", "arm64"):
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+                layout_id=f"UNSUPPORTED_ARCH_{arch}",
+                error=f"Architecture '{arch}' pthread_mutex_t layout is unsupported (only LP64 x86_64 and aarch64 glibc supported)",
+            )
+
+        # Check for non-glibc runtimes (e.g. musl libc)
+        maps = self.get_proc_maps(pid)
+        has_musl = any("musl" in (m.get("pathname", "").lower()) for m in maps)
+        if has_musl:
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+                layout_id="MUSL_UNSUPPORTED",
+                error="musl libc pthread_mutex_t internal layout is unsupported (does not follow glibc NPTL struct layout)",
+            )
+
+        # 2. Read Mutex Memory (glibc LP64 layout requires 40 bytes)
+        t_start_read = time.monotonic()
+        raw, st, err = self.read_memory(pid, lock_addr_int, 40)
+        read_latency_us = (time.monotonic() - t_start_read) * 1_000_000.0
+
+        if st == "PERMISSION_DENIED":
+            return MutexOwnerResolutionResult(
+                status=STATUS_PERMISSION_DENIED,
+                error=err or f"Permission denied reading memory at 0x{lock_addr_int:x}",
+                metadata={"memory_read_status": st, "latency_us": read_latency_us},
+            )
+        if st != "OBSERVED" or not raw or len(raw) < 20:
+            return MutexOwnerResolutionResult(
+                status=STATUS_MEMORY_READ_UNAVAILABLE,
+                error=err or f"Memory read at 0x{lock_addr_int:x} returned {st} (bytes={len(raw) if raw else 0})",
+                metadata={"memory_read_status": st, "latency_us": read_latency_us},
+            )
+
+        # 3. Unpack and Validate Mutex Structure
+        # glibc LP64 layout:
+        # offset 0: int32 __lock
+        # offset 4: uint32 __count
+        # offset 8: int32 __owner
+        # offset 12: uint32 __nusers
+        # offset 16: int32 __kind
         import struct as _struct
-        candidates = []
-        if len(raw) >= 12:
-            ints = _struct.unpack("iii", raw[:12])
-            futex_tid = ints[0] & 0x3fffffff
-            if 0 < futex_tid < 4194304:
-                candidates.append(futex_tid)
-            owner_cand = ints[2]
-            if 0 < owner_cand < 4194304:
-                candidates.append(owner_cand)
-        if len(raw) >= 20:
-            ints64 = _struct.unpack("iiiii", raw[:20])
-            if 0 < ints64[4] < 4194304:
-                candidates.append(ints64[4])
+        try:
+            m_lock, m_count, m_owner, m_nusers, m_kind = _struct.unpack("<iIiIi", raw[:20])
+        except Exception as exc:
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_STATE_INVALID,
+                error=f"Failed to unpack 20 bytes at 0x{lock_addr_int:x}: {exc}",
+                raw_bytes=raw,
+            )
 
-        task_dir = f"/proc/{pid}/task"
-        for tid in candidates:
-            if os.path.exists(os.path.join(task_dir, str(tid))):
-                return tid
-        return None
+        layout_id = LAYOUT_GLIBC_LP64
+        meta = {
+            "layout_id": layout_id,
+            "architecture": arch,
+            "lock_word": m_lock,
+            "count": m_count,
+            "owner": m_owner,
+            "nusers": m_nusers,
+            "kind": m_kind,
+            "read_bytes_len": len(raw),
+            "memory_read_status": "OBSERVED",
+            "latency_us": read_latency_us,
+        }
+
+        # Validate __kind:
+        # PTHREAD_MUTEX_DESTROYED is -1
+        if m_kind == -1:
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_STATE_INVALID,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error="pthread_mutex has been destroyed (__kind == -1)",
+            )
+
+        # Base kind must be 0 (TIMED/NORMAL), 1 (RECURSIVE), 2 (ERRORCHECK), 3 (ADAPTIVE)
+        base_kind = m_kind & 0x03
+        # Known valid flag bits in glibc:
+        # 0x10 (ROBUST), 0x20 (PRIO_INHERIT), 0x40 (PRIO_PROTECT), 0x80 (SHARED), 0x100 (ELISION), 0x200 (NO_ELISION)
+        valid_flags_mask = 0x03 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200
+        if (m_kind & ~valid_flags_mask) != 0 or m_kind < 0:
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_STATE_INVALID,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error=f"Invalid mutex kind {m_kind} (unknown flags 0x{m_kind:x}); bytes do not represent a valid pthread_mutex_t",
+            )
+        meta["base_kind"] = base_kind
+
+        # Validate __lock:
+        # If __lock == 0, mutex is unlocked
+        if m_lock == 0:
+            return MutexOwnerResolutionResult(
+                status=STATUS_OWNER_NOT_IDENTIFIED,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error="Mutex is currently unlocked (__lock == 0); no active owner exists",
+            )
+
+        # Validate __count:
+        # For non-recursive mutex (NORMAL or ADAPTIVE), count must be 0
+        if base_kind in (0, 3) and m_count != 0:
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_STATE_INVALID,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error=f"Normal/Adaptive mutex has non-zero count ({m_count}); inconsistent state or coincidental memory",
+            )
+        if m_count > 1000000:
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_STATE_INVALID,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error=f"Unreasonably large recursion count ({m_count}); bytes do not represent a valid pthread_mutex_t",
+            )
+
+        # Validate __owner:
+        if m_owner <= 0 or m_owner >= 4194304:
+            return MutexOwnerResolutionResult(
+                status=STATUS_OWNER_NOT_IDENTIFIED,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error=f"Mutex owner field contains non-TID value ({m_owner})",
+            )
+
+        # 4. Process Membership Verification:
+        # Verify that __owner belongs to this exact target process (/proc/<pid>/task/<__owner>)
+        task_entry = f"/proc/{pid}/task/{m_owner}"
+        if not os.path.exists(task_entry):
+            return MutexOwnerResolutionResult(
+                status=STATUS_OWNER_NOT_IDENTIFIED,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error=f"Extracted owner TID {m_owner} does not exist in target process {pid} (/proc/{pid}/task); likely coincidental memory or exited thread",
+            )
+
+        # 5. Lock Word vs Owner Consistency:
+        # In glibc NPTL:
+        # For normal/adaptive mutexes, __lock is typically 1 (locked) or 2 (contended).
+        # For PI or robust mutexes, __lock is (FUTEX_WAITERS | owner_tid) or owner_tid.
+        futex_tid = m_lock & 0x3fffffff
+        is_plausible_lock = (m_lock in (1, 2)) or (futex_tid == m_owner) or (0 < m_lock < 0x40000000)
+        if not is_plausible_lock:
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_STATE_INVALID,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error=f"Mutex __lock value {m_lock} is inconsistent with owner {m_owner}",
+            )
+
+        # Everything validated!
+        return MutexOwnerResolutionResult(
+            status=STATUS_OWNER_IDENTIFIED,
+            owner_tid=m_owner,
+            layout_id=layout_id,
+            raw_bytes=raw,
+            metadata=meta,
+        )
 
     def find_processes(
         self,
@@ -1617,8 +1878,19 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     },
                 })
 
+        self._last_threads_bytes_read = len(stdout.encode("utf-8")) if stdout else 0
         threads.sort(key=lambda t: t["tid"])
         return threads
+
+    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
+        """Remote mutex owner resolution is unsupported without an in-target verified agent.
+        
+        Strictly fails closed without touching local /proc or local process memory.
+        """
+        return MutexOwnerResolutionResult(
+            status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+            error=f"Remote target {self.target_host()} does not support verified pthread_mutex inspection over lightweight adapter",
+        )
 
     def _read_slices_via_collector(
         self,
@@ -2084,3 +2356,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 payload["error"] = f"Collector finished with unrecognized status '{st}'"
 
         return payload
+
+
+RemoteTargetAdapter = RemoteSshTargetAdapter
+
