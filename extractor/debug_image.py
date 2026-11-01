@@ -12,26 +12,38 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-_ELF_IDENTITY_CACHE: Dict[Tuple[str, int, int], "BinaryIdentity"] = {}
+_ELF_IDENTITY_CACHE: Dict[Tuple[int, int, int, int], "BinaryIdentity"] = {}
 _ELF_CACHE_LOCK = threading.Lock()
+_thread_local = threading.local()
+
+
+class ELFInspectionError(ValueError):
+    """Structured exception raised when ELF inspection fails, preserving per-invocation measured bytes."""
+    def __init__(self, message: str, bytes_read: int = 0, path: str = ""):
+        super().__init__(message)
+        self.bytes_read = (
+            max(0, int(bytes_read))
+            if isinstance(bytes_read, (int, float)) and not isinstance(bytes_read, bool)
+            else 0
+        )
+        self.path = path
 
 
 def clear_elf_identity_cache() -> None:
     """Clear cached ELF BinaryIdentity records."""
-    global _LAST_ELF_BYTES_READ
     with _ELF_CACHE_LOCK:
         _ELF_IDENTITY_CACHE.clear()
-        _LAST_ELF_BYTES_READ = 0
-
-
-_LAST_ELF_BYTES_READ: int = 0
+    if hasattr(_thread_local, "last_bytes_read"):
+        _thread_local.last_bytes_read = 0
 
 
 def get_last_elf_bytes_read() -> int:
-    """Returns measured bytes read in last inspect_elf call (even if an exception was raised)."""
-    global _LAST_ELF_BYTES_READ
-    with _ELF_CACHE_LOCK:
-        return _LAST_ELF_BYTES_READ
+    """Thread-local fallback getter for backwards compatibility.
+
+    Callers should prefer accessing .bytes_read directly on BinaryIdentity
+    or ELFInspectionError.
+    """
+    return getattr(_thread_local, "last_bytes_read", 0)
 
 
 @dataclass
@@ -103,9 +115,9 @@ def inspect_elf(path: Union[str, Any]) -> BinaryIdentity:
     """Inspect an ELF binary file and extract its architecture, build ID, and debug sections.
 
     Pure-Python parser with zero external dependencies and stat-verified in-memory caching.
+    Supports both file paths (str) and open file descriptor objects.
+    Caller owns passed-in file descriptors; inspect_elf will not close them.
     """
-    global _LAST_ELF_BYTES_READ
-
     is_path_str = isinstance(path, str)
     if is_path_str:
         if not os.path.exists(path):
@@ -113,14 +125,14 @@ def inspect_elf(path: Union[str, Any]) -> BinaryIdentity:
         abs_path = os.path.abspath(path)
         try:
             st = os.stat(abs_path)
-            cache_key = (abs_path, st.st_mtime_ns, st.st_size)
+            cache_key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
         except OSError:
             cache_key = None
     else:
         abs_path = getattr(path, "name", "<file_descriptor>")
         try:
             st = os.fstat(path.fileno())
-            cache_key = (abs_path, st.st_mtime_ns, st.st_size)
+            cache_key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
         except Exception:
             cache_key = None
 
@@ -134,39 +146,44 @@ def inspect_elf(path: Union[str, Any]) -> BinaryIdentity:
                 res_copy.cache_bytes_read = cached.cache_bytes_read or cached.bytes_read
                 res_copy.bytes_read = 0
                 res_copy.measurement_status = "CACHE_HIT"
-                _LAST_ELF_BYTES_READ = 0
+                _thread_local.last_bytes_read = 0
                 return res_copy
 
     raw_f = open(path, "rb") if is_path_str else path
     close_raw = is_path_str
+    if not is_path_str:
+        try:
+            raw_f.seek(0)
+        except Exception:
+            pass
     f = CountingReader(raw_f)
     try:
         ident = f.read(16)
         if len(ident) < 16 or ident[:4] != b"\x7fELF":
-            raise ValueError("Invalid ELF magic: '{}' is not an ELF binary".format(abs_path))
+            raise ELFInspectionError("Invalid ELF magic: '{}' is not an ELF binary".format(abs_path), bytes_read=f.bytes_read, path=abs_path)
 
         ei_class = ident[4]
         if ei_class not in (1, 2):
-            raise ValueError("Unsupported ELF class: {}".format(ei_class))
+            raise ELFInspectionError("Unsupported ELF class: {}".format(ei_class), bytes_read=f.bytes_read, path=abs_path)
         is_64 = (ei_class == 2)
 
         ei_data = ident[5]
         if ei_data not in (1, 2):
-            raise ValueError("Unsupported ELF endianness: {}".format(ei_data))
+            raise ELFInspectionError("Unsupported ELF endianness: {}".format(ei_data), bytes_read=f.bytes_read, path=abs_path)
         endian = "<" if ei_data == 1 else ">"
 
         f.seek(16)
         if is_64:
             hdr_bytes = f.read(48)
             if len(hdr_bytes) < 48:
-                raise ValueError("Truncated ELF64 header: {}".format(abs_path))
+                raise ELFInspectionError("Truncated ELF64 header: {}".format(abs_path), bytes_read=f.bytes_read, path=abs_path)
             e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = struct.unpack(
                 endian + "HHIQQQIHHHHHH", hdr_bytes
             )
         else:
             hdr_bytes = f.read(36)
             if len(hdr_bytes) < 36:
-                raise ValueError("Truncated ELF32 header: {}".format(abs_path))
+                raise ELFInspectionError("Truncated ELF32 header: {}".format(abs_path), bytes_read=f.bytes_read, path=abs_path)
             e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = struct.unpack(
                 endian + "HHIIIIIHHHHHH", hdr_bytes
             )
@@ -364,8 +381,8 @@ def inspect_elf(path: Union[str, Any]) -> BinaryIdentity:
             cache_bytes_read=0,
             measurement_status="EXACT_MEASURED",
         )
+        _thread_local.last_bytes_read = f.bytes_read
         with _ELF_CACHE_LOCK:
-            _LAST_ELF_BYTES_READ = f.bytes_read
             if cache_key is not None:
                 if len(_ELF_IDENTITY_CACHE) > 256:
                     _ELF_IDENTITY_CACHE.clear()
@@ -373,11 +390,15 @@ def inspect_elf(path: Union[str, Any]) -> BinaryIdentity:
                 cached_entry.cache_bytes_read = f.bytes_read
                 _ELF_IDENTITY_CACHE[cache_key] = cached_entry
         return ident_obj
-    except Exception as exc:
-        with _ELF_CACHE_LOCK:
-            _LAST_ELF_BYTES_READ = f.bytes_read
-        setattr(exc, "bytes_read", f.bytes_read)
+    except ELFInspectionError as eie:
+        _thread_local.last_bytes_read = f.bytes_read
+        setattr(eie, "bytes_read", f.bytes_read)
         raise
+    except Exception as exc:
+        _thread_local.last_bytes_read = f.bytes_read
+        err = ELFInspectionError(str(exc), bytes_read=f.bytes_read, path=abs_path)
+        err.__cause__ = exc
+        raise err
     finally:
         if close_raw:
             raw_f.close()

@@ -20,8 +20,103 @@ Strictly separates distinct observation metrics:
 """
 
 from dataclasses import asdict, dataclass, field
+import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def validate_non_negative_int(val: Any) -> Optional[int]:
+    """Strictly validate non-negative integer.
+
+    Rejects:
+    - bool (subclass of int in Python)
+    - negative values (< 0)
+    - float (including NaN, +Inf, -Inf, 1.0, 1.5)
+    - None or non-numeric types
+    - strings, dicts, lists
+
+    Returns valid non-negative int, or None if invalid.
+    """
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int) and val >= 0:
+        return val
+    return None
+
+
+def validate_non_negative_float(val: Any) -> Optional[float]:
+    """Strictly validate non-negative finite float or int.
+
+    Rejects:
+    - bool
+    - negative values (< 0.0)
+    - NaN, +Inf, -Inf
+    - non-numeric types
+
+    Returns valid float >= 0.0, or None if invalid.
+    """
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        fval = float(val)
+        if math.isnan(fval) or math.isinf(fval) or fval < 0.0:
+            return None
+        return fval
+    return None
+
+
+@dataclass
+class ObservationAccountingRecord:
+    """Explicit, auditable record of observation budget accounting."""
+    operation_id: str
+    accounting_owner: str           # "MODULE_INTERNAL", "WORKMANAGER", "ADAPTER", etc.
+    measured_bytes_read: int = 0
+    estimated_bytes_read: int = 0
+    charged_bytes: int = 0
+    latency_us: float = 0.0
+    accounting_status: str = "PENDING"  # "PENDING", "COMMITTED", "FAILED"
+    measurement_type: str = "MEASURED"   # "MEASURED", "ESTIMATED", "CACHE_HIT", "MIXED", "UNKNOWN"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def commit(self, tracker: Optional["ObservationBudgetTracker"] = None) -> bool:
+        """Atomically commit the accounting record to the budget tracker."""
+        if self.accounting_status == "COMMITTED":
+            return True  # Already committed, prevent double charging!
+        if tracker is not None:
+            if self.measured_bytes_read > 0:
+                tracker.record_read(
+                    bytes_read=self.measured_bytes_read,
+                    latency_us=self.latency_us,
+                    profile_id=self.operation_id,
+                )
+            elif self.estimated_bytes_read > 0:
+                tracker.record_read(
+                    bytes_read=None,
+                    conservative_estimate_bytes=self.estimated_bytes_read,
+                    latency_us=self.latency_us,
+                    profile_id=self.operation_id,
+                )
+            elif self.charged_bytes > 0:
+                tracker.record_read(
+                    bytes_read=self.charged_bytes,
+                    latency_us=self.latency_us,
+                    profile_id=self.operation_id,
+                )
+        self.accounting_status = "COMMITTED"
+        return True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "accounting_owner": self.accounting_owner,
+            "measured_bytes_read": self.measured_bytes_read,
+            "estimated_bytes_read": self.estimated_bytes_read,
+            "charged_bytes": self.charged_bytes if self.charged_bytes > 0 else (self.measured_bytes_read + self.estimated_bytes_read),
+            "latency_us": self.latency_us,
+            "accounting_status": self.accounting_status,
+            "measurement_type": self.measurement_type,
+            "metadata": self.metadata,
+        }
 
 
 DEFAULT_CONSERVATIVE_UNKNOWN_BYTES = 65536  # 64 KB conservative fallback when cost is unknown
@@ -289,8 +384,33 @@ class ObservationBudgetTracker:
         Never fabricates a measured byte count when bytes_read is None. Instead, tracks
         measured_bytes_read separately from conservative_estimated_bytes charged to the budget.
         """
+        # Strict validation of numeric inputs: reject bool, negative, NaN, Inf
+        if bytes_read is not None:
+            if isinstance(bytes_read, bool):
+                raise ValueError(f"Invalid boolean value for bytes_read: {bytes_read}")
+            if isinstance(bytes_read, float) and (math.isnan(bytes_read) or math.isinf(bytes_read)):
+                raise ValueError(f"Invalid float (NaN/Inf) for bytes_read: {bytes_read}")
+            if not isinstance(bytes_read, (int, float)) or bytes_read < 0:
+                raise ValueError(f"Invalid negative or malformed value for bytes_read: {bytes_read}")
+
+        if conservative_estimate_bytes is not None:
+            if isinstance(conservative_estimate_bytes, bool):
+                raise ValueError(f"Invalid boolean value for conservative_estimate_bytes: {conservative_estimate_bytes}")
+            if isinstance(conservative_estimate_bytes, float) and (math.isnan(conservative_estimate_bytes) or math.isinf(conservative_estimate_bytes)):
+                raise ValueError(f"Invalid float (NaN/Inf) for conservative_estimate_bytes: {conservative_estimate_bytes}")
+            if not isinstance(conservative_estimate_bytes, (int, float)) or conservative_estimate_bytes < 0:
+                raise ValueError(f"Invalid negative or malformed value for conservative_estimate_bytes: {conservative_estimate_bytes}")
+
+        if latency_us is not None:
+            if isinstance(latency_us, bool):
+                raise ValueError(f"Invalid boolean value for latency_us: {latency_us}")
+            if isinstance(latency_us, float) and (math.isnan(latency_us) or math.isinf(latency_us)):
+                raise ValueError(f"Invalid float (NaN/Inf) for latency_us: {latency_us}")
+            if not isinstance(latency_us, (int, float)) or latency_us < 0:
+                raise ValueError(f"Invalid negative or malformed value for latency_us: {latency_us}")
+
         # Measured reads: explicit integer >= 0 (partial reads use actual bytes obtained; 0 bytes obtained charged as 0 measured bytes)
-        measured = bytes_read is not None and isinstance(bytes_read, (int, float)) and bytes_read >= 0
+        measured = bytes_read is not None and not isinstance(bytes_read, bool) and isinstance(bytes_read, (int, float)) and bytes_read >= 0
         if measured:
             actual_b = max(0, int(bytes_read))
             charged_b = actual_b

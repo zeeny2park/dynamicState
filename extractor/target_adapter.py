@@ -25,7 +25,12 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from .debug_image import BinaryIdentity, inspect_elf
+from .debug_image import BinaryIdentity, inspect_elf, ELFInspectionError
+from .observation_budget import (
+    validate_non_negative_int,
+    validate_non_negative_float,
+    ObservationAccountingRecord,
+)
 
 
 
@@ -507,6 +512,25 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         companion_build_id: Optional[str] = None,
         companion_elf_path: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Discovers process executable, architecture, build ID, and validates process identity.
+
+        Strict Identity Verification Contract:
+        - IDENTITY_VERIFIED proves:
+          1. Process liveness and existence observed at T0 and T1 via os.kill(pid, 0).
+          2. Matching start time observed at T0 and T1 (/proc/<pid>/stat), proving no PID reuse.
+          3. Matching executable symlink observed at T0 and T1 (/proc/<pid>/exe).
+          4. Stable executable file descriptor opened directly (/proc/<pid>/exe), verified with fstat().
+          5. ELF parsing executed directly on that exact open file descriptor without reopening.
+          6. Valid non-unknown ELF architecture and ELF class (ELF32/ELF64).
+          7. If companion build ID specified, exact byte-for-byte match with runtime ELF build ID.
+
+        - IDENTITY_VERIFIED does NOT prove:
+          1. Does NOT prove cryptographic attestation or TPM hardware-rooted trust.
+          2. Does NOT prove that target process memory has not been altered via ptrace,
+             code injection, or dynamic library preloading (LD_PRELOAD).
+          3. Does NOT prove identity across sampling epochs (verified per-epoch).
+          4. Does NOT prove libc version or dynamic linker internals beyond ELF headers.
+        """
         empty_breakdown = {
             "readlink_bytes": 0,
             "stat_bytes": 0,
@@ -540,7 +564,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "error": f"Invalid PID {pid}",
                 "measured_bytes_read": 0,
                 "estimated_bytes_read": 0,
+                "charged_bytes": 0,
                 "measurement_status": "UNAVAILABLE",
+                "measurement_type": "UNKNOWN",
+                "accounting_owner": "ADAPTER",
+                "accounting_status": "COMMITTED",
                 "measurement_breakdown": empty_breakdown,
             }
 
@@ -571,7 +599,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "error": f"Target PID {pid} was not found (ESRCH)",
                 "measured_bytes_read": 0,
                 "estimated_bytes_read": 0,
+                "charged_bytes": 0,
                 "measurement_status": "UNAVAILABLE",
+                "measurement_type": "UNKNOWN",
+                "accounting_owner": "ADAPTER",
+                "accounting_status": "COMMITTED",
                 "measurement_breakdown": empty_breakdown,
             }
         except PermissionError:
@@ -605,13 +637,15 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 if r_paren != -1:
                     fields = stat_content_0[r_paren + 1:].split()
                     if len(fields) >= 20:
-                        start_time_0 = int(fields[19])
+                        raw_st0 = int(fields[19])
+                        if raw_st0 > 0:
+                            start_time_0 = raw_st0
             except ProcessLookupError:
                 terminated_during_inspection = True
             except Exception:
                 pass
 
-        # 2. Inspect /proc/<pid>/exe link
+        # 2. Inspect /proc/<pid>/exe link (T0)
         try:
             raw_link = os.readlink(f"/proc/{pid}/exe")
             readlink_bytes += len(raw_link.encode("utf-8", errors="replace"))
@@ -635,11 +669,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         # 3. Stable executable inspection and ELF identity
         runtime_identity: Optional[BinaryIdentity] = None
         elf_error = None
-        elf_target = f"/proc/{pid}/exe" if os.path.exists(f"/proc/{pid}/exe") else (runtime_exe if os.path.exists(runtime_exe) else "")
+        stable_fd_verified = False
 
-        if elf_target and link_status == "OBSERVED" and not terminated_during_inspection:
+        if not terminated_during_inspection and link_status == "OBSERVED":
             try:
-                # Open stable binary file descriptor to verify inode/device
+                # Open stable descriptor directly to /proc/<pid>/exe
                 with open(f"/proc/{pid}/exe", "rb") as fd:
                     fd_stat = os.fstat(fd.fileno())
                     if runtime_exe and os.path.exists(runtime_exe) and not is_deleted:
@@ -649,29 +683,24 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                                 exe_inconsistent = True
                         except Exception:
                             pass
-                    # Perform ELF inspection
-                    runtime_identity = inspect_elf(f"/proc/{pid}/exe")
-            except FileNotFoundError:
-                if runtime_exe and os.path.exists(runtime_exe) and not is_deleted:
-                    try:
-                        runtime_identity = inspect_elf(runtime_exe)
-                    except Exception as exc:
-                        elf_error = str(exc)
-                        elf_bytes_read += getattr(exc, "bytes_read", 0)
-                else:
-                    terminated_during_inspection = True
-            except ProcessLookupError:
+                    # CRITICAL FIX: Pass the EXACT OPEN FILE DESCRIPTOR to inspect_elf!
+                    # inspect_elf uses fstat on that exact descriptor and does not close it.
+                    runtime_identity = inspect_elf(fd)
+                    elf_bytes_read += runtime_identity.bytes_read
+                    if runtime_identity.cached:
+                        elf_bytes_from_cache += runtime_identity.cache_bytes_read
+                    stable_fd_verified = True
+            except (FileNotFoundError, ProcessLookupError):
                 terminated_during_inspection = True
+            except PermissionError as pe:
+                link_status = "PERMISSION_DENIED"
+                link_err = str(pe)
+            except ELFInspectionError as eie:
+                elf_error = str(eie)
+                elf_bytes_read += getattr(eie, "bytes_read", 0)
             except Exception as exc:
                 elf_error = str(exc)
                 elf_bytes_read += getattr(exc, "bytes_read", 0)
-
-            if runtime_identity is not None:
-                if runtime_identity.cached:
-                    elf_bytes_from_cache += runtime_identity.cache_bytes_read
-                    elf_bytes_read += runtime_identity.bytes_read
-                else:
-                    elf_bytes_read += runtime_identity.bytes_read
 
         # 4. Post-inspection verification (T1) to detect PID reuse or executable change
         try:
@@ -689,7 +718,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 if r_paren != -1:
                     fields = stat_content_1[r_paren + 1:].split()
                     if len(fields) >= 20:
-                        start_time_1 = int(fields[19])
+                        raw_st1 = int(fields[19])
+                        if raw_st1 > 0:
+                            start_time_1 = raw_st1
                 if start_time_0 is not None and start_time_1 is not None and start_time_0 != start_time_1:
                     pid_reused = True
             except ProcessLookupError:
@@ -697,16 +728,21 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             except Exception:
                 pass
 
+        raw_link_1 = None
+        link_status_1 = "PENDING"
         if not terminated_during_inspection and link_status == "OBSERVED":
             try:
                 raw_link_1 = os.readlink(f"/proc/{pid}/exe")
                 readlink_bytes += len(raw_link_1.encode("utf-8", errors="replace"))
+                link_status_1 = "OBSERVED"
                 if raw_link_1 != raw_link:
                     exe_changed = True
-            except ProcessLookupError:
+            except PermissionError:
+                link_status_1 = "PERMISSION_DENIED"
+            except (FileNotFoundError, ProcessLookupError):
                 terminated_during_inspection = True
             except Exception:
-                pass
+                link_status_1 = "FAILED"
 
         # 5. Companion Build ID validation if specified
         build_id_val = runtime_identity.build_id if runtime_identity else None
@@ -740,7 +776,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         if terminated_during_inspection:
             status_val = "TARGET_TERMINATED"
             identity_status = IDENTITY_UNAVAILABLE
-        elif link_status == "PERMISSION_DENIED":
+        elif link_status == "PERMISSION_DENIED" or link_status_1 == "PERMISSION_DENIED":
             status_val = "PERMISSION_DENIED"
             identity_status = IDENTITY_UNAVAILABLE
         elif pid_reused or exe_changed or exe_inconsistent or build_id_mismatch:
@@ -748,9 +784,14 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             identity_status = IDENTITY_INCONSISTENT
         elif (
             link_status == "OBSERVED"
+            and link_status_1 == "OBSERVED"
             and not is_deleted
+            and raw_link == raw_link_1
             and start_time_0 is not None
+            and start_time_1 is not None
             and start_time_0 > 0
+            and start_time_0 == start_time_1
+            and stable_fd_verified
             and runtime_identity is not None
             and runtime_identity.architecture != "unknown"
             and not build_id_unavailable
@@ -805,9 +846,14 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "has_debug_info": bool(getattr(runtime_identity, "has_debug_info", False)) if runtime_identity else False,
             "status": status_val,
             "identity_status": identity_status,
+            "stable_fd_verified": stable_fd_verified,
             "measured_bytes_read": total_measured_bytes,
             "estimated_bytes_read": estimated_bytes_read,
+            "charged_bytes": total_measured_bytes,
             "measurement_status": meas_status,
+            "measurement_type": "MEASURED" if total_measured_bytes > 0 else ("CACHE_HIT" if elf_bytes_from_cache > 0 else "UNKNOWN"),
+            "accounting_owner": "ADAPTER",
+            "accounting_status": "COMMITTED",
             "measurement_breakdown": meas_breakdown,
             "error": link_err or elf_error,
             "is_remote": False,
@@ -2207,7 +2253,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "host": self.target_host(),
             "measured_bytes_read": total_measured_bytes,
             "estimated_bytes_read": 0,
+            "charged_bytes": total_measured_bytes,
             "measurement_status": meas_status,
+            "measurement_type": "MEASURED" if total_measured_bytes > 0 else "UNKNOWN",
+            "accounting_owner": "ADAPTER",
+            "accounting_status": "COMMITTED",
             "measurement_breakdown": meas_breakdown,
         }
 

@@ -84,6 +84,9 @@ class TestPhase20A343StrictEvidenceAndAccuracy(unittest.TestCase):
         if os.path.exists(cls.work_dir):
             shutil.rmtree(cls.work_dir, ignore_errors=True)
 
+    def setUp(self):
+        clear_elf_identity_cache()
+
     def _sample_valid_proc_identity(self, pid: int = 1000) -> Dict[str, Any]:
         return {
             "pid": pid,

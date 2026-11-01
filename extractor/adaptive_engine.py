@@ -105,7 +105,14 @@ from .inspection_module import (
     InspectionModuleRegistry,
     InspectionProfile,
 )
-from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
+import math
+from .observation_budget import (
+    ObservationBudgetLimits,
+    ObservationBudgetTracker,
+    validate_non_negative_int,
+    validate_non_negative_float,
+    ObservationAccountingRecord,
+)
 from .target_adapter import (
     LocalTargetAdapter,
     ReadOnlyTargetAdapter,
@@ -1266,45 +1273,55 @@ class AdaptiveInvestigationEngine:
                     if res and res.get("threads"):
                         raw_meas_b = res.get("measured_bytes_read")
                         raw_est_b = res.get("estimated_bytes_read")
-                        if raw_meas_b is not None and not isinstance(raw_meas_b, bool) and isinstance(raw_meas_b, (int, float)) and raw_meas_b >= 0:
-                            wm_meas_b = int(raw_meas_b)
+                        raw_bytes_b = res.get("bytes_read")
+
+                        for name, v in [("measured_bytes_read", raw_meas_b), ("estimated_bytes_read", raw_est_b), ("bytes_read", raw_bytes_b)]:
+                            if v is not None:
+                                if isinstance(v, bool) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) or (isinstance(v, (int, float)) and v < 0):
+                                    raise ValueError(f"Invalid numeric value in WorkManager result for {name}: {repr(v)}")
+
+                        meas_val = validate_non_negative_int(raw_meas_b)
+                        est_val = validate_non_negative_int(raw_est_b)
+                        bytes_val = validate_non_negative_int(raw_bytes_b)
+
+                        if meas_val is not None:
                             if budget_tracker:
                                 budget_tracker.record_read(
-                                    bytes_read=wm_meas_b,
+                                    bytes_read=meas_val,
                                     latency_us=wm_elapsed_us,
                                     profile_id="insp_locks",
                                 )
                             res["measurement_type"] = "MEASURED"
-                        elif raw_est_b is not None and not isinstance(raw_est_b, bool) and isinstance(raw_est_b, (int, float)) and raw_est_b > 0:
+                        elif est_val is not None and est_val > 0:
                             if budget_tracker:
                                 budget_tracker.record_read(
                                     bytes_read=None,
-                                    conservative_estimate_bytes=int(raw_est_b),
+                                    conservative_estimate_bytes=est_val,
+                                    latency_us=wm_elapsed_us,
+                                    profile_id="insp_locks",
+                                )
+                            res["measurement_type"] = "ESTIMATED"
+                        elif bytes_val is not None and bytes_val > 0:
+                            if budget_tracker:
+                                budget_tracker.record_read(
+                                    bytes_read=None,
+                                    conservative_estimate_bytes=bytes_val,
                                     latency_us=wm_elapsed_us,
                                     profile_id="insp_locks",
                                 )
                             res["measurement_type"] = "ESTIMATED"
                         else:
-                            wm_raw_b = res.get("bytes_read")
-                            if wm_raw_b is not None and not isinstance(wm_raw_b, bool) and isinstance(wm_raw_b, (int, float)) and wm_raw_b > 0:
-                                if budget_tracker:
-                                    budget_tracker.record_read(
-                                        bytes_read=None,
-                                        conservative_estimate_bytes=int(wm_raw_b),
-                                        latency_us=wm_elapsed_us,
-                                        profile_id="insp_locks",
-                                    )
-                                res["measurement_type"] = "ESTIMATED"
-                            else:
-                                if budget_tracker:
-                                    budget_tracker.record_read(
-                                        bytes_read=0,
-                                        latency_us=wm_elapsed_us,
-                                        is_failure=False,
-                                        profile_id="insp_locks",
-                                    )
-                                res["measurement_type"] = "ZERO_BYTES"
+                            if budget_tracker:
+                                budget_tracker.record_read(
+                                    bytes_read=0,
+                                    latency_us=wm_elapsed_us,
+                                    is_failure=False,
+                                    profile_id="insp_locks",
+                                )
+                            res["measurement_type"] = "ZERO_BYTES"
+                        res["charged_bytes"] = (meas_val or 0) + (est_val or 0) + (bytes_val if meas_val is None and est_val is None else 0)
                         res["accounting_owner"] = "WORKMANAGER"
+                        res["accounting_status"] = "COMMITTED"
                         res["already_budget_accounted"] = True
                         return res
                     else:
@@ -1317,14 +1334,71 @@ class AdaptiveInvestigationEngine:
                             )
                 except Exception as wm_exc:
                     wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
-                    wm_consumed_b = getattr(wm_exc, "bytes_read", getattr(wm_exc, "measured_bytes_read", 0))
+
+                    # Validate numeric byte values on exception
+                    raw_meas = getattr(wm_exc, "measured_bytes_read", None)
+                    raw_est = getattr(wm_exc, "estimated_bytes_read", None)
+                    raw_bytes = getattr(wm_exc, "bytes_read", None)
+
+                    for name, v in [("measured_bytes_read", raw_meas), ("estimated_bytes_read", raw_est), ("bytes_read", raw_bytes)]:
+                        if v is not None:
+                            if isinstance(v, bool) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) or (isinstance(v, (int, float)) and v < 0):
+                                raise ValueError(f"Invalid numeric value on WorkManager exception for {name}: {repr(v)}")
+
+                    meas_val = validate_non_negative_int(raw_meas)
+                    est_val = validate_non_negative_int(raw_est)
+                    bytes_val = validate_non_negative_int(raw_bytes)
+
                     if budget_tracker:
-                        budget_tracker.record_read(
-                            bytes_read=wm_consumed_b if (isinstance(wm_consumed_b, (int, float)) and wm_consumed_b > 0) else 0,
-                            latency_us=wm_elapsed_us,
-                            is_failure=True,
-                            profile_id="insp_locks",
-                        )
+                        if meas_val is not None:
+                            budget_tracker.record_read(
+                                bytes_read=meas_val,
+                                latency_us=wm_elapsed_us,
+                                is_failure=True,
+                                profile_id="insp_locks",
+                            )
+                        elif est_val is not None and est_val > 0:
+                            budget_tracker.record_read(
+                                bytes_read=None,
+                                conservative_estimate_bytes=est_val,
+                                latency_us=wm_elapsed_us,
+                                is_failure=True,
+                                profile_id="insp_locks",
+                            )
+                        elif bytes_val is not None:
+                            m_type = getattr(wm_exc, "measurement_type", None)
+                            if m_type == "ESTIMATED":
+                                budget_tracker.record_read(
+                                    bytes_read=None,
+                                    conservative_estimate_bytes=bytes_val if bytes_val > 0 else budget_tracker.limits.conservative_unknown_bytes,
+                                    latency_us=wm_elapsed_us,
+                                    is_failure=True,
+                                    profile_id="insp_locks",
+                                )
+                            else:
+                                budget_tracker.record_read(
+                                    bytes_read=bytes_val,
+                                    latency_us=wm_elapsed_us,
+                                    is_failure=True,
+                                    profile_id="insp_locks",
+                                )
+                        else:
+                            # If only an estimate is available from the operation context, record as estimated.
+                            # Otherwise, apply ObservationBudgetTracker conservative unknown-cost policy.
+                            # NEVER default unknown consumed bytes to zero!
+                            op_estimate = kw.get("estimated_bytes", 4096)
+                            if op_estimate is not None and isinstance(op_estimate, (int, float)) and op_estimate > 0:
+                                fallback_charge = int(op_estimate)
+                            else:
+                                fallback_charge = budget_tracker.limits.conservative_unknown_bytes
+
+                            budget_tracker.record_read(
+                                bytes_read=None,
+                                conservative_estimate_bytes=fallback_charge,
+                                latency_us=wm_elapsed_us,
+                                is_failure=True,
+                                profile_id="insp_locks",
+                            )
 
                 # Ensure fallback does not silently continue after global budget is exhausted (Step 2)
                 if budget_tracker:
@@ -1341,7 +1415,9 @@ class AdaptiveInvestigationEngine:
                             "bytes_read": 0,
                             "measured_bytes_read": 0,
                             "estimated_bytes_read": 0,
+                            "charged_bytes": 0,
                             "accounting_owner": "MODULE_INTERNAL",
+                            "accounting_status": "COMMITTED",
                             "already_budget_accounted": True,
                         }
 
@@ -1598,7 +1674,10 @@ class AdaptiveInvestigationEngine:
                         "bytes_read": total_bytes_read,
                         "measured_bytes_read": total_measured_bytes,
                         "estimated_bytes_read": total_estimated_bytes,
+                        "charged_bytes": total_measured_bytes + total_estimated_bytes,
+                        "measurement_type": "MIXED" if (total_measured_bytes > 0 and total_estimated_bytes > 0) else ("MEASURED" if total_measured_bytes > 0 else "ESTIMATED"),
                         "accounting_owner": "MODULE_INTERNAL",
+                        "accounting_status": "COMMITTED",
                         "already_budget_accounted": True,
                         "fallback_executed": True,
                         "observation_latency_us": round((time.monotonic() - t_start_obs) * 1_000_000.0, 2),

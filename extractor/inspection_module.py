@@ -12,7 +12,13 @@ from dataclasses import asdict, dataclass, field
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from .observation_budget import ObservationBudgetTracker
+import math
+from .observation_budget import (
+    ObservationBudgetTracker,
+    validate_non_negative_int,
+    validate_non_negative_float,
+    ObservationAccountingRecord,
+)
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter, ReadOnlyTargetAdapter
 
 
@@ -325,40 +331,154 @@ class FunctionalInspectionModule(InspectionModule):
                 or result.get("error_code") in ("RESTRICTED", "SYMBOL_NOT_FOUND", "CAPABILITY_UNAVAILABLE")
             )
 
-            # Never fabricate measured bytes_read=4096 when bytes_read is not reported by the tool
-            raw_measured_bytes = result.get("bytes_read")
-            measured_bytes = (
-                int(raw_measured_bytes)
-                if (raw_measured_bytes is not None and not isinstance(raw_measured_bytes, bool) and isinstance(raw_measured_bytes, (int, float)) and raw_measured_bytes >= 0)
-                else None
+            # Canonical measurement contract & validation
+            raw_meas = result.get("measured_bytes_read")
+            raw_est = result.get("estimated_bytes_read")
+            raw_bytes = result.get("bytes_read")
+
+            for name, v in [("measured_bytes_read", raw_meas), ("estimated_bytes_read", raw_est), ("bytes_read", raw_bytes)]:
+                if v is not None:
+                    if isinstance(v, bool) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) or (isinstance(v, (int, float)) and v < 0):
+                        raise ValueError(f"Invalid numeric value in result for {name}: {repr(v)}")
+
+            meas_b = validate_non_negative_int(raw_meas)
+            est_b = validate_non_negative_int(raw_est)
+            bytes_b = validate_non_negative_int(raw_bytes)
+
+            already_accounted = (
+                result.get("accounting_status") == "COMMITTED"
+                or result.get("accounting_owner") in ("MODULE_INTERNAL", "WORKMANAGER", "ADAPTER")
+                or result.get("already_budget_accounted")
             )
 
-            # Prevent double-charging when the underlying module already performed granular accounting (Step 2)
-            if result.get("accounting_owner") in ("MODULE_INTERNAL", "WORKMANAGER") or result.get("already_budget_accounted"):
-                meas_b = result.get("measured_bytes_read", measured_bytes)
+            if already_accounted:
+                eff_meas = meas_b if meas_b is not None else (bytes_b if meas_b is None and est_b is None and result.get("measurement_type") != "ESTIMATED" else 0)
+                eff_est = est_b if est_b is not None else (bytes_b if meas_b is None and est_b is None and result.get("measurement_type") == "ESTIMATED" else 0)
                 read_accounting = {
-                    "measured_bytes_read": meas_b,
-                    "charged_bytes": int(result.get("bytes_read") or meas_b or 0),
-                    "used_conservative_byte_estimate": False,
+                    "measured_bytes_read": eff_meas,
+                    "estimated_bytes_read": eff_est,
+                    "charged_bytes": int(result.get("charged_bytes") or (eff_meas + eff_est)),
+                    "used_conservative_byte_estimate": eff_est > 0,
                 }
             else:
-                read_accounting = ctx.budget_tracker.record_read(
-                    bytes_read=measured_bytes,
-                    latency_us=lat_us,
-                    stop_ms=float(result.get("stop_duration_ms", 0.0)),
-                    is_failure=is_fail,
-                    conservative_estimate_bytes=eff_est_bytes,
-                    profile_id=self.profile.profile_id,
-                    profile_ceiling=self.profile.budget_ceiling,
-                )
+                if meas_b is not None and est_b is not None:
+                    if meas_b > 0:
+                        ctx.budget_tracker.record_read(
+                            bytes_read=meas_b,
+                            latency_us=lat_us,
+                            stop_ms=float(result.get("stop_duration_ms", 0.0)),
+                            is_failure=is_fail,
+                            profile_id=self.profile.profile_id,
+                            profile_ceiling=self.profile.budget_ceiling,
+                        )
+                    if est_b > 0:
+                        ctx.budget_tracker.record_read(
+                            bytes_read=None,
+                            conservative_estimate_bytes=est_b,
+                            latency_us=0.0,
+                            stop_ms=0.0,
+                            is_failure=is_fail,
+                            profile_id=self.profile.profile_id,
+                            profile_ceiling=self.profile.budget_ceiling,
+                        )
+                    read_accounting = {
+                        "measured_bytes_read": meas_b,
+                        "estimated_bytes_read": est_b,
+                        "charged_bytes": meas_b + est_b,
+                        "used_conservative_byte_estimate": est_b > 0,
+                    }
+                elif meas_b is not None:
+                    r = ctx.budget_tracker.record_read(
+                        bytes_read=meas_b,
+                        latency_us=lat_us,
+                        stop_ms=float(result.get("stop_duration_ms", 0.0)),
+                        is_failure=is_fail,
+                        profile_id=self.profile.profile_id,
+                        profile_ceiling=self.profile.budget_ceiling,
+                    )
+                    read_accounting = {
+                        "measured_bytes_read": meas_b,
+                        "estimated_bytes_read": 0,
+                        "charged_bytes": r["charged_bytes"],
+                        "used_conservative_byte_estimate": False,
+                    }
+                elif est_b is not None:
+                    r = ctx.budget_tracker.record_read(
+                        bytes_read=None,
+                        conservative_estimate_bytes=est_b,
+                        latency_us=lat_us,
+                        stop_ms=float(result.get("stop_duration_ms", 0.0)),
+                        is_failure=is_fail,
+                        profile_id=self.profile.profile_id,
+                        profile_ceiling=self.profile.budget_ceiling,
+                    )
+                    read_accounting = {
+                        "measured_bytes_read": None,
+                        "estimated_bytes_read": est_b,
+                        "charged_bytes": r["charged_bytes"],
+                        "used_conservative_byte_estimate": True,
+                    }
+                elif bytes_b is not None:
+                    m_type = result.get("measurement_type")
+                    if m_type == "ESTIMATED":
+                        r = ctx.budget_tracker.record_read(
+                            bytes_read=None,
+                            conservative_estimate_bytes=bytes_b,
+                            latency_us=lat_us,
+                            stop_ms=float(result.get("stop_duration_ms", 0.0)),
+                            is_failure=is_fail,
+                            profile_id=self.profile.profile_id,
+                            profile_ceiling=self.profile.budget_ceiling,
+                        )
+                        read_accounting = {
+                            "measured_bytes_read": None,
+                            "estimated_bytes_read": bytes_b,
+                            "charged_bytes": r["charged_bytes"],
+                            "used_conservative_byte_estimate": True,
+                        }
+                    else:
+                        r = ctx.budget_tracker.record_read(
+                            bytes_read=bytes_b,
+                            latency_us=lat_us,
+                            stop_ms=float(result.get("stop_duration_ms", 0.0)),
+                            is_failure=is_fail,
+                            profile_id=self.profile.profile_id,
+                            profile_ceiling=self.profile.budget_ceiling,
+                        )
+                        read_accounting = {
+                            "measured_bytes_read": bytes_b,
+                            "estimated_bytes_read": 0,
+                            "charged_bytes": r["charged_bytes"],
+                            "used_conservative_byte_estimate": False,
+                        }
+                else:
+                    fail_charge_b = eff_est_bytes if (eff_est_bytes is not None and eff_est_bytes > 0) else ctx.budget_tracker.limits.conservative_unknown_bytes
+                    r = ctx.budget_tracker.record_read(
+                        bytes_read=None,
+                        latency_us=lat_us,
+                        stop_ms=float(result.get("stop_duration_ms", 0.0)),
+                        is_failure=is_fail,
+                        conservative_estimate_bytes=fail_charge_b,
+                        profile_id=self.profile.profile_id,
+                        profile_ceiling=self.profile.budget_ceiling,
+                    )
+                    read_accounting = {
+                        "measured_bytes_read": None,
+                        "estimated_bytes_read": fail_charge_b,
+                        "charged_bytes": r["charged_bytes"],
+                        "used_conservative_byte_estimate": True,
+                    }
+
             ctx.budget_tracker.record_sample(profile_id=self.profile.profile_id)
 
             out = dict(result)
             out.setdefault("profile_id", self.profile.profile_id)
             out["measured_bytes_read"] = read_accounting["measured_bytes_read"]
+            out["estimated_bytes_read"] = read_accounting.get("estimated_bytes_read", 0)
             out["charged_bytes"] = read_accounting["charged_bytes"]
             out["used_conservative_byte_estimate"] = read_accounting["used_conservative_byte_estimate"]
             out["observation_latency_us"] = round(lat_us, 2)
+            out["accounting_status"] = "COMMITTED"
 
             # Post-execution profile ceiling check
             prof_ok, prof_reason = ctx.budget_tracker.check_profile_ceiling(
@@ -378,25 +498,99 @@ class FunctionalInspectionModule(InspectionModule):
             return out
         except Exception as exc:
             lat_us = (time.monotonic_ns() - t0_ns) / 1000.0
-            if getattr(exc, "already_budget_accounted", False):
+
+            # Check if exception already committed accounting
+            exc_accounted = (
+                getattr(exc, "accounting_status", None) == "COMMITTED"
+                or getattr(exc, "already_budget_accounted", False)
+            )
+            if exc_accounted:
+                meas_b = getattr(exc, "measured_bytes_read", 0)
+                est_b = getattr(exc, "estimated_bytes_read", 0)
+                charged_b = getattr(exc, "charged_bytes", getattr(exc, "bytes_read", meas_b + est_b))
                 read_acct = {
-                    "measured_bytes_read": getattr(exc, "measured_bytes_read", 0),
-                    "charged_bytes": getattr(exc, "bytes_read", 0),
-                    "used_conservative_byte_estimate": False,
+                    "measured_bytes_read": meas_b,
+                    "estimated_bytes_read": est_b,
+                    "charged_bytes": charged_b,
+                    "used_conservative_byte_estimate": est_b > 0,
                 }
             else:
-                consumed_b = getattr(exc, "bytes_read", getattr(exc, "measured_bytes_read", None))
-                if consumed_b is not None and not isinstance(consumed_b, bool) and isinstance(consumed_b, (int, float)) and consumed_b >= 0:
-                    read_acct = ctx.budget_tracker.record_read(
-                        bytes_read=int(consumed_b),
+                raw_meas = getattr(exc, "measured_bytes_read", None)
+                raw_est = getattr(exc, "estimated_bytes_read", None)
+                raw_bytes = getattr(exc, "bytes_read", None)
+
+                for name, v in [("measured_bytes_read", raw_meas), ("estimated_bytes_read", raw_est), ("bytes_read", raw_bytes)]:
+                    if v is not None:
+                        if isinstance(v, bool) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) or (isinstance(v, (int, float)) and v < 0):
+                            raise ValueError(f"Invalid numeric value on exception for {name}: {repr(v)}")
+
+                meas_val = validate_non_negative_int(raw_meas)
+                est_val = validate_non_negative_int(raw_est)
+                bytes_val = validate_non_negative_int(raw_bytes)
+
+                if meas_val is not None:
+                    r = ctx.budget_tracker.record_read(
+                        bytes_read=meas_val,
                         latency_us=lat_us,
                         is_failure=True,
                         profile_id=self.profile.profile_id,
                         profile_ceiling=self.profile.budget_ceiling,
                     )
+                    read_acct = {
+                        "measured_bytes_read": meas_val,
+                        "estimated_bytes_read": 0,
+                        "charged_bytes": r["charged_bytes"],
+                        "used_conservative_byte_estimate": False,
+                    }
+                elif est_val is not None and est_val > 0:
+                    r = ctx.budget_tracker.record_read(
+                        bytes_read=None,
+                        conservative_estimate_bytes=est_val,
+                        latency_us=lat_us,
+                        is_failure=True,
+                        profile_id=self.profile.profile_id,
+                        profile_ceiling=self.profile.budget_ceiling,
+                    )
+                    read_acct = {
+                        "measured_bytes_read": None,
+                        "estimated_bytes_read": est_val,
+                        "charged_bytes": r["charged_bytes"],
+                        "used_conservative_byte_estimate": True,
+                    }
+                elif bytes_val is not None:
+                    m_type = getattr(exc, "measurement_type", None)
+                    if m_type == "ESTIMATED":
+                        r = ctx.budget_tracker.record_read(
+                            bytes_read=None,
+                            conservative_estimate_bytes=bytes_val if bytes_val > 0 else ctx.budget_tracker.limits.conservative_unknown_bytes,
+                            latency_us=lat_us,
+                            is_failure=True,
+                            profile_id=self.profile.profile_id,
+                            profile_ceiling=self.profile.budget_ceiling,
+                        )
+                        read_acct = {
+                            "measured_bytes_read": None,
+                            "estimated_bytes_read": bytes_val,
+                            "charged_bytes": r["charged_bytes"],
+                            "used_conservative_byte_estimate": True,
+                        }
+                    else:
+                        r = ctx.budget_tracker.record_read(
+                            bytes_read=bytes_val,
+                            latency_us=lat_us,
+                            is_failure=True,
+                            profile_id=self.profile.profile_id,
+                            profile_ceiling=self.profile.budget_ceiling,
+                        )
+                        read_acct = {
+                            "measured_bytes_read": bytes_val,
+                            "estimated_bytes_read": 0,
+                            "charged_bytes": r["charged_bytes"],
+                            "used_conservative_byte_estimate": False,
+                        }
                 else:
                     fail_charge_b = eff_est_bytes if (eff_est_bytes is not None and eff_est_bytes > 0) else ctx.budget_tracker.limits.conservative_unknown_bytes
-                    read_acct = ctx.budget_tracker.record_read(
+                    r = ctx.budget_tracker.record_read(
                         bytes_read=None,
                         latency_us=lat_us,
                         is_failure=True,
@@ -404,6 +598,12 @@ class FunctionalInspectionModule(InspectionModule):
                         profile_id=self.profile.profile_id,
                         profile_ceiling=self.profile.budget_ceiling,
                     )
+                    read_acct = {
+                        "measured_bytes_read": None,
+                        "estimated_bytes_read": fail_charge_b,
+                        "charged_bytes": r["charged_bytes"],
+                        "used_conservative_byte_estimate": True,
+                    }
             ctx.budget_tracker.record_sample(profile_id=self.profile.profile_id)
             return {
                 "success": False,
@@ -413,8 +613,11 @@ class FunctionalInspectionModule(InspectionModule):
                 "abstained": True,
                 "profile_id": self.profile.profile_id,
                 "measured_bytes_read": read_acct["measured_bytes_read"],
+                "estimated_bytes_read": read_acct.get("estimated_bytes_read", 0),
                 "charged_bytes": read_acct["charged_bytes"],
                 "used_conservative_byte_estimate": read_acct["used_conservative_byte_estimate"],
+                "accounting_owner": "MODULE_INTERNAL",
+                "accounting_status": "COMMITTED",
             }
 
 
