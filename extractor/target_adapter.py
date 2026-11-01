@@ -282,6 +282,14 @@ class TargetExecutionAdapter(ABC):
         """Returns the measured byte count read during the last get_process_identity call."""
         return getattr(self, "_last_identity_bytes_read", 0)
 
+    def get_last_identity_latency_us(self) -> float:
+        """Returns the measured observation latency in microseconds during the last get_process_identity call."""
+        return getattr(self, "_last_identity_latency_us", 0.0)
+
+    def get_last_threads_breakdown(self) -> Dict[str, int]:
+        """Returns breakdown of bytes read during last get_threads call."""
+        return getattr(self, "_last_threads_breakdown", {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0})
+
     def close(self) -> None:
         """Clean up any active connection or temporary resources."""
         pass
@@ -311,9 +319,13 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         "get_last_threads_bytes_read",
         "get_last_maps_bytes_read",
         "get_last_identity_bytes_read",
+        "get_last_identity_latency_us",
+        "get_last_threads_breakdown",
         "_last_threads_bytes_read",
         "_last_maps_bytes_read",
         "_last_identity_bytes_read",
+        "_last_identity_latency_us",
+        "_last_threads_breakdown",
     }
 
     def __init__(self, inner: TargetExecutionAdapter):
@@ -361,6 +373,12 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
 
     def get_last_identity_bytes_read(self) -> int:
         return self._inner.get_last_identity_bytes_read()
+
+    def get_last_identity_latency_us(self) -> float:
+        return self._inner.get_last_identity_latency_us()
+
+    def get_last_threads_breakdown(self) -> Dict[str, int]:
+        return self._inner.get_last_threads_breakdown()
 
     def normalize_futex_address(self, val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
         return self._inner.normalize_futex_address(val)
@@ -411,6 +429,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         self._last_threads_bytes_read: int = 0
         self._last_maps_bytes_read: int = 0
         self._last_identity_bytes_read: int = 0
+        self._last_identity_latency_us: float = 0.0
+        self._last_identity_latency_us: float = 0.0
+        self._last_threads_breakdown: Dict[str, int] = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
 
     def is_remote(self) -> bool:
         return False
@@ -487,14 +508,17 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         except PermissionError:
             pass
 
+        t_id_start = time.monotonic()
         # 1. Inspect /proc/<pid>/exe link
         runtime_exe = ""
         is_deleted = False
         link_status = "OBSERVED"
         link_err = None
         raw_link = ""
+        total_ident_bytes = 0
         try:
             raw_link = os.readlink(f"/proc/{pid}/exe")
+            total_ident_bytes += len(raw_link.encode("utf-8", errors="replace"))
             if raw_link.endswith(" (deleted)"):
                 is_deleted = True
                 runtime_exe = raw_link[:-len(" (deleted)")]
@@ -513,7 +537,6 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         # 2. Extract process start time from /proc/<pid>/stat (field 22, 1-based)
         start_time = None
         stat_path = f"/proc/{pid}/stat"
-        total_ident_bytes = 0
         if os.path.exists(stat_path):
             try:
                 with open(stat_path, "r", encoding="utf-8", errors="replace") as f:
@@ -533,11 +556,16 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         if elf_target:
             try:
                 runtime_identity = inspect_elf(elf_target)
-                total_ident_bytes += 64  # ELF identification and header bytes read
+                if runtime_identity is not None and getattr(runtime_identity, "bytes_read", 0) > 0:
+                    total_ident_bytes += runtime_identity.bytes_read
+                else:
+                    total_ident_bytes += 64  # Fallback estimate only if measured count is 0
             except Exception:
                 pass
 
         self._last_identity_bytes_read = total_ident_bytes
+        self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
+        self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
 
         # Determine explicit verified identity status (Requirements Step 3)
         if link_status == "PERMISSION_DENIED":
@@ -924,14 +952,17 @@ class LocalTargetAdapter(TargetExecutionAdapter):
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         import struct as _struct
         threads: List[Dict[str, Any]] = []
-        total_proc_bytes_read = 0
         task_dir = f"/proc/{pid}/task"
         if not os.path.exists(task_dir):
             self._last_threads_bytes_read = 0
+            self._last_threads_breakdown = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
             return threads
 
         maps = self.get_proc_maps(pid)
-        total_proc_bytes_read += getattr(self, "_last_maps_bytes_read", 0)
+        maps_b = getattr(self, "_last_maps_bytes_read", 0)
+        task_bytes = 0
+        mem_bytes = 0
+        total_proc_bytes_read = maps_b
         stack_maps = [m for m in maps if m.get("category") == "stack" or m.get("pathname", "").startswith("[stack")]
         kernel_isolated = set(_get_kernel_isolated_cpus())
         sched_policy_names = {
@@ -960,7 +991,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         try:
                             with open(comm_file, "r", encoding="utf-8", errors="replace") as cf:
                                 raw_comm = cf.read()
-                                total_proc_bytes_read += len(raw_comm.encode("utf-8"))
+                                b_comm = len(raw_comm.encode("utf-8"))
+                                total_proc_bytes_read += b_comm
+                                task_bytes += b_comm
                                 comm = raw_comm.strip()
                         except Exception:
                             pass
@@ -970,7 +1003,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         try:
                             with open(stat_file, "r", encoding="utf-8", errors="replace") as sf:
                                 raw_stat = sf.read()
-                                total_proc_bytes_read += len(raw_stat.encode("utf-8"))
+                                b_stat = len(raw_stat.encode("utf-8"))
+                                total_proc_bytes_read += b_stat
+                                task_bytes += b_stat
                                 raw_stat = raw_stat.strip()
                                 rparen = raw_stat.rfind(")")
                                 if rparen != -1:
@@ -1017,7 +1052,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         try:
                             with open(status_file, "r", encoding="utf-8", errors="replace") as stf:
                                 stf_text = stf.read()
-                                total_proc_bytes_read += len(stf_text.encode("utf-8"))
+                                b_stf = len(stf_text.encode("utf-8"))
+                                total_proc_bytes_read += b_stf
+                                task_bytes += b_stf
                                 for sline in stf_text.splitlines():
                                     if sline.startswith("Cpus_allowed_list:"):
                                         cpus_allowed_list = sline.split(":", 1)[1].strip()
@@ -1056,7 +1093,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         try:
                             with open(wchan_file, "r", encoding="utf-8", errors="replace") as wf:
                                 raw_wchan = wf.read()
-                                total_proc_bytes_read += len(raw_wchan.encode("utf-8"))
+                                b_wchan = len(raw_wchan.encode("utf-8"))
+                                total_proc_bytes_read += b_wchan
+                                task_bytes += b_wchan
                                 wchan = raw_wchan.strip()
                         except Exception:
                             pass
@@ -1067,7 +1106,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         try:
                             with open(syscall_file, "r", encoding="utf-8", errors="replace") as syf:
                                 raw_sy = syf.read()
-                                total_proc_bytes_read += len(raw_sy.encode("utf-8"))
+                                b_sy = len(raw_sy.encode("utf-8"))
+                                total_proc_bytes_read += b_sy
+                                task_bytes += b_sy
                                 sy_raw = raw_sy.strip()
                                 if sy_raw.startswith("running"):
                                     is_running_user_space = True
@@ -1258,6 +1299,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             pass
 
         self._last_threads_bytes_read = total_proc_bytes_read
+        self._last_threads_breakdown = {
+            "maps_bytes": maps_b,
+            "task_bytes": task_bytes,
+            "memory_bytes": mem_bytes,
+            "total_bytes": total_proc_bytes_read,
+        }
         threads.sort(key=lambda t: t["tid"])
         return threads
 
@@ -1698,6 +1745,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._last_threads_bytes_read: int = 0
         self._last_maps_bytes_read: int = 0
         self._last_identity_bytes_read: int = 0
+        self._last_identity_latency_us: float = 0.0
 
     def is_remote(self) -> bool:
         return True
@@ -1774,7 +1822,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         
         Reads the first 64KB of remote /proc/<pid>/exe and parses ELF header host-side.
         """
+        t_id_start = time.monotonic()
         if pid <= 0:
+            self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
             return {
                 "pid": pid,
                 "status": "FAILED",
@@ -1870,6 +1920,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 pass
 
         self._last_identity_bytes_read = total_ident_bytes
+        self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
 
         # Strict verified identity check for remote targets
         is_verified = bool(remote_exe and start_time and start_time > 0 and arch != "unknown")

@@ -37,6 +37,7 @@ class BinaryIdentity:
     entry_point: Optional[int] = None
     pt_loads: List[Dict[str, Any]] = field(default_factory=list)
     pt_tls: Optional[Dict[str, Any]] = None
+    bytes_read: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -65,6 +66,24 @@ class CompatibilityResult:
         }
 
 
+class CountingReader:
+    """I/O boundary wrapper tracking exact measured bytes read from file handle."""
+    def __init__(self, raw):
+        self._raw = raw
+        self.bytes_read: int = 0
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._raw.read(n)
+        self.bytes_read += len(chunk)
+        return chunk
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._raw.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+
 def inspect_elf(path: str) -> BinaryIdentity:
     """Inspect an ELF binary file and extract its architecture, build ID, and debug sections.
 
@@ -88,7 +107,8 @@ def inspect_elf(path: str) -> BinaryIdentity:
                 res_copy.path = abs_path
                 return res_copy
 
-    with open(path, "rb") as f:
+    with open(path, "rb") as raw_f:
+        f = CountingReader(raw_f)
         ident = f.read(16)
         if len(ident) < 16 or ident[:4] != b"\x7fELF":
             raise ValueError("Invalid ELF magic: '{}' is not an ELF binary".format(path))
@@ -307,6 +327,7 @@ def inspect_elf(path: str) -> BinaryIdentity:
             entry_point=e_entry,
             pt_loads=pt_loads,
             pt_tls=pt_tls,
+            bytes_read=f.bytes_read,
         )
         if cache_key is not None:
             with _ELF_CACHE_LOCK:

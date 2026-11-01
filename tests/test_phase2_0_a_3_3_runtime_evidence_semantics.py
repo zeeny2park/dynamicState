@@ -266,7 +266,7 @@ class TestPhase20A33RuntimeEvidenceSemantics(unittest.TestCase):
 
             engine = AdaptiveInvestigationEngine()
             ctx = engine.registry.get("insp_locks")
-            res = ctx.func(None, pid=pid, adapter=adapter)
+            res = ctx.func(None, pid=pid, adapter=adapter, sampling_epoch=1)
 
             self.assertTrue(res["success"])
             self.assertTrue(res["deadlock_detected"])
@@ -297,7 +297,7 @@ class TestPhase20A33RuntimeEvidenceSemantics(unittest.TestCase):
 
             engine = AdaptiveInvestigationEngine()
             ctx = engine.registry.get("insp_locks")
-            res = ctx.func(None, pid=pid, adapter=adapter)
+            res = ctx.func(None, pid=pid, adapter=adapter, sampling_epoch=1)
 
             self.assertTrue(res["success"])
             self.assertTrue(res["deadlock_detected"])

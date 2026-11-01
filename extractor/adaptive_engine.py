@@ -296,7 +296,9 @@ class WaitForGraph:
                         has_cross_process_identity = True
             ep = getattr(edge, "sampling_epoch", None)
             if ep is not None:
-                if ref_epoch is None:
+                if isinstance(ep, bool) or not isinstance(ep, int) or ep < 0:
+                    issues.append(f"REJECT_INVALID_SAMPLING_EPOCH: Invalid sampling_epoch {ep} detected in wait-for graph")
+                elif ref_epoch is None:
                     ref_epoch = ep
                 elif ep != ref_epoch:
                     has_cross_epoch = True
@@ -328,12 +330,12 @@ class WaitForGraph:
             elif ref_pid is not None and edge.target_pid != ref_pid:
                 edge_issues.append(f"REJECT_CROSS_PROCESS_PID_MISMATCH: Edge target_pid {edge.target_pid} differs from graph reference {ref_pid}")
 
-            # Process identity validation (Requirements Step 3)
+            # Process identity validation (Step 1 Strict Evidence Gate)
             if not edge.process_identity or not isinstance(edge.process_identity, dict):
                 edge_issues.append(f"REJECT_MISSING_PROCESS_IDENTITY: Edge waiter TID {edge.waiter_tid} missing process_identity")
             else:
                 ident_pid = edge.process_identity.get("pid")
-                if ident_pid is None or (edge.target_pid is not None and ident_pid != edge.target_pid):
+                if ident_pid is None or edge.target_pid is None or ident_pid != edge.target_pid:
                     edge_issues.append(f"REJECT_IDENTITY_PID_MISMATCH: Identity PID {ident_pid} does not match edge target_pid {edge.target_pid}")
 
                 p_st = edge.process_identity.get("process_start_time") or edge.process_identity.get("start_time")
@@ -342,19 +344,19 @@ class WaitForGraph:
                 elif ref_start_time is not None and p_st != ref_start_time:
                     edge_issues.append(f"REJECT_CROSS_PROCESS_IDENTITY_MISMATCH: Edge process_start_time {p_st} differs from graph start_time {ref_start_time}")
 
-                p_ident_st = edge.process_identity.get("identity_status") or edge.process_identity.get("status")
+                p_ident_st = edge.process_identity.get("identity_status")
                 if p_ident_st == IDENTITY_UNAVAILABLE:
                     edge_issues.append(f"REJECT_IDENTITY_UNAVAILABLE: Process identity status is IDENTITY_UNAVAILABLE for waiter TID {edge.waiter_tid}")
                 elif p_ident_st == IDENTITY_INCONSISTENT:
                     edge_issues.append(f"REJECT_IDENTITY_INCONSISTENT: Process identity status is IDENTITY_INCONSISTENT for waiter TID {edge.waiter_tid}")
-                elif p_ident_st not in (IDENTITY_VERIFIED, "IDENTITY_VERIFIED", "OBSERVED"):
+                elif p_ident_st != IDENTITY_VERIFIED:
                     edge_issues.append(f"REJECT_IDENTITY_UNVERIFIED: Process identity status is unverified ({p_ident_st}) for waiter TID {edge.waiter_tid}; confirmed deadlock requires explicit verified identity")
 
-            # Sampling epoch validation (Requirements Step 4)
+            # Sampling epoch validation (Step 2 Sampling Epoch Semantics)
             edge_epoch = getattr(edge, "sampling_epoch", None)
             if edge_epoch is None:
                 edge_issues.append(f"REJECT_MISSING_SAMPLING_EPOCH: Edge waiter TID {edge.waiter_tid} missing explicit sampling_epoch")
-            elif not isinstance(edge_epoch, int) or edge_epoch < 0:
+            elif isinstance(edge_epoch, bool) or not isinstance(edge_epoch, int) or edge_epoch < 0:
                 edge_issues.append(f"REJECT_INVALID_SAMPLING_EPOCH: Edge waiter TID {edge.waiter_tid} has invalid sampling_epoch {edge_epoch}")
             elif ref_epoch is not None and edge_epoch != ref_epoch:
                 edge_issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Edge epoch {edge_epoch} differs from graph epoch {ref_epoch}")
@@ -508,6 +510,17 @@ class WaitForGraph:
             "result_category": category,
             "issues": issues,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WaitForGraph":
+        raw_edges = data.get("edges", [])
+        edges = []
+        for e in raw_edges:
+            if isinstance(e, WaitForEdge):
+                edges.append(e)
+            elif isinstance(e, dict):
+                edges.append(WaitForEdge(**e))
+        return cls(edges=edges)
 
 # -----------------------------------------------------------------------------
 # 1. Single Investigation Lifecycle State Machine
@@ -1168,16 +1181,17 @@ def canonicalize_investigation_report(report: Dict[str, Any]) -> Dict[str, Any]:
         cleaned.pop("report_json", None)
         cleaned.pop("session_id", None)
         cleaned.pop("investigation_id", None)
-        if "budget_usage" in cleaned and isinstance(cleaned["budget_usage"], dict):
-            b_copy = dict(cleaned["budget_usage"])
-            if "metrics" in b_copy and isinstance(b_copy["metrics"], dict):
-                m_copy = dict(b_copy["metrics"])
-                m_copy.pop("observation_latency_us", None)
-                m_copy.pop("wall_clock_elapsed_ms", None)
-                m_copy.pop("profile_usage", None)
-                b_copy["metrics"] = m_copy
-            b_copy.pop("utilization", None)
-            cleaned["budget_usage"] = b_copy
+        for b_key in ("budget_usage", "budget_summary"):
+            if b_key in cleaned and isinstance(cleaned[b_key], dict):
+                b_copy = dict(cleaned[b_key])
+                if "metrics" in b_copy and isinstance(b_copy["metrics"], dict):
+                    m_copy = dict(b_copy["metrics"])
+                    m_copy.pop("observation_latency_us", None)
+                    m_copy.pop("wall_clock_elapsed_ms", None)
+                    m_copy.pop("profile_usage", None)
+                    b_copy["metrics"] = m_copy
+                b_copy.pop("utilization", None)
+                cleaned[b_key] = b_copy
     return cleaned
 
 
@@ -1269,9 +1283,10 @@ class AdaptiveInvestigationEngine:
                             )
                 except Exception as wm_exc:
                     wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
+                    wm_consumed_b = getattr(wm_exc, "bytes_read", getattr(wm_exc, "measured_bytes_read", 0))
                     if budget_tracker:
                         budget_tracker.record_read(
-                            bytes_read=0,
+                            bytes_read=wm_consumed_b if (isinstance(wm_consumed_b, int) and wm_consumed_b > 0) else 0,
                             latency_us=wm_elapsed_us,
                             is_failure=True,
                             profile_id="insp_locks",
@@ -1298,8 +1313,21 @@ class AdaptiveInvestigationEngine:
             pid_val = kw.get("pid")
             adapter = kw.get("adapter")
             target_identity = kw.get("target_identity") or kw.get("target_info")
-            raw_epoch = kw.get("sampling_epoch") if kw.get("sampling_epoch") is not None else kw.get("epoch")
-            sampling_epoch = int(raw_epoch) if raw_epoch is not None else 0
+            raw_epoch = kw.get("sampling_epoch") if "sampling_epoch" in kw else kw.get("epoch")
+            sampling_epoch = None
+            if raw_epoch is not None:
+                if isinstance(raw_epoch, bool):
+                    sampling_epoch = -1
+                elif isinstance(raw_epoch, int):
+                    sampling_epoch = raw_epoch if raw_epoch >= 0 else -1
+                elif isinstance(raw_epoch, str):
+                    try:
+                        val = int(raw_epoch)
+                        sampling_epoch = val if val >= 0 else -1
+                    except (ValueError, TypeError):
+                        sampling_epoch = -1
+                else:
+                    sampling_epoch = -1
 
             if pid_val and adapter and hasattr(adapter, "get_threads"):
                 t_start_obs = time.monotonic()
@@ -1714,7 +1742,21 @@ class AdaptiveInvestigationEngine:
             adapter = kw.get("adapter")
             budget_tracker = kw.get("budget_tracker")
             target_identity = kw.get("target_identity") or kw.get("target_info")
-            sampling_epoch = int(kw.get("sampling_epoch") or kw.get("epoch") or 0)
+            raw_epoch = kw.get("sampling_epoch") if "sampling_epoch" in kw else kw.get("epoch")
+            sampling_epoch = None
+            if raw_epoch is not None:
+                if isinstance(raw_epoch, bool):
+                    sampling_epoch = -1
+                elif isinstance(raw_epoch, int):
+                    sampling_epoch = raw_epoch if raw_epoch >= 0 else -1
+                elif isinstance(raw_epoch, str):
+                    try:
+                        val = int(raw_epoch)
+                        sampling_epoch = val if val >= 0 else -1
+                    except (ValueError, TypeError):
+                        sampling_epoch = -1
+                else:
+                    sampling_epoch = -1
             if budget_tracker:
                 cur_elapsed = budget_tracker.elapsed_ms
                 rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
@@ -2086,6 +2128,7 @@ class AdaptiveInvestigationEngine:
                                 "measured_bytes_read": actual_bytes_total,
                             }
 
+                        t_sample_start = time.monotonic()
                         mem_info = adapter.get_process_memory_info(pid_val) if hasattr(adapter, "get_process_memory_info") else {}
                         st = mem_info.get("status", "OBSERVED")
                         if st in ("PERMISSION_DENIED", "TARGET_TERMINATED", "FAILED", "UNAVAILABLE"):
@@ -2103,8 +2146,9 @@ class AdaptiveInvestigationEngine:
 
                         sample_bytes = int(mem_info.get("actual_bytes_read", 2048))
                         actual_bytes_total += sample_bytes
+                        sample_lat_us = (time.monotonic() - t_sample_start) * 1_000_000.0
                         if budget_tracker:
-                            budget_tracker.record_read(bytes_read=sample_bytes, latency_us=1000.0, profile_id="insp_temporal_diff")
+                            budget_tracker.record_read(bytes_read=sample_bytes, latency_us=sample_lat_us, profile_id="insp_temporal_diff")
                             budget_tracker.record_sample(profile_id="insp_temporal_diff")
 
                         maps = adapter.get_proc_maps(pid_val) if hasattr(adapter, "get_proc_maps") else []
@@ -2627,21 +2671,27 @@ class AdaptiveInvestigationEngine:
             f"Validating target identity (pid={pid}) and probing available read-only observation capabilities.",
         )
 
+        t_stage1_start = time.monotonic()
         target_identity, capabilities, capture_quality = self._probe_target_and_capabilities(
             pid=pid,
             companion_elf_path=companion_elf_path,
             adapter=eff_adapter,
             fixture_data=fixture_data,
         )
+        stage1_elapsed_us = (time.monotonic() - t_stage1_start) * 1_000_000.0
         target_identity["provenance_class"] = eff_prov
         target_identity["trust_state"] = snap_trust_state
 
-        # Account for process identity read in observation budget (Step 2 requirement)
+        # Account for process identity read in observation budget (Step 4 requirement: measured latency)
         id_bytes = eff_adapter.get_last_identity_bytes_read() if hasattr(eff_adapter, "get_last_identity_bytes_read") else getattr(eff_adapter, "_last_identity_bytes_read", 0)
+        id_lat = eff_adapter.get_last_identity_latency_us() if hasattr(eff_adapter, "get_last_identity_latency_us") else stage1_elapsed_us
+        if id_lat <= 0.0:
+            id_lat = stage1_elapsed_us
+
         if id_bytes > 0:
             budget_tracker.record_read(
                 bytes_read=id_bytes,
-                latency_us=500.0,
+                latency_us=id_lat,
                 profile_id="target_validation",
             )
             budget_tracker.record_sample(profile_id="target_validation")
@@ -2755,9 +2805,10 @@ class AdaptiveInvestigationEngine:
                 raw_out = dict(step.get("output") or {})
                 is_fail = raw_out.get("success") is False or raw_out.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
                 meas_b = raw_out.get("bytes_read") if isinstance(raw_out.get("bytes_read"), int) else None
+                meas_lat_us = float(raw_out.get("latency_us") or (raw_out.get("duration_ms", 0.0) * 1000.0))
                 budget_tracker.record_read(
                     bytes_read=meas_b,
-                    latency_us=est_lat * 1000.0,
+                    latency_us=meas_lat_us if meas_lat_us > 0.0 else 0.0,
                     stop_ms=float(raw_out.get("stop_duration_ms", 0.0)),
                     is_failure=is_fail,
                     conservative_estimate_bytes=eff_est_b,
@@ -2851,6 +2902,7 @@ class AdaptiveInvestigationEngine:
                     adapter=eff_adapter,
                     budget_tracker=budget_tracker,
                     target_info=target_identity,
+                    parameters={"sampling_epoch": self.cache.current_epoch},
                     available_symbols=available_symbols,
                     capabilities=capabilities,
                 )
@@ -3094,6 +3146,7 @@ class AdaptiveInvestigationEngine:
                     target_info=target_identity,
                     parameters={
                         **selected_obs.target_ref,
+                        "sampling_epoch": self.cache.current_epoch,
                         "estimated_bytes": selected_obs.estimated_bytes,
                         "estimated_latency_ms": selected_obs.estimated_latency_ms,
                     },
@@ -3529,6 +3582,7 @@ class AdaptiveInvestigationEngine:
                 companion_elf=target_binary_path,
                 adapter=LocalTargetAdapter(),
                 budget_tracker=budget_tracker,
+                parameters={"sampling_epoch": self.cache.current_epoch},
             )
             res = mod.run(ctx, self.watch_manager)
             if isinstance(res, dict):
