@@ -66,6 +66,46 @@ def _get_kernel_isolated_cpus() -> List[int]:
     return sorted(set(isolated))
 
 
+def normalize_futex_address(val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
+    """Normalize raw syscall arg0 or lock address into canonical hex string and int.
+    
+    Requirements:
+    - Normalizes integer and hexadecimal-string addresses safely.
+    - Rejects zero, negative, malformed, and synthetic placeholder addresses ('0x_lock', '0x_futex_lock', '0x0').
+    - Preserves the original raw syscall argument separately from its normalized representation.
+    
+    Returns:
+        (canonical_hex, canonical_int, status, raw_arg)
+        where status is 'WAIT_ADDRESS_OBSERVED', 'INVALID_ADDRESS', or 'UNAVAILABLE'.
+    """
+    raw_arg = val
+    if val is None:
+        return None, None, "UNAVAILABLE", None
+    if isinstance(val, bool):
+        return None, None, "INVALID_ADDRESS", raw_arg
+    if isinstance(val, int):
+        if val <= 0:
+            return None, None, "INVALID_ADDRESS", raw_arg
+        return f"0x{val:x}", val, "WAIT_ADDRESS_OBSERVED", raw_arg
+    if isinstance(val, str):
+        v = val.strip()
+        if not v or v in ("0", "0x0", "0x_lock", "0x_futex_lock") or "lock" in v.lower():
+            return None, None, "INVALID_ADDRESS", raw_arg
+        try:
+            if v.startswith("0x") or v.startswith("0X"):
+                i_val = int(v, 16)
+            elif v.startswith("-"):
+                return None, None, "INVALID_ADDRESS", raw_arg
+            else:
+                i_val = int(v, 10)
+            if i_val <= 0:
+                return None, None, "INVALID_ADDRESS", raw_arg
+            return f"0x{i_val:x}", i_val, "WAIT_ADDRESS_OBSERVED", raw_arg
+        except (ValueError, TypeError):
+            return None, None, "INVALID_ADDRESS", raw_arg
+    return None, None, "INVALID_ADDRESS", raw_arg
+
+
 class TargetExecutionAdapter(ABC):
     """Abstract interface for interacting with a local or remote target process."""
 
@@ -153,6 +193,14 @@ class TargetExecutionAdapter(ABC):
         """Discovers running processes on the target host, optionally filtered by name or Build ID."""
         return []
 
+    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> Optional[int]:
+        """Resolves mutex owner TID for given lock address if readable, or None."""
+        return None
+
+    def normalize_futex_address(self, val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
+        """Normalize raw syscall arg0 or lock address into canonical hex string and int."""
+        return normalize_futex_address(val)
+
     def close(self) -> None:
         """Clean up any active connection or temporary resources."""
         pass
@@ -173,6 +221,8 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         "get_threads",
         "read_memory",
         "read_memory_batch",
+        "resolve_mutex_owner",
+        "normalize_futex_address",
         "is_remote",
         "target_host",
         "find_processes",
@@ -212,6 +262,12 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         requests: List[Tuple[int, int]],
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
         return self._inner.read_memory_batch(pid, requests)
+
+    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> Optional[int]:
+        return self._inner.resolve_mutex_owner(pid, lock_addr)
+
+    def normalize_futex_address(self, val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
+        return self._inner.normalize_futex_address(val)
 
     def is_remote(self) -> bool:
         return self._inner.is_remote()
@@ -271,6 +327,15 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             return False, f"Invalid or reserved system PID {pid} (must be integer > 1)"
         try:
             os.kill(pid, 0)
+            stat_path = f"/proc/{pid}/stat"
+            if os.path.exists(stat_path):
+                try:
+                    with open(stat_path, "r", encoding="utf-8", errors="replace") as f:
+                        parts = f.read().split()
+                        if len(parts) >= 3 and parts[2] in ("Z", "X"):
+                            return False, f"Target PID {pid} has terminated (state={parts[2]})"
+                except Exception:
+                    pass
             return True, None
         except ProcessLookupError:
             return False, f"Target PID {pid} was not found (ESRCH)"
@@ -404,19 +469,18 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "metadata": {},
             }
 
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        is_alive, live_err = self.check_liveness(pid)
+        if not is_alive and live_err and any(k in live_err.lower() for k in ("terminated", "not found", "zombie")):
             return {
                 "status": "TARGET_TERMINATED",
                 "pid": pid,
-                "error": f"Target PID {pid} was not found (ESRCH)",
+                "error": live_err,
                 "metrics": {},
                 "mappings_summary": {},
                 "metadata": {},
+                "heap_rss_bytes": None,
+                "heap_physical_residency_available": False,
             }
-        except PermissionError:
-            pass
 
         t_start = time.time()
         page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
@@ -506,6 +570,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         private_clean = None
         shared_dirty = None
         shared_clean = None
+        smaps_denied = False
         if os.path.exists(smaps_rollup_path):
             try:
                 with open(smaps_rollup_path, "r", encoding="utf-8", errors="replace") as f:
@@ -524,12 +589,25 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         elif line_s.startswith("Shared_Clean:"):
                             shared_clean = int(line_s.split()[1]) * 1024
             except PermissionError:
-                pass
+                smaps_denied = True
             except Exception:
                 pass
 
         # 4. Mappings summary from /proc/<pid>/maps
-        maps = self.get_proc_maps(pid)
+        try:
+            maps = self.get_proc_maps(pid)
+            maps_status = "OBSERVED"
+        except PermissionError:
+            return {
+                "status": "PERMISSION_DENIED",
+                "pid": pid,
+                "error": f"Permission denied reading /proc/{pid}/maps",
+                "metrics": {},
+                "mappings_summary": {},
+                "metadata": {},
+                "sources_status": {"maps": "PERMISSION_DENIED"},
+            }
+
         total_mapping_size = sum(m.get("size", 0) for m in maps)
         heap_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]")
         anon_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "anonymous" and m.get("is_writable"))
@@ -538,12 +616,36 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         vsz_eff = status_vsz if status_vsz is not None else (statm_vsz if statm_vsz is not None else total_mapping_size)
         rss_eff = status_rss if status_rss is not None else statm_rss
 
+        sources_status = {
+            "statm": "OBSERVED" if statm_vsz is not None else "UNAVAILABLE",
+            "status": "OBSERVED" if status_vsz is not None else "UNAVAILABLE",
+            "smaps_rollup": "OBSERVED" if pss is not None else ("PERMISSION_DENIED" if smaps_denied else "UNAVAILABLE"),
+            "maps": maps_status,
+        }
+
+        missing_optional_metrics = []
+        if pss is None:
+            missing_optional_metrics.extend([
+                "pss_bytes", "private_dirty_bytes", "private_clean_bytes",
+                "shared_dirty_bytes", "shared_clean_bytes",
+            ])
+
+        missing_required_metrics = []
+        if statm_vsz is None and status_vsz is None:
+            missing_required_metrics.append("vsz_bytes")
+        if statm_rss is None and status_rss is None:
+            missing_required_metrics.append("rss_bytes")
+
+        actual_bytes_read = sum(actual_costs.values()) + (len(maps) * 64)
+
         metrics = {
             "vsz_bytes": vsz_eff,
             "rss_bytes": rss_eff,
             "rss_anon_bytes": rss_anon,
             "rss_file_bytes": rss_file,
             "rss_shmem_bytes": rss_shmem,
+            "heap_rss_bytes": None,  # procfs does NOT measure heap-specific RSS without an extensive smaps VMA scan; process-wide RSS must NEVER be substituted as heap RSS
+            "heap_physical_residency_available": False,
             "vm_peak_bytes": vm_peak,
             "vm_hwm_bytes": vm_hwm,
             "vm_data_bytes": vm_data if vm_data is not None else statm_data,
@@ -578,6 +680,13 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "estimated_cost_bytes": 1024,
                 "actual_cost_bytes": actual_costs.get("status", actual_costs.get("statm", 1024)),
             },
+            "heap_rss": {
+                "source": "None in /proc/statm or /proc/status",
+                "method": "N/A",
+                "limitations": "Procfs does not provide heap-specific RSS without traversing /proc/<pid>/smaps VMA entries. Process-wide RSS must NEVER be substituted as heap RSS.",
+                "estimated_cost_bytes": 0,
+                "actual_cost_bytes": 0,
+            },
             "mapping_size": {
                 "source": "/proc/<pid>/maps",
                 "method": "Sequential VMA interval scan",
@@ -609,12 +718,19 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         }
 
         return {
-            "status": "OBSERVED",
+            "status": "OBSERVED" if not missing_required_metrics else "PARTIAL",
             "timestamp": t_start,
             "pid": pid,
             "metrics": metrics,
             "mappings_summary": mappings_summary,
             "metadata": metadata,
+            "sources_status": sources_status,
+            "missing_optional_metrics": missing_optional_metrics,
+            "missing_required_metrics": missing_required_metrics,
+            "heap_rss_bytes": None,
+            "heap_physical_residency_available": False,
+            "actual_bytes_read": actual_bytes_read,
+            "actual_costs": actual_costs,
         }
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
@@ -825,11 +941,19 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                                             syscall_name = "futex_time64"
                                         elif syscall_nr == 449:
                                             syscall_name = "futex_waitv"
-                                    if len(sy_parts) >= 2 and sy_parts[1].startswith("0x"):
-                                        try:
-                                            syscall_arg0 = int(sy_parts[1], 16)
-                                        except ValueError:
-                                            pass
+                                    raw_sy_arg0 = None
+                                    if len(sy_parts) >= 2:
+                                        raw_sy_arg0 = sy_parts[1]
+                                        if sy_parts[1].startswith("0x") or sy_parts[1].startswith("0X"):
+                                            try:
+                                                syscall_arg0 = int(sy_parts[1], 16)
+                                            except ValueError:
+                                                pass
+                                        else:
+                                            try:
+                                                syscall_arg0 = int(sy_parts[1], 10)
+                                            except ValueError:
+                                                pass
                                     if len(sy_parts) >= 2 and sy_parts[-2].startswith("0x"):
                                         syscall_sp = int(sy_parts[-2], 16)
                         except Exception:
@@ -881,7 +1005,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                             "tcb_address_int": None,
                         }
 
-                    lock_addr_hex = f"0x{syscall_arg0:x}" if (syscall_arg0 is not None and syscall_arg0 > 0) else None
+                    norm_hex, norm_int, addr_st, raw_arg = normalize_futex_address(syscall_arg0 if syscall_arg0 is not None else raw_sy_arg0)
 
                     concurrency_state = (
                         "WAITING_IN_FUTEX" if is_futex
@@ -899,10 +1023,15 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         "is_blocked_uninterruptible": (state == "D"),
                         "syscall_nr": syscall_nr,
                         "syscall_name": syscall_name,
-                        "syscall_arg0": lock_addr_hex,
-                        "syscall_arg0_int": syscall_arg0 if (syscall_arg0 and syscall_arg0 > 0) else None,
-                        "waiting_on_lock": lock_addr_hex,
-                        "lock_address_status": "OBSERVED" if lock_addr_hex else "UNAVAILABLE",
+                        "raw_syscall_arg0": raw_arg,
+                        "syscall_arg0": norm_hex,
+                        "syscall_arg0_int": norm_int,
+                        "waiting_on_lock": norm_hex,
+                        "lock_address_status": "OBSERVED" if addr_st == "WAIT_ADDRESS_OBSERVED" else "UNAVAILABLE",
+                        "wait_address_status": addr_st,
+                        "futex_wait_observed": is_futex,
+                        "lock_owner_identified": False,
+                        "owner_tid": None,
                         "wchan": wchan,
                         "is_futex_wait": is_futex,
                         "cpu_id": cpu_id,
@@ -995,6 +1124,44 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             return self._memory_reader(pid, address, size)
         from .watch_session import read_process_memory_slice
         return read_process_memory_slice(pid, address, size)
+
+    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> Optional[int]:
+        """Inspects target memory at lock_addr to identify pthread_mutex owner TID if readable."""
+        if not lock_addr:
+            return None
+        if isinstance(lock_addr, str):
+            try:
+                lock_addr_int = int(lock_addr, 16) if lock_addr.startswith("0x") else int(lock_addr, 10)
+            except ValueError:
+                return None
+        else:
+            lock_addr_int = int(lock_addr)
+        if lock_addr_int <= 0:
+            return None
+
+        raw, st, _ = self.read_memory(pid, lock_addr_int, 48)
+        if st != "OBSERVED" or not raw or len(raw) < 12:
+            return None
+        import struct as _struct
+        candidates = []
+        if len(raw) >= 12:
+            ints = _struct.unpack("iii", raw[:12])
+            futex_tid = ints[0] & 0x3fffffff
+            if 0 < futex_tid < 4194304:
+                candidates.append(futex_tid)
+            owner_cand = ints[2]
+            if 0 < owner_cand < 4194304:
+                candidates.append(owner_cand)
+        if len(raw) >= 20:
+            ints64 = _struct.unpack("iiiii", raw[:20])
+            if 0 < ints64[4] < 4194304:
+                candidates.append(ints64[4])
+
+        task_dir = f"/proc/{pid}/task"
+        for tid in candidates:
+            if os.path.exists(os.path.join(task_dir, str(tid))):
+                return tid
+        return None
 
     def find_processes(
         self,

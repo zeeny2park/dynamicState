@@ -106,7 +106,7 @@ from .inspection_module import (
     InspectionProfile,
 )
 from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
-from .target_adapter import LocalTargetAdapter, ReadOnlyTargetAdapter, TargetExecutionAdapter
+from .target_adapter import LocalTargetAdapter, ReadOnlyTargetAdapter, TargetExecutionAdapter, normalize_futex_address
 from .verdict_engine import (
     ASSERTION_ABSTAIN,
     ASSERTION_FAIL,
@@ -136,6 +136,77 @@ from .verdict_engine import (
     VerdictEngine,
     ZeroCdnReporter,
 )
+
+
+@dataclass
+class WaitForEdge:
+    """Directed edge in a lock wait-for graph: waiter_tid waits on sync_object held by owner_tid."""
+    waiter_tid: int
+    sync_object: str  # canonical hex address e.g. "0x7ffd12345678"
+    owner_tid: Optional[int]  # Identified owner TID, or None if unknown
+    source: str  # e.g. "pthread_mutex_memory", "futex_tid", "synthetic_graph"
+    timestamp: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "waiter_tid": self.waiter_tid,
+            "sync_object": self.sync_object,
+            "owner_tid": self.owner_tid,
+            "source": self.source,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class WaitForGraph:
+    """Directed wait-for graph with cycle detection for circular deadlock proof."""
+    edges: List[WaitForEdge] = field(default_factory=list)
+
+    def add_edge(self, edge: WaitForEdge) -> None:
+        self.edges.append(edge)
+
+    def find_cycle(self) -> Optional[List[int]]:
+        """Find a directed cycle in the wait-for graph.
+        
+        A directed cycle requires a sequence of known owner edges:
+        T1 -> T2 -> ... -> T1.
+        Any path terminating at an unknown owner (owner_tid is None) or 
+        a non-waiting thread CANNOT form a cycle.
+        """
+        adj: Dict[int, int] = {}
+        for edge in self.edges:
+            if edge.owner_tid is not None and edge.owner_tid > 0:
+                adj[edge.waiter_tid] = edge.owner_tid
+
+        visited: Set[int] = set()
+        for start_node in list(adj.keys()):
+            if start_node in visited:
+                continue
+            curr = start_node
+            path: List[int] = []
+            seen_in_path: Dict[int, int] = {}
+            while curr in adj:
+                if curr in seen_in_path:
+                    cycle_start = seen_in_path[curr]
+                    cycle = path[cycle_start:] + [curr]
+                    return cycle
+                seen_in_path[curr] = len(path)
+                path.append(curr)
+                visited.add(curr)
+                curr = adj[curr]
+        return None
+
+    def has_cycle(self) -> bool:
+        return self.find_cycle() is not None
+
+    def to_dict(self) -> Dict[str, Any]:
+        cycle = self.find_cycle()
+        return {
+            "edges": [e.to_dict() for e in self.edges],
+            "num_edges": len(self.edges),
+            "deadlock_cycle": cycle,
+            "deadlock_detected": bool(cycle),
+        }
 
 # -----------------------------------------------------------------------------
 # 1. Single Investigation Lifecycle State Machine
@@ -862,20 +933,42 @@ class AdaptiveInvestigationEngine:
                 try:
                     threads = adapter.get_threads(pid_val)
                     contended_locks = []
-                    deadlock_detected = False
                     waiters_by_lock: Dict[str, List[int]] = {}
+                    wait_for_graph = WaitForGraph()
 
                     for t in threads:
                         if t.get("is_futex_wait") or t.get("state") in ("D", "BLOCKED_LOCK"):
-                            lock_addr = t.get("syscall_arg0") or t.get("waiting_on_lock")
-                            if lock_addr and isinstance(lock_addr, str) and lock_addr.startswith("0x") and lock_addr not in ("0x_lock", "0x_futex_lock", "0x0"):
+                            raw_lock = t.get("syscall_arg0") or t.get("syscall_arg0_int") or t.get("waiting_on_lock")
+                            norm_hex, norm_int, addr_st, raw_arg = normalize_futex_address(raw_lock)
+                            if addr_st == "WAIT_ADDRESS_OBSERVED" and norm_hex:
+                                lock_addr = norm_hex
+                                lock_addr_int = norm_int
                                 t["waiting_on_lock"] = lock_addr
                                 t["lock_address_status"] = "OBSERVED"
+                                t["wait_address_status"] = "WAIT_ADDRESS_OBSERVED"
                                 waiters_by_lock.setdefault(lock_addr, []).append(t["tid"])
+
+                                owner_tid = None
+                                if hasattr(adapter, "resolve_mutex_owner") and lock_addr_int:
+                                    owner_tid = adapter.resolve_mutex_owner(pid_val, lock_addr_int)
+                                t["owner_tid"] = owner_tid
+                                t["lock_owner_identified"] = bool(owner_tid)
+
+                                wait_for_graph.add_edge(WaitForEdge(
+                                    waiter_tid=t["tid"],
+                                    sync_object=lock_addr,
+                                    owner_tid=owner_tid,
+                                    source="pthread_mutex_memory" if owner_tid else "procfs_syscall",
+                                    timestamp=time.time(),
+                                ))
                             else:
                                 lock_addr = None
+                                lock_addr_int = None
                                 t["waiting_on_lock"] = None
                                 t["lock_address_status"] = "UNAVAILABLE"
+                                t["wait_address_status"] = addr_st
+                                t["lock_owner_identified"] = False
+                                t["owner_tid"] = None
 
                             t["blocked"] = True
                             t["state"] = "BLOCKED_LOCK" if lock_addr else t.get("state", "S")
@@ -883,14 +976,22 @@ class AdaptiveInvestigationEngine:
                             if lock_addr:
                                 contended_locks.append({
                                     "lock_address": lock_addr,
+                                    "lock_address_int": lock_addr_int,
+                                    "raw_lock_address": raw_arg,
                                     "waiter_tid": t["tid"],
+                                    "owner_tid": t.get("owner_tid"),
                                     "thread_name": t.get("name"),
                                     "wchan": t.get("wchan"),
+                                    "futex_wait_observed": bool(t.get("is_futex_wait")),
+                                    "wait_address_observed": True,
+                                    "lock_owner_identified": bool(t.get("owner_tid")),
                                     "status": "OBSERVED",
                                 })
 
                     # Lock contention is observed when multiple threads wait on the same identified lock address
                     lock_contention_observed = any(len(w_tids) > 1 for w_tids in waiters_by_lock.values())
+                    deadlock_cycle = wait_for_graph.find_cycle()
+                    deadlock_detected = bool(deadlock_cycle)
 
                     return {
                         "success": True,
@@ -899,6 +1000,8 @@ class AdaptiveInvestigationEngine:
                         "contended_locks": contended_locks,
                         "lock_contention_observed": lock_contention_observed,
                         "deadlock_detected": deadlock_detected,
+                        "deadlock_cycle": deadlock_cycle,
+                        "wait_for_graph": wait_for_graph.to_dict(),
                         "bytes_read": len(threads) * 128,
                         "measured_bytes_read": len(threads) * 128,
                     }
@@ -931,7 +1034,7 @@ class AdaptiveInvestigationEngine:
                 try:
                     mem_info = adapter.get_process_memory_info(pid_val) if hasattr(adapter, "get_process_memory_info") else {}
                     st = mem_info.get("status", "OBSERVED")
-                    if st in ("PERMISSION_DENIED", "TARGET_TERMINATED", "FAILED"):
+                    if st in ("PERMISSION_DENIED", "TARGET_TERMINATED", "FAILED", "UNAVAILABLE"):
                         return {
                             "success": False,
                             "status": st,
@@ -939,6 +1042,7 @@ class AdaptiveInvestigationEngine:
                             "regions_inspected": [],
                             "memory_growth_candidates": [],
                             "bytes_read": 0,
+                            "measured_bytes_read": 0,
                         }
 
                     maps = adapter.get_proc_maps(pid_val) if hasattr(adapter, "get_proc_maps") else []
@@ -963,8 +1067,13 @@ class AdaptiveInvestigationEngine:
                             "target_expression": "[heap]",
                             "region": "[heap]",
                             "current_size": heap_size,
-                            "current_rss": rss_bytes,
+                            "current_heap_mapping_size": heap_size,
+                            "current_rss": None,  # procfs does NOT measure heap-specific RSS without an extensive smaps scan
+                            "heap_rss_bytes": None,
+                            "process_rss_bytes": rss_bytes,
                             "category": "heap",
+                            "severity": "MEDIUM",
+                            "candidate_tier": "ANOMALY_CANDIDATE_SCREENING_FLAG",
                             "screening_flag": "ANOMALY_CANDIDATE_SCREENING_FLAG",
                             "screening_rationale": (
                                 f"Heap mapping size ({heap_size // (1024*1024)}MB) exceeds screening threshold "
@@ -972,14 +1081,20 @@ class AdaptiveInvestigationEngine:
                                 f"Temporal observation required."
                             ),
                             "follow_up_profile_id": "insp_temporal_diff",
+                            "measurement_scope": "heap_mapping",
                         })
                     if anon_size > anon_thresh:
                         growth_candidates.append({
                             "target_expression": "anonymous_mmap",
                             "region": "anonymous",
                             "current_size": anon_size,
-                            "current_rss": rss_anon_bytes or rss_bytes,
+                            "current_anon_mapping_size": anon_size,
+                            "current_rss": rss_anon_bytes,
+                            "anon_rss_bytes": rss_anon_bytes,
+                            "process_rss_bytes": rss_bytes,
                             "category": "anonymous",
+                            "severity": "LOW",
+                            "candidate_tier": "ANOMALY_CANDIDATE_SCREENING_FLAG",
                             "screening_flag": "ANOMALY_CANDIDATE_SCREENING_FLAG",
                             "screening_rationale": (
                                 f"Writable anonymous mapping size ({anon_size // (1024*1024)}MB) exceeds screening threshold "
@@ -987,21 +1102,27 @@ class AdaptiveInvestigationEngine:
                                 f"Temporal observation required."
                             ),
                             "follow_up_profile_id": "insp_temporal_diff",
+                            "measurement_scope": "anon_mapping",
                         })
 
                     regions_inspected = list(sorted(set(m.get("category", "unknown") for m in maps)))
-                    meas_b = len(maps) * 64 + 1024
+                    meas_b = int(mem_info.get("actual_bytes_read", len(maps) * 64 + 1024))
                     return {
                         "success": True,
-                        "status": "OBSERVED",
+                        "status": "OBSERVED" if not mem_info.get("missing_required_metrics") else "PARTIAL",
                         "total_virtual_bytes": total_bytes,
                         "vsz_bytes": vsz_bytes,
                         "rss_bytes": rss_bytes,
                         "rss_anon_bytes": rss_anon_bytes,
                         "heap_size": heap_size,
+                        "heap_rss_bytes": None,
+                        "heap_physical_residency_available": False,
                         "anonymous_size": anon_size,
                         "memory_metrics": metrics,
                         "metadata": mem_info.get("metadata", {}),
+                        "sources_status": mem_info.get("sources_status", {}),
+                        "missing_optional_metrics": mem_info.get("missing_optional_metrics", []),
+                        "missing_required_metrics": mem_info.get("missing_required_metrics", []),
                         "regions_inspected": regions_inspected,
                         "memory_growth_candidates": growth_candidates,
                         "bytes_read": meas_b,
@@ -1065,26 +1186,59 @@ class AdaptiveInvestigationEngine:
                         nvcs1 = t1.get("nonvoluntary_ctxt_switches", 0)
                         is_stalled = (vcs0 == vcs1 and nvcs0 == nvcs1 and t1.get("is_futex_wait"))
 
-                        raw_lock = t_cand.get("syscall_arg0") or t_cand.get("waiting_on_lock")
-                        if raw_lock and isinstance(raw_lock, str) and raw_lock.startswith("0x") and raw_lock not in ("0x_lock", "0x_futex_lock", "0x0"):
-                            lock_addr = raw_lock
+                        raw_lock = t_cand.get("syscall_arg0") or t_cand.get("syscall_arg0_int") or t_cand.get("waiting_on_lock")
+                        norm_hex, norm_int, addr_st, raw_arg = normalize_futex_address(raw_lock)
+                        if addr_st == "WAIT_ADDRESS_OBSERVED" and norm_hex:
+                            lock_addr = norm_hex
+                            lock_addr_int = norm_int
                             lock_st = "OBSERVED"
                         else:
                             lock_addr = None
+                            lock_addr_int = None
                             lock_st = "UNAVAILABLE"
 
-                        # Distinguish: futex wait with unchanged context switches is thread contention stall, NOT deadlock confirmed
-                        cond = "thread_contention_stall_observed" if is_stalled else "uncontended_or_normal_progress"
+                        # Build wait-for graph across all waiting threads in threads_1
+                        wait_for_graph = WaitForGraph()
+                        for th in threads_1:
+                            if th.get("is_futex_wait") or th.get("state") in ("D", "BLOCKED_LOCK"):
+                                th_l = th.get("syscall_arg0") or th.get("syscall_arg0_int") or th.get("waiting_on_lock")
+                                th_hex, th_int, th_st, _ = normalize_futex_address(th_l)
+                                if th_st == "WAIT_ADDRESS_OBSERVED" and th_hex and th_int:
+                                    th_owner = adapter.resolve_mutex_owner(pid_val, th_int) if hasattr(adapter, "resolve_mutex_owner") else None
+                                    wait_for_graph.add_edge(WaitForEdge(
+                                        waiter_tid=th["tid"],
+                                        sync_object=th_hex,
+                                        owner_tid=th_owner,
+                                        source="pthread_mutex_memory" if th_owner else "procfs_syscall",
+                                        timestamp=time.time(),
+                                    ))
+
+                        cycle = wait_for_graph.find_cycle()
+                        owner_tid = adapter.resolve_mutex_owner(pid_val, lock_addr_int) if (hasattr(adapter, "resolve_mutex_owner") and lock_addr_int) else None
+
+                        # Distinguish: thread contention stall vs uncontended or normal progress
+                        if is_stalled:
+                            cond = "thread_contention_stall_observed"
+                        else:
+                            cond = "uncontended_or_normal_progress"
+
                         return {
                             "success": True,
                             "status": "OBSERVED",
                             "observed_condition": cond,
-                            "legacy_observed_condition": "stalled_owner_or_deadlock_confirmed" if is_stalled else "uncontended_or_normal_progress",
+                            "legacy_observed_condition": cond,
                             "tid": t_id,
                             "thread_name": t_cand.get("name"),
                             "is_stalled": is_stalled,
                             "lock_address": lock_addr,
+                            "lock_address_int": lock_addr_int,
+                            "raw_lock_address": raw_arg,
                             "lock_address_status": lock_st,
+                            "owner_tid": owner_tid,
+                            "lock_owner_identified": bool(owner_tid),
+                            "deadlock_cycle": cycle,
+                            "circular_deadlock_confirmed": bool(cycle),
+                            "wait_for_graph": wait_for_graph.to_dict(),
                             "concurrency_state": t_cand.get("concurrency_state", "WAITING_IN_FUTEX" if t1.get("is_futex_wait") else "RUNNING"),
                             "bytes_read": 512,
                             "measured_bytes_read": 512,
@@ -1188,12 +1342,28 @@ class AdaptiveInvestigationEngine:
             wait_ms = int(kw.pop("wait_ms", 30))
             num_samples = int(kw.pop("num_samples", 3))
             num_samples = max(2, min(4, num_samples))
+            budget_tracker = kw.get("budget_tracker")
 
             if wm and hasattr(wm, "capture_and_diff_expressions") and exprs and exprs[0] not in ("[heap]", "anonymous_mmap", "heap_or_pool"):
                 try:
                     return wm.capture_and_diff_expressions(expressions=exprs, wait_ms=wait_ms, **kw)
                 except Exception:
                     pass
+
+            # Determine explicit measurement scope and metric name
+            target_name = (target_expr or "process_rss").lower()
+            if "heap" in target_name:
+                measurement_scope = "heap_mapping"
+                metric_name = "heap_mapping_size_bytes"
+            elif "anon" in target_name:
+                measurement_scope = "anon_mapping"
+                metric_name = "anon_mapping_size_bytes"
+            elif "vsz" in target_name:
+                measurement_scope = "process_vsz"
+                metric_name = "vsz_bytes"
+            else:
+                measurement_scope = "process_rss"
+                metric_name = "process_rss_bytes"
 
             # Live target adapter multi-sample temporal sequence
             pid_val = kw.get("pid")
@@ -1202,12 +1372,82 @@ class AdaptiveInvestigationEngine:
                 try:
                     alive, l_err = adapter.check_liveness(pid_val) if hasattr(adapter, "check_liveness") else (True, None)
                     if not alive:
-                        return {"success": False, "status": "TARGET_TERMINATED", "error": l_err or f"Target PID {pid_val} is not running", "bytes_read": 0}
+                        return {
+                            "success": False,
+                            "status": "TARGET_TERMINATED",
+                            "error": l_err or f"Target PID {pid_val} is not running",
+                            "measurement_scope": measurement_scope,
+                            "metric_name": metric_name,
+                            "samples": [],
+                            "bytes_read": 0,
+                            "measured_bytes_read": 0,
+                        }
 
                     samples = []
                     t0 = time.time()
+                    t_start_wall = time.monotonic()
+                    actual_bytes_total = 0
 
                     for s_idx in range(num_samples):
+                        # Pre-sample wall-clock and byte budget check
+                        if budget_tracker:
+                            cur_elapsed = budget_tracker.elapsed_ms
+                            rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
+                            if s_idx > 0 and rem_wall_ms < float(wait_ms):
+                                return {
+                                    "success": True if len(samples) >= 1 else False,
+                                    "status": "PARTIAL" if len(samples) >= 1 else "BUDGET_EXHAUSTED",
+                                    "stop_reason": "BUDGET_EXHAUSTED",
+                                    "exhaustion_reason": f"Wall-clock budget exhausted before sample {s_idx} ({cur_elapsed:.1f}ms elapsed, remaining {rem_wall_ms:.1f}ms < wait_ms {wait_ms}ms)",
+                                    "samples": samples,
+                                    "num_samples": len(samples),
+                                    "measurement_scope": measurement_scope,
+                                    "metric_name": metric_name,
+                                    "observed_condition": "INSUFFICIENT_REGION_EVIDENCE" if len(samples) < 2 else "PROCESS_MEMORY_STABLE",
+                                    "legacy_observed_condition": "stable_or_reclaimed_allocation",
+                                    "is_temporal_sample": True,
+                                    "bytes_read": actual_bytes_total,
+                                    "measured_bytes_read": actual_bytes_total,
+                                    "actual_duration_ms": round((time.monotonic() - t_start_wall) * 1000.0, 2),
+                                }
+
+                            rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
+                            if rem_bytes < 1024:
+                                return {
+                                    "success": True if len(samples) >= 1 else False,
+                                    "status": "PARTIAL" if len(samples) >= 1 else "BUDGET_EXHAUSTED",
+                                    "stop_reason": "BUDGET_EXHAUSTED",
+                                    "exhaustion_reason": f"Byte budget exhausted before sample {s_idx} (remaining {rem_bytes}B < 1024B)",
+                                    "samples": samples,
+                                    "num_samples": len(samples),
+                                    "measurement_scope": measurement_scope,
+                                    "metric_name": metric_name,
+                                    "observed_condition": "INSUFFICIENT_REGION_EVIDENCE" if len(samples) < 2 else "PROCESS_MEMORY_STABLE",
+                                    "legacy_observed_condition": "stable_or_reclaimed_allocation",
+                                    "is_temporal_sample": True,
+                                    "bytes_read": actual_bytes_total,
+                                    "measured_bytes_read": actual_bytes_total,
+                                    "actual_duration_ms": round((time.monotonic() - t_start_wall) * 1000.0, 2),
+                                }
+
+                            if budget_tracker.metrics.samples_collected >= budget_tracker.limits.max_samples:
+                                return {
+                                    "success": True if len(samples) >= 1 else False,
+                                    "status": "PARTIAL" if len(samples) >= 1 else "BUDGET_EXHAUSTED",
+                                    "stop_reason": "BUDGET_EXHAUSTED",
+                                    "exhaustion_reason": f"Sample count limit ({budget_tracker.limits.max_samples}) reached before sample {s_idx}",
+                                    "samples": samples,
+                                    "num_samples": len(samples),
+                                    "measurement_scope": measurement_scope,
+                                    "metric_name": metric_name,
+                                    "observed_condition": "INSUFFICIENT_REGION_EVIDENCE" if len(samples) < 2 else "PROCESS_MEMORY_STABLE",
+                                    "legacy_observed_condition": "stable_or_reclaimed_allocation",
+                                    "is_temporal_sample": True,
+                                    "bytes_read": actual_bytes_total,
+                                    "measured_bytes_read": actual_bytes_total,
+                                    "actual_duration_ms": round((time.monotonic() - t_start_wall) * 1000.0, 2),
+                                }
+
                         if s_idx > 0:
                             time.sleep(max(wait_ms, 20) / 1000.0)
 
@@ -1218,19 +1458,33 @@ class AdaptiveInvestigationEngine:
                                 "status": "TARGET_TERMINATED",
                                 "error": f"Target process {pid_val} terminated during temporal sampling at sample {s_idx}",
                                 "samples_collected": len(samples),
-                                "bytes_read": len(samples) * 512,
+                                "samples": samples,
+                                "measurement_scope": measurement_scope,
+                                "metric_name": metric_name,
+                                "bytes_read": actual_bytes_total,
+                                "measured_bytes_read": actual_bytes_total,
                             }
 
                         mem_info = adapter.get_process_memory_info(pid_val) if hasattr(adapter, "get_process_memory_info") else {}
                         st = mem_info.get("status", "OBSERVED")
-                        if st in ("PERMISSION_DENIED", "TARGET_TERMINATED"):
+                        if st in ("PERMISSION_DENIED", "TARGET_TERMINATED", "FAILED", "UNAVAILABLE"):
                             return {
                                 "success": False,
                                 "status": st,
                                 "error": mem_info.get("error", f"Memory query failed: {st}"),
                                 "samples_collected": len(samples),
-                                "bytes_read": len(samples) * 512,
+                                "samples": samples,
+                                "measurement_scope": measurement_scope,
+                                "metric_name": metric_name,
+                                "bytes_read": actual_bytes_total,
+                                "measured_bytes_read": actual_bytes_total,
                             }
+
+                        sample_bytes = int(mem_info.get("actual_bytes_read", 2048))
+                        actual_bytes_total += sample_bytes
+                        if budget_tracker:
+                            budget_tracker.record_read(bytes_read=sample_bytes, latency_us=1000.0, profile_id="insp_temporal_diff")
+                            budget_tracker.record_sample(profile_id="insp_temporal_diff")
 
                         maps = adapter.get_proc_maps(pid_val) if hasattr(adapter, "get_proc_maps") else []
                         heap_sz = sum(m.get("size", 0) for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]")
@@ -1242,17 +1496,23 @@ class AdaptiveInvestigationEngine:
                         rss_val = metrics.get("rss_bytes", 0) or 0
                         anon_rss_val = metrics.get("rss_anon_bytes", 0) or 0
 
-                        target_name = (target_expr or "[heap]").lower()
-                        if "anon" in target_name:
-                            target_metric = anon_rss_val if anon_rss_val > 0 else anon_sz
+                        if measurement_scope == "heap_mapping":
+                            target_metric = heap_sz
+                        elif measurement_scope == "anon_mapping":
+                            target_metric = anon_sz
+                        elif measurement_scope == "process_vsz":
+                            target_metric = vsz_val
                         else:
-                            target_metric = rss_val if rss_val > 0 else heap_sz
+                            target_metric = rss_val
 
                         now = time.time()
                         samples.append({
                             "sample_index": s_idx,
                             "timestamp": now,
                             "elapsed_ms": round((now - t0) * 1000.0, 2),
+                            "measurement_scope": measurement_scope,
+                            "metric_name": metric_name,
+                            "target_metric_bytes": target_metric,
                             "vsz_bytes": vsz_val,
                             "rss_bytes": rss_val,
                             "rss_anon_bytes": anon_rss_val,
@@ -1260,8 +1520,27 @@ class AdaptiveInvestigationEngine:
                             "anon_mapping_size": anon_sz,
                             "total_mapping_size": total_map_sz,
                             "mapping_count": len(maps),
-                            "target_metric_bytes": target_metric,
+                            "heap_rss_bytes": None,  # Explicitly null: procfs cannot measure heap RSS without smaps scan
                         })
+
+                    if len(samples) < 2:
+                        return {
+                            "success": True,
+                            "status": "PARTIAL",
+                            "observed_condition": "INSUFFICIENT_REGION_EVIDENCE",
+                            "legacy_observed_condition": "stable_or_reclaimed_allocation",
+                            "condition_detail": "Fewer than 2 temporal samples collected; insufficient evidence for delta analysis.",
+                            "growth_detected": False,
+                            "growth_delta_bytes": 0,
+                            "samples": samples,
+                            "num_samples": len(samples),
+                            "measurement_scope": measurement_scope,
+                            "metric_name": metric_name,
+                            "heap_rss_bytes": None,
+                            "is_temporal_sample": True,
+                            "bytes_read": actual_bytes_total,
+                            "measured_bytes_read": actual_bytes_total,
+                        }
 
                     deltas = [
                         samples[i]["target_metric_bytes"] - samples[i - 1]["target_metric_bytes"]
@@ -1306,57 +1585,74 @@ class AdaptiveInvestigationEngine:
 
                     if is_burst_and_drop:
                         observed_cond = "temporary_workload_buffering"
-                        cond_detail = "Memory burst occurred during workload activity followed by reclamation; workload buffering, not leak."
+                        scoped_cond = "PROCESS_RSS_BURST_AND_RECLAIM"
+                        conditions = ["temporary_workload_buffering", "PROCESS_RSS_BURST_AND_RECLAIM"]
+                        cond_detail = f"Memory burst occurred during workload activity followed by reclamation in {measurement_scope}; temporary workload buffering, not leak."
                         growth_detected = False
                     elif is_mapping_only_expansion:
                         observed_cond = "mapping_expansion_without_allocation"
-                        cond_detail = "Virtual memory mappings expanded (VSZ growth) without corresponding physical page allocation or RSS growth."
+                        scoped_cond = "HEAP_MAPPING_EXPANSION" if measurement_scope == "heap_mapping" else "ANON_MAPPING_EXPANSION"
+                        conditions = ["mapping_expansion_without_allocation", scoped_cond]
+                        cond_detail = f"Virtual memory mappings expanded in {measurement_scope} without physical page allocation."
                         growth_detected = False
                     elif is_allocator_retention:
                         observed_cond = "allocator_retention"
-                        cond_detail = "Memory allocated and retained by runtime allocator/freelist pool; stable bounds across subsequent intervals."
+                        scoped_cond = "allocator_retention"
+                        conditions = ["allocator_retention"]
+                        cond_detail = f"Memory allocated and retained by runtime allocator/freelist pool in {measurement_scope}; stable bounds across subsequent intervals."
                         growth_detected = False
                     elif is_sustained_growth:
                         observed_cond = "sustained_monotonic_growth"
+                        scoped_cond = "PROCESS_RSS_SUSTAINED_GROWTH" if measurement_scope == "process_rss" else ("HEAP_MAPPING_EXPANSION" if measurement_scope == "heap_mapping" else "ANON_MAPPING_EXPANSION")
+                        conditions = ["sustained_monotonic_growth", scoped_cond]
                         cond_detail = (
-                            "Sustained monotonic memory growth observed across all temporal sampling intervals. "
-                            "Screening flag elevated; procfs measurements alone cannot certify a memory leak without allocation lifetime verification."
+                            f"Sustained monotonic memory growth observed in {measurement_scope} across all temporal sampling intervals. "
+                            f"Screening flag elevated; procfs measurements alone cannot prove a memory leak without allocation lifetime verification."
                         )
                         growth_detected = True
                     elif total_target_delta <= 0:
                         observed_cond = "stable_or_reclaimed_allocation"
-                        cond_detail = "Memory usage remained stable or was reclaimed across temporal samples."
+                        scoped_cond = "PROCESS_MEMORY_STABLE"
+                        conditions = ["stable_or_reclaimed_allocation", "PROCESS_MEMORY_STABLE"]
+                        cond_detail = f"Memory usage remained stable or was reclaimed in {measurement_scope} across temporal samples."
                         growth_detected = False
                     else:
                         observed_cond = "sustained_monotonic_growth"
-                        cond_detail = "Net memory growth observed across temporal sampling sequence."
+                        scoped_cond = "PROCESS_RSS_SUSTAINED_GROWTH" if measurement_scope == "process_rss" else ("HEAP_MAPPING_EXPANSION" if measurement_scope == "heap_mapping" else "ANON_MAPPING_EXPANSION")
+                        conditions = ["sustained_monotonic_growth", scoped_cond]
+                        cond_detail = f"Net memory growth observed in {measurement_scope} across temporal sampling sequence."
                         growth_detected = True
 
-                    meas_bytes = len(samples) * 512
                     return {
                         "success": True,
                         "status": "OBSERVED",
                         "observed_condition": observed_cond,
-                        "legacy_observed_condition": "monotonic_unreleased_growth_with_orphans" if growth_detected else "stable_or_reclaimed_allocation",
+                        "scoped_condition": scoped_cond,
+                        "conditions": conditions,
+                        "legacy_observed_condition": observed_cond,
                         "condition_detail": cond_detail,
                         "growth_detected": growth_detected,
                         "growth_delta_bytes": total_target_delta,
                         "initial_size": samples[0]["target_metric_bytes"],
                         "final_size": samples[-1]["target_metric_bytes"],
+                        "measurement_scope": measurement_scope,
+                        "metric_name": metric_name,
+                        "heap_rss_bytes": None,
                         "samples": samples,
                         "num_samples": len(samples),
                         "sampling_interval_ms": wait_ms,
                         "is_temporal_sample": True,
-                        "bytes_read": meas_bytes,
-                        "measured_bytes_read": meas_bytes,
+                        "bytes_read": actual_bytes_total,
+                        "measured_bytes_read": actual_bytes_total,
+                        "actual_duration_ms": round((time.monotonic() - t_start_wall) * 1000.0, 2),
                     }
                 except PermissionError as exc:
-                    return {"success": False, "status": "PERMISSION_DENIED", "error": str(exc), "bytes_read": 0}
+                    return {"success": False, "status": "PERMISSION_DENIED", "error": str(exc), "bytes_read": 0, "measured_bytes_read": 0}
                 except ProcessLookupError:
-                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "bytes_read": 0}
+                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "bytes_read": 0, "measured_bytes_read": 0}
                 except Exception as exc:
-                    return {"success": False, "status": "FAILED", "error": str(exc), "bytes_read": 0}
-            return {"success": True, "status": "OBSERVED", "observed_condition": "stable_or_reclaimed_allocation", "bytes_read": 0}
+                    return {"success": False, "status": "FAILED", "error": str(exc), "bytes_read": 0, "measured_bytes_read": 0}
+            return {"success": True, "status": "OBSERVED", "observed_condition": "PROCESS_MEMORY_STABLE", "legacy_observed_condition": "stable_or_reclaimed_allocation", "bytes_read": 0}
 
         reg.register(FunctionalInspectionModule(p_temp, _exec_insp_temporal_diff))
 
@@ -2206,10 +2502,14 @@ class AdaptiveInvestigationEngine:
                 ev_rec.details["outcomes_by_hypothesis"] = dict(raw_obs_res["outcomes_by_hypothesis"])
             elif "observed_condition" in raw_obs_res:
                 cond = raw_obs_res["observed_condition"]
+                legacy_cond = raw_obs_res.get("legacy_observed_condition")
                 outcomes_map = {}
                 for hid, h_map in selected_obs.expected_outcomes_by_hypothesis.items():
-                    if isinstance(h_map, dict) and cond in h_map:
-                        outcomes_map[hid] = h_map[cond]
+                    if isinstance(h_map, dict):
+                        if cond in h_map:
+                            outcomes_map[hid] = h_map[cond]
+                        elif legacy_cond and legacy_cond in h_map:
+                            outcomes_map[hid] = h_map[legacy_cond]
                 ev_rec.details["outcomes_by_hypothesis"] = outcomes_map
 
             if res_cat not in (RESULT_DUPLICATE_EVIDENCE, RESULT_NO_NEW_EVIDENCE):

@@ -207,6 +207,7 @@ class FunctionalInspectionModule(InspectionModule):
                 "pid": c.pid,
                 "companion_elf_path": c.companion_elf,
                 "adapter": c.adapter,
+                "budget_tracker": c.budget_tracker,
                 **c.parameters,
             }
         )
