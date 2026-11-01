@@ -471,19 +471,32 @@ class TestPhase20A34DeadlockProofAndBudgetAudit(unittest.TestCase):
         graph = WaitForGraph()
         t0 = 1000.0
         t1 = 1002.5  # 2.5s skew > 2.0s limit
+        proc_ident = {"pid": 100, "process_start_time": 1000, "architecture": "x86_64", "elf_class": "ELF64", "endianness": "little"}
+        meta_1 = {"raw_bytes": b"\x01" * 40, "lock_word": 1, "owner": 102, "kind": 0, "count": 0, "target_tids": [101, 102]}
+        meta_2 = {"raw_bytes": b"\x01" * 40, "lock_word": 1, "owner": 101, "kind": 0, "count": 0, "target_tids": [101, 102]}
         graph.add_edge(WaitForEdge(
             waiter_tid=101,
             sync_object="0x1000",
             owner_tid=102,
             owner_identification_status=STATUS_OWNER_IDENTIFIED,
+            mutex_layout_id=LAYOUT_GLIBC_LP64,
+            memory_read_status="OBSERVED",
             observation_timestamp=t0,
+            target_pid=100,
+            process_identity=proc_ident,
+            metadata=meta_1,
         ))
         graph.add_edge(WaitForEdge(
             waiter_tid=102,
             sync_object="0x2000",
             owner_tid=101,
             owner_identification_status=STATUS_OWNER_IDENTIFIED,
+            mutex_layout_id=LAYOUT_GLIBC_LP64,
+            memory_read_status="OBSERVED",
             observation_timestamp=t1,
+            target_pid=100,
+            process_identity=proc_ident,
+            metadata=meta_2,
         ))
 
         cycle, category, issues = graph.validate_and_analyze(max_temporal_skew_sec=2.0)

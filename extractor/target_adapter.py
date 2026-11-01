@@ -114,6 +114,15 @@ STATUS_MUTEX_STATE_INVALID = "MUTEX_STATE_INVALID"
 STATUS_MEMORY_READ_UNAVAILABLE = "MEMORY_READ_UNAVAILABLE"
 STATUS_PERMISSION_DENIED = "PERMISSION_DENIED"
 
+# Libc / ABI Verification Statuses
+ABI_GLIBC_VERIFIED = "GLIBC_ABI_VERIFIED"
+ABI_MUSL_UNSUPPORTED = "MUSL_UNSUPPORTED"
+ABI_LIBC_UNKNOWN = "LIBC_UNKNOWN"
+ABI_STATIC_OR_UNIDENTIFIED = "STATIC_OR_UNIDENTIFIED_RUNTIME"
+ABI_ARCH_UNSUPPORTED = "ARCHITECTURE_UNSUPPORTED"
+ABI_ELF_CLASS_UNSUPPORTED = "ELF_CLASS_UNSUPPORTED"
+ABI_ENDIANNESS_UNSUPPORTED = "ENDIANNESS_UNSUPPORTED"
+
 LAYOUT_GLIBC_LP64 = "GLIBC_LP64_PTHREAD_MUTEX_V1"
 
 
@@ -263,6 +272,10 @@ class TargetExecutionAdapter(ABC):
         """Returns the measured byte count read during the last get_proc_maps call."""
         return getattr(self, "_last_maps_bytes_read", 0)
 
+    def get_last_identity_bytes_read(self) -> int:
+        """Returns the measured byte count read during the last get_process_identity call."""
+        return getattr(self, "_last_identity_bytes_read", 0)
+
     def close(self) -> None:
         """Clean up any active connection or temporary resources."""
         pass
@@ -291,8 +304,10 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         "close",
         "get_last_threads_bytes_read",
         "get_last_maps_bytes_read",
+        "get_last_identity_bytes_read",
         "_last_threads_bytes_read",
         "_last_maps_bytes_read",
+        "_last_identity_bytes_read",
     }
 
     def __init__(self, inner: TargetExecutionAdapter):
@@ -337,6 +352,9 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
 
     def get_last_maps_bytes_read(self) -> int:
         return self._inner.get_last_maps_bytes_read()
+
+    def get_last_identity_bytes_read(self) -> int:
+        return self._inner.get_last_identity_bytes_read()
 
     def normalize_futex_address(self, val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
         return self._inner.normalize_futex_address(val)
@@ -384,6 +402,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
     def __init__(self, memory_reader_fn: Optional[Callable[[int, int, int], Tuple[Optional[bytes], str, Optional[str]]]] = None):
         self._memory_reader = memory_reader_fn
+        self._last_threads_bytes_read: int = 0
+        self._last_maps_bytes_read: int = 0
+        self._last_identity_bytes_read: int = 0
 
     def is_remote(self) -> bool:
         return False
@@ -480,10 +501,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         # 2. Extract process start time from /proc/<pid>/stat (field 22, 1-based)
         start_time = None
         stat_path = f"/proc/{pid}/stat"
+        total_ident_bytes = 0
         if os.path.exists(stat_path):
             try:
                 with open(stat_path, "r", encoding="utf-8", errors="replace") as f:
                     stat_content = f.read()
+                total_ident_bytes += len(stat_content.encode("utf-8", errors="replace"))
                 r_paren = stat_content.rfind(")")
                 if r_paren != -1:
                     rest_fields = stat_content[r_paren + 1:].split()
@@ -498,8 +521,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         if elf_target:
             try:
                 runtime_identity = inspect_elf(elf_target)
+                total_ident_bytes += 64  # ELF identification and header bytes read
             except Exception:
                 pass
+
+        self._last_identity_bytes_read = total_ident_bytes
 
         return {
             "pid": pid,
@@ -508,6 +534,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "is_deleted": is_deleted,
             "process_start_time": start_time,
             "architecture": runtime_identity.architecture if runtime_identity else "unknown",
+            "elf_class": runtime_identity.elf_class if runtime_identity else "unknown",
+            "endianness": runtime_identity.endianness if runtime_identity else "unknown",
             "elf_type": runtime_identity.elf_type if runtime_identity else "unknown",
             "build_id": runtime_identity.build_id if runtime_identity else None,
             "pt_loads": runtime_identity.pt_loads if runtime_identity else [],
@@ -1253,25 +1281,96 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 error=f"Invalid lock address integer: {lock_addr_int}",
             )
 
-        # 1. Architecture and Libc Validation
+        # 1. Architecture, Libc, and ELF ABI Validation
+        # Supported Glibc LP64 ABI Layout (glibc NPTL struct pthread_mutex_t):
+        # - offset  0: int32_t  __lock   (0=unlocked, 1=locked, 2=contended, or FUTEX_WAITERS|TID for PI)
+        # - offset  4: uint32_t __count  (recursion count; 0 for normal non-recursive mutex)
+        # - offset  8: int32_t  __owner  (owner thread ID, 0 < tid < 4,194,304)
+        # - offset 12: uint32_t __nusers
+        # - offset 16: int32_t  __kind   (base kind 0..3 + flags: 0x10=robust, 0x20=pi, 0x80=shared, -1=destroyed)
+        # - Supported target environments: Linux LP64 x86_64 and aarch64 glibc (ELF64, Little-Endian).
         proc_ident = self.get_process_identity(pid) if hasattr(self, "get_process_identity") else {}
-        arch = (proc_ident.get("architecture") or os.uname().machine).lower()
+        if proc_ident.get("status") == "TARGET_TERMINATED":
+            return MutexOwnerResolutionResult(
+                status=STATUS_OWNER_NOT_IDENTIFIED,
+                error="Target process terminated",
+            )
+
+        arch = (proc_ident.get("architecture") or "unknown").lower()
+        if not arch or arch == "unknown":
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+                layout_id=ABI_ARCH_UNSUPPORTED,
+                error="Target architecture cannot be established; fallback to host architecture is strictly forbidden",
+                metadata={"abi_status": ABI_ARCH_UNSUPPORTED, "architecture": "unknown"},
+            )
         if arch not in ("x86_64", "aarch64", "amd64", "arm64"):
             return MutexOwnerResolutionResult(
                 status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
-                layout_id=f"UNSUPPORTED_ARCH_{arch}",
+                layout_id=ABI_ARCH_UNSUPPORTED,
                 error=f"Architecture '{arch}' pthread_mutex_t layout is unsupported (only LP64 x86_64 and aarch64 glibc supported)",
+                metadata={"abi_status": ABI_ARCH_UNSUPPORTED, "architecture": arch},
             )
 
-        # Check for non-glibc runtimes (e.g. musl libc)
+        elf_class = proc_ident.get("elf_class") or "unknown"
+        if elf_class == "ELF32":
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+                layout_id=ABI_ELF_CLASS_UNSUPPORTED,
+                error="Target is 32-bit ELF (ELF32); LP64 glibc pthread_mutex layout requires ELF64",
+                metadata={"abi_status": ABI_ELF_CLASS_UNSUPPORTED, "elf_class": elf_class, "architecture": arch},
+            )
+        if elf_class != "ELF64":
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+                layout_id=ABI_ELF_CLASS_UNSUPPORTED,
+                error=f"Target ELF class '{elf_class}' unsupported; only ELF64 supported",
+                metadata={"abi_status": ABI_ELF_CLASS_UNSUPPORTED, "elf_class": elf_class, "architecture": arch},
+            )
+
+        endianness = (proc_ident.get("endianness") or "unknown").lower()
+        if endianness not in ("little", "1", "le"):
+            return MutexOwnerResolutionResult(
+                status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+                layout_id=ABI_ENDIANNESS_UNSUPPORTED,
+                error=f"Target endianness '{endianness}' unsupported; only little-endian LP64 supported",
+                metadata={"abi_status": ABI_ENDIANNESS_UNSUPPORTED, "endianness": endianness, "architecture": arch},
+            )
+
+        # Check for libc runtime evidence in /proc/<pid>/maps
         maps = self.get_proc_maps(pid)
         has_musl = any("musl" in (m.get("pathname", "").lower()) for m in maps)
         if has_musl:
             return MutexOwnerResolutionResult(
                 status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
-                layout_id="MUSL_UNSUPPORTED",
+                layout_id=ABI_MUSL_UNSUPPORTED,
                 error="musl libc pthread_mutex_t internal layout is unsupported (does not follow glibc NPTL struct layout)",
+                metadata={"abi_status": ABI_MUSL_UNSUPPORTED, "architecture": arch, "elf_class": elf_class, "endianness": endianness},
             )
+
+        # Positive evidence check for supported GNU C Library (glibc)
+        has_glibc = any(
+            ("libc.so.6" in m.get("pathname", "").lower() or
+             "libc-" in m.get("pathname", "").lower() or
+             "ld-linux" in m.get("pathname", "").lower())
+            for m in maps
+        )
+        if not has_glibc:
+            has_shared_libs = any(m.get("pathname", "").endswith(".so") or ".so." in m.get("pathname", "") for m in maps)
+            if not has_shared_libs:
+                return MutexOwnerResolutionResult(
+                    status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+                    layout_id=ABI_STATIC_OR_UNIDENTIFIED,
+                    error="Target binary is statically linked or unidentified runtime; pthread_mutex decoding unsupported",
+                    metadata={"abi_status": ABI_STATIC_OR_UNIDENTIFIED, "architecture": arch, "elf_class": elf_class, "endianness": endianness},
+                )
+            else:
+                return MutexOwnerResolutionResult(
+                    status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
+                    layout_id=ABI_LIBC_UNKNOWN,
+                    error="Target libc runtime is unknown or unsupported (no glibc markers detected)",
+                    metadata={"abi_status": ABI_LIBC_UNKNOWN, "architecture": arch, "elf_class": elf_class, "endianness": endianness},
+                )
 
         # 2. Read Mutex Memory (glibc LP64 layout requires 40 bytes)
         t_start_read = time.monotonic()
@@ -1282,22 +1381,16 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             return MutexOwnerResolutionResult(
                 status=STATUS_PERMISSION_DENIED,
                 error=err or f"Permission denied reading memory at 0x{lock_addr_int:x}",
-                metadata={"memory_read_status": st, "latency_us": read_latency_us},
+                metadata={"abi_status": ABI_GLIBC_VERIFIED, "memory_read_status": st, "latency_us": read_latency_us, "read_bytes_len": 0},
             )
         if st != "OBSERVED" or not raw or len(raw) < 20:
             return MutexOwnerResolutionResult(
                 status=STATUS_MEMORY_READ_UNAVAILABLE,
                 error=err or f"Memory read at 0x{lock_addr_int:x} returned {st} (bytes={len(raw) if raw else 0})",
-                metadata={"memory_read_status": st, "latency_us": read_latency_us},
+                metadata={"abi_status": ABI_GLIBC_VERIFIED, "memory_read_status": st, "latency_us": read_latency_us, "read_bytes_len": len(raw) if raw else 0},
             )
 
         # 3. Unpack and Validate Mutex Structure
-        # glibc LP64 layout:
-        # offset 0: int32 __lock
-        # offset 4: uint32 __count
-        # offset 8: int32 __owner
-        # offset 12: uint32 __nusers
-        # offset 16: int32 __kind
         import struct as _struct
         try:
             m_lock, m_count, m_owner, m_nusers, m_kind = _struct.unpack("<iIiIi", raw[:20])
@@ -1310,8 +1403,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
         layout_id = LAYOUT_GLIBC_LP64
         meta = {
+            "abi_status": ABI_GLIBC_VERIFIED,
             "layout_id": layout_id,
             "architecture": arch,
+            "elf_class": elf_class,
+            "endianness": endianness,
             "lock_word": m_lock,
             "count": m_count,
             "owner": m_owner,
@@ -1335,6 +1431,15 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
         # Base kind must be 0 (TIMED/NORMAL), 1 (RECURSIVE), 2 (ERRORCHECK), 3 (ADAPTIVE)
         base_kind = m_kind & 0x03
+        is_robust = bool(m_kind & 0x10)
+        is_pi = bool(m_kind & 0x20)
+        is_pp = bool(m_kind & 0x40)
+
+        meta["base_kind"] = base_kind
+        meta["is_robust"] = is_robust
+        meta["is_pi"] = is_pi
+        meta["is_pp"] = is_pp
+
         # Known valid flag bits in glibc:
         # 0x10 (ROBUST), 0x20 (PRIO_INHERIT), 0x40 (PRIO_PROTECT), 0x80 (SHARED), 0x100 (ELISION), 0x200 (NO_ELISION)
         valid_flags_mask = 0x03 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200
@@ -1346,7 +1451,25 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 metadata=meta,
                 error=f"Invalid mutex kind {m_kind} (unknown flags 0x{m_kind:x}); bytes do not represent a valid pthread_mutex_t",
             )
-        meta["base_kind"] = base_kind
+
+        # Handle Robust mutexes (0x10):
+        # In robust mutexes, if owner died, FUTEX_OWNER_DIED (0x40000000) is set in __lock
+        if is_robust and (m_lock & 0x40000000):
+            return MutexOwnerResolutionResult(
+                status=STATUS_OWNER_NOT_IDENTIFIED,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error="Robust mutex owner died (FUTEX_OWNER_DIED); no active owner exists",
+            )
+
+        # Handle Priority-Inheritance (PI) mutexes (0x20):
+        # In PI mutexes, kernel stores owner TID in __lock (with FUTEX_WAITERS 0x80000000)
+        if is_pi:
+            futex_tid = m_lock & 0x3fffffff
+            if futex_tid > 0:
+                m_owner = futex_tid
+                meta["owner"] = m_owner
 
         # Validate __lock:
         # If __lock == 0, mutex is unlocked
@@ -1361,7 +1484,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
         # Validate __count:
         # For non-recursive mutex (NORMAL or ADAPTIVE), count must be 0
-        if base_kind in (0, 3) and m_count != 0:
+        if base_kind in (0, 3) and not is_robust and m_count != 0:
             return MutexOwnerResolutionResult(
                 status=STATUS_MUTEX_STATE_INVALID,
                 layout_id=layout_id,
@@ -1413,6 +1536,16 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 raw_bytes=raw,
                 metadata=meta,
                 error=f"Mutex __lock value {m_lock} is inconsistent with owner {m_owner}",
+            )
+
+        # 6. Revalidate owner TID membership immediately before accepting owner result (Requirement 4.8)
+        if not os.path.exists(task_entry):
+            return MutexOwnerResolutionResult(
+                status=STATUS_OWNER_NOT_IDENTIFIED,
+                layout_id=layout_id,
+                raw_bytes=raw,
+                metadata=meta,
+                error=f"Owner TID {m_owner} exited during resolution (/proc/{pid}/task)",
             )
 
         # Everything validated!
@@ -1539,6 +1672,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._command_runner = command_runner or self._default_command_runner
         self.use_control_master = bool(use_control_master)
         self.collector_path = (collector_path or "").strip() or None
+        self._last_threads_bytes_read: int = 0
+        self._last_maps_bytes_read: int = 0
+        self._last_identity_bytes_read: int = 0
 
     def is_remote(self) -> bool:
         return True
@@ -1793,6 +1929,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         cmd = f"cat /proc/{int(pid)}/maps 2>/dev/null"
         rc, stdout, _ = self.run_ssh(cmd)
         mappings: List[Dict[str, Any]] = []
+        self._last_maps_bytes_read = len(stdout.encode("utf-8")) if stdout else 0
         if rc != 0 or not stdout:
             return mappings
 

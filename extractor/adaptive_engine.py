@@ -118,6 +118,13 @@ from .target_adapter import (
     STATUS_MUTEX_STATE_INVALID,
     STATUS_MEMORY_READ_UNAVAILABLE,
     STATUS_PERMISSION_DENIED,
+    ABI_GLIBC_VERIFIED,
+    ABI_MUSL_UNSUPPORTED,
+    ABI_LIBC_UNKNOWN,
+    ABI_STATIC_OR_UNIDENTIFIED,
+    ABI_ARCH_UNSUPPORTED,
+    ABI_ELF_CLASS_UNSUPPORTED,
+    ABI_ENDIANNESS_UNSUPPORTED,
     LAYOUT_GLIBC_LP64,
 )
 from .verdict_engine import (
@@ -180,6 +187,7 @@ class WaitForEdge:
     observation_timestamp: float = field(default_factory=time.time)
     target_pid: Optional[int] = None
     process_identity: Optional[Dict[str, Any]] = None
+    sampling_epoch: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
     # Backward compatibility: legacy source and timestamp properties
     source: Optional[str] = None
@@ -213,6 +221,7 @@ class WaitForEdge:
             "timestamp": self.timestamp,
             "target_pid": self.target_pid,
             "process_identity": self.process_identity,
+            "sampling_epoch": self.sampling_epoch,
             "metadata": self.metadata,
         }
 
@@ -225,13 +234,20 @@ class WaitForGraph:
     def add_edge(self, edge: WaitForEdge) -> None:
         self.edges.append(edge)
 
-    def validate_and_analyze(self, max_temporal_skew_sec: float = 2.0) -> Tuple[Optional[List[int]], str, List[str]]:
+    def validate_and_analyze(
+        self,
+        max_temporal_skew_sec: float = 2.0,
+        allowed_epoch: Optional[int] = None,
+        target_tids: Optional[Union[Set[int], List[int]]] = None,
+    ) -> Tuple[Optional[List[int]], str, List[str]]:
         """Validates all edges and analyzes the graph for circular deadlocks.
         
         Guarantees:
         - Cycles are accepted ONLY if every edge in the cycle has a verified owner (STATUS_OWNER_IDENTIFIED).
         - Rejects candidate cycles if edges have conflicting owners for the same lock address.
         - Rejects candidate cycles if timestamps across the cycle exhibit excessive temporal skew (> max_temporal_skew_sec).
+        - Rejects edges with missing or cross-process target PID or process identity.
+        - Rejects edges with unsupported mutex layout or unobserved memory reads.
         - Distinguishes confirmed cycles, unconfirmed contention, unknown owners, and incomplete graphs.
         
         Returns:
@@ -241,33 +257,156 @@ class WaitForGraph:
         if not self.edges:
             return None, RESULT_INCONCLUSIVE, ["No wait-for edges recorded"]
 
-        # 1. Edge Verification and Conflicting Owners Check
-        verified_edges: List[WaitForEdge] = []
+        # Track observations
         owners_by_lock: Dict[str, Set[int]] = {}
+        waiters_by_lock: Dict[str, Set[int]] = {}
+        edges_by_waiter: Dict[int, List[WaitForEdge]] = {}
+        verified_edges: List[WaitForEdge] = []
         has_unknown_owner = False
         has_unsupported_layout = False
-        waiters_by_lock: Dict[str, Set[int]] = {}
+        rejection_reasons: Dict[Tuple[int, str], List[str]] = {}
+
+        # 1. Establish reference target_pid and process identity from first available edge
+        ref_pid: Optional[int] = None
+        ref_start_time: Optional[Any] = None
+        ref_proc_ident: Optional[Dict[str, Any]] = None
+        ref_epoch: Optional[int] = allowed_epoch
+        has_cross_process_pid = False
+        has_cross_process_identity = False
+        has_cross_epoch = False
 
         for edge in self.edges:
+            if edge.target_pid is not None and edge.target_pid > 0:
+                if ref_pid is None:
+                    ref_pid = edge.target_pid
+                elif edge.target_pid != ref_pid:
+                    has_cross_process_pid = True
+            if edge.process_identity and isinstance(edge.process_identity, dict):
+                st = edge.process_identity.get("process_start_time") or edge.process_identity.get("start_time")
+                if st is not None:
+                    if ref_start_time is None:
+                        ref_start_time = st
+                        ref_proc_ident = edge.process_identity
+                    elif st != ref_start_time:
+                        has_cross_process_identity = True
+            ep = getattr(edge, "sampling_epoch", 0)
+            if ep is not None:
+                if ref_epoch is None:
+                    ref_epoch = ep
+                elif ep != ref_epoch:
+                    has_cross_epoch = True
+
+        if has_cross_process_pid:
+            issues.append(f"REJECT_CROSS_PROCESS_PID_MISMATCH: Cross-process evidence detected; multiple target PIDs in wait-for graph")
+        if has_cross_process_identity:
+            issues.append(f"REJECT_CROSS_PROCESS_IDENTITY_MISMATCH: Cross-process evidence detected; multiple process start identities in wait-for graph")
+        if has_cross_epoch:
+            issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Cross-epoch evidence detected; observations from different sampling epochs in wait-for graph")
+
+        # 2. Inspect and validate each edge
+        for edge in self.edges:
+            edge_key = (edge.waiter_tid, edge.sync_object)
+            edge_issues: List[str] = []
+
             waiters_by_lock.setdefault(edge.sync_object, set()).add(edge.waiter_tid)
-            if edge.owner_identification_status == STATUS_MUTEX_LAYOUT_UNSUPPORTED:
+            if edge.owner_tid is not None:
+                owners_by_lock.setdefault(edge.sync_object, set()).add(edge.owner_tid)
+            edges_by_waiter.setdefault(edge.waiter_tid, []).append(edge)
+
+            # Target PID validation
+            if edge.target_pid is None or edge.target_pid <= 0:
+                edge_issues.append(f"REJECT_MISSING_TARGET_PID: Edge waiter TID {edge.waiter_tid} has missing or invalid target_pid")
+            elif ref_pid is not None and edge.target_pid != ref_pid:
+                edge_issues.append(f"REJECT_CROSS_PROCESS_PID_MISMATCH: Edge target_pid {edge.target_pid} differs from graph reference {ref_pid}")
+
+            # Process identity validation
+            if not edge.process_identity or not isinstance(edge.process_identity, dict):
+                edge_issues.append(f"REJECT_MISSING_PROCESS_IDENTITY: Edge waiter TID {edge.waiter_tid} missing process_identity")
+            else:
+                p_st = edge.process_identity.get("process_start_time") or edge.process_identity.get("start_time")
+                if p_st is None:
+                    edge_issues.append(f"REJECT_MISSING_PROCESS_START_TIME: Edge waiter TID {edge.waiter_tid} process_identity lacks stable process_start_time")
+                elif ref_start_time is not None and p_st != ref_start_time:
+                    edge_issues.append(f"REJECT_CROSS_PROCESS_IDENTITY_MISMATCH: Edge process_start_time {p_st} differs from graph start_time {ref_start_time}")
+
+            # Sampling epoch validation
+            edge_epoch = getattr(edge, "sampling_epoch", 0)
+            if ref_epoch is not None and edge_epoch != ref_epoch:
+                edge_issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Edge epoch {edge_epoch} differs from graph epoch {ref_epoch}")
+
+            # Waiter / Owner TID validation
+            if edge.waiter_tid <= 0:
+                edge_issues.append(f"REJECT_INVALID_WAITER_TID: Invalid waiter TID {edge.waiter_tid}")
+            if edge.owner_tid is not None and edge.owner_tid <= 0:
+                edge_issues.append(f"REJECT_INVALID_OWNER_TID: Invalid owner TID {edge.owner_tid}")
+
+            # Task membership validation
+            effective_tids = set(target_tids) if target_tids else (set(edge.metadata.get("target_tids", [])) if (edge.metadata and edge.metadata.get("target_tids")) else None)
+            if effective_tids:
+                if edge.waiter_tid not in effective_tids:
+                    edge_issues.append(f"REJECT_WAITER_TID_NOT_IN_TARGET: Waiter TID {edge.waiter_tid} does not belong to target process")
+                if edge.owner_tid is not None and edge.owner_tid not in effective_tids:
+                    edge_issues.append(f"REJECT_OWNER_TID_NOT_IN_TARGET: Owner TID {edge.owner_tid} does not belong to target process")
+
+            # Mutex layout validation
+            if edge.owner_identification_status == STATUS_MUTEX_LAYOUT_UNSUPPORTED or edge.mutex_layout_id in (ABI_MUSL_UNSUPPORTED, ABI_LIBC_UNKNOWN, ABI_STATIC_OR_UNIDENTIFIED, ABI_ARCH_UNSUPPORTED, ABI_ELF_CLASS_UNSUPPORTED, ABI_ENDIANNESS_UNSUPPORTED):
                 has_unsupported_layout = True
-                issues.append(f"Mutex layout unsupported for waiter TID {edge.waiter_tid} on {edge.sync_object}")
-            elif edge.owner_identification_status != STATUS_OWNER_IDENTIFIED or edge.owner_tid is None:
+                edge_issues.append(f"REJECT_UNSUPPORTED_MUTEX_LAYOUT: Mutex layout {edge.mutex_layout_id} unsupported for waiter TID {edge.waiter_tid}")
+            elif edge.mutex_layout_id != LAYOUT_GLIBC_LP64:
+                edge_issues.append(f"REJECT_UNSUPPORTED_MUTEX_LAYOUT: Mutex layout {edge.mutex_layout_id} is not verified LP64 glibc")
+
+            # Memory read status validation
+            if edge.memory_read_status != "OBSERVED":
+                edge_issues.append(f"REJECT_MEMORY_READ_NOT_OBSERVED: Memory read status is '{edge.memory_read_status}' (must be OBSERVED)")
+
+            # Raw memory evidence and interpretation metadata
+            has_raw = bool((edge.metadata or {}).get("raw_bytes")) or bool((edge.metadata or {}).get("read_bytes_len", 0) > 0)
+            has_interp = any(k in (edge.metadata or {}) for k in ("lock_word", "kind", "base_kind", "owner"))
+            if not has_raw or not has_interp:
+                edge_issues.append(f"REJECT_MISSING_RAW_MEMORY_EVIDENCE: Edge lacks verified raw memory evidence or interpretation metadata")
+
+            # Normalized address validation
+            if edge.normalized_address and edge.normalized_address != edge.sync_object:
+                edge_issues.append(f"REJECT_ADDRESS_MISMATCH: normalized_address ({edge.normalized_address}) != sync_object ({edge.sync_object})")
+
+            # Timestamp validation
+            ts = edge.observation_timestamp or getattr(edge, "timestamp", 0.0) or 0.0
+            if ts <= 0:
+                edge_issues.append(f"REJECT_MISSING_OR_INVALID_TIMESTAMP: Observation timestamp is non-positive or missing ({ts})")
+
+            # Owner identification status validation
+            if edge.owner_identification_status != STATUS_OWNER_IDENTIFIED or edge.owner_tid is None:
                 has_unknown_owner = True
-                issues.append(f"Owner unconfirmed ({edge.owner_identification_status}) for waiter TID {edge.waiter_tid} on {edge.sync_object}")
+                edge_issues.append(f"REJECT_OWNER_NOT_IDENTIFIED: Owner unconfirmed ({edge.owner_identification_status}) for waiter TID {edge.waiter_tid}")
+
+            if edge_issues:
+                rejection_reasons[edge_key] = edge_issues
+                issues.extend(edge_issues)
             else:
                 verified_edges.append(edge)
-                owners_by_lock.setdefault(edge.sync_object, set()).add(edge.owner_tid)
 
-        # Check for conflicting owners for the same lock
+        # 3. Check conflicting owners on locks
         conflicting_locks = {lock: tids for lock, tids in owners_by_lock.items() if len(tids) > 1}
         if conflicting_locks:
             for lock, tids in conflicting_locks.items():
-                issues.append(f"Conflicting owners observed for lock {lock}: {tids}")
+                issues.append(f"Conflicting owners observed for lock {lock}: {sorted(tids)}")
             return None, RESULT_INCONSISTENT_OWNER_EVIDENCE, issues
 
-        # 2. Cycle Detection using ONLY verified edges
+        # 4. Multi-observation & conflict detection across waiter edges
+        for waiter_tid, w_edges in edges_by_waiter.items():
+            if len(w_edges) > 1:
+                distinct_locks = {e.sync_object for e in w_edges}
+                distinct_owners = {e.owner_tid for e in w_edges if e.owner_tid is not None}
+                if len(distinct_locks) > 1 or len(distinct_owners) > 1:
+                    issues.append(
+                        f"Conflicting observations for waiter TID {waiter_tid}: multiple locks ({sorted(distinct_locks)}) or owners ({sorted(distinct_owners)})"
+                    )
+                    return None, RESULT_INCONSISTENT_OWNER_EVIDENCE, issues
+
+        if has_cross_process_pid or has_cross_process_identity or has_cross_epoch:
+            return None, RESULT_INCONSISTENT_OWNER_EVIDENCE, issues
+
+        # 5. Cycle Detection using ONLY verified edges
         adj: Dict[int, int] = {}
         edge_map: Dict[Tuple[int, int], WaitForEdge] = {}
         for edge in verified_edges:
@@ -296,15 +435,14 @@ class WaitForGraph:
                 break
 
         if candidate_cycle:
-            # 3. Temporal Skew Validation
-            # Candidate cycle edges: (candidate_cycle[i], candidate_cycle[i+1])
+            # Validate temporal skew across candidate cycle edges
             cycle_timestamps: List[float] = []
             for i in range(len(candidate_cycle) - 1):
                 u = candidate_cycle[i]
                 v = candidate_cycle[i + 1]
                 e = edge_map.get((u, v))
                 if e:
-                    ts = e.observation_timestamp or e.timestamp or 0.0
+                    ts = e.observation_timestamp or getattr(e, "timestamp", 0.0) or 0.0
                     if ts > 0:
                         cycle_timestamps.append(ts)
             if cycle_timestamps:
@@ -1056,18 +1194,9 @@ class AdaptiveInvestigationEngine:
             budget_ceiling={"max_bytes_read": 65536, "max_wall_clock_ms": 500.0, "max_samples": 4},
         )
         def _exec_insp_locks(wm, **kw):
-            if wm and hasattr(wm, "inspect_thread_callstacks_and_locks"):
-                try:
-                    res = wm.inspect_thread_callstacks_and_locks(**kw)
-                    if res and res.get("threads"):
-                        return res
-                except Exception:
-                    pass
-            pid_val = kw.get("pid")
-            adapter = kw.get("adapter")
             budget_tracker = kw.get("budget_tracker")
 
-            # Pre-execution budget check
+            # 1. Pre-execution budget check BEFORE any expensive observation
             if budget_tracker:
                 cur_elapsed = budget_tracker.elapsed_ms
                 rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
@@ -1083,15 +1212,74 @@ class AdaptiveInvestigationEngine:
                         "deadlock_detected": False,
                         "bytes_read": 0,
                         "measured_bytes_read": 0,
+                        "estimated_bytes_read": 0,
                     }
+
+            # 2. WorkManager execution path (monitored and accounted for)
+            if wm and hasattr(wm, "inspect_thread_callstacks_and_locks"):
+                t_wm_start = time.monotonic()
+                try:
+                    res = wm.inspect_thread_callstacks_and_locks(**kw)
+                    if res and res.get("threads"):
+                        wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
+                        wm_meas_b = int(res.get("measured_bytes_read") or res.get("bytes_read") or 0)
+                        if budget_tracker:
+                            budget_tracker.record_read(
+                                bytes_read=wm_meas_b if wm_meas_b > 0 else None,
+                                latency_us=wm_elapsed_us,
+                                conservative_estimate_bytes=2048 if wm_meas_b == 0 else None,
+                                profile_id="insp_locks",
+                            )
+                        return res
+                except Exception:
+                    pass
+
+            pid_val = kw.get("pid")
+            adapter = kw.get("adapter")
+            target_identity = kw.get("target_identity") or kw.get("target_info")
+            sampling_epoch = int(kw.get("sampling_epoch") or kw.get("epoch") or 0)
 
             if pid_val and adapter and hasattr(adapter, "get_threads"):
                 t_start_obs = time.monotonic()
                 try:
+                    # Enforce pre-operation budget check before get_threads
+                    if budget_tracker:
+                        cur_elapsed = budget_tracker.elapsed_ms
+                        rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
+                        rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
+                        if rem_wall_ms <= 0.0 or rem_bytes < 256:
+                            return {
+                                "success": False,
+                                "status": "BUDGET_EXHAUSTED",
+                                "stop_reason": "BUDGET_EXHAUSTED",
+                                "error": "Budget exhausted before reading threads",
+                                "threads": [],
+                                "contended_locks": [],
+                                "deadlock_detected": False,
+                                "bytes_read": 0,
+                                "measured_bytes_read": 0,
+                                "estimated_bytes_read": 0,
+                            }
+
                     threads = adapter.get_threads(pid_val)
+                    th_meas = adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 0)
+                    if budget_tracker and th_meas > 0:
+                        budget_tracker.record_read(
+                            bytes_read=th_meas,
+                            latency_us=(time.monotonic() - t_start_obs) * 1_000_000.0,
+                            profile_id="insp_locks",
+                        )
+
+                    target_tids = {t["tid"] for t in threads}
+                    if not target_identity and hasattr(adapter, "get_process_identity"):
+                        target_identity = adapter.get_process_identity(pid_val)
+
                     contended_locks = []
                     waiters_by_lock: Dict[str, List[int]] = {}
                     wait_for_graph = WaitForGraph()
+                    is_partial_budget = False
+                    total_mutex_measured_bytes = 0
+                    total_mutex_estimated_bytes = 0
 
                     for t in threads:
                         if t.get("is_futex_wait") or t.get("state") in ("D", "BLOCKED_LOCK"):
@@ -1105,6 +1293,15 @@ class AdaptiveInvestigationEngine:
                                 t["wait_address_status"] = "WAIT_ADDRESS_OBSERVED"
                                 waiters_by_lock.setdefault(lock_addr, []).append(t["tid"])
 
+                                # Enforce pre-operation budget check before mutex memory read
+                                if budget_tracker:
+                                    cur_elapsed = budget_tracker.elapsed_ms
+                                    rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
+                                    rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
+                                    if rem_wall_ms <= 0.0 or rem_bytes < 40:
+                                        is_partial_budget = True
+                                        break
+
                                 owner_tid = None
                                 owner_res = None
                                 if hasattr(adapter, "resolve_mutex_owner") and lock_addr_int:
@@ -1115,9 +1312,13 @@ class AdaptiveInvestigationEngine:
                                     owner_id_st = owner_res.status
                                     layout_id = owner_res.layout_id
                                     raw_b = owner_res.raw_bytes
-                                    meta = owner_res.metadata
+                                    meta = dict(owner_res.metadata)
                                     mem_read_st = meta.get("memory_read_status", "OBSERVED" if raw_b else "UNAVAILABLE")
                                     evidence_src = "pthread_mutex_memory" if owner_tid else "procfs_syscall"
+
+                                    # Accurately account for all actual mutex memory reads, regardless of whether owner was identified
+                                    read_b = int(meta.get("read_bytes_len", len(raw_b) if raw_b else 0))
+                                    total_mutex_measured_bytes += read_b
                                 elif isinstance(owner_res, int) and owner_res > 0:
                                     owner_tid = owner_res
                                     owner_id_st = STATUS_OWNER_IDENTIFIED
@@ -1126,6 +1327,7 @@ class AdaptiveInvestigationEngine:
                                     meta = {}
                                     mem_read_st = "OBSERVED"
                                     evidence_src = "pthread_mutex_memory"
+                                    total_mutex_estimated_bytes += 40
                                 else:
                                     owner_tid = None
                                     owner_id_st = STATUS_OWNER_NOT_IDENTIFIED
@@ -1134,6 +1336,11 @@ class AdaptiveInvestigationEngine:
                                     meta = {}
                                     mem_read_st = "UNAVAILABLE"
                                     evidence_src = "procfs_syscall"
+
+                                meta["target_tids"] = list(target_tids)
+                                if raw_b:
+                                    meta["raw_bytes"] = raw_b
+                                meta["read_bytes_len"] = int(meta.get("read_bytes_len", len(raw_b) if raw_b else 0))
 
                                 t["owner_tid"] = owner_tid
                                 t["lock_owner_identified"] = (owner_id_st == STATUS_OWNER_IDENTIFIED and owner_tid is not None)
@@ -1152,6 +1359,8 @@ class AdaptiveInvestigationEngine:
                                     evidence_source=evidence_src,
                                     observation_timestamp=time.time(),
                                     target_pid=pid_val,
+                                    process_identity=target_identity,
+                                    sampling_epoch=sampling_epoch,
                                     metadata=meta,
                                 )
                                 wait_for_graph.add_edge(edge)
@@ -1184,21 +1393,35 @@ class AdaptiveInvestigationEngine:
                                     "status": "OBSERVED",
                                 })
 
-                    # Analyze wait-for graph
-                    deadlock_cycle, result_category, issues = wait_for_graph.validate_and_analyze()
+                    # Analyze wait-for graph with target task membership and epoch verification
+                    deadlock_cycle, result_category, issues = wait_for_graph.validate_and_analyze(
+                        target_tids=target_tids,
+                        allowed_epoch=sampling_epoch,
+                    )
                     deadlock_detected = bool(deadlock_cycle)
                     lock_contention_observed = (
                         result_category == RESULT_LOCK_CONTENTION_OBSERVED
                         or any(len(w_tids) > 1 for w_tids in waiters_by_lock.values())
                     )
 
-                    threads_bytes = adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", len(threads) * 128)
-                    mutex_bytes = sum(len(e.metadata.get("raw_bytes") or b"") if isinstance(e.metadata.get("raw_bytes"), bytes) else (40 if e.owner_tid else 0) for e in wait_for_graph.edges)
-                    total_bytes_read = threads_bytes + mutex_bytes
+                    threads_meas = adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 0)
+                    if threads_meas > 0:
+                        measured_threads_bytes = threads_meas
+                        estimated_threads_bytes = 0
+                    else:
+                        measured_threads_bytes = 0
+                        estimated_threads_bytes = len(threads) * 128
+
+                    total_measured_bytes = measured_threads_bytes + total_mutex_measured_bytes
+                    total_estimated_bytes = estimated_threads_bytes + total_mutex_estimated_bytes
+                    total_bytes_read = total_measured_bytes + total_estimated_bytes
+
+                    status_val = "PARTIAL" if is_partial_budget else "OBSERVED"
 
                     return {
                         "success": True,
-                        "status": "OBSERVED",
+                        "status": status_val,
+                        "stop_reason": "BUDGET_EXHAUSTED" if is_partial_budget else None,
                         "threads": threads,
                         "contended_locks": contended_locks,
                         "lock_contention_observed": lock_contention_observed,
@@ -1208,7 +1431,8 @@ class AdaptiveInvestigationEngine:
                         "issues": issues,
                         "wait_for_graph": wait_for_graph.to_dict(),
                         "bytes_read": total_bytes_read,
-                        "measured_bytes_read": total_bytes_read,
+                        "measured_bytes_read": total_measured_bytes,
+                        "estimated_bytes_read": total_estimated_bytes,
                         "observation_latency_us": round((time.monotonic() - t_start_obs) * 1_000_000.0, 2),
                     }
                 except PermissionError as exc:
@@ -1386,6 +1610,8 @@ class AdaptiveInvestigationEngine:
             target_tid = kw.get("tid")
             adapter = kw.get("adapter")
             budget_tracker = kw.get("budget_tracker")
+            target_identity = kw.get("target_identity") or kw.get("target_info")
+            sampling_epoch = int(kw.get("sampling_epoch") or kw.get("epoch") or 0)
             if budget_tracker:
                 cur_elapsed = budget_tracker.elapsed_ms
                 rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
@@ -1409,6 +1635,9 @@ class AdaptiveInvestigationEngine:
                     threads_1 = adapter.get_threads(pid_val)
                     t0_map = {t["tid"]: t for t in threads_0}
                     t1_map = {t["tid"]: t for t in threads_1}
+                    target_tids = {t["tid"] for t in threads_1}
+                    if not target_identity and hasattr(adapter, "get_process_identity"):
+                        target_identity = adapter.get_process_identity(pid_val)
 
                     t_cand = t1_map.get(target_tid) if target_tid else None
                     if not t_cand:
@@ -1449,7 +1678,7 @@ class AdaptiveInvestigationEngine:
                                         th_owner = th_res.owner_tid
                                         th_st_id = th_res.status
                                         th_layout = th_res.layout_id
-                                        th_meta = th_res.metadata
+                                        th_meta = dict(th_res.metadata)
                                         th_mem_st = th_meta.get("memory_read_status", "OBSERVED" if th_res.raw_bytes else "UNAVAILABLE")
                                         th_src = "pthread_mutex_memory" if th_owner else "procfs_syscall"
                                     elif isinstance(th_res, int) and th_res > 0:
@@ -1467,6 +1696,11 @@ class AdaptiveInvestigationEngine:
                                         th_mem_st = "UNAVAILABLE"
                                         th_src = "procfs_syscall"
 
+                                    th_meta["target_tids"] = list(target_tids)
+                                    if isinstance(th_res, MutexOwnerResolutionResult) and th_res.raw_bytes:
+                                        th_meta["raw_bytes"] = th_res.raw_bytes
+                                    th_meta["read_bytes_len"] = int(th_meta.get("read_bytes_len", len(th_res.raw_bytes) if (isinstance(th_res, MutexOwnerResolutionResult) and th_res.raw_bytes) else 0))
+
                                     wait_for_graph.add_edge(WaitForEdge(
                                         waiter_tid=th["tid"],
                                         sync_object=th_hex,
@@ -1479,10 +1713,15 @@ class AdaptiveInvestigationEngine:
                                         evidence_source=th_src,
                                         observation_timestamp=time.time(),
                                         target_pid=pid_val,
+                                        process_identity=target_identity,
+                                        sampling_epoch=sampling_epoch,
                                         metadata=th_meta,
                                     ))
 
-                        cycle, result_category, issues = wait_for_graph.validate_and_analyze()
+                        cycle, result_category, issues = wait_for_graph.validate_and_analyze(
+                            target_tids=target_tids,
+                            allowed_epoch=sampling_epoch,
+                        )
                         owner_res = adapter.resolve_mutex_owner(pid_val, lock_addr_int) if (hasattr(adapter, "resolve_mutex_owner") and lock_addr_int) else None
                         owner_tid = owner_res.owner_tid if isinstance(owner_res, MutexOwnerResolutionResult) else (int(owner_res) if owner_res else None)
 
@@ -1493,7 +1732,7 @@ class AdaptiveInvestigationEngine:
                             cond = "uncontended_or_normal_progress"
 
                         th_bytes = (adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 256)) * 2
-                        m_bytes = sum(len(e.metadata.get("raw_bytes") or b"") if isinstance(e.metadata.get("raw_bytes"), bytes) else (40 if e.owner_tid else 0) for e in wait_for_graph.edges)
+                        m_bytes = sum(int(e.metadata.get("read_bytes_len", len(e.metadata.get("raw_bytes") or b""))) for e in wait_for_graph.edges)
                         total_fl_bytes = th_bytes + m_bytes
 
                         return {
