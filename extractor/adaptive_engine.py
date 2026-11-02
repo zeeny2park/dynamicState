@@ -15,6 +15,7 @@ Coordinates evidence-grounded, budget-bounded adaptive investigations:
   SUSPECTED, PARTIALLY_CONFIRMED, CONFIRMED, REFUTED, INCONCLUSIVE)
 """
 
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -1278,7 +1279,20 @@ class AdaptiveInvestigationEngine:
                 wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
 
                 if wm_exc is None:
-                    if res and res.get("threads"):
+                    if isinstance(res, dict):
+                        # If WorkManager already authoritatively committed this operation to budget_tracker:
+                        if budget_tracker and budget_tracker.is_operation_committed(op_id):
+                            comm_rec = budget_tracker.get_committed_record(op_id)
+                            res["measured_bytes_read"] = comm_rec.measured_bytes_read
+                            res["estimated_bytes_read"] = comm_rec.estimated_bytes_read
+                            res["charged_bytes"] = comm_rec.charged_bytes
+                            res["bytes_read"] = comm_rec.charged_bytes
+                            res["measurement_type"] = comm_rec.measurement_type
+                            res["accounting_owner"] = comm_rec.accounting_owner
+                            res["accounting_status"] = "COMMITTED"
+                            res["operation_id"] = op_id
+                            return res
+
                         raw_meas_b = res.get("measured_bytes_read")
                         raw_est_b = res.get("estimated_bytes_read")
                         raw_bytes_b = res.get("bytes_read")
@@ -1303,6 +1317,7 @@ class AdaptiveInvestigationEngine:
                             and raw_meas_b is None
                             and raw_est_b is None
                             and raw_bytes_b is None
+                            and res.get("measurement_type") not in ("CACHE_HIT", "ZERO_BYTES")
                         )
 
                         if is_missing:
@@ -1314,7 +1329,7 @@ class AdaptiveInvestigationEngine:
                                     "status": "UNKNOWN_BYTE_COST_REJECTED",
                                     "result_category": "UNKNOWN_BYTE_COST_REJECTED",
                                     "error": "UNKNOWN_BYTE_COST_REJECTED: observation byte cost is unknown and strict cost accounting is enabled",
-                                    "threads": [],
+                                    "threads": res.get("threads", []),
                                     "contended_locks": [],
                                     "deadlock_detected": False,
                                     "bytes_read": 0,
@@ -1343,7 +1358,7 @@ class AdaptiveInvestigationEngine:
                                         "status": "BUDGET_EXHAUSTED",
                                         "result_category": "BUDGET_EXHAUSTED",
                                         "error": f"Budget exhausted: {budget_tracker.exhaustion_reason}",
-                                        "threads": [],
+                                        "threads": res.get("threads", []),
                                         "contended_locks": [],
                                         "deadlock_detected": False,
                                         "bytes_read": 0,
@@ -1385,7 +1400,11 @@ class AdaptiveInvestigationEngine:
                                 eff_meas = None
                                 eff_est = 0
 
-                            if eff_meas is not None and eff_meas > 0 and eff_est > 0:
+                            if res.get("measurement_type") == "CACHE_HIT":
+                                m_type = "CACHE_HIT"
+                                eff_meas = 0
+                                eff_est = 0
+                            elif eff_meas is not None and eff_meas > 0 and eff_est > 0:
                                 m_type = "MIXED"
                             elif eff_meas is not None and eff_meas > 0:
                                 m_type = "MEASURED"
@@ -1412,7 +1431,7 @@ class AdaptiveInvestigationEngine:
                                         "status": "BUDGET_EXHAUSTED",
                                         "result_category": "BUDGET_EXHAUSTED",
                                         "error": f"Budget exhausted: {budget_tracker.exhaustion_reason}",
-                                        "threads": [],
+                                        "threads": res.get("threads", []),
                                         "contended_locks": [],
                                         "deadlock_detected": False,
                                         "bytes_read": 0,
@@ -1433,14 +1452,6 @@ class AdaptiveInvestigationEngine:
                             res["accounting_status"] = "COMMITTED"
                             res["operation_id"] = op_id
                             return res
-                    else:
-                        if budget_tracker:
-                            budget_tracker.record_read(
-                                bytes_read=0,
-                                latency_us=wm_elapsed_us,
-                                is_failure=False,
-                                profile_id="insp_locks",
-                            )
                 else:
                     # WorkManager raised an exception
                     raw_meas = getattr(wm_exc, "measured_bytes_read", None)
@@ -1581,8 +1592,8 @@ class AdaptiveInvestigationEngine:
                     if budget_tracker:
                         cur_elapsed = budget_tracker.elapsed_ms
                         rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
-                        rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
-                        if rem_wall_ms <= 0.0 or rem_bytes < 40:
+                        rem_bytes = budget_tracker.remaining_bytes
+                        if rem_wall_ms <= 0.0 or rem_bytes < 40 or budget_tracker.is_budget_exhausted:
                             return {
                                 "success": False,
                                 "status": "BUDGET_EXHAUSTED",
@@ -1597,37 +1608,44 @@ class AdaptiveInvestigationEngine:
                                 "already_budget_accounted": True,
                             }
 
-                    threads = adapter.get_threads(pid_val)
-                    th_meas = adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 0)
-                    if budget_tracker and th_meas > 0:
-                        budget_tracker.record_read(
-                            bytes_read=th_meas,
-                            latency_us=(time.monotonic() - t_start_obs) * 1_000_000.0,
-                            profile_id="insp_locks",
-                        )
+                    fb_op_id = f"{op_id}_fallback"
+                    scope_cm = (
+                        budget_tracker.operation_scope(fb_op_id, profile_id="insp_locks", owner="MODULE_INTERNAL")
+                        if budget_tracker and hasattr(budget_tracker, "operation_scope")
+                        else nullcontext()
+                    )
+                    with scope_cm as fb_scope:
+                        threads = adapter.get_threads(pid_val)
+                        th_meas = adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 0)
+                        if budget_tracker and th_meas > 0:
+                            budget_tracker.record_read(
+                                bytes_read=th_meas,
+                                latency_us=(time.monotonic() - t_start_obs) * 1_000_000.0,
+                                profile_id="insp_locks",
+                            )
 
-                    target_tids = {t["tid"] for t in threads}
-                    is_partial_budget = False
+                        target_tids = {t["tid"] for t in threads}
+                        is_partial_budget = False
 
-                    if not target_identity and hasattr(adapter, "get_process_identity"):
-                        if budget_tracker:
-                            can_id, _, _ = budget_tracker.check_pre_execution(estimated_bytes=64, profile_id="insp_locks")
-                            if not can_id:
-                                is_partial_budget = True
-                        if not is_partial_budget:
-                            t_id_start = time.monotonic()
-                            target_identity = adapter.get_process_identity(pid_val)
-                            id_meas = adapter.get_last_identity_bytes_read() if hasattr(adapter, "get_last_identity_bytes_read") else getattr(adapter, "_last_identity_bytes_read", 0)
-                            if budget_tracker and id_meas > 0:
-                                budget_tracker.record_read(
-                                    bytes_read=id_meas,
-                                    latency_us=(time.monotonic() - t_id_start) * 1_000_000.0,
-                                    profile_id="insp_locks",
-                                )
+                        if not target_identity and hasattr(adapter, "get_process_identity"):
+                            if budget_tracker:
+                                can_id, _, _ = budget_tracker.check_pre_execution(estimated_bytes=64, profile_id="insp_locks")
+                                if not can_id:
+                                    is_partial_budget = True
+                            if not is_partial_budget:
+                                t_id_start = time.monotonic()
+                                target_identity = adapter.get_process_identity(pid_val)
+                                id_meas = adapter.get_last_identity_bytes_read() if hasattr(adapter, "get_last_identity_bytes_read") else getattr(adapter, "_last_identity_bytes_read", 0)
+                                if budget_tracker and id_meas > 0:
+                                    budget_tracker.record_read(
+                                        bytes_read=id_meas,
+                                        latency_us=(time.monotonic() - t_id_start) * 1_000_000.0,
+                                        profile_id="insp_locks",
+                                    )
 
-                    contended_locks = []
-                    waiters_by_lock: Dict[str, List[int]] = {}
-                    wait_for_graph = WaitForGraph()
+                        contended_locks = []
+                        waiters_by_lock: Dict[str, List[int]] = {}
+                        wait_for_graph = WaitForGraph()
                     total_mutex_measured_bytes = 0
                     total_mutex_estimated_bytes = 0
 
@@ -1792,20 +1810,19 @@ class AdaptiveInvestigationEngine:
                     total_bytes_read = total_measured_bytes + total_estimated_bytes
 
                     status_val = "PARTIAL" if is_partial_budget else "OBSERVED"
-                    fb_op_id = f"{op_id}_fallback"
-                    record = ObservationAccountingRecord(
-                        operation_id=fb_op_id,
-                        accounting_owner="MODULE_INTERNAL",
-                        measured_bytes_read=total_measured_bytes,
-                        estimated_bytes_read=total_estimated_bytes,
-                        charged_bytes=total_measured_bytes + total_estimated_bytes,
-                        latency_us=(time.monotonic() - t_start_obs) * 1_000_000.0,
-                        measurement_type="MIXED" if (total_measured_bytes > 0 and total_estimated_bytes > 0) else ("MEASURED" if total_measured_bytes > 0 else "ESTIMATED"),
-                        accounting_status="COMMITTED",
-                    )
-                    if budget_tracker:
-                        with budget_tracker._transaction_lock:
-                            budget_tracker._committed_transactions[fb_op_id] = record
+                    if fb_scope is not None:
+                        fb_scope.finalize(success=not is_partial_budget)
+                    elif budget_tracker:
+                        record = ObservationAccountingRecord(
+                            operation_id=fb_op_id,
+                            accounting_owner="MODULE_INTERNAL",
+                            measured_bytes_read=total_measured_bytes,
+                            estimated_bytes_read=total_estimated_bytes,
+                            charged_bytes=total_measured_bytes + total_estimated_bytes,
+                            latency_us=(time.monotonic() - t_start_obs) * 1_000_000.0,
+                            measurement_type="MIXED" if (total_measured_bytes > 0 and total_estimated_bytes > 0) else ("MEASURED" if total_measured_bytes > 0 else "ESTIMATED"),
+                        )
+                        budget_tracker.commit_transaction(record, profile_id="insp_locks", is_failure=is_partial_budget)
 
                     return {
                         "success": True,

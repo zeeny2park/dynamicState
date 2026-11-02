@@ -8,6 +8,7 @@ Defines modular, reusable inspection profiles with strict contracts:
 """
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 import math
 import time
@@ -301,26 +302,30 @@ class FunctionalInspectionModule(InspectionModule):
         for meta_key in ("estimated_bytes", "estimated_latency_ms", "estimated_samples", "estimated_stop_ms"):
             kwargs.pop(meta_key, None)
 
-        t0_bytes_read = ctx.budget_tracker.metrics.bytes_read
-        t0_meas_bytes = ctx.budget_tracker.metrics.measured_bytes_read
-        t0_est_bytes = ctx.budget_tracker.metrics.conservative_estimated_bytes
-
         safe_wm = ReadOnlyWatchManager(watch_manager) if watch_manager is not None else None
+        scope_cm = (
+            ctx.budget_tracker.operation_scope(op_id, profile_id=self.profile.profile_id, owner="MODULE_INTERNAL")
+            if ctx.budget_tracker and hasattr(ctx.budget_tracker, "operation_scope")
+            else nullcontext()
+        )
+        scope = None
         try:
-            if self._func is None:
-                raise RuntimeError(f"No callable bound to InspectionModule '{self.profile.profile_id}'")
+            with scope_cm as active_scope:
+                scope = active_scope
+                if self._func is None:
+                    raise RuntimeError(f"No callable bound to InspectionModule '{self.profile.profile_id}'")
 
-            try:
-                result = self._func(safe_wm, **kwargs)
-            except TypeError:
                 try:
-                    result = self._func(**kwargs)
+                    result = self._func(safe_wm, **kwargs)
                 except TypeError:
-                    kw_no_pid = {k: v for k, v in kwargs.items() if k != "pid"}
                     try:
-                        result = self._func(ctx.pid, **kw_no_pid)
+                        result = self._func(**kwargs)
                     except TypeError:
-                        result = self._func(ctx.pid)
+                        kw_no_pid = {k: v for k, v in kwargs.items() if k != "pid"}
+                        try:
+                            result = self._func(ctx.pid, **kw_no_pid)
+                        except TypeError:
+                            result = self._func(ctx.pid)
 
             if not isinstance(result, dict):
                 result = {"success": True, "value": result}
@@ -365,29 +370,22 @@ class FunctionalInspectionModule(InspectionModule):
 
             actual_op_id = result.get("operation_id") or op_id
 
-            # Authoritative accounting check:
-            # Did the inner layer authoritatively commit this operation to ctx.budget_tracker?
+            # Authoritative single-writer accounting check:
             if ctx.budget_tracker.is_operation_committed(actual_op_id):
                 comm_rec = ctx.budget_tracker.get_committed_record(actual_op_id)
                 read_accounting = comm_rec.to_dict()
-            elif ctx.budget_tracker.metrics.bytes_read > t0_bytes_read:
-                # The inner function called tracker.record_read() directly
-                charged_inc = ctx.budget_tracker.metrics.bytes_read - t0_bytes_read
-                meas_inc = ctx.budget_tracker.metrics.measured_bytes_read - t0_meas_bytes
-                est_inc = ctx.budget_tracker.metrics.conservative_estimated_bytes - t0_est_bytes
-                comm_rec = ObservationAccountingRecord(
-                    operation_id=actual_op_id,
-                    accounting_owner=result.get("accounting_owner") or "MODULE_INTERNAL",
-                    measured_bytes_read=meas_inc if (meas_inc > 0 or meas_b == 0) else None,
-                    estimated_bytes_read=est_inc,
-                    charged_bytes=charged_inc,
-                    latency_us=lat_us,
-                    accounting_status="COMMITTED",
-                    measurement_type="MIXED" if (meas_inc > 0 and est_inc > 0) else ("MEASURED" if meas_inc > 0 else "ESTIMATED"),
-                )
-                with ctx.budget_tracker._transaction_lock:
-                    ctx.budget_tracker._committed_transactions[actual_op_id] = comm_rec
-                read_accounting = comm_rec.to_dict()
+            elif scope is not None and getattr(scope, "reads_count", 0) > 0:
+                # Inner function called tracker.record_read() through active operation scope
+                comm_rec = scope.finalize(success=not is_fail)
+                read_accounting = comm_rec.to_dict() if comm_rec else {
+                    "operation_id": actual_op_id,
+                    "measured_bytes_read": scope.measured_bytes_read,
+                    "estimated_bytes_read": scope.estimated_bytes_read,
+                    "charged_bytes": scope.charged_bytes,
+                    "latency_us": scope.latency_us,
+                    "accounting_status": "COMMITTED",
+                    "measurement_type": "MEASURED" if scope.measured_bytes_read else "ESTIMATED",
+                }
             else:
                 # The tracker has NOT been charged for this operation yet, regardless of any
                 # unverified dictionary flags like accounting_status="COMMITTED" or already_budget_accounted=True!
@@ -536,23 +534,17 @@ class FunctionalInspectionModule(InspectionModule):
             if ctx.budget_tracker.is_operation_committed(exc_op_id):
                 comm_rec = ctx.budget_tracker.get_committed_record(exc_op_id)
                 read_acct = comm_rec.to_dict()
-            elif ctx.budget_tracker.metrics.bytes_read > t0_bytes_read:
-                charged_inc = ctx.budget_tracker.metrics.bytes_read - t0_bytes_read
-                meas_inc = ctx.budget_tracker.metrics.measured_bytes_read - t0_meas_bytes
-                est_inc = ctx.budget_tracker.metrics.conservative_estimated_bytes - t0_est_bytes
-                comm_rec = ObservationAccountingRecord(
-                    operation_id=exc_op_id,
-                    accounting_owner=getattr(exc, "accounting_owner", "MODULE_INTERNAL"),
-                    measured_bytes_read=meas_inc if meas_inc > 0 else None,
-                    estimated_bytes_read=est_inc,
-                    charged_bytes=charged_inc,
-                    latency_us=lat_us,
-                    accounting_status="COMMITTED",
-                    measurement_type="MIXED" if (meas_inc > 0 and est_inc > 0) else ("MEASURED" if meas_inc > 0 else "ESTIMATED"),
-                )
-                with ctx.budget_tracker._transaction_lock:
-                    ctx.budget_tracker._committed_transactions[exc_op_id] = comm_rec
-                read_acct = comm_rec.to_dict()
+            elif scope is not None and getattr(scope, "reads_count", 0) > 0:
+                comm_rec = scope.finalize(success=False, exc=exc)
+                read_acct = comm_rec.to_dict() if comm_rec else {
+                    "operation_id": exc_op_id,
+                    "measured_bytes_read": scope.measured_bytes_read,
+                    "estimated_bytes_read": scope.estimated_bytes_read,
+                    "charged_bytes": scope.charged_bytes,
+                    "latency_us": scope.latency_us,
+                    "accounting_status": "COMMITTED",
+                    "measurement_type": "MEASURED" if scope.measured_bytes_read else "ESTIMATED",
+                }
             else:
                 raw_meas = getattr(exc, "measured_bytes_read", None)
                 raw_est = getattr(exc, "estimated_bytes_read", None)
