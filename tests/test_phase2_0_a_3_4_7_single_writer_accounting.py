@@ -775,7 +775,7 @@ class TestPhase20A347SingleWriterAccounting(unittest.TestCase):
 
         violations = []
 
-        for py_path in extractor_dir.glob("*.py"):
+        for py_path in extractor_dir.rglob("*.py"):
             if py_path.name == "observation_budget.py":
                 continue  # Tracker itself is permitted internal access
 
@@ -804,7 +804,7 @@ class TestPhase20A347SingleWriterAccounting(unittest.TestCase):
 
         violations = []
 
-        for py_path in extractor_dir.glob("*.py"):
+        for py_path in extractor_dir.rglob("*.py"):
             if py_path.name == "observation_budget.py":
                 continue
 
