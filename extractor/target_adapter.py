@@ -324,15 +324,31 @@ class TargetExecutionAdapter(ABC):
 
         results = []
         any_failure = False
-        for addr, sz in slices:
+        for idx, (addr, sz) in enumerate(slices):
+            child_read = None
+            if adm is not None:
+                child_read = adm.start_child_read(
+                    target_type="memory_slice",
+                    target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx},
+                )
+                child_read.mark_started()
+
             if _adapter_supports_admission(self, "read_memory"):
                 res = self.read_memory(pid, addr, sz, admission=adm, budget_tracker=eff_tracker)
             else:
                 res = self.read_memory(pid, addr, sz)
             results.append(res)
-            _, st, _ = res
-            if st not in ("OBSERVED", "PARTIAL"):
+            raw_b, st, _ = res
+            act_b = len(raw_b) if raw_b else 0
+            is_fail = (st not in ("OBSERVED", "PARTIAL"))
+            if is_fail:
                 any_failure = True
+            if child_read is not None:
+                if child_read.state in ("ADMITTED", "PHYSICAL_READ_STARTED"):
+                    if act_b > 0:
+                        child_read.consume(actual_bytes=act_b, is_failure=is_fail)
+                    else:
+                        child_read.release()
 
         if own_adm and adm is not None and eff_tracker is not None:
             tot_b = adm.consumed_bytes
@@ -357,6 +373,14 @@ class TargetExecutionAdapter(ABC):
     def is_remote(self) -> bool:
         """Returns True if the target is on a remote host, False if local."""
         pass
+
+    def set_budget_tracker(self, tracker: Any) -> None:
+        """Sets the observation budget tracker for this adapter."""
+        self._budget_tracker = tracker
+
+    def get_budget_tracker(self) -> Optional[Any]:
+        """Returns the observation budget tracker for this adapter, if set."""
+        return getattr(self, "_budget_tracker", None)
 
     @abstractmethod
     def target_host(self) -> str:
@@ -1627,7 +1651,13 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 self._last_maps_bytes_read = 0
                 return []
 
+        pread_maps = None
         if adm is not None:
+            pread_maps = adm.start_child_read(
+                target_type="proc_maps",
+                target_spec={"pid": pid, "path": maps_path},
+            )
+            pread_maps.mark_started()
             adm.mark_physical_read_started()
 
         content = ""
@@ -1643,7 +1673,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         self._last_maps_bytes_read = m_bytes
 
         if m_bytes > 0:
-            if adm is not None:
+            if pread_maps is not None:
+                pread_maps.consume(actual_bytes=m_bytes, is_failure=(read_err is not None))
+            elif adm is not None:
                 adm.consume(actual_bytes=m_bytes, is_failure=(read_err is not None), accumulate=not own_adm)
             if own_adm and eff_tracker is not None:
                 active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
@@ -1658,6 +1690,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         reservations=[adm] if adm else None,
                     )
         else:
+            if pread_maps is not None:
+                pread_maps.release()
             if own_adm and adm is not None and eff_tracker is not None:
                 if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
                     eff_tracker.release_reservation(adm)
@@ -1779,6 +1813,39 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             6: "SCHED_DEADLINE",
         }
 
+        def _read_proc_file(tid_str: str, fname: str) -> Tuple[str, int]:
+            nonlocal total_proc_bytes_read, task_bytes
+            fpath = os.path.join(task_dir, tid_str, fname)
+            pread_f = None
+            if adm is not None:
+                pread_f = adm.start_child_read(
+                    target_type="proc_task_file",
+                    target_spec={"pid": pid, "tid": int(tid_str), "file": fname},
+                )
+            if not os.path.exists(fpath):
+                if pread_f is not None:
+                    pread_f.release()
+                return "", 0
+            try:
+                if pread_f is not None:
+                    pread_f.mark_started()
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    raw_text = f.read()
+                b_count = len(raw_text.encode("utf-8"))
+                total_proc_bytes_read += b_count
+                task_bytes += b_count
+                if pread_f is not None:
+                    pread_f.consume(actual_bytes=b_count)
+                return raw_text, b_count
+            except (FileNotFoundError, ProcessLookupError):
+                if pread_f is not None:
+                    pread_f.release()
+                return "", 0
+            except Exception:
+                if pread_f is not None:
+                    pread_f.consume(actual_bytes=None, conservative_estimate_bytes=32, is_failure=True)
+                return "", 0
+
         try:
             for tid_entry in os.listdir(task_dir):
                 if tid_entry.isdigit():
@@ -1791,92 +1858,69 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     cpu_id: Optional[int] = None
                     rt_priority = 0
                     sched_policy = "SCHED_OTHER"
-                    comm_file = os.path.join(task_dir, tid_entry, "comm")
-                    if os.path.exists(comm_file):
-                        try:
-                            with open(comm_file, "r", encoding="utf-8", errors="replace") as cf:
-                                raw_comm = cf.read()
-                                b_comm = len(raw_comm.encode("utf-8"))
-                                total_proc_bytes_read += b_comm
-                                task_bytes += b_comm
-                                comm = raw_comm.strip()
-                        except Exception:
-                            pass
+                    raw_comm, _ = _read_proc_file(tid_entry, "comm")
+                    if raw_comm:
+                        comm = raw_comm.strip()
+
                     kstkesp = 0
-                    stat_file = os.path.join(task_dir, tid_entry, "stat")
-                    if os.path.exists(stat_file):
-                        try:
-                            with open(stat_file, "r", encoding="utf-8", errors="replace") as sf:
-                                raw_stat = sf.read()
-                                b_stat = len(raw_stat.encode("utf-8"))
-                                total_proc_bytes_read += b_stat
-                                task_bytes += b_stat
-                                raw_stat = raw_stat.strip()
-                                rparen = raw_stat.rfind(")")
-                                if rparen != -1:
-                                    rest = raw_stat[rparen + 1:].strip().split()
-                                    if len(rest) >= 1:
-                                        state = rest[0]
-                                    if len(rest) >= 13:
-                                        try:
-                                            utime_ticks = int(rest[11])
-                                            stime_ticks = int(rest[12])
-                                        except (ValueError, IndexError):
-                                            pass
-                                    if len(rest) >= 26:
-                                        try:
-                                            startstack = int(rest[25])
-                                        except (ValueError, IndexError):
-                                            pass
-                                    if len(rest) >= 27:
-                                        try:
-                                            kstkesp = int(rest[26])
-                                        except (ValueError, IndexError):
-                                            pass
-                                    if len(rest) >= 37:
-                                        try:
-                                            cpu_id = int(rest[36])
-                                        except (ValueError, IndexError):
-                                            pass
-                                    if len(rest) >= 39:
-                                        try:
-                                            rt_priority = int(rest[37])
-                                            pol_num = int(rest[38])
-                                            sched_policy = sched_policy_names.get(pol_num, f"POLICY_{pol_num}")
-                                        except (ValueError, IndexError):
-                                            pass
-                        except Exception:
-                            pass
+                    raw_stat, _ = _read_proc_file(tid_entry, "stat")
+                    if raw_stat:
+                        raw_stat = raw_stat.strip()
+                        rparen = raw_stat.rfind(")")
+                        if rparen != -1:
+                            rest = raw_stat[rparen + 1:].strip().split()
+                            if len(rest) >= 1:
+                                state = rest[0]
+                            if len(rest) >= 13:
+                                try:
+                                    utime_ticks = int(rest[11])
+                                    stime_ticks = int(rest[12])
+                                except (ValueError, IndexError):
+                                    pass
+                            if len(rest) >= 26:
+                                try:
+                                    startstack = int(rest[25])
+                                except (ValueError, IndexError):
+                                    pass
+                            if len(rest) >= 27:
+                                try:
+                                    kstkesp = int(rest[26])
+                                except (ValueError, IndexError):
+                                    pass
+                            if len(rest) >= 37:
+                                try:
+                                    cpu_id = int(rest[36])
+                                except (ValueError, IndexError):
+                                    pass
+                            if len(rest) >= 39:
+                                try:
+                                    rt_priority = int(rest[37])
+                                    pol_num = int(rest[38])
+                                    sched_policy = sched_policy_names.get(pol_num, f"POLICY_{pol_num}")
+                                except (ValueError, IndexError):
+                                    pass
 
                     cpus_allowed_list = ""
                     numa_nodes_list = ""
                     voluntary_cs = 0
                     nonvoluntary_cs = 0
-                    status_file = os.path.join(task_dir, tid_entry, "status")
-                    if os.path.exists(status_file):
-                        try:
-                            with open(status_file, "r", encoding="utf-8", errors="replace") as stf:
-                                stf_text = stf.read()
-                                b_stf = len(stf_text.encode("utf-8"))
-                                total_proc_bytes_read += b_stf
-                                task_bytes += b_stf
-                                for sline in stf_text.splitlines():
-                                    if sline.startswith("Cpus_allowed_list:"):
-                                        cpus_allowed_list = sline.split(":", 1)[1].strip()
-                                    elif sline.startswith("Mems_allowed_list:"):
-                                        numa_nodes_list = sline.split(":", 1)[1].strip()
-                                    elif sline.startswith("voluntary_ctxt_switches:"):
-                                        try:
-                                            voluntary_cs = int(sline.split(":", 1)[1].strip())
-                                        except ValueError:
-                                            pass
-                                    elif sline.startswith("nonvoluntary_ctxt_switches:"):
-                                        try:
-                                            nonvoluntary_cs = int(sline.split(":", 1)[1].strip())
-                                        except ValueError:
-                                            pass
-                        except Exception:
-                            pass
+                    stf_text, _ = _read_proc_file(tid_entry, "status")
+                    if stf_text:
+                        for sline in stf_text.splitlines():
+                            if sline.startswith("Cpus_allowed_list:"):
+                                cpus_allowed_list = sline.split(":", 1)[1].strip()
+                            elif sline.startswith("Mems_allowed_list:"):
+                                numa_nodes_list = sline.split(":", 1)[1].strip()
+                            elif sline.startswith("voluntary_ctxt_switches:"):
+                                try:
+                                    voluntary_cs = int(sline.split(":", 1)[1].strip())
+                                except ValueError:
+                                    pass
+                            elif sline.startswith("nonvoluntary_ctxt_switches:"):
+                                try:
+                                    nonvoluntary_cs = int(sline.split(":", 1)[1].strip())
+                                except ValueError:
+                                    pass
 
                     pinned_cpus = _parse_cpulist(cpus_allowed_list)
                     if not pinned_cpus and hasattr(os, "sched_getaffinity"):
@@ -1893,58 +1937,42 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     syscall_name = None
                     syscall_arg0 = None
                     wchan = ""
-                    wchan_file = os.path.join(task_dir, tid_entry, "wchan")
-                    if os.path.exists(wchan_file):
-                        try:
-                            with open(wchan_file, "r", encoding="utf-8", errors="replace") as wf:
-                                raw_wchan = wf.read()
-                                b_wchan = len(raw_wchan.encode("utf-8"))
-                                total_proc_bytes_read += b_wchan
-                                task_bytes += b_wchan
-                                wchan = raw_wchan.strip()
-                        except Exception:
-                            pass
+                    raw_wchan, _ = _read_proc_file(tid_entry, "wchan")
+                    if raw_wchan:
+                        wchan = raw_wchan.strip()
 
                     is_running_user_space = (state == "R")
-                    syscall_file = os.path.join(task_dir, tid_entry, "syscall")
-                    if os.path.exists(syscall_file):
-                        try:
-                            with open(syscall_file, "r", encoding="utf-8", errors="replace") as syf:
-                                raw_sy = syf.read()
-                                b_sy = len(raw_sy.encode("utf-8"))
-                                total_proc_bytes_read += b_sy
-                                task_bytes += b_sy
-                                sy_raw = raw_sy.strip()
-                                if sy_raw.startswith("running"):
-                                    is_running_user_space = True
+                    raw_sy, _ = _read_proc_file(tid_entry, "syscall")
+                    if raw_sy:
+                        sy_raw = raw_sy.strip()
+                        if sy_raw.startswith("running"):
+                            is_running_user_space = True
+                        else:
+                            sy_parts = sy_raw.split()
+                            if len(sy_parts) >= 1 and sy_parts[0].isdigit():
+                                syscall_nr = int(sy_parts[0])
+                                # Support both x86_64 (202) and aarch64 (98) futex syscalls
+                                if syscall_nr in (98, 202):
+                                    syscall_name = "futex"
+                                elif syscall_nr == 422:
+                                    syscall_name = "futex_time64"
+                                elif syscall_nr == 449:
+                                    syscall_name = "futex_waitv"
+                            raw_sy_arg0 = None
+                            if len(sy_parts) >= 2:
+                                raw_sy_arg0 = sy_parts[1]
+                                if sy_parts[1].startswith("0x") or sy_parts[1].startswith("0X"):
+                                    try:
+                                        syscall_arg0 = int(sy_parts[1], 16)
+                                    except ValueError:
+                                        pass
                                 else:
-                                    sy_parts = sy_raw.split()
-                                    if len(sy_parts) >= 1 and sy_parts[0].isdigit():
-                                        syscall_nr = int(sy_parts[0])
-                                        # Support both x86_64 (202) and aarch64 (98) futex syscalls
-                                        if syscall_nr in (98, 202):
-                                            syscall_name = "futex"
-                                        elif syscall_nr == 422:
-                                            syscall_name = "futex_time64"
-                                        elif syscall_nr == 449:
-                                            syscall_name = "futex_waitv"
-                                    raw_sy_arg0 = None
-                                    if len(sy_parts) >= 2:
-                                        raw_sy_arg0 = sy_parts[1]
-                                        if sy_parts[1].startswith("0x") or sy_parts[1].startswith("0X"):
-                                            try:
-                                                syscall_arg0 = int(sy_parts[1], 16)
-                                            except ValueError:
-                                                pass
-                                        else:
-                                            try:
-                                                syscall_arg0 = int(sy_parts[1], 10)
-                                            except ValueError:
-                                                pass
-                                    if len(sy_parts) >= 2 and sy_parts[-2].startswith("0x"):
-                                        syscall_sp = int(sy_parts[-2], 16)
-                        except Exception:
-                            pass
+                                    try:
+                                        syscall_arg0 = int(sy_parts[1], 10)
+                                    except ValueError:
+                                        pass
+                            if len(sy_parts) >= 2 and sy_parts[-2].startswith("0x"):
+                                syscall_sp = int(sy_parts[-2], 16)
 
                     is_futex = bool(
                         (syscall_name and "futex" in syscall_name)
@@ -2042,10 +2070,15 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     })
 
             # Resolve stack_info and TCB address for pure user-space poll-mode threads (e.g. DPDK lcores where sp_int == 0)
-            unresolved_threads = [t for t in threads if t["stack_info"].get("status") != "AVAILABLE" or t["stack_info"].get("tcb_address") is None]
+            unresolved_threads = [
+                t for t in threads
+                if t["stack_info"].get("status") != "AVAILABLE" or (t["tid"] != pid and t["stack_info"].get("tcb_address") is None)
+            ]
             if unresolved_threads and self._memory_reader is None:
-                target_tids = {t["tid"]: t for t in threads}
+                target_tids = {t["tid"]: t for t in unresolved_threads}
                 for m in maps:
+                    if not any(t["stack_info"].get("status") != "AVAILABLE" or t["stack_info"].get("tcb_address") is None for t in unresolved_threads):
+                        break
                     if not m.get("is_readable") or not m.get("is_writable"):
                         continue
                     pathname = (m.get("pathname") or "").strip()
@@ -2053,11 +2086,18 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                         continue
                     vma_s = int(m["start_int"])
                     vma_e = int(m["end_int"])
-                    if (vma_e - vma_s) < 4096:
+                    sz = vma_e - vma_s
+                    if sz < 4096 or sz > 64 * 1024 * 1024:
                         continue
-                    top_from = max(vma_s, vma_e - 24576)
-                    from .watch_session import read_process_memory_slice
-                    raw_top, r_st, _ = read_process_memory_slice(pid, top_from, vma_e - top_from)
+                    top_from = max(vma_s, vma_e - 4096)
+                    mem_sz = vma_e - top_from
+                    if eff_tracker is not None and eff_tracker.remaining_bytes < mem_sz:
+                        break
+                    raw_top, r_st, _ = self.read_memory(pid, top_from, mem_sz, admission=adm, budget_tracker=eff_tracker)
+                    if raw_top:
+                        mem_b = len(raw_top)
+                        total_proc_bytes_read += mem_b
+                        mem_bytes += mem_b
                     if r_st != "OBSERVED" or not raw_top or len(raw_top) < 64:
                         continue
                     limit = len(raw_top) - 24
@@ -2111,9 +2151,10 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "memory_bytes": mem_bytes,
             "total_bytes": total_proc_bytes_read,
         }
-        extra_b = task_bytes + mem_bytes
-        if adm is not None and extra_b > 0:
-            adm.consume(actual_bytes=extra_b, accumulate=True)
+        if adm is not None and not getattr(adm, "child_reads", None):
+            extra_b = task_bytes + mem_bytes
+            if extra_b > 0:
+                adm.consume(actual_bytes=extra_b, accumulate=True)
 
         if own_adm and eff_tracker is not None:
             if total_proc_bytes_read > 0:
@@ -2165,14 +2206,23 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         if adm is not None:
             adm.mark_physical_read_started()
 
-        if self._memory_reader:
-            res_bytes, res_st, res_err = self._memory_reader(pid, address, size)
-        else:
-            from .watch_session import read_process_memory_slice
-            res_bytes, res_st, res_err = read_process_memory_slice(pid, address, size)
+        try:
+            if self._memory_reader:
+                res_bytes, res_st, res_err = self._memory_reader(pid, address, size)
+            else:
+                from .watch_session import read_process_memory_slice
+                res_bytes, res_st, res_err = read_process_memory_slice(pid, address, size)
+        except Exception as exc:
+            if adm is not None and own_adm and eff_tracker is not None:
+                if adm.consumed_bytes == 0 and adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
+                    try:
+                        eff_tracker.release_reservation(adm)
+                    except Exception:
+                        pass
+            raise exc
 
         actual_b = len(res_bytes) if res_bytes else 0
-        is_fail = (res_st not in ("OBSERVED", "PARTIAL"))
+        is_fail = (res_st != "OBSERVED")
 
         if adm is not None:
             if actual_b > 0:
@@ -2647,6 +2697,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._command_runner = command_runner or self._default_command_runner
         self.use_control_master = bool(use_control_master)
         self.collector_path = (collector_path or "").strip() or None
+        self._budget_tracker = None
         self._last_threads_bytes_read: int = 0
         self._last_maps_bytes_read: int = 0
         self._last_identity_bytes_read: int = 0
@@ -2660,6 +2711,81 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         p = f":{self.port}" if self.port != 22 else ""
         return f"{u}{self.host}{p}"
 
+    def set_budget_tracker(self, tracker: Any) -> None:
+        self._budget_tracker = tracker
+
+    def get_budget_tracker(self) -> Optional[Any]:
+        return getattr(self, "_budget_tracker", None)
+
+    def _acquire_remote_admission(
+        self,
+        projected_bytes: int,
+        profile_id: str,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Tuple[Optional[Any], bool, Optional[str]]:
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
+        if admission is not None:
+            if getattr(admission, "is_terminal", False):
+                return None, False, f"Admission in terminal state '{admission.state}'"
+            return admission, False, None
+
+        if eff_tracker is None:
+            return None, False, None
+
+        if eff_tracker.is_budget_exhausted:
+            return None, False, f"Observation budget exhausted: {eff_tracker.exhaustion_reason}"
+
+        active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+        try:
+            if active_scope is not None and not active_scope.is_finalized:
+                adm = active_scope.admit_read(projected_bytes=projected_bytes, profile_id=profile_id)
+            else:
+                adm = eff_tracker.admit_read(projected_bytes=projected_bytes, profile_id=profile_id)
+            return adm, True, None
+        except ValueError as ve:
+            return None, False, f"Observation budget admission rejected: {ve}"
+
+    def _finalize_remote_read(
+        self,
+        adm: Optional[Any],
+        own_adm: bool,
+        is_failure: bool,
+        profile_id: str,
+        budget_tracker: Optional[Any] = None,
+        operation_id: Optional[str] = None,
+    ) -> None:
+        if not own_adm or adm is None:
+            return
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+        if eff_tracker is None:
+            return
+
+        tot_b = adm.consumed_bytes
+        if tot_b > 0:
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+            if active_scope is not None and not active_scope.is_finalized:
+                active_scope.record_read(bytes_read=tot_b, admission=adm, profile_id=profile_id, is_failure=is_failure)
+            else:
+                eff_op_id = operation_id or f"standalone_remote_{profile_id}_{uuid.uuid4().hex[:8]}"
+                eff_tracker.commit_transaction(
+                    operation_id=eff_op_id,
+                    profile_id=profile_id,
+                    measured_bytes=tot_b,
+                    is_failure=is_failure,
+                    reservations=[adm],
+                )
+        else:
+            if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                eff_tracker.release_reservation(adm)
+
     def _default_command_runner(self, cmd_args: List[str], timeout: float) -> Tuple[int, str, str]:
         try:
             res = subprocess.run(
@@ -2671,11 +2797,30 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return res.returncode, res.stdout, res.stderr
         except subprocess.TimeoutExpired:
             return -1, "", f"SSH command timed out after {timeout:.1f}s"
+        except FileNotFoundError as fnf:
+            return -2, "", f"SSH command execution failed before invocation: {fnf}"
         except Exception as e:
+            err_msg = str(e)
+            if "not found" in err_msg.lower() or "permission" in err_msg.lower():
+                return -2, "", f"SSH command execution failed before invocation: {e}"
             return -1, "", f"SSH execution error: {e}"
 
-    def run_ssh(self, remote_shell_cmd: str, timeout: Optional[float] = None) -> Tuple[int, str, str]:
+    def run_ssh(
+        self,
+        remote_shell_cmd: str,
+        timeout: Optional[float] = None,
+        admission: Optional[Any] = None,
+        child_read: Optional[Any] = None,
+    ) -> Tuple[int, str, str]:
         """Runs a command on the remote target using configured SSH parameters."""
+        if admission is not None:
+            if getattr(admission, "is_terminal", False):
+                raise RuntimeError(f"Cannot execute SSH command under terminal admission '{admission.state}'")
+            admission.mark_physical_read_started()
+        if child_read is not None:
+            if getattr(child_read, "is_terminal", False):
+                raise RuntimeError(f"Cannot execute SSH command under terminal child read '{child_read.state}'")
+            child_read.mark_started()
         t = timeout or self.timeout_sec
         args = [
             self.ssh_bin,
@@ -2704,7 +2849,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return self._command_runner(args, t)
         except subprocess.TimeoutExpired:
             return -1, "", f"SSH command timed out after {t:.1f}s"
+        except (FileNotFoundError, PermissionError) as e:
+            return -2, "", f"SSH execution failed before invocation: {e}"
         except Exception as e:
+            err_msg = str(e)
+            if "not found" in err_msg.lower() or "permission" in err_msg.lower():
+                return -2, "", f"SSH execution failed before invocation: {e}"
             return -1, "", f"SSH execution error: {e}"
 
     def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
@@ -2799,22 +2949,65 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "measurement_breakdown": empty_breakdown,
             }
 
+        # Pre-read admission must occur before remote command execution
+        adm, own_adm, rej_err = self._acquire_remote_admission(65536 + 4096, "target_identity", admission=None, budget_tracker=budget_tracker)
+        if rej_err:
+            self._last_identity_bytes_read = 0
+            self._last_identity_estimated_bytes = 0
+            self._last_identity_status = "UNAVAILABLE"
+            self._last_identity_breakdown = empty_breakdown
+            self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
+            return {
+                "pid": pid,
+                "status": "FAILED",
+                "identity_status": IDENTITY_UNAVAILABLE,
+                "executable": "",
+                "architecture": "unknown",
+                "elf_class": "unknown",
+                "endianness": "unknown",
+                "elf_type": "unknown",
+                "build_id": None,
+                "pt_loads": [],
+                "process_start_time": None,
+                "is_remote": True,
+                "host": self.target_host(),
+                "error": f"Observation budget admission rejected: {rej_err}",
+                "measured_bytes_read": 0,
+                "estimated_bytes_read": 0,
+                "measurement_status": "UNAVAILABLE",
+                "measurement_breakdown": empty_breakdown,
+            }
+
         readlink_bytes = 0
         stat_bytes = 0
         elf_bytes_read = 0
 
         # 1. Resolve remote executable path
+        pread_exe = adm.start_child_read(target_type="remote_identity_readlink", target_spec={"pid": pid}) if adm is not None else None
         cmd_exe = f"readlink -f /proc/{int(pid)}/exe 2>/dev/null || readlink /proc/{int(pid)}/exe 2>/dev/null"
-        rc, stdout, _ = self.run_ssh(cmd_exe)
+        rc, stdout, _ = self.run_ssh(cmd_exe, admission=adm, child_read=pread_exe)
         remote_exe = stdout.strip() if rc == 0 else ""
-        readlink_bytes += len(stdout.encode("utf-8", errors="replace"))
+        b_exe = len(stdout.encode("utf-8", errors="replace")) if stdout else 0
+        readlink_bytes += b_exe
+        if pread_exe is not None:
+            if rc == -2:
+                pread_exe.release()
+            else:
+                pread_exe.consume(actual_bytes=b_exe)
 
         # 2. Extract remote process start time from /proc/<pid>/stat
+        pread_stat = adm.start_child_read(target_type="remote_identity_stat", target_spec={"pid": pid}) if adm is not None else None
         cmd_stat = f"cat /proc/{int(pid)}/stat 2>/dev/null"
-        rc_stat, stdout_stat, _ = self.run_ssh(cmd_stat)
+        rc_stat, stdout_stat, _ = self.run_ssh(cmd_stat, admission=adm, child_read=pread_stat)
         start_time = None
+        b_stat = len(stdout_stat.encode("utf-8", errors="replace")) if stdout_stat else 0
+        stat_bytes += b_stat
+        if pread_stat is not None:
+            if rc_stat == -2:
+                pread_stat.release()
+            else:
+                pread_stat.consume(actual_bytes=b_stat)
         if rc_stat == 0 and stdout_stat:
-            stat_bytes += len(stdout_stat.encode("utf-8", errors="replace"))
             r_paren = stdout_stat.rfind(")")
             if r_paren != -1:
                 fields = stdout_stat[r_paren + 1:].split()
@@ -2825,8 +3018,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         pass
 
         # 3. Extract first 64KB of executable via base64 to inspect ELF header on host
+        pread_hdr = adm.start_child_read(target_type="remote_identity_elf", target_spec={"pid": pid}) if adm is not None else None
         cmd_hdr = f"head -c 65536 /proc/{int(pid)}/exe 2>/dev/null | base64"
-        rc, stdout_b64, stderr = self.run_ssh(cmd_hdr, timeout=self.timeout_sec * 1.5)
+        rc, stdout_b64, stderr = self.run_ssh(cmd_hdr, timeout=self.timeout_sec * 1.5, admission=adm, child_read=pread_hdr)
+        b_hdr = len(stdout_b64.encode("utf-8", errors="replace")) if stdout_b64 else 0
+        elf_bytes_read += b_hdr
+        if pread_hdr is not None:
+            if rc == -2:
+                pread_hdr.release()
+            else:
+                pread_hdr.consume(actual_bytes=b_hdr)
 
         arch = "unknown"
         elf_class = "unknown"
@@ -2884,18 +3085,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         op_id = operation_id or f"proc_identity_{pid}_{uuid.uuid4().hex[:8]}"
         m_type = "MEASURED" if total_measured_bytes > 0 else "UNKNOWN"
         acct_status = "PENDING"
-        if budget_tracker is not None:
-            record = ObservationAccountingRecord(
-                operation_id=op_id,
-                accounting_owner="ADAPTER",
-                measured_bytes_read=total_measured_bytes,
-                estimated_bytes_read=0,
-                charged_bytes=total_measured_bytes,
-                latency_us=self._last_identity_latency_us,
-                measurement_type=m_type,
-            )
-            ok = budget_tracker.commit_transaction(record, profile_id="target_identity")
-            acct_status = "COMMITTED" if ok else "FAILED"
+        if own_adm and total_measured_bytes > 0:
+            acct_status = "COMMITTED"
+        self._finalize_remote_read(adm, own_adm, not is_verified, "target_identity", budget_tracker, operation_id=op_id)
 
         return {
             "pid": pid,
@@ -2933,14 +3125,31 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if not alive:
             return {"status": "TARGET_TERMINATED", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}}
 
+        adm, own_adm, rej_err = self._acquire_remote_admission(4096, "target_memory_info", admission=admission, budget_tracker=budget_tracker)
+        if rej_err:
+            return {"status": "UNAVAILABLE", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}, "error": rej_err}
+
+        pread = adm.start_child_read(target_type="remote_process_memory_info", target_spec={"pid": pid}) if adm is not None else None
         cmd = (
             f"cat /proc/{int(pid)}/statm 2>/dev/null; "
             f"echo '---DELIM_STATUS---'; cat /proc/{int(pid)}/status 2>/dev/null; "
             f"echo '---DELIM_SMAPS---'; head -c 4096 /proc/{int(pid)}/smaps_rollup 2>/dev/null"
         )
-        rc, stdout, stderr = self.run_ssh(cmd)
-        if rc != 0 or not stdout:
+        rc, stdout, stderr = self.run_ssh(cmd, admission=adm, child_read=pread)
+        if rc == -2:
+            if pread is not None:
+                pread.release()
+            self._finalize_remote_read(adm, own_adm, False, "target_memory_info", budget_tracker)
+            return {"status": "UNAVAILABLE", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}, "error": stderr.strip()}
+        elif rc != 0 or not stdout:
+            if pread is not None:
+                pread.consume(actual_bytes=None, conservative_estimate_bytes=4096, is_failure=True)
+            self._finalize_remote_read(adm, own_adm, True, "target_memory_info", budget_tracker)
             return {"status": "UNAVAILABLE", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}}
+
+        b_statm = len(stdout.encode("utf-8")) if stdout else 0
+        if pread is not None:
+            pread.consume(actual_bytes=b_statm)
 
         parts = stdout.split("---DELIM_STATUS---")
         raw_statm = parts[0].strip() if len(parts) > 0 else ""
@@ -3010,7 +3219,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             except (IndexError, ValueError):
                 pass
 
-        maps = self.get_proc_maps(pid)
+        maps = self.get_proc_maps(pid, admission=adm, budget_tracker=budget_tracker)
         total_mapping_size = sum(m.get("size", 0) for m in maps)
         heap_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]")
         anon_mapping_size = sum(m.get("size", 0) for m in maps if m.get("category") == "anonymous" and m.get("is_writable"))
@@ -3018,6 +3227,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         vsz_eff = status_vsz if status_vsz is not None else (statm_vsz if statm_vsz is not None else total_mapping_size)
         rss_eff = status_rss if status_rss is not None else statm_rss
+
+        self._finalize_remote_read(adm, own_adm, False, "target_memory_info", budget_tracker)
 
         return {
             "status": "OBSERVED",
@@ -3056,11 +3267,35 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         admission: Optional[Any] = None,
         budget_tracker: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
+        adm, own_adm, rej_err = self._acquire_remote_admission(4096, "target_maps", admission=admission, budget_tracker=budget_tracker)
+        if rej_err:
+            self._last_maps_bytes_read = 0
+            return []
+
+        pread = adm.start_child_read(target_type="remote_proc_maps", target_spec={"pid": pid}) if adm is not None else None
         cmd = f"cat /proc/{int(pid)}/maps 2>/dev/null"
-        rc, stdout, _ = self.run_ssh(cmd)
+        rc, stdout, stderr = self.run_ssh(cmd, admission=adm, child_read=pread)
         mappings: List[Dict[str, Any]] = []
-        self._last_maps_bytes_read = len(stdout.encode("utf-8")) if stdout else 0
-        if rc != 0 or not stdout:
+        if rc == -2:
+            if pread is not None:
+                pread.release()
+            self._finalize_remote_read(adm, own_adm, False, "target_maps", budget_tracker)
+            self._last_maps_bytes_read = 0
+            return []
+        elif rc != 0:
+            if pread is not None:
+                pread.consume(actual_bytes=None, conservative_estimate_bytes=4096, is_failure=True)
+            self._finalize_remote_read(adm, own_adm, True, "target_maps", budget_tracker)
+            self._last_maps_bytes_read = 0
+            return []
+
+        b_maps = len(stdout.encode("utf-8")) if stdout else 0
+        self._last_maps_bytes_read = b_maps
+        if pread is not None:
+            pread.consume(actual_bytes=b_maps)
+        self._finalize_remote_read(adm, own_adm, False, "target_maps", budget_tracker)
+
+        if not stdout:
             return mappings
 
         for line in stdout.splitlines():
@@ -3115,6 +3350,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         admission: Optional[Any] = None,
         budget_tracker: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
+        adm, own_adm, rej_err = self._acquire_remote_admission(4096, "target_threads", admission=admission, budget_tracker=budget_tracker)
+        if rej_err:
+            self._last_threads_bytes_read = 0
+            return []
+
+        pread = adm.start_child_read(target_type="remote_threads", target_spec={"pid": pid}) if adm is not None else None
         # Efficient remote script to list threads without spawning multiple remote processes
         remote_script = (
             f"for t in /proc/{int(pid)}/task/*; do "
@@ -3125,10 +3366,26 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             f"echo \"$tid $stat $comm\"; "
             f"done"
         )
-        rc, stdout, _ = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
+        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}", admission=adm, child_read=pread)
         threads: List[Dict[str, Any]] = []
-        if rc != 0 or not stdout:
-            return threads
+        if rc == -2:
+            if pread is not None:
+                pread.release()
+            self._finalize_remote_read(adm, own_adm, False, "target_threads", budget_tracker)
+            self._last_threads_bytes_read = 0
+            return []
+        elif rc != 0:
+            if pread is not None:
+                pread.consume(actual_bytes=None, conservative_estimate_bytes=2048, is_failure=True)
+            self._finalize_remote_read(adm, own_adm, True, "target_threads", budget_tracker)
+            self._last_threads_bytes_read = 0
+            return []
+
+        b_threads = len(stdout.encode("utf-8")) if stdout else 0
+        self._last_threads_bytes_read = b_threads
+        if pread is not None:
+            pread.consume(actual_bytes=b_threads)
+        self._finalize_remote_read(adm, own_adm, False, "target_threads", budget_tracker)
 
         for line in stdout.splitlines():
             tokens = line.strip().split(maxsplit=2)
@@ -3174,6 +3431,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self,
         pid: int,
         slices: List[Tuple[int, int]],
+        admission: Optional[Any] = None,
+        child_read: Optional[Any] = None,
     ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
         """Uses C99 dynamicstate-collector --read-slices on the remote target for zero-stop process_vm_readv batch reads."""
         if not self.collector_path or not slices:
@@ -3181,7 +3440,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         import json as _json
         spec = ",".join(f"0x{int(addr):x}:{max(0, int(sz))}" for addr, sz in slices)
         cmd = f"{shlex.quote(self.collector_path)} -p {int(pid)} --read-slices {shlex.quote(spec)} 2>/dev/null"
-        rc, stdout, _ = self.run_ssh(cmd)
+        rc, stdout, stderr = self.run_ssh(cmd, admission=admission, child_read=child_read)
+        if rc == 127 or "not found" in stderr.lower() or rc == -2:
+            return None
         if not stdout.strip():
             return None
         try:
@@ -3223,15 +3484,44 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         """Reads multiple memory slices in a single SSH roundtrip (via C99 collector or batched POSIX shell)."""
         if not slices:
             return []
+
+        total_proj = sum(sz for _, sz in slices)
+        adm, own_adm, rej_err = self._acquire_remote_admission(total_proj, "memory_read_batch", admission=admission, budget_tracker=budget_tracker)
+        if rej_err:
+            return [(None, "BUDGET_EXHAUSTED", rej_err) for _ in slices]
+
         if len(slices) == 1 and not self.collector_path:
-            return [self.read_memory(pid, slices[0][0], slices[0][1])]
+            return [self.read_memory(pid, slices[0][0], slices[0][1], admission=adm, budget_tracker=budget_tracker)]
+
+        child_reads: List[Optional[Any]] = []
+        if adm is not None:
+            adm.mark_physical_read_started()
+            for idx, (addr, sz) in enumerate(slices):
+                cr = adm.start_child_read(
+                    target_type="remote_memory_slice",
+                    target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx},
+                )
+                cr.mark_started()
+                child_reads.append(cr)
+        else:
+            child_reads = [None for _ in slices]
 
         if self.collector_path:
-            coll_res = self._read_slices_via_collector(pid, slices)
+            coll_res = self._read_slices_via_collector(pid, slices, admission=adm)
             if coll_res is not None:
+                any_fail = False
+                for idx, res_item in enumerate(coll_res):
+                    res_b, res_st, _ = res_item
+                    act_b = len(res_b) if res_b else 0
+                    is_fail = (res_st not in ("OBSERVED", "PARTIAL"))
+                    if is_fail:
+                        any_fail = True
+                    cr = child_reads[idx]
+                    if cr is not None:
+                        cr.consume(actual_bytes=act_b, is_failure=is_fail)
+                self._finalize_remote_read(adm, own_adm, any_fail, "memory_read_batch", budget_tracker)
                 return coll_res
 
-        # Single-SSH batched shell read with page-aligned dd fallback for 64-bit BusyBox offsets
         cmds = []
         for idx, (addr, sz) in enumerate(slices):
             a_int = int(addr)
@@ -3252,8 +3542,19 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 f"echo \"{idx}|$b\""
             )
         remote_script = "; ".join(cmds)
-        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
-        if rc != 0:
+        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}", admission=adm)
+        if rc == -2:
+            for cr in child_reads:
+                if cr is not None:
+                    cr.release()
+            self._finalize_remote_read(adm, own_adm, False, "memory_read_batch", budget_tracker)
+            return [(None, "UNAVAILABLE", f"SSH transport failed before execution: {stderr.strip()}") for _ in slices]
+        elif rc != 0:
+            for idx, (addr, sz) in enumerate(slices):
+                cr = child_reads[idx]
+                if cr is not None:
+                    cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True)
+            self._finalize_remote_read(adm, own_adm, True, "memory_read_batch", budget_tracker)
             alive, live_err = self.check_liveness(pid)
             if not alive:
                 st = "UNAVAILABLE" if (live_err and ("transport" in live_err.lower() or "timed out" in live_err.lower())) else "TARGET_TERMINATED"
@@ -3268,24 +3569,43 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     by_idx[int(k_str)] = val_b64.strip()
 
         results: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        any_failure = False
         for idx, (addr, sz) in enumerate(slices):
+            cr = child_reads[idx]
             if sz <= 0:
+                if cr is not None:
+                    cr.consume(actual_bytes=0, is_failure=False)
                 results.append((b"", "OBSERVED", None))
                 continue
             b64_str = by_idx.get(idx, "")
             if not b64_str:
+                if cr is not None:
+                    cr.consume(actual_bytes=0, is_failure=True)
+                any_failure = True
                 results.append((None, "UNAVAILABLE", f"Address 0x{int(addr):x} is not mapped or inaccessible on {self.target_host()}"))
                 continue
             try:
                 raw_b = base64.b64decode(b64_str)
                 if len(raw_b) == sz:
+                    if cr is not None:
+                        cr.consume(actual_bytes=len(raw_b), is_failure=False)
                     results.append((raw_b, "OBSERVED", None))
                 elif len(raw_b) > 0:
+                    if cr is not None:
+                        cr.consume(actual_bytes=len(raw_b), is_failure=False)
                     results.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{sz} bytes"))
                 else:
+                    if cr is not None:
+                        cr.consume(actual_bytes=0, is_failure=True)
+                    any_failure = True
                     results.append((None, "UNAVAILABLE", f"Zero bytes returned at 0x{int(addr):x}"))
             except Exception as e:
+                if cr is not None:
+                    cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True)
+                any_failure = True
                 results.append((None, "UNAVAILABLE", f"Base64 decode failure: {e}"))
+
+        self._finalize_remote_read(adm, own_adm, any_failure, "memory_read_batch", budget_tracker)
         return results
 
     def read_memory(
@@ -3299,42 +3619,83 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if size <= 0:
             return b"", "OBSERVED", None
 
+        adm, own_adm, rej_err = self._acquire_remote_admission(size, "memory_read", admission=admission, budget_tracker=budget_tracker)
+        if rej_err:
+            return None, "BUDGET_EXHAUSTED", rej_err
+
+        pread = adm.start_child_read(
+            target_type="remote_memory",
+            target_spec={"pid": pid, "address": address, "size": size},
+        ) if adm is not None else None
+
         if self.collector_path:
-            coll_res = self._read_slices_via_collector(pid, [(address, size)])
+            coll_res = self._read_slices_via_collector(pid, [(address, size)], admission=adm, child_read=pread)
             if coll_res is not None and len(coll_res) == 1:
+                res_b, res_st, res_err = coll_res[0]
+                act_b = len(res_b) if res_b else 0
+                is_fail = (res_st not in ("OBSERVED", "PARTIAL"))
+                if pread is not None:
+                    pread.consume(actual_bytes=act_b, is_failure=is_fail)
+                elif adm is not None:
+                    adm.consume(actual_bytes=act_b, is_failure=is_fail, accumulate=not own_adm)
+                self._finalize_remote_read(adm, own_adm, is_fail, "memory_read", budget_tracker)
                 return coll_res[0]
 
         # Remote memory read via dd and base64
-        # dd skip requires decimal integer
         cmd = f"dd if=/proc/{int(pid)}/mem bs=1 skip={int(address)} count={int(size)} 2>/dev/null | base64"
-        rc, stdout, stderr = self.run_ssh(cmd)
-        if rc != 0:
-            if rc == -1 or "timed out" in stderr.lower() or "connection" in stderr.lower():
-                return None, "UNAVAILABLE", f"SSH transport failed reading memory at 0x{address:x}: {stderr.strip()}"
-            alive, live_err = self.check_liveness(pid)
-            if not alive:
-                if live_err and ("transport failure" in live_err.lower() or "timed out" in live_err.lower()):
-                    return None, "UNAVAILABLE", f"SSH transport failure at 0x{address:x}: {live_err}"
-                return None, "TARGET_TERMINATED", live_err or "Remote process terminated"
+        rc, stdout, stderr = self.run_ssh(cmd, admission=adm, child_read=pread)
+        if rc == -2:
+            if pread is not None:
+                pread.release()
+            self._finalize_remote_read(adm, own_adm, False, "memory_read", budget_tracker)
+            return None, "UNAVAILABLE", f"SSH transport failed before execution at 0x{address:x}: {stderr.strip()}"
+        elif rc != 0:
+            if pread is not None:
+                pread.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
+            elif adm is not None:
+                adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
+            self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
             return None, "UNAVAILABLE", f"SSH transport failed reading memory at 0x{address:x}: {stderr.strip()}"
 
         encoded = stdout.strip()
         if not encoded:
-            # If 0 bytes returned, verify if process is still alive
-            alive, live_err = self.check_liveness(pid)
-            if not alive:
-                return None, "TARGET_TERMINATED", live_err or "Remote process terminated"
+            if pread is not None:
+                pread.consume(actual_bytes=0, is_failure=True)
+            elif adm is not None:
+                adm.consume(actual_bytes=0, is_failure=True, accumulate=not own_adm)
+            self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
             return None, "UNAVAILABLE", f"Address 0x{address:x} is not mapped or inaccessible on {self.target_host()}"
 
         try:
             raw_bytes = base64.b64decode(encoded)
-            if len(raw_bytes) == size:
+            act_b = len(raw_bytes)
+            if act_b == size:
+                if pread is not None:
+                    pread.consume(actual_bytes=act_b, is_failure=False)
+                elif adm is not None:
+                    adm.consume(actual_bytes=act_b, is_failure=False, accumulate=not own_adm)
+                self._finalize_remote_read(adm, own_adm, False, "memory_read", budget_tracker)
                 return raw_bytes, "OBSERVED", None
-            elif len(raw_bytes) > 0:
-                return raw_bytes, "PARTIAL", f"Partial read: {len(raw_bytes)}/{size} bytes"
+            elif act_b > 0:
+                if pread is not None:
+                    pread.consume(actual_bytes=act_b, is_failure=False)
+                elif adm is not None:
+                    adm.consume(actual_bytes=act_b, is_failure=False, accumulate=not own_adm)
+                self._finalize_remote_read(adm, own_adm, False, "memory_read", budget_tracker)
+                return raw_bytes, "PARTIAL", f"Partial read: {act_b}/{size} bytes"
             else:
+                if pread is not None:
+                    pread.consume(actual_bytes=0, is_failure=True)
+                elif adm is not None:
+                    adm.consume(actual_bytes=0, is_failure=True, accumulate=not own_adm)
+                self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
                 return None, "UNAVAILABLE", f"Zero bytes returned at 0x{address:x}"
         except Exception as e:
+            if pread is not None:
+                pread.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
+            elif adm is not None:
+                adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
+            self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
             return None, "UNAVAILABLE", f"Base64 decode failure: {e}"
 
     def find_processes(

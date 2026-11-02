@@ -2010,7 +2010,7 @@ class AdaptiveInvestigationEngine:
             requires_explicit_target_expression=False,
             estimated_bytes=2048,
             estimated_latency_ms=15.0,
-            budget_ceiling={"max_bytes_read": 32768, "max_wall_clock_ms": 400.0, "max_samples": 4},
+            budget_ceiling={"max_bytes_read": 131072, "max_wall_clock_ms": 600.0, "max_samples": 6},
         )
         def _exec_insp_frame_locals(wm, **kw):
             if wm and hasattr(wm, "inspect_thread_locals_and_frame_vars"):
