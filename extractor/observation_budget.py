@@ -32,10 +32,37 @@ import types
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 import uuid
 
-# Register MappingProxyType in copy._deepcopy_dispatch for deepcopy support
-copy._deepcopy_dispatch[types.MappingProxyType] = lambda x, memo: types.MappingProxyType(
-    copy.deepcopy(dict(x), memo)
-)
+def clone_frozen(obj: Any) -> Any:
+    """Recursively clones metadata or target_spec into an independent deeply frozen structure.
+
+    Guarantees:
+    - Mapping / MappingProxyType -> types.MappingProxyType with string keys and recursively frozen values.
+    - list / tuple -> tuple of recursively frozen elements.
+    - set / frozenset -> frozenset of recursively frozen elements.
+    - bytes / bytearray -> bytes.
+    - Supported primitives (int, float, str, bool, NoneType) -> returned directly (immutable).
+    - Objects with to_dict() -> frozen dict of to_dict().
+    - Unsupported mutable types -> raises TypeError explicitly.
+    """
+    if isinstance(obj, Mapping):
+        frozen_dict = {}
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise TypeError(f"Metadata dictionary keys must be strings, got {type(k).__name__}: {repr(k)}")
+            frozen_dict[k] = clone_frozen(v)
+        return types.MappingProxyType(frozen_dict)
+    elif isinstance(obj, (list, tuple)):
+        return tuple(clone_frozen(x) for x in obj)
+    elif isinstance(obj, (set, frozenset)):
+        return frozenset(clone_frozen(x) for x in obj)
+    elif isinstance(obj, (bytes, bytearray)):
+        return bytes(obj)
+    elif isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+    elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+        return clone_frozen(obj.to_dict())
+    else:
+        raise TypeError(f"Unsupported metadata value type for clone_frozen: {type(obj).__name__} ({repr(obj)})")
 
 
 def freeze_metadata(obj: Any) -> Any:
@@ -44,40 +71,34 @@ def freeze_metadata(obj: Any) -> Any:
     - dict / Mapping -> MappingProxyType of recursively frozen key-value pairs (keys must be strings)
     - list / tuple -> tuple of recursively frozen elements
     - set / frozenset -> frozenset of recursively frozen elements
+    - bytes / bytearray -> bytes
     - primitives (int, float, str, bool, None) -> unchanged
     - objects with to_dict() -> frozen dict
     - unsupported mutable types -> raise TypeError
     """
-    if isinstance(obj, Mapping):
-        frozen_dict = {}
-        for k, v in obj.items():
-            if not isinstance(k, str):
-                raise TypeError(f"Metadata dictionary keys must be strings, got {type(k).__name__}: {repr(k)}")
-            frozen_dict[k] = freeze_metadata(v)
-        return types.MappingProxyType(frozen_dict)
-    elif isinstance(obj, (list, tuple)):
-        return tuple(freeze_metadata(x) for x in obj)
-    elif isinstance(obj, (set, frozenset)):
-        return frozenset(freeze_metadata(x) for x in obj)
-    elif isinstance(obj, (int, float, str, bool, type(None))):
-        return obj
-    elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
-        return freeze_metadata(obj.to_dict())
-    else:
-        raise TypeError(f"Unsupported metadata value type: {type(obj).__name__} ({repr(obj)})")
+    return clone_frozen(obj)
 
 
 def unfreeze_metadata(obj: Any) -> Any:
     """Recursively converts frozen metadata back to mutable Python types for serialization."""
     if isinstance(obj, Mapping):
-        return {k: unfreeze_metadata(v) for k, v in obj.items()}
+        return {str(k): unfreeze_metadata(v) for k, v in obj.items()}
     elif isinstance(obj, (tuple, list)):
         return [unfreeze_metadata(x) for x in obj]
     elif isinstance(obj, (set, frozenset)):
         return {unfreeze_metadata(x) for x in obj}
+    elif isinstance(obj, (bytes, bytearray)):
+        return bytes(obj)
     elif isinstance(obj, (int, float, str, bool, type(None))):
         return obj
-    return obj
+    elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+        return unfreeze_metadata(obj.to_dict())
+    raise TypeError(f"Unsupported metadata value type for unfreeze: {type(obj).__name__} ({repr(obj)})")
+
+
+def clone_metadata(obj: Any) -> Any:
+    """Recursively clones metadata into standard mutable Python structures (dict, list, set)."""
+    return unfreeze_metadata(obj)
 
 
 def canonical_metadata_digest(metadata: Any) -> str:
@@ -242,6 +263,29 @@ class CommittedTransactionSnapshot:
             physical_read_id=self.physical_read_id,
         )
 
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "CommittedTransactionSnapshot":
+        snap = CommittedTransactionSnapshot(
+            operation_id=self.operation_id,
+            accounting_owner=self.accounting_owner,
+            measured_bytes_read=self.measured_bytes_read,
+            estimated_bytes_read=self.estimated_bytes_read,
+            charged_bytes=self.charged_bytes,
+            latency_us=self.latency_us,
+            stop_ms=self.stop_ms,
+            is_failure=self.is_failure,
+            accounting_status=self.accounting_status,
+            measurement_type=self.measurement_type,
+            fingerprint=self.fingerprint,
+            metadata=clone_frozen(self.metadata) if self.metadata is not None else None,
+            committed_at_ms=self.committed_at_ms,
+            session_id=self.session_id,
+            physical_consumption_id=self.physical_consumption_id,
+            accounting_transaction_id=self.accounting_transaction_id,
+            physical_read_id=self.physical_read_id,
+        )
+        memo[id(self)] = snap
+        return snap
+
 
 @dataclass
 class ObservationAccountingRecord:
@@ -272,7 +316,7 @@ class ObservationAccountingRecord:
                 latency_us=self.latency_us,
                 accounting_status=self.accounting_status,
                 measurement_type=self.measurement_type,
-                metadata=copy.deepcopy(self.metadata, memo),
+                metadata=clone_metadata(self.metadata) if self.metadata is not None else {},
                 session_id=self.session_id,
                 physical_consumption_id=self.physical_consumption_id,
                 accounting_transaction_id=self.accounting_transaction_id,
@@ -526,6 +570,10 @@ class PhysicalReadRecord:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        if self.target_spec is not None and not isinstance(self.target_spec, types.MappingProxyType):
+            self.target_spec = clone_frozen(self.target_spec)
+
     def __deepcopy__(self, memo: Dict[int, Any]) -> "PhysicalReadRecord":
         with self._lock:
             rec = PhysicalReadRecord(
@@ -534,7 +582,7 @@ class PhysicalReadRecord:
                 physical_consumption_id=self.physical_consumption_id,
                 operation_id=self.operation_id,
                 target_type=self.target_type,
-                target_spec=copy.deepcopy(self.target_spec, memo),
+                target_spec=clone_frozen(self.target_spec) if self.target_spec is not None else None,
                 state=self.state,
                 measured_bytes_read=self.measured_bytes_read,
                 estimated_bytes_read=self.estimated_bytes_read,
@@ -676,6 +724,11 @@ class PhysicalReadRecord:
         """Transitions PHYSICAL_READ_STARTED or CONSUMED -> FAILED_ACCOUNTED preserving physical consumption."""
         with self._lock:
             if self.state == "FAILED_ACCOUNTED":
+                if failure_reason is not None and self.failure_reason is not None and self.failure_reason != failure_reason:
+                    raise ValueError(
+                        f"Conflicting repeated FAILED_ACCOUNTED for physical read '{self.physical_read_id}': "
+                        f"existing '{self.failure_reason}' != new '{failure_reason}'"
+                    )
                 return  # Idempotent for identical outcome
             if self.state in ("ACCOUNTED", "RELEASED"):
                 raise RuntimeError(
@@ -780,6 +833,32 @@ class PhysicalConsumptionRecord:
             "session_id": self.session_id,
             "metadata": unfreeze_metadata(self.metadata),
         }
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "PhysicalConsumptionRecord":
+        rec = PhysicalConsumptionRecord(
+            physical_consumption_id=self.physical_consumption_id,
+            physical_read_id=self.physical_read_id,
+            reservation_id=self.reservation_id,
+            operation_id=self.operation_id,
+            measured_bytes_read=self.measured_bytes_read,
+            estimated_bytes_read=self.estimated_bytes_read,
+            charged_bytes=self.charged_bytes,
+            latency_us=self.latency_us,
+            stop_ms=self.stop_ms,
+            is_failure=self.is_failure,
+            accounting_status=self.accounting_status,
+            measurement_type=self.measurement_type,
+            target_type=self.target_type,
+            target_spec=clone_frozen(self.target_spec) if self.target_spec is not None else None,
+            created_at_ms=self.created_at_ms,
+            committed_at_ms=self.committed_at_ms,
+            accounting_owner=self.accounting_owner,
+            fingerprint=self.fingerprint,
+            metadata=clone_frozen(self.metadata) if self.metadata is not None else None,
+            session_id=self.session_id,
+        )
+        memo[id(self)] = rec
+        return rec
 
 
 @dataclass
@@ -915,6 +994,10 @@ class BudgetReservation:
         """Returns a deep copy of child physical reads to prevent external state mutation."""
         with self._lock:
             return copy.deepcopy(self.child_reads)
+
+    def get_physical_read_records(self) -> Dict[str, PhysicalReadRecord]:
+        """Returns deep copy of child physical reads for this reservation."""
+        return self.get_child_reads()
 
     def mark_physical_read_started(
         self,
@@ -1071,11 +1154,12 @@ class BudgetReservation:
         with self._lock:
             if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' in state {self.state}")
-            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0 and not any(c.state in ("CONSUMED", "ACCOUNTED") for c in self.child_reads.values()):
-                raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' with zero consumption; must be released")
             for cr in self.child_reads.values():
                 if cr.state == "PHYSICAL_READ_STARTED":
                     raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}': child read '{cr.physical_read_id}' remains in flight")
+            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0 and not any(c.state in ("CONSUMED", "ACCOUNTED") for c in self.child_reads.values()):
+                raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' with zero consumption; must be released")
+            for cr in self.child_reads.values():
                 if cr.state == "CONSUMED":
                     cr.account()
             self.state = "ACCOUNTED"
@@ -1090,11 +1174,12 @@ class BudgetReservation:
                 raise RuntimeError(
                     f"Conflicting terminal transition: cannot finalize reservation '{self.reservation_id}' in state {self.state}"
                 )
-            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0 and not any(c.state in ("CONSUMED", "ACCOUNTED") for c in self.child_reads.values()):
-                raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' with zero consumption; must be released")
             for cr in self.child_reads.values():
                 if cr.state == "PHYSICAL_READ_STARTED":
                     raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}': child read '{cr.physical_read_id}' remains in flight")
+            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0 and not any(c.state in ("CONSUMED", "ACCOUNTED") for c in self.child_reads.values()):
+                raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' with zero consumption; must be released")
+            for cr in self.child_reads.values():
                 if cr.state == "CONSUMED":
                     cr.account()
             self.state = "ACCOUNTED" if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED") else "FINALIZED"
@@ -1117,8 +1202,6 @@ class BudgetReservation:
             for cr in self.child_reads.values():
                 if not cr.is_terminal:
                     cr.mark_failed_accounted()
-            self.state = "FAILED_ACCOUNTED"
-            self._transition_history.append("FAILED_ACCOUNTED")
             self.state = "FAILED_ACCOUNTED"
             self._transition_history.append("FAILED_ACCOUNTED")
 
@@ -1474,6 +1557,10 @@ class ObservationBudgetTracker:
         """Sets a deterministic fault injection hook for failure testing."""
         with self._transaction_lock:
             self._fault_injection_hooks[point] = hook
+
+    def register_fault_injection(self, point: str, hook: Callable[[], None]) -> None:
+        """Alias for set_fault_injection."""
+        self.set_fault_injection(point, hook)
 
     def clear_fault_injections(self) -> None:
         """Clears all registered fault injection hooks."""
@@ -2049,6 +2136,7 @@ class ObservationBudgetTracker:
             try:
                 # 1. Register physical ledger entry
                 step = "physical_ledger"
+                self._trigger_fault("before_physical_ledger_insertion")
                 self._trigger_fault("during_physical_ledger_insertion")
 
                 # Register all child physical reads and physical consumption records
@@ -2110,13 +2198,18 @@ class ObservationBudgetTracker:
                     )
                     self._physical_read_records[root_pread_id] = root_cr
 
+                self._trigger_fault("after_physical_ledger_insertion")
+
                 # 2. Register logical ledger entry
                 step = "logical_ledger"
+                self._trigger_fault("before_logical_ledger_insertion")
                 self._trigger_fault("during_logical_ledger_insertion")
                 self._committed_transactions[prepared.target_op_id] = prepared.snapshot
+                self._trigger_fault("after_logical_ledger_insertion")
 
                 # 3. Apply global metrics
                 step = "metrics"
+                self._trigger_fault("before_metrics_mutation")
                 self._trigger_fault("during_metric_application")
                 d = prepared.deltas
                 self.metrics.bytes_read += d["bytes_read"]
@@ -2146,12 +2239,14 @@ class ObservationBudgetTracker:
                     if d["is_failure"]:
                         p_usage["failures"] += 1
 
+                step = "after_metrics"
                 self.metrics.wall_clock_elapsed_ms = round(self.elapsed_ms, 3)
                 if self.metrics.bytes_read >= self.limits.max_bytes_read:
                     self.metrics.is_budget_exhausted = True
                     self.metrics.exhaustion_reason = (
                         f"EXCEEDED_BYTES_READ: current {self.metrics.bytes_read}B >= max {self.limits.max_bytes_read}B"
                     )
+                self._trigger_fault("after_metrics_mutation")
 
                 # 5. Finalize reservations
                 step = "reservations"
@@ -2501,7 +2596,7 @@ class ObservationBudgetTracker:
             prepared = self._prepare_scope_commit(scope, is_fail=True)
             return self._recover_commit_failure(prepared, error=error, metrics_applied=False, step="manual_emergency")
 
-    def reconcile_ledger(self) -> Dict[str, Any]:
+    def reconcile_ledger(self, raise_on_error: bool = True) -> Dict[str, Any]:
         """Deterministically verifies that all aggregate metrics match the authoritative ledger exactly.
 
         Enforces all 19 P0.8 authoritative accounting invariants.
@@ -2782,11 +2877,11 @@ class ObservationBudgetTracker:
                 "inv_19_unknown_consumption_never_zero": inv_19_ok,
             }
 
-            if discrepancies:
+            if discrepancies and raise_on_error:
                 raise AssertionError(f"Tracker ledger reconciliation failed: {'; '.join(discrepancies)}")
 
             return {
-                "reconciled": True,
+                "reconciled": len(discrepancies) == 0,
                 "discrepancies": discrepancies,
                 "discrepancy_details": discrepancy_details,
                 "total_transactions": len(snaps),
@@ -2843,6 +2938,16 @@ class ObservationBudgetTracker:
         if record is None:
             if operation_id is None:
                 raise ValueError("Must provide either record or operation_id to commit_transaction")
+            res_consumed = sum(r.consumed_bytes for r in (reservations or []))
+            if measured_bytes is None and estimated_bytes is None and res_consumed > 0:
+                child_reads = [cr for r in (reservations or []) for cr in getattr(r, "child_reads", {}).values()]
+                if child_reads:
+                    measured_bytes = sum(cr.measured_bytes_read or 0 for cr in child_reads if cr.measured_bytes_read is not None)
+                    estimated_bytes = sum(cr.estimated_bytes_read for cr in child_reads)
+                elif is_failure:
+                    estimated_bytes = res_consumed
+                else:
+                    measured_bytes = res_consumed
             record = ObservationAccountingRecord(
                 operation_id=operation_id,
                 accounting_owner=accounting_owner,
@@ -3310,10 +3415,26 @@ class ObservationBudgetTracker:
         with self._transaction_lock:
             return operation_id in self._committed_transactions
 
-    def get_committed_record(self, operation_id: str) -> Optional[ObservationAccountingRecord]:
-        """Returns the authoritative committed ObservationAccountingRecord for operation_id."""
+    def get_committed_record(self, operation_id: str) -> Optional[CommittedTransactionSnapshot]:
+        """Returns an independent deep copy of the authoritative committed transaction snapshot."""
         with self._transaction_lock:
-            return self._committed_transactions.get(operation_id)
+            rec = self._committed_transactions.get(operation_id)
+            if rec is None:
+                return None
+            return copy.deepcopy(rec)
+
+    def get_child_reads(self, reservation_id: Optional[str] = None) -> Dict[str, PhysicalReadRecord]:
+        """Returns deep copy of child physical reads for a reservation or across all active reservations."""
+        with self._transaction_lock:
+            if reservation_id is not None:
+                res = self._active_reservations.get(reservation_id)
+                if res is not None:
+                    return res.get_child_reads()
+                return {}
+            result = {}
+            for res in self._active_reservations.values():
+                result.update(res.get_child_reads())
+            return result
 
     def get_committed_transactions(self) -> Dict[str, ObservationAccountingRecord]:
         """Returns a deep-copied dictionary of all authoritative committed transactions."""

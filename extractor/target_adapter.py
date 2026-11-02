@@ -2945,17 +2945,30 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         return rc, stdout, stderr
 
-    def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
+    def check_liveness(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        child_read: Optional[Any] = None,
+    ) -> Tuple[bool, Optional[str]]:
         if pid <= 0:
             return False, f"Invalid PID {pid}"
         
         # Test liveness strictly on remote target host
         cmd = f"kill -0 {int(pid)} 2>/dev/null && echo ALIVE || echo DEAD"
-        rc, stdout, stderr = self.run_ssh(cmd)
+        rc, stdout, stderr = self.run_ssh(cmd, admission=admission, child_read=child_read)
+        if rc == -2:
+            if child_read is not None and not child_read.is_terminal:
+                child_read.release()
+            return False, f"SSH command execution failed before invocation: {stderr.strip()}"
         if rc != 0:
+            if child_read is not None and not child_read.is_terminal:
+                child_read.consume(actual_bytes=0, is_failure=True)
             return False, f"SSH transport failure to {self.target_host()}: {stderr.strip() or 'Exit ' + str(rc)}"
         
         out = stdout.strip()
+        if child_read is not None and not child_read.is_terminal:
+            child_read.consume(actual_bytes=0, is_failure=False)
         if "ALIVE" in out:
             return True, None
         return False, f"Target PID {pid} is not running on {self.target_host()}"
@@ -3009,35 +3022,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "measurement_breakdown": empty_breakdown,
             }
 
-        alive, live_err = self.check_liveness(pid)
-        if not alive:
-            self._last_identity_bytes_read = 0
-            self._last_identity_estimated_bytes = 0
-            self._last_identity_status = "UNAVAILABLE"
-            self._last_identity_breakdown = empty_breakdown
-            self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
-            return {
-                "pid": pid,
-                "status": "TARGET_TERMINATED",
-                "identity_status": IDENTITY_UNAVAILABLE,
-                "executable": "",
-                "architecture": "unknown",
-                "elf_class": "unknown",
-                "endianness": "unknown",
-                "elf_type": "unknown",
-                "build_id": None,
-                "pt_loads": [],
-                "process_start_time": None,
-                "is_remote": True,
-                "host": self.target_host(),
-                "error": live_err or f"Target PID {pid} is not running on {self.target_host()}",
-                "measured_bytes_read": 0,
-                "estimated_bytes_read": 0,
-                "measurement_status": "UNAVAILABLE",
-                "measurement_breakdown": empty_breakdown,
-            }
-
-        # Pre-read admission must occur before remote command execution
+        # 1. Pre-read budget admission MUST occur before ANY remote execution (including check_liveness)
         adm, own_adm, rej_err = self._acquire_remote_admission(65536 + 4096, "target_identity", admission=None, budget_tracker=budget_tracker)
         if rej_err:
             self._last_identity_bytes_read = 0
@@ -3060,6 +3045,37 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "is_remote": True,
                 "host": self.target_host(),
                 "error": f"Observation budget admission rejected: {rej_err}",
+                "measured_bytes_read": 0,
+                "estimated_bytes_read": 0,
+                "measurement_status": "UNAVAILABLE",
+                "measurement_breakdown": empty_breakdown,
+            }
+
+        # 2. Check liveness under admission
+        pread_live = adm.start_child_read(target_type="remote_identity_liveness", target_spec={"pid": pid}) if adm is not None else None
+        alive, live_err = self.check_liveness(pid, admission=adm, child_read=pread_live)
+        if not alive:
+            self._finalize_remote_read(adm, own_adm, True, "target_identity", budget_tracker, operation_id=f"proc_identity_{pid}_{uuid.uuid4().hex[:8]}")
+            self._last_identity_bytes_read = 0
+            self._last_identity_estimated_bytes = 0
+            self._last_identity_status = "UNAVAILABLE"
+            self._last_identity_breakdown = empty_breakdown
+            self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
+            return {
+                "pid": pid,
+                "status": "TARGET_TERMINATED",
+                "identity_status": IDENTITY_UNAVAILABLE,
+                "executable": "",
+                "architecture": "unknown",
+                "elf_class": "unknown",
+                "endianness": "unknown",
+                "elf_type": "unknown",
+                "build_id": None,
+                "pt_loads": [],
+                "process_start_time": None,
+                "is_remote": True,
+                "host": self.target_host(),
+                "error": live_err or f"Target PID {pid} is not running on {self.target_host()}",
                 "measured_bytes_read": 0,
                 "estimated_bytes_read": 0,
                 "measurement_status": "UNAVAILABLE",
@@ -3209,13 +3225,15 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         budget_tracker: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Reads detailed process memory metrics from remote /proc/<pid>/statm, status, and smaps_rollup."""
-        alive, _ = self.check_liveness(pid)
-        if not alive:
-            return {"status": "TARGET_TERMINATED", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}}
-
         adm, own_adm, rej_err = self._acquire_remote_admission(4096, "target_memory_info", admission=admission, budget_tracker=budget_tracker)
         if rej_err:
             return {"status": "UNAVAILABLE", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}, "error": rej_err}
+
+        pread_live = adm.start_child_read(target_type="remote_meminfo_liveness", target_spec={"pid": pid}) if adm is not None else None
+        alive, live_err = self.check_liveness(pid, admission=adm, child_read=pread_live)
+        if not alive:
+            self._finalize_remote_read(adm, own_adm, True, "target_memory_info", budget_tracker)
+            return {"status": "TARGET_TERMINATED", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}, "error": live_err or "Remote process terminated"}
 
         pread = adm.start_child_read(target_type="remote_process_memory_info", target_spec={"pid": pid}) if adm is not None else None
         cmd = (
@@ -3647,11 +3665,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}", admission=adm, child_read=child_reads_shell[0] if child_reads_shell else None)
         if rc == -2:
             for cr in child_reads_shell:
-                if cr is not None:
+                if cr is not None and not cr.is_terminal:
                     cr.release()
             self._finalize_remote_read(adm, own_adm, False, "memory_read_batch", budget_tracker)
             return [(None, "UNAVAILABLE", f"SSH transport failed before execution: {stderr.strip()}") for _ in slices]
-        elif rc != 0:
+
+        for cr in child_reads_shell:
+            if cr is not None and not cr.is_terminal and cr.state == "ADMITTED":
+                cr.mark_started()
+
+        if rc != 0:
             for idx, (addr, sz) in enumerate(slices):
                 cr = child_reads_shell[idx]
                 if cr is not None:
