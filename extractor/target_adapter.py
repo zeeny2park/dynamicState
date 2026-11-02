@@ -91,6 +91,22 @@ def _adapter_supports_admission(adapter: Any, method_name: str) -> bool:
         return False
 
 
+def _adapter_supports_param(adapter: Any, method_name: str, param_name: str) -> bool:
+    """Checks whether an adapter's method accepts a named parameter without invoking it."""
+    method = getattr(adapter, method_name, None)
+    if not callable(method):
+        return False
+    try:
+        import inspect
+        sig = inspect.signature(method)
+        for p in sig.parameters.values():
+            if p.kind == inspect.Parameter.VAR_KEYWORD or p.name == param_name:
+                return True
+        return False
+    except (ValueError, TypeError):
+        return False
+
+
 def normalize_futex_address(val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
     """Normalize raw syscall arg0 or lock address into canonical hex string and int.
     
@@ -278,6 +294,7 @@ class TargetExecutionAdapter(ABC):
         size: int,
         admission: Optional[Any] = None,
         budget_tracker: Optional[Any] = None,
+        child_read: Optional[Any] = None,
     ) -> Tuple[Optional[bytes], str, Optional[str]]:
         """Reads raw bytes from target memory without suspending the process.
         
@@ -319,7 +336,7 @@ class TargetExecutionAdapter(ABC):
             except ValueError as ve:
                 return [(None, "BUDGET_EXHAUSTED", f"Observation budget admission rejected: {ve}") for _ in slices]
 
-        if adm is not None:
+        if adm is not None and not adm.is_terminal:
             adm.mark_physical_read_started()
 
         results = []
@@ -331,10 +348,12 @@ class TargetExecutionAdapter(ABC):
                     target_type="memory_slice",
                     target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx},
                 )
-                child_read.mark_started()
 
             if _adapter_supports_admission(self, "read_memory"):
-                res = self.read_memory(pid, addr, sz, admission=adm, budget_tracker=eff_tracker)
+                kwargs = {"admission": adm, "budget_tracker": eff_tracker}
+                if _adapter_supports_param(self, "read_memory", "child_read"):
+                    kwargs["child_read"] = child_read
+                res = self.read_memory(pid, addr, sz, **kwargs)
             else:
                 res = self.read_memory(pid, addr, sz)
             results.append(res)
@@ -344,15 +363,14 @@ class TargetExecutionAdapter(ABC):
             if is_fail:
                 any_failure = True
             if child_read is not None:
-                if child_read.state in ("ADMITTED", "PHYSICAL_READ_STARTED"):
-                    if act_b > 0:
-                        child_read.consume(actual_bytes=act_b, is_failure=is_fail)
-                    else:
-                        child_read.release()
+                if child_read.state == "ADMITTED":
+                    child_read.release()
+                elif child_read.state == "PHYSICAL_READ_STARTED":
+                    child_read.consume(actual_bytes=act_b, is_failure=is_fail)
 
         if own_adm and adm is not None and eff_tracker is not None:
             tot_b = adm.consumed_bytes
-            if tot_b > 0:
+            if tot_b > 0 or adm.state == "CONSUMED":
                 active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
                 if active_scope is not None and not active_scope.is_finalized:
                     active_scope.record_read(bytes_read=tot_b, admission=adm, profile_id="memory_read_batch", is_failure=any_failure)
@@ -365,8 +383,9 @@ class TargetExecutionAdapter(ABC):
                         reservations=[adm],
                     )
             else:
-                if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                if adm.state in ("ADMITTED", "RESERVED"):
                     eff_tracker.release_reservation(adm)
+        return results
         return results
 
     @abstractmethod
@@ -607,19 +626,24 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         size: int,
         admission: Optional[Any] = None,
         budget_tracker: Optional[Any] = None,
+        child_read: Optional[Any] = None,
     ) -> Tuple[Optional[bytes], str, Optional[str]]:
         eff_tracker = budget_tracker or self.get_budget_tracker()
         supports_adm = _adapter_supports_admission(self._inner, "read_memory")
+        supports_cr = _adapter_supports_param(self._inner, "read_memory", "child_read")
+        kwargs = {}
+        if supports_cr and child_read is not None:
+            kwargs["child_read"] = child_read
         if eff_tracker is not None:
             if not supports_adm:
                 raise PermissionError(
                     f"Target adapter {type(self._inner).__name__} does not support budget admission, "
                     f"but budget tracking is active."
                 )
-            return self._inner.read_memory(pid, address, size, admission=admission, budget_tracker=eff_tracker)
+            return self._inner.read_memory(pid, address, size, admission=admission, budget_tracker=eff_tracker, **kwargs)
         else:
             if supports_adm:
-                return self._inner.read_memory(pid, address, size, admission=admission, budget_tracker=None)
+                return self._inner.read_memory(pid, address, size, admission=admission, budget_tracker=None, **kwargs)
             return self._inner.read_memory(pid, address, size)
 
     def read_memory_batch(
@@ -1657,7 +1681,18 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 target_type="proc_maps",
                 target_spec={"pid": pid, "path": maps_path},
             )
+
+        if not os.path.exists(maps_path):
+            if pread_maps is not None:
+                pread_maps.release()
+            if own_adm and adm is not None and eff_tracker is not None:
+                eff_tracker.release_reservation(adm)
+            self._last_maps_bytes_read = 0
+            return []
+
+        if pread_maps is not None:
             pread_maps.mark_started()
+        if adm is not None and not adm.is_terminal:
             adm.mark_physical_read_started()
 
         content = ""
@@ -1672,29 +1707,36 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
         self._last_maps_bytes_read = m_bytes
 
-        if m_bytes > 0:
+        if read_err is None:
             if pread_maps is not None:
-                pread_maps.consume(actual_bytes=m_bytes, is_failure=(read_err is not None))
+                pread_maps.consume(actual_bytes=m_bytes, is_failure=False)
             elif adm is not None:
-                adm.consume(actual_bytes=m_bytes, is_failure=(read_err is not None), accumulate=not own_adm)
+                adm.consume(actual_bytes=m_bytes, is_failure=False, accumulate=not own_adm)
             if own_adm and eff_tracker is not None:
                 active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
                 if active_scope is not None and not active_scope.is_finalized:
-                    active_scope.record_read(bytes_read=m_bytes, admission=adm, profile_id="target_maps", is_failure=(read_err is not None))
+                    active_scope.record_read(bytes_read=m_bytes, admission=adm, profile_id="target_maps", is_failure=False)
                 else:
                     eff_tracker.commit_transaction(
                         operation_id=f"standalone_maps_{uuid.uuid4().hex[:8]}",
                         profile_id="target_maps",
                         measured_bytes=m_bytes,
-                        is_failure=(read_err is not None),
+                        is_failure=False,
                         reservations=[adm] if adm else None,
                     )
         else:
             if pread_maps is not None:
-                pread_maps.release()
-            if own_adm and adm is not None and eff_tracker is not None:
-                if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
-                    eff_tracker.release_reservation(adm)
+                pread_maps.consume(actual_bytes=None, conservative_estimate_bytes=4096, is_failure=True, failure_reason=str(read_err))
+            elif adm is not None:
+                adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
+            if own_adm and eff_tracker is not None:
+                eff_tracker.commit_transaction(
+                    operation_id=f"standalone_maps_{uuid.uuid4().hex[:8]}",
+                    profile_id="target_maps",
+                    estimated_bytes=4096,
+                    is_failure=True,
+                    reservations=[adm] if adm else None,
+                )
 
         if read_err is not None and m_bytes == 0:
             return mappings
@@ -1827,9 +1869,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     pread_f.release()
                 return "", 0
             try:
-                if pread_f is not None:
-                    pread_f.mark_started()
                 with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    if pread_f is not None:
+                        pread_f.mark_started()
                     raw_text = f.read()
                 b_count = len(raw_text.encode("utf-8"))
                 total_proc_bytes_read += b_count
@@ -1839,11 +1881,17 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 return raw_text, b_count
             except (FileNotFoundError, ProcessLookupError):
                 if pread_f is not None:
-                    pread_f.release()
+                    if pread_f.state == "PHYSICAL_READ_STARTED":
+                        pread_f.consume(actual_bytes=0, is_failure=True)
+                    elif pread_f.state == "ADMITTED":
+                        pread_f.release()
                 return "", 0
             except Exception:
                 if pread_f is not None:
-                    pread_f.consume(actual_bytes=None, conservative_estimate_bytes=32, is_failure=True)
+                    if pread_f.state == "PHYSICAL_READ_STARTED":
+                        pread_f.consume(actual_bytes=None, conservative_estimate_bytes=32, is_failure=True)
+                    elif pread_f.state == "ADMITTED":
+                        pread_f.release()
                 return "", 0
 
         try:
@@ -2182,11 +2230,18 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         size: int,
         admission: Optional[Any] = None,
         budget_tracker: Optional[Any] = None,
+        child_read: Optional[Any] = None,
     ) -> Tuple[Optional[bytes], str, Optional[str]]:
         eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
         if eff_tracker is None:
             from .observation_budget import ObservationBudgetTracker
             eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
+        # Pre-validation: Case A (failure before invocation)
+        if pid <= 0:
+            if child_read is not None and child_read.state == "ADMITTED":
+                child_read.release()
+            return None, "UNAVAILABLE", f"Invalid PID {pid}"
 
         adm = admission
         own_adm = False
@@ -2203,7 +2258,16 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             except ValueError as ve:
                 return None, "BUDGET_EXHAUSTED", f"Observation budget admission rejected: {ve}"
 
-        if adm is not None:
+        cr = child_read
+        if cr is None and adm is not None:
+            cr = adm.start_child_read(
+                target_type="memory_slice",
+                target_spec={"pid": pid, "address": address, "size": size},
+            )
+
+        if cr is not None and cr.state == "ADMITTED":
+            cr.mark_started()
+        elif adm is not None and not adm.is_terminal:
             adm.mark_physical_read_started()
 
         try:
@@ -2213,33 +2277,48 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 from .watch_session import read_process_memory_slice
                 res_bytes, res_st, res_err = read_process_memory_slice(pid, address, size)
         except Exception as exc:
-            if adm is not None and own_adm and eff_tracker is not None:
-                if adm.consumed_bytes == 0 and adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
-                    try:
-                        eff_tracker.release_reservation(adm)
-                    except Exception:
-                        pass
+            if cr is not None and cr.state in ("ADMITTED", "PHYSICAL_READ_STARTED"):
+                cr.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True, failure_reason=str(exc))
+            elif adm is not None:
+                adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
+            if own_adm and eff_tracker is not None:
+                try:
+                    eff_tracker.commit_transaction(
+                        operation_id=f"standalone_read_exc_{uuid.uuid4().hex[:8]}",
+                        profile_id="memory_read",
+                        estimated_bytes=size,
+                        is_failure=True,
+                        reservations=[adm],
+                    )
+                except Exception:
+                    pass
             raise exc
 
         actual_b = len(res_bytes) if res_bytes else 0
         is_fail = (res_st != "OBSERVED")
 
-        if adm is not None:
-            if actual_b > 0:
+        if res_bytes is not None:
+            if cr is not None:
+                cr.consume(actual_bytes=actual_b, is_failure=is_fail, failure_reason=res_err)
+            elif adm is not None:
                 adm.consume(actual_bytes=actual_b, is_failure=is_fail, accumulate=not own_adm)
-            else:
-                if own_adm and eff_tracker is not None and adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
-                    eff_tracker.release_reservation(adm)
+        else:
+            if cr is not None:
+                cr.consume(actual_bytes=0, is_failure=True, failure_reason=res_err)
+            elif adm is not None:
+                adm.consume(actual_bytes=0, is_failure=True, accumulate=not own_adm)
 
-        if own_adm and eff_tracker is not None and actual_b > 0:
+        if own_adm and eff_tracker is not None:
             active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+            tot_b = adm.consumed_bytes
             if active_scope is not None and not active_scope.is_finalized:
-                active_scope.record_read(bytes_read=actual_b, admission=adm, profile_id="memory_read", is_failure=is_fail)
+                active_scope.record_read(bytes_read=tot_b, admission=adm, profile_id="memory_read", is_failure=is_fail)
             else:
                 eff_tracker.commit_transaction(
                     operation_id=f"standalone_read_{uuid.uuid4().hex[:8]}",
                     profile_id="memory_read",
-                    measured_bytes=actual_b,
+                    measured_bytes=cr.measured_bytes_read if cr else tot_b,
+                    estimated_bytes=cr.estimated_bytes_read if cr else 0,
                     is_failure=is_fail,
                     reservations=[adm],
                 )
@@ -2769,7 +2848,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return
 
         tot_b = adm.consumed_bytes
-        if tot_b > 0:
+        if tot_b > 0 or adm.state == "CONSUMED":
             active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
             if active_scope is not None and not active_scope.is_finalized:
                 active_scope.record_read(bytes_read=tot_b, admission=adm, profile_id=profile_id, is_failure=is_failure)
@@ -2778,12 +2857,13 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 eff_tracker.commit_transaction(
                     operation_id=eff_op_id,
                     profile_id=profile_id,
-                    measured_bytes=tot_b,
+                    measured_bytes=None if is_failure else tot_b,
+                    estimated_bytes=tot_b if is_failure else 0,
                     is_failure=is_failure,
                     reservations=[adm],
                 )
         else:
-            if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+            if adm.state in ("ADMITTED", "RESERVED"):
                 eff_tracker.release_reservation(adm)
 
     def _default_command_runner(self, cmd_args: List[str], timeout: float) -> Tuple[int, str, str]:
@@ -2813,14 +2893,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         child_read: Optional[Any] = None,
     ) -> Tuple[int, str, str]:
         """Runs a command on the remote target using configured SSH parameters."""
-        if admission is not None:
-            if getattr(admission, "is_terminal", False):
-                raise RuntimeError(f"Cannot execute SSH command under terminal admission '{admission.state}'")
-            admission.mark_physical_read_started()
-        if child_read is not None:
-            if getattr(child_read, "is_terminal", False):
-                raise RuntimeError(f"Cannot execute SSH command under terminal child read '{child_read.state}'")
-            child_read.mark_started()
+        if admission is not None and getattr(admission, "is_terminal", False):
+            raise RuntimeError(f"Cannot execute SSH command under terminal admission '{admission.state}'")
+        if child_read is not None and getattr(child_read, "is_terminal", False):
+            raise RuntimeError(f"Cannot execute SSH command under terminal child read '{child_read.state}'")
+
         t = timeout or self.timeout_sec
         args = [
             self.ssh_bin,
@@ -2846,16 +2923,27 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         args.append(target_spec)
         args.append(remote_shell_cmd)
         try:
-            return self._command_runner(args, t)
+            rc, stdout, stderr = self._command_runner(args, t)
         except subprocess.TimeoutExpired:
-            return -1, "", f"SSH command timed out after {t:.1f}s"
+            rc, stdout, stderr = -1, "", f"SSH command timed out after {t:.1f}s"
         except (FileNotFoundError, PermissionError) as e:
-            return -2, "", f"SSH execution failed before invocation: {e}"
+            rc, stdout, stderr = -2, "", f"SSH execution failed before invocation: {e}"
         except Exception as e:
             err_msg = str(e)
             if "not found" in err_msg.lower() or "permission" in err_msg.lower():
-                return -2, "", f"SSH execution failed before invocation: {e}"
-            return -1, "", f"SSH execution error: {e}"
+                rc, stdout, stderr = -2, "", f"SSH execution failed before invocation: {e}"
+            else:
+                rc, stdout, stderr = -1, "", f"SSH execution error: {e}"
+
+        if rc == -2:
+            return rc, stdout, stderr
+
+        if admission is not None and not admission.is_terminal:
+            admission.mark_physical_read_started()
+        if child_read is not None and not child_read.is_terminal:
+            child_read.mark_started()
+
+        return rc, stdout, stderr
 
     def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
         if pid <= 0:
@@ -3493,34 +3581,48 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if len(slices) == 1 and not self.collector_path:
             return [self.read_memory(pid, slices[0][0], slices[0][1], admission=adm, budget_tracker=budget_tracker)]
 
-        child_reads: List[Optional[Any]] = []
-        if adm is not None:
-            adm.mark_physical_read_started()
-            for idx, (addr, sz) in enumerate(slices):
-                cr = adm.start_child_read(
-                    target_type="remote_memory_slice",
-                    target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx},
-                )
-                cr.mark_started()
-                child_reads.append(cr)
-        else:
-            child_reads = [None for _ in slices]
-
         if self.collector_path:
-            coll_res = self._read_slices_via_collector(pid, slices, admission=adm)
+            child_reads_coll = [
+                adm.start_child_read(
+                    target_type="remote_collector_memory_slice",
+                    target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx, "path": self.collector_path},
+                )
+                for idx, (addr, sz) in enumerate(slices)
+            ] if adm is not None else [None for _ in slices]
+
+            coll_res = self._read_slices_via_collector(pid, slices, admission=adm, child_read=child_reads_coll[0] if child_reads_coll else None)
             if coll_res is not None:
                 any_fail = False
                 for idx, res_item in enumerate(coll_res):
                     res_b, res_st, _ = res_item
-                    act_b = len(res_b) if res_b else 0
                     is_fail = (res_st not in ("OBSERVED", "PARTIAL"))
                     if is_fail:
                         any_fail = True
-                    cr = child_reads[idx]
+                    cr = child_reads_coll[idx]
+                    req_sz = slices[idx][1]
                     if cr is not None:
-                        cr.consume(actual_bytes=act_b, is_failure=is_fail)
+                        if is_fail and res_b is None:
+                            cr.consume(actual_bytes=None, conservative_estimate_bytes=req_sz, is_failure=True)
+                        else:
+                            act_b = len(res_b) if res_b else 0
+                            cr.consume(actual_bytes=act_b, is_failure=is_fail)
                 self._finalize_remote_read(adm, own_adm, any_fail, "memory_read_batch", budget_tracker)
                 return coll_res
+            else:
+                for cr in child_reads_coll:
+                    if cr is not None:
+                        if cr.state == "PHYSICAL_READ_STARTED":
+                            cr.consume(actual_bytes=0, is_failure=True, failure_reason="Collector execution failed")
+                        elif cr.state == "ADMITTED":
+                            cr.release()
+
+        child_reads_shell = [
+            adm.start_child_read(
+                target_type="remote_shell_memory_slice",
+                target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx},
+            )
+            for idx, (addr, sz) in enumerate(slices)
+        ] if adm is not None else [None for _ in slices]
 
         cmds = []
         for idx, (addr, sz) in enumerate(slices):
@@ -3542,16 +3644,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 f"echo \"{idx}|$b\""
             )
         remote_script = "; ".join(cmds)
-        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}", admission=adm)
+        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}", admission=adm, child_read=child_reads_shell[0] if child_reads_shell else None)
         if rc == -2:
-            for cr in child_reads:
+            for cr in child_reads_shell:
                 if cr is not None:
                     cr.release()
             self._finalize_remote_read(adm, own_adm, False, "memory_read_batch", budget_tracker)
             return [(None, "UNAVAILABLE", f"SSH transport failed before execution: {stderr.strip()}") for _ in slices]
         elif rc != 0:
             for idx, (addr, sz) in enumerate(slices):
-                cr = child_reads[idx]
+                cr = child_reads_shell[idx]
                 if cr is not None:
                     cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True)
             self._finalize_remote_read(adm, own_adm, True, "memory_read_batch", budget_tracker)
@@ -3571,7 +3673,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         results: List[Tuple[Optional[bytes], str, Optional[str]]] = []
         any_failure = False
         for idx, (addr, sz) in enumerate(slices):
-            cr = child_reads[idx]
+            cr = child_reads_shell[idx]
             if sz <= 0:
                 if cr is not None:
                     cr.consume(actual_bytes=0, is_failure=False)
@@ -3615,6 +3717,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         size: int,
         admission: Optional[Any] = None,
         budget_tracker: Optional[Any] = None,
+        child_read: Optional[Any] = None,
     ) -> Tuple[Optional[bytes], str, Optional[str]]:
         if size <= 0:
             return b"", "OBSERVED", None
@@ -3623,35 +3726,46 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if rej_err:
             return None, "BUDGET_EXHAUSTED", rej_err
 
-        pread = adm.start_child_read(
-            target_type="remote_memory",
-            target_spec={"pid": pid, "address": address, "size": size},
-        ) if adm is not None else None
-
         if self.collector_path:
-            coll_res = self._read_slices_via_collector(pid, [(address, size)], admission=adm, child_read=pread)
+            cr_coll = adm.start_child_read(
+                target_type="remote_collector_memory",
+                target_spec={"pid": pid, "address": address, "size": size, "path": self.collector_path},
+            ) if adm is not None else None
+
+            coll_res = self._read_slices_via_collector(pid, [(address, size)], admission=adm, child_read=cr_coll)
             if coll_res is not None and len(coll_res) == 1:
                 res_b, res_st, res_err = coll_res[0]
                 act_b = len(res_b) if res_b else 0
                 is_fail = (res_st not in ("OBSERVED", "PARTIAL"))
-                if pread is not None:
-                    pread.consume(actual_bytes=act_b, is_failure=is_fail)
+                if cr_coll is not None:
+                    cr_coll.consume(actual_bytes=act_b, is_failure=is_fail)
                 elif adm is not None:
                     adm.consume(actual_bytes=act_b, is_failure=is_fail, accumulate=not own_adm)
                 self._finalize_remote_read(adm, own_adm, is_fail, "memory_read", budget_tracker)
                 return coll_res[0]
+            else:
+                if cr_coll is not None:
+                    if cr_coll.state == "PHYSICAL_READ_STARTED":
+                        cr_coll.consume(actual_bytes=0, is_failure=True, failure_reason="Collector execution failed")
+                    elif cr_coll.state == "ADMITTED":
+                        cr_coll.release()
 
-        # Remote memory read via dd and base64
+        # Remote memory read via dd and base64: distinct fallback child read
+        cr_shell = adm.start_child_read(
+            target_type="remote_shell_memory",
+            target_spec={"pid": pid, "address": address, "size": size},
+        ) if adm is not None else None
+
         cmd = f"dd if=/proc/{int(pid)}/mem bs=1 skip={int(address)} count={int(size)} 2>/dev/null | base64"
-        rc, stdout, stderr = self.run_ssh(cmd, admission=adm, child_read=pread)
+        rc, stdout, stderr = self.run_ssh(cmd, admission=adm, child_read=cr_shell)
         if rc == -2:
-            if pread is not None:
-                pread.release()
+            if cr_shell is not None:
+                cr_shell.release()
             self._finalize_remote_read(adm, own_adm, False, "memory_read", budget_tracker)
             return None, "UNAVAILABLE", f"SSH transport failed before execution at 0x{address:x}: {stderr.strip()}"
         elif rc != 0:
-            if pread is not None:
-                pread.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
+            if cr_shell is not None:
+                cr_shell.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
             elif adm is not None:
                 adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
             self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
@@ -3659,8 +3773,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         encoded = stdout.strip()
         if not encoded:
-            if pread is not None:
-                pread.consume(actual_bytes=0, is_failure=True)
+            if cr_shell is not None:
+                cr_shell.consume(actual_bytes=0, is_failure=True)
             elif adm is not None:
                 adm.consume(actual_bytes=0, is_failure=True, accumulate=not own_adm)
             self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
@@ -3670,29 +3784,29 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             raw_bytes = base64.b64decode(encoded)
             act_b = len(raw_bytes)
             if act_b == size:
-                if pread is not None:
-                    pread.consume(actual_bytes=act_b, is_failure=False)
+                if cr_shell is not None:
+                    cr_shell.consume(actual_bytes=act_b, is_failure=False)
                 elif adm is not None:
                     adm.consume(actual_bytes=act_b, is_failure=False, accumulate=not own_adm)
                 self._finalize_remote_read(adm, own_adm, False, "memory_read", budget_tracker)
                 return raw_bytes, "OBSERVED", None
             elif act_b > 0:
-                if pread is not None:
-                    pread.consume(actual_bytes=act_b, is_failure=False)
+                if cr_shell is not None:
+                    cr_shell.consume(actual_bytes=act_b, is_failure=False)
                 elif adm is not None:
                     adm.consume(actual_bytes=act_b, is_failure=False, accumulate=not own_adm)
                 self._finalize_remote_read(adm, own_adm, False, "memory_read", budget_tracker)
                 return raw_bytes, "PARTIAL", f"Partial read: {act_b}/{size} bytes"
             else:
-                if pread is not None:
-                    pread.consume(actual_bytes=0, is_failure=True)
+                if cr_shell is not None:
+                    cr_shell.consume(actual_bytes=0, is_failure=True)
                 elif adm is not None:
                     adm.consume(actual_bytes=0, is_failure=True, accumulate=not own_adm)
                 self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
                 return None, "UNAVAILABLE", f"Zero bytes returned at 0x{address:x}"
         except Exception as e:
-            if pread is not None:
-                pread.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
+            if cr_shell is not None:
+                cr_shell.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
             elif adm is not None:
                 adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
             self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)

@@ -21,6 +21,7 @@ Strictly separates distinct observation metrics:
 
 from collections.abc import Mapping
 from contextlib import contextmanager
+import copy
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
@@ -30,6 +31,11 @@ import time
 import types
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 import uuid
+
+# Register MappingProxyType in copy._deepcopy_dispatch for deepcopy support
+copy._deepcopy_dispatch[types.MappingProxyType] = lambda x, memo: types.MappingProxyType(
+    copy.deepcopy(dict(x), memo)
+)
 
 
 def freeze_metadata(obj: Any) -> Any:
@@ -192,6 +198,7 @@ class CommittedTransactionSnapshot:
     session_id: Optional[str] = None
     physical_consumption_id: Optional[str] = None
     accounting_transaction_id: Optional[str] = None
+    physical_read_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, types.MappingProxyType):
@@ -215,6 +222,7 @@ class CommittedTransactionSnapshot:
             "session_id": self.session_id,
             "physical_consumption_id": self.physical_consumption_id,
             "accounting_transaction_id": self.accounting_transaction_id,
+            "physical_read_id": self.physical_read_id,
         }
 
     def to_record(self) -> "ObservationAccountingRecord":
@@ -231,6 +239,7 @@ class CommittedTransactionSnapshot:
             session_id=self.session_id,
             physical_consumption_id=self.physical_consumption_id,
             accounting_transaction_id=self.accounting_transaction_id,
+            physical_read_id=self.physical_read_id,
         )
 
 
@@ -249,7 +258,28 @@ class ObservationAccountingRecord:
     session_id: Optional[str] = None
     physical_consumption_id: Optional[str] = None
     accounting_transaction_id: Optional[str] = None
+    physical_read_id: Optional[str] = None
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "ObservationAccountingRecord":
+        with self._lock:
+            rec = ObservationAccountingRecord(
+                operation_id=self.operation_id,
+                accounting_owner=self.accounting_owner,
+                measured_bytes_read=self.measured_bytes_read,
+                estimated_bytes_read=self.estimated_bytes_read,
+                charged_bytes=self.charged_bytes,
+                latency_us=self.latency_us,
+                accounting_status=self.accounting_status,
+                measurement_type=self.measurement_type,
+                metadata=copy.deepcopy(self.metadata, memo),
+                session_id=self.session_id,
+                physical_consumption_id=self.physical_consumption_id,
+                accounting_transaction_id=self.accounting_transaction_id,
+                physical_read_id=self.physical_read_id,
+            )
+            memo[id(self)] = rec
+            return rec
 
     def validate(self) -> None:
         """Strictly validates all numeric fields before commit.
@@ -496,6 +526,30 @@ class PhysicalReadRecord:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
 
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "PhysicalReadRecord":
+        with self._lock:
+            rec = PhysicalReadRecord(
+                physical_read_id=self.physical_read_id,
+                reservation_id=self.reservation_id,
+                physical_consumption_id=self.physical_consumption_id,
+                operation_id=self.operation_id,
+                target_type=self.target_type,
+                target_spec=copy.deepcopy(self.target_spec, memo),
+                state=self.state,
+                measured_bytes_read=self.measured_bytes_read,
+                estimated_bytes_read=self.estimated_bytes_read,
+                charged_bytes=self.charged_bytes,
+                latency_us=self.latency_us,
+                is_failure=self.is_failure,
+                failure_reason=self.failure_reason,
+                created_at_ms=self.created_at_ms,
+                terminal_at_ms=self.terminal_at_ms,
+            )
+            rec._transition_history = list(self._transition_history)
+            rec._parent_reservation = None
+            memo[id(self)] = rec
+            return rec
+
     @property
     def is_admitted(self) -> bool:
         with self._lock:
@@ -524,7 +578,9 @@ class PhysicalReadRecord:
     def mark_started(self) -> None:
         """Transitions ADMITTED -> PHYSICAL_READ_STARTED at the real I/O boundary."""
         with self._lock:
-            if self.state in ("ACCOUNTED", "RELEASED", "FAILED_ACCOUNTED"):
+            if self.state == "RELEASED":
+                raise RuntimeError(f"Cannot start physical read '{self.physical_read_id}' in terminal state 'RELEASED'")
+            if self.state in ("ACCOUNTED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot start physical read '{self.physical_read_id}' in terminal state '{self.state}'")
             if self.state in ("PHYSICAL_READ_STARTED", "CONSUMED"):
                 return  # Idempotent
@@ -547,6 +603,9 @@ class PhysicalReadRecord:
                 raise RuntimeError(f"Cannot consume physical read '{self.physical_read_id}' in terminal state '{self.state}'")
             if self.state not in ("ADMITTED", "PHYSICAL_READ_STARTED", "CONSUMED"):
                 raise RuntimeError(f"Cannot consume physical read '{self.physical_read_id}' in state '{self.state}'")
+
+            if self.state == "ADMITTED":
+                self._transition_history.append("PHYSICAL_READ_STARTED")
 
             if actual_bytes is not None:
                 m_val = max(0, int(actual_bytes))
@@ -573,14 +632,24 @@ class PhysicalReadRecord:
         return ret_charged
 
     def release(self) -> None:
-        """Transitions ADMITTED or PHYSICAL_READ_STARTED -> RELEASED strictly when 0 bytes consumed."""
+        """Transitions ADMITTED -> RELEASED strictly when 0 bytes consumed and I/O was never invoked."""
         with self._lock:
+            if self.state == "RELEASED":
+                return  # Idempotent for identical outcome
+            if self.state in ("ACCOUNTED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(
+                    f"Conflicting terminal transition: cannot release physical read '{self.physical_read_id}' in terminal state '{self.state}'"
+                )
+            if self.state == "PHYSICAL_READ_STARTED":
+                raise RuntimeError(
+                    f"PHYSICAL_READ_STARTED must never transition to RELEASED for physical read '{self.physical_read_id}'"
+                )
             if self.charged_bytes > 0:
                 raise RuntimeError(
                     f"Physical read '{self.physical_read_id}' cannot be released after consuming bytes ({self.charged_bytes}B)"
                 )
-            if self.state in ("ACCOUNTED", "RELEASED", "FAILED_ACCOUNTED"):
-                raise RuntimeError(f"Cannot release physical read '{self.physical_read_id}' in terminal state '{self.state}'")
+            if self.state != "ADMITTED":
+                raise RuntimeError(f"Cannot release physical read '{self.physical_read_id}' in state '{self.state}'")
             self.state = "RELEASED"
             self.terminal_at_ms = time.time()
             self._transition_history.append("RELEASED")
@@ -591,8 +660,12 @@ class PhysicalReadRecord:
     def account(self) -> None:
         """Transitions CONSUMED -> ACCOUNTED upon authoritative tracker commit."""
         with self._lock:
-            if self.state in ("ACCOUNTED", "RELEASED", "FAILED_ACCOUNTED"):
-                return  # Idempotent
+            if self.state == "ACCOUNTED":
+                return  # Idempotent for identical outcome
+            if self.state in ("RELEASED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(
+                    f"Conflicting terminal transition: cannot account physical read '{self.physical_read_id}' in terminal state '{self.state}'"
+                )
             if self.state != "CONSUMED":
                 raise RuntimeError(f"Cannot account physical read '{self.physical_read_id}' in non-consumed state '{self.state}'")
             self.state = "ACCOUNTED"
@@ -600,15 +673,30 @@ class PhysicalReadRecord:
             self._transition_history.append("ACCOUNTED")
 
     def mark_failed_accounted(self, failure_reason: Optional[str] = None) -> None:
-        """Transitions to FAILED_ACCOUNTED preserving physical consumption."""
+        """Transitions PHYSICAL_READ_STARTED or CONSUMED -> FAILED_ACCOUNTED preserving physical consumption."""
         with self._lock:
-            if self.state in ("ACCOUNTED", "FAILED_ACCOUNTED"):
-                return  # Idempotent
-            self.state = "FAILED_ACCOUNTED"
+            if self.state == "FAILED_ACCOUNTED":
+                return  # Idempotent for identical outcome
+            if self.state in ("ACCOUNTED", "RELEASED"):
+                raise RuntimeError(
+                    f"Conflicting terminal transition: cannot mark failed_accounted for physical read '{self.physical_read_id}' in terminal state '{self.state}'"
+                )
+            if self.state not in ("PHYSICAL_READ_STARTED", "CONSUMED"):
+                raise RuntimeError(f"Cannot mark failed_accounted for physical read '{self.physical_read_id}' in state '{self.state}'")
+            if self.state == "PHYSICAL_READ_STARTED" and self.charged_bytes == 0 and self.measured_bytes_read is None:
+                fallback = DEFAULT_CONSERVATIVE_UNKNOWN_BYTES
+                self.estimated_bytes_read = fallback
+                self.charged_bytes = fallback
+                self._transition_history.append("CONSUMED")
+            self.is_failure = True
             if failure_reason:
                 self.failure_reason = failure_reason
+            self.state = "FAILED_ACCOUNTED"
             self.terminal_at_ms = time.time()
             self._transition_history.append("FAILED_ACCOUNTED")
+
+        if self._parent_reservation is not None:
+            self._parent_reservation._on_child_read_updated(self)
 
     def to_consumption_record(
         self,
@@ -664,6 +752,12 @@ class PhysicalConsumptionRecord:
     metadata: Any = None
     session_id: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        if self.target_spec is not None and not isinstance(self.target_spec, types.MappingProxyType):
+            object.__setattr__(self, "target_spec", freeze_metadata(self.target_spec))
+        if self.metadata is not None and not isinstance(self.metadata, types.MappingProxyType):
+            object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "physical_consumption_id": self.physical_consumption_id,
@@ -679,11 +773,12 @@ class PhysicalConsumptionRecord:
             "accounting_status": self.accounting_status,
             "measurement_type": self.measurement_type,
             "target_type": self.target_type,
-            "target_spec": self.target_spec,
+            "target_spec": unfreeze_metadata(self.target_spec),
             "created_at_ms": self.created_at_ms,
             "committed_at_ms": self.committed_at_ms,
             "accounting_owner": self.accounting_owner,
             "session_id": self.session_id,
+            "metadata": unfreeze_metadata(self.metadata),
         }
 
 
@@ -709,6 +804,26 @@ class BudgetReservation:
     child_reads: Dict[str, PhysicalReadRecord] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "BudgetReservation":
+        with self._lock:
+            res = BudgetReservation(
+                reservation_id=self.reservation_id,
+                operation_id=self.operation_id,
+                reserved_bytes=self.reserved_bytes,
+                profile_id=self.profile_id,
+                state=self.state,
+                consumed_bytes=self.consumed_bytes,
+                is_failure=self.is_failure,
+                scope_id=self.scope_id,
+                created_at_ms=self.created_at_ms,
+                physical_consumption_id=self.physical_consumption_id,
+                physical_read_id=self.physical_read_id,
+                child_reads={k: copy.deepcopy(v, memo) for k, v in self.child_reads.items()},
+            )
+            res._transition_history = list(self._transition_history)
+            memo[id(self)] = res
+            return res
 
     @property
     def is_admitted(self) -> bool:
@@ -746,10 +861,15 @@ class BudgetReservation:
             self.consumed_bytes = sum(c.charged_bytes for c in self.child_reads.values())
             if any(c.is_failure for c in self.child_reads.values()):
                 self.is_failure = True
-            if self.consumed_bytes > 0 and self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
-                self.state = "CONSUMED"
-                if "CONSUMED" not in self._transition_history:
-                    self._transition_history.append("CONSUMED")
+            if any(c.state == "PHYSICAL_READ_STARTED" for c in self.child_reads.values()) and self.state in ("ADMITTED", "RESERVED"):
+                self.state = "PHYSICAL_READ_STARTED"
+                if "PHYSICAL_READ_STARTED" not in self._transition_history:
+                    self._transition_history.append("PHYSICAL_READ_STARTED")
+            if any(c.state in ("CONSUMED", "ACCOUNTED", "FAILED_ACCOUNTED") for c in self.child_reads.values()) or self.consumed_bytes > 0:
+                if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
+                    self.state = "CONSUMED"
+                    if "CONSUMED" not in self._transition_history:
+                        self._transition_history.append("CONSUMED")
 
     def start_child_read(
         self,
@@ -764,14 +884,16 @@ class BudgetReservation:
                 raise RuntimeError(
                     f"Cannot start child read for reservation '{self.reservation_id}' in terminal state '{self.state}'"
                 )
-            # If an unused placeholder root was created by mark_physical_read_started, remove it
-            if len(self.child_reads) == 1 and self.physical_read_id in self.child_reads:
-                placeholder = self.child_reads[self.physical_read_id]
-                if placeholder.charged_bytes == 0 and placeholder.target_spec is None and placeholder.state in ("ADMITTED", "PHYSICAL_READ_STARTED"):
-                    del self.child_reads[self.physical_read_id]
 
             pread_id = physical_read_id or f"pread_{uuid.uuid4().hex[:12]}"
             pcons_id = physical_consumption_id or f"pcons_{uuid.uuid4().hex[:12]}"
+
+            if pread_id in self.child_reads:
+                raise ValueError(f"Duplicate physical_read_id '{pread_id}' in reservation '{self.reservation_id}'")
+            for existing_cr in self.child_reads.values():
+                if existing_cr.physical_consumption_id == pcons_id:
+                    raise ValueError(f"Duplicate physical_consumption_id '{pcons_id}' in reservation '{self.reservation_id}'")
+
             rec = PhysicalReadRecord(
                 physical_read_id=pread_id,
                 reservation_id=self.reservation_id,
@@ -790,8 +912,9 @@ class BudgetReservation:
             return rec
 
     def get_child_reads(self) -> Dict[str, PhysicalReadRecord]:
+        """Returns a deep copy of child physical reads to prevent external state mutation."""
         with self._lock:
-            return dict(self.child_reads)
+            return copy.deepcopy(self.child_reads)
 
     def mark_physical_read_started(
         self,
@@ -819,22 +942,6 @@ class BudgetReservation:
                 self.physical_read_id = physical_read_id
             elif not self.physical_read_id:
                 self.physical_read_id = f"pread_{uuid.uuid4().hex[:12]}"
-
-            if not self.child_reads:
-                root = PhysicalReadRecord(
-                    physical_read_id=self.physical_read_id,
-                    reservation_id=self.reservation_id,
-                    physical_consumption_id=self.physical_consumption_id,
-                    operation_id=self.operation_id,
-                    target_type="memory_slice",
-                )
-                root._parent_reservation = self
-                root.mark_started()
-                self.child_reads[self.physical_read_id] = root
-            else:
-                for cr in self.child_reads.values():
-                    if cr.state == "ADMITTED":
-                        cr.mark_started()
             self._transition_history.append("PHYSICAL_READ_STARTED")
 
     def consume(
@@ -940,13 +1047,17 @@ class BudgetReservation:
     def release(self) -> None:
         """Transitions ADMITTED / RESERVED / PHYSICAL_READ_STARTED -> RELEASED strictly when no physical consumption occurred."""
         with self._lock:
+            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
             if self.consumed_bytes > 0:
                 raise RuntimeError(f"A reservation must never be released if physical consumption occurred ({self.consumed_bytes}B)")
             for cr in self.child_reads.values():
+                if cr.state == "PHYSICAL_READ_STARTED":
+                    raise RuntimeError(
+                        f"A reservation must never be released if child read '{cr.physical_read_id}' is in PHYSICAL_READ_STARTED"
+                    )
                 if cr.charged_bytes > 0 or cr.state in ("CONSUMED", "ACCOUNTED", "FAILED_ACCOUNTED"):
                     raise RuntimeError(f"A reservation must never be released if child physical read '{cr.physical_read_id}' consumed bytes ({cr.charged_bytes}B)")
-            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
-                raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
             if self.state not in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
                 raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
             for cr in self.child_reads.values():
@@ -960,7 +1071,7 @@ class BudgetReservation:
         with self._lock:
             if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' in state {self.state}")
-            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0:
+            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0 and not any(c.state in ("CONSUMED", "ACCOUNTED") for c in self.child_reads.values()):
                 raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' with zero consumption; must be released")
             for cr in self.child_reads.values():
                 if cr.state == "PHYSICAL_READ_STARTED":
@@ -973,9 +1084,13 @@ class BudgetReservation:
     def finalize(self) -> None:
         """Transitions CONSUMED or RESERVED -> ACCOUNTED / FINALIZED upon tracker ledger commit."""
         with self._lock:
-            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
-                raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' in state {self.state}")
-            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0:
+            if self.state in ("ACCOUNTED", "FINALIZED"):
+                return  # Idempotent for identical outcome
+            if self.state in ("RELEASED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(
+                    f"Conflicting terminal transition: cannot finalize reservation '{self.reservation_id}' in state {self.state}"
+                )
+            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0 and not any(c.state in ("CONSUMED", "ACCOUNTED") for c in self.child_reads.values()):
                 raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' with zero consumption; must be released")
             for cr in self.child_reads.values():
                 if cr.state == "PHYSICAL_READ_STARTED":
@@ -993,11 +1108,17 @@ class BudgetReservation:
     def mark_failed_accounted(self) -> None:
         """Transitions CONSUMED -> FAILED_ACCOUNTED upon failure recovery recording."""
         with self._lock:
-            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
-                raise RuntimeError(f"Cannot mark failed_accounted for reservation '{self.reservation_id}' in state {self.state}")
+            if self.state == "FAILED_ACCOUNTED":
+                return  # Idempotent for identical outcome
+            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED"):
+                raise RuntimeError(
+                    f"Conflicting terminal transition: cannot mark failed_accounted for reservation '{self.reservation_id}' in state {self.state}"
+                )
             for cr in self.child_reads.values():
                 if not cr.is_terminal:
                     cr.mark_failed_accounted()
+            self.state = "FAILED_ACCOUNTED"
+            self._transition_history.append("FAILED_ACCOUNTED")
             self.state = "FAILED_ACCOUNTED"
             self._transition_history.append("FAILED_ACCOUNTED")
 
@@ -1896,6 +2017,33 @@ class ObservationBudgetTracker:
                 self._unregister_active_scope(prepared.scope)
                 return prepared.snapshot
 
+            # Pre-validate child reads and physical IDs before mutating state
+            all_res = list(prepared.scope._admissions)
+            for r_id, res in self._active_reservations.items():
+                if res.scope_id == prepared.scope.physical_consumption_id or res.operation_id == prepared.scope.operation_id:
+                    if res not in all_res:
+                        all_res.append(res)
+            for res in all_res:
+                for cr in res.child_reads.values():
+                    if cr.physical_read_id in self._physical_read_records:
+                        existing_cr = self._physical_read_records[cr.physical_read_id]
+                        if existing_cr.charged_bytes != cr.charged_bytes:
+                            raise ValueError(
+                                f"Physical read ID conflict: '{cr.physical_read_id}' already committed with "
+                                f"{existing_cr.charged_bytes}B, conflicting with {cr.charged_bytes}B"
+                            )
+                    if cr.physical_consumption_id in self._physical_consumption_records:
+                        existing_pcons = self._physical_consumption_records[cr.physical_consumption_id]
+                        if existing_pcons.charged_bytes != cr.charged_bytes:
+                            raise ValueError(
+                                f"Physical consumption ID conflict: '{cr.physical_consumption_id}' already committed with "
+                                f"{existing_pcons.charged_bytes}B, conflicting with {cr.charged_bytes}B"
+                            )
+                    if cr.state == "PHYSICAL_READ_STARTED":
+                        raise RuntimeError(
+                            f"Cannot commit operation '{prepared.target_op_id}': child read '{cr.physical_read_id}' is still in flight"
+                        )
+
             metrics_applied = False
             step = "start"
             try:
@@ -1904,29 +2052,14 @@ class ObservationBudgetTracker:
                 self._trigger_fault("during_physical_ledger_insertion")
 
                 # Register all child physical reads and physical consumption records
-                all_res = list(prepared.scope._admissions)
-                for r_id, res in self._active_reservations.items():
-                    if res.scope_id == prepared.scope.physical_consumption_id or res.operation_id == prepared.scope.operation_id:
-                        if res not in all_res:
-                            all_res.append(res)
                 has_child_reads = False
                 for res in all_res:
                     for cr in res.child_reads.values():
                         has_child_reads = True
                         cr.operation_id = prepared.target_op_id
-                        if cr.physical_read_id in self._physical_read_records:
-                            existing_cr = self._physical_read_records[cr.physical_read_id]
-                            if existing_cr.charged_bytes != cr.charged_bytes:
-                                raise ValueError(
-                                    f"Physical read ID conflict: '{cr.physical_read_id}' already committed with "
-                                    f"{existing_cr.charged_bytes}B, conflicting with {cr.charged_bytes}B"
-                                )
-                        if cr.state == "PHYSICAL_READ_STARTED":
-                            raise RuntimeError(
-                                f"Cannot commit operation '{prepared.target_op_id}': child read '{cr.physical_read_id}' is still in flight"
-                            )
-                        if cr.state == "CONSUMED":
-                            cr.account()
+                        if cr.state in ("CONSUMED", "ACCOUNTED"):
+                            if cr.state == "CONSUMED":
+                                cr.account()
                             pcons = cr.to_consumption_record(
                                 operation_id=prepared.target_op_id,
                                 committed_at_ms=time.time(),
@@ -1944,8 +2077,25 @@ class ObservationBudgetTracker:
                             self._physical_consumption_records[cr.physical_consumption_id] = pcons
 
                 if not has_child_reads:
-                    self._physical_consumption_records[prepared.snapshot.physical_consumption_id] = prepared.snapshot
                     root_pread_id = f"pread_{prepared.snapshot.physical_consumption_id}"
+                    root_pcons = PhysicalConsumptionRecord(
+                        physical_consumption_id=prepared.snapshot.physical_consumption_id,
+                        physical_read_id=root_pread_id,
+                        reservation_id=getattr(prepared.scope, "operation_id", "scope_res"),
+                        operation_id=prepared.target_op_id,
+                        measured_bytes_read=prepared.snapshot.measured_bytes_read,
+                        estimated_bytes_read=prepared.snapshot.estimated_bytes_read,
+                        charged_bytes=prepared.snapshot.charged_bytes,
+                        latency_us=prepared.snapshot.latency_us,
+                        stop_ms=prepared.snapshot.stop_ms,
+                        is_failure=prepared.snapshot.is_failure,
+                        accounting_status=prepared.snapshot.accounting_status,
+                        measurement_type=prepared.snapshot.measurement_type,
+                        created_at_ms=time.time(),
+                        committed_at_ms=time.time(),
+                        metadata=dict(prepared.snapshot.metadata),
+                    )
+                    self._physical_consumption_records[prepared.snapshot.physical_consumption_id] = root_pcons
                     root_cr = PhysicalReadRecord(
                         physical_read_id=root_pread_id,
                         reservation_id=getattr(prepared.scope, "operation_id", "scope_res"),
@@ -2087,7 +2237,6 @@ class ObservationBudgetTracker:
                     session_id=self.session_id,
                     physical_consumption_id=prepared.snapshot.physical_consumption_id,
                 )
-                self._physical_consumption_records[prepared.snapshot.physical_consumption_id] = snap
                 self._committed_transactions[prepared.target_op_id] = snap
 
             # Preserve child reads into physical ledger
@@ -2110,6 +2259,24 @@ class ObservationBudgetTracker:
 
             if not any(getattr(r, "operation_id", None) == prepared.target_op_id for r in self._physical_read_records.values()):
                 root_pread_id = f"pread_{prepared.snapshot.physical_consumption_id}"
+                root_pcons = PhysicalConsumptionRecord(
+                    physical_consumption_id=prepared.snapshot.physical_consumption_id,
+                    physical_read_id=root_pread_id,
+                    reservation_id=getattr(prepared.scope, "operation_id", "scope_res"),
+                    operation_id=prepared.target_op_id,
+                    measured_bytes_read=prepared.snapshot.measured_bytes_read,
+                    estimated_bytes_read=prepared.snapshot.estimated_bytes_read,
+                    charged_bytes=prepared.snapshot.charged_bytes,
+                    latency_us=prepared.snapshot.latency_us,
+                    stop_ms=prepared.snapshot.stop_ms,
+                    is_failure=True,
+                    accounting_status="FAILED",
+                    measurement_type=prepared.snapshot.measurement_type,
+                    created_at_ms=time.time(),
+                    committed_at_ms=time.time(),
+                    metadata=dict(prepared.snapshot.metadata),
+                )
+                self._physical_consumption_records[prepared.snapshot.physical_consumption_id] = root_pcons
                 root_cr = PhysicalReadRecord(
                     physical_read_id=root_pread_id,
                     reservation_id=getattr(prepared.scope, "operation_id", "scope_res"),
@@ -2184,7 +2351,7 @@ class ObservationBudgetTracker:
                 prepared = self._prepare_scope_commit(scope, is_fail=is_fail)
                 return self._execute_scope_commit(prepared)
             except Exception as exc:
-                if "Operation ID collision" in str(exc):
+                if any(k in str(exc) for k in ("Operation ID collision", "Physical read ID conflict", "Physical consumption ID conflict", "Accounting transaction ID conflict")):
                     raise
                 if scope.charged_bytes > 0 or scope.reads_count > 0:
                     try:
@@ -2259,7 +2426,7 @@ class ObservationBudgetTracker:
                 prepared = self._prepare_scope_commit(scope, is_fail=is_fail)
                 return self._execute_scope_commit(prepared)
             except Exception as exc:
-                if "Operation ID collision" in str(exc):
+                if any(k in str(exc) for k in ("Operation ID collision", "Physical read ID conflict", "Physical consumption ID conflict", "Accounting transaction ID conflict")):
                     raise
                 if scope.charged_bytes > 0 or scope.reads_count > 0:
                     try:
@@ -2335,7 +2502,10 @@ class ObservationBudgetTracker:
             return self._recover_commit_failure(prepared, error=error, metrics_applied=False, step="manual_emergency")
 
     def reconcile_ledger(self) -> Dict[str, Any]:
-        """Deterministically verifies that all aggregate metrics match the authoritative ledger exactly."""
+        """Deterministically verifies that all aggregate metrics match the authoritative ledger exactly.
+
+        Enforces all 19 P0.8 authoritative accounting invariants.
+        """
         with self._transaction_lock:
             snaps = list(self._committed_transactions.values())
             phys_snaps = list(self._physical_consumption_records.values())
@@ -2345,50 +2515,174 @@ class ObservationBudgetTracker:
             # 1. Uniqueness of physical read IDs
             read_ids = [r.physical_read_id for r in read_snaps]
             unique_read_ids = set(read_ids)
-            if len(read_ids) != len(unique_read_ids):
-                discrepancies.append(f"Physical read IDs not unique: Invariant 1 (physical_read_id uniqueness) violated: {len(read_ids)} total vs {len(unique_read_ids)} unique")
+            inv_1_ok = (len(read_ids) == len(unique_read_ids))
+            if not inv_1_ok:
+                discrepancies.append(
+                    f"Invariant 1 (physical_read_id uniqueness) violated: {len(read_ids)} total vs {len(unique_read_ids)} unique"
+                )
 
             # 2. Uniqueness of physical consumption IDs
             phys_ids = [s.physical_consumption_id for s in phys_snaps]
             unique_phys_ids = set(phys_ids)
-            if len(phys_ids) != len(unique_phys_ids):
-                discrepancies.append(f"Physical consumption IDs not unique: Invariant 2 (physical_consumption_id uniqueness) violated: {len(phys_ids)} total vs {len(unique_phys_ids)} unique")
+            inv_2_ok = (len(phys_ids) == len(unique_phys_ids))
+            if not inv_2_ok:
+                discrepancies.append(
+                    f"Invariant 2 (physical_consumption_id uniqueness) violated: Physical consumption IDs not unique: {len(phys_ids)} total vs {len(unique_phys_ids)} unique"
+                )
 
-            # 3. Reservation-to-read linkage
-            active_res_ids = set(self._active_reservations.keys())
+            # 3. Uniqueness of accounting transaction IDs
+            tx_ids = [s.accounting_transaction_id for s in snaps if getattr(s, "accounting_transaction_id", None)]
+            unique_tx_ids = set(tx_ids)
+            inv_3_ok = (len(tx_ids) == len(unique_tx_ids))
+            if not inv_3_ok:
+                discrepancies.append(
+                    f"Invariant 3 (accounting_transaction_id uniqueness) violated: {len(tx_ids)} total vs {len(unique_tx_ids)} unique"
+                )
+
+            # 4. Child identity uniqueness across reservations
+            seen_child_pread_ids: Set[str] = set()
+            inv_4_ok = True
+            for r_id, r in self._active_reservations.items():
+                if hasattr(r, "child_reads") and r.child_reads:
+                    for cid in r.child_reads.keys():
+                        if cid in seen_child_pread_ids:
+                            inv_4_ok = False
+                            discrepancies.append(
+                                f"Invariant 4 (child identity uniqueness across reservations) violated: child read '{cid}' shared across multiple reservations"
+                            )
+                        seen_child_pread_ids.add(cid)
+
+            # 5. Reservation-to-child linkage
+            inv_5_ok = True
             for r in read_snaps:
-                if not r.reservation_id:
-                    discrepancies.append(f"Invariant 3 (reservation-to-read linkage) violated: read '{r.physical_read_id}' has no reservation_id")
+                if not getattr(r, "reservation_id", None):
+                    inv_5_ok = False
+                    discrepancies.append(f"Invariant 5 (reservation-to-child linkage) violated: read '{r.physical_read_id}' has no reservation_id")
 
-            # 4. Read-to-consumption linkage
+            # 6. Child-to-consumption linkage
             read_id_set = set(read_ids)
+            inv_6_ok = True
             for p in phys_snaps:
-                if hasattr(p, "physical_read_id") and p.physical_read_id and p.physical_read_id not in read_id_set:
-                    discrepancies.append(f"Invariant 4 (read-to-consumption linkage) violated: consumption '{p.physical_consumption_id}' points to unknown read '{p.physical_read_id}'")
+                p_read_id = getattr(p, "physical_read_id", None)
+                if p_read_id and p_read_id not in read_id_set:
+                    inv_6_ok = False
+                    discrepancies.append(
+                        f"Invariant 6 (child-to-consumption linkage) violated: consumption '{p.physical_consumption_id}' points to unknown read '{p_read_id}'"
+                    )
 
-            # 5. Operation-to-transaction linkage
+            # 7. Operation-to-accounting linkage
             committed_op_ids = set(self._committed_transactions.keys())
+            active_scope_op_ids = {sc.operation_id for sc_list in self._active_scopes.values() for sc in sc_list}
+            inv_7_ok = True
             for p in phys_snaps:
                 p_op = getattr(p, "operation_id", None)
-                if p_op and p_op not in committed_op_ids:
+                if p_op and p_op not in committed_op_ids and p_op not in active_scope_op_ids:
                     if not any(p_op in s.operation_id for s in snaps) and not any(getattr(p, "physical_consumption_id", None) == s.physical_consumption_id for s in snaps):
-                        discrepancies.append(f"Invariant 5 (operation-to-transaction linkage) violated: physical record '{getattr(p, 'physical_consumption_id', None)}' has unlinked operation '{p_op}'")
+                        inv_7_ok = False
+                        discrepancies.append(
+                            f"Invariant 7 (operation-to-accounting linkage) violated: physical record '{getattr(p, 'physical_consumption_id', None)}' has unlinked operation '{p_op}'"
+                        )
 
-            # 6. Aggregate reservation consumption equals child consumption sum
+            # 8. No child record overwritten
+            inv_8_ok = inv_1_ok and inv_4_ok
+
+            # 9. No started read released
+            inv_9_ok = True
+            for r in read_snaps:
+                th = r.transition_history if hasattr(r, "transition_history") else []
+                if "PHYSICAL_READ_STARTED" in th and "RELEASED" in th:
+                    inv_9_ok = False
+                    discrepancies.append(
+                        f"Invariant 9 (no started read released) violated: read '{r.physical_read_id}' transitioned from STARTED to RELEASED: {th}"
+                    )
+            for r_id, r in self._active_reservations.items():
+                if hasattr(r, "child_reads"):
+                    for cr in r.child_reads.values():
+                        cr_th = cr.transition_history if hasattr(cr, "transition_history") else []
+                        if "PHYSICAL_READ_STARTED" in cr_th and "RELEASED" in cr_th:
+                            inv_9_ok = False
+                            discrepancies.append(
+                                f"Invariant 9 (no started child read released) violated: child '{cr.physical_read_id}' of '{r_id}' transitioned from STARTED to RELEASED: {cr_th}"
+                            )
+
+            # 10. No in-flight child at reservation finalization
+            inv_10_ok = True
+            for r in read_snaps:
+                if r.state == "PHYSICAL_READ_STARTED":
+                    inv_10_ok = False
+                    discrepancies.append(
+                        f"Invariant 10 (no started read without terminal outcome) violated: read '{r.physical_read_id}' is still in PHYSICAL_READ_STARTED"
+                    )
+            for r_id, r in self._active_reservations.items():
+                if hasattr(r, "child_reads"):
+                    for cr in r.child_reads.values():
+                        if cr.state == "PHYSICAL_READ_STARTED" and r.state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
+                            inv_10_ok = False
+                            discrepancies.append(
+                                f"Invariant 10 (no in-flight child at reservation finalization) violated: child read '{cr.physical_read_id}' of '{r_id}' is still PHYSICAL_READ_STARTED"
+                            )
+
+            # 11. No consumed child without accounting
+            active_scope_phys_ids = {s.physical_consumption_id for sc_list in self._active_scopes.values() for s in sc_list}
+            inv_11_ok = True
+            for r_id, r in self._active_reservations.items():
+                if r.state == "CONSUMED" and (r.scope_id is None or r.scope_id not in active_scope_phys_ids):
+                    inv_11_ok = False
+                    discrepancies.append(
+                        f"Invariant 11 (no consumed child without accounting) violated: active consumed reservation '{r_id}' has no active scope"
+                    )
+
+            # 12. No accounting without physical evidence
+            inv_12_ok = True
+            for op_id, s in self._committed_transactions.items():
+                if s.charged_bytes > 0:
+                    has_phys = (
+                        s.physical_consumption_id in self._physical_consumption_records
+                        or any(getattr(p, "operation_id", None) == op_id for p in phys_snaps)
+                        or any(getattr(r, "operation_id", None) == op_id for r in read_snaps)
+                    )
+                    if not has_phys:
+                        inv_12_ok = False
+                        discrepancies.append(
+                            f"Invariant 12 (no accounting without physical evidence) violated: transaction '{op_id}' has charged_bytes={s.charged_bytes} but no physical evidence"
+                        )
+
+            # 13. No physical consumption without valid physical_read_id
+            inv_13_ok = True
+            for p in phys_snaps:
+                p_read_id = getattr(p, "physical_read_id", None)
+                if not p_read_id or p_read_id not in read_id_set:
+                    inv_13_ok = False
+                    discrepancies.append(
+                        f"Invariant 13 (no physical consumption without valid physical_read_id) violated: record '{getattr(p, 'physical_consumption_id', None)}' has invalid read_id '{p_read_id}'"
+                    )
+
+            # 14. No duplicate physical execution identity
+            inv_14_ok = inv_1_ok and inv_2_ok and inv_4_ok
+
+            # 15. Aggregate reservation bytes equal child consumption sum
+            inv_15_ok = True
             for r_id, r in self._active_reservations.items():
                 if hasattr(r, "child_reads") and r.child_reads:
                     child_sum = sum(c.charged_bytes for c in r.child_reads.values())
                     if r.consumed_bytes != child_sum:
-                        discrepancies.append(f"Invariant 6 (aggregate reservation child sum) violated: reservation '{r_id}' consumed {r.consumed_bytes}B != child sum {child_sum}B")
+                        inv_15_ok = False
+                        discrepancies.append(
+                            f"Invariant 15 (aggregate reservation bytes equal child consumption sum) violated: reservation '{r_id}' consumed {r.consumed_bytes}B != child sum {child_sum}B"
+                        )
 
-            # 7. Committed bytes equal physical ledger totals
+            # 16. Committed bytes equal physical ledger totals
             sum_charged = sum(s.charged_bytes for s in snaps)
+            inv_16_ok = True
             if read_snaps:
                 sum_reads_charged = sum(r.charged_bytes for r in read_snaps)
                 if sum_reads_charged != sum_charged:
-                    discrepancies.append(f"Invariant 7 (committed bytes vs physical ledger totals) violated: committed={sum_charged}B vs physical_reads={sum_reads_charged}B")
+                    inv_16_ok = False
+                    discrepancies.append(
+                        f"Invariant 16 (committed bytes equal physical ledger totals) violated: committed={sum_charged}B vs physical_reads={sum_reads_charged}B"
+                    )
 
-            # 8. Global metrics equal committed totals
+            # 17. Global metrics equal committed totals
             sum_measured = sum(s.measured_bytes_read or 0 for s in snaps if s.measured_bytes_read is not None)
             sum_estimated = sum(s.estimated_bytes_read for s in snaps)
             sum_latency = sum(s.latency_us for s in snaps)
@@ -2397,20 +2691,28 @@ class ObservationBudgetTracker:
             sum_failed_status = sum(1 for s in snaps if s.accounting_status == "FAILED")
             sum_rejected_status = sum(1 for s in snaps if s.accounting_status == "REJECTED")
 
+            inv_17_ok = True
             if sum_charged != self.metrics.bytes_read:
-                discrepancies.append(f"bytes_read: ledger={sum_charged} vs metrics={self.metrics.bytes_read}")
+                inv_17_ok = False
+                discrepancies.append(f"Invariant 17 violated: bytes_read: ledger={sum_charged} vs metrics={self.metrics.bytes_read}")
             if sum_measured != self.metrics.measured_bytes_read:
-                discrepancies.append(f"measured_bytes: ledger={sum_measured} vs metrics={self.metrics.measured_bytes_read}")
+                inv_17_ok = False
+                discrepancies.append(f"Invariant 17 violated: measured_bytes ledger={sum_measured} vs metrics={self.metrics.measured_bytes_read}")
             if sum_estimated != self.metrics.conservative_estimated_bytes:
-                discrepancies.append(f"estimated_bytes: ledger={sum_estimated} vs metrics={self.metrics.conservative_estimated_bytes}")
+                inv_17_ok = False
+                discrepancies.append(f"Invariant 17 violated: estimated_bytes ledger={sum_estimated} vs metrics={self.metrics.conservative_estimated_bytes}")
             if round(sum_latency, 2) != round(self.metrics.observation_latency_us, 2):
-                discrepancies.append(f"latency: ledger={sum_latency} vs metrics={self.metrics.observation_latency_us}")
+                inv_17_ok = False
+                discrepancies.append(f"Invariant 17 violated: latency ledger={sum_latency} vs metrics={self.metrics.observation_latency_us}")
             if round(sum_stop, 2) != round(self.metrics.target_stop_duration_ms, 2):
-                discrepancies.append(f"stop_duration: ledger={sum_stop} vs metrics={self.metrics.target_stop_duration_ms}")
+                inv_17_ok = False
+                discrepancies.append(f"Invariant 17 violated: stop_duration ledger={sum_stop} vs metrics={self.metrics.target_stop_duration_ms}")
             if sum_failures != self.metrics.total_read_failures:
-                discrepancies.append(f"failures: ledger={sum_failures} vs metrics={self.metrics.total_read_failures}")
+                inv_17_ok = False
+                discrepancies.append(f"Invariant 17 violated: failures ledger={sum_failures} vs metrics={self.metrics.total_read_failures}")
 
-            # 9. Profile usage equals profile-specific physical totals
+            # 18. Profile usage equals committed profile totals
+            inv_18_ok = True
             for prof_id, p_usage in self.metrics.profile_usage.items():
                 p_snaps = [
                     s for s in snaps
@@ -2423,61 +2725,28 @@ class ObservationBudgetTracker:
                 p_est = sum(s.estimated_bytes_read for s in p_snaps)
                 p_fails = sum(1 for s in p_snaps if s.is_failure)
                 if p_charged != p_usage["bytes_read"]:
-                    discrepancies.append(f"Invariant 9 (profile '{prof_id}' bytes) violated: ledger={p_charged} vs usage={p_usage['bytes_read']}")
+                    inv_18_ok = False
+                    discrepancies.append(f"Invariant 18 (profile '{prof_id}' bytes) violated: ledger={p_charged} vs usage={p_usage['bytes_read']}")
                 if p_meas != p_usage["measured_bytes_read"]:
-                    discrepancies.append(f"Invariant 9 (profile '{prof_id}' measured) violated: ledger={p_meas} vs usage={p_usage['measured_bytes_read']}")
+                    inv_18_ok = False
+                    discrepancies.append(f"Invariant 18 (profile '{prof_id}' measured) violated: ledger={p_meas} vs usage={p_usage['measured_bytes_read']}")
                 if p_est != p_usage["conservative_estimated_bytes"]:
-                    discrepancies.append(f"Invariant 9 (profile '{prof_id}' estimated) violated: ledger={p_est} vs usage={p_usage['conservative_estimated_bytes']}")
+                    inv_18_ok = False
+                    discrepancies.append(f"Invariant 18 (profile '{prof_id}' estimated) violated: ledger={p_est} vs usage={p_usage['conservative_estimated_bytes']}")
                 if p_fails != p_usage["failures"]:
-                    discrepancies.append(f"Invariant 9 (profile '{prof_id}' failures) violated: ledger={p_fails} vs usage={p_usage['failures']}")
+                    inv_18_ok = False
+                    discrepancies.append(f"Invariant 18 (profile '{prof_id}' failures) violated: ledger={p_fails} vs usage={p_usage['failures']}")
 
-            # 10. No started read without terminal outcome
-            for r in read_snaps:
-                if r.state == "PHYSICAL_READ_STARTED":
-                    discrepancies.append(f"Invariant 10 (no started read without terminal outcome) violated: read '{r.physical_read_id}' is still in PHYSICAL_READ_STARTED")
-            for r_id, r in self._active_reservations.items():
-                if hasattr(r, "child_reads"):
-                    for cr in r.child_reads.values():
-                        if cr.state == "PHYSICAL_READ_STARTED" and r.state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
-                            discrepancies.append(f"Invariant 10 (no started child read without terminal outcome) violated: child read '{cr.physical_read_id}' of '{r_id}' is still PHYSICAL_READ_STARTED")
-
-            # 11. No consumed read without accounting
-            active_scope_phys_ids = {s.physical_consumption_id for sc_list in self._active_scopes.values() for s in sc_list}
-            for r_id, r in self._active_reservations.items():
-                if r.state == "CONSUMED" and (r.scope_id is None or r.scope_id not in active_scope_phys_ids):
-                    discrepancies.append(f"Invariant 11 (no consumed read without accounting) violated: active consumed reservation '{r_id}' has no active scope")
-
-            # 12. No accounting record without physical read evidence
-            for op_id, s in self._committed_transactions.items():
-                if s.charged_bytes > 0:
-                    has_phys = (s.physical_consumption_id in self._physical_consumption_records
-                                or any(getattr(p, "operation_id", None) == op_id for p in phys_snaps)
-                                or any(getattr(r, "operation_id", None) == op_id for r in read_snaps))
-                    if not has_phys:
-                        discrepancies.append(f"Invariant 12 (no accounting record without physical read evidence) violated: transaction '{op_id}' has charged_bytes={s.charged_bytes} but no physical evidence")
-
-            # 13. No released reservation with child consumption
-            for r_id, r in self._active_reservations.items():
-                if r.state == "RELEASED":
-                    if r.consumed_bytes > 0:
-                        discrepancies.append(f"Invariant 13 (no released reservation with child consumption) violated: reservation '{r_id}' is RELEASED but consumed_bytes={r.consumed_bytes}")
-                    if hasattr(r, "child_reads"):
-                        for cr in r.child_reads.values():
-                            if cr.charged_bytes > 0:
-                                discrepancies.append(f"Invariant 13 (no released reservation with child consumption) violated: child '{cr.physical_read_id}' of released reservation '{r_id}' has charged_bytes={cr.charged_bytes}")
-
-            # 14. No duplicate physical execution identity (verified in Invariant 1 and 2)
-
-            # 15. No orphan child record
-            all_known_res_ids = set(self._active_reservations.keys()) | {r.reservation_id for r in read_snaps if r.reservation_id}
-            for r in read_snaps:
-                if r.reservation_id not in all_known_res_ids:
-                    discrepancies.append(f"Invariant 15 (no orphan child record) violated: read '{r.physical_read_id}' has unknown reservation '{r.reservation_id}'")
-
-            # 16. No unknown consumption silently treated as zero
+            # 19. Unknown consumption never zero
+            inv_19_ok = True
             for r in read_snaps:
                 if r.is_failure and r.measured_bytes_read is None and r.charged_bytes == 0:
-                    discrepancies.append(f"Invariant 16 (no unknown consumption silently treated as zero) violated: read '{r.physical_read_id}' has unknown bytes charged as 0")
+                    inv_19_ok = False
+                    discrepancies.append(f"Invariant 19 (unknown consumption never zero) violated: read '{r.physical_read_id}' has unknown bytes charged as 0")
+            for s in snaps:
+                if s.measurement_type == "UNKNOWN" and s.charged_bytes == 0:
+                    inv_19_ok = False
+                    discrepancies.append(f"Invariant 19 (unknown consumption never zero) violated: transaction '{s.operation_id}' has unknown measurement charged as 0")
 
             valid_states = {"ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"}
             for r_id, r in self._active_reservations.items():
@@ -2491,12 +2760,35 @@ class ObservationBudgetTracker:
             duplicate_snaps = [s for s in snaps if "#duplicate_" in s.operation_id]
             collision_snaps = [s for s in snaps if "#collision_" in s.operation_id]
 
+            discrepancy_details = {
+                "inv_1_physical_read_id_uniqueness": inv_1_ok,
+                "inv_2_physical_consumption_id_uniqueness": inv_2_ok,
+                "inv_3_accounting_transaction_id_uniqueness": inv_3_ok,
+                "inv_4_child_identity_uniqueness": inv_4_ok,
+                "inv_5_reservation_to_child_linkage": inv_5_ok,
+                "inv_6_child_to_consumption_linkage": inv_6_ok,
+                "inv_7_operation_to_accounting_linkage": inv_7_ok,
+                "inv_8_no_child_overwrites": inv_8_ok,
+                "inv_9_no_started_read_released": inv_9_ok,
+                "inv_10_no_inflight_child_at_finalization": inv_10_ok,
+                "inv_11_no_consumed_child_without_accounting": inv_11_ok,
+                "inv_12_no_accounting_without_physical_evidence": inv_12_ok,
+                "inv_13_no_consumption_without_valid_read_id": inv_13_ok,
+                "inv_14_no_duplicate_physical_execution_identity": inv_14_ok,
+                "inv_15_aggregate_reservation_equals_child_sum": inv_15_ok,
+                "inv_16_committed_bytes_equal_physical_ledger": inv_16_ok,
+                "inv_17_global_metrics_equal_committed_totals": inv_17_ok,
+                "inv_18_profile_usage_equals_committed_profile_totals": inv_18_ok,
+                "inv_19_unknown_consumption_never_zero": inv_19_ok,
+            }
+
             if discrepancies:
                 raise AssertionError(f"Tracker ledger reconciliation failed: {'; '.join(discrepancies)}")
 
             return {
                 "reconciled": True,
                 "discrepancies": discrepancies,
+                "discrepancy_details": discrepancy_details,
                 "total_transactions": len(snaps),
                 "total_logical_transactions": len(snaps),
                 "total_physical_records": len(phys_snaps),
@@ -2708,6 +3000,12 @@ class ObservationBudgetTracker:
                     self.record_rejection(profile_id or record.operation_id, reason)
                     return False
 
+            # Validate accounting_transaction_id uniqueness if specified
+            tx_id = record.accounting_transaction_id or f"tx_{uuid.uuid4().hex[:12]}"
+            for existing_tx in self._committed_transactions.values():
+                if existing_tx.accounting_transaction_id == tx_id and existing_tx.operation_id != record.operation_id:
+                    raise ValueError(f"Accounting transaction ID conflict: '{tx_id}' already assigned to '{existing_tx.operation_id}'")
+
             # Pre-validate child reads before mutating any metrics or ledger state
             all_commit_res = list(reservations or [])
             for r_id, res in self._active_reservations.items():
@@ -2812,6 +3110,7 @@ class ObservationBudgetTracker:
                 committed_at_ms=round(self.elapsed_ms, 3),
                 session_id=self.session_id,
                 physical_consumption_id=phys_id,
+                accounting_transaction_id=tx_id,
             )
             self._committed_transactions[record.operation_id] = snapshot
             # Register child physical reads and physical consumption records
@@ -2825,8 +3124,9 @@ class ObservationBudgetTracker:
                 for cr in res.child_reads.values():
                     has_child_reads = True
                     cr.operation_id = record.operation_id
-                    if cr.state == "CONSUMED":
-                        cr.account()
+                    if cr.state in ("CONSUMED", "ACCOUNTED"):
+                        if cr.state == "CONSUMED":
+                            cr.account()
                         pcons = cr.to_consumption_record(
                             operation_id=record.operation_id,
                             committed_at_ms=time.time(),
@@ -2844,8 +3144,25 @@ class ObservationBudgetTracker:
                         self._physical_consumption_records[cr.physical_consumption_id] = pcons
 
             if not has_child_reads:
-                self._physical_consumption_records[phys_id] = snapshot
                 root_pread_id = f"pread_{phys_id}"
+                root_pcons = PhysicalConsumptionRecord(
+                    physical_consumption_id=phys_id,
+                    physical_read_id=root_pread_id,
+                    reservation_id="direct_commit",
+                    operation_id=record.operation_id,
+                    measured_bytes_read=actual_meas if meas_b is not None else None,
+                    estimated_bytes_read=actual_est,
+                    charged_bytes=total_charge,
+                    latency_us=lat_val,
+                    stop_ms=stop_val,
+                    is_failure=is_failure,
+                    accounting_status="COMMITTED",
+                    measurement_type=record.measurement_type,
+                    created_at_ms=time.time(),
+                    committed_at_ms=time.time(),
+                    metadata=dict(record.metadata),
+                )
+                self._physical_consumption_records[phys_id] = root_pcons
                 root_cr = PhysicalReadRecord(
                     physical_read_id=root_pread_id,
                     reservation_id="direct_commit",
@@ -2853,8 +3170,8 @@ class ObservationBudgetTracker:
                     operation_id=record.operation_id,
                     state="ACCOUNTED",
                     charged_bytes=total_charge,
-                    measured_bytes_read=record.measured_bytes_read,
-                    estimated_bytes_read=record.estimated_bytes_read or 0,
+                    measured_bytes_read=actual_meas if meas_b is not None else None,
+                    estimated_bytes_read=actual_est,
                     latency_us=lat_val,
                     is_failure=is_failure,
                 )
@@ -2863,23 +3180,27 @@ class ObservationBudgetTracker:
             # Finalize associated reservations
             if reservations:
                 for res in reservations:
-                    if res.consumed_bytes > 0 or total_charge > 0:
+                    if res.consumed_bytes > 0 or total_charge > 0 or res.state == "CONSUMED":
                         if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
                             res.account()
                     else:
-                        if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
+                        if res.state in ("ADMITTED", "RESERVED"):
                             res.release()
                             self._released_reservations_count += 1
+                        elif res.state == "PHYSICAL_READ_STARTED":
+                            res.account()
                     self._active_reservations.pop(res.reservation_id, None)
             for r_id, res in list(self._active_reservations.items()):
                 if res.operation_id == record.operation_id:
-                    if res.consumed_bytes > 0 or total_charge > 0:
+                    if res.consumed_bytes > 0 or total_charge > 0 or res.state == "CONSUMED":
                         if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
                             res.account()
                     else:
-                        if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
+                        if res.state in ("ADMITTED", "RESERVED"):
                             res.release()
                             self._released_reservations_count += 1
+                        elif res.state == "PHYSICAL_READ_STARTED":
+                            res.account()
                     self._active_reservations.pop(r_id, None)
 
             return True
@@ -2933,10 +3254,27 @@ class ObservationBudgetTracker:
                 physical_consumption_id=phys_id,
             )
             self._committed_transactions[record.operation_id] = snapshot
-            self._physical_consumption_records[phys_id] = snapshot
 
             if not any(getattr(r, "operation_id", None) == record.operation_id for r in self._physical_read_records.values()):
                 root_pread_id = f"pread_{phys_id}"
+                root_pcons = PhysicalConsumptionRecord(
+                    physical_consumption_id=phys_id,
+                    physical_read_id=root_pread_id,
+                    reservation_id="scope_register",
+                    operation_id=record.operation_id,
+                    measured_bytes_read=record.measured_bytes_read,
+                    estimated_bytes_read=record.estimated_bytes_read or 0,
+                    charged_bytes=record.charged_bytes or 0,
+                    latency_us=float(record.latency_us or 0.0),
+                    stop_ms=float(stop_ms or 0.0),
+                    is_failure=is_failure,
+                    accounting_status="COMMITTED",
+                    measurement_type=record.measurement_type,
+                    created_at_ms=time.time(),
+                    committed_at_ms=round(self.elapsed_ms, 3),
+                    metadata=dict(record.metadata),
+                )
+                self._physical_consumption_records[phys_id] = root_pcons
                 root_cr = PhysicalReadRecord(
                     physical_read_id=root_pread_id,
                     reservation_id="scope_register",
@@ -2953,19 +3291,19 @@ class ObservationBudgetTracker:
             return snapshot
 
     def get_physical_consumption_records(self) -> Dict[str, Any]:
-        """Returns read-only dictionary of all physical consumption records."""
+        """Returns read-only deep-copied dictionary of all physical consumption records."""
         with self._transaction_lock:
-            return dict(self._physical_consumption_records)
+            return copy.deepcopy(self._physical_consumption_records)
 
     def get_physical_read_records(self) -> Dict[str, PhysicalReadRecord]:
-        """Returns read-only dictionary of all committed physical read records."""
+        """Returns read-only deep-copied dictionary of all committed physical read records."""
         with self._transaction_lock:
-            return dict(self._physical_read_records)
+            return copy.deepcopy(self._physical_read_records)
 
     def get_active_reservations(self) -> Dict[str, BudgetReservation]:
         """Returns read-only dictionary of active reservations."""
         with self._transaction_lock:
-            return dict(self._active_reservations)
+            return copy.deepcopy(self._active_reservations)
 
     def is_operation_committed(self, operation_id: str) -> bool:
         """Returns True if the operation_id has an authoritative committed transaction."""
@@ -2978,9 +3316,9 @@ class ObservationBudgetTracker:
             return self._committed_transactions.get(operation_id)
 
     def get_committed_transactions(self) -> Dict[str, ObservationAccountingRecord]:
-        """Returns a copy of all authoritative committed transactions."""
+        """Returns a deep-copied dictionary of all authoritative committed transactions."""
         with self._transaction_lock:
-            return dict(self._committed_transactions)
+            return copy.deepcopy(self._committed_transactions)
 
     def start(self) -> None:
         """Reset or restart wall clock tracking."""
@@ -3347,7 +3685,37 @@ class ObservationBudgetTracker:
                     physical_consumption_id=phys_id,
                 )
                 self._committed_transactions[attributed_operation_id] = snapshot
-                self._physical_consumption_records[phys_id] = snapshot
+                pcons = PhysicalConsumptionRecord(
+                    physical_consumption_id=phys_id,
+                    physical_read_id=f"pread_{phys_id}",
+                    reservation_id="standalone",
+                    operation_id=attributed_operation_id,
+                    measured_bytes_read=int(bytes_read) if measured else None,
+                    estimated_bytes_read=charged_b if not measured else 0,
+                    charged_bytes=charged_b,
+                    latency_us=lat_val,
+                    stop_ms=stop_val,
+                    is_failure=is_failure,
+                    accounting_status="COMMITTED",
+                    measurement_type=cand_fp.measurement_type,
+                    created_at_ms=time.time(),
+                    committed_at_ms=time.time(),
+                    metadata={},
+                )
+                self._physical_consumption_records[phys_id] = pcons
+                pread = PhysicalReadRecord(
+                    physical_read_id=f"pread_{phys_id}",
+                    reservation_id="standalone",
+                    physical_consumption_id=phys_id,
+                    operation_id=attributed_operation_id,
+                    state="ACCOUNTED",
+                    charged_bytes=charged_b,
+                    measured_bytes_read=int(bytes_read) if measured else None,
+                    estimated_bytes_read=charged_b if not measured else 0,
+                    latency_us=lat_val,
+                    is_failure=is_failure,
+                )
+                self._physical_read_records[pread.physical_read_id] = pread
 
             return rec_summary
 
