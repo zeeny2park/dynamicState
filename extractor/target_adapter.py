@@ -249,9 +249,31 @@ class TargetExecutionAdapter(ABC):
         self,
         pid: int,
         slices: List[Tuple[int, int]],
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
         """Reads multiple (address, size) slices in a single batch operation when supported."""
-        return [self.read_memory(pid, addr, sz) for addr, sz in slices]
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
+        total_proj = sum(sz for _, sz in slices)
+        adm = admission
+        own_adm = False
+        if adm is None and eff_tracker is not None:
+            try:
+                adm = eff_tracker.admit_read(projected_bytes=total_proj, profile_id="memory_read_batch")
+                own_adm = True
+            except ValueError as ve:
+                return [(None, "BUDGET_EXHAUSTED", f"Observation budget admission rejected: {ve}") for _ in slices]
+
+        results = [self.read_memory(pid, addr, sz, admission=adm, budget_tracker=eff_tracker) for addr, sz in slices]
+        if own_adm and adm is not None:
+            tot_b = sum(len(b) for b, _, _ in results if b)
+            if tot_b == 0 and adm.state in ("ADMITTED", "RESERVED"):
+                eff_tracker.release_reservation(adm)
+        return results
 
     @abstractmethod
     def is_remote(self) -> bool:
@@ -360,13 +382,27 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         "_last_identity_breakdown",
         "_last_identity_status",
         "_last_threads_breakdown",
+        "set_budget_tracker",
+        "get_budget_tracker",
+        "_budget_tracker",
     }
 
-    def __init__(self, inner: TargetExecutionAdapter):
+    def __init__(self, inner: TargetExecutionAdapter, budget_tracker: Optional[Any] = None):
         if isinstance(inner, ReadOnlyTargetAdapter):
             self._inner = inner._inner
         else:
             self._inner = inner
+        self._budget_tracker = budget_tracker
+        if hasattr(self._inner, "set_budget_tracker"):
+            self._inner.set_budget_tracker(budget_tracker)
+
+    def set_budget_tracker(self, tracker: Any) -> None:
+        self._budget_tracker = tracker
+        if hasattr(self._inner, "set_budget_tracker"):
+            self._inner.set_budget_tracker(tracker)
+
+    def get_budget_tracker(self) -> Optional[Any]:
+        return getattr(self, "_budget_tracker", None) or (self._inner.get_budget_tracker() if hasattr(self._inner, "get_budget_tracker") else None)
 
     def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
         return self._inner.check_liveness(pid)
@@ -379,11 +415,12 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         budget_tracker: Optional[Any] = None,
         operation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        eff_tracker = budget_tracker or self.get_budget_tracker()
         return self._inner.get_process_identity(
             pid,
             companion_build_id=companion_build_id,
             companion_elf_path=companion_elf_path,
-            budget_tracker=budget_tracker,
+            budget_tracker=eff_tracker,
             operation_id=operation_id,
         )
 
@@ -399,15 +436,32 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         return self._inner.get_threads(pid)
 
-    def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
-        return self._inner.read_memory(pid, address, size)
+    def read_memory(
+        self,
+        pid: int,
+        address: int,
+        size: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Tuple[Optional[bytes], str, Optional[str]]:
+        eff_tracker = budget_tracker or self.get_budget_tracker()
+        try:
+            return self._inner.read_memory(pid, address, size, admission=admission, budget_tracker=eff_tracker)
+        except TypeError:
+            return self._inner.read_memory(pid, address, size)
 
     def read_memory_batch(
         self,
         pid: int,
         requests: List[Tuple[int, int]],
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
-        return self._inner.read_memory_batch(pid, requests)
+        eff_tracker = budget_tracker or self.get_budget_tracker()
+        try:
+            return self._inner.read_memory_batch(pid, requests, admission=admission, budget_tracker=eff_tracker)
+        except TypeError:
+            return self._inner.read_memory_batch(pid, requests)
 
     def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
         return self._inner.resolve_mutex_owner(pid, lock_addr)
@@ -466,7 +520,7 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         )
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in ("_inner",):
+        if name in ("_inner", "_budget_tracker"):
             super().__setattr__(name, value)
         else:
             raise PermissionError(
@@ -477,8 +531,13 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
 class LocalTargetAdapter(TargetExecutionAdapter):
     """Execution adapter for local Linux processes using direct /proc and process_vm_readv."""
 
-    def __init__(self, memory_reader_fn: Optional[Callable[[int, int, int], Tuple[Optional[bytes], str, Optional[str]]]] = None):
+    def __init__(
+        self,
+        memory_reader_fn: Optional[Callable[[int, int, int], Tuple[Optional[bytes], str, Optional[str]]]] = None,
+        budget_tracker: Optional[Any] = None,
+    ):
         self._memory_reader = memory_reader_fn
+        self._budget_tracker = budget_tracker
         self._last_threads_bytes_read: int = 0
         self._last_maps_bytes_read: int = 0
         self._last_identity_bytes_read: int = 0
@@ -495,6 +554,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "measurement_status": "UNAVAILABLE",
         }
         self._last_threads_breakdown: Dict[str, int] = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
+
+    def set_budget_tracker(self, tracker: Any) -> None:
+        self._budget_tracker = tracker
+
+    def get_budget_tracker(self) -> Optional[Any]:
+        return getattr(self, "_budget_tracker", None)
 
     def is_remote(self) -> bool:
         return False
@@ -595,10 +660,84 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "measurement_breakdown": empty_breakdown,
             }
 
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
+        op_id = operation_id or f"proc_identity_{pid}_{uuid.uuid4().hex[:8]}"
+        adm = None
+        if eff_tracker is not None:
+            if eff_tracker.is_budget_exhausted:
+                self._last_identity_bytes_read = 0
+                self._last_identity_estimated_bytes = 0
+                self._last_identity_status = "BUDGET_EXHAUSTED"
+                self._last_identity_breakdown = empty_breakdown
+                self._last_identity_latency_us = 0.0
+                return {
+                    "pid": pid,
+                    "status": "BUDGET_EXHAUSTED",
+                    "identity_status": IDENTITY_UNAVAILABLE,
+                    "executable": "",
+                    "architecture": "unknown",
+                    "elf_class": "unknown",
+                    "endianness": "unknown",
+                    "elf_type": "unknown",
+                    "build_id": None,
+                    "build_id_status": "UNAVAILABLE",
+                    "process_start_time": None,
+                    "is_remote": False,
+                    "is_deleted": False,
+                    "has_debug_info": False,
+                    "error": "Observation budget exhausted before target identity read",
+                    "charged_bytes": 0,
+                    "measured_bytes_read": 0,
+                    "estimated_bytes_read": 0,
+                    "measurement_type": "UNKNOWN",
+                    "accounting_owner": "ADAPTER",
+                    "accounting_status": "FAILED",
+                    "measurement_breakdown": empty_breakdown,
+                }
+            try:
+                adm = eff_tracker.admit_read(projected_bytes=min(4096, max(256, eff_tracker.remaining_bytes)), profile_id="target_identity", operation_id=op_id)
+            except ValueError as ve:
+                self._last_identity_bytes_read = 0
+                self._last_identity_estimated_bytes = 0
+                self._last_identity_status = "BUDGET_EXHAUSTED"
+                self._last_identity_breakdown = empty_breakdown
+                self._last_identity_latency_us = 0.0
+                return {
+                    "pid": pid,
+                    "status": "BUDGET_EXHAUSTED",
+                    "identity_status": IDENTITY_UNAVAILABLE,
+                    "executable": "",
+                    "architecture": "unknown",
+                    "elf_class": "unknown",
+                    "endianness": "unknown",
+                    "elf_type": "unknown",
+                    "build_id": None,
+                    "is_deleted": False,
+                    "process_start_time": None,
+                    "has_debug_info": False,
+                    "is_remote": False,
+                    "host": self.target_host(),
+                    "error": f"Observation budget admission rejected: {ve}",
+                    "measured_bytes_read": 0,
+                    "estimated_bytes_read": 0,
+                    "charged_bytes": 0,
+                    "measurement_status": "BUDGET_EXHAUSTED",
+                    "measurement_type": "UNKNOWN",
+                    "accounting_owner": "ADAPTER",
+                    "accounting_status": "FAILED",
+                    "measurement_breakdown": empty_breakdown,
+                }
+
         # Check process liveness (T0)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
+            if adm is not None and eff_tracker is not None and adm.state in ("ADMITTED", "RESERVED"):
+                eff_tracker.release_reservation(adm)
             self._last_identity_bytes_read = 0
             self._last_identity_estimated_bytes = 0
             self._last_identity_status = "UNAVAILABLE"
@@ -856,7 +995,10 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         op_id = operation_id or f"proc_identity_{pid}_{uuid.uuid4().hex[:8]}"
         m_type = "MEASURED" if total_measured_bytes > 0 else ("CACHE_HIT" if elf_bytes_from_cache > 0 else "UNKNOWN")
         acct_status = "PENDING"
-        if budget_tracker is not None:
+        if adm is not None:
+            adm.consume(actual_bytes=total_measured_bytes)
+
+        if eff_tracker is not None:
             record = ObservationAccountingRecord(
                 operation_id=op_id,
                 accounting_owner="ADAPTER",
@@ -866,7 +1008,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 latency_us=self._last_identity_latency_us,
                 measurement_type=m_type,
             )
-            ok = budget_tracker.commit_transaction(record, profile_id="target_identity")
+            ok = eff_tracker.commit_transaction(record, profile_id="target_identity")
             acct_status = "COMMITTED" if ok else "FAILED"
 
         return {
@@ -1196,9 +1338,28 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         if not os.path.exists(maps_path):
             return mappings
 
+        eff_tracker = getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
+        adm = None
+        if eff_tracker is not None:
+            if eff_tracker.is_budget_exhausted:
+                self._last_maps_bytes_read = 0
+                return []
+            try:
+                adm = eff_tracker.admit_read(projected_bytes=min(4096, max(256, eff_tracker.remaining_bytes)), profile_id="target_maps")
+            except ValueError:
+                self._last_maps_bytes_read = 0
+                return []
+
         with open(maps_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-            self._last_maps_bytes_read = len(content.encode("utf-8"))
+            m_bytes = len(content.encode("utf-8"))
+            self._last_maps_bytes_read = m_bytes
+            if adm is not None:
+                adm.consume(actual_bytes=m_bytes)
             for line in content.splitlines():
                 parts = line.strip().split(maxsplit=5)
                 if len(parts) >= 5:
@@ -1260,6 +1421,24 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             self._last_threads_bytes_read = 0
             self._last_threads_breakdown = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
             return threads
+
+        eff_tracker = getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
+        adm = None
+        if eff_tracker is not None:
+            if eff_tracker.is_budget_exhausted:
+                self._last_threads_bytes_read = 0
+                self._last_threads_breakdown = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
+                return []
+            try:
+                adm = eff_tracker.admit_read(projected_bytes=min(4096, max(256, eff_tracker.remaining_bytes)), profile_id="target_threads")
+            except ValueError:
+                self._last_threads_bytes_read = 0
+                self._last_threads_breakdown = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
+                return []
 
         maps = self.get_proc_maps(pid)
         maps_b = getattr(self, "_last_maps_bytes_read", 0)
@@ -1554,7 +1733,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     if (vma_e - vma_s) < 4096:
                         continue
                     top_from = max(vma_s, vma_e - 24576)
-                    raw_top, r_st, _ = self.read_memory(pid, top_from, vma_e - top_from)
+                    from .watch_session import read_process_memory_slice
+                    raw_top, r_st, _ = read_process_memory_slice(pid, top_from, vma_e - top_from)
                     if r_st != "OBSERVED" or not raw_top or len(raw_top) < 64:
                         continue
                     limit = len(raw_top) - 24
@@ -1608,14 +1788,49 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "memory_bytes": mem_bytes,
             "total_bytes": total_proc_bytes_read,
         }
+        if adm is not None:
+            adm.consume(actual_bytes=total_proc_bytes_read)
+
         threads.sort(key=lambda t: t["tid"])
         return threads
 
-    def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
+    def read_memory(
+        self,
+        pid: int,
+        address: int,
+        size: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Tuple[Optional[bytes], str, Optional[str]]:
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
+        adm = admission
+        own_adm = False
+        if adm is None and eff_tracker is not None:
+            try:
+                adm = eff_tracker.admit_read(projected_bytes=size, profile_id="memory_read")
+                own_adm = True
+            except ValueError as ve:
+                return None, "BUDGET_EXHAUSTED", f"Observation budget admission rejected: {ve}"
+
         if self._memory_reader:
-            return self._memory_reader(pid, address, size)
-        from .watch_session import read_process_memory_slice
-        return read_process_memory_slice(pid, address, size)
+            res_bytes, res_st, res_err = self._memory_reader(pid, address, size)
+        else:
+            from .watch_session import read_process_memory_slice
+            res_bytes, res_st, res_err = read_process_memory_slice(pid, address, size)
+
+        if adm is not None:
+            actual_b = len(res_bytes) if res_bytes else 0
+            if actual_b > 0:
+                adm.consume(actual_bytes=actual_b, is_failure=(res_st not in ("OBSERVED", "PARTIAL")))
+            else:
+                if own_adm and eff_tracker is not None and adm.state in ("ADMITTED", "RESERVED"):
+                    eff_tracker.release_reservation(adm)
+
+        return res_bytes, res_st, res_err
 
     def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
         """Inspects target memory at lock_addr to identify pthread_mutex owner TID if readable and valid.
