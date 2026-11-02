@@ -73,6 +73,24 @@ def _get_kernel_isolated_cpus() -> List[int]:
     return sorted(set(isolated))
 
 
+def _adapter_supports_admission(adapter: Any, method_name: str) -> bool:
+    """Checks whether an adapter's method accepts 'admission' parameter without invoking it."""
+    method = getattr(adapter, method_name, None)
+    if not callable(method):
+        return False
+    try:
+        import inspect
+        sig = inspect.signature(method)
+        for p in sig.parameters.values():
+            if p.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+            if p.name in ("admission", "budget_tracker"):
+                return True
+        return False
+    except (ValueError, TypeError):
+        return False
+
+
 def normalize_futex_address(val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
     """Normalize raw syscall arg0 or lock address into canonical hex string and int.
     
@@ -203,7 +221,12 @@ class TargetExecutionAdapter(ABC):
         """Discovers executable path, architecture, build ID, and ELF type."""
         pass
 
-    def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
+    def get_process_memory_info(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Reads detailed process memory metrics from /proc/<pid>/statm, /proc/<pid>/status,
         and /proc/<pid>/smaps_rollup (bounded, low-impact).
         
@@ -219,21 +242,43 @@ class TargetExecutionAdapter(ABC):
         return {"status": "UNAVAILABLE", "pid": pid, "metrics": {}, "mappings_summary": {}, "metadata": {}}
 
     @abstractmethod
-    def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
+    def get_proc_maps(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         """Reads /proc/<pid>/maps and returns structured memory mappings."""
         pass
 
-    def get_memory_mappings(self, pid: int) -> List[Dict[str, Any]]:
+    def get_memory_mappings(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         """Convenience alias for get_proc_maps."""
-        return self.get_proc_maps(pid)
+        return self.get_proc_maps(pid, admission=admission, budget_tracker=budget_tracker)
 
     @abstractmethod
-    def get_threads(self, pid: int) -> List[Dict[str, Any]]:
+    def get_threads(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         """Discovers active threads from /proc/<pid>/task."""
         pass
 
     @abstractmethod
-    def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
+    def read_memory(
+        self,
+        pid: int,
+        address: int,
+        size: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Tuple[Optional[bytes], str, Optional[str]]:
         """Reads raw bytes from target memory without suspending the process.
         
         Returns:
@@ -262,17 +307,50 @@ class TargetExecutionAdapter(ABC):
         adm = admission
         own_adm = False
         if adm is None and eff_tracker is not None:
+            if eff_tracker.is_budget_exhausted:
+                return [(None, "BUDGET_EXHAUSTED", f"Observation budget exhausted: {eff_tracker.exhaustion_reason}") for _ in slices]
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
             try:
-                adm = eff_tracker.admit_read(projected_bytes=total_proj, profile_id="memory_read_batch")
+                if active_scope is not None and not active_scope.is_finalized:
+                    adm = active_scope.admit_read(projected_bytes=total_proj, profile_id="memory_read_batch")
+                else:
+                    adm = eff_tracker.admit_read(projected_bytes=total_proj, profile_id="memory_read_batch")
                 own_adm = True
             except ValueError as ve:
                 return [(None, "BUDGET_EXHAUSTED", f"Observation budget admission rejected: {ve}") for _ in slices]
 
-        results = [self.read_memory(pid, addr, sz, admission=adm, budget_tracker=eff_tracker) for addr, sz in slices]
-        if own_adm and adm is not None:
-            tot_b = sum(len(b) for b, _, _ in results if b)
-            if tot_b == 0 and adm.state in ("ADMITTED", "RESERVED"):
-                eff_tracker.release_reservation(adm)
+        if adm is not None:
+            adm.mark_physical_read_started()
+
+        results = []
+        any_failure = False
+        for addr, sz in slices:
+            if _adapter_supports_admission(self, "read_memory"):
+                res = self.read_memory(pid, addr, sz, admission=adm, budget_tracker=eff_tracker)
+            else:
+                res = self.read_memory(pid, addr, sz)
+            results.append(res)
+            _, st, _ = res
+            if st not in ("OBSERVED", "PARTIAL"):
+                any_failure = True
+
+        if own_adm and adm is not None and eff_tracker is not None:
+            tot_b = adm.consumed_bytes
+            if tot_b > 0:
+                active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+                if active_scope is not None and not active_scope.is_finalized:
+                    active_scope.record_read(bytes_read=tot_b, admission=adm, profile_id="memory_read_batch", is_failure=any_failure)
+                else:
+                    eff_tracker.commit_transaction(
+                        operation_id=f"standalone_batch_{uuid.uuid4().hex[:8]}",
+                        profile_id="memory_read_batch",
+                        measured_bytes=tot_b,
+                        is_failure=any_failure,
+                        reservations=[adm],
+                    )
+            else:
+                if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                    eff_tracker.release_reservation(adm)
         return results
 
     @abstractmethod
@@ -294,7 +372,13 @@ class TargetExecutionAdapter(ABC):
         """Discovers running processes on the target host, optionally filtered by name or Build ID."""
         return []
 
-    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
+    def resolve_mutex_owner(
+        self,
+        pid: int,
+        lock_addr: Union[int, str],
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> MutexOwnerResolutionResult:
         """Resolves mutex owner TID for given lock address if readable and verified, or returns resolution result."""
         return MutexOwnerResolutionResult(
             status=STATUS_MUTEX_LAYOUT_UNSUPPORTED,
@@ -424,17 +508,73 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
             operation_id=operation_id,
         )
 
-    def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
-        return self._inner.get_process_memory_info(pid)
+    def get_process_memory_info(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        eff_tracker = budget_tracker or self.get_budget_tracker()
+        supports_adm = _adapter_supports_admission(self._inner, "get_process_memory_info")
+        if eff_tracker is not None:
+            if not supports_adm:
+                raise PermissionError(
+                    f"Target adapter {type(self._inner).__name__} does not support budget admission, "
+                    f"but budget tracking is active."
+                )
+            return self._inner.get_process_memory_info(pid, admission=admission, budget_tracker=eff_tracker)
+        else:
+            if supports_adm:
+                return self._inner.get_process_memory_info(pid, admission=admission, budget_tracker=None)
+            return self._inner.get_process_memory_info(pid)
 
-    def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
-        return self._inner.get_proc_maps(pid)
+    def get_proc_maps(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        eff_tracker = budget_tracker or self.get_budget_tracker()
+        supports_adm = _adapter_supports_admission(self._inner, "get_proc_maps")
+        if eff_tracker is not None:
+            if not supports_adm:
+                raise PermissionError(
+                    f"Target adapter {type(self._inner).__name__} does not support budget admission, "
+                    f"but budget tracking is active."
+                )
+            return self._inner.get_proc_maps(pid, admission=admission, budget_tracker=eff_tracker)
+        else:
+            if supports_adm:
+                return self._inner.get_proc_maps(pid, admission=admission, budget_tracker=None)
+            return self._inner.get_proc_maps(pid)
 
-    def get_memory_mappings(self, pid: int) -> List[Dict[str, Any]]:
-        return self._inner.get_memory_mappings(pid)
+    def get_memory_mappings(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        return self.get_proc_maps(pid, admission=admission, budget_tracker=budget_tracker)
 
-    def get_threads(self, pid: int) -> List[Dict[str, Any]]:
-        return self._inner.get_threads(pid)
+    def get_threads(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        eff_tracker = budget_tracker or self.get_budget_tracker()
+        supports_adm = _adapter_supports_admission(self._inner, "get_threads")
+        if eff_tracker is not None:
+            if not supports_adm:
+                raise PermissionError(
+                    f"Target adapter {type(self._inner).__name__} does not support budget admission, "
+                    f"but budget tracking is active."
+                )
+            return self._inner.get_threads(pid, admission=admission, budget_tracker=eff_tracker)
+        else:
+            if supports_adm:
+                return self._inner.get_threads(pid, admission=admission, budget_tracker=None)
+            return self._inner.get_threads(pid)
 
     def read_memory(
         self,
@@ -445,9 +585,17 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         budget_tracker: Optional[Any] = None,
     ) -> Tuple[Optional[bytes], str, Optional[str]]:
         eff_tracker = budget_tracker or self.get_budget_tracker()
-        try:
+        supports_adm = _adapter_supports_admission(self._inner, "read_memory")
+        if eff_tracker is not None:
+            if not supports_adm:
+                raise PermissionError(
+                    f"Target adapter {type(self._inner).__name__} does not support budget admission, "
+                    f"but budget tracking is active."
+                )
             return self._inner.read_memory(pid, address, size, admission=admission, budget_tracker=eff_tracker)
-        except TypeError:
+        else:
+            if supports_adm:
+                return self._inner.read_memory(pid, address, size, admission=admission, budget_tracker=None)
             return self._inner.read_memory(pid, address, size)
 
     def read_memory_batch(
@@ -458,12 +606,29 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         budget_tracker: Optional[Any] = None,
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
         eff_tracker = budget_tracker or self.get_budget_tracker()
-        try:
+        supports_adm = _adapter_supports_admission(self._inner, "read_memory_batch")
+        if eff_tracker is not None:
+            if not supports_adm:
+                raise PermissionError(
+                    f"Target adapter {type(self._inner).__name__} does not support budget admission, "
+                    f"but budget tracking is active."
+                )
             return self._inner.read_memory_batch(pid, requests, admission=admission, budget_tracker=eff_tracker)
-        except TypeError:
+        else:
+            if supports_adm:
+                return self._inner.read_memory_batch(pid, requests, admission=admission, budget_tracker=None)
             return self._inner.read_memory_batch(pid, requests)
 
-    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
+    def resolve_mutex_owner(
+        self,
+        pid: int,
+        lock_addr: Union[int, str],
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> MutexOwnerResolutionResult:
+        eff_tracker = budget_tracker or self.get_budget_tracker()
+        if _adapter_supports_admission(self._inner, "resolve_mutex_owner"):
+            return self._inner.resolve_mutex_owner(pid, lock_addr, admission=admission, budget_tracker=eff_tracker)
         return self._inner.resolve_mutex_owner(pid, lock_addr)
 
     def get_last_threads_bytes_read(self) -> int:
@@ -698,8 +863,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     "accounting_status": "FAILED",
                     "measurement_breakdown": empty_breakdown,
                 }
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
             try:
-                adm = eff_tracker.admit_read(projected_bytes=min(4096, max(256, eff_tracker.remaining_bytes)), profile_id="target_identity", operation_id=op_id)
+                if active_scope is not None and not active_scope.is_finalized:
+                    adm = active_scope.admit_read(projected_bytes=min(4096, max(256, eff_tracker.remaining_bytes)), profile_id="target_identity")
+                else:
+                    adm = eff_tracker.admit_read(projected_bytes=min(4096, max(256, eff_tracker.remaining_bytes)), profile_id="target_identity", operation_id=op_id)
             except ValueError as ve:
                 self._last_identity_bytes_read = 0
                 self._last_identity_estimated_bytes = 0
@@ -731,6 +900,9 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     "accounting_status": "FAILED",
                     "measurement_breakdown": empty_breakdown,
                 }
+
+        if adm is not None:
+            adm.mark_physical_read_started()
 
         # Check process liveness (T0)
         try:
@@ -996,20 +1168,35 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         m_type = "MEASURED" if total_measured_bytes > 0 else ("CACHE_HIT" if elf_bytes_from_cache > 0 else "UNKNOWN")
         acct_status = "PENDING"
         if adm is not None:
-            adm.consume(actual_bytes=total_measured_bytes)
+            if total_measured_bytes > 0:
+                adm.consume(actual_bytes=total_measured_bytes)
+            else:
+                if eff_tracker is not None and adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                    eff_tracker.release_reservation(adm)
 
-        if eff_tracker is not None:
-            record = ObservationAccountingRecord(
-                operation_id=op_id,
-                accounting_owner="ADAPTER",
-                measured_bytes_read=total_measured_bytes,
-                estimated_bytes_read=estimated_bytes_read,
-                charged_bytes=total_measured_bytes,
-                latency_us=self._last_identity_latency_us,
-                measurement_type=m_type,
-            )
-            ok = eff_tracker.commit_transaction(record, profile_id="target_identity")
-            acct_status = "COMMITTED" if ok else "FAILED"
+        if eff_tracker is not None and total_measured_bytes > 0:
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+            if active_scope is not None and not active_scope.is_finalized:
+                active_scope.record_read(
+                    bytes_read=total_measured_bytes,
+                    admission=adm,
+                    profile_id="target_identity",
+                )
+                acct_status = "COMMITTED"
+            else:
+                record = ObservationAccountingRecord(
+                    operation_id=op_id,
+                    accounting_owner="ADAPTER",
+                    measured_bytes_read=total_measured_bytes,
+                    estimated_bytes_read=estimated_bytes_read,
+                    charged_bytes=total_measured_bytes,
+                    latency_us=self._last_identity_latency_us,
+                    measurement_type=m_type,
+                )
+                ok = eff_tracker.commit_transaction(record, profile_id="target_identity", reservations=[adm] if adm else None)
+                acct_status = "COMMITTED" if ok else "FAILED"
+        elif total_measured_bytes == 0:
+            acct_status = "COMMITTED"
 
         return {
             "pid": pid,
@@ -1042,7 +1229,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "host": self.target_host(),
         }
 
-    def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
+    def get_process_memory_info(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Reads detailed process memory metrics from /proc/<pid>/statm, /proc/<pid>/status,
         and /proc/<pid>/smaps_rollup (bounded, low-impact).
         
@@ -1065,8 +1257,49 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 "metadata": {},
             }
 
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
+        adm = admission
+        own_adm = False
+        if adm is None and eff_tracker is not None:
+            if eff_tracker.is_budget_exhausted:
+                return {
+                    "status": "BUDGET_EXHAUSTED",
+                    "pid": pid,
+                    "error": f"Observation budget exhausted: {eff_tracker.exhaustion_reason}",
+                    "metrics": {},
+                    "mappings_summary": {},
+                    "metadata": {},
+                }
+            proj_b = min(8192, max(512, eff_tracker.remaining_bytes))
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+            try:
+                if active_scope is not None and not active_scope.is_finalized:
+                    adm = active_scope.admit_read(projected_bytes=proj_b, profile_id="target_memory_info")
+                else:
+                    adm = eff_tracker.admit_read(projected_bytes=proj_b, profile_id="target_memory_info")
+                own_adm = True
+            except ValueError as ve:
+                return {
+                    "status": "BUDGET_EXHAUSTED",
+                    "pid": pid,
+                    "error": f"Admission rejected: {ve}",
+                    "metrics": {},
+                    "mappings_summary": {},
+                    "metadata": {},
+                }
+
+        if adm is not None:
+            adm.mark_physical_read_started()
+
         is_alive, live_err = self.check_liveness(pid)
         if not is_alive and live_err and any(k in live_err.lower() for k in ("terminated", "not found", "zombie")):
+            if own_adm and adm is not None and eff_tracker is not None:
+                if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                    eff_tracker.release_reservation(adm)
             return {
                 "status": "TARGET_TERMINATED",
                 "pid": pid,
@@ -1191,11 +1424,17 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
         # 4. Mappings summary from /proc/<pid>/maps
         try:
-            maps = self.get_proc_maps(pid)
+            if _adapter_supports_admission(self, "get_proc_maps"):
+                maps = self.get_proc_maps(pid, admission=adm, budget_tracker=eff_tracker)
+            else:
+                maps = self.get_proc_maps(pid)
             maps_bytes = getattr(self, "_last_maps_bytes_read", 0)
             actual_costs["maps"] = maps_bytes
             maps_status = "OBSERVED"
         except PermissionError:
+            if own_adm and adm is not None and eff_tracker is not None:
+                if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                    eff_tracker.release_reservation(adm)
             return {
                 "status": "PERMISSION_DENIED",
                 "pid": pid,
@@ -1315,6 +1554,28 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             },
         }
 
+        actual_bytes_read = sum(actual_costs.values())
+        if adm is not None:
+            other_b = sum(v for k, v in actual_costs.items() if k != "maps")
+            if other_b > 0:
+                adm.consume(actual_bytes=other_b, accumulate=True)
+
+        if own_adm and eff_tracker is not None:
+            if actual_bytes_read > 0:
+                active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+                if active_scope is not None and not active_scope.is_finalized:
+                    active_scope.record_read(bytes_read=actual_bytes_read, admission=adm, profile_id="target_memory_info")
+                else:
+                    eff_tracker.commit_transaction(
+                        operation_id=f"standalone_meminfo_{uuid.uuid4().hex[:8]}",
+                        profile_id="target_memory_info",
+                        measured_bytes=actual_bytes_read,
+                        reservations=[adm],
+                    )
+            else:
+                if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                    eff_tracker.release_reservation(adm)
+
         return {
             "status": "OBSERVED" if not missing_required_metrics else "PARTIAL",
             "timestamp": t_start,
@@ -1331,89 +1592,138 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "actual_costs": actual_costs,
         }
 
-    def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
+    def get_proc_maps(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         maps_path = f"/proc/{pid}/maps"
         mappings: List[Dict[str, Any]] = []
         self._last_maps_bytes_read = 0
         if not os.path.exists(maps_path):
             return mappings
 
-        eff_tracker = getattr(self, "_budget_tracker", None)
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
         if eff_tracker is None:
             from .observation_budget import ObservationBudgetTracker
             eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
 
-        adm = None
-        if eff_tracker is not None:
+        adm = admission
+        own_adm = False
+        if adm is None and eff_tracker is not None:
             if eff_tracker.is_budget_exhausted:
                 self._last_maps_bytes_read = 0
                 return []
+            proj_b = min(4096, max(256, eff_tracker.remaining_bytes))
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
             try:
-                adm = eff_tracker.admit_read(projected_bytes=min(4096, max(256, eff_tracker.remaining_bytes)), profile_id="target_maps")
+                if active_scope is not None and not active_scope.is_finalized:
+                    adm = active_scope.admit_read(projected_bytes=proj_b, profile_id="target_maps")
+                else:
+                    adm = eff_tracker.admit_read(projected_bytes=proj_b, profile_id="target_maps")
+                own_adm = True
             except ValueError:
                 self._last_maps_bytes_read = 0
                 return []
 
-        with open(maps_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-            m_bytes = len(content.encode("utf-8"))
-            self._last_maps_bytes_read = m_bytes
+        if adm is not None:
+            adm.mark_physical_read_started()
+
+        content = ""
+        m_bytes = 0
+        read_err = None
+        try:
+            with open(maps_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+                m_bytes = len(content.encode("utf-8"))
+        except Exception as exc:
+            read_err = exc
+
+        self._last_maps_bytes_read = m_bytes
+
+        if m_bytes > 0:
             if adm is not None:
-                adm.consume(actual_bytes=m_bytes)
-            for line in content.splitlines():
-                parts = line.strip().split(maxsplit=5)
-                if len(parts) >= 5:
-                    addr_range = parts[0]
-                    perms = parts[1]
-                    offset = parts[2]
-                    pathname = parts[5] if len(parts) >= 6 else ""
+                adm.consume(actual_bytes=m_bytes, is_failure=(read_err is not None), accumulate=not own_adm)
+            if own_adm and eff_tracker is not None:
+                active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+                if active_scope is not None and not active_scope.is_finalized:
+                    active_scope.record_read(bytes_read=m_bytes, admission=adm, profile_id="target_maps", is_failure=(read_err is not None))
+                else:
+                    eff_tracker.commit_transaction(
+                        operation_id=f"standalone_maps_{uuid.uuid4().hex[:8]}",
+                        profile_id="target_maps",
+                        measured_bytes=m_bytes,
+                        is_failure=(read_err is not None),
+                        reservations=[adm] if adm else None,
+                    )
+        else:
+            if own_adm and adm is not None and eff_tracker is not None:
+                if adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                    eff_tracker.release_reservation(adm)
 
-                    try:
-                        start_hex, end_hex = addr_range.split("-")
-                        s_int = int(start_hex, 16)
-                        e_int = int(end_hex, 16)
-                        off_int = int(offset, 16)
-                    except Exception:
-                        continue
+        if read_err is not None and m_bytes == 0:
+            return mappings
 
-                    path_low = pathname.lower()
-                    is_hugepage = any(k in path_low for k in ("huge", "rtemap", "hugetlb"))
-                    category = "anonymous"
-                    if pathname == "[heap]":
-                        category = "heap"
-                    elif pathname.startswith("[stack"):
-                        category = "stack"
-                    elif is_hugepage and "w" in perms:
+        for line in content.splitlines():
+            parts = line.strip().split(maxsplit=5)
+            if len(parts) >= 5:
+                addr_range = parts[0]
+                perms = parts[1]
+                offset = parts[2]
+                pathname = parts[5] if len(parts) >= 6 else ""
+
+                try:
+                    start_hex, end_hex = addr_range.split("-")
+                    s_int = int(start_hex, 16)
+                    e_int = int(end_hex, 16)
+                    off_int = int(offset, 16)
+                except Exception:
+                    continue
+
+                path_low = pathname.lower()
+                is_hugepage = any(k in path_low for k in ("huge", "rtemap", "hugetlb"))
+                category = "anonymous"
+                if pathname == "[heap]":
+                    category = "heap"
+                elif pathname.startswith("[stack"):
+                    category = "stack"
+                elif is_hugepage and "w" in perms:
+                    category = "data"
+                elif pathname:
+                    if "x" in perms:
+                        category = "code"
+                    elif "w" in perms:
                         category = "data"
-                    elif pathname:
-                        if "x" in perms:
-                            category = "code"
-                        elif "w" in perms:
-                            category = "data"
-                        else:
-                            category = "file"
+                    else:
+                        category = "file"
 
-                    mappings.append({
-                        "start": f"0x{s_int:x}",
-                        "end": f"0x{e_int:x}",
-                        "start_int": s_int,
-                        "end_int": e_int,
-                        "size": e_int - s_int,
-                        "permissions": perms,
-                        "offset": offset,
-                        "offset_int": off_int,
-                        "category": category,
-                        "pathname": pathname,
-                        "is_hugepage": is_hugepage,
-                        "is_readable": "r" in perms,
-                        "is_writable": "w" in perms,
-                        "is_executable": "x" in perms,
-                    })
+                mappings.append({
+                    "start": f"0x{s_int:x}",
+                    "end": f"0x{e_int:x}",
+                    "start_int": s_int,
+                    "end_int": e_int,
+                    "size": e_int - s_int,
+                    "permissions": perms,
+                    "offset": offset,
+                    "offset_int": off_int,
+                    "category": category,
+                    "pathname": pathname,
+                    "is_hugepage": is_hugepage,
+                    "is_readable": "r" in perms,
+                    "is_writable": "w" in perms,
+                    "is_executable": "x" in perms,
+                })
         return mappings
 
     get_memory_mappings = get_proc_maps
 
-    def get_threads(self, pid: int) -> List[Dict[str, Any]]:
+    def get_threads(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         import struct as _struct
         threads: List[Dict[str, Any]] = []
         task_dir = f"/proc/{pid}/task"
@@ -1422,25 +1732,38 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             self._last_threads_breakdown = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
             return threads
 
-        eff_tracker = getattr(self, "_budget_tracker", None)
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
         if eff_tracker is None:
             from .observation_budget import ObservationBudgetTracker
             eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
 
-        adm = None
-        if eff_tracker is not None:
+        adm = admission
+        own_adm = False
+        if adm is None and eff_tracker is not None:
             if eff_tracker.is_budget_exhausted:
                 self._last_threads_bytes_read = 0
                 self._last_threads_breakdown = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
                 return []
+            proj_b = min(4096, max(256, eff_tracker.remaining_bytes))
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
             try:
-                adm = eff_tracker.admit_read(projected_bytes=min(4096, max(256, eff_tracker.remaining_bytes)), profile_id="target_threads")
+                if active_scope is not None and not active_scope.is_finalized:
+                    adm = active_scope.admit_read(projected_bytes=proj_b, profile_id="target_threads")
+                else:
+                    adm = eff_tracker.admit_read(projected_bytes=proj_b, profile_id="target_threads")
+                own_adm = True
             except ValueError:
                 self._last_threads_bytes_read = 0
                 self._last_threads_breakdown = {"maps_bytes": 0, "task_bytes": 0, "memory_bytes": 0, "total_bytes": 0}
                 return []
 
-        maps = self.get_proc_maps(pid)
+        if adm is not None:
+            adm.mark_physical_read_started()
+
+        if _adapter_supports_admission(self, "get_proc_maps"):
+            maps = self.get_proc_maps(pid, admission=adm, budget_tracker=eff_tracker)
+        else:
+            maps = self.get_proc_maps(pid)
         maps_b = getattr(self, "_last_maps_bytes_read", 0)
         task_bytes = 0
         mem_bytes = 0
@@ -1788,8 +2111,25 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "memory_bytes": mem_bytes,
             "total_bytes": total_proc_bytes_read,
         }
-        if adm is not None:
-            adm.consume(actual_bytes=total_proc_bytes_read)
+        extra_b = task_bytes + mem_bytes
+        if adm is not None and extra_b > 0:
+            adm.consume(actual_bytes=extra_b, accumulate=True)
+
+        if own_adm and eff_tracker is not None:
+            if total_proc_bytes_read > 0:
+                active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+                if active_scope is not None and not active_scope.is_finalized:
+                    active_scope.record_read(bytes_read=total_proc_bytes_read, admission=adm, profile_id="target_threads")
+                else:
+                    eff_tracker.commit_transaction(
+                        operation_id=f"standalone_threads_{uuid.uuid4().hex[:8]}",
+                        profile_id="target_threads",
+                        measured_bytes=total_proc_bytes_read,
+                        reservations=[adm] if adm else None,
+                    )
+            else:
+                if adm is not None and adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
+                    eff_tracker.release_reservation(adm)
 
         threads.sort(key=lambda t: t["tid"])
         return threads
@@ -1810,11 +2150,20 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         adm = admission
         own_adm = False
         if adm is None and eff_tracker is not None:
+            if eff_tracker.is_budget_exhausted:
+                return None, "BUDGET_EXHAUSTED", f"Observation budget exhausted: {eff_tracker.exhaustion_reason}"
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
             try:
-                adm = eff_tracker.admit_read(projected_bytes=size, profile_id="memory_read")
+                if active_scope is not None and not active_scope.is_finalized:
+                    adm = active_scope.admit_read(projected_bytes=size, profile_id="memory_read")
+                else:
+                    adm = eff_tracker.admit_read(projected_bytes=size, profile_id="memory_read")
                 own_adm = True
             except ValueError as ve:
                 return None, "BUDGET_EXHAUSTED", f"Observation budget admission rejected: {ve}"
+
+        if adm is not None:
+            adm.mark_physical_read_started()
 
         if self._memory_reader:
             res_bytes, res_st, res_err = self._memory_reader(pid, address, size)
@@ -1822,17 +2171,38 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             from .watch_session import read_process_memory_slice
             res_bytes, res_st, res_err = read_process_memory_slice(pid, address, size)
 
+        actual_b = len(res_bytes) if res_bytes else 0
+        is_fail = (res_st not in ("OBSERVED", "PARTIAL"))
+
         if adm is not None:
-            actual_b = len(res_bytes) if res_bytes else 0
             if actual_b > 0:
-                adm.consume(actual_bytes=actual_b, is_failure=(res_st not in ("OBSERVED", "PARTIAL")))
+                adm.consume(actual_bytes=actual_b, is_failure=is_fail, accumulate=not own_adm)
             else:
-                if own_adm and eff_tracker is not None and adm.state in ("ADMITTED", "RESERVED"):
+                if own_adm and eff_tracker is not None and adm.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and adm.consumed_bytes == 0:
                     eff_tracker.release_reservation(adm)
+
+        if own_adm and eff_tracker is not None and actual_b > 0:
+            active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+            if active_scope is not None and not active_scope.is_finalized:
+                active_scope.record_read(bytes_read=actual_b, admission=adm, profile_id="memory_read", is_failure=is_fail)
+            else:
+                eff_tracker.commit_transaction(
+                    operation_id=f"standalone_read_{uuid.uuid4().hex[:8]}",
+                    profile_id="memory_read",
+                    measured_bytes=actual_b,
+                    is_failure=is_fail,
+                    reservations=[adm],
+                )
 
         return res_bytes, res_st, res_err
 
-    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
+    def resolve_mutex_owner(
+        self,
+        pid: int,
+        lock_addr: Union[int, str],
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> MutexOwnerResolutionResult:
         """Inspects target memory at lock_addr to identify pthread_mutex owner TID if readable and valid.
         
         Strict Verification Requirements:
@@ -1869,6 +2239,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 error=f"Invalid lock address integer: {lock_addr_int}",
             )
 
+        eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
+        if eff_tracker is None:
+            from .observation_budget import ObservationBudgetTracker
+            eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+
         # 1. Architecture, Libc, and ELF ABI Validation
         # Supported Glibc LP64 ABI Layout (glibc NPTL struct pthread_mutex_t):
         # - offset  0: int32_t  __lock   (0=unlocked, 1=locked, 2=contended, or FUTEX_WAITERS|TID for PI)
@@ -1877,7 +2252,13 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         # - offset 12: uint32_t __nusers
         # - offset 16: int32_t  __kind   (base kind 0..3 + flags: 0x10=robust, 0x20=pi, 0x80=shared, -1=destroyed)
         # - Supported target environments: Linux LP64 x86_64 and aarch64 glibc (ELF64, Little-Endian).
-        proc_ident = self.get_process_identity(pid) if hasattr(self, "get_process_identity") else {}
+        if hasattr(self, "get_process_identity"):
+            if _adapter_supports_admission(self, "get_process_identity"):
+                proc_ident = self.get_process_identity(pid, budget_tracker=eff_tracker)
+            else:
+                proc_ident = self.get_process_identity(pid)
+        else:
+            proc_ident = {}
         if proc_ident.get("status") == "TARGET_TERMINATED":
             return MutexOwnerResolutionResult(
                 status=STATUS_OWNER_NOT_IDENTIFIED,
@@ -1926,7 +2307,10 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             )
 
         # Check for libc runtime evidence in /proc/<pid>/maps
-        maps = self.get_proc_maps(pid)
+        if _adapter_supports_admission(self, "get_proc_maps"):
+            maps = self.get_proc_maps(pid, admission=admission, budget_tracker=eff_tracker)
+        else:
+            maps = self.get_proc_maps(pid)
         has_musl = any("musl" in (m.get("pathname", "").lower()) for m in maps)
         if has_musl:
             return MutexOwnerResolutionResult(
@@ -1962,7 +2346,10 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
         # 2. Read Mutex Memory (glibc LP64 layout requires 40 bytes)
         t_start_read = time.monotonic()
-        raw, st, err = self.read_memory(pid, lock_addr_int, 40)
+        if _adapter_supports_admission(self, "read_memory"):
+            raw, st, err = self.read_memory(pid, lock_addr_int, 40, admission=admission, budget_tracker=eff_tracker)
+        else:
+            raw, st, err = self.read_memory(pid, lock_addr_int, 40)
         read_latency_us = (time.monotonic() - t_start_read) * 1_000_000.0
 
         if st == "PERMISSION_DENIED":
@@ -2535,7 +2922,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "measurement_breakdown": meas_breakdown,
         }
 
-    def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
+    def get_process_memory_info(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Reads detailed process memory metrics from remote /proc/<pid>/statm, status, and smaps_rollup."""
         alive, _ = self.check_liveness(pid)
         if not alive:
@@ -2658,7 +3050,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             },
         }
 
-    def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
+    def get_proc_maps(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         cmd = f"cat /proc/{int(pid)}/maps 2>/dev/null"
         rc, stdout, _ = self.run_ssh(cmd)
         mappings: List[Dict[str, Any]] = []
@@ -2712,7 +3109,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 })
         return mappings
 
-    def get_threads(self, pid: int) -> List[Dict[str, Any]]:
+    def get_threads(
+        self,
+        pid: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         # Efficient remote script to list threads without spawning multiple remote processes
         remote_script = (
             f"for t in /proc/{int(pid)}/task/*; do "
@@ -2752,7 +3154,13 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         threads.sort(key=lambda t: t["tid"])
         return threads
 
-    def resolve_mutex_owner(self, pid: int, lock_addr: Union[int, str]) -> MutexOwnerResolutionResult:
+    def resolve_mutex_owner(
+        self,
+        pid: int,
+        lock_addr: Union[int, str],
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> MutexOwnerResolutionResult:
         """Remote mutex owner resolution is unsupported without an in-target verified agent.
         
         Strictly fails closed without touching local /proc or local process memory.
@@ -2809,6 +3217,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self,
         pid: int,
         slices: List[Tuple[int, int]],
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
         """Reads multiple memory slices in a single SSH roundtrip (via C99 collector or batched POSIX shell)."""
         if not slices:
@@ -2878,7 +3288,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 results.append((None, "UNAVAILABLE", f"Base64 decode failure: {e}"))
         return results
 
-    def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
+    def read_memory(
+        self,
+        pid: int,
+        address: int,
+        size: int,
+        admission: Optional[Any] = None,
+        budget_tracker: Optional[Any] = None,
+    ) -> Tuple[Optional[bytes], str, Optional[str]]:
         if size <= 0:
             return b"", "OBSERVED", None
 
@@ -3229,4 +3646,5 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
 
 RemoteTargetAdapter = RemoteSshTargetAdapter
+RemoteSSHCollectorTargetAdapter = RemoteSshTargetAdapter
 

@@ -1615,9 +1615,10 @@ class AdaptiveInvestigationEngine:
                         else nullcontext()
                     )
                     with scope_cm as fb_scope:
+                        th_prior = getattr(fb_scope, "reads_count", 0)
                         threads = adapter.get_threads(pid_val)
                         th_meas = adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 0)
-                        if budget_tracker and th_meas > 0:
+                        if budget_tracker and th_meas > 0 and getattr(fb_scope, "reads_count", 0) == th_prior:
                             budget_tracker.record_read(
                                 bytes_read=th_meas,
                                 latency_us=(time.monotonic() - t_start_obs) * 1_000_000.0,
@@ -1634,9 +1635,10 @@ class AdaptiveInvestigationEngine:
                                     is_partial_budget = True
                             if not is_partial_budget:
                                 t_id_start = time.monotonic()
+                                id_prior = getattr(fb_scope, "reads_count", 0)
                                 target_identity = adapter.get_process_identity(pid_val)
                                 id_meas = adapter.get_last_identity_bytes_read() if hasattr(adapter, "get_last_identity_bytes_read") else getattr(adapter, "_last_identity_bytes_read", 0)
-                                if budget_tracker and id_meas > 0:
+                                if budget_tracker and id_meas > 0 and getattr(fb_scope, "reads_count", 0) == id_prior:
                                     budget_tracker.record_read(
                                         bytes_read=id_meas,
                                         latency_us=(time.monotonic() - t_id_start) * 1_000_000.0,

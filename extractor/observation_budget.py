@@ -471,25 +471,33 @@ class ObservationMetrics:
 @dataclass
 class BudgetReservation:
     """Explicit tracker-owned reservation lifecycle:
-    ADMITTED -> CONSUMED -> ACCOUNTED
+    ADMITTED -> PHYSICAL_READ_STARTED -> CONSUMED -> ACCOUNTED
     ADMITTED -> RELEASED (strictly when consumed_bytes == 0)
+    CONSUMED -> FAILED_ACCOUNTED (only if accounting itself cannot complete normally and recovery records the consumption)
     (Backward-compatible aliases: RESERVED -> CONSUMED -> FINALIZED)
     """
     reservation_id: str
     operation_id: str
     reserved_bytes: int
     profile_id: Optional[str] = None
-    state: str = "ADMITTED"  # "ADMITTED", "RESERVED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED"
+    state: str = "ADMITTED"  # "ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"
     consumed_bytes: int = 0
     is_failure: bool = False
     scope_id: Optional[str] = None
     created_at_ms: float = 0.0
+    physical_consumption_id: Optional[str] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
 
     @property
     def is_admitted(self) -> bool:
         with self._lock:
             return self.state in ("ADMITTED", "RESERVED")
+
+    @property
+    def is_physical_read_started(self) -> bool:
+        with self._lock:
+            return self.state == "PHYSICAL_READ_STARTED"
 
     @property
     def is_consumed(self) -> bool:
@@ -504,51 +512,117 @@ class BudgetReservation:
     @property
     def is_accounted(self) -> bool:
         with self._lock:
-            return self.state in ("ACCOUNTED", "FINALIZED")
+            return self.state in ("ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED")
+
+    @property
+    def transition_history(self) -> List[str]:
+        with self._lock:
+            return list(self._transition_history)
+
+    def mark_physical_read_started(self, physical_consumption_id: Optional[str] = None) -> None:
+        """Transitions ADMITTED / RESERVED -> PHYSICAL_READ_STARTED."""
+        with self._lock:
+            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(f"Cannot start physical read for reservation '{self.reservation_id}' in terminal state {self.state}")
+            if self.state in ("PHYSICAL_READ_STARTED", "CONSUMED"):
+                if physical_consumption_id and not self.physical_consumption_id:
+                    self.physical_consumption_id = physical_consumption_id
+                return
+            if self.state not in ("ADMITTED", "RESERVED"):
+                raise RuntimeError(f"Cannot start physical read for reservation '{self.reservation_id}' in state {self.state}")
+            self.state = "PHYSICAL_READ_STARTED"
+            if physical_consumption_id:
+                self.physical_consumption_id = physical_consumption_id
+            elif not self.physical_consumption_id:
+                self.physical_consumption_id = f"phys_{uuid.uuid4().hex[:12]}"
+            self._transition_history.append("PHYSICAL_READ_STARTED")
 
     def consume(
         self,
         actual_bytes: Optional[int],
         is_failure: bool = False,
+        accumulate: bool = False,
     ) -> int:
-        """Transitions ADMITTED / RESERVED -> CONSUMED."""
+        """Transitions ADMITTED / RESERVED / PHYSICAL_READ_STARTED -> CONSUMED.
+        
+        If already in CONSUMED, accumulate=True is required to accumulate consumption
+        without overwriting previous physical bytes.
+        """
         with self._lock:
-            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED"):
+            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot consume reservation '{self.reservation_id}' in state {self.state}")
-            if self.state not in ("ADMITTED", "RESERVED", "CONSUMED"):
+            b = max(0, int(actual_bytes or 0))
+            if self.state == "CONSUMED":
+                if not accumulate:
+                    if b == self.consumed_bytes:
+                        if is_failure:
+                            self.is_failure = True
+                        return self.consumed_bytes
+                    raise RuntimeError(
+                        f"Cannot consume reservation '{self.reservation_id}' in state CONSUMED without accumulate=True: "
+                        f"physical consumption would be overwritten"
+                    )
+            if self.state not in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
                 raise RuntimeError(f"Cannot consume reservation '{self.reservation_id}' in state {self.state}")
-            self.consumed_bytes = max(0, int(actual_bytes or 0))
+            if accumulate:
+                self.consumed_bytes += b
+            else:
+                self.consumed_bytes = b
             if is_failure:
                 self.is_failure = True
+            if not self.physical_consumption_id:
+                self.physical_consumption_id = f"phys_{uuid.uuid4().hex[:12]}"
             self.state = "CONSUMED"
+            self._transition_history.append("CONSUMED")
             return self.consumed_bytes
 
+    def accumulate_consume(
+        self,
+        actual_bytes: Optional[int],
+        is_failure: bool = False,
+    ) -> int:
+        """Convenience method to accumulate physical consumption atomically."""
+        return self.consume(actual_bytes=actual_bytes, is_failure=is_failure, accumulate=True)
+
     def release(self) -> None:
-        """Transitions ADMITTED / RESERVED -> RELEASED strictly when no physical consumption occurred."""
+        """Transitions ADMITTED / RESERVED / PHYSICAL_READ_STARTED -> RELEASED strictly when no physical consumption occurred."""
         with self._lock:
             if self.consumed_bytes > 0:
                 raise RuntimeError(f"A reservation must never be released if physical consumption occurred ({self.consumed_bytes}B)")
-            if self.state not in ("ADMITTED", "RESERVED"):
+            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
+            if self.state not in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
                 raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
             self.state = "RELEASED"
+            self._transition_history.append("RELEASED")
 
     def account(self) -> None:
         """Transitions CONSUMED -> ACCOUNTED upon authoritative tracker commit."""
         with self._lock:
-            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED"):
+            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' in state {self.state}")
-            if self.state in ("ADMITTED", "RESERVED") and self.consumed_bytes == 0:
+            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0:
                 raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' with zero consumption; must be released")
             self.state = "ACCOUNTED"
+            self._transition_history.append("ACCOUNTED")
 
     def finalize(self) -> None:
         """Transitions CONSUMED or RESERVED -> ACCOUNTED / FINALIZED upon tracker ledger commit."""
         with self._lock:
-            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED"):
+            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' in state {self.state}")
-            if self.state not in ("CONSUMED", "ADMITTED", "RESERVED"):
-                raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' in state {self.state}")
-            self.state = "ACCOUNTED" if self.state in ("ADMITTED", "CONSUMED") else "FINALIZED"
+            if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0:
+                raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' with zero consumption; must be released")
+            self.state = "ACCOUNTED" if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED") else "FINALIZED"
+            self._transition_history.append(self.state)
+
+    def mark_failed_accounted(self) -> None:
+        """Transitions CONSUMED -> FAILED_ACCOUNTED upon failure recovery recording."""
+        with self._lock:
+            if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(f"Cannot mark failed_accounted for reservation '{self.reservation_id}' in state {self.state}")
+            self.state = "FAILED_ACCOUNTED"
+            self._transition_history.append("FAILED_ACCOUNTED")
 
 
 @dataclass
@@ -738,7 +812,10 @@ class ActiveOperationScope:
             if eff_res is not None:
                 res = eff_res
                 res.scope_id = self.physical_consumption_id
-                res.consume(actual_bytes=charged_b, is_failure=is_failure)
+                if not res.is_consumed:
+                    res.consume(actual_bytes=charged_b, is_failure=is_failure)
+                elif is_failure:
+                    res.is_failure = True
             else:
                 try:
                     res = self.tracker.reserve_budget(
@@ -862,6 +939,12 @@ class ObservationBudgetTracker:
             return tracker._thread_local.current_scope
         return None
 
+    def get_active_scope(self) -> Optional["ActiveOperationScope"]:
+        """Returns the active operation scope on this thread for this tracker, if any."""
+        if hasattr(self._thread_local, "current_scope"):
+            return self._thread_local.current_scope
+        return None
+
     def __init__(
         self,
         limits: Optional[ObservationBudgetLimits] = None,
@@ -912,15 +995,21 @@ class ObservationBudgetTracker:
                 if not self._active_scopes[scope.operation_id]:
                     del self._active_scopes[scope.operation_id]
 
-    def _active_consumed_bytes(self) -> int:
+    def _active_consumed_bytes(self, profile_id: Optional[str] = None) -> int:
         with self._transaction_lock:
             active_scope_phys_ids = {
-                s.physical_consumption_id for scopes in self._active_scopes.values() for s in scopes if s.charged_bytes > 0
+                s.physical_consumption_id for scopes in self._active_scopes.values() for s in scopes
+                if (profile_id is None or s.profile_id == profile_id) and s.charged_bytes > 0
             }
-            scope_bytes = sum(s.charged_bytes for scopes in self._active_scopes.values() for s in scopes)
+            scope_bytes = sum(
+                s.charged_bytes for scopes in self._active_scopes.values() for s in scopes
+                if (profile_id is None or s.profile_id == profile_id)
+            )
             standalone_consumed = sum(
                 r.consumed_bytes for r in self._active_reservations.values()
-                if r.state == "CONSUMED" and (r.scope_id is None or r.scope_id not in active_scope_phys_ids)
+                if r.state == "CONSUMED"
+                and (profile_id is None or r.profile_id == profile_id)
+                and (r.scope_id is None or r.scope_id not in active_scope_phys_ids)
             )
             return scope_bytes + standalone_consumed
 
@@ -930,7 +1019,7 @@ class ObservationBudgetTracker:
             for r in self._active_reservations.values():
                 if profile_id is not None and r.profile_id != profile_id:
                     continue
-                if r.state in ("RESERVED", "ADMITTED"):
+                if r.state in ("RESERVED", "ADMITTED", "PHYSICAL_READ_STARTED"):
                     total += r.reserved_bytes
             return total
 
@@ -989,24 +1078,30 @@ class ObservationBudgetTracker:
                 self.metrics.exhaustion_reason = (
                     f"EXCEEDED_BYTES_READ: projected admission {projected}B > max {self.limits.max_bytes_read}B"
                 )
-                if not (allow_in_flight_overshoot and proj_b <= 4096):
+                if not allow_in_flight_overshoot:
                     raise ValueError(f"BUDGET_EXHAUSTED: {self.metrics.exhaustion_reason}")
+                elif (projected - self.limits.max_bytes_read) > self.limits.max_bytes_per_observation:
+                    raise ValueError(
+                        f"BUDGET_EXHAUSTED: In-flight overshoot {projected - self.limits.max_bytes_read}B "
+                        f"exceeds max buffer {self.limits.max_bytes_per_observation}B"
+                    )
 
             # Check profile limit if profile has ceiling
             eff_prof_id = profile_id or (scope.profile_id if scope else None)
             if eff_prof_id:
                 p_usage = self._get_or_init_profile_usage(eff_prof_id)
                 p_active_res = self._active_reservation_bytes(profile_id=eff_prof_id)
+                p_in_flight = self._active_consumed_bytes(profile_id=eff_prof_id)
                 ceil_limit = None
                 if profile_ceiling:
                     ceil_limit = profile_ceiling.get("max_bytes_read", profile_ceiling.get("max_bytes"))
                 if ceil_limit is None and hasattr(self.limits, "max_profile_bytes"):
                     ceil_limit = self.limits.max_profile_bytes.get(eff_prof_id)
 
-                if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + proj_b) > int(ceil_limit):
+                if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + p_in_flight + proj_b) > int(ceil_limit):
                     raise ValueError(
                         f"PROFILE_CEILING_EXCEEDED: Profile '{eff_prof_id}' projected "
-                        f"{p_usage['bytes_read'] + p_active_res + proj_b}B > max {ceil_limit}B"
+                        f"{p_usage['bytes_read'] + p_active_res + p_in_flight + proj_b}B > max {ceil_limit}B"
                     )
 
             res_id = f"adm_{uuid.uuid4().hex}"
@@ -1120,11 +1215,11 @@ class ObservationBudgetTracker:
         with self._transaction_lock:
             to_remove = []
             for r_id, res in list(self._active_reservations.items()):
-                if res.scope_id == scope.physical_consumption_id or (res.operation_id == scope.operation_id and res.state in ("ADMITTED", "RESERVED", "CONSUMED")):
-                    if res.consumed_bytes > 0:
+                if res.scope_id == scope.physical_consumption_id or (res.operation_id == scope.operation_id and res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED")):
+                    if res.consumed_bytes > 0 or scope.charged_bytes > 0:
                         res.finalize()
                     else:
-                        if res.state in ("ADMITTED", "RESERVED"):
+                        if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
                             res.release()
                             self._released_reservations_count += 1
                         else:
@@ -1609,8 +1704,74 @@ class ObservationBudgetTracker:
         is_fail: bool = False,
     ) -> CommittedTransactionSnapshot:
         with self._transaction_lock:
-            prepared = self._prepare_scope_commit(scope, is_fail=is_fail)
-            return self._execute_scope_commit(prepared)
+            try:
+                prepared = self._prepare_scope_commit(scope, is_fail=is_fail)
+                return self._execute_scope_commit(prepared)
+            except Exception as exc:
+                if "Operation ID collision" in str(exc):
+                    raise
+                if scope.charged_bytes > 0 or scope.reads_count > 0:
+                    try:
+                        cand_fp = AccountingFingerprint(
+                            operation_id=scope.operation_id,
+                            accounting_owner=scope.owner,
+                            measured_bytes_read=scope.measured_bytes_read,
+                            estimated_bytes_read=scope.estimated_bytes_read or 0,
+                            charged_bytes=scope.charged_bytes or 0,
+                            measurement_type="MIXED" if (scope.measured_bytes_read and scope.estimated_bytes_read) else ("MEASURED" if scope.measured_bytes_read is not None else "ESTIMATED"),
+                            profile_id=scope.profile_id,
+                            is_failure=True,
+                            stop_ms=round(max(0.0, float(scope.stop_ms)), 4),
+                            latency_us=round(max(0.0, float(scope.latency_us)), 4),
+                            session_id=self.session_id,
+                            metadata_digest=canonical_metadata_digest({"emergency": str(exc)}),
+                            physical_consumption_id=scope.physical_consumption_id,
+                        )
+                        snapshot = CommittedTransactionSnapshot(
+                            operation_id=scope.operation_id,
+                            accounting_owner=scope.owner,
+                            measured_bytes_read=scope.measured_bytes_read,
+                            estimated_bytes_read=scope.estimated_bytes_read or 0,
+                            charged_bytes=scope.charged_bytes or 0,
+                            latency_us=max(0.0, float(scope.latency_us)),
+                            stop_ms=max(0.0, float(scope.stop_ms)),
+                            is_failure=True,
+                            accounting_status="FAILED",
+                            measurement_type=cand_fp.measurement_type,
+                            fingerprint=cand_fp,
+                            metadata={"emergency_error": str(exc)},
+                            committed_at_ms=round(self.elapsed_ms, 3),
+                            session_id=self.session_id,
+                            physical_consumption_id=scope.physical_consumption_id,
+                        )
+                        deltas = {
+                            "bytes_read": scope.charged_bytes or 0,
+                            "measured_bytes_read": scope.measured_bytes_read or 0,
+                            "conservative_estimated_bytes": scope.estimated_bytes_read or 0,
+                            "unmeasured_reads": 1 if (scope.estimated_bytes_read and not scope.measured_bytes_read) else 0,
+                            "latency_us": max(0.0, float(scope.latency_us)),
+                            "stop_ms": max(0.0, float(scope.stop_ms)),
+                            "is_failure": True,
+                            "profile_id": scope.profile_id or scope.operation_id,
+                        }
+                        prep = PreparedCommit(
+                            snapshot=snapshot,
+                            target_op_id=scope.operation_id,
+                            is_duplicate=False,
+                            is_collision=False,
+                            deltas=deltas,
+                            scope=scope,
+                            reservations=[],
+                        )
+                        return self._recover_commit_failure(prep, error=exc, metrics_applied=False, step="prepare_failed")
+                    except Exception:
+                        self._finalize_scope_reservations(scope)
+                        self._unregister_active_scope(scope)
+                        raise exc
+                else:
+                    self._finalize_scope_reservations(scope)
+                    self._unregister_active_scope(scope)
+                    raise
 
     def _finalize_scope_duplicate_or_collision(
         self,
@@ -1618,8 +1779,75 @@ class ObservationBudgetTracker:
         is_fail: bool = False,
     ) -> CommittedTransactionSnapshot:
         with self._transaction_lock:
-            prepared = self._prepare_scope_commit(scope, is_fail=is_fail)
-            return self._execute_scope_commit(prepared)
+            try:
+                prepared = self._prepare_scope_commit(scope, is_fail=is_fail)
+                return self._execute_scope_commit(prepared)
+            except Exception as exc:
+                if "Operation ID collision" in str(exc):
+                    raise
+                if scope.charged_bytes > 0 or scope.reads_count > 0:
+                    try:
+                        cand_fp = AccountingFingerprint(
+                            operation_id=scope.operation_id,
+                            accounting_owner=scope.owner,
+                            measured_bytes_read=scope.measured_bytes_read,
+                            estimated_bytes_read=scope.estimated_bytes_read or 0,
+                            charged_bytes=scope.charged_bytes or 0,
+                            measurement_type="MIXED" if (scope.measured_bytes_read and scope.estimated_bytes_read) else ("MEASURED" if scope.measured_bytes_read is not None else "ESTIMATED"),
+                            profile_id=scope.profile_id,
+                            is_failure=True,
+                            stop_ms=round(max(0.0, float(scope.stop_ms)), 4),
+                            latency_us=round(max(0.0, float(scope.latency_us)), 4),
+                            session_id=self.session_id,
+                            metadata_digest=canonical_metadata_digest({"emergency": str(exc)}),
+                            physical_consumption_id=scope.physical_consumption_id,
+                        )
+                        target_op = f"{scope.operation_id}#emergency_{scope.physical_consumption_id}"
+                        snapshot = CommittedTransactionSnapshot(
+                            operation_id=target_op,
+                            accounting_owner=scope.owner,
+                            measured_bytes_read=scope.measured_bytes_read,
+                            estimated_bytes_read=scope.estimated_bytes_read or 0,
+                            charged_bytes=scope.charged_bytes or 0,
+                            latency_us=max(0.0, float(scope.latency_us)),
+                            stop_ms=max(0.0, float(scope.stop_ms)),
+                            is_failure=True,
+                            accounting_status="FAILED",
+                            measurement_type=cand_fp.measurement_type,
+                            fingerprint=cand_fp,
+                            metadata={"emergency_error": str(exc)},
+                            committed_at_ms=round(self.elapsed_ms, 3),
+                            session_id=self.session_id,
+                            physical_consumption_id=scope.physical_consumption_id,
+                        )
+                        deltas = {
+                            "bytes_read": scope.charged_bytes or 0,
+                            "measured_bytes_read": scope.measured_bytes_read or 0,
+                            "conservative_estimated_bytes": scope.estimated_bytes_read or 0,
+                            "unmeasured_reads": 1 if (scope.estimated_bytes_read and not scope.measured_bytes_read) else 0,
+                            "latency_us": max(0.0, float(scope.latency_us)),
+                            "stop_ms": max(0.0, float(scope.stop_ms)),
+                            "is_failure": True,
+                            "profile_id": scope.profile_id or scope.operation_id,
+                        }
+                        prep = PreparedCommit(
+                            snapshot=snapshot,
+                            target_op_id=target_op,
+                            is_duplicate=True,
+                            is_collision=False,
+                            deltas=deltas,
+                            scope=scope,
+                            reservations=[],
+                        )
+                        return self._recover_commit_failure(prep, error=exc, metrics_applied=False, step="prepare_failed")
+                    except Exception:
+                        self._finalize_scope_reservations(scope)
+                        self._unregister_active_scope(scope)
+                        raise exc
+                else:
+                    self._finalize_scope_reservations(scope)
+                    self._unregister_active_scope(scope)
+                    raise
 
     def _record_emergency_failure_snapshot(
         self,
@@ -1642,6 +1870,28 @@ class ObservationBudgetTracker:
             discrepancies = []
             if len(phys_ids) != len(unique_phys_ids):
                 discrepancies.append(f"Physical consumption IDs not unique: {len(phys_ids)} total vs {len(unique_phys_ids)} unique")
+
+            # 2. Every physical consumption record must match a committed transaction
+            for p_id, p_rec in self._physical_consumption_records.items():
+                if p_rec.operation_id not in self._committed_transactions and not any(p_id == s.physical_consumption_id for s in snaps):
+                    discrepancies.append(f"Physical record '{p_id}' has no corresponding committed transaction")
+
+            # 3. Every committed transaction with charged_bytes > 0 must have a physical record
+            for op_id, s in self._committed_transactions.items():
+                if s.charged_bytes > 0 and s.physical_consumption_id not in self._physical_consumption_records:
+                    discrepancies.append(f"Committed transaction '{op_id}' has no physical record for {s.physical_consumption_id}")
+
+            # 4. Check for consumed reservations without terminal accounting (when no scope is active)
+            active_scope_phys_ids = {s.physical_consumption_id for sc_list in self._active_scopes.values() for s in sc_list}
+            for r_id, r in self._active_reservations.items():
+                if r.state == "CONSUMED" and (r.scope_id is None or r.scope_id not in active_scope_phys_ids):
+                    discrepancies.append(f"Active consumed reservation '{r_id}' ({r.consumed_bytes}B) has no active scope")
+
+            # 5. Check reservation lifecycle states are canonical
+            valid_states = {"ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"}
+            for r_id, r in self._active_reservations.items():
+                if r.state not in valid_states:
+                    discrepancies.append(f"Reservation '{r_id}' in invalid state '{r.state}'")
 
             sum_charged = sum(s.charged_bytes for s in snaps)
             sum_measured = sum(s.measured_bytes_read or 0 for s in snaps if s.measured_bytes_read is not None)
@@ -1686,7 +1936,7 @@ class ObservationBudgetTracker:
                 if p_fails != p_usage["failures"]:
                     discrepancies.append(f"profile '{prof_id}' failures: ledger={p_fails} vs usage={p_usage['failures']}")
 
-            active_res_list = [r for r in self._active_reservations.values() if r.state in ("ADMITTED", "RESERVED")]
+            active_res_list = [r for r in self._active_reservations.values() if r.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED")]
             active_res_bytes = sum(r.reserved_bytes for r in active_res_list)
             consumed_unaccounted_bytes = sum(r.consumed_bytes for r in self._active_reservations.values() if r.state == "CONSUMED")
             active_in_flight_bytes = self._active_consumed_bytes()
@@ -1724,11 +1974,18 @@ class ObservationBudgetTracker:
 
     def commit_transaction(
         self,
-        record: ObservationAccountingRecord,
+        record: Optional[ObservationAccountingRecord] = None,
         profile_id: Optional[str] = None,
         profile_ceiling: Optional[Dict[str, Any]] = None,
         is_failure: bool = False,
         stop_ms: float = 0.0,
+        reservations: Optional[List[BudgetReservation]] = None,
+        operation_id: Optional[str] = None,
+        measured_bytes: Optional[int] = None,
+        estimated_bytes: Optional[int] = None,
+        latency_us: float = 0.0,
+        accounting_owner: str = "ADAPTER",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Authoritatively commits an ObservationAccountingRecord to this tracker.
 
@@ -1741,6 +1998,20 @@ class ObservationBudgetTracker:
         - Preserves partial consumed costs on failure and budget exhaustion.
         - Single authoritative writer to all tracker metrics and ledger snapshots.
         """
+        if record is None:
+            if operation_id is None:
+                raise ValueError("Must provide either record or operation_id to commit_transaction")
+            record = ObservationAccountingRecord(
+                operation_id=operation_id,
+                accounting_owner=accounting_owner,
+                measured_bytes_read=measured_bytes,
+                estimated_bytes_read=estimated_bytes or 0,
+                charged_bytes=max(0, int(measured_bytes or 0)) + int(estimated_bytes or 0),
+                latency_us=latency_us,
+                session_id=self.session_id,
+                metadata=dict(metadata or {}),
+            )
+
         with self._transaction_lock:
             # 0. Session ID validation
             if record.session_id is not None and record.session_id != self.session_id:
@@ -1970,6 +2241,29 @@ class ObservationBudgetTracker:
             )
             self._committed_transactions[record.operation_id] = snapshot
             self._physical_consumption_records[phys_id] = snapshot
+
+            # Finalize associated reservations
+            if reservations:
+                for res in reservations:
+                    if res.consumed_bytes > 0 or total_charge > 0:
+                        if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
+                            res.account()
+                    else:
+                        if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
+                            res.release()
+                            self._released_reservations_count += 1
+                    self._active_reservations.pop(res.reservation_id, None)
+            for r_id, res in list(self._active_reservations.items()):
+                if res.operation_id == record.operation_id:
+                    if res.consumed_bytes > 0 or total_charge > 0:
+                        if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
+                            res.account()
+                    else:
+                        if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
+                            res.release()
+                            self._released_reservations_count += 1
+                    self._active_reservations.pop(r_id, None)
+
             return True
 
     def _register_scope_transaction(
