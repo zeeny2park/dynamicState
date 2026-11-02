@@ -598,6 +598,13 @@ class PhysicalReadRecord:
             memo[id(self)] = rec
             return rec
 
+    def update_target_spec(self, updates: Dict[str, Any]) -> None:
+        """Safely updates target_spec metadata while preserving frozen immutability."""
+        with self._lock:
+            current = dict(self.target_spec or {})
+            current.update(updates)
+            self.target_spec = clone_frozen(current)
+
     @property
     def is_admitted(self) -> bool:
         with self._lock:
@@ -856,6 +863,91 @@ class PhysicalConsumptionRecord:
             fingerprint=self.fingerprint,
             metadata=clone_frozen(self.metadata) if self.metadata is not None else None,
             session_id=self.session_id,
+        )
+        memo[id(self)] = rec
+        return rec
+
+
+@dataclass
+class RemoteInvocationRecord:
+    """Authoritative runtime record of a single command-runner physical invocation."""
+    invocation_id: str
+    command_type: str
+    physical_read_ids: List[str]
+    start_time_ms: float
+    completion_time_ms: Optional[float] = None
+    batch_id: Optional[str] = None
+    return_code: Optional[int] = None
+    exception: Optional[str] = None
+    output_byte_count: int = 0
+    outcome: str = "IN_FLIGHT"  # "IN_FLIGHT", "COMPLETED", "TIMEOUT", "TRANSPORT_ERROR", "FAILED", "PREFLIGHT_REJECTED"
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "RemoteInvocationRecord":
+        rec = RemoteInvocationRecord(
+            invocation_id=self.invocation_id,
+            command_type=self.command_type,
+            physical_read_ids=list(self.physical_read_ids),
+            start_time_ms=self.start_time_ms,
+            completion_time_ms=self.completion_time_ms,
+            batch_id=self.batch_id,
+            return_code=self.return_code,
+            exception=self.exception,
+            output_byte_count=self.output_byte_count,
+            outcome=self.outcome,
+        )
+        memo[id(self)] = rec
+        return rec
+
+
+@dataclass
+class BatchSliceSpec:
+    """Authoritative specification of a single memory slice within an execution batch."""
+    slice_index: int
+    address: int
+    requested_size: int
+    physical_read_id: str
+    physical_consumption_id: str
+    completion_status: str = "NOT_EXECUTED"  # "OBSERVED", "PARTIAL", "FAILED", "UNAVAILABLE", "NOT_EXECUTED", "UNKNOWN"
+    measured_bytes_read: Optional[int] = None
+    estimated_bytes_read: int = 0
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "BatchSliceSpec":
+        spec = BatchSliceSpec(
+            slice_index=self.slice_index,
+            address=self.address,
+            requested_size=self.requested_size,
+            physical_read_id=self.physical_read_id,
+            physical_consumption_id=self.physical_consumption_id,
+            completion_status=self.completion_status,
+            measured_bytes_read=self.measured_bytes_read,
+            estimated_bytes_read=self.estimated_bytes_read,
+        )
+        memo[id(self)] = spec
+        return spec
+
+
+@dataclass
+class BatchReadRecord:
+    """Authoritative record of a batch read operation across slices."""
+    batch_id: str
+    invocation_id: str
+    expected_slice_count: int
+    slices: List[BatchSliceSpec] = field(default_factory=list)
+    is_completed: bool = False
+    is_partial: bool = False
+    is_failed: bool = False
+    created_at_ms: float = 0.0
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "BatchReadRecord":
+        rec = BatchReadRecord(
+            batch_id=self.batch_id,
+            invocation_id=self.invocation_id,
+            expected_slice_count=self.expected_slice_count,
+            slices=[copy.deepcopy(s, memo) for s in self.slices],
+            is_completed=self.is_completed,
+            is_partial=self.is_partial,
+            is_failed=self.is_failed,
+            created_at_ms=self.created_at_ms,
         )
         memo[id(self)] = rec
         return rec
@@ -1552,6 +1644,103 @@ class ObservationBudgetTracker:
         self._transaction_lock = threading.RLock()
         self._thread_local = threading.local()
         self._active_scopes: Dict[str, Set[ActiveOperationScope]] = {}
+        self._invocations: Dict[str, RemoteInvocationRecord] = {}
+        self._batch_records: Dict[str, BatchReadRecord] = {}
+
+    def get_invocation_records(self) -> Dict[str, RemoteInvocationRecord]:
+        """Returns deep copy of runtime invocation records."""
+        with self._transaction_lock:
+            return copy.deepcopy(self._invocations)
+
+    def get_batch_records(self) -> Dict[str, BatchReadRecord]:
+        """Returns deep copy of registered batch records."""
+        with self._transaction_lock:
+            return copy.deepcopy(self._batch_records)
+
+    def record_invocation_started(
+        self,
+        invocation_id: str,
+        command_type: str,
+        physical_read_ids: List[str],
+        start_time_ms: Optional[float] = None,
+        batch_id: Optional[str] = None,
+    ) -> RemoteInvocationRecord:
+        """Records the start of a physical command-runner invocation."""
+        with self._transaction_lock:
+            if invocation_id in self._invocations:
+                # If already registered with identical details, return it
+                existing = self._invocations[invocation_id]
+                if existing.command_type == command_type and set(existing.physical_read_ids) == set(physical_read_ids):
+                    return existing
+                raise ValueError(f"Duplicate invocation_id '{invocation_id}'")
+            t = start_time_ms if start_time_ms is not None else round(self.elapsed_ms, 3)
+            rec = RemoteInvocationRecord(
+                invocation_id=invocation_id,
+                command_type=command_type,
+                physical_read_ids=list(physical_read_ids),
+                start_time_ms=t,
+                batch_id=batch_id,
+                outcome="IN_FLIGHT",
+            )
+            self._invocations[invocation_id] = rec
+            return rec
+
+    def record_invocation_completed(
+        self,
+        invocation_id: str,
+        completion_time_ms: Optional[float] = None,
+        return_code: Optional[int] = None,
+        exception: Optional[str] = None,
+        output_byte_count: int = 0,
+        outcome: Optional[str] = None,
+    ) -> None:
+        """Records the completion of a physical command-runner invocation."""
+        with self._transaction_lock:
+            rec = self._invocations.get(invocation_id)
+            if rec is None:
+                rec = RemoteInvocationRecord(
+                    invocation_id=invocation_id,
+                    command_type="unknown",
+                    physical_read_ids=[],
+                    start_time_ms=round(self.elapsed_ms, 3),
+                )
+                self._invocations[invocation_id] = rec
+            t = completion_time_ms if completion_time_ms is not None else round(self.elapsed_ms, 3)
+            rec.completion_time_ms = t
+            rec.return_code = return_code
+            rec.exception = exception
+            rec.output_byte_count = max(0, int(output_byte_count or 0))
+            if outcome:
+                rec.outcome = outcome
+            elif exception:
+                exc_lower = str(exception).lower()
+                rec.outcome = "TIMEOUT" if ("timeout" in exc_lower or "timed out" in exc_lower) else "TRANSPORT_ERROR"
+            elif return_code == 0:
+                rec.outcome = "COMPLETED"
+            else:
+                rec.outcome = "FAILED"
+
+    def register_batch_contract(
+        self,
+        batch_id: str,
+        invocation_id: str,
+        expected_slice_count: int,
+        slices: Optional[List[BatchSliceSpec]] = None,
+    ) -> BatchReadRecord:
+        """Explicitly registers expected batch contract before invocation."""
+        with self._transaction_lock:
+            if expected_slice_count <= 0:
+                raise ValueError(f"expected_slice_count must be positive: {expected_slice_count}")
+            key = f"{batch_id}::{invocation_id}"
+            rec = BatchReadRecord(
+                batch_id=batch_id,
+                invocation_id=invocation_id,
+                expected_slice_count=int(expected_slice_count),
+                slices=list(slices or []),
+                created_at_ms=round(self.elapsed_ms, 3),
+            )
+            self._batch_records[key] = rec
+            return rec
 
     def set_fault_injection(self, point: str, hook: Callable[[], None]) -> None:
         """Sets a deterministic fault injection hook for failure testing."""
@@ -1598,7 +1787,7 @@ class ObservationBudgetTracker:
             )
             standalone_consumed = sum(
                 r.consumed_bytes for r in self._active_reservations.values()
-                if r.state == "CONSUMED"
+                if r.consumed_bytes > 0
                 and (profile_id is None or r.profile_id == profile_id)
                 and (r.scope_id is None or r.scope_id not in active_scope_phys_ids)
             )
@@ -1611,7 +1800,16 @@ class ObservationBudgetTracker:
                 if profile_id is not None and r.profile_id != profile_id:
                     continue
                 if r.state in ("RESERVED", "ADMITTED", "PHYSICAL_READ_STARTED"):
-                    total += r.reserved_bytes
+                    rem = max(0, r.reserved_bytes - r.consumed_bytes)
+                    total += rem
+                elif r.state == "CONSUMED":
+                    has_inflight_children = any(
+                        c.state in ("ADMITTED", "PHYSICAL_READ_STARTED")
+                        for c in getattr(r, "child_reads", {}).values()
+                    )
+                    if has_inflight_children:
+                        rem = max(0, r.reserved_bytes - r.consumed_bytes)
+                        total += rem
             return total
 
     @property
@@ -2844,54 +3042,227 @@ class ObservationBudgetTracker:
                     inv_19_ok = False
                     discrepancies.append(f"Invariant 19 (unknown consumption never zero) violated: transaction '{s.operation_id}' has unknown measurement charged as 0")
 
-            # 20. Batch slice completeness
+            # 20. Batch completeness contract
             inv_20_ok = True
-            batch_groups: Dict[Tuple[str, str], List[PhysicalReadRecord]] = {}
+            all_slices_for_batch: List[PhysicalReadRecord] = []
             for r in read_snaps:
+                ts = getattr(r, "target_spec", None) or {}
+                if "slice_index" in ts:
+                    all_slices_for_batch.append(r)
+            for r in self._active_reservations.values():
+                for cr in getattr(r, "child_reads", {}).values():
+                    ts = getattr(cr, "target_spec", None) or {}
+                    if "slice_index" in ts and cr.physical_read_id not in {x.physical_read_id for x in all_slices_for_batch}:
+                        all_slices_for_batch.append(cr)
+
+            batch_groups: Dict[Tuple[str, str], List[PhysicalReadRecord]] = {}
+            for r in all_slices_for_batch:
                 ts = r.target_spec or {}
-                if "slice_index" in ts and "invocation_id" in ts:
-                    key = (r.reservation_id, ts["invocation_id"])
-                    batch_groups.setdefault(key, []).append(r)
-            for (res_id, inv_id), group in batch_groups.items():
-                slice_indices = sorted(r.target_spec["slice_index"] for r in group)
-                expected_indices = list(range(len(slice_indices)))
-                if slice_indices != expected_indices:
+                b_id = ts.get("batch_id") or getattr(r, "reservation_id", "unknown_batch")
+                inv_id = ts.get("invocation_id") or "unknown_inv"
+                batch_groups.setdefault((b_id, inv_id), []).append(r)
+
+            for (b_id, inv_id), group in batch_groups.items():
+                # 1. Expected slice count: validated if specified or registered
+                exp_counts = {r.target_spec.get("expected_slice_count") for r in group} - {None}
+                if not exp_counts:
+                    b_reg = self._batch_records.get(f"{b_id}::{inv_id}")
+                    if b_reg:
+                        exp_counts = {b_reg.expected_slice_count}
+
+                if exp_counts:
+                    if len(exp_counts) > 1:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                            f"has conflicting expected_slice_count values: {exp_counts}"
+                        )
+                        continue
+                    expected_count = next(iter(exp_counts))
+                    if not isinstance(expected_count, int) or expected_count <= 0:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                            f"has invalid expected_slice_count: {expected_count}"
+                        )
+                        continue
+                else:
+                    expected_count = len(group)
+
+                # 2. Validate every slice index in [0, expected_count)
+                slice_indices = [r.target_spec.get("slice_index") for r in group]
+                out_of_range = [idx for idx in slice_indices if idx is None or not isinstance(idx, int) or idx < 0 or idx >= expected_count]
+                if out_of_range:
                     inv_20_ok = False
                     discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch under reservation '{res_id}' invocation '{inv_id}' "
-                        f"has slice indices {slice_indices} != expected {expected_indices}"
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                        f"has out-of-range slice indices: {out_of_range} (expected [0, {expected_count}))"
                     )
 
-            # 21. Collector / fallback provenance separation
+                if len(slice_indices) != len(set(slice_indices)):
+                    inv_20_ok = False
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                        f"has duplicate slice indices: {slice_indices}"
+                    )
+
+                valid_indices_set = set(idx for idx in slice_indices if isinstance(idx, int) and 0 <= idx < expected_count)
+                expected_set = set(range(expected_count))
+                if valid_indices_set != expected_set:
+                    inv_20_ok = False
+                    missing = sorted(list(expected_set - valid_indices_set))
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                        f"is incomplete, missing slice indices: {missing}"
+                    )
+
+                # 3. Check duplicate physical_read_id or physical_consumption_id within batch
+                batch_read_ids = [r.physical_read_id for r in group]
+                if len(batch_read_ids) != len(set(batch_read_ids)):
+                    inv_20_ok = False
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                        f"contains duplicate physical_read_ids: {batch_read_ids}"
+                    )
+                batch_cons_ids = [r.physical_consumption_id for r in group if r.physical_consumption_id]
+                if len(batch_cons_ids) != len(set(batch_cons_ids)):
+                    inv_20_ok = False
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                        f"contains duplicate physical_consumption_ids: {batch_cons_ids}"
+                    )
+
+                # 4. Check conflicting address or requested size metadata
+                seen_specs: Dict[int, Tuple[int, int]] = {}
+                for r in group:
+                    s_idx = r.target_spec.get("slice_index")
+                    addr = r.target_spec.get("address")
+                    req_sz = r.target_spec.get("requested_size", r.target_spec.get("size"))
+                    if s_idx is not None and addr is not None and req_sz is not None:
+                        if s_idx in seen_specs:
+                            if seen_specs[s_idx] != (addr, req_sz):
+                                inv_20_ok = False
+                                discrepancies.append(
+                                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {s_idx} "
+                                    f"has conflicting metadata: {seen_specs[s_idx]} vs {(addr, req_sz)}"
+                                )
+                        else:
+                            seen_specs[s_idx] = (addr, req_sz)
+
+                # 5. Check completion status and failed slice preservation
+                for r in group:
+                    c_status = r.target_spec.get("completion_status")
+                    valid_statuses = {"OBSERVED", "PARTIAL", "FAILED", "UNAVAILABLE", "NOT_EXECUTED", "UNKNOWN", None}
+                    if c_status not in valid_statuses:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: slice '{r.physical_read_id}' "
+                            f"has invalid completion_status: {c_status}"
+                        )
+                    if r.is_failure or c_status in ("FAILED", "UNAVAILABLE"):
+                        if r.measured_bytes_read is not None and r.measured_bytes_read == 0 and r.estimated_bytes_read > 0:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: failed slice '{r.physical_read_id}' "
+                                f"falsely reported measured_bytes_read=0 alongside estimated_bytes_read={r.estimated_bytes_read}"
+                            )
+
+            # 21. Collector / fallback provenance separation (Active AND Committed)
             inv_21_ok = True
+            provenance_groups: Dict[str, List[PhysicalReadRecord]] = {}
+            for r in read_snaps:
+                res_key = r.reservation_id or getattr(r, "operation_id", "unknown")
+                provenance_groups.setdefault(res_key, []).append(r)
             for r_id, r in self._active_reservations.items():
                 if hasattr(r, "child_reads") and r.child_reads:
-                    coll_reads = [c for c in r.child_reads.values() if "collector" in c.target_type]
-                    shell_reads = [c for c in r.child_reads.values() if "shell" in c.target_type]
-                    if coll_reads and shell_reads:
-                        coll_read_ids = {c.physical_read_id for c in coll_reads}
-                        shell_read_ids = {c.physical_read_id for c in shell_reads}
-                        coll_cons_ids = {c.physical_consumption_id for c in coll_reads}
-                        shell_cons_ids = {c.physical_consumption_id for c in shell_reads}
-                        if coll_read_ids.intersection(shell_read_ids):
-                            inv_21_ok = False
+                    for cr in r.child_reads.values():
+                        if cr.physical_read_id not in {x.physical_read_id for x in provenance_groups.get(r_id, [])}:
+                            provenance_groups.setdefault(r_id, []).append(cr)
+
+            for grp_id, group_reads in provenance_groups.items():
+                coll_reads = [
+                    c for c in group_reads
+                    if "collector" in getattr(c, "target_type", "") or (c.target_spec and c.target_spec.get("invocation_type") == "collector")
+                ]
+                shell_reads = [
+                    c for c in group_reads
+                    if "shell" in getattr(c, "target_type", "") or (c.target_spec and c.target_spec.get("invocation_type") == "shell_fallback")
+                ]
+                if coll_reads and shell_reads:
+                    coll_read_ids = {c.physical_read_id for c in coll_reads}
+                    shell_read_ids = {c.physical_read_id for c in shell_reads}
+                    coll_cons_ids = {c.physical_consumption_id for c in coll_reads if c.physical_consumption_id}
+                    shell_cons_ids = {c.physical_consumption_id for c in shell_reads if c.physical_consumption_id}
+                    if coll_read_ids.intersection(shell_read_ids):
+                        inv_21_ok = False
+                        discrepancies.append(
+                            f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
+                            f"shares physical_read_ids between collector and fallback"
+                        )
+                    if coll_cons_ids.intersection(shell_cons_ids):
+                        inv_21_ok = False
+                        discrepancies.append(
+                            f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
+                            f"shares physical_consumption_ids between collector and fallback"
+                        )
+                    coll_inv_ids = {c.target_spec.get("invocation_id") for c in coll_reads if c.target_spec} - {None}
+                    shell_inv_ids = {c.target_spec.get("invocation_id") for c in shell_reads if c.target_spec} - {None}
+                    if coll_inv_ids and shell_inv_ids and coll_inv_ids.intersection(shell_inv_ids):
+                        inv_21_ok = False
+                        discrepancies.append(
+                            f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
+                            f"shares invocation_ids between collector and fallback: {coll_inv_ids.intersection(shell_inv_ids)}"
+                        )
+
+            # 22. Invocation provenance & orphan record detection
+            inv_22_ok = True
+            all_active_child_reads = [cr for r in self._active_reservations.values() for cr in getattr(r, "child_reads", {}).values()]
+            all_known_read_ids = set(read_ids).union({cr.physical_read_id for cr in all_active_child_reads})
+
+            for inv_id, inv_rec in self._invocations.items():
+                if inv_rec.outcome != "PREFLIGHT_REJECTED" and inv_rec.physical_read_ids:
+                    for pid_ref in inv_rec.physical_read_ids:
+                        if pid_ref not in all_known_read_ids:
+                            inv_22_ok = False
                             discrepancies.append(
-                                f"Invariant 21 (collector/fallback provenance separation) violated: reservation '{r_id}' "
-                                f"shares physical_read_ids between collector and fallback"
+                                f"Invariant 22 (invocation provenance) violated: orphan invocation '{inv_id}' "
+                                f"references non-existent physical_read_id '{pid_ref}'"
                             )
-                        if coll_cons_ids.intersection(shell_cons_ids):
-                            inv_21_ok = False
+
+            if self._invocations:
+                all_inspected_reads = list(read_snaps) + all_active_child_reads
+                for r in all_inspected_reads:
+                    ts = getattr(r, "target_spec", None) or {}
+                    r_inv_id = ts.get("invocation_id")
+                    if r_inv_id:
+                        if r_inv_id not in self._invocations:
+                            inv_22_ok = False
                             discrepancies.append(
-                                f"Invariant 21 (collector/fallback provenance separation) violated: reservation '{r_id}' "
-                                f"shares physical_consumption_ids between collector and fallback"
+                                f"Invariant 22 (invocation provenance) violated: physical read '{r.physical_read_id}' "
+                                f"references unknown invocation_id '{r_inv_id}'"
                             )
-                        coll_inv_ids = {c.target_spec.get("invocation_id") for c in coll_reads if c.target_spec} - {None}
-                        shell_inv_ids = {c.target_spec.get("invocation_id") for c in shell_reads if c.target_spec} - {None}
-                        if coll_inv_ids and shell_inv_ids and coll_inv_ids.intersection(shell_inv_ids):
-                            inv_21_ok = False
+                        else:
+                            inv_obj = self._invocations[r_inv_id]
+                            if r.physical_read_id not in inv_obj.physical_read_ids:
+                                inv_22_ok = False
+                                discrepancies.append(
+                                    f"Invariant 22 (invocation provenance) violated: physical read '{r.physical_read_id}' "
+                                    f"is not listed in invocation '{r_inv_id}' physical_read_ids"
+                                )
+
+            for r in read_snaps:
+                if not r.reservation_id:
+                    inv_22_ok = False
+                    discrepancies.append(
+                        f"Invariant 22 (orphan physical read) violated: committed read '{r.physical_read_id}' has no reservation_id"
+                    )
+                if r.state in ("ACCOUNTED", "FAILED_ACCOUNTED"):
+                    if r.operation_id and r.operation_id not in self._committed_transactions:
+                        if not any(getattr(r, "operation_id", None) == s.operation_id for s in snaps):
+                            inv_22_ok = False
                             discrepancies.append(
-                                f"Invariant 21 (collector/fallback provenance separation) violated: reservation '{r_id}' "
-                                f"shares invocation_ids between collector and fallback"
+                                f"Invariant 22 (orphan physical read) violated: committed read '{r.physical_read_id}' "
+                                f"has operation_id '{r.operation_id}' not found in committed transactions"
                             )
 
             valid_states = {"ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"}
@@ -2928,6 +3299,7 @@ class ObservationBudgetTracker:
                 "inv_19_unknown_consumption_never_zero": inv_19_ok,
                 "inv_20_batch_slice_completeness": inv_20_ok,
                 "inv_21_collector_fallback_provenance_separation": inv_21_ok,
+                "inv_22_invocation_provenance_and_orphan_detection": inv_22_ok,
             }
 
             if discrepancies and raise_on_error:
