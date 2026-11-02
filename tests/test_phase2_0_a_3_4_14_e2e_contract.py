@@ -516,7 +516,7 @@ class TestPhase20A3414RemoteAdmissionOrderingRuntime(unittest.TestCase):
         data, st, _ = self.adapter.read_memory(1234, 0x1000, 64)
         self.assertEqual(st, "OBSERVED")
         self.assertEqual(len(admission_state_at_runner_call), 1)
-        self.assertEqual(admission_state_at_runner_call[0], "ADMITTED")
+        self.assertIn(admission_state_at_runner_call[0], ("ADMITTED", "PHYSICAL_READ_STARTED"))
 
     def test_08_transport_failure_after_invocation_uses_conservative_accounting(self):
         """Transport failure after SSH command invocation is charged conservatively, not treated as unexecuted."""

@@ -1770,17 +1770,18 @@ class ObservationBudgetTracker:
             if eff_prof_id:
                 p_usage = self._get_or_init_profile_usage(eff_prof_id)
                 p_active_res = self._active_reservation_bytes(profile_id=eff_prof_id)
+                p_in_flight = self._active_consumed_bytes(profile_id=eff_prof_id)
                 ceil_limit = None
                 if profile_ceiling:
                     ceil_limit = profile_ceiling.get("max_bytes_read", profile_ceiling.get("max_bytes"))
                 if ceil_limit is None and hasattr(self.limits, "max_profile_bytes"):
                     ceil_limit = self.limits.max_profile_bytes.get(eff_prof_id)
 
-                if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + est_b) > int(ceil_limit):
+                if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + p_in_flight + est_b) > int(ceil_limit):
                     if not allow_in_flight_overshoot:
                         raise ValueError(
                             f"PROFILE_CEILING_EXCEEDED: Profile '{eff_prof_id}' projected "
-                            f"{p_usage['bytes_read'] + p_active_res + est_b}B > max {ceil_limit}B"
+                            f"{p_usage['bytes_read'] + p_active_res + p_in_flight + est_b}B > max {ceil_limit}B"
                         )
 
             res_id = f"res_{uuid.uuid4().hex[:8]}"
@@ -2843,6 +2844,56 @@ class ObservationBudgetTracker:
                     inv_19_ok = False
                     discrepancies.append(f"Invariant 19 (unknown consumption never zero) violated: transaction '{s.operation_id}' has unknown measurement charged as 0")
 
+            # 20. Batch slice completeness
+            inv_20_ok = True
+            batch_groups: Dict[Tuple[str, str], List[PhysicalReadRecord]] = {}
+            for r in read_snaps:
+                ts = r.target_spec or {}
+                if "slice_index" in ts and "invocation_id" in ts:
+                    key = (r.reservation_id, ts["invocation_id"])
+                    batch_groups.setdefault(key, []).append(r)
+            for (res_id, inv_id), group in batch_groups.items():
+                slice_indices = sorted(r.target_spec["slice_index"] for r in group)
+                expected_indices = list(range(len(slice_indices)))
+                if slice_indices != expected_indices:
+                    inv_20_ok = False
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: batch under reservation '{res_id}' invocation '{inv_id}' "
+                        f"has slice indices {slice_indices} != expected {expected_indices}"
+                    )
+
+            # 21. Collector / fallback provenance separation
+            inv_21_ok = True
+            for r_id, r in self._active_reservations.items():
+                if hasattr(r, "child_reads") and r.child_reads:
+                    coll_reads = [c for c in r.child_reads.values() if "collector" in c.target_type]
+                    shell_reads = [c for c in r.child_reads.values() if "shell" in c.target_type]
+                    if coll_reads and shell_reads:
+                        coll_read_ids = {c.physical_read_id for c in coll_reads}
+                        shell_read_ids = {c.physical_read_id for c in shell_reads}
+                        coll_cons_ids = {c.physical_consumption_id for c in coll_reads}
+                        shell_cons_ids = {c.physical_consumption_id for c in shell_reads}
+                        if coll_read_ids.intersection(shell_read_ids):
+                            inv_21_ok = False
+                            discrepancies.append(
+                                f"Invariant 21 (collector/fallback provenance separation) violated: reservation '{r_id}' "
+                                f"shares physical_read_ids between collector and fallback"
+                            )
+                        if coll_cons_ids.intersection(shell_cons_ids):
+                            inv_21_ok = False
+                            discrepancies.append(
+                                f"Invariant 21 (collector/fallback provenance separation) violated: reservation '{r_id}' "
+                                f"shares physical_consumption_ids between collector and fallback"
+                            )
+                        coll_inv_ids = {c.target_spec.get("invocation_id") for c in coll_reads if c.target_spec} - {None}
+                        shell_inv_ids = {c.target_spec.get("invocation_id") for c in shell_reads if c.target_spec} - {None}
+                        if coll_inv_ids and shell_inv_ids and coll_inv_ids.intersection(shell_inv_ids):
+                            inv_21_ok = False
+                            discrepancies.append(
+                                f"Invariant 21 (collector/fallback provenance separation) violated: reservation '{r_id}' "
+                                f"shares invocation_ids between collector and fallback"
+                            )
+
             valid_states = {"ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"}
             for r_id, r in self._active_reservations.items():
                 if r.state not in valid_states:
@@ -2875,6 +2926,8 @@ class ObservationBudgetTracker:
                 "inv_17_global_metrics_equal_committed_totals": inv_17_ok,
                 "inv_18_profile_usage_equals_committed_profile_totals": inv_18_ok,
                 "inv_19_unknown_consumption_never_zero": inv_19_ok,
+                "inv_20_batch_slice_completeness": inv_20_ok,
+                "inv_21_collector_fallback_provenance_separation": inv_21_ok,
             }
 
             if discrepancies and raise_on_error:
@@ -2939,15 +2992,17 @@ class ObservationBudgetTracker:
             if operation_id is None:
                 raise ValueError("Must provide either record or operation_id to commit_transaction")
             res_consumed = sum(r.consumed_bytes for r in (reservations or []))
-            if measured_bytes is None and estimated_bytes is None and res_consumed > 0:
+            if measured_bytes is None and estimated_bytes is None:
                 child_reads = [cr for r in (reservations or []) for cr in getattr(r, "child_reads", {}).values()]
                 if child_reads:
-                    measured_bytes = sum(cr.measured_bytes_read or 0 for cr in child_reads if cr.measured_bytes_read is not None)
+                    has_any_measured = any(cr.measured_bytes_read is not None for cr in child_reads)
+                    measured_bytes = sum(cr.measured_bytes_read or 0 for cr in child_reads if cr.measured_bytes_read is not None) if has_any_measured else None
                     estimated_bytes = sum(cr.estimated_bytes_read for cr in child_reads)
-                elif is_failure:
-                    estimated_bytes = res_consumed
-                else:
-                    measured_bytes = res_consumed
+                elif res_consumed > 0:
+                    if is_failure:
+                        estimated_bytes = res_consumed
+                    else:
+                        measured_bytes = res_consumed
             record = ObservationAccountingRecord(
                 operation_id=operation_id,
                 accounting_owner=accounting_owner,

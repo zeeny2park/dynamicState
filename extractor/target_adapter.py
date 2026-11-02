@@ -2848,17 +2848,30 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return
 
         tot_b = adm.consumed_bytes
-        if tot_b > 0 or adm.state == "CONSUMED":
+        has_child = bool(getattr(adm, "child_reads", None))
+        has_consumed_child = any(
+            c.state in ("CONSUMED", "ACCOUNTED", "FAILED_ACCOUNTED")
+            for c in getattr(adm, "child_reads", {}).values()
+        ) if has_child else False
+
+        if tot_b > 0 or adm.state == "CONSUMED" or has_consumed_child:
             active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
             if active_scope is not None and not active_scope.is_finalized:
                 active_scope.record_read(bytes_read=tot_b, admission=adm, profile_id=profile_id, is_failure=is_failure)
             else:
                 eff_op_id = operation_id or f"standalone_remote_{profile_id}_{uuid.uuid4().hex[:8]}"
+                m_bytes = None
+                e_bytes = None
+                if not has_child:
+                    if is_failure:
+                        e_bytes = tot_b
+                    else:
+                        m_bytes = tot_b
                 eff_tracker.commit_transaction(
                     operation_id=eff_op_id,
                     profile_id=profile_id,
-                    measured_bytes=None if is_failure else tot_b,
-                    estimated_bytes=tot_b if is_failure else 0,
+                    measured_bytes=m_bytes,
+                    estimated_bytes=e_bytes,
                     is_failure=is_failure,
                     reservations=[adm],
                 )
@@ -2885,18 +2898,44 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 return -2, "", f"SSH command execution failed before invocation: {e}"
             return -1, "", f"SSH execution error: {e}"
 
+    def _check_pre_invocation(self, cmd_args: List[str]) -> Tuple[bool, Optional[str]]:
+        """Validates command and executable availability strictly before process invocation."""
+        if getattr(self._command_runner, "fail_before_execution", False):
+            return False, "ssh binary not found on local PATH before execution"
+        if hasattr(self._command_runner, "check_preflight"):
+            ok, reason = self._command_runner.check_preflight(cmd_args)
+            if not ok:
+                return False, reason
+        if self._command_runner == self._default_command_runner:
+            exe = self.ssh_bin
+            if not (shutil.which(exe) or (os.path.isabs(exe) and os.access(exe, os.X_OK))):
+                return False, f"executable '{exe}' not found on host before process creation"
+        return True, None
+
     def run_ssh(
         self,
         remote_shell_cmd: str,
         timeout: Optional[float] = None,
         admission: Optional[Any] = None,
-        child_read: Optional[Any] = None,
+        child_read: Optional[Union[Any, List[Any]]] = None,
+        child_reads: Optional[List[Any]] = None,
+        invocation_id: Optional[str] = None,
     ) -> Tuple[int, str, str]:
         """Runs a command on the remote target using configured SSH parameters."""
+        children: List[Any] = []
+        if child_reads is not None:
+            children.extend(cr for cr in child_reads if cr is not None)
+        if child_read is not None:
+            if isinstance(child_read, (list, tuple)):
+                children.extend(cr for cr in child_read if cr is not None)
+            else:
+                children.append(child_read)
+
         if admission is not None and getattr(admission, "is_terminal", False):
             raise RuntimeError(f"Cannot execute SSH command under terminal admission '{admission.state}'")
-        if child_read is not None and getattr(child_read, "is_terminal", False):
-            raise RuntimeError(f"Cannot execute SSH command under terminal child read '{child_read.state}'")
+        for cr in children:
+            if getattr(cr, "is_terminal", False):
+                raise RuntimeError(f"Cannot execute SSH command under terminal child read '{cr.state}'")
 
         t = timeout or self.timeout_sec
         args = [
@@ -2922,26 +2961,26 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         target_spec = f"{self.user}@{self.host}" if self.user else self.host
         args.append(target_spec)
         args.append(remote_shell_cmd)
+
+        # 1. Pre-invocation boundary: verify executable availability before process creation
+        pre_ok, pre_reason = self._check_pre_invocation(args)
+        if not pre_ok:
+            return -2, "", f"SSH command execution failed before invocation: {pre_reason}"
+
+        # 2. CROSS INVOCATION BOUNDARY: Mark physical execution started immediately before runner invocation
+        if admission is not None and not admission.is_terminal and admission.state == "ADMITTED":
+            admission.mark_physical_read_started()
+        for cr in children:
+            if not cr.is_terminal and cr.state == "ADMITTED":
+                cr.mark_started()
+
+        # 3. Invoke command runner (in-flight state is guaranteed to be PHYSICAL_READ_STARTED)
         try:
             rc, stdout, stderr = self._command_runner(args, t)
         except subprocess.TimeoutExpired:
             rc, stdout, stderr = -1, "", f"SSH command timed out after {t:.1f}s"
-        except (FileNotFoundError, PermissionError) as e:
-            rc, stdout, stderr = -2, "", f"SSH execution failed before invocation: {e}"
         except Exception as e:
-            err_msg = str(e)
-            if "not found" in err_msg.lower() or "permission" in err_msg.lower():
-                rc, stdout, stderr = -2, "", f"SSH execution failed before invocation: {e}"
-            else:
-                rc, stdout, stderr = -1, "", f"SSH execution error: {e}"
-
-        if rc == -2:
-            return rc, stdout, stderr
-
-        if admission is not None and not admission.is_terminal:
-            admission.mark_physical_read_started()
-        if child_read is not None and not child_read.is_terminal:
-            child_read.mark_started()
+            rc, stdout, stderr = -1, "", f"SSH execution error: {e}"
 
         return rc, stdout, stderr
 
@@ -2963,7 +3002,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return False, f"SSH command execution failed before invocation: {stderr.strip()}"
         if rc != 0:
             if child_read is not None and not child_read.is_terminal:
-                child_read.consume(actual_bytes=0, is_failure=True)
+                child_read.consume(actual_bytes=None, conservative_estimate_bytes=64, is_failure=True, failure_reason=stderr.strip() or f"Exit {rc}")
             return False, f"SSH transport failure to {self.target_host()}: {stderr.strip() or 'Exit ' + str(rc)}"
         
         out = stdout.strip()
@@ -3057,7 +3096,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if not alive:
             self._finalize_remote_read(adm, own_adm, True, "target_identity", budget_tracker, operation_id=f"proc_identity_{pid}_{uuid.uuid4().hex[:8]}")
             self._last_identity_bytes_read = 0
-            self._last_identity_estimated_bytes = 0
+            est_b = sum(c.estimated_bytes_read for c in adm.child_reads.values()) if adm else 0
+            self._last_identity_estimated_bytes = est_b
             self._last_identity_status = "UNAVAILABLE"
             self._last_identity_breakdown = empty_breakdown
             self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
@@ -3077,7 +3117,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "host": self.target_host(),
                 "error": live_err or f"Target PID {pid} is not running on {self.target_host()}",
                 "measured_bytes_read": 0,
-                "estimated_bytes_read": 0,
+                "estimated_bytes_read": est_b,
                 "measurement_status": "UNAVAILABLE",
                 "measurement_breakdown": empty_breakdown,
             }
@@ -3089,28 +3129,33 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         # 1. Resolve remote executable path
         pread_exe = adm.start_child_read(target_type="remote_identity_readlink", target_spec={"pid": pid}) if adm is not None else None
         cmd_exe = f"readlink -f /proc/{int(pid)}/exe 2>/dev/null || readlink /proc/{int(pid)}/exe 2>/dev/null"
-        rc, stdout, _ = self.run_ssh(cmd_exe, admission=adm, child_read=pread_exe)
-        remote_exe = stdout.strip() if rc == 0 else ""
-        b_exe = len(stdout.encode("utf-8", errors="replace")) if stdout else 0
+        rc_exe, stdout_exe, stderr_exe = self.run_ssh(cmd_exe, admission=adm, child_read=pread_exe)
+        remote_exe = stdout_exe.strip() if rc_exe == 0 else ""
+        b_exe = len(stdout_exe.encode("utf-8", errors="replace")) if (rc_exe == 0 and stdout_exe) else 0
         readlink_bytes += b_exe
         if pread_exe is not None:
-            if rc == -2:
+            if rc_exe == -2:
                 pread_exe.release()
+            elif rc_exe == 0 and stdout_exe.strip():
+                pread_exe.consume(actual_bytes=b_exe, is_failure=False)
             else:
-                pread_exe.consume(actual_bytes=b_exe)
+                pread_exe.consume(actual_bytes=None, conservative_estimate_bytes=1024, is_failure=True, failure_reason=stderr_exe.strip() or f"readlink failed rc={rc_exe}")
 
         # 2. Extract remote process start time from /proc/<pid>/stat
         pread_stat = adm.start_child_read(target_type="remote_identity_stat", target_spec={"pid": pid}) if adm is not None else None
         cmd_stat = f"cat /proc/{int(pid)}/stat 2>/dev/null"
-        rc_stat, stdout_stat, _ = self.run_ssh(cmd_stat, admission=adm, child_read=pread_stat)
+        rc_stat, stdout_stat, stderr_stat = self.run_ssh(cmd_stat, admission=adm, child_read=pread_stat)
         start_time = None
-        b_stat = len(stdout_stat.encode("utf-8", errors="replace")) if stdout_stat else 0
+        b_stat = len(stdout_stat.encode("utf-8", errors="replace")) if (rc_stat == 0 and stdout_stat) else 0
         stat_bytes += b_stat
         if pread_stat is not None:
             if rc_stat == -2:
                 pread_stat.release()
+            elif rc_stat == 0 and stdout_stat.strip():
+                pread_stat.consume(actual_bytes=b_stat, is_failure=False)
             else:
-                pread_stat.consume(actual_bytes=b_stat)
+                pread_stat.consume(actual_bytes=None, conservative_estimate_bytes=1024, is_failure=True, failure_reason=stderr_stat.strip() or f"stat failed rc={rc_stat}")
+
         if rc_stat == 0 and stdout_stat:
             r_paren = stdout_stat.rfind(")")
             if r_paren != -1:
@@ -3124,14 +3169,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         # 3. Extract first 64KB of executable via base64 to inspect ELF header on host
         pread_hdr = adm.start_child_read(target_type="remote_identity_elf", target_spec={"pid": pid}) if adm is not None else None
         cmd_hdr = f"head -c 65536 /proc/{int(pid)}/exe 2>/dev/null | base64"
-        rc, stdout_b64, stderr = self.run_ssh(cmd_hdr, timeout=self.timeout_sec * 1.5, admission=adm, child_read=pread_hdr)
-        b_hdr = len(stdout_b64.encode("utf-8", errors="replace")) if stdout_b64 else 0
+        rc_hdr, stdout_b64, stderr_hdr = self.run_ssh(cmd_hdr, timeout=self.timeout_sec * 1.5, admission=adm, child_read=pread_hdr)
+        b_hdr = len(stdout_b64.encode("utf-8", errors="replace")) if (rc_hdr == 0 and stdout_b64) else 0
         elf_bytes_read += b_hdr
         if pread_hdr is not None:
-            if rc == -2:
+            if rc_hdr == -2:
                 pread_hdr.release()
+            elif rc_hdr == 0 and stdout_b64.strip():
+                pread_hdr.consume(actual_bytes=b_hdr, is_failure=False)
             else:
-                pread_hdr.consume(actual_bytes=b_hdr)
+                pread_hdr.consume(actual_bytes=None, conservative_estimate_bytes=65536, is_failure=True, failure_reason=stderr_hdr.strip() or f"ELF header read failed rc={rc_hdr}")
 
         arch = "unknown"
         elf_class = "unknown"
@@ -3140,9 +3187,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         build_id = None
         pt_loads: List[Dict[str, Any]] = []
 
-        if rc == 0 and stdout_b64.strip():
+        if rc_hdr == 0 and stdout_b64.strip():
             raw_b64 = stdout_b64.strip()
-            elf_bytes_read += len(raw_b64.encode("utf-8", errors="replace"))
             try:
                 raw_elf = base64.b64decode(raw_b64)
                 if len(raw_elf) >= 64:
@@ -3165,19 +3211,22 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 pass
 
         total_measured_bytes = readlink_bytes + stat_bytes + elf_bytes_read
-        meas_status = "EXACT_MEASURED" if total_measured_bytes > 0 else "UNAVAILABLE"
+        total_estimated_bytes = sum(c.estimated_bytes_read for c in adm.child_reads.values()) if adm else 0
+        total_charged_bytes = total_measured_bytes + total_estimated_bytes
+        has_unknown = (total_estimated_bytes > 0)
+        meas_status = "EXACT_MEASURED" if (total_measured_bytes > 0 and not has_unknown) else ("PARTIAL_UNKNOWN" if total_measured_bytes > 0 else ("UNKNOWN" if has_unknown else "UNAVAILABLE"))
         meas_breakdown = {
             "readlink_bytes": readlink_bytes,
             "stat_bytes": stat_bytes,
             "elf_bytes_read": elf_bytes_read,
             "elf_bytes_from_cache": 0,
             "total_measured_bytes": total_measured_bytes,
-            "estimated_bytes_read": 0,
+            "estimated_bytes_read": total_estimated_bytes,
             "measurement_status": meas_status,
         }
 
         self._last_identity_bytes_read = total_measured_bytes
-        self._last_identity_estimated_bytes = 0
+        self._last_identity_estimated_bytes = total_estimated_bytes
         self._last_identity_status = meas_status
         self._last_identity_breakdown = meas_breakdown
         self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
@@ -3187,9 +3236,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         identity_status = IDENTITY_VERIFIED if is_verified else (IDENTITY_UNVERIFIED if remote_exe else IDENTITY_UNAVAILABLE)
 
         op_id = operation_id or f"proc_identity_{pid}_{uuid.uuid4().hex[:8]}"
-        m_type = "MEASURED" if total_measured_bytes > 0 else "UNKNOWN"
+        m_type = "MEASURED" if total_measured_bytes > 0 else ("UNKNOWN" if total_charged_bytes > 0 else "NONE")
         acct_status = "PENDING"
-        if own_adm and total_measured_bytes > 0:
+        if own_adm and total_charged_bytes > 0:
             acct_status = "COMMITTED"
         self._finalize_remote_read(adm, own_adm, not is_verified, "target_identity", budget_tracker, operation_id=op_id)
 
@@ -3208,8 +3257,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "is_remote": True,
             "host": self.target_host(),
             "measured_bytes_read": total_measured_bytes,
-            "estimated_bytes_read": 0,
-            "charged_bytes": total_measured_bytes,
+            "estimated_bytes_read": total_estimated_bytes,
+            "charged_bytes": total_charged_bytes,
             "measurement_status": meas_status,
             "measurement_type": m_type,
             "accounting_owner": "ADAPTER",
@@ -3396,13 +3445,17 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return []
 
         b_maps = len(stdout.encode("utf-8")) if stdout else 0
+        if not stdout:
+            if pread is not None:
+                pread.consume(actual_bytes=None, conservative_estimate_bytes=4096, is_failure=True, failure_reason="Empty maps output")
+            self._finalize_remote_read(adm, own_adm, True, "target_maps", budget_tracker)
+            self._last_maps_bytes_read = 0
+            return mappings
+
         self._last_maps_bytes_read = b_maps
         if pread is not None:
-            pread.consume(actual_bytes=b_maps)
+            pread.consume(actual_bytes=b_maps, is_failure=False)
         self._finalize_remote_read(adm, own_adm, False, "target_maps", budget_tracker)
-
-        if not stdout:
-            return mappings
 
         for line in stdout.splitlines():
             parts = line.strip().split(maxsplit=5)
@@ -3488,9 +3541,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return []
 
         b_threads = len(stdout.encode("utf-8")) if stdout else 0
+        if not stdout:
+            if pread is not None:
+                pread.consume(actual_bytes=None, conservative_estimate_bytes=2048, is_failure=True, failure_reason="Empty threads output")
+            self._finalize_remote_read(adm, own_adm, True, "target_threads", budget_tracker)
+            self._last_threads_bytes_read = 0
+            return []
+
         self._last_threads_bytes_read = b_threads
         if pread is not None:
-            pread.consume(actual_bytes=b_threads)
+            pread.consume(actual_bytes=b_threads, is_failure=False)
         self._finalize_remote_read(adm, own_adm, False, "target_threads", budget_tracker)
 
         for line in stdout.splitlines():
@@ -3538,7 +3598,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         pid: int,
         slices: List[Tuple[int, int]],
         admission: Optional[Any] = None,
-        child_read: Optional[Any] = None,
+        child_reads: Optional[List[Any]] = None,
+        invocation_id: Optional[str] = None,
     ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
         """Uses C99 dynamicstate-collector --read-slices on the remote target for zero-stop process_vm_readv batch reads."""
         if not self.collector_path or not slices:
@@ -3546,7 +3607,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         import json as _json
         spec = ",".join(f"0x{int(addr):x}:{max(0, int(sz))}" for addr, sz in slices)
         cmd = f"{shlex.quote(self.collector_path)} -p {int(pid)} --read-slices {shlex.quote(spec)} 2>/dev/null"
-        rc, stdout, stderr = self.run_ssh(cmd, admission=admission, child_read=child_read)
+        rc, stdout, stderr = self.run_ssh(
+            cmd,
+            admission=admission,
+            child_reads=child_reads,
+            invocation_id=invocation_id,
+        )
         if rc == 127 or "not found" in stderr.lower() or rc == -2:
             return None
         if not stdout.strip():
@@ -3600,15 +3666,30 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return [self.read_memory(pid, slices[0][0], slices[0][1], admission=adm, budget_tracker=budget_tracker)]
 
         if self.collector_path:
+            inv_coll_id = f"inv_coll_{uuid.uuid4().hex[:12]}"
             child_reads_coll = [
                 adm.start_child_read(
                     target_type="remote_collector_memory_slice",
-                    target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx, "path": self.collector_path},
+                    target_spec={
+                        "pid": pid,
+                        "address": addr,
+                        "size": sz,
+                        "slice_index": idx,
+                        "path": self.collector_path,
+                        "invocation_id": inv_coll_id,
+                        "invocation_type": "collector",
+                    },
                 )
                 for idx, (addr, sz) in enumerate(slices)
             ] if adm is not None else [None for _ in slices]
 
-            coll_res = self._read_slices_via_collector(pid, slices, admission=adm, child_read=child_reads_coll[0] if child_reads_coll else None)
+            coll_res = self._read_slices_via_collector(
+                pid,
+                slices,
+                admission=adm,
+                child_reads=child_reads_coll,
+                invocation_id=inv_coll_id,
+            )
             if coll_res is not None:
                 any_fail = False
                 for idx, res_item in enumerate(coll_res):
@@ -3627,17 +3708,27 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 self._finalize_remote_read(adm, own_adm, any_fail, "memory_read_batch", budget_tracker)
                 return coll_res
             else:
-                for cr in child_reads_coll:
+                for idx, cr in enumerate(child_reads_coll):
                     if cr is not None:
+                        req_sz = slices[idx][1]
                         if cr.state == "PHYSICAL_READ_STARTED":
                             cr.consume(actual_bytes=0, is_failure=True, failure_reason="Collector execution failed")
                         elif cr.state == "ADMITTED":
                             cr.release()
 
+        # Shell fallback path
+        inv_shell_id = f"inv_shell_{uuid.uuid4().hex[:12]}"
         child_reads_shell = [
             adm.start_child_read(
                 target_type="remote_shell_memory_slice",
-                target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx},
+                target_spec={
+                    "pid": pid,
+                    "address": addr,
+                    "size": sz,
+                    "slice_index": idx,
+                    "invocation_id": inv_shell_id,
+                    "invocation_type": "shell_fallback",
+                },
             )
             for idx, (addr, sz) in enumerate(slices)
         ] if adm is not None else [None for _ in slices]
@@ -3662,7 +3753,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 f"echo \"{idx}|$b\""
             )
         remote_script = "; ".join(cmds)
-        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}", admission=adm, child_read=child_reads_shell[0] if child_reads_shell else None)
+        rc, stdout, stderr = self.run_ssh(
+            f"sh -c {shlex.quote(remote_script)}",
+            admission=adm,
+            child_reads=child_reads_shell,
+            invocation_id=inv_shell_id,
+        )
         if rc == -2:
             for cr in child_reads_shell:
                 if cr is not None and not cr.is_terminal:
@@ -3670,15 +3766,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             self._finalize_remote_read(adm, own_adm, False, "memory_read_batch", budget_tracker)
             return [(None, "UNAVAILABLE", f"SSH transport failed before execution: {stderr.strip()}") for _ in slices]
 
-        for cr in child_reads_shell:
-            if cr is not None and not cr.is_terminal and cr.state == "ADMITTED":
-                cr.mark_started()
-
         if rc != 0:
             for idx, (addr, sz) in enumerate(slices):
                 cr = child_reads_shell[idx]
                 if cr is not None:
-                    cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True)
+                    cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True, failure_reason=f"SSH batch read failed: {stderr.strip() or rc}")
             self._finalize_remote_read(adm, own_adm, True, "memory_read_batch", budget_tracker)
             alive, live_err = self.check_liveness(pid)
             if not alive:
@@ -3705,7 +3797,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             b64_str = by_idx.get(idx, "")
             if not b64_str:
                 if cr is not None:
-                    cr.consume(actual_bytes=0, is_failure=True)
+                    cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True, failure_reason="Missing slice output")
                 any_failure = True
                 results.append((None, "UNAVAILABLE", f"Address 0x{int(addr):x} is not mapped or inaccessible on {self.target_host()}"))
                 continue
@@ -3721,12 +3813,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     results.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{sz} bytes"))
                 else:
                     if cr is not None:
-                        cr.consume(actual_bytes=0, is_failure=True)
+                        cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True, failure_reason="Zero bytes returned")
                     any_failure = True
                     results.append((None, "UNAVAILABLE", f"Zero bytes returned at 0x{int(addr):x}"))
             except Exception as e:
                 if cr is not None:
-                    cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True)
+                    cr.consume(actual_bytes=None, conservative_estimate_bytes=sz, is_failure=True, failure_reason=f"Base64 decode failure: {e}")
                 any_failure = True
                 results.append((None, "UNAVAILABLE", f"Base64 decode failure: {e}"))
 
@@ -3750,18 +3842,35 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return None, "BUDGET_EXHAUSTED", rej_err
 
         if self.collector_path:
+            inv_coll_id = f"inv_coll_{uuid.uuid4().hex[:12]}"
             cr_coll = adm.start_child_read(
                 target_type="remote_collector_memory",
-                target_spec={"pid": pid, "address": address, "size": size, "path": self.collector_path},
+                target_spec={
+                    "pid": pid,
+                    "address": address,
+                    "size": size,
+                    "path": self.collector_path,
+                    "invocation_id": inv_coll_id,
+                    "invocation_type": "collector",
+                },
             ) if adm is not None else None
 
-            coll_res = self._read_slices_via_collector(pid, [(address, size)], admission=adm, child_read=cr_coll)
+            coll_res = self._read_slices_via_collector(
+                pid,
+                [(address, size)],
+                admission=adm,
+                child_reads=[cr_coll] if cr_coll else None,
+                invocation_id=inv_coll_id,
+            )
             if coll_res is not None and len(coll_res) == 1:
                 res_b, res_st, res_err = coll_res[0]
                 act_b = len(res_b) if res_b else 0
                 is_fail = (res_st not in ("OBSERVED", "PARTIAL"))
                 if cr_coll is not None:
-                    cr_coll.consume(actual_bytes=act_b, is_failure=is_fail)
+                    if is_fail and res_b is None:
+                        cr_coll.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
+                    else:
+                        cr_coll.consume(actual_bytes=act_b, is_failure=is_fail)
                 elif adm is not None:
                     adm.consume(actual_bytes=act_b, is_failure=is_fail, accumulate=not own_adm)
                 self._finalize_remote_read(adm, own_adm, is_fail, "memory_read", budget_tracker)
@@ -3774,13 +3883,25 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         cr_coll.release()
 
         # Remote memory read via dd and base64: distinct fallback child read
+        inv_shell_id = f"inv_shell_{uuid.uuid4().hex[:12]}"
         cr_shell = adm.start_child_read(
             target_type="remote_shell_memory",
-            target_spec={"pid": pid, "address": address, "size": size},
+            target_spec={
+                "pid": pid,
+                "address": address,
+                "size": size,
+                "invocation_id": inv_shell_id,
+                "invocation_type": "shell_fallback",
+            },
         ) if adm is not None else None
 
         cmd = f"dd if=/proc/{int(pid)}/mem bs=1 skip={int(address)} count={int(size)} 2>/dev/null | base64"
-        rc, stdout, stderr = self.run_ssh(cmd, admission=adm, child_read=cr_shell)
+        rc, stdout, stderr = self.run_ssh(
+            cmd,
+            admission=adm,
+            child_read=cr_shell,
+            invocation_id=inv_shell_id,
+        )
         if rc == -2:
             if cr_shell is not None:
                 cr_shell.release()
@@ -3788,7 +3909,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return None, "UNAVAILABLE", f"SSH transport failed before execution at 0x{address:x}: {stderr.strip()}"
         elif rc != 0:
             if cr_shell is not None:
-                cr_shell.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
+                cr_shell.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True, failure_reason=stderr.strip() or f"SSH transport error rc={rc}")
             elif adm is not None:
                 adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
             self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
@@ -3797,9 +3918,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         encoded = stdout.strip()
         if not encoded:
             if cr_shell is not None:
-                cr_shell.consume(actual_bytes=0, is_failure=True)
+                cr_shell.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True, failure_reason=f"Address 0x{address:x} is not mapped or inaccessible")
             elif adm is not None:
-                adm.consume(actual_bytes=0, is_failure=True, accumulate=not own_adm)
+                adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
             self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
             return None, "UNAVAILABLE", f"Address 0x{address:x} is not mapped or inaccessible on {self.target_host()}"
 
@@ -3822,14 +3943,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 return raw_bytes, "PARTIAL", f"Partial read: {act_b}/{size} bytes"
             else:
                 if cr_shell is not None:
-                    cr_shell.consume(actual_bytes=0, is_failure=True)
+                    cr_shell.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True, failure_reason="Zero bytes returned")
                 elif adm is not None:
-                    adm.consume(actual_bytes=0, is_failure=True, accumulate=not own_adm)
+                    adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
                 self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
                 return None, "UNAVAILABLE", f"Zero bytes returned at 0x{address:x}"
         except Exception as e:
             if cr_shell is not None:
-                cr_shell.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True)
+                cr_shell.consume(actual_bytes=None, conservative_estimate_bytes=size, is_failure=True, failure_reason=f"Base64 decode failure: {e}")
             elif adm is not None:
                 adm.consume(actual_bytes=None, is_failure=True, accumulate=not own_adm)
             self._finalize_remote_read(adm, own_adm, True, "memory_read", budget_tracker)
