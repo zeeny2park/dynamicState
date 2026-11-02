@@ -21,6 +21,7 @@ Strictly separates distinct observation metrics:
 
 from dataclasses import asdict, dataclass, field
 import math
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,56 +68,127 @@ def validate_non_negative_float(val: Any) -> Optional[float]:
 
 @dataclass
 class ObservationAccountingRecord:
-    """Explicit, auditable record of observation budget accounting."""
+    """Explicit, auditable, transactional record of observation budget accounting."""
     operation_id: str
     accounting_owner: str           # "MODULE_INTERNAL", "WORKMANAGER", "ADAPTER", etc.
-    measured_bytes_read: int = 0
-    estimated_bytes_read: int = 0
-    charged_bytes: int = 0
+    measured_bytes_read: Optional[int] = None
+    estimated_bytes_read: Optional[int] = 0
+    charged_bytes: Optional[int] = 0
     latency_us: float = 0.0
     accounting_status: str = "PENDING"  # "PENDING", "COMMITTED", "FAILED"
-    measurement_type: str = "MEASURED"   # "MEASURED", "ESTIMATED", "CACHE_HIT", "MIXED", "UNKNOWN"
+    measurement_type: str = "MEASURED"   # "MEASURED", "ESTIMATED", "CACHE_HIT", "MIXED", "UNKNOWN", "ZERO_BYTES"
     metadata: Dict[str, Any] = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
-    def commit(self, tracker: Optional["ObservationBudgetTracker"] = None) -> bool:
-        """Atomically commit the accounting record to the budget tracker."""
-        if self.accounting_status == "COMMITTED":
-            return True  # Already committed, prevent double charging!
-        if tracker is not None:
-            if self.measured_bytes_read > 0:
-                tracker.record_read(
-                    bytes_read=self.measured_bytes_read,
-                    latency_us=self.latency_us,
-                    profile_id=self.operation_id,
+    def validate(self) -> None:
+        """Strictly validates all numeric fields before commit.
+
+        Rejects bool, negative values, NaN, infinity, and malformed types.
+        """
+        if self.measured_bytes_read is not None:
+            if isinstance(self.measured_bytes_read, bool):
+                raise ValueError(f"Invalid boolean value for measured_bytes_read: {self.measured_bytes_read}")
+            if isinstance(self.measured_bytes_read, float) and (math.isnan(self.measured_bytes_read) or math.isinf(self.measured_bytes_read)):
+                raise ValueError(f"Invalid float (NaN/Inf) for measured_bytes_read: {self.measured_bytes_read}")
+            if not isinstance(self.measured_bytes_read, (int, float)) or self.measured_bytes_read < 0:
+                raise ValueError(f"Invalid negative or malformed value for measured_bytes_read: {self.measured_bytes_read}")
+            self.measured_bytes_read = int(self.measured_bytes_read)
+
+        if self.estimated_bytes_read is not None:
+            if isinstance(self.estimated_bytes_read, bool):
+                raise ValueError(f"Invalid boolean value for estimated_bytes_read: {self.estimated_bytes_read}")
+            if isinstance(self.estimated_bytes_read, float) and (math.isnan(self.estimated_bytes_read) or math.isinf(self.estimated_bytes_read)):
+                raise ValueError(f"Invalid float (NaN/Inf) for estimated_bytes_read: {self.estimated_bytes_read}")
+            if not isinstance(self.estimated_bytes_read, (int, float)) or self.estimated_bytes_read < 0:
+                raise ValueError(f"Invalid negative or malformed value for estimated_bytes_read: {self.estimated_bytes_read}")
+            self.estimated_bytes_read = int(self.estimated_bytes_read)
+
+        if self.charged_bytes is not None:
+            if isinstance(self.charged_bytes, bool):
+                raise ValueError(f"Invalid boolean value for charged_bytes: {self.charged_bytes}")
+            if isinstance(self.charged_bytes, float) and (math.isnan(self.charged_bytes) or math.isinf(self.charged_bytes)):
+                raise ValueError(f"Invalid float (NaN/Inf) for charged_bytes: {self.charged_bytes}")
+            if not isinstance(self.charged_bytes, (int, float)) or self.charged_bytes < 0:
+                raise ValueError(f"Invalid negative or malformed value for charged_bytes: {self.charged_bytes}")
+            self.charged_bytes = int(self.charged_bytes)
+
+        if self.latency_us is not None:
+            if isinstance(self.latency_us, bool):
+                raise ValueError(f"Invalid boolean value for latency_us: {self.latency_us}")
+            if isinstance(self.latency_us, float) and (math.isnan(self.latency_us) or math.isinf(self.latency_us)):
+                raise ValueError(f"Invalid float (NaN/Inf) for latency_us: {self.latency_us}")
+            if not isinstance(self.latency_us, (int, float)) or self.latency_us < 0:
+                raise ValueError(f"Invalid negative or malformed value for latency_us: {self.latency_us}")
+            self.latency_us = float(self.latency_us)
+
+    def transition_to(self, new_status: str) -> None:
+        """Thread-safe transactional state transition validation.
+
+        Allowed transitions:
+        PENDING -> COMMITTED
+        PENDING -> FAILED
+        COMMITTED -> COMMITTED (idempotent no-op)
+        FAILED -> FAILED (idempotent no-op)
+        All other transitions raise RuntimeError.
+        """
+        with self._lock:
+            if self.accounting_status == new_status:
+                return
+            if self.accounting_status == "COMMITTED":
+                raise RuntimeError(
+                    f"Cannot transition transaction '{self.operation_id}' from COMMITTED to {new_status}"
                 )
-            elif self.estimated_bytes_read > 0:
-                tracker.record_read(
-                    bytes_read=None,
-                    conservative_estimate_bytes=self.estimated_bytes_read,
-                    latency_us=self.latency_us,
-                    profile_id=self.operation_id,
+            if self.accounting_status == "FAILED" and new_status == "COMMITTED":
+                raise RuntimeError(
+                    f"Cannot transition transaction '{self.operation_id}' from FAILED to COMMITTED"
                 )
-            elif self.charged_bytes > 0:
-                tracker.record_read(
-                    bytes_read=self.charged_bytes,
-                    latency_us=self.latency_us,
-                    profile_id=self.operation_id,
+            if new_status not in ("PENDING", "COMMITTED", "FAILED"):
+                raise ValueError(f"Invalid accounting status: {new_status}")
+            self.accounting_status = new_status
+
+    def commit(
+        self,
+        tracker: Optional["ObservationBudgetTracker"] = None,
+        profile_id: Optional[str] = None,
+        profile_ceiling: Optional[Dict[str, Any]] = None,
+        is_failure: bool = False,
+        stop_ms: float = 0.0,
+    ) -> bool:
+        """Atomically commits the accounting record to the budget tracker."""
+        with self._lock:
+            if self.accounting_status == "COMMITTED":
+                return True  # Already committed, idempotent duplicate prevention
+            self.validate()
+            if tracker is not None:
+                return tracker.commit_transaction(
+                    self,
+                    profile_id=profile_id,
+                    profile_ceiling=profile_ceiling,
+                    is_failure=is_failure,
+                    stop_ms=stop_ms,
                 )
-        self.accounting_status = "COMMITTED"
-        return True
+            else:
+                self.transition_to("COMMITTED")
+                return True
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "operation_id": self.operation_id,
-            "accounting_owner": self.accounting_owner,
-            "measured_bytes_read": self.measured_bytes_read,
-            "estimated_bytes_read": self.estimated_bytes_read,
-            "charged_bytes": self.charged_bytes if self.charged_bytes > 0 else (self.measured_bytes_read + self.estimated_bytes_read),
-            "latency_us": self.latency_us,
-            "accounting_status": self.accounting_status,
-            "measurement_type": self.measurement_type,
-            "metadata": self.metadata,
-        }
+        with self._lock:
+            eff_charged = (
+                self.charged_bytes
+                if (self.charged_bytes is not None and self.charged_bytes > 0)
+                else ((self.measured_bytes_read or 0) + (self.estimated_bytes_read or 0))
+            )
+            return {
+                "operation_id": self.operation_id,
+                "accounting_owner": self.accounting_owner,
+                "measured_bytes_read": self.measured_bytes_read,
+                "estimated_bytes_read": self.estimated_bytes_read if self.estimated_bytes_read is not None else 0,
+                "charged_bytes": eff_charged,
+                "latency_us": self.latency_us,
+                "accounting_status": self.accounting_status,
+                "measurement_type": self.measurement_type,
+                "metadata": self.metadata,
+            }
 
 
 DEFAULT_CONSERVATIVE_UNKNOWN_BYTES = 65536  # 64 KB conservative fallback when cost is unknown
@@ -202,6 +274,203 @@ class ObservationBudgetTracker:
         self._start_time_ns: int = time.monotonic_ns()
         self._last_sample_ns: int = 0
         self._history: List[Dict[str, Any]] = []
+        self._committed_transactions: Dict[str, ObservationAccountingRecord] = {}
+        self._transaction_lock = threading.RLock()
+
+    def commit_transaction(
+        self,
+        record: ObservationAccountingRecord,
+        profile_id: Optional[str] = None,
+        profile_ceiling: Optional[Dict[str, Any]] = None,
+        is_failure: bool = False,
+        stop_ms: float = 0.0,
+    ) -> bool:
+        """Authoritatively commits an ObservationAccountingRecord to this tracker.
+
+        Guarantees:
+        - Atomic deduplication: duplicate commits for the same operation_id charge exactly once.
+        - Concurrent commits for the same operation_id are thread-safe and charge exactly once.
+        - Rejection of unknown cost if reject_unknown_byte_cost is set.
+        - Strict numeric validation.
+        - Reconciliation: charges tracker metrics for measured and/or estimated bytes.
+        - State transition: marks record.accounting_status = 'COMMITTED' only on success.
+        - Operation collision: detects conflicting parameters on duplicate operation_id.
+        """
+        with self._transaction_lock:
+            # 1. Deduplication check
+            rec_charge = (
+                record.charged_bytes
+                if (record.charged_bytes is not None and record.charged_bytes > 0)
+                else ((record.measured_bytes_read or 0) + (record.estimated_bytes_read or 0))
+            )
+            if record.operation_id in self._committed_transactions:
+                existing = self._committed_transactions[record.operation_id]
+                if existing is not record:
+                    # Check for conflicting parameters on collision
+                    if (
+                        existing.charged_bytes != rec_charge
+                        or existing.accounting_owner != record.accounting_owner
+                    ):
+                        raise ValueError(
+                            f"Operation ID collision: '{record.operation_id}' was already committed with "
+                            f"owner={existing.accounting_owner}, charged={existing.charged_bytes}B, "
+                            f"conflicting with owner={record.accounting_owner}, charged={rec_charge}B"
+                        )
+                # Idempotent duplicate: record is marked COMMITTED without charging again
+                with record._lock:
+                    if record.accounting_status != "COMMITTED":
+                        record.transition_to("COMMITTED")
+                return True
+
+            # 2. Validate record fields
+            try:
+                record.validate()
+            except ValueError as ve:
+                with record._lock:
+                    record.transition_to("FAILED")
+                raise ve
+
+            # 3. Check for unknown byte cost handling
+            meas_b = record.measured_bytes_read
+            est_b = record.estimated_bytes_read
+            is_explicit_zero_meas = (meas_b is not None and meas_b == 0)
+            is_explicit_zero_est = (est_b is not None and est_b == 0 and meas_b is None)
+            is_missing_cost = (
+                meas_b is None
+                and (est_b is None or est_b == 0)
+                and not is_explicit_zero_est
+                and record.measurement_type not in ("CACHE_HIT", "ZERO_BYTES")
+            )
+
+            if is_missing_cost or record.measurement_type == "UNKNOWN":
+                if self.limits.reject_unknown_byte_cost:
+                    with record._lock:
+                        record.transition_to("FAILED")
+                    self.record_rejection(
+                        profile_id or record.operation_id,
+                        "UNKNOWN_BYTE_COST_REJECTED: observation byte cost is unknown and strict cost accounting is enabled",
+                    )
+                    return False
+                elif is_missing_cost or (est_b is None or est_b == 0):
+                    ceil = profile_ceiling or {}
+                    fallback = (
+                        ceil.get("conservative_unknown_bytes")
+                        or self.limits.conservative_unknown_bytes
+                    )
+                    eff_fallback = max(1, int(fallback))
+                    est_b = eff_fallback
+                    record.estimated_bytes_read = eff_fallback
+                    record.measurement_type = "UNKNOWN"
+
+            # 4. Resolve effective charged bytes
+            actual_meas = meas_b if (meas_b is not None and meas_b >= 0) else 0
+            actual_est = est_b if (est_b is not None and est_b >= 0) else 0
+            total_charge = actual_meas + actual_est
+            record.charged_bytes = total_charge
+
+            if record.measurement_type not in ("CACHE_HIT", "UNKNOWN"):
+                if is_explicit_zero_meas:
+                    record.measurement_type = "ZERO_BYTES"
+                elif actual_meas > 0 and actual_est > 0:
+                    record.measurement_type = "MIXED"
+                elif actual_meas > 0:
+                    record.measurement_type = "MEASURED"
+                elif actual_est > 0:
+                    record.measurement_type = "ESTIMATED"
+                else:
+                    record.measurement_type = "ZERO_BYTES"
+
+            # 5. Check budget limits
+            can_exec, rej_reason = self.check_budget(profile_id=profile_id, profile_ceiling=profile_ceiling)
+            if not can_exec and not is_failure:
+                with record._lock:
+                    record.transition_to("FAILED")
+                self.record_rejection(profile_id or record.operation_id, rej_reason or "BUDGET_EXHAUSTED")
+                return False
+
+            if not is_failure and total_charge > 0:
+                if (self.metrics.bytes_read + total_charge) > self.limits.max_bytes_read:
+                    with record._lock:
+                        record.transition_to("FAILED")
+                    reason = (
+                        f"EXCEEDED_BYTES_READ: current {self.metrics.bytes_read}B + "
+                        f"charged {total_charge}B > max {self.limits.max_bytes_read}B"
+                    )
+                    self.metrics.is_budget_exhausted = True
+                    self.metrics.exhaustion_reason = reason
+                    self.record_rejection(profile_id or record.operation_id, reason)
+                    return False
+
+            # 6. Apply charges to tracker metrics
+            if actual_meas > 0:
+                self.metrics.measured_bytes_read += actual_meas
+                self.metrics.bytes_read += actual_meas
+            if actual_est > 0:
+                self.metrics.conservative_estimated_bytes += actual_est
+                self.metrics.bytes_read += actual_est
+                if actual_meas == 0:
+                    self.metrics.unmeasured_reads_count += 1
+
+            lat_val = max(0.0, float(record.latency_us))
+            stop_val = max(0.0, float(stop_ms))
+            self.metrics.observation_latency_us += lat_val
+            self.metrics.target_stop_duration_ms += stop_val
+
+            if is_failure:
+                self.metrics.consecutive_read_failures += 1
+                self.metrics.total_read_failures += 1
+            else:
+                self.metrics.consecutive_read_failures = 0
+
+            eff_prof_id = profile_id or record.operation_id
+            if eff_prof_id:
+                p_usage = self._get_or_init_profile_usage(eff_prof_id)
+                p_usage["bytes_read"] += total_charge
+                p_usage["measured_bytes_read"] += actual_meas
+                p_usage["conservative_estimated_bytes"] += actual_est
+                if actual_meas == 0 and actual_est > 0:
+                    p_usage["unmeasured_reads_count"] += 1
+                p_usage["wall_clock_ms"] = round(p_usage["wall_clock_ms"] + (lat_val / 1000.0), 3)
+                p_usage["target_stop_ms"] = round(p_usage["target_stop_ms"] + stop_val, 3)
+                if is_failure:
+                    p_usage["failures"] += 1
+
+            self.metrics.wall_clock_elapsed_ms = round(self.elapsed_ms, 3)
+            self.check_budget(profile_id=eff_prof_id, profile_ceiling=profile_ceiling)
+
+            self._history.append({
+                "event": "TRANSACTION_COMMIT",
+                "operation_id": record.operation_id,
+                "accounting_owner": record.accounting_owner,
+                "measured_bytes_read": actual_meas if meas_b is not None else None,
+                "estimated_bytes_read": actual_est,
+                "charged_bytes": total_charge,
+                "measurement_type": record.measurement_type,
+                "latency_us": lat_val,
+                "stop_ms": stop_val,
+                "is_failure": is_failure,
+                "elapsed_ms": round(self.elapsed_ms, 3),
+            })
+
+            with record._lock:
+                record.transition_to("COMMITTED")
+            self._committed_transactions[record.operation_id] = record
+            return True
+
+    def is_operation_committed(self, operation_id: str) -> bool:
+        """Returns True if the operation_id has an authoritative committed transaction."""
+        with self._transaction_lock:
+            return operation_id in self._committed_transactions
+
+    def get_committed_record(self, operation_id: str) -> Optional[ObservationAccountingRecord]:
+        """Returns the authoritative committed ObservationAccountingRecord for operation_id."""
+        with self._transaction_lock:
+            return self._committed_transactions.get(operation_id)
+
+    def get_committed_transactions(self) -> Dict[str, ObservationAccountingRecord]:
+        """Returns a copy of all authoritative committed transactions."""
+        with self._transaction_lock:
+            return dict(self._committed_transactions)
 
     def start(self) -> None:
         """Reset or restart wall clock tracking."""

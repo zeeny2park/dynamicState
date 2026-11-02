@@ -24,6 +24,7 @@ import subprocess
 import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import uuid
 
 from .debug_image import BinaryIdentity, inspect_elf, ELFInspectionError
 from .observation_budget import (
@@ -191,7 +192,14 @@ class TargetExecutionAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_process_identity(self, pid: int) -> Dict[str, Any]:
+    def get_process_identity(
+        self,
+        pid: int,
+        companion_build_id: Optional[str] = None,
+        companion_elf_path: Optional[str] = None,
+        budget_tracker: Optional[Any] = None,
+        operation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Discovers executable path, architecture, build ID, and ELF type."""
         pass
 
@@ -363,8 +371,21 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
     def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
         return self._inner.check_liveness(pid)
 
-    def get_process_identity(self, pid: int) -> Dict[str, Any]:
-        return self._inner.get_process_identity(pid)
+    def get_process_identity(
+        self,
+        pid: int,
+        companion_build_id: Optional[str] = None,
+        companion_elf_path: Optional[str] = None,
+        budget_tracker: Optional[Any] = None,
+        operation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._inner.get_process_identity(
+            pid,
+            companion_build_id=companion_build_id,
+            companion_elf_path=companion_elf_path,
+            budget_tracker=budget_tracker,
+            operation_id=operation_id,
+        )
 
     def get_process_memory_info(self, pid: int) -> Dict[str, Any]:
         return self._inner.get_process_memory_info(pid)
@@ -511,6 +532,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         pid: int,
         companion_build_id: Optional[str] = None,
         companion_elf_path: Optional[str] = None,
+        budget_tracker: Optional[Any] = None,
+        operation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Discovers process executable, architecture, build ID, and validates process identity.
 
@@ -830,6 +853,22 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         self._last_identity_breakdown = meas_breakdown
         self._last_identity_latency_us = (time.monotonic() - t_id_start) * 1_000_000.0
 
+        op_id = operation_id or f"proc_identity_{pid}_{uuid.uuid4().hex[:8]}"
+        m_type = "MEASURED" if total_measured_bytes > 0 else ("CACHE_HIT" if elf_bytes_from_cache > 0 else "UNKNOWN")
+        acct_status = "PENDING"
+        if budget_tracker is not None:
+            record = ObservationAccountingRecord(
+                operation_id=op_id,
+                accounting_owner="ADAPTER",
+                measured_bytes_read=total_measured_bytes,
+                estimated_bytes_read=estimated_bytes_read,
+                charged_bytes=total_measured_bytes,
+                latency_us=self._last_identity_latency_us,
+                measurement_type=m_type,
+            )
+            ok = budget_tracker.commit_transaction(record, profile_id="target_identity")
+            acct_status = "COMMITTED" if ok else "FAILED"
+
         return {
             "pid": pid,
             "executable": runtime_exe,
@@ -851,9 +890,10 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "estimated_bytes_read": estimated_bytes_read,
             "charged_bytes": total_measured_bytes,
             "measurement_status": meas_status,
-            "measurement_type": "MEASURED" if total_measured_bytes > 0 else ("CACHE_HIT" if elf_bytes_from_cache > 0 else "UNKNOWN"),
+            "measurement_type": m_type,
             "accounting_owner": "ADAPTER",
-            "accounting_status": "COMMITTED",
+            "accounting_status": acct_status,
+            "operation_id": op_id,
             "measurement_breakdown": meas_breakdown,
             "error": link_err or elf_error,
             "is_remote": False,
@@ -2085,6 +2125,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         pid: int,
         companion_build_id: Optional[str] = None,
         companion_elf_path: Optional[str] = None,
+        budget_tracker: Optional[Any] = None,
+        operation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Discovers remote process executable, architecture, and Build ID.
         
@@ -2237,6 +2279,22 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         is_verified = bool(remote_exe and start_time and start_time > 0 and arch != "unknown")
         identity_status = IDENTITY_VERIFIED if is_verified else (IDENTITY_UNVERIFIED if remote_exe else IDENTITY_UNAVAILABLE)
 
+        op_id = operation_id or f"proc_identity_{pid}_{uuid.uuid4().hex[:8]}"
+        m_type = "MEASURED" if total_measured_bytes > 0 else "UNKNOWN"
+        acct_status = "PENDING"
+        if budget_tracker is not None:
+            record = ObservationAccountingRecord(
+                operation_id=op_id,
+                accounting_owner="ADAPTER",
+                measured_bytes_read=total_measured_bytes,
+                estimated_bytes_read=0,
+                charged_bytes=total_measured_bytes,
+                latency_us=self._last_identity_latency_us,
+                measurement_type=m_type,
+            )
+            ok = budget_tracker.commit_transaction(record, profile_id="target_identity")
+            acct_status = "COMMITTED" if ok else "FAILED"
+
         return {
             "pid": pid,
             "executable": remote_exe,
@@ -2255,9 +2313,10 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "estimated_bytes_read": 0,
             "charged_bytes": total_measured_bytes,
             "measurement_status": meas_status,
-            "measurement_type": "MEASURED" if total_measured_bytes > 0 else "UNKNOWN",
+            "measurement_type": m_type,
             "accounting_owner": "ADAPTER",
-            "accounting_status": "COMMITTED",
+            "accounting_status": acct_status,
+            "operation_id": op_id,
             "measurement_breakdown": meas_breakdown,
         }
 
