@@ -75,10 +75,10 @@ class TestPhase20A348AtomicLedger(unittest.TestCase):
         self.assertEqual(len(outcomes), 2)
         self.assertIsNotNone(outcomes[0])
         self.assertIsNotNone(outcomes[1])
-        # Charged exactly once
-        self.assertEqual(tracker.metrics.bytes_read, 150)
-        self.assertEqual(tracker.metrics.measured_bytes_read, 150)
-        self.assertEqual(len(tracker.get_committed_transactions()), 1)
+        # Under Phase 2.0-A.3.4.9 physical consumption accounting: both physical reads are preserved!
+        self.assertEqual(tracker.metrics.bytes_read, 300)
+        self.assertEqual(tracker.metrics.measured_bytes_read, 300)
+        self.assertEqual(len(tracker.get_committed_transactions()), 2)
         recon = tracker.reconcile_ledger()
         self.assertTrue(recon["reconciled"])
 

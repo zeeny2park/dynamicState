@@ -78,6 +78,7 @@ def canonical_metadata_digest(metadata: Any) -> str:
     """Computes a deterministic canonical SHA-256 digest of normalized metadata.
 
     Guarantees that dictionary key insertion order does not affect the digest.
+    Rejects unsupported mutable or non-canonical types without silent string conversion.
     """
     def _normalize(obj: Any) -> Any:
         if isinstance(obj, Mapping):
@@ -92,7 +93,7 @@ def canonical_metadata_digest(metadata: Any) -> str:
             return obj
         elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
             return _normalize(obj.to_dict())
-        return str(obj)
+        raise TypeError(f"Unsupported metadata value type for canonical identity: {type(obj).__name__} ({repr(obj)})")
 
     normalized = _normalize(metadata or {})
     raw_json = json.dumps(normalized, sort_keys=True, separators=(',', ':'))
@@ -154,6 +155,22 @@ class AccountingFingerprint:
     latency_us: float
     session_id: Optional[str] = None
     metadata_digest: str = ""
+    physical_consumption_id: Optional[str] = None
+
+    def matches_logical_fields(self, other: "AccountingFingerprint") -> bool:
+        """Checks if all logical identity and observation parameter fields match (ignoring physical_consumption_id)."""
+        return (
+            self.operation_id == other.operation_id
+            and self.accounting_owner == other.accounting_owner
+            and self.profile_id == other.profile_id
+            and self.measured_bytes_read == other.measured_bytes_read
+            and self.estimated_bytes_read == other.estimated_bytes_read
+            and self.charged_bytes == other.charged_bytes
+            and self.measurement_type == other.measurement_type
+            and self.is_failure == other.is_failure
+            and self.session_id == other.session_id
+            and self.metadata_digest == other.metadata_digest
+        )
 
 
 @dataclass(frozen=True)
@@ -173,6 +190,7 @@ class CommittedTransactionSnapshot:
     metadata: Any
     committed_at_ms: float
     session_id: Optional[str] = None
+    physical_consumption_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, types.MappingProxyType):
@@ -192,6 +210,7 @@ class CommittedTransactionSnapshot:
             "measurement_type": self.measurement_type,
             "metadata": unfreeze_metadata(self.metadata),
             "session_id": self.session_id,
+            "physical_consumption_id": self.physical_consumption_id,
         }
 
     def to_record(self) -> "ObservationAccountingRecord":
@@ -206,6 +225,7 @@ class CommittedTransactionSnapshot:
             measurement_type=self.measurement_type,
             metadata=unfreeze_metadata(self.metadata),
             session_id=self.session_id,
+            physical_consumption_id=self.physical_consumption_id,
         )
 
 
@@ -222,6 +242,7 @@ class ObservationAccountingRecord:
     measurement_type: str = "MEASURED"   # "MEASURED", "ESTIMATED", "CACHE_HIT", "MIXED", "UNKNOWN", "ZERO_BYTES"
     metadata: Dict[str, Any] = field(default_factory=dict)
     session_id: Optional[str] = None
+    physical_consumption_id: Optional[str] = None
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def validate(self) -> None:
@@ -298,6 +319,7 @@ class ObservationAccountingRecord:
         is_failure: bool = False,
         stop_ms: float = 0.0,
         session_id: Optional[str] = None,
+        physical_consumption_id: Optional[str] = None,
     ) -> AccountingFingerprint:
         """Computes canonical immutable accounting fingerprint."""
         with self._lock:
@@ -309,6 +331,7 @@ class ObservationAccountingRecord:
                 else ((meas_val or 0) + est_val)
             )
             meta_digest = canonical_metadata_digest(self.metadata)
+            phys_id = physical_consumption_id or self.physical_consumption_id
             return AccountingFingerprint(
                 operation_id=self.operation_id,
                 accounting_owner=self.accounting_owner,
@@ -322,6 +345,7 @@ class ObservationAccountingRecord:
                 latency_us=round(max(0.0, float(self.latency_us)), 4),
                 session_id=self.session_id or session_id,
                 metadata_digest=meta_digest,
+                physical_consumption_id=phys_id,
             )
 
     def commit(
@@ -444,6 +468,55 @@ class ObservationMetrics:
     profile_usage: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
+@dataclass
+class BudgetReservation:
+    """Explicit tracker-owned reservation lifecycle:
+    RESERVED -> CONSUMED -> FINALIZED
+    RESERVED -> RELEASED (strictly when consumed_bytes == 0)
+    """
+    reservation_id: str
+    operation_id: str
+    reserved_bytes: int
+    profile_id: Optional[str] = None
+    state: str = "RESERVED"  # "RESERVED", "CONSUMED", "RELEASED", "FINALIZED"
+    consumed_bytes: int = 0
+    is_failure: bool = False
+    scope_id: Optional[str] = None
+    created_at_ms: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def consume(
+        self,
+        actual_bytes: Optional[int],
+        is_failure: bool = False,
+    ) -> int:
+        """Transitions RESERVED -> CONSUMED."""
+        with self._lock:
+            if self.state not in ("RESERVED", "CONSUMED"):
+                raise RuntimeError(f"Cannot consume reservation '{self.reservation_id}' in state {self.state}")
+            self.consumed_bytes = max(0, int(actual_bytes or 0))
+            if is_failure:
+                self.is_failure = True
+            self.state = "CONSUMED"
+            return self.consumed_bytes
+
+    def release(self) -> None:
+        """Transitions RESERVED -> RELEASED strictly when no physical consumption occurred."""
+        with self._lock:
+            if self.consumed_bytes > 0:
+                raise RuntimeError(f"A reservation must never be released if physical consumption occurred ({self.consumed_bytes}B)")
+            if self.state != "RESERVED":
+                raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
+            self.state = "RELEASED"
+
+    def finalize(self) -> None:
+        """Transitions CONSUMED or RESERVED -> FINALIZED upon tracker ledger commit."""
+        with self._lock:
+            if self.state not in ("CONSUMED", "RESERVED"):
+                raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' in state {self.state}")
+            self.state = "FINALIZED"
+
+
 class ActiveOperationScope:
     """Thread-scoped operation accounting context with state machine.
 
@@ -456,11 +529,15 @@ class ActiveOperationScope:
         operation_id: str,
         profile_id: Optional[str] = None,
         owner: str = "MODULE_INTERNAL",
+        metadata: Optional[Dict[str, Any]] = None,
+        physical_consumption_id: Optional[str] = None,
     ):
         self.tracker = tracker
         self.operation_id = operation_id
         self.profile_id = profile_id
         self.owner = owner
+        self.physical_consumption_id: str = physical_consumption_id or f"{operation_id}__phys_{uuid.uuid4().hex[:8]}"
+        self.metadata: Dict[str, Any] = dict(metadata or {})
         self.measured_bytes_read: Optional[int] = None
         self.estimated_bytes_read: int = 0
         self.charged_bytes: int = 0
@@ -472,6 +549,7 @@ class ActiveOperationScope:
         self._reads: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
         self.nesting_count: int = 1
+        self._active_reservation: Optional[BudgetReservation] = None
 
     @property
     def is_finalized(self) -> bool:
@@ -488,15 +566,20 @@ class ActiveOperationScope:
         conservative_estimate_bytes: Optional[int] = None,
         profile_id: Optional[str] = None,
         profile_ceiling: Optional[Dict[str, Any]] = None,
+        reservation: Optional[BudgetReservation] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Record a read attributed directly to this operation scope.
 
-        Validates inputs, checks budget, and buffers the read in the scope.
+        Validates inputs, reserves budget atomically, and buffers the read in the scope.
         Does NOT prematurely update global aggregate metrics.
         """
         with self._lock:
             if self.state in ("FINALIZING", "COMMITTED", "FAILED", "REJECTED"):
                 raise RuntimeError(f"Cannot record read on scope '{self.operation_id}' in state {self.state}")
+
+            if metadata:
+                self.metadata.update(metadata)
 
             # Strict validation of numeric inputs: reject bool, negative, NaN, Inf
             if bytes_read is not None:
@@ -531,8 +614,8 @@ class ActiveOperationScope:
                 self.is_failure = True
                 raise ValueError("UNKNOWN_BYTE_COST_REJECTED: observation byte cost is unknown and strict cost accounting is enabled")
 
-            # Check if budget is already exhausted
-            if self.tracker.is_budget_exhausted:
+            # Check if budget is already exhausted (unless this read has a pre-existing in-flight reservation)
+            if self.tracker.is_budget_exhausted and reservation is None:
                 self.is_failure = True
                 return {
                     "success": False,
@@ -560,6 +643,40 @@ class ActiveOperationScope:
                 charged_b = max(1, int(fallback))
                 actual_b = None
                 used_conservative = True
+
+            # Atomic budget reservation lifecycle
+            eff_prof_id = profile_id or self.profile_id
+            if reservation is not None:
+                res = reservation
+                res.scope_id = self.physical_consumption_id
+                res.consume(actual_bytes=charged_b, is_failure=is_failure)
+            else:
+                try:
+                    res = self.tracker.reserve_budget(
+                        estimated_bytes=charged_b,
+                        profile_id=eff_prof_id,
+                        operation_id=self.operation_id,
+                        scope=self,
+                        profile_ceiling=profile_ceiling,
+                        allow_in_flight_overshoot=True,
+                    )
+                    res.consume(actual_bytes=charged_b, is_failure=is_failure)
+                except ValueError as ve:
+                    if "BUDGET_EXHAUSTED" in str(ve) or "PROFILE_CEILING_EXCEEDED" in str(ve):
+                        self.is_failure = True
+                        status_str = "BUDGET_EXHAUSTED" if "BUDGET_EXHAUSTED" in str(ve) else "PROFILE_CEILING_EXCEEDED"
+                        return {
+                            "success": False,
+                            "status": status_str,
+                            "error": str(ve),
+                            "measured_bytes_read": None,
+                            "charged_bytes": 0,
+                            "used_conservative_byte_estimate": False,
+                            "latency_us": 0.0,
+                            "stop_ms": 0.0,
+                            "is_failure": True,
+                        }
+                    raise
 
             lat_val = max(0.0, float(latency_us or 0.0))
             stop_val = max(0.0, float(stop_ms or 0.0))
@@ -603,7 +720,7 @@ class ActiveOperationScope:
     def finalize(
         self,
         success: bool = True,
-        exc: Optional[Exception] = None,
+        exc: Optional[BaseException] = None,
     ) -> Optional[CommittedTransactionSnapshot]:
         """Finalize and register the operation in the tracker ledger if not already committed."""
         with self._lock:
@@ -617,14 +734,17 @@ class ActiveOperationScope:
                 if self.reads_count == 0:
                     # Inner executor already authoritatively committed this operation
                     self.state = "COMMITTED"
+                    self.tracker._finalize_scope_reservations(self)
                     self.tracker._unregister_active_scope(self)
                     return self.tracker.get_committed_record(self.operation_id)
+                # Duplicate physical execution or collision
                 return self.tracker._finalize_scope_duplicate_or_collision(self, is_fail=is_fail)
 
             if self.reads_count > 0:
                 return self.tracker._finalize_scope_transaction(self, is_fail=is_fail)
             else:
                 self.state = "FAILED" if is_fail else "COMMITTED"
+                self.tracker._finalize_scope_reservations(self)
                 self.tracker._unregister_active_scope(self)
                 return None
 
@@ -644,6 +764,8 @@ class ObservationBudgetTracker:
         self._last_sample_ns: int = 0
         self._history: List[Dict[str, Any]] = []
         self._committed_transactions: Dict[str, CommittedTransactionSnapshot] = {}
+        self._physical_consumption_records: Dict[str, CommittedTransactionSnapshot] = {}
+        self._active_reservations: Dict[str, BudgetReservation] = {}
         self._failed_operations: Dict[str, str] = {}
         self._transaction_lock = threading.RLock()
         self._thread_local = threading.local()
@@ -666,11 +788,28 @@ class ObservationBudgetTracker:
         with self._transaction_lock:
             return sum(s.charged_bytes for scopes in self._active_scopes.values() for s in scopes)
 
+    def _active_reservation_bytes(self, profile_id: Optional[str] = None) -> int:
+        with self._transaction_lock:
+            active_scope_phys_ids = {
+                s.physical_consumption_id for scopes in self._active_scopes.values() for s in scopes if s.charged_bytes > 0
+            }
+            total = 0
+            for r in self._active_reservations.values():
+                if profile_id is not None and r.profile_id != profile_id:
+                    continue
+                if r.state == "RESERVED":
+                    total += r.reserved_bytes
+                elif r.state == "CONSUMED":
+                    if r.scope_id is None or r.scope_id not in active_scope_phys_ids:
+                        total += r.consumed_bytes
+            return total
+
     @property
     def remaining_bytes(self) -> int:
         with self._transaction_lock:
+            active_res = self._active_reservation_bytes()
             in_flight = self._active_consumed_bytes()
-            return max(0, self.limits.max_bytes_read - self.metrics.bytes_read - in_flight)
+            return max(0, self.limits.max_bytes_read - self.metrics.bytes_read - active_res - in_flight)
 
     @property
     def remaining_wall_clock_ms(self) -> float:
@@ -686,12 +825,114 @@ class ObservationBudgetTracker:
         with self._transaction_lock:
             return self.metrics.is_budget_exhausted
 
+    def reserve_budget(
+        self,
+        estimated_bytes: int,
+        profile_id: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        scope: Optional["ActiveOperationScope"] = None,
+        profile_ceiling: Optional[Dict[str, Any]] = None,
+        allow_in_flight_overshoot: bool = False,
+    ) -> BudgetReservation:
+        """Atomically reserves budget against global and profile limits before a physical read."""
+        with self._transaction_lock:
+            if isinstance(estimated_bytes, bool) or not isinstance(estimated_bytes, (int, float)) or estimated_bytes < 0:
+                raise ValueError(f"Invalid non-negative reservation bytes: {estimated_bytes}")
+            est_b = int(estimated_bytes)
+            if self.is_budget_exhausted:
+                raise ValueError(f"BUDGET_EXHAUSTED: cannot reserve budget ({self.exhaustion_reason})")
+
+            # Check global limits
+            active_res = self._active_reservation_bytes()
+            in_flight = self._active_consumed_bytes()
+            projected = self.metrics.bytes_read + active_res + in_flight + est_b
+
+            if projected > self.limits.max_bytes_read:
+                self.metrics.is_budget_exhausted = True
+                self.metrics.exhaustion_reason = (
+                    f"EXCEEDED_BYTES_READ: projected reservation {projected}B > max {self.limits.max_bytes_read}B"
+                )
+                if not allow_in_flight_overshoot:
+                    raise ValueError(f"BUDGET_EXHAUSTED: {self.metrics.exhaustion_reason}")
+
+            # Check profile limit if profile has ceiling
+            eff_prof_id = profile_id or (scope.profile_id if scope else None)
+            if eff_prof_id:
+                p_usage = self._get_or_init_profile_usage(eff_prof_id)
+                p_active_res = self._active_reservation_bytes(profile_id=eff_prof_id)
+                ceil_limit = None
+                if profile_ceiling:
+                    ceil_limit = profile_ceiling.get("max_bytes_read", profile_ceiling.get("max_bytes"))
+                if ceil_limit is None and hasattr(self.limits, "max_profile_bytes"):
+                    ceil_limit = self.limits.max_profile_bytes.get(eff_prof_id)
+
+                if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + est_b) > int(ceil_limit):
+                    if not allow_in_flight_overshoot:
+                        raise ValueError(
+                            f"PROFILE_CEILING_EXCEEDED: Profile '{eff_prof_id}' projected "
+                            f"{p_usage['bytes_read'] + p_active_res + est_b}B > max {ceil_limit}B"
+                        )
+
+            res_id = f"res_{uuid.uuid4().hex[:8]}"
+            res = BudgetReservation(
+                reservation_id=res_id,
+                operation_id=operation_id or (scope.operation_id if scope else "standalone"),
+                reserved_bytes=est_b,
+                profile_id=eff_prof_id,
+                scope_id=scope.physical_consumption_id if scope else None,
+                created_at_ms=round(self.elapsed_ms, 3),
+            )
+            self._active_reservations[res_id] = res
+            return res
+
+    def release_reservation(self, reservation: BudgetReservation) -> None:
+        """Transitions a reservation to RELEASED strictly when zero physical bytes were consumed."""
+        with self._transaction_lock:
+            reservation.release()
+            self._active_reservations.pop(reservation.reservation_id, None)
+
+    def _finalize_scope_reservations(self, scope: "ActiveOperationScope") -> None:
+        """Transitions all reservations belonging to scope to FINALIZED and cleans them up."""
+        with self._transaction_lock:
+            to_remove = []
+            for r_id, res in self._active_reservations.items():
+                if res.scope_id == scope.physical_consumption_id or (res.operation_id == scope.operation_id and res.state in ("RESERVED", "CONSUMED")):
+                    res.finalize()
+                    to_remove.append(r_id)
+            for r_id in to_remove:
+                del self._active_reservations[r_id]
+
+    @contextmanager
+    def reservation(
+        self,
+        estimated_bytes: int,
+        profile_id: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        scope: Optional["ActiveOperationScope"] = None,
+        profile_ceiling: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[BudgetReservation]:
+        """Context manager for explicit reservation lifecycle."""
+        res = self.reserve_budget(
+            estimated_bytes=estimated_bytes,
+            profile_id=profile_id,
+            operation_id=operation_id,
+            scope=scope,
+            profile_ceiling=profile_ceiling,
+        )
+        try:
+            yield res
+        except Exception:
+            if res.state == "RESERVED":
+                self.release_reservation(res)
+            raise
+
     @contextmanager
     def operation_scope(
         self,
         operation_id: str,
         profile_id: Optional[str] = None,
         owner: str = "MODULE_INTERNAL",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Iterator[ActiveOperationScope]:
         """Context manager establishing an authoritative thread-local operation scope."""
         if not hasattr(self._thread_local, "scope_stack"):
@@ -705,14 +946,21 @@ class ObservationBudgetTracker:
 
         if existing_on_thread is not None:
             existing_on_thread.nesting_count += 1
+            if metadata:
+                existing_on_thread.metadata.update(metadata)
             self._thread_local.scope_stack.append(existing_on_thread)
+            inner_exc = None
             try:
                 yield existing_on_thread
+            except BaseException as exc:
+                inner_exc = exc
+                existing_on_thread.is_failure = True
+                raise
             finally:
                 self._thread_local.scope_stack.pop()
                 existing_on_thread.nesting_count -= 1
                 if existing_on_thread.nesting_count == 0:
-                    existing_on_thread.finalize(success=True)
+                    existing_on_thread.finalize(success=(not existing_on_thread.is_failure and inner_exc is None), exc=inner_exc)
             return
 
         scope = ActiveOperationScope(
@@ -720,6 +968,7 @@ class ObservationBudgetTracker:
             operation_id=operation_id,
             profile_id=profile_id,
             owner=owner,
+            metadata=metadata,
         )
         self._register_active_scope(scope)
         self._thread_local.scope_stack.append(scope)
@@ -728,15 +977,16 @@ class ObservationBudgetTracker:
         exc_occurred = None
         try:
             yield scope
-        except Exception as exc:
+        except BaseException as exc:
             exc_occurred = exc
+            scope.is_failure = True
             raise
         finally:
             self._thread_local.scope_stack.pop()
             prev = self._thread_local.scope_stack[-1] if self._thread_local.scope_stack else None
             self._thread_local.current_scope = prev
             try:
-                scope.finalize(success=(exc_occurred is None), exc=exc_occurred)
+                scope.finalize(success=(exc_occurred is None and not scope.is_failure), exc=exc_occurred)
             finally:
                 self._unregister_active_scope(scope)
 
@@ -749,117 +999,131 @@ class ObservationBudgetTracker:
             if scope.operation_id in self._committed_transactions:
                 return self._finalize_scope_duplicate_or_collision(scope, is_fail=is_fail)
 
-            meas_b = scope.measured_bytes_read
-            est_b = scope.estimated_bytes_read
-            total_charge = scope.charged_bytes
+            try:
+                meas_b = scope.measured_bytes_read
+                est_b = scope.estimated_bytes_read
+                total_charge = scope.charged_bytes
 
-            if meas_b is not None and meas_b > 0 and est_b > 0:
-                m_type = "MIXED"
-            elif meas_b is not None and meas_b > 0:
-                m_type = "MEASURED"
-            elif est_b > 0:
-                m_type = "ESTIMATED"
-            elif meas_b == 0:
-                m_type = "ZERO_BYTES"
-            else:
-                m_type = "MEASURED"
+                if meas_b is not None and meas_b > 0 and est_b > 0:
+                    m_type = "MIXED"
+                elif meas_b is not None and meas_b > 0:
+                    m_type = "MEASURED"
+                elif est_b > 0:
+                    m_type = "ESTIMATED"
+                elif meas_b == 0:
+                    m_type = "ZERO_BYTES"
+                else:
+                    m_type = "MEASURED"
 
-            rec = ObservationAccountingRecord(
-                operation_id=scope.operation_id,
-                accounting_owner=scope.owner,
-                measured_bytes_read=meas_b,
-                estimated_bytes_read=est_b,
-                charged_bytes=total_charge,
-                latency_us=scope.latency_us,
-                measurement_type=m_type,
-                session_id=self.session_id,
-            )
+                status = "FAILED" if is_fail else "COMMITTED"
+                lat_val = max(0.0, float(scope.latency_us))
+                stop_val = max(0.0, float(scope.stop_ms))
+                actual_meas = meas_b if (meas_b is not None and meas_b >= 0) else 0
+                actual_est = est_b if (est_b is not None and est_b >= 0) else 0
 
-            cand_fp = rec.create_fingerprint(
-                profile_id=scope.profile_id,
-                is_failure=is_fail,
-                stop_ms=scope.stop_ms,
-                session_id=self.session_id,
-            )
+                try:
+                    frozen_meta = freeze_metadata(scope.metadata)
+                    meta_digest = canonical_metadata_digest(scope.metadata)
+                except (TypeError, ValueError) as meta_err:
+                    is_fail = True
+                    status = "FAILED"
+                    frozen_meta = freeze_metadata({"metadata_error": str(meta_err)})
+                    meta_digest = canonical_metadata_digest(frozen_meta)
 
-            actual_meas = meas_b if (meas_b is not None and meas_b >= 0) else 0
-            actual_est = est_b if (est_b is not None and est_b >= 0) else 0
-
-            self.metrics.bytes_read += total_charge
-            if actual_meas > 0:
-                self.metrics.measured_bytes_read += actual_meas
-            if actual_est > 0:
-                self.metrics.conservative_estimated_bytes += actual_est
-                if actual_meas == 0:
-                    self.metrics.unmeasured_reads_count += 1
-
-            lat_val = max(0.0, float(scope.latency_us))
-            stop_val = max(0.0, float(scope.stop_ms))
-            self.metrics.observation_latency_us += lat_val
-            self.metrics.target_stop_duration_ms += stop_val
-
-            if is_fail:
-                self.metrics.total_read_failures += 1
-                self.metrics.consecutive_read_failures += 1
-            else:
-                self.metrics.consecutive_read_failures = 0
-
-            eff_prof_id = scope.profile_id or scope.operation_id
-            if eff_prof_id:
-                p_usage = self._get_or_init_profile_usage(eff_prof_id)
-                p_usage["bytes_read"] += total_charge
-                p_usage["measured_bytes_read"] += actual_meas
-                p_usage["conservative_estimated_bytes"] += actual_est
-                p_usage["wall_clock_ms"] = round(p_usage["wall_clock_ms"] + (lat_val / 1000.0), 3)
-                p_usage["target_stop_ms"] = round(p_usage["target_stop_ms"] + stop_val, 3)
-                if is_fail:
-                    p_usage["failures"] += 1
-
-            self.metrics.wall_clock_elapsed_ms = round(self.elapsed_ms, 3)
-            if self.metrics.bytes_read >= self.limits.max_bytes_read:
-                self.metrics.is_budget_exhausted = True
-                self.metrics.exhaustion_reason = (
-                    f"EXCEEDED_BYTES_READ: current {self.metrics.bytes_read}B >= max {self.limits.max_bytes_read}B"
+                cand_fp = AccountingFingerprint(
+                    operation_id=scope.operation_id,
+                    accounting_owner=scope.owner,
+                    measured_bytes_read=meas_b,
+                    estimated_bytes_read=est_b,
+                    charged_bytes=total_charge,
+                    measurement_type=m_type,
+                    profile_id=scope.profile_id,
+                    is_failure=is_fail,
+                    stop_ms=round(stop_val, 4),
+                    latency_us=round(lat_val, 4),
+                    session_id=self.session_id,
+                    metadata_digest=meta_digest,
+                    physical_consumption_id=scope.physical_consumption_id,
                 )
 
-            status = "FAILED" if is_fail else "COMMITTED"
-            scope.state = status
-            with rec._lock:
-                rec.transition_to(status)
+                # Commit metrics and ledger as one atomic transaction
+                self.metrics.bytes_read += total_charge
+                if actual_meas > 0:
+                    self.metrics.measured_bytes_read += actual_meas
+                if actual_est > 0:
+                    self.metrics.conservative_estimated_bytes += actual_est
+                    if actual_meas == 0:
+                        self.metrics.unmeasured_reads_count += 1
 
-            snapshot = CommittedTransactionSnapshot(
-                operation_id=scope.operation_id,
-                accounting_owner=scope.owner,
-                measured_bytes_read=meas_b,
-                estimated_bytes_read=est_b,
-                charged_bytes=total_charge,
-                latency_us=lat_val,
-                stop_ms=stop_val,
-                is_failure=is_fail,
-                accounting_status=status,
-                measurement_type=m_type,
-                fingerprint=cand_fp,
-                metadata={},
-                committed_at_ms=round(self.elapsed_ms, 3),
-                session_id=self.session_id,
-            )
-            self._committed_transactions[scope.operation_id] = snapshot
-            self._unregister_active_scope(scope)
+                self.metrics.observation_latency_us += lat_val
+                self.metrics.target_stop_duration_ms += stop_val
 
-            self._history.append({
-                "event": "TRANSACTION_COMMIT",
-                "operation_id": scope.operation_id,
-                "accounting_owner": scope.owner,
-                "measured_bytes_read": actual_meas if meas_b is not None else None,
-                "estimated_bytes_read": actual_est,
-                "charged_bytes": total_charge,
-                "measurement_type": m_type,
-                "latency_us": lat_val,
-                "stop_ms": stop_val,
-                "is_failure": is_fail,
-                "elapsed_ms": round(self.elapsed_ms, 3),
-            })
-            return snapshot
+                if is_fail:
+                    self.metrics.total_read_failures += 1
+                    self.metrics.consecutive_read_failures += 1
+                else:
+                    self.metrics.consecutive_read_failures = 0
+
+                eff_prof_id = scope.profile_id or scope.operation_id
+                if eff_prof_id:
+                    p_usage = self._get_or_init_profile_usage(eff_prof_id)
+                    p_usage["bytes_read"] += total_charge
+                    p_usage["measured_bytes_read"] += actual_meas
+                    p_usage["conservative_estimated_bytes"] += actual_est
+                    p_usage["wall_clock_ms"] = round(p_usage["wall_clock_ms"] + (lat_val / 1000.0), 3)
+                    p_usage["target_stop_ms"] = round(p_usage["target_stop_ms"] + stop_val, 3)
+                    if is_fail:
+                        p_usage["failures"] += 1
+
+                self.metrics.wall_clock_elapsed_ms = round(self.elapsed_ms, 3)
+                if self.metrics.bytes_read >= self.limits.max_bytes_read:
+                    self.metrics.is_budget_exhausted = True
+                    self.metrics.exhaustion_reason = (
+                        f"EXCEEDED_BYTES_READ: current {self.metrics.bytes_read}B >= max {self.limits.max_bytes_read}B"
+                    )
+
+                self._finalize_scope_reservations(scope)
+                scope.state = status
+
+                snapshot = CommittedTransactionSnapshot(
+                    operation_id=scope.operation_id,
+                    accounting_owner=scope.owner,
+                    measured_bytes_read=meas_b,
+                    estimated_bytes_read=est_b,
+                    charged_bytes=total_charge,
+                    latency_us=lat_val,
+                    stop_ms=stop_val,
+                    is_failure=is_fail,
+                    accounting_status=status,
+                    measurement_type=m_type,
+                    fingerprint=cand_fp,
+                    metadata=frozen_meta,
+                    committed_at_ms=round(self.elapsed_ms, 3),
+                    session_id=self.session_id,
+                    physical_consumption_id=scope.physical_consumption_id,
+                )
+                self._committed_transactions[scope.operation_id] = snapshot
+                self._physical_consumption_records[scope.physical_consumption_id] = snapshot
+                self._unregister_active_scope(scope)
+
+                self._history.append({
+                    "event": "TRANSACTION_COMMIT",
+                    "operation_id": scope.operation_id,
+                    "accounting_owner": scope.owner,
+                    "measured_bytes_read": actual_meas if meas_b is not None else None,
+                    "estimated_bytes_read": actual_est,
+                    "charged_bytes": total_charge,
+                    "measurement_type": m_type,
+                    "latency_us": lat_val,
+                    "stop_ms": stop_val,
+                    "is_failure": is_fail,
+                    "elapsed_ms": round(self.elapsed_ms, 3),
+                })
+                return snapshot
+            except Exception as e:
+                if scope.charged_bytes > 0 and scope.operation_id not in self._committed_transactions:
+                    return self._record_emergency_failure_snapshot(scope, error=e)
+                raise
 
     def _finalize_scope_duplicate_or_collision(
         self,
@@ -886,6 +1150,18 @@ class ObservationBudgetTracker:
             else:
                 m_type = "MEASURED"
 
+            lat_val = max(0.0, float(scope.latency_us))
+            stop_val = max(0.0, float(scope.stop_ms))
+            actual_meas = meas_b if (meas_b is not None and meas_b >= 0) else 0
+            actual_est = est_b if (est_b is not None and est_b >= 0) else 0
+
+            try:
+                frozen_meta = freeze_metadata(scope.metadata)
+                meta_digest = canonical_metadata_digest(scope.metadata)
+            except Exception as meta_err:
+                frozen_meta = freeze_metadata({"metadata_error": str(meta_err)})
+                meta_digest = canonical_metadata_digest(frozen_meta)
+
             cand_fp = AccountingFingerprint(
                 operation_id=scope.operation_id,
                 accounting_owner=scope.owner,
@@ -895,69 +1171,210 @@ class ObservationBudgetTracker:
                 measurement_type=m_type,
                 profile_id=scope.profile_id,
                 is_failure=is_fail,
-                stop_ms=round(max(0.0, float(scope.stop_ms)), 4),
-                latency_us=round(max(0.0, float(scope.latency_us)), 4),
+                stop_ms=round(stop_val, 4),
+                latency_us=round(lat_val, 4),
                 session_id=self.session_id,
-                metadata_digest=canonical_metadata_digest({}),
+                metadata_digest=meta_digest,
+                physical_consumption_id=scope.physical_consumption_id,
             )
 
+            self._finalize_scope_reservations(scope)
             self._unregister_active_scope(scope)
 
-            if existing.fingerprint == cand_fp:
-                # Idempotent duplicate: identical fingerprint, no additional charges applied
+            if total_charge == 0:
+                # No physical bytes were consumed: idempotent logical reference
                 scope.state = "COMMITTED"
                 return existing
 
-            # Collision!
-            scope.state = "REJECTED"
-            # If the scope actually consumed bytes, preserve them in ledger through explicit collision snapshot
-            if total_charge > 0:
-                collision_id = f"{scope.operation_id}#collision_{uuid.uuid4().hex[:6]}"
+            # Physical consumption occurred!
+            eff_prof_id = scope.profile_id or scope.operation_id
+            is_logical_match = existing.fingerprint.matches_logical_fields(cand_fp)
+
+            if is_logical_match:
+                # Same logical operation, concurrent duplicate physical execution!
+                dup_id = f"{scope.operation_id}#duplicate_{scope.physical_consumption_id}"
+                scope.state = "COMMITTED"
+
                 self.metrics.bytes_read += total_charge
-                if meas_b and meas_b > 0:
-                    self.metrics.measured_bytes_read += meas_b
-                if est_b > 0:
-                    self.metrics.conservative_estimated_bytes += est_b
-                lat_val = max(0.0, float(scope.latency_us))
-                stop_val = max(0.0, float(scope.stop_ms))
+                if actual_meas > 0:
+                    self.metrics.measured_bytes_read += actual_meas
+                if actual_est > 0:
+                    self.metrics.conservative_estimated_bytes += actual_est
+                    if actual_meas == 0:
+                        self.metrics.unmeasured_reads_count += 1
+
                 self.metrics.observation_latency_us += lat_val
                 self.metrics.target_stop_duration_ms += stop_val
-                self.metrics.total_read_failures += 1
-                if self.metrics.bytes_read >= self.limits.max_bytes_read:
-                    self.metrics.is_budget_exhausted = True
 
-                eff_prof_id = scope.profile_id or scope.operation_id
+                if is_fail:
+                    self.metrics.total_read_failures += 1
+                    self.metrics.consecutive_read_failures += 1
+                else:
+                    self.metrics.consecutive_read_failures = 0
+
                 if eff_prof_id:
                     p_usage = self._get_or_init_profile_usage(eff_prof_id)
                     p_usage["bytes_read"] += total_charge
-                    p_usage["measured_bytes_read"] += (meas_b or 0)
-                    p_usage["conservative_estimated_bytes"] += est_b
+                    p_usage["measured_bytes_read"] += actual_meas
+                    p_usage["conservative_estimated_bytes"] += actual_est
                     p_usage["wall_clock_ms"] = round(p_usage["wall_clock_ms"] + (lat_val / 1000.0), 3)
                     p_usage["target_stop_ms"] = round(p_usage["target_stop_ms"] + stop_val, 3)
-                    p_usage["failures"] += 1
+                    if is_fail:
+                        p_usage["failures"] += 1
 
-                collision_snap = CommittedTransactionSnapshot(
-                    operation_id=collision_id,
+                self.metrics.wall_clock_elapsed_ms = round(self.elapsed_ms, 3)
+                if self.metrics.bytes_read >= self.limits.max_bytes_read:
+                    self.metrics.is_budget_exhausted = True
+                    self.metrics.exhaustion_reason = (
+                        f"EXCEEDED_BYTES_READ: current {self.metrics.bytes_read}B >= max {self.limits.max_bytes_read}B"
+                    )
+
+                dup_snap = CommittedTransactionSnapshot(
+                    operation_id=dup_id,
                     accounting_owner=scope.owner,
                     measured_bytes_read=meas_b,
                     estimated_bytes_read=est_b,
                     charged_bytes=total_charge,
                     latency_us=lat_val,
                     stop_ms=stop_val,
-                    is_failure=True,
-                    accounting_status="REJECTED",
+                    is_failure=is_fail,
+                    accounting_status="COMMITTED",
                     measurement_type=m_type,
                     fingerprint=cand_fp,
-                    metadata={"collision_with": scope.operation_id},
+                    metadata=freeze_metadata({"duplicate_of": scope.operation_id, **unfreeze_metadata(frozen_meta)}),
                     committed_at_ms=round(self.elapsed_ms, 3),
                     session_id=self.session_id,
+                    physical_consumption_id=scope.physical_consumption_id,
                 )
-                self._committed_transactions[collision_id] = collision_snap
+                self._committed_transactions[dup_id] = dup_snap
+                self._physical_consumption_records[scope.physical_consumption_id] = dup_snap
+                return dup_snap
+
+            # Collision!
+            scope.state = "REJECTED"
+            collision_id = f"{scope.operation_id}#collision_{scope.physical_consumption_id}"
+            self.metrics.bytes_read += total_charge
+            if actual_meas > 0:
+                self.metrics.measured_bytes_read += actual_meas
+            if actual_est > 0:
+                self.metrics.conservative_estimated_bytes += actual_est
+            self.metrics.observation_latency_us += lat_val
+            self.metrics.target_stop_duration_ms += stop_val
+            self.metrics.total_read_failures += 1
+
+            if eff_prof_id:
+                p_usage = self._get_or_init_profile_usage(eff_prof_id)
+                p_usage["bytes_read"] += total_charge
+                p_usage["measured_bytes_read"] += actual_meas
+                p_usage["conservative_estimated_bytes"] += actual_est
+                p_usage["wall_clock_ms"] = round(p_usage["wall_clock_ms"] + (lat_val / 1000.0), 3)
+                p_usage["target_stop_ms"] = round(p_usage["target_stop_ms"] + stop_val, 3)
+                p_usage["failures"] += 1
+
+            if self.metrics.bytes_read >= self.limits.max_bytes_read:
+                self.metrics.is_budget_exhausted = True
+
+            collision_snap = CommittedTransactionSnapshot(
+                operation_id=collision_id,
+                accounting_owner=scope.owner,
+                measured_bytes_read=meas_b,
+                estimated_bytes_read=est_b,
+                charged_bytes=total_charge,
+                latency_us=lat_val,
+                stop_ms=stop_val,
+                is_failure=True,
+                accounting_status="REJECTED",
+                measurement_type=m_type,
+                fingerprint=cand_fp,
+                metadata=freeze_metadata({"collision_with": scope.operation_id, **unfreeze_metadata(frozen_meta)}),
+                committed_at_ms=round(self.elapsed_ms, 3),
+                session_id=self.session_id,
+                physical_consumption_id=scope.physical_consumption_id,
+            )
+            self._committed_transactions[collision_id] = collision_snap
+            self._physical_consumption_records[scope.physical_consumption_id] = collision_snap
 
             raise ValueError(
                 f"Operation ID collision: '{scope.operation_id}' was already committed with "
                 f"fingerprint {existing.fingerprint}, conflicting with candidate {cand_fp}"
             )
+
+    def _record_emergency_failure_snapshot(
+        self,
+        scope: "ActiveOperationScope",
+        error: Exception,
+    ) -> CommittedTransactionSnapshot:
+        """Emergency ledger commit preserving consumed physical bytes when an unexpected finalization error occurs."""
+        with self._transaction_lock:
+            meas_b = scope.measured_bytes_read
+            est_b = scope.estimated_bytes_read
+            total_charge = scope.charged_bytes
+            lat_val = max(0.0, float(scope.latency_us))
+            stop_val = max(0.0, float(scope.stop_ms))
+
+            self.metrics.bytes_read += total_charge
+            if meas_b and meas_b > 0:
+                self.metrics.measured_bytes_read += meas_b
+            if est_b > 0:
+                self.metrics.conservative_estimated_bytes += est_b
+            self.metrics.observation_latency_us += lat_val
+            self.metrics.target_stop_duration_ms += stop_val
+            self.metrics.total_read_failures += 1
+
+            eff_prof_id = scope.profile_id or scope.operation_id
+            if eff_prof_id:
+                p_usage = self._get_or_init_profile_usage(eff_prof_id)
+                p_usage["bytes_read"] += total_charge
+                p_usage["measured_bytes_read"] += (meas_b or 0)
+                p_usage["conservative_estimated_bytes"] += est_b
+                p_usage["wall_clock_ms"] = round(p_usage["wall_clock_ms"] + (lat_val / 1000.0), 3)
+                p_usage["target_stop_ms"] = round(p_usage["target_stop_ms"] + stop_val, 3)
+                p_usage["failures"] += 1
+
+            if self.metrics.bytes_read >= self.limits.max_bytes_read:
+                self.metrics.is_budget_exhausted = True
+
+            scope.state = "FAILED"
+            self._finalize_scope_reservations(scope)
+            self._unregister_active_scope(scope)
+
+            err_meta = freeze_metadata({"emergency_error": str(error), "error_type": type(error).__name__})
+            fp = AccountingFingerprint(
+                operation_id=scope.operation_id,
+                accounting_owner=scope.owner,
+                measured_bytes_read=meas_b,
+                estimated_bytes_read=est_b,
+                charged_bytes=total_charge,
+                measurement_type="MEASURED" if meas_b else "ESTIMATED",
+                profile_id=scope.profile_id,
+                is_failure=True,
+                stop_ms=round(stop_val, 4),
+                latency_us=round(lat_val, 4),
+                session_id=self.session_id,
+                metadata_digest=canonical_metadata_digest(err_meta),
+                physical_consumption_id=scope.physical_consumption_id,
+            )
+
+            snap = CommittedTransactionSnapshot(
+                operation_id=scope.operation_id,
+                accounting_owner=scope.owner,
+                measured_bytes_read=meas_b,
+                estimated_bytes_read=est_b,
+                charged_bytes=total_charge,
+                latency_us=lat_val,
+                stop_ms=stop_val,
+                is_failure=True,
+                accounting_status="FAILED",
+                measurement_type=fp.measurement_type,
+                fingerprint=fp,
+                metadata=err_meta,
+                committed_at_ms=round(self.elapsed_ms, 3),
+                session_id=self.session_id,
+                physical_consumption_id=scope.physical_consumption_id,
+            )
+            self._committed_transactions[scope.operation_id] = snap
+            self._physical_consumption_records[scope.physical_consumption_id] = snap
+            return snap
 
     def reconcile_ledger(self) -> Dict[str, Any]:
         """Deterministically verifies that all aggregate metrics match the authoritative ledger exactly."""
@@ -969,6 +1386,8 @@ class ObservationBudgetTracker:
             sum_latency = sum(s.latency_us for s in snaps)
             sum_stop = sum(s.stop_ms for s in snaps)
             sum_failures = sum(1 for s in snaps if s.is_failure)
+            sum_failed_status = sum(1 for s in snaps if s.accounting_status == "FAILED")
+            sum_rejected_status = sum(1 for s in snaps if s.accounting_status == "REJECTED")
 
             discrepancies = []
             if sum_charged != self.metrics.bytes_read:
@@ -986,10 +1405,29 @@ class ObservationBudgetTracker:
 
             # Check profile usage
             for prof_id, p_usage in self.metrics.profile_usage.items():
-                p_snaps = [s for s in snaps if (s.fingerprint.profile_id == prof_id or (s.fingerprint.profile_id is None and s.operation_id == prof_id))]
+                p_snaps = [
+                    s for s in snaps
+                    if (s.fingerprint.profile_id == prof_id
+                        or (s.fingerprint.profile_id is None and s.operation_id == prof_id)
+                        or (s.fingerprint.profile_id is None and s.operation_id.startswith(f"{prof_id}#")))
+                ]
                 p_charged = sum(s.charged_bytes for s in p_snaps)
+                p_meas = sum(s.measured_bytes_read or 0 for s in p_snaps if s.measured_bytes_read is not None)
+                p_est = sum(s.estimated_bytes_read for s in p_snaps)
+                p_fails = sum(1 for s in p_snaps if s.is_failure)
                 if p_charged != p_usage["bytes_read"]:
                     discrepancies.append(f"profile '{prof_id}' bytes: ledger={p_charged} vs usage={p_usage['bytes_read']}")
+                if p_meas != p_usage["measured_bytes_read"]:
+                    discrepancies.append(f"profile '{prof_id}' measured: ledger={p_meas} vs usage={p_usage['measured_bytes_read']}")
+                if p_est != p_usage["conservative_estimated_bytes"]:
+                    discrepancies.append(f"profile '{prof_id}' estimated: ledger={p_est} vs usage={p_usage['conservative_estimated_bytes']}")
+                if p_fails != p_usage["failures"]:
+                    discrepancies.append(f"profile '{prof_id}' failures: ledger={p_fails} vs usage={p_usage['failures']}")
+
+            active_res_bytes = sum(r.reserved_bytes for r in self._active_reservations.values() if r.state == "RESERVED")
+            active_in_flight_bytes = self._active_consumed_bytes()
+            duplicate_snaps = [s for s in snaps if "#duplicate_" in s.operation_id]
+            collision_snaps = [s for s in snaps if "#collision_" in s.operation_id]
 
             if discrepancies:
                 raise AssertionError(f"Tracker ledger reconciliation failed: {'; '.join(discrepancies)}")
@@ -1003,6 +1441,13 @@ class ObservationBudgetTracker:
                 "total_latency_us": sum_latency,
                 "total_stop_ms": sum_stop,
                 "total_failures": sum_failures,
+                "total_failed_outcomes": sum_failed_status,
+                "total_rejected_outcomes": sum_rejected_status,
+                "duplicate_logical_operations_count": len(duplicate_snaps),
+                "collision_records_count": len(collision_snaps),
+                "physical_consumption_records_count": len(self._physical_consumption_records),
+                "active_reservations_bytes": active_res_bytes,
+                "active_in_flight_bytes": active_in_flight_bytes,
             }
 
     def commit_transaction(
@@ -1038,10 +1483,11 @@ class ObservationBudgetTracker:
                     f"Failed operation ID '{record.operation_id}' cannot be recommitted as a successful transaction"
                 )
 
-            # 2. Validate record fields
+            # 2. Validate record fields & freeze metadata
             try:
                 record.validate()
-                freeze_metadata(record.metadata)
+                frozen_meta = freeze_metadata(record.metadata)
+                meta_digest = canonical_metadata_digest(record.metadata)
             except (ValueError, TypeError) as ve:
                 with record._lock:
                     record.transition_to("FAILED")
@@ -1099,11 +1545,15 @@ class ObservationBudgetTracker:
                 else:
                     record.measurement_type = "ZERO_BYTES"
 
+            phys_id = record.physical_consumption_id or f"{record.operation_id}__phys_commit"
+            record.physical_consumption_id = phys_id
+
             cand_fingerprint = record.create_fingerprint(
                 profile_id=profile_id,
                 is_failure=is_failure,
                 stop_ms=stop_ms,
                 session_id=self.session_id,
+                physical_consumption_id=phys_id,
             )
 
             # 5. Collision & Deduplication check against authoritative committed snapshots
@@ -1117,8 +1567,8 @@ class ObservationBudgetTracker:
                     raise ValueError(
                         f"Rejected operation ID '{record.operation_id}' cannot be recommitted as a successful transaction"
                     )
-                if existing.fingerprint == cand_fingerprint:
-                    # Idempotent duplicate: record is marked COMMITTED without charging again
+                if existing.fingerprint.matches_logical_fields(cand_fingerprint):
+                    # Duplicate commit of the same logical record: idempotent no-op
                     with record._lock:
                         if record.accounting_status != "COMMITTED":
                             record.transition_to("COMMITTED")
@@ -1231,8 +1681,10 @@ class ObservationBudgetTracker:
                 metadata=dict(record.metadata),
                 committed_at_ms=round(self.elapsed_ms, 3),
                 session_id=self.session_id,
+                physical_consumption_id=phys_id,
             )
             self._committed_transactions[record.operation_id] = snapshot
+            self._physical_consumption_records[phys_id] = snapshot
             return True
 
     def _register_scope_transaction(
@@ -1244,15 +1696,18 @@ class ObservationBudgetTracker:
     ) -> CommittedTransactionSnapshot:
         """Internal tracker method registering accumulated scope transactions into ledger."""
         with self._transaction_lock:
+            phys_id = record.physical_consumption_id or f"{record.operation_id}__phys_scope"
+            record.physical_consumption_id = phys_id
             cand_fp = record.create_fingerprint(
                 profile_id=profile_id,
                 is_failure=is_failure,
                 stop_ms=stop_ms,
                 session_id=self.session_id,
+                physical_consumption_id=phys_id,
             )
             if record.operation_id in self._committed_transactions:
                 existing = self._committed_transactions[record.operation_id]
-                if existing.fingerprint == cand_fp:
+                if existing.fingerprint.matches_logical_fields(cand_fp):
                     return existing
                 raise ValueError(
                     f"Operation ID collision: '{record.operation_id}' was already committed with "
@@ -1278,9 +1733,21 @@ class ObservationBudgetTracker:
                 metadata=dict(record.metadata),
                 committed_at_ms=round(self.elapsed_ms, 3),
                 session_id=self.session_id,
+                physical_consumption_id=phys_id,
             )
             self._committed_transactions[record.operation_id] = snapshot
+            self._physical_consumption_records[phys_id] = snapshot
             return snapshot
+
+    def get_physical_consumption_records(self) -> Dict[str, CommittedTransactionSnapshot]:
+        """Returns read-only dictionary of all physical consumption records."""
+        with self._transaction_lock:
+            return dict(self._physical_consumption_records)
+
+    def get_active_reservations(self) -> Dict[str, BudgetReservation]:
+        """Returns read-only dictionary of active reservations."""
+        with self._transaction_lock:
+            return dict(self._active_reservations)
 
     def is_operation_committed(self, operation_id: str) -> bool:
         """Returns True if the operation_id has an authoritative committed transaction."""
@@ -1624,6 +2091,7 @@ class ObservationBudgetTracker:
 
             # Standalone read ledger registration (when called outside an operation_scope)
             if not in_scope and attributed_operation_id:
+                phys_id = f"{attributed_operation_id}__phys_standalone"
                 cand_fp = AccountingFingerprint(
                     operation_id=attributed_operation_id,
                     accounting_owner="STANDALONE_READ",
@@ -1637,6 +2105,7 @@ class ObservationBudgetTracker:
                     latency_us=round(lat_val, 4),
                     session_id=self.session_id,
                     metadata_digest=canonical_metadata_digest({}),
+                    physical_consumption_id=phys_id,
                 )
                 snapshot = CommittedTransactionSnapshot(
                     operation_id=attributed_operation_id,
@@ -1653,8 +2122,10 @@ class ObservationBudgetTracker:
                     metadata={},
                     committed_at_ms=round(self.elapsed_ms, 3),
                     session_id=self.session_id,
+                    physical_consumption_id=phys_id,
                 )
                 self._committed_transactions[attributed_operation_id] = snapshot
+                self._physical_consumption_records[phys_id] = snapshot
 
             return rec_summary
 
