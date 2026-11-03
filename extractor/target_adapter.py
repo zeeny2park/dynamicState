@@ -755,10 +755,12 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
     def read_memory_batch(
         self,
         pid: int,
-        requests: List[Tuple[int, int]],
+        requests: Optional[List[Tuple[int, int]]] = None,
         admission: Optional[Any] = None,
         budget_tracker: Optional[Any] = None,
+        slices: Optional[List[Tuple[int, int]]] = None,
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
+        eff_requests = requests if requests is not None else (slices or [])
         eff_tracker = budget_tracker or self.get_budget_tracker()
         supports_adm = _adapter_supports_admission(self._inner, "read_memory_batch")
         if eff_tracker is not None:
@@ -767,11 +769,11 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
                     f"Target adapter {type(self._inner).__name__} does not support budget admission, "
                     f"but budget tracking is active."
                 )
-            return self._inner.read_memory_batch(pid, requests, admission=admission, budget_tracker=eff_tracker)
+            return self._inner.read_memory_batch(pid, eff_requests, admission=admission, budget_tracker=eff_tracker)
         else:
             if supports_adm:
-                return self._inner.read_memory_batch(pid, requests, admission=admission, budget_tracker=None)
-            return self._inner.read_memory_batch(pid, requests)
+                return self._inner.read_memory_batch(pid, eff_requests, admission=admission, budget_tracker=None)
+            return self._inner.read_memory_batch(pid, eff_requests)
 
     def resolve_mutex_owner(
         self,
