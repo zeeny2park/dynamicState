@@ -216,6 +216,7 @@ class CommittedTransactionSnapshot:
     fingerprint: AccountingFingerprint
     metadata: Any
     committed_at_ms: float
+    committed_duration_ms: float = 0.0
     session_id: Optional[str] = None
     physical_consumption_id: Optional[str] = None
     accounting_transaction_id: Optional[str] = None
@@ -239,6 +240,8 @@ class CommittedTransactionSnapshot:
             "is_failure": self.is_failure,
             "accounting_status": self.accounting_status,
             "measurement_type": self.measurement_type,
+            "committed_at_ms": self.committed_at_ms,
+            "committed_duration_ms": self.committed_duration_ms,
             "metadata": unfreeze_metadata(self.metadata),
             "session_id": self.session_id,
             "physical_consumption_id": self.physical_consumption_id,
@@ -278,6 +281,7 @@ class CommittedTransactionSnapshot:
             fingerprint=self.fingerprint,
             metadata=clone_frozen(self.metadata) if self.metadata is not None else None,
             committed_at_ms=self.committed_at_ms,
+            committed_duration_ms=self.committed_duration_ms,
             session_id=self.session_id,
             physical_consumption_id=self.physical_consumption_id,
             accounting_transaction_id=self.accounting_transaction_id,
@@ -573,6 +577,10 @@ class PhysicalReadRecord:
     def __post_init__(self) -> None:
         if self.target_spec is not None and not isinstance(self.target_spec, types.MappingProxyType):
             self.target_spec = clone_frozen(self.target_spec)
+        if self.terminal_at_ms is not None and self.terminal_at_ms < self.created_at_ms:
+            raise ValueError(
+                f"Terminal timestamp regression: terminal_at_ms ({self.terminal_at_ms}) < created_at_ms ({self.created_at_ms})"
+            )
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "PhysicalReadRecord":
         with self._lock:
@@ -706,7 +714,12 @@ class PhysicalReadRecord:
             if self.state != "ADMITTED":
                 raise RuntimeError(f"Cannot release physical read '{self.physical_read_id}' in state '{self.state}'")
             self.state = "RELEASED"
-            self.terminal_at_ms = round(time.time() * 1000.0, 3)
+            t_now = round(time.time() * 1000.0, 3)
+            if t_now < self.created_at_ms:
+                raise ValueError(
+                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
+                )
+            self.terminal_at_ms = t_now
             self._transition_history.append("RELEASED")
 
         if self._parent_reservation is not None:
@@ -724,7 +737,12 @@ class PhysicalReadRecord:
             if self.state != "CONSUMED":
                 raise RuntimeError(f"Cannot account physical read '{self.physical_read_id}' in non-consumed state '{self.state}'")
             self.state = "ACCOUNTED"
-            self.terminal_at_ms = round(time.time() * 1000.0, 3)
+            t_now = round(time.time() * 1000.0, 3)
+            if t_now < self.created_at_ms:
+                raise ValueError(
+                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
+                )
+            self.terminal_at_ms = t_now
             self._transition_history.append("ACCOUNTED")
 
     def mark_failed_accounted(self, failure_reason: Optional[str] = None) -> None:
@@ -752,7 +770,12 @@ class PhysicalReadRecord:
             if failure_reason:
                 self.failure_reason = failure_reason
             self.state = "FAILED_ACCOUNTED"
-            self.terminal_at_ms = round(time.time() * 1000.0, 3)
+            t_now = round(time.time() * 1000.0, 3)
+            if t_now < self.created_at_ms:
+                raise ValueError(
+                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
+                )
+            self.terminal_at_ms = t_now
             self._transition_history.append("FAILED_ACCOUNTED")
 
         if self._parent_reservation is not None:
@@ -817,6 +840,10 @@ class PhysicalConsumptionRecord:
             object.__setattr__(self, "target_spec", freeze_metadata(self.target_spec))
         if self.metadata is not None and not isinstance(self.metadata, types.MappingProxyType):
             object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
+        if self.committed_at_ms > 0 and self.created_at_ms > 0 and self.committed_at_ms < self.created_at_ms:
+            raise ValueError(
+                f"Committed timestamp regression: committed_at_ms ({self.committed_at_ms}) < created_at_ms ({self.created_at_ms})"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -876,6 +903,7 @@ class RemoteInvocationRecord:
     physical_read_ids: Tuple[str, ...]
     start_time_ms: float
     completion_time_ms: Optional[float] = None
+    duration_ms: Optional[float] = None
     batch_id: Optional[str] = None
     return_code: Optional[int] = None
     exception: Optional[str] = None
@@ -885,6 +913,10 @@ class RemoteInvocationRecord:
     def __post_init__(self) -> None:
         if isinstance(self.physical_read_ids, list):
             object.__setattr__(self, "physical_read_ids", tuple(self.physical_read_ids))
+        if self.completion_time_ms is not None and self.completion_time_ms < self.start_time_ms:
+            raise ValueError(
+                f"Invocation timestamp regression: completion_time_ms ({self.completion_time_ms}) < start_time_ms ({self.start_time_ms})"
+            )
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "RemoteInvocationRecord":
         rec = RemoteInvocationRecord(
@@ -893,6 +925,7 @@ class RemoteInvocationRecord:
             physical_read_ids=self.physical_read_ids,
             start_time_ms=self.start_time_ms,
             completion_time_ms=self.completion_time_ms,
+            duration_ms=self.duration_ms,
             batch_id=self.batch_id,
             return_code=self.return_code,
             exception=self.exception,
@@ -909,8 +942,8 @@ class BatchSliceSpec:
     slice_index: int
     address: int
     requested_size: int
-    physical_read_id: str
-    physical_consumption_id: str
+    physical_read_id: Optional[str] = None
+    physical_consumption_id: Optional[str] = None
     completion_status: str = "NOT_EXECUTED"  # "OBSERVED", "PARTIAL", "FAILED", "UNAVAILABLE", "NOT_EXECUTED", "UNKNOWN"
     measured_bytes_read: Optional[int] = None
     estimated_bytes_read: int = 0
@@ -945,6 +978,10 @@ class BatchReadRecord:
     def __post_init__(self) -> None:
         if isinstance(self.slices, list):
             object.__setattr__(self, "slices", tuple(self.slices))
+        if self.slices:
+            indices = [s.slice_index for s in self.slices]
+            if len(indices) != len(set(indices)):
+                raise ValueError(f"Duplicate slice indices in batch contract: {indices}")
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "BatchReadRecord":
         rec = BatchReadRecord(
@@ -978,6 +1015,7 @@ class BudgetReservation:
     is_failure: bool = False
     scope_id: Optional[str] = None
     created_at_ms: float = 0.0
+    terminal_at_ms: Optional[float] = None
     physical_consumption_id: Optional[str] = None
     physical_read_id: Optional[str] = None
     child_reads: Dict[str, PhysicalReadRecord] = field(default_factory=dict)
@@ -996,6 +1034,7 @@ class BudgetReservation:
                 is_failure=self.is_failure,
                 scope_id=self.scope_id,
                 created_at_ms=self.created_at_ms,
+                terminal_at_ms=self.terminal_at_ms,
                 physical_consumption_id=self.physical_consumption_id,
                 physical_read_id=self.physical_read_id,
                 child_reads={k: copy.deepcopy(v, memo) for k, v in self.child_reads.items()},
@@ -1247,6 +1286,12 @@ class BudgetReservation:
                 if not cr.is_terminal:
                     cr.release()
             self.state = "RELEASED"
+            t_now = round(time.time() * 1000.0, 3)
+            if self.created_at_ms > 0 and t_now < self.created_at_ms:
+                raise ValueError(
+                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
+                )
+            self.terminal_at_ms = t_now
             self._transition_history.append("RELEASED")
 
     def account(self) -> None:
@@ -1263,6 +1308,12 @@ class BudgetReservation:
                 if cr.state == "CONSUMED":
                     cr.account()
             self.state = "ACCOUNTED"
+            t_now = round(time.time() * 1000.0, 3)
+            if self.created_at_ms > 0 and t_now < self.created_at_ms:
+                raise ValueError(
+                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
+                )
+            self.terminal_at_ms = t_now
             self._transition_history.append("ACCOUNTED")
 
     def finalize(self) -> None:
@@ -1283,6 +1334,12 @@ class BudgetReservation:
                 if cr.state == "CONSUMED":
                     cr.account()
             self.state = "ACCOUNTED" if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED") else "FINALIZED"
+            t_now = round(time.time() * 1000.0, 3)
+            if self.created_at_ms > 0 and t_now < self.created_at_ms:
+                raise ValueError(
+                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
+                )
+            self.terminal_at_ms = t_now
             self._transition_history.append(self.state)
 
     @property
@@ -1647,6 +1704,7 @@ class ObservationBudgetTracker:
         self._physical_read_records: Dict[str, PhysicalReadRecord] = {}
         self._active_reservations: Dict[str, BudgetReservation] = {}
         self._released_reservations: Dict[str, BudgetReservation] = {}
+        self._committed_reservations: Dict[str, BudgetReservation] = {}
         self._released_reservations_count: int = 0
         self._failed_operations: Dict[str, str] = {}
         self._fault_injection_hooks: Dict[str, Callable[[], None]] = {}
@@ -1654,6 +1712,7 @@ class ObservationBudgetTracker:
         self._thread_local = threading.local()
         self._active_scopes: Dict[str, Set[ActiveOperationScope]] = {}
         self._invocations: Dict[str, RemoteInvocationRecord] = {}
+        self._invocation_start_mono_ns: Dict[str, int] = {}
         self._batch_records: Dict[str, BatchReadRecord] = {}
 
     def get_invocation_records(self) -> Dict[str, RemoteInvocationRecord]:
@@ -1665,6 +1724,16 @@ class ObservationBudgetTracker:
         """Returns deep copy of registered batch records."""
         with self._transaction_lock:
             return copy.deepcopy(self._batch_records)
+
+    def get_committed_reservations(self) -> Dict[str, BudgetReservation]:
+        """Returns deep copy of committed reservations."""
+        with self._transaction_lock:
+            return copy.deepcopy(self._committed_reservations)
+
+    def get_released_reservations(self) -> Dict[str, BudgetReservation]:
+        """Returns deep copy of released reservations."""
+        with self._transaction_lock:
+            return copy.deepcopy(self._released_reservations)
 
     def record_invocation_started(
         self,
@@ -1678,16 +1747,25 @@ class ObservationBudgetTracker:
         with self._transaction_lock:
             if invocation_id in self._invocations:
                 raise ValueError(f"Duplicate invocation start: invocation_id '{invocation_id}' is already registered")
-            t = start_time_ms if start_time_ms is not None else round(time.time() * 1000.0, 3)
+            if start_time_ms is not None:
+                if not isinstance(start_time_ms, (int, float)) or math.isnan(start_time_ms) or math.isinf(start_time_ms) or start_time_ms <= 0:
+                    raise ValueError(f"Invalid start_time_ms: {start_time_ms}")
+                t = float(start_time_ms)
+            else:
+                t = round(time.time() * 1000.0, 3)
+
             rec = RemoteInvocationRecord(
                 invocation_id=invocation_id,
                 command_type=command_type,
                 physical_read_ids=tuple(physical_read_ids),
-                start_time_ms=float(t),
+                start_time_ms=t,
                 batch_id=batch_id,
                 outcome="IN_FLIGHT",
             )
             self._invocations[invocation_id] = rec
+            if not hasattr(self, "_invocation_start_mono_ns"):
+                self._invocation_start_mono_ns = {}
+            self._invocation_start_mono_ns[invocation_id] = time.monotonic_ns()
             return copy.deepcopy(rec)
 
     def record_invocation_completed(
@@ -1698,6 +1776,7 @@ class ObservationBudgetTracker:
         exception: Optional[str] = None,
         output_byte_count: int = 0,
         outcome: Optional[str] = None,
+        duration_ms: Optional[float] = None,
     ) -> None:
         """Records the completion of a physical command-runner invocation."""
         with self._transaction_lock:
@@ -1710,7 +1789,46 @@ class ObservationBudgetTracker:
                 raise RuntimeError(
                     f"Duplicate completion for invocation '{invocation_id}': already terminal '{rec.outcome}'"
                 )
-            t = completion_time_ms if completion_time_ms is not None else round(time.time() * 1000.0, 3)
+
+            # Validate completion_time_ms or compute it
+            if completion_time_ms is not None:
+                if not isinstance(completion_time_ms, (int, float)) or math.isnan(completion_time_ms) or math.isinf(completion_time_ms) or completion_time_ms <= 0:
+                    raise ValueError(f"Invalid completion_time_ms: {completion_time_ms}")
+                comp_ms = float(completion_time_ms)
+                # CRITICAL: Detect timestamp regression - never silently conceal with max()
+                if comp_ms < rec.start_time_ms:
+                    raise ValueError(
+                        f"Timestamp regression detected for invocation '{invocation_id}': "
+                        f"completion_time_ms ({comp_ms}) is earlier than start_time_ms ({rec.start_time_ms})"
+                    )
+            else:
+                if duration_ms is not None:
+                    comp_ms = round(rec.start_time_ms + duration_ms, 3)
+                else:
+                    t_now = round(time.time() * 1000.0, 3)
+                    if t_now < rec.start_time_ms:
+                        raise ValueError(
+                            f"Timestamp regression detected for invocation '{invocation_id}': "
+                            f"completion_time_ms ({t_now}) is earlier than start_time_ms ({rec.start_time_ms})"
+                        )
+                    comp_ms = t_now
+
+            # Monotonic duration measurement
+            eff_dur_ms = duration_ms
+            if eff_dur_ms is None and hasattr(self, "_invocation_start_mono_ns") and invocation_id in self._invocation_start_mono_ns:
+                start_mono_ns = self._invocation_start_mono_ns.pop(invocation_id)
+                end_mono_ns = time.monotonic_ns()
+                dur_ns = end_mono_ns - start_mono_ns
+                if dur_ns < 0:
+                    raise ValueError(f"Monotonic clock regressed for invocation '{invocation_id}': start_ns={start_mono_ns}, end_ns={end_mono_ns}")
+                eff_dur_ms = round(dur_ns / 1_000_000.0, 3)
+            elif eff_dur_ms is not None:
+                if not isinstance(eff_dur_ms, (int, float)) or math.isnan(eff_dur_ms) or math.isinf(eff_dur_ms) or eff_dur_ms < 0:
+                    raise ValueError(f"Invalid duration_ms: {eff_dur_ms}")
+                eff_dur_ms = float(eff_dur_ms)
+            else:
+                eff_dur_ms = round(comp_ms - rec.start_time_ms, 3)
+
             eff_outcome = outcome
             if not eff_outcome:
                 if exception:
@@ -1721,13 +1839,13 @@ class ObservationBudgetTracker:
                 else:
                     eff_outcome = "FAILED"
 
-            comp_ms = max(float(t), rec.start_time_ms)
             updated_rec = RemoteInvocationRecord(
                 invocation_id=rec.invocation_id,
                 command_type=rec.command_type,
                 physical_read_ids=rec.physical_read_ids,
                 start_time_ms=rec.start_time_ms,
                 completion_time_ms=comp_ms,
+                duration_ms=eff_dur_ms,
                 batch_id=rec.batch_id,
                 return_code=return_code,
                 exception=exception,
@@ -1930,7 +2048,7 @@ class ObservationBudgetTracker:
                 state="ADMITTED",
                 scope_id=scope.physical_consumption_id if scope else None,
                 physical_consumption_id=pcons_id,
-                created_at_ms=round(self.elapsed_ms, 3),
+                created_at_ms=round(time.time() * 1000.0, 3),
             )
             self._active_reservations[res_id] = res
             self._trigger_fault("after_admission_before_read")
@@ -2010,6 +2128,7 @@ class ObservationBudgetTracker:
                         )
 
             res_id = f"res_{uuid.uuid4().hex[:8]}"
+            pcons_id = f"pcons_{uuid.uuid4().hex[:12]}"
             res = BudgetReservation(
                 reservation_id=res_id,
                 operation_id=operation_id or (scope.operation_id if scope else "standalone"),
@@ -2017,8 +2136,8 @@ class ObservationBudgetTracker:
                 profile_id=eff_prof_id,
                 state="RESERVED",
                 scope_id=scope.physical_consumption_id if scope else None,
-                physical_consumption_id=scope.physical_consumption_id if scope else None,
-                created_at_ms=round(self.elapsed_ms, 3),
+                physical_consumption_id=pcons_id,
+                created_at_ms=round(time.time() * 1000.0, 3),
             )
             self._active_reservations[res_id] = res
             return res
@@ -2038,15 +2157,18 @@ class ObservationBudgetTracker:
         with self._transaction_lock:
             to_remove = []
             for r_id, res in list(self._active_reservations.items()):
-                if res.scope_id == scope.physical_consumption_id or (res.operation_id == scope.operation_id and res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED")):
+                if res.scope_id == scope.physical_consumption_id or (res.scope_id is None and res.operation_id == scope.operation_id and res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED")):
                     if res.consumed_bytes > 0 or scope.charged_bytes > 0:
                         res.finalize()
+                        self._committed_reservations[res.reservation_id] = res
                     else:
                         if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
                             res.release()
                             self._released_reservations_count += 1
+                            self._released_reservations[res.reservation_id] = res
                         else:
                             res.finalize()
+                            self._committed_reservations[res.reservation_id] = res
                     to_remove.append(r_id)
             for r_id in to_remove:
                 self._active_reservations.pop(r_id, None)
@@ -2281,7 +2403,8 @@ class ObservationBudgetTracker:
             measurement_type=m_type,
             fingerprint=cand_fp,
             metadata=frozen_meta,
-            committed_at_ms=round(self.elapsed_ms, 3),
+            committed_at_ms=round(time.time() * 1000.0, 3),
+            committed_duration_ms=round(self.elapsed_ms, 3),
             session_id=self.session_id,
             physical_consumption_id=scope.physical_consumption_id,
         )
@@ -2336,7 +2459,7 @@ class ObservationBudgetTracker:
             # Pre-validate child reads and physical IDs before mutating state
             all_res = list(prepared.scope._admissions)
             for r_id, res in self._active_reservations.items():
-                if res.scope_id == prepared.scope.physical_consumption_id or res.operation_id == prepared.scope.operation_id:
+                if res.scope_id == prepared.scope.physical_consumption_id or (res.scope_id is None and res.operation_id == prepared.scope.operation_id):
                     if res not in all_res:
                         all_res.append(res)
             for res in all_res:
@@ -2557,7 +2680,8 @@ class ObservationBudgetTracker:
                     measurement_type=prepared.snapshot.measurement_type,
                     fingerprint=fp,
                     metadata=err_meta,
-                    committed_at_ms=round(self.elapsed_ms, 3),
+                    committed_at_ms=round(time.time() * 1000.0, 3),
+            committed_duration_ms=round(self.elapsed_ms, 3),
                     session_id=self.session_id,
                     physical_consumption_id=prepared.snapshot.physical_consumption_id,
                 )
@@ -2566,7 +2690,7 @@ class ObservationBudgetTracker:
             # Preserve child reads into physical ledger
             all_res = list(prepared.scope._admissions)
             for r_id, res in self._active_reservations.items():
-                if res.scope_id == prepared.scope.physical_consumption_id or res.operation_id == prepared.scope.operation_id:
+                if res.scope_id == prepared.scope.physical_consumption_id or (res.scope_id is None and res.operation_id == prepared.scope.operation_id):
                     if res not in all_res:
                         all_res.append(res)
             for res in all_res:
@@ -2707,7 +2831,8 @@ class ObservationBudgetTracker:
                             measurement_type=cand_fp.measurement_type,
                             fingerprint=cand_fp,
                             metadata={"emergency_error": str(exc)},
-                            committed_at_ms=round(self.elapsed_ms, 3),
+                            committed_at_ms=round(time.time() * 1000.0, 3),
+            committed_duration_ms=round(self.elapsed_ms, 3),
                             session_id=self.session_id,
                             physical_consumption_id=scope.physical_consumption_id,
                         )
@@ -2783,7 +2908,8 @@ class ObservationBudgetTracker:
                             measurement_type=cand_fp.measurement_type,
                             fingerprint=cand_fp,
                             metadata={"emergency_error": str(exc)},
-                            committed_at_ms=round(self.elapsed_ms, 3),
+                            committed_at_ms=round(time.time() * 1000.0, 3),
+            committed_duration_ms=round(self.elapsed_ms, 3),
                             session_id=self.session_id,
                             physical_consumption_id=scope.physical_consumption_id,
                         )
@@ -3215,6 +3341,18 @@ class ObservationBudgetTracker:
                             f"Invariant 20 (batch slice completeness) violated: slice '{r.physical_read_id}' "
                             f"has invalid completion_status: {c_status}"
                         )
+                    if c_status in ("OBSERVED", "PARTIAL") and r.is_failure:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: slice '{r.physical_read_id}' "
+                            f"has successful status '{c_status}' but physical read is marked failure"
+                        )
+                    if c_status in ("FAILED", "UNAVAILABLE") and not r.is_failure and r.state != "RELEASED":
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: slice '{r.physical_read_id}' "
+                            f"has failure status '{c_status}' but physical read is not marked failure"
+                        )
                     if r.is_failure or c_status in ("FAILED", "UNAVAILABLE"):
                         if r.measured_bytes_read is not None and r.measured_bytes_read == 0 and r.estimated_bytes_read > 0:
                             inv_20_ok = False
@@ -3222,6 +3360,62 @@ class ObservationBudgetTracker:
                                 f"Invariant 20 (batch slice completeness) violated: failed slice '{r.physical_read_id}' "
                                 f"falsely reported measured_bytes_read=0 alongside estimated_bytes_read={r.estimated_bytes_read}"
                             )
+
+                # 5b. Authoritative BatchReadRecord contract vs actual slice comparison
+                if b_reg is not None and b_reg.slices:
+                    slices_by_idx = {s.slice_index: s for s in b_reg.slices}
+                    actual_by_idx = {r.target_spec.get("slice_index"): r for r in group if r.target_spec and "slice_index" in r.target_spec}
+                    for idx_val, s_spec in slices_by_idx.items():
+                        act_r = actual_by_idx.get(idx_val)
+                        if act_r is None:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} in contract has no matching physical read record"
+                            )
+                            continue
+                        act_spec = act_r.target_spec or {}
+                        act_addr = act_spec.get("address")
+                        if act_addr is not None and s_spec.address is not None and act_addr != s_spec.address:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} address mismatch: contract={s_spec.address} vs actual={act_addr}"
+                            )
+                        act_sz = act_spec.get("requested_size", act_spec.get("size"))
+                        if act_sz is not None and s_spec.requested_size is not None and act_sz != s_spec.requested_size:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} requested_size mismatch: contract={s_spec.requested_size} vs actual={act_sz}"
+                            )
+                        if s_spec.physical_read_id and act_r.physical_read_id and s_spec.physical_read_id != act_r.physical_read_id:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} physical_read_id mismatch: contract={s_spec.physical_read_id} vs actual={act_r.physical_read_id}"
+                            )
+                        if s_spec.physical_consumption_id and act_r.physical_consumption_id and s_spec.physical_consumption_id != act_r.physical_consumption_id:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} physical_consumption_id mismatch: contract={s_spec.physical_consumption_id} vs actual={act_r.physical_consumption_id}"
+                            )
+                    unexpected_contract_indices = set(actual_by_idx.keys()) - set(slices_by_idx.keys())
+                    if unexpected_contract_indices:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' has unexpected slice indices not in contract: {unexpected_contract_indices}"
+                        )
+                    for r in group:
+                        c_status = (r.target_spec or {}).get("completion_status")
+                        if r.state == "ACCOUNTED" and not r.is_failure:
+                            if c_status in ("NOT_EXECUTED", "FAILED"):
+                                inv_20_ok = False
+                                discrepancies.append(
+                                    f"Invariant 20 (batch slice completeness) violated: slice '{r.physical_read_id}' is accounted success but completion_status is '{c_status}'"
+                                )
+                        elif r.state == "FAILED_ACCOUNTED" or r.is_failure:
+                            if c_status == "OBSERVED" and r.measured_bytes_read == 0:
+                                inv_20_ok = False
+                                discrepancies.append(
+                                    f"Invariant 20 (batch slice completeness) violated: failed slice '{r.physical_read_id}' falsely marked OBSERVED with 0 bytes"
+                                )
 
                 # 6. Terminal status check when batch or parent reservation is completed
                 is_batch_committed = any(r.state in ("ACCOUNTED", "FAILED_ACCOUNTED") for r in group)
@@ -3294,11 +3488,17 @@ class ObservationBudgetTracker:
             # Validate registered batch contracts have valid invocations
             for b_key, b_rec in self._batch_records.items():
                 if self._invocations and b_rec.invocation_id not in self._invocations:
-                    inv_22_ok = False
-                    discrepancies.append(
-                        f"Invariant 22 (orphan batch contract) violated: registered batch '{b_rec.batch_id}' "
-                        f"references non-existent invocation_id '{b_rec.invocation_id}'"
-                    )
+                    batch_reads = [
+                        r for r in all_inspected_reads
+                        if getattr(r, "batch_id", None) == b_rec.batch_id
+                        or (getattr(r, "target_spec", None) or {}).get("batch_id") == b_rec.batch_id
+                    ]
+                    if not batch_reads or any(r.state not in ("ADMITTED", "RELEASED") for r in batch_reads):
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (orphan batch contract) violated: registered batch '{b_rec.batch_id}' "
+                            f"references non-existent invocation_id '{b_rec.invocation_id}'"
+                        )
 
             for inv_id, inv_rec in self._invocations.items():
                 if inv_rec.outcome != "PREFLIGHT_REJECTED" and inv_rec.physical_read_ids:
@@ -3323,7 +3523,7 @@ class ObservationBudgetTracker:
                 for r in all_inspected_reads:
                     ts = getattr(r, "target_spec", None) or {}
                     r_inv_id = ts.get("invocation_id")
-                    if r_inv_id:
+                    if r_inv_id and r.state not in ("ADMITTED", "RELEASED"):
                         if r_inv_id not in self._invocations:
                             inv_22_ok = False
                             discrepancies.append(
@@ -3353,6 +3553,85 @@ class ObservationBudgetTracker:
                                 f"Invariant 22 (orphan physical read) violated: committed read '{r.physical_read_id}' "
                                 f"has operation_id '{r.operation_id}' not found in committed transactions"
                             )
+
+            for p in phys_snaps:
+                if p.physical_read_id not in self._physical_read_records:
+                    inv_22_ok = False
+                    discrepancies.append(
+                        f"Invariant 22 (orphan physical consumption) violated: consumption '{p.physical_consumption_id}' has no matching physical read record in _physical_read_records"
+                    )
+
+            # 23. Reservation Registry Lifecycle Exclusivity & Ownership
+            inv_23_ok = True
+            act_ids = set(self._active_reservations.keys())
+            rel_ids = set(self._released_reservations.keys())
+            com_ids = set(getattr(self, "_committed_reservations", {}).keys())
+
+            overlap_act_rel = act_ids.intersection(rel_ids)
+            if overlap_act_rel:
+                inv_23_ok = False
+                discrepancies.append(
+                    f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in active and released registries: {overlap_act_rel}"
+                )
+            overlap_act_com = act_ids.intersection(com_ids)
+            if overlap_act_com:
+                inv_23_ok = False
+                discrepancies.append(
+                    f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in active and committed registries: {overlap_act_com}"
+                )
+            overlap_rel_com = rel_ids.intersection(com_ids)
+            if overlap_rel_com:
+                inv_23_ok = False
+                discrepancies.append(
+                    f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in released and committed registries: {overlap_rel_com}"
+                )
+
+            # Physical read lifecycle ownership across active, released, committed
+            committed_read_ids = set(self._physical_read_records.keys())
+            for r_id, r in self._active_reservations.items():
+                for cr_id, cr in r.child_reads.items():
+                    if cr_id in committed_read_ids and cr.state not in ("ACCOUNTED", "FAILED_ACCOUNTED"):
+                        inv_23_ok = False
+                        discrepancies.append(
+                            f"Invariant 23 (physical read ownership) violated: active reservation '{r_id}' child read '{cr_id}' already in committed physical ledger"
+                        )
+            for r_id, r in self._released_reservations.items():
+                for cr_id, cr in r.child_reads.items():
+                    if cr_id in committed_read_ids:
+                        inv_23_ok = False
+                        discrepancies.append(
+                            f"Invariant 23 (physical read ownership) violated: released reservation '{r_id}' child read '{cr_id}' found in committed physical ledger"
+                        )
+
+            # 24. Bottom-up reconstructed exactly-once accounting
+            inv_24_ok = True
+            reconstructed_measured = 0
+            reconstructed_estimated = 0
+            reconstructed_charged = 0
+            for pread_id, cr in self._physical_read_records.items():
+                m_val = cr.measured_bytes_read if cr.measured_bytes_read is not None else 0
+                e_val = cr.estimated_bytes_read
+                c_val = cr.charged_bytes
+                if c_val != m_val + e_val:
+                    inv_24_ok = False
+                    discrepancies.append(
+                        f"Invariant 24 (accounting reconstruction) violated: read '{pread_id}' charged_bytes ({c_val}) != measured ({m_val}) + estimated ({e_val})"
+                    )
+                if cr.measured_bytes_read is None and c_val == 0:
+                    inv_24_ok = False
+                    discrepancies.append(
+                        f"Invariant 24 (accounting reconstruction) violated: unmeasured/unknown read '{pread_id}' charged 0 bytes"
+                    )
+                reconstructed_measured += m_val
+                reconstructed_estimated += e_val
+                reconstructed_charged += c_val
+
+            cons_charged_total = sum(p.charged_bytes for p in self._physical_consumption_records.values())
+            if reconstructed_charged != cons_charged_total:
+                inv_24_ok = False
+                discrepancies.append(
+                    f"Invariant 24 (accounting reconstruction) violated: reconstructed physical read charged total ({reconstructed_charged}B) != physical consumption total ({cons_charged_total}B)"
+                )
 
             valid_states = {"ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"}
             for r_id, r in self._active_reservations.items():
@@ -3389,6 +3668,8 @@ class ObservationBudgetTracker:
                 "inv_20_batch_slice_completeness": inv_20_ok,
                 "inv_21_collector_fallback_provenance_separation": inv_21_ok,
                 "inv_22_invocation_provenance_and_orphan_detection": inv_22_ok,
+                "inv_23_reservation_registry_lifecycle_exclusivity": inv_23_ok,
+                "inv_24_accounting_reconstruction": inv_24_ok,
             }
 
             if discrepancies and raise_on_error:
@@ -3728,7 +4009,8 @@ class ObservationBudgetTracker:
                 measurement_type=record.measurement_type,
                 fingerprint=cand_fingerprint,
                 metadata=dict(record.metadata),
-                committed_at_ms=round(self.elapsed_ms, 3),
+                committed_at_ms=round(time.time() * 1000.0, 3),
+            committed_duration_ms=round(self.elapsed_ms, 3),
                 session_id=self.session_id,
                 physical_consumption_id=phys_id,
                 accounting_transaction_id=tx_id,
@@ -3804,24 +4086,30 @@ class ObservationBudgetTracker:
                     if res.consumed_bytes > 0 or total_charge > 0 or res.state == "CONSUMED":
                         if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
                             res.account()
+                        self._committed_reservations[res.reservation_id] = res
                     else:
                         if res.state in ("ADMITTED", "RESERVED"):
                             res.release()
                             self._released_reservations_count += 1
+                            self._released_reservations[res.reservation_id] = res
                         elif res.state == "PHYSICAL_READ_STARTED":
                             res.account()
+                            self._committed_reservations[res.reservation_id] = res
                     self._active_reservations.pop(res.reservation_id, None)
             for r_id, res in list(self._active_reservations.items()):
                 if res.operation_id == record.operation_id:
                     if res.consumed_bytes > 0 or total_charge > 0 or res.state == "CONSUMED":
                         if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
                             res.account()
+                        self._committed_reservations[res.reservation_id] = res
                     else:
                         if res.state in ("ADMITTED", "RESERVED"):
                             res.release()
                             self._released_reservations_count += 1
+                            self._released_reservations[res.reservation_id] = res
                         elif res.state == "PHYSICAL_READ_STARTED":
                             res.account()
+                            self._committed_reservations[res.reservation_id] = res
                     self._active_reservations.pop(r_id, None)
 
             return True
@@ -3870,7 +4158,8 @@ class ObservationBudgetTracker:
                 measurement_type=record.measurement_type,
                 fingerprint=cand_fp,
                 metadata=dict(record.metadata),
-                committed_at_ms=round(self.elapsed_ms, 3),
+                committed_at_ms=round(time.time() * 1000.0, 3),
+            committed_duration_ms=round(self.elapsed_ms, 3),
                 session_id=self.session_id,
                 physical_consumption_id=phys_id,
             )
@@ -3892,7 +4181,8 @@ class ObservationBudgetTracker:
                     accounting_status="COMMITTED",
                     measurement_type=record.measurement_type,
                     created_at_ms=round(time.time() * 1000.0, 3),
-                    committed_at_ms=round(self.elapsed_ms, 3),
+                    committed_at_ms=round(time.time() * 1000.0, 3),
+            committed_duration_ms=round(self.elapsed_ms, 3),
                     metadata=dict(record.metadata),
                 )
                 self._physical_consumption_records[phys_id] = root_pcons
@@ -4317,7 +4607,8 @@ class ObservationBudgetTracker:
                     measurement_type=cand_fp.measurement_type,
                     fingerprint=cand_fp,
                     metadata={},
-                    committed_at_ms=round(self.elapsed_ms, 3),
+                    committed_at_ms=round(time.time() * 1000.0, 3),
+            committed_duration_ms=round(self.elapsed_ms, 3),
                     session_id=self.session_id,
                     physical_consumption_id=phys_id,
                 )

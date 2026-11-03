@@ -606,8 +606,12 @@ class TestKeyLifecycleAndConcurrencyGates(unittest.TestCase):
                 del os.environ["DYNAMICSTATE_CAPTURE_KEY_FILE"]
             if saved_sec:
                 os.environ["DYNAMICSTATE_CAPTURE_SECRET"] = saved_sec
+            else:
+                os.environ.pop("DYNAMICSTATE_CAPTURE_SECRET", None)
             if saved_kr:
                 os.environ["DYNAMICSTATE_CAPTURE_KEYRING"] = saved_kr
+            else:
+                os.environ.pop("DYNAMICSTATE_CAPTURE_KEYRING", None)
 
     def test_gate_zero_secret_leakage_contract(self):
         """Zero-leakage security contract: keys and capability tokens are never revealed in repr, str, to_dict, or serialization."""

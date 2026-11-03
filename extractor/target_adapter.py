@@ -15,6 +15,7 @@ Enforces:
 
 from abc import ABC, abstractmethod
 import base64
+from contextlib import nullcontext
 import copy
 from dataclasses import dataclass, field
 import errno
@@ -3106,14 +3107,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return -2, "", f"SSH command execution failed before invocation: {pre_reason}"
 
         # 3. CROSS INVOCATION BOUNDARY: Mark physical execution started immediately before runner invocation
-        t_mono_start = time.monotonic()
+        t_mono_start_ns = time.monotonic_ns()
         t_start_ms = round(time.time() * 1000.0, 3)
-
-        if admission is not None and not admission.is_terminal and admission.state == "ADMITTED":
-            admission.mark_physical_read_started()
-        for cr in children:
-            if not cr.is_terminal and cr.state == "ADMITTED":
-                cr.mark_started()
 
         eff_tracker = getattr(self, "_budget_tracker", None)
         if eff_tracker is None and admission is not None and hasattr(admission, "tracker"):
@@ -3126,14 +3121,21 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 eff_tracker = None
 
         child_pids = [cr.physical_read_id for cr in children]
-        if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_started"):
-            eff_tracker.record_invocation_started(
-                invocation_id=eff_inv_id,
-                command_type=eff_cmd_type,
-                physical_read_ids=child_pids,
-                start_time_ms=t_start_ms,
-                batch_id=eff_batch_id,
-            )
+        with (getattr(eff_tracker, "_transaction_lock", None) or nullcontext()):
+            if admission is not None and not admission.is_terminal and admission.state == "ADMITTED":
+                admission.mark_physical_read_started()
+            for cr in children:
+                if not cr.is_terminal and cr.state == "ADMITTED":
+                    cr.mark_started()
+
+            if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_started"):
+                eff_tracker.record_invocation_started(
+                    invocation_id=eff_inv_id,
+                    command_type=eff_cmd_type,
+                    physical_read_ids=child_pids,
+                    start_time_ms=t_start_ms,
+                    batch_id=eff_batch_id,
+                )
         with getattr(self, "_invocation_lock", threading.RLock()):
             if not hasattr(self, "_invocations"):
                 self._invocations = {}
@@ -3158,8 +3160,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             rc, stdout, stderr = -1, "", f"SSH execution error: {e}"
             exc_str = f"{type(e).__name__}: {e}"
 
-        t_mono_end = time.monotonic()
-        dur_ms = max(0.0, (t_mono_end - t_mono_start) * 1000.0)
+        t_mono_end_ns = time.monotonic_ns()
+        dur_ns = t_mono_end_ns - t_mono_start_ns
+        if dur_ns < 0:
+            raise ValueError(f"Monotonic clock regressed: start_ns={t_mono_start_ns}, end_ns={t_mono_end_ns}")
+        dur_ms = round(dur_ns / 1_000_000.0, 3)
         t_comp_ms = round(t_start_ms + dur_ms, 3)
         out_bytes = len(stdout.encode("utf-8")) if stdout else 0
 
@@ -3188,12 +3193,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 exception=eff_exc,
                 output_byte_count=out_bytes,
                 outcome=eff_outcome,
+                duration_ms=dur_ms,
             )
         with getattr(self, "_invocation_lock", threading.RLock()):
             if eff_inv_id in self._invocations:
                 self._invocations[eff_inv_id].update({
                     "completion_time_ms": t_comp_ms,
                     "completion_time": t_comp_ms / 1000.0,
+                    "duration_ms": dur_ms,
                     "return_code": rc,
                     "exception": eff_exc,
                     "output_byte_count": out_bytes,
@@ -3930,45 +3937,46 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         if self.collector_path:
             inv_coll_id = f"inv_coll_{uuid.uuid4().hex[:12]}"
-            child_reads_coll = [
-                adm.start_child_read(
-                    target_type="remote_collector_memory_slice",
-                    target_spec={
-                        "pid": pid,
-                        "batch_id": batch_id,
-                        "invocation_id": inv_coll_id,
-                        "expected_slice_count": expected_slice_count,
-                        "slice_index": idx,
-                        "address": addr,
-                        "requested_size": sz,
-                        "size": sz,
-                        "path": self.collector_path,
-                        "invocation_type": "collector",
-                        "completion_status": "NOT_EXECUTED",
-                    },
-                )
-                for idx, (addr, sz) in enumerate(slices)
-            ] if adm is not None else [None for _ in slices]
+            with (getattr(eff_tracker, "_transaction_lock", None) or nullcontext()):
+                child_reads_coll = [
+                    adm.start_child_read(
+                        target_type="remote_collector_memory_slice",
+                        target_spec={
+                            "pid": pid,
+                            "batch_id": batch_id,
+                            "invocation_id": inv_coll_id,
+                            "expected_slice_count": expected_slice_count,
+                            "slice_index": idx,
+                            "address": addr,
+                            "requested_size": sz,
+                            "size": sz,
+                            "path": self.collector_path,
+                            "invocation_type": "collector",
+                            "completion_status": "NOT_EXECUTED",
+                        },
+                    )
+                    for idx, (addr, sz) in enumerate(slices)
+                ] if adm is not None else [None for _ in slices]
 
-            coll_slice_specs = [
-                BatchSliceSpec(
-                    slice_index=idx,
-                    address=addr,
-                    requested_size=sz,
-                    physical_read_id=child_reads_coll[idx].physical_read_id if child_reads_coll[idx] else f"cr_coll_{batch_id}_{idx}",
-                    physical_consumption_id=child_reads_coll[idx].physical_consumption_id if child_reads_coll[idx] else f"cons_coll_{batch_id}_{idx}",
-                    completion_status="NOT_EXECUTED",
-                )
-                for idx, (addr, sz) in enumerate(slices)
-            ]
+                coll_slice_specs = [
+                    BatchSliceSpec(
+                        slice_index=idx,
+                        address=addr,
+                        requested_size=sz,
+                        physical_read_id=child_reads_coll[idx].physical_read_id if child_reads_coll[idx] else f"cr_coll_{batch_id}_{idx}",
+                        physical_consumption_id=child_reads_coll[idx].physical_consumption_id if child_reads_coll[idx] else f"cons_coll_{batch_id}_{idx}",
+                        completion_status="NOT_EXECUTED",
+                    )
+                    for idx, (addr, sz) in enumerate(slices)
+                ]
 
-            if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
-                eff_tracker.register_batch_contract(
-                    batch_id=batch_id,
-                    invocation_id=inv_coll_id,
-                    expected_slice_count=expected_slice_count,
-                    slices=coll_slice_specs,
-                )
+                if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
+                    eff_tracker.register_batch_contract(
+                        batch_id=batch_id,
+                        invocation_id=inv_coll_id,
+                        expected_slice_count=expected_slice_count,
+                        slices=coll_slice_specs,
+                    )
 
             coll_res = self._read_slices_via_collector(
                 pid,
@@ -4008,44 +4016,45 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         # Shell fallback path
         inv_shell_id = f"inv_shell_{uuid.uuid4().hex[:12]}"
-        child_reads_shell = [
-            adm.start_child_read(
-                target_type="remote_shell_memory_slice",
-                target_spec={
-                    "pid": pid,
-                    "batch_id": batch_id,
-                    "invocation_id": inv_shell_id,
-                    "expected_slice_count": expected_slice_count,
-                    "slice_index": idx,
-                    "address": addr,
-                    "requested_size": sz,
-                    "size": sz,
-                    "invocation_type": "shell_fallback",
-                    "completion_status": "NOT_EXECUTED",
-                },
-            )
-            for idx, (addr, sz) in enumerate(slices)
-        ] if adm is not None else [None for _ in slices]
+        with (getattr(eff_tracker, "_transaction_lock", None) or nullcontext()):
+            child_reads_shell = [
+                adm.start_child_read(
+                    target_type="remote_shell_memory_slice",
+                    target_spec={
+                        "pid": pid,
+                        "batch_id": batch_id,
+                        "invocation_id": inv_shell_id,
+                        "expected_slice_count": expected_slice_count,
+                        "slice_index": idx,
+                        "address": addr,
+                        "requested_size": sz,
+                        "size": sz,
+                        "invocation_type": "shell_fallback",
+                        "completion_status": "NOT_EXECUTED",
+                    },
+                )
+                for idx, (addr, sz) in enumerate(slices)
+            ] if adm is not None else [None for _ in slices]
 
-        shell_slice_specs = [
-            BatchSliceSpec(
-                slice_index=idx,
-                address=addr,
-                requested_size=sz,
-                physical_read_id=child_reads_shell[idx].physical_read_id if child_reads_shell[idx] else f"cr_shell_{batch_id}_{idx}",
-                physical_consumption_id=child_reads_shell[idx].physical_consumption_id if child_reads_shell[idx] else f"cons_shell_{batch_id}_{idx}",
-                completion_status="NOT_EXECUTED",
-            )
-            for idx, (addr, sz) in enumerate(slices)
-        ]
+            shell_slice_specs = [
+                BatchSliceSpec(
+                    slice_index=idx,
+                    address=addr,
+                    requested_size=sz,
+                    physical_read_id=child_reads_shell[idx].physical_read_id if child_reads_shell[idx] else f"cr_shell_{batch_id}_{idx}",
+                    physical_consumption_id=child_reads_shell[idx].physical_consumption_id if child_reads_shell[idx] else f"cons_shell_{batch_id}_{idx}",
+                    completion_status="NOT_EXECUTED",
+                )
+                for idx, (addr, sz) in enumerate(slices)
+            ]
 
-        if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
-            eff_tracker.register_batch_contract(
-                batch_id=batch_id,
-                invocation_id=inv_shell_id,
-                expected_slice_count=expected_slice_count,
-                slices=shell_slice_specs,
-            )
+            if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
+                eff_tracker.register_batch_contract(
+                    batch_id=batch_id,
+                    invocation_id=inv_shell_id,
+                    expected_slice_count=expected_slice_count,
+                    slices=shell_slice_specs,
+                )
 
         cmds = []
         for idx, (addr, sz) in enumerate(slices):
@@ -4300,9 +4309,47 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "echo \"$pid|$comm|$exe|$cmd\"; "
             "done"
         )
-        rc, stdout, _ = self.run_ssh(f"sh -c {shlex.quote(remote_script)}", command_type="find_processes")
+        eff_tracker = budget_tracker or self.get_budget_tracker()
+        adm = None
+        own_adm = False
+        cr = None
+        if eff_tracker is not None:
+            adm, own_adm, rej_err = self._acquire_remote_admission(
+                projected_bytes=4096,
+                profile_id="find_processes",
+                budget_tracker=eff_tracker,
+            )
+            if rej_err:
+                return []
+            if adm is not None:
+                cr = adm.start_child_read(
+                    target_type="remote_find_processes",
+                    target_spec={"command_type": "find_processes"},
+                )
+
+        rc, stdout, stderr = self.run_ssh(
+            f"sh -c {shlex.quote(remote_script)}",
+            admission=adm,
+            child_read=cr,
+            command_type="find_processes",
+        )
+        if rc == -2:
+            if cr is not None and not cr.is_terminal:
+                cr.release()
+            self._finalize_remote_read(adm, own_adm, False, "find_processes", eff_tracker)
+            return []
+        if rc != 0:
+            if cr is not None and not cr.is_terminal:
+                cr.consume(actual_bytes=None, conservative_estimate_bytes=64, is_failure=True, failure_reason=stderr.strip() or f"Exit {rc}")
+            self._finalize_remote_read(adm, own_adm, True, "find_processes", eff_tracker)
+            return []
+        if cr is not None and not cr.is_terminal:
+            out_bytes = len(stdout.encode("utf-8")) if stdout else 0
+            cr.consume(actual_bytes=out_bytes, is_failure=False)
+        self._finalize_remote_read(adm, own_adm, False, "find_processes", eff_tracker)
+
         results: List[Dict[str, Any]] = []
-        if rc != 0 or not stdout:
+        if not stdout:
             return results
 
         q = (process_name or "").strip().lower()
@@ -4466,6 +4513,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         policy: str = "all",
         max_mb: int = 64,
         max_region_mb: int = 32,
+        budget_tracker: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Runs dynamicstate-collector --json on remote target to capture memory snapshot bundle."""
         if not self.collector_path:
@@ -4475,10 +4523,43 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             f"-t {int(timeout_ms)} --policy {shlex.quote(policy)} -m {int(max_mb)} -r {int(max_region_mb)} --json"
         )
         ssh_timeout = (float(timeout_ms) / 1000.0) + self.timeout_sec
-        rc, stdout, stderr = self.run_ssh(cmd, timeout=ssh_timeout, command_type="collector_snapshot")
+
+        eff_tracker = budget_tracker or self.get_budget_tracker()
+        adm = None
+        own_adm = False
+        cr = None
+        if eff_tracker is not None:
+            adm, own_adm, rej_err = self._acquire_remote_admission(
+                projected_bytes=max_mb * 1024 * 1024,
+                profile_id="collector_snapshot",
+                budget_tracker=eff_tracker,
+            )
+            if rej_err:
+                return {"success": False, "status": "BUDGET_EXHAUSTED", "error": rej_err}
+            if adm is not None:
+                cr = adm.start_child_read(
+                    target_type="remote_collector_snapshot",
+                    target_spec={"pid": pid, "command_type": "collector_snapshot"},
+                )
+
+        rc, stdout, stderr = self.run_ssh(
+            cmd,
+            timeout=ssh_timeout,
+            admission=adm,
+            child_read=cr,
+            command_type="collector_snapshot",
+        )
+        if rc == -2:
+            if cr is not None and not cr.is_terminal:
+                cr.release()
+            self._finalize_remote_read(adm, own_adm, False, "collector_snapshot", eff_tracker)
+            return {"success": False, "status": "PREFLIGHT_REJECTED", "error": stderr.strip()}
 
         # Empty stdout: transport failure, connection dropped, or remote timeout
         if not stdout.strip():
+            if cr is not None and not cr.is_terminal:
+                cr.consume(actual_bytes=None, conservative_estimate_bytes=4096, is_failure=True, failure_reason=stderr.strip() or f"Exit {rc}")
+            self._finalize_remote_read(adm, own_adm, True, "collector_snapshot", eff_tracker)
             is_to = (rc == -1 or "timed out" in stderr.lower())
             status = "SSH_TIMEOUT" if is_to else ("SSH_FAILURE" if rc != 0 else "FAILED")
             return {
@@ -4495,6 +4576,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             if not isinstance(payload, dict):
                 raise ValueError("Collector JSON output is not a dictionary object")
         except Exception as e:
+            if cr is not None and not cr.is_terminal:
+                cr.consume(actual_bytes=None, conservative_estimate_bytes=4096, is_failure=True, failure_reason=f"Failed to parse collector JSON output: {e}")
+            self._finalize_remote_read(adm, own_adm, True, "collector_snapshot", eff_tracker)
             return {
                 "success": False,
                 "status": "MALFORMED_OUTPUT",
@@ -4586,6 +4670,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 payload["status"] = "UNKNOWN_STATUS"
                 payload["success"] = False
                 payload["error"] = f"Collector finished with unrecognized status '{st}'"
+
+        if cr is not None and not cr.is_terminal:
+            is_succ = payload.get("success", False)
+            if is_succ:
+                cr.consume(actual_bytes=bytes_captured, is_failure=False)
+            else:
+                cr.consume(actual_bytes=None, conservative_estimate_bytes=4096, is_failure=True, failure_reason=payload.get("error", "Collector failure"))
+        self._finalize_remote_read(adm, own_adm, not payload.get("success", False), "collector_snapshot", eff_tracker)
 
         return payload
 
