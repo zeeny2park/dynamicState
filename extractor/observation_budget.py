@@ -303,7 +303,7 @@ class ObservationAccountingRecord:
     physical_consumption_id: Optional[str] = None
     accounting_transaction_id: Optional[str] = None
     physical_read_id: Optional[str] = None
-    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "ObservationAccountingRecord":
         with self._lock:
@@ -564,10 +564,10 @@ class PhysicalReadRecord:
     latency_us: float = 0.0
     is_failure: bool = False
     failure_reason: Optional[str] = None
-    created_at_ms: float = field(default_factory=time.time)
+    created_at_ms: float = field(default_factory=lambda: round(time.time() * 1000.0, 3))
     terminal_at_ms: Optional[float] = None
-    _parent_reservation: Optional[Any] = field(default=None, init=False, repr=False)
-    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _parent_reservation: Optional[Any] = field(default=None, init=False, repr=False, compare=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -706,7 +706,7 @@ class PhysicalReadRecord:
             if self.state != "ADMITTED":
                 raise RuntimeError(f"Cannot release physical read '{self.physical_read_id}' in state '{self.state}'")
             self.state = "RELEASED"
-            self.terminal_at_ms = time.time()
+            self.terminal_at_ms = round(time.time() * 1000.0, 3)
             self._transition_history.append("RELEASED")
 
         if self._parent_reservation is not None:
@@ -724,7 +724,7 @@ class PhysicalReadRecord:
             if self.state != "CONSUMED":
                 raise RuntimeError(f"Cannot account physical read '{self.physical_read_id}' in non-consumed state '{self.state}'")
             self.state = "ACCOUNTED"
-            self.terminal_at_ms = time.time()
+            self.terminal_at_ms = round(time.time() * 1000.0, 3)
             self._transition_history.append("ACCOUNTED")
 
     def mark_failed_accounted(self, failure_reason: Optional[str] = None) -> None:
@@ -752,7 +752,7 @@ class PhysicalReadRecord:
             if failure_reason:
                 self.failure_reason = failure_reason
             self.state = "FAILED_ACCOUNTED"
-            self.terminal_at_ms = time.time()
+            self.terminal_at_ms = round(time.time() * 1000.0, 3)
             self._transition_history.append("FAILED_ACCOUNTED")
 
         if self._parent_reservation is not None:
@@ -784,7 +784,7 @@ class PhysicalReadRecord:
                 target_type=self.target_type,
                 target_spec=self.target_spec,
                 created_at_ms=self.created_at_ms,
-                committed_at_ms=committed_at_ms or time.time(),
+                committed_at_ms=committed_at_ms if committed_at_ms is not None else round(time.time() * 1000.0, 3),
             )
 
 
@@ -868,12 +868,12 @@ class PhysicalConsumptionRecord:
         return rec
 
 
-@dataclass
+@dataclass(frozen=True)
 class RemoteInvocationRecord:
     """Authoritative runtime record of a single command-runner physical invocation."""
     invocation_id: str
     command_type: str
-    physical_read_ids: List[str]
+    physical_read_ids: Tuple[str, ...]
     start_time_ms: float
     completion_time_ms: Optional[float] = None
     batch_id: Optional[str] = None
@@ -882,11 +882,15 @@ class RemoteInvocationRecord:
     output_byte_count: int = 0
     outcome: str = "IN_FLIGHT"  # "IN_FLIGHT", "COMPLETED", "TIMEOUT", "TRANSPORT_ERROR", "FAILED", "PREFLIGHT_REJECTED"
 
+    def __post_init__(self) -> None:
+        if isinstance(self.physical_read_ids, list):
+            object.__setattr__(self, "physical_read_ids", tuple(self.physical_read_ids))
+
     def __deepcopy__(self, memo: Dict[int, Any]) -> "RemoteInvocationRecord":
         rec = RemoteInvocationRecord(
             invocation_id=self.invocation_id,
             command_type=self.command_type,
-            physical_read_ids=list(self.physical_read_ids),
+            physical_read_ids=self.physical_read_ids,
             start_time_ms=self.start_time_ms,
             completion_time_ms=self.completion_time_ms,
             batch_id=self.batch_id,
@@ -899,7 +903,7 @@ class RemoteInvocationRecord:
         return rec
 
 
-@dataclass
+@dataclass(frozen=True)
 class BatchSliceSpec:
     """Authoritative specification of a single memory slice within an execution batch."""
     slice_index: int
@@ -926,24 +930,28 @@ class BatchSliceSpec:
         return spec
 
 
-@dataclass
+@dataclass(frozen=True)
 class BatchReadRecord:
     """Authoritative record of a batch read operation across slices."""
     batch_id: str
     invocation_id: str
     expected_slice_count: int
-    slices: List[BatchSliceSpec] = field(default_factory=list)
+    slices: Tuple[BatchSliceSpec, ...] = field(default_factory=tuple)
     is_completed: bool = False
     is_partial: bool = False
     is_failed: bool = False
     created_at_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.slices, list):
+            object.__setattr__(self, "slices", tuple(self.slices))
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "BatchReadRecord":
         rec = BatchReadRecord(
             batch_id=self.batch_id,
             invocation_id=self.invocation_id,
             expected_slice_count=self.expected_slice_count,
-            slices=[copy.deepcopy(s, memo) for s in self.slices],
+            slices=tuple(copy.deepcopy(s, memo) for s in self.slices),
             is_completed=self.is_completed,
             is_partial=self.is_partial,
             is_failed=self.is_failed,
@@ -973,7 +981,7 @@ class BudgetReservation:
     physical_consumption_id: Optional[str] = None
     physical_read_id: Optional[str] = None
     child_reads: Dict[str, PhysicalReadRecord] = field(default_factory=dict)
-    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "BudgetReservation":
@@ -1072,7 +1080,7 @@ class BudgetReservation:
                 operation_id=self.operation_id,
                 target_type=target_type,
                 target_spec=target_spec,
-                created_at_ms=time.time(),
+                created_at_ms=round(time.time() * 1000.0, 3),
             )
             rec._parent_reservation = self
             self.child_reads[pread_id] = rec
@@ -1638,6 +1646,7 @@ class ObservationBudgetTracker:
         self._physical_consumption_records: Dict[str, Any] = {}
         self._physical_read_records: Dict[str, PhysicalReadRecord] = {}
         self._active_reservations: Dict[str, BudgetReservation] = {}
+        self._released_reservations: Dict[str, BudgetReservation] = {}
         self._released_reservations_count: int = 0
         self._failed_operations: Dict[str, str] = {}
         self._fault_injection_hooks: Dict[str, Callable[[], None]] = {}
@@ -1668,22 +1677,18 @@ class ObservationBudgetTracker:
         """Records the start of a physical command-runner invocation."""
         with self._transaction_lock:
             if invocation_id in self._invocations:
-                # If already registered with identical details, return it
-                existing = self._invocations[invocation_id]
-                if existing.command_type == command_type and set(existing.physical_read_ids) == set(physical_read_ids):
-                    return existing
-                raise ValueError(f"Duplicate invocation_id '{invocation_id}'")
-            t = start_time_ms if start_time_ms is not None else round(self.elapsed_ms, 3)
+                raise ValueError(f"Duplicate invocation start: invocation_id '{invocation_id}' is already registered")
+            t = start_time_ms if start_time_ms is not None else round(time.time() * 1000.0, 3)
             rec = RemoteInvocationRecord(
                 invocation_id=invocation_id,
                 command_type=command_type,
-                physical_read_ids=list(physical_read_ids),
-                start_time_ms=t,
+                physical_read_ids=tuple(physical_read_ids),
+                start_time_ms=float(t),
                 batch_id=batch_id,
                 outcome="IN_FLIGHT",
             )
             self._invocations[invocation_id] = rec
-            return rec
+            return copy.deepcopy(rec)
 
     def record_invocation_completed(
         self,
@@ -1698,27 +1703,38 @@ class ObservationBudgetTracker:
         with self._transaction_lock:
             rec = self._invocations.get(invocation_id)
             if rec is None:
-                rec = RemoteInvocationRecord(
-                    invocation_id=invocation_id,
-                    command_type="unknown",
-                    physical_read_ids=[],
-                    start_time_ms=round(self.elapsed_ms, 3),
+                raise RuntimeError(
+                    f"Cannot complete invocation '{invocation_id}': no start record registered"
                 )
-                self._invocations[invocation_id] = rec
-            t = completion_time_ms if completion_time_ms is not None else round(self.elapsed_ms, 3)
-            rec.completion_time_ms = t
-            rec.return_code = return_code
-            rec.exception = exception
-            rec.output_byte_count = max(0, int(output_byte_count or 0))
-            if outcome:
-                rec.outcome = outcome
-            elif exception:
-                exc_lower = str(exception).lower()
-                rec.outcome = "TIMEOUT" if ("timeout" in exc_lower or "timed out" in exc_lower) else "TRANSPORT_ERROR"
-            elif return_code == 0:
-                rec.outcome = "COMPLETED"
-            else:
-                rec.outcome = "FAILED"
+            if rec.outcome != "IN_FLIGHT":
+                raise RuntimeError(
+                    f"Duplicate completion for invocation '{invocation_id}': already terminal '{rec.outcome}'"
+                )
+            t = completion_time_ms if completion_time_ms is not None else round(time.time() * 1000.0, 3)
+            eff_outcome = outcome
+            if not eff_outcome:
+                if exception:
+                    exc_lower = str(exception).lower()
+                    eff_outcome = "TIMEOUT" if ("timeout" in exc_lower or "timed out" in exc_lower) else "TRANSPORT_ERROR"
+                elif return_code == 0:
+                    eff_outcome = "COMPLETED"
+                else:
+                    eff_outcome = "FAILED"
+
+            comp_ms = max(float(t), rec.start_time_ms)
+            updated_rec = RemoteInvocationRecord(
+                invocation_id=rec.invocation_id,
+                command_type=rec.command_type,
+                physical_read_ids=rec.physical_read_ids,
+                start_time_ms=rec.start_time_ms,
+                completion_time_ms=comp_ms,
+                batch_id=rec.batch_id,
+                return_code=return_code,
+                exception=exception,
+                output_byte_count=max(0, int(output_byte_count or 0)),
+                outcome=eff_outcome,
+            )
+            self._invocations[invocation_id] = updated_rec
 
     def register_batch_contract(
         self,
@@ -1729,18 +1745,29 @@ class ObservationBudgetTracker:
     ) -> BatchReadRecord:
         """Explicitly registers expected batch contract before invocation."""
         with self._transaction_lock:
-            if expected_slice_count <= 0:
-                raise ValueError(f"expected_slice_count must be positive: {expected_slice_count}")
+            if not isinstance(expected_slice_count, int) or expected_slice_count <= 0:
+                raise ValueError(f"expected_slice_count must be a positive integer: {expected_slice_count}")
             key = f"{batch_id}::{invocation_id}"
+            if key in self._batch_records:
+                existing = self._batch_records[key]
+                if existing.expected_slice_count != expected_slice_count:
+                    raise ValueError(
+                        f"Cannot modify expected_slice_count for batch '{batch_id}' invocation '{invocation_id}': "
+                        f"existing {existing.expected_slice_count} != requested {expected_slice_count}"
+                    )
+                raise ValueError(
+                    f"Duplicate batch contract registration: contract for '{key}' is already registered"
+                )
+            slice_tuple = tuple(slices) if slices else ()
             rec = BatchReadRecord(
                 batch_id=batch_id,
                 invocation_id=invocation_id,
                 expected_slice_count=int(expected_slice_count),
-                slices=list(slices or []),
-                created_at_ms=round(self.elapsed_ms, 3),
+                slices=slice_tuple,
+                created_at_ms=round(time.time() * 1000.0, 3),
             )
             self._batch_records[key] = rec
-            return rec
+            return copy.deepcopy(rec)
 
     def set_fault_injection(self, point: str, hook: Callable[[], None]) -> None:
         """Sets a deterministic fault injection hook for failure testing."""
@@ -2001,6 +2028,9 @@ class ObservationBudgetTracker:
         with self._transaction_lock:
             reservation.release()
             self._active_reservations.pop(reservation.reservation_id, None)
+            if not hasattr(self, "_released_reservations"):
+                self._released_reservations = {}
+            self._released_reservations[reservation.reservation_id] = reservation
             self._released_reservations_count += 1
 
     def _finalize_scope_reservations(self, scope: "ActiveOperationScope") -> None:
@@ -2349,7 +2379,7 @@ class ObservationBudgetTracker:
                                 cr.account()
                             pcons = cr.to_consumption_record(
                                 operation_id=prepared.target_op_id,
-                                committed_at_ms=time.time(),
+                                committed_at_ms=round(time.time() * 1000.0, 3),
                                 accounting_status=prepared.snapshot.accounting_status,
                             )
                             self._physical_read_records[cr.physical_read_id] = cr
@@ -2357,7 +2387,7 @@ class ObservationBudgetTracker:
                         elif cr.state == "FAILED_ACCOUNTED":
                             pcons = cr.to_consumption_record(
                                 operation_id=prepared.target_op_id,
-                                committed_at_ms=time.time(),
+                                committed_at_ms=round(time.time() * 1000.0, 3),
                                 accounting_status="FAILED",
                             )
                             self._physical_read_records[cr.physical_read_id] = cr
@@ -2378,8 +2408,8 @@ class ObservationBudgetTracker:
                         is_failure=prepared.snapshot.is_failure,
                         accounting_status=prepared.snapshot.accounting_status,
                         measurement_type=prepared.snapshot.measurement_type,
-                        created_at_ms=time.time(),
-                        committed_at_ms=time.time(),
+                        created_at_ms=round(time.time() * 1000.0, 3),
+                        committed_at_ms=round(time.time() * 1000.0, 3),
                         metadata=dict(prepared.snapshot.metadata),
                     )
                     self._physical_consumption_records[prepared.snapshot.physical_consumption_id] = root_pcons
@@ -2545,7 +2575,7 @@ class ObservationBudgetTracker:
                         cr.mark_failed_accounted(failure_reason=str(error))
                         pcons = cr.to_consumption_record(
                             operation_id=prepared.target_op_id,
-                            committed_at_ms=time.time(),
+                            committed_at_ms=round(time.time() * 1000.0, 3),
                             accounting_status="FAILED",
                         )
                         self._physical_read_records[cr.physical_read_id] = cr
@@ -2566,8 +2596,8 @@ class ObservationBudgetTracker:
                     is_failure=True,
                     accounting_status="FAILED",
                     measurement_type=prepared.snapshot.measurement_type,
-                    created_at_ms=time.time(),
-                    committed_at_ms=time.time(),
+                    created_at_ms=round(time.time() * 1000.0, 3),
+                    committed_at_ms=round(time.time() * 1000.0, 3),
                     metadata=dict(prepared.snapshot.metadata),
                 )
                 self._physical_consumption_records[prepared.snapshot.physical_consumption_id] = root_pcons
@@ -3054,6 +3084,11 @@ class ObservationBudgetTracker:
                     ts = getattr(cr, "target_spec", None) or {}
                     if "slice_index" in ts and cr.physical_read_id not in {x.physical_read_id for x in all_slices_for_batch}:
                         all_slices_for_batch.append(cr)
+            for r in getattr(self, "_released_reservations", {}).values():
+                for cr in getattr(r, "child_reads", {}).values():
+                    ts = getattr(cr, "target_spec", None) or {}
+                    if "slice_index" in ts and cr.physical_read_id not in {x.physical_read_id for x in all_slices_for_batch}:
+                        all_slices_for_batch.append(cr)
 
             batch_groups: Dict[Tuple[str, str], List[PhysicalReadRecord]] = {}
             for r in all_slices_for_batch:
@@ -3062,32 +3097,53 @@ class ObservationBudgetTracker:
                 inv_id = ts.get("invocation_id") or "unknown_inv"
                 batch_groups.setdefault((b_id, inv_id), []).append(r)
 
-            for (b_id, inv_id), group in batch_groups.items():
-                # 1. Expected slice count: validated if specified or registered
-                exp_counts = {r.target_spec.get("expected_slice_count") for r in group} - {None}
-                if not exp_counts:
-                    b_reg = self._batch_records.get(f"{b_id}::{inv_id}")
-                    if b_reg:
-                        exp_counts = {b_reg.expected_slice_count}
+            # Union of registered contracts and observed batch groups
+            all_batch_keys = set(batch_groups.keys())
+            for key, b_reg in self._batch_records.items():
+                all_batch_keys.add((b_reg.batch_id, b_reg.invocation_id))
 
-                if exp_counts:
-                    if len(exp_counts) > 1:
-                        inv_20_ok = False
-                        discrepancies.append(
-                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                            f"has conflicting expected_slice_count values: {exp_counts}"
-                        )
-                        continue
-                    expected_count = next(iter(exp_counts))
-                    if not isinstance(expected_count, int) or expected_count <= 0:
-                        inv_20_ok = False
-                        discrepancies.append(
-                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                            f"has invalid expected_slice_count: {expected_count}"
-                        )
-                        continue
-                else:
-                    expected_count = len(group)
+            for (b_id, inv_id) in sorted(all_batch_keys):
+                group = batch_groups.get((b_id, inv_id), [])
+                b_reg = self._batch_records.get(f"{b_id}::{inv_id}")
+
+                # 1. Expected slice count: strictly required, never inferred from len(group)
+                exp_counts = {r.target_spec.get("expected_slice_count") for r in group} - {None}
+                if b_reg is not None:
+                    exp_counts.add(b_reg.expected_slice_count)
+
+                if not exp_counts:
+                    inv_20_ok = False
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                        f"has no explicit expected_slice_count recorded"
+                    )
+                    continue
+
+                if len(exp_counts) > 1:
+                    inv_20_ok = False
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                        f"has conflicting expected_slice_count values: {exp_counts}"
+                    )
+                    continue
+
+                expected_count = next(iter(exp_counts))
+                if not isinstance(expected_count, int) or expected_count <= 0:
+                    inv_20_ok = False
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                        f"has invalid expected_slice_count: {expected_count}"
+                    )
+                    continue
+
+                # Batch with zero observed slice records
+                if not group:
+                    inv_20_ok = False
+                    discrepancies.append(
+                        f"Invariant 20 (batch slice completeness) violated: registered batch contract '{b_id}' invocation '{inv_id}' "
+                        f"has 0 observed slice records (expected {expected_count})"
+                    )
+                    continue
 
                 # 2. Validate every slice index in [0, expected_count)
                 slice_indices = [r.target_spec.get("slice_index") for r in group]
@@ -3167,6 +3223,18 @@ class ObservationBudgetTracker:
                                 f"falsely reported measured_bytes_read=0 alongside estimated_bytes_read={r.estimated_bytes_read}"
                             )
 
+                # 6. Terminal status check when batch or parent reservation is completed
+                is_batch_committed = any(r.state in ("ACCOUNTED", "FAILED_ACCOUNTED") for r in group)
+                if is_batch_committed:
+                    for r in group:
+                        c_status = r.target_spec.get("completion_status")
+                        if r.state not in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED") or c_status in ("NOT_EXECUTED", "UNKNOWN"):
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: slice '{r.physical_read_id}' "
+                                f"of committed batch '{b_id}' has non-terminal completion_status '{c_status}' or state '{r.state}'"
+                            )
+
             # 21. Collector / fallback provenance separation (Active AND Committed)
             inv_21_ok = True
             provenance_groups: Dict[str, List[PhysicalReadRecord]] = {}
@@ -3216,8 +3284,21 @@ class ObservationBudgetTracker:
 
             # 22. Invocation provenance & orphan record detection
             inv_22_ok = True
-            all_active_child_reads = [cr for r in self._active_reservations.values() for cr in getattr(r, "child_reads", {}).values()]
+            all_active_child_reads = (
+                [cr for r in self._active_reservations.values() for cr in getattr(r, "child_reads", {}).values()]
+                + [cr for r in getattr(self, "_released_reservations", {}).values() for cr in getattr(r, "child_reads", {}).values()]
+            )
             all_known_read_ids = set(read_ids).union({cr.physical_read_id for cr in all_active_child_reads})
+            all_inspected_reads = list(read_snaps) + all_active_child_reads
+
+            # Validate registered batch contracts have valid invocations
+            for b_key, b_rec in self._batch_records.items():
+                if self._invocations and b_rec.invocation_id not in self._invocations:
+                    inv_22_ok = False
+                    discrepancies.append(
+                        f"Invariant 22 (orphan batch contract) violated: registered batch '{b_rec.batch_id}' "
+                        f"references non-existent invocation_id '{b_rec.invocation_id}'"
+                    )
 
             for inv_id, inv_rec in self._invocations.items():
                 if inv_rec.outcome != "PREFLIGHT_REJECTED" and inv_rec.physical_read_ids:
@@ -3228,9 +3309,17 @@ class ObservationBudgetTracker:
                                 f"Invariant 22 (invocation provenance) violated: orphan invocation '{inv_id}' "
                                 f"references non-existent physical_read_id '{pid_ref}'"
                             )
+                # Unresolved IN_FLIGHT check
+                if inv_rec.outcome == "IN_FLIGHT" and inv_rec.physical_read_ids:
+                    child_matches = [r for r in all_inspected_reads if r.physical_read_id in inv_rec.physical_read_ids]
+                    if child_matches and all(r.state in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED") for r in child_matches):
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (unresolved in-flight invocation) violated: invocation '{inv_id}' "
+                            f"remains IN_FLIGHT while all referenced physical reads are terminal"
+                        )
 
             if self._invocations:
-                all_inspected_reads = list(read_snaps) + all_active_child_reads
                 for r in all_inspected_reads:
                     ts = getattr(r, "target_spec", None) or {}
                     r_inv_id = ts.get("invocation_id")
@@ -3661,7 +3750,7 @@ class ObservationBudgetTracker:
                             cr.account()
                         pcons = cr.to_consumption_record(
                             operation_id=record.operation_id,
-                            committed_at_ms=time.time(),
+                            committed_at_ms=round(time.time() * 1000.0, 3),
                             accounting_status="COMMITTED",
                         )
                         self._physical_read_records[cr.physical_read_id] = cr
@@ -3669,7 +3758,7 @@ class ObservationBudgetTracker:
                     elif cr.state == "FAILED_ACCOUNTED":
                         pcons = cr.to_consumption_record(
                             operation_id=record.operation_id,
-                            committed_at_ms=time.time(),
+                            committed_at_ms=round(time.time() * 1000.0, 3),
                             accounting_status="FAILED",
                         )
                         self._physical_read_records[cr.physical_read_id] = cr
@@ -3690,8 +3779,8 @@ class ObservationBudgetTracker:
                     is_failure=is_failure,
                     accounting_status="COMMITTED",
                     measurement_type=record.measurement_type,
-                    created_at_ms=time.time(),
-                    committed_at_ms=time.time(),
+                    created_at_ms=round(time.time() * 1000.0, 3),
+                    committed_at_ms=round(time.time() * 1000.0, 3),
                     metadata=dict(record.metadata),
                 )
                 self._physical_consumption_records[phys_id] = root_pcons
@@ -3802,7 +3891,7 @@ class ObservationBudgetTracker:
                     is_failure=is_failure,
                     accounting_status="COMMITTED",
                     measurement_type=record.measurement_type,
-                    created_at_ms=time.time(),
+                    created_at_ms=round(time.time() * 1000.0, 3),
                     committed_at_ms=round(self.elapsed_ms, 3),
                     metadata=dict(record.metadata),
                 )
@@ -4246,8 +4335,8 @@ class ObservationBudgetTracker:
                     is_failure=is_failure,
                     accounting_status="COMMITTED",
                     measurement_type=cand_fp.measurement_type,
-                    created_at_ms=time.time(),
-                    committed_at_ms=time.time(),
+                    created_at_ms=round(time.time() * 1000.0, 3),
+                    committed_at_ms=round(time.time() * 1000.0, 3),
                     metadata={},
                 )
                 self._physical_consumption_records[phys_id] = pcons

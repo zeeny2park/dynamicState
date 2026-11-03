@@ -882,7 +882,7 @@ class TestPhase20A3415ReconciliationEnhancements(unittest.TestCase):
         """All 21 invariants evaluate to True on healthy transactions."""
         with self.tracker.operation_scope("op_healthy", profile_id="p1") as scope:
             adm = scope.admit_read(64)
-            cr = adm.start_child_read(target_spec={"slice_index": 0, "invocation_id": "inv_1"})
+            cr = adm.start_child_read(target_spec={"slice_index": 0, "invocation_id": "inv_1", "expected_slice_count": 1})
             cr.mark_started()
             cr.consume(actual_bytes=64)
             scope.record_read(bytes_read=64, admission=adm)

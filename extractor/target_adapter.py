@@ -15,6 +15,7 @@ Enforces:
 
 from abc import ABC, abstractmethod
 import base64
+import copy
 from dataclasses import dataclass, field
 import errno
 import os
@@ -22,6 +23,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import uuid
@@ -31,6 +33,7 @@ from .observation_budget import (
     validate_non_negative_int,
     validate_non_negative_float,
     ObservationAccountingRecord,
+    BatchSliceSpec,
 )
 
 
@@ -336,18 +339,66 @@ class TargetExecutionAdapter(ABC):
             except ValueError as ve:
                 return [(None, "BUDGET_EXHAUSTED", f"Observation budget admission rejected: {ve}") for _ in slices]
 
+        batch_id = f"batch_{uuid.uuid4().hex[:12]}"
+        inv_id = f"inv_local_{uuid.uuid4().hex[:12]}"
+        expected_slice_count = len(slices)
+
         if adm is not None and not adm.is_terminal:
             adm.mark_physical_read_started()
 
-        results = []
-        any_failure = False
+        child_reads = []
         for idx, (addr, sz) in enumerate(slices):
             child_read = None
             if adm is not None:
                 child_read = adm.start_child_read(
                     target_type="memory_slice",
-                    target_spec={"pid": pid, "address": addr, "size": sz, "slice_index": idx},
+                    target_spec={
+                        "pid": pid,
+                        "address": addr,
+                        "size": sz,
+                        "slice_index": idx,
+                        "expected_slice_count": expected_slice_count,
+                        "batch_id": batch_id,
+                        "invocation_id": inv_id,
+                        "completion_status": "NOT_EXECUTED",
+                    },
                 )
+            child_reads.append(child_read)
+
+        slice_specs = [
+            BatchSliceSpec(
+                slice_index=idx,
+                address=addr,
+                requested_size=sz,
+                physical_read_id=child_reads[idx].physical_read_id if child_reads[idx] else f"cr_loc_{batch_id}_{idx}",
+                physical_consumption_id=child_reads[idx].physical_consumption_id if child_reads[idx] else f"cons_loc_{batch_id}_{idx}",
+                completion_status="NOT_EXECUTED",
+            )
+            for idx, (addr, sz) in enumerate(slices)
+        ]
+
+        child_pids = [cr.physical_read_id for cr in child_reads if cr is not None]
+        if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
+            eff_tracker.register_batch_contract(
+                batch_id=batch_id,
+                invocation_id=inv_id,
+                expected_slice_count=expected_slice_count,
+                slices=slice_specs,
+            )
+        if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_started"):
+            eff_tracker.record_invocation_started(
+                invocation_id=inv_id,
+                command_type="local_memory_batch",
+                physical_read_ids=child_pids,
+                batch_id=batch_id,
+            )
+
+        results = []
+        any_failure = False
+        for idx, (addr, sz) in enumerate(slices):
+            child_read = child_reads[idx]
+            if child_read is not None and child_read.state == "ADMITTED":
+                child_read.mark_started()
 
             if _adapter_supports_admission(self, "read_memory"):
                 kwargs = {"admission": adm, "budget_tracker": eff_tracker}
@@ -363,10 +414,17 @@ class TargetExecutionAdapter(ABC):
             if is_fail:
                 any_failure = True
             if child_read is not None:
-                if child_read.state == "ADMITTED":
-                    child_read.release()
-                elif child_read.state == "PHYSICAL_READ_STARTED":
+                if hasattr(child_read, "update_target_spec"):
+                    child_read.update_target_spec({"completion_status": st})
+                if child_read.state in ("PHYSICAL_READ_STARTED", "CONSUMED"):
                     child_read.consume(actual_bytes=act_b, is_failure=is_fail)
+
+        if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_completed"):
+            eff_tracker.record_invocation_completed(
+                invocation_id=inv_id,
+                return_code=1 if any_failure else 0,
+                outcome="FAILED" if any_failure else "COMPLETED",
+            )
 
         if own_adm and adm is not None and eff_tracker is not None:
             tot_b = adm.consumed_bytes
@@ -411,6 +469,7 @@ class TargetExecutionAdapter(ABC):
         process_name: Optional[str] = None,
         companion_build_id: Optional[str] = None,
         limit: int = 50,
+        budget_tracker: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """Discovers running processes on the target host, optionally filtered by name or Build ID."""
         return []
@@ -715,6 +774,7 @@ class ReadOnlyTargetAdapter(TargetExecutionAdapter):
         process_name: Optional[str] = None,
         companion_build_id: Optional[str] = None,
         limit: int = 50,
+        budget_tracker: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         return self._inner.find_processes(
             process_name=process_name,
@@ -2667,6 +2727,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         process_name: Optional[str] = None,
         companion_build_id: Optional[str] = None,
         limit: int = 50,
+        budget_tracker: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         q = (process_name or "").strip().lower()
@@ -2782,6 +2843,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._last_maps_bytes_read: int = 0
         self._last_identity_bytes_read: int = 0
         self._last_identity_latency_us: float = 0.0
+        self._invocation_lock = threading.RLock()
+        self._invocations: Dict[str, Dict[str, Any]] = {}
 
     def is_remote(self) -> bool:
         return True
@@ -2812,6 +2875,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if admission is not None:
             if getattr(admission, "is_terminal", False):
                 return None, False, f"Admission in terminal state '{admission.state}'"
+            if eff_tracker is not None and not hasattr(admission, "tracker"):
+                admission.tracker = eff_tracker
             return admission, False, None
 
         if eff_tracker is None:
@@ -2826,6 +2891,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 adm = active_scope.admit_read(projected_bytes=projected_bytes, profile_id=profile_id)
             else:
                 adm = eff_tracker.admit_read(projected_bytes=projected_bytes, profile_id=profile_id)
+            adm.tracker = eff_tracker
             return adm, True, None
         except ValueError as ve:
             return None, False, f"Observation budget admission rejected: {ve}"
@@ -2915,7 +2981,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
     def get_invocation_records(self) -> Dict[str, Any]:
         """Returns deep copy of runtime invocation records on this adapter."""
-        return copy.deepcopy(getattr(self, "_invocations", {}))
+        with getattr(self, "_invocation_lock", threading.RLock()):
+            return copy.deepcopy(getattr(self, "_invocations", {}))
 
     @staticmethod
     def _set_slice_status(cr: Any, status: str) -> None:
@@ -2955,7 +3022,41 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             if getattr(cr, "is_terminal", False):
                 raise RuntimeError(f"Cannot execute SSH command under terminal child read '{cr.state}'")
 
-        eff_inv_id = invocation_id or f"inv_{uuid.uuid4().hex[:12]}"
+        # 1. Enforce Authoritative Invocation Identity and detect conflicts
+        # An already started physical read cannot have its invocation_id replaced
+        for cr in children:
+            ts = dict(getattr(cr, "target_spec", None) or {})
+            child_inv = ts.get("invocation_id")
+            if child_inv and getattr(cr, "state", None) != "ADMITTED":
+                if invocation_id is not None and invocation_id != child_inv:
+                    raise RuntimeError(
+                        f"Cannot replace invocation_id for physical read '{cr.physical_read_id}' in state '{cr.state}'"
+                    )
+
+        eff_inv_id = invocation_id
+        for cr in children:
+            ts = dict(getattr(cr, "target_spec", None) or {})
+            child_inv = ts.get("invocation_id")
+            if child_inv:
+                if eff_inv_id is None:
+                    eff_inv_id = child_inv
+                elif eff_inv_id != child_inv:
+                    raise ValueError(
+                        f"Conflicting child invocation_id '{child_inv}' does not match runner invocation_id '{eff_inv_id}' "
+                        f"for physical read '{cr.physical_read_id}'"
+                    )
+
+        if eff_inv_id is None:
+            eff_inv_id = f"inv_{uuid.uuid4().hex[:12]}"
+
+        # Never silently replace an ID after execution has started
+        for cr in children:
+            ts = dict(getattr(cr, "target_spec", None) or {})
+            if getattr(cr, "state", None) != "ADMITTED" and ts.get("invocation_id") and ts.get("invocation_id") != eff_inv_id:
+                raise RuntimeError(
+                    f"Cannot replace invocation_id for physical read '{cr.physical_read_id}' in state '{cr.state}'"
+                )
+
         eff_cmd_type = command_type or "remote_command"
         eff_batch_id = batch_id
 
@@ -2999,13 +3100,15 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         args.append(target_spec)
         args.append(remote_shell_cmd)
 
-        # 1. Pre-invocation boundary: verify executable availability before process creation
+        # 2. Pre-invocation boundary: verify executable availability before process creation
         pre_ok, pre_reason = self._check_pre_invocation(args)
         if not pre_ok:
             return -2, "", f"SSH command execution failed before invocation: {pre_reason}"
 
-        # 2. CROSS INVOCATION BOUNDARY: Mark physical execution started immediately before runner invocation
-        t_start = time.time()
+        # 3. CROSS INVOCATION BOUNDARY: Mark physical execution started immediately before runner invocation
+        t_mono_start = time.monotonic()
+        t_start_ms = round(time.time() * 1000.0, 3)
+
         if admission is not None and not admission.is_terminal and admission.state == "ADMITTED":
             admission.mark_physical_read_started()
         for cr in children:
@@ -3028,21 +3131,23 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 invocation_id=eff_inv_id,
                 command_type=eff_cmd_type,
                 physical_read_ids=child_pids,
-                start_time_ms=t_start,
+                start_time_ms=t_start_ms,
                 batch_id=eff_batch_id,
             )
-        if not hasattr(self, "_invocations"):
-            self._invocations = {}
-        self._invocations[eff_inv_id] = {
-            "invocation_id": eff_inv_id,
-            "command_type": eff_cmd_type,
-            "physical_read_ids": child_pids,
-            "start_time": t_start,
-            "batch_id": eff_batch_id,
-            "outcome": "IN_FLIGHT",
-        }
+        with getattr(self, "_invocation_lock", threading.RLock()):
+            if not hasattr(self, "_invocations"):
+                self._invocations = {}
+            self._invocations[eff_inv_id] = {
+                "invocation_id": eff_inv_id,
+                "command_type": eff_cmd_type,
+                "physical_read_ids": child_pids,
+                "start_time_ms": t_start_ms,
+                "start_time": t_start_ms / 1000.0,
+                "batch_id": eff_batch_id,
+                "outcome": "IN_FLIGHT",
+            }
 
-        # 3. Invoke command runner (in-flight state is guaranteed to be PHYSICAL_READ_STARTED)
+        # 4. Invoke command runner (in-flight state is guaranteed to be PHYSICAL_READ_STARTED)
         exc_str = None
         try:
             rc, stdout, stderr = self._command_runner(args, t)
@@ -3051,9 +3156,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             exc_str = "TimeoutExpired"
         except Exception as e:
             rc, stdout, stderr = -1, "", f"SSH execution error: {e}"
-            exc_str = str(e)
+            exc_str = f"{type(e).__name__}: {e}"
 
-        t_comp = time.time()
+        t_mono_end = time.monotonic()
+        dur_ms = max(0.0, (t_mono_end - t_mono_start) * 1000.0)
+        t_comp_ms = round(t_start_ms + dur_ms, 3)
         out_bytes = len(stdout.encode("utf-8")) if stdout else 0
 
         eff_outcome = None
@@ -3076,20 +3183,22 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_completed"):
             eff_tracker.record_invocation_completed(
                 invocation_id=eff_inv_id,
-                completion_time_ms=t_comp,
+                completion_time_ms=t_comp_ms,
                 return_code=rc,
                 exception=eff_exc,
                 output_byte_count=out_bytes,
                 outcome=eff_outcome,
             )
-        if eff_inv_id in self._invocations:
-            self._invocations[eff_inv_id].update({
-                "completion_time": t_comp,
-                "return_code": rc,
-                "exception": eff_exc,
-                "output_byte_count": out_bytes,
-                "outcome": eff_outcome,
-            })
+        with getattr(self, "_invocation_lock", threading.RLock()):
+            if eff_inv_id in self._invocations:
+                self._invocations[eff_inv_id].update({
+                    "completion_time_ms": t_comp_ms,
+                    "completion_time": t_comp_ms / 1000.0,
+                    "return_code": rc,
+                    "exception": eff_exc,
+                    "output_byte_count": out_bytes,
+                    "outcome": eff_outcome,
+                })
 
         return rc, stdout, stderr
 
@@ -3841,11 +3950,24 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 for idx, (addr, sz) in enumerate(slices)
             ] if adm is not None else [None for _ in slices]
 
+            coll_slice_specs = [
+                BatchSliceSpec(
+                    slice_index=idx,
+                    address=addr,
+                    requested_size=sz,
+                    physical_read_id=child_reads_coll[idx].physical_read_id if child_reads_coll[idx] else f"cr_coll_{batch_id}_{idx}",
+                    physical_consumption_id=child_reads_coll[idx].physical_consumption_id if child_reads_coll[idx] else f"cons_coll_{batch_id}_{idx}",
+                    completion_status="NOT_EXECUTED",
+                )
+                for idx, (addr, sz) in enumerate(slices)
+            ]
+
             if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
                 eff_tracker.register_batch_contract(
                     batch_id=batch_id,
                     invocation_id=inv_coll_id,
                     expected_slice_count=expected_slice_count,
+                    slices=coll_slice_specs,
                 )
 
             coll_res = self._read_slices_via_collector(
@@ -3905,11 +4027,24 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             for idx, (addr, sz) in enumerate(slices)
         ] if adm is not None else [None for _ in slices]
 
+        shell_slice_specs = [
+            BatchSliceSpec(
+                slice_index=idx,
+                address=addr,
+                requested_size=sz,
+                physical_read_id=child_reads_shell[idx].physical_read_id if child_reads_shell[idx] else f"cr_shell_{batch_id}_{idx}",
+                physical_consumption_id=child_reads_shell[idx].physical_consumption_id if child_reads_shell[idx] else f"cons_shell_{batch_id}_{idx}",
+                completion_status="NOT_EXECUTED",
+            )
+            for idx, (addr, sz) in enumerate(slices)
+        ]
+
         if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
             eff_tracker.register_batch_contract(
                 batch_id=batch_id,
                 invocation_id=inv_shell_id,
                 expected_slice_count=expected_slice_count,
+                slices=shell_slice_specs,
             )
 
         cmds = []
@@ -4151,6 +4286,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         process_name: Optional[str] = None,
         companion_build_id: Optional[str] = None,
         limit: int = 50,
+        budget_tracker: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """Discovers running processes on the remote target via a single POSIX shell scan of /proc."""
         remote_script = (
