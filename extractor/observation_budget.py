@@ -29,7 +29,7 @@ import math
 import threading
 import time
 import types
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
 def clone_frozen(obj: Any) -> Any:
@@ -625,7 +625,15 @@ class PhysicalReadRecord:
 
     def update_target_spec(self, updates: Dict[str, Any]) -> None:
         """Safely updates target_spec metadata while preserving frozen immutability."""
-        with self._lock:
+        with self._lock_hierarchy():
+            if self.is_terminal:
+                raise RuntimeError(
+                    f"Cannot update target_spec of physical read '{self.physical_read_id}' in terminal state '{self.state}'"
+                )
+            if self._parent_reservation is not None and self._parent_reservation.is_terminal:
+                raise RuntimeError(
+                    f"Cannot update target_spec of physical read '{self.physical_read_id}': parent reservation '{self._parent_reservation.reservation_id}' is in terminal state '{self._parent_reservation.state}'"
+                )
             current = dict(self.target_spec or {})
             current.update(updates)
             self.target_spec = clone_frozen(current)
@@ -1418,7 +1426,7 @@ class BudgetReservation:
                     f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
                 )
             for cr in self.child_reads.values():
-                if cr.state == "CONSUMED" and cr.created_at_ms > t_now:
+                if cr.state in ("CONSUMED", "ADMITTED") and cr.created_at_ms > t_now:
                     raise ValueError(
                         f"Terminal timestamp regression for child read '{cr.physical_read_id}': "
                         f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
@@ -1430,6 +1438,10 @@ class BudgetReservation:
                     cr.state = "ACCOUNTED"
                     cr.terminal_at_ms = t_now
                     cr._transition_history.append("ACCOUNTED")
+                elif cr.state == "ADMITTED":
+                    cr.state = "RELEASED"
+                    cr.terminal_at_ms = t_now
+                    cr._transition_history.append("RELEASED")
             self.state = "ACCOUNTED"
             self.terminal_at_ms = t_now
             self._transition_history.append("ACCOUNTED")
@@ -1459,7 +1471,7 @@ class BudgetReservation:
                     f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
                 )
             for cr in self.child_reads.values():
-                if cr.state == "CONSUMED" and cr.created_at_ms > t_now:
+                if cr.state in ("CONSUMED", "ADMITTED") and cr.created_at_ms > t_now:
                     raise ValueError(
                         f"Terminal timestamp regression for child read '{cr.physical_read_id}': "
                         f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
@@ -1471,6 +1483,10 @@ class BudgetReservation:
                     cr.state = "ACCOUNTED"
                     cr.terminal_at_ms = t_now
                     cr._transition_history.append("ACCOUNTED")
+                elif cr.state == "ADMITTED":
+                    cr.state = "RELEASED"
+                    cr.terminal_at_ms = t_now
+                    cr._transition_history.append("RELEASED")
             self.state = "ACCOUNTED" if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED") else "FINALIZED"
             self.terminal_at_ms = t_now
             self._transition_history.append(self.state)
@@ -1901,7 +1917,7 @@ class ObservationBudgetTracker:
         self,
         invocation_id: str,
         command_type: str,
-        physical_read_ids: List[str],
+        physical_read_ids: Optional[Sequence[str]] = None,
         start_time_ms: Optional[float] = None,
         batch_id: Optional[str] = None,
     ) -> RemoteInvocationRecord:
@@ -1919,7 +1935,7 @@ class ObservationBudgetTracker:
             rec = RemoteInvocationRecord(
                 invocation_id=invocation_id,
                 command_type=command_type,
-                physical_read_ids=tuple(physical_read_ids),
+                physical_read_ids=tuple(physical_read_ids or []),
                 start_time_ms=t,
                 batch_id=batch_id,
                 outcome="IN_FLIGHT",
@@ -2059,6 +2075,14 @@ class ObservationBudgetTracker:
 
     def register_fault_injection(self, point: str, hook: Callable[[], None]) -> None:
         """Alias for set_fault_injection."""
+        self.set_fault_injection(point, hook)
+
+    def inject_fault(self, point: str, hook: Optional[Callable[[], None]] = None) -> None:
+        """Convenience method to register a fault injection hook."""
+        if hook is None:
+            def default_fault_hook():
+                raise RuntimeError(f"Injected fault at {point}")
+            hook = default_fault_hook
         self.set_fault_injection(point, hook)
 
     def clear_fault_injections(self) -> None:
@@ -2632,6 +2656,10 @@ class ObservationBudgetTracker:
                     if cr.physical_read_id in self._physical_read_records:
                         existing_cr = self._physical_read_records[cr.physical_read_id]
                         if existing_cr.charged_bytes != cr.charged_bytes:
+                            for r in all_res:
+                                if not r.is_terminal:
+                                    r.mark_failed_accounted()
+                                self._active_reservations.pop(r.reservation_id, None)
                             raise ValueError(
                                 f"Physical read ID conflict: '{cr.physical_read_id}' already committed with "
                                 f"{existing_cr.charged_bytes}B, conflicting with {cr.charged_bytes}B"
@@ -4237,7 +4265,9 @@ class ObservationBudgetTracker:
                     if res not in all_commit_res:
                         all_commit_res.append(res)
             for res in all_commit_res:
-                for cr in res.child_reads.values():
+                with res._lock:
+                    c_reads = list(res.child_reads.values())
+                for cr in c_reads:
                     if cr.physical_read_id in self._physical_read_records:
                         existing_cr = self._physical_read_records[cr.physical_read_id]
                         if existing_cr.charged_bytes != cr.charged_bytes:
@@ -4346,7 +4376,9 @@ class ObservationBudgetTracker:
                         all_commit_res.append(res)
             has_child_reads = False
             for res in all_commit_res:
-                for cr in res.child_reads.values():
+                with res._lock:
+                    c_reads = list(res.child_reads.values())
+                for cr in c_reads:
                     has_child_reads = True
                     cr.operation_id = record.operation_id
                     if cr.state in ("CONSUMED", "ACCOUNTED"):
@@ -4370,6 +4402,7 @@ class ObservationBudgetTracker:
 
             if not has_child_reads:
                 root_pread_id = f"pread_{phys_id}"
+                t_comm = round(time.time() * 1000.0, 3)
                 root_pcons = PhysicalConsumptionRecord(
                     physical_consumption_id=phys_id,
                     physical_read_id=root_pread_id,
@@ -4381,10 +4414,10 @@ class ObservationBudgetTracker:
                     latency_us=lat_val,
                     stop_ms=stop_val,
                     is_failure=is_failure,
-                    accounting_status="COMMITTED",
+                    accounting_status="FAILED" if is_failure else "COMMITTED",
                     measurement_type=record.measurement_type,
-                    created_at_ms=round(time.time() * 1000.0, 3),
-                    committed_at_ms=round(time.time() * 1000.0, 3),
+                    created_at_ms=t_comm,
+                    committed_at_ms=t_comm,
                     metadata=dict(record.metadata),
                 )
                 self._physical_consumption_records[phys_id] = root_pcons
@@ -4393,18 +4426,22 @@ class ObservationBudgetTracker:
                     reservation_id="direct_commit",
                     physical_consumption_id=phys_id,
                     operation_id=record.operation_id,
-                    state="ACCOUNTED",
+                    state="FAILED_ACCOUNTED" if is_failure else "ACCOUNTED",
                     charged_bytes=total_charge,
                     measured_bytes_read=actual_meas if meas_b is not None else None,
                     estimated_bytes_read=actual_est,
                     latency_us=lat_val,
                     is_failure=is_failure,
+                    created_at_ms=t_comm,
+                    terminal_at_ms=t_comm,
                 )
                 self._physical_read_records[root_pread_id] = root_cr
 
             # Finalize associated reservations
             if reservations:
                 for res in reservations:
+                    if is_failure:
+                        res.is_failure = True
                     if res.consumed_bytes > 0 or total_charge > 0 or res.state == "CONSUMED":
                         if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
                             res.account()
@@ -4420,6 +4457,8 @@ class ObservationBudgetTracker:
                     self._active_reservations.pop(res.reservation_id, None)
             for r_id, res in list(self._active_reservations.items()):
                 if res.operation_id == record.operation_id:
+                    if is_failure:
+                        res.is_failure = True
                     if res.consumed_bytes > 0 or total_charge > 0 or res.state == "CONSUMED":
                         if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"):
                             res.account()

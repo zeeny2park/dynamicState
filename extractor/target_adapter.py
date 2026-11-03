@@ -319,6 +319,9 @@ class TargetExecutionAdapter(ABC):
         budget_tracker: Optional[Any] = None,
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
         """Reads multiple (address, size) slices in a single batch operation when supported."""
+        if not slices:
+            return []
+
         eff_tracker = budget_tracker or getattr(self, "_budget_tracker", None)
         if eff_tracker is None:
             from .observation_budget import ObservationBudgetTracker
@@ -379,46 +382,88 @@ class TargetExecutionAdapter(ABC):
         ]
 
         child_pids = [cr.physical_read_id for cr in child_reads if cr is not None]
-        if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
-            eff_tracker.register_batch_contract(
-                batch_id=batch_id,
-                invocation_id=inv_id,
-                expected_slice_count=expected_slice_count,
-                slices=slice_specs,
-            )
-        if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_started"):
-            eff_tracker.record_invocation_started(
-                invocation_id=inv_id,
-                command_type="local_memory_batch",
-                physical_read_ids=child_pids,
-                batch_id=batch_id,
-            )
+        with (getattr(eff_tracker, "_transaction_lock", None) or nullcontext()):
+            if eff_tracker is not None and hasattr(eff_tracker, "register_batch_contract"):
+                eff_tracker.register_batch_contract(
+                    batch_id=batch_id,
+                    invocation_id=inv_id,
+                    expected_slice_count=expected_slice_count,
+                    slices=slice_specs,
+                )
+            if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_started"):
+                eff_tracker.record_invocation_started(
+                    invocation_id=inv_id,
+                    command_type="local_memory_batch",
+                    physical_read_ids=child_pids,
+                    batch_id=batch_id,
+                )
 
         results = []
         any_failure = False
-        for idx, (addr, sz) in enumerate(slices):
-            child_read = child_reads[idx]
-            if child_read is not None and child_read.state == "ADMITTED":
-                child_read.mark_started()
+        try:
+            for idx, (addr, sz) in enumerate(slices):
+                child_read = child_reads[idx]
+                if child_read is not None and child_read.state == "ADMITTED":
+                    child_read.mark_started()
 
-            if _adapter_supports_admission(self, "read_memory"):
-                kwargs = {"admission": adm, "budget_tracker": eff_tracker}
-                if _adapter_supports_param(self, "read_memory", "child_read"):
-                    kwargs["child_read"] = child_read
-                res = self.read_memory(pid, addr, sz, **kwargs)
-            else:
-                res = self.read_memory(pid, addr, sz)
-            results.append(res)
-            raw_b, st, _ = res
-            act_b = len(raw_b) if raw_b else 0
-            is_fail = (st not in ("OBSERVED", "PARTIAL"))
-            if is_fail:
-                any_failure = True
-            if child_read is not None:
-                if hasattr(child_read, "update_target_spec"):
-                    child_read.update_target_spec({"completion_status": st})
-                if child_read.state in ("PHYSICAL_READ_STARTED", "CONSUMED"):
-                    child_read.consume(actual_bytes=act_b, is_failure=is_fail)
+                if _adapter_supports_admission(self, "read_memory"):
+                    kwargs = {"admission": adm, "budget_tracker": eff_tracker}
+                    if _adapter_supports_param(self, "read_memory", "child_read"):
+                        kwargs["child_read"] = child_read
+                    res = self.read_memory(pid, addr, sz, **kwargs)
+                else:
+                    res = self.read_memory(pid, addr, sz)
+                results.append(res)
+                raw_b, st, res_err = res
+                act_b = len(raw_b) if raw_b else 0
+                is_fail = (st not in ("OBSERVED", "PARTIAL"))
+                if is_fail:
+                    any_failure = True
+                if child_read is not None:
+                    if hasattr(child_read, "update_target_spec"):
+                        child_read.update_target_spec({"completion_status": st})
+                    if child_read.state in ("PHYSICAL_READ_STARTED", "CONSUMED"):
+                        child_read.consume(actual_bytes=act_b, is_failure=is_fail, failure_reason=res_err)
+        except Exception as exc:
+            for idx, cr in enumerate(child_reads):
+                if cr is not None:
+                    if cr.state == "PHYSICAL_READ_STARTED":
+                        if hasattr(cr, "update_target_spec"):
+                            cr.update_target_spec({"completion_status": "FAILED"})
+                        cr.consume(actual_bytes=None, conservative_estimate_bytes=slices[idx][1], is_failure=True, failure_reason=str(exc))
+                    elif cr.state == "ADMITTED":
+                        if hasattr(cr, "update_target_spec"):
+                            cr.update_target_spec({"completion_status": "UNAVAILABLE"})
+                        cr.release()
+            if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_completed"):
+                if inv_id in getattr(eff_tracker, "_invocations", {}):
+                    inv_rec = eff_tracker._invocations[inv_id]
+                    if inv_rec.outcome == "IN_FLIGHT":
+                        eff_tracker.record_invocation_completed(
+                            invocation_id=inv_id,
+                            return_code=1,
+                            outcome="FAILED",
+                            exception=str(exc),
+                        )
+            if own_adm and adm is not None and eff_tracker is not None:
+                tot_b = adm.consumed_bytes
+                if tot_b > 0 or adm.state == "CONSUMED":
+                    active_scope = eff_tracker.get_active_scope() if hasattr(eff_tracker, "get_active_scope") else None
+                    if active_scope is not None and not active_scope.is_finalized:
+                        active_scope.record_read(bytes_read=tot_b, admission=adm, profile_id="memory_read_batch", is_failure=True)
+                    else:
+                        eff_tracker.commit_transaction(
+                            operation_id=f"standalone_batch_exc_{uuid.uuid4().hex[:8]}",
+                            profile_id="memory_read_batch",
+                            measured_bytes=None,
+                            estimated_bytes=None,
+                            is_failure=True,
+                            reservations=[adm],
+                        )
+                else:
+                    if adm.state in ("ADMITTED", "RESERVED"):
+                        eff_tracker.release_reservation(adm)
+            raise
 
         if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_completed"):
             eff_tracker.record_invocation_completed(
@@ -437,14 +482,14 @@ class TargetExecutionAdapter(ABC):
                     eff_tracker.commit_transaction(
                         operation_id=f"standalone_batch_{uuid.uuid4().hex[:8]}",
                         profile_id="memory_read_batch",
-                        measured_bytes=tot_b,
+                        measured_bytes=None,
+                        estimated_bytes=None,
                         is_failure=any_failure,
                         reservations=[adm],
                     )
             else:
                 if adm.state in ("ADMITTED", "RESERVED"):
                     eff_tracker.release_reservation(adm)
-        return results
         return results
 
     @abstractmethod
