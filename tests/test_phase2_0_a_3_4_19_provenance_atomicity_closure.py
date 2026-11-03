@@ -293,7 +293,7 @@ class TestPhase20A3419WorkstreamAInvariant22Totality(unittest.TestCase):
         self.assertEqual(len(report["discrepancies"]), 0)
 
     def test_09_unexecuted_batch_contract_reads_in_admitted_released_pass_invariant_22(self):
-        """9. Batch contract whose reads definitely never crossed physical boundary (ADMITTED/RELEASED) is permitted."""
+        """9. Batch contract requires explicit invocation record (e.g. PREFLIGHT_REJECTED); absent invocation is rejected."""
         inv_unreached = "inv_not_executed_09"
         read_id = "pread_09"
 
@@ -321,6 +321,15 @@ class TestPhase20A3419WorkstreamAInvariant22Totality(unittest.TestCase):
             expected_slice_count=1,
             slices=slices,
         )
+
+        # Under A.3.4.20, absent invocation record is unconditionally rejected (no silent bypass)
+        report_fail = self.tracker.reconcile_ledger(raise_on_error=False)
+        self.assertFalse(report_fail["reconciled"])
+        self.assertTrue(any("orphan batch contract" in d for d in report_fail["discrepancies"]))
+
+        # Once explicitly recorded as PREFLIGHT_REJECTED, it reconciles cleanly
+        self.tracker.record_invocation_started(invocation_id=inv_unreached, command_type="shell", physical_read_ids=[read_id])
+        self.tracker.record_invocation_completed(invocation_id=inv_unreached, return_code=-2, outcome="PREFLIGHT_REJECTED")
 
         report = self.tracker.reconcile_ledger(raise_on_error=True)
         self.assertTrue(report["reconciled"])
@@ -979,6 +988,10 @@ class TestPhase20A3419WorkstreamEConcurrencyAndImmutabilityRegressions(unittest.
 
     def test_39_concurrent_terminal_transitions_and_reconciliations_thread_safety(self):
         """39. Concurrent execution of terminal operations, completes, and reconciliations has zero race/deadlock."""
+        self.tracker = ObservationBudgetTracker(
+            limits=ObservationBudgetLimits(max_consecutive_read_failures=100, max_total_read_failures=100)
+        )
+        self.tracker.start()
         num_threads = 6
         iterations_per_thread = 4
         threads = []

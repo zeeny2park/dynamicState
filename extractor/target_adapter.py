@@ -2825,6 +2825,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         command_runner: Optional[Callable[[List[str], float], Tuple[int, str, str]]] = None,
         use_control_master: bool = False,
         collector_path: Optional[str] = None,
+        budget_tracker: Optional[Any] = None,
     ):
         if not host:
             raise ValueError("Remote host must be specified")
@@ -2840,6 +2841,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.use_control_master = bool(use_control_master)
         self.collector_path = (collector_path or "").strip() or None
         self._budget_tracker = None
+        if budget_tracker is not None:
+            self.set_budget_tracker(budget_tracker)
         self._last_threads_bytes_read: int = 0
         self._last_maps_bytes_read: int = 0
         self._last_identity_bytes_read: int = 0
@@ -3104,6 +3107,56 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         # 2. Pre-invocation boundary: verify executable availability before process creation
         pre_ok, pre_reason = self._check_pre_invocation(args)
         if not pre_ok:
+            eff_tracker = getattr(self, "_budget_tracker", None)
+            if eff_tracker is None and admission is not None and hasattr(admission, "tracker"):
+                eff_tracker = admission.tracker
+            if eff_tracker is None:
+                try:
+                    from .observation_budget import ObservationBudgetTracker
+                    eff_tracker = ObservationBudgetTracker.get_active_thread_tracker()
+                except ImportError:
+                    eff_tracker = None
+
+            is_batch = bool(eff_batch_id) or (
+                eff_tracker is not None
+                and hasattr(eff_tracker, "_batch_records")
+                and any(b.invocation_id == eff_inv_id or b.batch_id == eff_batch_id for b in eff_tracker._batch_records.values())
+            )
+            if is_batch:
+                t_start_ms = round(time.time() * 1000.0, 3)
+                child_pids = [cr.physical_read_id for cr in children]
+                if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_started"):
+                    if eff_inv_id not in getattr(eff_tracker, "_invocations", {}):
+                        eff_tracker.record_invocation_started(
+                            invocation_id=eff_inv_id,
+                            command_type=eff_cmd_type,
+                            physical_read_ids=child_pids,
+                            start_time_ms=t_start_ms,
+                            batch_id=eff_batch_id,
+                        )
+                    eff_tracker.record_invocation_completed(
+                        invocation_id=eff_inv_id,
+                        return_code=-2,
+                        outcome="PREFLIGHT_REJECTED",
+                        completion_time_ms=t_start_ms,
+                        duration_ms=0.0,
+                        output_byte_count=0,
+                    )
+                with getattr(self, "_invocation_lock", threading.RLock()):
+                    if not hasattr(self, "_invocations"):
+                        self._invocations = {}
+                    self._invocations[eff_inv_id] = {
+                        "invocation_id": eff_inv_id,
+                        "command_type": eff_cmd_type,
+                        "physical_read_ids": child_pids,
+                        "start_time_ms": t_start_ms,
+                        "start_time": t_start_ms / 1000.0,
+                        "completion_time_ms": t_start_ms,
+                        "duration_ms": 0.0,
+                        "batch_id": eff_batch_id,
+                        "return_code": -2,
+                        "outcome": "PREFLIGHT_REJECTED",
+                    }
             return -2, "", f"SSH command execution failed before invocation: {pre_reason}"
 
         # 3. CROSS INVOCATION BOUNDARY: Mark physical execution started immediately before runner invocation
@@ -3129,13 +3182,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     cr.mark_started()
 
             if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_started"):
-                eff_tracker.record_invocation_started(
-                    invocation_id=eff_inv_id,
-                    command_type=eff_cmd_type,
-                    physical_read_ids=child_pids,
-                    start_time_ms=t_start_ms,
-                    batch_id=eff_batch_id,
-                )
+                if eff_inv_id not in getattr(eff_tracker, "_invocations", {}):
+                    eff_tracker.record_invocation_started(
+                        invocation_id=eff_inv_id,
+                        command_type=eff_cmd_type,
+                        physical_read_ids=child_pids,
+                        start_time_ms=t_start_ms,
+                        batch_id=eff_batch_id,
+                    )
         with getattr(self, "_invocation_lock", threading.RLock()):
             if not hasattr(self, "_invocations"):
                 self._invocations = {}
@@ -3977,6 +4031,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         expected_slice_count=expected_slice_count,
                         slices=coll_slice_specs,
                     )
+                    child_coll_pids = [c.physical_read_id for c in child_reads_coll if c]
+                    if hasattr(eff_tracker, "record_invocation_started") and inv_coll_id not in getattr(eff_tracker, "_invocations", {}):
+                        eff_tracker.record_invocation_started(
+                            invocation_id=inv_coll_id,
+                            command_type="memory_batch_collector",
+                            physical_read_ids=child_coll_pids,
+                            batch_id=batch_id,
+                        )
 
             coll_res = self._read_slices_via_collector(
                 pid,
@@ -4013,6 +4075,15 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                             cr.consume(actual_bytes=0, is_failure=True, failure_reason="Collector execution failed")
                         elif cr.state == "ADMITTED":
                             cr.release()
+                if eff_tracker is not None and hasattr(eff_tracker, "record_invocation_completed"):
+                    if inv_coll_id in getattr(eff_tracker, "_invocations", {}):
+                        coll_inv_rec = eff_tracker._invocations[inv_coll_id]
+                        if coll_inv_rec.outcome == "IN_FLIGHT":
+                            eff_tracker.record_invocation_completed(
+                                invocation_id=inv_coll_id,
+                                return_code=-1,
+                                outcome="FAILED",
+                            )
 
         # Shell fallback path
         inv_shell_id = f"inv_shell_{uuid.uuid4().hex[:12]}"
@@ -4055,6 +4126,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     expected_slice_count=expected_slice_count,
                     slices=shell_slice_specs,
                 )
+                child_shell_pids = [c.physical_read_id for c in child_reads_shell if c]
+                if hasattr(eff_tracker, "record_invocation_started") and inv_shell_id not in getattr(eff_tracker, "_invocations", {}):
+                    eff_tracker.record_invocation_started(
+                        invocation_id=inv_shell_id,
+                        command_type="memory_batch_shell",
+                        physical_read_ids=child_shell_pids,
+                        batch_id=batch_id,
+                    )
 
         cmds = []
         for idx, (addr, sz) in enumerate(slices):

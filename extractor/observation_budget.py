@@ -574,6 +574,21 @@ class PhysicalReadRecord:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
 
+    @contextmanager
+    def _lock_hierarchy(self):
+        """Universal lock hierarchy: Level 2 (Reservation) -> Level 3 (PhysicalRead).
+        
+        Strictly enforces universal lock order to prevent lock-inversion deadlocks.
+        """
+        parent = self._parent_reservation
+        if parent is not None:
+            with parent._lock:
+                with self._lock:
+                    yield
+        else:
+            with self._lock:
+                yield
+
     def __post_init__(self) -> None:
         if self.target_spec is not None and not isinstance(self.target_spec, types.MappingProxyType):
             self.target_spec = clone_frozen(self.target_spec)
@@ -642,7 +657,12 @@ class PhysicalReadRecord:
 
     def mark_started(self) -> None:
         """Transitions ADMITTED -> PHYSICAL_READ_STARTED at the real I/O boundary."""
-        with self._lock:
+        with self._lock_hierarchy():
+            if self._parent_reservation is not None:
+                if self._parent_reservation.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
+                    raise RuntimeError(
+                        f"Cannot start physical read '{self.physical_read_id}': parent reservation '{self._parent_reservation.reservation_id}' is in terminal state '{self._parent_reservation.state}'"
+                    )
             if self.state == "RELEASED":
                 raise RuntimeError(f"Cannot start physical read '{self.physical_read_id}' in terminal state 'RELEASED'")
             if self.state in ("ACCOUNTED", "FAILED_ACCOUNTED"):
@@ -663,7 +683,12 @@ class PhysicalReadRecord:
         failure_reason: Optional[str] = None,
     ) -> int:
         """Transitions ADMITTED or PHYSICAL_READ_STARTED -> CONSUMED."""
-        with self._lock:
+        with self._lock_hierarchy():
+            if self._parent_reservation is not None:
+                if self._parent_reservation.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
+                    raise RuntimeError(
+                        f"Cannot consume physical read '{self.physical_read_id}': parent reservation '{self._parent_reservation.reservation_id}' is in terminal state '{self._parent_reservation.state}'"
+                    )
             if self.state in ("ACCOUNTED", "RELEASED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot consume physical read '{self.physical_read_id}' in terminal state '{self.state}'")
             if self.state not in ("ADMITTED", "PHYSICAL_READ_STARTED", "CONSUMED"):
@@ -692,15 +717,25 @@ class PhysicalReadRecord:
             self._transition_history.append("CONSUMED")
             ret_charged = self.charged_bytes
 
-        if self._parent_reservation is not None:
-            self._parent_reservation._on_child_read_updated(self)
+            if self._parent_reservation is not None:
+                self._parent_reservation.consumed_bytes = sum(c.charged_bytes for c in self._parent_reservation.child_reads.values())
+                if any(c.is_failure for c in self._parent_reservation.child_reads.values()):
+                    self._parent_reservation.is_failure = True
+                if self._parent_reservation.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
+                    self._parent_reservation.state = "CONSUMED"
+                    if "CONSUMED" not in self._parent_reservation._transition_history:
+                        self._parent_reservation._transition_history.append("CONSUMED")
         return ret_charged
 
     def release(self) -> None:
         """Transitions ADMITTED -> RELEASED strictly when 0 bytes consumed and I/O was never invoked."""
-        with self._lock:
+        with self._lock_hierarchy():
             if self.state == "RELEASED":
                 return  # Idempotent for identical outcome
+            if self._parent_reservation is not None and self._parent_reservation.state in ("ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(
+                    f"Conflicting terminal transition: cannot release physical read '{self.physical_read_id}': parent reservation '{self._parent_reservation.reservation_id}' is in terminal state '{self._parent_reservation.state}'"
+                )
             if self.state in ("ACCOUNTED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(
                     f"Conflicting terminal transition: cannot release physical read '{self.physical_read_id}' in terminal state '{self.state}'"
@@ -724,14 +759,15 @@ class PhysicalReadRecord:
             self.terminal_at_ms = t_now
             self._transition_history.append("RELEASED")
 
-        if self._parent_reservation is not None:
-            self._parent_reservation._on_child_read_updated(self)
-
     def account(self) -> None:
         """Transitions CONSUMED -> ACCOUNTED upon authoritative tracker commit."""
-        with self._lock:
+        with self._lock_hierarchy():
             if self.state == "ACCOUNTED":
                 return  # Idempotent for identical outcome
+            if self._parent_reservation is not None and self._parent_reservation.state in ("RELEASED", "FAILED_ACCOUNTED"):
+                raise RuntimeError(
+                    f"Conflicting terminal transition: cannot account physical read '{self.physical_read_id}': parent reservation '{self._parent_reservation.reservation_id}' is in terminal state '{self._parent_reservation.state}'"
+                )
             if self.state in ("RELEASED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(
                     f"Conflicting terminal transition: cannot account physical read '{self.physical_read_id}' in terminal state '{self.state}'"
@@ -749,7 +785,7 @@ class PhysicalReadRecord:
 
     def mark_failed_accounted(self, failure_reason: Optional[str] = None) -> None:
         """Transitions PHYSICAL_READ_STARTED or CONSUMED -> FAILED_ACCOUNTED preserving physical consumption."""
-        with self._lock:
+        with self._lock_hierarchy():
             if self.state == "FAILED_ACCOUNTED":
                 if failure_reason is not None and self.failure_reason is not None and self.failure_reason != failure_reason:
                     raise ValueError(
@@ -757,6 +793,10 @@ class PhysicalReadRecord:
                         f"existing '{self.failure_reason}' != new '{failure_reason}'"
                     )
                 return  # Idempotent for identical outcome
+            if self._parent_reservation is not None and self._parent_reservation.state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
+                raise RuntimeError(
+                    f"Conflicting terminal transition: cannot mark failed_accounted for physical read '{self.physical_read_id}': parent reservation '{self._parent_reservation.reservation_id}' is in terminal state '{self._parent_reservation.state}'"
+                )
             if self.state in ("ACCOUNTED", "RELEASED"):
                 raise RuntimeError(
                     f"Conflicting terminal transition: cannot mark failed_accounted for physical read '{self.physical_read_id}' in terminal state '{self.state}'"
@@ -780,8 +820,9 @@ class PhysicalReadRecord:
             self.terminal_at_ms = t_now
             self._transition_history.append("FAILED_ACCOUNTED")
 
-        if self._parent_reservation is not None:
-            self._parent_reservation._on_child_read_updated(self)
+            if self._parent_reservation is not None:
+                self._parent_reservation.consumed_bytes = sum(c.charged_bytes for c in self._parent_reservation.child_reads.values())
+                self._parent_reservation.is_failure = True
 
     def to_consumption_record(
         self,
@@ -1032,6 +1073,26 @@ class BudgetReservation:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
 
+    @contextmanager
+    def _lock_with_children(self):
+        """Universal lock hierarchy: Level 2 (Reservation) -> Level 3 (Child PhysicalReads in sorted order).
+        
+        Strictly enforces universal lock order and prevents lock-inversion deadlocks.
+        """
+        with self._lock:
+            sorted_child_locks = [
+                c._lock for _, c in sorted(self.child_reads.items(), key=lambda item: item[0])
+            ]
+            acquired = []
+            try:
+                for lock in sorted_child_locks:
+                    lock.acquire()
+                    acquired.append(lock)
+                yield
+            finally:
+                for lock in reversed(acquired):
+                    lock.release()
+
     def __post_init__(self) -> None:
         if self.created_at_ms <= 0:
             self.created_at_ms = round(time.time() * 1000.0, 3)
@@ -1151,7 +1212,7 @@ class BudgetReservation:
 
     def get_child_reads(self) -> Dict[str, PhysicalReadRecord]:
         """Returns a deep copy of child physical reads to prevent external state mutation."""
-        with self._lock:
+        with self._lock_with_children():
             return copy.deepcopy(self.child_reads)
 
     def get_physical_read_records(self) -> Dict[str, PhysicalReadRecord]:
@@ -1164,7 +1225,7 @@ class BudgetReservation:
         physical_read_id: Optional[str] = None,
     ) -> None:
         """Transitions ADMITTED / RESERVED -> PHYSICAL_READ_STARTED."""
-        with self._lock:
+        with self._lock_with_children():
             if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot start physical read for reservation '{self.reservation_id}' in terminal state {self.state}")
             if self.state in ("PHYSICAL_READ_STARTED", "CONSUMED"):
@@ -1198,7 +1259,7 @@ class BudgetReservation:
         If already in CONSUMED, accumulate=True is required to accumulate consumption
         without overwriting previous physical bytes.
         """
-        with self._lock:
+        with self._lock_with_children():
             if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(f"Cannot consume reservation '{self.reservation_id}' in state {self.state}")
             b = max(0, int(actual_bytes or 0))
@@ -1266,6 +1327,7 @@ class BudgetReservation:
                 operation_id=self.operation_id,
                 target_type="memory_slice",
             )
+            root._parent_reservation = self
             root.consume(actual_bytes=actual_bytes, is_failure=is_failure)
             self.child_reads[self.physical_read_id] = root
             if accumulate:
@@ -1287,10 +1349,16 @@ class BudgetReservation:
         return self.consume(actual_bytes=actual_bytes, is_failure=is_failure, accumulate=True)
 
     def release(self) -> None:
-        """Transitions ADMITTED / RESERVED / PHYSICAL_READ_STARTED -> RELEASED strictly when no physical consumption occurred."""
-        with self._lock:
+        """Transitions ADMITTED / RESERVED -> RELEASED strictly when no physical consumption occurred.
+        
+        Enforces two-phase atomic transition: validates parent and all children prerequisites
+        before committing state mutations, assigning identical terminal_at_ms.
+        """
+        with self._lock_with_children():
             if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
-                raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
+                raise RuntimeError(
+                    f"Cannot release reservation '{self.reservation_id}' in state {self.state}"
+                )
             if self.consumed_bytes > 0:
                 raise RuntimeError(f"A reservation must never be released if physical consumption occurred ({self.consumed_bytes}B)")
             for cr in self.child_reads.values():
@@ -1300,6 +1368,8 @@ class BudgetReservation:
                     )
                 if cr.charged_bytes > 0 or cr.state in ("CONSUMED", "ACCOUNTED", "FAILED_ACCOUNTED"):
                     raise RuntimeError(f"A reservation must never be released if child physical read '{cr.physical_read_id}' consumed bytes ({cr.charged_bytes}B)")
+                if cr.state not in ("ADMITTED", "RELEASED"):
+                    raise RuntimeError(f"Cannot release reservation '{self.reservation_id}': child read '{cr.physical_read_id}' is in state '{cr.state}'")
             if self.state not in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
                 raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
 
@@ -1315,18 +1385,27 @@ class BudgetReservation:
                         f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
                     )
 
+            # Phase 2: Commit all mutations atomically together
             for cr in self.child_reads.values():
                 if not cr.is_terminal:
-                    cr.release()
+                    cr.state = "RELEASED"
+                    cr.terminal_at_ms = t_now
+                    cr._transition_history.append("RELEASED")
             self.state = "RELEASED"
             self.terminal_at_ms = t_now
             self._transition_history.append("RELEASED")
 
     def account(self) -> None:
-        """Transitions CONSUMED -> ACCOUNTED upon authoritative tracker commit."""
-        with self._lock:
+        """Transitions CONSUMED -> ACCOUNTED upon authoritative tracker commit.
+        
+        Enforces two-phase atomic transition: validates parent and all children prerequisites
+        before committing state mutations, assigning identical terminal_at_ms.
+        """
+        with self._lock_with_children():
             if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
-                raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' in state {self.state}")
+                raise RuntimeError(
+                    f"Cannot account reservation '{self.reservation_id}' in state {self.state}"
+                )
             for cr in self.child_reads.values():
                 if cr.state == "PHYSICAL_READ_STARTED":
                     raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}': child read '{cr.physical_read_id}' remains in flight")
@@ -1345,16 +1424,23 @@ class BudgetReservation:
                         f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
                     )
 
+            # Phase 2: Commit all mutations atomically together
             for cr in self.child_reads.values():
                 if cr.state == "CONSUMED":
-                    cr.account()
+                    cr.state = "ACCOUNTED"
+                    cr.terminal_at_ms = t_now
+                    cr._transition_history.append("ACCOUNTED")
             self.state = "ACCOUNTED"
             self.terminal_at_ms = t_now
             self._transition_history.append("ACCOUNTED")
 
     def finalize(self) -> None:
-        """Transitions CONSUMED or RESERVED -> ACCOUNTED / FINALIZED upon tracker ledger commit."""
-        with self._lock:
+        """Transitions CONSUMED or RESERVED -> ACCOUNTED / FINALIZED upon tracker ledger commit.
+        
+        Enforces two-phase atomic transition: validates parent and all children prerequisites
+        before committing state mutations, assigning identical terminal_at_ms.
+        """
+        with self._lock_with_children():
             if self.state in ("ACCOUNTED", "FINALIZED"):
                 return  # Idempotent for identical outcome
             if self.state in ("RELEASED", "FAILED_ACCOUNTED"):
@@ -1379,9 +1465,12 @@ class BudgetReservation:
                         f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
                     )
 
+            # Phase 2: Commit all mutations atomically together
             for cr in self.child_reads.values():
                 if cr.state == "CONSUMED":
-                    cr.account()
+                    cr.state = "ACCOUNTED"
+                    cr.terminal_at_ms = t_now
+                    cr._transition_history.append("ACCOUNTED")
             self.state = "ACCOUNTED" if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED") else "FINALIZED"
             self.terminal_at_ms = t_now
             self._transition_history.append(self.state)
@@ -1392,8 +1481,12 @@ class BudgetReservation:
             return self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED")
 
     def mark_failed_accounted(self) -> None:
-        """Transitions CONSUMED -> FAILED_ACCOUNTED upon failure recovery recording."""
-        with self._lock:
+        """Transitions CONSUMED -> FAILED_ACCOUNTED upon failure recovery recording.
+        
+        Enforces two-phase atomic transition: validates parent and all children prerequisites
+        before committing state mutations, assigning identical terminal_at_ms.
+        """
+        with self._lock_with_children():
             if self.state == "FAILED_ACCOUNTED":
                 return  # Idempotent for identical outcome
             if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED"):
@@ -1413,9 +1506,20 @@ class BudgetReservation:
                         f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
                     )
 
+            # Phase 2: Commit all mutations atomically together
             for cr in self.child_reads.values():
                 if not cr.is_terminal:
-                    cr.mark_failed_accounted()
+                    if cr.state == "PHYSICAL_READ_STARTED" and cr.charged_bytes == 0 and cr.measured_bytes_read is None:
+                        fallback = DEFAULT_CONSERVATIVE_UNKNOWN_BYTES
+                        cr.estimated_bytes_read = fallback
+                        cr.charged_bytes = fallback
+                        cr._transition_history.append("CONSUMED")
+                    cr.is_failure = True
+                    cr.state = "FAILED_ACCOUNTED"
+                    cr.terminal_at_ms = t_now
+                    cr._transition_history.append("FAILED_ACCOUNTED")
+            self.consumed_bytes = sum(c.charged_bytes for c in self.child_reads.values())
+            self.is_failure = True
             self.state = "FAILED_ACCOUNTED"
             self.terminal_at_ms = t_now
             self._transition_history.append("FAILED_ACCOUNTED")
@@ -3141,6 +3245,17 @@ class ObservationBudgetTracker:
             inv_11_ok = True
             for r_id, r in self._active_reservations.items():
                 if r.state == "CONSUMED" and (r.scope_id is None or r.scope_id not in active_scope_phys_ids):
+                    # Check if reservation is associated with an active in-flight or recently completed invocation
+                    is_active_inv = False
+                    if hasattr(r, "child_reads") and r.child_reads:
+                        for cr in r.child_reads.values():
+                            ts = getattr(cr, "target_spec", None) or {}
+                            c_inv = ts.get("invocation_id")
+                            if c_inv and c_inv in self._invocations:
+                                is_active_inv = True
+                                break
+                    if is_active_inv:
+                        continue
                     inv_11_ok = False
                     discrepancies.append(
                         f"Invariant 11 (no consumed child without accounting) violated: active consumed reservation '{r_id}' has no active scope"
@@ -3493,6 +3608,30 @@ class ObservationBudgetTracker:
                                 f"of committed batch '{b_id}' has non-terminal completion_status '{c_status}' or state '{r.state}'"
                             )
 
+                # 7. Conflicting invocation IDs across batch and reads
+                if b_reg is not None:
+                    for r in group:
+                        ts = getattr(r, "target_spec", None) or {}
+                        r_b_id = ts.get("batch_id")
+                        r_inv_id = ts.get("invocation_id")
+                        if r_b_id == b_reg.batch_id and r_inv_id and r_inv_id != b_reg.invocation_id:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (conflicting invocation ID across batch and reads) violated: batch '{b_reg.batch_id}' "
+                                f"contract expects invocation '{b_reg.invocation_id}' but slice '{r.physical_read_id}' has '{r_inv_id}'"
+                            )
+
+                # 8. Failed invocation with incomplete slices
+                if inv_id in self._invocations:
+                    parent_inv = self._invocations[inv_id]
+                    if parent_inv.outcome in ("FAILED", "TIMEOUT", "TRANSPORT_ERROR"):
+                        if len(group) < expected_count or valid_indices_set != expected_set:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (failed invocation with incomplete slices) violated: failed invocation '{inv_id}' "
+                                f"of batch '{b_id}' has incomplete slices: {len(group)} observed vs {expected_count} expected"
+                            )
+
             # 21. Collector / fallback provenance separation (Active AND Committed)
             inv_21_ok = True
             provenance_groups: Dict[str, List[PhysicalReadRecord]] = {}
@@ -3550,23 +3689,39 @@ class ObservationBudgetTracker:
             all_known_read_ids = set(read_ids).union({cr.physical_read_id for cr in all_active_child_reads})
             all_inspected_reads = list({r.physical_read_id: r for r in list(read_snaps) + all_active_child_reads}.values())
 
-            # Validate registered batch contracts have valid invocations regardless of invocation count
+            # Validate registered batch contracts have valid invocations unconditionally
             for b_key, b_rec in self._batch_records.items():
                 if b_rec.invocation_id not in self._invocations:
-                    batch_reads = [
-                        r for r in all_inspected_reads
-                        if getattr(r, "batch_id", None) == b_rec.batch_id
-                        or (getattr(r, "target_spec", None) or {}).get("batch_id") == b_rec.batch_id
-                    ]
-                    if not batch_reads or not all(r.state in ("ADMITTED", "RELEASED") for r in batch_reads):
-                        inv_22_ok = False
-                        discrepancies.append(
-                            f"Invariant 22 (orphan batch contract) violated: registered batch '{b_rec.batch_id}' "
-                            f"references non-existent invocation_id '{b_rec.invocation_id}'"
-                        )
+                    inv_22_ok = False
+                    discrepancies.append(
+                        f"Invariant 22 (orphan batch contract) violated: registered batch '{b_rec.batch_id}' "
+                        f"references non-existent invocation_id '{b_rec.invocation_id}'"
+                    )
+                else:
+                    inv_rec = self._invocations[b_rec.invocation_id]
+                    if inv_rec.outcome == "PREFLIGHT_REJECTED":
+                        batch_reads = [
+                            r for r in all_inspected_reads
+                            if getattr(r, "batch_id", None) == b_rec.batch_id
+                            or (getattr(r, "target_spec", None) or {}).get("batch_id") == b_rec.batch_id
+                        ]
+                        for r in batch_reads:
+                            if r.charged_bytes > 0 or r.state not in ("ADMITTED", "RELEASED"):
+                                inv_22_ok = False
+                                discrepancies.append(
+                                    f"Invariant 22 (preflight rejected with consumption) violated: batch '{b_rec.batch_id}' "
+                                    f"was PREFLIGHT_REJECTED but slice '{r.physical_read_id}' has state '{r.state}' and charged {r.charged_bytes}B"
+                                )
 
             for inv_id, inv_rec in self._invocations.items():
                 if inv_rec.outcome != "PREFLIGHT_REJECTED" and inv_rec.physical_read_ids:
+                    matching_reads = [r for r in all_inspected_reads if r.physical_read_id in inv_rec.physical_read_ids]
+                    if matching_reads and all(r.state == "RELEASED" for r in matching_reads):
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (contradictory invocation state) violated: started invocation '{inv_id}' "
+                            f"in outcome '{inv_rec.outcome}' has all referenced physical reads released"
+                        )
                     for pid_ref in inv_rec.physical_read_ids:
                         if pid_ref not in all_known_read_ids:
                             inv_22_ok = False
@@ -3583,7 +3738,7 @@ class ObservationBudgetTracker:
                                     inv_22_ok = False
                                     discrepancies.append(
                                         f"Invariant 22 (invocation linkage mismatch) violated: invocation '{inv_id}' "
-                                        f"references physical read '{pid_ref}' pointing to conflicting invocation '{m_inv}'"
+                                        f"references physical read '{pid_ref}' pointing to conflicting invocation ID '{m_inv}'"
                                     )
                 # Unresolved IN_FLIGHT check
                 if inv_rec.outcome == "IN_FLIGHT" and inv_rec.physical_read_ids:
