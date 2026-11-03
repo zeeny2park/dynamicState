@@ -880,12 +880,16 @@ class TestPhase20A3415ReconciliationEnhancements(unittest.TestCase):
 
     def test_37_reconcile_ledger_passes_on_healthy_system(self):
         """All 21 invariants evaluate to True on healthy transactions."""
+        from dataclasses import replace
+        self.tracker.record_invocation_started("inv_1", "read", [])
         with self.tracker.operation_scope("op_healthy", profile_id="p1") as scope:
             adm = scope.admit_read(64)
             cr = adm.start_child_read(target_spec={"slice_index": 0, "invocation_id": "inv_1", "expected_slice_count": 1})
+            self.tracker._invocations["inv_1"] = replace(self.tracker._invocations["inv_1"], physical_read_ids=(cr.physical_read_id,))
             cr.mark_started()
             cr.consume(actual_bytes=64)
             scope.record_read(bytes_read=64, admission=adm)
+        self.tracker.record_invocation_completed("inv_1", return_code=0)
 
         recon = self.tracker.reconcile_ledger()
         self.assertTrue(recon["reconciled"])

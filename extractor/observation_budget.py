@@ -577,6 +577,8 @@ class PhysicalReadRecord:
     def __post_init__(self) -> None:
         if self.target_spec is not None and not isinstance(self.target_spec, types.MappingProxyType):
             self.target_spec = clone_frozen(self.target_spec)
+        if self.state in ("ACCOUNTED", "RELEASED", "FAILED_ACCOUNTED") and self.terminal_at_ms is None:
+            self.terminal_at_ms = self.created_at_ms
         if self.terminal_at_ms is not None and self.terminal_at_ms < self.created_at_ms:
             raise ValueError(
                 f"Terminal timestamp regression: terminal_at_ms ({self.terminal_at_ms}) < created_at_ms ({self.created_at_ms})"
@@ -713,12 +715,12 @@ class PhysicalReadRecord:
                 )
             if self.state != "ADMITTED":
                 raise RuntimeError(f"Cannot release physical read '{self.physical_read_id}' in state '{self.state}'")
-            self.state = "RELEASED"
             t_now = round(time.time() * 1000.0, 3)
             if t_now < self.created_at_ms:
                 raise ValueError(
                     f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
                 )
+            self.state = "RELEASED"
             self.terminal_at_ms = t_now
             self._transition_history.append("RELEASED")
 
@@ -736,12 +738,12 @@ class PhysicalReadRecord:
                 )
             if self.state != "CONSUMED":
                 raise RuntimeError(f"Cannot account physical read '{self.physical_read_id}' in non-consumed state '{self.state}'")
-            self.state = "ACCOUNTED"
             t_now = round(time.time() * 1000.0, 3)
             if t_now < self.created_at_ms:
                 raise ValueError(
                     f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
                 )
+            self.state = "ACCOUNTED"
             self.terminal_at_ms = t_now
             self._transition_history.append("ACCOUNTED")
 
@@ -761,6 +763,11 @@ class PhysicalReadRecord:
                 )
             if self.state not in ("PHYSICAL_READ_STARTED", "CONSUMED"):
                 raise RuntimeError(f"Cannot mark failed_accounted for physical read '{self.physical_read_id}' in state '{self.state}'")
+            t_now = round(time.time() * 1000.0, 3)
+            if t_now < self.created_at_ms:
+                raise ValueError(
+                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
+                )
             if self.state == "PHYSICAL_READ_STARTED" and self.charged_bytes == 0 and self.measured_bytes_read is None:
                 fallback = DEFAULT_CONSERVATIVE_UNKNOWN_BYTES
                 self.estimated_bytes_read = fallback
@@ -770,11 +777,6 @@ class PhysicalReadRecord:
             if failure_reason:
                 self.failure_reason = failure_reason
             self.state = "FAILED_ACCOUNTED"
-            t_now = round(time.time() * 1000.0, 3)
-            if t_now < self.created_at_ms:
-                raise ValueError(
-                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
-                )
             self.terminal_at_ms = t_now
             self._transition_history.append("FAILED_ACCOUNTED")
 
@@ -913,10 +915,18 @@ class RemoteInvocationRecord:
     def __post_init__(self) -> None:
         if isinstance(self.physical_read_ids, list):
             object.__setattr__(self, "physical_read_ids", tuple(self.physical_read_ids))
-        if self.completion_time_ms is not None and self.completion_time_ms < self.start_time_ms:
-            raise ValueError(
-                f"Invocation timestamp regression: completion_time_ms ({self.completion_time_ms}) < start_time_ms ({self.start_time_ms})"
-            )
+        if not isinstance(self.start_time_ms, (int, float)) or math.isnan(self.start_time_ms) or math.isinf(self.start_time_ms) or self.start_time_ms <= 0:
+            raise ValueError(f"Invalid start_time_ms: {self.start_time_ms}")
+        if self.completion_time_ms is not None:
+            if not isinstance(self.completion_time_ms, (int, float)) or math.isnan(self.completion_time_ms) or math.isinf(self.completion_time_ms) or self.completion_time_ms <= 0:
+                raise ValueError(f"Invalid completion_time_ms: {self.completion_time_ms}")
+            if self.completion_time_ms < self.start_time_ms:
+                raise ValueError(
+                    f"Invocation timestamp regression: completion_time_ms ({self.completion_time_ms}) < start_time_ms ({self.start_time_ms})"
+                )
+        if self.duration_ms is not None:
+            if not isinstance(self.duration_ms, (int, float)) or math.isnan(self.duration_ms) or math.isinf(self.duration_ms) or self.duration_ms < 0:
+                raise ValueError(f"Invalid duration_ms: {self.duration_ms}")
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "RemoteInvocationRecord":
         rec = RemoteInvocationRecord(
@@ -1021,6 +1031,16 @@ class BudgetReservation:
     child_reads: Dict[str, PhysicalReadRecord] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.created_at_ms <= 0:
+            self.created_at_ms = round(time.time() * 1000.0, 3)
+        if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED") and self.terminal_at_ms is None:
+            self.terminal_at_ms = self.created_at_ms
+        if self.terminal_at_ms is not None and self.terminal_at_ms < self.created_at_ms:
+            raise ValueError(
+                f"Terminal timestamp regression: terminal_at_ms ({self.terminal_at_ms}) < created_at_ms ({self.created_at_ms})"
+            )
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "BudgetReservation":
         with self._lock:
@@ -1282,15 +1302,23 @@ class BudgetReservation:
                     raise RuntimeError(f"A reservation must never be released if child physical read '{cr.physical_read_id}' consumed bytes ({cr.charged_bytes}B)")
             if self.state not in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
                 raise RuntimeError(f"Cannot release reservation '{self.reservation_id}' in state {self.state}")
-            for cr in self.child_reads.values():
-                if not cr.is_terminal:
-                    cr.release()
-            self.state = "RELEASED"
+
             t_now = round(time.time() * 1000.0, 3)
             if self.created_at_ms > 0 and t_now < self.created_at_ms:
                 raise ValueError(
                     f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
                 )
+            for cr in self.child_reads.values():
+                if not cr.is_terminal and cr.created_at_ms > t_now:
+                    raise ValueError(
+                        f"Terminal timestamp regression for child read '{cr.physical_read_id}': "
+                        f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
+                    )
+
+            for cr in self.child_reads.values():
+                if not cr.is_terminal:
+                    cr.release()
+            self.state = "RELEASED"
             self.terminal_at_ms = t_now
             self._transition_history.append("RELEASED")
 
@@ -1304,15 +1332,23 @@ class BudgetReservation:
                     raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}': child read '{cr.physical_read_id}' remains in flight")
             if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0 and not any(c.state in ("CONSUMED", "ACCOUNTED") for c in self.child_reads.values()):
                 raise RuntimeError(f"Cannot account reservation '{self.reservation_id}' with zero consumption; must be released")
-            for cr in self.child_reads.values():
-                if cr.state == "CONSUMED":
-                    cr.account()
-            self.state = "ACCOUNTED"
+
             t_now = round(time.time() * 1000.0, 3)
             if self.created_at_ms > 0 and t_now < self.created_at_ms:
                 raise ValueError(
                     f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
                 )
+            for cr in self.child_reads.values():
+                if cr.state == "CONSUMED" and cr.created_at_ms > t_now:
+                    raise ValueError(
+                        f"Terminal timestamp regression for child read '{cr.physical_read_id}': "
+                        f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
+                    )
+
+            for cr in self.child_reads.values():
+                if cr.state == "CONSUMED":
+                    cr.account()
+            self.state = "ACCOUNTED"
             self.terminal_at_ms = t_now
             self._transition_history.append("ACCOUNTED")
 
@@ -1330,15 +1366,23 @@ class BudgetReservation:
                     raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}': child read '{cr.physical_read_id}' remains in flight")
             if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED") and self.consumed_bytes == 0 and not any(c.state in ("CONSUMED", "ACCOUNTED") for c in self.child_reads.values()):
                 raise RuntimeError(f"Cannot finalize reservation '{self.reservation_id}' with zero consumption; must be released")
-            for cr in self.child_reads.values():
-                if cr.state == "CONSUMED":
-                    cr.account()
-            self.state = "ACCOUNTED" if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED") else "FINALIZED"
+
             t_now = round(time.time() * 1000.0, 3)
             if self.created_at_ms > 0 and t_now < self.created_at_ms:
                 raise ValueError(
                     f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
                 )
+            for cr in self.child_reads.values():
+                if cr.state == "CONSUMED" and cr.created_at_ms > t_now:
+                    raise ValueError(
+                        f"Terminal timestamp regression for child read '{cr.physical_read_id}': "
+                        f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
+                    )
+
+            for cr in self.child_reads.values():
+                if cr.state == "CONSUMED":
+                    cr.account()
+            self.state = "ACCOUNTED" if self.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED") else "FINALIZED"
             self.terminal_at_ms = t_now
             self._transition_history.append(self.state)
 
@@ -1356,10 +1400,24 @@ class BudgetReservation:
                 raise RuntimeError(
                     f"Conflicting terminal transition: cannot mark failed_accounted for reservation '{self.reservation_id}' in state {self.state}"
                 )
+
+            t_now = round(time.time() * 1000.0, 3)
+            if self.created_at_ms > 0 and t_now < self.created_at_ms:
+                raise ValueError(
+                    f"Terminal timestamp regression: terminal_at_ms ({t_now}) < created_at_ms ({self.created_at_ms})"
+                )
+            for cr in self.child_reads.values():
+                if not cr.is_terminal and cr.created_at_ms > t_now:
+                    raise ValueError(
+                        f"Terminal timestamp regression for child read '{cr.physical_read_id}': "
+                        f"terminal_at_ms ({t_now}) < created_at_ms ({cr.created_at_ms})"
+                    )
+
             for cr in self.child_reads.values():
                 if not cr.is_terminal:
                     cr.mark_failed_accounted()
             self.state = "FAILED_ACCOUNTED"
+            self.terminal_at_ms = t_now
             self._transition_history.append("FAILED_ACCOUNTED")
 
 
@@ -1790,7 +1848,21 @@ class ObservationBudgetTracker:
                     f"Duplicate completion for invocation '{invocation_id}': already terminal '{rec.outcome}'"
                 )
 
-            # Validate completion_time_ms or compute it
+            # 1. Validate duration_ms first if provided
+            eff_dur_ms: Optional[float] = None
+            if duration_ms is not None:
+                if not isinstance(duration_ms, (int, float)) or math.isnan(duration_ms) or math.isinf(duration_ms) or duration_ms < 0:
+                    raise ValueError(f"Invalid duration_ms: {duration_ms}")
+                eff_dur_ms = float(duration_ms)
+            elif hasattr(self, "_invocation_start_mono_ns") and invocation_id in self._invocation_start_mono_ns:
+                start_mono_ns = self._invocation_start_mono_ns[invocation_id]
+                end_mono_ns = time.monotonic_ns()
+                dur_ns = end_mono_ns - start_mono_ns
+                if dur_ns < 0:
+                    raise ValueError(f"Monotonic clock regressed for invocation '{invocation_id}': start_ns={start_mono_ns}, end_ns={end_mono_ns}")
+                eff_dur_ms = round(dur_ns / 1_000_000.0, 3)
+
+            # 2. Validate completion_time_ms
             if completion_time_ms is not None:
                 if not isinstance(completion_time_ms, (int, float)) or math.isnan(completion_time_ms) or math.isinf(completion_time_ms) or completion_time_ms <= 0:
                     raise ValueError(f"Invalid completion_time_ms: {completion_time_ms}")
@@ -1802,32 +1874,17 @@ class ObservationBudgetTracker:
                         f"completion_time_ms ({comp_ms}) is earlier than start_time_ms ({rec.start_time_ms})"
                     )
             else:
-                if duration_ms is not None:
-                    comp_ms = round(rec.start_time_ms + duration_ms, 3)
-                else:
-                    t_now = round(time.time() * 1000.0, 3)
-                    if t_now < rec.start_time_ms:
-                        raise ValueError(
-                            f"Timestamp regression detected for invocation '{invocation_id}': "
-                            f"completion_time_ms ({t_now}) is earlier than start_time_ms ({rec.start_time_ms})"
-                        )
-                    comp_ms = t_now
+                t_now = round(time.time() * 1000.0, 3)
+                if t_now < rec.start_time_ms:
+                    raise ValueError(
+                        f"Timestamp regression detected for invocation '{invocation_id}': "
+                        f"completion_time_ms ({t_now}) is earlier than start_time_ms ({rec.start_time_ms})"
+                    )
+                comp_ms = t_now
 
-            # Monotonic duration measurement
-            eff_dur_ms = duration_ms
-            if eff_dur_ms is None and hasattr(self, "_invocation_start_mono_ns") and invocation_id in self._invocation_start_mono_ns:
-                start_mono_ns = self._invocation_start_mono_ns.pop(invocation_id)
-                end_mono_ns = time.monotonic_ns()
-                dur_ns = end_mono_ns - start_mono_ns
-                if dur_ns < 0:
-                    raise ValueError(f"Monotonic clock regressed for invocation '{invocation_id}': start_ns={start_mono_ns}, end_ns={end_mono_ns}")
-                eff_dur_ms = round(dur_ns / 1_000_000.0, 3)
-            elif eff_dur_ms is not None:
-                if not isinstance(eff_dur_ms, (int, float)) or math.isnan(eff_dur_ms) or math.isinf(eff_dur_ms) or eff_dur_ms < 0:
-                    raise ValueError(f"Invalid duration_ms: {eff_dur_ms}")
-                eff_dur_ms = float(eff_dur_ms)
-            else:
-                eff_dur_ms = round(comp_ms - rec.start_time_ms, 3)
+            # Fallback duration only if no monotonic measurement was available
+            if eff_dur_ms is None:
+                eff_dur_ms = round(max(0.0, comp_ms - rec.start_time_ms), 3)
 
             eff_outcome = outcome
             if not eff_outcome:
@@ -1848,10 +1905,14 @@ class ObservationBudgetTracker:
                 duration_ms=eff_dur_ms,
                 batch_id=rec.batch_id,
                 return_code=return_code,
-                exception=exception,
+                exception=str(exception) if exception else None,
                 output_byte_count=max(0, int(output_byte_count or 0)),
                 outcome=eff_outcome,
             )
+
+            # Atomic commit of invocation outcome & cleanup of monotonic start entry
+            if hasattr(self, "_invocation_start_mono_ns"):
+                self._invocation_start_mono_ns.pop(invocation_id, None)
             self._invocations[invocation_id] = updated_rec
 
     def register_batch_contract(
@@ -2518,6 +2579,7 @@ class ObservationBudgetTracker:
 
                 if not has_child_reads:
                     root_pread_id = f"pread_{prepared.snapshot.physical_consumption_id}"
+                    t_comm = round(time.time() * 1000.0, 3)
                     root_pcons = PhysicalConsumptionRecord(
                         physical_consumption_id=prepared.snapshot.physical_consumption_id,
                         physical_read_id=root_pread_id,
@@ -2531,8 +2593,8 @@ class ObservationBudgetTracker:
                         is_failure=prepared.snapshot.is_failure,
                         accounting_status=prepared.snapshot.accounting_status,
                         measurement_type=prepared.snapshot.measurement_type,
-                        created_at_ms=round(time.time() * 1000.0, 3),
-                        committed_at_ms=round(time.time() * 1000.0, 3),
+                        created_at_ms=t_comm,
+                        committed_at_ms=t_comm,
                         metadata=dict(prepared.snapshot.metadata),
                     )
                     self._physical_consumption_records[prepared.snapshot.physical_consumption_id] = root_pcons
@@ -2547,6 +2609,8 @@ class ObservationBudgetTracker:
                         estimated_bytes_read=prepared.snapshot.estimated_bytes_read,
                         latency_us=prepared.snapshot.latency_us,
                         is_failure=prepared.snapshot.is_failure,
+                        created_at_ms=t_comm,
+                        terminal_at_ms=t_comm,
                     )
                     self._physical_read_records[root_pread_id] = root_cr
 
@@ -3481,19 +3545,20 @@ class ObservationBudgetTracker:
             all_active_child_reads = (
                 [cr for r in self._active_reservations.values() for cr in getattr(r, "child_reads", {}).values()]
                 + [cr for r in getattr(self, "_released_reservations", {}).values() for cr in getattr(r, "child_reads", {}).values()]
+                + [cr for r in getattr(self, "_committed_reservations", {}).values() for cr in getattr(r, "child_reads", {}).values()]
             )
             all_known_read_ids = set(read_ids).union({cr.physical_read_id for cr in all_active_child_reads})
-            all_inspected_reads = list(read_snaps) + all_active_child_reads
+            all_inspected_reads = list({r.physical_read_id: r for r in list(read_snaps) + all_active_child_reads}.values())
 
-            # Validate registered batch contracts have valid invocations
+            # Validate registered batch contracts have valid invocations regardless of invocation count
             for b_key, b_rec in self._batch_records.items():
-                if self._invocations and b_rec.invocation_id not in self._invocations:
+                if b_rec.invocation_id not in self._invocations:
                     batch_reads = [
                         r for r in all_inspected_reads
                         if getattr(r, "batch_id", None) == b_rec.batch_id
                         or (getattr(r, "target_spec", None) or {}).get("batch_id") == b_rec.batch_id
                     ]
-                    if not batch_reads or any(r.state not in ("ADMITTED", "RELEASED") for r in batch_reads):
+                    if not batch_reads or not all(r.state in ("ADMITTED", "RELEASED") for r in batch_reads):
                         inv_22_ok = False
                         discrepancies.append(
                             f"Invariant 22 (orphan batch contract) violated: registered batch '{b_rec.batch_id}' "
@@ -3509,6 +3574,17 @@ class ObservationBudgetTracker:
                                 f"Invariant 22 (invocation provenance) violated: orphan invocation '{inv_id}' "
                                 f"references non-existent physical_read_id '{pid_ref}'"
                             )
+                        else:
+                            matched_r = next((x for x in all_inspected_reads if x.physical_read_id == pid_ref), None)
+                            if matched_r is not None:
+                                m_ts = getattr(matched_r, "target_spec", None) or {}
+                                m_inv = m_ts.get("invocation_id")
+                                if m_inv and m_inv != inv_id:
+                                    inv_22_ok = False
+                                    discrepancies.append(
+                                        f"Invariant 22 (invocation linkage mismatch) violated: invocation '{inv_id}' "
+                                        f"references physical read '{pid_ref}' pointing to conflicting invocation '{m_inv}'"
+                                    )
                 # Unresolved IN_FLIGHT check
                 if inv_rec.outcome == "IN_FLIGHT" and inv_rec.physical_read_ids:
                     child_matches = [r for r in all_inspected_reads if r.physical_read_id in inv_rec.physical_read_ids]
@@ -3519,25 +3595,55 @@ class ObservationBudgetTracker:
                             f"remains IN_FLIGHT while all referenced physical reads are terminal"
                         )
 
-            if self._invocations:
-                for r in all_inspected_reads:
-                    ts = getattr(r, "target_spec", None) or {}
-                    r_inv_id = ts.get("invocation_id")
-                    if r_inv_id and r.state not in ("ADMITTED", "RELEASED"):
-                        if r_inv_id not in self._invocations:
+                # Temporal completeness and valid duration for invocations
+                if inv_rec.outcome != "IN_FLIGHT":
+                    if inv_rec.completion_time_ms is None:
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (terminal timestamp completeness) violated: terminal invocation '{inv_id}' "
+                            f"in outcome '{inv_rec.outcome}' has no completion_time_ms"
+                        )
+                    elif inv_rec.completion_time_ms < inv_rec.start_time_ms:
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (timestamp regression) violated: invocation '{inv_id}' completion_time_ms "
+                            f"({inv_rec.completion_time_ms}) < start_time_ms ({inv_rec.start_time_ms})"
+                        )
+                if inv_rec.duration_ms is not None and (math.isnan(inv_rec.duration_ms) or math.isinf(inv_rec.duration_ms) or inv_rec.duration_ms < 0):
+                    inv_22_ok = False
+                    discrepancies.append(
+                        f"Invariant 22 (invalid duration) violated: invocation '{inv_id}' has invalid duration_ms {inv_rec.duration_ms}"
+                    )
+
+            # Residual monotonic start entries
+            if hasattr(self, "_invocation_start_mono_ns"):
+                for mono_inv_id in self._invocation_start_mono_ns:
+                    if mono_inv_id in self._invocations and self._invocations[mono_inv_id].outcome != "IN_FLIGHT":
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (residual monotonic start) violated: completed invocation '{mono_inv_id}' "
+                            f"retains residual entry in _invocation_start_mono_ns"
+                        )
+
+            # Physical read invocation provenance regardless of invocation count
+            for r in all_inspected_reads:
+                ts = getattr(r, "target_spec", None) or {}
+                r_inv_id = ts.get("invocation_id")
+                if r_inv_id and r.state not in ("ADMITTED", "RELEASED"):
+                    if r_inv_id not in self._invocations:
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (invocation provenance) violated: physical read '{r.physical_read_id}' "
+                            f"references unknown invocation_id '{r_inv_id}'"
+                        )
+                    else:
+                        inv_obj = self._invocations[r_inv_id]
+                        if r.physical_read_id not in inv_obj.physical_read_ids:
                             inv_22_ok = False
                             discrepancies.append(
                                 f"Invariant 22 (invocation provenance) violated: physical read '{r.physical_read_id}' "
-                                f"references unknown invocation_id '{r_inv_id}'"
+                                f"is not listed in invocation '{r_inv_id}' physical_read_ids"
                             )
-                        else:
-                            inv_obj = self._invocations[r_inv_id]
-                            if r.physical_read_id not in inv_obj.physical_read_ids:
-                                inv_22_ok = False
-                                discrepancies.append(
-                                    f"Invariant 22 (invocation provenance) violated: physical read '{r.physical_read_id}' "
-                                    f"is not listed in invocation '{r_inv_id}' physical_read_ids"
-                                )
 
             for r in read_snaps:
                 if not r.reservation_id:
@@ -3585,6 +3691,67 @@ class ObservationBudgetTracker:
                 discrepancies.append(
                     f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in released and committed registries: {overlap_rel_com}"
                 )
+
+            # Check terminal records have terminal timestamps, valid ordering, and parent/child consistency
+            all_reservations_map = dict(self._active_reservations)
+            all_reservations_map.update(getattr(self, "_released_reservations", {}))
+            all_reservations_map.update(getattr(self, "_committed_reservations", {}))
+
+            for res_id_key, res_obj in all_reservations_map.items():
+                if res_obj.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
+                    if res_obj.terminal_at_ms is None:
+                        inv_23_ok = False
+                        discrepancies.append(
+                            f"Invariant 23 (terminal timestamp completeness) violated: terminal reservation '{res_id_key}' "
+                            f"in state '{res_obj.state}' has no terminal_at_ms"
+                        )
+                    elif res_obj.created_at_ms > 0 and res_obj.terminal_at_ms < res_obj.created_at_ms:
+                        inv_23_ok = False
+                        discrepancies.append(
+                            f"Invariant 23 (timestamp regression) violated: reservation '{res_id_key}' terminal_at_ms "
+                            f"({res_obj.terminal_at_ms}) < created_at_ms ({res_obj.created_at_ms})"
+                        )
+                if res_obj.consumed_bytes > 0 and res_obj.state == "RELEASED":
+                    inv_23_ok = False
+                    discrepancies.append(
+                        f"Invariant 23 (invalid transition) violated: reservation '{res_id_key}' has consumed {res_obj.consumed_bytes}B but is RELEASED"
+                    )
+                if res_obj.state in ("ACCOUNTED", "FINALIZED"):
+                    for cr in res_obj.child_reads.values():
+                        if cr.state not in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED"):
+                            inv_23_ok = False
+                            discrepancies.append(
+                                f"Invariant 23 (parent/child consistency) violated: reservation '{res_id_key}' is '{res_obj.state}' "
+                                f"but child read '{cr.physical_read_id}' is non-terminal '{cr.state}'"
+                            )
+                elif res_obj.state == "RELEASED":
+                    for cr in res_obj.child_reads.values():
+                        if cr.state != "RELEASED":
+                            inv_23_ok = False
+                            discrepancies.append(
+                                f"Invariant 23 (parent/child consistency) violated: released reservation '{res_id_key}' "
+                                f"has non-released child read '{cr.physical_read_id}' in state '{cr.state}'"
+                            )
+
+            for r in all_inspected_reads:
+                if r.state in ("ACCOUNTED", "RELEASED", "FAILED_ACCOUNTED"):
+                    if r.terminal_at_ms is None:
+                        inv_23_ok = False
+                        discrepancies.append(
+                            f"Invariant 23 (terminal timestamp completeness) violated: terminal read '{r.physical_read_id}' "
+                            f"in state '{r.state}' has no terminal_at_ms"
+                        )
+                    elif r.terminal_at_ms < r.created_at_ms:
+                        inv_23_ok = False
+                        discrepancies.append(
+                            f"Invariant 23 (timestamp regression) violated: read '{r.physical_read_id}' terminal_at_ms "
+                            f"({r.terminal_at_ms}) < created_at_ms ({r.created_at_ms})"
+                        )
+                if "PHYSICAL_READ_STARTED" in getattr(r, "transition_history", []) and r.state == "RELEASED":
+                    inv_23_ok = False
+                    discrepancies.append(
+                        f"Invariant 23 (invalid transition) violated: physical read '{r.physical_read_id}' started execution but transitioned to RELEASED"
+                    )
 
             # Physical read lifecycle ownership across active, released, committed
             committed_read_ids = set(self._physical_read_records.keys())
