@@ -1633,6 +1633,21 @@ class ActiveOperationScope:
         with self._lock:
             return self.state in ("COMMITTED", "FAILED", "REJECTED")
 
+    def get_status_snapshot(self) -> Dict[str, Any]:
+        """Returns an atomic snapshot of this scope's status, protected by scope._lock (L1.5)."""
+        with self._lock:
+            if self.tracker is not None:
+                self.tracker._trigger_fault("inside_scope_lock")
+            return {
+                "operation_id": self.operation_id,
+                "state": self.state,
+                "reads_count": self.reads_count,
+                "charged_bytes": self.charged_bytes,
+                "measured_bytes_read": self.measured_bytes_read,
+                "estimated_bytes_read": self.estimated_bytes_read,
+                "is_failure": self.is_failure,
+            }
+
     def admit_read(
         self,
         projected_bytes: int,
@@ -3629,9 +3644,9 @@ class ObservationBudgetTracker:
                             "is_failure": getattr(cr, "is_failure", False),
                             "created_at_ms": getattr(cr, "created_at_ms", 0),
                             "terminal_at_ms": getattr(cr, "terminal_at_ms", None),
-                            "transition_history": list(getattr(cr, "_transition_history", [])),
-                            "target_spec": dict(getattr(cr, "target_spec", None) or {}),
-                            "metadata": dict(getattr(cr, "metadata", None) or {}),
+                            "transition_history": tuple(getattr(cr, "_transition_history", [])),
+                            "target_spec": clone_frozen(getattr(cr, "target_spec", None) or {}),
+                            "metadata": clone_frozen(getattr(cr, "metadata", None) or {}),
                             "physical_read_id": getattr(cr, "physical_read_id", cid),
                             "physical_consumption_id": getattr(cr, "physical_consumption_id", None),
                             "operation_id": getattr(cr, "operation_id", None),
@@ -3662,9 +3677,9 @@ class ObservationBudgetTracker:
                                 "is_failure": cr.is_failure,
                                 "created_at_ms": cr.created_at_ms,
                                 "terminal_at_ms": cr.terminal_at_ms,
-                                "transition_history": list(cr._transition_history),
-                                "target_spec": dict(cr.target_spec) if cr.target_spec else {},
-                                "metadata": dict(cr.metadata) if cr.metadata else {},
+                                "transition_history": tuple(cr._transition_history),
+                                "target_spec": clone_frozen(cr.target_spec if cr.target_spec else {}),
+                                "metadata": clone_frozen(cr.metadata if cr.metadata else {}),
                                 "physical_read_id": cr.physical_read_id,
                                 "physical_consumption_id": cr.physical_consumption_id,
                                 "operation_id": cr.operation_id,
@@ -3698,9 +3713,9 @@ class ObservationBudgetTracker:
                         "is_failure": getattr(cr, "is_failure", False),
                         "created_at_ms": getattr(cr, "created_at_ms", 0),
                         "terminal_at_ms": getattr(cr, "terminal_at_ms", None),
-                        "target_spec": dict(getattr(cr, "target_spec", None) or {}),
-                        "metadata": dict(getattr(cr, "metadata", None) or {}),
-                        "transition_history": list(getattr(cr, "_transition_history", [])),
+                        "target_spec": clone_frozen(getattr(cr, "target_spec", None) or {}),
+                        "metadata": clone_frozen(getattr(cr, "metadata", None) or {}),
+                        "transition_history": tuple(getattr(cr, "_transition_history", [])),
                         "batch_id": getattr(cr, "batch_id", None),
                     }
                 with cr._lock:
@@ -3717,9 +3732,9 @@ class ObservationBudgetTracker:
                         "is_failure": cr.is_failure,
                         "created_at_ms": cr.created_at_ms,
                         "terminal_at_ms": cr.terminal_at_ms,
-                        "target_spec": dict(cr.target_spec) if cr.target_spec else {},
-                        "metadata": dict(cr.metadata) if cr.metadata else {},
-                        "transition_history": list(cr._transition_history),
+                        "target_spec": clone_frozen(cr.target_spec if cr.target_spec else {}),
+                        "metadata": clone_frozen(cr.metadata if cr.metadata else {}),
+                        "transition_history": tuple(cr._transition_history),
                         "batch_id": getattr(cr, "batch_id", None),
                     }
 
@@ -3739,7 +3754,7 @@ class ObservationBudgetTracker:
                     "measurement_type": getattr(p, "measurement_type", "ESTIMATED"),
                     "created_at_ms": getattr(p, "created_at_ms", 0.0),
                     "committed_at_ms": getattr(p, "committed_at_ms", 0.0),
-                    "metadata": dict(getattr(p, "metadata", None) or {}),
+                    "metadata": clone_frozen(getattr(p, "metadata", None) or {}),
                 }
 
             def _snapshot_committed_tx_dict(s: Any) -> Dict[str, Any]:
@@ -3756,7 +3771,7 @@ class ObservationBudgetTracker:
                     "accounting_status": getattr(s, "accounting_status", "COMMITTED"),
                     "measurement_type": getattr(s, "measurement_type", "ESTIMATED"),
                     "profile_id": getattr(fp, "profile_id", None),
-                    "metadata": dict(getattr(s, "metadata", None) or {}),
+                    "metadata": clone_frozen(getattr(s, "metadata", None) or {}),
                     "committed_at_ms": getattr(s, "committed_at_ms", 0.0),
                     "committed_duration_ms": getattr(s, "committed_duration_ms", 0.0),
                     "physical_consumption_id": getattr(s, "physical_consumption_id", None),
@@ -3809,7 +3824,7 @@ class ObservationBudgetTracker:
                 "exhaustion_reason": self.metrics.exhaustion_reason,
                 "wall_clock_elapsed_ms": self.metrics.wall_clock_elapsed_ms,
                 "profile_usage": {
-                    prof_id: dict(p_usage)
+                    prof_id: clone_frozen(p_usage)
                     for prof_id, p_usage in getattr(self.metrics, "profile_usage", {}).items()
                 },
             }
@@ -3832,16 +3847,16 @@ class ObservationBudgetTracker:
                     "batch_id": b_rec.batch_id,
                     "invocation_id": b_rec.invocation_id,
                     "expected_slice_count": b_rec.expected_slice_count,
-                    "slices": [
-                        {
+                    "slices": tuple(
+                        clone_frozen({
                             "slice_index": s.slice_index,
                             "address": getattr(s, "address", None),
                             "requested_size": getattr(s, "requested_size", None),
                             "physical_read_id": getattr(s, "physical_read_id", None),
                             "physical_consumption_id": getattr(s, "physical_consumption_id", None),
-                        }
+                        })
                         for s in getattr(b_rec, "slices", [])
-                    ],
+                    ),
                 }
                 for b_key, b_rec in getattr(self, "_batch_records", {}).items()
             }
@@ -3854,927 +3869,930 @@ class ObservationBudgetTracker:
                     "start_time_ms": getattr(inv_rec, "start_time_ms", 0.0),
                     "completion_time_ms": getattr(inv_rec, "completion_time_ms", None),
                     "duration_ms": getattr(inv_rec, "duration_ms", None),
-                    "physical_read_ids": list(getattr(inv_rec, "physical_read_ids", [])),
+                    "physical_read_ids": tuple(getattr(inv_rec, "physical_read_ids", [])),
                 }
                 for inv_id, inv_rec in getattr(self, "_invocations", {}).items()
             }
 
-            invocation_start_mono_snap = set(getattr(self, "_invocation_start_mono_ns", {}).keys())
+            invocation_start_mono_snap = frozenset(getattr(self, "_invocation_start_mono_ns", {}).keys())
             released_reservations_count = getattr(self, "_released_reservations_count", 0)
 
-            act_ids = set(active_res_snaps.keys())
-            rel_ids = set(released_res_snaps.keys())
-            com_ids = set(committed_res_snaps.keys())
-            committed_op_ids = set(tx_snaps_dict.keys())
-            committed_read_ids = set(read_snaps_dict.keys())
+            act_ids = frozenset(active_res_snaps.keys())
+            rel_ids = frozenset(released_res_snaps.keys())
+            com_ids = frozenset(committed_res_snaps.keys())
+            committed_op_ids = frozenset(tx_snaps_dict.keys())
+            committed_read_ids = frozenset(read_snaps_dict.keys())
 
-            discrepancies: List[str] = []
+        # Synchronization hook for genuine post-capture immutable snapshot isolation proof
+        self._trigger_fault("after_reconciliation_snapshot_capture")
 
-            # 1. Uniqueness of physical read IDs
-            read_ids = [r["physical_read_id"] for r in read_snaps]
-            unique_read_ids = set(read_ids)
-            inv_1_ok = (len(read_ids) == len(unique_read_ids))
-            if not inv_1_ok:
-                discrepancies.append(
-                    f"Invariant 1 (physical_read_id uniqueness) violated: {len(read_ids)} total vs {len(unique_read_ids)} unique"
-                )
+        discrepancies: List[str] = []
 
-            # 2. Uniqueness of physical consumption IDs
-            phys_ids = [s["physical_consumption_id"] for s in phys_snaps]
-            unique_phys_ids = set(phys_ids)
-            inv_2_ok = (len(phys_ids) == len(unique_phys_ids))
-            if not inv_2_ok:
-                discrepancies.append(
-                    f"Invariant 2 (physical_consumption_id uniqueness) violated: Physical consumption IDs not unique: {len(phys_ids)} total vs {len(unique_phys_ids)} unique"
-                )
+        # 1. Uniqueness of physical read IDs
+        read_ids = [r["physical_read_id"] for r in read_snaps]
+        unique_read_ids = set(read_ids)
+        inv_1_ok = (len(read_ids) == len(unique_read_ids))
+        if not inv_1_ok:
+            discrepancies.append(
+                f"Invariant 1 (physical_read_id uniqueness) violated: {len(read_ids)} total vs {len(unique_read_ids)} unique"
+            )
 
-            # 3. Uniqueness of accounting transaction IDs
-            tx_ids = [s["accounting_transaction_id"] for s in snaps if s.get("accounting_transaction_id")]
-            unique_tx_ids = set(tx_ids)
-            inv_3_ok = (len(tx_ids) == len(unique_tx_ids))
-            if not inv_3_ok:
-                discrepancies.append(
-                    f"Invariant 3 (accounting_transaction_id uniqueness) violated: {len(tx_ids)} total vs {len(unique_tx_ids)} unique"
-                )
+        # 2. Uniqueness of physical consumption IDs
+        phys_ids = [s["physical_consumption_id"] for s in phys_snaps]
+        unique_phys_ids = set(phys_ids)
+        inv_2_ok = (len(phys_ids) == len(unique_phys_ids))
+        if not inv_2_ok:
+            discrepancies.append(
+                f"Invariant 2 (physical_consumption_id uniqueness) violated: Physical consumption IDs not unique: {len(phys_ids)} total vs {len(unique_phys_ids)} unique"
+            )
 
-            # 4. Child identity uniqueness across reservations
-            seen_child_pread_ids: Set[str] = set()
-            inv_4_ok = True
-            for r_id, r_info in active_res_snaps.items():
-                for cid in r_info["child_snaps"].keys():
-                    if cid in seen_child_pread_ids:
-                        inv_4_ok = False
-                        discrepancies.append(
-                            f"Invariant 4 (child identity uniqueness across reservations) violated: child read '{cid}' shared across multiple reservations"
-                        )
-                    seen_child_pread_ids.add(cid)
+        # 3. Uniqueness of accounting transaction IDs
+        tx_ids = [s["accounting_transaction_id"] for s in snaps if s.get("accounting_transaction_id")]
+        unique_tx_ids = set(tx_ids)
+        inv_3_ok = (len(tx_ids) == len(unique_tx_ids))
+        if not inv_3_ok:
+            discrepancies.append(
+                f"Invariant 3 (accounting_transaction_id uniqueness) violated: {len(tx_ids)} total vs {len(unique_tx_ids)} unique"
+            )
 
-            # 5. Reservation-to-child linkage
-            inv_5_ok = True
-            for r in read_snaps:
-                if not r.get("reservation_id"):
-                    inv_5_ok = False
-                    discrepancies.append(f"Invariant 5 (reservation-to-child linkage) violated: read '{r['physical_read_id']}' has no reservation_id")
-
-            # 6. Child-to-consumption linkage
-            read_id_set = set(read_ids)
-            inv_6_ok = True
-            for p in phys_snaps:
-                p_read_id = p.get("physical_read_id")
-                if p_read_id and p_read_id not in read_id_set:
-                    inv_6_ok = False
+        # 4. Child identity uniqueness across reservations
+        seen_child_pread_ids: Set[str] = set()
+        inv_4_ok = True
+        for r_id, r_info in active_res_snaps.items():
+            for cid in r_info["child_snaps"].keys():
+                if cid in seen_child_pread_ids:
+                    inv_4_ok = False
                     discrepancies.append(
-                        f"Invariant 6 (child-to-consumption linkage) violated: consumption '{p['physical_consumption_id']}' points to unknown read '{p_read_id}'"
+                        f"Invariant 4 (child identity uniqueness across reservations) violated: child read '{cid}' shared across multiple reservations"
+                    )
+                seen_child_pread_ids.add(cid)
+
+        # 5. Reservation-to-child linkage
+        inv_5_ok = True
+        for r in read_snaps:
+            if not r.get("reservation_id"):
+                inv_5_ok = False
+                discrepancies.append(f"Invariant 5 (reservation-to-child linkage) violated: read '{r['physical_read_id']}' has no reservation_id")
+
+        # 6. Child-to-consumption linkage
+        read_id_set = set(read_ids)
+        inv_6_ok = True
+        for p in phys_snaps:
+            p_read_id = p.get("physical_read_id")
+            if p_read_id and p_read_id not in read_id_set:
+                inv_6_ok = False
+                discrepancies.append(
+                    f"Invariant 6 (child-to-consumption linkage) violated: consumption '{p['physical_consumption_id']}' points to unknown read '{p_read_id}'"
+                )
+
+        # 7. Operation-to-accounting linkage
+        inv_7_ok = True
+        for p in phys_snaps:
+            p_op = p.get("operation_id")
+            if p_op and p_op not in committed_op_ids and p_op not in active_scope_op_ids:
+                if not any(p_op in s["operation_id"] for s in snaps) and not any(p.get("physical_consumption_id") == s["physical_consumption_id"] for s in snaps):
+                    inv_7_ok = False
+                    discrepancies.append(
+                        f"Invariant 7 (operation-to-accounting linkage) violated: physical record '{p.get('physical_consumption_id')}' has unlinked operation '{p_op}'"
                     )
 
-            # 7. Operation-to-accounting linkage
-            inv_7_ok = True
-            for p in phys_snaps:
-                p_op = p.get("operation_id")
-                if p_op and p_op not in committed_op_ids and p_op not in active_scope_op_ids:
-                    if not any(p_op in s["operation_id"] for s in snaps) and not any(p.get("physical_consumption_id") == s["physical_consumption_id"] for s in snaps):
-                        inv_7_ok = False
-                        discrepancies.append(
-                            f"Invariant 7 (operation-to-accounting linkage) violated: physical record '{p.get('physical_consumption_id')}' has unlinked operation '{p_op}'"
-                        )
+        # 8. No child record overwritten
+        inv_8_ok = inv_1_ok and inv_4_ok
 
-            # 8. No child record overwritten
-            inv_8_ok = inv_1_ok and inv_4_ok
-
-            # 9. No started read released
-            inv_9_ok = True
-            for r in read_snaps:
-                th = r.get("transition_history") or []
-                if "PHYSICAL_READ_STARTED" in th and "RELEASED" in th:
+        # 9. No started read released
+        inv_9_ok = True
+        for r in read_snaps:
+            th = r.get("transition_history") or []
+            if "PHYSICAL_READ_STARTED" in th and "RELEASED" in th:
+                inv_9_ok = False
+                discrepancies.append(
+                    f"Invariant 9 (no started read released) violated: read '{r['physical_read_id']}' transitioned from STARTED to RELEASED: {th}"
+                )
+        for r_id, r_info in active_res_snaps.items():
+            for cid, cs in r_info["child_snaps"].items():
+                cr_th = cs.get("transition_history") or []
+                if "PHYSICAL_READ_STARTED" in cr_th and "RELEASED" in cr_th:
                     inv_9_ok = False
                     discrepancies.append(
-                        f"Invariant 9 (no started read released) violated: read '{r['physical_read_id']}' transitioned from STARTED to RELEASED: {th}"
+                        f"Invariant 9 (no started child read released) violated: child '{cid}' of '{r_id}' transitioned from STARTED to RELEASED: {cr_th}"
                     )
-            for r_id, r_info in active_res_snaps.items():
-                for cid, cs in r_info["child_snaps"].items():
-                    cr_th = cs.get("transition_history") or []
-                    if "PHYSICAL_READ_STARTED" in cr_th and "RELEASED" in cr_th:
-                        inv_9_ok = False
-                        discrepancies.append(
-                            f"Invariant 9 (no started child read released) violated: child '{cid}' of '{r_id}' transitioned from STARTED to RELEASED: {cr_th}"
-                        )
 
-            # 10. No in-flight child at reservation finalization
-            inv_10_ok = True
-            for r in read_snaps:
-                if r.get("state") == "PHYSICAL_READ_STARTED":
+        # 10. No in-flight child at reservation finalization
+        inv_10_ok = True
+        for r in read_snaps:
+            if r.get("state") == "PHYSICAL_READ_STARTED":
+                inv_10_ok = False
+                discrepancies.append(
+                    f"Invariant 10 (no started read without terminal outcome) violated: read '{r['physical_read_id']}' is still in PHYSICAL_READ_STARTED"
+                )
+        for r_id, r_info in active_res_snaps.items():
+            r_state = r_info["state"]
+            for cid, cs in r_info["child_snaps"].items():
+                if cs["state"] == "PHYSICAL_READ_STARTED" and r_state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
                     inv_10_ok = False
                     discrepancies.append(
-                        f"Invariant 10 (no started read without terminal outcome) violated: read '{r['physical_read_id']}' is still in PHYSICAL_READ_STARTED"
-                    )
-            for r_id, r_info in active_res_snaps.items():
-                r_state = r_info["state"]
-                for cid, cs in r_info["child_snaps"].items():
-                    if cs["state"] == "PHYSICAL_READ_STARTED" and r_state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
-                        inv_10_ok = False
-                        discrepancies.append(
-                            f"Invariant 10 (no in-flight child at reservation finalization) violated: child read '{cid}' of '{r_id}' is still PHYSICAL_READ_STARTED"
-                        )
-
-            # 11. No consumed child without accounting
-            inv_11_ok = True
-            for r_id, r_info in active_res_snaps.items():
-                r_state = r_info["state"]
-                r_scope_id = r_info["scope_id"]
-                if r_state == "CONSUMED" and (r_scope_id is None or r_scope_id not in active_scope_phys_ids):
-                    is_active_inv = False
-                    for cs in r_info["child_snaps"].values():
-                        ts = cs.get("target_spec") or {}
-                        c_inv = ts.get("invocation_id")
-                        if c_inv and c_inv in invocations_snap:
-                            is_active_inv = True
-                            break
-                    if is_active_inv:
-                        continue
-                    inv_11_ok = False
-                    discrepancies.append(
-                        f"Invariant 11 (no consumed child without accounting) violated: active consumed reservation '{r_id}' has no active scope"
+                        f"Invariant 10 (no in-flight child at reservation finalization) violated: child read '{cid}' of '{r_id}' is still PHYSICAL_READ_STARTED"
                     )
 
-            # 12. No accounting without physical evidence
-            inv_12_ok = True
-            for op_id, s in tx_snaps_dict.items():
-                if s["charged_bytes"] > 0:
-                    has_phys = (
-                        s["physical_consumption_id"] in phys_snaps_dict
-                        or any(p.get("operation_id") == op_id for p in phys_snaps)
-                        or any(r.get("operation_id") == op_id for r in read_snaps)
-                    )
-                    if not has_phys:
-                        inv_12_ok = False
-                        discrepancies.append(
-                            f"Invariant 12 (no accounting without physical evidence) violated: transaction '{op_id}' has charged_bytes={s['charged_bytes']} but no physical evidence"
-                        )
-
-            # 13. No physical consumption without valid physical_read_id
-            inv_13_ok = True
-            for p in phys_snaps:
-                p_read_id = p.get("physical_read_id")
-                if not p_read_id or p_read_id not in read_id_set:
-                    inv_13_ok = False
-                    discrepancies.append(
-                        f"Invariant 13 (no physical consumption without valid physical_read_id) violated: record '{p.get('physical_consumption_id')}' has invalid read_id '{p_read_id}'"
-                    )
-
-            # 14. No duplicate physical execution identity
-            inv_14_ok = inv_1_ok and inv_2_ok and inv_4_ok
-
-            # 15. Aggregate reservation bytes equal child consumption sum
-            inv_15_ok = True
-            for r_id, r_info in active_res_snaps.items():
-                r_consumed = r_info["consumed_bytes"]
-                c_snaps = r_info["child_snaps"]
-                if c_snaps:
-                    child_sum = sum(c["charged_bytes"] for c in c_snaps.values())
-                    if r_consumed != child_sum:
-                        inv_15_ok = False
-                        discrepancies.append(
-                            f"Invariant 15 (aggregate reservation bytes equal child consumption sum) violated: reservation '{r_id}' consumed {r_consumed}B != child sum {child_sum}B"
-                        )
-
-            # 16. Committed bytes equal physical ledger totals
-            sum_charged = sum(s["charged_bytes"] for s in snaps)
-            inv_16_ok = True
-            if read_snaps:
-                sum_reads_charged = sum(r["charged_bytes"] for r in read_snaps)
-                if sum_reads_charged != sum_charged:
-                    inv_16_ok = False
-                    discrepancies.append(
-                        f"Invariant 16 (committed bytes equal physical ledger totals) violated: committed={sum_charged}B vs physical_reads={sum_reads_charged}B"
-                    )
-
-            # 17. Global metrics equal committed totals
-            sum_measured = sum(s["measured_bytes_read"] or 0 for s in snaps if s["measured_bytes_read"] is not None)
-            sum_estimated = sum(s["estimated_bytes_read"] for s in snaps)
-            sum_latency = sum(s["latency_us"] for s in snaps)
-            sum_stop = sum(s["stop_ms"] for s in snaps)
-            sum_failures = sum(1 for s in snaps if s["is_failure"])
-            sum_failed_status = sum(1 for s in snaps if s["accounting_status"] == "FAILED")
-            sum_rejected_status = sum(1 for s in snaps if s["accounting_status"] == "REJECTED")
-
-            inv_17_ok = True
-            if sum_charged != metrics_snap["bytes_read"]:
-                inv_17_ok = False
-                discrepancies.append(f"Invariant 17 violated: bytes_read: ledger={sum_charged} vs metrics={metrics_snap['bytes_read']}")
-            if sum_measured != metrics_snap["measured_bytes_read"]:
-                inv_17_ok = False
-                discrepancies.append(f"Invariant 17 violated: measured_bytes ledger={sum_measured} vs metrics={metrics_snap['measured_bytes_read']}")
-            if sum_estimated != metrics_snap["conservative_estimated_bytes"]:
-                inv_17_ok = False
-                discrepancies.append(f"Invariant 17 violated: estimated_bytes ledger={sum_estimated} vs metrics={metrics_snap['conservative_estimated_bytes']}")
-            if round(sum_latency, 2) != round(metrics_snap["observation_latency_us"], 2):
-                inv_17_ok = False
-                discrepancies.append(f"Invariant 17 violated: latency ledger={sum_latency} vs metrics={metrics_snap['observation_latency_us']}")
-            if round(sum_stop, 2) != round(metrics_snap["target_stop_duration_ms"], 2):
-                inv_17_ok = False
-                discrepancies.append(f"Invariant 17 violated: stop_duration ledger={sum_stop} vs metrics={metrics_snap['target_stop_duration_ms']}")
-            if sum_failures != metrics_snap["total_read_failures"]:
-                inv_17_ok = False
-                discrepancies.append(f"Invariant 17 violated: failures ledger={sum_failures} vs metrics={metrics_snap['total_read_failures']}")
-
-            # 18. Profile usage equals committed profile totals
-            inv_18_ok = True
-            for prof_id, p_usage in metrics_snap["profile_usage"].items():
-                p_snaps = [
-                    s for s in snaps
-                    if (s.get("profile_id") == prof_id
-                        or (s.get("profile_id") is None and s["operation_id"] == prof_id)
-                        or (s.get("profile_id") is None and s["operation_id"].startswith(f"{prof_id}#")))
-                ]
-                p_charged = sum(s["charged_bytes"] for s in p_snaps)
-                p_meas = sum(s["measured_bytes_read"] or 0 for s in p_snaps if s["measured_bytes_read"] is not None)
-                p_est = sum(s["estimated_bytes_read"] for s in p_snaps)
-                p_fails = sum(1 for s in p_snaps if s["is_failure"])
-                if p_charged != p_usage["bytes_read"]:
-                    inv_18_ok = False
-                    discrepancies.append(f"Invariant 18 (profile '{prof_id}' bytes) violated: ledger={p_charged} vs usage={p_usage['bytes_read']}")
-                if p_meas != p_usage["measured_bytes_read"]:
-                    inv_18_ok = False
-                    discrepancies.append(f"Invariant 18 (profile '{prof_id}' measured) violated: ledger={p_meas} vs usage={p_usage['measured_bytes_read']}")
-                if p_est != p_usage["conservative_estimated_bytes"]:
-                    inv_18_ok = False
-                    discrepancies.append(f"Invariant 18 (profile '{prof_id}' estimated) violated: ledger={p_est} vs usage={p_usage['conservative_estimated_bytes']}")
-                if p_fails != p_usage["failures"]:
-                    inv_18_ok = False
-                    discrepancies.append(f"Invariant 18 (profile '{prof_id}' failures) violated: ledger={p_fails} vs usage={p_usage['failures']}")
-
-            # 19. Unknown consumption never zero
-            inv_19_ok = True
-            for r in read_snaps:
-                r_fail = r.get("is_failure", False)
-                r_meas = r.get("measured_bytes_read")
-                r_charged = r.get("charged_bytes", 0)
-                if r_fail and r_meas is None and r_charged == 0:
-                    inv_19_ok = False
-                    discrepancies.append(f"Invariant 19 (unknown consumption never zero) violated: read '{r['physical_read_id']}' has unknown bytes charged as 0")
-            for s in snaps:
-                if s.get("measurement_type") == "UNKNOWN" and s.get("charged_bytes", 0) == 0:
-                    inv_19_ok = False
-                    discrepancies.append(f"Invariant 19 (unknown consumption never zero) violated: transaction '{s['operation_id']}' has unknown measurement charged as 0")
-
-            # 20. Batch completeness contract
-            inv_20_ok = True
-            all_slices_for_batch: List[Dict[str, Any]] = []
-            for r in read_snaps:
-                ts = r.get("target_spec") or {}
-                if "slice_index" in ts:
-                    all_slices_for_batch.append(r)
-            for r_info in active_res_snaps.values():
+        # 11. No consumed child without accounting
+        inv_11_ok = True
+        for r_id, r_info in active_res_snaps.items():
+            r_state = r_info["state"]
+            r_scope_id = r_info["scope_id"]
+            if r_state == "CONSUMED" and (r_scope_id is None or r_scope_id not in active_scope_phys_ids):
+                is_active_inv = False
                 for cs in r_info["child_snaps"].values():
                     ts = cs.get("target_spec") or {}
-                    if "slice_index" in ts and cs["physical_read_id"] not in {x["physical_read_id"] for x in all_slices_for_batch}:
-                        all_slices_for_batch.append(cs)
-            for r_info in released_res_snaps.values():
-                for cs in r_info["child_snaps"].values():
-                    ts = cs.get("target_spec") or {}
-                    if "slice_index" in ts and cs["physical_read_id"] not in {x["physical_read_id"] for x in all_slices_for_batch}:
-                        all_slices_for_batch.append(cs)
+                    c_inv = ts.get("invocation_id")
+                    if c_inv and c_inv in invocations_snap:
+                        is_active_inv = True
+                        break
+                if is_active_inv:
+                    continue
+                inv_11_ok = False
+                discrepancies.append(
+                    f"Invariant 11 (no consumed child without accounting) violated: active consumed reservation '{r_id}' has no active scope"
+                )
 
-            batch_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-            for r_snap in all_slices_for_batch:
+        # 12. No accounting without physical evidence
+        inv_12_ok = True
+        for op_id, s in tx_snaps_dict.items():
+            if s["charged_bytes"] > 0:
+                has_phys = (
+                    s["physical_consumption_id"] in phys_snaps_dict
+                    or any(p.get("operation_id") == op_id for p in phys_snaps)
+                    or any(r.get("operation_id") == op_id for r in read_snaps)
+                )
+                if not has_phys:
+                    inv_12_ok = False
+                    discrepancies.append(
+                        f"Invariant 12 (no accounting without physical evidence) violated: transaction '{op_id}' has charged_bytes={s['charged_bytes']} but no physical evidence"
+                    )
+
+        # 13. No physical consumption without valid physical_read_id
+        inv_13_ok = True
+        for p in phys_snaps:
+            p_read_id = p.get("physical_read_id")
+            if not p_read_id or p_read_id not in read_id_set:
+                inv_13_ok = False
+                discrepancies.append(
+                    f"Invariant 13 (no physical consumption without valid physical_read_id) violated: record '{p.get('physical_consumption_id')}' has invalid read_id '{p_read_id}'"
+                )
+
+        # 14. No duplicate physical execution identity
+        inv_14_ok = inv_1_ok and inv_2_ok and inv_4_ok
+
+        # 15. Aggregate reservation bytes equal child consumption sum
+        inv_15_ok = True
+        for r_id, r_info in active_res_snaps.items():
+            r_consumed = r_info["consumed_bytes"]
+            c_snaps = r_info["child_snaps"]
+            if c_snaps:
+                child_sum = sum(c["charged_bytes"] for c in c_snaps.values())
+                if r_consumed != child_sum:
+                    inv_15_ok = False
+                    discrepancies.append(
+                        f"Invariant 15 (aggregate reservation bytes equal child consumption sum) violated: reservation '{r_id}' consumed {r_consumed}B != child sum {child_sum}B"
+                    )
+
+        # 16. Committed bytes equal physical ledger totals
+        sum_charged = sum(s["charged_bytes"] for s in snaps)
+        inv_16_ok = True
+        if read_snaps:
+            sum_reads_charged = sum(r["charged_bytes"] for r in read_snaps)
+            if sum_reads_charged != sum_charged:
+                inv_16_ok = False
+                discrepancies.append(
+                    f"Invariant 16 (committed bytes equal physical ledger totals) violated: committed={sum_charged}B vs physical_reads={sum_reads_charged}B"
+                )
+
+        # 17. Global metrics equal committed totals
+        sum_measured = sum(s["measured_bytes_read"] or 0 for s in snaps if s["measured_bytes_read"] is not None)
+        sum_estimated = sum(s["estimated_bytes_read"] for s in snaps)
+        sum_latency = sum(s["latency_us"] for s in snaps)
+        sum_stop = sum(s["stop_ms"] for s in snaps)
+        sum_failures = sum(1 for s in snaps if s["is_failure"])
+        sum_failed_status = sum(1 for s in snaps if s["accounting_status"] == "FAILED")
+        sum_rejected_status = sum(1 for s in snaps if s["accounting_status"] == "REJECTED")
+
+        inv_17_ok = True
+        if sum_charged != metrics_snap["bytes_read"]:
+            inv_17_ok = False
+            discrepancies.append(f"Invariant 17 violated: bytes_read: ledger={sum_charged} vs metrics={metrics_snap['bytes_read']}")
+        if sum_measured != metrics_snap["measured_bytes_read"]:
+            inv_17_ok = False
+            discrepancies.append(f"Invariant 17 violated: measured_bytes ledger={sum_measured} vs metrics={metrics_snap['measured_bytes_read']}")
+        if sum_estimated != metrics_snap["conservative_estimated_bytes"]:
+            inv_17_ok = False
+            discrepancies.append(f"Invariant 17 violated: estimated_bytes ledger={sum_estimated} vs metrics={metrics_snap['conservative_estimated_bytes']}")
+        if round(sum_latency, 2) != round(metrics_snap["observation_latency_us"], 2):
+            inv_17_ok = False
+            discrepancies.append(f"Invariant 17 violated: latency ledger={sum_latency} vs metrics={metrics_snap['observation_latency_us']}")
+        if round(sum_stop, 2) != round(metrics_snap["target_stop_duration_ms"], 2):
+            inv_17_ok = False
+            discrepancies.append(f"Invariant 17 violated: stop_duration ledger={sum_stop} vs metrics={metrics_snap['target_stop_duration_ms']}")
+        if sum_failures != metrics_snap["total_read_failures"]:
+            inv_17_ok = False
+            discrepancies.append(f"Invariant 17 violated: failures ledger={sum_failures} vs metrics={metrics_snap['total_read_failures']}")
+
+        # 18. Profile usage equals committed profile totals
+        inv_18_ok = True
+        for prof_id, p_usage in metrics_snap["profile_usage"].items():
+            p_snaps = [
+                s for s in snaps
+                if (s.get("profile_id") == prof_id
+                    or (s.get("profile_id") is None and s["operation_id"] == prof_id)
+                    or (s.get("profile_id") is None and s["operation_id"].startswith(f"{prof_id}#")))
+            ]
+            p_charged = sum(s["charged_bytes"] for s in p_snaps)
+            p_meas = sum(s["measured_bytes_read"] or 0 for s in p_snaps if s["measured_bytes_read"] is not None)
+            p_est = sum(s["estimated_bytes_read"] for s in p_snaps)
+            p_fails = sum(1 for s in p_snaps if s["is_failure"])
+            if p_charged != p_usage["bytes_read"]:
+                inv_18_ok = False
+                discrepancies.append(f"Invariant 18 (profile '{prof_id}' bytes) violated: ledger={p_charged} vs usage={p_usage['bytes_read']}")
+            if p_meas != p_usage["measured_bytes_read"]:
+                inv_18_ok = False
+                discrepancies.append(f"Invariant 18 (profile '{prof_id}' measured) violated: ledger={p_meas} vs usage={p_usage['measured_bytes_read']}")
+            if p_est != p_usage["conservative_estimated_bytes"]:
+                inv_18_ok = False
+                discrepancies.append(f"Invariant 18 (profile '{prof_id}' estimated) violated: ledger={p_est} vs usage={p_usage['conservative_estimated_bytes']}")
+            if p_fails != p_usage["failures"]:
+                inv_18_ok = False
+                discrepancies.append(f"Invariant 18 (profile '{prof_id}' failures) violated: ledger={p_fails} vs usage={p_usage['failures']}")
+
+        # 19. Unknown consumption never zero
+        inv_19_ok = True
+        for r in read_snaps:
+            r_fail = r.get("is_failure", False)
+            r_meas = r.get("measured_bytes_read")
+            r_charged = r.get("charged_bytes", 0)
+            if r_fail and r_meas is None and r_charged == 0:
+                inv_19_ok = False
+                discrepancies.append(f"Invariant 19 (unknown consumption never zero) violated: read '{r['physical_read_id']}' has unknown bytes charged as 0")
+        for s in snaps:
+            if s.get("measurement_type") == "UNKNOWN" and s.get("charged_bytes", 0) == 0:
+                inv_19_ok = False
+                discrepancies.append(f"Invariant 19 (unknown consumption never zero) violated: transaction '{s['operation_id']}' has unknown measurement charged as 0")
+
+        # 20. Batch completeness contract
+        inv_20_ok = True
+        all_slices_for_batch: List[Dict[str, Any]] = []
+        for r in read_snaps:
+            ts = r.get("target_spec") or {}
+            if "slice_index" in ts:
+                all_slices_for_batch.append(r)
+        for r_info in active_res_snaps.values():
+            for cs in r_info["child_snaps"].values():
+                ts = cs.get("target_spec") or {}
+                if "slice_index" in ts and cs["physical_read_id"] not in {x["physical_read_id"] for x in all_slices_for_batch}:
+                    all_slices_for_batch.append(cs)
+        for r_info in released_res_snaps.values():
+            for cs in r_info["child_snaps"].values():
+                ts = cs.get("target_spec") or {}
+                if "slice_index" in ts and cs["physical_read_id"] not in {x["physical_read_id"] for x in all_slices_for_batch}:
+                    all_slices_for_batch.append(cs)
+
+        batch_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for r_snap in all_slices_for_batch:
+            ts = r_snap.get("target_spec") or {}
+            b_id = ts.get("batch_id") or r_snap.get("reservation_id") or "unknown_batch"
+            inv_id = ts.get("invocation_id") or "unknown_inv"
+            batch_groups.setdefault((b_id, inv_id), []).append(r_snap)
+
+        all_batch_keys = set(batch_groups.keys())
+        for key, b_reg in batch_records_snap.items():
+            all_batch_keys.add((b_reg["batch_id"], b_reg["invocation_id"]))
+
+        for (b_id, inv_id) in sorted(all_batch_keys):
+            group = batch_groups.get((b_id, inv_id), [])
+            b_reg = batch_records_snap.get(f"{b_id}::{inv_id}")
+
+            # 1. Expected slice count: strictly required, never inferred from len(group)
+            exp_counts = {r_snap["target_spec"].get("expected_slice_count") for r_snap in group if r_snap.get("target_spec")} - {None}
+            if b_reg is not None:
+                exp_counts.add(b_reg["expected_slice_count"])
+
+            if not exp_counts:
+                inv_20_ok = False
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                    f"has no explicit expected_slice_count recorded"
+                )
+                continue
+
+            if len(exp_counts) > 1:
+                inv_20_ok = False
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                    f"has conflicting expected_slice_count values: {exp_counts}"
+                )
+                continue
+
+            expected_count = next(iter(exp_counts))
+            if not isinstance(expected_count, int) or expected_count <= 0:
+                inv_20_ok = False
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                    f"has invalid expected_slice_count: {expected_count}"
+                )
+                continue
+
+            # Batch with zero observed slice records
+            if not group:
+                inv_20_ok = False
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: registered batch contract '{b_id}' invocation '{inv_id}' "
+                    f"has 0 observed slice records (expected {expected_count})"
+                )
+                continue
+
+            # 2. Validate every slice index in [0, expected_count)
+            slice_indices = [r_snap["target_spec"].get("slice_index") for r_snap in group if r_snap.get("target_spec")]
+            out_of_range = [idx for idx in slice_indices if idx is None or not isinstance(idx, int) or idx < 0 or idx >= expected_count]
+            if out_of_range:
+                inv_20_ok = False
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                    f"has out-of-range slice indices: {out_of_range} (expected [0, {expected_count}))"
+                )
+
+            if len(slice_indices) != len(set(slice_indices)):
+                inv_20_ok = False
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                    f"has duplicate slice indices: {slice_indices}"
+                )
+
+            valid_indices_set = set(idx for idx in slice_indices if isinstance(idx, int) and 0 <= idx < expected_count)
+            expected_set = set(range(expected_count))
+            if valid_indices_set != expected_set:
+                inv_20_ok = False
+                missing = sorted(list(expected_set - valid_indices_set))
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                    f"is incomplete, missing slice indices: {missing}"
+                )
+
+            # 3. Check duplicate physical_read_id or physical_consumption_id within batch
+            batch_read_ids = [r_snap["physical_read_id"] for r_snap in group]
+            if len(batch_read_ids) != len(set(batch_read_ids)):
+                inv_20_ok = False
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                    f"contains duplicate physical_read_ids: {batch_read_ids}"
+                )
+            batch_cons_ids = [r_snap["physical_consumption_id"] for r_snap in group if r_snap.get("physical_consumption_id")]
+            if len(batch_cons_ids) != len(set(batch_cons_ids)):
+                inv_20_ok = False
+                discrepancies.append(
+                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
+                    f"contains duplicate physical_consumption_ids: {batch_cons_ids}"
+                )
+
+            # 4. Check conflicting address or requested size metadata
+            seen_specs: Dict[int, Tuple[int, int]] = {}
+            for r_snap in group:
                 ts = r_snap.get("target_spec") or {}
-                b_id = ts.get("batch_id") or r_snap.get("reservation_id") or "unknown_batch"
-                inv_id = ts.get("invocation_id") or "unknown_inv"
-                batch_groups.setdefault((b_id, inv_id), []).append(r_snap)
+                s_idx = ts.get("slice_index")
+                addr = ts.get("address")
+                req_sz = ts.get("requested_size", ts.get("size"))
+                if s_idx is not None and addr is not None and req_sz is not None:
+                    if s_idx in seen_specs:
+                        if seen_specs[s_idx] != (addr, req_sz):
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {s_idx} "
+                                f"has conflicting metadata: {seen_specs[s_idx]} vs {(addr, req_sz)}"
+                            )
+                    else:
+                        seen_specs[s_idx] = (addr, req_sz)
 
-            all_batch_keys = set(batch_groups.keys())
-            for key, b_reg in batch_records_snap.items():
-                all_batch_keys.add((b_reg["batch_id"], b_reg["invocation_id"]))
-
-            for (b_id, inv_id) in sorted(all_batch_keys):
-                group = batch_groups.get((b_id, inv_id), [])
-                b_reg = batch_records_snap.get(f"{b_id}::{inv_id}")
-
-                # 1. Expected slice count: strictly required, never inferred from len(group)
-                exp_counts = {r_snap["target_spec"].get("expected_slice_count") for r_snap in group if r_snap.get("target_spec")} - {None}
-                if b_reg is not None:
-                    exp_counts.add(b_reg["expected_slice_count"])
-
-                if not exp_counts:
+            # 5. Check completion status and failed slice preservation
+            for r_snap in group:
+                ts = r_snap.get("target_spec") or {}
+                c_status = ts.get("completion_status")
+                valid_statuses = {"OBSERVED", "PARTIAL", "FAILED", "UNAVAILABLE", "NOT_EXECUTED", "UNKNOWN", "TARGET_TERMINATED", "PERMISSION_DENIED", None}
+                if c_status not in valid_statuses:
                     inv_20_ok = False
                     discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                        f"has no explicit expected_slice_count recorded"
+                        f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' "
+                        f"has invalid completion_status: {c_status}"
                     )
-                    continue
-
-                if len(exp_counts) > 1:
+                if c_status in ("OBSERVED", "PARTIAL") and r_snap.get("is_failure", False):
                     inv_20_ok = False
                     discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                        f"has conflicting expected_slice_count values: {exp_counts}"
+                        f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' "
+                        f"has successful status '{c_status}' but physical read is marked failure"
                     )
-                    continue
-
-                expected_count = next(iter(exp_counts))
-                if not isinstance(expected_count, int) or expected_count <= 0:
+                if c_status in ("FAILED", "UNAVAILABLE", "TARGET_TERMINATED", "PERMISSION_DENIED") and not r_snap.get("is_failure", False) and r_snap.get("state") != "RELEASED":
                     inv_20_ok = False
                     discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                        f"has invalid expected_slice_count: {expected_count}"
+                        f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' "
+                        f"has failure status '{c_status}' but physical read is not marked failure"
                     )
-                    continue
+                if r_snap.get("is_failure", False) or c_status in ("FAILED", "UNAVAILABLE", "TARGET_TERMINATED", "PERMISSION_DENIED"):
+                    if r_snap.get("measured_bytes_read") is not None and r_snap.get("measured_bytes_read") == 0 and r_snap.get("estimated_bytes_read", 0) > 0:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: failed slice '{r_snap['physical_read_id']}' "
+                            f"falsely reported measured_bytes_read=0 alongside estimated_bytes_read={r_snap.get('estimated_bytes_read', 0)}"
+                        )
 
-                # Batch with zero observed slice records
-                if not group:
+            # 5b. Authoritative BatchReadRecord contract vs actual slice comparison
+            if b_reg is not None and b_reg.get("slices"):
+                slices_by_idx = {s["slice_index"]: s for s in b_reg["slices"]}
+                actual_by_idx = {r_snap["target_spec"].get("slice_index"): r_snap for r_snap in group if r_snap.get("target_spec") and "slice_index" in r_snap["target_spec"]}
+                for idx_val, s_spec in slices_by_idx.items():
+                    act_r = actual_by_idx.get(idx_val)
+                    if act_r is None:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} in contract has no matching physical read record"
+                        )
+                        continue
+                    act_spec = act_r.get("target_spec") or {}
+                    act_addr = act_spec.get("address")
+                    if act_addr is not None and s_spec.get("address") is not None and act_addr != s_spec["address"]:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} address mismatch: contract={s_spec['address']} vs actual={act_addr}"
+                        )
+                    act_sz = act_spec.get("requested_size", act_spec.get("size"))
+                    if act_sz is not None and s_spec.get("requested_size") is not None and act_sz != s_spec["requested_size"]:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} requested_size mismatch: contract={s_spec['requested_size']} vs actual={act_sz}"
+                        )
+                    if s_spec.get("physical_read_id") and act_r.get("physical_read_id") and s_spec["physical_read_id"] != act_r["physical_read_id"]:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} physical_read_id mismatch: contract={s_spec['physical_read_id']} vs actual={act_r['physical_read_id']}"
+                        )
+                    if s_spec.get("physical_consumption_id") and act_r.get("physical_consumption_id") and s_spec["physical_consumption_id"] != act_r["physical_consumption_id"]:
+                        inv_20_ok = False
+                        discrepancies.append(
+                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} physical_consumption_id mismatch: contract={s_spec['physical_consumption_id']} vs actual={act_r['physical_consumption_id']}"
+                        )
+                unexpected_contract_indices = set(actual_by_idx.keys()) - set(slices_by_idx.keys())
+                if unexpected_contract_indices:
                     inv_20_ok = False
                     discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: registered batch contract '{b_id}' invocation '{inv_id}' "
-                        f"has 0 observed slice records (expected {expected_count})"
+                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' has unexpected slice indices not in contract: {unexpected_contract_indices}"
                     )
-                    continue
-
-                # 2. Validate every slice index in [0, expected_count)
-                slice_indices = [r_snap["target_spec"].get("slice_index") for r_snap in group if r_snap.get("target_spec")]
-                out_of_range = [idx for idx in slice_indices if idx is None or not isinstance(idx, int) or idx < 0 or idx >= expected_count]
-                if out_of_range:
-                    inv_20_ok = False
-                    discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                        f"has out-of-range slice indices: {out_of_range} (expected [0, {expected_count}))"
-                    )
-
-                if len(slice_indices) != len(set(slice_indices)):
-                    inv_20_ok = False
-                    discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                        f"has duplicate slice indices: {slice_indices}"
-                    )
-
-                valid_indices_set = set(idx for idx in slice_indices if isinstance(idx, int) and 0 <= idx < expected_count)
-                expected_set = set(range(expected_count))
-                if valid_indices_set != expected_set:
-                    inv_20_ok = False
-                    missing = sorted(list(expected_set - valid_indices_set))
-                    discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                        f"is incomplete, missing slice indices: {missing}"
-                    )
-
-                # 3. Check duplicate physical_read_id or physical_consumption_id within batch
-                batch_read_ids = [r_snap["physical_read_id"] for r_snap in group]
-                if len(batch_read_ids) != len(set(batch_read_ids)):
-                    inv_20_ok = False
-                    discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                        f"contains duplicate physical_read_ids: {batch_read_ids}"
-                    )
-                batch_cons_ids = [r_snap["physical_consumption_id"] for r_snap in group if r_snap.get("physical_consumption_id")]
-                if len(batch_cons_ids) != len(set(batch_cons_ids)):
-                    inv_20_ok = False
-                    discrepancies.append(
-                        f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' invocation '{inv_id}' "
-                        f"contains duplicate physical_consumption_ids: {batch_cons_ids}"
-                    )
-
-                # 4. Check conflicting address or requested size metadata
-                seen_specs: Dict[int, Tuple[int, int]] = {}
-                for r_snap in group:
-                    ts = r_snap.get("target_spec") or {}
-                    s_idx = ts.get("slice_index")
-                    addr = ts.get("address")
-                    req_sz = ts.get("requested_size", ts.get("size"))
-                    if s_idx is not None and addr is not None and req_sz is not None:
-                        if s_idx in seen_specs:
-                            if seen_specs[s_idx] != (addr, req_sz):
-                                inv_20_ok = False
-                                discrepancies.append(
-                                    f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {s_idx} "
-                                    f"has conflicting metadata: {seen_specs[s_idx]} vs {(addr, req_sz)}"
-                                )
-                        else:
-                            seen_specs[s_idx] = (addr, req_sz)
-
-                # 5. Check completion status and failed slice preservation
                 for r_snap in group:
                     ts = r_snap.get("target_spec") or {}
                     c_status = ts.get("completion_status")
-                    valid_statuses = {"OBSERVED", "PARTIAL", "FAILED", "UNAVAILABLE", "NOT_EXECUTED", "UNKNOWN", "TARGET_TERMINATED", "PERMISSION_DENIED", None}
-                    if c_status not in valid_statuses:
+                    if r_snap.get("state") == "ACCOUNTED" and not r_snap.get("is_failure", False):
+                        if c_status in ("NOT_EXECUTED", "FAILED"):
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' is accounted success but completion_status is '{c_status}'"
+                            )
+                    elif r_snap.get("state") == "FAILED_ACCOUNTED" or r_snap.get("is_failure", False):
+                        if c_status == "OBSERVED" and r_snap.get("measured_bytes_read") == 0:
+                            inv_20_ok = False
+                            discrepancies.append(
+                                f"Invariant 20 (batch slice completeness) violated: failed slice '{r_snap['physical_read_id']}' falsely marked OBSERVED with 0 bytes"
+                            )
+
+            # 6. Terminal status check when batch or parent reservation is completed
+            is_batch_committed = any(r_snap.get("state") in ("ACCOUNTED", "FAILED_ACCOUNTED") for r_snap in group)
+            if is_batch_committed:
+                for r_snap in group:
+                    ts = r_snap.get("target_spec") or {}
+                    c_status = ts.get("completion_status")
+                    if r_snap.get("state") not in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED") or c_status in ("NOT_EXECUTED", "UNKNOWN"):
                         inv_20_ok = False
                         discrepancies.append(
                             f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' "
-                            f"has invalid completion_status: {c_status}"
+                            f"of committed batch '{b_id}' has non-terminal completion_status '{c_status}' or state '{r_snap.get('state')}'"
                         )
-                    if c_status in ("OBSERVED", "PARTIAL") and r_snap.get("is_failure", False):
+
+            # 7. Conflicting invocation IDs across batch and reads
+            if b_reg is not None:
+                for r_snap in group:
+                    ts = r_snap.get("target_spec") or {}
+                    r_b_id = ts.get("batch_id")
+                    r_inv_id = ts.get("invocation_id")
+                    if r_b_id == b_reg["batch_id"] and r_inv_id and r_inv_id != b_reg["invocation_id"]:
                         inv_20_ok = False
                         discrepancies.append(
-                            f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' "
-                            f"has successful status '{c_status}' but physical read is marked failure"
+                            f"Invariant 20 (conflicting invocation ID across batch and reads) violated: batch '{b_reg['batch_id']}' "
+                            f"contract expects invocation '{b_reg['invocation_id']}' but slice '{r_snap['physical_read_id']}' has '{r_inv_id}'"
                         )
-                    if c_status in ("FAILED", "UNAVAILABLE", "TARGET_TERMINATED", "PERMISSION_DENIED") and not r_snap.get("is_failure", False) and r_snap.get("state") != "RELEASED":
+
+            # 8. Failed invocation with incomplete slices
+            if inv_id in invocations_snap:
+                parent_inv = invocations_snap[inv_id]
+                if parent_inv["outcome"] in ("FAILED", "TIMEOUT", "TRANSPORT_ERROR"):
+                    if len(group) < expected_count or valid_indices_set != expected_set:
                         inv_20_ok = False
                         discrepancies.append(
-                            f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' "
-                            f"has failure status '{c_status}' but physical read is not marked failure"
-                        )
-                    if r_snap.get("is_failure", False) or c_status in ("FAILED", "UNAVAILABLE", "TARGET_TERMINATED", "PERMISSION_DENIED"):
-                        if r_snap.get("measured_bytes_read") is not None and r_snap.get("measured_bytes_read") == 0 and r_snap.get("estimated_bytes_read", 0) > 0:
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (batch slice completeness) violated: failed slice '{r_snap['physical_read_id']}' "
-                                f"falsely reported measured_bytes_read=0 alongside estimated_bytes_read={r_snap.get('estimated_bytes_read', 0)}"
-                            )
-
-                # 5b. Authoritative BatchReadRecord contract vs actual slice comparison
-                if b_reg is not None and b_reg.get("slices"):
-                    slices_by_idx = {s["slice_index"]: s for s in b_reg["slices"]}
-                    actual_by_idx = {r_snap["target_spec"].get("slice_index"): r_snap for r_snap in group if r_snap.get("target_spec") and "slice_index" in r_snap["target_spec"]}
-                    for idx_val, s_spec in slices_by_idx.items():
-                        act_r = actual_by_idx.get(idx_val)
-                        if act_r is None:
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} in contract has no matching physical read record"
-                            )
-                            continue
-                        act_spec = act_r.get("target_spec") or {}
-                        act_addr = act_spec.get("address")
-                        if act_addr is not None and s_spec.get("address") is not None and act_addr != s_spec["address"]:
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} address mismatch: contract={s_spec['address']} vs actual={act_addr}"
-                            )
-                        act_sz = act_spec.get("requested_size", act_spec.get("size"))
-                        if act_sz is not None and s_spec.get("requested_size") is not None and act_sz != s_spec["requested_size"]:
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} requested_size mismatch: contract={s_spec['requested_size']} vs actual={act_sz}"
-                            )
-                        if s_spec.get("physical_read_id") and act_r.get("physical_read_id") and s_spec["physical_read_id"] != act_r["physical_read_id"]:
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} physical_read_id mismatch: contract={s_spec['physical_read_id']} vs actual={act_r['physical_read_id']}"
-                            )
-                        if s_spec.get("physical_consumption_id") and act_r.get("physical_consumption_id") and s_spec["physical_consumption_id"] != act_r["physical_consumption_id"]:
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' slice {idx_val} physical_consumption_id mismatch: contract={s_spec['physical_consumption_id']} vs actual={act_r['physical_consumption_id']}"
-                            )
-                    unexpected_contract_indices = set(actual_by_idx.keys()) - set(slices_by_idx.keys())
-                    if unexpected_contract_indices:
-                        inv_20_ok = False
-                        discrepancies.append(
-                            f"Invariant 20 (batch slice completeness) violated: batch '{b_id}' has unexpected slice indices not in contract: {unexpected_contract_indices}"
-                        )
-                    for r_snap in group:
-                        ts = r_snap.get("target_spec") or {}
-                        c_status = ts.get("completion_status")
-                        if r_snap.get("state") == "ACCOUNTED" and not r_snap.get("is_failure", False):
-                            if c_status in ("NOT_EXECUTED", "FAILED"):
-                                inv_20_ok = False
-                                discrepancies.append(
-                                    f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' is accounted success but completion_status is '{c_status}'"
-                                )
-                        elif r_snap.get("state") == "FAILED_ACCOUNTED" or r_snap.get("is_failure", False):
-                            if c_status == "OBSERVED" and r_snap.get("measured_bytes_read") == 0:
-                                inv_20_ok = False
-                                discrepancies.append(
-                                    f"Invariant 20 (batch slice completeness) violated: failed slice '{r_snap['physical_read_id']}' falsely marked OBSERVED with 0 bytes"
-                                )
-
-                # 6. Terminal status check when batch or parent reservation is completed
-                is_batch_committed = any(r_snap.get("state") in ("ACCOUNTED", "FAILED_ACCOUNTED") for r_snap in group)
-                if is_batch_committed:
-                    for r_snap in group:
-                        ts = r_snap.get("target_spec") or {}
-                        c_status = ts.get("completion_status")
-                        if r_snap.get("state") not in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED") or c_status in ("NOT_EXECUTED", "UNKNOWN"):
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (batch slice completeness) violated: slice '{r_snap['physical_read_id']}' "
-                                f"of committed batch '{b_id}' has non-terminal completion_status '{c_status}' or state '{r_snap.get('state')}'"
-                            )
-
-                # 7. Conflicting invocation IDs across batch and reads
-                if b_reg is not None:
-                    for r_snap in group:
-                        ts = r_snap.get("target_spec") or {}
-                        r_b_id = ts.get("batch_id")
-                        r_inv_id = ts.get("invocation_id")
-                        if r_b_id == b_reg["batch_id"] and r_inv_id and r_inv_id != b_reg["invocation_id"]:
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (conflicting invocation ID across batch and reads) violated: batch '{b_reg['batch_id']}' "
-                                f"contract expects invocation '{b_reg['invocation_id']}' but slice '{r_snap['physical_read_id']}' has '{r_inv_id}'"
-                            )
-
-                # 8. Failed invocation with incomplete slices
-                if inv_id in invocations_snap:
-                    parent_inv = invocations_snap[inv_id]
-                    if parent_inv["outcome"] in ("FAILED", "TIMEOUT", "TRANSPORT_ERROR"):
-                        if len(group) < expected_count or valid_indices_set != expected_set:
-                            inv_20_ok = False
-                            discrepancies.append(
-                                f"Invariant 20 (failed invocation with incomplete slices) violated: failed invocation '{inv_id}' "
-                                f"of batch '{b_id}' has incomplete slices: {len(group)} observed vs {expected_count} expected"
-                            )
-
-            # 21. Collector / fallback provenance separation (Active AND Committed)
-            inv_21_ok = True
-            provenance_groups: Dict[str, List[Dict[str, Any]]] = {}
-            for r_snap in read_snaps:
-                res_key = r_snap.get("reservation_id") or r_snap.get("operation_id") or "unknown"
-                provenance_groups.setdefault(res_key, []).append(r_snap)
-            for r_id, r_info in active_res_snaps.items():
-                for cs in r_info["child_snaps"].values():
-                    if cs["physical_read_id"] not in {x["physical_read_id"] for x in provenance_groups.get(r_id, [])}:
-                        provenance_groups.setdefault(r_id, []).append(cs)
-
-            for grp_id, group_reads in provenance_groups.items():
-                coll_reads = [
-                    c for c in group_reads
-                    if "collector" in c.get("target_type", "") or (c.get("target_spec") and c["target_spec"].get("invocation_type") == "collector")
-                ]
-                shell_reads = [
-                    c for c in group_reads
-                    if "shell" in c.get("target_type", "") or (c.get("target_spec") and c["target_spec"].get("invocation_type") == "shell_fallback")
-                ]
-                if coll_reads and shell_reads:
-                    coll_read_ids = {c["physical_read_id"] for c in coll_reads}
-                    shell_read_ids = {c["physical_read_id"] for c in shell_reads}
-                    coll_cons_ids = {c["physical_consumption_id"] for c in coll_reads if c.get("physical_consumption_id")}
-                    shell_cons_ids = {c["physical_consumption_id"] for c in shell_reads if c.get("physical_consumption_id")}
-                    if coll_read_ids.intersection(shell_read_ids):
-                        inv_21_ok = False
-                        discrepancies.append(
-                            f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
-                            f"shares physical_read_ids between collector and fallback"
-                        )
-                    if coll_cons_ids.intersection(shell_cons_ids):
-                        inv_21_ok = False
-                        discrepancies.append(
-                            f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
-                            f"shares physical_consumption_ids between collector and fallback"
-                        )
-                    coll_inv_ids = {c["target_spec"].get("invocation_id") for c in coll_reads if c.get("target_spec")} - {None}
-                    shell_inv_ids = {c["target_spec"].get("invocation_id") for c in shell_reads if c.get("target_spec")} - {None}
-                    if coll_inv_ids and shell_inv_ids and coll_inv_ids.intersection(shell_inv_ids):
-                        inv_21_ok = False
-                        discrepancies.append(
-                            f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
-                            f"shares invocation_ids between collector and fallback: {coll_inv_ids.intersection(shell_inv_ids)}"
+                            f"Invariant 20 (failed invocation with incomplete slices) violated: failed invocation '{inv_id}' "
+                            f"of batch '{b_id}' has incomplete slices: {len(group)} observed vs {expected_count} expected"
                         )
 
-            # 22. Invocation provenance & orphan record detection
-            inv_22_ok = True
-            all_active_child_snaps = (
-                [cs for r_info in active_res_snaps.values() for cs in r_info["child_snaps"].values()]
-                + [cs for r_info in released_res_snaps.values() for cs in r_info["child_snaps"].values()]
-                + [cs for r_info in committed_res_snaps.values() for cs in r_info["child_snaps"].values()]
-            )
-            all_inspected_snaps_map = dict(read_snaps_dict)
-            for cs in all_active_child_snaps:
-                all_inspected_snaps_map.setdefault(cs["physical_read_id"], cs)
-            all_inspected_reads = list(all_inspected_snaps_map.values())
-            all_known_read_ids = set(read_ids).union({cr["physical_read_id"] for cr in all_active_child_snaps})
+        # 21. Collector / fallback provenance separation (Active AND Committed)
+        inv_21_ok = True
+        provenance_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for r_snap in read_snaps:
+            res_key = r_snap.get("reservation_id") or r_snap.get("operation_id") or "unknown"
+            provenance_groups.setdefault(res_key, []).append(r_snap)
+        for r_id, r_info in active_res_snaps.items():
+            for cs in r_info["child_snaps"].values():
+                if cs["physical_read_id"] not in {x["physical_read_id"] for x in provenance_groups.get(r_id, [])}:
+                    provenance_groups.setdefault(r_id, []).append(cs)
 
-            # Validate registered batch contracts have valid invocations unconditionally
-            for b_key, b_rec in batch_records_snap.items():
-                if b_rec["invocation_id"] not in invocations_snap:
-                    inv_22_ok = False
+        for grp_id, group_reads in provenance_groups.items():
+            coll_reads = [
+                c for c in group_reads
+                if "collector" in c.get("target_type", "") or (c.get("target_spec") and c["target_spec"].get("invocation_type") == "collector")
+            ]
+            shell_reads = [
+                c for c in group_reads
+                if "shell" in c.get("target_type", "") or (c.get("target_spec") and c["target_spec"].get("invocation_type") == "shell_fallback")
+            ]
+            if coll_reads and shell_reads:
+                coll_read_ids = {c["physical_read_id"] for c in coll_reads}
+                shell_read_ids = {c["physical_read_id"] for c in shell_reads}
+                coll_cons_ids = {c["physical_consumption_id"] for c in coll_reads if c.get("physical_consumption_id")}
+                shell_cons_ids = {c["physical_consumption_id"] for c in shell_reads if c.get("physical_consumption_id")}
+                if coll_read_ids.intersection(shell_read_ids):
+                    inv_21_ok = False
                     discrepancies.append(
-                        f"Invariant 22 (orphan batch contract) violated: registered batch '{b_rec['batch_id']}' "
-                        f"references non-existent invocation_id '{b_rec['invocation_id']}'"
+                        f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
+                        f"shares physical_read_ids between collector and fallback"
                     )
-                else:
-                    inv_rec = invocations_snap[b_rec["invocation_id"]]
-                    if inv_rec["outcome"] == "PREFLIGHT_REJECTED":
-                        batch_reads = [
-                            r for r in all_inspected_reads
-                            if r.get("batch_id") == b_rec["batch_id"]
-                            or (r.get("target_spec") and r["target_spec"].get("batch_id") == b_rec["batch_id"])
-                        ]
-                        for r in batch_reads:
-                            if r.get("charged_bytes", 0) > 0 or r.get("state") not in ("ADMITTED", "RELEASED"):
-                                inv_22_ok = False
-                                discrepancies.append(
-                                    f"Invariant 22 (preflight rejected with consumption) violated: batch '{b_rec['batch_id']}' "
-                                    f"was PREFLIGHT_REJECTED but slice '{r['physical_read_id']}' has state '{r.get('state')}' and charged {r.get('charged_bytes', 0)}B"
-                                )
+                if coll_cons_ids.intersection(shell_cons_ids):
+                    inv_21_ok = False
+                    discrepancies.append(
+                        f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
+                        f"shares physical_consumption_ids between collector and fallback"
+                    )
+                coll_inv_ids = {c["target_spec"].get("invocation_id") for c in coll_reads if c.get("target_spec")} - {None}
+                shell_inv_ids = {c["target_spec"].get("invocation_id") for c in shell_reads if c.get("target_spec")} - {None}
+                if coll_inv_ids and shell_inv_ids and coll_inv_ids.intersection(shell_inv_ids):
+                    inv_21_ok = False
+                    discrepancies.append(
+                        f"Invariant 21 (collector/fallback provenance separation) violated: group '{grp_id}' "
+                        f"shares invocation_ids between collector and fallback: {coll_inv_ids.intersection(shell_inv_ids)}"
+                    )
 
-            for inv_id, inv_rec in invocations_snap.items():
-                if inv_rec["outcome"] != "PREFLIGHT_REJECTED" and inv_rec["physical_read_ids"]:
-                    matching_reads = [r for r in all_inspected_reads if r["physical_read_id"] in inv_rec["physical_read_ids"]]
-                    if matching_reads and all(r.get("state") == "RELEASED" for r in matching_reads):
-                        inv_22_ok = False
-                        discrepancies.append(
-                            f"Invariant 22 (contradictory invocation state) violated: started invocation '{inv_id}' "
-                            f"in outcome '{inv_rec['outcome']}' has all referenced physical reads released"
-                        )
-                    for pid_ref in inv_rec["physical_read_ids"]:
-                        if pid_ref not in all_known_read_ids:
+        # 22. Invocation provenance & orphan record detection
+        inv_22_ok = True
+        all_active_child_snaps = (
+            [cs for r_info in active_res_snaps.values() for cs in r_info["child_snaps"].values()]
+            + [cs for r_info in released_res_snaps.values() for cs in r_info["child_snaps"].values()]
+            + [cs for r_info in committed_res_snaps.values() for cs in r_info["child_snaps"].values()]
+        )
+        all_inspected_snaps_map = dict(read_snaps_dict)
+        for cs in all_active_child_snaps:
+            all_inspected_snaps_map.setdefault(cs["physical_read_id"], cs)
+        all_inspected_reads = list(all_inspected_snaps_map.values())
+        all_known_read_ids = set(read_ids).union({cr["physical_read_id"] for cr in all_active_child_snaps})
+
+        # Validate registered batch contracts have valid invocations unconditionally
+        for b_key, b_rec in batch_records_snap.items():
+            if b_rec["invocation_id"] not in invocations_snap:
+                inv_22_ok = False
+                discrepancies.append(
+                    f"Invariant 22 (orphan batch contract) violated: registered batch '{b_rec['batch_id']}' "
+                    f"references non-existent invocation_id '{b_rec['invocation_id']}'"
+                )
+            else:
+                inv_rec = invocations_snap[b_rec["invocation_id"]]
+                if inv_rec["outcome"] == "PREFLIGHT_REJECTED":
+                    batch_reads = [
+                        r for r in all_inspected_reads
+                        if r.get("batch_id") == b_rec["batch_id"]
+                        or (r.get("target_spec") and r["target_spec"].get("batch_id") == b_rec["batch_id"])
+                    ]
+                    for r in batch_reads:
+                        if r.get("charged_bytes", 0) > 0 or r.get("state") not in ("ADMITTED", "RELEASED"):
                             inv_22_ok = False
                             discrepancies.append(
-                                f"Invariant 22 (invocation provenance) violated: orphan invocation '{inv_id}' "
-                                f"references non-existent physical_read_id '{pid_ref}'"
+                                f"Invariant 22 (preflight rejected with consumption) violated: batch '{b_rec['batch_id']}' "
+                                f"was PREFLIGHT_REJECTED but slice '{r['physical_read_id']}' has state '{r.get('state')}' and charged {r.get('charged_bytes', 0)}B"
                             )
-                        else:
-                            matched_r = next((x for x in all_inspected_reads if x["physical_read_id"] == pid_ref), None)
-                            if matched_r is not None:
-                                m_ts = matched_r.get("target_spec") or {}
-                                m_inv = m_ts.get("invocation_id")
-                                if m_inv and m_inv != inv_id:
-                                    inv_22_ok = False
-                                    discrepancies.append(
-                                        f"Invariant 22 (invocation linkage mismatch) violated: invocation '{inv_id}' "
-                                        f"references physical read '{pid_ref}' pointing to conflicting invocation ID '{m_inv}'"
-                                    )
-                # Unresolved IN_FLIGHT check
-                if inv_rec["outcome"] == "IN_FLIGHT" and inv_rec["physical_read_ids"]:
-                    child_matches = [r for r in all_inspected_reads if r["physical_read_id"] in inv_rec["physical_read_ids"]]
-                    if child_matches and all(r.get("state") in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED") for r in child_matches):
-                        inv_22_ok = False
-                        discrepancies.append(
-                            f"Invariant 22 (unresolved in-flight invocation) violated: invocation '{inv_id}' "
-                            f"remains IN_FLIGHT while all referenced physical reads are terminal"
-                        )
 
-                # Temporal completeness and valid duration for invocations
-                if inv_rec["outcome"] != "IN_FLIGHT":
-                    if inv_rec["completion_time_ms"] is None:
-                        inv_22_ok = False
-                        discrepancies.append(
-                            f"Invariant 22 (terminal timestamp completeness) violated: terminal invocation '{inv_id}' "
-                            f"in outcome '{inv_rec['outcome']}' has no completion_time_ms"
-                        )
-                    elif inv_rec["completion_time_ms"] < inv_rec["start_time_ms"]:
-                        inv_22_ok = False
-                        discrepancies.append(
-                            f"Invariant 22 (timestamp regression) violated: invocation '{inv_id}' completion_time_ms "
-                            f"({inv_rec['completion_time_ms']}) < start_time_ms ({inv_rec['start_time_ms']})"
-                        )
-                if inv_rec["duration_ms"] is not None and (math.isnan(inv_rec["duration_ms"]) or math.isinf(inv_rec["duration_ms"]) or inv_rec["duration_ms"] < 0):
+        for inv_id, inv_rec in invocations_snap.items():
+            if inv_rec["outcome"] != "PREFLIGHT_REJECTED" and inv_rec["physical_read_ids"]:
+                matching_reads = [r for r in all_inspected_reads if r["physical_read_id"] in inv_rec["physical_read_ids"]]
+                if matching_reads and all(r.get("state") == "RELEASED" for r in matching_reads):
                     inv_22_ok = False
                     discrepancies.append(
-                        f"Invariant 22 (invalid duration) violated: invocation '{inv_id}' has invalid duration_ms {inv_rec['duration_ms']}"
+                        f"Invariant 22 (contradictory invocation state) violated: started invocation '{inv_id}' "
+                        f"in outcome '{inv_rec['outcome']}' has all referenced physical reads released"
                     )
-
-            # Residual monotonic start entries
-            for mono_inv_id in invocation_start_mono_snap:
-                if mono_inv_id in invocations_snap and invocations_snap[mono_inv_id]["outcome"] != "IN_FLIGHT":
+                for pid_ref in inv_rec["physical_read_ids"]:
+                    if pid_ref not in all_known_read_ids:
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (invocation provenance) violated: orphan invocation '{inv_id}' "
+                            f"references non-existent physical_read_id '{pid_ref}'"
+                        )
+                    else:
+                        matched_r = next((x for x in all_inspected_reads if x["physical_read_id"] == pid_ref), None)
+                        if matched_r is not None:
+                            m_ts = matched_r.get("target_spec") or {}
+                            m_inv = m_ts.get("invocation_id")
+                            if m_inv and m_inv != inv_id:
+                                inv_22_ok = False
+                                discrepancies.append(
+                                    f"Invariant 22 (invocation linkage mismatch) violated: invocation '{inv_id}' "
+                                    f"references physical read '{pid_ref}' pointing to conflicting invocation ID '{m_inv}'"
+                                )
+            # Unresolved IN_FLIGHT check
+            if inv_rec["outcome"] == "IN_FLIGHT" and inv_rec["physical_read_ids"]:
+                child_matches = [r for r in all_inspected_reads if r["physical_read_id"] in inv_rec["physical_read_ids"]]
+                if child_matches and all(r.get("state") in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED") for r in child_matches):
                     inv_22_ok = False
                     discrepancies.append(
-                        f"Invariant 22 (residual monotonic start) violated: completed invocation '{mono_inv_id}' "
-                        f"retains residual entry in _invocation_start_mono_ns"
+                        f"Invariant 22 (unresolved in-flight invocation) violated: invocation '{inv_id}' "
+                        f"remains IN_FLIGHT while all referenced physical reads are terminal"
                     )
 
-            # Physical read invocation provenance regardless of invocation count
-            for r in all_inspected_reads:
-                ts = r.get("target_spec") or {}
-                r_inv_id = ts.get("invocation_id")
-                if r_inv_id and r.get("state") not in ("ADMITTED", "RELEASED"):
-                    if r_inv_id not in invocations_snap:
+            # Temporal completeness and valid duration for invocations
+            if inv_rec["outcome"] != "IN_FLIGHT":
+                if inv_rec["completion_time_ms"] is None:
+                    inv_22_ok = False
+                    discrepancies.append(
+                        f"Invariant 22 (terminal timestamp completeness) violated: terminal invocation '{inv_id}' "
+                        f"in outcome '{inv_rec['outcome']}' has no completion_time_ms"
+                    )
+                elif inv_rec["completion_time_ms"] < inv_rec["start_time_ms"]:
+                    inv_22_ok = False
+                    discrepancies.append(
+                        f"Invariant 22 (timestamp regression) violated: invocation '{inv_id}' completion_time_ms "
+                        f"({inv_rec['completion_time_ms']}) < start_time_ms ({inv_rec['start_time_ms']})"
+                    )
+            if inv_rec["duration_ms"] is not None and (math.isnan(inv_rec["duration_ms"]) or math.isinf(inv_rec["duration_ms"]) or inv_rec["duration_ms"] < 0):
+                inv_22_ok = False
+                discrepancies.append(
+                    f"Invariant 22 (invalid duration) violated: invocation '{inv_id}' has invalid duration_ms {inv_rec['duration_ms']}"
+                )
+
+        # Residual monotonic start entries
+        for mono_inv_id in invocation_start_mono_snap:
+            if mono_inv_id in invocations_snap and invocations_snap[mono_inv_id]["outcome"] != "IN_FLIGHT":
+                inv_22_ok = False
+                discrepancies.append(
+                    f"Invariant 22 (residual monotonic start) violated: completed invocation '{mono_inv_id}' "
+                    f"retains residual entry in _invocation_start_mono_ns"
+                )
+
+        # Physical read invocation provenance regardless of invocation count
+        for r in all_inspected_reads:
+            ts = r.get("target_spec") or {}
+            r_inv_id = ts.get("invocation_id")
+            if r_inv_id and r.get("state") not in ("ADMITTED", "RELEASED"):
+                if r_inv_id not in invocations_snap:
+                    inv_22_ok = False
+                    discrepancies.append(
+                        f"Invariant 22 (invocation provenance) violated: physical read '{r['physical_read_id']}' "
+                        f"references unknown invocation_id '{r_inv_id}'"
+                    )
+                else:
+                    inv_obj = invocations_snap[r_inv_id]
+                    if r["physical_read_id"] not in inv_obj["physical_read_ids"]:
                         inv_22_ok = False
                         discrepancies.append(
                             f"Invariant 22 (invocation provenance) violated: physical read '{r['physical_read_id']}' "
-                            f"references unknown invocation_id '{r_inv_id}'"
+                            f"is not listed in invocation '{r_inv_id}' physical_read_ids"
                         )
-                    else:
-                        inv_obj = invocations_snap[r_inv_id]
-                        if r["physical_read_id"] not in inv_obj["physical_read_ids"]:
-                            inv_22_ok = False
-                            discrepancies.append(
-                                f"Invariant 22 (invocation provenance) violated: physical read '{r['physical_read_id']}' "
-                                f"is not listed in invocation '{r_inv_id}' physical_read_ids"
-                            )
 
-            for r_snap in read_snaps:
-                if not r_snap.get("reservation_id"):
-                    inv_22_ok = False
-                    discrepancies.append(
-                        f"Invariant 22 (orphan physical read) violated: committed read '{r_snap['physical_read_id']}' has no reservation_id"
-                    )
-                if r_snap.get("state") in ("ACCOUNTED", "FAILED_ACCOUNTED"):
-                    if r_snap.get("operation_id") and r_snap["operation_id"] not in tx_snaps_dict:
-                        if not any(r_snap["operation_id"] == s["operation_id"] for s in snaps):
-                            inv_22_ok = False
-                            discrepancies.append(
-                                f"Invariant 22 (orphan physical read) violated: committed read '{r_snap['physical_read_id']}' "
-                                f"has operation_id '{r_snap['operation_id']}' not found in committed transactions"
-                            )
-
-            for p in phys_snaps:
-                if p.get("physical_read_id") not in read_snaps_dict:
-                    inv_22_ok = False
-                    discrepancies.append(
-                        f"Invariant 22 (orphan physical consumption) violated: consumption '{p['physical_consumption_id']}' has no matching physical read record in _physical_read_records"
-                    )
-
-            # 23. Reservation Registry Lifecycle Exclusivity & Ownership
-            inv_23_ok = True
-            overlap_act_rel = act_ids.intersection(rel_ids)
-            if overlap_act_rel:
-                inv_23_ok = False
+        for r_snap in read_snaps:
+            if not r_snap.get("reservation_id"):
+                inv_22_ok = False
                 discrepancies.append(
-                    f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in active and released registries: {overlap_act_rel}"
+                    f"Invariant 22 (orphan physical read) violated: committed read '{r_snap['physical_read_id']}' has no reservation_id"
                 )
-            overlap_act_com = act_ids.intersection(com_ids)
-            if overlap_act_com:
-                inv_23_ok = False
+            if r_snap.get("state") in ("ACCOUNTED", "FAILED_ACCOUNTED"):
+                if r_snap.get("operation_id") and r_snap["operation_id"] not in tx_snaps_dict:
+                    if not any(r_snap["operation_id"] == s["operation_id"] for s in snaps):
+                        inv_22_ok = False
+                        discrepancies.append(
+                            f"Invariant 22 (orphan physical read) violated: committed read '{r_snap['physical_read_id']}' "
+                            f"has operation_id '{r_snap['operation_id']}' not found in committed transactions"
+                        )
+
+        for p in phys_snaps:
+            if p.get("physical_read_id") not in read_snaps_dict:
+                inv_22_ok = False
                 discrepancies.append(
-                    f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in active and committed registries: {overlap_act_com}"
-                )
-            overlap_rel_com = rel_ids.intersection(com_ids)
-            if overlap_rel_com:
-                inv_23_ok = False
-                discrepancies.append(
-                    f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in released and committed registries: {overlap_rel_com}"
+                    f"Invariant 22 (orphan physical consumption) violated: consumption '{p['physical_consumption_id']}' has no matching physical read record in _physical_read_records"
                 )
 
-            all_known_reservations = (
-                list(active_res_snaps.items())
-                + list(released_res_snaps.items())
-                + list(committed_res_snaps.items())
+        # 23. Reservation Registry Lifecycle Exclusivity & Ownership
+        inv_23_ok = True
+        overlap_act_rel = act_ids.intersection(rel_ids)
+        if overlap_act_rel:
+            inv_23_ok = False
+            discrepancies.append(
+                f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in active and released registries: {overlap_act_rel}"
+            )
+        overlap_act_com = act_ids.intersection(com_ids)
+        if overlap_act_com:
+            inv_23_ok = False
+            discrepancies.append(
+                f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in active and committed registries: {overlap_act_com}"
+            )
+        overlap_rel_com = rel_ids.intersection(com_ids)
+        if overlap_rel_com:
+            inv_23_ok = False
+            discrepancies.append(
+                f"Invariant 23 (reservation registry exclusivity) violated: duplicate membership in released and committed registries: {overlap_rel_com}"
             )
 
-            for res_id_key, r_info in all_known_reservations:
-                res_state = r_info["state"]
-                res_term = r_info["terminal_at_ms"]
-                res_created = r_info["created_at_ms"]
-                res_consumed = r_info["consumed_bytes"]
-                if res_state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
-                    if res_term is None:
-                        inv_23_ok = False
-                        discrepancies.append(
-                            f"Invariant 23 (terminal timestamp completeness) violated: terminal reservation '{res_id_key}' "
-                            f"in state '{res_state}' has no terminal_at_ms"
-                        )
-                    elif res_created > 0 and res_term < res_created:
-                        inv_23_ok = False
-                        discrepancies.append(
-                            f"Invariant 23 (timestamp regression) violated: reservation '{res_id_key}' terminal_at_ms "
-                            f"({res_term}) < created_at_ms ({res_created})"
-                        )
-                if res_consumed > 0 and res_state == "RELEASED":
+        all_known_reservations = (
+            list(active_res_snaps.items())
+            + list(released_res_snaps.items())
+            + list(committed_res_snaps.items())
+        )
+
+        for res_id_key, r_info in all_known_reservations:
+            res_state = r_info["state"]
+            res_term = r_info["terminal_at_ms"]
+            res_created = r_info["created_at_ms"]
+            res_consumed = r_info["consumed_bytes"]
+            if res_state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
+                if res_term is None:
                     inv_23_ok = False
                     discrepancies.append(
-                        f"Invariant 23 (invalid transition) violated: reservation '{res_id_key}' has consumed {res_consumed}B but is RELEASED"
+                        f"Invariant 23 (terminal timestamp completeness) violated: terminal reservation '{res_id_key}' "
+                        f"in state '{res_state}' has no terminal_at_ms"
                     )
-                c_snaps = r_info["child_snaps"]
-                if res_state in ("ACCOUNTED", "FINALIZED"):
-                    for cid, cs in c_snaps.items():
-                        if cs["state"] not in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED"):
-                            inv_23_ok = False
-                            discrepancies.append(
-                                f"Invariant 23 (parent/child consistency) violated: reservation '{res_id_key}' is '{res_state}' "
-                                f"but child read '{cid}' is non-terminal '{cs['state']}'"
-                            )
-                elif res_state == "RELEASED":
-                    for cid, cs in c_snaps.items():
-                        if cs["state"] != "RELEASED":
-                            inv_23_ok = False
-                            discrepancies.append(
-                                f"Invariant 23 (parent/child consistency) violated: released reservation '{res_id_key}' "
-                                f"has non-released child read '{cid}' in state '{cs['state']}'"
-                            )
-
-            for r in all_inspected_reads:
-                r_st = r.get("state")
-                r_term = r.get("terminal_at_ms")
-                r_created = r.get("created_at_ms", 0)
-                r_th = r.get("transition_history") or []
-                if r_st in ("ACCOUNTED", "RELEASED", "FAILED_ACCOUNTED"):
-                    if r_term is None:
-                        inv_23_ok = False
-                        discrepancies.append(
-                            f"Invariant 23 (terminal timestamp completeness) violated: terminal read '{r['physical_read_id']}' "
-                            f"in state '{r_st}' has no terminal_at_ms"
-                        )
-                    elif r_term < r_created:
-                        inv_23_ok = False
-                        discrepancies.append(
-                            f"Invariant 23 (timestamp regression) violated: read '{r['physical_read_id']}' terminal_at_ms "
-                            f"({r_term}) < created_at_ms ({r_created})"
-                        )
-                if "PHYSICAL_READ_STARTED" in r_th and r_st == "RELEASED":
+                elif res_created > 0 and res_term < res_created:
                     inv_23_ok = False
                     discrepancies.append(
-                        f"Invariant 23 (invalid transition) violated: physical read '{r['physical_read_id']}' started execution but transitioned to RELEASED"
+                        f"Invariant 23 (timestamp regression) violated: reservation '{res_id_key}' terminal_at_ms "
+                        f"({res_term}) < created_at_ms ({res_created})"
                     )
-
-            # Physical read lifecycle ownership across active, released, committed
-            for r_id, r_info in active_res_snaps.items():
-                for cr_id, cs in r_info["child_snaps"].items():
-                    if cr_id in committed_read_ids and cs["state"] not in ("ACCOUNTED", "FAILED_ACCOUNTED"):
-                        inv_23_ok = False
-                        discrepancies.append(
-                            f"Invariant 23 (physical read ownership) violated: active reservation '{r_id}' child read '{cr_id}' already in committed physical ledger"
-                        )
-            for r_id, r_info in released_res_snaps.items():
-                for cr_id, cs in r_info["child_snaps"].items():
-                    if cr_id in committed_read_ids:
-                        inv_23_ok = False
-                        discrepancies.append(
-                            f"Invariant 23 (physical read ownership) violated: released reservation '{r_id}' child read '{cr_id}' found in committed physical ledger"
-                        )
-
-            # 24. Bottom-up reconstructed exactly-once accounting
-            inv_24_ok = True
-            reconstructed_measured = 0
-            reconstructed_estimated = 0
-            reconstructed_charged = 0
-            for pread_id, cr in read_snaps_dict.items():
-                m_val = cr["measured_bytes_read"] if cr["measured_bytes_read"] is not None else 0
-                e_val = cr.get("estimated_bytes_read", 0)
-                c_val = cr.get("charged_bytes", 0)
-                is_none_meas = cr["measured_bytes_read"] is None
-                if c_val != m_val + e_val:
-                    inv_24_ok = False
-                    discrepancies.append(
-                        f"Invariant 24 (accounting reconstruction) violated: read '{pread_id}' charged_bytes ({c_val}) != measured ({m_val}) + estimated ({e_val})"
-                    )
-                if is_none_meas and c_val == 0:
-                    inv_24_ok = False
-                    discrepancies.append(
-                        f"Invariant 24 (accounting reconstruction) violated: unmeasured/unknown read '{pread_id}' charged 0 bytes"
-                    )
-                reconstructed_measured += m_val
-                reconstructed_estimated += e_val
-                reconstructed_charged += c_val
-
-            cons_charged_total = sum(p.get("charged_bytes", 0) for p in phys_snaps)
-            if reconstructed_charged != cons_charged_total:
-                inv_24_ok = False
+            if res_consumed > 0 and res_state == "RELEASED":
+                inv_23_ok = False
                 discrepancies.append(
-                    f"Invariant 24 (accounting reconstruction) violated: reconstructed physical read charged total ({reconstructed_charged}B) != physical consumption total ({cons_charged_total}B)"
+                    f"Invariant 23 (invalid transition) violated: reservation '{res_id_key}' has consumed {res_consumed}B but is RELEASED"
+                )
+            c_snaps = r_info["child_snaps"]
+            if res_state in ("ACCOUNTED", "FINALIZED"):
+                for cid, cs in c_snaps.items():
+                    if cs["state"] not in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED"):
+                        inv_23_ok = False
+                        discrepancies.append(
+                            f"Invariant 23 (parent/child consistency) violated: reservation '{res_id_key}' is '{res_state}' "
+                            f"but child read '{cid}' is non-terminal '{cs['state']}'"
+                        )
+            elif res_state == "RELEASED":
+                for cid, cs in c_snaps.items():
+                    if cs["state"] != "RELEASED":
+                        inv_23_ok = False
+                        discrepancies.append(
+                            f"Invariant 23 (parent/child consistency) violated: released reservation '{res_id_key}' "
+                            f"has non-released child read '{cid}' in state '{cs['state']}'"
+                        )
+
+        for r in all_inspected_reads:
+            r_st = r.get("state")
+            r_term = r.get("terminal_at_ms")
+            r_created = r.get("created_at_ms", 0)
+            r_th = r.get("transition_history") or []
+            if r_st in ("ACCOUNTED", "RELEASED", "FAILED_ACCOUNTED"):
+                if r_term is None:
+                    inv_23_ok = False
+                    discrepancies.append(
+                        f"Invariant 23 (terminal timestamp completeness) violated: terminal read '{r['physical_read_id']}' "
+                        f"in state '{r_st}' has no terminal_at_ms"
+                    )
+                elif r_term < r_created:
+                    inv_23_ok = False
+                    discrepancies.append(
+                        f"Invariant 23 (timestamp regression) violated: read '{r['physical_read_id']}' terminal_at_ms "
+                        f"({r_term}) < created_at_ms ({r_created})"
+                    )
+            if "PHYSICAL_READ_STARTED" in r_th and r_st == "RELEASED":
+                inv_23_ok = False
+                discrepancies.append(
+                    f"Invariant 23 (invalid transition) violated: physical read '{r['physical_read_id']}' started execution but transitioned to RELEASED"
                 )
 
-            valid_states = {"ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"}
-            for r_id, r_info in active_res_snaps.items():
-                if r_info["state"] not in valid_states:
-                    discrepancies.append(f"Reservation '{r_id}' in invalid state '{r_info['state']}'")
+        # Physical read lifecycle ownership across active, released, committed
+        for r_id, r_info in active_res_snaps.items():
+            for cr_id, cs in r_info["child_snaps"].items():
+                if cr_id in committed_read_ids and cs["state"] not in ("ACCOUNTED", "FAILED_ACCOUNTED"):
+                    inv_23_ok = False
+                    discrepancies.append(
+                        f"Invariant 23 (physical read ownership) violated: active reservation '{r_id}' child read '{cr_id}' already in committed physical ledger"
+                    )
+        for r_id, r_info in released_res_snaps.items():
+            for cr_id, cs in r_info["child_snaps"].items():
+                if cr_id in committed_read_ids:
+                    inv_23_ok = False
+                    discrepancies.append(
+                        f"Invariant 23 (physical read ownership) violated: released reservation '{r_id}' child read '{cr_id}' found in committed physical ledger"
+                    )
 
-            active_res_list = [r for r in active_res_snaps.values() if r["state"] in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED")]
-            active_res_bytes = sum(r["reserved_bytes"] for r in active_res_list)
-            consumed_unaccounted_bytes = sum(r["consumed_bytes"] for r in active_res_snaps.values() if r["state"] == "CONSUMED")
-            active_in_flight_bytes = sum(r["consumed_bytes"] for r in active_res_snaps.values() if r["state"] in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"))
-            duplicate_snaps = [s for s in snaps if "#duplicate_" in s["operation_id"]]
-            collision_snaps = [s for s in snaps if "#collision_" in s["operation_id"]]
+        # 24. Bottom-up reconstructed exactly-once accounting
+        inv_24_ok = True
+        reconstructed_measured = 0
+        reconstructed_estimated = 0
+        reconstructed_charged = 0
+        for pread_id, cr in read_snaps_dict.items():
+            m_val = cr["measured_bytes_read"] if cr["measured_bytes_read"] is not None else 0
+            e_val = cr.get("estimated_bytes_read", 0)
+            c_val = cr.get("charged_bytes", 0)
+            is_none_meas = cr["measured_bytes_read"] is None
+            if c_val != m_val + e_val:
+                inv_24_ok = False
+                discrepancies.append(
+                    f"Invariant 24 (accounting reconstruction) violated: read '{pread_id}' charged_bytes ({c_val}) != measured ({m_val}) + estimated ({e_val})"
+                )
+            if is_none_meas and c_val == 0:
+                inv_24_ok = False
+                discrepancies.append(
+                    f"Invariant 24 (accounting reconstruction) violated: unmeasured/unknown read '{pread_id}' charged 0 bytes"
+                )
+            reconstructed_measured += m_val
+            reconstructed_estimated += e_val
+            reconstructed_charged += c_val
 
-            discrepancy_details = {
-                "inv_1_physical_read_id_uniqueness": inv_1_ok,
-                "inv_2_physical_consumption_id_uniqueness": inv_2_ok,
-                "inv_3_accounting_transaction_id_uniqueness": inv_3_ok,
-                "inv_4_child_identity_uniqueness": inv_4_ok,
-                "inv_5_reservation_to_child_linkage": inv_5_ok,
-                "inv_6_child_to_consumption_linkage": inv_6_ok,
-                "inv_7_operation_to_accounting_linkage": inv_7_ok,
-                "inv_8_no_child_overwrites": inv_8_ok,
-                "inv_9_no_started_read_released": inv_9_ok,
-                "inv_10_no_inflight_child_at_finalization": inv_10_ok,
-                "inv_11_no_consumed_child_without_accounting": inv_11_ok,
-                "inv_12_no_accounting_without_physical_evidence": inv_12_ok,
-                "inv_13_no_consumption_without_valid_read_id": inv_13_ok,
-                "inv_14_no_duplicate_physical_execution_identity": inv_14_ok,
-                "inv_15_aggregate_reservation_equals_child_sum": inv_15_ok,
-                "inv_16_committed_bytes_equal_physical_ledger": inv_16_ok,
-                "inv_17_global_metrics_equal_committed_totals": inv_17_ok,
-                "inv_18_profile_usage_equals_committed_profile_totals": inv_18_ok,
-                "inv_19_unknown_consumption_never_zero": inv_19_ok,
-                "inv_20_batch_slice_completeness": inv_20_ok,
-                "inv_21_collector_fallback_provenance_separation": inv_21_ok,
-                "inv_22_invocation_provenance_and_orphan_detection": inv_22_ok,
-                "inv_23_reservation_registry_lifecycle_exclusivity": inv_23_ok,
-                "inv_24_accounting_reconstruction": inv_24_ok,
-            }
+        cons_charged_total = sum(p.get("charged_bytes", 0) for p in phys_snaps)
+        if reconstructed_charged != cons_charged_total:
+            inv_24_ok = False
+            discrepancies.append(
+                f"Invariant 24 (accounting reconstruction) violated: reconstructed physical read charged total ({reconstructed_charged}B) != physical consumption total ({cons_charged_total}B)"
+            )
 
-            if discrepancies and raise_on_error:
-                raise AssertionError(f"Tracker ledger reconciliation failed: {'; '.join(discrepancies)}")
+        valid_states = {"ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED", "RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"}
+        for r_id, r_info in active_res_snaps.items():
+            if r_info["state"] not in valid_states:
+                discrepancies.append(f"Reservation '{r_id}' in invalid state '{r_info['state']}'")
 
-            return {
-                "reconciled": len(discrepancies) == 0,
-                "discrepancies": discrepancies,
-                "discrepancy_details": discrepancy_details,
-                "total_transactions": len(snaps),
-                "total_logical_transactions": len(snaps),
-                "total_physical_records": len(phys_snaps),
-                "total_physical_reads": len(read_snaps),
-                "unique_physical_consumption_ids": len(unique_phys_ids),
-                "unique_physical_read_ids": len(unique_read_ids),
-                "duplicate_logical_operations_count": len(duplicate_snaps),
-                "collision_records_count": len(collision_snaps),
-                "total_bytes_read": sum_charged,
-                "total_measured_bytes": sum_measured,
-                "total_estimated_bytes": sum_estimated,
-                "total_latency_us": sum_latency,
-                "total_stop_ms": sum_stop,
-                "total_failures": sum_failures,
-                "total_failed_outcomes": sum_failed_status,
-                "total_rejected_outcomes": sum_rejected_status,
-                "active_reservations_count": len(active_res_list),
-                "active_reservations_bytes": active_res_bytes,
-                "consumed_unaccounted_reservations_bytes": consumed_unaccounted_bytes,
-                "released_reservations_count": released_reservations_count,
-                "active_in_flight_scopes_count": active_scopes_count,
-                "active_in_flight_bytes": active_in_flight_bytes,
-                "physical_consumption_records_count": len(phys_snaps),
-            }
+        active_res_list = [r for r in active_res_snaps.values() if r["state"] in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED")]
+        active_res_bytes = sum(r["reserved_bytes"] for r in active_res_list)
+        consumed_unaccounted_bytes = sum(r["consumed_bytes"] for r in active_res_snaps.values() if r["state"] == "CONSUMED")
+        active_in_flight_bytes = sum(r["consumed_bytes"] for r in active_res_snaps.values() if r["state"] in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"))
+        duplicate_snaps = [s for s in snaps if "#duplicate_" in s["operation_id"]]
+        collision_snaps = [s for s in snaps if "#collision_" in s["operation_id"]]
+
+        discrepancy_details = {
+            "inv_1_physical_read_id_uniqueness": inv_1_ok,
+            "inv_2_physical_consumption_id_uniqueness": inv_2_ok,
+            "inv_3_accounting_transaction_id_uniqueness": inv_3_ok,
+            "inv_4_child_identity_uniqueness": inv_4_ok,
+            "inv_5_reservation_to_child_linkage": inv_5_ok,
+            "inv_6_child_to_consumption_linkage": inv_6_ok,
+            "inv_7_operation_to_accounting_linkage": inv_7_ok,
+            "inv_8_no_child_overwrites": inv_8_ok,
+            "inv_9_no_started_read_released": inv_9_ok,
+            "inv_10_no_inflight_child_at_finalization": inv_10_ok,
+            "inv_11_no_consumed_child_without_accounting": inv_11_ok,
+            "inv_12_no_accounting_without_physical_evidence": inv_12_ok,
+            "inv_13_no_consumption_without_valid_read_id": inv_13_ok,
+            "inv_14_no_duplicate_physical_execution_identity": inv_14_ok,
+            "inv_15_aggregate_reservation_equals_child_sum": inv_15_ok,
+            "inv_16_committed_bytes_equal_physical_ledger": inv_16_ok,
+            "inv_17_global_metrics_equal_committed_totals": inv_17_ok,
+            "inv_18_profile_usage_equals_committed_profile_totals": inv_18_ok,
+            "inv_19_unknown_consumption_never_zero": inv_19_ok,
+            "inv_20_batch_slice_completeness": inv_20_ok,
+            "inv_21_collector_fallback_provenance_separation": inv_21_ok,
+            "inv_22_invocation_provenance_and_orphan_detection": inv_22_ok,
+            "inv_23_reservation_registry_lifecycle_exclusivity": inv_23_ok,
+            "inv_24_accounting_reconstruction": inv_24_ok,
+        }
+
+        if discrepancies and raise_on_error:
+            raise AssertionError(f"Tracker ledger reconciliation failed: {'; '.join(discrepancies)}")
+
+        return {
+            "reconciled": len(discrepancies) == 0,
+            "discrepancies": discrepancies,
+            "discrepancy_details": discrepancy_details,
+            "total_transactions": len(snaps),
+            "total_logical_transactions": len(snaps),
+            "total_physical_records": len(phys_snaps),
+            "total_physical_reads": len(read_snaps),
+            "unique_physical_consumption_ids": len(unique_phys_ids),
+            "unique_physical_read_ids": len(unique_read_ids),
+            "duplicate_logical_operations_count": len(duplicate_snaps),
+            "collision_records_count": len(collision_snaps),
+            "total_bytes_read": sum_charged,
+            "total_measured_bytes": sum_measured,
+            "total_estimated_bytes": sum_estimated,
+            "total_latency_us": sum_latency,
+            "total_stop_ms": sum_stop,
+            "total_failures": sum_failures,
+            "total_failed_outcomes": sum_failed_status,
+            "total_rejected_outcomes": sum_rejected_status,
+            "active_reservations_count": len(active_res_list),
+            "active_reservations_bytes": active_res_bytes,
+            "consumed_unaccounted_reservations_bytes": consumed_unaccounted_bytes,
+            "released_reservations_count": released_reservations_count,
+            "active_in_flight_scopes_count": active_scopes_count,
+            "active_in_flight_bytes": active_in_flight_bytes,
+            "physical_consumption_records_count": len(phys_snaps),
+        }
 
     def commit_transaction(
         self,
