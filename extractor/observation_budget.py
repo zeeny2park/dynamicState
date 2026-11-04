@@ -20,7 +20,7 @@ Strictly separates distinct observation metrics:
 """
 
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import copy
 from dataclasses import asdict, dataclass, field
 import hashlib
@@ -1642,7 +1642,7 @@ class ActiveOperationScope:
     ) -> BudgetReservation:
         """Acquires a pre-read budget admission before starting physical target read."""
         track = self.tracker
-        track_lock = track._transaction_lock if track is not None else contextlib.nullcontext()
+        track_lock = track._transaction_lock if track is not None else nullcontext()
         with track_lock:
             with self._lock:
                 if self.state in ("FINALIZING", "COMMITTED", "FAILED", "REJECTED"):
@@ -1696,7 +1696,7 @@ class ActiveOperationScope:
         Does NOT prematurely update global aggregate metrics.
         """
         track = self.tracker
-        track_lock = track._transaction_lock if track is not None else contextlib.nullcontext()
+        track_lock = track._transaction_lock if track is not None else nullcontext()
         with track_lock:
             with self._lock:
                 if self.state in ("FINALIZING", "COMMITTED", "FAILED", "REJECTED"):
@@ -1858,7 +1858,7 @@ class ActiveOperationScope:
     ) -> Optional[CommittedTransactionSnapshot]:
         """Finalize and register the operation in the tracker ledger if not already committed."""
         track = self.tracker
-        track_lock = track._transaction_lock if track is not None else contextlib.nullcontext()
+        track_lock = track._transaction_lock if track is not None else nullcontext()
         with track_lock:
             with self._lock:
                 if self.state in ("COMMITTED", "FAILED", "REJECTED"):
@@ -1880,9 +1880,9 @@ class ActiveOperationScope:
                     # Duplicate physical execution or collision
                     return self.tracker._finalize_scope_duplicate_or_collision(self, is_fail=is_fail)
 
-                unique_admissions = list({r.reservation_id: r for r in self._admissions}.values())
+                candidates = self.tracker._get_authoritative_scope_candidates(self) if self.tracker is not None else list({r.reservation_id: r for r in self._admissions}.values())
                 adm_consumed = 0
-                for r in unique_admissions:
+                for r in candidates:
                     with r._lock_with_children():
                         if r.child_reads:
                             r_sum = sum(c.charged_bytes for c in r.child_reads.values())
@@ -1892,14 +1892,15 @@ class ActiveOperationScope:
 
                 if self.reads_count > 0 or adm_consumed > 0:
                     if self.reads_count == 0 and adm_consumed > 0:
-                        self.reads_count += len(unique_admissions)
+                        self.reads_count += len(candidates)
                         self.measured_bytes_read = adm_consumed
                         self.charged_bytes = adm_consumed
                     return self.tracker._finalize_scope_transaction(self, is_fail=is_fail)
                 else:
                     self.state = "FAILED" if is_fail else "COMMITTED"
-                    self.tracker._finalize_scope_reservations(self)
-                    self.tracker._unregister_active_scope(self)
+                    if self.tracker is not None:
+                        self.tracker._finalize_scope_reservations(self, target_reservations=candidates)
+                        self.tracker._unregister_active_scope(self)
                     return None
 
 
@@ -2421,6 +2422,12 @@ class ObservationBudgetTracker:
             )
             res._tracker = self
             self._active_reservations[res_id] = res
+            if scope is not None:
+                with scope._lock:
+                    if scope.state in ("FINALIZING", "COMMITTED", "FAILED", "REJECTED"):
+                        raise RuntimeError(f"Cannot reserve budget on scope '{scope.operation_id}' in state {scope.state}")
+                    if res not in scope._admissions:
+                        scope._admissions.append(res)
             return res
 
     def release_reservation(self, reservation: BudgetReservation) -> None:
@@ -2540,6 +2547,29 @@ class ObservationBudgetTracker:
             for lock in reversed(acquired_res_locks):
                 lock.release()
 
+    def _get_authoritative_scope_candidates(
+        self,
+        scope: "ActiveOperationScope",
+    ) -> List[BudgetReservation]:
+        """Authoritatively snapshots all reservations belonging to a scope in deterministic sorted order.
+
+        Linearization point: acquired under _transaction_lock and scope._lock.
+        """
+        candidate_map: Dict[str, BudgetReservation] = {}
+        with scope._lock:
+            for r in getattr(scope, "_admissions", []):
+                if r is not None and getattr(r, "reservation_id", None):
+                    candidate_map[r.reservation_id] = r
+
+        for r_id, r in self._active_reservations.items():
+            if r is not None and getattr(r, "reservation_id", None):
+                if r.scope_id == scope.physical_consumption_id or (
+                    r.scope_id is None and r.operation_id == scope.operation_id
+                ):
+                    candidate_map[r.reservation_id] = r
+
+        return [candidate_map[k] for k in sorted(candidate_map.keys())]
+
     def _finalize_scope_reservations(
         self,
         scope: "ActiveOperationScope",
@@ -2548,15 +2578,8 @@ class ObservationBudgetTracker:
         """Transitions all reservations belonging to scope to FINALIZED/ACCOUNTED and cleans them up."""
         with self._transaction_lock:
             self._trigger_fault("before_reservation_finalization")
+            candidates = list(target_reservations) if target_reservations is not None else self._get_authoritative_scope_candidates(scope)
             to_remove = []
-            candidates = list(target_reservations) if target_reservations is not None else [
-                res for r_id, res in self._active_reservations.items()
-                if res.scope_id == scope.physical_consumption_id or (res.scope_id is None and res.operation_id == scope.operation_id and res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED", "CONSUMED"))
-            ]
-            if target_reservations is None:
-                for r in getattr(scope, "_admissions", []):
-                    if r not in candidates and r.reservation_id in self._active_reservations:
-                        candidates.append(r)
             with self._lock_reservations_with_children(candidates) as (locked_res, locked_children):
                 for res in locked_res:
                     if res.state in ("ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
@@ -2860,11 +2883,7 @@ class ObservationBudgetTracker:
                 return prepared.snapshot
 
             # Pre-validate child reads and physical IDs before mutating state
-            all_res = list(prepared.scope._admissions)
-            for r_id, res in self._active_reservations.items():
-                if res.scope_id == prepared.scope.physical_consumption_id or (res.scope_id is None and res.operation_id == prepared.scope.operation_id):
-                    if res not in all_res:
-                        all_res.append(res)
+            all_res = self._get_authoritative_scope_candidates(prepared.scope)
 
             metrics_applied = False
             step = "start"
@@ -3116,11 +3135,7 @@ class ObservationBudgetTracker:
             self._trigger_fault("recovery_physical_evidence")
             self._trigger_fault("during_recovery_physical_evidence")
 
-            all_res = list(prepared.scope._admissions)
-            for r_id, res in self._active_reservations.items():
-                if res.scope_id == prepared.scope.physical_consumption_id or (res.scope_id is None and res.operation_id == prepared.scope.operation_id):
-                    if res not in all_res:
-                        all_res.append(res)
+            all_res = self._get_authoritative_scope_candidates(prepared.scope)
             with self._lock_reservations_with_children(all_res) as (locked_res, locked_children):
                 for res in locked_res:
                     for cr in res.child_reads.values():
@@ -3265,11 +3280,7 @@ class ObservationBudgetTracker:
             if expected_stages.issubset(stages) and scope.operation_id in self._committed_transactions:
                 return self._committed_transactions[scope.operation_id]
 
-            unique_admissions = list({r.reservation_id: r for r in getattr(scope, "_admissions", [])}.values())
-            for r_id, res in self._active_reservations.items():
-                if res.scope_id == scope.physical_consumption_id or (res.scope_id is None and res.operation_id == scope.operation_id):
-                    if res not in unique_admissions:
-                        unique_admissions.append(res)
+            unique_admissions = self._get_authoritative_scope_candidates(scope)
 
             total_consumed = 0
             for r in unique_admissions:
@@ -3639,9 +3650,11 @@ class ObservationBudgetTracker:
                         f"Invariant 10 (no started read without terminal outcome) violated: read '{r.physical_read_id}' is still in PHYSICAL_READ_STARTED"
                     )
             for r_id, r in self._active_reservations.items():
-                c_reads = _get_res_children(r)
+                with r._lock:
+                    r_state = r.state
+                    c_reads = dict(r.child_reads)
                 for cr in c_reads.values():
-                    if cr.state == "PHYSICAL_READ_STARTED" and r.state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
+                    if cr.state == "PHYSICAL_READ_STARTED" and r_state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
                         inv_10_ok = False
                         discrepancies.append(
                             f"Invariant 10 (no in-flight child at reservation finalization) violated: child read '{cr.physical_read_id}' of '{r_id}' is still PHYSICAL_READ_STARTED"
@@ -3651,10 +3664,13 @@ class ObservationBudgetTracker:
             active_scope_phys_ids = {s.physical_consumption_id for sc_list in self._active_scopes.values() for s in sc_list}
             inv_11_ok = True
             for r_id, r in self._active_reservations.items():
-                if r.state == "CONSUMED" and (r.scope_id is None or r.scope_id not in active_scope_phys_ids):
+                with r._lock:
+                    r_state = r.state
+                    r_scope_id = r.scope_id
+                    c_reads = dict(r.child_reads)
+                if r_state == "CONSUMED" and (r_scope_id is None or r_scope_id not in active_scope_phys_ids):
                     # Check if reservation is associated with an active in-flight or recently completed invocation
                     is_active_inv = False
-                    c_reads = _get_res_children(r)
                     for cr in c_reads.values():
                         ts = getattr(cr, "target_spec", None) or {}
                         c_inv = ts.get("invocation_id")
@@ -3699,13 +3715,15 @@ class ObservationBudgetTracker:
             # 15. Aggregate reservation bytes equal child consumption sum
             inv_15_ok = True
             for r_id, r in self._active_reservations.items():
-                c_reads = _get_res_children(r)
+                with r._lock:
+                    r_consumed = r.consumed_bytes
+                    c_reads = dict(r.child_reads)
                 if c_reads:
                     child_sum = sum(c.charged_bytes for c in c_reads.values())
-                    if r.consumed_bytes != child_sum:
+                    if r_consumed != child_sum:
                         inv_15_ok = False
                         discrepancies.append(
-                            f"Invariant 15 (aggregate reservation bytes equal child consumption sum) violated: reservation '{r_id}' consumed {r.consumed_bytes}B != child sum {child_sum}B"
+                            f"Invariant 15 (aggregate reservation bytes equal child consumption sum) violated: reservation '{r_id}' consumed {r_consumed}B != child sum {child_sum}B"
                         )
 
             # 16. Committed bytes equal physical ledger totals
