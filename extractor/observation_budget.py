@@ -2264,76 +2264,85 @@ class ObservationBudgetTracker:
         ADMITTED -> RELEASED (strictly when zero physical read occurred)
         """
         with self._transaction_lock:
-            self._trigger_fault("before_admission")
-            if scope is not None:
-                with scope._lock:
+            scope_lock = scope._lock if scope is not None else nullcontext()
+            with scope_lock:
+                self._trigger_fault("before_admission")
+                if scope is not None:
                     if scope.state in ("FINALIZING", "COMMITTED", "FAILED", "REJECTED"):
                         raise RuntimeError(f"Cannot admit read on scope '{scope.operation_id}' in state {scope.state}")
-            if isinstance(projected_bytes, bool) or not isinstance(projected_bytes, (int, float)) or projected_bytes < 0:
-                raise ValueError(f"Invalid non-negative admission bytes: {projected_bytes}")
-            proj_b = int(projected_bytes)
+                if isinstance(projected_bytes, bool) or not isinstance(projected_bytes, (int, float)) or projected_bytes < 0:
+                    raise ValueError(f"Invalid non-negative admission bytes: {projected_bytes}")
+                proj_b = int(projected_bytes)
 
-            if self.is_budget_exhausted:
-                raise ValueError(f"BUDGET_EXHAUSTED: cannot admit read ({self.exhaustion_reason})")
+                if self.is_budget_exhausted:
+                    raise ValueError(f"BUDGET_EXHAUSTED: cannot admit read ({self.exhaustion_reason})")
 
-            # Check global limits atomically
-            active_res = self._active_reservation_bytes()
-            in_flight = self._active_consumed_bytes()
-            projected = self.metrics.bytes_read + active_res + in_flight + proj_b
+                # Check global limits atomically
+                active_res = self._active_reservation_bytes()
+                in_flight = self._active_consumed_bytes()
+                projected = self.metrics.bytes_read + active_res + in_flight + proj_b
 
-            if projected > self.limits.max_bytes_read:
-                self.metrics.is_budget_exhausted = True
-                self.metrics.exhaustion_reason = (
-                    f"EXCEEDED_BYTES_READ: projected admission {projected}B > max {self.limits.max_bytes_read}B"
+                if projected > self.limits.max_bytes_read:
+                    self.metrics.is_budget_exhausted = True
+                    self.metrics.exhaustion_reason = (
+                        f"EXCEEDED_BYTES_READ: projected admission {projected}B > max {self.limits.max_bytes_read}B"
+                    )
+                    if not allow_in_flight_overshoot:
+                        raise ValueError(f"BUDGET_EXHAUSTED: {self.metrics.exhaustion_reason}")
+                    elif (projected - self.limits.max_bytes_read) > self.limits.max_bytes_per_observation:
+                        raise ValueError(
+                            f"BUDGET_EXHAUSTED: In-flight overshoot {projected - self.limits.max_bytes_read}B "
+                            f"exceeds max buffer {self.limits.max_bytes_per_observation}B"
+                        )
+
+                # Check profile limit if profile has ceiling
+                eff_prof_id = profile_id or (scope.profile_id if scope else None)
+                if eff_prof_id:
+                    p_usage = self._get_or_init_profile_usage(eff_prof_id)
+                    p_active_res = self._active_reservation_bytes(profile_id=eff_prof_id)
+                    p_in_flight = self._active_consumed_bytes(profile_id=eff_prof_id)
+                    ceil_limit = None
+                    if profile_ceiling:
+                        ceil_limit = profile_ceiling.get("max_bytes_read", profile_ceiling.get("max_bytes"))
+                    if ceil_limit is None and hasattr(self.limits, "max_profile_bytes"):
+                        ceil_limit = self.limits.max_profile_bytes.get(eff_prof_id)
+
+                    if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + p_in_flight + proj_b) > int(ceil_limit):
+                        raise ValueError(
+                            f"PROFILE_CEILING_EXCEEDED: Profile '{eff_prof_id}' projected "
+                            f"{p_usage['bytes_read'] + p_active_res + p_in_flight + proj_b}B > max {ceil_limit}B"
+                        )
+
+                res_id = f"adm_{uuid.uuid4().hex}"
+                pcons_id = scope.physical_consumption_id if scope else None
+                res = BudgetReservation(
+                    reservation_id=res_id,
+                    operation_id=operation_id or (scope.operation_id if scope else "standalone"),
+                    reserved_bytes=proj_b,
+                    profile_id=eff_prof_id,
+                    state="ADMITTED",
+                    scope_id=scope.physical_consumption_id if scope else None,
+                    physical_consumption_id=pcons_id,
+                    created_at_ms=round(time.time() * 1000.0, 3),
                 )
-                if not allow_in_flight_overshoot:
-                    raise ValueError(f"BUDGET_EXHAUSTED: {self.metrics.exhaustion_reason}")
-                elif (projected - self.limits.max_bytes_read) > self.limits.max_bytes_per_observation:
-                    raise ValueError(
-                        f"BUDGET_EXHAUSTED: In-flight overshoot {projected - self.limits.max_bytes_read}B "
-                        f"exceeds max buffer {self.limits.max_bytes_per_observation}B"
-                    )
+                res._tracker = self
 
-            # Check profile limit if profile has ceiling
-            eff_prof_id = profile_id or (scope.profile_id if scope else None)
-            if eff_prof_id:
-                p_usage = self._get_or_init_profile_usage(eff_prof_id)
-                p_active_res = self._active_reservation_bytes(profile_id=eff_prof_id)
-                p_in_flight = self._active_consumed_bytes(profile_id=eff_prof_id)
-                ceil_limit = None
-                if profile_ceiling:
-                    ceil_limit = profile_ceiling.get("max_bytes_read", profile_ceiling.get("max_bytes"))
-                if ceil_limit is None and hasattr(self.limits, "max_profile_bytes"):
-                    ceil_limit = self.limits.max_profile_bytes.get(eff_prof_id)
+                self._trigger_fault("before_admission_publication")
+                self._trigger_fault("during_reservation_admission")
 
-                if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + p_in_flight + proj_b) > int(ceil_limit):
-                    raise ValueError(
-                        f"PROFILE_CEILING_EXCEEDED: Profile '{eff_prof_id}' projected "
-                        f"{p_usage['bytes_read'] + p_active_res + p_in_flight + proj_b}B > max {ceil_limit}B"
-                    )
+                try:
+                    self._active_reservations[res_id] = res
+                    if scope is not None:
+                        if res not in scope._admissions:
+                            scope._admissions.append(res)
+                except Exception:
+                    self._active_reservations.pop(res_id, None)
+                    if scope is not None and res in scope._admissions:
+                        scope._admissions.remove(res)
+                    raise
 
-            res_id = f"adm_{uuid.uuid4().hex}"
-            pcons_id = scope.physical_consumption_id if scope else None
-            res = BudgetReservation(
-                reservation_id=res_id,
-                operation_id=operation_id or (scope.operation_id if scope else "standalone"),
-                reserved_bytes=proj_b,
-                profile_id=eff_prof_id,
-                state="ADMITTED",
-                scope_id=scope.physical_consumption_id if scope else None,
-                physical_consumption_id=pcons_id,
-                created_at_ms=round(time.time() * 1000.0, 3),
-            )
-            res._tracker = self
-            self._active_reservations[res_id] = res
-            if scope is not None:
-                with scope._lock:
-                    if scope.state in ("FINALIZING", "COMMITTED", "FAILED", "REJECTED"):
-                        raise RuntimeError(f"Cannot admit read on scope '{scope.operation_id}' in state {scope.state}")
-                    if res not in scope._admissions:
-                        scope._admissions.append(res)
-            self._trigger_fault("after_admission_before_read")
-            return res
+                self._trigger_fault("after_admission_before_read")
+                return res
 
     @contextmanager
     def admitted_read(
@@ -2370,65 +2379,78 @@ class ObservationBudgetTracker:
     ) -> BudgetReservation:
         """Atomically reserves budget against global and profile limits before a physical read."""
         with self._transaction_lock:
-            if isinstance(estimated_bytes, bool) or not isinstance(estimated_bytes, (int, float)) or estimated_bytes < 0:
-                raise ValueError(f"Invalid non-negative reservation bytes: {estimated_bytes}")
-            est_b = int(estimated_bytes)
-            if self.is_budget_exhausted:
-                raise ValueError(f"BUDGET_EXHAUSTED: cannot reserve budget ({self.exhaustion_reason})")
-
-            # Check global limits
-            active_res = self._active_reservation_bytes()
-            in_flight = self._active_consumed_bytes()
-            projected = self.metrics.bytes_read + active_res + in_flight + est_b
-
-            if projected > self.limits.max_bytes_read:
-                self.metrics.is_budget_exhausted = True
-                self.metrics.exhaustion_reason = (
-                    f"EXCEEDED_BYTES_READ: projected reservation {projected}B > max {self.limits.max_bytes_read}B"
-                )
-                if not allow_in_flight_overshoot:
-                    raise ValueError(f"BUDGET_EXHAUSTED: {self.metrics.exhaustion_reason}")
-
-            # Check profile limit if profile has ceiling
-            eff_prof_id = profile_id or (scope.profile_id if scope else None)
-            if eff_prof_id:
-                p_usage = self._get_or_init_profile_usage(eff_prof_id)
-                p_active_res = self._active_reservation_bytes(profile_id=eff_prof_id)
-                p_in_flight = self._active_consumed_bytes(profile_id=eff_prof_id)
-                ceil_limit = None
-                if profile_ceiling:
-                    ceil_limit = profile_ceiling.get("max_bytes_read", profile_ceiling.get("max_bytes"))
-                if ceil_limit is None and hasattr(self.limits, "max_profile_bytes"):
-                    ceil_limit = self.limits.max_profile_bytes.get(eff_prof_id)
-
-                if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + p_in_flight + est_b) > int(ceil_limit):
-                    if not allow_in_flight_overshoot:
-                        raise ValueError(
-                            f"PROFILE_CEILING_EXCEEDED: Profile '{eff_prof_id}' projected "
-                            f"{p_usage['bytes_read'] + p_active_res + p_in_flight + est_b}B > max {ceil_limit}B"
-                        )
-
-            res_id = f"res_{uuid.uuid4().hex[:8]}"
-            pcons_id = f"pcons_{uuid.uuid4().hex[:12]}"
-            res = BudgetReservation(
-                reservation_id=res_id,
-                operation_id=operation_id or (scope.operation_id if scope else "standalone"),
-                reserved_bytes=est_b,
-                profile_id=eff_prof_id,
-                state="RESERVED",
-                scope_id=scope.physical_consumption_id if scope else None,
-                physical_consumption_id=pcons_id,
-                created_at_ms=round(time.time() * 1000.0, 3),
-            )
-            res._tracker = self
-            self._active_reservations[res_id] = res
-            if scope is not None:
-                with scope._lock:
+            scope_lock = scope._lock if scope is not None else nullcontext()
+            with scope_lock:
+                if scope is not None:
                     if scope.state in ("FINALIZING", "COMMITTED", "FAILED", "REJECTED"):
                         raise RuntimeError(f"Cannot reserve budget on scope '{scope.operation_id}' in state {scope.state}")
-                    if res not in scope._admissions:
-                        scope._admissions.append(res)
-            return res
+                if isinstance(estimated_bytes, bool) or not isinstance(estimated_bytes, (int, float)) or estimated_bytes < 0:
+                    raise ValueError(f"Invalid non-negative reservation bytes: {estimated_bytes}")
+                est_b = int(estimated_bytes)
+                if self.is_budget_exhausted:
+                    raise ValueError(f"BUDGET_EXHAUSTED: cannot reserve budget ({self.exhaustion_reason})")
+
+                # Check global limits
+                active_res = self._active_reservation_bytes()
+                in_flight = self._active_consumed_bytes()
+                projected = self.metrics.bytes_read + active_res + in_flight + est_b
+
+                if projected > self.limits.max_bytes_read:
+                    self.metrics.is_budget_exhausted = True
+                    self.metrics.exhaustion_reason = (
+                        f"EXCEEDED_BYTES_READ: projected reservation {projected}B > max {self.limits.max_bytes_read}B"
+                    )
+                    if not allow_in_flight_overshoot:
+                        raise ValueError(f"BUDGET_EXHAUSTED: {self.metrics.exhaustion_reason}")
+
+                # Check profile limit if profile has ceiling
+                eff_prof_id = profile_id or (scope.profile_id if scope else None)
+                if eff_prof_id:
+                    p_usage = self._get_or_init_profile_usage(eff_prof_id)
+                    p_active_res = self._active_reservation_bytes(profile_id=eff_prof_id)
+                    p_in_flight = self._active_consumed_bytes(profile_id=eff_prof_id)
+                    ceil_limit = None
+                    if profile_ceiling:
+                        ceil_limit = profile_ceiling.get("max_bytes_read", profile_ceiling.get("max_bytes"))
+                    if ceil_limit is None and hasattr(self.limits, "max_profile_bytes"):
+                        ceil_limit = self.limits.max_profile_bytes.get(eff_prof_id)
+
+                    if ceil_limit is not None and (p_usage["bytes_read"] + p_active_res + p_in_flight + est_b) > int(ceil_limit):
+                        if not allow_in_flight_overshoot:
+                            raise ValueError(
+                                f"PROFILE_CEILING_EXCEEDED: Profile '{eff_prof_id}' projected "
+                                f"{p_usage['bytes_read'] + p_active_res + p_in_flight + est_b}B > max {ceil_limit}B"
+                            )
+
+                res_id = f"res_{uuid.uuid4().hex[:8]}"
+                pcons_id = f"pcons_{uuid.uuid4().hex[:12]}"
+                res = BudgetReservation(
+                    reservation_id=res_id,
+                    operation_id=operation_id or (scope.operation_id if scope else "standalone"),
+                    reserved_bytes=est_b,
+                    profile_id=eff_prof_id,
+                    state="RESERVED",
+                    scope_id=scope.physical_consumption_id if scope else None,
+                    physical_consumption_id=pcons_id,
+                    created_at_ms=round(time.time() * 1000.0, 3),
+                )
+                res._tracker = self
+
+                self._trigger_fault("before_reservation_publication")
+                self._trigger_fault("during_reservation_admission")
+
+                try:
+                    self._active_reservations[res_id] = res
+                    if scope is not None:
+                        if res not in scope._admissions:
+                            scope._admissions.append(res)
+                except Exception:
+                    self._active_reservations.pop(res_id, None)
+                    if scope is not None and res in scope._admissions:
+                        scope._admissions.remove(res)
+                    raise
+
+                return res
 
     def release_reservation(self, reservation: BudgetReservation) -> None:
         """Transitions a reservation to RELEASED strictly when zero physical bytes were consumed."""
@@ -2555,20 +2577,28 @@ class ObservationBudgetTracker:
 
         Linearization point: acquired under _transaction_lock and scope._lock.
         """
-        candidate_map: Dict[str, BudgetReservation] = {}
-        with scope._lock:
-            for r in getattr(scope, "_admissions", []):
-                if r is not None and getattr(r, "reservation_id", None):
-                    candidate_map[r.reservation_id] = r
+        with self._transaction_lock:
+            with scope._lock:
+                candidate_map: Dict[str, BudgetReservation] = {}
+                for r in getattr(scope, "_admissions", []):
+                    if r is not None and getattr(r, "reservation_id", None):
+                        candidate_map[r.reservation_id] = r
 
-        for r_id, r in self._active_reservations.items():
-            if r is not None and getattr(r, "reservation_id", None):
-                if r.scope_id == scope.physical_consumption_id or (
-                    r.scope_id is None and r.operation_id == scope.operation_id
-                ):
-                    candidate_map[r.reservation_id] = r
+                for r_id, r in self._active_reservations.items():
+                    if r is not None and getattr(r, "reservation_id", None):
+                        if r.scope_id == scope.physical_consumption_id or (
+                            r.scope_id is None and r.operation_id == scope.operation_id
+                        ):
+                            if r.reservation_id in candidate_map:
+                                if candidate_map[r.reservation_id] is not r:
+                                    raise ValueError(
+                                        f"Reservation identity collision: duplicate reservation_id '{r.reservation_id}' "
+                                        f"associated with distinct BudgetReservation instances"
+                                    )
+                            else:
+                                candidate_map[r.reservation_id] = r
 
-        return [candidate_map[k] for k in sorted(candidate_map.keys())]
+                return [candidate_map[k] for k in sorted(candidate_map.keys())]
 
     def _finalize_scope_reservations(
         self,
@@ -3537,11 +3567,83 @@ class ObservationBudgetTracker:
         Enforces all 19 P0.8 authoritative accounting invariants.
         """
         with self._transaction_lock:
+            def _snapshot_res_and_children(res_obj: Any):
+                if not hasattr(res_obj, "_lock_with_children"):
+                    c_reads = dict(getattr(res_obj, "child_reads", {}))
+                    c_snaps = {}
+                    for cid, cr in c_reads.items():
+                        c_snaps[cid] = {
+                            "state": getattr(cr, "state", None),
+                            "charged_bytes": getattr(cr, "charged_bytes", 0),
+                            "transition_history": list(getattr(cr, "_transition_history", [])),
+                            "target_spec": dict(getattr(cr, "target_spec", None) or {}),
+                            "metadata": dict(getattr(cr, "metadata", None) or {}),
+                            "physical_read_id": getattr(cr, "physical_read_id", cid),
+                            "physical_consumption_id": getattr(cr, "physical_consumption_id", None),
+                            "operation_id": getattr(cr, "operation_id", None),
+                            "target_type": getattr(cr, "target_type", "memory_slice"),
+                            "obj": cr,
+                        }
+                    return {
+                        "state": getattr(res_obj, "state", None),
+                        "consumed_bytes": getattr(res_obj, "consumed_bytes", 0),
+                        "reserved_bytes": getattr(res_obj, "reserved_bytes", 0),
+                        "scope_id": getattr(res_obj, "scope_id", None),
+                        "operation_id": getattr(res_obj, "operation_id", None),
+                        "created_at_ms": getattr(res_obj, "created_at_ms", 0),
+                        "terminal_at_ms": getattr(res_obj, "terminal_at_ms", None),
+                        "child_reads": c_reads,
+                        "child_snaps": c_snaps,
+                        "obj": res_obj,
+                    }
+                with res_obj._lock_with_children():
+                    c_reads = dict(res_obj.child_reads)
+                    c_snaps = {}
+                    for cid, cr in c_reads.items():
+                        with cr._lock:
+                            c_snaps[cid] = {
+                                "state": cr.state,
+                                "charged_bytes": cr.charged_bytes,
+                                "transition_history": list(cr._transition_history),
+                                "target_spec": dict(cr.target_spec) if cr.target_spec else {},
+                                "metadata": dict(cr.metadata) if cr.metadata else {},
+                                "physical_read_id": cr.physical_read_id,
+                                "physical_consumption_id": cr.physical_consumption_id,
+                                "operation_id": cr.operation_id,
+                                "target_type": cr.target_type,
+                                "obj": cr,
+                            }
+                    return {
+                        "state": res_obj.state,
+                        "consumed_bytes": res_obj.consumed_bytes,
+                        "reserved_bytes": res_obj.reserved_bytes,
+                        "scope_id": res_obj.scope_id,
+                        "operation_id": res_obj.operation_id,
+                        "created_at_ms": res_obj.created_at_ms,
+                        "terminal_at_ms": res_obj.terminal_at_ms,
+                        "child_reads": c_reads,
+                        "child_snaps": c_snaps,
+                        "obj": res_obj,
+                    }
+
             def _get_res_children(res_obj: Any) -> Dict[str, PhysicalReadRecord]:
                 if not hasattr(res_obj, "_lock"):
                     return dict(getattr(res_obj, "child_reads", {}))
                 with res_obj._lock:
                     return dict(getattr(res_obj, "child_reads", {}))
+
+            active_res_snaps = {
+                r_id: _snapshot_res_and_children(r)
+                for r_id, r in sorted(self._active_reservations.items(), key=lambda x: x[0])
+            }
+            released_res_snaps = {
+                r_id: _snapshot_res_and_children(r)
+                for r_id, r in sorted(getattr(self, "_released_reservations", {}).items(), key=lambda x: x[0])
+            }
+            committed_res_snaps = {
+                r_id: _snapshot_res_and_children(r)
+                for r_id, r in sorted(getattr(self, "_committed_reservations", {}).items(), key=lambda x: x[0])
+            }
 
             snaps = list(self._committed_transactions.values())
             phys_snaps = list(self._physical_consumption_records.values())
@@ -3578,9 +3680,8 @@ class ObservationBudgetTracker:
             # 4. Child identity uniqueness across reservations
             seen_child_pread_ids: Set[str] = set()
             inv_4_ok = True
-            for r_id, r in self._active_reservations.items():
-                c_reads = _get_res_children(r)
-                for cid in c_reads.keys():
+            for r_id, r_info in active_res_snaps.items():
+                for cid in r_info["child_snaps"].keys():
                     if cid in seen_child_pread_ids:
                         inv_4_ok = False
                         discrepancies.append(
@@ -3625,54 +3726,52 @@ class ObservationBudgetTracker:
             # 9. No started read released
             inv_9_ok = True
             for r in read_snaps:
-                th = r.transition_history if hasattr(r, "transition_history") else []
+                with r._lock if hasattr(r, "_lock") else nullcontext():
+                    th = r.transition_history if hasattr(r, "transition_history") else []
                 if "PHYSICAL_READ_STARTED" in th and "RELEASED" in th:
                     inv_9_ok = False
                     discrepancies.append(
                         f"Invariant 9 (no started read released) violated: read '{r.physical_read_id}' transitioned from STARTED to RELEASED: {th}"
                     )
-            for r_id, r in self._active_reservations.items():
-                c_reads = _get_res_children(r)
-                for cr in c_reads.values():
-                    cr_th = cr.transition_history if hasattr(cr, "transition_history") else []
+            for r_id, r_info in active_res_snaps.items():
+                for cid, cs in r_info["child_snaps"].items():
+                    cr_th = cs["transition_history"]
                     if "PHYSICAL_READ_STARTED" in cr_th and "RELEASED" in cr_th:
                         inv_9_ok = False
                         discrepancies.append(
-                            f"Invariant 9 (no started child read released) violated: child '{cr.physical_read_id}' of '{r_id}' transitioned from STARTED to RELEASED: {cr_th}"
+                            f"Invariant 9 (no started child read released) violated: child '{cid}' of '{r_id}' transitioned from STARTED to RELEASED: {cr_th}"
                         )
 
             # 10. No in-flight child at reservation finalization
             inv_10_ok = True
             for r in read_snaps:
-                if r.state == "PHYSICAL_READ_STARTED":
+                with r._lock if hasattr(r, "_lock") else nullcontext():
+                    r_st = r.state
+                if r_st == "PHYSICAL_READ_STARTED":
                     inv_10_ok = False
                     discrepancies.append(
                         f"Invariant 10 (no started read without terminal outcome) violated: read '{r.physical_read_id}' is still in PHYSICAL_READ_STARTED"
                     )
-            for r_id, r in self._active_reservations.items():
-                with r._lock:
-                    r_state = r.state
-                    c_reads = dict(r.child_reads)
-                for cr in c_reads.values():
-                    if cr.state == "PHYSICAL_READ_STARTED" and r_state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
+            for r_id, r_info in active_res_snaps.items():
+                r_state = r_info["state"]
+                for cid, cs in r_info["child_snaps"].items():
+                    if cs["state"] == "PHYSICAL_READ_STARTED" and r_state in ("ACCOUNTED", "FINALIZED", "RELEASED"):
                         inv_10_ok = False
                         discrepancies.append(
-                            f"Invariant 10 (no in-flight child at reservation finalization) violated: child read '{cr.physical_read_id}' of '{r_id}' is still PHYSICAL_READ_STARTED"
+                            f"Invariant 10 (no in-flight child at reservation finalization) violated: child read '{cid}' of '{r_id}' is still PHYSICAL_READ_STARTED"
                         )
 
             # 11. No consumed child without accounting
             active_scope_phys_ids = {s.physical_consumption_id for sc_list in self._active_scopes.values() for s in sc_list}
             inv_11_ok = True
-            for r_id, r in self._active_reservations.items():
-                with r._lock:
-                    r_state = r.state
-                    r_scope_id = r.scope_id
-                    c_reads = dict(r.child_reads)
+            for r_id, r_info in active_res_snaps.items():
+                r_state = r_info["state"]
+                r_scope_id = r_info["scope_id"]
                 if r_state == "CONSUMED" and (r_scope_id is None or r_scope_id not in active_scope_phys_ids):
                     # Check if reservation is associated with an active in-flight or recently completed invocation
                     is_active_inv = False
-                    for cr in c_reads.values():
-                        ts = getattr(cr, "target_spec", None) or {}
+                    for cs in r_info["child_snaps"].values():
+                        ts = cs["target_spec"]
                         c_inv = ts.get("invocation_id")
                         if c_inv and c_inv in self._invocations:
                             is_active_inv = True
@@ -3714,12 +3813,11 @@ class ObservationBudgetTracker:
 
             # 15. Aggregate reservation bytes equal child consumption sum
             inv_15_ok = True
-            for r_id, r in self._active_reservations.items():
-                with r._lock:
-                    r_consumed = r.consumed_bytes
-                    c_reads = dict(r.child_reads)
-                if c_reads:
-                    child_sum = sum(c.charged_bytes for c in c_reads.values())
+            for r_id, r_info in active_res_snaps.items():
+                r_consumed = r_info["consumed_bytes"]
+                c_snaps = r_info["child_snaps"]
+                if c_snaps:
+                    child_sum = sum(c["charged_bytes"] for c in c_snaps.values())
                     if r_consumed != child_sum:
                         inv_15_ok = False
                         discrepancies.append(
@@ -3810,16 +3908,16 @@ class ObservationBudgetTracker:
                 ts = getattr(r, "target_spec", None) or {}
                 if "slice_index" in ts:
                     all_slices_for_batch.append(r)
-            for r in self._active_reservations.values():
-                for cr in _get_res_children(r).values():
-                    ts = getattr(cr, "target_spec", None) or {}
-                    if "slice_index" in ts and cr.physical_read_id not in {x.physical_read_id for x in all_slices_for_batch}:
-                        all_slices_for_batch.append(cr)
-            for r in getattr(self, "_released_reservations", {}).values():
-                for cr in _get_res_children(r).values():
-                    ts = getattr(cr, "target_spec", None) or {}
-                    if "slice_index" in ts and cr.physical_read_id not in {x.physical_read_id for x in all_slices_for_batch}:
-                        all_slices_for_batch.append(cr)
+            for r_info in active_res_snaps.values():
+                for cs in r_info["child_snaps"].values():
+                    ts = cs["target_spec"]
+                    if "slice_index" in ts and cs["physical_read_id"] not in {x.physical_read_id for x in all_slices_for_batch}:
+                        all_slices_for_batch.append(cs["obj"])
+            for r_info in released_res_snaps.values():
+                for cs in r_info["child_snaps"].values():
+                    ts = cs["target_spec"]
+                    if "slice_index" in ts and cs["physical_read_id"] not in {x.physical_read_id for x in all_slices_for_batch}:
+                        all_slices_for_batch.append(cs["obj"])
 
             batch_groups: Dict[Tuple[str, str], List[PhysicalReadRecord]] = {}
             for r in all_slices_for_batch:
@@ -4064,9 +4162,9 @@ class ObservationBudgetTracker:
             for r in read_snaps:
                 res_key = r.reservation_id or getattr(r, "operation_id", "unknown")
                 provenance_groups.setdefault(res_key, []).append(r)
-            for r_id, r in self._active_reservations.items():
-                c_reads = _get_res_children(r)
-                for cr in c_reads.values():
+            for r_id, r_info in active_res_snaps.items():
+                for cs in r_info["child_snaps"].values():
+                    cr = cs["obj"]
                     if cr.physical_read_id not in {x.physical_read_id for x in provenance_groups.get(r_id, [])}:
                         provenance_groups.setdefault(r_id, []).append(cr)
 
@@ -4108,9 +4206,9 @@ class ObservationBudgetTracker:
             # 22. Invocation provenance & orphan record detection
             inv_22_ok = True
             all_active_child_reads = (
-                [cr for r in self._active_reservations.values() for cr in _get_res_children(r).values()]
-                + [cr for r in getattr(self, "_released_reservations", {}).values() for cr in _get_res_children(r).values()]
-                + [cr for r in getattr(self, "_committed_reservations", {}).values() for cr in _get_res_children(r).values()]
+                [cs["obj"] for r_info in active_res_snaps.values() for cs in r_info["child_snaps"].values()]
+                + [cs["obj"] for r_info in released_res_snaps.values() for cs in r_info["child_snaps"].values()]
+                + [cs["obj"] for r_info in committed_res_snaps.values() for cs in r_info["child_snaps"].values()]
             )
             all_known_read_ids = set(read_ids).union({cr.physical_read_id for cr in all_active_child_reads})
             all_inspected_reads = list({r.physical_read_id: r for r in list(read_snaps) + all_active_child_reads}.values())
@@ -4274,45 +4372,52 @@ class ObservationBudgetTracker:
                 )
 
             # Check terminal records have terminal timestamps, valid ordering, and parent/child consistency
-            all_reservations_map = dict(self._active_reservations)
-            all_reservations_map.update(getattr(self, "_released_reservations", {}))
-            all_reservations_map.update(getattr(self, "_committed_reservations", {}))
+            all_known_reservations = (
+                list(active_res_snaps.items())
+                + list(released_res_snaps.items())
+                + list(committed_res_snaps.items())
+            )
 
-            for res_id_key, res_obj in all_reservations_map.items():
-                if res_obj.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
-                    if res_obj.terminal_at_ms is None:
+            for res_id_key, r_info in all_known_reservations:
+                res_obj = r_info["obj"]
+                res_state = r_info["state"]
+                res_term = r_info["terminal_at_ms"]
+                res_created = r_info["created_at_ms"]
+                res_consumed = r_info["consumed_bytes"]
+                if res_state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
+                    if res_term is None:
                         inv_23_ok = False
                         discrepancies.append(
                             f"Invariant 23 (terminal timestamp completeness) violated: terminal reservation '{res_id_key}' "
-                            f"in state '{res_obj.state}' has no terminal_at_ms"
+                            f"in state '{res_state}' has no terminal_at_ms"
                         )
-                    elif res_obj.created_at_ms > 0 and res_obj.terminal_at_ms < res_obj.created_at_ms:
+                    elif res_created > 0 and res_term < res_created:
                         inv_23_ok = False
                         discrepancies.append(
                             f"Invariant 23 (timestamp regression) violated: reservation '{res_id_key}' terminal_at_ms "
-                            f"({res_obj.terminal_at_ms}) < created_at_ms ({res_obj.created_at_ms})"
+                            f"({res_term}) < created_at_ms ({res_created})"
                         )
-                if res_obj.consumed_bytes > 0 and res_obj.state == "RELEASED":
+                if res_consumed > 0 and res_state == "RELEASED":
                     inv_23_ok = False
                     discrepancies.append(
-                        f"Invariant 23 (invalid transition) violated: reservation '{res_id_key}' has consumed {res_obj.consumed_bytes}B but is RELEASED"
+                        f"Invariant 23 (invalid transition) violated: reservation '{res_id_key}' has consumed {res_consumed}B but is RELEASED"
                     )
-                c_reads = _get_res_children(res_obj)
-                if res_obj.state in ("ACCOUNTED", "FINALIZED"):
-                    for cr in c_reads.values():
-                        if cr.state not in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED"):
+                c_snaps = r_info["child_snaps"]
+                if res_state in ("ACCOUNTED", "FINALIZED"):
+                    for cid, cs in c_snaps.items():
+                        if cs["state"] not in ("ACCOUNTED", "FAILED_ACCOUNTED", "RELEASED"):
                             inv_23_ok = False
                             discrepancies.append(
-                                f"Invariant 23 (parent/child consistency) violated: reservation '{res_id_key}' is '{res_obj.state}' "
-                                f"but child read '{cr.physical_read_id}' is non-terminal '{cr.state}'"
+                                f"Invariant 23 (parent/child consistency) violated: reservation '{res_id_key}' is '{res_state}' "
+                                f"but child read '{cid}' is non-terminal '{cs['state']}'"
                             )
-                elif res_obj.state == "RELEASED":
-                    for cr in c_reads.values():
-                        if cr.state != "RELEASED":
+                elif res_state == "RELEASED":
+                    for cid, cs in c_snaps.items():
+                        if cs["state"] != "RELEASED":
                             inv_23_ok = False
                             discrepancies.append(
                                 f"Invariant 23 (parent/child consistency) violated: released reservation '{res_id_key}' "
-                                f"has non-released child read '{cr.physical_read_id}' in state '{cr.state}'"
+                                f"has non-released child read '{cid}' in state '{cs['state']}'"
                             )
 
             for r in all_inspected_reads:
@@ -4337,15 +4442,15 @@ class ObservationBudgetTracker:
 
             # Physical read lifecycle ownership across active, released, committed
             committed_read_ids = set(self._physical_read_records.keys())
-            for r_id, r in self._active_reservations.items():
-                for cr_id, cr in _get_res_children(r).items():
-                    if cr_id in committed_read_ids and cr.state not in ("ACCOUNTED", "FAILED_ACCOUNTED"):
+            for r_id, r_info in active_res_snaps.items():
+                for cr_id, cs in r_info["child_snaps"].items():
+                    if cr_id in committed_read_ids and cs["state"] not in ("ACCOUNTED", "FAILED_ACCOUNTED"):
                         inv_23_ok = False
                         discrepancies.append(
                             f"Invariant 23 (physical read ownership) violated: active reservation '{r_id}' child read '{cr_id}' already in committed physical ledger"
                         )
-            for r_id, r in self._released_reservations.items():
-                for cr_id, cr in _get_res_children(r).items():
+            for r_id, r_info in released_res_snaps.items():
+                for cr_id, cs in r_info["child_snaps"].items():
                     if cr_id in committed_read_ids:
                         inv_23_ok = False
                         discrepancies.append(
