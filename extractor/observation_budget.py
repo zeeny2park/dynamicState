@@ -630,6 +630,8 @@ class PhysicalReadRecord:
     def update_target_spec(self, updates: Dict[str, Any]) -> None:
         """Safely updates target_spec metadata while preserving frozen immutability."""
         with self._lock_hierarchy():
+            if self._parent_reservation is not None and getattr(self._parent_reservation, "_tracker", None) is not None:
+                self._parent_reservation._tracker._trigger_fault("before_target_spec_update")
             if self.is_terminal:
                 raise RuntimeError(
                     f"Cannot update target_spec of physical read '{self.physical_read_id}' in terminal state '{self.state}'"
@@ -645,6 +647,8 @@ class PhysicalReadRecord:
     def update_metadata(self, updates: Dict[str, Any]) -> None:
         """Safely updates metadata while preserving frozen immutability and respecting lock hierarchy."""
         with self._lock_hierarchy():
+            if self._parent_reservation is not None and getattr(self._parent_reservation, "_tracker", None) is not None:
+                self._parent_reservation._tracker._trigger_fault("before_metadata_update")
             if self.is_terminal:
                 raise RuntimeError(
                     f"Cannot update metadata of physical read '{self.physical_read_id}' in terminal state '{self.state}'"
@@ -711,6 +715,8 @@ class PhysicalReadRecord:
     ) -> int:
         """Transitions ADMITTED or PHYSICAL_READ_STARTED -> CONSUMED."""
         with self._lock_hierarchy():
+            if self._parent_reservation is not None and getattr(self._parent_reservation, "_tracker", None) is not None:
+                self._parent_reservation._tracker._trigger_fault("before_child_consumption")
             if self._parent_reservation is not None:
                 if self._parent_reservation.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
                     raise RuntimeError(
@@ -1100,6 +1106,7 @@ class BudgetReservation:
     child_reads: Dict[str, PhysicalReadRecord] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
     _transition_history: List[str] = field(default_factory=lambda: ["ADMITTED"], init=False, repr=False)
+    _tracker: Optional[Any] = field(default=None, init=False, repr=False, compare=False)
 
     @contextmanager
     def _lock_with_children(self):
@@ -1149,6 +1156,7 @@ class BudgetReservation:
                 child_reads={k: copy.deepcopy(v, memo) for k, v in self.child_reads.items()},
             )
             res._transition_history = list(self._transition_history)
+            res._tracker = self._tracker
             memo[id(self)] = res
             return res
 
@@ -1208,6 +1216,8 @@ class BudgetReservation:
     ) -> PhysicalReadRecord:
         """Starts and registers a child physical read under this aggregate reservation."""
         with self._lock:
+            if self._tracker is not None:
+                self._tracker._trigger_fault("during_child_registration")
             if self.state in ("RELEASED", "ACCOUNTED", "FINALIZED", "FAILED", "FAILED_ACCOUNTED"):
                 raise RuntimeError(
                     f"Cannot start child read for reservation '{self.reservation_id}' in terminal state '{self.state}'"
@@ -1416,6 +1426,8 @@ class BudgetReservation:
                     )
 
             # Phase 2: Commit all mutations atomically together
+            if self._tracker is not None:
+                self._tracker._trigger_fault("before_reservation_finalize_commit")
             for cr in self.child_reads.values():
                 if not cr.is_terminal:
                     cr.state = "RELEASED"
@@ -1455,6 +1467,8 @@ class BudgetReservation:
                     )
 
             # Phase 2: Commit all mutations atomically together
+            if self._tracker is not None:
+                self._tracker._trigger_fault("before_reservation_finalize_commit")
             for cr in self.child_reads.values():
                 if cr.state == "CONSUMED":
                     cr.state = "ACCOUNTED"
@@ -1500,6 +1514,8 @@ class BudgetReservation:
                     )
 
             # Phase 2: Commit all mutations atomically together
+            if self._tracker is not None:
+                self._tracker._trigger_fault("before_reservation_finalize_commit")
             for cr in self.child_reads.values():
                 if cr.state == "CONSUMED":
                     cr.state = "ACCOUNTED"
@@ -1545,6 +1561,8 @@ class BudgetReservation:
                     )
 
             # Phase 2: Commit all mutations atomically together
+            if self._tracker is not None:
+                self._tracker._trigger_fault("before_reservation_finalize_commit")
             for cr in self.child_reads.values():
                 if not cr.is_terminal:
                     if cr.state == "PHYSICAL_READ_STARTED" and cr.charged_bytes == 0 and cr.measured_bytes_read is None:
@@ -1846,6 +1864,9 @@ class ActiveOperationScope:
                 if self.state in ("COMMITTED", "FAILED", "REJECTED"):
                     return self.tracker.get_committed_record(self.operation_id)
 
+                if self.tracker is not None:
+                    self.tracker._trigger_fault("before_scope_finalizing")
+
                 self.state = "FINALIZING"
                 is_fail = (not success) or self.is_failure or (exc is not None)
 
@@ -1862,7 +1883,7 @@ class ActiveOperationScope:
                 unique_admissions = list({r.reservation_id: r for r in self._admissions}.values())
                 adm_consumed = 0
                 for r in unique_admissions:
-                    with r._lock:
+                    with r._lock_with_children():
                         if r.child_reads:
                             r_sum = sum(c.charged_bytes for c in r.child_reads.values())
                             if r_sum > r.consumed_bytes:
@@ -1936,6 +1957,17 @@ class ObservationBudgetTracker:
         self._metrics_applied_operations: Set[str] = set()
         self._profile_metrics_applied_operations: Set[str] = set()
         self._failure_metric_counted_operations: Set[str] = set()
+        self._recovery_stages_completed: Dict[str, Set[str]] = {}
+
+    def get_recovery_stages_completed(self, operation_id: str) -> Set[str]:
+        """Returns the set of completed recovery stages for an operation."""
+        with self._transaction_lock:
+            return set(self._recovery_stages_completed.get(operation_id, set()))
+
+    def _record_recovery_stage(self, operation_id: str, stage: str) -> None:
+        if operation_id not in self._recovery_stages_completed:
+            self._recovery_stages_completed[operation_id] = set()
+        self._recovery_stages_completed[operation_id].add(stage)
 
     def get_invocation_records(self) -> Dict[str, RemoteInvocationRecord]:
         """Returns deep copy of runtime invocation records."""
@@ -2163,31 +2195,35 @@ class ObservationBudgetTracker:
                 s.charged_bytes for scopes in self._active_scopes.values() for s in scopes
                 if (profile_id is None or s.profile_id == profile_id)
             )
-            standalone_consumed = sum(
-                r.consumed_bytes for r in self._active_reservations.values()
-                if r.consumed_bytes > 0
-                and (profile_id is None or r.profile_id == profile_id)
-                and (r.scope_id is None or r.scope_id not in active_scope_phys_ids)
-            )
+            standalone_consumed = 0
+            for r in list(self._active_reservations.values()):
+                with r._lock:
+                    if (
+                        r.consumed_bytes > 0
+                        and (profile_id is None or r.profile_id == profile_id)
+                        and (r.scope_id is None or r.scope_id not in active_scope_phys_ids)
+                    ):
+                        standalone_consumed += r.consumed_bytes
             return scope_bytes + standalone_consumed
 
     def _active_reservation_bytes(self, profile_id: Optional[str] = None) -> int:
         with self._transaction_lock:
             total = 0
-            for r in self._active_reservations.values():
-                if profile_id is not None and r.profile_id != profile_id:
-                    continue
-                if r.state in ("RESERVED", "ADMITTED", "PHYSICAL_READ_STARTED"):
-                    rem = max(0, r.reserved_bytes - r.consumed_bytes)
-                    total += rem
-                elif r.state == "CONSUMED":
-                    has_inflight_children = any(
-                        c.state in ("ADMITTED", "PHYSICAL_READ_STARTED")
-                        for c in getattr(r, "child_reads", {}).values()
-                    )
-                    if has_inflight_children:
+            for r in list(self._active_reservations.values()):
+                with r._lock:
+                    if profile_id is not None and r.profile_id != profile_id:
+                        continue
+                    if r.state in ("RESERVED", "ADMITTED", "PHYSICAL_READ_STARTED"):
                         rem = max(0, r.reserved_bytes - r.consumed_bytes)
                         total += rem
+                    elif r.state == "CONSUMED":
+                        has_inflight_children = any(
+                            c.state in ("ADMITTED", "PHYSICAL_READ_STARTED")
+                            for c in getattr(r, "child_reads", {}).values()
+                        )
+                        if has_inflight_children:
+                            rem = max(0, r.reserved_bytes - r.consumed_bytes)
+                            total += rem
             return total
 
     @property
@@ -2287,6 +2323,7 @@ class ObservationBudgetTracker:
                 physical_consumption_id=pcons_id,
                 created_at_ms=round(time.time() * 1000.0, 3),
             )
+            res._tracker = self
             self._active_reservations[res_id] = res
             if scope is not None:
                 with scope._lock:
@@ -2382,6 +2419,7 @@ class ObservationBudgetTracker:
                 physical_consumption_id=pcons_id,
                 created_at_ms=round(time.time() * 1000.0, 3),
             )
+            res._tracker = self
             self._active_reservations[res_id] = res
             return res
 
@@ -2478,21 +2516,23 @@ class ObservationBudgetTracker:
                                 f"{committed_cr.charged_bytes}B by '{committed_cr.operation_id}', conflicting with {cr.charged_bytes}B by '{cr.operation_id}'"
                             )
 
-            for other_r_id, other_r in self._active_reservations.items():
-                if other_r.reservation_id not in unique_res_map:
+            other_active = [r for r_id, r in self._active_reservations.items() if r.reservation_id not in unique_res_map]
+            other_active_sorted = sorted(other_active, key=lambda r: r.reservation_id)
+            for other_r in other_active_sorted:
+                with other_r._lock:
                     for other_cid, other_cr in other_r.child_reads.items():
                         if other_cid in child_records:
-                            if other_cr is not child_records[other_cid]:
-                                raise ValueError(
-                                    f"Conflicting reservation ownership: child read '{other_cid}' shared across multiple reservations "
-                                    f"('{child_records[other_cid].reservation_id}' and '{other_r_id}')"
-                                )
+                            raise ValueError(
+                                f"Conflicting reservation ownership: child read '{other_cid}' shared across multiple reservations "
+                                f"('{child_records[other_cid].reservation_id}' and '{other_r.reservation_id}')"
+                            )
 
             sorted_child_records = [child_records[k] for k in sorted(child_records.keys())]
             for cr in sorted_child_records:
                 cr._lock.acquire()
                 acquired_child_locks.append(cr._lock)
 
+            self._trigger_fault("during_identity_snapshot")
             yield sorted_reservations, sorted_child_records
         finally:
             for lock in reversed(acquired_child_locks):
@@ -2507,6 +2547,7 @@ class ObservationBudgetTracker:
     ) -> None:
         """Transitions all reservations belonging to scope to FINALIZED/ACCOUNTED and cleans them up."""
         with self._transaction_lock:
+            self._trigger_fault("before_reservation_finalization")
             to_remove = []
             candidates = list(target_reservations) if target_reservations is not None else [
                 res for r_id, res in self._active_reservations.items()
@@ -2516,21 +2557,22 @@ class ObservationBudgetTracker:
                 for r in getattr(scope, "_admissions", []):
                     if r not in candidates and r.reservation_id in self._active_reservations:
                         candidates.append(r)
-            for res in candidates:
-                if res.state in ("ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
-                    self._committed_reservations[res.reservation_id] = res
-                elif res.consumed_bytes > 0 or scope.charged_bytes > 0 or getattr(res, "is_failure", False):
-                    res.finalize()
-                    self._committed_reservations[res.reservation_id] = res
-                else:
-                    if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
-                        res.release()
-                        self._released_reservations_count += 1
-                        self._released_reservations[res.reservation_id] = res
-                    else:
+            with self._lock_reservations_with_children(candidates) as (locked_res, locked_children):
+                for res in locked_res:
+                    if res.state in ("ACCOUNTED", "FINALIZED", "FAILED_ACCOUNTED"):
+                        self._committed_reservations[res.reservation_id] = res
+                    elif res.consumed_bytes > 0 or scope.charged_bytes > 0 or getattr(res, "is_failure", False):
                         res.finalize()
                         self._committed_reservations[res.reservation_id] = res
-                to_remove.append(res.reservation_id)
+                    else:
+                        if res.state in ("ADMITTED", "RESERVED", "PHYSICAL_READ_STARTED"):
+                            res.release()
+                            self._released_reservations_count += 1
+                            self._released_reservations[res.reservation_id] = res
+                        else:
+                            res.finalize()
+                            self._committed_reservations[res.reservation_id] = res
+                    to_remove.append(res.reservation_id)
             for r_id in to_remove:
                 self._active_reservations.pop(r_id, None)
 
@@ -3025,6 +3067,7 @@ class ObservationBudgetTracker:
             # 1. Recovery entry
             self._trigger_fault("recovery_entry")
             self._trigger_fault("during_emergency_recovery")
+            self._record_recovery_stage(prepared.target_op_id, "recovery_entry")
 
             # 2. Logical failed transaction registration
             self._trigger_fault("recovery_logical_registration")
@@ -3067,6 +3110,7 @@ class ObservationBudgetTracker:
                     physical_consumption_id=prepared.snapshot.physical_consumption_id,
                 )
                 self._committed_transactions[prepared.target_op_id] = snap
+            self._record_recovery_stage(prepared.target_op_id, "recovery_logical_registration")
 
             # 3. Physical evidence preservation
             self._trigger_fault("recovery_physical_evidence")
@@ -3123,6 +3167,7 @@ class ObservationBudgetTracker:
                         is_failure=True,
                     )
                     self._physical_read_records[root_pread_id] = root_cr
+                self._record_recovery_stage(prepared.target_op_id, "recovery_physical_evidence")
 
                 # 4. Global & profile metric reconciliation
                 self._trigger_fault("recovery_metric_reconciliation")
@@ -3179,6 +3224,7 @@ class ObservationBudgetTracker:
                         self.metrics.exhaustion_reason = (
                             f"EXCEEDED_BYTES_READ: current {self.metrics.bytes_read}B >= max {self.limits.max_bytes_read}B"
                         )
+                self._record_recovery_stage(prepared.target_op_id, "recovery_metric_reconciliation")
 
                 # 5. Reservation failure accounting / finalization
                 self._trigger_fault("recovery_reservation_finalization")
@@ -3190,12 +3236,14 @@ class ObservationBudgetTracker:
                     if not res.is_terminal:
                         res.mark_failed_accounted()
                 self._finalize_scope_reservations(prepared.scope, target_reservations=locked_res)
+                self._record_recovery_stage(prepared.target_op_id, "recovery_reservation_finalization")
 
                 # 6. Scope unregister / cleanup
                 self._trigger_fault("recovery_cleanup")
                 self._trigger_fault("during_recovery_cleanup")
 
                 self._unregister_active_scope(prepared.scope)
+                self._record_recovery_stage(prepared.target_op_id, "recovery_cleanup")
                 return snap
 
     def retry_recovery(
@@ -3205,6 +3253,18 @@ class ObservationBudgetTracker:
     ) -> CommittedTransactionSnapshot:
         """Explicitly re-runs recovery for a scope after an incomplete or failed recovery attempt."""
         with self._transaction_lock:
+            stages = self._recovery_stages_completed.get(scope.operation_id, set())
+            expected_stages = {
+                "recovery_entry",
+                "recovery_logical_registration",
+                "recovery_physical_evidence",
+                "recovery_metric_reconciliation",
+                "recovery_reservation_finalization",
+                "recovery_cleanup",
+            }
+            if expected_stages.issubset(stages) and scope.operation_id in self._committed_transactions:
+                return self._committed_transactions[scope.operation_id]
+
             unique_admissions = list({r.reservation_id: r for r in getattr(scope, "_admissions", [])}.values())
             for r_id, res in self._active_reservations.items():
                 if res.scope_id == scope.physical_consumption_id or (res.scope_id is None and res.operation_id == scope.operation_id):
@@ -3213,7 +3273,7 @@ class ObservationBudgetTracker:
 
             total_consumed = 0
             for r in unique_admissions:
-                with r._lock:
+                with r._lock_with_children():
                     if r.child_reads:
                         r_sum = sum(c.charged_bytes for c in r.child_reads.values())
                         if r_sum > r.consumed_bytes:
