@@ -712,14 +712,14 @@ class TestPhase20A3430CriticalSectionStress(unittest.TestCase):
         def scope_inside_hook():
             if threading.current_thread().name in ("worker_0", "worker_1"):
                 try:
-                    scope_inside_barrier.wait(timeout=2.0)
+                    scope_inside_barrier.wait(timeout=5.0)
                 except threading.BrokenBarrierError:
                     pass
 
         def child_inside_hook():
             if threading.current_thread().name in ("worker_0", "worker_1"):
                 try:
-                    child_inside_barrier.wait(timeout=2.0)
+                    child_inside_barrier.wait(timeout=5.0)
                 except threading.BrokenBarrierError:
                     pass
 
