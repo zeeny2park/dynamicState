@@ -1,0 +1,56 @@
+name: CI - DynamicState Concurrency & Evidence Verification
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Log Environment & Python Details
+        run: |
+          echo "=== Python Version ==="
+          python3 --version
+          which python3
+          echo "=== OS and Kernel Information ==="
+          uname -a
+          echo "=== Architecture ==="
+          lscpu || true
+
+      - name: Install Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest pytest-timeout
+
+      - name: Phase 33 Self-Verification Concurrency Stability (3x Repeat)
+        run: |
+          for i in 1 2 3; do
+            echo "=== Phase 33 Run $i/3 ==="
+            python3 -m unittest tests/test_phase2_0_a_3_4_33_proof_harness_self_verification.py -v
+          done
+
+      - name: Phase 23-33 Concurrency & Lock Regression Suite
+        run: |
+          python3 -m pytest tests/test_phase2_0_a_3_4_2*.py tests/test_phase2_0_a_3_4_3*.py -v --timeout=120
+
+      - name: Phase 2.0 Full Verification Suite
+        run: |
+          python3 -m pytest tests/test_phase2_0_*.py -q --timeout=300
+
+      - name: Phase 16 CLI Security & Truthfulness Suite
+        run: |
+          python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py -v
