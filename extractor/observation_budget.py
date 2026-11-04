@@ -32,37 +32,96 @@ import types
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
-def clone_frozen(obj: Any) -> Any:
+def clone_frozen(
+    obj: Any,
+    in_progress: Optional[Set[int]] = None,
+    memo: Optional[Dict[int, Any]] = None,
+    keepalive: Optional[List[Any]] = None,
+) -> Any:
     """Recursively clones metadata or target_spec into an independent deeply frozen structure.
 
     Guarantees:
     - Mapping / MappingProxyType -> types.MappingProxyType with string keys and recursively frozen values.
     - list / tuple -> tuple of recursively frozen elements.
-    - set / frozenset -> frozenset of recursively frozen elements.
+    - set / frozenset -> frozenset of recursively frozen elements (falls back to sorted tuple if elements are unhashable).
     - bytes / bytearray -> bytes.
-    - Supported primitives (int, float, str, bool, NoneType) -> returned directly (immutable).
-    - Objects with to_dict() -> frozen dict of to_dict().
+    - Supported primitives (int, str, bool, NoneType) -> returned directly (immutable).
+    - float -> validated (non-finite values rejected with ValueError, -0.0 canonicalized to 0.0).
+    - Objects with to_dict() -> frozen dict of to_dict() (must return an independent Mapping, memoized).
     - Unsupported mutable types -> raises TypeError explicitly.
+    - Cyclic structures -> raises ValueError deterministically without infinite recursion.
+    - DAG diamond structures -> preserved via memoization.
     """
-    if isinstance(obj, Mapping):
-        frozen_dict = {}
-        for k, v in obj.items():
-            if not isinstance(k, str):
-                raise TypeError(f"Metadata dictionary keys must be strings, got {type(k).__name__}: {repr(k)}")
-            frozen_dict[k] = clone_frozen(v)
-        return types.MappingProxyType(frozen_dict)
-    elif isinstance(obj, (list, tuple)):
-        return tuple(clone_frozen(x) for x in obj)
-    elif isinstance(obj, (set, frozenset)):
-        return frozenset(clone_frozen(x) for x in obj)
-    elif isinstance(obj, (bytes, bytearray)):
-        return bytes(obj)
-    elif isinstance(obj, (int, float, str, bool, type(None))):
+    if in_progress is None:
+        in_progress = set()
+    if memo is None:
+        memo = {}
+    if keepalive is None:
+        keepalive = []
+
+    keepalive.append(obj)
+    obj_id = id(obj)
+    if obj_id in memo:
+        return memo[obj_id]
+    if obj_id in in_progress:
+        raise ValueError(f"Cyclic reference detected in metadata structure: {type(obj).__name__}")
+
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError(f"Non-finite float value is not supported in metadata: {obj}")
+        if obj == 0.0:
+            return 0.0
         return obj
-    elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
-        return clone_frozen(obj.to_dict())
-    else:
-        raise TypeError(f"Unsupported metadata value type for clone_frozen: {type(obj).__name__} ({repr(obj)})")
+
+    if isinstance(obj, (int, str, bool, type(None))):
+        return obj
+
+    if isinstance(obj, (bytes, bytearray)):
+        res = bytes(obj)
+        memo[obj_id] = res
+        return res
+
+    in_progress.add(obj_id)
+    try:
+        if isinstance(obj, Mapping):
+            frozen_dict: Dict[str, Any] = {}
+            for k, v in obj.items():
+                if not isinstance(k, str):
+                    raise TypeError(f"Metadata dictionary keys must be strings, got {type(k).__name__}: {repr(k)}")
+                frozen_dict[k] = clone_frozen(v, in_progress, memo, keepalive)
+            res = types.MappingProxyType(frozen_dict)
+            memo[obj_id] = res
+            return res
+
+        elif isinstance(obj, (list, tuple)):
+            res = tuple(clone_frozen(x, in_progress, memo, keepalive) for x in obj)
+            memo[obj_id] = res
+            return res
+
+        elif isinstance(obj, (set, frozenset)):
+            items = [clone_frozen(x, in_progress, memo, keepalive) for x in obj]
+            try:
+                res = frozenset(items)
+            except TypeError:
+                res = tuple(sorted(items, key=lambda x: str(x)))
+            memo[obj_id] = res
+            return res
+
+        elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+            dict_res = obj.to_dict()
+            if dict_res is obj:
+                raise ValueError(f"to_dict() returned self, causing a cyclic reference: {type(obj).__name__}")
+            if not isinstance(dict_res, Mapping):
+                raise TypeError(f"to_dict() must return a Mapping, got {type(dict_res).__name__}")
+            res = keepalive.append(dict_res)
+            res = clone_frozen(dict_res, in_progress, memo, keepalive)
+            memo[obj_id] = res
+            return res
+
+        else:
+            raise TypeError(f"Unsupported metadata value type for clone_frozen: {type(obj).__name__} ({repr(obj)})")
+    finally:
+        in_progress.remove(obj_id)
 
 
 def freeze_metadata(obj: Any) -> Any:
@@ -79,21 +138,81 @@ def freeze_metadata(obj: Any) -> Any:
     return clone_frozen(obj)
 
 
-def unfreeze_metadata(obj: Any) -> Any:
+def unfreeze_metadata(
+    obj: Any,
+    in_progress: Optional[Set[int]] = None,
+    memo: Optional[Dict[int, Any]] = None,
+    keepalive: Optional[List[Any]] = None,
+) -> Any:
     """Recursively converts frozen metadata back to mutable Python types for serialization."""
-    if isinstance(obj, Mapping):
-        return {str(k): unfreeze_metadata(v) for k, v in obj.items()}
-    elif isinstance(obj, (tuple, list)):
-        return [unfreeze_metadata(x) for x in obj]
-    elif isinstance(obj, (set, frozenset)):
-        return {unfreeze_metadata(x) for x in obj}
-    elif isinstance(obj, (bytes, bytearray)):
-        return bytes(obj)
-    elif isinstance(obj, (int, float, str, bool, type(None))):
+    if in_progress is None:
+        in_progress = set()
+    if memo is None:
+        memo = {}
+    if keepalive is None:
+        keepalive = []
+
+    keepalive.append(obj)
+    obj_id = id(obj)
+    if obj_id in memo:
+        return memo[obj_id]
+    if obj_id in in_progress:
+        raise ValueError(f"Cyclic reference detected in metadata structure: {type(obj).__name__}")
+
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError(f"Non-finite float value is not supported in metadata: {obj}")
+        if obj == 0.0:
+            return 0.0
         return obj
-    elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
-        return unfreeze_metadata(obj.to_dict())
-    raise TypeError(f"Unsupported metadata value type for unfreeze: {type(obj).__name__} ({repr(obj)})")
+
+    if isinstance(obj, (int, str, bool, type(None))):
+        return obj
+
+    if isinstance(obj, (bytes, bytearray)):
+        res = bytes(obj)
+        memo[obj_id] = res
+        return res
+
+    in_progress.add(obj_id)
+    try:
+        if isinstance(obj, Mapping):
+            unfrozen_dict: Dict[str, Any] = {}
+            memo[obj_id] = unfrozen_dict
+            for k, v in obj.items():
+                unfrozen_dict[str(k)] = unfreeze_metadata(v, in_progress, memo, keepalive)
+            return unfrozen_dict
+
+        elif isinstance(obj, (tuple, list)):
+            unfrozen_list: List[Any] = []
+            memo[obj_id] = unfrozen_list
+            for x in obj:
+                unfrozen_list.append(unfreeze_metadata(x, in_progress, memo, keepalive))
+            return unfrozen_list
+
+        elif isinstance(obj, (set, frozenset)):
+            items = [unfreeze_metadata(x, in_progress, memo, keepalive) for x in obj]
+            try:
+                res = set(items)
+            except TypeError:
+                res = list(items)
+            memo[obj_id] = res
+            return res
+
+        elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+            dict_res = obj.to_dict()
+            if dict_res is obj:
+                raise ValueError(f"to_dict() returned self, causing a cyclic reference: {type(obj).__name__}")
+            if not isinstance(dict_res, Mapping):
+                raise TypeError(f"to_dict() must return a Mapping, got {type(dict_res).__name__}")
+            res = keepalive.append(dict_res)
+            res = unfreeze_metadata(dict_res, in_progress, memo, keepalive)
+            memo[obj_id] = res
+            return res
+
+        raise TypeError(f"Unsupported metadata value type for unfreeze: {type(obj).__name__} ({repr(obj)})")
+    finally:
+        in_progress.remove(obj_id)
 
 
 def clone_metadata(obj: Any) -> Any:
@@ -104,26 +223,74 @@ def clone_metadata(obj: Any) -> Any:
 def canonical_metadata_digest(metadata: Any) -> str:
     """Computes a deterministic canonical SHA-256 digest of normalized metadata.
 
-    Guarantees that dictionary key insertion order does not affect the digest.
-    Rejects unsupported mutable or non-canonical types without silent string conversion.
+    Guarantees:
+    - Dictionary key insertion order does not affect the digest.
+    - Detects cycles deterministically with ValueError.
+    - Rejects non-finite float values (NaN, +Inf, -Inf) with ValueError.
+    - Canonicalizes -0.0 to 0.0.
+    - Disallows non-standard JSON NaN/Infinity values via allow_nan=False.
+    - Rejects unsupported mutable or non-canonical types without silent string conversion.
     """
+    in_progress: Set[int] = set()
+    memo: Dict[int, Any] = {}
+    keepalive: List[Any] = []
+
     def _normalize(obj: Any) -> Any:
-        if isinstance(obj, Mapping):
-            return {str(k): _normalize(obj[k]) for k in sorted(obj.keys())}
-        elif isinstance(obj, (list, tuple)):
-            return [_normalize(x) for x in obj]
-        elif isinstance(obj, (set, frozenset)):
-            return sorted([_normalize(x) for x in obj], key=lambda x: str(x))
-        elif isinstance(obj, float):
+        keepalive.append(obj)
+        obj_id = id(obj)
+        if obj_id in memo:
+            return memo[obj_id]
+        if obj_id in in_progress:
+            raise ValueError(f"Cyclic reference detected in canonical digest: {type(obj).__name__}")
+
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                raise ValueError(f"Non-finite float value is not supported in metadata digest: {obj}")
+            if obj == 0.0:
+                return 0.0
             return round(obj, 4)
-        elif isinstance(obj, (int, str, bool, type(None))):
+
+        if isinstance(obj, (int, str, bool, type(None))):
             return obj
-        elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
-            return _normalize(obj.to_dict())
-        raise TypeError(f"Unsupported metadata value type for canonical identity: {type(obj).__name__} ({repr(obj)})")
+
+        if isinstance(obj, (bytes, bytearray)):
+            return bytes(obj).hex()
+
+        in_progress.add(obj_id)
+        try:
+            if isinstance(obj, Mapping):
+                res = {str(k): _normalize(obj[k]) for k in sorted(obj.keys())}
+                memo[obj_id] = res
+                return res
+            elif isinstance(obj, (list, tuple)):
+                res = [_normalize(x) for x in obj]
+                memo[obj_id] = res
+                return res
+            elif isinstance(obj, (set, frozenset)):
+                norm_items = [_normalize(x) for x in obj]
+                res = sorted(
+                    norm_items,
+                    key=lambda x: json.dumps(x, sort_keys=True, separators=(',', ':'), allow_nan=False)
+                    if isinstance(x, (dict, list))
+                    else str(x),
+                )
+                memo[obj_id] = res
+                return res
+            elif hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+                dict_res = obj.to_dict()
+                if dict_res is obj:
+                    raise ValueError(f"to_dict() returned self, causing a cyclic reference: {type(obj).__name__}")
+                if not isinstance(dict_res, Mapping):
+                    raise TypeError(f"to_dict() must return a Mapping, got {type(dict_res).__name__}")
+                res = _normalize(dict_res)
+                memo[obj_id] = res
+                return res
+            raise TypeError(f"Unsupported metadata value type for canonical identity: {type(obj).__name__} ({repr(obj)})")
+        finally:
+            in_progress.remove(obj_id)
 
     normalized = _normalize(metadata or {})
-    raw_json = json.dumps(normalized, sort_keys=True, separators=(',', ':'))
+    raw_json = json.dumps(normalized, sort_keys=True, separators=(',', ':'), allow_nan=False)
     return hashlib.sha256(raw_json.encode('utf-8')).hexdigest()
 
 
@@ -3629,6 +3796,7 @@ class ObservationBudgetTracker:
         Enforces all 24 authoritative accounting invariants using one coherent point-in-time snapshot.
         Every mutable field used by invariant validation is evaluated strictly from the snapshot.
         """
+        self._trigger_fault("before_reconciliation_snapshot_capture")
         with self._transaction_lock:
             # 1. Authoritative Immutable Snapshots capture
             def _snapshot_res_and_children(res_obj: Any) -> Dict[str, Any]:
@@ -4761,6 +4929,8 @@ class ObservationBudgetTracker:
             "inv_23_reservation_registry_lifecycle_exclusivity": inv_23_ok,
             "inv_24_accounting_reconstruction": inv_24_ok,
         }
+
+        self._trigger_fault("after_reconciliation_invariant_evaluation")
 
         if discrepancies and raise_on_error:
             raise AssertionError(f"Tracker ledger reconciliation failed: {'; '.join(discrepancies)}")
