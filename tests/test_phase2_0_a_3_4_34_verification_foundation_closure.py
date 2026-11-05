@@ -148,6 +148,86 @@ def get_recursive_retained_size(obj: Any, seen: Optional[Set[int]] = None) -> in
     return size
 
 
+class OutermostCloneFrozenInterceptor:
+    """Test-only reusable helper measuring outermost clone_frozen invocations during snapshot capture."""
+
+    def __init__(self, target_module: Any = observation_budget):
+        self.target_module = target_module
+        self.orig_clone_frozen = target_module.clone_frozen
+        self._tls = threading.local()
+        self.active = False
+        self.target_thread_id: Optional[int] = None
+        self.per_reconciliation_invocation_counts: List[int] = []
+        self.per_reconciliation_invocation_durations_ns: List[List[int]] = []
+        self.per_reconciliation_aggregate_durations_ns: List[float] = []
+        self._current_reconciliation_samples: List[int] = []
+
+    def start_reconciliation_capture(self) -> None:
+        """Called by before_reconciliation_snapshot_capture hook."""
+        self._tls.depth = 0
+        self._current_reconciliation_samples = []
+        self.target_thread_id = threading.get_ident()
+        self.active = True
+
+    def end_reconciliation_capture(self) -> Tuple[int, int]:
+        """Called by after_reconciliation_snapshot_capture hook.
+
+        Returns (invocation_count, aggregate_duration_ns).
+        Fails explicitly if capture was not active, recursion did not unwind, or no invocations were measured.
+        """
+        if not self.active:
+            raise AssertionError("end_reconciliation_capture called while capture was not active")
+        self.active = False
+        self.target_thread_id = None
+        depth = getattr(self._tls, "depth", 0)
+        if depth != 0:
+            self._tls.depth = 0
+            raise AssertionError(f"clone_frozen recursion depth did not unwind to zero: depth={depth}")
+        if not self._current_reconciliation_samples:
+            raise AssertionError("Missing instrumentation: 0 outermost clone_frozen invocations recorded during capture")
+        samples_copy = list(self._current_reconciliation_samples)
+        count = len(samples_copy)
+        agg_ns = sum(samples_copy)
+        self.per_reconciliation_invocation_counts.append(count)
+        self.per_reconciliation_invocation_durations_ns.append(samples_copy)
+        self.per_reconciliation_aggregate_durations_ns.append(float(agg_ns))
+        self._current_reconciliation_samples = []
+        return count, agg_ns
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        depth = getattr(self._tls, "depth", 0)
+        self._tls.depth = depth + 1
+        is_target_thread = (threading.get_ident() == self.target_thread_id)
+        is_outer = (depth == 0) and self.active and is_target_thread
+        t0 = time.perf_counter_ns() if is_outer else 0
+        success = False
+        try:
+            res = self.orig_clone_frozen(*args, **kwargs)
+            success = True
+            return res
+        finally:
+            t1 = time.perf_counter_ns() if is_outer else 0
+            self._tls.depth -= 1
+            if is_outer and t0 > 0 and success:
+                self._current_reconciliation_samples.append(t1 - t0)
+
+    def attach(self) -> OutermostCloneFrozenInterceptor:
+        self.target_module.clone_frozen = self
+        return self
+
+    def detach(self) -> None:
+        self.target_module.clone_frozen = self.orig_clone_frozen
+        self.active = False
+        self.target_thread_id = None
+        self._tls.depth = 0
+
+    def __enter__(self) -> OutermostCloneFrozenInterceptor:
+        return self.attach()
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.detach()
+
+
 # ---------------------------------------------------------------------------
 # Worker Lifecycle Implementation
 # ---------------------------------------------------------------------------
@@ -268,10 +348,11 @@ class LockAcquisitionRecord:
     hold_duration_ns: Optional[int]
     max_recursion_depth: int
     total_reentrant_acquisitions: int
+    phase: str = "default"
 
 
 class ProductionCriticalSectionRecorder:
-    """Records lock acquisitions and outermost hold intervals accurately and deterministically."""
+    """Records lock acquisitions and outermost hold intervals accurately and deterministically with thread-phase attribution."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -280,7 +361,16 @@ class ProductionCriticalSectionRecorder:
         self.active_threads_by_level: Dict[str, Set[int]] = collections.defaultdict(set)
         self.max_simultaneous: Dict[str, int] = collections.defaultdict(int)
         self.reentrancy_depth: Dict[Tuple[int, int], int] = collections.defaultdict(int)
-        self._entry_times: Dict[Tuple[int, int], Tuple[int, int, int, int]] = {}
+        self._entry_times: Dict[Tuple[int, int], Tuple[int, int, int, int, str]] = {}
+        self._tls = threading.local()
+
+    def set_thread_phase(self, phase: str) -> None:
+        """Sets the active execution phase for the calling thread."""
+        self._tls.phase = phase
+
+    def get_thread_phase(self) -> str:
+        """Returns the active execution phase for the calling thread."""
+        return getattr(self._tls, "phase", "default")
 
     def record_acquire(
         self,
@@ -293,6 +383,7 @@ class ProductionCriticalSectionRecorder:
     ) -> None:
         with self._lock:
             key = (thread_id, lock_id)
+            phase = self.get_thread_phase()
             cur_depth = self.reentrancy_depth.get(key, 0)
             if cur_depth == 0:
                 self.reentrancy_depth[key] = 1
@@ -301,16 +392,17 @@ class ProductionCriticalSectionRecorder:
                 cur_active = len(self.active_threads_by_level[level])
                 if cur_active > self.max_simultaneous[level]:
                     self.max_simultaneous[level] = cur_active
-                self._entry_times[key] = (attempt_ns, acquired_ns, 1, 0)
+                self._entry_times[key] = (attempt_ns, acquired_ns, 1, 0, phase)
             else:
                 new_depth = cur_depth + 1
                 self.reentrancy_depth[key] = new_depth
-                prev_attempt, prev_acquired, prev_max, prev_reentrant = self._entry_times[key]
+                prev_attempt, prev_acquired, prev_max, prev_reentrant, prev_phase = self._entry_times[key]
                 self._entry_times[key] = (
                     prev_attempt,
                     prev_acquired,
                     max(prev_max, new_depth),
                     prev_reentrant + 1,
+                    prev_phase,
                 )
 
     def record_release(
@@ -334,7 +426,7 @@ class ProductionCriticalSectionRecorder:
                     self.active_threads_by_level[level].discard(thread_id)
                 entry_info = self._entry_times.pop(key, None)
                 if entry_info:
-                    attempt_ns, acquired_ns, max_depth, reentrant_count = entry_info
+                    attempt_ns, acquired_ns, max_depth, reentrant_count, phase = entry_info
                     rec = LockAcquisitionRecord(
                         thread_id=thread_id,
                         lock_id=lock_id,
@@ -347,21 +439,26 @@ class ProductionCriticalSectionRecorder:
                         hold_duration_ns=release_ns - acquired_ns,
                         max_recursion_depth=max_depth,
                         total_reentrant_acquisitions=reentrant_count,
+                        phase=phase,
                     )
                     self.records_by_thread[thread_id].append(rec)
 
-    def get_thread_waits(self, thread_id: int, level: Optional[str] = None) -> List[int]:
+    def get_thread_waits(self, thread_id: int, level: Optional[str] = None, phase: Optional[str] = None) -> List[int]:
         with self._lock:
             recs = list(self.records_by_thread.get(thread_id, []))
         if level is not None:
             recs = [r for r in recs if r.level == level]
+        if phase is not None:
+            recs = [r for r in recs if r.phase == phase]
         return [r.wait_duration_ns for r in recs]
 
-    def get_thread_holds(self, thread_id: int, level: Optional[str] = None) -> List[int]:
+    def get_thread_holds(self, thread_id: int, level: Optional[str] = None, phase: Optional[str] = None) -> List[int]:
         with self._lock:
             recs = list(self.records_by_thread.get(thread_id, []))
         if level is not None:
             recs = [r for r in recs if r.level == level and r.hold_duration_ns is not None]
+        if phase is not None:
+            recs = [r for r in recs if r.phase == phase and r.hold_duration_ns is not None]
         return [r.hold_duration_ns for r in recs if r.hold_duration_ns is not None]
 
     def cleanup_thread(self, thread_id: int) -> None:
@@ -376,6 +473,7 @@ class ProductionCriticalSectionRecorder:
             self.max_simultaneous.clear()
             self.reentrancy_depth.clear()
             self._entry_times.clear()
+        self._tls.phase = "default"
 
 
 class InstrumentedLock:
@@ -1235,12 +1333,13 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         return float(s[idx])
 
     def test_16_ten_boundary_benchmark_with_internal_snapshot_freeze_measurement(self):
-        """Measures all 10 boundaries independently across N=20 samples with non-double-counted outermost clone_frozen."""
+        """Measures all 10 boundaries independently across N=20 samples with non-double-counted outermost clone_frozen and phase-attributed L1 locks."""
         recorder = ProductionCriticalSectionRecorder()
         tracker = make_tracker()
         instrument_tracker(tracker, recorder)
 
         # Warm-up phase
+        recorder.set_thread_phase("warmup")
         sc_warm = make_scope(tracker, "warmup_op_34")
         r_warm = tracker.admit_read(50, scope=sc_warm)
         sc_warm.record_read(50, admission=r_warm)
@@ -1250,37 +1349,20 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
 
         # Measurement data structures
         capture_durations_ns: List[float] = []
-        internal_freeze_durations_ns: List[float] = []
-        micro_freeze_durations_ns: List[float] = []
         eval_durations_ns: List[float] = []
         total_durations_ns: List[float] = []
         tx_latencies_us: List[float] = []
+        micro_freeze_durations_ns: List[float] = []
 
-        orig_clone_frozen = observation_budget.clone_frozen
-        snapshot_capture_active = False
-        freeze_samples_in_current_reconciliation: List[int] = []
-        _tls = threading.local()
-
-        def wrapped_clone_frozen(*args: Any, **kwargs: Any) -> Any:
-            depth = getattr(_tls, "depth", 0)
-            _tls.depth = depth + 1
-            is_outer = (depth == 0) and snapshot_capture_active
-            t0 = time.perf_counter_ns() if is_outer else 0
-            try:
-                return orig_clone_frozen(*args, **kwargs)
-            finally:
-                t1 = time.perf_counter_ns() if is_outer else 0
-                _tls.depth -= 1
-                if is_outer and t0 > 0:
-                    freeze_samples_in_current_reconciliation.append(t1 - t0)
-
-        observation_budget.clone_frozen = wrapped_clone_frozen
-        self.addCleanup(setattr, observation_budget, "clone_frozen", orig_clone_frozen)
+        interceptor = OutermostCloneFrozenInterceptor(observation_budget)
+        self.addCleanup(interceptor.detach)
         N = 20
         tracemalloc.start()
         self.addCleanup(tracemalloc.stop)
-        try:
+
+        with interceptor:
             for i in range(N):
+                recorder.set_thread_phase("tx_preparation")
                 sc = make_scope(tracker, f"bench_op_34_{i}")
                 t_tx0 = time.perf_counter_ns()
                 r = tracker.admit_read(100, scope=sc)
@@ -1298,19 +1380,15 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
                 t_eval_end = 0
 
                 def cap_start_hook():
-                    nonlocal t_cap_start, snapshot_capture_active, freeze_samples_in_current_reconciliation
+                    nonlocal t_cap_start
                     t_cap_start = time.perf_counter_ns()
-                    snapshot_capture_active = True
-                    _tls.depth = 0
-                    freeze_samples_in_current_reconciliation = []
+                    interceptor.start_reconciliation_capture()
 
                 def cap_end_hook():
-                    nonlocal t_cap_end, t_eval_start, snapshot_capture_active
-                    snapshot_capture_active = False
+                    nonlocal t_cap_end, t_eval_start
                     t_cap_end = time.perf_counter_ns()
                     t_eval_start = t_cap_end
-                    freeze_sum = sum(freeze_samples_in_current_reconciliation)
-                    internal_freeze_durations_ns.append(float(freeze_sum))
+                    interceptor.end_reconciliation_capture()
 
                 def eval_end_hook():
                     nonlocal t_eval_end
@@ -1320,9 +1398,11 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
                 tracker.set_fault_injection("after_reconciliation_snapshot_capture", cap_end_hook)
                 tracker.set_fault_injection("after_reconciliation_invariant_evaluation", eval_end_hook)
 
+                recorder.set_thread_phase("reconciliation")
                 t_tot0 = time.perf_counter_ns()
                 rec = tracker.reconcile_ledger(raise_on_error=True)
                 t_tot1 = time.perf_counter_ns()
+                recorder.set_thread_phase("idle")
 
                 total_durations_ns.append(t_tot1 - t_tot0)
                 if t_cap_start and t_cap_end:
@@ -1332,12 +1412,9 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
 
                 # Independent micro-benchmark
                 t_frz0 = time.perf_counter_ns()
-                _ = orig_clone_frozen(tracker.metrics.profile_usage)
+                _ = interceptor.orig_clone_frozen(tracker.metrics.profile_usage)
                 t_frz1 = time.perf_counter_ns()
                 micro_freeze_durations_ns.append(t_frz1 - t_frz0)
-
-        finally:
-            observation_budget.clone_frozen = orig_clone_frozen
 
         current_mem, peak_mem = tracemalloc.get_traced_memory()
         tracemalloc.stop()
@@ -1346,8 +1423,14 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         retained_mem = get_recursive_retained_size(rec)
 
         th_id = threading.get_ident()
-        l1_waits_ns = [float(w) for w in recorder.get_thread_waits(th_id, level="L1")]
-        l1_holds_ns = [float(h) for h in recorder.get_thread_holds(th_id, level="L1")]
+        # Explicit phase attribution separating reconciliation L1 from transaction preparation L1
+        recon_l1_waits_ns = [float(w) for w in recorder.get_thread_waits(th_id, level="L1", phase="reconciliation")]
+        recon_l1_holds_ns = [float(h) for h in recorder.get_thread_holds(th_id, level="L1", phase="reconciliation")]
+        tx_prep_l1_waits_ns = [float(w) for w in recorder.get_thread_waits(th_id, level="L1", phase="tx_preparation")]
+        tx_prep_l1_holds_ns = [float(h) for h in recorder.get_thread_holds(th_id, level="L1", phase="tx_preparation")]
+
+        internal_freeze_durations_ns = interceptor.per_reconciliation_aggregate_durations_ns
+        invocation_counts = interceptor.per_reconciliation_invocation_counts
 
         # Verification of sample integrity across all 10 boundaries
         self._validate_samples(capture_durations_ns, "1. Snapshot Capture Duration", expected_count=N)
@@ -1355,28 +1438,33 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         self._validate_samples(micro_freeze_durations_ns, "3. Independent Micro clone_frozen", expected_count=N)
         self._validate_samples(eval_durations_ns, "4. Invariant Evaluation Duration", expected_count=N)
         self._validate_samples(total_durations_ns, "5. Total Reconciliation Duration", expected_count=N)
-        self._validate_samples(l1_waits_ns, "6. L1 Lock Wait Duration", expected_count=None)
-        self.assertGreaterEqual(len(l1_waits_ns), N)
-        self._validate_samples(l1_holds_ns, "7. L1 Lock Hold Duration", expected_count=None)
-        self.assertGreaterEqual(len(l1_holds_ns), N)
+        self._validate_samples(recon_l1_waits_ns, "6. Reconciliation L1 Lock Wait Duration", expected_count=N)
+        self._validate_samples(recon_l1_holds_ns, "7. Reconciliation L1 Lock Hold Duration", expected_count=N)
+        self._validate_samples(tx_prep_l1_waits_ns, "Tx Preparation L1 Lock Wait Duration", expected_count=N * 7)
+        self._validate_samples(tx_prep_l1_holds_ns, "Tx Preparation L1 Lock Hold Duration", expected_count=N * 7)
         self._validate_samples(tx_latencies_us, "8. Transaction Latency", expected_count=N)
         self.assertGreater(peak_mem, 0)
         self.assertGreater(shallow_mem, 0)
         self.assertGreater(retained_mem, shallow_mem)
+
+        # Verify deep-freeze invocation completeness across every iteration
+        self.assertEqual(len(invocation_counts), N)
+        for count in invocation_counts:
+            self.assertGreaterEqual(count, 7, "Each reconciliation snapshot capture must have at least 7 outermost clone_frozen calls")
 
         # Invariant: capture and evaluation intervals do not overlap
         self.assertGreater(self._calc_median(capture_durations_ns), 0)
         self.assertGreater(self._calc_median(eval_durations_ns), 0)
         self.assertGreater(self._calc_median(internal_freeze_durations_ns), 0)
 
-        print("\n--- Phase 2.0-A.3.4.34 10-Boundary Benchmark Evidence ---")
+        print("\n--- Phase 2.0-A.3.4.3 10-Boundary Benchmark Evidence ---")
         print(f"1. Snapshot Capture Duration [DIRECT_MEASUREMENT]:      med={self._calc_median(capture_durations_ns)/1e3:.2f}us, p95={self._calc_p95(capture_durations_ns)/1e3:.2f}us (N={len(capture_durations_ns)})")
-        print(f"2. Internal Snapshot Deep Freeze [DIRECT_MEASUREMENT]:  med={self._calc_median(internal_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(internal_freeze_durations_ns)/1e3:.2f}us (N={len(internal_freeze_durations_ns)})")
+        print(f"2. Internal Snapshot Deep Freeze [DIRECT_MEASUREMENT]:  med={self._calc_median(internal_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(internal_freeze_durations_ns)/1e3:.2f}us (N={len(internal_freeze_durations_ns)}, calls/iter min={min(invocation_counts)}, max={max(invocation_counts)})")
         print(f"3. Independent Micro clone_frozen [DIRECT_MEASUREMENT]: med={self._calc_median(micro_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(micro_freeze_durations_ns)/1e3:.2f}us (N={len(micro_freeze_durations_ns)})")
         print(f"4. Invariant Evaluation Duration [DIRECT_MEASUREMENT]:  med={self._calc_median(eval_durations_ns)/1e3:.2f}us, p95={self._calc_p95(eval_durations_ns)/1e3:.2f}us (N={len(eval_durations_ns)})")
         print(f"5. Total Reconciliation Duration [DIRECT_MEASUREMENT]:  med={self._calc_median(total_durations_ns)/1e3:.2f}us, p95={self._calc_p95(total_durations_ns)/1e3:.2f}us (N={len(total_durations_ns)})")
-        print(f"6. L1 Lock Wait Duration [DIRECT_MEASUREMENT]:          med={self._calc_median(l1_waits_ns)/1e3:.2f}us, p95={self._calc_p95(l1_waits_ns)/1e3:.2f}us (N={len(l1_waits_ns)})")
-        print(f"7. L1 Lock Hold Duration [DIRECT_MEASUREMENT]:          med={self._calc_median(l1_holds_ns)/1e3:.2f}us, p95={self._calc_p95(l1_holds_ns)/1e3:.2f}us (N={len(l1_holds_ns)})")
+        print(f"6. Reconciliation L1 Wait Duration [DIRECT_MEASUREMENT]: med={self._calc_median(recon_l1_waits_ns)/1e3:.2f}us, p95={self._calc_p95(recon_l1_waits_ns)/1e3:.2f}us (N={len(recon_l1_waits_ns)}) [Tx Prep N={len(tx_prep_l1_waits_ns)}]")
+        print(f"7. Reconciliation L1 Hold Duration [DIRECT_MEASUREMENT]: med={self._calc_median(recon_l1_holds_ns)/1e3:.2f}us, p95={self._calc_p95(recon_l1_holds_ns)/1e3:.2f}us (N={len(recon_l1_holds_ns)}) [Tx Prep N={len(tx_prep_l1_holds_ns)}]")
         print(f"8. Transaction Latency (N={N}) [DIRECT_MEASUREMENT]:     med={self._calc_median(tx_latencies_us):.2f}us, p95={self._calc_p95(tx_latencies_us):.2f}us (N={len(tx_latencies_us)})")
         print(f"9. Peak Allocated Memory [DIRECT_MEASUREMENT]:          {peak_mem} bytes")
         print(f"10. Shallow / Retained Result Mem [DIRECT_MEASUREMENT]: {shallow_mem} bytes / {retained_mem} bytes")
@@ -2466,47 +2554,77 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
             self.assertFalse(w.is_alive())
 
     def test_47_recursive_clone_frozen_not_double_counted(self):
-        """Nested recursive clone_frozen calls are not double-counted; depth returns to zero."""
+        """OutermostCloneFrozenInterceptor: nested recursion not double counted, depth unwinds, repeated calls, and worker isolation."""
         nested = {
             "key1": [1, 2, {"key2": {"key3": (3, 4, 5)}}],
             "key4": {"key5": [6, 7, {"key6": "value"}]},
         }
 
-        orig_clone_frozen = observation_budget.clone_frozen
-        _tls = threading.local()
-        samples: List[int] = []
-        active = True
-
-        def tracking_clone_frozen(*args: Any, **kwargs: Any) -> Any:
-            depth = getattr(_tls, "depth", 0)
-            _tls.depth = depth + 1
-            is_outer = (depth == 0) and active
-            t0 = time.perf_counter_ns() if is_outer else 0
-            try:
-                return orig_clone_frozen(*args, **kwargs)
-            finally:
-                t1 = time.perf_counter_ns() if is_outer else 0
-                _tls.depth -= 1
-                if is_outer and t0 > 0:
-                    samples.append(t1 - t0)
-
-        observation_budget.clone_frozen = tracking_clone_frozen
-        try:
-            res = tracking_clone_frozen(nested)
+        with OutermostCloneFrozenInterceptor(observation_budget) as interceptor:
+            # 1. Nested recursive clone_frozen calls produce exactly one outermost measurement sample
+            interceptor.start_reconciliation_capture()
+            res = observation_budget.clone_frozen(nested)
             self.assertIsNotNone(res)
-            # The nested structure contains dozens of internal recursive calls, but outermost count must be exactly 1!
-            self.assertEqual(len(samples), 1)
-            self.assertGreater(samples[0], 0)
-            self.assertEqual(getattr(_tls, "depth", 0), 0)
+            self.assertEqual(res["key1"][0], 1)
+            count, agg_ns = interceptor.end_reconciliation_capture()
+            self.assertEqual(count, 1)
+            self.assertEqual(len(interceptor.per_reconciliation_invocation_durations_ns[0]), 1)
+            self.assertEqual(interceptor.per_reconciliation_aggregate_durations_ns[0], float(agg_ns))
+            self.assertGreater(agg_ns, 0)
+            self.assertEqual(getattr(interceptor._tls, "depth", 0), 0)
 
-            # Exception safety: cyclic object raises ValueError and still unwinds depth to 0
+            # 2. Repeated invocations within one reconciliation record correct counts
+            interceptor.start_reconciliation_capture()
+            _ = observation_budget.clone_frozen({"a": 1})
+            _ = observation_budget.clone_frozen([10, 20, [30, 40]])
+            _ = observation_budget.clone_frozen({"b": {"c": 50}})
+            count2, agg_ns2 = interceptor.end_reconciliation_capture()
+            self.assertEqual(count2, 3)
+            self.assertEqual(len(interceptor.per_reconciliation_invocation_durations_ns[1]), 3)
+            self.assertEqual(sum(interceptor.per_reconciliation_invocation_durations_ns[1]), agg_ns2)
+            self.assertEqual(getattr(interceptor._tls, "depth", 0), 0)
+
+            # 3. Exception unwinding returns thread-local recursion depth to zero on cyclic objects
+            interceptor.start_reconciliation_capture()
             cyclic: Dict[str, Any] = {}
             cyclic["self"] = cyclic
             with self.assertRaises(ValueError):
-                tracking_clone_frozen(cyclic)
-            self.assertEqual(getattr(_tls, "depth", 0), 0)
-        finally:
-            observation_budget.clone_frozen = orig_clone_frozen
+                observation_budget.clone_frozen(cyclic)
+            self.assertEqual(getattr(interceptor._tls, "depth", 0), 0)
+
+            # Missing instrumentation check: 0 invocations recorded fails closed
+            with self.assertRaises(AssertionError):
+                interceptor.end_reconciliation_capture()
+
+            # 4. Measurements from worker threads do not pollute main-thread capture windows
+            interceptor.start_reconciliation_capture()
+            _ = observation_budget.clone_frozen({"main_1": 1})
+
+            worker_executed = threading.Event()
+
+            def worker_fn():
+                # Worker thread calls clone_frozen
+                w_res = observation_budget.clone_frozen({"worker": [1, 2, 3]})
+                self.assertIsNotNone(w_res)
+                # Worker thread depth must be zero
+                self.assertEqual(getattr(interceptor._tls, "depth", 0), 0)
+                worker_executed.set()
+
+            worker = WorkerThread(target=worker_fn, name="interceptor_isolation_worker")
+            worker.start()
+            join_workers([worker], timeout_s=3.0)
+            self.assertTrue(worker_executed.is_set())
+
+            _ = observation_budget.clone_frozen({"main_2": 2})
+            count4, agg_ns4 = interceptor.end_reconciliation_capture()
+            # Must record exactly 2 main thread invocations; worker thread invocation is NOT counted!
+            self.assertEqual(count4, 2)
+            self.assertEqual(len(interceptor.per_reconciliation_invocation_durations_ns[2]), 2)
+            self.assertEqual(sum(interceptor.per_reconciliation_invocation_durations_ns[2]), agg_ns4)
+            self.assertEqual(getattr(interceptor._tls, "depth", 0), 0)
+
+        # 5. Outside context manager, clone_frozen is reliably restored
+        self.assertIs(observation_budget.clone_frozen, interceptor.orig_clone_frozen)
 
     def test_48_benchmark_stats_reject_empty_nan_inf_and_negative_samples(self):
         """Median, P95, and sample validation reject empty, NaN, Inf, and negative inputs."""
