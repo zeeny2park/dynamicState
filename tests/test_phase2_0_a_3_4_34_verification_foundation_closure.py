@@ -56,8 +56,9 @@ import time
 import tracemalloc
 import unittest
 import unittest.mock
-from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+import contextlib
+from contextlib import contextmanager, nullcontext
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import extractor.observation_budget as observation_budget
 from extractor.observation_budget import (
@@ -349,10 +350,11 @@ class LockAcquisitionRecord:
     max_recursion_depth: int
     total_reentrant_acquisitions: int
     phase: str = "default"
+    operation: str = "default"
 
 
 class ProductionCriticalSectionRecorder:
-    """Records lock acquisitions and outermost hold intervals accurately and deterministically with thread-phase attribution."""
+    """Records lock acquisitions and outermost hold intervals accurately and deterministically with thread-phase and operation attribution."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -361,16 +363,36 @@ class ProductionCriticalSectionRecorder:
         self.active_threads_by_level: Dict[str, Set[int]] = collections.defaultdict(set)
         self.max_simultaneous: Dict[str, int] = collections.defaultdict(int)
         self.reentrancy_depth: Dict[Tuple[int, int], int] = collections.defaultdict(int)
-        self._entry_times: Dict[Tuple[int, int], Tuple[int, int, int, int, str]] = {}
+        self._entry_times: Dict[Tuple[int, int], Tuple[int, int, int, int, str, str]] = {}
         self._tls = threading.local()
 
-    def set_thread_phase(self, phase: str) -> None:
-        """Sets the active execution phase for the calling thread."""
+    def set_thread_attribution(self, phase: str, operation: str = "default") -> None:
+        """Sets the active execution phase and operation for the calling thread."""
         self._tls.phase = phase
+        self._tls.operation = operation
+
+    def set_thread_phase(self, phase: str, operation: str = "default") -> None:
+        """Sets the active execution phase and operation for the calling thread."""
+        self.set_thread_attribution(phase=phase, operation=operation)
 
     def get_thread_phase(self) -> str:
         """Returns the active execution phase for the calling thread."""
         return getattr(self._tls, "phase", "default")
+
+    def get_thread_operation(self) -> str:
+        """Returns the active execution operation for the calling thread."""
+        return getattr(self._tls, "operation", "default")
+
+    @contextmanager
+    def phase_scope(self, phase: str, operation: str = "default") -> Iterator[None]:
+        """Context manager guaranteeing phase and operation restoration via try/finally."""
+        prev_phase = self.get_thread_phase()
+        prev_op = self.get_thread_operation()
+        self.set_thread_attribution(phase=phase, operation=operation)
+        try:
+            yield
+        finally:
+            self.set_thread_attribution(phase=prev_phase, operation=prev_op)
 
     def record_acquire(
         self,
@@ -384,6 +406,7 @@ class ProductionCriticalSectionRecorder:
         with self._lock:
             key = (thread_id, lock_id)
             phase = self.get_thread_phase()
+            operation = self.get_thread_operation()
             cur_depth = self.reentrancy_depth.get(key, 0)
             if cur_depth == 0:
                 self.reentrancy_depth[key] = 1
@@ -392,17 +415,18 @@ class ProductionCriticalSectionRecorder:
                 cur_active = len(self.active_threads_by_level[level])
                 if cur_active > self.max_simultaneous[level]:
                     self.max_simultaneous[level] = cur_active
-                self._entry_times[key] = (attempt_ns, acquired_ns, 1, 0, phase)
+                self._entry_times[key] = (attempt_ns, acquired_ns, 1, 0, phase, operation)
             else:
                 new_depth = cur_depth + 1
                 self.reentrancy_depth[key] = new_depth
-                prev_attempt, prev_acquired, prev_max, prev_reentrant, prev_phase = self._entry_times[key]
+                prev_attempt, prev_acquired, prev_max, prev_reentrant, prev_phase, prev_op = self._entry_times[key]
                 self._entry_times[key] = (
                     prev_attempt,
                     prev_acquired,
                     max(prev_max, new_depth),
                     prev_reentrant + 1,
                     prev_phase,
+                    prev_op,
                 )
 
     def record_release(
@@ -426,7 +450,7 @@ class ProductionCriticalSectionRecorder:
                     self.active_threads_by_level[level].discard(thread_id)
                 entry_info = self._entry_times.pop(key, None)
                 if entry_info:
-                    attempt_ns, acquired_ns, max_depth, reentrant_count, phase = entry_info
+                    attempt_ns, acquired_ns, max_depth, reentrant_count, phase, operation = entry_info
                     rec = LockAcquisitionRecord(
                         thread_id=thread_id,
                         lock_id=lock_id,
@@ -440,26 +464,65 @@ class ProductionCriticalSectionRecorder:
                         max_recursion_depth=max_depth,
                         total_reentrant_acquisitions=reentrant_count,
                         phase=phase,
+                        operation=operation,
                     )
                     self.records_by_thread[thread_id].append(rec)
 
-    def get_thread_waits(self, thread_id: int, level: Optional[str] = None, phase: Optional[str] = None) -> List[int]:
+    def get_thread_records(
+        self,
+        thread_id: int,
+        level: Optional[str] = None,
+        phase: Optional[str] = None,
+        operation: Optional[str] = None,
+    ) -> List[LockAcquisitionRecord]:
         with self._lock:
             recs = list(self.records_by_thread.get(thread_id, []))
         if level is not None:
             recs = [r for r in recs if r.level == level]
         if phase is not None:
             recs = [r for r in recs if r.phase == phase]
+        if operation is not None:
+            recs = [r for r in recs if r.operation == operation]
+        return recs
+
+    def get_thread_waits(
+        self,
+        thread_id: int,
+        level: Optional[str] = None,
+        phase: Optional[str] = None,
+        operation: Optional[str] = None,
+    ) -> List[int]:
+        recs = self.get_thread_records(thread_id, level=level, phase=phase, operation=operation)
         return [r.wait_duration_ns for r in recs]
 
-    def get_thread_holds(self, thread_id: int, level: Optional[str] = None, phase: Optional[str] = None) -> List[int]:
+    def get_thread_holds(
+        self,
+        thread_id: int,
+        level: Optional[str] = None,
+        phase: Optional[str] = None,
+        operation: Optional[str] = None,
+    ) -> List[int]:
+        recs = self.get_thread_records(thread_id, level=level, phase=phase, operation=operation)
+        return [r.hold_duration_ns for r in recs if r.hold_duration_ns is not None]
+
+    def validate_records(
+        self,
+        thread_id: int,
+        require_phase: bool = True,
+        require_operation: bool = True,
+    ) -> None:
+        """Rejects records with missing, blank, default, or inconsistent attribution."""
         with self._lock:
             recs = list(self.records_by_thread.get(thread_id, []))
-        if level is not None:
-            recs = [r for r in recs if r.level == level and r.hold_duration_ns is not None]
-        if phase is not None:
-            recs = [r for r in recs if r.phase == phase and r.hold_duration_ns is not None]
-        return [r.hold_duration_ns for r in recs if r.hold_duration_ns is not None]
+        for r in recs:
+            if require_phase and (not r.phase or r.phase in ("", "default")):
+                raise ValueError(f"LockAcquisitionRecord has missing or default phase: {r}")
+            if require_operation and (not r.operation or r.operation in ("", "default")):
+                raise ValueError(f"LockAcquisitionRecord has missing or default operation: {r}")
+            if r.wait_duration_ns < 0:
+                raise ValueError(f"LockAcquisitionRecord has negative wait duration: {r}")
+            if r.hold_duration_ns is not None and r.hold_duration_ns < 0:
+                raise ValueError(f"LockAcquisitionRecord has negative hold duration: {r}")
 
     def cleanup_thread(self, thread_id: int) -> None:
         with self._lock:
@@ -474,6 +537,7 @@ class ProductionCriticalSectionRecorder:
             self.reentrancy_depth.clear()
             self._entry_times.clear()
         self._tls.phase = "default"
+        self._tls.operation = "default"
 
 
 class InstrumentedLock:
@@ -1339,12 +1403,12 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         instrument_tracker(tracker, recorder)
 
         # Warm-up phase
-        recorder.set_thread_phase("warmup")
-        sc_warm = make_scope(tracker, "warmup_op_34")
-        r_warm = tracker.admit_read(50, scope=sc_warm)
-        sc_warm.record_read(50, admission=r_warm)
-        sc_warm.finalize(success=True)
-        tracker.reconcile_ledger(raise_on_error=True)
+        with recorder.phase_scope("warmup", "warmup_pipeline"):
+            sc_warm = make_scope(tracker, "warmup_op_34")
+            r_warm = tracker.admit_read(50, scope=sc_warm)
+            sc_warm.record_read(50, admission=r_warm)
+            sc_warm.finalize(success=True)
+            tracker.reconcile_ledger(raise_on_error=True)
         recorder.reset()
 
         # Measurement data structures
@@ -1362,15 +1426,19 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
 
         with interceptor:
             for i in range(N):
-                recorder.set_thread_phase("tx_preparation")
-                sc = make_scope(tracker, f"bench_op_34_{i}")
+                tx_id = f"bench_op_34_{i}"
                 t_tx0 = time.perf_counter_ns()
-                r = tracker.admit_read(100, scope=sc)
-                c = r.start_child_read()
-                c.consume(100)
-                r.consume(100)
-                sc.record_read(100, admission=r)
-                sc.finalize(success=True)
+                with recorder.phase_scope("tx_preparation", f"{tx_id}:create_scope"):
+                    sc = make_scope(tracker, tx_id)
+                with recorder.phase_scope("tx_preparation", f"{tx_id}:admit_read"):
+                    r = tracker.admit_read(100, scope=sc)
+                    c = r.start_child_read()
+                    c.consume(100)
+                    r.consume(100)
+                with recorder.phase_scope("tx_preparation", f"{tx_id}:record_read"):
+                    sc.record_read(100, admission=r)
+                with recorder.phase_scope("tx_preparation", f"{tx_id}:finalize"):
+                    sc.finalize(success=True)
                 t_tx1 = time.perf_counter_ns()
                 tx_latencies_us.append((t_tx1 - t_tx0) / 1_000.0)
 
@@ -1394,15 +1462,15 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
                     nonlocal t_eval_end
                     t_eval_end = time.perf_counter_ns()
 
-                tracker.set_fault_injection("before_reconciliation_snapshot_capture", cap_start_hook)
-                tracker.set_fault_injection("after_reconciliation_snapshot_capture", cap_end_hook)
-                tracker.set_fault_injection("after_reconciliation_invariant_evaluation", eval_end_hook)
+                with recorder.phase_scope("benchmark_setup", f"{tx_id}:fault_hooks"):
+                    tracker.set_fault_injection("before_reconciliation_snapshot_capture", cap_start_hook)
+                    tracker.set_fault_injection("after_reconciliation_snapshot_capture", cap_end_hook)
+                    tracker.set_fault_injection("after_reconciliation_invariant_evaluation", eval_end_hook)
 
-                recorder.set_thread_phase("reconciliation")
-                t_tot0 = time.perf_counter_ns()
-                rec = tracker.reconcile_ledger(raise_on_error=True)
-                t_tot1 = time.perf_counter_ns()
-                recorder.set_thread_phase("idle")
+                with recorder.phase_scope("reconciliation", f"{tx_id}:reconcile_ledger"):
+                    t_tot0 = time.perf_counter_ns()
+                    rec = tracker.reconcile_ledger(raise_on_error=True)
+                    t_tot1 = time.perf_counter_ns()
 
                 total_durations_ns.append(t_tot1 - t_tot0)
                 if t_cap_start and t_cap_end:
@@ -1423,14 +1491,18 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         retained_mem = get_recursive_retained_size(rec)
 
         th_id = threading.get_ident()
-        # Explicit phase attribution separating reconciliation L1 from transaction preparation L1
+        # Explicit phase and operation attribution separating reconciliation, tx_preparation, and benchmark_setup
         recon_l1_waits_ns = [float(w) for w in recorder.get_thread_waits(th_id, level="L1", phase="reconciliation")]
         recon_l1_holds_ns = [float(h) for h in recorder.get_thread_holds(th_id, level="L1", phase="reconciliation")]
         tx_prep_l1_waits_ns = [float(w) for w in recorder.get_thread_waits(th_id, level="L1", phase="tx_preparation")]
         tx_prep_l1_holds_ns = [float(h) for h in recorder.get_thread_holds(th_id, level="L1", phase="tx_preparation")]
+        bench_setup_l1_waits_ns = [float(w) for w in recorder.get_thread_waits(th_id, level="L1", phase="benchmark_setup")]
 
         internal_freeze_durations_ns = interceptor.per_reconciliation_aggregate_durations_ns
         invocation_counts = interceptor.per_reconciliation_invocation_counts
+
+        # Strict validation: verify attribution completeness and consistency across all records
+        recorder.validate_records(th_id, require_phase=True, require_operation=True)
 
         # Verification of sample integrity across all 10 boundaries
         self._validate_samples(capture_durations_ns, "1. Snapshot Capture Duration", expected_count=N)
@@ -1440,31 +1512,49 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         self._validate_samples(total_durations_ns, "5. Total Reconciliation Duration", expected_count=N)
         self._validate_samples(recon_l1_waits_ns, "6. Reconciliation L1 Lock Wait Duration", expected_count=N)
         self._validate_samples(recon_l1_holds_ns, "7. Reconciliation L1 Lock Hold Duration", expected_count=N)
-        self._validate_samples(tx_prep_l1_waits_ns, "Tx Preparation L1 Lock Wait Duration", expected_count=N * 7)
-        self._validate_samples(tx_prep_l1_holds_ns, "Tx Preparation L1 Lock Hold Duration", expected_count=N * 7)
+        self._validate_samples(tx_prep_l1_waits_ns, "Tx Preparation L1 Lock Wait Duration", expected_count=N * 4)
+        self._validate_samples(tx_prep_l1_holds_ns, "Tx Preparation L1 Lock Hold Duration", expected_count=N * 4)
+        self.assertEqual(len(bench_setup_l1_waits_ns), N * 3, "Benchmark fault injection setup must have exactly 3 L1 acquisitions per iteration")
         self._validate_samples(tx_latencies_us, "8. Transaction Latency", expected_count=N)
         self.assertGreater(peak_mem, 0)
         self.assertGreater(shallow_mem, 0)
         self.assertGreater(retained_mem, shallow_mem)
 
-        # Verify deep-freeze invocation completeness across every iteration
+        # Operation-level attribution verification for each individual transaction iteration
+        for i in range(N):
+            tx_id = f"bench_op_34_{i}"
+            self.assertEqual(len(recorder.get_thread_waits(th_id, level="L1", phase="tx_preparation", operation=f"{tx_id}:create_scope")), 1)
+            self.assertEqual(len(recorder.get_thread_waits(th_id, level="L1", phase="tx_preparation", operation=f"{tx_id}:admit_read")), 1)
+            self.assertEqual(len(recorder.get_thread_waits(th_id, level="L1", phase="tx_preparation", operation=f"{tx_id}:record_read")), 1)
+            self.assertEqual(len(recorder.get_thread_waits(th_id, level="L1", phase="tx_preparation", operation=f"{tx_id}:finalize")), 1)
+            self.assertEqual(len(recorder.get_thread_waits(th_id, level="L1", phase="reconciliation", operation=f"{tx_id}:reconcile_ledger")), 1)
+
+        # Verify deep-freeze invocation completeness against the derived production snapshot contract
+        # Snapshot Contract:
+        # 2 * child_reads + 2 * physical_reads + 1 * physical_consumptions + 1 * committed_tx + 1 * profile_usage
+        # With warmup already committed: 6 * (i + 2) + 1 = 6 * i + 13 calls
         self.assertEqual(len(invocation_counts), N)
-        for count in invocation_counts:
-            self.assertGreaterEqual(count, 7, "Each reconciliation snapshot capture must have at least 7 outermost clone_frozen calls")
+        for i, count in enumerate(invocation_counts):
+            expected_deep_freeze_calls = 6 * i + 13
+            self.assertEqual(
+                count,
+                expected_deep_freeze_calls,
+                f"Iteration {i} outermost clone_frozen count mismatch against production snapshot contract: expected {expected_deep_freeze_calls}, got {count}",
+            )
 
         # Invariant: capture and evaluation intervals do not overlap
         self.assertGreater(self._calc_median(capture_durations_ns), 0)
         self.assertGreater(self._calc_median(eval_durations_ns), 0)
         self.assertGreater(self._calc_median(internal_freeze_durations_ns), 0)
 
-        print("\n--- Phase 2.0-A.3.4.3 10-Boundary Benchmark Evidence ---")
+        print("\n--- Phase 2.0-A.3.4.4 10-Boundary Benchmark Evidence ---")
         print(f"1. Snapshot Capture Duration [DIRECT_MEASUREMENT]:      med={self._calc_median(capture_durations_ns)/1e3:.2f}us, p95={self._calc_p95(capture_durations_ns)/1e3:.2f}us (N={len(capture_durations_ns)})")
-        print(f"2. Internal Snapshot Deep Freeze [DIRECT_MEASUREMENT]:  med={self._calc_median(internal_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(internal_freeze_durations_ns)/1e3:.2f}us (N={len(internal_freeze_durations_ns)}, calls/iter min={min(invocation_counts)}, max={max(invocation_counts)})")
+        print(f"2. Internal Snapshot Deep Freeze [DIRECT_MEASUREMENT]:  med={self._calc_median(internal_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(internal_freeze_durations_ns)/1e3:.2f}us (N={len(internal_freeze_durations_ns)}, contract min={min(invocation_counts)}, max={max(invocation_counts)})")
         print(f"3. Independent Micro clone_frozen [DIRECT_MEASUREMENT]: med={self._calc_median(micro_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(micro_freeze_durations_ns)/1e3:.2f}us (N={len(micro_freeze_durations_ns)})")
         print(f"4. Invariant Evaluation Duration [DIRECT_MEASUREMENT]:  med={self._calc_median(eval_durations_ns)/1e3:.2f}us, p95={self._calc_p95(eval_durations_ns)/1e3:.2f}us (N={len(eval_durations_ns)})")
         print(f"5. Total Reconciliation Duration [DIRECT_MEASUREMENT]:  med={self._calc_median(total_durations_ns)/1e3:.2f}us, p95={self._calc_p95(total_durations_ns)/1e3:.2f}us (N={len(total_durations_ns)})")
-        print(f"6. Reconciliation L1 Wait Duration [DIRECT_MEASUREMENT]: med={self._calc_median(recon_l1_waits_ns)/1e3:.2f}us, p95={self._calc_p95(recon_l1_waits_ns)/1e3:.2f}us (N={len(recon_l1_waits_ns)}) [Tx Prep N={len(tx_prep_l1_waits_ns)}]")
-        print(f"7. Reconciliation L1 Hold Duration [DIRECT_MEASUREMENT]: med={self._calc_median(recon_l1_holds_ns)/1e3:.2f}us, p95={self._calc_p95(recon_l1_holds_ns)/1e3:.2f}us (N={len(recon_l1_holds_ns)}) [Tx Prep N={len(tx_prep_l1_holds_ns)}]")
+        print(f"6. Reconciliation L1 Wait Duration [DIRECT_MEASUREMENT]: med={self._calc_median(recon_l1_waits_ns)/1e3:.2f}us, p95={self._calc_p95(recon_l1_waits_ns)/1e3:.2f}us (N={len(recon_l1_waits_ns)}) [Tx Prep N={len(tx_prep_l1_waits_ns)}, Setup N={len(bench_setup_l1_waits_ns)}]")
+        print(f"7. Reconciliation L1 Hold Duration [DIRECT_MEASUREMENT]: med={self._calc_median(recon_l1_holds_ns)/1e3:.2f}us, p95={self._calc_p95(recon_l1_holds_ns)/1e3:.2f}us (N={len(recon_l1_holds_ns)}) [Tx Prep N={len(tx_prep_l1_holds_ns)}, Setup N={len(bench_setup_l1_waits_ns)}]")
         print(f"8. Transaction Latency (N={N}) [DIRECT_MEASUREMENT]:     med={self._calc_median(tx_latencies_us):.2f}us, p95={self._calc_p95(tx_latencies_us):.2f}us (N={len(tx_latencies_us)})")
         print(f"9. Peak Allocated Memory [DIRECT_MEASUREMENT]:          {peak_mem} bytes")
         print(f"10. Shallow / Retained Result Mem [DIRECT_MEASUREMENT]: {shallow_mem} bytes / {retained_mem} bytes")
@@ -2653,6 +2743,86 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
             TestPhase20A3434BenchmarkBoundaryIntegrity._validate_samples([1.0, float("nan")], "nan_test")
         with self.assertRaises(ValueError):
             TestPhase20A3434BenchmarkBoundaryIntegrity._validate_samples([1.0, -1.0], "neg_test")
+
+    def test_49_phase_lifecycle_exception_safety_and_attribution_validation(self):
+        """Phase and operation restoration on normal/exception exit, thread isolation, and record validation."""
+        recorder = ProductionCriticalSectionRecorder()
+        raw_lock = threading.Lock()
+        lock = InstrumentedLock(raw_lock, recorder, level="L1", name="phase_test_lock")
+        th_id = threading.get_ident()
+
+        # 1. Normal completion restores prior phase and operation
+        self.assertEqual(recorder.get_thread_phase(), "default")
+        self.assertEqual(recorder.get_thread_operation(), "default")
+        with recorder.phase_scope("phase_a", "op_a"):
+            self.assertEqual(recorder.get_thread_phase(), "phase_a")
+            self.assertEqual(recorder.get_thread_operation(), "op_a")
+            with lock:
+                pass
+        self.assertEqual(recorder.get_thread_phase(), "default")
+        self.assertEqual(recorder.get_thread_operation(), "default")
+
+        # 2. Exceptional exit restores prior phase and operation via try/finally
+        try:
+            with recorder.phase_scope("phase_err", "op_err"):
+                self.assertEqual(recorder.get_thread_phase(), "phase_err")
+                self.assertEqual(recorder.get_thread_operation(), "op_err")
+                with lock:
+                    pass
+                raise RuntimeError("simulated error inside phase")
+        except RuntimeError:
+            pass
+
+        self.assertEqual(recorder.get_thread_phase(), "default")
+        self.assertEqual(recorder.get_thread_operation(), "default")
+
+        # 3. Subsequent measurements are not contaminated by stale phase
+        with lock:
+            pass
+        recs = recorder.get_thread_records(th_id)
+        self.assertEqual(len(recs), 3)
+        self.assertEqual(recs[0].phase, "phase_a")
+        self.assertEqual(recs[0].operation, "op_a")
+        self.assertEqual(recs[1].phase, "phase_err")
+        self.assertEqual(recs[1].operation, "op_err")
+        self.assertEqual(recs[2].phase, "default")
+        self.assertEqual(recs[2].operation, "default")
+
+        # 4. Worker thread phase isolation
+        worker_phase = None
+        worker_op = None
+
+        def worker_fn():
+            nonlocal worker_phase, worker_op
+            worker_phase = recorder.get_thread_phase()
+            worker_op = recorder.get_thread_operation()
+            with recorder.phase_scope("worker_phase", "worker_op"):
+                with lock:
+                    pass
+
+        with recorder.phase_scope("main_phase", "main_op"):
+            worker = WorkerThread(target=worker_fn, name="phase_iso_worker")
+            worker.start()
+            join_workers([worker], timeout_s=3.0)
+            # Main thread phase was unchanged by worker
+            self.assertEqual(recorder.get_thread_phase(), "main_phase")
+            self.assertEqual(recorder.get_thread_operation(), "main_op")
+
+        # Worker saw default initially, not main_phase
+        self.assertEqual(worker_phase, "default")
+        self.assertEqual(worker_op, "default")
+
+        # 5. validate_records rejects default/missing phase or operation
+        with self.assertRaises(ValueError):
+            recorder.validate_records(th_id, require_phase=True, require_operation=True)
+
+        # But a recorder with fully attributed records passes validate_records
+        valid_recorder = ProductionCriticalSectionRecorder()
+        valid_lock = InstrumentedLock(threading.Lock(), valid_recorder, level="L1", name="valid_lock")
+        with valid_recorder.phase_scope("tx_phase", "tx_op"):
+            with valid_lock:
+                pass
+        valid_recorder.validate_records(th_id, require_phase=True, require_operation=True)
 
 
 if __name__ == "__main__":

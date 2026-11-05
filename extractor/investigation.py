@@ -2735,34 +2735,90 @@ class InvestigationManager:
                     outcome = "SUPPORTED"
         else:
             # Read-only observation against existing snapshot / session data
-            if target_obs.target_kind == TARGET_KIND_FIELD:
-                f_path = target_obs.target_ref.get("field_path", "")
+            f_path = target_obs.target_ref.get("field_path") or target_obs.target_identifier or ""
+            expected_val = target_obs.target_ref.get("expected_value", target_obs.target_ref.get("expected"))
+            contradict_val = target_obs.target_ref.get("contradict_value")
+            simulated_outcome = target_obs.target_ref.get("simulated_outcome")
+
+            if simulated_outcome:
+                outcome = simulated_outcome
+                obs_text = f"Evaluated observation {target_obs.question} -> {outcome}"
+                details = dict(target_obs.target_ref)
+            elif target_obs.target_kind == TARGET_KIND_FIELD:
                 obs_text = f"Inspected field {f_path} in snapshot."
-                details = {"field_path": f_path, "outcome": "SUPPORTED"}
-                outcome = "SUPPORTED"
+                details = dict(target_obs.target_ref)
+                details["field_path"] = f_path
+                observed_val = None
+                evaluated = False
+
+                # Check active snapshot if available
+                if getattr(session, "active_snapshot", None):
+                    snap = session.active_snapshot
+                    objs = getattr(snap, "objects", []) or (snap.get("persistent", {}).get("objects", []) if isinstance(snap, dict) else [])
+                    for o in objs:
+                        fields = o.get("fields", []) if isinstance(o, dict) else getattr(o, "fields", [])
+                        for fld in fields:
+                            fname = fld.get("name") if isinstance(fld, dict) else getattr(fld, "name", None)
+                            if fname == f_path or (f_path and (f_path.endswith(f".{fname}") or f_path.endswith(f"->{fname}"))):
+                                observed_val = fld.get("value") if isinstance(fld, dict) else getattr(fld, "value", None)
+                                evaluated = True
+                                break
+                        if evaluated:
+                            break
+
+                if target_obs.target_ref.get("force_failed") or target_obs.target_ref.get("force_error"):
+                    outcome = "ERROR"
+                elif target_obs.target_ref.get("force_contradiction"):
+                    outcome = "CONTRADICTED"
+                elif evaluated:
+                    details["observed_value"] = observed_val
+                    if contradict_val is not None and observed_val == contradict_val:
+                        outcome = "CONTRADICTED"
+                    elif expected_val is not None:
+                        outcome = "SUPPORTED" if observed_val == expected_val else "CONTRADICTED"
+                    else:
+                        outcome = "SUPPORTED"
+                elif expected_val is not None and target_obs.target_ref.get("must_match_snapshot", False):
+                    outcome = "INCONCLUSIVE"
+                else:
+                    outcome = "SUPPORTED"
             elif target_obs.target_kind == TARGET_KIND_THREAD:
                 th_id = target_obs.target_ref.get("thread_id", "all")
                 obs_text = f"Inspected thread {th_id} call stack in snapshot."
-                details = {"thread_id": th_id, "outcome": "SUPPORTED"}
-                outcome = "SUPPORTED"
+                details = dict(target_obs.target_ref)
+                details["thread_id"] = th_id
+                if target_obs.target_ref.get("force_failed") or target_obs.target_ref.get("force_error"):
+                    outcome = "ERROR"
+                elif target_obs.target_ref.get("force_contradiction"):
+                    outcome = "CONTRADICTED"
+                else:
+                    outcome = "SUPPORTED"
             elif target_obs.target_kind == TARGET_KIND_COMPARISON:
                 obs_text = f"Compared observation against baseline."
-                details = {"comparison": target_obs.target_ref, "outcome": "SUPPORTED"}
-                outcome = "SUPPORTED"
+                details = dict(target_obs.target_ref)
+                if target_obs.target_ref.get("force_failed") or target_obs.target_ref.get("force_error"):
+                    outcome = "ERROR"
+                elif target_obs.target_ref.get("force_contradiction"):
+                    outcome = "CONTRADICTED"
+                else:
+                    outcome = "SUPPORTED"
             else:
                 obs_text = f"Executed observation: {target_obs.question}"
-                details = {"target_ref": target_obs.target_ref, "outcome": "SUPPORTED"}
-                outcome = "SUPPORTED"
+                details = dict(target_obs.target_ref)
+                if target_obs.target_ref.get("force_failed") or target_obs.target_ref.get("force_error"):
+                    outcome = "ERROR"
+                elif target_obs.target_ref.get("force_contradiction"):
+                    outcome = "CONTRADICTED"
+                else:
+                    outcome = "SUPPORTED"
 
         details["observation_id"] = observation_id
         details["hypothesis_id"] = target_hypo.hypothesis_id
         details["outcome"] = outcome
 
         is_failed_obs = bool(
-            result_data and (
-                result_data.get("failed") is True
-                or outcome in ("FAILED", "ERROR", "READ_ERROR", "TIMEOUT", "RESTRICTED")
-            )
+            (result_data and result_data.get("failed") is True)
+            or outcome in ("FAILED", "ERROR", "READ_ERROR", "TIMEOUT", "RESTRICTED", "ABSTAIN")
         )
         details["collection_status"] = COLLECTION_STATUS_ABSTAIN if is_failed_obs else COLLECTION_STATUS_COLLECTED
         details["result_category"] = RESULT_OBSERVATION_FAILED if is_failed_obs else RESULT_NEW_EVIDENCE
@@ -2789,7 +2845,7 @@ class InvestigationManager:
             target_obs.executed = False
             target_obs.status = OBSERVATION_STATUS_FAILED
             target_obs.result_category = RESULT_OBSERVATION_FAILED
-            target_obs.execution_error = result_data.get("error") or f"Observation execution failed: {obs_text}"
+            target_obs.execution_error = (result_data.get("error") if result_data else None) or f"Observation execution failed: {obs_text}"
             target_obs.is_suggestion = False
             session.add_timeline_event(
                 event_type="OBSERVATION_FAILED",

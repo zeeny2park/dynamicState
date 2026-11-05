@@ -7836,6 +7836,20 @@ class WatchSessionManager:
         except Exception:
             adaptive_summary = None
 
+        if adaptive_summary and adaptive_summary.get("final_diagnosis"):
+            adaptive_diag = adaptive_summary["final_diagnosis"]
+            st_prefix = f"[{adaptive_summary.get('hypothesis_state')}] " if adaptive_summary.get("hypothesis_state") else ""
+            hypothesis = f"{st_prefix}{adaptive_diag}"
+            if adaptive_summary.get("confidence_score") is not None:
+                try:
+                    confidence_score = float(adaptive_summary["confidence_score"])
+                except (ValueError, TypeError):
+                    pass
+            for step in adaptive_summary.get("recommended_next_steps", []):
+                act = step.get("action") if isinstance(step, dict) else str(step)
+                if act and act not in remediation_steps:
+                    remediation_steps.append(act)
+
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
             "pid": pid,
