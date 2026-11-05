@@ -387,14 +387,24 @@ class InstrumentedLock:
     - Preserves exceptions without altering recorder state or depth.
     """
 
-    def __init__(self, raw_lock: Any, recorder: ProductionCriticalSectionRecorder, level: str, name: str):
+    def __init__(
+        self,
+        raw_lock: Any,
+        recorder: ProductionCriticalSectionRecorder,
+        level: str,
+        name: str,
+        pre_acquire_hook: Optional[Callable[[], None]] = None,
+    ):
         self._real_lock = raw_lock
         self.recorder = recorder
         self.level = level
         self.name = name
         self.lock_id = id(raw_lock)
+        self.pre_acquire_hook = pre_acquire_hook
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if self.pre_acquire_hook is not None:
+            self.pre_acquire_hook()
         t_att = time.perf_counter_ns()
         acquired = self._real_lock.acquire(blocking, timeout)
         t_acq = time.perf_counter_ns()
@@ -833,10 +843,12 @@ class TestPhase20A3434LockRecorderReleaseCorrectness(unittest.TestCase):
         def owner_work():
             with inst_lock:
                 owner_acquired.set()
-                owner_can_finish.wait(timeout=5.0)
+                if not owner_can_finish.wait(timeout=5.0):
+                    raise TimeoutError("owner_work: owner_can_finish timed out")
 
         def non_owner_work():
-            owner_acquired.wait(timeout=5.0)
+            if not owner_acquired.wait(timeout=5.0):
+                raise TimeoutError("non_owner_work: owner_acquired timed out")
             try:
                 inst_lock.release()
             except RuntimeError as exc:
@@ -846,21 +858,23 @@ class TestPhase20A3434LockRecorderReleaseCorrectness(unittest.TestCase):
 
         t_owner = WorkerThread(target=owner_work, name="owner_w")
         t_non_owner = WorkerThread(target=non_owner_work, name="non_owner_w")
-        t_owner.start()
-        t_non_owner.start()
+        try:
+            start_worker_group([t_owner, t_non_owner], cleanup_events=[owner_can_finish, release_attempted, owner_acquired])
+            if not release_attempted.wait(timeout=5.0):
+                raise TimeoutError("Main thread: release_attempted timed out")
+            self.assertEqual(len(non_owner_exceptions), 1)
+            self.assertIn("cannot release un-acquired lock", str(non_owner_exceptions[0]))
 
-        release_attempted.wait(timeout=5.0)
-        self.assertEqual(len(non_owner_exceptions), 1)
-        self.assertIn("cannot release un-acquired lock", str(non_owner_exceptions[0]))
-
-        # Verify owner's recorded state remains intact despite non-owner release attempt
-        owner_key = (t_owner.ident, inst_lock.lock_id)
-        self.assertEqual(self.recorder.reentrancy_depth.get(owner_key), 1)
-        self.assertIn(owner_key, self.recorder.active_holders["L1"])
-        self.assertEqual(len(self.recorder.records_by_thread[t_non_owner.ident]), 0)
-
-        owner_can_finish.set()
-        join_workers([t_owner, t_non_owner], timeout_s=5.0)
+            # Verify owner's recorded state remains intact despite non-owner release attempt
+            owner_key = (t_owner.ident, inst_lock.lock_id)
+            self.assertEqual(self.recorder.reentrancy_depth.get(owner_key), 1)
+            self.assertIn(owner_key, self.recorder.active_holders["L1"])
+            self.assertEqual(len(self.recorder.records_by_thread[t_non_owner.ident]), 0)
+        finally:
+            owner_can_finish.set()
+            join_workers([t_owner, t_non_owner], timeout_s=5.0, cleanup_events=[owner_can_finish, release_attempted, owner_acquired])
+            self.assertFalse(t_owner.is_alive())
+            self.assertFalse(t_non_owner.is_alive())
 
         # After owner legitimately releases, depth is 0 and exactly 1 record is created
         self.assertNotIn(owner_key, self.recorder.reentrancy_depth)
@@ -969,29 +983,47 @@ class TestPhase20A3434LockRecorderConcurrencyIntegrity(unittest.TestCase):
         self.recorder = ProductionCriticalSectionRecorder()
 
     def test_09_multiple_threads_acquiring_same_lock_serialization_and_wait(self):
-        """Contended lock serializes threads; blocked thread records positive wait duration."""
+        """Contended lock serializes threads; blocked thread records positive wait duration without sleep."""
         raw_lock = threading.Lock()
-        inst_lock = InstrumentedLock(raw_lock, self.recorder, level="L1", name="contended_l1")
+        b_at_lock = threading.Event()
+        inst_lock = InstrumentedLock(raw_lock, self.recorder, level="L1", name="contended_l1", pre_acquire_hook=b_at_lock.set)
 
         b_entry = threading.Barrier(2)
         b_exit = threading.Barrier(2)
 
         def thread_a():
             with inst_lock:
-                b_entry.wait(timeout=5.0)
-                time.sleep(0.01)
-            b_exit.wait(timeout=5.0)
+                try:
+                    b_entry.wait(timeout=5.0)
+                except (threading.BrokenBarrierError, TimeoutError) as exc:
+                    raise TimeoutError("thread_a: b_entry timed out") from exc
+                if not b_at_lock.wait(timeout=5.0):
+                    raise TimeoutError("thread_a: b_at_lock timed out")
+            try:
+                b_exit.wait(timeout=5.0)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise TimeoutError("thread_a: b_exit timed out") from exc
 
         def thread_b():
-            b_entry.wait(timeout=5.0)
+            try:
+                b_entry.wait(timeout=5.0)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise TimeoutError("thread_b: b_entry timed out") from exc
             with inst_lock:
                 pass
-            b_exit.wait(timeout=5.0)
+            try:
+                b_exit.wait(timeout=5.0)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise TimeoutError("thread_b: b_exit timed out") from exc
 
         w_a = WorkerThread(target=thread_a, name="worker_a")
         w_b = WorkerThread(target=thread_b, name="worker_b")
-        start_worker_group([w_a, w_b])
-        join_workers([w_a, w_b], timeout_s=5.0)
+        try:
+            start_worker_group([w_a, w_b], cleanup_events=[b_at_lock])
+            join_workers([w_a, w_b], timeout_s=5.0, cleanup_events=[b_at_lock])
+        finally:
+            self.assertFalse(w_a.is_alive())
+            self.assertFalse(w_b.is_alive())
 
         self.assertEqual(self.recorder.max_simultaneous["L1"], 1)
         waits_b = self.recorder.get_thread_waits(w_b.ident, level="L1")
@@ -1007,16 +1039,26 @@ class TestPhase20A3434LockRecorderConcurrencyIntegrity(unittest.TestCase):
 
         def worker_1():
             with lock_a:
-                b_both_held.wait(timeout=5.0)
+                try:
+                    b_both_held.wait(timeout=5.0)
+                except (threading.BrokenBarrierError, TimeoutError) as exc:
+                    raise TimeoutError("worker_1: b_both_held timed out") from exc
 
         def worker_2():
             with lock_b:
-                b_both_held.wait(timeout=5.0)
+                try:
+                    b_both_held.wait(timeout=5.0)
+                except (threading.BrokenBarrierError, TimeoutError) as exc:
+                    raise TimeoutError("worker_2: b_both_held timed out") from exc
 
         w1 = WorkerThread(target=worker_1, name="w1")
         w2 = WorkerThread(target=worker_2, name="w2")
-        start_worker_group([w1, w2])
-        join_workers([w1, w2], timeout_s=5.0)
+        try:
+            start_worker_group([w1, w2])
+            join_workers([w1, w2], timeout_s=5.0)
+        finally:
+            self.assertFalse(w1.is_alive())
+            self.assertFalse(w2.is_alive())
 
         # L3 permitted max simultaneous threads is 2 (independent locks)
         self.assertEqual(self.recorder.max_simultaneous["L3"], 2)
@@ -1028,7 +1070,10 @@ class TestPhase20A3434LockRecorderConcurrencyIntegrity(unittest.TestCase):
         barrier = threading.Barrier(4)
 
         def worker_fn():
-            barrier.wait(timeout=5.0)
+            try:
+                barrier.wait(timeout=5.0)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise TimeoutError("worker_fn: barrier timed out") from exc
             for _ in range(25):
                 with inst_lock:
                     with inst_lock:
@@ -1036,8 +1081,12 @@ class TestPhase20A3434LockRecorderConcurrencyIntegrity(unittest.TestCase):
                             pass
 
         workers = [WorkerThread(target=worker_fn, name=f"rlock_w_{i}") for i in range(4)]
-        start_worker_group(workers)
-        join_workers(workers, timeout_s=5.0)
+        try:
+            start_worker_group(workers)
+            join_workers(workers, timeout_s=5.0)
+        finally:
+            for w in workers:
+                self.assertFalse(w.is_alive())
 
         self.assertEqual(len(self.recorder.reentrancy_depth), 0)
         self.assertEqual(len(self.recorder.active_holders["L1"]), 0)
@@ -1055,14 +1104,21 @@ class TestPhase20A3434LockRecorderConcurrencyIntegrity(unittest.TestCase):
         barrier = threading.Barrier(4)
 
         def rapid_loop():
-            barrier.wait(timeout=5.0)
+            try:
+                barrier.wait(timeout=5.0)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise TimeoutError("rapid_loop: barrier timed out") from exc
             for _ in range(50):
                 with lock:
                     pass
 
         workers = [WorkerThread(target=rapid_loop, name=f"rapid_w_{i}") for i in range(4)]
-        start_worker_group(workers)
-        join_workers(workers, timeout_s=5.0)
+        try:
+            start_worker_group(workers)
+            join_workers(workers, timeout_s=5.0)
+        finally:
+            for w in workers:
+                self.assertFalse(w.is_alive())
 
         self.assertEqual(len(self.recorder.active_holders["L1"]), 0)
         self.assertEqual(len(self.recorder.active_threads_by_level["L1"]), 0)
@@ -1120,10 +1176,40 @@ class TestPhase20A3434LockRecorderConcurrencyIntegrity(unittest.TestCase):
 # 3. Benchmark Boundary Integrity (10 Boundaries) (Production Measurement)
 # ===========================================================================
 class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
-    """Production Measurement Integrity: Rigorous measurement of all 10 boundaries with direct internal snapshot freeze timing on production ObservationBudgetTracker."""
+    """Production Measurement Integrity: Rigorous measurement of all 10 boundaries with direct internal snapshot freeze timing on production ObservationBudgetTracker.
+    
+    Boundary Classifications:
+    1. Snapshot Capture Duration:      DIRECT_MEASUREMENT (Measured around with self._transaction_lock in reconcile_ledger)
+    2. Internal Snapshot Deep Freeze:  DIRECT_MEASUREMENT (Outermost clone_frozen calls during capture window via thread-local recursion guard)
+    3. Independent Micro clone_frozen: DIRECT_MEASUREMENT (Dedicated microbenchmark timing on production metrics profile)
+    4. Invariant Evaluation Duration:  DIRECT_MEASUREMENT (Measured post lock-release across all 24 invariant evaluations)
+    5. Total Reconciliation Duration:  DIRECT_MEASUREMENT (Outer wall-clock duration of reconcile_ledger)
+    6. L1 Lock Wait Duration:          DIRECT_MEASUREMENT (InstrumentedLock attempt-to-acquired duration per transaction)
+    7. L1 Lock Hold Duration:          DIRECT_MEASUREMENT (InstrumentedLock acquired-to-release duration per transaction)
+    8. Transaction Latency (N=20):     DIRECT_MEASUREMENT (Complete admission -> child read -> record -> finalize cycle)
+    9. Peak Allocated Memory:          DIRECT_MEASUREMENT (tracemalloc peak heap allocation)
+    10. Shallow / Retained Result Mem: DIRECT_MEASUREMENT (sys.getsizeof vs cycle-safe recursive object traversal)
+    Unmeasured Costs:                  NOT_MEASURED (OS scheduler context switches, cache invalidation, GC pauses)
+    """
+
+    @staticmethod
+    def _validate_samples(samples: List[float], name: str, expected_count: Optional[int] = None) -> None:
+        """Validates that a sample list is non-empty, contains only valid finite non-negative numbers, and matches count."""
+        if not samples:
+            raise ValueError(f"Benchmark boundary '{name}' sample set is empty")
+        if expected_count is not None and len(samples) != expected_count:
+            raise ValueError(f"Benchmark boundary '{name}' expected {expected_count} samples, got {len(samples)}")
+        for i, val in enumerate(samples):
+            if val is None or math.isnan(val) or math.isinf(val) or val < 0:
+                raise ValueError(f"Benchmark boundary '{name}' sample [{i}] is invalid: {val}")
 
     @staticmethod
     def _calc_median(samples: List[float]) -> float:
+        if not samples:
+            raise ValueError("Cannot calculate median of empty sample set")
+        for val in samples:
+            if math.isnan(val) or math.isinf(val) or val < 0:
+                raise ValueError(f"Invalid measurement sample: {val}")
         s = sorted(samples)
         n = len(s)
         if n % 2 == 1:
@@ -1132,6 +1218,11 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
 
     @staticmethod
     def _calc_p95(samples: List[float]) -> float:
+        if not samples:
+            raise ValueError("Cannot calculate P95 of empty sample set")
+        for val in samples:
+            if math.isnan(val) or math.isinf(val) or val < 0:
+                raise ValueError(f"Invalid measurement sample: {val}")
         s = sorted(samples)
         n = len(s)
         if n == 1:
@@ -1144,7 +1235,7 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         return float(s[idx])
 
     def test_16_ten_boundary_benchmark_with_internal_snapshot_freeze_measurement(self):
-        """Measures all 10 boundaries independently across N=20 samples with internal clone_frozen intercept."""
+        """Measures all 10 boundaries independently across N=20 samples with non-double-counted outermost clone_frozen."""
         recorder = ProductionCriticalSectionRecorder()
         tracker = make_tracker()
         instrument_tracker(tracker, recorder)
@@ -1168,19 +1259,26 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         orig_clone_frozen = observation_budget.clone_frozen
         snapshot_capture_active = False
         freeze_samples_in_current_reconciliation: List[int] = []
+        _tls = threading.local()
 
         def wrapped_clone_frozen(*args: Any, **kwargs: Any) -> Any:
-            if snapshot_capture_active:
-                t0 = time.perf_counter_ns()
-                res = orig_clone_frozen(*args, **kwargs)
-                t1 = time.perf_counter_ns()
-                freeze_samples_in_current_reconciliation.append(t1 - t0)
-                return res
-            return orig_clone_frozen(*args, **kwargs)
+            depth = getattr(_tls, "depth", 0)
+            _tls.depth = depth + 1
+            is_outer = (depth == 0) and snapshot_capture_active
+            t0 = time.perf_counter_ns() if is_outer else 0
+            try:
+                return orig_clone_frozen(*args, **kwargs)
+            finally:
+                t1 = time.perf_counter_ns() if is_outer else 0
+                _tls.depth -= 1
+                if is_outer and t0 > 0:
+                    freeze_samples_in_current_reconciliation.append(t1 - t0)
 
         observation_budget.clone_frozen = wrapped_clone_frozen
+        self.addCleanup(setattr, observation_budget, "clone_frozen", orig_clone_frozen)
         N = 20
         tracemalloc.start()
+        self.addCleanup(tracemalloc.stop)
         try:
             for i in range(N):
                 sc = make_scope(tracker, f"bench_op_34_{i}")
@@ -1203,6 +1301,7 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
                     nonlocal t_cap_start, snapshot_capture_active, freeze_samples_in_current_reconciliation
                     t_cap_start = time.perf_counter_ns()
                     snapshot_capture_active = True
+                    _tls.depth = 0
                     freeze_samples_in_current_reconciliation = []
 
                 def cap_end_hook():
@@ -1210,7 +1309,8 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
                     snapshot_capture_active = False
                     t_cap_end = time.perf_counter_ns()
                     t_eval_start = t_cap_end
-                    internal_freeze_durations_ns.append(sum(freeze_samples_in_current_reconciliation))
+                    freeze_sum = sum(freeze_samples_in_current_reconciliation)
+                    internal_freeze_durations_ns.append(float(freeze_sum))
 
                 def eval_end_hook():
                     nonlocal t_eval_end
@@ -1249,14 +1349,17 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         l1_waits_ns = [float(w) for w in recorder.get_thread_waits(th_id, level="L1")]
         l1_holds_ns = [float(h) for h in recorder.get_thread_holds(th_id, level="L1")]
 
-        # Verification of non-empty sample sets
-        self.assertEqual(len(tx_latencies_us), N)
-        self.assertEqual(len(total_durations_ns), N)
-        self.assertEqual(len(capture_durations_ns), N)
-        self.assertEqual(len(internal_freeze_durations_ns), N)
-        self.assertEqual(len(micro_freeze_durations_ns), N)
-        self.assertEqual(len(eval_durations_ns), N)
-        self.assertGreater(len(l1_holds_ns), 0)
+        # Verification of sample integrity across all 10 boundaries
+        self._validate_samples(capture_durations_ns, "1. Snapshot Capture Duration", expected_count=N)
+        self._validate_samples(internal_freeze_durations_ns, "2. Internal Snapshot Deep Freeze", expected_count=N)
+        self._validate_samples(micro_freeze_durations_ns, "3. Independent Micro clone_frozen", expected_count=N)
+        self._validate_samples(eval_durations_ns, "4. Invariant Evaluation Duration", expected_count=N)
+        self._validate_samples(total_durations_ns, "5. Total Reconciliation Duration", expected_count=N)
+        self._validate_samples(l1_waits_ns, "6. L1 Lock Wait Duration", expected_count=None)
+        self.assertGreaterEqual(len(l1_waits_ns), N)
+        self._validate_samples(l1_holds_ns, "7. L1 Lock Hold Duration", expected_count=None)
+        self.assertGreaterEqual(len(l1_holds_ns), N)
+        self._validate_samples(tx_latencies_us, "8. Transaction Latency", expected_count=N)
         self.assertGreater(peak_mem, 0)
         self.assertGreater(shallow_mem, 0)
         self.assertGreater(retained_mem, shallow_mem)
@@ -1267,16 +1370,16 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
         self.assertGreater(self._calc_median(internal_freeze_durations_ns), 0)
 
         print("\n--- Phase 2.0-A.3.4.34 10-Boundary Benchmark Evidence ---")
-        print(f"1. Snapshot Capture Duration:      med={self._calc_median(capture_durations_ns)/1e3:.2f}us, p95={self._calc_p95(capture_durations_ns)/1e3:.2f}us")
-        print(f"2. Internal Snapshot Deep Freeze:  med={self._calc_median(internal_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(internal_freeze_durations_ns)/1e3:.2f}us")
-        print(f"3. Independent Micro clone_frozen: med={self._calc_median(micro_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(micro_freeze_durations_ns)/1e3:.2f}us")
-        print(f"4. Invariant Evaluation Duration:  med={self._calc_median(eval_durations_ns)/1e3:.2f}us, p95={self._calc_p95(eval_durations_ns)/1e3:.2f}us")
-        print(f"5. Total Reconciliation Duration:  med={self._calc_median(total_durations_ns)/1e3:.2f}us, p95={self._calc_p95(total_durations_ns)/1e3:.2f}us")
-        print(f"6. L1 Lock Wait Duration:          med={self._calc_median(l1_waits_ns)/1e3:.2f}us, p95={self._calc_p95(l1_waits_ns)/1e3:.2f}us")
-        print(f"7. L1 Lock Hold Duration:          med={self._calc_median(l1_holds_ns)/1e3:.2f}us, p95={self._calc_p95(l1_holds_ns)/1e3:.2f}us")
-        print(f"8. Transaction Latency (N={N}):     med={self._calc_median(tx_latencies_us):.2f}us, p95={self._calc_p95(tx_latencies_us):.2f}us")
-        print(f"9. Peak Allocated Memory:          {peak_mem} bytes")
-        print(f"10. Shallow / Retained Result Mem: {shallow_mem} bytes / {retained_mem} bytes")
+        print(f"1. Snapshot Capture Duration [DIRECT_MEASUREMENT]:      med={self._calc_median(capture_durations_ns)/1e3:.2f}us, p95={self._calc_p95(capture_durations_ns)/1e3:.2f}us (N={len(capture_durations_ns)})")
+        print(f"2. Internal Snapshot Deep Freeze [DIRECT_MEASUREMENT]:  med={self._calc_median(internal_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(internal_freeze_durations_ns)/1e3:.2f}us (N={len(internal_freeze_durations_ns)})")
+        print(f"3. Independent Micro clone_frozen [DIRECT_MEASUREMENT]: med={self._calc_median(micro_freeze_durations_ns)/1e3:.2f}us, p95={self._calc_p95(micro_freeze_durations_ns)/1e3:.2f}us (N={len(micro_freeze_durations_ns)})")
+        print(f"4. Invariant Evaluation Duration [DIRECT_MEASUREMENT]:  med={self._calc_median(eval_durations_ns)/1e3:.2f}us, p95={self._calc_p95(eval_durations_ns)/1e3:.2f}us (N={len(eval_durations_ns)})")
+        print(f"5. Total Reconciliation Duration [DIRECT_MEASUREMENT]:  med={self._calc_median(total_durations_ns)/1e3:.2f}us, p95={self._calc_p95(total_durations_ns)/1e3:.2f}us (N={len(total_durations_ns)})")
+        print(f"6. L1 Lock Wait Duration [DIRECT_MEASUREMENT]:          med={self._calc_median(l1_waits_ns)/1e3:.2f}us, p95={self._calc_p95(l1_waits_ns)/1e3:.2f}us (N={len(l1_waits_ns)})")
+        print(f"7. L1 Lock Hold Duration [DIRECT_MEASUREMENT]:          med={self._calc_median(l1_holds_ns)/1e3:.2f}us, p95={self._calc_p95(l1_holds_ns)/1e3:.2f}us (N={len(l1_holds_ns)})")
+        print(f"8. Transaction Latency (N={N}) [DIRECT_MEASUREMENT]:     med={self._calc_median(tx_latencies_us):.2f}us, p95={self._calc_p95(tx_latencies_us):.2f}us (N={len(tx_latencies_us)})")
+        print(f"9. Peak Allocated Memory [DIRECT_MEASUREMENT]:          {peak_mem} bytes")
+        print(f"10. Shallow / Retained Result Mem [DIRECT_MEASUREMENT]: {shallow_mem} bytes / {retained_mem} bytes")
 
 
 # ===========================================================================
@@ -1307,7 +1410,8 @@ class TestPhase20A3434WorkerLifecycleClosure(unittest.TestCase):
         ev_cleanup = threading.Event()
 
         def long_work():
-            ev_cleanup.wait(timeout=5.0)
+            if not ev_cleanup.wait(timeout=5.0):
+                raise TimeoutError("long_work: ev_cleanup timed out")
 
         w1 = WorkerThread(target=long_work, name="partial_w1")
         w2 = WorkerThread(target=long_work, name="partial_w2")
@@ -1327,11 +1431,13 @@ class TestPhase20A3434WorkerLifecycleClosure(unittest.TestCase):
 
         def blocked_worker():
             w_started.set()
-            ev_cleanup.wait(timeout=5.0)
+            if not ev_cleanup.wait(timeout=5.0):
+                raise TimeoutError("blocked_worker: ev_cleanup timed out")
 
         w = WorkerThread(target=blocked_worker, name="blocked_w")
         w.start()
-        w_started.wait(timeout=5.0)
+        if not w_started.wait(timeout=5.0):
+            raise TimeoutError("w_started timed out")
 
         try:
             self.assertEqual(1, 2)
@@ -1847,6 +1953,27 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
             def __call__(self, *args: Any, **kwargs: Any):
                 raise AssertionError(f"ILLEGAL LIVE ACCESS: call {self._name}()")
 
+            def __int__(self):
+                raise AssertionError(f"ILLEGAL LIVE ACCESS: int({self._name})")
+
+            def __float__(self):
+                raise AssertionError(f"ILLEGAL LIVE ACCESS: float({self._name})")
+
+            def __add__(self, other: Any):
+                raise AssertionError(f"ILLEGAL LIVE ACCESS: {self._name} + {other}")
+
+            def __sub__(self, other: Any):
+                raise AssertionError(f"ILLEGAL LIVE ACCESS: {self._name} - {other}")
+
+            def __eq__(self, other: Any):
+                raise AssertionError(f"ILLEGAL LIVE ACCESS: {self._name} == {other}")
+
+            def __ne__(self, other: Any):
+                raise AssertionError(f"ILLEGAL LIVE ACCESS: {self._name} != {other}")
+
+            def __repr__(self):
+                return f"<PoisonTrap for {self._name}>"
+
         # 1. Clean production execution with all 14 fields poisoned post-capture
         clean_tracker = make_tracker()
         sc_clean = make_scope(clean_tracker, "op_clean_poison")
@@ -1880,7 +2007,11 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
                         orig_fn()
                     # Controlled in-path evaluation step deliberately accessing the poisoned live field
                     val = getattr(self, self.target_f)
-                    if callable(val):
+                    if self.target_f in ("metrics", "limits"):
+                        _ = getattr(val, "bytes_read" if self.target_f == "metrics" else "max_bytes_read")
+                    elif self.target_f in ("_released_reservations_count", "_active_consumed_bytes"):
+                        _ = int(val)
+                    elif callable(val):
                         val()
                     elif hasattr(val, "__getitem__"):
                         _ = val["test_key"]
@@ -2054,17 +2185,27 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
         b_entry = threading.Barrier(2)
 
         def do_commit():
-            b_entry.wait(timeout=5.0)
+            try:
+                b_entry.wait(timeout=5.0)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise TimeoutError("Barrier timeout in do_commit") from exc
             sc_commit.finalize(success=True)
 
         def do_recovery():
-            b_entry.wait(timeout=5.0)
+            try:
+                b_entry.wait(timeout=5.0)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise TimeoutError("Barrier timeout in do_recovery") from exc
             tracker.retry_recovery(sc_rec)
 
         w_c = WorkerThread(target=do_commit, name="commit_worker")
         w_r = WorkerThread(target=do_recovery, name="recovery_worker")
-        start_worker_group([w_c, w_r])
-        join_workers([w_c, w_r], timeout_s=5.0)
+        try:
+            start_worker_group([w_c, w_r])
+            join_workers([w_c, w_r], timeout_s=5.0)
+        finally:
+            self.assertFalse(w_c.is_alive(), "Worker w_c leaked alive")
+            self.assertFalse(w_r.is_alive(), "Worker w_r leaked alive")
 
         self.assertEqual(recorder.max_simultaneous["L1"], 1)
 
@@ -2083,9 +2224,11 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
 
         def post_capture_sync_hook():
             ev_capture_done.set()
-            ev_mutation_done.wait(timeout=5.0)
+            if not ev_mutation_done.wait(timeout=5.0):
+                raise TimeoutError("post_capture_sync_hook timed out waiting for mutation")
 
         self.tracker.set_fault_injection("after_reconciliation_snapshot_capture", post_capture_sync_hook)
+        self.addCleanup(self.tracker.clear_fault_injections)
 
         recon_results: List[Dict[str, Any]] = []
 
@@ -2094,7 +2237,8 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
             recon_results.append(res)
 
         def mutator_thread():
-            ev_capture_done.wait(timeout=5.0)
+            if not ev_capture_done.wait(timeout=5.0):
+                raise TimeoutError("mutator_thread timed out waiting for capture")
             # Thread B concurrently mutates live production structures across multiple registries
             self.tracker.metrics.bytes_read += 1_000_000
             self.tracker.metrics.total_read_failures += 42
@@ -2109,15 +2253,19 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
 
         th_a = WorkerThread(target=reconciler_thread, name="thread_a_reconciler")
         th_b = WorkerThread(target=mutator_thread, name="thread_b_mutator")
-        start_worker_group([th_a, th_b])
-        join_workers([th_a, th_b], timeout_s=5.0)
+        try:
+            start_worker_group([th_a, th_b], cleanup_events=[ev_capture_done, ev_mutation_done])
+            join_workers([th_a, th_b], timeout_s=5.0, cleanup_events=[ev_capture_done, ev_mutation_done])
+        finally:
+            self.tracker.clear_fault_injections()
+            self.assertFalse(th_a.is_alive(), "Worker th_a leaked alive")
+            self.assertFalse(th_b.is_alive(), "Worker th_b leaked alive")
 
         # Thread A evaluation used the captured snapshot and was unaffected by Thread B's concurrent mutations
         self.assertEqual(len(recon_results), 1)
         self.assertTrue(recon_results[0]["reconciled"])
 
         # Verification: subsequent reconciliation on main thread detects Thread B's mutations
-        self.tracker.clear_fault_injections()
         rec2 = self.tracker.reconcile_ledger(raise_on_error=False)
         self.assertFalse(rec2["reconciled"])
 
@@ -2136,9 +2284,12 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
         def pre_capture_mutator():
             tracker1.metrics.bytes_read += 500_000
 
-        tracker1.set_fault_injection("before_reconciliation_snapshot_capture", pre_capture_mutator)
-        rec_pre = tracker1.reconcile_ledger(raise_on_error=False)
-        self.assertFalse(rec_pre["reconciled"], "Pre-capture mutation must be captured into snapshot and fail reconciliation")
+        try:
+            tracker1.set_fault_injection("before_reconciliation_snapshot_capture", pre_capture_mutator)
+            rec_pre = tracker1.reconcile_ledger(raise_on_error=False)
+            self.assertFalse(rec_pre["reconciled"], "Pre-capture mutation must be captured into snapshot and fail reconciliation")
+        finally:
+            tracker1.clear_fault_injections()
 
         # Case 2: Mutation after capture completes -> snapshot remains clean -> in-flight reconciliation succeeds
         tracker2 = make_tracker()
@@ -2153,9 +2304,12 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
         def post_capture_mutator():
             tracker2.metrics.bytes_read += 500_000
 
-        tracker2.set_fault_injection("after_reconciliation_snapshot_capture", post_capture_mutator)
-        rec_post = tracker2.reconcile_ledger(raise_on_error=True)
-        self.assertTrue(rec_post["reconciled"], "Post-capture mutation must not affect in-flight snapshot evaluation")
+        try:
+            tracker2.set_fault_injection("after_reconciliation_snapshot_capture", post_capture_mutator)
+            rec_post = tracker2.reconcile_ledger(raise_on_error=True)
+            self.assertTrue(rec_post["reconciled"], "Post-capture mutation must not affect in-flight snapshot evaluation")
+        finally:
+            tracker2.clear_fault_injections()
 
     def test_43_snapshot_isolation_repeated_concurrent_cycles(self):
         """Repeated concurrent execution cycles prove deterministic snapshot isolation without race conditions."""
@@ -2174,7 +2328,8 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
 
             def hook():
                 ev_cap.set()
-                ev_mut.wait(timeout=5.0)
+                if not ev_mut.wait(timeout=5.0):
+                    raise TimeoutError(f"Hook timed out waiting for mutation in cycle {cycle}")
 
             tracker.set_fault_injection("after_reconciliation_snapshot_capture", hook)
             res_box: List[Dict[str, Any]] = []
@@ -2183,7 +2338,8 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
                 res_box.append(tracker.reconcile_ledger(raise_on_error=True))
 
             def mut_task():
-                ev_cap.wait(timeout=5.0)
+                if not ev_cap.wait(timeout=5.0):
+                    raise TimeoutError(f"Mutator timed out waiting for capture in cycle {cycle}")
                 tracker.metrics.bytes_read += 100_000
                 tracker._physical_read_records[f"leak_{cycle}"] = PhysicalReadRecord(
                     physical_read_id=f"leak_{cycle}",
@@ -2196,8 +2352,16 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
 
             w_recon = WorkerThread(target=recon_task, name=f"w_recon_{cycle}")
             w_mut = WorkerThread(target=mut_task, name=f"w_mut_{cycle}")
-            start_worker_group([w_recon, w_mut])
-            join_workers([w_recon, w_mut], timeout_s=5.0)
+            try:
+                start_worker_group([w_recon, w_mut], cleanup_events=[ev_cap, ev_mut])
+                join_workers([w_recon, w_mut], timeout_s=5.0, cleanup_events=[ev_cap, ev_mut])
+            finally:
+                tracker.clear_fault_injections()
+                self.assertFalse(w_recon.is_alive(), f"Worker w_recon_{cycle} leaked alive")
+                self.assertFalse(w_mut.is_alive(), f"Worker w_mut_{cycle} leaked alive")
+
+            self.assertEqual(len(res_box), 1)
+            self.assertTrue(res_box[0]["reconciled"])
 
             self.assertEqual(len(res_box), 1)
             self.assertTrue(res_box[0]["reconciled"])
@@ -2247,6 +2411,130 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
         frozen_zero = clone_frozen({"num": -0.0})
         self.assertEqual(math.copysign(1.0, frozen_zero["num"]), 1.0)
         self.assertEqual(canonical_metadata_digest({"n": -0.0}), canonical_metadata_digest({"n": 0.0}))
+
+    def test_44_deliberate_synchronization_event_wait_timeout_fails_explicitly(self):
+        """Deliberate event wait timeout explicitly raises TimeoutError and propagates to parent."""
+        ev = threading.Event()
+
+        def worker_fn():
+            if not ev.wait(timeout=0.02):
+                raise TimeoutError("Deliberate event wait timeout in worker")
+
+        w = WorkerThread(target=worker_fn, name="timeout_event_w")
+        w.start()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                join_workers([w], timeout_s=1.0)
+            self.assertIn("Deliberate event wait timeout in worker", str(ctx.exception))
+            self.assertIsInstance(ctx.exception.__cause__, TimeoutError)
+        finally:
+            self.assertFalse(w.is_alive())
+
+    def test_45_deliberate_synchronization_barrier_wait_timeout_fails_explicitly(self):
+        """Deliberate barrier wait timeout explicitly raises BrokenBarrierError and propagates to parent."""
+        barrier = threading.Barrier(2)
+
+        def worker_fn():
+            try:
+                barrier.wait(timeout=0.02)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise TimeoutError("Deliberate barrier wait timeout in worker") from exc
+
+        w = WorkerThread(target=worker_fn, name="timeout_barrier_w")
+        w.start()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                join_workers([w], timeout_s=1.0)
+            self.assertIn("Deliberate barrier wait timeout in worker", str(ctx.exception))
+            self.assertIsInstance(ctx.exception.__cause__, TimeoutError)
+        finally:
+            self.assertFalse(w.is_alive())
+
+    def test_46_deliberate_worker_failure_propagates_and_cleans_up(self):
+        """Deliberate worker failure propagates to parent join_workers and leaves zero alive threads."""
+        def bad_worker():
+            raise ValueError("Deliberate worker calculation fault")
+
+        w = WorkerThread(target=bad_worker, name="fault_w")
+        w.start()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                join_workers([w], timeout_s=1.0)
+            self.assertIn("Deliberate worker calculation fault", str(ctx.exception))
+            self.assertIsInstance(ctx.exception.__cause__, ValueError)
+        finally:
+            self.assertFalse(w.is_alive())
+
+    def test_47_recursive_clone_frozen_not_double_counted(self):
+        """Nested recursive clone_frozen calls are not double-counted; depth returns to zero."""
+        nested = {
+            "key1": [1, 2, {"key2": {"key3": (3, 4, 5)}}],
+            "key4": {"key5": [6, 7, {"key6": "value"}]},
+        }
+
+        orig_clone_frozen = observation_budget.clone_frozen
+        _tls = threading.local()
+        samples: List[int] = []
+        active = True
+
+        def tracking_clone_frozen(*args: Any, **kwargs: Any) -> Any:
+            depth = getattr(_tls, "depth", 0)
+            _tls.depth = depth + 1
+            is_outer = (depth == 0) and active
+            t0 = time.perf_counter_ns() if is_outer else 0
+            try:
+                return orig_clone_frozen(*args, **kwargs)
+            finally:
+                t1 = time.perf_counter_ns() if is_outer else 0
+                _tls.depth -= 1
+                if is_outer and t0 > 0:
+                    samples.append(t1 - t0)
+
+        observation_budget.clone_frozen = tracking_clone_frozen
+        try:
+            res = tracking_clone_frozen(nested)
+            self.assertIsNotNone(res)
+            # The nested structure contains dozens of internal recursive calls, but outermost count must be exactly 1!
+            self.assertEqual(len(samples), 1)
+            self.assertGreater(samples[0], 0)
+            self.assertEqual(getattr(_tls, "depth", 0), 0)
+
+            # Exception safety: cyclic object raises ValueError and still unwinds depth to 0
+            cyclic: Dict[str, Any] = {}
+            cyclic["self"] = cyclic
+            with self.assertRaises(ValueError):
+                tracking_clone_frozen(cyclic)
+            self.assertEqual(getattr(_tls, "depth", 0), 0)
+        finally:
+            observation_budget.clone_frozen = orig_clone_frozen
+
+    def test_48_benchmark_stats_reject_empty_nan_inf_and_negative_samples(self):
+        """Median, P95, and sample validation reject empty, NaN, Inf, and negative inputs."""
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._calc_median([])
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._calc_p95([])
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._calc_median([1.0, float("nan")])
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._calc_median([1.0, float("inf")])
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._calc_median([1.0, -10.0])
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._calc_p95([1.0, float("nan")])
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._calc_p95([1.0, float("inf")])
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._calc_p95([1.0, -10.0])
+
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._validate_samples([], "empty_test")
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._validate_samples([1.0] * 5, "count_mismatch", expected_count=20)
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._validate_samples([1.0, float("nan")], "nan_test")
+        with self.assertRaises(ValueError):
+            TestPhase20A3434BenchmarkBoundaryIntegrity._validate_samples([1.0, -1.0], "neg_test")
 
 
 if __name__ == "__main__":
