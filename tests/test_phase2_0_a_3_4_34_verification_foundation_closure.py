@@ -1,12 +1,27 @@
 """Phase 2.0-A.3.4.34 — Verification Foundation Closure.
 
 Strict correctness and verification foundation suite.
+
+Production vs Test-Only Component Traceability:
+- Production Components Tested:
+  * extractor.observation_budget.ObservationBudgetTracker (production accounting, 24 invariants, 14 mutable fields, locks)
+  * extractor.observation_budget.ActiveOperationScope (production operation scopes, lifecycle, locks)
+  * extractor.observation_budget.ObservationReservation (production reservations, child reads, locks)
+  * extractor.observation_budget.PhysicalReadRecord (production physical reads, metadata, locks)
+  * extractor.observation_budget.clone_frozen (production immutable snapshot cloning engine)
+- Test-Only Instrumentation & Harness Components:
+  * InstrumentedLock: Test-only lock wrapper recording acquire/release timings and reentrancy depth.
+  * ProductionCriticalSectionRecorder: Test-only thread-safe metrics collector for lock hold/wait durations.
+  * WorkerThread, join_workers, start_worker_group: Test-only concurrency test harness helpers.
+  * ReconciliationSnapshotBoundaryAuditor: Test-only static AST verification tool auditing production reconcile_ledger().
+  * get_recursive_retained_size: Test-only memory measurement helper.
+
 Establishes:
-1. Lock Recorder Release Correctness:
+1. Lock Recorder Release Correctness (Test-Only Instrumentation Correctness):
    - Release recorded ONLY upon successful underlying release.
    - Exceptions during release preserved without state mutation.
    - Accurate depth and hold interval tracking across normal and reentrant locks.
-2. Lock Recorder Concurrency Integrity:
+2. Lock Recorder Concurrency Integrity (Test-Only Instrumentation Concurrency):
    - Adversarial multi-threaded contention, independent locks, and loops.
    - Reset while idle and worker cleanup validation.
    - Non-negative durations and strict owner distinction.
@@ -14,17 +29,18 @@ Establishes:
    - Snapshot capture vs internal deep freeze vs independent microbenchmark vs invariant evaluation.
    - Total reconciliation, L1 wait, L1 hold, Tx latency, peak memory, shallow & retained memory.
    - Cycle-safe recursive size, warm-up, exact median and P95 linear interpolation.
-4. Worker Lifecycle Closure:
+4. Worker Lifecycle Closure (Test Harness Correctness):
    - Failed start state preservation, monotonic group deadline, timeout unjoined identification.
    - Cleanup events on failure/timeout, cause preservation (__cause__), repeated join idempotency.
-5. AST Auditor Verification Completeness:
+5. AST Auditor Verification Completeness (Test-Only AST Tool Auditing Production Code):
    - Zero violations in production reconcile_ledger().
    - 18 negative fixtures and 3 positive fixtures preserved.
    - Fail-closed verification on dynamic eval/exec, external helpers, path-insensitive alias dataflow,
      nested closures, reflection, and helper argument/return propagation.
-6. Full Regression Battery:
+6. Full Regression Battery (Actual Production Code Correctness):
    - 24 invariants, canonical 14-field PoisonTrap (clean + in-path detection), commit fault matrix (12 pts),
-     recovery fault matrix (12 pts), retry idempotency, concurrent commit/recovery serialization.
+     recovery fault matrix (12 pts), retry idempotency, concurrent commit/recovery serialization,
+     and real multi-threaded snapshot isolation under concurrent live-state mutations.
 """
 
 from __future__ import annotations
@@ -740,10 +756,13 @@ class ReconciliationSnapshotBoundaryAuditor:
 
 
 # ===========================================================================
-# 1. Lock Recorder Release Correctness
+# 1. Lock Recorder Release Correctness (Test-Only Instrumentation)
 # ===========================================================================
 class TestPhase20A3434LockRecorderReleaseCorrectness(unittest.TestCase):
-    """Rigorous audit of InstrumentedLock and ProductionCriticalSectionRecorder release behavior."""
+    """Test-Only Instrumentation Verification: Rigorous audit of test-only InstrumentedLock and ProductionCriticalSectionRecorder release behavior.
+    
+    Proves correctness of the test-only lock instrumentation harness, NOT production locking.
+    """
 
     def setUp(self):
         self.recorder = ProductionCriticalSectionRecorder()
@@ -938,10 +957,13 @@ class TestPhase20A3434LockRecorderReleaseCorrectness(unittest.TestCase):
 
 
 # ===========================================================================
-# 2. Lock Recorder Concurrency Integrity
+# 2. Lock Recorder Concurrency Integrity (Test-Only Instrumentation)
 # ===========================================================================
 class TestPhase20A3434LockRecorderConcurrencyIntegrity(unittest.TestCase):
-    """Adversarial multi-threaded contention and concurrency integrity verification."""
+    """Test-Only Instrumentation Concurrency: Multi-threaded contention and concurrency integrity verification for the test harness recorder.
+    
+    Proves concurrency safety of the test harness recorder under multi-threaded test execution, NOT production transaction concurrency.
+    """
 
     def setUp(self):
         self.recorder = ProductionCriticalSectionRecorder()
@@ -1095,10 +1117,10 @@ class TestPhase20A3434LockRecorderConcurrencyIntegrity(unittest.TestCase):
 
 
 # ===========================================================================
-# 3. Benchmark Boundary Integrity (10 Boundaries)
+# 3. Benchmark Boundary Integrity (10 Boundaries) (Production Measurement)
 # ===========================================================================
 class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
-    """Rigorous measurement of all 10 boundaries with direct internal snapshot freeze timing."""
+    """Production Measurement Integrity: Rigorous measurement of all 10 boundaries with direct internal snapshot freeze timing on production ObservationBudgetTracker."""
 
     @staticmethod
     def _calc_median(samples: List[float]) -> float:
@@ -1258,10 +1280,13 @@ class TestPhase20A3434BenchmarkBoundaryIntegrity(unittest.TestCase):
 
 
 # ===========================================================================
-# 4. Worker Lifecycle Closure
+# 4. Worker Lifecycle Closure (Test Harness Utilities)
 # ===========================================================================
 class TestPhase20A3434WorkerLifecycleClosure(unittest.TestCase):
-    """Validates worker thread lifecycle, startup error handling, monotonic timeout, and cleanup."""
+    """Test Harness Lifecycle Closure: Validates test-only WorkerThread lifecycle, startup error handling, monotonic timeout, and cleanup.
+    
+    Proves lifecycle and cleanup correctness of test harness utilities, NOT production daemon lifecycle.
+    """
 
     def test_17_worker_startup_failure_preserves_unstarted_state(self):
         """Failure inside start() does not leave a false started=True flag."""
@@ -1406,10 +1431,10 @@ class TestPhase20A3434WorkerLifecycleClosure(unittest.TestCase):
 
 
 # ===========================================================================
-# 5. AST Auditor Regression & Limitations
+# 5. AST Auditor Regression & Limitations (Test-Only AST Static Analysis Auditor)
 # ===========================================================================
 class TestPhase20A3434ASTAuditorRegressionAndLimitations(unittest.TestCase):
-    """Verifies complete AST auditor fidelity, negative/positive fixtures, and fail-closed limitation tests."""
+    """Test-Only AST Static Analysis Auditor: Verifies AST auditor fidelity, negative/positive fixtures, and fail-closed limitation tests auditing production reconcile_ledger()."""
 
     def test_25_ast_audit_production_code_zero_violations(self):
         """Production reconcile_ledger() in extractor/observation_budget.py has exactly 0 violations."""
@@ -1766,10 +1791,10 @@ def reconcile_ledger(self):
 
 
 # ===========================================================================
-# 6. Full Regression Battery
+# 6. Adversarial and Accounting Regression Battery (Actual Production Code)
 # ===========================================================================
 class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
-    """Verifies all 24 invariants, canonical 14 PoisonTrap fields, fault matrices, and recovery."""
+    """Production Invariants & Snapshot Isolation Regression: Validates 24 production invariants, canonical 14-field PoisonTrap snapshot isolation, 12 commit points, 12 recovery points, retry idempotency, and concurrent serialization on production ObservationBudgetTracker."""
 
     def setUp(self):
         self.tracker = make_tracker()
@@ -1819,21 +1844,79 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
             def __bool__(self):
                 raise AssertionError(f"ILLEGAL LIVE ACCESS: bool({self._name})")
 
+            def __call__(self, *args: Any, **kwargs: Any):
+                raise AssertionError(f"ILLEGAL LIVE ACCESS: call {self._name}()")
+
         # 1. Clean production execution with all 14 fields poisoned post-capture
+        clean_tracker = make_tracker()
+        sc_clean = make_scope(clean_tracker, "op_clean_poison")
+        r_clean = clean_tracker.admit_read(50, scope=sc_clean)
+        c_clean = r_clean.start_child_read()
+        c_clean.consume(50)
+        r_clean.consume(50)
+        sc_clean.record_read(50, admission=r_clean)
+        sc_clean.finalize(success=True)
+
         def poison_hook():
             for f in CANONICAL_AUTHORITATIVE_MUTABLE_FIELDS:
-                setattr(self.tracker, f, PoisonTrap(f))
+                setattr(clean_tracker, f, PoisonTrap(f))
 
-        self.tracker.set_fault_injection("after_reconciliation_snapshot_capture", poison_hook)
-        rec = self.tracker.reconcile_ledger(raise_on_error=True)
+        clean_tracker.set_fault_injection("after_reconciliation_snapshot_capture", poison_hook)
+        rec = clean_tracker.reconcile_ledger(raise_on_error=True)
         self.assertTrue(rec["reconciled"])
+        self.assertEqual(len(rec["discrepancy_details"]), 24)
 
-        # 2. In-path negative verification: touching any poisoned field triggers AssertionError
+        # 2. In-path negative controls: deliberate live-field access inside reconcile_ledger() triggers PoisonTrap
+        class FaultyEvaluationReconciler(ObservationBudgetTracker):
+            def __init__(self, target_f: str, *args: Any, **kwargs: Any):
+                super().__init__(*args, **kwargs)
+                self.target_f = target_f
+
+            def reconcile_ledger(self, raise_on_error: bool = True) -> Dict[str, Any]:
+                orig_fn = self._fault_injection_hooks.get("after_reconciliation_snapshot_capture")
+
+                def faulty_step():
+                    if orig_fn:
+                        orig_fn()
+                    # Controlled in-path evaluation step deliberately accessing the poisoned live field
+                    val = getattr(self, self.target_f)
+                    if callable(val):
+                        val()
+                    elif hasattr(val, "__getitem__"):
+                        _ = val["test_key"]
+                    elif hasattr(val, "__iter__"):
+                        _ = list(val)
+                    else:
+                        _ = getattr(val, "bytes_read", 0)
+
+                self.set_fault_injection("after_reconciliation_snapshot_capture", faulty_step)
+                return super().reconcile_ledger(raise_on_error=raise_on_error)
+
         for field in CANONICAL_AUTHORITATIVE_MUTABLE_FIELDS:
-            with self.subTest(field=field):
-                poisoned_obj = PoisonTrap(field)
-                with self.assertRaises(AssertionError):
-                    _ = getattr(poisoned_obj, "some_attribute")
+            with self.subTest(faulty_field=field):
+                f_tracker = FaultyEvaluationReconciler(
+                    target_f=field,
+                    limits=ObservationBudgetLimits(max_bytes_read=10_000_000, max_bytes_per_observation=10_000_000),
+                )
+                f_tracker.start()
+                f_scope = make_scope(f_tracker, f"op_poison_neg_{field}")
+                f_res = f_tracker.admit_read(50, scope=f_scope)
+                f_c = f_res.start_child_read()
+                f_c.consume(50)
+                f_res.consume(50)
+                f_scope.record_read(50, admission=f_res)
+                f_scope.finalize(success=True)
+
+                def poison_f():
+                    for f in CANONICAL_AUTHORITATIVE_MUTABLE_FIELDS:
+                        setattr(f_tracker, f, PoisonTrap(f))
+
+                f_tracker.set_fault_injection("after_reconciliation_snapshot_capture", poison_f)
+
+                with self.assertRaises(AssertionError) as ctx:
+                    f_tracker.reconcile_ledger(raise_on_error=True)
+                self.assertIn("ILLEGAL LIVE ACCESS", str(ctx.exception))
+                self.assertIn(field, str(ctx.exception))
 
     def test_36_commit_mutation_fault_matrix_12_points(self):
         """All 12 commit mutation points fail cleanly and preserve accounting integrity."""
@@ -1986,8 +2069,8 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
         self.assertEqual(recorder.max_simultaneous["L1"], 1)
 
     def test_40_post_capture_snapshot_isolation_under_concurrent_source_mutations(self):
-        """Mutations to live source registries post-capture do not affect in-flight invariant evaluation."""
-        scope = make_scope(self.tracker, "op_snapshot_isolation")
+        """Thread B concurrently mutates live registries while Thread A evaluates snapshot; in-flight result is isolated."""
+        scope = make_scope(self.tracker, "op_conc_snapshot_isolation")
         r = self.tracker.admit_read(100, scope=scope)
         c = r.start_child_read()
         c.consume(100)
@@ -1995,18 +2078,129 @@ class TestPhase20A3434AdversarialAndAccountingRegression(unittest.TestCase):
         scope.record_read(100, admission=r)
         scope.finalize(success=True)
 
-        mutation_fired = [False]
+        ev_capture_done = threading.Event()
+        ev_mutation_done = threading.Event()
+
+        def post_capture_sync_hook():
+            ev_capture_done.set()
+            ev_mutation_done.wait(timeout=5.0)
+
+        self.tracker.set_fault_injection("after_reconciliation_snapshot_capture", post_capture_sync_hook)
+
+        recon_results: List[Dict[str, Any]] = []
+
+        def reconciler_thread():
+            res = self.tracker.reconcile_ledger(raise_on_error=True)
+            recon_results.append(res)
+
+        def mutator_thread():
+            ev_capture_done.wait(timeout=5.0)
+            # Thread B concurrently mutates live production structures across multiple registries
+            self.tracker.metrics.bytes_read += 1_000_000
+            self.tracker.metrics.total_read_failures += 42
+            self.tracker._physical_read_records["concurrent_leak_id"] = PhysicalReadRecord(
+                physical_read_id="concurrent_leak_id",
+                physical_consumption_id="cons_leak",
+                reservation_id="res_leak",
+                operation_id="op_leak",
+                charged_bytes=500,
+            )
+            ev_mutation_done.set()
+
+        th_a = WorkerThread(target=reconciler_thread, name="thread_a_reconciler")
+        th_b = WorkerThread(target=mutator_thread, name="thread_b_mutator")
+        start_worker_group([th_a, th_b])
+        join_workers([th_a, th_b], timeout_s=5.0)
+
+        # Thread A evaluation used the captured snapshot and was unaffected by Thread B's concurrent mutations
+        self.assertEqual(len(recon_results), 1)
+        self.assertTrue(recon_results[0]["reconciled"])
+
+        # Verification: subsequent reconciliation on main thread detects Thread B's mutations
+        self.tracker.clear_fault_injections()
+        rec2 = self.tracker.reconcile_ledger(raise_on_error=False)
+        self.assertFalse(rec2["reconciled"])
+
+    def test_42_snapshot_isolation_mutation_before_vs_after_capture(self):
+        """Mutations before capture are captured into snapshot; mutations after capture are strictly isolated."""
+        # Case 1: Mutation before capture begins -> captured into snapshot -> reconciliation detects discrepancy
+        tracker1 = make_tracker()
+        sc1 = make_scope(tracker1, "op_snap_pre")
+        r1 = tracker1.admit_read(100, scope=sc1)
+        c1 = r1.start_child_read()
+        c1.consume(100)
+        r1.consume(100)
+        sc1.record_read(100, admission=r1)
+        sc1.finalize(success=True)
+
+        def pre_capture_mutator():
+            tracker1.metrics.bytes_read += 500_000
+
+        tracker1.set_fault_injection("before_reconciliation_snapshot_capture", pre_capture_mutator)
+        rec_pre = tracker1.reconcile_ledger(raise_on_error=False)
+        self.assertFalse(rec_pre["reconciled"], "Pre-capture mutation must be captured into snapshot and fail reconciliation")
+
+        # Case 2: Mutation after capture completes -> snapshot remains clean -> in-flight reconciliation succeeds
+        tracker2 = make_tracker()
+        sc2 = make_scope(tracker2, "op_snap_post")
+        r2 = tracker2.admit_read(100, scope=sc2)
+        c2 = r2.start_child_read()
+        c2.consume(100)
+        r2.consume(100)
+        sc2.record_read(100, admission=r2)
+        sc2.finalize(success=True)
 
         def post_capture_mutator():
-            # Deliberately mutate live production metrics after snapshot capture
-            self.tracker.metrics.bytes_read += 1_000_000
-            mutation_fired[0] = True
+            tracker2.metrics.bytes_read += 500_000
 
-        self.tracker.set_fault_injection("after_reconciliation_snapshot_capture", post_capture_mutator)
-        rec = self.tracker.reconcile_ledger(raise_on_error=True)
+        tracker2.set_fault_injection("after_reconciliation_snapshot_capture", post_capture_mutator)
+        rec_post = tracker2.reconcile_ledger(raise_on_error=True)
+        self.assertTrue(rec_post["reconciled"], "Post-capture mutation must not affect in-flight snapshot evaluation")
 
-        self.assertTrue(mutation_fired[0])
-        self.assertTrue(rec["reconciled"], "In-flight evaluation was contaminated by post-capture mutation")
+    def test_43_snapshot_isolation_repeated_concurrent_cycles(self):
+        """Repeated concurrent execution cycles prove deterministic snapshot isolation without race conditions."""
+        for cycle in range(5):
+            tracker = make_tracker()
+            sc = make_scope(tracker, f"op_conc_cycle_{cycle}")
+            r = tracker.admit_read(50, scope=sc)
+            c = r.start_child_read()
+            c.consume(50)
+            r.consume(50)
+            sc.record_read(50, admission=r)
+            sc.finalize(success=True)
+
+            ev_cap = threading.Event()
+            ev_mut = threading.Event()
+
+            def hook():
+                ev_cap.set()
+                ev_mut.wait(timeout=5.0)
+
+            tracker.set_fault_injection("after_reconciliation_snapshot_capture", hook)
+            res_box: List[Dict[str, Any]] = []
+
+            def recon_task():
+                res_box.append(tracker.reconcile_ledger(raise_on_error=True))
+
+            def mut_task():
+                ev_cap.wait(timeout=5.0)
+                tracker.metrics.bytes_read += 100_000
+                tracker._physical_read_records[f"leak_{cycle}"] = PhysicalReadRecord(
+                    physical_read_id=f"leak_{cycle}",
+                    physical_consumption_id=f"c_leak_{cycle}",
+                    reservation_id="res_leak",
+                    operation_id=f"op_conc_cycle_{cycle}",
+                    charged_bytes=50,
+                )
+                ev_mut.set()
+
+            w_recon = WorkerThread(target=recon_task, name=f"w_recon_{cycle}")
+            w_mut = WorkerThread(target=mut_task, name=f"w_mut_{cycle}")
+            start_worker_group([w_recon, w_mut])
+            join_workers([w_recon, w_mut], timeout_s=5.0)
+
+            self.assertEqual(len(res_box), 1)
+            self.assertTrue(res_box[0]["reconciled"])
 
     def test_41_clone_frozen_adversarial_matrix(self):
         """Deeply nested structures, DAG diamonds, custom Mapping cycles, and -0.0 canonicalization."""
