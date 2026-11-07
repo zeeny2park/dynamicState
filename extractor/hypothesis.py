@@ -82,16 +82,22 @@ VALID_OBSERVATION_STATUSES = {
 
 # Hypothesis validation statuses
 HYPOTHESIS_STATUS_PROPOSED = "PROPOSED"
+HYPOTHESIS_STATUS_INVESTIGATING = "INVESTIGATING"
 HYPOTHESIS_STATUS_SUPPORTED = "SUPPORTED"
 HYPOTHESIS_STATUS_CONTRADICTED = "CONTRADICTED"
 HYPOTHESIS_STATUS_INCONCLUSIVE = "INCONCLUSIVE"
+HYPOTHESIS_STATUS_ABSTAINED = "ABSTAINED"
+HYPOTHESIS_STATUS_REJECTED = "REJECTED"
 HYPOTHESIS_STATUS_VALIDATED = "VALIDATED"
 
 VALID_HYPOTHESIS_STATUSES = {
     HYPOTHESIS_STATUS_PROPOSED,
+    HYPOTHESIS_STATUS_INVESTIGATING,
     HYPOTHESIS_STATUS_SUPPORTED,
     HYPOTHESIS_STATUS_CONTRADICTED,
     HYPOTHESIS_STATUS_INCONCLUSIVE,
+    HYPOTHESIS_STATUS_ABSTAINED,
+    HYPOTHESIS_STATUS_REJECTED,
     HYPOTHESIS_STATUS_VALIDATED,
 }
 
@@ -308,8 +314,13 @@ class InvestigationHypothesis:
     provenance: Dict[str, Any] = field(default_factory=dict)
     target_threads: List[Union[int, str]] = field(default_factory=list)
     target_regions: List[str] = field(default_factory=list)
-    confidence_score: float = 0.5
+    confidence_score: float = 0.40
     anomaly_category: Optional[str] = None
+    abstained_evidence_ids: List[str] = field(default_factory=list)
+    inconclusive_evidence_ids: List[str] = field(default_factory=list)
+    unverified_claim_ids: List[str] = field(default_factory=list)
+    quality_breakdown: Dict[str, Any] = field(default_factory=dict)
+    confidence_history: List[Dict[str, Any]] = field(default_factory=list)
 
     def __setattr__(self, name, value):
         super().__setattr__(name, value)
@@ -408,8 +419,13 @@ class InvestigationHypothesis:
             provenance=dict(data.get("provenance", {})),
             target_threads=list(data.get("target_threads", [])),
             target_regions=list(data.get("target_regions", [])),
-            confidence_score=float(data.get("confidence_score", 0.5)),
+            confidence_score=float(data.get("confidence_score", 0.40)),
             anomaly_category=data.get("anomaly_category"),
+            abstained_evidence_ids=list(data.get("abstained_evidence_ids", [])),
+            inconclusive_evidence_ids=list(data.get("inconclusive_evidence_ids", [])),
+            unverified_claim_ids=list(data.get("unverified_claim_ids", [])),
+            quality_breakdown=dict(data.get("quality_breakdown", {})),
+            confidence_history=list(data.get("confidence_history", [])),
         )
 
 
@@ -943,29 +959,17 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                     f"Inspect lock ownership, owner thread progress, and stack frame locals for thread {tid}."
                 ),
                 expected_outcomes={
-                    "thread_contention_stall_observed": "SUPPORTED",
-                    "stalled_lock_owner_identified": "SUPPORTED",
-                    "circular_deadlock_confirmed": "SUPPORTED",
                     "stalled_owner_or_deadlock_confirmed": "SUPPORTED",
                     "uncontended_or_normal_progress": "CONTRADICTED",
-                    "normal_condition_variable_wait": "CONTRADICTED",
                 },
                 expected_outcomes_by_hypothesis={
                     h1_id: {
-                        "thread_contention_stall_observed": "SUPPORTED",
-                        "stalled_lock_owner_identified": "SUPPORTED",
-                        "circular_deadlock_confirmed": "SUPPORTED",
                         "stalled_owner_or_deadlock_confirmed": "SUPPORTED",
                         "uncontended_or_normal_progress": "CONTRADICTED",
-                        "normal_condition_variable_wait": "CONTRADICTED",
                     },
                     h2_id: {
-                        "thread_contention_stall_observed": "CONTRADICTED",
-                        "stalled_lock_owner_identified": "CONTRADICTED",
-                        "circular_deadlock_confirmed": "CONTRADICTED",
                         "stalled_owner_or_deadlock_confirmed": "CONTRADICTED",
                         "uncontended_or_normal_progress": "SUPPORTED",
-                        "normal_condition_variable_wait": "SUPPORTED",
                     },
                 },
                 discriminating_power="HIGH",
@@ -1082,47 +1086,17 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
                 target_ref={"target_expression": target_expr, "region": region},
                 discriminating_criteria=f"Compare allocation metrics for '{target_expr}' across consecutive runtime epochs.",
                 expected_outcomes={
-                    "sustained_monotonic_growth": "SUPPORTED",
                     "monotonic_unreleased_growth_with_orphans": "SUPPORTED",
-                    "PROCESS_RSS_SUSTAINED_GROWTH": "SUPPORTED",
-                    "temporary_workload_buffering": "CONTRADICTED",
-                    "allocator_retention": "CONTRADICTED",
-                    "mapping_expansion_without_allocation": "CONTRADICTED",
                     "stable_or_reclaimed_allocation": "CONTRADICTED",
-                    "PROCESS_RSS_BURST_AND_RECLAIM": "CONTRADICTED",
-                    "HEAP_MAPPING_EXPANSION": "CONTRADICTED",
-                    "ANON_MAPPING_EXPANSION": "CONTRADICTED",
-                    "PROCESS_MEMORY_STABLE": "CONTRADICTED",
-                    "INSUFFICIENT_REGION_EVIDENCE": "INCONCLUSIVE",
                 },
                 expected_outcomes_by_hypothesis={
                     h1_id: {
-                        "sustained_monotonic_growth": "SUPPORTED",
                         "monotonic_unreleased_growth_with_orphans": "SUPPORTED",
-                        "PROCESS_RSS_SUSTAINED_GROWTH": "SUPPORTED",
-                        "temporary_workload_buffering": "CONTRADICTED",
-                        "allocator_retention": "CONTRADICTED",
-                        "mapping_expansion_without_allocation": "CONTRADICTED",
                         "stable_or_reclaimed_allocation": "CONTRADICTED",
-                        "PROCESS_RSS_BURST_AND_RECLAIM": "CONTRADICTED",
-                        "HEAP_MAPPING_EXPANSION": "CONTRADICTED",
-                        "ANON_MAPPING_EXPANSION": "CONTRADICTED",
-                        "PROCESS_MEMORY_STABLE": "CONTRADICTED",
-                        "INSUFFICIENT_REGION_EVIDENCE": "INCONCLUSIVE",
                     },
                     h2_id: {
-                        "sustained_monotonic_growth": "CONTRADICTED",
                         "monotonic_unreleased_growth_with_orphans": "CONTRADICTED",
-                        "PROCESS_RSS_SUSTAINED_GROWTH": "CONTRADICTED",
-                        "temporary_workload_buffering": "SUPPORTED",
-                        "allocator_retention": "SUPPORTED",
-                        "mapping_expansion_without_allocation": "SUPPORTED",
                         "stable_or_reclaimed_allocation": "SUPPORTED",
-                        "PROCESS_RSS_BURST_AND_RECLAIM": "SUPPORTED",
-                        "HEAP_MAPPING_EXPANSION": "SUPPORTED",
-                        "ANON_MAPPING_EXPANSION": "SUPPORTED",
-                        "PROCESS_MEMORY_STABLE": "SUPPORTED",
-                        "INSUFFICIENT_REGION_EVIDENCE": "INCONCLUSIVE",
                     },
                 },
                 discriminating_power="HIGH",
@@ -1472,8 +1446,669 @@ class DeterministicHypothesisGenerator(HypothesisGenerator):
             )
             hypotheses.extend([h1, h2])
 
+        # 5. Deadlock Indicators (Wait-for Cycle vs Transient Lock Order Contention)
+        for dl in triage_data.get("deadlock_indicators", []):
+            cycle_desc = dl.get("cycle_description") or dl.get("target_expression") or "lock_cycle"
+            tids = dl.get("tids") or dl.get("threads") or []
+            supp_ids = _valid_eids(dl.get("evidence_ids", [dl.get("evidence_id")] if dl.get("evidence_id") else []))
+            d_hash = hashlib.sha256(f"{investigation_id}:deadlock:{cycle_desc}".encode("utf-8")).hexdigest()[:8]
+            h1_id = f"hypo_deadlock_cycle_{d_hash}"
+            h2_id = f"hypo_deadlock_transient_{d_hash}"
+            obs_id = f"obs_disc_deadlock_{d_hash}"
+            disc_obs = FollowUpObservation(
+                observation_id=obs_id,
+                hypothesis_id=h1_id,
+                tested_hypothesis_ids=[h1_id, h2_id],
+                profile_id=dl.get("follow_up_profile_id", "insp_locks"),
+                question=f"Does lock wait cycle '{cycle_desc}' persist across a second sample with zero progress?",
+                why_needed=f"Confirm persistent deadlock cycle ({h1_id}) vs transient lock handoff ({h2_id}).",
+                target_kind=TARGET_KIND_THREAD,
+                target_ref={"cycle": cycle_desc, "tids": tids, "target_expression": cycle_desc},
+                discriminating_criteria=f"Re-verify wait-for graph cycle '{cycle_desc}' across consecutive epochs.",
+                expected_outcomes={
+                    "persistent_lock_cycle_confirmed": "SUPPORTED",
+                    "cycle_resolved_or_progressing": "CONTRADICTED",
+                },
+                expected_outcomes_by_hypothesis={
+                    h1_id: {"persistent_lock_cycle_confirmed": "SUPPORTED", "cycle_resolved_or_progressing": "CONTRADICTED"},
+                    h2_id: {"persistent_lock_cycle_confirmed": "CONTRADICTED", "cycle_resolved_or_progressing": "SUPPORTED"},
+                },
+                discriminating_power="HIGH",
+                required_capture_quality="COMPLETE",
+                safety_constraints=["Read-only thread/lock re-sampling."],
+                prerequisites=["threads_available"],
+                risk_level="READ_ONLY",
+                estimated_cost="LOW",
+                estimated_bytes=2048,
+                estimated_latency_ms=10.0,
+                estimated_samples=1,
+                estimated_stop_ms=0.0,
+            )
+            h1 = InvestigationHypothesis(
+                hypothesis_id=h1_id,
+                investigation_id=investigation_id,
+                title=f"Circular Lock Deadlock Detected ({cycle_desc})",
+                claim=f"Threads {tids} are deadlocked in a circular wait cycle ({cycle_desc}).",
+                proposed_mechanism=f"Mutual lock acquisition order inversion created a permanent wait cycle: {cycle_desc}.",
+                supporting_evidence_ids=list(supp_ids),
+                confidence=init_conf,
+                confidence_score=init_score,
+                candidate_objects=[cycle_desc],
+                target_threads=list(tids),
+                suggested_observations=[disc_obs],
+                validation_status=HYPOTHESIS_STATUS_PROPOSED,
+                target_kind=TARGET_KIND_THREAD,
+                target_identifier=cycle_desc,
+                competing_hypothesis_ids=[h2_id],
+                anomaly_category="DEADLOCK_INDICATORS",
+                provenance={"generator": "DeterministicHypothesisGenerator", "anomaly_category": "DEADLOCK_INDICATORS", "recipe_id": "DEADLOCK_INDICATORS", "is_benign_explanation": False, "provenance_class": provenance_class},
+            )
+            h2 = InvestigationHypothesis(
+                hypothesis_id=h2_id,
+                investigation_id=investigation_id,
+                title=f"Transient Lock Contention During Handoff ({cycle_desc})",
+                claim=f"Apparent wait cycle ({cycle_desc}) is a transient unstopped sampling artifact during lock handoff.",
+                proposed_mechanism="Non-atomic thread stack sampling observed lock handoff mid-transition.",
+                supporting_evidence_ids=list(supp_ids),
+                confidence=init_conf,
+                confidence_score=init_score,
+                candidate_objects=[cycle_desc],
+                target_threads=list(tids),
+                suggested_observations=[FollowUpObservation.from_dict(disc_obs.to_dict())],
+                validation_status=HYPOTHESIS_STATUS_PROPOSED,
+                target_kind=TARGET_KIND_THREAD,
+                target_identifier=cycle_desc,
+                competing_hypothesis_ids=[h1_id],
+                anomaly_category="DEADLOCK_INDICATORS",
+                provenance={"generator": "DeterministicHypothesisGenerator", "anomaly_category": "DEADLOCK_INDICATORS", "recipe_id": "DEADLOCK_INDICATORS", "is_benign_explanation": True, "provenance_class": provenance_class},
+            )
+            hypotheses.extend([h1, h2])
+
+        # 6. Generic / Additional Deterministic Recipe Candidates (suspicious_objects, invalid_transitions, allocation_anomalies, inaccessible_memory, unexpected_fields, inconsistent_relationships, process_termination)
+        extra_recipe_mappings = [
+            ("suspicious_object_states", "SUSPICIOUS_OBJECT_STATE", "insp_consistency", TARGET_KIND_OBJECT, "consistent_invalid_object_state", "transient_in_flight_update"),
+            ("invalid_state_transitions", "INVALID_STATE_TRANSITIONS", "insp_temporal_diff", TARGET_KIND_COMPARISON, "illegal_state_transition_confirmed", "valid_or_reinitialized_transition"),
+            ("allocation_anomalies", "ALLOCATION_DEALLOCATION_ANOMALIES", "insp_pool", TARGET_KIND_OBJECT, "pool_or_freelist_anomaly_confirmed", "allocation_state_reconciled"),
+            ("inaccessible_memory_candidates", "INACCESSIBLE_MEMORY", "insp_integrity", TARGET_KIND_FIELD, "dangling_or_unmapped_pointer_confirmed", "null_or_validly_mapped_pointer"),
+            ("unexpected_field_values", "UNEXPECTED_FIELD_VALUES", "insp_consistency", TARGET_KIND_FIELD, "consistent_out_of_bounds_field_value", "within_bounds_or_torn_read"),
+            ("inconsistent_relationships", "INCONSISTENT_OBJECT_RELATIONSHIPS", "insp_consistency", TARGET_KIND_OBJECT, "persistent_structural_relationship_mismatch", "concurrent_mutation_settled"),
+            ("process_terminations", "PROCESS_TERMINATION_DURING_INVESTIGATION", "insp_locks", TARGET_KIND_THREAD, "process_terminated_confirmed", "process_alive"),
+        ]
+        for key_name, recipe_id, prof_id, t_kind, pos_cond, neg_cond in extra_recipe_mappings:
+            for item in triage_data.get(key_name, []):
+                expr = item.get("target_expression") or item.get("field_path") or item.get("symbol") or recipe_id.lower()
+                supp_ids = _valid_eids(item.get("evidence_ids", [item.get("evidence_id")] if item.get("evidence_id") else []))
+                r_hash = hashlib.sha256(f"{investigation_id}:{recipe_id}:{expr}".encode("utf-8")).hexdigest()[:8]
+                h1_id = f"hypo_{recipe_id.lower()}_{r_hash}"
+                h2_id = f"hypo_{recipe_id.lower()}_benign_{r_hash}"
+                obs_id = f"obs_disc_{recipe_id.lower()}_{r_hash}"
+                disc_obs = FollowUpObservation(
+                    observation_id=obs_id,
+                    hypothesis_id=h1_id,
+                    tested_hypothesis_ids=[h1_id, h2_id],
+                    profile_id=item.get("follow_up_profile_id", prof_id),
+                    question=f"Does follow-up verification confirm {recipe_id} on '{expr}'?",
+                    why_needed=f"Discriminate {recipe_id} defect ({h1_id}) from benign/transient state ({h2_id}) on '{expr}'.",
+                    target_kind=t_kind,
+                    target_ref={"target_expression": expr, "field_path": expr},
+                    discriminating_criteria=DETERMINISTIC_DIAGNOSTIC_RECIPES[recipe_id]["decision_rules"],
+                    expected_outcomes={pos_cond: "SUPPORTED", neg_cond: "CONTRADICTED"},
+                    expected_outcomes_by_hypothesis={
+                        h1_id: {pos_cond: "SUPPORTED", neg_cond: "CONTRADICTED"},
+                        h2_id: {pos_cond: "CONTRADICTED", neg_cond: "SUPPORTED"},
+                    },
+                    discriminating_power="HIGH",
+                    required_capture_quality="COMPLETE",
+                    safety_constraints=["Read-only verification."],
+                    prerequisites=list(DETERMINISTIC_DIAGNOSTIC_RECIPES[recipe_id]["required_capabilities"]),
+                    risk_level="READ_ONLY",
+                    estimated_cost="LOW",
+                    estimated_bytes=1024,
+                    estimated_latency_ms=10.0,
+                    estimated_samples=1,
+                    estimated_stop_ms=0.0,
+                )
+                h1 = InvestigationHypothesis(
+                    hypothesis_id=h1_id,
+                    investigation_id=investigation_id,
+                    title=f"{recipe_id.replace('_', ' ').title()} in '{expr}'",
+                    claim=f"Runtime anomaly ({recipe_id}) detected on '{expr}'.",
+                    proposed_mechanism=DETERMINISTIC_DIAGNOSTIC_RECIPES[recipe_id]["decision_rules"],
+                    supporting_evidence_ids=list(supp_ids),
+                    confidence=init_conf,
+                    confidence_score=init_score,
+                    candidate_objects=[expr],
+                    candidate_fields=[expr],
+                    suggested_observations=[disc_obs],
+                    validation_status=HYPOTHESIS_STATUS_PROPOSED,
+                    target_kind=t_kind,
+                    target_identifier=expr,
+                    competing_hypothesis_ids=[h2_id],
+                    anomaly_category=recipe_id,
+                    provenance={"generator": "DeterministicHypothesisGenerator", "anomaly_category": recipe_id, "recipe_id": recipe_id, "is_benign_explanation": False, "provenance_class": provenance_class},
+                )
+                h2 = InvestigationHypothesis(
+                    hypothesis_id=h2_id,
+                    investigation_id=investigation_id,
+                    title=f"Transient or Benign State on '{expr}' ({recipe_id})",
+                    claim=f"Observed state on '{expr}' is a transient concurrent read or benign condition.",
+                    proposed_mechanism="Unstopped concurrent read or normal lifecycle transition.",
+                    supporting_evidence_ids=list(supp_ids),
+                    confidence=init_conf,
+                    confidence_score=init_score,
+                    candidate_objects=[expr],
+                    candidate_fields=[expr],
+                    suggested_observations=[FollowUpObservation.from_dict(disc_obs.to_dict())],
+                    validation_status=HYPOTHESIS_STATUS_PROPOSED,
+                    target_kind=t_kind,
+                    target_identifier=expr,
+                    competing_hypothesis_ids=[h1_id],
+                    anomaly_category=recipe_id,
+                    provenance={"generator": "DeterministicHypothesisGenerator", "anomaly_category": recipe_id, "recipe_id": recipe_id, "is_benign_explanation": True, "provenance_class": provenance_class},
+                )
+                hypotheses.extend([h1, h2])
+
         return hypotheses
 
+
+
+# -----------------------------------------------------------------------------
+# Phase 2.0-A.3.7: 10-Dimension Evidence Quality & Confidence Calibration Model
+# -----------------------------------------------------------------------------
+
+EVIDENCE_QUALITY_DIMENSION_DOCS: Dict[str, Dict[str, str]] = {
+    "provenance_trust": {
+        "meaning": "Cryptographic and origin trust of evidence (LIVE_RUNTIME_CAPTURE with verified receipt vs IMPORTED_UNVERIFIED or SYNTHETIC).",
+        "impact": "Caps maximum achievable confidence (<=0.40 for unverified caller claims, <=0.60 for synthetic fixtures, 1.0 ceiling for verified live capture).",
+    },
+    "execution_authenticity": {
+        "meaning": "Whether the observation was independently executed by the production adapter vs simulated or caller-submitted.",
+        "impact": "Simulated or forced outcomes cannot produce production proof or VALIDATED status.",
+    },
+    "observation_completeness": {
+        "meaning": "Completeness of the underlying snapshot or slice read (COMPLETE vs PARTIAL, TRUNCATED, FAILED, or ABSTAIN).",
+        "impact": "PARTIAL observations cap confidence at <=0.55; FAILED/ABSTAIN observations contribute 0.0 positive support.",
+    },
+    "directness_of_observation": {
+        "meaning": "Direct runtime state/field/thread measurement vs static DWARF symbol linkage or indirect inference.",
+        "impact": "Static-only or indirect evidence cannot exceed 0.45 confidence without direct runtime state observation.",
+    },
+    "type_and_identity_compatibility": {
+        "meaning": "Verification that PID, process start_time, GNU Build ID, object address, and C type match the hypothesis target.",
+        "impact": "Incompatible type or mismatched target identity zeroes out support from that observation.",
+    },
+    "temporal_freshness": {
+        "meaning": "Recency of the observation epoch relative to current investigation epoch, process lifetime, and object lifetime.",
+        "impact": "Stale epochs or cross-lifetime observations decay confidence by up to 50% and cap confidence at <=0.50.",
+    },
+    "reproducibility": {
+        "meaning": "Confirmation across multiple temporal epochs or deterministic controlled execution.",
+        "impact": "Required to unlock confidence >0.75 for temporal/leak/transition hypotheses and 0.95 for VALIDATED.",
+    },
+    "independent_corroboration": {
+        "meaning": "Count of genuinely independent evidence clusters (excluding duplicates, derived records, and same-snapshot multi-field reads).",
+        "impact": "Only independent clusters increase corroboration bonus (+0.12 for 2nd independent source, +0.08 for 3rd+).",
+    },
+    "contradictory_evidence": {
+        "meaning": "Presence and quality of counterevidence refuting or challenging the hypothesis.",
+        "impact": "Credible direct counterevidence transitions status to CONTRADICTED (score <=0.20); partial counterevidence reduces and caps confidence (<=0.50).",
+    },
+    "collection_limitations": {
+        "meaning": "Atomicity and collection constraints (ATOMIC_STOPPED / ZERO_STOP_ATOMIC vs NON_ATOMIC or permission restrictions).",
+        "impact": "NON_ATOMIC consistency caps confidence at <=0.55 and prevents VALIDATED promotion.",
+    },
+}
+
+
+@dataclass
+class EvidenceQualityDimensions:
+    """Explicit 10-dimension evidence quality evaluation vector (each in [0.0, 1.0])."""
+    provenance_trust: float = 1.0
+    execution_authenticity: float = 1.0
+    observation_completeness: float = 1.0
+    directness_of_observation: float = 1.0
+    type_and_identity_compatibility: float = 1.0
+    temporal_freshness: float = 1.0
+    reproducibility: float = 0.7
+    independent_corroboration: float = 0.55
+    contradictory_evidence: float = 1.0
+    collection_limitations: float = 1.0
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "provenance_trust": round(float(self.provenance_trust), 3),
+            "execution_authenticity": round(float(self.execution_authenticity), 3),
+            "observation_completeness": round(float(self.observation_completeness), 3),
+            "directness_of_observation": round(float(self.directness_of_observation), 3),
+            "type_and_identity_compatibility": round(float(self.type_and_identity_compatibility), 3),
+            "temporal_freshness": round(float(self.temporal_freshness), 3),
+            "reproducibility": round(float(self.reproducibility), 3),
+            "independent_corroboration": round(float(self.independent_corroboration), 3),
+            "contradictory_evidence": round(float(self.contradictory_evidence), 3),
+            "collection_limitations": round(float(self.collection_limitations), 3),
+        }
+
+
+def evaluate_record_quality_dimensions(
+    rec: EvidenceRecord,
+    reference_epoch: Optional[int] = None,
+    reference_process_identity: Optional[str] = None,
+) -> EvidenceQualityDimensions:
+    """Deterministically score a single EvidenceRecord across the 10 quality dimensions."""
+    d = rec.details or {}
+    p = rec.provenance or {}
+    cq = rec.capture_quality or {}
+    prov_cls = rec.provenance_class
+
+    # 1. Provenance trust
+    if prov_cls in TRUSTED_PROVENANCE_CLASSES and not d.get("caller_submitted") and not d.get("unverified_caller_claim"):
+        prov_trust = 1.0 if (p.get("live_capture_receipt") or p.get("verifier_attestation") or p.get("capture_receipt")) else 0.90
+    elif prov_cls in ("SYNTHETIC", "SYNTHETIC_FIXTURE"):
+        prov_trust = 0.40
+    else:
+        prov_trust = 0.20
+
+    # 2. Execution authenticity
+    is_sim = bool(
+        d.get("is_simulated")
+        or p.get("is_simulated")
+        or d.get("authority_level") in ("TEST", "SYNTHETIC")
+        or p.get("authority_level") in ("TEST", "SYNTHETIC")
+        or any(d.get(k) is not None for k in ("force_failed", "force_error", "force_contradiction", "simulated_outcome"))
+    )
+    if is_sim:
+        exec_auth = 0.25
+    elif d.get("caller_submitted") or d.get("unverified_caller_claim") or rec.source == "unverified_caller":
+        exec_auth = 0.15 if not d.get("independently_verified") else 0.85
+    else:
+        exec_auth = 1.0
+
+    # 3. Observation completeness
+    comp_status = str(cq.get("completeness") or cq.get("status") or d.get("collection_status") or "COMPLETE").upper()
+    if comp_status in ("FAILED", "INVALID", "UNTRUSTED", "ABSTAIN", "UNAVAILABLE"):
+        obs_comp = 0.0
+    elif comp_status in ("PARTIAL", "TRUNCATED", "UNVERIFIED"):
+        obs_comp = 0.55
+    else:
+        obs_comp = 1.0
+
+    # 4. Directness of observation
+    if rec.nature in (NATURE_HYPOTHESIS, NATURE_INFERENCE) or rec.evidence_type in (EVIDENCE_TYPE_HYPOTHESIS, EVIDENCE_TYPE_INFERENCE):
+        directness = 0.20
+    elif rec.evidence_type == EVIDENCE_TYPE_STATIC_LINK or rec.source in ("static_provider", "dwarf_static"):
+        directness = 0.55
+    else:
+        directness = 1.0
+
+    # 5. Type and identity compatibility
+    if d.get("type_compatible") is False or d.get("identity_compatible") is False or p.get("identity_mismatch") is True:
+        type_id_compat = 0.0
+    elif d.get("ambiguous_resolution") is True:
+        type_id_compat = 0.40
+    else:
+        type_id_compat = 1.0
+
+    # 6. Temporal freshness
+    rec_epoch = d.get("capture_epoch", d.get("epoch", (rec.snapshot_ref or {}).get("epoch")))
+    rec_proc_id = (rec.target_identity or {}).get("process_identity") or d.get("process_identity")
+    if d.get("is_stale") is True or d.get("lifetime_expired") is True or d.get("object_freed") is True:
+        temp_fresh = 0.20
+    elif reference_process_identity and rec_proc_id and str(rec_proc_id) != str(reference_process_identity):
+        temp_fresh = 0.10
+    elif reference_epoch is not None and rec_epoch is not None and not isinstance(rec_epoch, bool):
+        epoch_lag = max(0, int(reference_epoch) - int(rec_epoch))
+        if epoch_lag == 0:
+            temp_fresh = 1.0
+        elif epoch_lag == 1:
+            temp_fresh = 0.85
+        elif epoch_lag <= 3:
+            temp_fresh = 0.65
+        else:
+            temp_fresh = 0.35
+    else:
+        temp_fresh = 0.90
+
+    # 7. Reproducibility
+    if p.get("verifier_attestation") or d.get("samples_compared", 1) >= 2 or rec.evidence_type == EVIDENCE_TYPE_COMPARISON:
+        reprod = 1.0
+    elif obs_comp >= 1.0:
+        reprod = 0.75
+    else:
+        reprod = 0.45
+
+    # 10. Collection limitations
+    cons_lvl = str(cq.get("consistency_level") or cq.get("consistency_classification") or d.get("consistency_classification") or "STOPPED").upper()
+    if cons_lvl == "NON_ATOMIC" or d.get("is_non_atomic") is True:
+        coll_lim = 0.50
+    elif comp_status == "PARTIAL":
+        coll_lim = 0.65
+    else:
+        coll_lim = 1.0
+
+    return EvidenceQualityDimensions(
+        provenance_trust=prov_trust,
+        execution_authenticity=exec_auth,
+        observation_completeness=obs_comp,
+        directness_of_observation=directness,
+        type_and_identity_compatibility=type_id_compat,
+        temporal_freshness=temp_fresh,
+        reproducibility=reprod,
+        independent_corroboration=0.55,
+        contradictory_evidence=1.0,
+        collection_limitations=coll_lim,
+    )
+
+
+def classify_evidence_relationship(
+    rec_a: EvidenceRecord,
+    rec_b: EvidenceRecord,
+    ledger: Optional[EvidenceLedger] = None,
+) -> str:
+    """Classify the dependency/correlation relationship between two EvidenceRecords.
+
+    Returns one of:
+    - 'duplicate': Same record, identical semantic digest, or duplicate import of same observation.
+    - 'derived': One record derives from the other via parent_evidence_ids or transitive ancestry.
+    - 'correlated': Multiple fields from the same observation, repeated reads from the same snapshot,
+      or sibling findings derived from the same root observation.
+    - 'contradictory': Opposing outcomes on the same hypothesis or target field.
+    - 'independent': Genuinely independent observations from distinct captures/epochs/tools.
+    """
+    if rec_a.evidence_id == rec_b.evidence_id:
+        return "duplicate"
+
+    da = rec_a.details or {}
+    db = rec_b.details or {}
+
+    # Check contradiction first
+    out_a = da.get("outcome")
+    out_b = db.get("outcome")
+    if (out_a == "SUPPORTED" and out_b == "CONTRADICTED") or (out_a == "CONTRADICTED" and out_b == "SUPPORTED"):
+        return "contradictory"
+
+    # Check duplicate (same semantic_digest, or same normalized observation payload across import paths)
+    sem_a = da.get("semantic_digest")
+    sem_b = db.get("semantic_digest")
+    if sem_a and sem_b and sem_a == sem_b:
+        return "duplicate"
+
+    fo_a = rec_a.field_observation or {}
+    fo_b = rec_b.field_observation or {}
+    fp_a = fo_a.get("field_path") or da.get("field_path")
+    fp_b = fo_b.get("field_path") or db.get("field_path")
+    val_a = fo_a.get("value") if "value" in fo_a else da.get("observed_value")
+    val_b = fo_b.get("value") if "value" in fo_b else db.get("observed_value")
+    snap_a = (rec_a.snapshot_ref or {}).get("snapshot_id") or da.get("snapshot_id")
+    snap_b = (rec_b.snapshot_ref or {}).get("snapshot_id") or db.get("snapshot_id")
+    epoch_a = da.get("capture_epoch", da.get("epoch", (rec_a.snapshot_ref or {}).get("epoch")))
+    epoch_b = db.get("capture_epoch", db.get("epoch", (rec_b.snapshot_ref or {}).get("epoch")))
+
+    # Duplicate import across different paths: same non-empty observation text & field/value at same snapshot/epoch
+    if rec_a.observation and rec_a.observation.strip() == (rec_b.observation or "").strip():
+        if snap_a == snap_b and epoch_a == epoch_b and fp_a == fp_b and val_a == val_b:
+            return "duplicate"
+    if fp_a and fp_b and fp_a == fp_b and val_a is not None and val_a == val_b:
+        if (snap_a and snap_a == snap_b) or (epoch_a is not None and epoch_a == epoch_b):
+            return "duplicate"
+
+    # Check derived (direct or transitive parent_evidence_ids relationship)
+    parents_a = set(rec_a.parent_evidence_ids or [])
+    parents_b = set(rec_b.parent_evidence_ids or [])
+    if rec_a.evidence_id in parents_b or rec_b.evidence_id in parents_a:
+        return "derived"
+
+    if ledger is not None:
+        anc_a: Set[str] = set()
+        stack = list(parents_a)
+        while stack:
+            cur = stack.pop()
+            if cur in anc_a:
+                continue
+            anc_a.add(cur)
+            crec = ledger.get_record(cur)
+            if crec:
+                stack.extend(crec.parent_evidence_ids or [])
+        anc_b: Set[str] = set()
+        stack = list(parents_b)
+        while stack:
+            cur = stack.pop()
+            if cur in anc_b:
+                continue
+            anc_b.add(cur)
+            crec = ledger.get_record(cur)
+            if crec:
+                stack.extend(crec.parent_evidence_ids or [])
+        if rec_a.evidence_id in anc_b or rec_b.evidence_id in anc_a:
+            return "derived"
+        if anc_a and anc_b and (anc_a & anc_b):
+            return "correlated"
+
+    # Check correlated:
+    # 1. Multiple fields from the same underlying observation (same observation_id or batch_id)
+    obs_id_a = da.get("observation_id") or da.get("root_observation_id") or da.get("batch_id")
+    obs_id_b = db.get("observation_id") or db.get("root_observation_id") or db.get("batch_id")
+    if obs_id_a and obs_id_b and obs_id_a == obs_id_b:
+        return "correlated"
+
+    # 2. Repeated reads or multiple fields from the exact same snapshot
+    if snap_a and snap_b and snap_a == snap_b:
+        return "correlated"
+
+    # 3. Shared parent evidence IDs
+    if parents_a and parents_b and (parents_a & parents_b):
+        return "correlated"
+
+    # 4. Same source tool at the exact same capture epoch on the same object
+    if epoch_a is not None and epoch_b is not None and epoch_a == epoch_b and rec_a.source == rec_b.source:
+        obj_a = (rec_a.object_observation or {}).get("object_id") or da.get("object_id")
+        obj_b = (rec_b.object_observation or {}).get("object_id") or db.get("object_id")
+        if obj_a and obj_b and obj_a == obj_b:
+            return "correlated"
+
+    return "independent"
+
+
+def cluster_independent_supporting_evidence(
+    evidence_ids: List[str],
+    ledger: Optional[EvidenceLedger] = None,
+) -> Tuple[List[str], List[str], Dict[str, str]]:
+    """Filter duplicate evidence and group derived/correlated records into independent clusters.
+
+    Returns:
+        (deduped_non_duplicate_ids, independent_cluster_representative_ids, relationship_map)
+    """
+    deduped_ids: List[str] = []
+    independent_rep_ids: List[str] = []
+    rel_map: Dict[str, str] = {}
+    accepted_records: List[EvidenceRecord] = []
+    independent_records: List[EvidenceRecord] = []
+
+    for eid in evidence_ids:
+        if eid in deduped_ids:
+            rel_map[eid] = "duplicate"
+            continue
+        rec = ledger.get_record(eid) if ledger else None
+        if rec is None:
+            deduped_ids.append(eid)
+            independent_rep_ids.append(eid)
+            rel_map[eid] = "independent"
+            continue
+
+        is_dup = False
+        is_derived_or_corr = False
+        rel_type = "independent"
+        for prev_rec in accepted_records:
+            rel = classify_evidence_relationship(prev_rec, rec, ledger=ledger)
+            if rel == "duplicate":
+                is_dup = True
+                rel_type = "duplicate"
+                break
+            elif rel in ("derived", "correlated"):
+                is_derived_or_corr = True
+                rel_type = rel
+
+        rel_map[eid] = rel_type
+        if is_dup:
+            continue
+
+        deduped_ids.append(eid)
+        accepted_records.append(rec)
+        if not is_derived_or_corr:
+            independent_rep_ids.append(eid)
+            independent_records.append(rec)
+
+    return deduped_ids, independent_rep_ids, rel_map
+
+
+# -----------------------------------------------------------------------------
+# Phase 2.0-A.3.8: Deterministic Diagnostic Recipes (All 11 Cases)
+# -----------------------------------------------------------------------------
+
+DETERMINISTIC_DIAGNOSTIC_RECIPES: Dict[str, Dict[str, Any]] = {
+    "BLOCKED_THREADS": {
+        "recipe_id": "BLOCKED_THREADS",
+        "applicability_conditions": ["Thread state is S/D in blocking syscall or futex across triage"],
+        "required_capabilities": ["threads_available"],
+        "candidate_observations": ["insp_locks", "insp_frame_locals"],
+        "observation_budget": {"max_samples": 4, "max_bytes": 65536},
+        "decision_rules": "Compare thread frame locals and progress counters across samples to separate active stall from benign idle wait.",
+        "positive_indicators": ["Thread blocked with pending work and zero progress across epochs"],
+        "counter_indicators": ["Work queue empty or progress counter advancing"],
+        "abstention_conditions": ["Thread table unreadable (EPERM/RESTRICTED)"],
+        "termination_conditions": ["Stall confirmed or benign idle wait confirmed"],
+        "report_requirements": ["TID, blocking function, progress counter delta, competing idle hypothesis"],
+    },
+    "MUTEX_CONTENTION": {
+        "recipe_id": "MUTEX_CONTENTION",
+        "applicability_conditions": ["Multiple threads waiting on the same mutex/futex address"],
+        "required_capabilities": ["threads_available", "memory_read_available"],
+        "candidate_observations": ["insp_locks", "insp_find_owners"],
+        "observation_budget": {"max_samples": 4, "max_bytes": 65536},
+        "decision_rules": "Identify mutex owner TID from futex/pthread_mutex_t word and check whether owner is progressing or stalled.",
+        "positive_indicators": ["Non-null mutex owner TID holding lock while waiters queue without progress"],
+        "counter_indicators": ["Mutex owner actively releasing lock and advancing"],
+        "abstention_conditions": ["Mutex memory unreadable or owner TID cannot be resolved"],
+        "termination_conditions": ["Owner stall confirmed or lock turnover observed"],
+        "report_requirements": ["Mutex address, owner TID, waiter TIDs, owner callstack"],
+    },
+    "DEADLOCK_INDICATORS": {
+        "recipe_id": "DEADLOCK_INDICATORS",
+        "applicability_conditions": ["Wait-for graph contains a cycle (T1 -> L1 -> T2 -> L2 -> T1) or self-deadlock"],
+        "required_capabilities": ["threads_available", "memory_read_available"],
+        "candidate_observations": ["insp_locks", "insp_frame_locals"],
+        "observation_budget": {"max_samples": 3, "max_bytes": 65536},
+        "decision_rules": "Verify circular lock wait graph persists across two consecutive samples.",
+        "positive_indicators": ["Closed cycle in thread-lock dependency graph with zero progress"],
+        "counter_indicators": ["Cycle breaks or lock owner changes between samples"],
+        "abstention_conditions": ["Lock owner fields optimized out or unreadable"],
+        "termination_conditions": ["Persistent wait-for cycle verified across 2 samples"],
+        "report_requirements": ["Cycle participants (TIDs and lock addresses), stack frames"],
+    },
+    "MEMORY_GROWTH": {
+        "recipe_id": "MEMORY_GROWTH",
+        "applicability_conditions": ["High pool/heap utilization or growing allocation count"],
+        "required_capabilities": ["memory_read_available", "symbol_resolution"],
+        "candidate_observations": ["insp_pool", "insp_temporal_diff", "insp_find_owners"],
+        "observation_budget": {"max_samples": 6, "max_bytes": 262144},
+        "decision_rules": "Single snapshot cannot confirm leak; require >=2 temporal samples showing monotonic growth plus orphan/owner check.",
+        "positive_indicators": ["Monotonic allocation growth across >=2 epochs with unreferenced/orphaned blocks"],
+        "counter_indicators": ["Allocation count stabilizes, decreases, or all blocks have active owners"],
+        "abstention_conditions": ["Only 1 sample available or heap/pool unreadable"],
+        "termination_conditions": ["Multi-sample growth + orphan status resolved"],
+        "report_requirements": ["Allocation delta across epochs, orphan count, owner thread/global references"],
+    },
+    "SUSPICIOUS_OBJECT_STATE": {
+        "recipe_id": "SUSPICIOUS_OBJECT_STATE",
+        "applicability_conditions": ["Object state enum, magic header, or invariant flags violate domain constraints"],
+        "required_capabilities": ["memory_read_available", "symbol_resolution"],
+        "candidate_observations": ["insp_integrity", "insp_consistency"],
+        "observation_budget": {"max_samples": 3, "max_bytes": 32768},
+        "decision_rules": "Perform seqlock double-read consistency check to rule out torn concurrent read before confirming corrupted/invalid object state.",
+        "positive_indicators": ["Consistent double-read confirms invalid state enum or corrupted magic field"],
+        "counter_indicators": ["Double-read detects transient in-flight mutation that resolves to valid state"],
+        "abstention_conditions": ["Object address unmapped or symbol missing"],
+        "termination_conditions": ["Consistent invalid state confirmed or transient torn read identified"],
+        "report_requirements": ["Object symbol/address, observed field values, consistency check result"],
+    },
+    "INVALID_STATE_TRANSITIONS": {
+        "recipe_id": "INVALID_STATE_TRANSITIONS",
+        "applicability_conditions": ["State machine or monotonic counter transitions to an illegal successor state across epochs"],
+        "required_capabilities": ["memory_read_available", "symbol_resolution"],
+        "candidate_observations": ["insp_temporal_diff", "insp_consistency"],
+        "observation_budget": {"max_samples": 4, "max_bytes": 32768},
+        "decision_rules": "Verify both baseline and current observations share process/object identity and complete consistency, then check transition validity.",
+        "positive_indicators": ["Verified state transition from S_before to S_after violates state invariant or regresses monotonic seq"],
+        "counter_indicators": ["Transition follows valid state graph or PID/object was legitimately reinitialized"],
+        "abstention_conditions": ["Baseline or current snapshot incomplete/non-atomic"],
+        "termination_conditions": ["Transition legality determined across verified epochs"],
+        "report_requirements": ["Before/after state values, epochs, candidate writer functions"],
+    },
+    "ALLOCATION_DEALLOCATION_ANOMALIES": {
+        "recipe_id": "ALLOCATION_DEALLOCATION_ANOMALIES",
+        "applicability_conditions": ["Pool freelist cycle, double-free marker, use-after-free poison pattern, or active_count != allocated slots"],
+        "required_capabilities": ["memory_read_available", "symbol_resolution"],
+        "candidate_observations": ["insp_pool", "insp_integrity"],
+        "observation_budget": {"max_samples": 3, "max_bytes": 131072},
+        "decision_rules": "Cross-check pool slot headers against freelist and active reference pointers.",
+        "positive_indicators": ["Freed slot referenced by live pointer, duplicate slot in freelist, or poisoned header in active slot"],
+        "counter_indicators": ["Slot accounting reconciles after quiescent double-read"],
+        "abstention_conditions": ["Pool base pointer NULL or unmapped"],
+        "termination_conditions": ["Slot/freelist integrity verified or corruption confirmed"],
+        "report_requirements": ["Pool expression, anomalous slot indices/addresses, reference holders"],
+    },
+    "INACCESSIBLE_MEMORY": {
+        "recipe_id": "INACCESSIBLE_MEMORY",
+        "applicability_conditions": ["Pointer targets unmapped VMA, guard page (---p), or permission-restricted address"],
+        "required_capabilities": ["memory_read_available"],
+        "candidate_observations": ["insp_integrity", "insp_consistency"],
+        "observation_budget": {"max_samples": 2, "max_bytes": 16384},
+        "decision_rules": "Distinguish permission restriction (EPERM -> ABSTAIN) from genuine unmapped/dangling pointer in readable process.",
+        "positive_indicators": ["Process memory is readable, double-read confirms non-null pointer targets unmapped/guard VMA"],
+        "counter_indicators": ["Pointer was NULL/uninitialized during startup or target VMA is newly mapped"],
+        "abstention_conditions": ["Process-wide EPERM/EACCES on /proc/<pid>/mem or process_vm_readv"],
+        "termination_conditions": ["Dangling/unmapped pointer confirmed or permission abstention recorded"],
+        "report_requirements": ["Pointer expression, target address, /proc/<pid>/maps coverage status"],
+    },
+    "UNEXPECTED_FIELD_VALUES": {
+        "recipe_id": "UNEXPECTED_FIELD_VALUES",
+        "applicability_conditions": ["Field value out of expected range, NaN/Inf, negative count, or sentinel violation"],
+        "required_capabilities": ["memory_read_available", "symbol_resolution"],
+        "candidate_observations": ["insp_consistency", "insp_temporal_diff"],
+        "observation_budget": {"max_samples": 3, "max_bytes": 16384},
+        "decision_rules": "Verify unique DWARF field resolution, type compatibility, and consistent read before confirming out-of-bounds value.",
+        "positive_indicators": ["Uniquely resolved typed field holds out-of-range value across consistent reads"],
+        "counter_indicators": ["Value is within valid range or was a torn concurrent read"],
+        "abstention_conditions": ["Ambiguous field name or missing DWARF type info"],
+        "termination_conditions": ["Consistent field value verified against expected bounds"],
+        "report_requirements": ["Field path, C type, observed value, expected bounds"],
+    },
+    "INCONSISTENT_OBJECT_RELATIONSHIPS": {
+        "recipe_id": "INCONSISTENT_OBJECT_RELATIONSHIPS",
+        "applicability_conditions": ["Bidirectional pointer mismatch (parent->child->parent != parent) or container size != linked node count"],
+        "required_capabilities": ["memory_read_available", "symbol_resolution"],
+        "candidate_observations": ["insp_consistency", "insp_integrity"],
+        "observation_budget": {"max_samples": 3, "max_bytes": 65536},
+        "decision_rules": "Perform consistent double-read of linked objects to distinguish mid-update skew from structural invariant breakage.",
+        "positive_indicators": ["Stable snapshot / zero-skew double-read shows broken back-pointer or count/list mismatch"],
+        "counter_indicators": ["Seqlock/double-read detects concurrent update that settles to consistent links"],
+        "abstention_conditions": ["Intermediate node pointer unmapped or traversal depth exceeded"],
+        "termination_conditions": ["Relationship invariant verified or structural inconsistency confirmed"],
+        "report_requirements": ["Parent/child expressions, observed addresses/counts, skew status"],
+    },
+    "PROCESS_TERMINATION_DURING_INVESTIGATION": {
+        "recipe_id": "PROCESS_TERMINATION_DURING_INVESTIGATION",
+        "applicability_conditions": ["Target PID exits (ESRCH) or becomes zombie (State Z) mid-investigation"],
+        "required_capabilities": [],
+        "candidate_observations": [],
+        "observation_budget": {"max_samples": 1, "max_bytes": 0},
+        "decision_rules": "Immediately halt further live reads, preserve all previously verified evidence in ledger, record terminal process state, and conclude without fabricating post-exit observations.",
+        "positive_indicators": ["check_liveness returns ESRCH or zombie state after initial validation"],
+        "counter_indicators": ["Process remains alive and responsive"],
+        "abstention_conditions": ["Subsequent observations after process exit must be marked ABSTAIN (TARGET_TERMINATED)"],
+        "termination_conditions": ["Immediate clean termination of live observation loop upon target exit"],
+        "report_requirements": ["Last verified epoch before exit, preserved findings, explicit TARGET_TERMINATED limitation"],
+    },
+}
 
 # -----------------------------------------------------------------------------
 # Pluggable LLM & External Hypothesis Sanitization
@@ -2207,14 +2842,27 @@ class HypothesisValidator:
         new_is_duplicate = False
         trigger_eid = None
         is_inconclusive = False
+        is_abstained_obs = False
         if new_evidence:
             trigger_eid = new_evidence.evidence_id
+            nd = new_evidence.details or {}
+            if (
+                nd.get("collection_status") in ("FAILED", "ABSTAIN")
+                or nd.get("outcome") == "ABSTAIN"
+                or nd.get("result_category") in ("OBSERVATION_FAILED", "OBSERVATION_UNAVAILABLE", "BUDGET_REJECTED")
+            ):
+                is_abstained_obs = True
+                if new_evidence.evidence_id not in hypothesis.abstained_evidence_ids:
+                    hypothesis.abstained_evidence_ids.append(new_evidence.evidence_id)
+
             existing_ids = list(dict.fromkeys(hypothesis.supporting_evidence_ids + hypothesis.contradicting_evidence_ids))
             existing = [ledger.get_record(e) for e in existing_ids if ledger.get_record(e)]
             if cls.is_duplicate_evidence(ledger, new_evidence, existing):
                 new_is_duplicate = True
 
-            if not _is_valid_observational_evidence(new_evidence, allow_missing_in_ledger=False):
+            if is_abstained_obs:
+                is_inconclusive = True
+            elif not _is_valid_observational_evidence(new_evidence, allow_missing_in_ledger=False):
                 is_inconclusive = True
             elif not new_is_duplicate and not cycle_found and not prov_error:
                 is_contradiction = False
@@ -2240,6 +2888,8 @@ class HypothesisValidator:
                 is_inconclusive = (
                     specific_outcome in ("INCONCLUSIVE", "UNKNOWN", "ABSTAIN")
                     or (not specific_outcome and ("inconclusive" in obs_text or "insufficient" in obs_text))
+                    or (specific_outcome is None and details.get("stage") == "FOLLOW_UP")
+                    or (specific_outcome is None and details.get("require_explicit_outcome") is True)
                 )
 
                 if is_contradiction:
@@ -2249,7 +2899,8 @@ class HypothesisValidator:
                         if pid and pid not in hypothesis.contradicting_evidence_ids and _is_valid_observational_evidence(ledger.get_record(pid)):
                             hypothesis.contradicting_evidence_ids.append(pid)
                 elif is_inconclusive:
-                    pass
+                    if new_evidence.evidence_id not in hypothesis.inconclusive_evidence_ids:
+                        hypothesis.inconclusive_evidence_ids.append(new_evidence.evidence_id)
                 else:
                     if new_evidence.evidence_id not in hypothesis.supporting_evidence_ids:
                         hypothesis.supporting_evidence_ids.append(new_evidence.evidence_id)
@@ -2311,6 +2962,10 @@ class HypothesisValidator:
             new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
             new_conf = CONFIDENCE_LOW
             reason = "Supporting evidence originates from FAILED, INVALID, or missing capture quality; cannot support hypothesis."
+        elif new_evidence and is_inconclusive and (new_evidence.details or {}).get("stage") == "FOLLOW_UP" and supp_count <= 1:
+            new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+            new_conf = CONFIDENCE_LOW
+            reason = "Discriminating follow-up observation returned inconclusive evidence; competing hypotheses remain unresolved."
         elif supp_count > 0:
             proof_valid, proof_msg, proof_rec = cls.verify_causal_proof(
                 hypothesis,
@@ -2430,18 +3085,114 @@ class HypothesisValidator:
                     f"{hypothesis.confidence_rationale or ''} (Confidence capped at {new_conf} due to PARTIAL capture quality)"
                 ).strip()
 
-        # Calibrate numeric confidence_score deterministically to [0.05, 0.95]
+        # Phase 2.0-A.3.7: Multi-dimensional evidence quality & correlation-aware confidence calibration
+        old_conf_score = float(getattr(hypothesis, "confidence_score", 0.40) or 0.40)
+        _, indep_supp_ids, supp_rel_map = cluster_independent_supporting_evidence(hypothesis.supporting_evidence_ids, ledger)
+        indep_supp_count = len(indep_supp_ids)
+
+        # Evaluate partial vs direct counterevidence
+        all_contra_partial = False
+        if contra_count > 0 and supp_count > 0:
+            contra_recs = [ledger.get_record(cid) for cid in hypothesis.contradicting_evidence_ids if ledger.get_record(cid)]
+            if contra_recs and all(
+                (cr.details or {}).get("counterevidence_strength") == "PARTIAL"
+                or (cr.details or {}).get("partial_counterevidence") is True
+                for cr in contra_recs
+            ):
+                all_contra_partial = True
+                new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+                new_conf = CONFIDENCE_LOW
+                reason = f"Supported by {supp_count} observation(s) but challenged by {contra_count} partial counterevidence record(s); capped at INCONCLUSIVE."
+
+        # Aggregate 10-dimension quality vector across supporting evidence
+        supp_recs = [ledger.get_record(eid) for eid in indep_supp_ids if ledger.get_record(eid)]
+        if supp_recs:
+            q_vecs = [evaluate_record_quality_dimensions(r) for r in supp_recs]
+            n_q = float(len(q_vecs))
+            agg_q = EvidenceQualityDimensions(
+                provenance_trust=sum(v.provenance_trust for v in q_vecs) / n_q,
+                execution_authenticity=sum(v.execution_authenticity for v in q_vecs) / n_q,
+                observation_completeness=min(v.observation_completeness for v in q_vecs),
+                directness_of_observation=max(v.directness_of_observation for v in q_vecs),
+                type_and_identity_compatibility=min(v.type_and_identity_compatibility for v in q_vecs),
+                temporal_freshness=min(v.temporal_freshness for v in q_vecs),
+                reproducibility=max(v.reproducibility for v in q_vecs),
+                independent_corroboration=min(1.0, 0.55 + 0.22 * max(0, indep_supp_count - 1)) if indep_supp_count > 0 else 0.0,
+                contradictory_evidence=1.0 if contra_count == 0 else (0.50 if all_contra_partial else 0.05),
+                collection_limitations=min(v.collection_limitations for v in q_vecs),
+            )
+        else:
+            agg_q = EvidenceQualityDimensions(
+                provenance_trust=0.5,
+                execution_authenticity=0.5,
+                observation_completeness=0.0,
+                directness_of_observation=0.0,
+                type_and_identity_compatibility=1.0,
+                temporal_freshness=1.0,
+                reproducibility=0.0,
+                independent_corroboration=0.0,
+                contradictory_evidence=1.0 if contra_count == 0 else 0.05,
+                collection_limitations=1.0 if not (has_partial_evidence or has_non_atomic_evidence) else 0.5,
+            )
+
+        hypothesis.quality_breakdown = {
+            "dimensions": agg_q.to_dict(),
+            "total_supporting_records": supp_count,
+            "independent_supporting_clusters": indep_supp_count,
+            "contradicting_records": contra_count,
+            "abstained_records": len(hypothesis.abstained_evidence_ids),
+            "relationships": supp_rel_map,
+        }
+
         if new_status == HYPOTHESIS_STATUS_VALIDATED:
             hypothesis.confidence_score = 0.95
         elif new_status == HYPOTHESIS_STATUS_CONTRADICTED:
-            hypothesis.confidence_score = round(max(0.05, 0.20 * (supp_count / float(max(1, supp_count + contra_count * 2)))), 3)
+            hypothesis.confidence_score = round(max(0.05, 0.20 * (indep_supp_count / float(max(1, indep_supp_count + contra_count * 2)))), 3)
+        elif all_contra_partial:
+            hypothesis.confidence_score = round(min(0.45, max(0.20, 0.50 - 0.10 * contra_count)), 3)
         elif new_status == HYPOTHESIS_STATUS_SUPPORTED:
-            base_c = min(0.85, 0.50 + 0.15 * min(supp_count, 3))
-            if has_partial_evidence or has_non_atomic_evidence:
+            # Base score from first independent cluster weighted by quality
+            q_mult = (
+                0.30 * agg_q.provenance_trust
+                + 0.25 * agg_q.execution_authenticity
+                + 0.20 * agg_q.observation_completeness
+                + 0.15 * agg_q.directness_of_observation
+                + 0.10 * agg_q.temporal_freshness
+            )
+            base_c = 0.40 + 0.25 * q_mult + 0.10 * min(max(0, indep_supp_count - 1), 2)
+            # Apply deterministic caps for degraded dimensions
+            if agg_q.provenance_trust <= 0.25 or agg_q.execution_authenticity <= 0.20:
+                base_c = min(base_c, 0.45)
+            elif agg_q.provenance_trust <= 0.45 or agg_q.execution_authenticity <= 0.30:
+                base_c = min(base_c, 0.58)
+            if agg_q.directness_of_observation <= 0.60 and indep_supp_count <= 1:
+                base_c = min(base_c, 0.48)
+            if agg_q.temporal_freshness <= 0.40:
+                base_c = min(base_c, 0.48)
+            if has_partial_evidence or has_non_atomic_evidence or agg_q.collection_limitations < 0.70:
                 base_c = min(base_c, 0.55)
-            hypothesis.confidence_score = round(base_c, 3)
+            hypothesis.confidence_score = round(min(0.85, max(0.20, base_c)), 3)
         else:
-            hypothesis.confidence_score = 0.25 if new_status == HYPOTHESIS_STATUS_INCONCLUSIVE else 0.40
+            if is_abstained_obs and supp_count == 0 and contra_count == 0:
+                # Zero confidence increase from ABSTAIN observations
+                hypothesis.confidence_score = round(min(old_conf_score, 0.25 if new_status == HYPOTHESIS_STATUS_INCONCLUSIVE else 0.35), 3)
+            else:
+                hypothesis.confidence_score = 0.25 if new_status in (HYPOTHESIS_STATUS_INCONCLUSIVE, HYPOTHESIS_STATUS_ABSTAINED) else 0.35
+
+        # Record auditable confidence transition explanation
+        if round(hypothesis.confidence_score, 3) != round(old_conf_score, 3) or new_status != old_status:
+            hypothesis.confidence_history.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "from_status": old_status,
+                "to_status": new_status,
+                "from_score": round(old_conf_score, 3),
+                "to_score": round(hypothesis.confidence_score, 3),
+                "trigger_evidence_id": trigger_eid,
+                "independent_clusters": indep_supp_count,
+                "contradicting_count": contra_count,
+                "quality_dimensions": agg_q.to_dict(),
+                "rationale": reason,
+            })
 
         status_changed = (new_status != old_status) or (new_conf != old_conf)
         hypothesis.validation_status = new_status

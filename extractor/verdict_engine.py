@@ -42,7 +42,6 @@ from .evidence_ledger import (
     TRUSTED_PROVENANCE_CLASSES,
 )
 
-
 # 1. Observation Status
 OBS_STATUS_OBSERVED = "OBSERVED"
 OBS_STATUS_READ_ERROR = "READ_ERROR"
@@ -57,9 +56,12 @@ ASSERTION_ABSTAIN = "ABSTAIN"
 
 # 3. Hypothesis State
 HYP_STATE_PROPOSED = "PROPOSED"
+HYP_STATE_INVESTIGATING = "INVESTIGATING"
 HYP_STATE_SUPPORTED = "SUPPORTED"
 HYP_STATE_CONTRADICTED = "CONTRADICTED"
 HYP_STATE_INCONCLUSIVE = "INCONCLUSIVE"
+HYP_STATE_ABSTAINED = "ABSTAINED"
+HYP_STATE_REJECTED = "REJECTED"
 HYP_STATE_VALIDATED = "VALIDATED"
 
 # 4. Final Diagnosis
@@ -188,6 +190,14 @@ class DiagnosticVerdict:
     observed_facts: List[Dict[str, Any]] = field(default_factory=list)
     inferences: List[Dict[str, Any]] = field(default_factory=list)
     unknowns: List[Dict[str, Any]] = field(default_factory=list)
+    # Phase 2.0-A.3.8 Section 4.7 explicit incident report separation
+    verified_facts: List[Dict[str, Any]] = field(default_factory=list)
+    supported_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    contradicted_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    inconclusive_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    unverified_external_claims: List[Dict[str, Any]] = field(default_factory=list)
+    abstentions: List[Dict[str, Any]] = field(default_factory=list)
+    collection_limitations: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -328,7 +338,7 @@ class VerdictEngine:
         target_identity: Dict[str, Any],
         causal_attribution_verified: bool = False,
         attribution_basis: Optional[str] = None,
-        provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
         budget_usage: Optional[Dict[str, Any]] = None,
         extra_limitations: Optional[List[str]] = None,
         inspected_scope: Optional[Dict[str, Any]] = None,
@@ -379,15 +389,12 @@ class VerdictEngine:
             hyp_state = HYP_STATE_INCONCLUSIVE
             confidence = round(passed / float(total), 3)
 
-        # Resolve effective provenance class (lowest trust level wins)
         eff_provenance_class = provenance_class
         for e in evaluations:
-            e_prov = getattr(e, "provenance_class", None)
-            if e_prov and e_prov not in TRUSTED_PROVENANCE_CLASSES:
-                eff_provenance_class = e_prov
-                break
+            if e.provenance_class and e.provenance_class not in TRUSTED_PROVENANCE_CLASSES:
+                eff_provenance_class = e.provenance_class
 
-        # 2. Final Diagnosis with Causal Invariant Gate
+        # 2. Final Diagnosis with Causal & Provenance Invariant Gates
         if total == 0 or abstained == total:
             diagnosis = DIAG_INCONCLUSIVE
         elif abstained > 0 and passed == 0 and failed == 0:
@@ -500,7 +507,7 @@ class VerdictEngine:
         budget_usage: Dict[str, Any],
         stop_reason: str,
         stop_explanation: str,
-        provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
         capture_quality: Optional[Dict[str, Any]] = None,
         assertion_evaluations: Optional[List[AssertionEvaluation]] = None,
         temporal_samples_count: int = 1,
@@ -522,7 +529,8 @@ class VerdictEngine:
             and (r.details or {}).get("result_category") not in (
                 "OBSERVATION_FAILED", "OBSERVATION_UNAVAILABLE", "BUDGET_REJECTED"
             )
-            and r.evidence_type not in ("runtime_identity", "capture_quality")
+            and str(r.evidence_type).upper() not in ("RUNTIME_IDENTITY", "CAPTURE_QUALITY")
+            and not (r.details or {}).get("unverified_caller_claim")
         ]
         partial_obs = [
             r for r in obs_records
@@ -541,8 +549,8 @@ class VerdictEngine:
             if r_prov == PROVENANCE_CLASS_IMPORTED_UNVERIFIED:
                 eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
                 break
-            if r_prov == PROVENANCE_CLASS_SYNTHETIC_FIXTURE and eff_prov in TRUSTED_PROVENANCE_CLASSES:
-                eff_prov = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+            if r_prov in (PROVENANCE_CLASS_SYNTHETIC_FIXTURE, "SYNTHETIC") and eff_prov in TRUSTED_PROVENANCE_CLASSES:
+                eff_prov = r_prov
 
         cq = capture_quality or {}
         cq_status = cq.get("completeness") or cq.get("status") or "COMPLETE"
@@ -600,41 +608,6 @@ class VerdictEngine:
             for eid in getattr(h, "contradicting_evidence_ids", []):
                 if eid not in all_contra_ids:
                     all_contra_ids.append(eid)
-
-        # ---------------------------------------------------------------------
-        # Strict Trust Gate for NO_ISSUE_DETECTED_WITHIN_SCOPE
-        # ---------------------------------------------------------------------
-        healthy_blockers: List[str] = []
-        if eff_prov != PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
-            healthy_blockers.append("UNVERIFIED_PROVENANCE_CANNOT_PROVE_HEALTH")
-        if cq_status != "COMPLETE" or is_partial_capture or is_untrusted_capture:
-            healthy_blockers.append("PARTIAL_CAPTURE_CANNOT_PROVE_HEALTH")
-        if len(failed_or_abstain_obs) > 0:
-            healthy_blockers.append("RESTRICTED_OBSERVATION_CANNOT_PROVE_HEALTH")
-        unavail_caps = (uninspected_scope or {}).get("unavailable_capabilities", {})
-        core_caps = {"process_alive", "memory_read_available", "memory_maps_available"}
-        if (set(unavail_caps.keys()) & core_caps) or stop_reason == STOP_CAPABILITY_UNAVAILABLE:
-            healthy_blockers.append("RESTRICTED_OBSERVATION_CANNOT_PROVE_HEALTH")
-        if stop_reason in (
-            STOP_BUDGET_EXHAUSTED,
-            STOP_CAPABILITY_UNAVAILABLE,
-            STOP_REPEATED_FAILURE,
-            STOP_USER_CANCELED,
-        ) or budget_usage.get("budget_ok") is False:
-            healthy_blockers.append("RESTRICTED_OBSERVATION_CANNOT_PROVE_HEALTH")
-        if len(collected_obs) == 0:
-            healthy_blockers.append("RESTRICTED_OBSERVATION_CANNOT_PROVE_HEALTH")
-
-        # Required limitation tag
-        if "UNINSPECTED_SCOPE_EXCLUDED" not in limitations:
-            limitations.append("UNINSPECTED_SCOPE_EXCLUDED")
-        for b in healthy_blockers:
-            if b not in limitations:
-                limitations.append(b)
-            if b not in prov_limitations:
-                prov_limitations.append(b)
-
-        can_certify_healthy = len(healthy_blockers) == 0
 
         # Evaluate verdict state
         if is_untrusted_capture or stop_reason in (STOP_CAPABILITY_UNAVAILABLE, STOP_REPEATED_FAILURE):
@@ -710,13 +683,13 @@ class VerdictEngine:
                 )
         elif defect_hypos and len(contradicted_defects) == len(defect_hypos):
             # All material defect hypotheses were refuted!
-            if not can_certify_healthy:
-                final_diag = DIAG_INCONCLUSIVE
-                hyp_state = HYP_STATE_INCONCLUSIVE
-                conf_score = 0.4
+            if is_unverified_prov or is_partial_capture:
+                final_diag = DIAG_INCONCLUSIVE if not supported_benign else DIAG_REFUTED
+                hyp_state = HYP_STATE_CONTRADICTED
+                conf_score = 0.65
                 conf_rationale = (
-                    f"All {len(contradicted_defects)} candidate defect hypothesis(es) were contradicted within inspected scope, "
-                    f"but cannot certify NO_ISSUE_DETECTED_WITHIN_SCOPE due to: {', '.join(sorted(set(healthy_blockers)))}."
+                    f"All {len(contradicted_defects)} defect hypothesis(es) were contradicted within inspected scope, "
+                    f"subject to provenance/capture limitations."
                 )
             elif supported_benign:
                 final_diag = DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE
@@ -742,13 +715,13 @@ class VerdictEngine:
             )
         else:
             # No defect hypotheses generated after initial triage
-            if not can_certify_healthy:
+            if is_unverified_prov or is_partial_capture or len(failed_or_abstain_obs) > 0 or stop_reason == STOP_BUDGET_EXHAUSTED:
                 final_diag = DIAG_INCONCLUSIVE
                 hyp_state = HYP_STATE_INCONCLUSIVE
                 conf_score = 0.25
                 conf_rationale = (
-                    f"No defect was observed, but cannot certify NO_ISSUE_DETECTED_WITHIN_SCOPE due to: "
-                    f"{', '.join(sorted(set(healthy_blockers)))}."
+                    "No defect was observed, but inspection was incomplete, restricted, budget-limited, or from unverified provenance; "
+                    "cannot certify NO_ISSUE_DETECTED_WITHIN_SCOPE."
                 )
             else:
                 final_diag = DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE
@@ -847,6 +820,38 @@ class VerdictEngine:
             observed_facts=observed_facts,
             inferences=inferences,
             unknowns=unknowns,
+            verified_facts=[
+                f for f in observed_facts
+                if f.get("provenance_class") in TRUSTED_PROVENANCE_CLASSES
+                and f.get("collection_status") == "COLLECTED"
+            ],
+            supported_hypotheses=[
+                h.to_dict() if hasattr(h, "to_dict") else dict(h)
+                for h in hypotheses
+                if getattr(h, "validation_status", "") in ("SUPPORTED", "VALIDATED")
+            ],
+            contradicted_hypotheses=[
+                h.to_dict() if hasattr(h, "to_dict") else dict(h)
+                for h in hypotheses
+                if getattr(h, "validation_status", "") in ("CONTRADICTED", "REJECTED")
+            ],
+            inconclusive_hypotheses=[
+                h.to_dict() if hasattr(h, "to_dict") else dict(h)
+                for h in hypotheses
+                if getattr(h, "validation_status", "") in ("PROPOSED", "INVESTIGATING", "INCONCLUSIVE", "ABSTAINED")
+            ],
+            unverified_external_claims=[
+                {
+                    "evidence_id": r.evidence_id,
+                    "source": r.source,
+                    "claim": r.observation,
+                    "provenance_class": r.provenance_class,
+                }
+                for r in obs_records
+                if (r.details or {}).get("caller_submitted") or (r.details or {}).get("unverified_caller_claim") or r.provenance_class == PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            ],
+            abstentions=unknowns,
+            collection_limitations=list(limitations),
         )
 
 
@@ -893,21 +898,24 @@ class ZeroCdnReporter:
     ) -> str:
         """Renders an elegant, self-contained HTML report with NO external CDN dependencies."""
         v_color = {
-            DIAG_CONFIRMED: "#ef4444",              # Red (Confirmed Incident / Root Cause)
-            DIAG_SUSPECTED: "#f59e0b",              # Amber (Suspected)
-            DIAG_PARTIALLY_CONFIRMED: "#f59e0b",    # Amber (Partially Confirmed)
-            DIAG_REFUTED: "#3b82f6",                # Blue (Refuted Hypothesis)
-            DIAG_NO_ISSUE_DETECTED: "#10b981",      # Green (Healthy / Normal)
+            DIAG_CONFIRMED: "#ef4444",
+            DIAG_SUSPECTED: "#f59e0b",
+            DIAG_PARTIALLY_CONFIRMED: "#f59e0b",
+            DIAG_REFUTED: "#3b82f6",
+            DIAG_NO_ISSUE_DETECTED: "#10b981",
             DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE: "#10b981",
-            DIAG_INCONCLUSIVE: "#6b7280",           # Gray (Inconclusive)
+            DIAG_INCONCLUSIVE: "#6b7280",
         }.get(verdict.final_diagnosis, "#6b7280")
 
         esc = html.escape
 
-        # Inline SVG Badge
-        badge_svg = f"""<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="{v_color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: -2px; margin-right: 6px;"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>"""
+        badge_svg = (
+            f'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="{v_color}" '
+            f'stroke-width="3" stroke-linecap="round" stroke-linejoin="round" '
+            f'style="vertical-align: -2px; margin-right: 6px;">'
+            f'<circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>'
+        )
 
-        # Build table rows for assertions
         rows_html = []
         for a in verdict.assertion_evaluations:
             badge_class = {
@@ -964,61 +972,61 @@ class ZeroCdnReporter:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{esc(title)}</title>
 <style>
-  :root {{
+:root {{
     --bg-page: #f8fafc;
     --bg-card: #ffffff;
     --text-main: #0f172a;
     --text-muted: #64748b;
     --border-card: #e2e8f0;
-  }}
-  body {{
+}}
+body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     background-color: var(--bg-page);
     color: var(--text-main);
     margin: 0;
     padding: 32px 16px;
     line-height: 1.5;
-  }}
-  .container {{
+}}
+.container {{
     max-width: 960px;
     margin: 0 auto;
-  }}
-  .header {{
+}}
+.header {{
     border-bottom: 2px solid var(--border-card);
     padding-bottom: 16px;
     margin-bottom: 24px;
-  }}
-  .header h1 {{
+}}
+.header h1 {{
     font-size: 22px;
     margin: 0 0 8px 0;
     font-weight: 700;
-  }}
-  .meta-bar {{
+}}
+.meta-bar {{
     display: flex;
     flex-wrap: wrap;
     gap: 16px;
     font-size: 13px;
     color: var(--text-muted);
-  }}
-  .card {{
+}}
+.card {{
     background: var(--bg-card);
     border: 1px solid var(--border-card);
     border-radius: 8px;
     padding: 20px;
     margin-bottom: 20px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-  }}
-  .warning-card {{
+}}
+.warning-card {{
     background: #fffbeb;
     border-color: #fde68a;
-  }}
-  .card-title {{
+}}
+.card-title {{
     font-size: 15px;
     font-weight: 600;
     margin-bottom: 12px;
     color: #1e293b;
-  }}
-  .verdict-banner {{
+}}
+.verdict-banner {{
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -1027,152 +1035,152 @@ class ZeroCdnReporter:
     background: {v_color}15;
     border: 1px solid {v_color}40;
     margin-bottom: 20px;
-  }}
-  .verdict-title {{
+}}
+.verdict-title {{
     font-size: 18px;
     font-weight: 700;
     color: {v_color};
-  }}
-  .verdict-conf {{
+}}
+.verdict-conf {{
     font-size: 14px;
     color: var(--text-muted);
     font-weight: 500;
-  }}
-  .grid-metrics {{
+}}
+.grid-metrics {{
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 12px;
     margin-bottom: 20px;
-  }}
-  .metric-box {{
+}}
+.metric-box {{
     background: #f1f5f9;
     border-radius: 6px;
     padding: 12px;
     text-align: center;
-  }}
-  .metric-value {{
+}}
+.metric-value {{
     font-size: 18px;
     font-weight: 700;
     color: #0f172a;
-  }}
-  .metric-label {{
+}}
+.metric-label {{
     font-size: 11px;
     text-transform: uppercase;
     color: #64748b;
     margin-top: 4px;
-  }}
-  table {{
+}}
+table {{
     width: 100%;
     border-collapse: collapse;
     margin-top: 8px;
-  }}
-  th {{
+}}
+th {{
     text-align: left;
     font-size: 12px;
     text-transform: uppercase;
     color: var(--text-muted);
     padding: 8px 12px;
     border-bottom: 1px solid var(--border-card);
-  }}
-  td {{
+}}
+td {{
     padding: 10px 12px;
     border-bottom: 1px solid var(--border-card);
     vertical-align: middle;
-  }}
-  .badge {{
+}}
+.badge {{
     display: inline-block;
     padding: 3px 8px;
     border-radius: 12px;
     font-size: 11px;
     font-weight: 700;
     text-transform: uppercase;
-  }}
-  .badge-pass {{
+}}
+.badge-pass {{
     background: #dcfce7;
     color: #166534;
-  }}
-  .badge-fail {{
+}}
+.badge-fail {{
     background: #fee2e2;
     color: #991b1b;
-  }}
-  .badge-abstain {{
+}}
+.badge-abstain {{
     background: #f1f5f9;
     color: #475569;
-  }}
-  footer {{
+}}
+footer {{
     text-align: center;
     font-size: 12px;
     color: #94a3b8;
     margin-top: 32px;
-  }}
+}}
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="header">
-    <h1>{esc(title)}</h1>
-    <div class="meta-bar">
-      <span><strong>Target PID:</strong> {esc(str(verdict.target_identity.get("pid", "N/A")))}</span>
-      <span><strong>Companion ELF:</strong> {esc(str(verdict.target_identity.get("companion_elf", "N/A")))}</span>
-      <span><strong>Provenance:</strong> {esc(getattr(verdict, "provenance_class", "N/A"))}</span>
-      <span><strong>Stop Reason:</strong> {esc(getattr(verdict, "stop_reason", "N/A"))}</span>
-      <span><strong>Timestamp:</strong> {esc(verdict.generated_at)}</span>
+    <div class="header">
+        <h1>{esc(title)}</h1>
+        <div class="meta-bar">
+            <span><strong>Target PID:</strong> {esc(str(verdict.target_identity.get("pid", "N/A")))}</span>
+            <span><strong>Companion ELF:</strong> {esc(str(verdict.target_identity.get("companion_elf", "N/A")))}</span>
+            <span><strong>Provenance:</strong> {esc(verdict.provenance_class)}</span>
+            <span><strong>Stop Reason:</strong> {esc(verdict.stop_reason)}</span>
+            <span><strong>Timestamp:</strong> {esc(verdict.generated_at)}</span>
+        </div>
     </div>
-  </div>
 
-  <div class="verdict-banner">
-    <div class="verdict-title">{badge_svg}{esc(verdict.final_diagnosis)}</div>
-    <div class="verdict-conf">Confidence: {int(verdict.confidence_score * 100)}% | State: {esc(verdict.hypothesis_state)}</div>
-  </div>
-
-  <div class="grid-metrics">
-    <div class="metric-box">
-      <div class="metric-value">{stop_ms:.2f} ms</div>
-      <div class="metric-label">Target Stop Duration</div>
+    <div class="verdict-banner">
+        <div class="verdict-title">{badge_svg}{esc(verdict.final_diagnosis)}</div>
+        <div class="verdict-conf">Confidence: {int(verdict.confidence_score * 100)}% | State: {esc(verdict.hypothesis_state)}</div>
     </div>
-    <div class="metric-box">
-      <div class="metric-value">{lat_us:.1f} µs</div>
-      <div class="metric-label">Observation Latency</div>
-    </div>
-    <div class="metric-box">
-      <div class="metric-value">{bytes_read} B</div>
-      <div class="metric-label">Bytes Read</div>
-    </div>
-    <div class="metric-box">
-      <div class="metric-value">{verdict.passed_count}/{verdict.total_assertions}</div>
-      <div class="metric-label">Assertions Passed</div>
-    </div>
-  </div>
 
-  {limitations_html}
-
-  <div class="card">
-    <div class="card-title">Adaptive Investigation Evidence Ledger &amp; Proof Matrix</div>
-    <div style="font-size: 14px; margin-bottom: 12px; color: #334155;">
-      <strong>Target Hypothesis / Goal:</strong> <em>{esc(verdict.hypothesis)}</em><br>
-      <strong>Confidence Rationale:</strong> {esc(getattr(verdict, "confidence_rationale", ""))}
+    <div class="grid-metrics">
+        <div class="metric-box">
+            <div class="metric-value">{stop_ms:.2f} ms</div>
+            <div class="metric-label">Target Stop Duration</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-value">{lat_us:.1f} µs</div>
+            <div class="metric-label">Observation Latency</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-value">{bytes_read} B</div>
+            <div class="metric-label">Bytes Read</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-value">{verdict.passed_count}/{verdict.total_assertions}</div>
+            <div class="metric-label">Assertions Passed</div>
+        </div>
     </div>
-    <table>
-      <thead>
-        <tr>
-          <th>Assertion</th>
-          <th>Verdict</th>
-          <th>Observed</th>
-          <th>Expected</th>
-          <th>Details</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows_str}
-      </tbody>
-    </table>
-  </div>
 
-  {remediation_html}
+{limitations_html}
 
-  <footer>
-    Generated by dynamicState Adaptive Investigation Engine (Zero-Stop Architecture)
-  </footer>
+    <div class="card">
+        <div class="card-title">Adaptive Investigation Evidence Ledger &amp; Proof Matrix</div>
+        <div style="font-size: 14px; margin-bottom: 12px; color: #334155;">
+            <strong>Target Hypothesis / Goal:</strong> <em>{esc(verdict.hypothesis)}</em><br>
+            <strong>Confidence Rationale:</strong> {esc(verdict.confidence_rationale)}
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Assertion</th>
+                    <th>Verdict</th>
+                    <th>Observed</th>
+                    <th>Expected</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows_str}
+            </tbody>
+        </table>
+    </div>
+
+{remediation_html}
+
+    <footer>
+        Generated by dynamicState Adaptive Investigation Engine (Zero-Stop Architecture)
+    </footer>
 </div>
 </body>
 </html>

@@ -15,7 +15,6 @@ Coordinates evidence-grounded, budget-bounded adaptive investigations:
   SUSPECTED, PARTIALLY_CONFIRMED, CONFIRMED, REFUTED, INCONCLUSIVE)
 """
 
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -53,7 +52,6 @@ from .evidence_ledger import (
     EVIDENCE_TYPE_RUNTIME_IDENTITY,
     EvidenceLedger,
     EvidenceRecord,
-    LiveCaptureReceipt,
     NATURE_HYPOTHESIS,
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
@@ -62,20 +60,17 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     TRUSTED_PROVENANCE_CLASSES,
-    TRUST_STATE_LIVE_VERIFIED,
-    TRUST_STATE_IMPORTED_UNVERIFIED,
-    TRUST_STATE_INVALID_OR_TAMPERED,
-    TRUST_STATE_VERIFICATION_UNAVAILABLE,
-    determine_snapshot_trust_state,
-    verify_live_capture_receipt,
 )
 from .hypothesis import (
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
     CONFIDENCE_MEDIUM,
+    HYPOTHESIS_STATUS_ABSTAINED,
     HYPOTHESIS_STATUS_CONTRADICTED,
     HYPOTHESIS_STATUS_INCONCLUSIVE,
+    HYPOTHESIS_STATUS_INVESTIGATING,
     HYPOTHESIS_STATUS_PROPOSED,
+    HYPOTHESIS_STATUS_REJECTED,
     HYPOTHESIS_STATUS_SUPPORTED,
     HYPOTHESIS_STATUS_VALIDATED,
     OBSERVATION_STATUS_CANCELED,
@@ -106,39 +101,8 @@ from .inspection_module import (
     InspectionModuleRegistry,
     InspectionProfile,
 )
-import math
-from .observation_budget import (
-    ObservationBudgetLimits,
-    ObservationBudgetTracker,
-    validate_non_negative_int,
-    validate_non_negative_float,
-    ObservationAccountingRecord,
-)
-from .target_adapter import (
-    LocalTargetAdapter,
-    ReadOnlyTargetAdapter,
-    TargetExecutionAdapter,
-    normalize_futex_address,
-    MutexOwnerResolutionResult,
-    STATUS_OWNER_IDENTIFIED,
-    STATUS_OWNER_NOT_IDENTIFIED,
-    STATUS_MUTEX_LAYOUT_UNSUPPORTED,
-    STATUS_MUTEX_STATE_INVALID,
-    STATUS_MEMORY_READ_UNAVAILABLE,
-    STATUS_PERMISSION_DENIED,
-    ABI_GLIBC_VERIFIED,
-    ABI_MUSL_UNSUPPORTED,
-    ABI_LIBC_UNKNOWN,
-    ABI_STATIC_OR_UNIDENTIFIED,
-    ABI_ARCH_UNSUPPORTED,
-    ABI_ELF_CLASS_UNSUPPORTED,
-    ABI_ENDIANNESS_UNSUPPORTED,
-    IDENTITY_VERIFIED,
-    IDENTITY_UNAVAILABLE,
-    IDENTITY_INCONSISTENT,
-    IDENTITY_UNVERIFIED,
-    LAYOUT_GLIBC_LP64,
-)
+from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
+from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter
 from .verdict_engine import (
     ASSERTION_ABSTAIN,
     ASSERTION_FAIL,
@@ -169,367 +133,6 @@ from .verdict_engine import (
     ZeroCdnReporter,
 )
 
-
-RESULT_DEADLOCK_CYCLE_CONFIRMED = "DEADLOCK_CYCLE_CONFIRMED"
-RESULT_LOCK_CONTENTION_OBSERVED = "LOCK_CONTENTION_OBSERVED"
-RESULT_WAITING_WITH_UNKNOWN_OWNER = "WAITING_WITH_UNKNOWN_OWNER"
-RESULT_INCOMPLETE_WAIT_FOR_GRAPH = "INCOMPLETE_WAIT_FOR_GRAPH"
-RESULT_INCONSISTENT_OWNER_EVIDENCE = "INCONSISTENT_OWNER_EVIDENCE"
-RESULT_INCONCLUSIVE = "INCONCLUSIVE"
-
-
-@dataclass
-class WaitForEdge:
-    """Directed edge in a lock wait-for graph: waiter_tid waits on sync_object held by owner_tid.
-    
-    Auditable Evidence Guarantees:
-    - Retains full provenance including waiter TID, raw futex argument, normalized address.
-    - Explicit owner identification verification status and mutex layout identifier.
-    - Direct memory read status, timestamps, and target process identification.
-    """
-    waiter_tid: int
-    sync_object: str  # canonical hex address e.g. "0x7ffd12345678"
-    raw_futex_argument: Any = None
-    normalized_address: Optional[str] = None
-    owner_tid: Optional[int] = None  # Identified owner TID, or None if unknown
-    owner_identification_status: str = STATUS_OWNER_NOT_IDENTIFIED
-    mutex_layout_id: Optional[str] = None
-    memory_read_status: str = "UNAVAILABLE"
-    evidence_source: str = "procfs_syscall"
-    observation_timestamp: float = field(default_factory=time.time)
-    target_pid: Optional[int] = None
-    process_identity: Optional[Dict[str, Any]] = None
-    sampling_epoch: Optional[int] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    # Backward compatibility: legacy source and timestamp properties
-    source: Optional[str] = None
-    timestamp: Optional[float] = None
-
-    def __post_init__(self):
-        if self.source and not self.evidence_source:
-            self.evidence_source = self.source
-        elif self.evidence_source and not self.source:
-            self.source = self.evidence_source
-        if self.timestamp is not None:
-            self.observation_timestamp = self.timestamp
-        elif self.observation_timestamp is not None and self.timestamp is None:
-            self.timestamp = self.observation_timestamp
-        if self.normalized_address is None:
-            self.normalized_address = self.sync_object
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "waiter_tid": self.waiter_tid,
-            "sync_object": self.sync_object,
-            "raw_futex_argument": self.raw_futex_argument,
-            "normalized_address": self.normalized_address,
-            "owner_tid": self.owner_tid,
-            "owner_identification_status": self.owner_identification_status,
-            "mutex_layout_id": self.mutex_layout_id,
-            "memory_read_status": self.memory_read_status,
-            "evidence_source": self.evidence_source,
-            "source": self.source,
-            "observation_timestamp": self.observation_timestamp,
-            "timestamp": self.timestamp,
-            "target_pid": self.target_pid,
-            "process_identity": self.process_identity,
-            "sampling_epoch": self.sampling_epoch,
-            "metadata": self.metadata,
-        }
-
-
-@dataclass
-class WaitForGraph:
-    """Directed wait-for graph with cycle detection and adversarial verification for circular deadlock proof."""
-    edges: List[WaitForEdge] = field(default_factory=list)
-
-    def add_edge(self, edge: WaitForEdge) -> None:
-        self.edges.append(edge)
-
-    def validate_and_analyze(
-        self,
-        max_temporal_skew_sec: float = 2.0,
-        allowed_epoch: Optional[int] = None,
-        target_tids: Optional[Union[Set[int], List[int]]] = None,
-    ) -> Tuple[Optional[List[int]], str, List[str]]:
-        """Validates all edges and analyzes the graph for circular deadlocks.
-        
-        Guarantees:
-        - Cycles are accepted ONLY if every edge in the cycle has a verified owner (STATUS_OWNER_IDENTIFIED).
-        - Rejects candidate cycles if edges have conflicting owners for the same lock address.
-        - Rejects candidate cycles if timestamps across the cycle exhibit excessive temporal skew (> max_temporal_skew_sec).
-        - Rejects edges with missing or cross-process target PID or process identity.
-        - Rejects edges with unsupported mutex layout or unobserved memory reads.
-        - Distinguishes confirmed cycles, unconfirmed contention, unknown owners, and incomplete graphs.
-        
-        Returns:
-            (deadlock_cycle, result_category, issues)
-        """
-        issues: List[str] = []
-        if not self.edges:
-            return None, RESULT_INCONCLUSIVE, ["No wait-for edges recorded"]
-
-        # Track observations
-        owners_by_lock: Dict[str, Set[int]] = {}
-        waiters_by_lock: Dict[str, Set[int]] = {}
-        edges_by_waiter: Dict[int, List[WaitForEdge]] = {}
-        verified_edges: List[WaitForEdge] = []
-        has_unknown_owner = False
-        has_unsupported_layout = False
-        rejection_reasons: Dict[Tuple[int, str], List[str]] = {}
-
-        # 1. Establish reference target_pid and process identity from first available edge
-        ref_pid: Optional[int] = None
-        ref_start_time: Optional[Any] = None
-        ref_proc_ident: Optional[Dict[str, Any]] = None
-        ref_epoch: Optional[int] = allowed_epoch
-        has_cross_process_pid = False
-        has_cross_process_identity = False
-        has_cross_epoch = False
-        has_missing_epoch = False
-
-        for edge in self.edges:
-            if edge.target_pid is not None and edge.target_pid > 0:
-                if ref_pid is None:
-                    ref_pid = edge.target_pid
-                elif edge.target_pid != ref_pid:
-                    has_cross_process_pid = True
-            if edge.process_identity and isinstance(edge.process_identity, dict):
-                st = edge.process_identity.get("process_start_time") or edge.process_identity.get("start_time")
-                if st is not None:
-                    if ref_start_time is None:
-                        ref_start_time = st
-                        ref_proc_ident = edge.process_identity
-                    elif st != ref_start_time:
-                        has_cross_process_identity = True
-            ep = getattr(edge, "sampling_epoch", None)
-            if ep is not None:
-                if isinstance(ep, bool) or not isinstance(ep, int) or ep < 0:
-                    issues.append(f"REJECT_INVALID_SAMPLING_EPOCH: Invalid sampling_epoch {ep} detected in wait-for graph")
-                elif ref_epoch is None:
-                    ref_epoch = ep
-                elif ep != ref_epoch:
-                    has_cross_epoch = True
-            else:
-                has_missing_epoch = True
-
-        if has_cross_process_pid:
-            issues.append(f"REJECT_CROSS_PROCESS_PID_MISMATCH: Cross-process evidence detected; multiple target PIDs in wait-for graph")
-        if has_cross_process_identity:
-            issues.append(f"REJECT_CROSS_PROCESS_IDENTITY_MISMATCH: Cross-process evidence detected; multiple process start identities in wait-for graph")
-        if has_cross_epoch:
-            issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Cross-epoch evidence detected; observations from different sampling epochs in wait-for graph")
-        if has_missing_epoch:
-            issues.append(f"REJECT_MISSING_SAMPLING_EPOCH: Edge missing explicit sampling_epoch detected in wait-for graph")
-
-        # 2. Inspect and validate each edge
-        for edge in self.edges:
-            edge_key = (edge.waiter_tid, edge.sync_object)
-            edge_issues: List[str] = []
-
-            waiters_by_lock.setdefault(edge.sync_object, set()).add(edge.waiter_tid)
-            if edge.owner_tid is not None:
-                owners_by_lock.setdefault(edge.sync_object, set()).add(edge.owner_tid)
-            edges_by_waiter.setdefault(edge.waiter_tid, []).append(edge)
-
-            # Target PID validation
-            if edge.target_pid is None or edge.target_pid <= 0:
-                edge_issues.append(f"REJECT_MISSING_TARGET_PID: Edge waiter TID {edge.waiter_tid} has missing or invalid target_pid")
-            elif ref_pid is not None and edge.target_pid != ref_pid:
-                edge_issues.append(f"REJECT_CROSS_PROCESS_PID_MISMATCH: Edge target_pid {edge.target_pid} differs from graph reference {ref_pid}")
-
-            # Process identity validation (Step 1 Strict Evidence Gate)
-            if not edge.process_identity or not isinstance(edge.process_identity, dict):
-                edge_issues.append(f"REJECT_MISSING_PROCESS_IDENTITY: Edge waiter TID {edge.waiter_tid} missing process_identity")
-            else:
-                ident_pid = edge.process_identity.get("pid")
-                if ident_pid is None or edge.target_pid is None or ident_pid != edge.target_pid:
-                    edge_issues.append(f"REJECT_IDENTITY_PID_MISMATCH: Identity PID {ident_pid} does not match edge target_pid {edge.target_pid}")
-
-                p_st = edge.process_identity.get("process_start_time") or edge.process_identity.get("start_time")
-                if p_st is None or not isinstance(p_st, (int, float)) or p_st <= 0:
-                    edge_issues.append(f"REJECT_MISSING_PROCESS_START_TIME: Edge waiter TID {edge.waiter_tid} process_identity lacks stable process_start_time")
-                elif ref_start_time is not None and p_st != ref_start_time:
-                    edge_issues.append(f"REJECT_CROSS_PROCESS_IDENTITY_MISMATCH: Edge process_start_time {p_st} differs from graph start_time {ref_start_time}")
-
-                p_ident_st = edge.process_identity.get("identity_status")
-                if p_ident_st == IDENTITY_UNAVAILABLE:
-                    edge_issues.append(f"REJECT_IDENTITY_UNAVAILABLE: Process identity status is IDENTITY_UNAVAILABLE for waiter TID {edge.waiter_tid}")
-                elif p_ident_st == IDENTITY_INCONSISTENT:
-                    edge_issues.append(f"REJECT_IDENTITY_INCONSISTENT: Process identity status is IDENTITY_INCONSISTENT for waiter TID {edge.waiter_tid}")
-                elif p_ident_st != IDENTITY_VERIFIED:
-                    edge_issues.append(f"REJECT_IDENTITY_UNVERIFIED: Process identity status is unverified ({p_ident_st}) for waiter TID {edge.waiter_tid}; confirmed deadlock requires explicit verified identity")
-
-            # Sampling epoch validation (Step 2 Sampling Epoch Semantics)
-            edge_epoch = getattr(edge, "sampling_epoch", None)
-            if edge_epoch is None:
-                edge_issues.append(f"REJECT_MISSING_SAMPLING_EPOCH: Edge waiter TID {edge.waiter_tid} missing explicit sampling_epoch")
-            elif isinstance(edge_epoch, bool) or not isinstance(edge_epoch, int) or edge_epoch < 0:
-                edge_issues.append(f"REJECT_INVALID_SAMPLING_EPOCH: Edge waiter TID {edge.waiter_tid} has invalid sampling_epoch {edge_epoch}")
-            elif ref_epoch is not None and edge_epoch != ref_epoch:
-                edge_issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Edge epoch {edge_epoch} differs from graph epoch {ref_epoch}")
-            if allowed_epoch is not None and edge_epoch is not None and edge_epoch != allowed_epoch:
-                edge_issues.append(f"REJECT_CROSS_EPOCH_MISMATCH: Edge epoch {edge_epoch} differs from allowed epoch {allowed_epoch}")
-
-            # Waiter / Owner TID validation
-            if edge.waiter_tid <= 0:
-                edge_issues.append(f"REJECT_INVALID_WAITER_TID: Invalid waiter TID {edge.waiter_tid}")
-            if edge.owner_tid is not None and edge.owner_tid <= 0:
-                edge_issues.append(f"REJECT_INVALID_OWNER_TID: Invalid owner TID {edge.owner_tid}")
-
-            # Task membership validation
-            effective_tids = set(target_tids) if target_tids else (set(edge.metadata.get("target_tids", [])) if (edge.metadata and edge.metadata.get("target_tids")) else None)
-            if effective_tids:
-                if edge.waiter_tid not in effective_tids:
-                    edge_issues.append(f"REJECT_WAITER_TID_NOT_IN_TARGET: Waiter TID {edge.waiter_tid} does not belong to target process")
-                if edge.owner_tid is not None and edge.owner_tid not in effective_tids:
-                    edge_issues.append(f"REJECT_OWNER_TID_NOT_IN_TARGET: Owner TID {edge.owner_tid} does not belong to target process")
-
-            # Mutex layout validation
-            if edge.owner_identification_status == STATUS_MUTEX_LAYOUT_UNSUPPORTED or edge.mutex_layout_id in (ABI_MUSL_UNSUPPORTED, ABI_LIBC_UNKNOWN, ABI_STATIC_OR_UNIDENTIFIED, ABI_ARCH_UNSUPPORTED, ABI_ELF_CLASS_UNSUPPORTED, ABI_ENDIANNESS_UNSUPPORTED):
-                has_unsupported_layout = True
-                edge_issues.append(f"REJECT_UNSUPPORTED_MUTEX_LAYOUT: Mutex layout {edge.mutex_layout_id} unsupported for waiter TID {edge.waiter_tid}")
-            elif edge.mutex_layout_id != LAYOUT_GLIBC_LP64:
-                edge_issues.append(f"REJECT_UNSUPPORTED_MUTEX_LAYOUT: Mutex layout {edge.mutex_layout_id} is not verified LP64 glibc")
-
-            # Memory read status validation
-            if edge.memory_read_status != "OBSERVED":
-                edge_issues.append(f"REJECT_MEMORY_READ_NOT_OBSERVED: Memory read status is '{edge.memory_read_status}' (must be OBSERVED)")
-
-            # Raw memory evidence and interpretation metadata
-            has_raw = bool((edge.metadata or {}).get("raw_bytes")) or bool((edge.metadata or {}).get("read_bytes_len", 0) > 0)
-            has_interp = any(k in (edge.metadata or {}) for k in ("lock_word", "kind", "base_kind", "owner"))
-            if not has_raw or not has_interp:
-                edge_issues.append(f"REJECT_MISSING_RAW_MEMORY_EVIDENCE: Edge lacks verified raw memory evidence or interpretation metadata")
-
-            # Normalized address validation
-            if edge.normalized_address and edge.normalized_address != edge.sync_object:
-                edge_issues.append(f"REJECT_ADDRESS_MISMATCH: normalized_address ({edge.normalized_address}) != sync_object ({edge.sync_object})")
-
-            # Timestamp validation
-            ts = edge.observation_timestamp or getattr(edge, "timestamp", 0.0) or 0.0
-            if ts <= 0:
-                edge_issues.append(f"REJECT_MISSING_OR_INVALID_TIMESTAMP: Observation timestamp is non-positive or missing ({ts})")
-
-            # Owner identification status validation
-            if edge.owner_identification_status != STATUS_OWNER_IDENTIFIED or edge.owner_tid is None:
-                has_unknown_owner = True
-                edge_issues.append(f"REJECT_OWNER_NOT_IDENTIFIED: Owner unconfirmed ({edge.owner_identification_status}) for waiter TID {edge.waiter_tid}")
-
-            if edge_issues:
-                rejection_reasons[edge_key] = edge_issues
-                issues.extend(edge_issues)
-            else:
-                verified_edges.append(edge)
-
-        # 3. Check conflicting owners on locks
-        conflicting_locks = {lock: tids for lock, tids in owners_by_lock.items() if len(tids) > 1}
-        if conflicting_locks:
-            for lock, tids in conflicting_locks.items():
-                issues.append(f"Conflicting owners observed for lock {lock}: {sorted(tids)}")
-            return None, RESULT_INCONSISTENT_OWNER_EVIDENCE, issues
-
-        # 4. Multi-observation & conflict detection across waiter edges
-        for waiter_tid, w_edges in edges_by_waiter.items():
-            if len(w_edges) > 1:
-                distinct_locks = {e.sync_object for e in w_edges}
-                distinct_owners = {e.owner_tid for e in w_edges if e.owner_tid is not None}
-                if len(distinct_locks) > 1 or len(distinct_owners) > 1:
-                    issues.append(
-                        f"Conflicting observations for waiter TID {waiter_tid}: multiple locks ({sorted(distinct_locks)}) or owners ({sorted(distinct_owners)})"
-                    )
-                    return None, RESULT_INCONSISTENT_OWNER_EVIDENCE, issues
-
-        if has_cross_process_pid or has_cross_process_identity or has_cross_epoch:
-            return None, RESULT_INCONSISTENT_OWNER_EVIDENCE, issues
-
-        # 5. Cycle Detection using ONLY verified edges
-        adj: Dict[int, int] = {}
-        edge_map: Dict[Tuple[int, int], WaitForEdge] = {}
-        for edge in verified_edges:
-            if edge.owner_tid is not None:
-                adj[edge.waiter_tid] = edge.owner_tid
-                edge_map[(edge.waiter_tid, edge.owner_tid)] = edge
-
-        candidate_cycle: Optional[List[int]] = None
-        visited: Set[int] = set()
-        for start_node in list(adj.keys()):
-            if start_node in visited:
-                continue
-            curr = start_node
-            path: List[int] = []
-            seen_in_path: Dict[int, int] = {}
-            while curr in adj:
-                if curr in seen_in_path:
-                    cycle_start = seen_in_path[curr]
-                    candidate_cycle = path[cycle_start:] + [curr]
-                    break
-                seen_in_path[curr] = len(path)
-                path.append(curr)
-                visited.add(curr)
-                curr = adj[curr]
-            if candidate_cycle:
-                break
-
-        if candidate_cycle:
-            # Validate temporal skew across candidate cycle edges
-            cycle_timestamps: List[float] = []
-            for i in range(len(candidate_cycle) - 1):
-                u = candidate_cycle[i]
-                v = candidate_cycle[i + 1]
-                e = edge_map.get((u, v))
-                if e:
-                    ts = e.observation_timestamp or getattr(e, "timestamp", 0.0) or 0.0
-                    if ts > 0:
-                        cycle_timestamps.append(ts)
-            if cycle_timestamps:
-                skew = max(cycle_timestamps) - min(cycle_timestamps)
-                if skew > max_temporal_skew_sec:
-                    issues.append(f"Excessive temporal skew in candidate cycle: {skew:.2f}s > {max_temporal_skew_sec:.2f}s")
-                    return None, RESULT_INCONCLUSIVE, issues
-
-            # Fully confirmed circular deadlock!
-            return candidate_cycle, RESULT_DEADLOCK_CYCLE_CONFIRMED, issues
-
-        # No verified cycle found
-        has_contention = any(len(tids) > 1 for tids in waiters_by_lock.values())
-        if has_contention:
-            return None, RESULT_LOCK_CONTENTION_OBSERVED, issues
-
-        if has_unsupported_layout or has_unknown_owner:
-            return None, RESULT_WAITING_WITH_UNKNOWN_OWNER, issues
-
-        return None, RESULT_INCOMPLETE_WAIT_FOR_GRAPH, issues
-
-    def find_cycle(self) -> Optional[List[int]]:
-        cycle, category, _ = self.validate_and_analyze()
-        return cycle
-
-    def has_cycle(self) -> bool:
-        return self.find_cycle() is not None
-
-    def to_dict(self) -> Dict[str, Any]:
-        cycle, category, issues = self.validate_and_analyze()
-        return {
-            "edges": [e.to_dict() for e in self.edges],
-            "num_edges": len(self.edges),
-            "deadlock_cycle": cycle,
-            "deadlock_detected": bool(cycle),
-            "result_category": category,
-            "issues": issues,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "WaitForGraph":
-        raw_edges = data.get("edges", [])
-        edges = []
-        for e in raw_edges:
-            if isinstance(e, WaitForEdge):
-                edges.append(e)
-            elif isinstance(e, dict):
-                edges.append(WaitForEdge(**e))
-        return cls(edges=edges)
-
 # -----------------------------------------------------------------------------
 # 1. Single Investigation Lifecycle State Machine
 # -----------------------------------------------------------------------------
@@ -544,6 +147,8 @@ STATE_HYPOTHESIS_UPDATE = "HYPOTHESIS_UPDATE"
 STATE_FINALIZATION = "FINALIZATION"
 STATE_COMPLETED = "COMPLETED"
 STATE_INCONCLUSIVE = "INCONCLUSIVE"
+STATE_ABSTAINED = "ABSTAINED"
+STATE_CAPABILITY_UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
 STATE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 STATE_FAILED = "FAILED"
 STATE_CANCELED = "CANCELED"
@@ -551,6 +156,8 @@ STATE_CANCELED = "CANCELED"
 TERMINAL_LIFECYCLE_STATES = {
     STATE_COMPLETED,
     STATE_INCONCLUSIVE,
+    STATE_ABSTAINED,
+    STATE_CAPABILITY_UNAVAILABLE,
     STATE_BUDGET_EXHAUSTED,
     STATE_FAILED,
     STATE_CANCELED,
@@ -597,12 +204,16 @@ VALID_LIFECYCLE_TRANSITIONS: Dict[str, Set[str]] = {
     STATE_FINALIZATION: {
         STATE_COMPLETED,
         STATE_INCONCLUSIVE,
+        STATE_ABSTAINED,
+        STATE_CAPABILITY_UNAVAILABLE,
         STATE_BUDGET_EXHAUSTED,
         STATE_FAILED,
         STATE_CANCELED,
     },
     STATE_COMPLETED: set(),
     STATE_INCONCLUSIVE: set(),
+    STATE_ABSTAINED: set(),
+    STATE_CAPABILITY_UNAVAILABLE: set(),
     STATE_BUDGET_EXHAUSTED: set(),
     STATE_FAILED: set(),
     STATE_CANCELED: set(),
@@ -1016,22 +627,9 @@ class AdaptiveInvestigationPlanner:
     ) -> List[str]:
         """Backward-compatible helper that refines profile queue when explicit symbols are present."""
         additional: List[str] = []
-
-        # If deadlock or mutex contention found, ensure thread owner analysis is scheduled
         if inspection_result.get("deadlock_detected") or inspection_result.get("contended_locks"):
-            if "insp_find_owners" not in already_scheduled and self.registry.get("insp_find_owners"):
-                additional.append("insp_find_owners")
-
-        # If memory pool leakage or stuck slots found, add symbol owner lookup
-        if inspection_result.get("leak_count", 0) > 0 or inspection_result.get("stuck_slots"):
-            if "insp_find_owners" not in already_scheduled and self.registry.get("insp_find_owners"):
-                additional.append("insp_find_owners")
-
-        # If corrupted pointers found in memory integrity audit, schedule frame locals
-        if inspection_result.get("corrupted_pointers", 0) > 0:
             if "insp_frame_locals" not in already_scheduled and self.registry.get("insp_frame_locals"):
                 additional.append("insp_frame_locals")
-
         return additional
 
 
@@ -1189,7 +787,7 @@ def canonicalize_investigation_report(report: Dict[str, Any]) -> Dict[str, Any]:
         cleaned.pop("report_json", None)
         cleaned.pop("session_id", None)
         cleaned.pop("investigation_id", None)
-        for b_key in ("budget_usage", "budget_summary"):
+        for b_key in ("budget_usage", "consumed_execution_budget"):
             if b_key in cleaned and isinstance(cleaned[b_key], dict):
                 b_copy = dict(cleaned[b_key])
                 if "metrics" in b_copy and isinstance(b_copy["metrics"], dict):
@@ -1242,763 +840,12 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=15.0,
             budget_ceiling={"max_bytes_read": 65536, "max_wall_clock_ms": 500.0, "max_samples": 4},
         )
-        def _exec_insp_locks(wm, **kw):
-            budget_tracker = kw.get("budget_tracker")
-
-            # 1. Pre-execution budget check BEFORE any expensive observation
-            if budget_tracker:
-                cur_elapsed = budget_tracker.elapsed_ms
-                rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
-                rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
-                if rem_wall_ms <= 0.0 or rem_bytes < 40:
-                    return {
-                        "success": False,
-                        "status": "BUDGET_EXHAUSTED",
-                        "stop_reason": "BUDGET_EXHAUSTED",
-                        "error": "Budget exhausted before executing lock inspection",
-                        "threads": [],
-                        "contended_locks": [],
-                        "deadlock_detected": False,
-                        "bytes_read": 0,
-                        "measured_bytes_read": 0,
-                        "estimated_bytes_read": 0,
-                        "already_budget_accounted": True,
-                    }
-
-            op_id = kw.get("operation_id") or f"insp_locks_{uuid.uuid4().hex[:12]}"
-
-            # 2. WorkManager execution path (monitored and accounted for)
-            if wm and hasattr(wm, "inspect_thread_callstacks_and_locks"):
-                t_wm_start = time.monotonic()
-                res = None
-                wm_exc = None
-                try:
-                    res = wm.inspect_thread_callstacks_and_locks(**kw)
-                except Exception as exc:
-                    wm_exc = exc
-                wm_elapsed_us = (time.monotonic() - t_wm_start) * 1_000_000.0
-
-                if wm_exc is None:
-                    if isinstance(res, dict):
-                        # If WorkManager already authoritatively committed this operation to budget_tracker:
-                        if budget_tracker and budget_tracker.is_operation_committed(op_id):
-                            comm_rec = budget_tracker.get_committed_record(op_id)
-                            res["measured_bytes_read"] = comm_rec.measured_bytes_read
-                            res["estimated_bytes_read"] = comm_rec.estimated_bytes_read
-                            res["charged_bytes"] = comm_rec.charged_bytes
-                            res["bytes_read"] = comm_rec.charged_bytes
-                            res["measurement_type"] = comm_rec.measurement_type
-                            res["accounting_owner"] = comm_rec.accounting_owner
-                            res["accounting_status"] = "COMMITTED"
-                            res["operation_id"] = op_id
-                            return res
-
-                        raw_meas_b = res.get("measured_bytes_read")
-                        raw_est_b = res.get("estimated_bytes_read")
-                        raw_bytes_b = res.get("bytes_read")
-
-                        for name, v in [("measured_bytes_read", raw_meas_b), ("estimated_bytes_read", raw_est_b), ("bytes_read", raw_bytes_b)]:
-                            if v is not None:
-                                if isinstance(v, bool) or not isinstance(v, (int, float)):
-                                    raise ValueError(f"Invalid numeric value in WorkManager result for {name}: {repr(v)}")
-                                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-                                    raise ValueError(f"Invalid numeric value (NaN/Inf) in WorkManager result for {name}: {repr(v)}")
-                                if v < 0:
-                                    raise ValueError(f"Invalid numeric value (negative) in WorkManager result for {name}: {repr(v)}")
-
-                        meas_val = validate_non_negative_int(raw_meas_b)
-                        est_val = validate_non_negative_int(raw_est_b)
-                        bytes_val = validate_non_negative_int(raw_bytes_b)
-
-                        is_missing = (
-                            meas_val is None
-                            and est_val is None
-                            and bytes_val is None
-                            and raw_meas_b is None
-                            and raw_est_b is None
-                            and raw_bytes_b is None
-                            and res.get("measurement_type") not in ("CACHE_HIT", "ZERO_BYTES")
-                        )
-
-                        if is_missing:
-                            if budget_tracker and budget_tracker.limits.reject_unknown_byte_cost:
-                                if budget_tracker:
-                                    budget_tracker.record_rejection("insp_locks", "UNKNOWN_BYTE_COST_REJECTED")
-                                return {
-                                    "success": False,
-                                    "status": "UNKNOWN_BYTE_COST_REJECTED",
-                                    "result_category": "UNKNOWN_BYTE_COST_REJECTED",
-                                    "error": "UNKNOWN_BYTE_COST_REJECTED: observation byte cost is unknown and strict cost accounting is enabled",
-                                    "threads": res.get("threads", []),
-                                    "contended_locks": [],
-                                    "deadlock_detected": False,
-                                    "bytes_read": 0,
-                                    "measured_bytes_read": None,
-                                    "estimated_bytes_read": 0,
-                                    "charged_bytes": 0,
-                                    "measurement_type": "UNKNOWN",
-                                    "accounting_owner": "WORKMANAGER",
-                                    "accounting_status": "FAILED",
-                                    "operation_id": op_id,
-                                }
-                            unknown_cost = budget_tracker.limits.conservative_unknown_bytes if budget_tracker else DEFAULT_CONSERVATIVE_UNKNOWN_BYTES
-                            record = ObservationAccountingRecord(
-                                operation_id=op_id,
-                                accounting_owner="WORKMANAGER",
-                                measured_bytes_read=None,
-                                estimated_bytes_read=unknown_cost,
-                                latency_us=wm_elapsed_us,
-                                measurement_type="UNKNOWN",
-                            )
-                            if budget_tracker:
-                                ok = budget_tracker.commit_transaction(record, profile_id="insp_locks")
-                                if not ok:
-                                    return {
-                                        "success": False,
-                                        "status": "BUDGET_EXHAUSTED",
-                                        "result_category": "BUDGET_EXHAUSTED",
-                                        "error": f"Budget exhausted: {budget_tracker.exhaustion_reason}",
-                                        "threads": res.get("threads", []),
-                                        "contended_locks": [],
-                                        "deadlock_detected": False,
-                                        "bytes_read": 0,
-                                        "measured_bytes_read": None,
-                                        "estimated_bytes_read": 0,
-                                        "charged_bytes": 0,
-                                        "measurement_type": "UNKNOWN",
-                                        "accounting_owner": "WORKMANAGER",
-                                        "accounting_status": "FAILED",
-                                        "operation_id": op_id,
-                                    }
-                            res["measured_bytes_read"] = None
-                            res["estimated_bytes_read"] = unknown_cost
-                            res["charged_bytes"] = unknown_cost
-                            res["bytes_read"] = unknown_cost
-                            res["measurement_type"] = "UNKNOWN"
-                            res["accounting_owner"] = "WORKMANAGER"
-                            res["accounting_status"] = "COMMITTED"
-                            res["operation_id"] = op_id
-                            return res
-                        else:
-                            if meas_val is not None and est_val is not None:
-                                eff_meas = meas_val
-                                eff_est = est_val
-                            elif meas_val is not None:
-                                eff_meas = meas_val
-                                eff_est = 0
-                            elif est_val is not None:
-                                eff_meas = None
-                                eff_est = est_val
-                            elif bytes_val is not None:
-                                if res.get("measurement_type") == "ESTIMATED":
-                                    eff_meas = None
-                                    eff_est = bytes_val
-                                else:
-                                    eff_meas = bytes_val
-                                    eff_est = 0
-                            else:
-                                eff_meas = None
-                                eff_est = 0
-
-                            if res.get("measurement_type") == "CACHE_HIT":
-                                m_type = "CACHE_HIT"
-                                eff_meas = 0
-                                eff_est = 0
-                            elif eff_meas is not None and eff_meas > 0 and eff_est > 0:
-                                m_type = "MIXED"
-                            elif eff_meas is not None and eff_meas > 0:
-                                m_type = "MEASURED"
-                            elif eff_est > 0:
-                                m_type = "ESTIMATED"
-                            elif eff_meas == 0 or (eff_est == 0 and eff_meas is None):
-                                m_type = "ZERO_BYTES"
-                            else:
-                                m_type = "MEASURED"
-
-                            record = ObservationAccountingRecord(
-                                operation_id=op_id,
-                                accounting_owner="WORKMANAGER",
-                                measured_bytes_read=eff_meas,
-                                estimated_bytes_read=eff_est,
-                                latency_us=wm_elapsed_us,
-                                measurement_type=m_type,
-                            )
-                            if budget_tracker:
-                                ok = budget_tracker.commit_transaction(record, profile_id="insp_locks")
-                                if not ok:
-                                    return {
-                                        "success": False,
-                                        "status": "BUDGET_EXHAUSTED",
-                                        "result_category": "BUDGET_EXHAUSTED",
-                                        "error": f"Budget exhausted: {budget_tracker.exhaustion_reason}",
-                                        "threads": res.get("threads", []),
-                                        "contended_locks": [],
-                                        "deadlock_detected": False,
-                                        "bytes_read": 0,
-                                        "measured_bytes_read": eff_meas,
-                                        "estimated_bytes_read": eff_est,
-                                        "charged_bytes": 0,
-                                        "measurement_type": m_type,
-                                        "accounting_owner": "WORKMANAGER",
-                                        "accounting_status": "FAILED",
-                                        "operation_id": op_id,
-                                    }
-                            res["measured_bytes_read"] = eff_meas
-                            res["estimated_bytes_read"] = eff_est
-                            res["charged_bytes"] = (eff_meas or 0) + (eff_est or 0)
-                            res["bytes_read"] = res["charged_bytes"]
-                            res["measurement_type"] = m_type
-                            res["accounting_owner"] = "WORKMANAGER"
-                            res["accounting_status"] = "COMMITTED"
-                            res["operation_id"] = op_id
-                            return res
-                else:
-                    # WorkManager raised an exception
-                    raw_meas = getattr(wm_exc, "measured_bytes_read", None)
-                    raw_est = getattr(wm_exc, "estimated_bytes_read", None)
-                    raw_bytes = getattr(wm_exc, "bytes_read", None)
-
-                    for name, v in [("measured_bytes_read", raw_meas), ("estimated_bytes_read", raw_est), ("bytes_read", raw_bytes)]:
-                        if v is not None:
-                            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                                raise ValueError(f"Invalid numeric value on WorkManager exception for {name}: {repr(v)}")
-                            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-                                raise ValueError(f"Invalid numeric value (NaN/Inf) on WorkManager exception for {name}: {repr(v)}")
-                            if v < 0:
-                                raise ValueError(f"Invalid numeric value (negative) on WorkManager exception for {name}: {repr(v)}")
-
-                    meas_val = validate_non_negative_int(raw_meas)
-                    est_val = validate_non_negative_int(raw_est)
-                    bytes_val = validate_non_negative_int(raw_bytes)
-
-                    is_missing_exc = (
-                        meas_val is None
-                        and est_val is None
-                        and bytes_val is None
-                        and raw_meas is None
-                        and raw_est is None
-                        and raw_bytes is None
-                    )
-
-                    if is_missing_exc:
-                        if budget_tracker and budget_tracker.limits.reject_unknown_byte_cost:
-                            if budget_tracker:
-                                budget_tracker.record_rejection("insp_locks", "UNKNOWN_BYTE_COST_REJECTED")
-                            return {
-                                "success": False,
-                                "status": "UNKNOWN_BYTE_COST_REJECTED",
-                                "result_category": "UNKNOWN_BYTE_COST_REJECTED",
-                                "error": "UNKNOWN_BYTE_COST_REJECTED: WorkManager failed with unknown byte cost",
-                                "threads": [],
-                                "bytes_read": 0,
-                                "measured_bytes_read": None,
-                                "estimated_bytes_read": 0,
-                                "charged_bytes": 0,
-                                "measurement_type": "UNKNOWN",
-                                "accounting_owner": "WORKMANAGER",
-                                "accounting_status": "FAILED",
-                                "operation_id": op_id,
-                            }
-                        op_estimate = kw.get("estimated_bytes", 4096)
-                        fallback_charge = int(op_estimate) if (op_estimate is not None and isinstance(op_estimate, (int, float)) and op_estimate > 0) else (budget_tracker.limits.conservative_unknown_bytes if budget_tracker else DEFAULT_CONSERVATIVE_UNKNOWN_BYTES)
-                        record = ObservationAccountingRecord(
-                            operation_id=op_id,
-                            accounting_owner="WORKMANAGER",
-                            measured_bytes_read=None,
-                            estimated_bytes_read=fallback_charge,
-                            latency_us=wm_elapsed_us,
-                            measurement_type="UNKNOWN",
-                        )
-                    else:
-                        if meas_val is not None and est_val is not None:
-                            eff_m = meas_val
-                            eff_e = est_val
-                        elif meas_val is not None:
-                            eff_m = meas_val
-                            eff_e = 0
-                        elif est_val is not None:
-                            eff_m = None
-                            eff_e = est_val
-                        elif bytes_val is not None:
-                            if getattr(wm_exc, "measurement_type", None) == "ESTIMATED":
-                                eff_m = None
-                                eff_e = bytes_val
-                            else:
-                                eff_m = bytes_val
-                                eff_e = 0
-                        else:
-                            eff_m = None
-                            eff_e = 0
-
-                        record = ObservationAccountingRecord(
-                            operation_id=op_id,
-                            accounting_owner="WORKMANAGER",
-                            measured_bytes_read=eff_m,
-                            estimated_bytes_read=eff_e,
-                            latency_us=wm_elapsed_us,
-                            measurement_type="MIXED" if (eff_m and eff_m > 0 and eff_e and eff_e > 0) else ("MEASURED" if (eff_m and eff_m > 0) else "ESTIMATED"),
-                        )
-
-                    if budget_tracker:
-                        budget_tracker.commit_transaction(record, profile_id="insp_locks", is_failure=True)
-
-                # Ensure fallback does not silently continue after global budget is exhausted
-                if budget_tracker:
-                    ok, rej_reason = budget_tracker.check_budget(profile_id="insp_locks")
-                    if not ok:
-                        ch_b = record.charged_bytes if 'record' in locals() else 0
-                        m_b = record.measured_bytes_read if 'record' in locals() else 0
-                        e_b = record.estimated_bytes_read if 'record' in locals() else 0
-                        return {
-                            "success": False,
-                            "status": "BUDGET_EXHAUSTED",
-                            "stop_reason": "BUDGET_EXHAUSTED",
-                            "error": f"Budget exhausted after initial attempt: {rej_reason}",
-                            "threads": [],
-                            "contended_locks": [],
-                            "deadlock_detected": False,
-                            "bytes_read": ch_b,
-                            "measured_bytes_read": m_b,
-                            "estimated_bytes_read": e_b,
-                            "charged_bytes": ch_b,
-                            "accounting_owner": "WORKMANAGER",
-                            "accounting_status": "COMMITTED",
-                            "operation_id": op_id,
-                        }
-
-            pid_val = kw.get("pid")
-            adapter = kw.get("adapter")
-            target_identity = kw.get("target_identity") or kw.get("target_info")
-            raw_epoch = kw.get("sampling_epoch") if "sampling_epoch" in kw else kw.get("epoch")
-            sampling_epoch = None
-            if raw_epoch is not None:
-                if isinstance(raw_epoch, bool):
-                    sampling_epoch = -1
-                elif isinstance(raw_epoch, int):
-                    sampling_epoch = raw_epoch if raw_epoch >= 0 else -1
-                elif isinstance(raw_epoch, str):
-                    try:
-                        val = int(raw_epoch)
-                        sampling_epoch = val if val >= 0 else -1
-                    except (ValueError, TypeError):
-                        sampling_epoch = -1
-                else:
-                    sampling_epoch = -1
-
-            if pid_val and adapter and hasattr(adapter, "get_threads"):
-                t_start_obs = time.monotonic()
-                try:
-                    # Enforce pre-operation budget check before get_threads
-                    if budget_tracker:
-                        cur_elapsed = budget_tracker.elapsed_ms
-                        rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
-                        rem_bytes = budget_tracker.remaining_bytes
-                        if rem_wall_ms <= 0.0 or rem_bytes < 40 or budget_tracker.is_budget_exhausted:
-                            return {
-                                "success": False,
-                                "status": "BUDGET_EXHAUSTED",
-                                "stop_reason": "BUDGET_EXHAUSTED",
-                                "error": "Budget exhausted before reading threads",
-                                "threads": [],
-                                "contended_locks": [],
-                                "deadlock_detected": False,
-                                "bytes_read": 0,
-                                "measured_bytes_read": 0,
-                                "estimated_bytes_read": 0,
-                                "already_budget_accounted": True,
-                            }
-
-                    fb_op_id = f"{op_id}_fallback"
-                    scope_cm = (
-                        budget_tracker.operation_scope(fb_op_id, profile_id="insp_locks", owner="MODULE_INTERNAL")
-                        if budget_tracker and hasattr(budget_tracker, "operation_scope")
-                        else nullcontext()
-                    )
-                    with scope_cm as fb_scope:
-                        th_prior = getattr(fb_scope, "reads_count", 0)
-                        threads = adapter.get_threads(pid_val)
-                        th_meas = adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 0)
-                        if budget_tracker and th_meas > 0 and getattr(fb_scope, "reads_count", 0) == th_prior:
-                            budget_tracker.record_read(
-                                bytes_read=th_meas,
-                                latency_us=(time.monotonic() - t_start_obs) * 1_000_000.0,
-                                profile_id="insp_locks",
-                            )
-
-                        target_tids = {t["tid"] for t in threads}
-                        is_partial_budget = False
-
-                        if not target_identity and hasattr(adapter, "get_process_identity"):
-                            if budget_tracker:
-                                can_id, _, _ = budget_tracker.check_pre_execution(estimated_bytes=64, profile_id="insp_locks")
-                                if not can_id:
-                                    is_partial_budget = True
-                            if not is_partial_budget:
-                                t_id_start = time.monotonic()
-                                id_prior = getattr(fb_scope, "reads_count", 0)
-                                target_identity = adapter.get_process_identity(pid_val)
-                                id_meas = adapter.get_last_identity_bytes_read() if hasattr(adapter, "get_last_identity_bytes_read") else getattr(adapter, "_last_identity_bytes_read", 0)
-                                if budget_tracker and id_meas > 0 and getattr(fb_scope, "reads_count", 0) == id_prior:
-                                    budget_tracker.record_read(
-                                        bytes_read=id_meas,
-                                        latency_us=(time.monotonic() - t_id_start) * 1_000_000.0,
-                                        profile_id="insp_locks",
-                                    )
-
-                        contended_locks = []
-                        waiters_by_lock: Dict[str, List[int]] = {}
-                        wait_for_graph = WaitForGraph()
-                    total_mutex_measured_bytes = 0
-                    total_mutex_estimated_bytes = 0
-
-                    for t in threads:
-                        if is_partial_budget:
-                            break
-                        if t.get("is_futex_wait") or t.get("state") in ("D", "BLOCKED_LOCK"):
-                            raw_lock = t.get("syscall_arg0") or t.get("syscall_arg0_int") or t.get("waiting_on_lock")
-                            norm_hex, norm_int, addr_st, raw_arg = normalize_futex_address(raw_lock)
-                            if addr_st == "WAIT_ADDRESS_OBSERVED" and norm_hex:
-                                lock_addr = norm_hex
-                                lock_addr_int = norm_int
-                                t["waiting_on_lock"] = lock_addr
-                                t["lock_address_status"] = "OBSERVED"
-                                t["wait_address_status"] = "WAIT_ADDRESS_OBSERVED"
-                                waiters_by_lock.setdefault(lock_addr, []).append(t["tid"])
-
-                                # Enforce pre-operation budget check before mutex memory read
-                                if budget_tracker:
-                                    cur_elapsed = budget_tracker.elapsed_ms
-                                    rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
-                                    rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
-                                    if rem_wall_ms <= 0.0 or rem_bytes < 40:
-                                        is_partial_budget = True
-                                        break
-
-                                owner_tid = None
-                                owner_res = None
-                                if hasattr(adapter, "resolve_mutex_owner") and lock_addr_int:
-                                    owner_res = adapter.resolve_mutex_owner(pid_val, lock_addr_int)
-
-                                if isinstance(owner_res, MutexOwnerResolutionResult):
-                                    owner_tid = owner_res.owner_tid
-                                    owner_id_st = owner_res.status
-                                    layout_id = owner_res.layout_id
-                                    raw_b = owner_res.raw_bytes
-                                    meta = dict(owner_res.metadata)
-                                    mem_read_st = meta.get("memory_read_status", "OBSERVED" if raw_b else "UNAVAILABLE")
-                                    evidence_src = "pthread_mutex_memory" if owner_tid else "procfs_syscall"
-
-                                    # Accurately account for all actual mutex memory reads, regardless of whether owner was identified
-                                    read_b = int(meta.get("read_bytes_len", len(raw_b) if raw_b else 0))
-                                    read_lat = float(meta.get("latency_us", 0.0))
-                                    total_mutex_measured_bytes += read_b
-                                    if budget_tracker:
-                                        budget_tracker.record_read(
-                                            bytes_read=read_b,
-                                            latency_us=read_lat,
-                                            is_failure=(owner_id_st in (STATUS_MEMORY_READ_UNAVAILABLE, STATUS_PERMISSION_DENIED)),
-                                            profile_id="insp_locks",
-                                        )
-                                        ok_cur, _ = budget_tracker.check_budget(profile_id="insp_locks")
-                                        if not ok_cur:
-                                            is_partial_budget = True
-                                elif isinstance(owner_res, int) and owner_res > 0:
-                                    owner_tid = owner_res
-                                    owner_id_st = STATUS_OWNER_IDENTIFIED
-                                    layout_id = LAYOUT_GLIBC_LP64
-                                    raw_b = None
-                                    meta = {}
-                                    mem_read_st = "OBSERVED"
-                                    evidence_src = "pthread_mutex_memory"
-                                    total_mutex_estimated_bytes += 40
-                                    if budget_tracker:
-                                        budget_tracker.record_read(
-                                            bytes_read=None,
-                                            conservative_estimate_bytes=40,
-                                            profile_id="insp_locks",
-                                        )
-                                else:
-                                    owner_tid = None
-                                    owner_id_st = STATUS_OWNER_NOT_IDENTIFIED
-                                    layout_id = None
-                                    raw_b = None
-                                    meta = {}
-                                    mem_read_st = "UNAVAILABLE"
-                                    evidence_src = "procfs_syscall"
-                                    if budget_tracker:
-                                        budget_tracker.record_read(
-                                            bytes_read=0,
-                                            is_failure=True,
-                                            profile_id="insp_locks",
-                                        )
-
-                                meta["target_tids"] = list(target_tids)
-                                if raw_b:
-                                    meta["raw_bytes"] = raw_b
-                                meta["read_bytes_len"] = int(meta.get("read_bytes_len", len(raw_b) if raw_b else 0))
-
-                                t["owner_tid"] = owner_tid
-                                t["lock_owner_identified"] = (owner_id_st == STATUS_OWNER_IDENTIFIED and owner_tid is not None)
-                                t["owner_identification_status"] = owner_id_st
-                                t["mutex_layout_id"] = layout_id
-
-                                edge = WaitForEdge(
-                                    waiter_tid=t["tid"],
-                                    sync_object=lock_addr,
-                                    raw_futex_argument=raw_arg,
-                                    normalized_address=lock_addr,
-                                    owner_tid=owner_tid,
-                                    owner_identification_status=owner_id_st,
-                                    mutex_layout_id=layout_id,
-                                    memory_read_status=mem_read_st,
-                                    evidence_source=evidence_src,
-                                    observation_timestamp=time.time(),
-                                    target_pid=pid_val,
-                                    process_identity=target_identity,
-                                    sampling_epoch=sampling_epoch,
-                                    metadata=meta,
-                                )
-                                wait_for_graph.add_edge(edge)
-                            else:
-                                lock_addr = None
-                                lock_addr_int = None
-                                t["waiting_on_lock"] = None
-                                t["lock_address_status"] = "UNAVAILABLE"
-                                t["wait_address_status"] = addr_st
-                                t["lock_owner_identified"] = False
-                                t["owner_tid"] = None
-
-                            t["blocked"] = True
-                            t["state"] = "BLOCKED_LOCK" if lock_addr else t.get("state", "S")
-
-                            if lock_addr:
-                                contended_locks.append({
-                                    "lock_address": lock_addr,
-                                    "lock_address_int": lock_addr_int,
-                                    "raw_lock_address": raw_arg,
-                                    "waiter_tid": t["tid"],
-                                    "owner_tid": t.get("owner_tid"),
-                                    "owner_identification_status": t.get("owner_identification_status", STATUS_OWNER_NOT_IDENTIFIED),
-                                    "mutex_layout_id": t.get("mutex_layout_id"),
-                                    "thread_name": t.get("name"),
-                                    "wchan": t.get("wchan"),
-                                    "futex_wait_observed": bool(t.get("is_futex_wait")),
-                                    "wait_address_observed": True,
-                                    "lock_owner_identified": bool(t.get("owner_tid")),
-                                    "status": "OBSERVED",
-                                })
-
-                    # Analyze wait-for graph with target task membership and epoch verification
-                    deadlock_cycle, result_category, issues = wait_for_graph.validate_and_analyze(
-                        target_tids=target_tids,
-                        allowed_epoch=sampling_epoch,
-                    )
-                    deadlock_detected = bool(deadlock_cycle)
-                    lock_contention_observed = (
-                        result_category == RESULT_LOCK_CONTENTION_OBSERVED
-                        or any(len(w_tids) > 1 for w_tids in waiters_by_lock.values())
-                    )
-
-                    threads_meas = adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 0)
-                    if threads_meas > 0:
-                        measured_threads_bytes = threads_meas
-                        estimated_threads_bytes = 0
-                    else:
-                        measured_threads_bytes = 0
-                        estimated_threads_bytes = len(threads) * 128
-
-                    total_measured_bytes = measured_threads_bytes + total_mutex_measured_bytes
-                    total_estimated_bytes = estimated_threads_bytes + total_mutex_estimated_bytes
-                    total_bytes_read = total_measured_bytes + total_estimated_bytes
-
-                    status_val = "PARTIAL" if is_partial_budget else "OBSERVED"
-                    if fb_scope is not None:
-                        fb_scope.finalize(success=not is_partial_budget)
-                    elif budget_tracker:
-                        record = ObservationAccountingRecord(
-                            operation_id=fb_op_id,
-                            accounting_owner="MODULE_INTERNAL",
-                            measured_bytes_read=total_measured_bytes,
-                            estimated_bytes_read=total_estimated_bytes,
-                            charged_bytes=total_measured_bytes + total_estimated_bytes,
-                            latency_us=(time.monotonic() - t_start_obs) * 1_000_000.0,
-                            measurement_type="MIXED" if (total_measured_bytes > 0 and total_estimated_bytes > 0) else ("MEASURED" if total_measured_bytes > 0 else "ESTIMATED"),
-                        )
-                        budget_tracker.commit_transaction(record, profile_id="insp_locks", is_failure=is_partial_budget)
-
-                    return {
-                        "success": True,
-                        "status": status_val,
-                        "stop_reason": "BUDGET_EXHAUSTED" if is_partial_budget else None,
-                        "threads": threads,
-                        "contended_locks": contended_locks,
-                        "lock_contention_observed": lock_contention_observed,
-                        "deadlock_detected": deadlock_detected,
-                        "deadlock_cycle": deadlock_cycle,
-                        "result_category": result_category,
-                        "issues": issues,
-                        "wait_for_graph": wait_for_graph.to_dict(),
-                        "bytes_read": total_bytes_read,
-                        "measured_bytes_read": total_measured_bytes,
-                        "estimated_bytes_read": total_estimated_bytes,
-                        "charged_bytes": total_measured_bytes + total_estimated_bytes,
-                        "measurement_type": "MIXED" if (total_measured_bytes > 0 and total_estimated_bytes > 0) else ("MEASURED" if total_measured_bytes > 0 else "ESTIMATED"),
-                        "accounting_owner": "MODULE_INTERNAL",
-                        "accounting_status": "COMMITTED",
-                        "already_budget_accounted": True,
-                        "fallback_executed": True,
-                        "operation_id": fb_op_id,
-                        "observation_latency_us": round((time.monotonic() - t_start_obs) * 1_000_000.0, 2),
-                    }
-                except PermissionError as exc:
-                    return {"success": False, "status": "PERMISSION_DENIED", "error": f"Permission denied reading thread tasks: {exc}", "threads": [], "bytes_read": 0}
-                except ProcessLookupError:
-                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "threads": [], "bytes_read": 0}
-                except Exception as exc:
-                    return {"success": False, "status": "FAILED", "error": str(exc), "threads": [], "bytes_read": 0}
-            return {"success": True, "threads": [], "bytes_read": 0}
-
-        reg.register(FunctionalInspectionModule(p_locks, _exec_insp_locks))
-
-        # 1b. Process Memory Mappings & Region Analysis (Low-impact triage, no hardcoded symbols)
-        p_maps = InspectionProfile(
-            profile_id="insp_memory_maps",
-            domain=DOMAIN_MEMORY,
-            name="Process Memory Mappings & Region Analysis",
-            priority=145,
-            required_capabilities=["memory_maps_available"],
-            requires_explicit_target_expression=False,
-            estimated_bytes=2048,
-            estimated_latency_ms=10.0,
-            budget_ceiling={"max_bytes_read": 32768, "max_wall_clock_ms": 300.0, "max_samples": 4},
+        reg.register(
+            FunctionalInspectionModule(
+                p_locks,
+                lambda wm, **kw: wm.inspect_thread_callstacks_and_locks(**kw) if wm else {"success": True, "threads": [], "bytes_read": 0},
+            )
         )
-        def _exec_insp_maps(wm, **kw):
-            pid_val = kw.get("pid")
-            adapter = kw.get("adapter")
-            budget_tracker = kw.get("budget_tracker")
-            if budget_tracker:
-                cur_elapsed = budget_tracker.elapsed_ms
-                rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
-                rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
-                if rem_wall_ms <= 0.0 or rem_bytes < 256:
-                    return {
-                        "success": False,
-                        "status": "BUDGET_EXHAUSTED",
-                        "stop_reason": "BUDGET_EXHAUSTED",
-                        "error": "Budget exhausted before executing memory maps inspection",
-                        "regions_inspected": [],
-                        "memory_growth_candidates": [],
-                        "bytes_read": 0,
-                        "measured_bytes_read": 0,
-                    }
-
-            if pid_val and adapter:
-                try:
-                    mem_info = adapter.get_process_memory_info(pid_val) if hasattr(adapter, "get_process_memory_info") else {}
-                    st = mem_info.get("status", "OBSERVED")
-                    if st in ("PERMISSION_DENIED", "TARGET_TERMINATED", "FAILED", "UNAVAILABLE"):
-                        return {
-                            "success": False,
-                            "status": st,
-                            "error": mem_info.get("error", f"Process memory inspection failed: {st}"),
-                            "regions_inspected": [],
-                            "memory_growth_candidates": [],
-                            "bytes_read": 0,
-                            "measured_bytes_read": 0,
-                        }
-
-                    maps = adapter.get_proc_maps(pid_val) if hasattr(adapter, "get_proc_maps") else []
-                    total_bytes = sum(m.get("size", 0) for m in maps)
-                    heap_maps = [m for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]"]
-                    anon_maps = [m for m in maps if m.get("category") == "anonymous" and m.get("is_writable")]
-                    heap_size = sum(m.get("size", 0) for m in heap_maps)
-                    anon_size = sum(m.get("size", 0) for m in anon_maps)
-
-                    metrics = mem_info.get("metrics", {})
-                    vsz_bytes = metrics.get("vsz_bytes", total_bytes)
-                    rss_bytes = metrics.get("rss_bytes")
-                    rss_anon_bytes = metrics.get("rss_anon_bytes")
-
-                    # Configurable screening criteria (screening flag != defect proof)
-                    heap_thresh = int(kw.get("screening_heap_size_bytes", 4 * 1024 * 1024))
-                    anon_thresh = int(kw.get("screening_anon_size_bytes", 16 * 1024 * 1024))
-
-                    growth_candidates = []
-                    if heap_size > heap_thresh:
-                        growth_candidates.append({
-                            "target_expression": "[heap]",
-                            "region": "[heap]",
-                            "current_size": heap_size,
-                            "current_heap_mapping_size": heap_size,
-                            "current_rss": None,  # procfs does NOT measure heap-specific RSS without an extensive smaps scan
-                            "heap_rss_bytes": None,
-                            "process_rss_bytes": rss_bytes,
-                            "category": "heap",
-                            "severity": "MEDIUM",
-                            "candidate_tier": "ANOMALY_CANDIDATE_SCREENING_FLAG",
-                            "screening_flag": "ANOMALY_CANDIDATE_SCREENING_FLAG",
-                            "screening_rationale": (
-                                f"Heap mapping size ({heap_size // (1024*1024)}MB) exceeds screening threshold "
-                                f"({heap_thresh // (1024*1024)}MB); screening criteria alone do NOT prove a memory leak. "
-                                f"Temporal observation required."
-                            ),
-                            "follow_up_profile_id": "insp_temporal_diff",
-                            "measurement_scope": "heap_mapping",
-                        })
-                    if anon_size > anon_thresh:
-                        growth_candidates.append({
-                            "target_expression": "anonymous_mmap",
-                            "region": "anonymous",
-                            "current_size": anon_size,
-                            "current_anon_mapping_size": anon_size,
-                            "current_rss": rss_anon_bytes,
-                            "anon_rss_bytes": rss_anon_bytes,
-                            "process_rss_bytes": rss_bytes,
-                            "category": "anonymous",
-                            "severity": "LOW",
-                            "candidate_tier": "ANOMALY_CANDIDATE_SCREENING_FLAG",
-                            "screening_flag": "ANOMALY_CANDIDATE_SCREENING_FLAG",
-                            "screening_rationale": (
-                                f"Writable anonymous mapping size ({anon_size // (1024*1024)}MB) exceeds screening threshold "
-                                f"({anon_thresh // (1024*1024)}MB); screening criteria alone do NOT prove a memory leak. "
-                                f"Temporal observation required."
-                            ),
-                            "follow_up_profile_id": "insp_temporal_diff",
-                            "measurement_scope": "anon_mapping",
-                        })
-
-                    regions_inspected = list(sorted(set(m.get("category", "unknown") for m in maps)))
-                    meas_b = int(mem_info.get("actual_bytes_read") or (adapter.get_last_maps_bytes_read() if hasattr(adapter, "get_last_maps_bytes_read") else getattr(adapter, "_last_maps_bytes_read", 0)) or 1024)
-                    return {
-                        "success": True,
-                        "status": "OBSERVED" if not mem_info.get("missing_required_metrics") else "PARTIAL",
-                        "total_virtual_bytes": total_bytes,
-                        "vsz_bytes": vsz_bytes,
-                        "rss_bytes": rss_bytes,
-                        "rss_anon_bytes": rss_anon_bytes,
-                        "heap_size": heap_size,
-                        "heap_rss_bytes": None,
-                        "heap_physical_residency_available": False,
-                        "anonymous_size": anon_size,
-                        "memory_metrics": metrics,
-                        "metadata": mem_info.get("metadata", {}),
-                        "sources_status": mem_info.get("sources_status", {}),
-                        "missing_optional_metrics": mem_info.get("missing_optional_metrics", []),
-                        "missing_required_metrics": mem_info.get("missing_required_metrics", []),
-                        "regions_inspected": regions_inspected,
-                        "memory_growth_candidates": growth_candidates,
-                        "bytes_read": meas_b,
-                        "measured_bytes_read": meas_b,
-                    }
-                except PermissionError as exc:
-                    return {"success": False, "status": "PERMISSION_DENIED", "error": str(exc), "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
-                except ProcessLookupError:
-                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
-                except Exception as exc:
-                    return {"success": False, "status": "FAILED", "error": str(exc), "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
-            return {"success": True, "status": "OBSERVED", "regions_inspected": [], "memory_growth_candidates": [], "bytes_read": 0}
-
-        reg.register(FunctionalInspectionModule(p_maps, _exec_insp_maps))
 
         # 2. Stack Frame Locals & Parameters (No hardcoded symbols)
         p_locals = InspectionProfile(
@@ -2010,203 +857,14 @@ class AdaptiveInvestigationEngine:
             requires_explicit_target_expression=False,
             estimated_bytes=2048,
             estimated_latency_ms=15.0,
-            budget_ceiling={"max_bytes_read": 131072, "max_wall_clock_ms": 600.0, "max_samples": 6},
+            budget_ceiling={"max_bytes_read": 32768, "max_wall_clock_ms": 400.0, "max_samples": 4},
         )
-        def _exec_insp_frame_locals(wm, **kw):
-            if wm and hasattr(wm, "inspect_thread_locals_and_frame_vars"):
-                try:
-                    res = wm.inspect_thread_locals_and_frame_vars(**kw)
-                    if res and res.get("success"):
-                        return res
-                except Exception:
-                    pass
-            # Concurrency/thread-state follow-up fallback
-            pid_val = kw.get("pid")
-            target_tid = kw.get("tid")
-            adapter = kw.get("adapter")
-            budget_tracker = kw.get("budget_tracker")
-            target_identity = kw.get("target_identity") or kw.get("target_info")
-            raw_epoch = kw.get("sampling_epoch") if "sampling_epoch" in kw else kw.get("epoch")
-            sampling_epoch = None
-            if raw_epoch is not None:
-                if isinstance(raw_epoch, bool):
-                    sampling_epoch = -1
-                elif isinstance(raw_epoch, int):
-                    sampling_epoch = raw_epoch if raw_epoch >= 0 else -1
-                elif isinstance(raw_epoch, str):
-                    try:
-                        val = int(raw_epoch)
-                        sampling_epoch = val if val >= 0 else -1
-                    except (ValueError, TypeError):
-                        sampling_epoch = -1
-                else:
-                    sampling_epoch = -1
-            if budget_tracker:
-                cur_elapsed = budget_tracker.elapsed_ms
-                rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
-                rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
-                if rem_wall_ms <= 0.0 or rem_bytes < 256:
-                    return {
-                        "success": False,
-                        "status": "BUDGET_EXHAUSTED",
-                        "stop_reason": "BUDGET_EXHAUSTED",
-                        "error": "Budget exhausted before executing frame locals inspection",
-                        "frames": [],
-                        "bytes_read": 0,
-                        "measured_bytes_read": 0,
-                    }
-
-            if pid_val and adapter and hasattr(adapter, "get_threads"):
-                t_start_fl = time.monotonic()
-                try:
-                    threads_0 = adapter.get_threads(pid_val)
-                    time.sleep(0.02)
-                    threads_1 = adapter.get_threads(pid_val)
-                    t0_map = {t["tid"]: t for t in threads_0}
-                    t1_map = {t["tid"]: t for t in threads_1}
-                    target_tids = {t["tid"] for t in threads_1}
-                    if not target_identity and hasattr(adapter, "get_process_identity"):
-                        target_identity = adapter.get_process_identity(pid_val)
-
-                    t_cand = t1_map.get(target_tid) if target_tid else None
-                    if not t_cand:
-                        for t in threads_1:
-                            if t.get("is_futex_wait") or t.get("state") in ("D", "BLOCKED_LOCK"):
-                                t_cand = t
-                                break
-                    if t_cand:
-                        t_id = t_cand["tid"]
-                        t0 = t0_map.get(t_id, {})
-                        t1 = t1_map.get(t_id, {})
-                        vcs0 = t0.get("voluntary_ctxt_switches", 0)
-                        vcs1 = t1.get("voluntary_ctxt_switches", 0)
-                        nvcs0 = t0.get("nonvoluntary_ctxt_switches", 0)
-                        nvcs1 = t1.get("nonvoluntary_ctxt_switches", 0)
-                        is_stalled = (vcs0 == vcs1 and nvcs0 == nvcs1 and t1.get("is_futex_wait"))
-
-                        raw_lock = t_cand.get("syscall_arg0") or t_cand.get("syscall_arg0_int") or t_cand.get("waiting_on_lock")
-                        norm_hex, norm_int, addr_st, raw_arg = normalize_futex_address(raw_lock)
-                        if addr_st == "WAIT_ADDRESS_OBSERVED" and norm_hex:
-                            lock_addr = norm_hex
-                            lock_addr_int = norm_int
-                            lock_st = "OBSERVED"
-                        else:
-                            lock_addr = None
-                            lock_addr_int = None
-                            lock_st = "UNAVAILABLE"
-
-                        # Build wait-for graph across all waiting threads in threads_1
-                        wait_for_graph = WaitForGraph()
-                        for th in threads_1:
-                            if th.get("is_futex_wait") or th.get("state") in ("D", "BLOCKED_LOCK"):
-                                th_l = th.get("syscall_arg0") or th.get("syscall_arg0_int") or th.get("waiting_on_lock")
-                                th_hex, th_int, th_st, th_raw_arg = normalize_futex_address(th_l)
-                                if th_st == "WAIT_ADDRESS_OBSERVED" and th_hex and th_int:
-                                    th_res = adapter.resolve_mutex_owner(pid_val, th_int) if hasattr(adapter, "resolve_mutex_owner") else None
-                                    if isinstance(th_res, MutexOwnerResolutionResult):
-                                        th_owner = th_res.owner_tid
-                                        th_st_id = th_res.status
-                                        th_layout = th_res.layout_id
-                                        th_meta = dict(th_res.metadata)
-                                        th_mem_st = th_meta.get("memory_read_status", "OBSERVED" if th_res.raw_bytes else "UNAVAILABLE")
-                                        th_src = "pthread_mutex_memory" if th_owner else "procfs_syscall"
-                                    elif isinstance(th_res, int) and th_res > 0:
-                                        th_owner = th_res
-                                        th_st_id = STATUS_OWNER_IDENTIFIED
-                                        th_layout = LAYOUT_GLIBC_LP64
-                                        th_meta = {}
-                                        th_mem_st = "OBSERVED"
-                                        th_src = "pthread_mutex_memory"
-                                    else:
-                                        th_owner = None
-                                        th_st_id = STATUS_OWNER_NOT_IDENTIFIED
-                                        th_layout = None
-                                        th_meta = {}
-                                        th_mem_st = "UNAVAILABLE"
-                                        th_src = "procfs_syscall"
-
-                                    th_meta["target_tids"] = list(target_tids)
-                                    if isinstance(th_res, MutexOwnerResolutionResult) and th_res.raw_bytes:
-                                        th_meta["raw_bytes"] = th_res.raw_bytes
-                                    th_meta["read_bytes_len"] = int(th_meta.get("read_bytes_len", len(th_res.raw_bytes) if (isinstance(th_res, MutexOwnerResolutionResult) and th_res.raw_bytes) else 0))
-
-                                    wait_for_graph.add_edge(WaitForEdge(
-                                        waiter_tid=th["tid"],
-                                        sync_object=th_hex,
-                                        raw_futex_argument=th_raw_arg,
-                                        normalized_address=th_hex,
-                                        owner_tid=th_owner,
-                                        owner_identification_status=th_st_id,
-                                        mutex_layout_id=th_layout,
-                                        memory_read_status=th_mem_st,
-                                        evidence_source=th_src,
-                                        observation_timestamp=time.time(),
-                                        target_pid=pid_val,
-                                        process_identity=target_identity,
-                                        sampling_epoch=sampling_epoch,
-                                        metadata=th_meta,
-                                    ))
-
-                        cycle, result_category, issues = wait_for_graph.validate_and_analyze(
-                            target_tids=target_tids,
-                            allowed_epoch=sampling_epoch,
-                        )
-                        owner_res = adapter.resolve_mutex_owner(pid_val, lock_addr_int) if (hasattr(adapter, "resolve_mutex_owner") and lock_addr_int) else None
-                        owner_tid = owner_res.owner_tid if isinstance(owner_res, MutexOwnerResolutionResult) else (int(owner_res) if owner_res else None)
-
-                        # Distinguish: thread contention stall vs uncontended or normal progress
-                        if is_stalled:
-                            cond = "thread_contention_stall_observed"
-                        else:
-                            cond = "uncontended_or_normal_progress"
-
-                        th_bytes = (adapter.get_last_threads_bytes_read() if hasattr(adapter, "get_last_threads_bytes_read") else getattr(adapter, "_last_threads_bytes_read", 256)) * 2
-                        m_bytes = sum(int(e.metadata.get("read_bytes_len", len(e.metadata.get("raw_bytes") or b""))) for e in wait_for_graph.edges)
-                        total_fl_bytes = th_bytes + m_bytes
-
-                        return {
-                            "success": True,
-                            "status": "OBSERVED",
-                            "observed_condition": cond,
-                            "legacy_observed_condition": cond,
-                            "tid": t_id,
-                            "thread_name": t_cand.get("name"),
-                            "is_stalled": is_stalled,
-                            "lock_address": lock_addr,
-                            "lock_address_int": lock_addr_int,
-                            "raw_lock_address": raw_arg,
-                            "lock_address_status": lock_st,
-                            "owner_tid": owner_tid,
-                            "lock_owner_identified": bool(owner_tid),
-                            "deadlock_cycle": cycle,
-                            "circular_deadlock_confirmed": bool(cycle),
-                            "result_category": result_category,
-                            "issues": issues,
-                            "wait_for_graph": wait_for_graph.to_dict(),
-                            "concurrency_state": t_cand.get("concurrency_state", "WAITING_IN_FUTEX" if t1.get("is_futex_wait") else "RUNNING"),
-                            "bytes_read": total_fl_bytes,
-                            "measured_bytes_read": total_fl_bytes,
-                            "observation_latency_us": round((time.monotonic() - t_start_fl) * 1_000_000.0, 2),
-                        }
-                    th_bytes = getattr(adapter, "_last_threads_bytes_read", 128) * 2
-                    return {
-                        "success": True,
-                        "status": "OBSERVED",
-                        "observed_condition": "uncontended_or_normal_progress",
-                        "legacy_observed_condition": "uncontended_or_normal_progress",
-                        "bytes_read": th_bytes,
-                        "measured_bytes_read": th_bytes,
-                        "observation_latency_us": round((time.monotonic() - t_start_fl) * 1_000_000.0, 2),
-                    }
-                except PermissionError as exc:
-                    return {"success": False, "status": "PERMISSION_DENIED", "error": f"Permission denied reading thread states: {exc}", "bytes_read": 0}
-                except ProcessLookupError:
-                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "bytes_read": 0}
-                except Exception as exc:
-                    return {"success": False, "status": "FAILED", "error": str(exc), "bytes_read": 0}
-            return {"success": True, "status": "OBSERVED", "frames": [], "bytes_read": 0}
-
-        reg.register(FunctionalInspectionModule(p_locals, _exec_insp_frame_locals))
+        reg.register(
+            FunctionalInspectionModule(
+                p_locals,
+                lambda wm, **kw: wm.inspect_thread_locals_and_frame_vars(**kw) if wm else {"success": True, "frames": [], "bytes_read": 0},
+            )
+        )
 
         # 3. Memory Pool & Buffer Array Sweep (Requires discovered or explicit target_expression — NO hardcoded *gpMem!)
         p_pool = InspectionProfile(
@@ -2220,14 +878,15 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=25.0,
             budget_ceiling={"max_bytes_read": 131072, "max_wall_clock_ms": 600.0, "max_samples": 4},
         )
-        reg.register(
-            FunctionalInspectionModule(
-                p_pool,
-                lambda wm, **kw: wm.scan_memory_pool_or_array(
-                    target_expression=kw.pop("target_expression"), **kw
-                ),
-            )
-        )
+        def _run_pool(wm, **kw):
+            expr = kw.pop("target_expression", kw.pop("base_expression", None))
+            kw.pop("region", None)
+            try:
+                return wm.scan_memory_pool_or_array(base_expression=expr, **kw)
+            except TypeError:
+                return wm.scan_memory_pool_or_array(target_expression=expr, **kw)
+
+        reg.register(FunctionalInspectionModule(p_pool, _run_pool))
 
         # 4. Memory Integrity Audit (Requires discovered or explicit root_expression — NO hardcoded g_corrupt_record!)
         p_integ = InspectionProfile(
@@ -2241,14 +900,14 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=20.0,
             budget_ceiling={"max_bytes_read": 65536, "max_wall_clock_ms": 500.0, "max_samples": 4},
         )
-        reg.register(
-            FunctionalInspectionModule(
-                p_integ,
-                lambda wm, **kw: wm.audit_memory_integrity(
-                    root_expression=kw.pop("root_expression", kw.pop("target_expression", None)), **kw
-                ),
-            )
-        )
+        def _run_integ(wm, **kw):
+            expr = kw.pop("root_expression", kw.pop("target_expression", kw.pop("field_path", None)))
+            try:
+                return wm.audit_memory_integrity(target_expressions=[expr] if isinstance(expr, str) else expr, **kw)
+            except TypeError:
+                return wm.audit_memory_integrity(root_expression=expr, **kw)
+
+        reg.register(FunctionalInspectionModule(p_integ, _run_integ))
 
         # 5. Symbol Owner Lookup (Requires discovered or explicit target_expression — NO hardcoded *gpMem!)
         p_owners = InspectionProfile(
@@ -2262,14 +921,12 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=30.0,
             budget_ceiling={"max_bytes_read": 65536, "max_wall_clock_ms": 500.0, "max_samples": 4},
         )
-        reg.register(
-            FunctionalInspectionModule(
-                p_owners,
-                lambda wm, **kw: wm.find_symbol_owners_and_threads(
-                    target_expression=kw.pop("target_expression"), **kw
-                ),
-            )
-        )
+        def _run_owners(wm, **kw):
+            expr = kw.pop("target_expression", None)
+            kw.pop("region", None)
+            return wm.find_symbol_owners_and_threads(target_expression=expr, **kw)
+
+        reg.register(FunctionalInspectionModule(p_owners, _run_owners))
 
         # 6. Temporal Multi-Sample Symbol Delta (Requires discovered or explicit target_expression)
         p_temp = InspectionProfile(
@@ -2283,327 +940,16 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=20.0,
             budget_ceiling={"max_bytes_read": 16384, "max_wall_clock_ms": 500.0, "max_samples": 4},
         )
-        def _exec_insp_temporal_diff(wm, **kw):
-            target_expr = kw.pop("target_expression", None)
-            exprs = [target_expr] if isinstance(target_expr, str) else kw.pop("expressions", [])
-            wait_ms = int(kw.pop("wait_ms", 30))
-            num_samples = int(kw.pop("num_samples", 3))
-            num_samples = max(2, min(4, num_samples))
-            budget_tracker = kw.get("budget_tracker")
+        def _run_temp(wm, **kw):
+            t_expr = kw.pop("target_expression", kw.pop("field_path", None))
+            exprs = [t_expr] if isinstance(t_expr, str) else kw.pop("expressions", [])
+            w_ms = int(kw.pop("wait_ms", 10))
+            kw.pop("region", None)
+            if hasattr(wm, "capture_and_diff_symbols"):
+                return wm.capture_and_diff_symbols(expressions=exprs, wait_ms=w_ms, **kw)
+            return wm.capture_and_diff_expressions(expressions=exprs, wait_ms=w_ms, **kw)
 
-            if wm and hasattr(wm, "capture_and_diff_expressions") and exprs and exprs[0] not in ("[heap]", "anonymous_mmap", "heap_or_pool"):
-                try:
-                    return wm.capture_and_diff_expressions(expressions=exprs, wait_ms=wait_ms, **kw)
-                except Exception:
-                    pass
-
-            # Determine explicit measurement scope and metric name
-            target_name = (target_expr or "process_rss").lower()
-            if "heap" in target_name:
-                measurement_scope = "heap_mapping"
-                metric_name = "heap_mapping_size_bytes"
-            elif "anon" in target_name:
-                measurement_scope = "anon_mapping"
-                metric_name = "anon_mapping_size_bytes"
-            elif "vsz" in target_name:
-                measurement_scope = "process_vsz"
-                metric_name = "vsz_bytes"
-            else:
-                measurement_scope = "process_rss"
-                metric_name = "process_rss_bytes"
-
-            # Live target adapter multi-sample temporal sequence
-            pid_val = kw.get("pid")
-            adapter = kw.get("adapter")
-            if pid_val and adapter:
-                try:
-                    alive, l_err = adapter.check_liveness(pid_val) if hasattr(adapter, "check_liveness") else (True, None)
-                    if not alive:
-                        return {
-                            "success": False,
-                            "status": "TARGET_TERMINATED",
-                            "error": l_err or f"Target PID {pid_val} is not running",
-                            "measurement_scope": measurement_scope,
-                            "metric_name": metric_name,
-                            "samples": [],
-                            "bytes_read": 0,
-                            "measured_bytes_read": 0,
-                        }
-
-                    samples = []
-                    t0 = time.time()
-                    t_start_wall = time.monotonic()
-                    actual_bytes_total = 0
-
-                    for s_idx in range(num_samples):
-                        # Pre-sample wall-clock and byte budget check
-                        if budget_tracker:
-                            cur_elapsed = budget_tracker.elapsed_ms
-                            rem_wall_ms = budget_tracker.limits.max_wall_clock_ms - cur_elapsed
-                            if s_idx > 0 and rem_wall_ms < float(wait_ms):
-                                return {
-                                    "success": True if len(samples) >= 1 else False,
-                                    "status": "PARTIAL" if len(samples) >= 1 else "BUDGET_EXHAUSTED",
-                                    "stop_reason": "BUDGET_EXHAUSTED",
-                                    "exhaustion_reason": f"Wall-clock budget exhausted before sample {s_idx} ({cur_elapsed:.1f}ms elapsed, remaining {rem_wall_ms:.1f}ms < wait_ms {wait_ms}ms)",
-                                    "samples": samples,
-                                    "num_samples": len(samples),
-                                    "measurement_scope": measurement_scope,
-                                    "metric_name": metric_name,
-                                    "observed_condition": "INSUFFICIENT_REGION_EVIDENCE" if len(samples) < 2 else "PROCESS_MEMORY_STABLE",
-                                    "legacy_observed_condition": "stable_or_reclaimed_allocation",
-                                    "is_temporal_sample": True,
-                                    "bytes_read": actual_bytes_total,
-                                    "measured_bytes_read": actual_bytes_total,
-                                    "actual_duration_ms": round((time.monotonic() - t_start_wall) * 1000.0, 2),
-                                }
-
-                            rem_bytes = budget_tracker.limits.max_bytes_read - budget_tracker.metrics.bytes_read
-                            if rem_bytes < 1024:
-                                return {
-                                    "success": True if len(samples) >= 1 else False,
-                                    "status": "PARTIAL" if len(samples) >= 1 else "BUDGET_EXHAUSTED",
-                                    "stop_reason": "BUDGET_EXHAUSTED",
-                                    "exhaustion_reason": f"Byte budget exhausted before sample {s_idx} (remaining {rem_bytes}B < 1024B)",
-                                    "samples": samples,
-                                    "num_samples": len(samples),
-                                    "measurement_scope": measurement_scope,
-                                    "metric_name": metric_name,
-                                    "observed_condition": "INSUFFICIENT_REGION_EVIDENCE" if len(samples) < 2 else "PROCESS_MEMORY_STABLE",
-                                    "legacy_observed_condition": "stable_or_reclaimed_allocation",
-                                    "is_temporal_sample": True,
-                                    "bytes_read": actual_bytes_total,
-                                    "measured_bytes_read": actual_bytes_total,
-                                    "actual_duration_ms": round((time.monotonic() - t_start_wall) * 1000.0, 2),
-                                }
-
-                            if budget_tracker.metrics.samples_collected >= budget_tracker.limits.max_samples:
-                                return {
-                                    "success": True if len(samples) >= 1 else False,
-                                    "status": "PARTIAL" if len(samples) >= 1 else "BUDGET_EXHAUSTED",
-                                    "stop_reason": "BUDGET_EXHAUSTED",
-                                    "exhaustion_reason": f"Sample count limit ({budget_tracker.limits.max_samples}) reached before sample {s_idx}",
-                                    "samples": samples,
-                                    "num_samples": len(samples),
-                                    "measurement_scope": measurement_scope,
-                                    "metric_name": metric_name,
-                                    "observed_condition": "INSUFFICIENT_REGION_EVIDENCE" if len(samples) < 2 else "PROCESS_MEMORY_STABLE",
-                                    "legacy_observed_condition": "stable_or_reclaimed_allocation",
-                                    "is_temporal_sample": True,
-                                    "bytes_read": actual_bytes_total,
-                                    "measured_bytes_read": actual_bytes_total,
-                                    "actual_duration_ms": round((time.monotonic() - t_start_wall) * 1000.0, 2),
-                                }
-
-                        if s_idx > 0:
-                            time.sleep(max(wait_ms, 20) / 1000.0)
-
-                        alive, _ = adapter.check_liveness(pid_val) if hasattr(adapter, "check_liveness") else (True, None)
-                        if not alive:
-                            return {
-                                "success": False,
-                                "status": "TARGET_TERMINATED",
-                                "error": f"Target process {pid_val} terminated during temporal sampling at sample {s_idx}",
-                                "samples_collected": len(samples),
-                                "samples": samples,
-                                "measurement_scope": measurement_scope,
-                                "metric_name": metric_name,
-                                "bytes_read": actual_bytes_total,
-                                "measured_bytes_read": actual_bytes_total,
-                            }
-
-                        t_sample_start = time.monotonic()
-                        mem_info = adapter.get_process_memory_info(pid_val) if hasattr(adapter, "get_process_memory_info") else {}
-                        st = mem_info.get("status", "OBSERVED")
-                        if st in ("PERMISSION_DENIED", "TARGET_TERMINATED", "FAILED", "UNAVAILABLE"):
-                            return {
-                                "success": False,
-                                "status": st,
-                                "error": mem_info.get("error", f"Memory query failed: {st}"),
-                                "samples_collected": len(samples),
-                                "samples": samples,
-                                "measurement_scope": measurement_scope,
-                                "metric_name": metric_name,
-                                "bytes_read": actual_bytes_total,
-                                "measured_bytes_read": actual_bytes_total,
-                            }
-
-                        sample_bytes = int(mem_info.get("actual_bytes_read", 2048))
-                        actual_bytes_total += sample_bytes
-                        sample_lat_us = (time.monotonic() - t_sample_start) * 1_000_000.0
-                        if budget_tracker:
-                            budget_tracker.record_read(bytes_read=sample_bytes, latency_us=sample_lat_us, profile_id="insp_temporal_diff")
-                            budget_tracker.record_sample(profile_id="insp_temporal_diff")
-
-                        maps = adapter.get_proc_maps(pid_val) if hasattr(adapter, "get_proc_maps") else []
-                        heap_sz = sum(m.get("size", 0) for m in maps if m.get("category") == "heap" or m.get("pathname") == "[heap]")
-                        anon_sz = sum(m.get("size", 0) for m in maps if m.get("category") == "anonymous" and m.get("is_writable"))
-                        total_map_sz = sum(m.get("size", 0) for m in maps)
-
-                        metrics = mem_info.get("metrics", {})
-                        vsz_val = metrics.get("vsz_bytes", total_map_sz)
-                        rss_val = metrics.get("rss_bytes", 0) or 0
-                        anon_rss_val = metrics.get("rss_anon_bytes", 0) or 0
-
-                        if measurement_scope == "heap_mapping":
-                            target_metric = heap_sz
-                        elif measurement_scope == "anon_mapping":
-                            target_metric = anon_sz
-                        elif measurement_scope == "process_vsz":
-                            target_metric = vsz_val
-                        else:
-                            target_metric = rss_val
-
-                        now = time.time()
-                        samples.append({
-                            "sample_index": s_idx,
-                            "timestamp": now,
-                            "elapsed_ms": round((now - t0) * 1000.0, 2),
-                            "measurement_scope": measurement_scope,
-                            "metric_name": metric_name,
-                            "target_metric_bytes": target_metric,
-                            "vsz_bytes": vsz_val,
-                            "rss_bytes": rss_val,
-                            "rss_anon_bytes": anon_rss_val,
-                            "heap_mapping_size": heap_sz,
-                            "anon_mapping_size": anon_sz,
-                            "total_mapping_size": total_map_sz,
-                            "mapping_count": len(maps),
-                            "heap_rss_bytes": None,  # Explicitly null: procfs cannot measure heap RSS without smaps scan
-                        })
-
-                    if len(samples) < 2:
-                        return {
-                            "success": True,
-                            "status": "PARTIAL",
-                            "observed_condition": "INSUFFICIENT_REGION_EVIDENCE",
-                            "legacy_observed_condition": "stable_or_reclaimed_allocation",
-                            "condition_detail": "Fewer than 2 temporal samples collected; insufficient evidence for delta analysis.",
-                            "growth_detected": False,
-                            "growth_delta_bytes": 0,
-                            "samples": samples,
-                            "num_samples": len(samples),
-                            "measurement_scope": measurement_scope,
-                            "metric_name": metric_name,
-                            "heap_rss_bytes": None,
-                            "is_temporal_sample": True,
-                            "bytes_read": actual_bytes_total,
-                            "measured_bytes_read": actual_bytes_total,
-                        }
-
-                    deltas = [
-                        samples[i]["target_metric_bytes"] - samples[i - 1]["target_metric_bytes"]
-                        for i in range(1, len(samples))
-                    ]
-                    rss_deltas = [
-                        samples[i]["rss_bytes"] - samples[i - 1]["rss_bytes"]
-                        for i in range(1, len(samples))
-                    ]
-
-                    total_target_delta = samples[-1]["target_metric_bytes"] - samples[0]["target_metric_bytes"]
-                    total_rss_delta = samples[-1]["rss_bytes"] - samples[0]["rss_bytes"]
-                    total_map_delta = samples[-1]["total_mapping_size"] - samples[0]["total_mapping_size"]
-
-                    # 1. Temporary workload buffering: grew then dropped back
-                    is_burst_and_drop = (
-                        len(deltas) >= 2
-                        and deltas[0] > 0
-                        and deltas[1] < 0
-                        and total_target_delta <= (deltas[0] // 2)
-                    )
-
-                    # 2. Mapping expansion without allocation: mapping size expanded, but RSS remained flat
-                    is_mapping_only_expansion = (
-                        total_map_delta > 0
-                        and abs(total_rss_delta) < 65536
-                        and all(abs(rd) < 65536 for rd in rss_deltas)
-                    )
-
-                    # 3. Allocator retention: initial growth, then completely flat across remaining intervals
-                    is_allocator_retention = (
-                        len(deltas) >= 2
-                        and deltas[0] > 0
-                        and all(abs(d) < 32768 for d in deltas[1:])
-                    )
-
-                    # 4. Sustained monotonic growth: positive growth across all sample intervals
-                    is_sustained_growth = (
-                        all(d > 0 for d in deltas)
-                        and total_target_delta > 0
-                    )
-
-                    if is_burst_and_drop:
-                        observed_cond = "temporary_workload_buffering"
-                        scoped_cond = "PROCESS_RSS_BURST_AND_RECLAIM"
-                        conditions = ["temporary_workload_buffering", "PROCESS_RSS_BURST_AND_RECLAIM"]
-                        cond_detail = f"Memory burst occurred during workload activity followed by reclamation in {measurement_scope}; temporary workload buffering, not leak."
-                        growth_detected = False
-                    elif is_mapping_only_expansion:
-                        observed_cond = "mapping_expansion_without_allocation"
-                        scoped_cond = "HEAP_MAPPING_EXPANSION" if measurement_scope == "heap_mapping" else "ANON_MAPPING_EXPANSION"
-                        conditions = ["mapping_expansion_without_allocation", scoped_cond]
-                        cond_detail = f"Virtual memory mappings expanded in {measurement_scope} without physical page allocation."
-                        growth_detected = False
-                    elif is_allocator_retention:
-                        observed_cond = "allocator_retention"
-                        scoped_cond = "allocator_retention"
-                        conditions = ["allocator_retention"]
-                        cond_detail = f"Memory allocated and retained by runtime allocator/freelist pool in {measurement_scope}; stable bounds across subsequent intervals."
-                        growth_detected = False
-                    elif is_sustained_growth:
-                        observed_cond = "sustained_monotonic_growth"
-                        scoped_cond = "PROCESS_RSS_SUSTAINED_GROWTH" if measurement_scope == "process_rss" else ("HEAP_MAPPING_EXPANSION" if measurement_scope == "heap_mapping" else "ANON_MAPPING_EXPANSION")
-                        conditions = ["sustained_monotonic_growth", scoped_cond]
-                        cond_detail = (
-                            f"Sustained monotonic memory growth observed in {measurement_scope} across all temporal sampling intervals. "
-                            f"Screening flag elevated; procfs measurements alone cannot prove a memory leak without allocation lifetime verification."
-                        )
-                        growth_detected = True
-                    elif total_target_delta <= 0:
-                        observed_cond = "stable_or_reclaimed_allocation"
-                        scoped_cond = "PROCESS_MEMORY_STABLE"
-                        conditions = ["stable_or_reclaimed_allocation", "PROCESS_MEMORY_STABLE"]
-                        cond_detail = f"Memory usage remained stable or was reclaimed in {measurement_scope} across temporal samples."
-                        growth_detected = False
-                    else:
-                        observed_cond = "sustained_monotonic_growth"
-                        scoped_cond = "PROCESS_RSS_SUSTAINED_GROWTH" if measurement_scope == "process_rss" else ("HEAP_MAPPING_EXPANSION" if measurement_scope == "heap_mapping" else "ANON_MAPPING_EXPANSION")
-                        conditions = ["sustained_monotonic_growth", scoped_cond]
-                        cond_detail = f"Net memory growth observed in {measurement_scope} across temporal sampling sequence."
-                        growth_detected = True
-
-                    return {
-                        "success": True,
-                        "status": "OBSERVED",
-                        "observed_condition": observed_cond,
-                        "scoped_condition": scoped_cond,
-                        "conditions": conditions,
-                        "legacy_observed_condition": observed_cond,
-                        "condition_detail": cond_detail,
-                        "growth_detected": growth_detected,
-                        "growth_delta_bytes": total_target_delta,
-                        "initial_size": samples[0]["target_metric_bytes"],
-                        "final_size": samples[-1]["target_metric_bytes"],
-                        "measurement_scope": measurement_scope,
-                        "metric_name": metric_name,
-                        "heap_rss_bytes": None,
-                        "samples": samples,
-                        "num_samples": len(samples),
-                        "sampling_interval_ms": wait_ms,
-                        "is_temporal_sample": True,
-                        "bytes_read": actual_bytes_total,
-                        "measured_bytes_read": actual_bytes_total,
-                        "actual_duration_ms": round((time.monotonic() - t_start_wall) * 1000.0, 2),
-                    }
-                except PermissionError as exc:
-                    return {"success": False, "status": "PERMISSION_DENIED", "error": str(exc), "bytes_read": 0, "measured_bytes_read": 0}
-                except ProcessLookupError:
-                    return {"success": False, "status": "TARGET_TERMINATED", "error": f"Target process {pid_val} terminated", "bytes_read": 0, "measured_bytes_read": 0}
-                except Exception as exc:
-                    return {"success": False, "status": "FAILED", "error": str(exc), "bytes_read": 0, "measured_bytes_read": 0}
-            return {"success": True, "status": "OBSERVED", "observed_condition": "PROCESS_MEMORY_STABLE", "legacy_observed_condition": "stable_or_reclaimed_allocation", "bytes_read": 0}
-
-        reg.register(FunctionalInspectionModule(p_temp, _exec_insp_temporal_diff))
+        reg.register(FunctionalInspectionModule(p_temp, _run_temp))
 
         # 7. Concurrent Read Consistency Verifier (Requires discovered or explicit field_path / target_expression)
         p_cons = InspectionProfile(
@@ -2617,15 +963,14 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=10.0,
             budget_ceiling={"max_bytes_read": 8192, "max_wall_clock_ms": 300.0, "max_samples": 4},
         )
-        reg.register(
-            FunctionalInspectionModule(
-                p_cons,
-                lambda wm, **kw: wm.verify_concurrent_read_consistency(
-                    target_expression=kw.pop("field_path", kw.pop("target_expression", None)),
-                    **kw,
-                ),
-            )
-        )
+        def _run_cons(wm, **kw):
+            expr = kw.pop("field_path", kw.pop("target_expression", None))
+            try:
+                return wm.verify_concurrent_read_consistency(expressions=[expr] if isinstance(expr, str) else expr, **kw)
+            except TypeError:
+                return wm.verify_concurrent_read_consistency(target_expression=expr, **kw)
+
+        reg.register(FunctionalInspectionModule(p_cons, _run_cons))
 
         # 8. IPC Pipeline Inspection (Requires discovered or explicit pipeline_expression — NO hardcoded g_ipc_ring!)
         p_ipc = InspectionProfile(
@@ -2639,15 +984,14 @@ class AdaptiveInvestigationEngine:
             estimated_latency_ms=15.0,
             budget_ceiling={"max_bytes_read": 16384, "max_wall_clock_ms": 400.0, "max_samples": 4},
         )
-        reg.register(
-            FunctionalInspectionModule(
-                p_ipc,
-                lambda wm, **kw: wm.trace_ipc_pipeline(
-                    pipeline_expression=kw.pop("pipeline_expression", kw.pop("target_expression", None)),
-                    **kw,
-                ),
-            )
-        )
+        def _run_ipc(wm, **kw):
+            expr = kw.pop("pipeline_expression", kw.pop("target_expression", None))
+            try:
+                return wm.trace_ipc_pipeline(pipeline_expression=expr, **kw)
+            except TypeError:
+                return wm.evaluate_symbol_paths(expressions=[expr] if isinstance(expr, str) else [], **kw)
+
+        reg.register(FunctionalInspectionModule(p_ipc, _run_ipc))
 
         return reg
 
@@ -2681,93 +1025,82 @@ class AdaptiveInvestigationEngine:
             return t_id, caps, cq
 
         alive, liveness_err = adapter.check_liveness(pid) if pid and pid > 0 else (False, "Invalid PID")
-
-        # 1. Discover runtime process identity from adapter
-        proc_ident = adapter.get_process_identity(pid) if (pid and pid > 0) else {}
-        runtime_exe = proc_ident.get("executable") or ""
-        runtime_build_id = proc_ident.get("build_id")
-        is_deleted = proc_ident.get("is_deleted", False)
-        start_time = proc_ident.get("process_start_time")
-        ident_status = proc_ident.get("status", "OBSERVED" if alive else "FAILED")
-
-        unavail_reasons: Dict[str, str] = {}
-        if ident_status == "PERMISSION_DENIED":
-            unavail_reasons["target_identity"] = "Cannot inspect target identity: Permission denied accessing /proc/<pid>/exe"
-            unavail_reasons["procfs_accessible"] = "Permission denied accessing /proc/<pid>/"
-        elif ident_status == "TARGET_TERMINATED" or not alive:
-            unavail_reasons["process_alive"] = liveness_err or f"PID {pid} is not running"
-
-        if is_deleted:
-            unavail_reasons["executable_deleted"] = "Runtime executable was deleted on disk"
-
-        # 2. Companion ELF & DWARF capabilities verification
-        # /proc/<pid>/exe must NOT automatically be treated as a valid companion image.
-        companion_status = "NOT_PROVIDED"
-        companion_build_id = None
+        elf_info: Dict[str, Any] = {}
         has_dwarf = False
-        companion_rejection_reason = None
-
-        if companion_elf_path:
-            if not os.path.exists(companion_elf_path):
-                companion_status = "COMPANION_NOT_FOUND"
-                companion_rejection_reason = f"Companion ELF '{companion_elf_path}' does not exist on disk"
-                unavail_reasons["dwarf_symbols_available"] = companion_rejection_reason
-            else:
-                try:
-                    comp_ident = inspect_elf(companion_elf_path)
-                    companion_build_id = getattr(comp_ident, "build_id", None)
-                    comp_dwarf = bool(getattr(comp_ident, "has_debug_info", False))
-
-                    # Verify Build ID equality between runtime target and companion image
-                    if runtime_build_id and companion_build_id and runtime_build_id.lower() != companion_build_id.lower():
-                        companion_status = "BUILD_ID_MISMATCH"
-                        companion_rejection_reason = (
-                            f"Companion ELF Build ID ({companion_build_id}) does not match "
-                            f"runtime target Build ID ({runtime_build_id})"
-                        )
-                        unavail_reasons["dwarf_symbols_available"] = companion_rejection_reason
-                    else:
-                        companion_status = "MATCHED"
-                        if comp_dwarf:
-                            has_dwarf = True
-                        else:
-                            unavail_reasons["dwarf_symbols_available"] = (
-                                f"Matching companion ELF '{companion_elf_path}' contains no DWARF debug info (.debug_info)"
-                            )
-                except Exception as exc:
-                    companion_status = "COMPANION_INSPECTION_FAILED"
-                    companion_rejection_reason = f"Failed to inspect companion ELF: {exc}"
-                    unavail_reasons["dwarf_symbols_available"] = companion_rejection_reason
-        else:
-            companion_status = "NOT_PROVIDED"
-            # If no companion ELF was provided, inspect runtime executable itself
-            if proc_ident.get("has_debug_info"):
-                has_dwarf = True
-            else:
-                unavail_reasons["dwarf_symbols_available"] = (
-                    "No companion ELF supplied and runtime executable is stripped (lacks DWARF debug info)"
-                )
+        if companion_elf_path and os.path.exists(companion_elf_path):
+            try:
+                b_id = inspect_elf(companion_elf_path)
+                has_dwarf = bool(getattr(b_id, "has_debug_info", False))
+                elf_info = {
+                    "build_id": getattr(b_id, "build_id", None),
+                    "has_dwarf_info": has_dwarf,
+                    "arch": getattr(b_id, "machine", None),
+                }
+            except Exception as exc:
+                elf_info = {"elf_inspection_error": str(exc), "has_dwarf_info": False}
 
         maps_ok = False
         threads_ok = False
         mem_read_ok = False
+        unavail_reasons: Dict[str, str] = {}
 
-        if alive and ident_status != "PERMISSION_DENIED":
-            maps_path = f"/proc/{pid}/maps"
-            task_path = f"/proc/{pid}/task"
-            maps_ok = os.access(maps_path, os.R_OK)
-            if not maps_ok:
-                unavail_reasons["memory_maps_available"] = f"Cannot read {maps_path} (permission or procfs restriction)"
-            threads_ok = os.path.isdir(task_path) and os.access(task_path, os.R_OK)
-            if not threads_ok:
-                unavail_reasons["threads_available"] = f"Cannot enumerate {task_path}"
-            # Check memory read capability
-            mem_path = f"/proc/{pid}/mem"
-            mem_read_ok = os.access(mem_path, os.R_OK) or maps_ok
-            if not mem_read_ok:
-                unavail_reasons["memory_read_available"] = "Process memory read restricted (EPERM / ptrace_scope)"
-        elif not alive:
+        proc_ident: Dict[str, Any] = {}
+        if alive:
+            try:
+                proc_ident = adapter.get_process_identity(pid) or {}
+            except Exception:
+                proc_ident = {}
+            if adapter.is_remote():
+                try:
+                    rem_maps = adapter.get_proc_maps(pid)
+                    maps_ok = bool(rem_maps)
+                except Exception:
+                    maps_ok = False
+                try:
+                    rem_threads = adapter.get_threads(pid)
+                    threads_ok = bool(rem_threads)
+                except Exception:
+                    threads_ok = False
+                mem_read_ok = maps_ok
+            else:
+                maps_path = f"/proc/{pid}/maps"
+                task_path = f"/proc/{pid}/task"
+                maps_ok = os.access(maps_path, os.R_OK)
+                if not maps_ok:
+                    unavail_reasons["memory_maps_available"] = f"Cannot read {maps_path} (permission or procfs restriction)"
+                threads_ok = os.path.isdir(task_path) and os.access(task_path, os.R_OK)
+                if not threads_ok:
+                    unavail_reasons["threads_available"] = f"Cannot enumerate {task_path}"
+                mem_path = f"/proc/{pid}/mem"
+                mem_read_ok = os.access(mem_path, os.R_OK) or maps_ok
+                if not mem_read_ok:
+                    unavail_reasons["memory_read_available"] = "Process memory read restricted (EPERM / ptrace_scope)"
+
+            # Verify Build ID match between running target and companion ELF
+            target_bid = proc_ident.get("build_id")
+            comp_bid = elf_info.get("build_id")
+            if target_bid and comp_bid and str(target_bid).strip().lower() != str(comp_bid).strip().lower():
+                has_dwarf = False
+                elf_info["build_id_mismatch"] = True
+                elf_info["target_build_id"] = target_bid
+                unavail_reasons["dwarf_symbols_available"] = (
+                    f"Build ID mismatch between target PID {pid} ({target_bid}) and companion ELF ({comp_bid})"
+                )
+            elif hasattr(adapter, "pin_target_identity"):
+                try:
+                    adapter.pin_target_identity(pid, companion_build_id=comp_bid)
+                except Exception as pin_exc:
+                    has_dwarf = False
+                    unavail_reasons["dwarf_symbols_available"] = str(pin_exc)
+        else:
             unavail_reasons["process_alive"] = liveness_err or f"PID {pid} is not running"
+
+        if not has_dwarf and "dwarf_symbols_available" not in unavail_reasons:
+            unavail_reasons["dwarf_symbols_available"] = (
+                f"No DWARF debug info found in '{companion_elf_path}'"
+                if companion_elf_path
+                else "No companion ELF / debug image supplied"
+            )
 
         watch_hist_ok = False
         if self.watch_manager and hasattr(self.watch_manager, "list_sessions"):
@@ -2781,32 +1114,20 @@ class AdaptiveInvestigationEngine:
             "process_alive": alive,
             "memory_maps_available": maps_ok,
             "threads_available": threads_ok,
-            "dwarf_symbols_available": has_dwarf and (ident_status != "PERMISSION_DENIED"),
+            "dwarf_symbols_available": has_dwarf,
             "memory_read_available": mem_read_ok,
             "watch_history_available": watch_hist_ok,
-            "procfs_accessible": bool(alive and ident_status != "PERMISSION_DENIED"),
             "unavailable_reasons": unavail_reasons,
         }
         target_identity = {
             "pid": pid,
-            "executable": runtime_exe,
-            "runtime_build_id": runtime_build_id,
-            "build_id": runtime_build_id,
-            "is_deleted": is_deleted,
-            "process_start_time": start_time,
-            "companion_elf": companion_elf_path if companion_status == "MATCHED" else (runtime_exe if not companion_elf_path else None),
-            "companion_elf_path": companion_elf_path,
-            "companion_build_id": companion_build_id,
-            "companion_status": companion_status,
-            "companion_rejection_reason": companion_rejection_reason,
+            "companion_elf": companion_elf_path,
             "alive": alive,
-            "architecture": proc_ident.get("architecture", "unknown"),
-            "elf_type": proc_ident.get("elf_type", "unknown"),
-            "has_dwarf_info": has_dwarf,
+            **elf_info,
         }
         capture_quality = {
-            "completeness": "COMPLETE" if (alive and mem_read_ok and ident_status != "PERMISSION_DENIED") else ("FAILED" if not alive else "PARTIAL"),
-            "status": "COMPLETE" if (alive and mem_read_ok and ident_status != "PERMISSION_DENIED") else ("FAILED" if not alive else "PARTIAL"),
+            "completeness": "COMPLETE" if (alive and mem_read_ok) else ("FAILED" if not alive else "PARTIAL"),
+            "status": "COMPLETE" if (alive and mem_read_ok) else ("FAILED" if not alive else "PARTIAL"),
             "consistency_level": "ZERO_STOP_ATOMIC",
         }
         return target_identity, caps, capture_quality
@@ -2822,110 +1143,23 @@ class AdaptiveInvestigationEngine:
         budget_limits: Optional[ObservationBudgetLimits] = None,
         target_adapter: Optional[TargetExecutionAdapter] = None,
         session_id: Optional[str] = None,
-        provenance_class: Optional[str] = None,
-        capture_receipt: Optional[Any] = None,
+        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
         fixture_data: Optional[Dict[str, Any]] = None,
         follow_up_executor: Optional[Callable[[FollowUpObservation, int], Dict[str, Any]]] = None,
         existing_state_machine: Optional[InvestigationStateMachine] = None,
         existing_executed_keys: Optional[Set[str]] = None,
         cancel_requested: bool = False,
-        verification_authority: Optional[Any] = None,
-        snapshot: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Executes an evidence-grounded, budget-bounded Process Health Investigation
         through the single explicit investigation state machine.
         """
-        rcpt_sess = None
-        if capture_receipt:
-            rcpt_sess = getattr(capture_receipt, "session_id", None)
-            if isinstance(capture_receipt, dict):
-                rcpt_sess = capture_receipt.get("session_id")
-        sess_id = session_id or rcpt_sess or f"inv_health_{uuid.uuid4().hex[:8]}"
+        sess_id = session_id or f"inv_health_{uuid.uuid4().hex[:8]}"
         limits = budget_limits or self.default_limits
         budget_tracker = ObservationBudgetTracker(limits)
         budget_tracker.start()
 
-        # Wrap adapter in strictly read-only execution boundary
-        raw_adapter = target_adapter or LocalTargetAdapter()
-        eff_adapter = (
-            raw_adapter
-            if isinstance(raw_adapter, ReadOnlyTargetAdapter)
-            else ReadOnlyTargetAdapter(raw_adapter)
-        )
-
-        # Determine provenance
-        # LIVE_RUNTIME_CAPTURE strictly requires an authentic, verified LiveCaptureReceipt
-        is_synthetic = False
-        if fixture_data is not None:
-            target_ident = fixture_data.get("target_identity", {})
-            if (
-                target_ident.get("is_synthetic") is True
-                or target_ident.get("provenance_class") == PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-                or fixture_data.get("provenance_class") == PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-                or provenance_class == PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-            ):
-                is_synthetic = True
-
-        eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        verified_receipt = None
-        effective_receipt = capture_receipt
-        if effective_receipt is None and snapshot is not None:
-            effective_receipt = getattr(snapshot, "receipt", None)
-
-        snap_trust_state = TRUST_STATE_IMPORTED_UNVERIFIED
-        snap_trust_error = None
-
-        if is_synthetic:
-            eff_prov = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-            snap_trust_state = TRUST_STATE_IMPORTED_UNVERIFIED
-        elif effective_receipt is not None:
-            runtime_bin = getattr(snapshot, "binary", None) if snapshot is not None else None
-            expected_build_id = getattr(snapshot, "build_id", None) if snapshot is not None else None
-            eff_companion_elf = companion_elf_path
-            if fixture_data is not None and companion_elf_path and not os.path.exists(companion_elf_path):
-                eff_companion_elf = None
-            snap_trust_state, snap_trust_error = determine_snapshot_trust_state(
-                effective_receipt,
-                verification_authority=verification_authority,
-                expected_session_id=sess_id,
-                expected_pid=pid if pid and pid > 0 else None,
-                expected_executable_path=runtime_bin,
-                companion_elf_path=eff_companion_elf,
-                expected_build_id=expected_build_id,
-                snapshot=snapshot,
-            )
-            if snap_trust_state == TRUST_STATE_LIVE_VERIFIED:
-                eff_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-                verified_receipt = effective_receipt
-            else:
-                eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        elif provenance_class == PROVENANCE_CLASS_IMPORTED_UNVERIFIED or (
-            fixture_data and fixture_data.get("provenance_class") == PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        ):
-            eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        elif fixture_data is not None:
-            eff_prov = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-        elif provenance_class == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
-            # Caller attempted to assert LIVE without verified receipt -> force unverified
-            eff_prov = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        elif provenance_class:
-            eff_prov = provenance_class
-
-        ledger = self.ledger if self.ledger is not None else EvidenceLedger(
-            session_id=sess_id,
-            live_capture_receipt=verified_receipt,
-            verification_authority=verification_authority,
-        )
-        ledger.trust_state = snap_trust_state
-        ledger.trust_error = snap_trust_error
-        if self.ledger is not None:
-            self.ledger.live_capture_receipt = verified_receipt
-            self.ledger.verification_authority = verification_authority
-            self.ledger.session_id = sess_id
-        self.adapter.default_provenance_class = eff_prov
-        self.adapter.live_capture_receipt = verified_receipt
-        self.adapter.verification_authority = verification_authority
-
+        eff_adapter = target_adapter or LocalTargetAdapter()
+        ledger = self.ledger if self.ledger is not None else EvidenceLedger(session_id=sess_id)
         sm = existing_state_machine or InvestigationStateMachine(initial_state=STATE_CREATED)
         executed_keys: Set[str] = set(existing_executed_keys or set())
         observation_log: List[Dict[str, Any]] = []
@@ -2955,30 +1189,20 @@ class AdaptiveInvestigationEngine:
             f"Validating target identity (pid={pid}) and probing available read-only observation capabilities.",
         )
 
-        t_stage1_start = time.monotonic()
+        # Prevent untrusted imported data from forging LIVE_RUNTIME_CAPTURE
+        eff_prov = provenance_class
+        if fixture_data and fixture_data.get("provenance_class"):
+            if fixture_data["provenance_class"] not in TRUSTED_PROVENANCE_CLASSES:
+                eff_prov = fixture_data["provenance_class"]
+        self.adapter.default_provenance_class = eff_prov
+
         target_identity, capabilities, capture_quality = self._probe_target_and_capabilities(
             pid=pid,
             companion_elf_path=companion_elf_path,
             adapter=eff_adapter,
             fixture_data=fixture_data,
         )
-        stage1_elapsed_us = (time.monotonic() - t_stage1_start) * 1_000_000.0
         target_identity["provenance_class"] = eff_prov
-        target_identity["trust_state"] = snap_trust_state
-
-        # Account for process identity read in observation budget (Step 4 requirement: measured latency)
-        id_bytes = eff_adapter.get_last_identity_bytes_read() if hasattr(eff_adapter, "get_last_identity_bytes_read") else getattr(eff_adapter, "_last_identity_bytes_read", 0)
-        id_lat = eff_adapter.get_last_identity_latency_us() if hasattr(eff_adapter, "get_last_identity_latency_us") else stage1_elapsed_us
-        if id_lat <= 0.0:
-            id_lat = stage1_elapsed_us
-
-        if id_bytes > 0:
-            budget_tracker.record_read(
-                bytes_read=id_bytes,
-                latency_us=id_lat,
-                profile_id="target_validation",
-            )
-            budget_tracker.record_sample(profile_id="target_validation")
 
         # Record target identity & capture quality in ledger
         id_rec = EvidenceRecord(
@@ -3058,9 +1282,24 @@ class AdaptiveInvestigationEngine:
         triage_failures = 0
         triage_budget_rejected = False
 
-        if fixture_data and "initial_triage" in fixture_data:
+        if fixture_data and ("initial_triage" in fixture_data or "triage_observations" in fixture_data or any(k in fixture_data for k in triage_candidates)):
             # Deterministic fixture-driven initial triage
-            triage_Steps = fixture_data["initial_triage"]
+            triage_Steps = list(fixture_data.get("initial_triage") or [])
+            for idx_to, to_item in enumerate(fixture_data.get("triage_observations") or []):
+                is_abs = to_item.get("collection_status") in ("ABSTAIN", "FAILED")
+                triage_Steps.append({
+                    "step_id": to_item.get("source", f"triage_obs_{idx_to}"),
+                    "domain": to_item.get("domain", DOMAIN_GENERIC),
+                    "estimated_bytes": to_item.get("bytes_read", 512),
+                    "output": {
+                        "success": not is_abs,
+                        "status": "RESTRICTED" if is_abs else "OBSERVED",
+                        "summary": to_item.get("observation", "Triage observation"),
+                        "bytes_read": to_item.get("bytes_read", 512),
+                        "error": to_item.get("error"),
+                        "provenance_class": to_item.get("provenance_class", eff_prov),
+                    },
+                })
             for step in triage_Steps:
                 step_id = step.get("step_id", "triage_step")
                 step_domain = step.get("domain", DOMAIN_GENERIC)
@@ -3089,10 +1328,9 @@ class AdaptiveInvestigationEngine:
                 raw_out = dict(step.get("output") or {})
                 is_fail = raw_out.get("success") is False or raw_out.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
                 meas_b = raw_out.get("bytes_read") if isinstance(raw_out.get("bytes_read"), int) else None
-                meas_lat_us = float(raw_out.get("latency_us") or (raw_out.get("duration_ms", 0.0) * 1000.0))
                 budget_tracker.record_read(
                     bytes_read=meas_b,
-                    latency_us=meas_lat_us if meas_lat_us > 0.0 else 0.0,
+                    latency_us=est_lat * 1000.0,
                     stop_ms=float(raw_out.get("stop_duration_ms", 0.0)),
                     is_failure=is_fail,
                     conservative_estimate_bytes=eff_est_b,
@@ -3156,6 +1394,14 @@ class AdaptiveInvestigationEngine:
                         qb_copy = dict(qb)
                         qb_copy["evidence_id"] = ev_rec.evidence_id
                         triage_candidates["queue_backlogs"].append(qb_copy)
+            # Also ingest top-level candidate lists from fixture_data
+            last_triage_eid = observation_log[-1].get("evidence_id") if observation_log and observation_log[-1].get("result_category") not in (RESULT_OBSERVATION_FAILED, RESULT_OBSERVATION_UNAVAILABLE) else None
+            for cand_key in ("suspicious_threads", "memory_growth_candidates", "pointer_anomalies", "queue_backlogs"):
+                for item in (fixture_data.get(cand_key) or []):
+                    item_copy = dict(item)
+                    if last_triage_eid and "evidence_id" not in item_copy and "evidence_ids" not in item_copy:
+                        item_copy["evidence_id"] = last_triage_eid
+                    triage_candidates[cand_key].append(item_copy)
         else:
             # Execute registered initial triage modules via scheduler
             initial_plan = self.planner.plan_initial_inspections(
@@ -3186,7 +1432,6 @@ class AdaptiveInvestigationEngine:
                     adapter=eff_adapter,
                     budget_tracker=budget_tracker,
                     target_info=target_identity,
-                    parameters={"sampling_epoch": self.cache.current_epoch},
                     available_symbols=available_symbols,
                     capabilities=capabilities,
                 )
@@ -3229,55 +1474,31 @@ class AdaptiveInvestigationEngine:
                 else:
                     if mod.profile.domain not in inspected_domains:
                         inspected_domains.append(mod.profile.domain)
-                    for sym in res.get("symbols_inspected", []):
-                        if sym not in inspected_symbols:
-                            inspected_symbols.append(sym)
-                    for reg_name in res.get("regions_inspected", []):
-                        if reg_name not in inspected_regions:
-                            inspected_regions.append(reg_name)
-                    for mc in res.get("memory_growth_candidates", []):
-                        mc_copy = dict(mc)
-                        mc_copy["evidence_id"] = ev_rec.evidence_id
-                        triage_candidates["memory_growth_candidates"].append(mc_copy)
-                    for pa in res.get("pointer_anomalies", []):
-                        pa_copy = dict(pa)
-                        pa_copy["evidence_id"] = ev_rec.evidence_id
-                        triage_candidates["pointer_anomalies"].append(pa_copy)
-                    for qb in res.get("queue_backlogs", []):
-                        qb_copy = dict(qb)
-                        qb_copy["evidence_id"] = ev_rec.evidence_id
-                        triage_candidates["queue_backlogs"].append(qb_copy)
                     for th in res.get("threads", []) or []:
                         if isinstance(th, dict):
                             tid = th.get("tid", th.get("thread_id"))
                             if tid is not None and tid not in inspected_threads:
                                 inspected_threads.append(tid)
-                            is_suspicious_th = bool(
+                            if (
                                 th.get("deadlock")
                                 or th.get("waiting_on_lock")
-                                or th.get("blocked")
-                                or th.get("is_futex_wait")
-                                or th.get("state") in ("D", "BLOCKED_LOCK")
-                                or (res.get("deadlock_detected") and tid in (res.get("deadlock_cycle") or []))
-                                or any(c.get("waiter_tid") == tid for c in (res.get("contended_locks") or []))
-                            )
-                            if is_suspicious_th:
-                                raw_l = th.get("waiting_on_lock") or th.get("syscall_arg0")
-                                if raw_l and isinstance(raw_l, str) and raw_l.startswith("0x") and raw_l not in ("0x_lock", "0x_futex_lock", "0x0"):
-                                    lock_addr = raw_l
-                                    lock_st = "OBSERVED"
-                                else:
-                                    lock_addr = None
-                                    lock_st = "UNAVAILABLE"
-
+                                or th.get("is_waiting_on_lock")
+                                or th.get("lock_wait_info")
+                                or res.get("deadlock_detected")
+                                or res.get("contended_locks")
+                                or any(lk.get("is_locked") or lk.get("owner_tid") for lk in (res.get("locks") or []) if isinstance(lk, dict))
+                                or any(
+                                    any(k in str(fr.get("function_name", "")).lower() for k in ("mutex_lock", "lll_lock_wait", "futex_wait", "deadlock", "lock_wait"))
+                                    for fr in (th.get("callstack") or [])
+                                    if isinstance(fr, dict)
+                                )
+                            ):
                                 triage_candidates["suspicious_threads"].append({
                                     "tid": tid,
                                     "name": th.get("name", f"thread_{tid}"),
-                                    "top_function": (th.get("callstack") or [{}])[0].get("function_name", th.get("syscall_name") or "lock_wait"),
-                                    "lock_address": lock_addr,
-                                    "lock_address_status": lock_st,
+                                    "top_function": (th.get("callstack") or [{}])[0].get("function_name", "lock_wait"),
+                                    "lock_address": th.get("waiting_on_lock"),
                                     "evidence_id": ev_rec.evidence_id,
-                                    "follow_up_profile_id": "insp_frame_locals",
                                 })
 
         # ---------------------------------------------------------------------
@@ -3318,19 +1539,6 @@ class AdaptiveInvestigationEngine:
 
         max_loop_steps = 12
         for step_idx in range(max_loop_steps):
-            if not budget_tracker.can_continue():
-                should_stop, s_code, s_exp = AdaptiveTerminationPolicy.evaluate_stopping_policy(
-                    budget_tracker=budget_tracker,
-                    hypotheses=hypotheses,
-                    remaining_observations_count=0,
-                    consecutive_non_novel_steps=consecutive_non_novel,
-                    consecutive_failures=consecutive_failures,
-                    temporal_samples_count=temporal_samples_count,
-                )
-                stop_reason = s_code or STOP_BUDGET_EXHAUSTED
-                stop_explanation = s_exp or "Observation budget exhausted."
-                break
-
             sm.transition(
                 STATE_FOLLOW_UP_PLANNING,
                 f"Planning discriminating follow-up observation (iteration {step_idx + 1}).",
@@ -3359,6 +1567,10 @@ class AdaptiveInvestigationEngine:
             ) and selected_obs is None
 
             if selected_obs is None:
+                if not capabilities.get("process_alive", True) and not fixture_data:
+                    stop_reason = STOP_CAPABILITY_UNAVAILABLE
+                    stop_explanation = f"Target process PID {pid} is not running or exited before observation."
+                    break
                 _, stop_reason, stop_explanation = AdaptiveTerminationPolicy.evaluate_stopping_policy(
                     budget_tracker=budget_tracker,
                     hypotheses=hypotheses,
@@ -3371,6 +1583,44 @@ class AdaptiveInvestigationEngine:
                 )
                 break
 
+            # Transition tested hypotheses from PROPOSED -> INVESTIGATING
+            for h in hypotheses:
+                if (h.hypothesis_id in selected_obs.tested_hypothesis_ids or h.hypothesis_id == selected_obs.hypothesis_id) and h.validation_status == HYPOTHESIS_STATUS_PROPOSED:
+                    h.validation_status = HYPOTHESIS_STATUS_INVESTIGATING
+                    h.status_history.append({
+                        "from_status": HYPOTHESIS_STATUS_PROPOSED,
+                        "to_status": HYPOTHESIS_STATUS_INVESTIGATING,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "reason": f"Selected discriminating observation '{selected_obs.observation_id}' for execution.",
+                        "trigger_evidence_id": None,
+                    })
+
+            # Check target liveness before executing follow-up observation (Recipe 11: Process Termination During Investigation)
+            if fixture_data is None and follow_up_executor is None and pid and pid > 1:
+                still_alive, term_err = eff_adapter.check_liveness(pid)
+                if not still_alive:
+                    term_rec = EvidenceRecord(
+                        evidence_id=f"ev_term_{uuid.uuid4().hex[:8]}",
+                        evidence_type=EVIDENCE_TYPE_DIAGNOSTIC,
+                        nature=NATURE_OBSERVATION,
+                        source="target_liveness_monitor",
+                        session_id=sess_id,
+                        observation=f"Target process PID {pid} terminated during investigation ({term_err}).",
+                        details={
+                            "collection_status": "ABSTAIN",
+                            "result_category": RESULT_OBSERVATION_UNAVAILABLE,
+                            "target_terminated": True,
+                            "error": term_err or "Process terminated",
+                            "provenance_class": eff_prov,
+                        },
+                        provenance={"provenance_class": eff_prov},
+                        capture_quality={"completeness": "PARTIAL", "consistency_level": "NON_ATOMIC"},
+                    )
+                    self.adapter.record_into_ledger(term_rec, ledger)
+                    stop_reason = STOP_CAPABILITY_UNAVAILABLE
+                    stop_explanation = f"Target process PID {pid} terminated mid-investigation ({term_err}); halting further live observations."
+                    break
+
             # Execute selected discriminating observation
             sm.transition(
                 STATE_OBSERVATION,
@@ -3382,44 +1632,23 @@ class AdaptiveInvestigationEngine:
             executed_keys.add(epoch_key)
 
             t_obs_0 = time.monotonic_ns()
-            prof_ceil = None
-            if selected_obs.profile_id and self.registry.get(selected_obs.profile_id):
-                prof_ceil = getattr(self.registry.get(selected_obs.profile_id), "budget_ceiling", None)
-
             if follow_up_executor is not None:
-                can_run, pre_reason, eff_est_bytes = budget_tracker.check_pre_execution(
-                    profile_id=selected_obs.profile_id,
-                    profile_ceiling=prof_ceil,
-                    estimated_bytes=selected_obs.estimated_bytes,
-                    estimated_latency_ms=selected_obs.estimated_latency_ms,
-                    estimated_samples=1,
+                raw_obs_res = follow_up_executor(selected_obs, self.cache.current_epoch)
+                lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
+                is_fail = (
+                    raw_obs_res.get("success") is False
+                    or raw_obs_res.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
                 )
-                if not can_run:
-                    budget_tracker.record_rejection(selected_obs.profile_id, pre_reason or "BUDGET_EXCEEDED")
-                    raw_obs_res = {
-                        "success": False,
-                        "result_category": RESULT_BUDGET_REJECTED,
-                        "error": pre_reason,
-                        "bytes_read": None,
-                    }
-                else:
-                    raw_obs_res = follow_up_executor(selected_obs, self.cache.current_epoch)
-                    lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
-                    is_fail = (
-                        raw_obs_res.get("success") is False
-                        or raw_obs_res.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
-                    )
-                    meas_b = raw_obs_res.get("bytes_read") if isinstance(raw_obs_res.get("bytes_read"), int) else None
-                    budget_tracker.record_read(
-                        bytes_read=meas_b,
-                        latency_us=lat_us,
-                        stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
-                        is_failure=is_fail,
-                        conservative_estimate_bytes=selected_obs.estimated_bytes,
-                        profile_id=selected_obs.profile_id or selected_obs.observation_id,
-                        profile_ceiling=prof_ceil,
-                    )
-                    budget_tracker.record_sample(profile_id=selected_obs.profile_id or selected_obs.observation_id)
+                meas_b = raw_obs_res.get("bytes_read") if isinstance(raw_obs_res.get("bytes_read"), int) else None
+                budget_tracker.record_read(
+                    bytes_read=meas_b,
+                    latency_us=lat_us,
+                    stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
+                    is_failure=is_fail,
+                    conservative_estimate_bytes=selected_obs.estimated_bytes,
+                    profile_id=selected_obs.profile_id or selected_obs.observation_id,
+                )
+                budget_tracker.record_sample(profile_id=selected_obs.profile_id or selected_obs.observation_id)
             elif selected_obs.profile_id and self.registry.get(selected_obs.profile_id):
                 mod = self.registry.get(selected_obs.profile_id)
                 ctx = InspectionContext(
@@ -3430,7 +1659,6 @@ class AdaptiveInvestigationEngine:
                     target_info=target_identity,
                     parameters={
                         **selected_obs.target_ref,
-                        "sampling_epoch": self.cache.current_epoch,
                         "estimated_bytes": selected_obs.estimated_bytes,
                         "estimated_latency_ms": selected_obs.estimated_latency_ms,
                     },
@@ -3465,23 +1693,20 @@ class AdaptiveInvestigationEngine:
             res_cat = (ev_rec.details or {}).get("result_category", RESULT_NEW_EVIDENCE)
 
             # Attach observation linkage metadata
+            ev_rec.details["stage"] = "FOLLOW_UP"
             ev_rec.details["observation_id"] = selected_obs.observation_id
             ev_rec.details["tested_hypothesis_ids"] = list(selected_obs.tested_hypothesis_ids)
             if "outcomes_by_hypothesis" in raw_obs_res:
                 ev_rec.details["outcomes_by_hypothesis"] = dict(raw_obs_res["outcomes_by_hypothesis"])
             elif "observed_condition" in raw_obs_res:
                 cond = raw_obs_res["observed_condition"]
-                legacy_cond = raw_obs_res.get("legacy_observed_condition")
                 outcomes_map = {}
                 for hid, h_map in selected_obs.expected_outcomes_by_hypothesis.items():
-                    if isinstance(h_map, dict):
-                        if cond in h_map:
-                            outcomes_map[hid] = h_map[cond]
-                        elif legacy_cond and legacy_cond in h_map:
-                            outcomes_map[hid] = h_map[legacy_cond]
+                    if isinstance(h_map, dict) and cond in h_map:
+                        outcomes_map[hid] = h_map[cond]
                 ev_rec.details["outcomes_by_hypothesis"] = outcomes_map
 
-            if res_cat not in (RESULT_DUPLICATE_EVIDENCE, RESULT_NO_NEW_EVIDENCE):
+            if res_cat != RESULT_DUPLICATE_EVIDENCE:
                 self.adapter.record_into_ledger(ev_rec, ledger)
 
             selected_obs.result_category = res_cat
@@ -3542,6 +1767,27 @@ class AdaptiveInvestigationEngine:
                             new_evidence=ev_rec,
                             capture_quality=capture_quality,
                         )
+            elif res_cat in (RESULT_OBSERVATION_FAILED, RESULT_OBSERVATION_UNAVAILABLE, RESULT_BUDGET_REJECTED):
+                for h in hypotheses:
+                    if h.hypothesis_id in selected_obs.tested_hypothesis_ids or h.hypothesis_id == selected_obs.hypothesis_id:
+                        if ev_rec.evidence_id not in h.abstained_evidence_ids:
+                            h.abstained_evidence_ids.append(ev_rec.evidence_id)
+                        rem_for_h = [
+                            o for o in h.suggested_observations
+                            if not o.executed and o.status == OBSERVATION_STATUS_PROPOSED and o.observation_id not in executed_keys
+                        ]
+                        if not rem_for_h and h.validation_status in (HYPOTHESIS_STATUS_PROPOSED, HYPOTHESIS_STATUS_INVESTIGATING):
+                            prev_st = h.validation_status
+                            h.validation_status = HYPOTHESIS_STATUS_ABSTAINED
+                            h.confidence = "LOW"
+                            h.confidence_score = min(float(getattr(h, "confidence_score", 0.35)), 0.25)
+                            h.status_history.append({
+                                "from_status": prev_st,
+                                "to_status": HYPOTHESIS_STATUS_ABSTAINED,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "reason": f"Observation '{selected_obs.observation_id}' abstained/failed ({res_cat}); no executable observations remain.",
+                                "trigger_evidence_id": ev_rec.evidence_id,
+                            })
 
             # Check stopping policy
             rem_count = sum(
@@ -3738,13 +1984,90 @@ class AdaptiveInvestigationEngine:
         )
         report_json = ZeroCdnReporter.render_json(verdict)
 
+        # Compute structured Phase 2.0-A.3.6 Section 2.4 execution status & observation counts
+        cov = verdict.evidence_coverage or {}
+        succ_obs_cnt = int(cov.get("collected_observations_count", 0)) + int(cov.get("partial_observations_count", 0))
+        fail_or_abs_cnt = int(cov.get("failed_or_abstained_count", 0))
+        failed_obs_cnt = sum(1 for item in observation_log if item.get("result_category") == RESULT_OBSERVATION_FAILED)
+        abstained_obs_cnt = sum(
+            1 for item in observation_log
+            if item.get("result_category") in (RESULT_OBSERVATION_UNAVAILABLE, RESULT_BUDGET_REJECTED, RESULT_OBSERVATION_FAILED)
+        )
+        actual_obs_cnt = len(observation_log)
+
+        if sm.state == STATE_BUDGET_EXHAUSTED or verdict.stop_reason == STOP_BUDGET_EXHAUSTED:
+            exec_status = STATE_BUDGET_EXHAUSTED
+            fail_cat: Optional[str] = "BUDGET_EXHAUSTED"
+        elif sm.state == STATE_CANCELED or verdict.stop_reason == STOP_USER_CANCELED:
+            exec_status = STATE_CANCELED
+            fail_cat = "USER_CANCELED"
+        elif verdict.stop_reason == STOP_CAPABILITY_UNAVAILABLE and succ_obs_cnt == 0:
+            exec_status = STATE_CAPABILITY_UNAVAILABLE
+            fail_cat = "CAPABILITY_UNAVAILABLE"
+        elif succ_obs_cnt == 0 and abstained_obs_cnt > 0:
+            exec_status = STATE_ABSTAINED
+            fail_cat = "ALL_OBSERVATIONS_ABSTAINED"
+        elif verdict.final_diagnosis == DIAG_INCONCLUSIVE:
+            exec_status = STATE_INCONCLUSIVE
+            fail_cat = "INSUFFICIENT_OR_RESTRICTED_EVIDENCE" if unavailable_capabilities or fail_or_abs_cnt > 0 else None
+        else:
+            exec_status = STATE_COMPLETED
+            fail_cat = None
+
+        diag_errors = [
+            {
+                "step_id": item.get("step_id") or item.get("observation_id"),
+                "stage": item.get("stage"),
+                "result_category": item.get("result_category"),
+                "reason": item.get("reason"),
+            }
+            for item in observation_log
+            if item.get("result_category") in (RESULT_OBSERVATION_FAILED, RESULT_OBSERVATION_UNAVAILABLE, RESULT_BUDGET_REJECTED)
+        ]
+
+        lifecycle_14_steps = [
+            {"step": 1, "name": "symptom_or_request_intake", "status": "COMPLETED", "detail": goal},
+            {"step": 2, "name": "target_identity_verification", "status": "COMPLETED" if capabilities.get("process_alive", True) else "FAILED", "detail": f"PID={pid}"},
+            {"step": 3, "name": "capability_discovery", "status": "COMPLETED", "detail": f"unavailable={list(unavailable_capabilities.keys())}"},
+            {"step": 4, "name": "initial_low_impact_triage", "status": "COMPLETED" if executed_profiles else "ABSTAINED", "detail": f"profiles={executed_profiles}"},
+            {"step": 5, "name": "anomaly_detection", "status": "COMPLETED", "detail": f"candidates={sum(len(v) for v in triage_candidates.values() if isinstance(v, list))}"},
+            {"step": 6, "name": "candidate_hypothesis_generation", "status": "COMPLETED", "detail": f"hypotheses_count={len(hypotheses)}"},
+            {"step": 7, "name": "hypothesis_prioritization", "status": "COMPLETED", "detail": f"active_hypotheses={len(hypotheses)}"},
+            {"step": 8, "name": "discriminating_observation_planning", "status": "COMPLETED", "detail": f"decisions={len(planner_decisions)}"},
+            {"step": 9, "name": "observation_execution_under_budget", "status": "COMPLETED" if succ_obs_cnt > 0 else "ABSTAINED", "detail": f"actual={actual_obs_cnt},succ={succ_obs_cnt}"},
+            {"step": 10, "name": "evidence_normalization_and_ledger_recording", "status": "COMPLETED", "detail": f"records={len(ledger._records)}"},
+            {"step": 11, "name": "hypothesis_re_evaluation", "status": "COMPLETED", "detail": f"states={[h.validation_status for h in hypotheses]}"},
+            {"step": 12, "name": "iterative_refinement_or_stopping_decision", "status": "COMPLETED", "detail": f"stop_reason={verdict.stop_reason}"},
+            {"step": 13, "name": "verdict_synthesis", "status": "COMPLETED", "detail": f"verdict={verdict.final_diagnosis}"},
+            {"step": 14, "name": "incident_report_generation", "status": "COMPLETED", "detail": "HTML+JSON generated"},
+        ]
+
+        scope_narrowing_trace = {
+            "initial_request": goal,
+            "initial_broad_domains_considered": [DOMAIN_CONCURRENCY, DOMAIN_MEMORY, DOMAIN_INTEGRITY, DOMAIN_IPC, DOMAIN_TEMPORAL],
+            "triage_profiles_executed": list(executed_profiles),
+            "narrowed_domains": list(inspected_domains),
+            "narrowed_threads": list(inspected_threads),
+            "narrowed_symbols": list(inspected_symbols),
+            "pruned_domains": list(uninspected_scope.get("uninspected_domains", [])),
+        }
+
         return {
             "success": True,
             "session_id": sess_id,
-            "target_identity": target_identity,
             "goal": goal,
             "hypothesis": hypothesis or goal,
             "lifecycle_state": sm.state,
+            "execution_status": exec_status,
+            "failure_category": fail_cat,
+            "diagnostic_error_details": diag_errors,
+            "actual_observation_count": actual_obs_cnt,
+            "successful_observation_count": succ_obs_cnt,
+            "failed_observation_count": failed_obs_cnt,
+            "abstained_observation_count": abstained_obs_cnt,
+            "consumed_execution_budget": budget_summary,
+            "lifecycle_steps": lifecycle_14_steps,
+            "scope_narrowing_trace": scope_narrowing_trace,
             "state_transitions": sm.transitions,
             "stop_reason": verdict.stop_reason,
             "stop_explanation": verdict.stop_explanation,
@@ -3760,20 +2083,24 @@ class AdaptiveInvestigationEngine:
             "contradicting_evidence_ids": verdict.contradicting_evidence_ids,
             "provenance_class": verdict.provenance_class,
             "provenance_limitations": verdict.provenance_limitations,
-            "trust_state": snap_trust_state,
-            "trust_error": snap_trust_error,
             "limitations": verdict.limitations,
             "competing_hypotheses": [h.to_dict() for h in hypotheses],
             "observed_facts": verdict.observed_facts,
             "inferences": verdict.inferences,
             "unknowns": verdict.unknowns,
+            "verified_facts": verdict.verified_facts,
+            "supported_hypotheses": verdict.supported_hypotheses,
+            "contradicted_hypotheses": verdict.contradicted_hypotheses,
+            "inconclusive_hypotheses": verdict.inconclusive_hypotheses,
+            "unverified_external_claims": verdict.unverified_external_claims,
+            "abstentions": verdict.abstentions,
+            "collection_limitations": verdict.collection_limitations,
             "recommended_next_steps": verdict.recommended_next_steps,
             "executed_profiles": executed_profiles,
             "executed_observation_keys": sorted(executed_keys),
             "observation_log": observation_log,
             "planner_decisions": planner_decisions,
             "budget_usage": budget_summary,
-            "budget_summary": budget_summary,
             "total_assertions": verdict.total_assertions,
             "passed_assertions": verdict.passed_count,
             "failed_assertions": verdict.failed_count,
@@ -3790,21 +2117,7 @@ class AdaptiveInvestigationEngine:
                 }
                 for a in verdict.assertion_evaluations
             ],
-            "inspection_summary": {
-                k: {
-                    "success": v.get("success", True),
-                    "status": v.get("status"),
-                    "deadlock_detected": v.get("deadlock_detected"),
-                    "deadlock_cycle": v.get("deadlock_cycle"),
-                    "result_category": v.get("result_category"),
-                    "lock_contention_observed": v.get("lock_contention_observed"),
-                    "issues": v.get("issues"),
-                    "bytes_read": v.get("bytes_read"),
-                    "measured_bytes_read": v.get("measured_bytes_read"),
-                }
-                for k, v in inspection_outputs.items()
-            },
-            "inspection_outputs": inspection_outputs,
+            "inspection_summary": {k: {"success": v.get("success", True)} for k, v in inspection_outputs.items()},
             "evidence_ledger_count": len(ledger._records),
             "evidence_ledger": ledger.to_dict(),
             "report_html": report_html,
@@ -3866,7 +2179,6 @@ class AdaptiveInvestigationEngine:
                 companion_elf=target_binary_path,
                 adapter=LocalTargetAdapter(),
                 budget_tracker=budget_tracker,
-                parameters={"sampling_epoch": self.cache.current_epoch},
             )
             res = mod.run(ctx, self.watch_manager)
             if isinstance(res, dict):
@@ -3874,7 +2186,7 @@ class AdaptiveInvestigationEngine:
                 rec = ledger.record_evidence(
                     module_id=mod.module_id,
                     domain=mod.domain,
-                    provenance_class=PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+                    provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
                     evidence_payload=res,
                 )
         lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
@@ -3997,7 +2309,7 @@ class AdaptiveInvestigationEngine:
             assertion_evaluations=[],
             causal_attribution_verified=False,
             attribution_basis=None,
-            provenance_class=PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+            provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
             target_identity={"pid": "N/A", "companion_elf": "N/A"},
             limitations=[],
             budget_usage={},

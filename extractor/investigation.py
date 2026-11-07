@@ -87,14 +87,12 @@ from .evidence_adapter import (
 )
 from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
 from .verdict_engine import (
+    ASSERTION_ABSTAIN,
+    ASSERTION_FAIL,
+    ASSERTION_PASS,
+    AssertionEvaluation,
     VerdictEngine,
     ZeroCdnReporter,
-    AssertionEvaluation,
-    ASSERTION_PASS,
-    ASSERTION_FAIL,
-    ASSERTION_ABSTAIN,
-    DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE,
-    DIAG_INCONCLUSIVE,
     sanitize_report_output_path,
 )
 from .hypothesis import (
@@ -577,24 +575,6 @@ class InvestigationSession:
                     session.executed_observation_keys.add(obs.semantic_key)
 
         session.status = data.get("status", session.status)
-
-        # Re-verify provenance integrity upon deserialization:
-        # If ledger does not have verified live capture, never allow session summary/target_ref to claim LIVE_RUNTIME_CAPTURE
-        if not getattr(session.ledger, "verified_live_capture", False):
-            if session.summary.get("provenance_class") == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
-                session.summary["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-            if session.target_ref.get("provenance_class") == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
-                session.target_ref["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-            if session.target_ref.get("live_capture") is True:
-                session.target_ref["live_capture"] = False
-            if session.summary.get("final_diagnosis") == DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE:
-                session.summary["final_diagnosis"] = DIAG_INCONCLUSIVE
-                session.summary["verdict"] = DIAG_INCONCLUSIVE
-                lims = list(session.summary.get("limitations", []))
-                if "UNVERIFIED_PROVENANCE_CANNOT_PROVE_HEALTH" not in lims:
-                    lims.append("UNVERIFIED_PROVENANCE_CANNOT_PROVE_HEALTH")
-                session.summary["limitations"] = lims
-
         return session
 
 
@@ -1272,7 +1252,6 @@ class InvestigationManager:
         watch_session_id: Optional[str] = None,
         observation_window: Optional[Dict[str, Any]] = None,
         watch_manager: Optional[Any] = None,
-        provenance_class: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Start an investigation from an existing offline snapshot or authorized target.
 
@@ -1297,7 +1276,6 @@ class InvestigationManager:
         )
         self.sessions[inv_id] = session
 
-        # Sanitize constraints and prevent external callers from forging live capture or trusted provenance
         sanitized_constraints = dict(constraints or {})
         sanitized_constraints.pop("live_capture", None)
         sanitized_constraints.pop("provenance_class", None)
@@ -1310,8 +1288,6 @@ class InvestigationManager:
             "constraints": sanitized_constraints,
             "watch_session_id": watch_session_id,
             "observation_window": observation_window or {},
-            "provenance_class": PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
-            "live_capture": False,
         }
 
         # Check for temporal investigation routing (Phase 24)
@@ -1372,7 +1348,7 @@ class InvestigationManager:
                 session.summary["error"] = f"Invalid PID format: '{pid}'"
                 return session.to_dict()
 
-            if parsed_pid <= 0 or parsed_pid > 2147483647:
+            if parsed_pid <= 1 or parsed_pid > 2147483647:
                 session.status = "FAILED"
                 session.stages["target_identity"] = {
                     "status": "FAILED",
@@ -1487,8 +1463,6 @@ class InvestigationManager:
                 session.target_ref["memory_snapshot_path"] = snap_dir
                 session.target_ref["live_capture"] = True
                 session.target_ref["capture_source"] = "LIVE_PROCESS"
-                session.target_ref["provenance_class"] = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-                provenance_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
             except ProcessLookupError as proc_err:
                 session.status = "FAILED"
                 session.stages["capture_quality"] = {
@@ -1507,15 +1481,6 @@ class InvestigationManager:
                 }
                 session.summary["error"] = f"Live memory capture failed: {cap_exc}"
                 return session.to_dict()
-
-        # Enforce provenance bounds: external callers cannot forge LIVE_RUNTIME_CAPTURE without an authentic runtime capture
-        if not session.target_ref.get("live_capture"):
-            session.target_ref["live_capture"] = False
-            session.target_ref["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-            provenance_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        else:
-            session.target_ref["provenance_class"] = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-            provenance_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
 
         if static_provider:
             session.static_provider = static_provider
@@ -2006,6 +1971,7 @@ class InvestigationManager:
                     rcpt_data = data.get("capture_receipt")
                     if rcpt_data and isinstance(rcpt_data, dict):
                         from .capture_backend import CaptureReceipt
+                        rcpt = CaptureReceipt.from_dict(rcpt_data)
                         sig_ok, sig_reason, _ = rcpt.verify_with_status()
                         if sig_ok:
                             return True, rcpt, "Embedded capture receipt verified"
@@ -2621,6 +2587,456 @@ class InvestigationManager:
             },
         }
 
+    def _evaluate_observation_against_session(
+        self,
+        session: InvestigationSession,
+        target_obs: FollowUpObservation,
+        target_hypo: InvestigationHypothesis,
+    ) -> Dict[str, Any]:
+        """Strictly evaluate a Field, Thread, Comparison, or General observation against actual session state.
+
+        Enforces Phase 2.0-A.3.6 Section 2.1:
+        - SUPPORTED: Actual, independently executed observation supports the hypothesis.
+        - CONTRADICTED: Actual, independently executed observation contradicts the hypothesis.
+        - INCONCLUSIVE: Observation was executed, but available information cannot establish support or contradiction.
+        - ABSTAIN: Observation could not be executed or evidence trust requirements were not satisfied.
+        - Unexecuted or missing-snapshot observations NEVER produce SUPPORTED.
+        """
+        t_ref = target_obs.target_ref if isinstance(target_obs.target_ref, dict) else {}
+        t_kind = target_obs.target_kind
+
+        # Gather snapshots attached to session
+        snaps: List[Dict[str, Any]] = []
+        if hasattr(session, "snapshots") and isinstance(getattr(session, "snapshots"), list):
+            snaps.extend(getattr(session, "snapshots"))
+        if hasattr(session, "active_snapshot") and getattr(session, "active_snapshot") is not None:
+            act_s = getattr(session, "active_snapshot")
+            snaps.append(act_s.to_dict() if hasattr(act_s, "to_dict") else (act_s if isinstance(act_s, dict) else {}))
+        if hasattr(session, "raw_snapshot") and getattr(session, "raw_snapshot") is not None:
+            raw_s = getattr(session, "raw_snapshot")
+            snaps.append(raw_s.to_dict() if hasattr(raw_s, "to_dict") else (raw_s if isinstance(raw_s, dict) else {}))
+
+        # Check test-only forced flags in target_ref
+        if t_ref.get("force_failed") or t_ref.get("force_error"):
+            return {
+                "outcome": "FAILED",
+                "observation_text": "Forced failure in observation control.",
+                "details": {"reason": "forced_failure", "is_simulated": True, "authority_level": "TEST"},
+                "provenance_class": "SYNTHETIC",
+            }
+        if t_ref.get("force_contradiction"):
+            return {
+                "outcome": "CONTRADICTED",
+                "observation_text": "Forced contradiction in observation control.",
+                "details": {"reason": "forced_contradiction", "is_simulated": True, "authority_level": "TEST"},
+                "provenance_class": "SYNTHETIC",
+            }
+        if t_ref.get("simulated_outcome") is not None:
+            return {
+                "outcome": "ABSTAIN",
+                "observation_text": "Simulated outcome isolated from production proof.",
+                "details": {"reason": "simulated_outcome_isolated", "is_simulated": True, "authority_level": "TEST"},
+                "provenance_class": "SYNTHETIC",
+            }
+
+        # 1. FIELD OBSERVATIONS
+        if t_kind == TARGET_KIND_FIELD:
+            f_path = str(t_ref.get("field_path") or target_obs.target_identifier or "").strip()
+            if not f_path:
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": "Field observation missing field_path.",
+                    "details": {"reason": "missing_field_path", "field_path": ""},
+                }
+            if not snaps:
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Cannot observe field '{f_path}': no actual snapshot available in session.",
+                    "details": {"reason": "missing_snapshot", "field_path": f_path},
+                }
+
+            cur_snap = snaps[-1]
+            snap_comp = str(cur_snap.get("completeness") or (cur_snap.get("capture_quality") or {}).get("completeness") or "COMPLETE").upper()
+            if snap_comp in ("FAILED", "INVALID", "UNTRUSTED"):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Cannot observe field '{f_path}': snapshot is {snap_comp}.",
+                    "details": {"reason": f"snapshot_{snap_comp.lower()}", "field_path": f_path, "snapshot_completeness": snap_comp},
+                }
+
+            # Validate observation epoch
+            req_epoch = t_ref.get("required_epoch", t_ref.get("expected_epoch"))
+            snap_epoch = cur_snap.get("epoch", cur_snap.get("capture_epoch", 0))
+            if req_epoch is not None and int(snap_epoch) != int(req_epoch):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Epoch mismatch for field '{f_path}': expected epoch {req_epoch}, snapshot is epoch {snap_epoch}.",
+                    "details": {"reason": "observation_epoch_mismatch", "field_path": f_path, "expected_epoch": req_epoch, "actual_epoch": snap_epoch},
+                }
+            min_epoch = t_ref.get("min_epoch")
+            if min_epoch is not None and int(snap_epoch) < int(min_epoch):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Stale snapshot epoch {snap_epoch} < min_epoch {min_epoch} for field '{f_path}'.",
+                    "details": {"reason": "stale_observation_epoch", "field_path": f_path},
+                }
+
+            # Resolve field across snapshot objects/fields
+            matches: List[Dict[str, Any]] = []
+            snap_fields = cur_snap.get("fields") or {}
+            if isinstance(snap_fields, dict) and f_path in snap_fields:
+                entry = snap_fields[f_path]
+                if isinstance(entry, dict):
+                    matches.append(entry)
+                else:
+                    matches.append({"field_path": f_path, "value": entry, "type": type(entry).__name__})
+            for obj in (cur_snap.get("objects") or []):
+                if not isinstance(obj, dict):
+                    continue
+                obj_name = str(obj.get("name") or obj.get("object_id") or "")
+                obj_fields = obj.get("fields") or {}
+                if isinstance(obj_fields, dict):
+                    for k, v in obj_fields.items():
+                        full_k = f"{obj_name}.{k}" if obj_name else k
+                        if k == f_path or full_k == f_path:
+                            if isinstance(v, dict) and "value" in v:
+                                matches.append({"field_path": full_k, **v})
+                            else:
+                                matches.append({"field_path": full_k, "value": v, "type": type(v).__name__})
+
+            if len(matches) == 0:
+                return {
+                    "outcome": "ABSTAIN" if snap_comp == "PARTIAL" else "INCONCLUSIVE",
+                    "observation_text": f"Field '{f_path}' was not found in snapshot.",
+                    "details": {"reason": "field_not_found", "field_path": f_path, "snapshot_completeness": snap_comp},
+                }
+            if len(matches) > 1:
+                return {
+                    "outcome": "INCONCLUSIVE",
+                    "observation_text": f"Ambiguous resolution for field '{f_path}': matched {len(matches)} distinct candidates.",
+                    "details": {"reason": "ambiguous_field_resolution", "field_path": f_path, "match_count": len(matches), "ambiguous_resolution": True},
+                }
+
+            match = matches[0]
+            obs_val = match.get("value")
+            val_status = str(match.get("status", "OBSERVED")).upper()
+            if "value" not in match or obs_val is None or val_status in ("READ_ERROR", "UNAVAILABLE", "MEMORY_NOT_CAPTURED", "OPTIMIZED_OUT"):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Field '{f_path}' resolved, but actual value is unavailable ({val_status}).",
+                    "details": {"reason": "missing_observed_field_value", "field_path": f_path},
+                }
+
+            # Validate type compatibility
+            exp_type = t_ref.get("expected_type")
+            act_type = str(match.get("type") or type(obs_val).__name__)
+            if exp_type and str(exp_type).lower() not in act_type.lower():
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Type incompatibility on field '{f_path}': expected {exp_type}, got {act_type}.",
+                    "details": {"reason": "type_incompatibility", "field_path": f_path, "type_compatible": False},
+                }
+
+            # Require explicit expected value / criterion (never infer SUPPORTED merely because field exists!)
+            has_expected = ("expected_value" in t_ref) or ("expected_min" in t_ref) or ("expected_max" in t_ref) or ("expected_op" in t_ref)
+            if not has_expected:
+                return {
+                    "outcome": "INCONCLUSIVE",
+                    "observation_text": f"Observed field '{f_path}' = {obs_val!r}, but no expected value criterion was specified.",
+                    "details": {"reason": "missing_expected_value", "field_path": f_path, "observed_value": obs_val},
+                }
+
+            exp_val = t_ref.get("expected_value")
+            if exp_val is not None and not isinstance(obs_val, type(exp_val)) and not (isinstance(obs_val, (int, float)) and isinstance(exp_val, (int, float)) and not isinstance(obs_val, bool) and not isinstance(exp_val, bool)):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Incompatible value types for field '{f_path}': observed {type(obs_val).__name__}, expected {type(exp_val).__name__}.",
+                    "details": {"reason": "type_incompatibility", "field_path": f_path, "type_compatible": False},
+                }
+
+            op = str(t_ref.get("expected_op", "==")).strip()
+            matched_crit = False
+            if "expected_min" in t_ref or "expected_max" in t_ref:
+                lo = t_ref.get("expected_min", float("-inf"))
+                hi = t_ref.get("expected_max", float("inf"))
+                matched_crit = (lo <= obs_val <= hi)
+            elif op == "==":
+                matched_crit = (obs_val == exp_val)
+            elif op == "!=":
+                matched_crit = (obs_val != exp_val)
+            elif op == ">":
+                matched_crit = (obs_val > exp_val)
+            elif op == ">=":
+                matched_crit = (obs_val >= exp_val)
+            elif op == "<":
+                matched_crit = (obs_val < exp_val)
+            elif op == "<=":
+                matched_crit = (obs_val <= exp_val)
+            else:
+                return {
+                    "outcome": "INCONCLUSIVE",
+                    "observation_text": f"Unsupported operator '{op}' for field '{f_path}'.",
+                    "details": {"reason": "unsupported_operator", "field_path": f_path},
+                }
+
+            out_str = "SUPPORTED" if matched_crit else "CONTRADICTED"
+            return {
+                "outcome": out_str,
+                "observation_text": f"Field '{f_path}' observed value {obs_val!r} ({op} {exp_val!r}) -> {out_str}.",
+                "details": {
+                    "field_path": f_path,
+                    "observed_value": obs_val,
+                    "expected_value": exp_val,
+                    "epoch": snap_epoch,
+                    "snapshot_completeness": snap_comp,
+                },
+            }
+
+        # 2. THREAD OBSERVATIONS
+        if t_kind == TARGET_KIND_THREAD:
+            if not snaps:
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": "Thread observation requires collected thread information, but no snapshot is present.",
+                    "details": {"reason": "missing_thread_snapshot"},
+                }
+            cur_snap = snaps[-1]
+            th_enum = cur_snap.get("thread_enumeration") or (cur_snap.get("provenance") or {}).get("thread_enumeration") or {}
+            if th_enum.get("status") in ("FAILED", "UNAVAILABLE") or cur_snap.get("threads_collection_failed") is True:
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": "Thread collection failed on target; abstaining.",
+                    "details": {"reason": "thread_collection_failed", "error": th_enum.get("error")},
+                }
+            threads = cur_snap.get("threads") if "threads" in cur_snap else cur_snap.get("thread_metadata")
+            if not isinstance(threads, list):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": "No collected thread table present in snapshot.",
+                    "details": {"reason": "missing_thread_table"},
+                }
+
+            req_tid = t_ref.get("tid", t_ref.get("thread_id", target_obs.target_identifier))
+            req_name = t_ref.get("thread_name")
+            matched_threads: List[Dict[str, Any]] = []
+            for th in threads:
+                if not isinstance(th, dict):
+                    continue
+                if req_tid is not None and str(req_tid) not in ("all", "*", "") and str(th.get("tid", th.get("thread_id"))) == str(req_tid):
+                    matched_threads.append(th)
+                elif req_name and str(th.get("name", "")) == str(req_name):
+                    matched_threads.append(th)
+
+            if len(matched_threads) == 0:
+                # Distinguish missing thread in a valid collected table from a collection failure!
+                return {
+                    "outcome": "CONTRADICTED" if t_ref.get("require_thread_present", True) else "INCONCLUSIVE",
+                    "observation_text": f"Thread '{req_tid or req_name}' was not found in the collected thread table ({len(threads)} threads collected).",
+                    "details": {
+                        "reason": "thread_missing_from_collected_table",
+                        "thread_collection_succeeded": True,
+                        "collected_thread_count": len(threads),
+                        "requested_thread": req_tid or req_name,
+                    },
+                }
+            if len(matched_threads) > 1:
+                return {
+                    "outcome": "INCONCLUSIVE",
+                    "observation_text": f"Ambiguous thread identity '{req_tid or req_name}': matched {len(matched_threads)} threads.",
+                    "details": {"reason": "ambiguous_thread_identity"},
+                }
+
+            th_obj = matched_threads[0]
+            if th_obj.get("is_synthetic") is True:
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": "Synthetic thread metadata cannot establish runtime support.",
+                    "details": {"reason": "synthetic_thread_metadata", "is_simulated": True},
+                    "provenance_class": "SYNTHETIC",
+                }
+
+            exp_state = t_ref.get("expected_state")
+            exp_func = t_ref.get("expected_function")
+            exp_lock = t_ref.get("expected_lock")
+            if exp_state is None and exp_func is None and exp_lock is None:
+                return {
+                    "outcome": "INCONCLUSIVE",
+                    "observation_text": f"Thread {th_obj.get('tid')} exists, but no requested thread attributes were specified to verify.",
+                    "details": {"reason": "missing_requested_thread_attributes", "tid": th_obj.get("tid")},
+                }
+
+            if exp_state is not None:
+                act_state = th_obj.get("state") or th_obj.get("state_char")
+                if act_state is None:
+                    return {
+                        "outcome": "ABSTAIN",
+                        "observation_text": f"Requested state attribute missing on thread {th_obj.get('tid')}.",
+                        "details": {"reason": "missing_thread_state_attribute"},
+                    }
+                if str(act_state) != str(exp_state):
+                    return {
+                        "outcome": "CONTRADICTED",
+                        "observation_text": f"Thread {th_obj.get('tid')} state is '{act_state}', expected '{exp_state}'.",
+                        "details": {"tid": th_obj.get("tid"), "observed_state": act_state, "expected_state": exp_state},
+                    }
+
+            if exp_func is not None:
+                cstack = th_obj.get("callstack") or th_obj.get("frames")
+                top_fn = th_obj.get("top_function") or (cstack[0].get("function_name") if isinstance(cstack, list) and cstack and isinstance(cstack[0], dict) else None)
+                if top_fn is None:
+                    return {
+                        "outcome": "ABSTAIN",
+                        "observation_text": f"Requested callstack/function attribute unavailable on thread {th_obj.get('tid')}.",
+                        "details": {"reason": "missing_thread_callstack_attribute"},
+                    }
+                if str(exp_func) not in str(top_fn):
+                    return {
+                        "outcome": "CONTRADICTED",
+                        "observation_text": f"Thread {th_obj.get('tid')} top function is '{top_fn}', expected '{exp_func}'.",
+                        "details": {"tid": th_obj.get("tid"), "observed_function": top_fn, "expected_function": exp_func},
+                    }
+
+            if exp_lock is not None:
+                act_lock = th_obj.get("lock_address") or th_obj.get("waiting_on_lock")
+                if act_lock is None:
+                    return {
+                        "outcome": "ABSTAIN",
+                        "observation_text": f"Requested lock attribute unavailable on thread {th_obj.get('tid')}.",
+                        "details": {"reason": "missing_thread_lock_attribute"},
+                    }
+                if str(act_lock) != str(exp_lock):
+                    return {
+                        "outcome": "CONTRADICTED",
+                        "observation_text": f"Thread {th_obj.get('tid')} lock is '{act_lock}', expected '{exp_lock}'.",
+                        "details": {"tid": th_obj.get("tid"), "observed_lock": act_lock, "expected_lock": exp_lock},
+                    }
+
+            return {
+                "outcome": "SUPPORTED",
+                "observation_text": f"Verified thread {th_obj.get('tid')} attributes match expected criteria.",
+                "details": {"tid": th_obj.get("tid"), "thread": th_obj},
+            }
+
+        # 3. COMPARISON OBSERVATIONS
+        if t_kind == TARGET_KIND_COMPARISON:
+            base_snap = t_ref.get("baseline_snapshot")
+            curr_snap = t_ref.get("current_snapshot")
+            if not isinstance(base_snap, dict) or not isinstance(curr_snap, dict):
+                if len(snaps) >= 2:
+                    base_snap = snaps[-2]
+                    curr_snap = snaps[-1]
+                else:
+                    return {
+                        "outcome": "ABSTAIN",
+                        "observation_text": "Comparison observation requires both baseline and current snapshots.",
+                        "details": {"reason": "missing_baseline_or_current_snapshot"},
+                    }
+
+            # Reject incomplete snapshots (do not infer changes from incomplete snapshots)
+            base_comp = str(base_snap.get("completeness") or (base_snap.get("capture_quality") or {}).get("completeness") or "COMPLETE").upper()
+            curr_comp = str(curr_snap.get("completeness") or (curr_snap.get("capture_quality") or {}).get("completeness") or "COMPLETE").upper()
+            if base_comp != "COMPLETE" or curr_comp != "COMPLETE":
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Comparison rejected: incomplete snapshot(s) (baseline={base_comp}, current={curr_comp}).",
+                    "details": {"reason": "incomplete_snapshot_comparison_rejected", "baseline_completeness": base_comp, "current_completeness": curr_comp},
+                }
+
+            # Verify process and object identity
+            if base_snap.get("pid") != curr_snap.get("pid") or (base_snap.get("process_start_time") and curr_snap.get("process_start_time") and base_snap.get("process_start_time") != curr_snap.get("process_start_time")):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": "Comparison rejected: process identity (PID or start_time) mismatch between baseline and current snapshot.",
+                    "details": {"reason": "process_identity_mismatch"},
+                }
+            if base_snap.get("executable_build_id") and curr_snap.get("executable_build_id") and base_snap.get("executable_build_id") != curr_snap.get("executable_build_id"):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": "Comparison rejected: executable Build ID mismatch between baseline and current snapshot.",
+                    "details": {"reason": "build_id_mismatch"},
+                }
+            if base_snap.get("object_id") and curr_snap.get("object_id") and base_snap.get("object_id") != curr_snap.get("object_id"):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": "Comparison rejected: object identity mismatch between baseline and current snapshot.",
+                    "details": {"reason": "object_identity_mismatch"},
+                }
+
+            # Verify sampling epochs (reject stale or non-monotonic comparisons)
+            b_epoch = int(base_snap.get("epoch", base_snap.get("capture_epoch", 0)))
+            c_epoch = int(curr_snap.get("epoch", curr_snap.get("capture_epoch", 1)))
+            if c_epoch <= b_epoch:
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Comparison rejected: stale or non-increasing sampling epoch (baseline={b_epoch}, current={c_epoch}).",
+                    "details": {"reason": "stale_or_invalid_sampling_epoch", "baseline_epoch": b_epoch, "current_epoch": c_epoch},
+                }
+
+            f_path = str(t_ref.get("field_path") or target_obs.target_identifier or "").strip()
+            b_fields = base_snap.get("fields") or {}
+            c_fields = curr_snap.get("fields") or {}
+            if not f_path or f_path not in b_fields or f_path not in c_fields:
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Comparison rejected: field '{f_path}' missing in baseline or current snapshot.",
+                    "details": {"reason": "missing_field_in_comparison"},
+                }
+
+            b_entry = b_fields[f_path]
+            c_entry = c_fields[f_path]
+            b_val = b_entry.get("value") if isinstance(b_entry, dict) else b_entry
+            c_val = c_entry.get("value") if isinstance(c_entry, dict) else c_entry
+            b_type = b_entry.get("type", type(b_val).__name__) if isinstance(b_entry, dict) else type(b_val).__name__
+            c_type = c_entry.get("type", type(c_val).__name__) if isinstance(c_entry, dict) else type(c_val).__name__
+
+            if b_type != c_type or type(b_val) is not type(c_val):
+                return {
+                    "outcome": "ABSTAIN",
+                    "observation_text": f"Comparison rejected: incompatible field types ({b_type} vs {c_type}) on '{f_path}'.",
+                    "details": {"reason": "incompatible_comparison_types"},
+                }
+
+            exp_change = t_ref.get("expected_change")  # e.g. "INCREASED", "DECREASED", "CHANGED", "UNCHANGED"
+            exp_delta = t_ref.get("expected_delta")
+            if exp_change is None and exp_delta is None:
+                return {
+                    "outcome": "INCONCLUSIVE",
+                    "observation_text": f"Compared '{f_path}' ({b_val!r} -> {c_val!r}), but no expected comparison criterion was specified.",
+                    "details": {"reason": "missing_comparison_criteria", "before_value": b_val, "after_value": c_val},
+                }
+
+            matched = False
+            if exp_delta is not None and isinstance(b_val, (int, float)) and isinstance(c_val, (int, float)):
+                matched = ((c_val - b_val) == exp_delta)
+            elif exp_change == "INCREASED":
+                matched = (c_val > b_val)
+            elif exp_change == "DECREASED":
+                matched = (c_val < b_val)
+            elif exp_change == "CHANGED":
+                matched = (c_val != b_val)
+            elif exp_change == "UNCHANGED":
+                matched = (c_val == b_val)
+
+            out_str = "SUPPORTED" if matched else "CONTRADICTED"
+            return {
+                "outcome": out_str,
+                "observation_text": f"Compared '{f_path}' across epochs {b_epoch}->{c_epoch}: {b_val!r} -> {c_val!r} ({out_str}).",
+                "details": {
+                    "field_path": f_path,
+                    "before_value": b_val,
+                    "after_value": c_val,
+                    "baseline_epoch": b_epoch,
+                    "current_epoch": c_epoch,
+                },
+            }
+
+        # 4. GENERAL OBSERVATIONS: never default to SUPPORTED!
+        return {
+            "outcome": "ABSTAIN",
+            "observation_text": f"Observation '{target_obs.question}' abstained: no executable snapshot or target criterion available.",
+            "details": {"reason": "no_permissive_supported_default", "target_ref": t_ref},
+        }
+
     def execute_observation(
         self,
         investigation_id: str,
@@ -2707,125 +3123,138 @@ class InvestigationManager:
                 "blocked": True,
             }
 
-        # Formulate observation record
+        # Formulate observation record with Phase 2.0-A.3.6 strict fail-closed semantics
         ev_id = f"ev_obs_{uuid.uuid4().hex[:8]}"
-        outcome = "INCONCLUSIVE"
+        outcome = "ABSTAIN"
         source = "investigation_observer"
+        prov_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        authority_lvl = "PRODUCTION"
+        is_simulated_ctrl = False
+
+        t_ref = target_obs.target_ref if isinstance(target_obs.target_ref, dict) else {}
+
+        # Isolate test-only simulation controls (force_failed, force_error, force_contradiction, simulated_outcome)
+        sim_controls_present = any(
+            (isinstance(result_data, dict) and result_data.get(k) is not None)
+            or (isinstance(t_ref, dict) and t_ref.get(k) is not None)
+            or (isinstance(result_data, dict) and isinstance(result_data.get("details"), dict) and result_data["details"].get(k) is not None)
+            for k in ("force_failed", "force_error", "force_contradiction", "simulated_outcome")
+        )
+        if sim_controls_present:
+            is_simulated_ctrl = True
+            prov_class = "SYNTHETIC"
+            authority_lvl = "TEST"
+            source = "synthetic_simulator"
 
         if result_data:
-            obs_text = result_data.get("observation", f"Observed {target_obs.question}")
+            obs_text = result_data.get("observation") or result_data.get("evidence_summary") or f"Observed {target_obs.question}"
             details = dict(result_data.get("details", {}))
+            raw_prov = dict(result_data.get("provenance", {}))
             details["caller_submitted"] = True
-            details.pop("execution_provenance", None)
-            outcome = result_data.get("outcome", details.get("outcome", "SUPPORTED"))
-            # Invariant 9: Caller-submitted results cannot fabricate causal proof without verification
-            if (
-                outcome == "VALIDATED"
-                or details.get("verified_transition") is True
-                or details.get("causal_proof") is True
-                or details.get("reproduction_verified") is True
-                or details.get("transition_verified") is True
-                or details.get("verified_writer") is True
+            prov_class = "SYNTHETIC" if is_simulated_ctrl else PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            # Strip all caller-forged metadata fields
+            forged_keys_detected: List[str] = []
+            for f_key in (
+                "execution_provenance",
+                "verifier_attestation",
+                "live_capture_receipt",
+                "capture_receipt",
+                "function_attribution_verified",
+                "attribution_basis",
+                "confidence",
+                "confidence_score",
             ):
-                details["unverified_caller_claim"] = True
-                details["verified_transition"] = False
-                details["causal_proof"] = False
-                source = "unverified_caller"
-                if outcome == "VALIDATED":
-                    outcome = "SUPPORTED"
-        else:
-            # Read-only observation against existing snapshot / session data
-            f_path = target_obs.target_ref.get("field_path") or target_obs.target_identifier or ""
-            expected_val = target_obs.target_ref.get("expected_value", target_obs.target_ref.get("expected"))
-            contradict_val = target_obs.target_ref.get("contradict_value")
-            simulated_outcome = target_obs.target_ref.get("simulated_outcome")
+                if f_key in details or f_key in result_data or f_key in raw_prov:
+                    forged_keys_detected.append(f_key)
+                details.pop(f_key, None)
+                raw_prov.pop(f_key, None)
 
-            if simulated_outcome:
-                outcome = simulated_outcome
-                obs_text = f"Evaluated observation {target_obs.question} -> {outcome}"
-                details = dict(target_obs.target_ref)
-            elif target_obs.target_kind == TARGET_KIND_FIELD:
-                obs_text = f"Inspected field {f_path} in snapshot."
-                details = dict(target_obs.target_ref)
-                details["field_path"] = f_path
-                observed_val = None
-                evaluated = False
+            if result_data.get("provenance_class") in TRUSTED_PROVENANCE_CLASSES or raw_prov.get("provenance_class") in TRUSTED_PROVENANCE_CLASSES or details.get("provenance_class") in TRUSTED_PROVENANCE_CLASSES:
+                forged_keys_detected.append("provenance_class")
 
-                # Check active snapshot if available
-                if getattr(session, "active_snapshot", None):
-                    snap = session.active_snapshot
-                    objs = getattr(snap, "objects", []) or (snap.get("persistent", {}).get("objects", []) if isinstance(snap, dict) else [])
-                    for o in objs:
-                        fields = o.get("fields", []) if isinstance(o, dict) else getattr(o, "fields", [])
-                        for fld in fields:
-                            fname = fld.get("name") if isinstance(fld, dict) else getattr(fld, "name", None)
-                            if fname == f_path or (f_path and (f_path.endswith(f".{fname}") or f_path.endswith(f"->{fname}"))):
-                                observed_val = fld.get("value") if isinstance(fld, dict) else getattr(fld, "value", None)
-                                evaluated = True
-                                break
-                        if evaluated:
-                            break
+            if result_data.get("collection_status") in ("VERIFIED", "AUTHENTICATED") or details.get("collection_status") in ("VERIFIED", "AUTHENTICATED"):
+                forged_keys_detected.append("collection_status")
+                details.pop("collection_status", None)
 
-                if target_obs.target_ref.get("force_failed") or target_obs.target_ref.get("force_error"):
-                    outcome = "ERROR"
-                elif target_obs.target_ref.get("force_contradiction"):
+            if is_simulated_ctrl:
+                details["is_simulated"] = True
+                details["authority_level"] = "TEST"
+                sim_ff = (result_data.get("force_failed") or details.get("force_failed") or t_ref.get("force_failed"))
+                sim_fe = (result_data.get("force_error") or details.get("force_error") or t_ref.get("force_error"))
+                sim_fc = (result_data.get("force_contradiction") or details.get("force_contradiction") or t_ref.get("force_contradiction"))
+                sim_out = (result_data.get("simulated_outcome") or details.get("simulated_outcome") or t_ref.get("simulated_outcome"))
+                if sim_ff or sim_fe:
+                    outcome = "FAILED"
+                elif sim_fc:
                     outcome = "CONTRADICTED"
-                elif evaluated:
-                    details["observed_value"] = observed_val
-                    if contradict_val is not None and observed_val == contradict_val:
-                        outcome = "CONTRADICTED"
-                    elif expected_val is not None:
-                        outcome = "SUPPORTED" if observed_val == expected_val else "CONTRADICTED"
-                    else:
-                        outcome = "SUPPORTED"
-                elif expected_val is not None and target_obs.target_ref.get("must_match_snapshot", False):
-                    outcome = "INCONCLUSIVE"
+                elif sim_out is not None:
+                    # Simulated outcomes are isolated from production proof: never produce trusted SUPPORTED/VALIDATED
+                    s_up = str(sim_out).upper()
+                    outcome = "INCONCLUSIVE" if s_up in ("SUPPORTED", "VALIDATED", "CONFIRMED") else s_up
+                    details["simulated_outcome_isolated"] = str(sim_out)
                 else:
-                    outcome = "SUPPORTED"
-            elif target_obs.target_kind == TARGET_KIND_THREAD:
-                th_id = target_obs.target_ref.get("thread_id", "all")
-                obs_text = f"Inspected thread {th_id} call stack in snapshot."
-                details = dict(target_obs.target_ref)
-                details["thread_id"] = th_id
-                if target_obs.target_ref.get("force_failed") or target_obs.target_ref.get("force_error"):
-                    outcome = "ERROR"
-                elif target_obs.target_ref.get("force_contradiction"):
-                    outcome = "CONTRADICTED"
-                else:
-                    outcome = "SUPPORTED"
-            elif target_obs.target_kind == TARGET_KIND_COMPARISON:
-                obs_text = f"Compared observation against baseline."
-                details = dict(target_obs.target_ref)
-                if target_obs.target_ref.get("force_failed") or target_obs.target_ref.get("force_error"):
-                    outcome = "ERROR"
-                elif target_obs.target_ref.get("force_contradiction"):
-                    outcome = "CONTRADICTED"
-                else:
-                    outcome = "SUPPORTED"
+                    outcome = "ABSTAIN"
             else:
-                obs_text = f"Executed observation: {target_obs.question}"
-                details = dict(target_obs.target_ref)
-                if target_obs.target_ref.get("force_failed") or target_obs.target_ref.get("force_error"):
-                    outcome = "ERROR"
-                elif target_obs.target_ref.get("force_contradiction"):
-                    outcome = "CONTRADICTED"
-                else:
+                outcome = result_data.get("outcome", details.get("outcome", "INCONCLUSIVE"))
+                if outcome == "CONFIRMED":
                     outcome = "SUPPORTED"
+
+                # Invariant 9 & Phase 2.0-A.3.6: Caller-submitted results cannot fabricate causal proof or forged metadata
+                has_forged_claims = bool(
+                    forged_keys_detected
+                    or outcome == "VALIDATED"
+                    or details.get("verified_transition") is True
+                    or details.get("causal_proof") is True
+                    or details.get("reproduction_verified") is True
+                    or details.get("transition_verified") is True
+                    or details.get("verified_writer") is True
+                    or result_data.get("verified_transition") is True
+                    or result_data.get("causal_proof") is True
+                    or result_data.get("reproduction_verified") is True
+                    or result_data.get("verified_writer") is True
+                )
+                if has_forged_claims:
+                    details["unverified_caller_claim"] = True
+                    details["forged_metadata_detected"] = True
+                    details["forged_keys"] = forged_keys_detected
+                    details["verified_transition"] = False
+                    details["transition_verified"] = False
+                    details["causal_proof"] = False
+                    details["reproduction_verified"] = False
+                    details["verified_writer"] = False
+                    source = "unverified_caller"
+                    if outcome == "VALIDATED":
+                        outcome = "SUPPORTED"
+                    # If caller attempted to forge provenance_class, receipts, confidence, or collection_status without independent session evidence, block SUPPORTED
+                    if any(k in forged_keys_detected for k in ("provenance_class", "live_capture_receipt", "capture_receipt", "verifier_attestation", "execution_provenance", "confidence", "confidence_score", "collection_status")):
+                        if not target_hypo.supporting_evidence_ids and not session.findings:
+                            outcome = "INCONCLUSIVE"
+                            details["outcome_downgraded_reason"] = "unverified_forged_caller_metadata"
+        else:
+            # Strict fail-closed read-only observation against actual session snapshot / thread / comparison state
+            eval_out = self._evaluate_observation_against_session(session, target_obs, target_hypo)
+            outcome = eval_out["outcome"]
+            obs_text = eval_out["observation_text"]
+            details = eval_out["details"]
+            prov_class = eval_out.get("provenance_class", PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE)
 
         details["observation_id"] = observation_id
         details["hypothesis_id"] = target_hypo.hypothesis_id
         details["outcome"] = outcome
+        details["provenance_class"] = prov_class
 
         is_failed_obs = bool(
             (result_data and result_data.get("failed") is True)
-            or outcome in ("FAILED", "ERROR", "READ_ERROR", "TIMEOUT", "RESTRICTED", "ABSTAIN")
+            or outcome in ("FAILED", "ERROR", "READ_ERROR", "TIMEOUT", "RESTRICTED")
         )
-        details["collection_status"] = COLLECTION_STATUS_ABSTAIN if is_failed_obs else COLLECTION_STATUS_COLLECTED
+        is_abstain_obs = is_failed_obs or (outcome == "ABSTAIN")
+        details["collection_status"] = COLLECTION_STATUS_ABSTAIN if is_abstain_obs else COLLECTION_STATUS_COLLECTED
         details["result_category"] = RESULT_OBSERVATION_FAILED if is_failed_obs else RESULT_NEW_EVIDENCE
 
         ev_record = EvidenceRecord(
             evidence_id=ev_id,
-            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION if target_obs.target_kind == TARGET_KIND_FIELD else EVIDENCE_TYPE_OBJECT_STATE,
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION if target_obs.target_kind == TARGET_KIND_FIELD else (EVIDENCE_TYPE_COMPARISON if target_obs.target_kind == TARGET_KIND_COMPARISON else EVIDENCE_TYPE_OBJECT_STATE),
             nature=NATURE_OBSERVATION,
             source=source,
             session_id=investigation_id,
@@ -2833,10 +3262,15 @@ class InvestigationManager:
             observation=obs_text,
             parent_evidence_ids=[e for e in target_hypo.supporting_evidence_ids if session.ledger.get_record(e)],
             details=details,
-            provenance={"submission_channel": "external_caller" if result_data else "internal_observer"},
+            provenance={
+                "submission_channel": "external_caller" if result_data else "internal_observer",
+                "provenance_class": prov_class,
+                "authority_level": authority_lvl,
+                "is_simulated": is_simulated_ctrl,
+            },
             capture_quality={
-                "completeness": "FAILED" if is_failed_obs else "COMPLETE",
-                "consistency_level": "STOPPED",
+                "completeness": "FAILED" if is_failed_obs else ("UNVERIFIED" if result_data else details.get("snapshot_completeness", "COMPLETE")),
+                "consistency_level": "UNVERIFIED" if result_data else details.get("snapshot_consistency", "STOPPED"),
             },
         )
         session.ledger.add_record(ev_record)
@@ -2845,7 +3279,7 @@ class InvestigationManager:
             target_obs.executed = False
             target_obs.status = OBSERVATION_STATUS_FAILED
             target_obs.result_category = RESULT_OBSERVATION_FAILED
-            target_obs.execution_error = (result_data.get("error") if result_data else None) or f"Observation execution failed: {obs_text}"
+            target_obs.execution_error = result_data.get("error") or f"Observation execution failed: {obs_text}"
             target_obs.is_suggestion = False
             session.add_timeline_event(
                 event_type="OBSERVATION_FAILED",
@@ -2997,19 +3431,16 @@ class InvestigationManager:
         if cap_status in ("FAILED", "INVALID"):
             trust_level = "UNTRUSTED"
             trust_caveat = f"Capture quality is {cap_status}. Data is untrusted and cannot substantiate verified runtime facts."
-        elif cap_status == "UNVERIFIED":
-            trust_level = "UNVERIFIED"
-            trust_caveat = "Capture quality is UNVERIFIED. Data is unverified and cannot substantiate verified runtime facts."
-        elif cap_status in ("PARTIAL", "DEGRADED"):
+        elif cap_status == "PARTIAL":
             trust_level = "PARTIALLY_TRUSTED"
-            trust_caveat = f"Capture quality is {cap_status}. Findings may reflect incomplete memory layout, unread regions, or execution skew."
+            trust_caveat = "Capture quality is PARTIAL. Findings may reflect incomplete memory layout, unread regions, or execution skew."
 
-        # Monotonicity & trust boundary: when capture is UNTRUSTED or UNVERIFIED, suppress observed_facts
-        if trust_level in ("UNTRUSTED", "UNVERIFIED"):
+        # Monotonicity & trust boundary: when capture is UNTRUSTED, suppress observed_facts
+        if trust_level == "UNTRUSTED":
             for f in session.findings:
                 if f.category == "fact":
                     f.category = "unknown"
-                    f.status = "UNTRUSTED" if trust_level == "UNTRUSTED" else "UNVERIFIED"
+                    f.status = "UNTRUSTED"
                     f.confidence = "low"
                     f.uncertainty = trust_caveat
             for h in session.hypotheses:
@@ -3084,51 +3515,10 @@ class InvestigationManager:
             ),
         }
 
-        # Synthesize verdict once for both zero-CDN HTML and JSON representations
-        investigation_evaluations = [
-            AssertionEvaluation(
-                raw_assertion=h.title,
-                lhs_expression=h.title,
-                resolved_expression=h.title,
-                operator="VALIDATED",
-                expected="TRUE",
-                observed_value=h.validation_status,
-                observation_status="OBSERVED",
-                verdict=ASSERTION_PASS if h.validation_status == HYPOTHESIS_STATUS_VALIDATED else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN),
-                reason=h.claim,
-            )
-            for h in session.hypotheses
-        ]
-        is_live_capture = bool(session.target_ref.get("live_capture"))
-        report_prov_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE if is_live_capture else PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        if trust_level in ("UNTRUSTED", "UNVERIFIED") or cap_status in ("FAILED", "INVALID", "UNVERIFIED"):
-            report_prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        elif session.target_ref.get("provenance_class") in (PROVENANCE_CLASS_IMPORTED_UNVERIFIED, PROVENANCE_CLASS_SYNTHETIC_FIXTURE):
-            report_prov_class = session.target_ref.get("provenance_class")
-        elif not is_live_capture:
-            report_prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-
-        synth_report_verdict = VerdictEngine.synthesize_verdict(
-            hypothesis=session.goal,
-            evaluations=investigation_evaluations,
-            target_identity=session.stages.get("target_identity", {}).get("details", {}),
-            causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
-            provenance_class=report_prov_class,
-        )
-        report_html_rendered = ZeroCdnReporter.render_html(
-            synth_report_verdict,
-            title=f"dynamicState Investigation: {session.goal[:40]}",
-            remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
-        )
-        report_json_rendered = ZeroCdnReporter.render_json(synth_report_verdict)
-
         return {
             "investigation_id": session.investigation_id,
             "goal": session.goal,
             "status": session.status,
-            "verdict": session.summary.get("verdict") or synth_report_verdict.final_diagnosis,
-            "final_diagnosis": session.summary.get("final_diagnosis") or synth_report_verdict.final_diagnosis,
-            "provenance_class": report_prov_class,
             "created_at": session.created_at,
             "target_identity": session.stages["target_identity"].get("details", {}),
             "capture_quality": session.stages["capture_quality"].get("details", {}),
@@ -3140,10 +3530,6 @@ class InvestigationManager:
             },
             "stages": session.stages,
             "summary": session.summary,
-            "inspected_scope": session.summary.get("inspected_scope", {}),
-            "uninspected_scope": session.summary.get("uninspected_scope", {}),
-            "limitations": session.summary.get("limitations", []),
-            "provenance_limitations": session.summary.get("provenance_limitations", []),
             "findings_summary": {
                 "total": len(session.findings),
                 "facts_count": len(facts),
@@ -3162,9 +3548,7 @@ class InvestigationManager:
             "comparisons": session.comparison_results,
             "static_code_links": session.stages["static_code_link"].get("details", {}),
             "recommended_next_steps": [s.to_dict() for s in session.next_steps],
-            "next_steps": [s.to_dict() for s in session.next_steps],
             "evidence_ledger": session.ledger.to_dict(),
-            "evidence_count": len(session.ledger._records),
             "timeline": list(session.timeline),
             "timeline_count": len(session.timeline),
             "lifecycle_state": session.lifecycle_state,
@@ -3176,8 +3560,34 @@ class InvestigationManager:
                 "confidence": session.summary.get("confidence_score", 0.5),
                 "budget_summary": session.budget_tracker.to_dict(),
             },
-            "report_html": report_html_rendered,
-            "report_json": report_json_rendered,
+            "report_html": ZeroCdnReporter.render_html(
+                VerdictEngine.synthesize_verdict(
+                    hypothesis=session.goal,
+                    evaluations=[
+                        AssertionEvaluation(
+                            raw_assertion=h.title,
+                            lhs_expression=h.title,
+                            resolved_expression=h.title,
+                            operator="VALIDATED",
+                            expected="TRUE",
+                            observed_value=h.validation_status,
+                            observation_status="OBSERVED",
+                            verdict=(
+                                ASSERTION_PASS
+                                if h.validation_status in (HYPOTHESIS_STATUS_VALIDATED, HYPOTHESIS_STATUS_SUPPORTED)
+                                else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN)
+                            ),
+                            reason=h.claim,
+                        )
+                        for h in session.hypotheses
+                    ],
+                    target_identity=session.stages.get("target_identity", {}).get("details", {}),
+                    causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
+                    budget_usage=session.budget_tracker.to_dict(),
+                ),
+                title=f"dynamicState Investigation: {session.goal[:40]}",
+                remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
+            ),
         }
 
     def export_html_report(self, investigation_id: str, output_path: str) -> bool:
@@ -3205,18 +3615,10 @@ class InvestigationManager:
         fixture_data: Optional[Dict[str, Any]] = None,
         follow_up_executor: Optional[Any] = None,
         watch_manager: Optional[Any] = None,
-        provenance_class: Optional[str] = None,
-        capture_receipt: Optional[Any] = None,
-        verification_authority: Optional[Any] = None,
-        snapshot: Optional[Any] = None,
+        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     ) -> Dict[str, Any]:
         """Runs an evidence-grounded, budget-bounded Process Health Investigation and registers the session."""
-        rcpt_sess = (
-            getattr(capture_receipt, "session_id", None)
-            if capture_receipt and hasattr(capture_receipt, "session_id")
-            else (capture_receipt.get("session_id") if isinstance(capture_receipt, dict) else None)
-        )
-        inv_id = rcpt_sess or f"inv_{uuid.uuid4().hex[:10]}"
+        inv_id = f"inv_{uuid.uuid4().hex[:10]}"
         session = InvestigationSession(
             investigation_id=inv_id,
             goal=goal,
@@ -3238,13 +3640,10 @@ class InvestigationManager:
             budget_limits=ObservationBudgetLimits.from_dict(budgets),
             session_id=inv_id,
             provenance_class=provenance_class,
-            capture_receipt=capture_receipt,
             fixture_data=fixture_data,
             follow_up_executor=follow_up_executor,
             existing_state_machine=session.state_machine,
             existing_executed_keys=session.executed_observation_keys,
-            verification_authority=verification_authority,
-            snapshot=snapshot,
         )
         session.status = res.get("lifecycle_state", STATE_COMPLETED)
         session.executed_observation_keys = set(res.get("executed_observation_keys", []))
@@ -3252,9 +3651,13 @@ class InvestigationManager:
             InvestigationHypothesis.from_dict(h) if isinstance(h, dict) else h
             for h in res.get("competing_hypotheses", [])
         ]
+        if isinstance(res.get("budget_usage"), dict):
+            session.budgets.update(res["budget_usage"])
         session.summary.update({
             "verdict": res.get("verdict"),
             "final_diagnosis": res.get("final_diagnosis"),
+            "execution_status": res.get("execution_status"),
+            "failure_category": res.get("failure_category"),
             "confidence_score": res.get("confidence_score"),
             "confidence_rationale": res.get("confidence_rationale"),
             "stop_reason": res.get("stop_reason"),
@@ -3262,8 +3665,7 @@ class InvestigationManager:
             "inspected_scope": res.get("inspected_scope"),
             "uninspected_scope": res.get("uninspected_scope"),
             "evidence_coverage": res.get("evidence_coverage"),
-            "limitations": res.get("limitations", []),
-            "provenance_limitations": res.get("provenance_limitations", []),
+            "consumed_execution_budget": res.get("consumed_execution_budget") or res.get("budget_usage"),
         })
         return res
 
@@ -3820,24 +4222,16 @@ class InvestigationManager:
         # Resolve raw snapshot or semantic snapshot
         raw_snap = None
         if mem_snap_path and os.path.exists(mem_snap_path):
-            if os.path.exists(os.path.join(mem_snap_path, "metadata.json")):
-                from .memory_snapshot import RawMemorySnapshot
-                raw_snap = RawMemorySnapshot.load(mem_snap_path)
-            elif os.path.exists(os.path.join(mem_snap_path, "snapshot_metadata.json")):
-                raw_snap = RawRuntimeSnapshot.load(mem_snap_path)
+            raw_snap = RawRuntimeSnapshot.load(mem_snap_path)
         elif snap_id:
             # Check corpus memory_snapshots
             candidate_p = os.path.join(self.corpus_dir, "memory_snapshots", snap_id)
             if os.path.exists(candidate_p):
-                if os.path.exists(os.path.join(candidate_p, "metadata.json")):
-                    from .memory_snapshot import RawMemorySnapshot
-                    raw_snap = RawMemorySnapshot.load(candidate_p)
-                elif os.path.exists(os.path.join(candidate_p, "snapshot_metadata.json")):
-                    raw_snap = RawRuntimeSnapshot.load(candidate_p)
+                raw_snap = RawRuntimeSnapshot.load(candidate_p)
 
-        target_exec = getattr(raw_snap, "executable", getattr(raw_snap, "binary", None)) if raw_snap else None
-        target_build_id = getattr(raw_snap, "executable_build_id", None) if raw_snap else None
-        pid = getattr(raw_snap, "pid", None) if raw_snap else t_ref.get("pid")
+        target_exec = raw_snap.executable if raw_snap else None
+        target_build_id = raw_snap.executable_build_id if raw_snap else None
+        pid = raw_snap.pid if raw_snap else t_ref.get("pid")
 
         dbg_build_id = None
         if dbg_path and os.path.exists(dbg_path):
@@ -3944,20 +4338,11 @@ class InvestigationManager:
         t_ref = session.target_ref
         raw_snap = None
         if t_ref.get("memory_snapshot_path") and os.path.exists(t_ref["memory_snapshot_path"]):
-            p = t_ref["memory_snapshot_path"]
-            if os.path.exists(os.path.join(p, "metadata.json")):
-                from .memory_snapshot import RawMemorySnapshot
-                raw_snap = RawMemorySnapshot.load(p)
-            elif os.path.exists(os.path.join(p, "snapshot_metadata.json")):
-                raw_snap = RawRuntimeSnapshot.load(p)
+            raw_snap = RawRuntimeSnapshot.load(t_ref["memory_snapshot_path"])
         elif t_ref.get("snapshot_id"):
             cand = os.path.join(self.corpus_dir, "memory_snapshots", t_ref["snapshot_id"])
             if os.path.exists(cand):
-                if os.path.exists(os.path.join(cand, "metadata.json")):
-                    from .memory_snapshot import RawMemorySnapshot
-                    raw_snap = RawMemorySnapshot.load(cand)
-                elif os.path.exists(os.path.join(cand, "snapshot_metadata.json")):
-                    raw_snap = RawRuntimeSnapshot.load(cand)
+                raw_snap = RawRuntimeSnapshot.load(cand)
 
         consistency_level = "UNKNOWN"
         stop_mechanism = "NONE"
@@ -3974,33 +4359,30 @@ class InvestigationManager:
         limitations: List[str] = []
 
         if raw_snap:
-            duration_us = getattr(raw_snap, "capture_duration_us", getattr(raw_snap, "duration_us", 0.0))
-            bytes_captured = getattr(raw_snap, "bytes_captured", 0)
+            duration_us = raw_snap.capture_duration_us
+            bytes_captured = raw_snap.bytes_captured
             prov = getattr(raw_snap, "provenance", {}) or {}
             obs_meta = getattr(raw_snap, "observation_metadata", {}) or {}
 
-            bytes_requested = getattr(raw_snap, "bytes_requested", None) or prov.get("bytes_requested") or obs_meta.get("bytes_requested") or bytes_captured
+            bytes_requested = prov.get("bytes_requested") or obs_meta.get("bytes_requested") or bytes_captured
             bytes_omitted = prov.get("bytes_omitted") or obs_meta.get("bytes_omitted") or 0
-            regions_attempted = getattr(raw_snap, "regions_requested", None) or prov.get("regions_attempted") or obs_meta.get("regions_attempted") or len(getattr(raw_snap, "memory_regions", getattr(raw_snap, "regions", [])))
+            regions_attempted = prov.get("regions_attempted") or obs_meta.get("regions_attempted") or len(raw_snap.memory_regions)
             stop_mechanism = prov.get("stop_mechanism") or obs_meta.get("stop_mechanism") or ("SIGSTOP" if prov.get("stop_state_machine", {}).get("stop_confirmed") else "NONE")
             stopped_threads = prov.get("stopped_threads", False)
 
             # Examine memory regions
-            all_regs = getattr(raw_snap, "memory_regions", None) or getattr(raw_snap, "regions", [])
-            for r in all_regs:
-                st = r.get("status") if isinstance(r, dict) else getattr(r, "status", None)
+            for r in raw_snap.memory_regions:
+                st = r.get("status")
                 if st == "PARTIAL":
                     partial_reads += 1
                 elif st == "FAILED":
                     failed_reads += 1
-                    pn = r.get("pathname", r.get("region_id", "unknown")) if isinstance(r, dict) else (getattr(r, "pathname", None) or getattr(r, "region_id", "unknown"))
-                    missing_regions.append(pn)
+                    missing_regions.append(r.get("pathname", r.get("region_id", "unknown")))
                 elif st == "OMITTED":
                     omitted_regions += 1
-                    rid = r.get("region_id", "unknown") if isinstance(r, dict) else getattr(r, "region_id", "unknown")
-                    missing_regions.append(f"{rid} (omitted: policy limit)")
+                    missing_regions.append(f"{r.get('region_id', 'unknown')} (omitted: policy limit)")
 
-            backend = getattr(raw_snap, "capture_backend", getattr(raw_snap, "backend", "unknown")) or "unknown"
+            backend = raw_snap.capture_backend or "unknown"
             raw_consistency = prov.get("snapshot_consistency") or obs_meta.get("consistency_classification")
             if raw_consistency == NON_ATOMIC or ("process_vm_readv" in backend and not stopped_threads):
                 consistency_level = NON_ATOMIC
@@ -4094,12 +4476,9 @@ class InvestigationManager:
 
         # Assign honest stage status
         if raw_snap:
-            val_verdict = getattr(raw_snap, "validation_verdict", None)
-            if getattr(raw_snap, "completeness", None) in ("INVALID", "FAILED") or val_verdict == "INVALID" or (bytes_captured == 0 and regions_attempted > 0):
+            if getattr(raw_snap, "completeness", None) in ("INVALID", "FAILED") or (bytes_captured == 0 and regions_attempted > 0):
                 stage_status = "FAILED"
-            elif val_verdict == "UNVERIFIED":
-                stage_status = "UNVERIFIED"
-            elif getattr(raw_snap, "completeness", None) == "PARTIAL" or getattr(raw_snap, "status", None) == "DEGRADED" or failed_reads > 0 or partial_reads > 0 or omitted_regions > 0:
+            elif getattr(raw_snap, "completeness", None) == "PARTIAL" or failed_reads > 0 or partial_reads > 0 or omitted_regions > 0:
                 stage_status = "PARTIAL"
             else:
                 stage_status = "COMPLETED"

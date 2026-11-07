@@ -190,10 +190,13 @@ def inspect_elf(path: Union[str, Any]) -> BinaryIdentity:
 
         arch_map = {
             3: "x86",
+            8: "mips",
+            20: "ppc",
+            21: "ppc64",
             62: "x86_64",
             40: "arm",
             183: "aarch64",
-            243: "riscv",
+            243: "riscv64" if is_64 else "riscv",
         }
         arch_name = arch_map.get(e_machine, "machine_0x{:04x}".format(e_machine))
 

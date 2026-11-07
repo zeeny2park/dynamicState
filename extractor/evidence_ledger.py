@@ -10,15 +10,14 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
-import os
 import re
-import stat
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 
 PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE = "LIVE_RUNTIME_CAPTURE"
 PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION = "CONTROLLED_RUNTIME_REPRODUCTION"
+PROVENANCE_CLASS_SYNTHETIC = "SYNTHETIC"
 PROVENANCE_CLASS_SYNTHETIC_FIXTURE = "SYNTHETIC_FIXTURE"
 PROVENANCE_CLASS_IMPORTED_UNVERIFIED = "IMPORTED_UNVERIFIED"
 
@@ -27,17 +26,29 @@ TRUSTED_PROVENANCE_CLASSES = {
     PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
 }
 
-# Trust State Model (Explicit trust evaluation decoupled from memory consistency)
-TRUST_STATE_LIVE_VERIFIED = "LIVE_VERIFIED"
-TRUST_STATE_IMPORTED_UNVERIFIED = "IMPORTED_UNVERIFIED"
-TRUST_STATE_INVALID_OR_TAMPERED = "INVALID_OR_TAMPERED"
-TRUST_STATE_VERIFICATION_UNAVAILABLE = "VERIFICATION_UNAVAILABLE"
+SYNTHETIC_PROVENANCE_CLASSES = {
+    PROVENANCE_CLASS_SYNTHETIC,
+    PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+}
 
-ALL_TRUST_STATES = {
-    TRUST_STATE_LIVE_VERIFIED,
-    TRUST_STATE_IMPORTED_UNVERIFIED,
-    TRUST_STATE_INVALID_OR_TAMPERED,
-    TRUST_STATE_VERIFICATION_UNAVAILABLE,
+VALID_PROVENANCE_CLASSES = {
+    PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+    PROVENANCE_CLASS_SYNTHETIC,
+    PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+    PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+}
+
+OBSERVATION_OUTCOME_SUPPORTED = "SUPPORTED"
+OBSERVATION_OUTCOME_CONTRADICTED = "CONTRADICTED"
+OBSERVATION_OUTCOME_INCONCLUSIVE = "INCONCLUSIVE"
+OBSERVATION_OUTCOME_ABSTAIN = "ABSTAIN"
+
+VALID_OBSERVATION_OUTCOMES = {
+    OBSERVATION_OUTCOME_SUPPORTED,
+    OBSERVATION_OUTCOME_CONTRADICTED,
+    OBSERVATION_OUTCOME_INCONCLUSIVE,
+    OBSERVATION_OUTCOME_ABSTAIN,
 }
 
 # Genuine supported function attribution mechanisms
@@ -66,940 +77,6 @@ ALL_TRUST_CLAIMS = {
     CLAIM_STATE_TRANSITION_VERIFIED,
     CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
 }
-
-
-def load_secure_key_file(path: str, max_size: int = 4096) -> Dict[str, str]:
-    """Loads capture signing/verification keys from a secured file without TOCTOU races.
-    
-    Enforces strict security constraints:
-    - Path must exist and not be a symlink (opened with O_NOFOLLOW).
-    - Opened FD validated with fstat: regular file only, mode 0600 or 0400 (no group/world access).
-    - Owner must match current user UID or root.
-    - Read directly from the validated FD; rejects empty, malformed, or oversized keys (> 4096 bytes).
-    - Rejects embedded NUL bytes and delimiter characters ('|').
-    - Secret length must be >= 16 bytes and <= 256 bytes.
-    """
-    if not path or not isinstance(path, str):
-        raise ValueError("Key file path must be a non-empty string")
-
-    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        open_flags |= os.O_NOFOLLOW
-
-    try:
-        fd = os.open(path, open_flags)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Key file '{path}' does not exist")
-    except OSError as err:
-        import errno
-        if err.errno in (errno.ELOOP, errno.EMLINK) or os.path.islink(path):
-            raise PermissionError(f"Insecure key file '{path}': symlinks are forbidden")
-        raise PermissionError(f"Cannot open key file '{path}': {err}")
-
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise PermissionError(f"Insecure key file '{path}': must be a regular file")
-
-        # Reject any group or world access permissions (must be 0600 or 0400)
-        if (st.st_mode & 0o077) != 0:
-            raise PermissionError(
-                f"Insecure key file '{path}': permissions ({oct(st.st_mode & 0o777)}) permit group/world access. Must be 0600 or 0400."
-            )
-
-        # Check ownership: current UID or root
-        curr_uid = os.geteuid() if hasattr(os, "geteuid") else 0
-        if st.st_uid != curr_uid and st.st_uid != 0:
-            raise PermissionError(
-                f"Insecure key file '{path}': owner UID {st.st_uid} does not match process UID {curr_uid}"
-            )
-
-        # Check file size (reject oversized key file)
-        if st.st_size > max_size:
-            raise ValueError(f"Key file '{path}' is oversized ({st.st_size} bytes; max {max_size} bytes allowed)")
-        if st.st_size == 0:
-            raise ValueError(f"Key file '{path}' is empty")
-
-        chunks: List[bytes] = []
-        total_read = 0
-        while True:
-            chunk = os.read(fd, min(4096, max_size - total_read + 1))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total_read += len(chunk)
-            if total_read > max_size:
-                raise ValueError(f"Key file '{path}' exceeds maximum size of {max_size} bytes")
-
-        raw_bytes = b"".join(chunks)
-        if total_read == 0:
-            raise ValueError(f"Key file '{path}' is empty")
-        if st.st_size > 0 and len(raw_bytes) != st.st_size:
-            raise ValueError(f"Key file '{path}' size mismatch (stat reported {st.st_size} bytes, read {len(raw_bytes)} bytes)")
-    finally:
-        os.close(fd)
-
-    # Check for embedded NUL bytes
-    if b"\x00" in raw_bytes:
-        raise ValueError(f"Insecure key file '{path}': embedded NUL bytes are forbidden")
-
-    try:
-        content = raw_bytes.decode("utf-8").strip()
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"Key file '{path}' is not valid UTF-8: {exc}")
-
-    if not content:
-        raise ValueError(f"Key file '{path}' is empty")
-
-    keys: Dict[str, str] = {}
-    if content.startswith("{"):
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Malformed JSON keyring in '{path}': {exc}")
-        if not isinstance(data, dict):
-            raise ValueError(f"Keyring in '{path}' must be a JSON object")
-        if not data:
-            raise ValueError(f"Keyring in '{path}' is empty")
-        for k, v in data.items():
-            if not isinstance(k, str) or not isinstance(v, str):
-                raise ValueError(f"Invalid key entry in '{path}': keys and secrets must be strings")
-            if "\x00" in k or "|" in k:
-                raise ValueError(f"Key ID '{k}' in '{path}' contains forbidden delimiter or NUL character")
-            if len(v) < 16:
-                raise ValueError(f"Key '{k}' in '{path}' is too short ({len(v)} chars; min 16 required)")
-            if len(v) > 256:
-                raise ValueError(f"Key '{k}' in '{path}' is oversized ({len(v)} chars; max 256 allowed)")
-            if "\x00" in v or "|" in v:
-                raise ValueError(f"Key '{k}' in '{path}' contains forbidden delimiter or NUL character")
-            keys[k] = v
-    else:
-        if len(content) < 16:
-            raise ValueError(f"Key in '{path}' is too short ({len(content)} chars; min 16 required)")
-        if len(content) > 256:
-            raise ValueError(f"Key in '{path}' is oversized ({len(content)} chars; max 256 allowed)")
-        if "|" in content:
-            raise ValueError(f"Key in '{path}' contains forbidden delimiter '|'")
-        keys["file_default"] = content
-
-    return keys
-
-
-def load_secure_key_fd(fd: int, max_size: int = 4096) -> str:
-    """Reads capture signing/verification key from an open file descriptor with strict validation."""
-    if not isinstance(fd, int) or fd < 0:
-        raise ValueError(f"Invalid file descriptor: {fd}")
-    try:
-        st = os.fstat(fd)
-    except OSError as exc:
-        raise ValueError(f"Cannot stat key file descriptor {fd}: {exc}")
-
-    if not (stat.S_ISREG(st.st_mode) or stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode)):
-        raise ValueError(f"Key descriptor {fd} is not a regular file, pipe, or socket")
-
-    raw_chunks: List[bytes] = []
-    total_read = 0
-    dup_fd = os.dup(fd)
-    try:
-        while total_read <= max_size:
-            chunk = os.read(dup_fd, min(4096, max_size - total_read + 1))
-            if not chunk:
-                break
-            raw_chunks.append(chunk)
-            total_read += len(chunk)
-    finally:
-        os.close(dup_fd)
-
-    raw_bytes = b"".join(raw_chunks)
-    if len(raw_bytes) > max_size:
-        raise ValueError(f"Key from FD {fd} is oversized (exceeds {max_size} bytes)")
-
-    if b"\x00" in raw_bytes:
-        raise ValueError(f"Key from FD {fd} contains forbidden embedded NUL byte")
-
-    try:
-        content = raw_bytes.decode("utf-8").strip()
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"Key from FD {fd} is not valid UTF-8: {exc}")
-
-    if len(content) < 16:
-        raise ValueError(f"Key from FD {fd} is too short ({len(content)} chars; min 16 required)")
-    if len(content) > 256:
-        raise ValueError(f"Key from FD {fd} is oversized ({len(content)} chars; max 256 allowed)")
-    if "|" in content:
-        raise ValueError(f"Key from FD {fd} contains forbidden delimiter '|'")
-
-    return content
-
-
-class CaptureVerificationAuthority:
-    """Authority for verifying capture receipts against trusted keys.
-    
-    Operates fail-closed: if no keys are registered or loaded from the environment,
-    verification requests fail immediately. Secrets are never exposed in string representations,
-    logs, or serialized outputs.
-    """
-    def __init__(self, keys: Optional[Dict[str, str]] = None):
-        self._keys: Dict[str, str] = dict(keys or {})
-        self._revoked_keys: Set[str] = set()
-
-    def register_key(self, key_id: str, secret: str) -> None:
-        if not key_id or not secret:
-            raise ValueError("key_id and secret must be non-empty strings")
-        self._keys[key_id] = secret
-        self._revoked_keys.discard(key_id)
-
-    def register_key_file(self, path: str, default_key_id: str = "file_default") -> int:
-        """Loads and registers keys from a secure file (0600 or 0400 mode)."""
-        keys = load_secure_key_file(path)
-        count = 0
-        for k, v in keys.items():
-            eff_k = default_key_id if k == "file_default" else k
-            self.register_key(eff_k, v)
-            count += 1
-        return count
-
-    def register_key_fd(self, fd: int, key_id: str = "fd_default") -> None:
-        """Loads and registers a key from an inherited file descriptor."""
-        key = load_secure_key_fd(fd)
-        self.register_key(key_id, key)
-
-    def revoke_key(self, key_id: str) -> None:
-        if not key_id:
-            raise ValueError("key_id must be a non-empty string")
-        self._revoked_keys.add(key_id)
-
-    def get_key(self, key_id: str) -> Optional[str]:
-        if key_id in self._revoked_keys:
-            return None
-        return self._keys.get(key_id)
-
-    def has_keys(self) -> bool:
-        return bool(self._keys)
-
-    def is_revoked(self, key_id: str) -> bool:
-        return key_id in self._revoked_keys
-
-    @classmethod
-    def from_key_file(cls, path: str, default_key_id: str = "file_default") -> "CaptureVerificationAuthority":
-        """Explicit production factory to load verification keys from a secure file."""
-        auth = cls()
-        auth.register_key_file(path, default_key_id=default_key_id)
-        return auth
-
-    @classmethod
-    def from_keyring_file(cls, path: str) -> "CaptureVerificationAuthority":
-        """Explicit production factory to load verification keyring from a secure JSON file."""
-        auth = cls()
-        auth.register_key_file(path)
-        return auth
-
-    @classmethod
-    def from_key_fd(cls, fd: int, key_id: str = "fd_default") -> "CaptureVerificationAuthority":
-        """Explicit production factory to load verification key from an inherited file descriptor."""
-        auth = cls()
-        auth.register_key_fd(fd, key_id=key_id)
-        return auth
-
-    @classmethod
-    def from_environment(cls) -> "CaptureVerificationAuthority":
-        """Loads verification keys from explicit environment configuration.
-        
-        Strict error visibility: Invalid configuration raises visible, actionable errors
-        instead of silently swallowing exceptions.
-
-        DEPRECATED: Use explicit CaptureVerificationAuthority.from_key_file() or from_key_fd().
-        Raw environment secrets (DYNAMICSTATE_CAPTURE_SECRET) and inline JSON keyrings are prohibited.
-        """
-        import warnings
-        warnings.warn(
-            "CaptureVerificationAuthority.from_environment() is deprecated and will be removed in a future release. "
-            "Use explicit CaptureVerificationAuthority.from_key_file() or from_key_fd().",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        auth = cls()
-
-        # 1. Reject raw secrets in environment
-        if "DYNAMICSTATE_CAPTURE_SECRET" in os.environ and os.environ["DYNAMICSTATE_CAPTURE_SECRET"]:
-            raise ValueError(
-                "Insecure key provisioning: Passing raw secrets via DYNAMICSTATE_CAPTURE_SECRET is prohibited. "
-                "Use explicit key files (from_key_file) or inherited file descriptors (from_key_fd)."
-            )
-
-        # 2. DYNAMICSTATE_CAPTURE_KEY_FILE (Strict secure file validation - no silent swallowing)
-        key_file = os.environ.get("DYNAMICSTATE_CAPTURE_KEY_FILE")
-        if key_file:
-            auth.register_key_file(key_file)
-
-        # 3. DYNAMICSTATE_CAPTURE_KEYRING: Only secure file paths allowed; inline JSON strings prohibited
-        keyring_spec = os.environ.get("DYNAMICSTATE_CAPTURE_KEYRING")
-        if keyring_spec:
-            if not os.path.exists(keyring_spec):
-                raise ValueError(
-                    "Insecure key provisioning: Inline JSON keyring strings in DYNAMICSTATE_CAPTURE_KEYRING are prohibited. "
-                    "Use a secure key file path or explicit key authority registration."
-                )
-            auth.register_key_file(keyring_spec)
-
-        return auth
-
-    def __repr__(self) -> str:
-        # Never expose secrets!
-        registered = sorted(self._keys.keys())
-        revoked = sorted(self._revoked_keys)
-        return f"<CaptureVerificationAuthority keys={registered} revoked={revoked}>"
-
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-class CaptureSigningAuthority:
-    """Authority for signing authentic LiveCaptureReceipts using a dedicated key."""
-    def __init__(self, key_id: str, secret: str):
-        if not key_id or not secret:
-            raise ValueError("CaptureSigningAuthority requires non-empty key_id and secret")
-        if not isinstance(key_id, str) or not isinstance(secret, str):
-            raise TypeError("key_id and secret must be strings")
-        if "|" in key_id or "\0" in key_id:
-            raise ValueError("key_id contains forbidden delimiter or control character")
-        self._key_id = key_id
-        self._secret = secret
-
-    @classmethod
-    def from_key_file(cls, path: str, key_id: str = "collector_key") -> "CaptureSigningAuthority":
-        """Explicit production factory to load signing key from a secure file."""
-        keys = load_secure_key_file(path)
-        if key_id in keys:
-            sec = keys[key_id]
-        elif "file_default" in keys:
-            sec = keys["file_default"]
-        elif len(keys) == 1:
-            key_id, sec = next(iter(keys.items()))
-        else:
-            raise ValueError(f"Key '{key_id}' not found in key file '{path}'")
-        return cls(key_id=key_id, secret=sec)
-
-    @classmethod
-    def from_key_fd(cls, fd: int, key_id: str = "collector_key") -> "CaptureSigningAuthority":
-        """Explicit production factory to load signing key from an inherited file descriptor."""
-        sec = load_secure_key_fd(fd)
-        return cls(key_id=key_id, secret=sec)
-
-    @property
-    def key_id(self) -> str:
-        return self._key_id
-
-    def sign(self, payload: str) -> str:
-        return hmac.new(self._secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    def __repr__(self) -> str:
-        return f"<CaptureSigningAuthority key_id={self._key_id!r}>"
-
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-_DEFAULT_VERIFICATION_AUTHORITY: Optional[CaptureVerificationAuthority] = None
-_DEFAULT_SIGNING_AUTHORITY: Optional[CaptureSigningAuthority] = None
-
-
-def get_default_verification_authority() -> CaptureVerificationAuthority:
-    """Returns the globally configured verification authority, or unconfigured authority (fail-closed).
-    
-    Production callers must explicitly initialize the authority using
-    set_default_verification_authority() or CaptureVerificationAuthority.from_key_file().
-    """
-    global _DEFAULT_VERIFICATION_AUTHORITY
-    if _DEFAULT_VERIFICATION_AUTHORITY is None:
-        _DEFAULT_VERIFICATION_AUTHORITY = CaptureVerificationAuthority()
-    return _DEFAULT_VERIFICATION_AUTHORITY
-
-
-def set_default_verification_authority(auth: Optional[CaptureVerificationAuthority]) -> None:
-    global _DEFAULT_VERIFICATION_AUTHORITY
-    _DEFAULT_VERIFICATION_AUTHORITY = auth
-
-
-def get_default_signing_authority() -> Optional[CaptureSigningAuthority]:
-    """Returns the globally configured signing authority.
-    
-    Production callers must explicitly configure the signing authority.
-    """
-    global _DEFAULT_SIGNING_AUTHORITY
-    return _DEFAULT_SIGNING_AUTHORITY
-
-
-def set_default_signing_authority(auth: Optional[CaptureSigningAuthority]) -> None:
-    global _DEFAULT_SIGNING_AUTHORITY
-    _DEFAULT_SIGNING_AUTHORITY = auth
-
-
-def setup_test_capture_authorities(
-    key_id: str = "test_key_phase2_0_a2",
-    secret: str = "test_secret_32bytes_deterministic_12345",
-) -> Tuple[CaptureSigningAuthority, CaptureVerificationAuthority]:
-    """Helper for test suites to inject deterministic test-only keys without polluting production."""
-    signer = CaptureSigningAuthority(key_id=key_id, secret=secret)
-    verifier = CaptureVerificationAuthority(keys={key_id: secret, "default": secret})
-    set_default_signing_authority(signer)
-    set_default_verification_authority(verifier)
-    return signer, verifier
-
-
-def reset_capture_authorities() -> None:
-    """Reset global authorities back to unconfigured state."""
-    global _DEFAULT_VERIFICATION_AUTHORITY, _DEFAULT_SIGNING_AUTHORITY
-    _DEFAULT_VERIFICATION_AUTHORITY = None
-    _DEFAULT_SIGNING_AUTHORITY = None
-
-
-@dataclass(frozen=True)
-class LiveCaptureReceipt:
-    """Authentic cryptographic receipt establishing verified live runtime capture.
-    
-    Binds target identity, session/capture ID, build ID, capture source,
-    manifest digest, start time, and integrity validation.
-    """
-    receipt_id: str
-    session_id: str
-    pid: int
-    executable_path: str
-    build_id: Optional[str]
-    capture_source: str
-    manifest_digest: str
-    integrity_validated: bool
-    issued_at: str
-    version: str = "v2"
-    process_start_time: str = "0"
-    signature: str = ""
-    key_id: str = "default"
-    provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-
-    def verify_authenticity(
-        self,
-        secret: Optional[str] = None,
-        verification_authority: Optional[CaptureVerificationAuthority] = None,
-    ) -> bool:
-        """Verify HMAC signature against secret or verification authority."""
-        ok, _ = verify_live_capture_receipt(
-            self,
-            secret=secret,
-            verification_authority=verification_authority,
-        )
-        return ok
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "LiveCaptureReceipt":
-        v = str(data.get("version", "v2"))
-        if v != "v2":
-            raise ValueError(f"UNSUPPORTED_RECEIPT_VERSION: Receipt version '{v}' is not supported")
-        return cls(
-            receipt_id=str(data.get("receipt_id", "")),
-            session_id=str(data.get("session_id", "")),
-            pid=int(data.get("pid", 0)),
-            executable_path=str(data.get("executable_path", "")),
-            build_id=data.get("build_id"),
-            capture_source=str(data.get("capture_source", "live_collector")),
-            manifest_digest=str(data.get("manifest_digest", "")),
-            integrity_validated=bool(data.get("integrity_validated", False)),
-            issued_at=str(data.get("issued_at", "")),
-            version=v,
-            process_start_time=str(data.get("process_start_time", "0")),
-            signature=str(data.get("signature", "")),
-            key_id=str(data.get("key_id", "default")),
-            provenance_class=str(data.get("provenance_class", PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE)),
-        )
-
-
-def _validate_receipt_field(name: str, val: Any) -> None:
-    if val is None:
-        return
-    s = str(val)
-    if "|" in s or "\n" in s or "\r" in s or "\x00" in s:
-        raise ValueError(f"Field '{name}' contains forbidden delimiter or control character: {val!r}")
-
-
-def compute_live_receipt_signature(
-    secret_or_signer: Union[CaptureSigningAuthority, str],
-    receipt_id: str,
-    session_id: str,
-    pid: int,
-    executable_path: str,
-    build_id: Optional[str],
-    capture_source: str,
-    integrity_validated: bool,
-    issued_at: str,
-    process_start_time: Union[str, int] = "0",
-    manifest_digest: str = "",
-    key_id: str = "default",
-) -> str:
-    _validate_receipt_field("receipt_id", receipt_id)
-    _validate_receipt_field("session_id", session_id)
-    _validate_receipt_field("executable_path", executable_path)
-    _validate_receipt_field("build_id", build_id)
-    _validate_receipt_field("capture_source", capture_source)
-    _validate_receipt_field("manifest_digest", manifest_digest)
-    _validate_receipt_field("issued_at", issued_at)
-    _validate_receipt_field("process_start_time", process_start_time)
-    _validate_receipt_field("key_id", key_id)
-
-    raw = (
-        f"LIVE_RECEIPT|v2|{receipt_id}|{session_id}|{pid}|"
-        f"{process_start_time}|{executable_path}|{build_id or ''}|"
-        f"{capture_source}|{manifest_digest}|{'TRUE' if integrity_validated else 'FALSE'}|"
-        f"{issued_at}|{key_id}"
-    )
-    if isinstance(secret_or_signer, CaptureSigningAuthority):
-        return secret_or_signer.sign(raw)
-    return hmac.new(secret_or_signer.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def issue_live_capture_receipt(
-    session_id: str,
-    pid: int,
-    executable_path: str,
-    build_id: Optional[str] = None,
-    process_start_time: Union[str, int] = "100000",
-    manifest_digest: Optional[str] = None,
-    capture_source: str = "live_collector",
-    integrity_validated: bool = True,
-    signer: Optional[Union[CaptureSigningAuthority, str]] = None,
-    secret: Optional[str] = None,
-    key_id: Optional[str] = None,
-    receipt_id: Optional[str] = None,
-    issued_at: Optional[str] = None,
-) -> LiveCaptureReceipt:
-    """Issue a signed LiveCaptureReceipt. Fails closed if no signing key is configured."""
-    eff_signer = signer or secret
-    eff_key_id = key_id
-
-    if eff_signer is None:
-        active_signer = get_default_signing_authority()
-        if active_signer is None:
-            raise ValueError(
-                "No capture signing key configured. Cannot issue live capture receipt without explicit signing authority."
-            )
-        eff_signer = active_signer
-        eff_key_id = active_signer.key_id
-    elif isinstance(eff_signer, CaptureSigningAuthority):
-        eff_key_id = eff_signer.key_id
-    elif isinstance(eff_signer, str):
-        eff_key_id = eff_key_id or "default"
-
-    rcpt_id = receipt_id or f"lrcpt_{uuid.uuid4().hex[:12]}"
-    now_iso = issued_at or datetime.now(timezone.utc).isoformat()
-    start_time_str = str(process_start_time)
-
-    # Derive deterministic manifest digest placeholder if none provided
-    if manifest_digest is None:
-        manifest_digest = hashlib.sha256(
-            f"MANIFEST_MOCK_{pid}_{executable_path}_{start_time_str}".encode("utf-8")
-        ).hexdigest()
-
-    sig = compute_live_receipt_signature(
-        secret_or_signer=eff_signer,
-        receipt_id=rcpt_id,
-        session_id=session_id,
-        pid=pid,
-        executable_path=executable_path,
-        build_id=build_id,
-        capture_source=capture_source,
-        manifest_digest=manifest_digest,
-        integrity_validated=integrity_validated,
-        issued_at=now_iso,
-        process_start_time=start_time_str,
-        key_id=eff_key_id or "default",
-    )
-
-    return LiveCaptureReceipt(
-        receipt_id=rcpt_id,
-        session_id=session_id,
-        pid=pid,
-        executable_path=executable_path,
-        build_id=build_id,
-        capture_source=capture_source,
-        manifest_digest=manifest_digest,
-        integrity_validated=integrity_validated,
-        issued_at=now_iso,
-        process_start_time=start_time_str,
-        signature=sig,
-        key_id=eff_key_id or "default",
-    )
-
-
-def verify_live_capture_receipt(
-    receipt: Any,
-    secret: Optional[str] = None,
-    verification_authority: Optional[CaptureVerificationAuthority] = None,
-    expected_session_id: Optional[str] = None,
-    expected_pid: Optional[int] = None,
-    expected_manifest_digest: Optional[str] = None,
-    expected_build_id: Optional[str] = None,
-    expected_executable_path: Optional[str] = None,
-    companion_elf_path: Optional[str] = None,
-    snapshot: Optional[Any] = None,
-) -> Tuple[bool, Optional[str]]:
-    """Validates that a receipt is authentic, unmodified, and bound to the expected target and snapshot."""
-    if receipt is None:
-        return False, "NO_RECEIPT: No capture or session receipt provided"
-
-    # Explicitly reject alternate receipt types: CaptureReceipt from capture_backend.py
-    # cannot establish LIVE_VERIFIED because it lacks mandatory session binding, manifest digest,
-    # and Phase 2.0 v2 trust contract.
-    if hasattr(receipt, "backend_name") and hasattr(receipt, "artifact_manifest"):
-        return (
-            False,
-            "UNSUPPORTED_RECEIPT_TYPE: CaptureReceipt cannot establish LIVE_VERIFIED "
-            "(lacks mandatory session binding, manifest digest, and Phase 2.0 v2 trust contract)",
-        )
-
-    # Support LiveCaptureReceipt
-    if isinstance(receipt, dict):
-        try:
-            receipt = LiveCaptureReceipt.from_dict(receipt)
-        except Exception as exc:
-            return False, f"MALFORMED_RECEIPT: {exc}"
-
-    if not isinstance(receipt, LiveCaptureReceipt):
-        return False, f"UNRECOGNIZED_RECEIPT_TYPE: {type(receipt).__name__}"
-
-    rcpt_ver = getattr(receipt, "version", "v2")
-    if rcpt_ver != "v2":
-        return False, f"UNSUPPORTED_RECEIPT_VERSION: Receipt version '{rcpt_ver}' is not supported"
-
-    # Canonical field character and delimiter validation
-    for field_name in (
-        "receipt_id",
-        "session_id",
-        "executable_path",
-        "build_id",
-        "capture_source",
-        "manifest_digest",
-        "issued_at",
-        "key_id",
-        "process_start_time",
-    ):
-        f_val = getattr(receipt, field_name, None)
-        if f_val is not None and any(c in str(f_val) for c in ("|", "\n", "\r", "\x00")):
-            return False, f"MALFORMED_RECEIPT: Field '{field_name}' contains forbidden delimiter or control character"
-
-    if not receipt.signature:
-        return False, "UNSIGNED_RECEIPT: Receipt has no HMAC signature"
-
-    if not receipt.key_id:
-        return False, "MISSING_MANDATORY_FIELD: key_id is missing or empty"
-
-    # Resolve verification key fail-closed
-    auth = verification_authority or get_default_verification_authority()
-
-    # Revocation must be checked immediately regardless of explicit secret argument
-    if auth and auth.is_revoked(receipt.key_id):
-        return False, f"KEY_REVOKED: Key ID '{receipt.key_id}' has been revoked"
-
-    resolved_secret = secret
-
-    if resolved_secret is None:
-        if not auth or not auth.has_keys():
-            return (
-                False,
-                "VERIFICATION_KEY_UNAVAILABLE: No capture verification keys configured in authority or environment",
-            )
-        resolved_secret = auth.get_key(receipt.key_id)
-        if not resolved_secret:
-            return False, f"UNKNOWN_KEY_ID: Key ID '{receipt.key_id}' not found in verification authority"
-
-    # Cryptographic HMAC verification
-    expected_sig = compute_live_receipt_signature(
-        secret_or_signer=resolved_secret,
-        receipt_id=receipt.receipt_id,
-        session_id=receipt.session_id,
-        pid=receipt.pid,
-        executable_path=receipt.executable_path,
-        build_id=receipt.build_id,
-        capture_source=receipt.capture_source,
-        manifest_digest=receipt.manifest_digest,
-        integrity_validated=receipt.integrity_validated,
-        issued_at=receipt.issued_at,
-        process_start_time=receipt.process_start_time,
-        key_id=receipt.key_id,
-    )
-    if not hmac.compare_digest(receipt.signature, expected_sig):
-        return False, "SIGNATURE_INVALID: LiveCaptureReceipt signature verification failed"
-
-    # Check mandatory fields
-    if not receipt.receipt_id:
-        return False, "MISSING_MANDATORY_FIELD: receipt_id is missing or empty"
-    if not receipt.session_id:
-        return False, "MISSING_MANDATORY_FIELD: session_id is missing or empty"
-    if not receipt.pid or receipt.pid <= 0:
-        return False, "MISSING_MANDATORY_FIELD: pid is missing or non-positive"
-    if receipt.process_start_time is None or str(receipt.process_start_time).strip() in ("", "0"):
-        return False, "MISSING_PROCESS_START_TIME: process_start_time is missing, empty, or zero"
-    if not receipt.executable_path:
-        return False, "MISSING_MANDATORY_FIELD: executable_path is missing or empty"
-    if not receipt.manifest_digest:
-        return False, "MISSING_MANDATORY_FIELD: manifest_digest is missing or empty"
-    if not receipt.issued_at:
-        return False, "MISSING_MANDATORY_FIELD: issued_at is missing or empty"
-    if not receipt.key_id:
-        return False, "MISSING_MANDATORY_FIELD: key_id is missing or empty"
-
-    if not receipt.integrity_validated:
-        return False, "INTEGRITY_CHECK_FAILED: Receipt indicates integrity validation failed or was skipped"
-
-    # Session binding
-    if expected_session_id and receipt.session_id != expected_session_id:
-        return False, f"SESSION_MISMATCH: Receipt session '{receipt.session_id}' != expected '{expected_session_id}'"
-
-    # Target identity bindings
-    if expected_pid is not None and int(receipt.pid) != int(expected_pid):
-        return False, f"PID_MISMATCH: Receipt PID {receipt.pid} != expected {expected_pid}"
-
-    if expected_manifest_digest and receipt.manifest_digest.lower() != expected_manifest_digest.lower():
-        return (
-            False,
-            f"MANIFEST_DIGEST_MISMATCH: Receipt manifest digest {receipt.manifest_digest} != expected {expected_manifest_digest}",
-        )
-
-    if expected_build_id:
-        if not receipt.build_id:
-            return False, f"MISSING_BUILD_ID: Expected build ID {expected_build_id} but receipt has no build ID"
-        if receipt.build_id.lower() != expected_build_id.lower():
-            return False, f"BUILD_ID_MISMATCH: Receipt build ID {receipt.build_id} != expected {expected_build_id}"
-
-    # Companion ELF check
-    if companion_elf_path:
-        if not os.path.exists(companion_elf_path):
-            return False, f"COMPANION_ELF_NOT_FOUND: Companion ELF file not found at '{companion_elf_path}'"
-        try:
-            from .debug_image import inspect_elf
-            c_ident = inspect_elf(companion_elf_path)
-        except Exception as exc:
-            return False, f"COMPANION_ELF_INVALID: Failed to parse companion ELF '{companion_elf_path}': {exc}"
-        if not c_ident:
-            return False, f"COMPANION_ELF_INVALID: Failed to parse companion ELF '{companion_elf_path}'"
-        if not c_ident.build_id:
-            return False, f"COMPANION_ELF_MISSING_BUILD_ID: Companion ELF '{companion_elf_path}' does not contain an ELF Build ID note"
-        if not receipt.build_id:
-            return False, f"MISSING_BUILD_ID: Companion ELF requires build ID {c_ident.build_id} but receipt has no build ID"
-        if receipt.build_id.lower() != c_ident.build_id.lower():
-            return False, f"BUILD_ID_MISMATCH: Receipt build ID {receipt.build_id} != companion ELF {c_ident.build_id}"
-
-    if expected_executable_path:
-        norm_exp = os.path.realpath(expected_executable_path) if os.path.exists(expected_executable_path) else os.path.abspath(expected_executable_path)
-        norm_rcpt = os.path.realpath(receipt.executable_path) if os.path.exists(receipt.executable_path) else os.path.abspath(receipt.executable_path)
-        if norm_exp != norm_rcpt:
-            return False, f"EXECUTABLE_PATH_MISMATCH: Receipt exe '{receipt.executable_path}' != expected '{expected_executable_path}'"
-
-    # Exact Snapshot binding (if provided)
-    if snapshot is not None:
-        if hasattr(snapshot, "validate_integrity"):
-            val_ok, val_errs = snapshot.validate_integrity()
-            if not val_ok:
-                return False, f"SNAPSHOT_INTEGRITY_FAILED: Snapshot failed integrity validation: {val_errs}"
-
-        snap_verdict = getattr(snapshot, "validation_verdict", None)
-        if snap_verdict != "VALIDATED":
-            return False, f"SNAPSHOT_NOT_VALIDATED: Referenced snapshot validation verdict is '{snap_verdict}'"
-
-        if getattr(snapshot, "pid", None) and int(snapshot.pid) != int(receipt.pid):
-            return False, f"PID_MISMATCH: Snapshot PID {snapshot.pid} != receipt PID {receipt.pid}"
-
-        snap_st = getattr(snapshot, "process_starttime", None)
-        if not snap_st or str(snap_st).strip() in ("", "0"):
-            return False, "MISSING_PROCESS_START_TIME: Snapshot start time is missing, empty, or zero"
-        if str(snap_st) != str(receipt.process_start_time):
-            return (
-                False,
-                f"PROCESS_START_TIME_MISMATCH: Snapshot start time {snap_st} != receipt start time {receipt.process_start_time}",
-            )
-
-        disk_digest = None
-        snap_out = getattr(snapshot, "output_dir", None)
-        if snap_out:
-            if not os.path.isdir(snap_out):
-                return False, f"SNAPSHOT_DIR_NOT_FOUND: Snapshot output directory '{snap_out}' does not exist"
-            dir_open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            if hasattr(os, "O_DIRECTORY"):
-                dir_open_flags |= os.O_DIRECTORY
-            if hasattr(os, "O_NOFOLLOW"):
-                dir_open_flags |= os.O_NOFOLLOW
-            try:
-                dir_fd = os.open(snap_out, dir_open_flags)
-            except OSError as err:
-                if getattr(err, "errno", None) in (errno.ELOOP, errno.EMLINK):
-                    return False, f"SNAPSHOT_DIR_SYMLINK: Snapshot directory '{snap_out}' is a symbolic link"
-                return False, f"SNAPSHOT_DIR_INACCESSIBLE: Cannot open snapshot dir '{snap_out}': {err}"
-            try:
-                dir_st = os.fstat(dir_fd)
-                if not stat.S_ISDIR(dir_st.st_mode):
-                    return False, f"SNAPSHOT_DIR_NOT_DIRECTORY: Snapshot path '{snap_out}' is not a directory"
-
-                # Verify pinned directory identity consistency
-                pinned = getattr(snapshot, "_pinned_dir_identity", None)
-                if pinned is not None:
-                    current_ident = (dir_st.st_dev, dir_st.st_ino)
-                    if current_ident != pinned:
-                        return (
-                            False,
-                            f"SNAPSHOT_DIR_SUBSTITUTION: Snapshot directory identity changed after integrity validation "
-                            f"(pinned {pinned} != current {current_ident})",
-                        )
-
-                manifest_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-                if hasattr(os, "O_NOFOLLOW"):
-                    manifest_flags |= os.O_NOFOLLOW
-                try:
-                    mfd = os.open("manifest.json", manifest_flags, dir_fd=dir_fd)
-                except OSError as err:
-                    if getattr(err, "errno", None) in (errno.ELOOP, errno.EMLINK):
-                        return False, "MANIFEST_SYMLINK_REJECTED: manifest.json is a symbolic link"
-                    return False, f"MISSING_MANIFEST: manifest.json is missing or inaccessible in snapshot directory: {err}"
-                try:
-                    mst = os.fstat(mfd)
-                    if not stat.S_ISREG(mst.st_mode):
-                        return False, f"MISSING_MANIFEST: manifest.json in snapshot directory is not a regular file (mode {oct(mst.st_mode)})"
-                    chunks = []
-                    total_read = 0
-                    while True:
-                        chunk = os.read(mfd, min(4096, mst.st_size - total_read + 1))
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        total_read += len(chunk)
-                    raw_bytes = b"".join(chunks)
-                    if len(raw_bytes) != mst.st_size:
-                        return False, f"SNAPSHOT_INTEGRITY_FAILED: manifest.json read size mismatch during digest computation (stat {mst.st_size} != read {len(raw_bytes)})"
-                    disk_digest = hashlib.sha256(raw_bytes).hexdigest()
-                finally:
-                    os.close(mfd)
-            finally:
-                os.close(dir_fd)
-        elif hasattr(snapshot, "compute_manifest_digest"):
-            disk_digest = snapshot.compute_manifest_digest()
-
-        if not disk_digest:
-            return False, "MISSING_MANIFEST: Cannot compute disk manifest digest for snapshot"
-
-        if disk_digest.lower() != receipt.manifest_digest.lower():
-            return (
-                False,
-                f"MANIFEST_DIGEST_MISMATCH: Snapshot manifest digest {disk_digest} != receipt manifest digest {receipt.manifest_digest}",
-            )
-
-        snap_bin = getattr(snapshot, "binary", None)
-        if snap_bin:
-            norm_snap = os.path.realpath(snap_bin) if os.path.exists(snap_bin) else os.path.abspath(snap_bin)
-            norm_rcpt = os.path.realpath(receipt.executable_path) if os.path.exists(receipt.executable_path) else os.path.abspath(receipt.executable_path)
-            if norm_snap != norm_rcpt:
-                return False, f"EXECUTABLE_PATH_MISMATCH: Snapshot binary '{snap_bin}' != receipt exe '{receipt.executable_path}'"
-
-        snap_bid = getattr(snapshot, "build_id", None)
-        if snap_bid and receipt.build_id and snap_bid.lower() != receipt.build_id.lower():
-            return False, f"BUILD_ID_MISMATCH: Snapshot build ID {snap_bid} != receipt build ID {receipt.build_id}"
-        if snap_bid and not receipt.build_id:
-            return False, f"MISSING_BUILD_ID: Snapshot has build ID {snap_bid} but receipt has none"
-
-    return True, None
-
-
-def determine_snapshot_trust_state(
-    receipt: Any,
-    secret: Optional[str] = None,
-    verification_authority: Optional[CaptureVerificationAuthority] = None,
-    expected_session_id: Optional[str] = None,
-    expected_pid: Optional[int] = None,
-    expected_manifest_digest: Optional[str] = None,
-    expected_build_id: Optional[str] = None,
-    expected_executable_path: Optional[str] = None,
-    companion_elf_path: Optional[str] = None,
-    snapshot: Optional[Any] = None,
-) -> Tuple[str, Optional[str]]:
-    """Determine snapshot trust state: LIVE_VERIFIED, IMPORTED_UNVERIFIED, INVALID_OR_TAMPERED, or VERIFICATION_UNAVAILABLE.
-    
-    Explicitly decoupled from target memory consistency (NON_ATOMIC, STOPPED, ATOMIC).
-    """
-    if receipt is None:
-        return TRUST_STATE_IMPORTED_UNVERIFIED, "NO_RECEIPT: No capture or session receipt provided"
-
-    ok, reason = verify_live_capture_receipt(
-        receipt,
-        secret=secret,
-        verification_authority=verification_authority,
-        expected_session_id=expected_session_id,
-        expected_pid=expected_pid,
-        expected_manifest_digest=expected_manifest_digest,
-        expected_build_id=expected_build_id,
-        expected_executable_path=expected_executable_path,
-        companion_elf_path=companion_elf_path,
-        snapshot=snapshot,
-    )
-
-    if ok:
-        return TRUST_STATE_LIVE_VERIFIED, None
-
-    if reason and ("VERIFICATION_KEY_UNAVAILABLE" in reason or "NO_VERIFICATION_KEY" in reason):
-        return TRUST_STATE_VERIFICATION_UNAVAILABLE, reason
-
-    if reason and ("UNSUPPORTED_RECEIPT_TYPE" in reason or "UNRECOGNIZED_RECEIPT_TYPE" in reason):
-        return TRUST_STATE_IMPORTED_UNVERIFIED, reason
-
-    return TRUST_STATE_INVALID_OR_TAMPERED, reason
-
-
-def create_receipt_from_snapshot(
-    snapshot: Any,
-    session_id: str,
-    signing_authority: Optional[CaptureSigningAuthority] = None,
-    secret: Optional[str] = None,
-    key_id: Optional[str] = None,
-    companion_elf: Optional[str] = None,
-    receipt_id: Optional[str] = None,
-    allow_host_signing: bool = False,
-) -> LiveCaptureReceipt:
-    """Generate a LiveCaptureReceipt bound to a validated RawMemorySnapshot (restricted to authorized test harnesses)."""
-    if not allow_host_signing and not os.environ.get("DYNAMICSTATE_ALLOW_HOST_SIGNING"):
-        raise PermissionError(
-            "Host-side receipt signing is restricted to test environments; live capture receipts must originate from the trusted capture component (dynamicstate-collector)."
-        )
-    is_valid = True
-    if hasattr(snapshot, "validate_integrity"):
-        is_valid, _ = snapshot.validate_integrity()
-    if getattr(snapshot, "validation_verdict", "VALIDATED") != "VALIDATED":
-        is_valid = False
-
-    build_id = getattr(snapshot, "build_id", None)
-    if companion_elf and not build_id:
-        try:
-            from .debug_image import inspect_elf
-            ident = inspect_elf(companion_elf)
-            build_id = ident.build_id
-        except Exception:
-            pass
-
-    manifest_digest = getattr(snapshot, "manifest_digest", None)
-    if not manifest_digest and hasattr(snapshot, "compute_manifest_digest"):
-        manifest_digest = snapshot.compute_manifest_digest()
-    if not manifest_digest:
-        manifest_digest = hashlib.sha256(b"EMPTY_MANIFEST").hexdigest()
-
-    return issue_live_capture_receipt(
-        session_id=session_id,
-        pid=int(getattr(snapshot, "pid", 0)),
-        executable_path=str(getattr(snapshot, "binary", "")),
-        build_id=build_id,
-        process_start_time=str(getattr(snapshot, "process_starttime", "0")),
-        manifest_digest=manifest_digest,
-        capture_source=str(getattr(snapshot, "backend", "native_collector")),
-        integrity_validated=is_valid,
-        signer=signing_authority or secret,
-        key_id=key_id,
-        receipt_id=receipt_id,
-    )
 
 
 @dataclass(frozen=True)
@@ -1469,34 +546,11 @@ class EvidenceRecord:
 
     @property
     def provenance_class(self) -> str:
-        if isinstance(self.provenance, dict):
-            if self.provenance.get("is_synthetic") is True:
-                return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-            p_cls = self.provenance.get("provenance_class")
-            if p_cls in (PROVENANCE_CLASS_SYNTHETIC_FIXTURE, PROVENANCE_CLASS_IMPORTED_UNVERIFIED):
-                return str(p_cls)
-            if p_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
-                return PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
-            if p_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
-                rcpt = self.provenance.get("capture_receipt") or self.provenance.get("live_receipt")
-                if rcpt is not None:
-                    ok, _ = verify_live_capture_receipt(rcpt, expected_session_id=self.session_id)
-                    if ok:
-                        return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-                if self.provenance.get("verified_live_capture") is True:
-                    return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-
-        if isinstance(self.details, dict):
-            if self.details.get("is_synthetic") is True:
-                return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-            d_cls = self.details.get("provenance_class")
-            if d_cls in (PROVENANCE_CLASS_SYNTHETIC_FIXTURE, PROVENANCE_CLASS_IMPORTED_UNVERIFIED):
-                return str(d_cls)
-            if d_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE and self.details.get("verified_live_capture") is True:
-                return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
-
-        return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        if isinstance(self.provenance, dict) and self.provenance.get("provenance_class"):
+            return str(self.provenance["provenance_class"])
+        if isinstance(self.details, dict) and self.details.get("provenance_class"):
+            return str(self.details["provenance_class"])
+        return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
 
     @property
     def attribution_level(self) -> str:
@@ -1636,17 +690,11 @@ class EvidenceLedger:
         schema_version: str = EVIDENCE_SCHEMA_VERSION,
         session_secret: Optional[str] = None,
         capability_key: Optional[str] = None,
-        live_capture_receipt: Optional[Any] = None,
-        verification_authority: Optional[CaptureVerificationAuthority] = None,
     ):
         self.session_id: str = session_id or f"inv_sess_{uuid.uuid4().hex[:8]}"
         self.schema_version: str = schema_version
         self.session_secret: str = session_secret or uuid.uuid4().hex
         self._capability_key: str = capability_key or uuid.uuid4().hex
-        self.live_capture_receipt: Optional[Any] = live_capture_receipt
-        self.verification_authority: Optional[CaptureVerificationAuthority] = verification_authority
-        self.trust_state: str = TRUST_STATE_IMPORTED_UNVERIFIED
-        self.trust_error: Optional[str] = None
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self._records: List[EvidenceRecord] = []
         self._by_id: Dict[str, EvidenceRecord] = {}
@@ -1658,21 +706,6 @@ class EvidenceLedger:
         return self._capability_key
 
     @property
-    def verified_live_capture(self) -> bool:
-        """Indicates whether this ledger holds authenticated live capture evidence."""
-        if self.live_capture_receipt is not None:
-            ok, _ = verify_live_capture_receipt(
-                self.live_capture_receipt,
-                verification_authority=self.verification_authority,
-                expected_session_id=self.session_id,
-            )
-            return ok
-        return any(
-            (isinstance(r.provenance, dict) and r.provenance.get("verified_live_capture") is True)
-            for r in self._records
-        )
-
-    @property
     def records(self) -> List[EvidenceRecord]:
         return list(self._records)
 
@@ -1680,7 +713,7 @@ class EvidenceLedger:
         self,
         module_id: str,
         domain: str = "GENERIC",
-        provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
         attribution_basis: Optional[str] = None,
         evidence_payload: Optional[Dict[str, Any]] = None,
         nature: str = NATURE_OBSERVATION,
@@ -1907,38 +940,6 @@ class EvidenceLedger:
         if not record.session_id:
             record.session_id = self.session_id
 
-        # Provenance Invariant Gate:
-        # Caller-supplied LIVE_RUNTIME_CAPTURE must be backed by an authentic verified receipt.
-        p_dict = record.provenance if isinstance(record.provenance, dict) else {}
-        d_dict = record.details if isinstance(record.details, dict) else {}
-
-        if p_dict.get("is_synthetic") is True or d_dict.get("is_synthetic") is True or record.source in ("synthetic", "synthetic_adversarial_fixture"):
-            if record.provenance:
-                record.provenance["provenance_class"] = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-            if record.details:
-                record.details["provenance_class"] = PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-        else:
-            claimed_prov = p_dict.get("provenance_class") or d_dict.get("provenance_class")
-            if claimed_prov == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
-                rcpt = p_dict.get("capture_receipt") or p_dict.get("live_receipt") or self.live_capture_receipt
-                rcpt_ok, rcpt_err = verify_live_capture_receipt(
-                    rcpt,
-                    verification_authority=self.verification_authority,
-                    expected_session_id=self.session_id,
-                    expected_pid=record.target_identity.get("pid") if record.target_identity else None,
-                )
-                if not rcpt_ok:
-                    if record.provenance:
-                        record.provenance["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-                        record.provenance["unverified_reason"] = rcpt_err
-                    if record.details and "provenance_class" in record.details:
-                        record.details["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-                else:
-                    if record.provenance:
-                        record.provenance["verified_live_capture"] = True
-                    if record.details:
-                        record.details["verified_live_capture"] = True
-
         # Schema validation
         self.validate_record(record)
 
@@ -2055,10 +1056,111 @@ class EvidenceLedger:
                 record.provenance["verifier_attestation"] = None
                 record.provenance.pop("function_attribution_verified", None)
                 record.provenance.pop("attribution_basis", None)
+                if record.provenance.get("provenance_class") in TRUSTED_PROVENANCE_CLASSES:
+                    record.provenance["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
             if record.details:
                 record.details.pop("execution_provenance", None)
                 record.details.pop("function_attribution_verified", None)
                 record.details.pop("attribution_basis", None)
+                if record.details.get("provenance_class") in TRUSTED_PROVENANCE_CLASSES:
+                    record.details["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+        # Enforce explicit provenance class validity and synthetic/imported/live separation
+        prov_cls = record.provenance_class
+        if prov_cls not in VALID_PROVENANCE_CLASSES:
+            raise ValueError(f"Invalid provenance_class '{prov_cls}'. Expected one of {sorted(VALID_PROVENANCE_CLASSES)}")
+
+        is_sim = bool(
+            p_details.get("is_simulated") is True
+            or p_prov.get("is_simulated") is True
+            or any(p_details.get(k) is not None for k in ("force_failed", "force_error", "force_contradiction", "simulated_outcome"))
+            or any(p_prov.get(k) is not None for k in ("force_failed", "force_error", "force_contradiction", "simulated_outcome"))
+        )
+        auth_lvl = p_prov.get("authority_level") or p_details.get("authority_level")
+        if prov_cls in TRUSTED_PROVENANCE_CLASSES:
+            if is_sim:
+                raise ValueError(f"Prohibited synthetic-to-live escalation: simulated record '{record.evidence_id}' cannot claim {prov_cls}")
+            if auth_lvl in ("TEST", "SYNTHETIC"):
+                raise ValueError(f"Prohibited authority escalation: test/synthetic authority '{auth_lvl}' cannot claim {prov_cls}")
+            for par_id in record.parent_evidence_ids:
+                par_rec = self._by_id.get(par_id)
+                if par_rec and par_rec.provenance_class in SYNTHETIC_PROVENANCE_CLASSES:
+                    raise ValueError(
+                        f"Prohibited synthetic-to-live escalation: record '{record.evidence_id}' derives from synthetic parent '{par_id}' ({par_rec.provenance_class})"
+                    )
+
+        # Validate attached LiveCaptureReceipt when present on LIVE_RUNTIME_CAPTURE records
+        raw_live_rcpt = p_prov.get("live_capture_receipt") or p_details.get("live_capture_receipt")
+        if raw_live_rcpt is not None:
+            from .capture_backend import LiveCaptureReceipt
+            rcpt_obj = raw_live_rcpt if isinstance(raw_live_rcpt, LiveCaptureReceipt) else LiveCaptureReceipt.from_dict(raw_live_rcpt)
+            t_ident = record.target_identity or {}
+            exp_pid = t_ident.get("pid")
+            exp_bid = t_ident.get("build_id") or t_ident.get("target_build_id")
+            exp_proc_id = t_ident.get("process_identity")
+            exp_exe_id = t_ident.get("executable_identity") or t_ident.get("executable")
+            ok_rcpt, reason_rcpt = rcpt_obj.verify(
+                expected_session_id=record.session_id or self.session_id,
+                expected_pid=exp_pid,
+                expected_process_identity=exp_proc_id,
+                expected_executable_identity=exp_exe_id,
+                expected_build_id=exp_bid,
+                require_production_authority=(prov_cls in TRUSTED_PROVENANCE_CLASSES),
+            )
+            if not ok_rcpt and prov_cls in TRUSTED_PROVENANCE_CLASSES:
+                raise ValueError(f"LiveCaptureReceipt rejected for record '{record.evidence_id}': {reason_rcpt}")
+
+
+    def transition_provenance(
+        self,
+        evidence_id: str,
+        target_provenance_class: str,
+        live_receipt: Optional[Any] = None,
+        expected_target_identity: Optional[Dict[str, Any]] = None,
+    ) -> EvidenceRecord:
+        """Enforce fail-closed provenance transitions on an existing EvidenceRecord.
+
+        Rules:
+        - SYNTHETIC / SYNTHETIC_FIXTURE can NEVER transition to LIVE_RUNTIME_CAPTURE or CONTROLLED_RUNTIME_REPRODUCTION.
+        - IMPORTED_UNVERIFIED can ONLY transition to LIVE_RUNTIME_CAPTURE if a valid, authenticated LiveCaptureReceipt
+          matching the session and target identity is provided.
+        """
+        rec = self.get_record(evidence_id)
+        if not rec:
+            raise ValueError(f"EvidenceRecord '{evidence_id}' not found in ledger")
+        if target_provenance_class not in VALID_PROVENANCE_CLASSES:
+            raise ValueError(f"Invalid target_provenance_class '{target_provenance_class}'")
+
+        cur_cls = rec.provenance_class
+        if cur_cls in SYNTHETIC_PROVENANCE_CLASSES and target_provenance_class not in SYNTHETIC_PROVENANCE_CLASSES:
+            raise ValueError(
+                f"Prohibited provenance transition: {cur_cls} cannot escalate to {target_provenance_class}"
+            )
+
+        if target_provenance_class == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE and cur_cls != PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+            if live_receipt is None:
+                raise ValueError(
+                    f"Prohibited provenance transition: {cur_cls} -> LIVE_RUNTIME_CAPTURE requires an authentic LiveCaptureReceipt"
+                )
+            from .capture_backend import LiveCaptureReceipt
+            rcpt_obj = live_receipt if isinstance(live_receipt, LiveCaptureReceipt) else LiveCaptureReceipt.from_dict(live_receipt)
+            t_id = expected_target_identity or rec.target_identity or {}
+            ok, reason = rcpt_obj.verify(
+                expected_session_id=rec.session_id or self.session_id,
+                expected_pid=t_id.get("pid"),
+                expected_process_identity=t_id.get("process_identity"),
+                expected_executable_identity=t_id.get("executable_identity") or t_id.get("executable"),
+                expected_build_id=t_id.get("build_id") or t_id.get("target_build_id"),
+                require_production_authority=True,
+            )
+            if not ok:
+                raise ValueError(f"LiveCaptureReceipt verification failed for provenance transition: {reason}")
+            rec.provenance["live_capture_receipt"] = rcpt_obj.to_dict()
+
+        rec.provenance["provenance_class"] = target_provenance_class
+        if "provenance_class" in rec.details:
+            rec.details["provenance_class"] = target_provenance_class
+        return rec
 
     def get_record(self, evidence_id: str) -> Optional[EvidenceRecord]:
         """Look up record by unique ID."""
@@ -2171,21 +1273,11 @@ class EvidenceLedger:
         return []
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize full ledger to dictionary (without exposing secrets)."""
-        rcpt_dict = None
-        if self.live_capture_receipt:
-            if hasattr(self.live_capture_receipt, "to_dict"):
-                rcpt_dict = self.live_capture_receipt.to_dict()
-            elif isinstance(self.live_capture_receipt, dict):
-                rcpt_dict = dict(self.live_capture_receipt)
-
+        """Serialize full ledger to dictionary."""
         return {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "created_at": self.created_at,
-            "trust_state": self.trust_state,
-            "trust_error": self.trust_error,
-            "live_capture_receipt": rcpt_dict,
             "record_count": len(self._records),
             "records": [r.to_dict() for r in self._records],
         }
@@ -2195,25 +1287,11 @@ class EvidenceLedger:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     @classmethod
-    def from_dict(
-        cls,
-        data: Dict[str, Any],
-        verification_authority: Optional[CaptureVerificationAuthority] = None,
-    ) -> "EvidenceLedger":
+    def from_dict(cls, data: Dict[str, Any]) -> "EvidenceLedger":
         """Reconstruct EvidenceLedger from serialized dictionary."""
-        rcpt_data = data.get("live_capture_receipt")
-        rcpt = None
-        if rcpt_data and isinstance(rcpt_data, dict):
-            try:
-                rcpt = LiveCaptureReceipt.from_dict(rcpt_data)
-            except Exception:
-                rcpt = None
-
         ledger = cls(
             session_id=data.get("session_id"),
             schema_version=data.get("schema_version", EVIDENCE_SCHEMA_VERSION),
-            live_capture_receipt=rcpt,
-            verification_authority=verification_authority,
         )
         ledger.created_at = data.get("created_at", ledger.created_at)
         for rec_data in data.get("records", []):

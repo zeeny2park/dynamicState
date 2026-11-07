@@ -447,7 +447,7 @@ class RawRuntimeSnapshot:
             self.capture_receipt = disk_receipt
 
     @classmethod
-    def load(cls, output_dir: str) -> "RawRuntimeSnapshot":
+    def load(cls, output_dir: str, expected_build_id: Optional[str] = None) -> "RawRuntimeSnapshot":
         # Security invariant: Reject path traversal and symlinks at the root
         norm = os.path.normpath(output_dir)
         if ".." in output_dir.replace("\\", "/").split("/") or ".." in norm.split(os.path.sep):
@@ -556,6 +556,14 @@ class RawRuntimeSnapshot:
                 return snap
 
             # Validate process binding
+            if expected_build_id is not None and snap.executable_build_id != expected_build_id:
+                snap.capture_receipt = None
+                snap.provenance["is_authenticated_capture"] = False
+                snap.provenance["verification_status"] = "IDENTITY_MISMATCH"
+                snap.provenance["verification_error"] = (
+                    f"Expected Build ID {expected_build_id} mismatches snapshot Build ID {snap.executable_build_id}"
+                )
+                return snap
             if rcpt.pid != snap.pid or rcpt.executable_build_id != snap.executable_build_id:
                 snap.capture_receipt = None
                 snap.provenance["is_authenticated_capture"] = False

@@ -443,6 +443,240 @@ def issue_capture_receipt(
 
 
 @dataclass
+class LiveCaptureReceipt:
+    """Cryptographic receipt proving an authentic live runtime observation or slice capture.
+
+    Validates:
+    - authenticity (HMAC-SHA256 signature)
+    - session identity (session_id)
+    - PID (pid)
+    - process identity (process_identity: pid:start_time:boot_id)
+    - executable identity (executable_identity: exe_path:inode)
+    - Build ID (build_id)
+    - snapshot binding (snapshot_binding)
+    - capture epoch (capture_epoch)
+    - applicable target identity constraints (target_constraints)
+    """
+    receipt_id: str
+    session_id: str
+    pid: int
+    process_identity: str
+    executable_identity: str
+    build_id: str
+    snapshot_binding: str
+    capture_epoch: int
+    timestamp_ns: int = 0
+    authority_level: str = "PRODUCTION"  # "PRODUCTION", "TEST", "SYNTHETIC"
+    provenance_class: str = "LIVE_RUNTIME_CAPTURE"
+    key_id: str = "default"
+    signature: str = ""
+    target_constraints: Dict[str, Any] = field(default_factory=dict)
+    schema_version: str = "2.0.0"
+
+    def canonical_payload(self) -> str:
+        tc_json = json.dumps(self.target_constraints or {}, sort_keys=True, separators=(",", ":"))
+        return (
+            f"live_rcpt_v2|{self.receipt_id}|{self.session_id}|{int(self.pid)}|"
+            f"{self.process_identity}|{self.executable_identity}|{self.build_id or str()}|"
+            f"{self.snapshot_binding}|{int(self.capture_epoch)}|{int(self.timestamp_ns)}|"
+            f"{self.authority_level}|{self.provenance_class}|{self.key_id}|{tc_json}"
+        )
+
+    def compute_signature(self, secret: Optional[str] = None) -> str:
+        if secret:
+            sec = secret
+        else:
+            _, sec = get_default_key_store().get_active_signing_key()
+        return hmac.new(sec.encode("utf-8"), self.canonical_payload().encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def sign(self, secret: Optional[str] = None) -> "LiveCaptureReceipt":
+        if not self.timestamp_ns:
+            self.timestamp_ns = time.time_ns()
+        if not self.key_id or self.key_id == "default":
+            kid, _ = get_default_key_store().get_active_signing_key()
+            self.key_id = kid
+        self.signature = self.compute_signature(secret=secret)
+        return self
+
+    def matches_secret(self, secret: str) -> bool:
+        if not self.signature or not secret:
+            return False
+        expected = self.compute_signature(secret=secret)
+        return hmac.compare_digest(self.signature, expected)
+
+    def verify(
+        self,
+        expected_session_id: Optional[str] = None,
+        expected_pid: Optional[int] = None,
+        expected_process_identity: Optional[str] = None,
+        expected_executable_identity: Optional[str] = None,
+        expected_build_id: Optional[str] = None,
+        expected_snapshot_binding: Optional[str] = None,
+        min_capture_epoch: Optional[int] = None,
+        max_capture_epoch: Optional[int] = None,
+        max_age_ns: Optional[int] = None,
+        expected_constraints: Optional[Dict[str, Any]] = None,
+        require_production_authority: bool = True,
+        secret: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Validate LiveCaptureReceipt against all Phase 2.0-A.3.6 security and identity invariants."""
+        # 1. Reject synthetic-to-live escalation
+        if self.provenance_class in ("SYNTHETIC", "SYNTHETIC_FIXTURE", "IMPORTED_UNVERIFIED"):
+            return False, f"synthetic_or_unverified_provenance_rejected:{self.provenance_class}"
+        if self.provenance_class != "LIVE_RUNTIME_CAPTURE":
+            return False, f"invalid_live_provenance_class:{self.provenance_class}"
+
+        # 2. Reject test authority used as production authority
+        if require_production_authority and self.authority_level != "PRODUCTION":
+            return False, f"test_authority_rejected_in_production:{self.authority_level}"
+
+        # 3. Validate cryptographic authenticity
+        if not self.signature or not self.receipt_id:
+            return False, "missing_receipt_signature_or_id"
+        sig_ok, sig_reason, _ = get_default_key_store().verify_receipt(self, explicit_secret=secret)
+        if not sig_ok:
+            return False, f"invalid_signature:{sig_reason}"
+
+        # 4. Validate session identity (reject cross-session receipts)
+        if not self.session_id or not str(self.session_id).strip():
+            return False, "missing_session_identity"
+        if expected_session_id is not None and str(self.session_id) != str(expected_session_id):
+            return False, f"cross_session_receipt_rejected:expected={expected_session_id},got={self.session_id}"
+
+        # 5. Validate PID & process identity (reject cross-process / PID-reused receipts)
+        if isinstance(self.pid, bool) or not isinstance(self.pid, int) or self.pid <= 1:
+            return False, f"invalid_pid:{self.pid}"
+        if expected_pid is not None and int(self.pid) != int(expected_pid):
+            return False, f"cross_process_pid_rejected:expected={expected_pid},got={self.pid}"
+        if not self.process_identity or not str(self.process_identity).strip():
+            return False, "missing_process_identity"
+        if expected_process_identity is not None and str(self.process_identity) != str(expected_process_identity):
+            return False, f"cross_process_identity_rejected:expected={expected_process_identity},got={self.process_identity}"
+
+        # 6. Validate executable identity
+        if not self.executable_identity or not str(self.executable_identity).strip():
+            return False, "missing_executable_identity"
+        if expected_executable_identity is not None:
+            exp_exe = str(expected_executable_identity)
+            act_exe = str(self.executable_identity)
+            # Allow matching either full path:inode or canonical path prefix when inode was not queried by caller
+            if act_exe != exp_exe and act_exe.split(":")[0] != exp_exe.split(":")[0]:
+                return False, f"mismatched_executable_identity:expected={exp_exe},got={act_exe}"
+            if ":" in exp_exe and ":" in act_exe and act_exe != exp_exe:
+                return False, f"mismatched_executable_inode:expected={exp_exe},got={act_exe}"
+
+        # 7. Validate Build ID
+        if expected_build_id is not None and str(expected_build_id).strip():
+            if not self.build_id or str(self.build_id).strip().lower() != str(expected_build_id).strip().lower():
+                return False, f"mismatched_build_id:expected={expected_build_id},got={self.build_id}"
+
+        # 8. Validate snapshot binding
+        if not self.snapshot_binding or not str(self.snapshot_binding).strip():
+            return False, "missing_snapshot_binding"
+        if expected_snapshot_binding is not None and str(self.snapshot_binding) != str(expected_snapshot_binding):
+            return False, f"mismatched_snapshot_binding:expected={expected_snapshot_binding},got={self.snapshot_binding}"
+
+        # 9. Validate capture epoch and freshness (reject stale receipts)
+        if not isinstance(self.capture_epoch, int) or isinstance(self.capture_epoch, bool) or self.capture_epoch < 0:
+            return False, f"invalid_capture_epoch:{self.capture_epoch}"
+        if min_capture_epoch is not None and self.capture_epoch < int(min_capture_epoch):
+            return False, f"stale_capture_epoch:min={min_capture_epoch},got={self.capture_epoch}"
+        if max_capture_epoch is not None and self.capture_epoch > int(max_capture_epoch):
+            return False, f"future_capture_epoch:max={max_capture_epoch},got={self.capture_epoch}"
+        if max_age_ns is not None and self.timestamp_ns > 0:
+            now_ns = time.time_ns()
+            if (now_ns - self.timestamp_ns) > int(max_age_ns):
+                return False, f"stale_receipt_timestamp:age_ns={now_ns - self.timestamp_ns},max_age_ns={max_age_ns}"
+
+        # 10. Validate applicable target identity constraints
+        if expected_constraints:
+            for k, exp_v in expected_constraints.items():
+                act_v = (self.target_constraints or {}).get(k)
+                if act_v != exp_v:
+                    return False, f"target_constraint_mismatch:{k}:expected={exp_v},got={act_v}"
+
+        return True, "VERIFIED"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "session_id": self.session_id,
+            "pid": self.pid,
+            "process_identity": self.process_identity,
+            "executable_identity": self.executable_identity,
+            "build_id": self.build_id,
+            "snapshot_binding": self.snapshot_binding,
+            "capture_epoch": self.capture_epoch,
+            "timestamp_ns": self.timestamp_ns,
+            "authority_level": self.authority_level,
+            "provenance_class": self.provenance_class,
+            "key_id": self.key_id,
+            "signature": self.signature,
+            "target_constraints": dict(self.target_constraints or {}),
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LiveCaptureReceipt":
+        if not isinstance(data, dict):
+            raise TypeError("LiveCaptureReceipt.from_dict requires a dictionary")
+        return cls(
+            receipt_id=str(data.get("receipt_id", "")),
+            session_id=str(data.get("session_id", "")),
+            pid=int(data.get("pid", 0)) if not isinstance(data.get("pid"), bool) else 0,
+            process_identity=str(data.get("process_identity", "")),
+            executable_identity=str(data.get("executable_identity", "")),
+            build_id=str(data.get("build_id") or ""),
+            snapshot_binding=str(data.get("snapshot_binding", "")),
+            capture_epoch=int(data.get("capture_epoch", -1)) if not isinstance(data.get("capture_epoch"), bool) else -1,
+            timestamp_ns=int(data.get("timestamp_ns", 0)),
+            authority_level=str(data.get("authority_level", "PRODUCTION")),
+            provenance_class=str(data.get("provenance_class", "LIVE_RUNTIME_CAPTURE")),
+            key_id=str(data.get("key_id", "default")),
+            signature=str(data.get("signature", "")),
+            target_constraints=dict(data.get("target_constraints") or {}),
+            schema_version=str(data.get("schema_version", "2.0.0")),
+        )
+
+
+def issue_live_capture_receipt(
+    session_id: str,
+    pid: int,
+    process_identity: str,
+    executable_identity: str,
+    build_id: str,
+    snapshot_binding: str,
+    capture_epoch: int = 0,
+    authority_level: str = "PRODUCTION",
+    provenance_class: str = "LIVE_RUNTIME_CAPTURE",
+    target_constraints: Optional[Dict[str, Any]] = None,
+    secret: Optional[str] = None,
+    key_id: Optional[str] = None,
+) -> LiveCaptureReceipt:
+    ks = get_default_key_store()
+    active_kid, active_sec = ks.get_active_signing_key()
+    use_kid = key_id if key_id else active_kid
+    use_sec = secret if secret else active_sec
+    rcpt = LiveCaptureReceipt(
+        receipt_id=f"live_rcpt_{uuid.uuid4().hex[:12]}",
+        session_id=str(session_id),
+        pid=int(pid),
+        process_identity=str(process_identity),
+        executable_identity=str(executable_identity),
+        build_id=str(build_id or ""),
+        snapshot_binding=str(snapshot_binding),
+        capture_epoch=int(capture_epoch),
+        timestamp_ns=time.time_ns(),
+        authority_level=str(authority_level),
+        provenance_class=str(provenance_class),
+        key_id=use_kid,
+        target_constraints=dict(target_constraints or {}),
+    )
+    rcpt.sign(secret=use_sec)
+    return rcpt
+
+
+@dataclass
 class CaptureLatencyReport:
     """Exact latency measurements for each phase of runtime state capture.
 
@@ -1246,6 +1480,19 @@ def _read_proc_maps(pid: int) -> ProcMapsResult:
         elif not pathname:
             cat = "anonymous"
 
+        is_guard_preceded_stack = (
+            cat == "anonymous"
+            and perms.startswith("rw")
+            and (end - start) >= 4 * 1024 * 1024
+            and bool(regions)
+            and regions[-1].get("permissions", "").startswith("---")
+            and regions[-1].get("end") == start
+        )
+        if (cat == "stack" or is_guard_preceded_stack) and (end - start) > 128 * 1024:
+            start = end - 128 * 1024
+        elif cat == "anonymous" and not pathname and (end - start) >= 2 * 1024 * 1024:
+            end = start + 256 * 1024
+
         regions.append({
             "start": start,
             "end": end,
@@ -1843,10 +2090,19 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 bytes_omitted += tail_omitted
 
             buf = ctypes.create_string_buffer(chunk_size)
+            ctypes.memset(buf, 0, chunk_size)
             l_iov = _struct_iovec(ctypes.cast(buf, ctypes.c_void_p), chunk_size)
             r_iov = _struct_iovec(ctypes.c_void_p(reg_start), chunk_size)
             read_plans.append((idx, reg, reg_start, reg_size, chunk_size, tail_omitted, buf, l_iov, r_iov))
             bytes_attempted += chunk_size
+
+        # Pre-warm collector and target virtual pages before SIGSTOP so page faults do not occur during suspension
+        if should_suspend and fn_vm_readv and not getattr(policy, "mem_reader", None):
+            for _item_idx, _reg, _r_start, _r_size, _c_size, _t_omit, _buf, _l_iov, _r_iov in read_plans:
+                try:
+                    fn_vm_readv(pid, ctypes.byref(_l_iov), 1, ctypes.byref(_r_iov), 1, 0)
+                except Exception:
+                    pass
 
         read_results = []
 
@@ -2010,6 +2266,16 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                         0
                     )
                     err = ctypes.get_errno() if nread <= 0 else 0
+                    if nread <= 0 and err == errno.EINTR:
+                        nread = fn_vm_readv(
+                            pid,
+                            ctypes.byref(l_iov),
+                            1,
+                            ctypes.byref(r_iov),
+                            1,
+                            0
+                        )
+                        err = ctypes.get_errno() if nread <= 0 else 0
                     if nread <= 0 and err in (errno.ENOSYS, errno.EPERM) and handle.mem_pinned and handle.mem_fd is not None:
                         # Fallback to pinned /proc/<pid>/mem if process_vm_readv is not permitted or syscall unsupported
                         try:

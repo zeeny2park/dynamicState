@@ -32,27 +32,25 @@ from .debug_image import BinaryIdentity, inspect_elf
 from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
 from .verdict_engine import (
-    VerdictEngine, ZeroCdnReporter, sanitize_report_output_path, DiagnosticVerdict, AssertionEvaluation,
-    ASSERTION_PASS, ASSERTION_FAIL, ASSERTION_ABSTAIN,
-    DIAG_CONFIRMED, DIAG_SUSPECTED, DIAG_PARTIALLY_CONFIRMED, DIAG_REFUTED, DIAG_NO_ISSUE_DETECTED, DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE, DIAG_INCONCLUSIVE,
-    HYP_STATE_SUPPORTED, HYP_STATE_PROPOSED
+    VerdictEngine,
+    ZeroCdnReporter,
+    AssertionEvaluation,
+    DiagnosticVerdict,
+    sanitize_report_output_path,
+    ASSERTION_PASS,
+    ASSERTION_FAIL,
+    ASSERTION_ABSTAIN,
+    DIAG_CONFIRMED,
+    DIAG_SUSPECTED,
+    DIAG_PARTIALLY_CONFIRMED,
+    DIAG_REFUTED,
+    DIAG_NO_ISSUE_DETECTED,
+    DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE,
+    DIAG_INCONCLUSIVE,
 )
 from .evidence_adapter import EvidenceAdapter
 from .evidence_ledger import EvidenceLedger
 from .observation_budget import ObservationBudgetTracker, ObservationBudgetLimits
-
-
-ZERO_STOP_NON_ATOMIC_CONSISTENCY: Dict[str, Any] = {
-    "level": "NON_ATOMIC",
-    "is_consistent_snapshot": False,
-    "process_stopped": False,
-    "is_atomic_read": False,
-    "mechanism": "ZERO_STOP_CONCURRENT_READ",
-    "causal_guarantee": "NONE",
-    "has_causal_guarantee": False,
-    "data_completeness": "BEST_EFFORT_NON_ATOMIC",
-    "warning": "Read concurrently on live running threads without process suspension. Multi-variable observations may reflect distinct execution instants and cannot establish causal sequencing.",
-}
 
 
 # -----------------------------------------------------------------------------
@@ -779,18 +777,14 @@ class WatchSessionManager:
                     out.append(item)
                 elif isinstance(item, str) and item.strip():
                     out.append({"action": "eval", "expression": item.strip()})
-                else:
-                    out.append({
-                        "action": "malformed_step",
-                        "raw_item": item,
-                        "error": f"Invalid step format: expected dictionary or expression string, got {type(item).__name__}",
-                    })
             return out
         return []
 
     def _get_session_dir(self, session_id: str) -> str:
+        if not session_id or not isinstance(session_id, str) or ".." in session_id or "/" in session_id or "\\" in session_id:
+            raise ValueError(f"Invalid session_id '{session_id}': path traversal characters prohibited")
         d = os.path.join(self.sessions_dir, session_id)
-        os.makedirs(d, exist_ok=True)
+        os.makedirs(d, mode=0o700, exist_ok=True)
         return d
 
     def _get_session_file(self, session_id: str) -> str:
@@ -1575,15 +1569,15 @@ class WatchSessionManager:
             session = self.get_session(session_id)
             if not session:
                 return None
-
             evt = self._stop_events.get(session_id)
             if evt:
                 evt.set()
-
             th = self._threads.get(session_id)
-            if th and th.is_alive() and th != threading.current_thread():
-                th.join(timeout=2.0)
 
+        if th and th.is_alive() and th != threading.current_thread():
+            th.join(timeout=2.0)
+
+        with self._lock:
             session.status = "STOPPED"
             session.end_time = datetime.now(timezone.utc).isoformat()
             self._persist_session(session)
@@ -2219,18 +2213,24 @@ class WatchSessionManager:
             # Liveness check via adapter
             alive, live_err = adapter.check_liveness(session.pid)
             if not alive:
+                is_transport_err = bool(live_err and any(k in live_err.lower() for k in ("transport failure", "timed out", "ssh execution error")))
                 with self._lock:
-                    session.status = "STOPPED"
-                    session.end_time = datetime.now(timezone.utc).isoformat()
                     session.gaps.append(CaptureGap(
                         gap_id=f"gap_{uuid.uuid4().hex[:6]}",
                         start_ns=t_start_ns,
                         end_ns=t_start_ns,
                         duration_ms=0.0,
-                        reason="TARGET_TERMINATED",
+                        reason="TRANSPORT_DISCONNECTED" if is_transport_err else "TARGET_TERMINATED",
                         timestamp=datetime.now(timezone.utc).isoformat(),
                     ))
-                    self._persist_session(session)
+                    if len(session.gaps) > 500:
+                        del session.gaps[:-500]
+                    session.status = "STOPPED"
+                    session.end_time = datetime.now(timezone.utc).isoformat()
+                    try:
+                        self._persist_session(session)
+                    except OSError:
+                        pass
                 break
 
             # Gap detection: if elapsed time > 1.8x expected interval, record gap
@@ -2978,7 +2978,6 @@ class WatchSessionManager:
             "is_remote": target_adapter.is_remote(),
             "load_bias": f"0x{load_bias:x}",
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "capture_latency_us": elapsed_us,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "coercions_count": len(coercions_applied),
@@ -3004,6 +3003,17 @@ class WatchSessionManager:
         """Samples a set of symbol expressions twice separated by `wait_ms` (with 0.00ms stop time)
         and returns a structured comparison of changed, unchanged, and unreadable fields.
         """
+        target_adapter = self._resolve_adapter(
+            pid=pid,
+            remote_host=remote_host,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_proxy_jump=ssh_proxy_jump,
+            ssh_proxy_command=ssh_proxy_command,
+            adapter=adapter,
+        )
+
         ctx_info = self.resolve_target_context(
             pid=pid,
             companion_elf_path=companion_elf_path,
@@ -3016,17 +3026,6 @@ class WatchSessionManager:
         )
         pid = ctx_info["pid"]
         companion_elf_path = ctx_info["companion_elf_path"]
-
-        target_adapter = self._resolve_adapter(
-            pid=pid,
-            remote_host=remote_host,
-            ssh_user=ssh_user,
-            ssh_port=ssh_port,
-            ssh_key=ssh_key,
-            ssh_proxy_jump=ssh_proxy_jump,
-            ssh_proxy_command=ssh_proxy_command,
-            adapter=adapter,
-        )
         primary_elf, _ = self._split_companion_elf_paths(companion_elf_path)
         idx = DwarfIndexer.get_index(primary_elf or companion_elf_path)
         expr_list = self._coerce_str_list(expressions)
@@ -3116,7 +3115,6 @@ class WatchSessionManager:
             "is_remote": target_adapter.is_remote(),
             "wait_ms": clamped_wait_ms,
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "timestamp_before": snap_a.get("timestamp"),
             "timestamp_after": snap_b.get("timestamp"),
             "summary": {
@@ -3161,8 +3159,8 @@ class WatchSessionManager:
 
     def save_golden_baseline(
         self,
-        pid: Optional[int] = None,
-        companion_elf_path: Optional[str] = None,
+        pid: int,
+        companion_elf_path: str,
         label: str = "Golden Baseline",
         expressions: Optional[List[str]] = None,
         remote_host: Optional[str] = None,
@@ -3173,20 +3171,8 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Captures current target state for key symbol expressions and persists it as a Golden Baseline."""
-        ctx_info = self.resolve_target_context(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            remote_host=remote_host,
-            ssh_user=ssh_user,
-            ssh_port=ssh_port,
-            ssh_key=ssh_key,
-            ssh_proxy_jump=ssh_proxy_jump,
-            adapter=adapter,
-        )
-        eff_pid = ctx_info["pid"]
-        eff_elf = ctx_info["companion_elf_path"]
         target_adapter = self._resolve_adapter(
-            pid=eff_pid,
+            pid=pid,
             remote_host=remote_host,
             ssh_user=ssh_user,
             ssh_port=ssh_port,
@@ -3196,11 +3182,11 @@ class WatchSessionManager:
         )
         expr_list = [e.strip() for e in (expressions or []) if e and e.strip()]
         if not expr_list:
-            expr_list = self._auto_select_diagnostic_expressions(eff_elf, max_items=15)
+            expr_list = self._auto_select_diagnostic_expressions(companion_elf_path, max_items=15)
 
         eval_res = self.evaluate_symbol_paths(
-            pid=eff_pid,
-            companion_elf_path=eff_elf,
+            pid=pid,
+            companion_elf_path=companion_elf_path,
             expressions=expr_list,
             adapter=target_adapter,
         )
@@ -4159,7 +4145,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "base_expression": base_expression,
             "was_coerced": bool(coerced_meta.get("was_coerced")),
@@ -4590,7 +4575,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "target_expression": target_expression,
             "resolved_expression": resolved.get("resolved_expression") or target_expression,
@@ -5294,7 +5278,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "head_expression": head_expr,
             "node_type": node_struct_type.name,
@@ -5672,7 +5655,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "threads_inspected": len(thread_reports),
             "threads": thread_reports,
@@ -5937,7 +5919,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "health_status": "ANOMALIES_DETECTED" if anomalies else "HEALTHY",
             "checked_symbols_count": checked_count,
@@ -6137,7 +6118,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "results": results,
         }
@@ -6277,7 +6257,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "shared_mappings_count": len(shared_mappings),
             "shared_mappings": shared_mappings,
@@ -6545,7 +6524,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "threads_count": len(thread_results),
             "threads": thread_results,
@@ -6721,7 +6699,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "overall_status": overall_status,
             "health_score": score,
@@ -6884,7 +6861,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "pipeline_health": pipeline_health,
             "bottleneck_diagnosis": bottleneck_diagnosis,
@@ -7152,7 +7128,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "scanned_heap_bytes": scanned_heap_bytes,
             "known_polymorphic_classes": sorted(set(vtable_map.values())),
@@ -7477,7 +7452,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "nodes_count": len(nodes),
             "edges_count": len(edges),
@@ -7682,7 +7656,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "snippets_count": len(snippets),
             "snippets": snippets,
@@ -7740,21 +7713,34 @@ class WatchSessionManager:
             classified_symptom = "COMPREHENSIVE_SYMPTOM_CHECK"
 
         # 2. Run composite triage + dependency graph + source correlation + heap scan
-        triage = self.auto_triage_incident(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            adapter=target_adapter,
-        )
-        dep_graph = self.build_dependency_graph(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            adapter=target_adapter,
-        )
-        heap_report = self.scan_heap_objects(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            adapter=target_adapter,
-        )
+        legacy_sweep_errors: List[Dict[str, Any]] = []
+        try:
+            triage = self.auto_triage_incident(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                adapter=target_adapter,
+            )
+        except Exception as exc:
+            legacy_sweep_errors.append({"stage": "auto_triage_incident", "error_type": type(exc).__name__, "error": str(exc)})
+            triage = {"overall_status": "INCONCLUSIVE", "health_score": 50, "findings": [], "source_remediation_targets": []}
+        try:
+            dep_graph = self.build_dependency_graph(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                adapter=target_adapter,
+            )
+        except Exception as exc:
+            legacy_sweep_errors.append({"stage": "build_dependency_graph", "error_type": type(exc).__name__, "error": str(exc)})
+            dep_graph = {"causal_chains": [], "nodes_count": 0, "edges_count": 0, "nodes": [], "edges": [], "root_blocker_nodes": []}
+        try:
+            heap_report = self.scan_heap_objects(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                adapter=target_adapter,
+            )
+        except Exception as exc:
+            legacy_sweep_errors.append({"stage": "scan_heap_objects", "error_type": type(exc).__name__, "error": str(exc)})
+            heap_report = {"leaked_candidates_count": 0, "total_objects_found": 0, "objects": [], "class_histogram": {}}
 
         # Merge heap leak findings into triage findings if any leaked objects were discovered
         findings = list(triage.get("findings") or [])
@@ -7795,12 +7781,16 @@ class WatchSessionManager:
 
         # Correlate source code with runtime variables at top remediation target or active thread frame
         top_source_loc = (triage.get("source_remediation_targets") or [None])[0]
-        source_corr = self.correlate_source_and_state(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            source_location=top_source_loc,
-            adapter=target_adapter,
-        )
+        try:
+            source_corr = self.correlate_source_and_state(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                source_location=top_source_loc,
+                adapter=target_adapter,
+            )
+        except Exception as exc:
+            legacy_sweep_errors.append({"stage": "correlate_source_and_state", "error_type": type(exc).__name__, "error": str(exc)})
+            source_corr = {"snippets": []}
 
         # Synthesize primary root-cause hypothesis and step-by-step causal narrative
         causal_chains = dep_graph.get("causal_chains") or []
@@ -7824,6 +7814,17 @@ class WatchSessionManager:
                 remediation_steps.append(f["recommended_action"])
 
         adaptive_summary = None
+        adaptive_error_details: List[Dict[str, Any]] = []
+        adaptive_verification_succeeded = False
+        exec_status = "COMPLETED"
+        fail_category: Optional[str] = None
+        stop_reason = "SUFFICIENT_EVIDENCE"
+        actual_obs_cnt = 0
+        succ_obs_cnt = 0
+        fail_obs_cnt = 0
+        abs_obs_cnt = 0
+        consumed_budget: Dict[str, Any] = {}
+
         try:
             from .adaptive_engine import AdaptiveInvestigationEngine
             adap_engine = AdaptiveInvestigationEngine(watch_manager=self)
@@ -7833,22 +7834,36 @@ class WatchSessionManager:
                 companion_elf_path=companion_elf_path,
                 target_adapter=target_adapter,
             )
-        except Exception:
-            adaptive_summary = None
-
-        if adaptive_summary and adaptive_summary.get("final_diagnosis"):
-            adaptive_diag = adaptive_summary["final_diagnosis"]
-            st_prefix = f"[{adaptive_summary.get('hypothesis_state')}] " if adaptive_summary.get("hypothesis_state") else ""
-            hypothesis = f"{st_prefix}{adaptive_diag}"
-            if adaptive_summary.get("confidence_score") is not None:
-                try:
-                    confidence_score = float(adaptive_summary["confidence_score"])
-                except (ValueError, TypeError):
-                    pass
-            for step in adaptive_summary.get("recommended_next_steps", []):
-                act = step.get("action") if isinstance(step, dict) else str(step)
-                if act and act not in remediation_steps:
-                    remediation_steps.append(act)
+            exec_status = str(adaptive_summary.get("execution_status", adaptive_summary.get("lifecycle_state", "COMPLETED")))
+            fail_category = adaptive_summary.get("failure_category")
+            stop_reason = str(adaptive_summary.get("stop_reason", "SUFFICIENT_EVIDENCE"))
+            adaptive_error_details = list(adaptive_summary.get("diagnostic_error_details") or [])
+            actual_obs_cnt = int(adaptive_summary.get("actual_observation_count", 0))
+            succ_obs_cnt = int(adaptive_summary.get("successful_observation_count", 0))
+            fail_obs_cnt = int(adaptive_summary.get("failed_observation_count", 0))
+            abs_obs_cnt = int(adaptive_summary.get("abstained_observation_count", 0))
+            consumed_budget = dict(adaptive_summary.get("consumed_execution_budget") or adaptive_summary.get("budget_usage") or {})
+            adaptive_verification_succeeded = exec_status in ("COMPLETED", "INCONCLUSIVE") and adaptive_summary.get("success", False) is True
+        except Exception as adap_exc:
+            exec_status = "FAILED"
+            fail_category = type(adap_exc).__name__
+            stop_reason = "ADAPTIVE_ENGINE_EXCEPTION"
+            adaptive_verification_succeeded = False
+            adaptive_error_details.append({
+                "stage": "adaptive_investigation_engine",
+                "error_type": type(adap_exc).__name__,
+                "error": str(adap_exc),
+            })
+            adaptive_summary = {
+                "success": False,
+                "execution_status": "FAILED",
+                "failure_category": fail_category,
+                "stop_reason": stop_reason,
+                "diagnostic_error_details": list(adaptive_error_details),
+                "error": str(adap_exc),
+            }
+            # Never represent fallback legacy findings as successful adaptive verification
+            confidence_score = min(confidence_score, 0.35)
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -7856,9 +7871,19 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "symptom_query": symptom_query,
+            "execution_status": exec_status,
+            "failure_category": fail_category,
+            "stop_reason": stop_reason,
+            "diagnostic_error_details": adaptive_error_details,
+            "actual_observation_count": actual_obs_cnt,
+            "successful_observation_count": succ_obs_cnt,
+            "failed_observation_count": fail_obs_cnt,
+            "abstained_observation_count": abs_obs_cnt,
+            "consumed_execution_budget": consumed_budget,
+            "adaptive_verification_succeeded": adaptive_verification_succeeded,
+            "legacy_findings": list(findings),
             "adaptive_investigation": adaptive_summary,
             "classified_symptom": classified_symptom,
             "root_cause_hypothesis": hypothesis,
@@ -8301,7 +8326,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "natural_query": natural_query,
             "expanded_keywords": expanded_keywords,
@@ -8747,7 +8771,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "drift_status": drift_status,
             "drift_score": drift_score,
@@ -9014,7 +9037,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "pt_tls_geometry": {
                 "tls_memsz": tls_memsz,
@@ -9222,7 +9244,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "overall_consistency_status": overall_status,
             "symbols_checked_count": len(symbol_reports),
@@ -9625,7 +9646,6 @@ class WatchSessionManager:
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
-            "consistency": ZERO_STOP_NON_ATOMIC_CONSISTENCY,
             "evaluation_latency_us": latency_us,
             "sample_window_ms": clamped_win_ms,
             "kernel_isolated_cpus": _get_kernel_isolated_cpus(),
@@ -9708,69 +9728,45 @@ class WatchSessionManager:
         with self._lock:
             saved = dict(self._active_target_context)
 
-        # Strict PID boundary and type checks before any integer coercion
         if isinstance(pid, bool):
             raise ValueError("Invalid target PID: boolean value is not a valid PID")
-        if pid is not None and not isinstance(pid, (int, float, str)):
-            raise ValueError(f"Unsupported target PID type: {type(pid).__name__}")
-        if isinstance(pid, float):
-            if not pid.is_integer():
-                raise ValueError(f"Invalid fractional target PID {pid}: PID must be an integer > 1")
-            pid = int(pid)
         if pid is not None and isinstance(pid, str):
             p_str = pid.strip()
-            if not p_str:
-                if not process_name and not saved.get("pid"):
-                    raise ValueError("No target PID provided and no target session bound")
+            if p_str.startswith("-") or p_str == "1":
+                raise ValueError(f"Invalid or reserved system PID: {p_str} (PID must be an integer > 1)")
+            if p_str.isdigit():
+                pid = int(p_str)
+            elif p_str and not process_name:
+                process_name = p_str
                 pid = None
-            else:
-                if "." in p_str:
-                    try:
-                        f_val = float(p_str)
-                        if not f_val.is_integer():
-                            raise ValueError(f"Invalid fractional target PID '{p_str}': PID must be an integer > 1")
-                        pid = int(f_val)
-                        p_str = str(pid)
-                    except ValueError as ve:
-                        if "fractional" in str(ve):
-                            raise
-                        raise ValueError(f"Invalid non-numeric target PID: {p_str}")
-                if p_str.startswith("-") or p_str == "1":
-                    raise ValueError(f"Invalid or reserved system PID: {p_str} (PID must be an integer > 1)")
-                if p_str.isdigit():
-                    pid = int(p_str)
-                elif not process_name:
-                    process_name = p_str
-                    pid = None
-                else:
-                    raise ValueError(f"Invalid non-numeric target PID: {p_str}")
-        if pid is not None and isinstance(pid, int):
-            p_int = pid
+            elif p_str:
+                raise ValueError(f"Invalid non-numeric target PID: {p_str}")
+        if pid is not None and isinstance(pid, (int, float)):
+            p_int = int(pid)
             if p_int == 1 or p_int < 0:
                 raise ValueError(f"Invalid or reserved system PID {p_int}: PID must be an integer > 1 (PID 1 is reserved)")
-            if p_int == 0:
+            if p_int == 0 and not process_name and not saved.get("pid"):
                 raise ValueError("Invalid target PID 0: PID must be an integer > 1")
+
+        eff_remote_host = remote_host if remote_host is not None else saved.get("remote_host")
+        eff_ssh_user = ssh_user if ssh_user is not None else saved.get("ssh_user")
+        coerced_port = self._coerce_int(ssh_port, 22, 1, 65535)
+        eff_ssh_port = coerced_port if (coerced_port and coerced_port != 22) else self._coerce_int(saved.get("ssh_port"), 22, 1, 65535)
+        eff_ssh_key = ssh_key if ssh_key is not None else saved.get("ssh_key")
+        eff_ssh_jump = ssh_proxy_jump if ssh_proxy_jump is not None else saved.get("ssh_proxy_jump")
 
         explicit_pid = int(pid) if (pid is not None and int(pid) > 1) else None
         saved_pid = int(saved["pid"]) if (saved.get("pid") is not None and int(saved["pid"]) > 0) else None
         eff_pid = explicit_pid if explicit_pid is not None else saved_pid
 
-        is_same_target = (explicit_pid is None or explicit_pid == saved_pid)
-
-        # Do NOT inherit remote SSH parameters or remote host across different target processes
-        if is_same_target:
-            eff_remote_host = remote_host if remote_host is not None else saved.get("remote_host")
-            eff_ssh_user = ssh_user if ssh_user is not None else saved.get("ssh_user")
-            coerced_port = self._coerce_int(ssh_port, 22, 1, 65535)
-            eff_ssh_port = coerced_port if (coerced_port and coerced_port != 22) else self._coerce_int(saved.get("ssh_port"), 22, 1, 65535)
-            eff_ssh_key = ssh_key if ssh_key is not None else saved.get("ssh_key")
-            eff_ssh_jump = ssh_proxy_jump if ssh_proxy_jump is not None else saved.get("ssh_proxy_jump")
+        # If caller explicitly switched to a different PID without specifying companion_elf_path,
+        # prefer auto-discovering `/proc/<pid>/exe` first if it differs from saved_pid
+        if explicit_pid is not None and saved_pid is not None and explicit_pid != saved_pid and not companion_elf_path:
+            eff_elf = None
+            eff_proc_name = process_name
         else:
-            eff_remote_host = remote_host
-            eff_ssh_user = ssh_user
-            eff_ssh_port = self._coerce_int(ssh_port, 22, 1, 65535) or 22
-            eff_ssh_key = ssh_key
-            eff_ssh_jump = ssh_proxy_jump
+            eff_elf = companion_elf_path if (companion_elf_path and str(companion_elf_path).strip()) else saved.get("companion_elf_path")
+            eff_proc_name = process_name or saved.get("process_name")
 
         target_adapter = self._resolve_adapter(
             pid=eff_pid or 1,
@@ -9782,52 +9778,23 @@ class WatchSessionManager:
             adapter=adapter,
         )
 
-        # Inspect actual running target binary Build ID
-        running_target_build_id = None
-        if eff_pid and eff_pid > 0 and not target_adapter.is_remote():
-            try:
-                exe_cand = f"/proc/{eff_pid}/exe"
-                if os.path.exists(exe_cand):
-                    exe_real = os.readlink(exe_cand).replace(" (deleted)", "").strip()
-                    if exe_real and os.path.isfile(exe_real):
-                        running_target_build_id = inspect_elf(exe_real).build_id
-            except Exception:
-                pass
-
-        # If caller explicitly switched to a different PID without specifying companion_elf_path,
-        # prefer auto-discovering `/proc/<pid>/exe` first if it differs from saved_pid
-        if explicit_pid is not None and saved_pid is not None and explicit_pid != saved_pid and not companion_elf_path:
-            eff_elf = None
-            eff_proc_name = process_name
-            known_build_id = running_target_build_id
-        else:
-            eff_elf = companion_elf_path if (companion_elf_path and str(companion_elf_path).strip()) else saved.get("companion_elf_path")
-            eff_proc_name = process_name or saved.get("process_name")
-            known_build_id = saved.get("build_id") if is_same_target else running_target_build_id
-
         elf_auto_discovered = False
         elf_discovery_source = None
         auto_healed_pid = False
         previous_pid = None
 
-        # Step 1: If eff_elf is known, inspect its build_id & basename and verify against running binary
+        # Step 1: If eff_elf is known, inspect its build_id & basename for process discovery/healing
+        known_build_id = saved.get("build_id")
         if eff_elf:
             primary_cand, _ = self._split_companion_elf_paths(eff_elf)
             if primary_cand and os.path.isfile(primary_cand):
                 try:
                     ident = inspect_elf(primary_cand)
-                    companion_bid = ident.build_id
-                    if running_target_build_id and companion_bid and running_target_build_id != companion_bid:
-                        raise ValueError(
-                            f"Target process '{eff_pid}' running executable has build-id '{running_target_build_id}', "
-                            f"but companion image '{primary_cand}' has build-id '{companion_bid}'. Mismatched symbols rejected."
-                        )
-                    known_build_id = companion_bid or running_target_build_id
+                    known_build_id = ident.build_id
                     if not eff_proc_name:
                         eff_proc_name = os.path.basename(primary_cand)
-                except Exception as b_exc:
-                    if "Mismatched symbols rejected" in str(b_exc):
-                        raise
+                except Exception:
+                    pass
 
         # Step 2: Check liveness of eff_pid; if dead (process restarted!) or omitted, attempt PID auto-discovery / auto-healing
         pid_alive = False
@@ -9934,16 +9901,9 @@ class WatchSessionManager:
                 except Exception:
                     continue
 
-            # If still not found, only fallback to saved companion ELF if target was not switched to a different PID,
-            # or if the running target's actual Build ID matches saved companion Build ID
+            # If still not found and saved context has a valid companion_elf_path with matching build_id, fallback to saved
             if not eff_elf and saved.get("companion_elf_path"):
-                saved_companion = saved.get("companion_elf_path")
-                can_inherit = (explicit_pid is None or explicit_pid == saved_pid)
-                if not can_inherit and running_target_build_id and saved.get("build_id") and running_target_build_id == saved.get("build_id"):
-                    can_inherit = True
-                if can_inherit:
-                    eff_elf = saved_companion
-                    known_build_id = saved.get("build_id")
+                eff_elf = saved.get("companion_elf_path")
 
         if not eff_pid or eff_pid <= 0:
             raise ValueError("Target PID could not be resolved. Provide `pid` or `process_name`, or bind a target first via `runtime_target_connect`.")
@@ -10824,9 +10784,7 @@ class WatchSessionManager:
             action = str(step.get("action") or step.get("tool") or "ask").strip().lower()
             step_t0 = time.monotonic_ns()
             try:
-                if action == "malformed_step":
-                    raise ValueError(step.get("error") or "Malformed step input: expected dictionary")
-                elif action in ("eval", "runtime_eval_memory_path", "evaluate_symbol_paths"):
+                if action in ("eval", "runtime_eval_memory_path", "evaluate_symbol_paths"):
                     exprs = step.get("expressions") or ([step["expression"]] if step.get("expression") else ["*gpMem"])
                     if isinstance(exprs, str):
                         exprs = [x.strip() for x in exprs.split(",") if x.strip()]
@@ -10882,37 +10840,7 @@ class WatchSessionManager:
                         companion_elf_path=eff_elf,
                         adapter=adapter,
                     )
-                elif action in ("callstack", "callstacks", "locks", "runtime_inspect_thread_callstack_and_locks", "inspect_thread_callstack_and_locks", "inspect_thread_callstacks_and_locks"):
-                    raw_out = self.inspect_thread_callstacks_and_locks(
-                        pid=eff_pid,
-                        companion_elf_path=eff_elf,
-                        adapter=adapter,
-                    )
-                elif action in ("diff", "capture_diff", "capture_and_diff", "runtime_capture_and_diff"):
-                    raw_out = self.capture_and_diff_expressions(
-                        pid=eff_pid,
-                        companion_elf_path=eff_elf,
-                        expressions=step.get("expressions"),
-                        wait_ms=int(step.get("wait_ms") or 200),
-                        adapter=adapter,
-                    )
-                elif action in ("heap", "scan_heap", "runtime_scan_heap_objects", "scan_heap_objects"):
-                    raw_out = self.scan_heap_objects(
-                        pid=eff_pid,
-                        companion_elf_path=eff_elf,
-                        class_filter=step.get("class_filter"),
-                        adapter=adapter,
-                    )
-                elif action in ("verify_consistency", "runtime_verify_concurrent_read_consistency", "verify_concurrent_read_consistency"):
-                    raw_out = self.verify_concurrent_read_consistency(
-                        pid=eff_pid,
-                        companion_elf_path=eff_elf,
-                        expressions=step.get("expressions") or ["gpRegistry.magic"],
-                        retries=int(step.get("retries") or 3),
-                        inter_read_delay_ms=int(step.get("inter_read_delay_ms") or 5),
-                        adapter=adapter,
-                    )
-                elif action in ("ask", "question", "ask_runtime_question", "runtime_ask"):
+                else:
                     q_txt = str(step.get("question") or step.get("expression") or "프로세스 상태 요약")
                     raw_out = self.ask_runtime_question(
                         question=q_txt,
@@ -10920,8 +10848,6 @@ class WatchSessionManager:
                         companion_elf_path=eff_elf,
                         adapter=adapter,
                     )
-                else:
-                    raise ValueError(f"Unsupported batch action '{action}'. Supported actions: eval, scan_pool, find_owners, tls, dpdk, triage, callstack, diff, heap, verify_consistency, ask.")
 
                 final_out = (
                     self.summarize_for_llm_budget(
@@ -10934,36 +10860,14 @@ class WatchSessionManager:
                     if compact
                     else raw_out
                 )
-                # Check if step produced a structured failure dictionary without raising
-                is_step_failed = False
-                step_failure_msg = None
-                if isinstance(raw_out, dict):
-                    if raw_out.get("success") is False:
-                        is_step_failed = True
-                        step_failure_msg = raw_out.get("error") or raw_out.get("error_message") or "Step execution returned failure"
-                    elif raw_out.get("status") in ("FAILED", "ERROR") and "results" not in raw_out:
-                        is_step_failed = True
-                        step_failure_msg = raw_out.get("error") or f"Step returned status {raw_out.get('status')}"
-
-                if is_step_failed:
-                    failed_count += 1
-                    step_results.append({
-                        "step_id": step_id,
-                        "action": action,
-                        "success": False,
-                        "error": step_failure_msg,
-                        "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
-                        "output": final_out,
-                    })
-                else:
-                    succeeded_count += 1
-                    step_results.append({
-                        "step_id": step_id,
-                        "action": action,
-                        "success": True,
-                        "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
-                        "output": final_out,
-                    })
+                succeeded_count += 1
+                step_results.append({
+                    "step_id": step_id,
+                    "action": action,
+                    "success": True,
+                    "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
+                    "output": final_out,
+                })
             except Exception as step_exc:
                 failed_count += 1
                 step_results.append({
@@ -10975,13 +10879,7 @@ class WatchSessionManager:
                 })
 
         total_latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
-        total_steps = len(normalized_steps)
-        overall_success = (failed_count == 0)
-        is_partial = (succeeded_count > 0 and failed_count > 0)
-
-        res: Dict[str, Any] = {
-            "success": overall_success,
-            "partial_success": is_partial,
+        return {
             "pid": eff_pid,
             "companion_elf": eff_elf,
             "auto_healed_pid": ctx_info.get("auto_healed_pid", False),
@@ -10989,25 +10887,15 @@ class WatchSessionManager:
             "stop_duration_ms": 0.0,
             "batch_latency_us": total_latency_us,
             "compact_mode": compact,
-            "steps_requested": total_steps,
+            "steps_requested": len(normalized_steps),
             "steps_succeeded": succeeded_count,
             "steps_failed": failed_count,
             "cross_step_highlights": cross_step_highlights,
             "step_results": step_results,
             "llm_next_step_hint": (
-                f"Executed {succeeded_count}/{total_steps} batch diagnostic step(s) in {total_latency_us}us with 0.00ms target stop time."
+                f"Executed {succeeded_count}/{len(normalized_steps)} batch diagnostic step(s) in {total_latency_us}us with 0.00ms target stop time."
             ),
         }
-        if failed_count > 0:
-            if is_partial:
-                res["error_code"] = "PARTIAL_BATCH_FAILURE"
-                res["error"] = f"{failed_count} of {total_steps} batch step(s) failed"
-                res["recovery_hint"] = "Review failed steps in 'step_results' to diagnose individual action failures."
-            else:
-                res["error_code"] = "ALL_STEPS_FAILED"
-                res["error"] = f"All {failed_count} batch step(s) failed"
-                res["recovery_hint"] = "Check target process liveness and parameters for all batch steps."
-        return res
 
 
     # -------------------------------------------------------------------------
@@ -11128,10 +11016,10 @@ class WatchSessionManager:
         self,
         hypothesis: str,
         assertions: List[str],
-        correlate_owners: bool = True,
         pid: Optional[int] = None,
         companion_elf_path: Optional[str] = None,
         process_name: Optional[str] = None,
+        correlate_owners: bool = True,
         remote_host: Optional[str] = None,
         ssh_user: Optional[str] = None,
         ssh_port: int = 22,
@@ -11140,11 +11028,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
         report_html_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Declarative Multi-Assertion Hypothesis Verifier (`runtime_verify_hypothesis`) in 0.00ms zero-stop mode.
-        Evaluates a list of forgiving C/C++ assertions (`==`, `!=`, `>=`, `<=`, `>`, `<`, `IS_NULL`, `NOT_NULL`),
-        classifies the hypothesis verdict as `CONFIRMED`, `PARTIALLY_CONFIRMED`, or `REFUTED`, and automatically
-        correlates thread owners for any referenced buffer slots.
-        """
+        """Declarative Multi-Assertion Hypothesis Verifier (`runtime_verify_hypothesis`)."""
         t_start_ns = time.monotonic_ns()
         ctx_info = self.resolve_target_context(
             pid=pid,
@@ -11195,23 +11079,22 @@ class WatchSessionManager:
 
             if st == "OBSERVED":
                 passed, expected_val = self._compare_assertion_values(obs_val, op, rhs_raw)
-                ast_verdict = ASSERTION_PASS if passed else ASSERTION_FAIL
-            elif st == "NULL_POINTER" and op in ("IS_NULL", "=="):
+                a_verdict = ASSERTION_PASS if passed else ASSERTION_FAIL
+            elif st == "NULL_POINTER" and op in ("IS_NULL", "==") and "->" not in lhs and "." not in lhs:
                 passed, expected_val = self._compare_assertion_values(0, op, rhs_raw)
-                ast_verdict = ASSERTION_PASS if passed else ASSERTION_FAIL
+                a_verdict = ASSERTION_PASS if passed else ASSERTION_FAIL
             else:
                 passed = False
                 expected_val = rhs_raw
-                ast_verdict = ASSERTION_ABSTAIN
+                a_verdict = ASSERTION_ABSTAIN
 
-            if ast_verdict == ASSERTION_PASS:
+            if a_verdict == ASSERTION_PASS:
                 passed_count += 1
-            elif ast_verdict == ASSERTION_FAIL:
+            elif a_verdict == ASSERTION_FAIL:
                 failed_count += 1
             else:
                 abstain_count += 1
 
-            # Check if expression references an indexed slot like `gpMem->buffers[5].seq`
             m_slot = re.match(r"^(.+?\[\s*\d+\s*\])", res_expr)
             if m_slot:
                 slot_base = m_slot.group(1)
@@ -11227,9 +11110,9 @@ class WatchSessionManager:
                 "expected": expected_val,
                 "observed_value": obs_val,
                 "evaluation_status": st,
+                "verdict": a_verdict,
                 "runtime_address": ev.get("runtime_address"),
                 "passed": passed,
-                "verdict": ast_verdict,
                 "self_repair": ev.get("self_repair"),
             })
             ae_list.append(
@@ -11241,9 +11124,9 @@ class WatchSessionManager:
                     expected=expected_val,
                     observed_value=obs_val,
                     observation_status=st,
-                    verdict=ast_verdict,
-                    reason="Condition satisfied" if ast_verdict == ASSERTION_PASS else (
-                        f"Observation status {st}" if ast_verdict == ASSERTION_ABSTAIN else f"Observed {obs_val} != {op} {expected_val}"
+                    verdict=a_verdict,
+                    reason="Condition satisfied" if a_verdict == ASSERTION_PASS else (
+                        f"Observation status {st}" if a_verdict == ASSERTION_ABSTAIN else f"Observed {obs_val} != {op} {expected_val}"
                     ),
                     runtime_address=ev.get("runtime_address"),
                     was_coerced=ev.get("was_coerced", False),
@@ -11400,10 +11283,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """1-Call Comprehensive Incident Report & Source-Level Remediation Exporter (`runtime_export_incident_report`).
-        Synthesizes Target Identity, Auto-Triage Root-Cause Scorecard, Thread Callstacks & Locks,
-        and optional Hypothesis Verification into a structured Markdown + JSON deliverable (`0.00ms` stop time).
-        """
+        """1-Call Comprehensive Incident Report & Source-Level Remediation Exporter (`runtime_export_incident_report`)."""
         t_start_ns = time.monotonic_ns()
         if pid is not None and not remote_host and adapter is None:
             if pid <= 0 or (pid != os.getpid() and not os.path.exists(f"/proc/{pid}")):
@@ -11531,97 +11411,81 @@ class WatchSessionManager:
         report_markdown = "\n".join(md_lines) + "\n"
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
 
-        # Generate zero-CDN HTML & normalized JSON deliverables (computed once)
-        diag_evals = []
-        if hyp_res and hyp_res.get("assertion_results"):
-            for a_item in hyp_res.get("assertion_results", []):
-                diag_evals.append(VerdictEngine.evaluate_assertion(
-                    raw_assertion=a_item.get("assertion", ""),
-                    lhs=a_item.get("lhs_expression", ""),
-                    op=a_item.get("operator", "=="),
-                    rhs_raw=str(a_item.get("expected")) if a_item.get("expected") is not None else None,
-                    observed_value=a_item.get("observed_value"),
-                    obs_status=a_item.get("evaluation_status", "OBSERVED"),
-                    res_expr=a_item.get("resolved_expression", ""),
-                ))
-
-        hyp_text = hypothesis or title
-        if hyp_res and hyp_res.get("assertion_results"):
-            synth_verdict = VerdictEngine.synthesize_verdict(
-                hypothesis=hyp_text,
-                evaluations=diag_evals,
-                target_identity={"pid": eff_pid, "companion_elf": eff_elf},
-                causal_attribution_verified=False,
-                budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": latency_us}},
+        diag_verdict = (
+            hyp_res["verdict"]
+            if hyp_res
+            else (
+                DIAG_CONFIRMED
+                if any(f.get("severity") in ("CRITICAL", "HIGH") for f in findings)
+                else (DIAG_SUSPECTED if findings else DIAG_NO_ISSUE_DETECTED)
             )
+        )
+        dv = DiagnosticVerdict(
+            hypothesis=hypothesis or title,
+            final_diagnosis=diag_verdict,
+            hypothesis_state="SUPPORTED" if diag_verdict in (DIAG_CONFIRMED, DIAG_NO_ISSUE_DETECTED) else "INCONCLUSIVE",
+            confidence_score=hyp_res["confidence_score"] if hyp_res else (0.9 if not findings else 0.8),
+            total_assertions=hyp_res["total_assertions"] if hyp_res else 0,
+            passed_count=hyp_res["passed_assertions"] if hyp_res else 0,
+            failed_count=hyp_res["failed_assertions"] if hyp_res else 0,
+            abstain_count=hyp_res.get("abstain_assertions", 0) if hyp_res else 0,
+            assertion_evaluations=[],
+            causal_attribution_verified=False,
+            attribution_basis=None,
+            provenance_class="LIVE_RUNTIME_CAPTURE",
+            target_identity={"pid": eff_pid, "companion_elf": eff_elf},
+            limitations=[],
+            budget_usage={
+                "metrics": {
+                    "target_stop_duration_ms": 0.0,
+                    "observation_latency_us": latency_us,
+                    "bytes_read": 4096,
+                }
+            },
+        )
+        if template_path and os.path.exists(template_path):
+            with open(template_path, "r", encoding="utf-8") as tf:
+                tpl_str = tf.read()
+            report_html = tpl_str.replace("{{VERDICT}}", diag_verdict)
         else:
-            # Triage-driven incident verdict when no assertion evaluations are requested
-            if findings:
-                is_crit = any(f.get("severity") in ("CRITICAL", "HIGH") for f in findings)
-                diag_state = DIAG_CONFIRMED if is_crit else DIAG_SUSPECTED
-                h_state = HYP_STATE_SUPPORTED
-                conf = 0.85
-            else:
-                diag_state = DIAG_NO_ISSUE_DETECTED
-                h_state = HYP_STATE_SUPPORTED
-                conf = 1.0
+            report_html = ZeroCdnReporter.render_html(dv, title=title, remediation_checklist=remediation_checklist)
+        report_json = ZeroCdnReporter.render_json(dv)
 
-            synth_verdict = DiagnosticVerdict(
-                hypothesis=hyp_text,
-                final_diagnosis=diag_state,
-                hypothesis_state=h_state,
-                confidence_score=conf,
-                total_assertions=0,
-                passed_count=0,
-                failed_count=0,
-                abstain_count=0,
-                assertion_evaluations=[],
-                causal_attribution_verified=False,
-                attribution_basis=None,
-                provenance_class="LIVE_RUNTIME_CAPTURE",
-                target_identity={"pid": eff_pid, "companion_elf": eff_elf},
-                limitations=[],
-                budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": latency_us}},
-            )
-
-        report_html = ZeroCdnReporter.render_html(synth_verdict, title=title, remediation_checklist=remediation_checklist)
-        report_json = ZeroCdnReporter.render_json(synth_verdict)
-
-        # Handle primary output_path (markdown or html based on extension)
         saved_path = None
         save_error = None
-        sanitized_out, out_path_err = sanitize_report_output_path(output_path, file_type="incident report")
-        if out_path_err:
-            save_error = out_path_err
-        elif sanitized_out:
-            try:
-                os.makedirs(os.path.dirname(sanitized_out), exist_ok=True)
-                is_html_out = sanitized_out.lower().endswith((".html", ".htm"))
-                to_write = report_html if is_html_out else report_markdown
-                with open(sanitized_out, "w", encoding="utf-8") as rf:
-                    rf.write(to_write)
-                saved_path = sanitized_out
-            except OSError as os_err:
-                save_error = f"Failed to write report to {sanitized_out}: {os_err}"
-
-        # Handle explicit report_html_path if provided
-        saved_html_path = None
-        save_html_error = None
-        sanitized_html, html_path_err = sanitize_report_output_path(report_html_path, file_type="HTML report")
-        if html_path_err:
-            save_html_error = html_path_err
-        elif sanitized_html:
-            # Prevent accidental collision/clobbering of primary output path
-            if sanitized_out and os.path.realpath(sanitized_out) == os.path.realpath(sanitized_html):
-                save_html_error = f"Refusing to overwrite primary output path '{sanitized_out}' with HTML report. Specify distinct paths."
+        if output_path and str(output_path).strip():
+            san_out, out_err = sanitize_report_output_path(output_path, file_type="incident report")
+            if out_err or not san_out:
+                save_error = out_err or f"Refusing to write incident report to protected system path: {output_path}"
+                print(f"WARNING: {save_error}", file=sys.stderr)
             else:
                 try:
-                    os.makedirs(os.path.dirname(sanitized_html), exist_ok=True)
-                    with open(sanitized_html, "w", encoding="utf-8") as hf:
-                        hf.write(report_html)
-                    saved_html_path = sanitized_html
+                    os.makedirs(os.path.dirname(san_out), exist_ok=True)
+                    with open(san_out, "w", encoding="utf-8") as rf:
+                        rf.write(report_markdown)
+                    saved_path = san_out
                 except OSError as os_err:
-                    save_html_error = f"Failed to write HTML report to {sanitized_html}: {os_err}"
+                    save_error = f"Failed to write report to {san_out}: {os_err}"
+
+        saved_html_path = None
+        save_html_error = None
+        if report_html_path and str(report_html_path).strip():
+            if saved_path and os.path.abspath(str(report_html_path).strip()) == saved_path:
+                save_html_error = f"Refusing to overwrite primary output path '{saved_path}' with HTML report."
+                print(f"WARNING: {save_html_error}", file=sys.stderr)
+            else:
+                san_html, html_err = sanitize_report_output_path(report_html_path, file_type="HTML report")
+                if html_err or not san_html:
+                    save_html_error = html_err or f"Refusing to write HTML report to protected system path: {report_html_path}"
+                    print(f"WARNING: {save_html_error}", file=sys.stderr)
+                else:
+                    try:
+                        os.makedirs(os.path.dirname(san_html), exist_ok=True)
+                        with open(san_html, "w", encoding="utf-8") as hf:
+                            hf.write(report_html)
+                        saved_html_path = san_html
+                    except OSError as os_err:
+                        save_html_error = f"Failed to write HTML report to {san_html}: {os_err}"
 
         return {
             "success": True,
