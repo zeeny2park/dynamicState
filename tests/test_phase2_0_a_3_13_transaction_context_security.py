@@ -194,15 +194,19 @@ class TestPhase20A313TransactionContextSecurity(unittest.TestCase):
         # Attempting issuance without explicit transaction reference must fail-closed
         with self.assertRaises(ValueError) as ctx:
             ad.issue_live_receipt_for_session(self.session_id, self.pid)
-        self.assertIn("ambiguous", str(ctx.exception).lower())
-        self.assertIn("explicit transaction reference required", str(ctx.exception).lower())
+        self.assertIn("explicit committed capturetransaction reference", str(ctx.exception).lower())
 
         # Explicit issuance succeeds
         rcpt1 = ad.issue_live_receipt_for_session(self.session_id, self.pid, transaction=tx1)
         self.assertEqual(rcpt1.physical_bytes_read, 64)
 
-        # Now only tx2 remains unissued, so single candidate succeeds
-        rcpt2 = ad.issue_live_receipt_for_session(self.session_id, self.pid)
+        # Single candidate without explicit reference must also be rejected
+        with self.assertRaises(ValueError) as ctx:
+            ad.issue_live_receipt_for_session(self.session_id, self.pid)
+        self.assertIn("explicit committed capturetransaction reference", str(ctx.exception).lower())
+
+        # Explicit issuance of tx2 succeeds
+        rcpt2 = ad.issue_live_receipt_for_session(self.session_id, self.pid, transaction=tx2)
         self.assertEqual(rcpt2.physical_bytes_read, 128)
 
     def test_07_unscoped_reads_never_yield_receipt(self):
@@ -218,7 +222,10 @@ class TestPhase20A313TransactionContextSecurity(unittest.TestCase):
         # Attempting to issue a receipt must fail closed because no capture transaction exists
         with self.assertRaises(ValueError) as ctx:
             ad.issue_live_receipt_for_session(self.session_id, self.pid)
-        self.assertIn("no physical reads performed in capture transaction", str(ctx.exception))
+        self.assertTrue(
+            "no physical reads" in str(ctx.exception).lower()
+            or "explicit committed capturetransaction reference" in str(ctx.exception).lower()
+        )
 
 
 if __name__ == "__main__":

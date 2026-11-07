@@ -45,7 +45,11 @@ from extractor.adaptive_engine import (
     AdaptiveInvestigationEngine,
     ObservationBudgetLimits,
 )
-from extractor.capture_backend import LiveCaptureReceipt
+from extractor.capture_backend import (
+    LiveCaptureReceipt,
+    issue_causal_attestation,
+    get_trusted_causal_authority_token,
+)
 from extractor.evidence_adapter import EvidenceAdapter
 from extractor.evidence_ledger import (
     EVIDENCE_TYPE_COMPARISON,
@@ -304,7 +308,38 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
             ledger = EvidenceLedger(session_id="sess_transition")
             rcpt = adapter.issue_live_receipt_for_session("sess_transition", proc.pid, transaction=tx)
             epoch = rcpt.capture_epoch
-            rec = ledger.record(
+
+            pre_rec = ledger.record(
+                evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
+                observation=f"Initial sequence state={val_1}",
+                target_identity={
+                    "pid": proc.pid,
+                    "process_identity": rcpt.process_identity,
+                    "executable_identity": rcpt.executable_identity,
+                    "build_id": rcpt.build_id,
+                },
+                details={"val": val_1},
+            )
+
+            c_att = issue_causal_attestation(
+                session_id="sess_transition",
+                target_identity={
+                    "pid": proc.pid,
+                    "process_identity": rcpt.process_identity,
+                    "executable_identity": rcpt.executable_identity,
+                    "build_id": rcpt.build_id,
+                },
+                operation_id=tx.transaction_id,
+                precondition_evidence_id=pre_rec.evidence_id,
+                postcondition_evidence_id="evi_seq_trans",
+                claimed_transition={"before": val_1, "after": val_2},
+                intervention_details={"action": "SET sequence 9999"},
+                authority_level="PRODUCTION",
+                verifier_authority_token=get_trusted_causal_authority_token(),
+            )
+
+            rec = EvidenceRecord(
+                evidence_id="evi_seq_trans",
                 evidence_type=EVIDENCE_TYPE_COMPARISON,
                 observation=f"sequence transitioned {val_1} -> {val_2}",
                 target_identity={
@@ -315,8 +350,13 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
                 },
                 snapshot_ref={"snapshot_id": rcpt.snapshot_binding, "epoch": epoch},
                 details={"before": val_1, "after": val_2, "transition_verified": True, "epoch": epoch, "capture_epoch": epoch},
-                provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt},
+                provenance={
+                    "provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+                    "live_capture_receipt": rcpt,
+                    "causal_attestation": c_att.to_dict(),
+                },
             )
+            ledger.add_record(rec)
             hypo = InvestigationHypothesis(hypothesis_id="h_seq_trans")
             HypothesisValidator.evaluate(hypo, ledger, new_evidence=rec)
             self.assertEqual(hypo.validation_status, HYPOTHESIS_STATUS_SUPPORTED)

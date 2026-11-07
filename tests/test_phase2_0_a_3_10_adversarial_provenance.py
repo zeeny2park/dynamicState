@@ -333,7 +333,10 @@ class TestPhase20A310AdversarialProvenance(unittest.TestCase):
         self.assertEqual(adapter.cumulative_physical_bytes_read, 0)
         with self.assertRaises(ValueError) as ctx:
             adapter.issue_live_receipt_for_session("sess_no_read", cur_pid)
-        self.assertIn("physical_bytes_read=0", str(ctx.exception).lower())
+        self.assertTrue(
+            "physical_bytes_read=0" in str(ctx.exception).lower()
+            or "explicit committed capturetransaction reference" in str(ctx.exception).lower()
+        )
 
     # 16. Custom memory reader attempting production authority -> forced to TEST authority
     def test_16_custom_memory_reader_cannot_obtain_production_authority(self):

@@ -331,15 +331,15 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
             r_vma = maps[0]["start_int"] if maps else 0
 
             # Probe transaction
-            with adapter.capture_transaction(session_id="sess_d", pid=proc.pid, operation_type="probe"):
+            with adapter.capture_transaction(session_id="sess_d", pid=proc.pid, operation_type="probe") as probe_tx:
                 adapter.read_memory(proc.pid, r_vma, 32)
-            probe_rcpt = adapter.issue_live_receipt_for_session("sess_d", proc.pid)
+            probe_rcpt = adapter.issue_live_receipt_for_session("sess_d", proc.pid, transaction=probe_tx)
             self.assertEqual(probe_rcpt.operation_type, "probe")
 
             # Diagnostic transaction
-            with adapter.capture_transaction(session_id="sess_d", pid=proc.pid, operation_type="diagnostic"):
+            with adapter.capture_transaction(session_id="sess_d", pid=proc.pid, operation_type="diagnostic") as diag_tx:
                 adapter.read_memory(proc.pid, r_vma, 64)
-            diag_rcpt = adapter.issue_live_receipt_for_session("sess_d", proc.pid)
+            diag_rcpt = adapter.issue_live_receipt_for_session("sess_d", proc.pid, transaction=diag_tx)
             self.assertEqual(diag_rcpt.operation_type, "diagnostic")
 
             ledger = EvidenceLedger(session_id="sess_d")
@@ -481,9 +481,9 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
             vaddr = maps[0]["start_int"] if maps else 0
 
             for epoch in range(1, 4):
-                with adapter.capture_transaction(session_id=f"sess_rep_{epoch}", pid=proc.pid):
+                with adapter.capture_transaction(session_id=f"sess_rep_{epoch}", pid=proc.pid) as tx_epoch:
                     adapter.read_memory(proc.pid, vaddr, 64)
-                rcpt = adapter.issue_live_receipt_for_session(f"sess_rep_{epoch}", proc.pid)
+                rcpt = adapter.issue_live_receipt_for_session(f"sess_rep_{epoch}", proc.pid, transaction=tx_epoch)
                 self.assertIsNotNone(rcpt)
                 self.assertEqual(rcpt.authority_level, "PRODUCTION")
                 adapter.advance_epoch()

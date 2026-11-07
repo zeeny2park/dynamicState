@@ -688,45 +688,53 @@ class InvestigationWorkflowEngine:
 
         # Durable operation lifecycle tracking: RESERVED -> EXECUTING -> COMMITTED / FAILED / ABORTED
         obs_key = f"0x{target_addr:x}:{target_size}"
+        op_id = instance.context.get("current_operation_id") or f"op_obs_{target_addr:x}_{target_size}_{instance.session_id}"
+        instance.context["current_operation_id"] = op_id
+        op_records = instance.context.setdefault("operation_records", {})
         op_lifecycle = instance.context.setdefault("operation_lifecycle", {})
         completed_obs = instance.context.setdefault("completed_observations", [])
 
-        # Non-re-execution check on resume: only skip if observation was durably COMMITTED
+        # Non-re-execution check on resume: only skip if observation was durably COMMITTED with valid receipt
         if obs_key in completed_obs and op_lifecycle.get(obs_key, "COMMITTED") == "COMMITTED" and "last_receipt" in instance.context:
             return self.transition_stage(
                 instance,
                 STAGE_EVALUATING_EVIDENCE,
                 f"Observation at 0x{target_addr:x} already committed in previous run; avoiding duplicate physical read",
-                details={"target_addr": hex(target_addr), "cached": True, "lifecycle_state": "COMMITTED"},
+                details={"target_addr": hex(target_addr), "cached": True, "lifecycle_state": "COMMITTED", "operation_id": op_id},
             )
 
         op_lifecycle[obs_key] = "RESERVED"
+        op_records[op_id] = {"operation_id": op_id, "target_addr": hex(target_addr), "target_size": target_size, "state": "RESERVED"}
         try:
             op_lifecycle[obs_key] = "EXECUTING"
+            op_records[op_id]["state"] = "EXECUTING"
             if hasattr(self.target_adapter, "capture_transaction"):
                 with self.target_adapter.capture_transaction(instance.session_id, instance.target_pid, operation_type="diagnostic") as tx:
                     raw_bytes, status, err = self.target_adapter.read_memory(instance.target_pid, target_addr, target_size)
                     if status not in ("OBSERVED", "PARTIAL") or not raw_bytes:
                         op_lifecycle[obs_key] = "FAILED"
+                        op_records[op_id]["state"] = "FAILED"
                         instance.record_transition(STAGE_FAILED, f"Observation read failed: {err}")
                         return False
                     instance.context["last_read_bytes"] = len(raw_bytes)
                     instance.context["last_read_digest"] = tx.observation_digest
                 rcpt = self.target_adapter.issue_live_receipt_for_session(instance.session_id, instance.target_pid, transaction=tx)
             else:
-                raw_bytes, status, err = self.target_adapter.read_memory(instance.target_pid, target_addr, target_size)
-                if status not in ("OBSERVED", "PARTIAL") or not raw_bytes:
-                    op_lifecycle[obs_key] = "FAILED"
-                    instance.record_transition(STAGE_FAILED, f"Observation read failed: {err}")
-                    return False
-                instance.context["last_read_bytes"] = len(raw_bytes)
-                rcpt = self.target_adapter.issue_live_receipt_for_session(instance.session_id, instance.target_pid)
+                op_lifecycle[obs_key] = "FAILED"
+                op_records[op_id]["state"] = "FAILED"
+                instance.stopping_reason = STOP_CAPABILITY_UNAVAILABLE
+                instance.stopping_explanation = "Target adapter lacks required capture_transaction capability for diagnostic observation"
+                instance.record_transition(STAGE_ABSTAINED, instance.stopping_explanation)
+                return False
 
             instance.context["last_receipt"] = rcpt.to_dict()
             op_lifecycle[obs_key] = "COMMITTED"
+            op_records[op_id]["state"] = "COMMITTED"
+            op_records[op_id]["receipt_id"] = rcpt.receipt_id
             completed_obs.append(obs_key)
         except Exception as exc:
             op_lifecycle[obs_key] = "ABORTED"
+            op_records[op_id]["state"] = "ABORTED"
             alive, _ = self.target_adapter.check_liveness(instance.target_pid)
             if not alive:
                 instance.stopping_reason = STOP_TARGET_TERMINATED
@@ -832,11 +840,20 @@ class InvestigationWorkflowEngine:
                 has_verified_causal_attestation = True
                 break
 
-        # Deduplicate evidence count: avoid counting correlated/duplicate observations as independent
-        distinct_observations = {
-            f"{r.evidence_type}:{(r.details or {}).get('address', '')}:{(r.field_observation or {}).get('field_path', '')}"
-            for r in ledger_records
-        }
+        # Deduplicate evidence count: avoid counting multiple records from one physical observation as independent evidence
+        distinct_observations = set()
+        for r in ledger_records:
+            rcpt_id = None
+            if r.provenance and isinstance(r.provenance, dict):
+                lcr = r.provenance.get("live_capture_receipt")
+                if isinstance(lcr, dict):
+                    rcpt_id = lcr.get("receipt_id")
+                elif hasattr(lcr, "receipt_id"):
+                    rcpt_id = getattr(lcr, "receipt_id")
+            if rcpt_id:
+                distinct_observations.add(f"receipt:{rcpt_id}")
+            else:
+                distinct_observations.add(f"{r.evidence_type}:{(r.details or {}).get('address', '')}:{(r.field_observation or {}).get('field_path', '')}:{r.evidence_id}")
         eff_evidence_count = len(distinct_observations)
 
         for h in hyps:
@@ -846,7 +863,8 @@ class InvestigationWorkflowEngine:
             if hid == "hyp_deadlock":
                 if has_deadlock_signal:
                     h["status"] = HYPOTHESIS_STATUS_SUPPORTED
-                    evidence_boost = min(0.55, 0.20 * len(waiting_futex_threads) + 0.10 * eff_evidence_count)
+                    # Waiting thread counts alone must not independently confirm deadlock; require circular signal & observations
+                    evidence_boost = min(0.55, 0.15 * eff_evidence_count)
                     h["confidence"] = round(min(0.95, prior + evidence_boost), 3)
                     h["causally_verified"] = has_verified_causal_attestation
                 elif has_contention_signal:
@@ -1204,11 +1222,25 @@ class InvestigationWorkflowEngine:
                     f"{pinned['build_id']} -> {cur_ident['build_id']}"
                 )
 
-        # Abort any in-flight uncommitted operations across recovery
+        # Abort any in-flight uncommitted operations across recovery; validate COMMITTED operations
         op_lifecycle = inst.context.get("operation_lifecycle", {})
-        for op_id, op_state in op_lifecycle.items():
+        op_records = inst.context.get("operation_records", {})
+        for op_id, op_state in list(op_lifecycle.items()):
             if op_state in ("RESERVED", "EXECUTING"):
                 op_lifecycle[op_id] = "ABORTED"
+            elif op_state == "COMMITTED":
+                # Never treat a serialized COMMITTED flag as sufficient proof without validating receipt/evidence
+                has_rcpt = "last_receipt" in inst.context or any(bool(r.get("receipt_id")) for r in op_records.values())
+                if not has_rcpt:
+                    op_lifecycle[op_id] = "UNKNOWN"
+
+        for rec_id, rec_data in list(op_records.items()):
+            rec_st = rec_data.get("state")
+            if rec_st in ("RESERVED", "EXECUTING"):
+                rec_data["state"] = "ABORTED"
+            elif rec_st == "COMMITTED":
+                if not rec_data.get("receipt_id") and "last_receipt" not in inst.context:
+                    rec_data["state"] = "UNKNOWN"
 
         # Restore ledger if serialized in checkpoint
         restored_ledger = inst.context.get("restored_evidence_ledger")

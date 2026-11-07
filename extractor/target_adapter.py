@@ -292,13 +292,13 @@ class TargetExecutionAdapter(ABC):
                     if pid is None or int(ctx_tx.pid) == int(pid):
                         eff_tx = ctx_tx
             if eff_tx is None and pid is not None:
-                # Only check active transactions explicitly registered on this adapter
-                matching = [
-                    t for t in self._active_transactions.values()
-                    if t.adapter_id == self.adapter_id and not t.committed and not t.aborted and int(t.pid) == int(pid)
-                ]
-                if len(matching) == 1:
-                    eff_tx = matching[0]
+                # Check thread-local transaction context stack for active transaction on this adapter and PID
+                cur_stack = _tx_stack.get(None) or []
+                for t in reversed(cur_stack):
+                    if t.adapter_id == self.adapter_id and not t.committed and not t.aborted:
+                        if int(t.pid) == int(pid):
+                            eff_tx = t
+                            break
 
         if eff_tx is not None:
             if num_reads > 0:
@@ -373,8 +373,6 @@ class TargetExecutionAdapter(ABC):
         """Commit an active capture transaction, verifying target identity post-capture."""
         self._ensure_tracking_state()
         target_tx = tx or _current_capture_tx.get(None)
-        if not target_tx and len(self._active_transactions) == 1:
-            target_tx = next(iter(self._active_transactions.values()))
         if not target_tx or target_tx.aborted:
             raise ValueError("No active or valid capture transaction to commit")
         if target_tx.adapter_id and target_tx.adapter_id != self.adapter_id:
@@ -548,8 +546,15 @@ class TargetExecutionAdapter(ABC):
             "read_latency_p50_ms": round(p50, 4),
             "read_latency_p95_ms": round(p95, 4),
             "read_latency_max_ms": round(max_lat, 4),
+            "physical_read_latency_p50_ms": round(p50, 4),
+            "physical_read_latency_p95_ms": round(p95, 4),
+            "physical_read_latency_max_ms": round(max_lat, 4),
             "target_suspension_applicable": False,
+            "target_suspension_status": "NOT_APPLICABLE",
             "process_suspension_time_ms": None,
+            "collector_overhead_ms": 0.0,
+            "clock_source": "time.monotonic_ns",
+            "measurement_type": "MEASURED",
             "suspension_explanation": "Zero-stop concurrent read (process_vm_readv / procfs mem); target process was not suspended with SIGSTOP",
             "measurement_method": "monotonic_ns_user_space",
             "sla_4_5ms_satisfied": bool(max_lat < 4.5),
@@ -566,6 +571,8 @@ class TargetExecutionAdapter(ABC):
                 raise PIDReusedError(
                     f"Cannot pin target identity for PID {pid}: missing mandatory attribute '{req_field}'"
                 )
+        if companion_build_id:
+            ident["companion_build_id"] = str(companion_build_id)
         if companion_build_id and ident.get("build_id"):
             if str(ident["build_id"]).strip().lower() != str(companion_build_id).strip().lower():
                 raise ValueError(
@@ -607,83 +614,44 @@ class TargetExecutionAdapter(ABC):
         from .capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
 
         tx: Optional[CaptureTransaction] = None
-        if transaction is not None:
-            if isinstance(transaction, str):
-                tx = self._committed_transactions.get(transaction)
-                if tx is None:
-                    if transaction in self._active_transactions:
-                        raise ValueError(f"Cannot issue live receipt: capture transaction '{transaction}' is active and not committed")
-                    raise ValueError(f"Capture transaction '{transaction}' not found on adapter")
-            else:
-                tx = transaction
+        if transaction is None:
+            raise ValueError(
+                "Explicit committed CaptureTransaction reference or transaction ID required for live capture receipt issuance; "
+                "implicit, single-candidate, and automatic transaction selection is strictly prohibited."
+            )
+        if isinstance(transaction, str):
+            tx = self._committed_transactions.get(transaction)
+            if tx is None:
+                if transaction in self._active_transactions:
+                    raise ValueError(f"Cannot issue live receipt: capture transaction '{transaction}' is active and not committed")
+                raise ValueError(f"Capture transaction '{transaction}' not found on adapter")
+        else:
+            tx = transaction
             if tx.adapter_id and tx.adapter_id != self.adapter_id:
                 raise ValueError(
                     f"Transaction ownership mismatch: transaction '{tx.transaction_id}' "
                     f"belongs to adapter '{tx.adapter_id}', not '{self.adapter_id}'"
                 )
-            if tx.receipt_issued:
-                raise ValueError(f"Live capture receipt already issued for transaction '{tx.transaction_id}'")
-        else:
-            candidates = [
-                t for t in self._committed_transactions.values()
-                if t.adapter_id == self.adapter_id
-                and str(t.session_id) == str(session_id)
-                and int(t.pid) == int(pid)
-                and not t.receipt_issued
-                and not t.aborted
-            ]
-            if len(candidates) == 1:
-                tx = candidates[0]
-            elif len(candidates) > 1:
-                # Ambiguous candidate set: multiple committed unissued transactions exist.
-                # Sorting timestamps is strictly prohibited. Reject fail-closed.
+            if tx.aborted:
                 raise ValueError(
-                    f"Ambiguous receipt issuance: multiple ({len(candidates)}) committed unissued capture transactions "
-                    f"exist for session '{session_id}' and PID {pid}; explicit transaction reference required"
+                    f"Cannot issue live capture receipt for aborted capture transaction '{tx.transaction_id}': {tx.abort_reason}"
                 )
-            else:
-                # Check if a receipt was already issued for this session & PID
-                already_issued = [
-                    t for t in self._committed_transactions.values()
-                    if t.adapter_id == self.adapter_id
-                    and str(t.session_id) == str(session_id)
-                    and int(t.pid) == int(pid)
-                    and t.receipt_issued
-                ]
-                if already_issued:
-                    raise ValueError(f"Live capture receipt already issued for transaction '{already_issued[-1].transaction_id}'")
-
-                ctx_tx = _current_capture_tx.get(None)
-                if (
-                    ctx_tx is not None
-                    and ctx_tx.adapter_id == self.adapter_id
-                    and str(ctx_tx.session_id) == str(session_id)
-                    and int(ctx_tx.pid) == int(pid)
-                    and not ctx_tx.committed
-                    and not ctx_tx.aborted
-                    and ctx_tx.physical_bytes_read > 0
-                ):
-                    tx = self.commit_capture_transaction(ctx_tx)
-                elif len(self._active_transactions) == 1:
-                    act = next(iter(self._active_transactions.values()))
-                    if (
-                        act.adapter_id == self.adapter_id
-                        and str(act.session_id) == str(session_id)
-                        and int(act.pid) == int(pid)
-                        and not act.committed
-                        and not act.aborted
-                        and act.physical_bytes_read > 0
-                    ):
-                        tx = self.commit_capture_transaction(act)
-
-        if tx is None or tx.physical_bytes_read <= 0:
-            raise ValueError(
-                f"Cannot issue live capture receipt for PID {pid}: no physical reads performed in capture transaction (physical_bytes_read={self._physical_bytes_read})"
-            )
+            if not tx.committed:
+                raise ValueError(f"Cannot issue live capture receipt for uncommitted capture transaction '{tx.transaction_id}'")
+            if tx.transaction_id not in self._committed_transactions:
+                raise ValueError(f"Capture transaction '{tx.transaction_id}' is not recorded in adapter committed transactions")
 
         if tx.adapter_id and tx.adapter_id != self.adapter_id:
             raise ValueError(
-                f"Transaction ownership mismatch: transaction '{tx.transaction_id}' belongs to adapter '{tx.adapter_id}', not '{self.adapter_id}'"
+                f"Transaction ownership mismatch: transaction '{tx.transaction_id}' "
+                f"belongs to adapter '{tx.adapter_id}', not '{self.adapter_id}'"
+            )
+        if tx.receipt_issued:
+            raise ValueError(f"Cannot reuse capture transaction '{tx.transaction_id}': receipt already issued. New physical reads required.")
+
+        if tx.physical_bytes_read <= 0:
+            raise ValueError(
+                f"Cannot issue live capture receipt for PID {pid}: no physical reads performed in capture transaction (physical_bytes_read={self._physical_bytes_read})"
             )
 
         if str(tx.session_id) != str(session_id):
@@ -716,9 +684,6 @@ class TargetExecutionAdapter(ABC):
             raise ValueError(
                 f"Cannot reuse capture transaction '{tx.transaction_id}': receipt already issued. New physical reads required."
             )
-
-        # Atomic receipt issuance
-        tx.receipt_issued = True
 
         if int(pid) in self._pinned_identities:
             ok_pin, pin_err = self.verify_pinned_identity(int(pid))
@@ -876,8 +841,14 @@ class TargetExecutionAdapter(ABC):
 class LocalTargetAdapter(TargetExecutionAdapter):
     """Execution adapter for local Linux processes using direct /proc and process_vm_readv."""
 
-    def __init__(self, memory_reader_fn: Optional[Callable[[int, int, int], Tuple[Optional[bytes], str, Optional[str]]]] = None):
+    def __init__(
+        self,
+        memory_reader_fn: Optional[Callable[[int, int, int], Tuple[Optional[bytes], str, Optional[str]]]] = None,
+        adapter_id: Optional[str] = None,
+    ):
         self._ensure_tracking_state()
+        if adapter_id:
+            self._adapter_id = str(adapter_id)
         self._memory_reader = memory_reader_fn
 
     def is_remote(self) -> bool:

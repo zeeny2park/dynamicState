@@ -1246,6 +1246,12 @@ class EvidenceLedger:
             if not ok_att:
                 raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': {err_att}")
 
+            if c_att.target_identity and record.target_identity:
+                c_pid = c_att.target_identity.get("pid")
+                r_pid = record.target_identity.get("pid")
+                if c_pid is not None and r_pid is not None and int(c_pid) != int(r_pid):
+                    raise ValueError(f"CausalAttestation target PID mismatch for record '{record.evidence_id}': attestation has {c_pid}, record has {r_pid}")
+
             if not hasattr(self, "_used_causal_attestation_ids"):
                 self._used_causal_attestation_ids: Set[str] = set()
             if c_att.attestation_id in self._used_causal_attestation_ids:
@@ -1255,8 +1261,26 @@ class EvidenceLedger:
             if c_att.precondition_evidence_id and c_att.precondition_evidence_id not in self._by_id:
                 raise ValueError(f"CausalAttestation references nonexistent precondition evidence '{c_att.precondition_evidence_id}'")
 
-        if (p_details.get("causal_proof") is True or p_details.get("deterministic_transition_verified") is True) and not raw_causal and not p_prov.get("verifier_attestation"):
+        if (
+            p_details.get("causal_proof") is True
+            or p_details.get("deterministic_transition_verified") is True
+            or p_details.get("transition_verified") is True
+            or p_prov.get("causally_verified") is True
+        ) and not raw_causal and not p_prov.get("verifier_attestation"):
             raise ValueError(f"Caller-supplied causal_proof=True on record '{record.evidence_id}' rejected: missing valid cryptographic CausalAttestation")
+
+        # Reject synthetic or imported provenance escalation to production authority
+        prov_cls = p_prov.get("provenance_class") or record.provenance_class
+        if prov_cls in ("SYNTHETIC", "SYNTHETIC_FIXTURE", "IMPORTED_UNVERIFIED"):
+            lcr = p_prov.get("live_capture_receipt")
+            if lcr:
+                lcr_auth = lcr.get("authority_level") if isinstance(lcr, dict) else getattr(lcr, "authority_level", None)
+                if lcr_auth == "PRODUCTION":
+                    raise ValueError(f"Synthetic or imported evidence '{record.evidence_id}' cannot claim PRODUCTION authority live_capture_receipt")
+            if raw_causal:
+                ca_auth = raw_causal.get("authority_level") if isinstance(raw_causal, dict) else getattr(raw_causal, "authority_level", None)
+                if ca_auth == "PRODUCTION":
+                    raise ValueError(f"Synthetic or imported evidence '{record.evidence_id}' cannot claim PRODUCTION authority causal_attestation")
 
 
     def transition_provenance(
@@ -1427,6 +1451,7 @@ class EvidenceLedger:
             "session_id": self.session_id,
             "created_at": self.created_at,
             "record_count": len(self._records),
+            "used_causal_attestation_ids": list(getattr(self, "_used_causal_attestation_ids", set())),
             "records": [r.to_dict() for r in self._records],
         }
 
@@ -1442,8 +1467,15 @@ class EvidenceLedger:
             schema_version=data.get("schema_version", EVIDENCE_SCHEMA_VERSION),
         )
         ledger.created_at = data.get("created_at", ledger.created_at)
+        ledger._used_causal_attestation_ids = set()
+        seen_ids = set()
         for rec_data in data.get("records", []):
-            ledger.add_record(EvidenceRecord.from_dict(rec_data))
+            rec = EvidenceRecord.from_dict(rec_data)
+            if rec.evidence_id in seen_ids:
+                raise ValueError(f"Duplicate evidence_id '{rec.evidence_id}' during ledger reconstruction")
+            seen_ids.add(rec.evidence_id)
+            ledger.add_record(rec)
+        ledger._used_causal_attestation_ids.update(data.get("used_causal_attestation_ids", []))
         return ledger
 
     @classmethod

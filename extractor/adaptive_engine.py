@@ -1066,8 +1066,9 @@ class AdaptiveInvestigationEngine:
                         r_vmas = [m for m in p_maps if m.get("is_readable")]
                         if r_vmas:
                             if hasattr(adapter, "capture_transaction"):
-                                with adapter.capture_transaction(session_id=session_id or "probe_cap", pid=pid, operation_type="diagnostic"):
+                                with adapter.capture_transaction(session_id=session_id or "probe_cap", pid=pid, operation_type="diagnostic") as p_tx:
                                     adapter.read_memory(pid, r_vmas[0]["start_int"], 64)
+                                    caps["_probe_tx"] = p_tx
                             else:
                                 adapter.read_memory(pid, r_vmas[0]["start_int"], 64)
                 except Exception:
@@ -1229,12 +1230,14 @@ class AdaptiveInvestigationEngine:
         target_identity["provenance_class"] = eff_prov
 
         live_rcpt_obj = None
-        if eff_adapter._physical_bytes_read > 0 and capabilities.get("process_alive") and not fixture_data:
+        probe_tx = capabilities.get("_probe_tx")
+        if probe_tx is not None and probe_tx.physical_bytes_read > 0 and capabilities.get("process_alive") and not fixture_data:
             try:
                 live_rcpt_obj = eff_adapter.issue_live_receipt_for_session(
                     session_id=sess_id,
                     pid=pid,
                     companion_build_id=target_identity.get("build_id"),
+                    transaction=probe_tx,
                 )
             except Exception:
                 live_rcpt_obj = None
@@ -1511,15 +1514,6 @@ class AdaptiveInvestigationEngine:
                         )
                     except Exception:
                         step_rcpt = None
-                elif eff_adapter._physical_bytes_read > 0 and capabilities.get("process_alive") and not fixture_data:
-                    try:
-                        step_rcpt = eff_adapter.issue_live_receipt_for_session(
-                            session_id=sess_id,
-                            pid=pid,
-                            companion_build_id=target_identity.get("build_id"),
-                        )
-                    except Exception:
-                        step_rcpt = None
 
                 if step_rcpt:
                     res["live_capture_receipt"] = step_rcpt.to_dict()
@@ -1775,15 +1769,6 @@ class AdaptiveInvestigationEngine:
                         pid=pid,
                         companion_build_id=target_identity.get("build_id"),
                         transaction=step_tx,
-                    )
-                except Exception:
-                    step_rcpt = None
-            elif eff_adapter._physical_bytes_read > 0 and capabilities.get("process_alive") and not fixture_data:
-                try:
-                    step_rcpt = eff_adapter.issue_live_receipt_for_session(
-                        session_id=sess_id,
-                        pid=pid,
-                        companion_build_id=target_identity.get("build_id"),
                     )
                 except Exception:
                     step_rcpt = None

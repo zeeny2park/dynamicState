@@ -201,6 +201,30 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase2_0_a_3_13_sla_measurement.py
 
+      - name: Run Phase 2.0-A.3.14 Explicit Transaction Receipt Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_explicit_transaction_receipt.py
+
+      - name: Run Phase 2.0-A.3.14 Context Isolation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_context_isolation.py
+
+      - name: Run Phase 2.0-A.3.14 Durable Causal Attestation Trust Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_durable_causal_trust.py
+
+      - name: Run Phase 2.0-A.3.14 Authoritative Evidence Ledger Boundary Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_authoritative_ledger_boundary.py
+
+      - name: Run Phase 2.0-A.3.14 Real Exactly-Once Workflow Recovery Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_workflow_crash_boundaries.py
+
+      - name: Run Phase 2.0-A.3.14 Target Identity Trust and SLA Measurement Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_target_identity_and_measurement.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

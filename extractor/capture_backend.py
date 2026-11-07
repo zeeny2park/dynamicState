@@ -781,9 +781,124 @@ def issue_live_capture_receipt(
 _TRUSTED_CAUSAL_VERIFIER_TOKEN = os.urandom(32).hex()
 
 
+class CausalVerifierAuthority:
+    """Explicit trusted verifier authority managing causal verification keys and attestation lifecycle."""
+
+    def __init__(
+        self,
+        authority_id: str = "dynamicstate_causal_verifier_v1",
+        key_store: Optional["CaptureKeyStore"] = None,
+        authority_secret: Optional[str] = None,
+    ):
+        self.authority_id = authority_id
+        self.key_store = key_store or get_default_key_store()
+        self._authority_token = authority_secret or _TRUSTED_CAUSAL_VERIFIER_TOKEN
+        self._revoked_keys: Set[str] = set()
+
+    def get_verifier_token(self) -> str:
+        """Access token bound to this specific authority instance."""
+        return self._authority_token
+
+    def rotate_key(self, new_key_id: str, new_secret: Optional[str] = None) -> Tuple[str, str]:
+        """Rotate the active attestation signing key."""
+        sec = new_secret or os.urandom(32).hex()
+        if hasattr(self.key_store, "register_key"):
+            self.key_store.register_key(new_key_id, sec)
+        if hasattr(self.key_store, "_keys"):
+            self.key_store._keys[new_key_id] = sec
+        if hasattr(self.key_store, "_active_key_id"):
+            self.key_store._active_key_id = new_key_id
+        return new_key_id, sec
+
+    def revoke_key(self, key_id: str) -> None:
+        """Revoke a signing key so subsequent verifications reject it."""
+        self._revoked_keys.add(key_id)
+        if hasattr(self.key_store, "revoke_key"):
+            self.key_store.revoke_key(key_id)
+
+    def is_key_revoked(self, key_id: str) -> bool:
+        if key_id in self._revoked_keys:
+            return True
+        if hasattr(self.key_store, "is_revoked"):
+            return self.key_store.is_revoked(key_id)
+        return False
+
+    def issue_attestation(
+        self,
+        session_id: str,
+        target_identity: Dict[str, Any],
+        operation_id: str,
+        precondition_evidence_id: str,
+        postcondition_evidence_id: str,
+        claimed_transition: Dict[str, Any],
+        intervention_details: Optional[Dict[str, Any]] = None,
+        ttl_seconds: int = 3600,
+        authority_level: str = "PRODUCTION",
+        verifier_authority_token: Optional[str] = None,
+        secret: Optional[str] = None,
+        key_id: Optional[str] = None,
+    ) -> "CausalAttestation":
+        if authority_level == "PRODUCTION":
+            if verifier_authority_token != self._authority_token and verifier_authority_token != _TRUSTED_CAUSAL_VERIFIER_TOKEN:
+                raise ValueError(
+                    "Unauthorized causal attestation issuance: PRODUCTION authority can only be issued by trusted causal verification authority."
+                )
+
+        if not session_id or not str(session_id).strip():
+            raise ValueError("CausalAttestation requires non-empty session_id")
+        if not operation_id or not str(operation_id).strip():
+            raise ValueError("CausalAttestation requires non-empty operation_id")
+        if not target_identity or not isinstance(target_identity, dict):
+            raise ValueError("CausalAttestation requires non-empty target_identity dict")
+        pid = target_identity.get("pid")
+        if pid is None or int(pid) <= 1:
+            raise ValueError(f"CausalAttestation target_identity requires valid PID, got {pid}")
+        if not target_identity.get("executable_identity") and not target_identity.get("executable"):
+            raise ValueError("CausalAttestation target_identity requires verified executable identity")
+        if not precondition_evidence_id or not str(precondition_evidence_id).strip():
+            raise ValueError("CausalAttestation requires non-empty precondition_evidence_id")
+        if not postcondition_evidence_id or not str(postcondition_evidence_id).strip():
+            raise ValueError("CausalAttestation requires non-empty postcondition_evidence_id")
+        if not claimed_transition or not isinstance(claimed_transition, dict):
+            raise ValueError("CausalAttestation requires non-empty claimed_transition dict")
+
+        active_kid, active_sec = self.key_store.get_active_signing_key()
+        use_kid = key_id or active_kid
+        if self.is_key_revoked(use_kid):
+            raise ValueError(f"Cannot sign CausalAttestation: key '{use_kid}' is revoked")
+        use_sec = secret or (active_sec if use_kid == active_kid else self.key_store.resolve_key(use_kid))
+
+        now = time.time_ns()
+        exp = now + int(ttl_seconds * 1_000_000_000)
+        att = CausalAttestation(
+            attestation_id=f"causal_att_{uuid.uuid4().hex[:12]}",
+            session_id=str(session_id),
+            target_identity=dict(target_identity),
+            operation_id=str(operation_id),
+            precondition_evidence_id=str(precondition_evidence_id),
+            postcondition_evidence_id=str(postcondition_evidence_id),
+            claimed_transition=dict(claimed_transition),
+            intervention_details=dict(intervention_details or {}),
+            issued_at_ns=now,
+            expires_at_ns=exp,
+            verifier_identity=self.authority_id,
+            key_id=use_kid,
+            authority_level=str(authority_level),
+        )
+        att.sign(secret=use_sec)
+        return att
+
+
+_DEFAULT_CAUSAL_AUTHORITY = CausalVerifierAuthority()
+
+
+def get_default_causal_authority() -> CausalVerifierAuthority:
+    return _DEFAULT_CAUSAL_AUTHORITY
+
+
 def get_trusted_causal_authority_token() -> str:
     """Internal token reserved strictly for authorized causal verification engines."""
-    return _TRUSTED_CAUSAL_VERIFIER_TOKEN
+    return _DEFAULT_CAUSAL_AUTHORITY.get_verifier_token()
 
 
 @dataclass
@@ -860,7 +975,17 @@ class CausalAttestation:
             if hasattr(ks, "is_revoked") and ks.is_revoked(self.key_id):
                 return False, f"KEY_REVOKED: Attestation signing key '{self.key_id}' is revoked"
             try:
-                if self.key_id in ("default", "ephemeral") or not ks._keys.get(self.key_id):
+                if hasattr(ks, "_keys") and self.key_id in ks._keys:
+                    use_sec = ks._keys[self.key_id]
+                elif hasattr(ks, "resolve_key"):
+                    try:
+                        use_sec = ks.resolve_key(self.key_id)
+                    except Exception:
+                        if self.key_id in ("default", "ephemeral"):
+                            _, use_sec = ks.get_active_signing_key()
+                        else:
+                            raise
+                elif self.key_id in ("default", "ephemeral"):
                     _, use_sec = ks.get_active_signing_key()
                 else:
                     use_sec = ks.resolve_key(self.key_id)
@@ -928,33 +1053,20 @@ def issue_causal_attestation(
     secret: Optional[str] = None,
     key_id: Optional[str] = None,
 ) -> CausalAttestation:
-    if authority_level == "PRODUCTION":
-        if verifier_authority_token != _TRUSTED_CAUSAL_VERIFIER_TOKEN:
-            raise ValueError(
-                "Unauthorized causal attestation issuance: PRODUCTION authority can only be issued by trusted causal verification authority."
-            )
-    ks = get_default_key_store()
-    active_kid, active_sec = ks.get_active_signing_key()
-    use_kid = key_id or active_kid
-    use_sec = secret or active_sec
-    now = time.time_ns()
-    exp = now + int(ttl_seconds * 1_000_000_000)
-    att = CausalAttestation(
-        attestation_id=f"causal_att_{uuid.uuid4().hex[:12]}",
-        session_id=str(session_id),
-        target_identity=dict(target_identity or {}),
-        operation_id=str(operation_id or ""),
-        precondition_evidence_id=str(precondition_evidence_id or ""),
-        postcondition_evidence_id=str(postcondition_evidence_id or ""),
-        claimed_transition=dict(claimed_transition or {}),
-        intervention_details=dict(intervention_details or {}),
-        issued_at_ns=now,
-        expires_at_ns=exp,
-        key_id=use_kid,
-        authority_level=str(authority_level),
+    return _DEFAULT_CAUSAL_AUTHORITY.issue_attestation(
+        session_id=session_id,
+        target_identity=target_identity,
+        operation_id=operation_id,
+        precondition_evidence_id=precondition_evidence_id,
+        postcondition_evidence_id=postcondition_evidence_id,
+        claimed_transition=claimed_transition,
+        intervention_details=intervention_details,
+        ttl_seconds=ttl_seconds,
+        authority_level=authority_level,
+        verifier_authority_token=verifier_authority_token,
+        secret=secret,
+        key_id=key_id,
     )
-    att.sign(secret=use_sec)
-    return att
 
 
 @dataclass

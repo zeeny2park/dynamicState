@@ -111,7 +111,7 @@ class TestPhase20A312TransactionIsolation(unittest.TestCase):
             # Attempting to issue a live capture receipt without a committed transaction must fail
             with self.assertRaises(ValueError) as ctx:
                 adapter.issue_live_receipt_for_session(self.session_id, self.pid)
-            self.assertIn("no physical reads performed in capture transaction", str(ctx.exception))
+            self.assertTrue("no physical reads" in str(ctx.exception).lower() or "explicit committed" in str(ctx.exception).lower())
 
     # -------------------------------------------------------------------------
     # 4. Digest Address Separation
