@@ -815,7 +815,15 @@ class AdaptiveInvestigationEngine:
         default_limits: Optional[ObservationBudgetLimits] = None,
         ledger: Optional[EvidenceLedger] = None,
     ):
-        self.watch_manager = watch_manager
+        if watch_manager is None:
+            try:
+                from extractor.watch_session import WatchSessionManager
+                import tempfile
+                self.watch_manager = WatchSessionManager(corpus_dir=tempfile.mkdtemp(prefix="adaptive_wm_"))
+            except Exception:
+                self.watch_manager = None
+        else:
+            self.watch_manager = watch_manager
         self.registry = registry or self._build_default_registry()
         self.default_limits = default_limits or ObservationBudgetLimits()
         self.planner = AdaptiveInvestigationPlanner(self.registry)
@@ -1056,7 +1064,11 @@ class AdaptiveInvestigationEngine:
                     if p_maps:
                         r_vmas = [m for m in p_maps if m.get("is_readable")]
                         if r_vmas:
-                            adapter.read_memory(pid, r_vmas[0]["start_int"], 64)
+                            if hasattr(adapter, "capture_transaction"):
+                                with adapter.capture_transaction(session_id="probe_cap", pid=pid, operation_type="probe"):
+                                    adapter.read_memory(pid, r_vmas[0]["start_int"], 64)
+                            else:
+                                adapter.read_memory(pid, r_vmas[0]["start_int"], 64)
                 except Exception:
                     pass
             if adapter.is_remote():
@@ -1476,7 +1488,19 @@ class AdaptiveInvestigationEngine:
                     })
                     break
 
-                if live_rcpt_obj:
+                step_rcpt = None
+                try:
+                    step_rcpt = eff_adapter.issue_live_receipt_for_session(
+                        session_id=sess_id,
+                        pid=pid,
+                        companion_build_id=target_identity.get("build_id"),
+                    )
+                except Exception:
+                    step_rcpt = None
+
+                if step_rcpt:
+                    res["live_capture_receipt"] = step_rcpt.to_dict()
+                elif live_rcpt_obj and getattr(live_rcpt_obj, "operation_type", "diagnostic") != "probe":
                     res["live_capture_receipt"] = live_rcpt_obj.to_dict()
 
                 ev_rec = self.adapter.adapt_generic_tool_output(
@@ -1710,7 +1734,19 @@ class AdaptiveInvestigationEngine:
                     temporal_samples_count += 1
                     self.cache.advance_epoch()
 
-            if live_rcpt_obj:
+            step_rcpt = None
+            try:
+                step_rcpt = eff_adapter.issue_live_receipt_for_session(
+                    session_id=sess_id,
+                    pid=pid,
+                    companion_build_id=target_identity.get("build_id"),
+                )
+            except Exception:
+                step_rcpt = None
+
+            if step_rcpt:
+                raw_obs_res["live_capture_receipt"] = step_rcpt.to_dict()
+            elif live_rcpt_obj and getattr(live_rcpt_obj, "operation_type", "diagnostic") != "probe":
                 raw_obs_res["live_capture_receipt"] = live_rcpt_obj.to_dict()
 
             ev_rec = self.adapter.adapt_generic_tool_output(

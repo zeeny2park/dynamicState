@@ -473,6 +473,13 @@ VALID_EVIDENCE_TYPES = {
     EVIDENCE_TYPE_DIAGNOSTIC,
 }
 
+DIAGNOSTIC_EVIDENCE_TYPES = {
+    EVIDENCE_TYPE_FIELD_OBSERVATION,
+    EVIDENCE_TYPE_OBJECT_STATE,
+    EVIDENCE_TYPE_COMPARISON,
+    EVIDENCE_TYPE_DIAGNOSTIC,
+}
+
 # Nature classification: direct observation vs inference
 NATURE_OBSERVATION = "observation"
 NATURE_INFERENCE = "inference"
@@ -1141,10 +1148,63 @@ class EvidenceLedger:
                     rcpt_ep_int = None
                 if exp_ep_int is not None and rcpt_ep_int is not None and exp_ep_int != rcpt_ep_int:
                     raise ValueError(f"LiveCaptureReceipt capture_epoch mismatch for record '{record.evidence_id}': expected {exp_epoch}, got {rcpt_obj.capture_epoch}")
+
+            # A.3.11: Probe receipt isolation
+            if record.evidence_type in DIAGNOSTIC_EVIDENCE_TYPES and getattr(rcpt_obj, "operation_type", "diagnostic") == "probe":
+                raise ValueError(f"Probe read receipt cannot attest to diagnostic evidence record '{record.evidence_id}'")
+
+            # A.3.11: Observation digest binding
+            rec_obs_dig = (record.details or {}).get("observation_digest") or (record.details or {}).get("expected_observation_digest")
+            if not rec_obs_dig and "payload_digest" in (record.details or {}):
+                rec_obs_dig = (record.details or {}).get("payload_digest")
+            if getattr(rcpt_obj, "observation_digest", "") and rec_obs_dig:
+                if str(rcpt_obj.observation_digest) != str(rec_obs_dig):
+                    raise ValueError(
+                        f"Mismatched observation digest for record '{record.evidence_id}': "
+                        f"receipt={rcpt_obj.observation_digest}, record={rec_obs_dig}"
+                    )
+
+            # A.3.11: Receipt replay protection
+            if not hasattr(self, "_used_operation_ids"):
+                self._used_operation_ids: Dict[str, Dict[str, Any]] = {}
+            op_id = getattr(rcpt_obj, "operation_id", None)
+            eff_field = (record.field_observation or {}).get("field_path") or record.details.get("field_path") or ""
+            if op_id:
+                if op_id in self._used_operation_ids:
+                    prev = self._used_operation_ids[op_id]
+                    if prev.get("session_id") != (record.session_id or self.session_id):
+                        raise ValueError(f"Receipt replay across sessions rejected for operation '{op_id}'")
+                    if exp_pid is not None and prev.get("pid") is not None and prev["pid"] != exp_pid:
+                        raise ValueError(f"Receipt replay across PIDs rejected for operation '{op_id}'")
+                    if prev.get("evidence_id") != record.evidence_id and not record.details.get("derived_from"):
+                        if prev.get("observation") != record.observation or prev.get("field") != eff_field:
+                            raise ValueError(
+                                f"Receipt replay detected for operation '{op_id}' across different evidence records: "
+                                f"prev='{prev.get('evidence_id')}', new='{record.evidence_id}'"
+                            )
+                self._used_operation_ids[op_id] = {
+                    "session_id": record.session_id or self.session_id,
+                    "pid": exp_pid,
+                    "evidence_id": record.evidence_id,
+                    "observation": record.observation,
+                    "field": eff_field,
+                }
         elif prov_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
             att = p_prov.get("verifier_attestation") or p_details.get("verifier_attestation")
             if not att or not isinstance(att, dict) or att.get("attestation_rejected") or not att.get("token_sig"):
                 raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION record '{record.evidence_id}' requires a valid cryptographically authenticated verifier attestation")
+            if att.get("revoked") or att.get("expired"):
+                raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION attestation is revoked or expired for '{record.evidence_id}'")
+            if att.get("investigation_id") and str(att["investigation_id"]) != str(self.session_id):
+                raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION attestation session mismatch: expected '{self.session_id}', got '{att.get('investigation_id')}'")
+
+            # Verify cryptographic attestation signature
+            fp = att.get("evidence_fingerprint")
+            if not fp:
+                raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION missing evidence_fingerprint for '{record.evidence_id}'")
+            expected_sig = compute_attestation_signature(self.session_secret, record.evidence_id, fp, self.session_id)
+            if not hmac.compare_digest(str(att.get("token_sig", "")), str(expected_sig)):
+                raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION cryptographic signature verification failed for '{record.evidence_id}'")
 
 
     def transition_provenance(

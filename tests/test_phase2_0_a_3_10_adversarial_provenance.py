@@ -23,9 +23,14 @@ Tests proving all 18 negative / adversarial provenance scenarios fail closed:
 
 import os
 import unittest
+import uuid
 from unittest.mock import MagicMock
 
-from extractor.capture_backend import LiveCaptureReceipt, issue_live_capture_receipt
+from extractor.capture_backend import (
+    LiveCaptureReceipt,
+    get_trusted_capture_authority_token,
+    issue_live_capture_receipt,
+)
 from extractor.evidence_adapter import EvidenceAdapter
 from extractor.evidence_ledger import (
     EVIDENCE_TYPE_FIELD_OBSERVATION,
@@ -62,6 +67,11 @@ class TestPhase20A310AdversarialProvenance(unittest.TestCase):
             "capture_epoch": self.epoch,
             "authority_level": "PRODUCTION",
             "provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+            "capture_authority_token": get_trusted_capture_authority_token(),
+            "physical_bytes_read": 64,
+            "physical_reads_count": 1,
+            "operation_id": f"op_{uuid.uuid4().hex[:8]}",
+            "observation_digest": "digest_valid_1",
         }
         params.update(overrides)
         return issue_live_capture_receipt(**params)

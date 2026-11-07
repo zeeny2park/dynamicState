@@ -358,6 +358,7 @@ class EvidenceAdapter:
                     "epoch": epoch,
                     "limitations": limitations,
                     "self_repair": item.get("self_repair"),
+                    **({"observation_digest": (rcpt if isinstance(rcpt, dict) else rcpt.to_dict()).get("observation_digest")} if rcpt and (rcpt if isinstance(rcpt, dict) else getattr(rcpt, "to_dict", lambda: {})()).get("observation_digest") else {}),
                 },
             )
             records.append(rec)
@@ -623,6 +624,11 @@ class EvidenceAdapter:
             "measured_bytes_read": tool_result.get("measured_bytes_read"),
             "charged_bytes": tool_result.get("charged_bytes"),
         }
+
+        if rcpt:
+            rcpt_dict = rcpt if isinstance(rcpt, dict) else (rcpt.to_dict() if hasattr(rcpt, "to_dict") else {})
+            if rcpt_dict.get("observation_digest"):
+                compact_details["observation_digest"] = rcpt_dict["observation_digest"]
 
         if tool_result.get("error"):
             compact_details["error"] = str(tool_result["error"])

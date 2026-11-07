@@ -25,7 +25,16 @@ Validates:
 
 import unittest
 
-from extractor.capture_backend import issue_live_capture_receipt
+from extractor.capture_backend import (
+    get_trusted_capture_authority_token,
+    issue_live_capture_receipt as _orig_issue_live_capture_receipt,
+)
+
+
+def issue_live_capture_receipt(**kwargs):
+    kwargs.setdefault("capture_authority_token", get_trusted_capture_authority_token())
+    kwargs.setdefault("physical_bytes_read", 64)
+    return _orig_issue_live_capture_receipt(**kwargs)
 from extractor.evidence_ledger import (
     EVIDENCE_TYPE_COMPARISON,
     EVIDENCE_TYPE_FIELD_OBSERVATION,

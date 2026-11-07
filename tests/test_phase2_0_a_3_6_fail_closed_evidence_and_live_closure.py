@@ -24,7 +24,11 @@ import unittest
 from unittest.mock import patch
 
 from extractor.adaptive_engine import AdaptiveInvestigationEngine
-from extractor.capture_backend import LiveCaptureReceipt, issue_live_capture_receipt
+from extractor.capture_backend import (
+    LiveCaptureReceipt,
+    get_trusted_capture_authority_token,
+    issue_live_capture_receipt,
+)
 from extractor.evidence_ledger import (
     EvidenceLedger,
     EvidenceRecord,
@@ -308,6 +312,7 @@ class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
             authority_level="PRODUCTION",
             provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
             target_constraints={"arch": "x86_64"},
+            capture_authority_token=get_trusted_capture_authority_token(),
         )
         ok, reason = valid_rcpt.verify(
             expected_session_id="sess_auth_1",

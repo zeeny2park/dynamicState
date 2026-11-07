@@ -137,7 +137,7 @@ class FunctionalInspectionModule(InspectionModule):
         self._arg_mapper = arg_mapper or (
             lambda c: {
                 "pid": c.pid,
-                "companion_elf_path": c.companion_elf,
+                "companion_elf_path": c.companion_elf or (c.target_info or {}).get("executable") or f"/proc/{c.pid}/exe",
                 "adapter": c.adapter,
                 **c.parameters,
             }

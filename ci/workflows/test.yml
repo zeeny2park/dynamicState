@@ -149,6 +149,18 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase2_0_a_3_10_real_cpp_e2e.py
 
+      - name: Run Phase 2.0-A.3.11 Attestation Security Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_11_attestation_security.py
+
+      - name: Run Phase 2.0-A.3.11 Executable Workflow Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_11_executable_workflow.py
+
+      - name: Run Phase 2.0-A.3.11 Real C++ Live Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_11_real_cpp_e2e.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

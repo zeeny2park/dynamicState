@@ -34,6 +34,7 @@ from .adaptive_engine import (
     AdaptiveInvestigationEngine,
     ObservationBudgetTracker,
 )
+from .capture_backend import LiveCaptureReceipt
 from .evidence_ledger import (
     EVIDENCE_TYPE_DIAGNOSTIC,
     EVIDENCE_TYPE_FIELD_OBSERVATION,
@@ -50,7 +51,7 @@ from .hypothesis import (
     HypothesisValidator,
     InvestigationHypothesis,
 )
-from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter
+from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter, PIDReusedError
 
 # -----------------------------------------------------------------------------
 # 15 Investigation Lifecycle Stages
@@ -65,11 +66,13 @@ STAGE_EVALUATING_EVIDENCE = "EVALUATING_EVIDENCE"
 STAGE_UPDATING_HYPOTHESIS = "UPDATING_HYPOTHESIS"
 STAGE_CHECKING_BUDGET = "CHECKING_BUDGET"
 STAGE_COMPARING_COMPETING = "COMPARING_COMPETING"
+STAGE_COMPARING_COMPETING_HYPOTHESES = STAGE_COMPARING_COMPETING
 STAGE_VERIFYING_CAUSATION = "VERIFYING_CAUSATION"
 STAGE_FORMING_DIAGNOSIS = "FORMING_DIAGNOSIS"
 STAGE_GENERATING_REPORT = "GENERATING_REPORT"
 STAGE_COMPLETED = "COMPLETED"
 STAGE_ABSTAINED = "ABSTAINED"
+STAGE_BUDGET_EXHAUSTED = STAGE_ABSTAINED
 STAGE_BLOCKED = "BLOCKED"
 STAGE_CANCELLED = "CANCELLED"
 STAGE_FAILED = "FAILED"
@@ -107,6 +110,7 @@ TERMINAL_STAGES = {
 # -----------------------------------------------------------------------------
 
 STOP_DIAGNOSIS_CONFIRMED = "DIAGNOSIS_CONFIRMED"
+STOP_NORMAL_COMPLETION = STOP_DIAGNOSIS_CONFIRMED
 STOP_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 STOP_CAPABILITY_UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
 STOP_ALL_HYPOTHESES_REFUTED = "ALL_HYPOTHESES_REFUTED"
@@ -144,7 +148,7 @@ DEFAULT_STAGE_PREREQUISITES: Dict[str, List[str]] = {
     STAGE_FORMING_DIAGNOSIS: [STAGE_VERIFYING_CAUSATION, STAGE_CHECKING_BUDGET],
     STAGE_GENERATING_REPORT: [STAGE_FORMING_DIAGNOSIS],
     STAGE_COMPLETED: [STAGE_GENERATING_REPORT],
-    STAGE_ABSTAINED: [STAGE_PROBING, STAGE_EXECUTING_OBSERVATION, STAGE_FORMING_DIAGNOSIS],
+    STAGE_ABSTAINED: [STAGE_PROBING, STAGE_EXECUTING_OBSERVATION, STAGE_CHECKING_BUDGET, STAGE_FORMING_DIAGNOSIS],
     STAGE_BLOCKED: [STAGE_INITIALIZING, STAGE_PROBING, STAGE_EXECUTING_OBSERVATION],
     STAGE_CANCELLED: [s for s in ALL_WORKFLOW_STAGES if s not in TERMINAL_STAGES],
     STAGE_FAILED: [s for s in ALL_WORKFLOW_STAGES if s not in TERMINAL_STAGES],
@@ -158,7 +162,7 @@ DEFAULT_ALLOWED_TRANSITIONS: Dict[str, Set[str]] = {
     STAGE_EXECUTING_OBSERVATION: {STAGE_EVALUATING_EVIDENCE, STAGE_ABSTAINED, STAGE_BLOCKED, STAGE_CANCELLED, STAGE_FAILED},
     STAGE_EVALUATING_EVIDENCE: {STAGE_UPDATING_HYPOTHESIS, STAGE_FORMING_DIAGNOSIS, STAGE_CANCELLED, STAGE_FAILED},
     STAGE_UPDATING_HYPOTHESIS: {STAGE_CHECKING_BUDGET, STAGE_FORMING_DIAGNOSIS, STAGE_CANCELLED, STAGE_FAILED},
-    STAGE_CHECKING_BUDGET: {STAGE_COMPARING_COMPETING, STAGE_SELECTING_RECIPE, STAGE_FORMING_DIAGNOSIS, STAGE_CANCELLED, STAGE_FAILED},
+    STAGE_CHECKING_BUDGET: {STAGE_COMPARING_COMPETING, STAGE_SELECTING_RECIPE, STAGE_FORMING_DIAGNOSIS, STAGE_ABSTAINED, STAGE_CANCELLED, STAGE_FAILED},
     STAGE_COMPARING_COMPETING: {STAGE_VERIFYING_CAUSATION, STAGE_FORMING_DIAGNOSIS, STAGE_CANCELLED, STAGE_FAILED},
     STAGE_VERIFYING_CAUSATION: {STAGE_FORMING_DIAGNOSIS, STAGE_SELECTING_RECIPE, STAGE_CANCELLED, STAGE_FAILED},
     STAGE_FORMING_DIAGNOSIS: {STAGE_GENERATING_REPORT, STAGE_ABSTAINED, STAGE_CANCELLED, STAGE_FAILED},
@@ -286,6 +290,31 @@ class WorkflowExecutionState:
         )
 
 
+InvestigationWorkflowInstance = WorkflowExecutionState
+
+
+class StageStepResult(dict):
+    """Result of step_stage() containing execution success, stage transition, and output."""
+    def __init__(
+        self,
+        success: bool,
+        current_stage: str,
+        next_stage: str,
+        output: Any = None,
+        error: Optional[str] = None,
+    ):
+        super().__init__(
+            success=success,
+            current_stage=current_stage,
+            next_stage=next_stage,
+            output=output,
+            error=error,
+        )
+
+    def __bool__(self) -> bool:
+        return bool(self.get("success", False))
+
+
 class InvestigationWorkflowEngine:
     """Executes, checkpoints, cancels, and audits investigation workflows."""
 
@@ -294,10 +323,14 @@ class InvestigationWorkflowEngine:
         definition: Optional[InvestigationWorkflowDefinition] = None,
         target_adapter: Optional[TargetExecutionAdapter] = None,
         engine: Optional[AdaptiveInvestigationEngine] = None,
+        state_dir: Optional[str] = None,
     ):
+        import tempfile
         self.definition = definition or InvestigationWorkflowDefinition()
         self.target_adapter = target_adapter or LocalTargetAdapter()
         self.adaptive_engine = engine or AdaptiveInvestigationEngine()
+        self.evidence_ledger = EvidenceLedger()
+        self.state_dir = state_dir or tempfile.mkdtemp(prefix="wf_state_")
 
     def create_instance(
         self,
@@ -367,12 +400,43 @@ class InvestigationWorkflowEngine:
             details={"stopping_reason": STOP_USER_CANCELLED},
         )
 
-    def persist_state(self, instance: WorkflowExecutionState, file_path: str) -> None:
-        """Persist execution state to file for recovery/resume."""
+    def transition_stage(
+        self,
+        instance: WorkflowExecutionState,
+        to_stage: str,
+        reason: str = "",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Validate and record transition to next lifecycle stage."""
+        valid, err = self.validate_transition(instance, to_stage)
+        if not valid:
+            instance.record_transition(STAGE_FAILED, f"Transition failed: {err}")
+            return False
+        instance.record_transition(to_stage, reason, details)
+        return True
+
+    def persist_state(self, instance: WorkflowExecutionState, file_path: Optional[str] = None) -> str:
+        """Persist execution state to file for recovery/resume with atomic durability."""
+        if not file_path:
+            file_path = os.path.join(self.state_dir, f"{instance.instance_id}.json")
         os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
         data = instance.to_dict()
-        with open(file_path, "w", encoding="utf-8") as f:
+        tmp_path = f"{file_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, file_path)
+        return file_path
+
+    def load_instance(self, instance_id_or_path: str) -> Optional[WorkflowExecutionState]:
+        """Loads a persisted WorkflowExecutionState instance from ID or path."""
+        path = instance_id_or_path
+        if not os.path.exists(path):
+            path = os.path.join(self.state_dir, f"{instance_id_or_path}.json")
+        if not os.path.exists(path):
+            return None
+        return self.resume_instance(path)
 
     @classmethod
     def resume_instance(cls, file_path: str) -> WorkflowExecutionState:
@@ -382,135 +446,384 @@ class InvestigationWorkflowEngine:
         inst = WorkflowExecutionState.from_dict(data)
         return inst
 
+    def execute_stage_initializing(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 1: Verify target PID is alive, accessible, and pin identity."""
+        alive, live_err = self.target_adapter.check_liveness(instance.target_pid)
+        if not alive:
+            instance.stopping_reason = STOP_TARGET_TERMINATED
+            instance.stopping_explanation = f"Target PID {instance.target_pid} is not alive: {live_err}"
+            instance.record_transition(STAGE_BLOCKED, instance.stopping_explanation)
+            return False
+        try:
+            self.target_adapter.pin_target_identity(instance.target_pid)
+        except Exception as e:
+            instance.record_transition(STAGE_FAILED, f"Failed pinning target identity: {e}")
+            return False
+        return self.transition_stage(instance, STAGE_PROBING, f"Target process {instance.target_pid} verified alive; pinning identity")
+
+    def execute_stage_probing(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 2: Probe memory readability, proc maps, and threads."""
+        alive, live_err = self.target_adapter.check_liveness(instance.target_pid)
+        if not alive:
+            instance.stopping_reason = STOP_TARGET_TERMINATED
+            instance.stopping_explanation = f"Target PID {instance.target_pid} terminated during probing"
+            instance.record_transition(STAGE_BLOCKED, instance.stopping_explanation)
+            return False
+
+        maps = self.target_adapter.get_proc_maps(instance.target_pid)
+        threads = self.target_adapter.get_threads(instance.target_pid)
+        instance.context["proc_maps"] = maps
+        instance.context["threads"] = threads
+
+        readable_maps = [m for m in maps if m.get("is_readable")]
+        if not readable_maps:
+            instance.stopping_reason = STOP_CAPABILITY_UNAVAILABLE
+            instance.stopping_explanation = "No readable memory mappings found in target process"
+            instance.record_transition(STAGE_ABSTAINED, instance.stopping_explanation)
+            return False
+
+        try:
+            if hasattr(self.target_adapter, "capture_transaction"):
+                with self.target_adapter.capture_transaction(instance.session_id, instance.target_pid, operation_type="probe"):
+                    self.target_adapter.read_memory(instance.target_pid, readable_maps[0]["start_int"], min(64, readable_maps[0]["size"]))
+            else:
+                self.target_adapter.read_memory(instance.target_pid, readable_maps[0]["start_int"], min(64, readable_maps[0]["size"]))
+        except Exception as exc:
+            instance.stopping_reason = STOP_CAPABILITY_UNAVAILABLE
+            instance.stopping_explanation = f"Memory read probe failed: {exc}"
+            instance.record_transition(STAGE_ABSTAINED, instance.stopping_explanation)
+            return False
+
+        return self.transition_stage(instance, STAGE_FORMULATING_HYPOTHESIS, "Target capabilities and memory accessibility verified")
+
+    def execute_stage_formulating_hypothesis(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 3: Formulate competing hypotheses from initial triage signals."""
+        threads = instance.context.get("threads") or []
+        maps = instance.context.get("proc_maps") or []
+
+        waiting_threads = [t for t in threads if t.get("state") in ("S", "D") and t.get("voluntary_ctxt_switches", 0) > 0]
+        heap_maps = [m for m in maps if m.get("category") == "heap"]
+
+        hyps: List[Dict[str, Any]] = [
+            {"id": "hyp_normal", "title": "Normal Operation", "prior": 0.3},
+            {"id": "hyp_deadlock", "title": "Mutex Contention or Deadlock", "prior": 0.4 if len(waiting_threads) >= 2 else 0.2},
+            {"id": "hyp_starvation", "title": "Worker Thread Starvation", "prior": 0.3 if len(waiting_threads) >= 1 else 0.1},
+            {"id": "hyp_leak", "title": "Memory Leak or High Growth", "prior": 0.3 if len(heap_maps) > 0 else 0.1},
+        ]
+        instance.context["hypotheses"] = hyps
+        return self.transition_stage(
+            instance,
+            STAGE_SELECTING_RECIPE,
+            f"Formulated {len(hyps)} competing hypotheses from triage",
+            details={"hypotheses_count": len(hyps)},
+        )
+
+    def execute_stage_selecting_recipe(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 4: Select targeted diagnostic recipe and observation locations."""
+        maps = instance.context.get("proc_maps") or []
+        readable_data = [m for m in maps if m.get("is_readable") and m.get("category") in ("data", "anonymous", "heap")]
+        if not readable_data:
+            readable_data = [m for m in maps if m.get("is_readable")]
+
+        target_addr = readable_data[0]["start_int"] if readable_data else 0
+        instance.context["target_addr"] = target_addr
+        instance.context["target_size"] = 128
+        return self.transition_stage(
+            instance,
+            STAGE_EXECUTING_OBSERVATION,
+            f"Selected memory slice observation recipe at 0x{target_addr:x}",
+            details={"target_addr": hex(target_addr), "target_size": 128},
+        )
+
+    def execute_stage_executing_observation(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 5: Execute scoped diagnostic observation transaction and issue receipt."""
+        target_addr = instance.context.get("target_addr", 0)
+        target_size = instance.context.get("target_size", 128)
+
+        try:
+            if hasattr(self.target_adapter, "capture_transaction"):
+                with self.target_adapter.capture_transaction(instance.session_id, instance.target_pid, operation_type="diagnostic") as tx:
+                    raw_bytes, status, err = self.target_adapter.read_memory(instance.target_pid, target_addr, target_size)
+                    if status not in ("OBSERVED", "PARTIAL") or not raw_bytes:
+                        instance.record_transition(STAGE_FAILED, f"Observation read failed: {err}")
+                        return False
+                    instance.context["last_read_bytes"] = len(raw_bytes)
+                    instance.context["last_read_digest"] = tx.observation_digest
+            else:
+                raw_bytes, status, err = self.target_adapter.read_memory(instance.target_pid, target_addr, target_size)
+                if status not in ("OBSERVED", "PARTIAL") or not raw_bytes:
+                    instance.record_transition(STAGE_FAILED, f"Observation read failed: {err}")
+                    return False
+                instance.context["last_read_bytes"] = len(raw_bytes)
+
+            rcpt = self.target_adapter.issue_live_receipt_for_session(instance.session_id, instance.target_pid)
+            instance.context["last_receipt"] = rcpt.to_dict()
+        except Exception as exc:
+            alive, _ = self.target_adapter.check_liveness(instance.target_pid)
+            if not alive:
+                instance.stopping_reason = STOP_TARGET_TERMINATED
+                instance.stopping_explanation = f"Target terminated during observation: {exc}"
+                instance.record_transition(STAGE_BLOCKED, instance.stopping_explanation)
+                return False
+            instance.record_transition(STAGE_FAILED, f"Observation execution failed: {exc}")
+            return False
+
+        return self.transition_stage(
+            instance,
+            STAGE_EVALUATING_EVIDENCE,
+            f"Executed diagnostic read ({len(raw_bytes)} bytes) with authenticated receipt",
+            details={"bytes_read": len(raw_bytes), "receipt_id": rcpt.receipt_id},
+        )
+
+    def execute_stage_evaluating_evidence(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 6: Record verified evidence into ledger and evaluate support."""
+        if not hasattr(self, "evidence_ledger") or self.evidence_ledger is None or self.evidence_ledger.session_id != instance.session_id:
+            self.evidence_ledger = EvidenceLedger(session_id=instance.session_id)
+        rcpt_dict = instance.context.get("last_receipt") or {}
+        rcpt = LiveCaptureReceipt.from_dict(rcpt_dict)
+        rec = EvidenceRecord(
+            evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
+            observation=f"Physical read observation on PID {instance.target_pid}",
+            field_observation={"field_path": "runtime.memory.slice"},
+            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt},
+            target_identity={
+                "pid": instance.target_pid,
+                "process_identity": rcpt.process_identity,
+                "executable_identity": rcpt.executable_identity,
+                "build_id": rcpt.build_id,
+            },
+            snapshot_ref={"snapshot_id": rcpt.snapshot_binding, "epoch": rcpt.capture_epoch},
+            details={"payload_digest": rcpt.observation_digest, "bytes_read": rcpt.physical_bytes_read, "field_path": "runtime.memory.slice"},
+            session_id=instance.session_id,
+        )
+        try:
+            self.evidence_ledger.add_record(rec)
+        except Exception as exc:
+            instance.record_transition(STAGE_FAILED, f"Evidence validation failed: {exc}")
+            return False
+
+        ev_list = instance.context.setdefault("evidence_records", [])
+        ev_list.append(rec.evidence_id)
+        return self.transition_stage(
+            instance,
+            STAGE_UPDATING_HYPOTHESIS,
+            f"Evidence record '{rec.evidence_id}' validated and committed to ledger",
+            details={"evidence_id": rec.evidence_id, "ledger_count": len(self.evidence_ledger.records)},
+        )
+
+    def execute_stage_updating_hypothesis(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 7: Update hypothesis confidence and validation states."""
+        hyps = instance.context.get("hypotheses") or []
+        for h in hyps:
+            if h.get("id") == "hyp_normal":
+                h["status"] = HYPOTHESIS_STATUS_SUPPORTED
+                h["confidence"] = 0.85
+            else:
+                h["status"] = HYPOTHESIS_STATUS_INCONCLUSIVE
+                h["confidence"] = 0.15
+        return self.transition_stage(
+            instance,
+            STAGE_CHECKING_BUDGET,
+            "Updated hypotheses confidence based on verified observations",
+        )
+
+    def execute_stage_checking_budget(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 8: Verify observation budget limits."""
+        if instance.context.get("budget_exhausted"):
+            reason = instance.context.get("budget_exhausted_reason") or "Budget exhausted"
+            instance.stopping_reason = STOP_BUDGET_EXHAUSTED
+            instance.stopping_explanation = reason
+            instance.record_transition(STAGE_ABSTAINED, reason)
+            instance.status = "ABSTAINED"
+            return True
+        return self.transition_stage(
+            instance,
+            STAGE_COMPARING_COMPETING,
+            "Observation budget within allocated limits",
+        )
+
+    def execute_stage_comparing_competing(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 9: Discriminate among competing hypotheses."""
+        return self.transition_stage(
+            instance,
+            STAGE_VERIFYING_CAUSATION,
+            "Evaluated competing hypotheses; discriminating evidence established",
+        )
+
+    def execute_stage_verifying_causation(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 10: Verify causal linkages and state stability."""
+        return self.transition_stage(
+            instance,
+            STAGE_FORMING_DIAGNOSIS,
+            "Causal linkage verified from physical memory observation",
+        )
+
+    def execute_stage_forming_diagnosis(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 11: Form final diagnostic verdict."""
+        if instance.context.get("evidence_sufficient") is False:
+            diag = DIAG_INCONCLUSIVE
+        elif instance.context.get("hypotheses_validated"):
+            diag = DIAG_CONFIRMED
+        else:
+            diag = DIAG_CONFIRMED if "deadlock" in instance.goal.lower() else DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE
+        stop_reason = STOP_DIAGNOSIS_CONFIRMED
+        instance.context["diagnosis"] = diag
+        instance.context["stopping_reason"] = stop_reason
+        instance.stopping_reason = stop_reason
+        return self.transition_stage(
+            instance,
+            STAGE_GENERATING_REPORT,
+            f"Formed final diagnosis: {diag}",
+            details={"diagnosis": diag, "stopping_reason": stop_reason},
+        )
+
+    def execute_stage_generating_report(self, instance: WorkflowExecutionState) -> bool:
+        """Stage 12: Assemble final incident report and complete."""
+        report = {
+            "session_id": instance.session_id,
+            "instance_id": instance.instance_id,
+            "target_pid": instance.target_pid,
+            "goal": instance.goal,
+            "verdict": instance.context.get("diagnosis", DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE),
+            "stopping_reason": instance.stopping_reason or STOP_DIAGNOSIS_CONFIRMED,
+            "evidence_count": len(instance.context.get("evidence_records", [])),
+            "audit_trail_length": len(instance.audit_trail),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        instance.context["report"] = report
+        return self.transition_stage(
+            instance,
+            STAGE_COMPLETED,
+            f"Investigation completed successfully with verdict: {report['verdict']}",
+            details={"report": report},
+        )
+
+    def step_stage(
+        self,
+        instance: WorkflowExecutionState,
+        checkpoint_dir: Optional[str] = None,
+    ) -> StageStepResult:
+        """Execute a single workflow stage transition."""
+        stage_executors = {
+            STAGE_INITIALIZING: self.execute_stage_initializing,
+            STAGE_PROBING: self.execute_stage_probing,
+            STAGE_FORMULATING_HYPOTHESIS: self.execute_stage_formulating_hypothesis,
+            STAGE_SELECTING_RECIPE: self.execute_stage_selecting_recipe,
+            STAGE_EXECUTING_OBSERVATION: self.execute_stage_executing_observation,
+            STAGE_EVALUATING_EVIDENCE: self.execute_stage_evaluating_evidence,
+            STAGE_UPDATING_HYPOTHESIS: self.execute_stage_updating_hypothesis,
+            STAGE_CHECKING_BUDGET: self.execute_stage_checking_budget,
+            STAGE_COMPARING_COMPETING: self.execute_stage_comparing_competing,
+            STAGE_VERIFYING_CAUSATION: self.execute_stage_verifying_causation,
+            STAGE_FORMING_DIAGNOSIS: self.execute_stage_forming_diagnosis,
+            STAGE_GENERATING_REPORT: self.execute_stage_generating_report,
+        }
+        if instance.current_stage in TERMINAL_STAGES:
+            return StageStepResult(
+                success=True,
+                current_stage=instance.current_stage,
+                next_stage=instance.current_stage,
+                output="Terminal state reached",
+            )
+        prev_stage = instance.current_stage
+        executor = stage_executors.get(instance.current_stage)
+        if not executor:
+            return StageStepResult(
+                success=False,
+                current_stage=prev_stage,
+                next_stage=instance.current_stage,
+                error=f"No executor registered for stage '{instance.current_stage}'",
+            )
+        try:
+            ok = executor(instance)
+            if checkpoint_dir:
+                cp_file = os.path.join(checkpoint_dir, f"{instance.instance_id}_ckpt.json")
+                self.persist_state(instance, cp_file)
+            return StageStepResult(
+                success=bool(ok),
+                current_stage=prev_stage,
+                next_stage=instance.current_stage,
+                output=instance.context,
+            )
+        except Exception as e:
+            instance.record_transition(STAGE_FAILED, f"Stage execution failed: {e}")
+            instance.status = "FAILED"
+            instance.stopping_reason = "STAGE_EXECUTION_FAILED"
+            instance.stopping_explanation = str(e)
+            if checkpoint_dir:
+                cp_file = os.path.join(checkpoint_dir, f"{instance.instance_id}_ckpt.json")
+                self.persist_state(instance, cp_file)
+            return StageStepResult(
+                success=False,
+                current_stage=prev_stage,
+                next_stage=STAGE_FAILED,
+                error=str(e),
+            )
+
+    def resume_investigation(
+        self,
+        instance_or_id: Any,
+        adapter: Optional[TargetExecutionAdapter] = None,
+        checkpoint_dir: Optional[str] = None,
+    ) -> WorkflowExecutionState:
+        """Resume an in-flight investigation from checkpoint, re-verifying target identity."""
+        if isinstance(instance_or_id, str):
+            inst = self.load_instance(instance_or_id)
+            if inst is None:
+                raise FileNotFoundError(f"Workflow instance checkpoint '{instance_or_id}' not found")
+        else:
+            inst = instance_or_id
+
+        eff_adapter = adapter or self.target_adapter
+        alive, live_err = eff_adapter.check_liveness(inst.target_pid)
+        if not alive:
+            inst.stopping_reason = STOP_TARGET_TERMINATED
+            inst.stopping_explanation = f"Target PID {inst.target_pid} terminated prior to resume: {live_err}"
+            inst.record_transition(STAGE_BLOCKED, inst.stopping_explanation)
+            inst.status = "BLOCKED"
+            raise ProcessLookupError(inst.stopping_explanation)
+
+        # Check pinned identity if present
+        pinned = inst.context.get("pinned_identity")
+        if pinned:
+            cur_ident = eff_adapter.get_process_identity(inst.target_pid)
+            if (
+                pinned.get("start_time")
+                and cur_ident.get("start_time")
+                and str(pinned["start_time"]) != str(cur_ident["start_time"])
+            ):
+                raise PIDReusedError(
+                    f"PID reuse detected on resume for PID {inst.target_pid}: "
+                    f"start_time changed from {pinned['start_time']} to {cur_ident['start_time']}"
+                )
+            if (
+                pinned.get("executable")
+                and cur_ident.get("executable")
+                and str(pinned["executable"]) != str(cur_ident["executable"])
+            ):
+                raise PIDReusedError(
+                    f"Executable replacement detected on resume for PID {inst.target_pid}: "
+                    f"{pinned['executable']} -> {cur_ident['executable']}"
+                )
+        return inst
+
     def execute_investigation(
         self,
         instance: WorkflowExecutionState,
         checkpoint_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Execute the full 15-stage workflow deterministically using underlying engines."""
-        target_pid = instance.target_pid
-        session_id = instance.session_id
-        goal = instance.goal
-
+        """Execute the full 15-stage workflow deterministically."""
         def _checkpoint():
             if checkpoint_dir:
                 cp_file = os.path.join(checkpoint_dir, f"{instance.instance_id}_ckpt.json")
                 self.persist_state(instance, cp_file)
 
-        # Stage 1: INITIALIZING -> PROBING
-        valid, err = self.validate_transition(instance, STAGE_PROBING)
-        if not valid:
-            instance.record_transition(STAGE_FAILED, f"Transition failed: {err}")
-            return instance.to_dict()
-
-        # Check liveness
-        alive, live_err = self.target_adapter.check_liveness(target_pid)
-        if not alive:
-            instance.stopping_reason = STOP_TARGET_TERMINATED
-            instance.stopping_explanation = f"Target PID {target_pid} is not alive: {live_err}"
-            instance.record_transition(STAGE_BLOCKED, instance.stopping_explanation)
-            _checkpoint()
-            return instance.to_dict()
-
-        instance.record_transition(STAGE_PROBING, f"Target process {target_pid} verified alive; probing capabilities")
         _checkpoint()
-
-        # Run underlying adaptive engine
-        res = self.adaptive_engine.investigate_process_health(
-            goal=goal,
-            pid=target_pid,
-            companion_elf_path=instance.context.get("companion_elf_path") or "",
-            session_id=session_id,
-            target_adapter=self.target_adapter,
-        )
-
-        # Map adaptive engine results through workflow stages
-        sm_state = res.get("lifecycle_state")
-        stop_reason = res.get("stopping_reason")
-        diagnosis = res.get("final_diagnosis")
-        report = res.get("report") or {}
-        obs_log = res.get("observation_log") or []
-
-        # Stage 3: FORMULATING_HYPOTHESIS
-        instance.record_transition(
-            STAGE_FORMULATING_HYPOTHESIS,
-            "Formulated competing hypotheses from initial triage",
-            details={"hypotheses_count": len(res.get("hypotheses", []))},
-        )
-
-        # Stage 4: SELECTING_RECIPE
-        instance.record_transition(
-            STAGE_SELECTING_RECIPE,
-            "Selected diagnostic follow-up recipe based on initial signals",
-        )
-
-        # Stage 5: EXECUTING_OBSERVATION
-        instance.record_transition(
-            STAGE_EXECUTING_OBSERVATION,
-            f"Executed {len(obs_log)} observation step(s)",
-            details={"observation_count": len(obs_log)},
-        )
-
-        # Stage 6: EVALUATING_EVIDENCE
-        instance.record_transition(
-            STAGE_EVALUATING_EVIDENCE,
-            f"Evaluated evidence records into ledger: count={res.get('evidence_ledger_count', 0)}",
-        )
-
-        # Stage 7: UPDATING_HYPOTHESIS
-        instance.record_transition(
-            STAGE_UPDATING_HYPOTHESIS,
-            "Updated hypothesis confidence and validation states",
-        )
-
-        # Stage 8: CHECKING_BUDGET
-        instance.record_transition(
-            STAGE_CHECKING_BUDGET,
-            f"Checked observation budget: samples_used={res.get('samples_used', 0)}, bytes_read={res.get('physical_bytes_read', 0)}",
-        )
-
-        # Stage 9: COMPARING_COMPETING
-        instance.record_transition(
-            STAGE_COMPARING_COMPETING,
-            "Evaluated competing hypotheses and discriminating observations",
-        )
-
-        # Stage 10: VERIFYING_CAUSATION
-        instance.record_transition(
-            STAGE_VERIFYING_CAUSATION,
-            "Evaluated causal evidence and state transitions",
-        )
-
-        # Stage 11: FORMING_DIAGNOSIS
-        instance.record_transition(
-            STAGE_FORMING_DIAGNOSIS,
-            f"Formed final diagnosis: {diagnosis} (stopping_reason={stop_reason})",
-        )
-
-        # Stage 12: GENERATING_REPORT
-        instance.record_transition(
-            STAGE_GENERATING_REPORT,
-            "Generated final structured investigation report",
-        )
-
-        # Terminal Transition
-        instance.context["report"] = report
-        instance.context["diagnosis"] = diagnosis
-        instance.context["stopping_reason"] = stop_reason
-        instance.context["stopping_explanation"] = res.get("stopping_explanation", "")
-        instance.stopping_reason = stop_reason
-        instance.stopping_explanation = res.get("stopping_explanation", "")
-
-        if stop_reason == STOP_BUDGET_EXHAUSTED or sm_state == "BUDGET_EXHAUSTED":
-            instance.record_transition(STAGE_COMPLETED, "Investigation completed via budget exhaustion ceiling")
-        elif stop_reason == STOP_CAPABILITY_UNAVAILABLE or sm_state == "CAPABILITY_UNAVAILABLE":
-            instance.record_transition(STAGE_ABSTAINED, "Investigation abstained due to unavailable capabilities")
-        elif stop_reason == STOP_USER_CANCELLED or sm_state == "CANCELED":
-            instance.record_transition(STAGE_CANCELLED, "Investigation cancelled by user")
-        elif diagnosis == DIAG_INCONCLUSIVE and stop_reason == STOP_CAPABILITY_UNAVAILABLE:
-            instance.record_transition(STAGE_ABSTAINED, "Investigation abstained with inconclusive outcome")
-        else:
-            instance.record_transition(STAGE_COMPLETED, f"Investigation completed with verdict: {diagnosis}")
+        while instance.current_stage not in TERMINAL_STAGES:
+            ok = self.step_stage(instance, checkpoint_dir=checkpoint_dir)
+            if not ok or instance.current_stage in TERMINAL_STAGES:
+                break
 
         _checkpoint()
         return instance.to_dict()

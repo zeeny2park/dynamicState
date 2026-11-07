@@ -456,6 +456,10 @@ class LiveCaptureReceipt:
     - snapshot binding (snapshot_binding)
     - capture epoch (capture_epoch)
     - applicable target identity constraints (target_constraints)
+    - operation identity (operation_id)
+    - observation digest (observation_digest)
+    - physical reads accounting (physical_bytes_read, physical_reads_count)
+    - operation type ("diagnostic", "probe")
     """
     receipt_id: str
     session_id: str
@@ -471,9 +475,25 @@ class LiveCaptureReceipt:
     key_id: str = "default"
     signature: str = ""
     target_constraints: Dict[str, Any] = field(default_factory=dict)
-    schema_version: str = "2.0.0"
+    schema_version: str = "2.1.0"
+    operation_id: str = ""
+    observation_digest: str = ""
+    physical_bytes_read: int = 0
+    physical_reads_count: int = 0
+    operation_type: str = "diagnostic"
 
-    def canonical_payload(self) -> str:
+    def canonical_payload_v3(self) -> str:
+        tc_json = json.dumps(self.target_constraints or {}, sort_keys=True, separators=(",", ":"))
+        return (
+            f"live_rcpt_v3|{self.receipt_id}|{self.session_id}|{int(self.pid)}|"
+            f"{self.process_identity}|{self.executable_identity}|{self.build_id or str()}|"
+            f"{self.snapshot_binding}|{int(self.capture_epoch)}|{int(self.timestamp_ns)}|"
+            f"{self.authority_level}|{self.provenance_class}|{self.key_id}|{tc_json}|"
+            f"{self.operation_id}|{self.observation_digest}|{int(self.physical_bytes_read)}|"
+            f"{int(self.physical_reads_count)}|{self.operation_type}"
+        )
+
+    def canonical_payload_v2(self) -> str:
         tc_json = json.dumps(self.target_constraints or {}, sort_keys=True, separators=(",", ":"))
         return (
             f"live_rcpt_v2|{self.receipt_id}|{self.session_id}|{int(self.pid)}|"
@@ -481,6 +501,11 @@ class LiveCaptureReceipt:
             f"{self.snapshot_binding}|{int(self.capture_epoch)}|{int(self.timestamp_ns)}|"
             f"{self.authority_level}|{self.provenance_class}|{self.key_id}|{tc_json}"
         )
+
+    def canonical_payload(self) -> str:
+        if self.schema_version == "2.0.0" and not self.operation_id and not self.observation_digest and self.physical_bytes_read == 0 and self.operation_type == "diagnostic":
+            return self.canonical_payload_v2()
+        return self.canonical_payload_v3()
 
     def compute_signature(self, secret: Optional[str] = None) -> str:
         if secret:
@@ -501,8 +526,17 @@ class LiveCaptureReceipt:
     def matches_secret(self, secret: str) -> bool:
         if not self.signature or not secret:
             return False
-        expected = self.compute_signature(secret=secret)
-        return hmac.compare_digest(self.signature, expected)
+        # Try primary canonical payload
+        expected = hmac.new(secret.encode("utf-8"), self.canonical_payload().encode("utf-8"), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(self.signature, expected):
+            return True
+        # Try v3 explicit
+        expected_v3 = hmac.new(secret.encode("utf-8"), self.canonical_payload_v3().encode("utf-8"), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(self.signature, expected_v3):
+            return True
+        # Try v2 legacy format
+        expected_v2 = hmac.new(secret.encode("utf-8"), self.canonical_payload_v2().encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(self.signature, expected_v2)
 
     def verify(
         self,
@@ -518,8 +552,12 @@ class LiveCaptureReceipt:
         expected_constraints: Optional[Dict[str, Any]] = None,
         require_production_authority: bool = True,
         secret: Optional[str] = None,
+        expected_operation_id: Optional[str] = None,
+        expected_observation_digest: Optional[str] = None,
+        reject_probe_for_diagnostic: bool = False,
+        require_physical_reads: bool = False,
     ) -> Tuple[bool, str]:
-        """Validate LiveCaptureReceipt against all Phase 2.0-A.3.6 security and identity invariants."""
+        """Validate LiveCaptureReceipt against all Phase 2.0-A.3.6 through A.3.11 security and identity invariants."""
         # 1. Reject synthetic-to-live escalation
         if self.provenance_class in ("SYNTHETIC", "SYNTHETIC_FIXTURE", "IMPORTED_UNVERIFIED"):
             return False, f"synthetic_or_unverified_provenance_rejected:{self.provenance_class}"
@@ -595,6 +633,27 @@ class LiveCaptureReceipt:
                 if act_v != exp_v:
                     return False, f"target_constraint_mismatch:{k}:expected={exp_v},got={act_v}"
 
+        # 11. Remote execution receipts must identify the remote target
+        if (self.target_constraints or {}).get("is_remote"):
+            if not (self.target_constraints or {}).get("target_host"):
+                return False, "remote_receipt_missing_target_host"
+
+        # 12. Physical reads required
+        if require_physical_reads and self.physical_bytes_read <= 0:
+            return False, "no_physical_reads_in_receipt"
+
+        # 13. Probe read isolation
+        if reject_probe_for_diagnostic and self.operation_type == "probe":
+            return False, "probe_receipt_cannot_attest_diagnostic_evidence"
+
+        # 14. Operation identity check
+        if expected_operation_id is not None and str(self.operation_id) != str(expected_operation_id):
+            return False, f"mismatched_operation_id:expected={expected_operation_id},got={self.operation_id}"
+
+        # 15. Observation digest check
+        if expected_observation_digest is not None and str(self.observation_digest) != str(expected_observation_digest):
+            return False, f"mismatched_observation_digest:expected={expected_observation_digest},got={self.observation_digest}"
+
         return True, "VERIFIED"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -614,6 +673,11 @@ class LiveCaptureReceipt:
             "signature": self.signature,
             "target_constraints": dict(self.target_constraints or {}),
             "schema_version": self.schema_version,
+            "operation_id": self.operation_id,
+            "observation_digest": self.observation_digest,
+            "physical_bytes_read": self.physical_bytes_read,
+            "physical_reads_count": self.physical_reads_count,
+            "operation_type": self.operation_type,
         }
 
     @classmethod
@@ -635,8 +699,21 @@ class LiveCaptureReceipt:
             key_id=str(data.get("key_id", "default")),
             signature=str(data.get("signature", "")),
             target_constraints=dict(data.get("target_constraints") or {}),
-            schema_version=str(data.get("schema_version", "2.0.0")),
+            schema_version=str(data.get("schema_version", "2.1.0")),
+            operation_id=str(data.get("operation_id", "")),
+            observation_digest=str(data.get("observation_digest", "")),
+            physical_bytes_read=int(data.get("physical_bytes_read", 0)),
+            physical_reads_count=int(data.get("physical_reads_count", 0)),
+            operation_type=str(data.get("operation_type", "diagnostic")),
         )
+
+
+_TRUSTED_CAPTURE_AUTHORITY_TOKEN = os.urandom(32).hex()
+
+
+def get_trusted_capture_authority_token() -> str:
+    """Internal token reserved strictly for trusted capture adapters."""
+    return _TRUSTED_CAPTURE_AUTHORITY_TOKEN
 
 
 def issue_live_capture_receipt(
@@ -652,7 +729,26 @@ def issue_live_capture_receipt(
     target_constraints: Optional[Dict[str, Any]] = None,
     secret: Optional[str] = None,
     key_id: Optional[str] = None,
+    operation_id: str = "",
+    observation_digest: str = "",
+    physical_bytes_read: int = 0,
+    physical_reads_count: int = 0,
+    operation_type: str = "diagnostic",
+    capture_authority_token: Optional[str] = None,
+    schema_version: str = "2.1.0",
+    **kwargs: Any,
 ) -> LiveCaptureReceipt:
+    if provenance_class in ("SYNTHETIC", "SYNTHETIC_FIXTURE", "IMPORTED_UNVERIFIED"):
+        authority_level = "SYNTHETIC" if authority_level == "PRODUCTION" else authority_level
+
+    # 2.1: Production receipt issuance must only be possible through a trusted capture authority.
+    # Generic callers cannot mint production receipts without proof of trusted capture authority.
+    if authority_level == "PRODUCTION":
+        if capture_authority_token != _TRUSTED_CAPTURE_AUTHORITY_TOKEN:
+            raise ValueError(
+                "Unauthorized receipt minting: PRODUCTION authority can only be issued by a trusted capture authority."
+            )
+
     ks = get_default_key_store()
     active_kid, active_sec = ks.get_active_signing_key()
     use_kid = key_id if key_id else active_kid
@@ -671,6 +767,12 @@ def issue_live_capture_receipt(
         provenance_class=str(provenance_class),
         key_id=use_kid,
         target_constraints=dict(target_constraints or {}),
+        schema_version=schema_version,
+        operation_id=str(operation_id or ""),
+        observation_digest=str(observation_digest or ""),
+        physical_bytes_read=int(physical_bytes_read or 0),
+        physical_reads_count=int(physical_reads_count or 0),
+        operation_type=str(operation_type or "diagnostic"),
     )
     rcpt.sign(secret=use_sec)
     return rcpt
