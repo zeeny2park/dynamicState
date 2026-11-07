@@ -836,6 +836,19 @@ class TrustConsumptionResult:
         )
 
 
+class DurableCommitOutcome(Enum):
+    NOT_COMMITTED = "NOT_COMMITTED"
+    COMMITTED = "COMMITTED"
+    COMMIT_UNKNOWN = "COMMIT_UNKNOWN"
+
+
+class DurableCommitError(RuntimeError):
+    def __init__(self, message: str, outcome: DurableCommitOutcome, cause: Optional[Exception] = None):
+        super().__init__(message)
+        self.outcome = outcome
+        self.cause = cause
+
+
 class DurableTrustStore:
     """Persistent durable trust store for causal verifier keys, revocations, and anti-replay state.
 
@@ -1035,11 +1048,16 @@ class DurableTrustStore:
             except Exception as e:
                 raise RuntimeError(f"Durable trust store at '{self.store_path}' is corrupted or unreadable: {e}") from e
 
-    def save(self) -> None:
-        """Atomically persist trust store state to disk."""
+    def reconcile_from_disk(self) -> None:
+        """Reconcile in-memory state from disk under lock after indeterminate commit outcome."""
+        with self._file_lock():
+            self.load()
+
+    def save(self) -> DurableCommitOutcome:
+        """Atomically persist trust store state to disk with strict commit outcome semantics."""
         with self._file_lock():
             if not self.store_path:
-                return
+                return DurableCommitOutcome.COMMITTED
             if os.path.islink(self.store_path):
                 raise RuntimeError(f"Refusing to save trust store to symlink: '{self.store_path}'")
             payload = {
@@ -1055,6 +1073,7 @@ class DurableTrustStore:
             dir_name = os.path.dirname(os.path.abspath(self.store_path))
             os.makedirs(dir_name, mode=0o700, exist_ok=True)
             tmp_path = os.path.join(dir_name, f".trust_tmp_{uuid.uuid4().hex[:12]}")
+            commit_point_reached = False
             try:
                 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                 if hasattr(os, "O_NOFOLLOW"):
@@ -1064,6 +1083,16 @@ class DurableTrustStore:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         json.dump(payload, f, indent=2)
                         f.flush()
+                        # Apply and verify 0600 mode on temporary file before replacement
+                        try:
+                            os.chmod(tmp_path, 0o600)
+                        except OSError as ce:
+                            raise RuntimeError(f"Failed to apply 0600 mode on temporary trust store: {ce}") from ce
+                        st = os.stat(tmp_path)
+                        import stat as _st
+                        if _st.S_IMODE(st.st_mode) != 0o600:
+                            raise RuntimeError(f"Failed to verify 0600 mode on temporary trust store: got {oct(st.st_mode)}")
+                        # fsync temporary file data and metadata after permission changes
                         os.fsync(f.fileno())
                 except BaseException:
                     try:
@@ -1072,10 +1101,11 @@ class DurableTrustStore:
                         pass
                     raise
 
+                # EXACT DURABLE COMMIT POINT: Atomic replacement under existing file lock
                 os.replace(tmp_path, self.store_path)
-                os.chmod(self.store_path, 0o600)
+                commit_point_reached = True
 
-                # Parent directory fsync
+                # Parent directory fsync after replacement to commit directory entry to non-volatile storage
                 dir_flags = os.O_RDONLY
                 if hasattr(os, "O_DIRECTORY"):
                     dir_flags |= os.O_DIRECTORY
@@ -1084,13 +1114,26 @@ class DurableTrustStore:
                     os.fsync(dir_fd)
                 finally:
                     os.close(dir_fd)
+
+                return DurableCommitOutcome.COMMITTED
             except Exception as e:
                 if os.path.exists(tmp_path):
                     try:
                         os.remove(tmp_path)
                     except OSError:
                         pass
-                raise RuntimeError(f"Failed to persist durable trust store to '{self.store_path}': {e}") from e
+                if commit_point_reached:
+                    raise DurableCommitError(
+                        f"Trust store commit outcome uncertain: atomic replace completed but parent directory fsync failed: {e}",
+                        outcome=DurableCommitOutcome.COMMIT_UNKNOWN,
+                        cause=e,
+                    ) from e
+                else:
+                    raise DurableCommitError(
+                        f"Failed to persist durable trust store to '{self.store_path}': {e}",
+                        outcome=DurableCommitOutcome.NOT_COMMITTED,
+                        cause=e,
+                    ) from e
 
     def register_key(self, key_id: str, secret: str, is_active: bool = False) -> None:
         with self._file_lock():
@@ -1107,6 +1150,13 @@ class DurableTrustStore:
                 self.active_key_id = kid
             try:
                 self.save()
+            except DurableCommitError as dce:
+                if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                    self.reconcile_from_disk()
+                    raise
+                self.keys = orig_keys
+                self.active_key_id = orig_active
+                raise
             except Exception:
                 self.keys = orig_keys
                 self.active_key_id = orig_active
@@ -1130,6 +1180,13 @@ class DurableTrustStore:
                 self.active_key_id = available[0] if available else ""
             try:
                 self.save()
+            except DurableCommitError as dce:
+                if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                    self.reconcile_from_disk()
+                    raise
+                self.revoked_keys = orig_rev
+                self.active_key_id = orig_active
+                raise
             except Exception:
                 self.revoked_keys = orig_rev
                 self.active_key_id = orig_active
@@ -1150,6 +1207,12 @@ class DurableTrustStore:
             self.used_attestation_ids.add(att_id)
             try:
                 self.save()
+            except DurableCommitError as dce:
+                if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                    self.reconcile_from_disk()
+                    raise
+                self.used_attestation_ids = orig_set
+                raise
             except Exception:
                 self.used_attestation_ids = orig_set
                 raise
@@ -1287,6 +1350,25 @@ class DurableTrustStore:
 
             try:
                 self.save()
+            except DurableCommitError as dce:
+                if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                    self.reconcile_from_disk()
+                    return TrustConsumptionResult(
+                        status=TrustConsumptionStatus.PERSISTENCE_FAILURE,
+                        reason=f"Commit outcome uncertain during atomic trust consumption: {dce}",
+                        attestation_id=att_id,
+                        key_id=kid,
+                        evidence_id=str(evidence_id),
+                    )
+                self.used_attestation_ids = orig_used_set
+                self.used_attestations = orig_used_dict
+                return TrustConsumptionResult(
+                    status=TrustConsumptionStatus.PERSISTENCE_FAILURE,
+                    reason=f"Persistence failure during atomic trust consumption: {dce}",
+                    attestation_id=att_id,
+                    key_id=kid,
+                    evidence_id=str(evidence_id),
+                )
             except Exception as e:
                 self.used_attestation_ids = orig_used_set
                 self.used_attestations = orig_used_dict
@@ -1375,6 +1457,17 @@ class DurableTrustStore:
                                 e_list.append(metadata["evidence_id"])
                         try:
                             self.save()
+                        except DurableCommitError as dce:
+                            if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                                self.reconcile_from_disk()
+                                raise
+                            prev.clear()
+                            prev.update(orig_prev)
+                            if orig_eids:
+                                prev["evidence_ids"] = orig_eids
+                            else:
+                                prev.pop("evidence_ids", None)
+                            raise
                         except Exception:
                             prev.clear()
                             prev.update(orig_prev)
@@ -1400,6 +1493,12 @@ class DurableTrustStore:
             self.used_operation_ids[oid] = rec
             try:
                 self.save()
+            except DurableCommitError as dce:
+                if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                    self.reconcile_from_disk()
+                    raise
+                self.used_operation_ids = orig_ops
+                raise
             except Exception:
                 self.used_operation_ids = orig_ops
                 raise
@@ -1420,6 +1519,15 @@ class DurableTrustStore:
             rec["receipt_id"] = rid
             try:
                 self.save()
+            except DurableCommitError as dce:
+                if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                    self.reconcile_from_disk()
+                    raise
+                if orig_rcpt is None:
+                    rec.pop("receipt_id", None)
+                else:
+                    rec["receipt_id"] = orig_rcpt
+                raise
             except Exception:
                 if orig_rcpt is None:
                     rec.pop("receipt_id", None)
@@ -1433,6 +1541,7 @@ class DurableTrustStore:
         evidence_id: str,
         derived_from: Optional[Union[str, List[str]]] = None,
         parent_evidence_ids: Optional[List[str]] = None,
+        parent_evidence_digest: Optional[str] = None,
     ) -> None:
         """Atomically bind an evidence ID to a committed operation in trust store."""
         with self._file_lock():
@@ -1457,11 +1566,29 @@ class DurableTrustStore:
                         )
                 orig_eids = list(eids)
                 eids.append(eid)
+                if parent_evidence_digest:
+                    pdigs = rec.setdefault("parent_digests", {})
+                    pdigs[eid] = str(parent_evidence_digest)
                 try:
                     self.save()
+                except DurableCommitError as dce:
+                    if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                        self.reconcile_from_disk()
+                        raise
+                    rec["evidence_ids"] = orig_eids
+                    raise
                 except Exception:
                     rec["evidence_ids"] = orig_eids
                     raise
+            else:
+                # Idempotent re-bind: ensure parent_evidence_digest does not conflict
+                if parent_evidence_digest and "parent_digests" in rec and eid in rec["parent_digests"]:
+                    existing_digest = rec["parent_digests"][eid]
+                    if str(existing_digest) != str(parent_evidence_digest):
+                        raise ValueError(
+                            f"Conflicting parent digest for evidence '{eid}' under operation '{oid}': "
+                            f"existing='{existing_digest}', provided='{parent_evidence_digest}'"
+                        )
 
     def is_operation_used(self, op_id: str) -> bool:
         with self._file_lock():

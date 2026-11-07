@@ -480,6 +480,22 @@ DIAGNOSTIC_EVIDENCE_TYPES = {
     EVIDENCE_TYPE_DIAGNOSTIC,
 }
 
+ALLOWED_PRIMARY_OPERATION_EVIDENCE_TYPES = {
+    EVIDENCE_TYPE_OBJECT_STATE,
+    EVIDENCE_TYPE_FIELD_OBSERVATION,
+    EVIDENCE_TYPE_RUNTIME_IDENTITY,
+    EVIDENCE_TYPE_CAPTURE_QUALITY,
+    EVIDENCE_TYPE_DIAGNOSTIC,
+}
+
+ALLOWED_DERIVED_OPERATION_EVIDENCE_TYPES = {
+    EVIDENCE_TYPE_OBJECT_STATE,
+    EVIDENCE_TYPE_FIELD_OBSERVATION,
+    EVIDENCE_TYPE_COMPARISON,
+    EVIDENCE_TYPE_INFERENCE,
+    EVIDENCE_TYPE_DIAGNOSTIC,
+}
+
 # Nature classification: direct observation vs inference
 NATURE_OBSERVATION = "observation"
 NATURE_INFERENCE = "inference"
@@ -1016,6 +1032,8 @@ class EvidenceLedger:
                         op_meta["parent_evidence_ids"] = list(record.parent_evidence_ids)
                     if (record.details or {}).get("observation_digest"):
                         op_meta["observation_digest"] = str(record.details["observation_digest"])
+                    if (record.details or {}).get("parent_evidence_digest"):
+                        op_meta["parent_evidence_digest"] = str(record.details["parent_evidence_digest"])
 
                     self.trust_store.record_used_operation(
                         op_id=str(op_id),
@@ -1030,6 +1048,7 @@ class EvidenceLedger:
                             record.evidence_id,
                             derived_from=(record.details or {}).get("derived_from"),
                             parent_evidence_ids=record.parent_evidence_ids,
+                            parent_evidence_digest=(record.details or {}).get("parent_evidence_digest"),
                         )
 
             self._records.append(record)
@@ -1283,103 +1302,6 @@ class EvidenceLedger:
                         f"Mismatched observation digest for record '{record.evidence_id}': "
                         f"receipt={rcpt_obj.observation_digest}, record={rec_obs_dig}"
                     )
-
-            # A.3.11/A.3.15: Receipt and operation replay protection & derivation
-            if not hasattr(self, "_used_operation_ids"):
-                self._used_operation_ids: Dict[str, Dict[str, Any]] = {}
-            if not hasattr(self, "_operation_to_evidence_ids"):
-                self._operation_to_evidence_ids: Dict[str, List[str]] = {}
-            if not hasattr(self, "_operation_to_receipt_id"):
-                self._operation_to_receipt_id: Dict[str, str] = {}
-
-            op_id = getattr(rcpt_obj, "operation_id", None)
-            rcpt_id = getattr(rcpt_obj, "receipt_id", None)
-            eff_field = (record.field_observation or {}).get("field_path") or record.details.get("field_path") or ""
-
-            if op_id:
-                # 1. Bind receipt to operation (one receipt per operation)
-                if rcpt_id:
-                    if op_id in self._operation_to_receipt_id:
-                        bound_rcpt = self._operation_to_receipt_id[op_id]
-                        if bound_rcpt != rcpt_id:
-                            raise ValueError(
-                                f"Receipt-to-operation conflict: operation '{op_id}' is already bound to receipt '{bound_rcpt}', "
-                                f"cannot bind to different receipt '{rcpt_id}'"
-                            )
-                    else:
-                        self._operation_to_receipt_id[op_id] = rcpt_id
-
-                # Validate derived_from if present
-                derived_from = record.details.get("derived_from")
-                if derived_from:
-                    if isinstance(derived_from, str):
-                        derived_list = [derived_from]
-                    elif isinstance(derived_from, (list, tuple)):
-                        derived_list = list(derived_from)
-                    else:
-                        derived_list = []
-                    for d_src in derived_list:
-                        if d_src not in self._by_id:
-                            raise ValueError(
-                                f"Derived record '{record.evidence_id}' references nonexistent source observation '{d_src}'"
-                            )
-                    if not record.parent_evidence_ids and derived_list:
-                        record.parent_evidence_ids = list(derived_list)
-                    for d_src in derived_list:
-                        if d_src not in record.parent_evidence_ids:
-                            raise ValueError(
-                                f"Derived record '{record.evidence_id}' missing source '{d_src}' in parent_evidence_ids"
-                            )
-                        src_rec = self._by_id[d_src]
-                        src_op = (src_rec.details or {}).get("operation_id")
-                        if not src_op and (src_rec.provenance or {}).get("live_capture_receipt"):
-                            slcr = src_rec.provenance["live_capture_receipt"]
-                            src_op = slcr.get("operation_id") if isinstance(slcr, dict) else getattr(slcr, "operation_id", None)
-                        if record.evidence_type != EVIDENCE_TYPE_COMPARISON and src_op and str(src_op) != str(op_id):
-                            raise ValueError(
-                                f"Derivation operation mismatch: source '{d_src}' belongs to operation '{src_op}', "
-                                f"derived record '{record.evidence_id}' claims operation '{op_id}'"
-                            )
-
-                # 2. Check source observation vs. derived evidence
-                if op_id in self._operation_to_evidence_ids:
-                    if not derived_from:
-                        if record.evidence_id not in self._operation_to_evidence_ids[op_id]:
-                            raise ValueError(
-                                f"Receipt replay detected for operation '{op_id}' across different evidence records: "
-                                f"operation is already bound to primary observation '{self._operation_to_evidence_ids[op_id][0]}'. "
-                                f"Multiple records from one operation must explicitly derive from the primary observation via 'derived_from' and 'parent_evidence_ids'."
-                            )
-                    if record.evidence_id not in self._operation_to_evidence_ids[op_id]:
-                        self._operation_to_evidence_ids[op_id].append(record.evidence_id)
-                else:
-                    self._operation_to_evidence_ids[op_id] = [record.evidence_id]
-
-                if op_id in self._used_operation_ids:
-                    prev = self._used_operation_ids[op_id]
-                    if prev.get("session_id") != (record.session_id or self.session_id):
-                        raise ValueError(f"Receipt replay across sessions rejected for operation '{op_id}'")
-                    if exp_pid is not None and prev.get("pid") is not None and prev["pid"] != exp_pid:
-                        raise ValueError(f"Receipt replay across PIDs rejected for operation '{op_id}'")
-                t_ident = record.target_identity or {}
-                rec_used_op = {
-                    "session_id": record.session_id or self.session_id,
-                    "pid": exp_pid,
-                    "evidence_id": record.evidence_id,
-                    "observation": record.observation,
-                    "field": eff_field,
-                }
-                if rcpt_id:
-                    rec_used_op["receipt_id"] = str(rcpt_id)
-                if t_ident.get("process_identity"):
-                    rec_used_op["process_identity"] = str(t_ident["process_identity"])
-                if t_ident.get("executable_identity") or t_ident.get("executable"):
-                    rec_used_op["executable_identity"] = str(t_ident.get("executable_identity") or t_ident.get("executable"))
-                if t_ident.get("build_id"):
-                    rec_used_op["build_id"] = str(t_ident["build_id"])
-                if t_ident.get("target_host"):
-                    rec_used_op["target_host"] = str(t_ident["target_host"])
-                self._used_operation_ids[op_id] = rec_used_op
         elif prov_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
             att = p_prov.get("verifier_attestation") or p_details.get("verifier_attestation")
             if not att or not isinstance(att, dict) or att.get("attestation_rejected") or not att.get("token_sig"):
@@ -1396,6 +1318,214 @@ class EvidenceLedger:
             expected_sig = compute_attestation_signature(self.session_secret, record.evidence_id, fp, self.session_id)
             if not hmac.compare_digest(str(att.get("token_sig", "")), str(expected_sig)):
                 raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION cryptographic signature verification failed for '{record.evidence_id}'")
+
+        # Derivation and Self-Reference validation (applicable across all provenance classes)
+        if record.parent_evidence_ids and record.evidence_id in record.parent_evidence_ids:
+            raise ValueError(
+                f"Self-referential derivation rejected: record '{record.evidence_id}' lists itself in parent_evidence_ids"
+            )
+        if record.details and record.details.get("derived_from") == record.evidence_id:
+            raise ValueError(
+                f"Self-referential derivation rejected: record '{record.evidence_id}' has derived_from equal to itself"
+            )
+
+        # Operation replay & type validation metadata extraction
+        op_id = getattr(rcpt_obj, "operation_id", None) if 'rcpt_obj' in locals() and rcpt_obj else None
+        rcpt_id = getattr(rcpt_obj, "receipt_id", None) if 'rcpt_obj' in locals() and rcpt_obj else None
+        rcpt_obs_dig = getattr(rcpt_obj, "observation_digest", "") if 'rcpt_obj' in locals() and rcpt_obj else ""
+        rcpt_op_type = getattr(rcpt_obj, "operation_type", "") if 'rcpt_obj' in locals() and rcpt_obj else ""
+
+        if not op_id:
+            raw_rc = p_prov.get("live_capture_receipt") or (record.details or {}).get("live_capture_receipt")
+            if raw_rc:
+                from .capture_backend import LiveCaptureReceipt
+                if isinstance(raw_rc, LiveCaptureReceipt):
+                    op_id = getattr(raw_rc, "operation_id", None)
+                    rcpt_id = getattr(raw_rc, "receipt_id", None)
+                    rcpt_obs_dig = getattr(raw_rc, "observation_digest", "")
+                    rcpt_op_type = getattr(raw_rc, "operation_type", "")
+                elif isinstance(raw_rc, dict):
+                    op_id = raw_rc.get("operation_id")
+                    rcpt_id = raw_rc.get("receipt_id")
+                    rcpt_obs_dig = raw_rc.get("observation_digest", "")
+                    rcpt_op_type = raw_rc.get("operation_type", "")
+
+        if not op_id and record.details:
+            op_id = record.details.get("operation_id")
+        if not rcpt_id and record.details and "receipt_id" in record.details:
+            rcpt_id = record.details["receipt_id"]
+        if not op_id and record.provenance and "causal_attestation" in record.provenance:
+            ca = record.provenance["causal_attestation"]
+            op_id = getattr(ca, "operation_id", None) if hasattr(ca, "operation_id") else (ca.get("operation_id") if isinstance(ca, dict) else None)
+
+        # Validate derived_from if present
+        derived_from = (record.details or {}).get("derived_from")
+        if derived_from:
+            if isinstance(derived_from, str):
+                derived_list = [derived_from]
+            elif isinstance(derived_from, (list, tuple)):
+                derived_list = list(derived_from)
+            else:
+                derived_list = []
+            for d_src in derived_list:
+                if d_src not in self._by_id:
+                    raise ValueError(
+                        f"Derived record '{record.evidence_id}' references nonexistent source observation '{d_src}'"
+                    )
+            if not record.parent_evidence_ids and derived_list:
+                record.parent_evidence_ids = list(derived_list)
+            for d_src in derived_list:
+                if d_src not in record.parent_evidence_ids:
+                    raise ValueError(
+                        f"Derived record '{record.evidence_id}' missing source '{d_src}' in parent_evidence_ids"
+                    )
+
+        # Deep validation of parent_evidence_ids (session identity, cross-target, and canonical parent digest)
+        if record.parent_evidence_ids:
+            for p_id in record.parent_evidence_ids:
+                if p_id not in self._by_id:
+                    raise ValueError(
+                        f"Referenced parent evidence '{p_id}' for record '{record.evidence_id}' does not exist in ledger"
+                    )
+                p_rec = self._by_id[p_id]
+                if p_rec.session_id != (record.session_id or self.session_id):
+                    raise ValueError(
+                        f"Cross-session derivation rejected for '{record.evidence_id}': parent '{p_id}' belongs to session "
+                        f"'{p_rec.session_id}', record belongs to '{record.session_id or self.session_id}'"
+                    )
+                p_tident = p_rec.target_identity or {}
+                r_tident = record.target_identity or {}
+                if p_tident.get("pid") and r_tident.get("pid") and int(p_tident["pid"]) != int(r_tident["pid"]):
+                    raise ValueError(
+                        f"Cross-target derivation rejected: parent '{p_id}' PID {p_tident['pid']} != record PID {r_tident['pid']} (PID mismatch)"
+                    )
+                if p_tident.get("target_host") and r_tident.get("target_host") and str(p_tident["target_host"]) != str(r_tident["target_host"]):
+                    raise ValueError(
+                        f"Cross-target derivation rejected: parent '{p_id}' host {p_tident['target_host']} != record host {r_tident['target_host']}"
+                    )
+                if op_id and p_tident.get("process_identity") and r_tident.get("process_identity") and str(p_tident["process_identity"]) != str(r_tident["process_identity"]):
+                    raise ValueError(
+                        f"Cross-target derivation rejected: parent '{p_id}' process {p_tident['process_identity']} != record process {r_tident['process_identity']}"
+                    )
+                exp_p_digest = compute_evidence_fingerprint(p_rec)
+                p_digs = (record.details or {}).get("parent_evidence_digests")
+                if isinstance(p_digs, dict) and p_id in p_digs:
+                    if p_digs[p_id] != exp_p_digest:
+                        raise ValueError(
+                            f"Parent evidence digest mismatch for record '{record.evidence_id}' referencing '{p_id}': "
+                            f"expected '{exp_p_digest}', got '{p_digs[p_id]}'"
+                        )
+                elif len(record.parent_evidence_ids) == 1 and record.details and "parent_evidence_digest" in record.details:
+                    actual_p_digest = record.details["parent_evidence_digest"]
+                    if actual_p_digest != exp_p_digest:
+                        raise ValueError(
+                            f"Parent evidence digest mismatch for record '{record.evidence_id}' referencing '{p_id}': "
+                            f"expected '{exp_p_digest}', got '{actual_p_digest}'"
+                        )
+                else:
+                    if record.details is None:
+                        record.details = {}
+                    record.details.setdefault("parent_evidence_digests", {})[p_id] = exp_p_digest
+                    if len(record.parent_evidence_ids) == 1:
+                        record.details["parent_evidence_digest"] = exp_p_digest
+
+
+        if op_id:
+            if not hasattr(self, "_used_operation_ids"):
+                self._used_operation_ids: Dict[str, Dict[str, Any]] = {}
+            if not hasattr(self, "_operation_to_evidence_ids"):
+                self._operation_to_evidence_ids: Dict[str, List[str]] = {}
+            if not hasattr(self, "_operation_to_receipt_id"):
+                self._operation_to_receipt_id: Dict[str, str] = {}
+
+            if rcpt_id:
+                if op_id in self._operation_to_receipt_id:
+                    bound_rcpt = self._operation_to_receipt_id[op_id]
+                    if bound_rcpt != rcpt_id:
+                        raise ValueError(
+                            f"Receipt-to-operation conflict: operation '{op_id}' is already bound to receipt '{bound_rcpt}', "
+                            f"cannot bind to different receipt '{rcpt_id}'"
+                        )
+                else:
+                    self._operation_to_receipt_id[op_id] = rcpt_id
+
+            # Operation evidence type validation
+            if op_id in self._operation_to_evidence_ids:
+                if record.evidence_type not in ALLOWED_DERIVED_OPERATION_EVIDENCE_TYPES:
+                    raise ValueError(
+                        f"Evidence type '{record.evidence_type}' is not permitted to share capture operation ID '{op_id}'"
+                    )
+            else:
+                is_causal_comparison = (record.evidence_type == EVIDENCE_TYPE_COMPARISON and (
+                    p_prov.get("causal_attestation") or (record.details or {}).get("causal_attestation")
+                ))
+                if record.evidence_type not in ALLOWED_PRIMARY_OPERATION_EVIDENCE_TYPES and not is_causal_comparison:
+                    raise ValueError(
+                        f"Evidence type '{record.evidence_type}' is not permitted as primary record for capture operation ID '{op_id}'"
+                    )
+
+            if derived_from:
+                for d_src in (derived_from if isinstance(derived_from, (list, tuple)) else [derived_from]):
+                    src_rec = self._by_id.get(d_src)
+                    if src_rec:
+                        src_op = (src_rec.details or {}).get("operation_id")
+                        if not src_op and (src_rec.provenance or {}).get("live_capture_receipt"):
+                            slcr = src_rec.provenance["live_capture_receipt"]
+                            src_op = slcr.get("operation_id") if isinstance(slcr, dict) else getattr(slcr, "operation_id", None)
+                        if record.evidence_type != EVIDENCE_TYPE_COMPARISON and src_op and str(src_op) != str(op_id):
+                            raise ValueError(
+                                f"Derivation operation mismatch: source '{d_src}' belongs to operation '{src_op}', "
+                                f"derived record '{record.evidence_id}' claims operation '{op_id}'"
+                            )
+
+            if op_id in self._operation_to_evidence_ids:
+                if not derived_from:
+                    if record.evidence_id not in self._operation_to_evidence_ids[op_id]:
+                        raise ValueError(
+                            f"Receipt replay detected for operation '{op_id}' across different evidence records: "
+                            f"operation is already bound to primary observation '{self._operation_to_evidence_ids[op_id][0]}'. "
+                            f"Multiple records from one operation must explicitly derive from the primary observation via 'derived_from' and 'parent_evidence_ids'."
+                        )
+                if record.evidence_id not in self._operation_to_evidence_ids[op_id]:
+                    self._operation_to_evidence_ids[op_id].append(record.evidence_id)
+            else:
+                self._operation_to_evidence_ids[op_id] = [record.evidence_id]
+
+            t_ident = record.target_identity or {}
+            rec_pid = t_ident.get("pid")
+            eff_pid = int(rec_pid) if rec_pid is not None and not isinstance(rec_pid, bool) else None
+
+            if op_id in self._used_operation_ids:
+                prev = self._used_operation_ids[op_id]
+                if prev.get("session_id") != (record.session_id or self.session_id):
+                    raise ValueError(f"Receipt replay across sessions rejected for operation '{op_id}'")
+                if eff_pid is not None and prev.get("pid") is not None and prev["pid"] != eff_pid:
+                    raise ValueError(f"Receipt replay across PIDs rejected for operation '{op_id}'")
+
+            eff_field = (record.field_observation or {}).get("field_path") or (record.details or {}).get("field_path") or ""
+            rec_used_op = {
+                "session_id": record.session_id or self.session_id,
+                "pid": eff_pid,
+                "process_identity": str(t_ident.get("process_identity", "")),
+                "executable_identity": str(t_ident.get("executable_identity") or t_ident.get("executable", "")),
+                "build_id": str(t_ident.get("build_id", "")),
+                "target_host": str(t_ident.get("target_host", "")),
+                "receipt_id": str(rcpt_id or ""),
+                "observation_digest": str(rcpt_obs_dig or (record.details or {}).get("observation_digest", "")),
+                "operation_type": str(rcpt_op_type or (record.details or {}).get("operation_type", "capture")),
+                "evidence_id": self._operation_to_evidence_ids[op_id][0],
+                "evidence_ids": list(self._operation_to_evidence_ids[op_id]),
+                "recorded_at": (record.timestamp or datetime.now(timezone.utc).isoformat()),
+                "observation": record.observation,
+                "field": eff_field,
+            }
+            if (record.details or {}).get("parent_evidence_digest"):
+                rec_used_op["parent_evidence_digest"] = record.details["parent_evidence_digest"]
+            if (record.details or {}).get("derived_from"):
+                rec_used_op["derived_from"] = record.details["derived_from"]
+            if record.parent_evidence_ids:
+                rec_used_op["parent_evidence_ids"] = list(record.parent_evidence_ids)
+            self._used_operation_ids[op_id] = rec_used_op
 
         # P0 Cryptographic Causal Attestation Verification
         raw_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
@@ -1831,27 +1961,56 @@ class EvidenceLedger:
                     f"Forged operation mapping detected: key-set mismatch between serialized and rebuilt "
                     f"used_operation_ids: missing={sorted(list(missing))}, extra={sorted(list(extra))}"
                 )
+            ALLOWED_OP_FIELDS = {
+                "session_id", "pid", "process_identity", "executable_identity",
+                "build_id", "target_host", "receipt_id", "observation_digest",
+                "operation_type", "evidence_id", "evidence_ids", "recorded_at",
+                "observation", "field", "parent_evidence_digest", "derived_from",
+                "parent_evidence_ids", "physical_bytes_read", "physical_reads_count",
+                "adapter_id", "initial_flag"
+            }
             for op_k, op_dict in ser_used_ops.items():
+                if not isinstance(op_dict, dict):
+                    raise ValueError(f"used_operation_ids entry '{op_k}' must be a dictionary")
                 rebuilt_rec = rebuilt_used_ops[op_k]
-                if op_dict.get("session_id") != rebuilt_rec.get("session_id"):
-                    raise ValueError(
-                        f"Session inconsistency for operation '{op_k}': serialized={op_dict.get('session_id')}, "
-                        f"rebuilt={rebuilt_rec.get('session_id')}"
-                    )
-                if op_dict.get("pid") is not None and rebuilt_rec.get("pid") is not None:
-                    if int(op_dict["pid"]) != int(rebuilt_rec["pid"]):
-                        raise ValueError(
-                            f"PID inconsistency for operation '{op_k}': serialized={op_dict.get('pid')}, "
-                            f"rebuilt={rebuilt_rec.get('pid')}"
-                        )
-                for id_f in ("process_identity", "executable_identity", "build_id", "target_host", "receipt_id"):
-                    s_v = op_dict.get(id_f)
-                    r_v = rebuilt_rec.get(id_f)
-                    if s_v is not None and r_v is not None and str(s_v) != str(r_v):
-                        raise ValueError(
-                            f"Identity/receipt metadata mismatch for operation '{op_k}', field '{id_f}': "
-                            f"serialized={s_v}, rebuilt={r_v}"
-                        )
+
+                # 1. Reject unexpected fields where schema requires strictness
+                for fld in op_dict.keys():
+                    if fld not in ALLOWED_OP_FIELDS:
+                        raise ValueError(f"Unexpected metadata field '{fld}' in serialized used_operation_ids for operation '{op_k}'")
+
+                # 2. Canonical metadata fields validation (detect missing and conflicting metadata)
+                for canon_f in (
+                    "session_id", "pid", "process_identity", "executable_identity",
+                    "build_id", "target_host", "receipt_id", "observation_digest",
+                    "operation_type", "evidence_id", "recorded_at"
+                ):
+                    rebuilt_val = rebuilt_rec.get(canon_f)
+                    ser_val = op_dict.get(canon_f)
+                    # Missing metadata check: if non-empty in rebuilt record, must be present and non-empty in serialized
+                    if rebuilt_val is not None and str(rebuilt_val) != "" and (ser_val is None or str(ser_val) == ""):
+                        raise ValueError(f"Missing canonical metadata field '{canon_f}' in serialized used_operation_ids for operation '{op_k}'")
+                    # Conflicting metadata check
+                    if ser_val is not None and rebuilt_val is not None and str(ser_val) != "" and str(rebuilt_val) != "":
+                        if canon_f == "pid":
+                            if int(ser_val) != int(rebuilt_val):
+                                raise ValueError(f"PID inconsistency for operation '{op_k}': serialized={ser_val}, rebuilt={rebuilt_val}")
+                        elif canon_f == "session_id":
+                            if str(ser_val) != str(rebuilt_val):
+                                raise ValueError(f"Session inconsistency for operation '{op_k}': serialized={ser_val}, rebuilt={rebuilt_val}")
+                        elif str(ser_val) != str(rebuilt_val):
+                            raise ValueError(f"Metadata conflict / metadata mismatch for operation '{op_k}', field '{canon_f}': serialized={ser_val}, rebuilt={rebuilt_val}")
+
+                # 3. Canonical ordered evidence_ids validation and duplicate rejection
+                if "evidence_ids" in op_dict:
+                    ser_eids = op_dict["evidence_ids"]
+                    if not isinstance(ser_eids, list):
+                        raise ValueError(f"evidence_ids for operation '{op_k}' must be a list")
+                    if len(ser_eids) != len(set(ser_eids)):
+                        raise ValueError(f"Duplicate evidence ID detected in used_operation_ids evidence_ids for operation '{op_k}'")
+                    rebuilt_eids = rebuilt_rec.get("evidence_ids", [])
+                    if ser_eids != rebuilt_eids:
+                        raise ValueError(f"Canonical ordered evidence_ids mismatch for operation '{op_k}': serialized={ser_eids}, rebuilt={rebuilt_eids}")
 
         return ledger
 
