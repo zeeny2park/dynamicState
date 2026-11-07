@@ -581,6 +581,12 @@ class EvidenceRecord:
             safe_att.pop("token_sig", None)
             safe_att.pop("evidence_fingerprint", None)
             prov_copy["verifier_attestation"] = safe_att
+        if "live_capture_receipt" in prov_copy and hasattr(prov_copy["live_capture_receipt"], "to_dict"):
+            prov_copy["live_capture_receipt"] = prov_copy["live_capture_receipt"].to_dict()
+
+        details_copy = dict(self.details) if self.details else {}
+        if "live_capture_receipt" in details_copy and hasattr(details_copy["live_capture_receipt"], "to_dict"):
+            details_copy["live_capture_receipt"] = details_copy["live_capture_receipt"].to_dict()
 
         data: Dict[str, Any] = {
             "evidence_id": self.evidence_id,
@@ -592,7 +598,7 @@ class EvidenceRecord:
             "parent_evidence_ids": list(self.parent_evidence_ids),
             "schema_version": self.schema_version,
             "provenance": prov_copy,
-            "details": self.details,
+            "details": details_copy,
         }
         if self.session_id is not None:
             data["session_id"] = self.session_id

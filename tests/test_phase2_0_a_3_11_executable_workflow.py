@@ -179,9 +179,8 @@ class TestPhase20A311ExecutableWorkflow(unittest.TestCase):
                 target_pid=proc.pid,
                 goal="Verify budget exhaustion halts workflow",
             )
-            # Advance to CHECKING_BUDGET
-            inst.current_stage = STAGE_CHECKING_BUDGET
-            inst.audit_trail.append({"from_stage": STAGE_UPDATING_HYPOTHESIS, "to_stage": STAGE_CHECKING_BUDGET, "reason": "Advance to budget check"})
+            # Advance to CHECKING_BUDGET via transition API
+            inst.record_transition(STAGE_CHECKING_BUDGET, "Advance to budget check")
             inst.context["budget_exhausted"] = True
             inst.context["budget_exhausted_reason"] = "Max bytes read budget 65536 reached"
 
@@ -206,8 +205,7 @@ class TestPhase20A311ExecutableWorkflow(unittest.TestCase):
                 target_pid=proc.pid,
                 goal="Verify inconclusive diagnosis",
             )
-            inst.current_stage = STAGE_FORMING_DIAGNOSIS
-            inst.audit_trail.append({"from_stage": STAGE_VERIFYING_CAUSATION, "to_stage": STAGE_FORMING_DIAGNOSIS, "reason": "Advance to diagnosis"})
+            inst.record_transition(STAGE_FORMING_DIAGNOSIS, "Advance to diagnosis")
             inst.context["hypotheses_validated"] = []
             inst.context["evidence_sufficient"] = False
 
@@ -232,8 +230,7 @@ class TestPhase20A311ExecutableWorkflow(unittest.TestCase):
                 target_pid=proc.pid,
                 goal="Verify confirmed diagnosis",
             )
-            inst.current_stage = STAGE_FORMING_DIAGNOSIS
-            inst.audit_trail.append({"from_stage": STAGE_VERIFYING_CAUSATION, "to_stage": STAGE_FORMING_DIAGNOSIS, "reason": "Advance to diagnosis"})
+            inst.record_transition(STAGE_FORMING_DIAGNOSIS, "Advance to diagnosis")
             inst.context["hypotheses_validated"] = [{"id": "hyp_1", "statement": "Mutex Contention"}]
             inst.context["evidence_sufficient"] = True
 
@@ -397,7 +394,7 @@ class TestPhase20A311ExecutableWorkflow(unittest.TestCase):
             target_pid=os.getpid(),
             goal="Terminal idempotency check",
         )
-        inst.current_stage = STAGE_COMPLETED
+        inst.record_transition(STAGE_COMPLETED, "Terminal state setup")
         inst.status = "COMPLETED"
         self.assertEqual(inst.current_stage, STAGE_COMPLETED)
 

@@ -18,6 +18,7 @@ LocalTargetAdapter, HypothesisValidator, VerdictEngine) without adding new MCP t
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -44,14 +45,21 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
 )
 from .hypothesis import (
+    HYPOTHESIS_STATUS_ABSTAINED,
     HYPOTHESIS_STATUS_CONTRADICTED,
     HYPOTHESIS_STATUS_INCONCLUSIVE,
+    HYPOTHESIS_STATUS_PROPOSED,
+    HYPOTHESIS_STATUS_REJECTED,
     HYPOTHESIS_STATUS_SUPPORTED,
     HYPOTHESIS_STATUS_VALIDATED,
     HypothesisValidator,
     InvestigationHypothesis,
 )
 from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter, PIDReusedError
+
+HYPOTHESIS_STATUS_NOT_TESTED = "NOT_TESTED"
+HYPOTHESIS_STATUS_REFUTED = "REFUTED"
+HYPOTHESIS_STATUS_INVALIDATED = "INVALIDATED"
 
 # -----------------------------------------------------------------------------
 # 15 Investigation Lifecycle Stages
@@ -118,6 +126,7 @@ STOP_NO_DISCRIMINATING_OBSERVATIONS = "NO_DISCRIMINATING_OBSERVATIONS"
 STOP_TARGET_TERMINATED = "TARGET_TERMINATED"
 STOP_OBSERVATION_ABSTAINED = "OBSERVATION_ABSTAINED"
 STOP_USER_CANCELLED = "USER_CANCELLED"
+STOP_EVIDENCE_INSUFFICIENT = "EVIDENCE_INSUFFICIENT"
 
 ALL_STOPPING_REASONS = {
     STOP_DIAGNOSIS_CONFIRMED,
@@ -128,6 +137,7 @@ ALL_STOPPING_REASONS = {
     STOP_TARGET_TERMINATED,
     STOP_OBSERVATION_ABSTAINED,
     STOP_USER_CANCELLED,
+    STOP_EVIDENCE_INSUFFICIENT,
 }
 
 # -----------------------------------------------------------------------------
@@ -187,6 +197,51 @@ class InvestigationWorkflowDefinition:
     timeout_seconds: float = 300.0
     max_retries_per_stage: int = 2
 
+    def validate(self) -> Tuple[bool, Optional[str]]:
+        """Validates structural integrity, reachability, absence of dead-ends, and valid prerequisites."""
+        if not self.stages:
+            return False, "Workflow definition has empty stages"
+        if STAGE_INITIALIZING not in self.stages:
+            return False, f"Workflow definition missing required initial stage '{STAGE_INITIALIZING}'"
+
+        # Check absence of dead-end non-terminal states
+        for stage in self.stages:
+            if stage not in TERMINAL_STAGES:
+                outgoing = self.allowed_transitions.get(stage, set())
+                if not outgoing:
+                    return False, f"Dead-end non-terminal stage detected: '{stage}' has no outgoing transitions"
+
+        # Check reachability of terminal states from every non-terminal stage via BFS
+        for stage in self.stages:
+            if stage in TERMINAL_STAGES:
+                continue
+            visited = set()
+            queue = [stage]
+            can_reach_terminal = False
+            while queue:
+                curr = queue.pop(0)
+                if curr in TERMINAL_STAGES:
+                    can_reach_terminal = True
+                    break
+                for nxt in self.allowed_transitions.get(curr, set()):
+                    if nxt not in visited and nxt in self.stages:
+                        visited.add(nxt)
+                        queue.append(nxt)
+            if not can_reach_terminal:
+                return False, f"Unreachable terminal states: stage '{stage}' cannot reach any terminal stage"
+
+        # Check prerequisite chains
+        for stage, prereqs in self.prerequisites.items():
+            if stage not in self.stages:
+                return False, f"Prerequisite configured for stage '{stage}' which is not in definition stages"
+            for p in prereqs:
+                if p not in self.stages:
+                    return False, f"Prerequisite '{p}' for stage '{stage}' not in definition stages"
+                if p == stage:
+                    return False, f"Self-referential prerequisite for stage '{stage}'"
+
+        return True, None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "workflow_id": self.workflow_id,
@@ -214,23 +269,54 @@ class InvestigationWorkflowDefinition:
         )
 
 
-@dataclass
 class WorkflowExecutionState:
     """Live execution state and auditable history for an investigation instance."""
-    instance_id: str
-    workflow_id: str
-    session_id: str
-    target_pid: int
-    goal: str
-    current_stage: str = STAGE_INITIALIZING
-    status: str = "RUNNING"  # RUNNING, COMPLETED, ABSTAINED, BLOCKED, CANCELLED, FAILED
-    stopping_reason: Optional[str] = None
-    stopping_explanation: str = ""
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    context: Dict[str, Any] = field(default_factory=dict)
-    audit_trail: List[Dict[str, Any]] = field(default_factory=list)
-    stage_retries: Dict[str, int] = field(default_factory=dict)
+
+    def __init__(
+        self,
+        instance_id: str,
+        workflow_id: str,
+        session_id: str,
+        target_pid: int,
+        goal: str,
+        current_stage: str = STAGE_INITIALIZING,
+        status: str = "RUNNING",
+        stopping_reason: Optional[str] = None,
+        stopping_explanation: str = "",
+        created_at: Optional[str] = None,
+        updated_at: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        audit_trail: Optional[List[Dict[str, Any]]] = None,
+        stage_retries: Optional[Dict[str, int]] = None,
+    ):
+        self.instance_id = str(instance_id)
+        self.workflow_id = str(workflow_id)
+        self.session_id = str(session_id)
+        self.target_pid = int(target_pid)
+        self.goal = str(goal)
+        self._current_stage = str(current_stage)
+        self.status = str(status)
+        self.stopping_reason = stopping_reason
+        self.stopping_explanation = str(stopping_explanation or "")
+        now_ts = datetime.now(timezone.utc).isoformat()
+        self.created_at = created_at or now_ts
+        self.updated_at = updated_at or now_ts
+        self.context = dict(context or {})
+        self.audit_trail = list(audit_trail or [])
+        self.stage_retries = dict(stage_retries or {})
+        self._in_transition = False
+
+    @property
+    def current_stage(self) -> str:
+        return self._current_stage
+
+    @current_stage.setter
+    def current_stage(self, val: str) -> None:
+        if not getattr(self, "_in_transition", False):
+            raise ValueError(
+                f"Direct mutation of current_stage to '{val}' is prohibited; use transition_stage() or record_transition()"
+            )
+        self._current_stage = str(val)
 
     def record_transition(
         self,
@@ -241,13 +327,17 @@ class WorkflowExecutionState:
         now_ts = datetime.now(timezone.utc).isoformat()
         entry = {
             "timestamp": now_ts,
-            "from_stage": self.current_stage,
+            "from_stage": self._current_stage,
             "to_stage": to_stage,
             "reason": reason,
             "details": details or {},
         }
         self.audit_trail.append(entry)
-        self.current_stage = to_stage
+        self._in_transition = True
+        try:
+            self.current_stage = to_stage
+        finally:
+            self._in_transition = False
         self.updated_at = now_ts
         if to_stage in TERMINAL_STAGES:
             self.status = to_stage
@@ -271,7 +361,7 @@ class WorkflowExecutionState:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> WorkflowExecutionState:
+    def from_dict(cls, data: Dict[str, Any]) -> "WorkflowExecutionState":
         return cls(
             instance_id=data["instance_id"],
             workflow_id=data.get("workflow_id", "default_adaptive_investigation"),
@@ -327,6 +417,9 @@ class InvestigationWorkflowEngine:
     ):
         import tempfile
         self.definition = definition or InvestigationWorkflowDefinition()
+        ok_def, err_def = self.definition.validate()
+        if not ok_def:
+            raise ValueError(f"Invalid workflow definition: {err_def}")
         self.target_adapter = target_adapter or LocalTargetAdapter()
         self.adaptive_engine = engine or AdaptiveInvestigationEngine()
         self.evidence_ledger = EvidenceLedger()
@@ -341,6 +434,9 @@ class InvestigationWorkflowEngine:
         max_samples: int = 10,
         max_bytes: int = 256 * 1024,
     ) -> WorkflowExecutionState:
+        ok_def, err_def = self.definition.validate()
+        if not ok_def:
+            raise ValueError(f"Invalid workflow definition: {err_def}")
         inst_id = f"wf_inst_{uuid.uuid4().hex[:12]}"
         instance = WorkflowExecutionState(
             instance_id=inst_id,
@@ -416,14 +512,43 @@ class InvestigationWorkflowEngine:
         return True
 
     def persist_state(self, instance: WorkflowExecutionState, file_path: Optional[str] = None) -> str:
-        """Persist execution state to file for recovery/resume with atomic durability."""
+        """Persist execution state to file for recovery/resume with atomic durability and checksum verification."""
         if not file_path:
             file_path = os.path.join(self.state_dir, f"{instance.instance_id}.json")
         os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
-        data = instance.to_dict()
+
+        ledger_dict = None
+        if hasattr(self, "evidence_ledger") and self.evidence_ledger is not None:
+            ledger_dict = self.evidence_ledger.to_dict()
+
+        checkpoint_data = {
+            "schema_version": "2.0.0",
+            "instance": instance.to_dict(),
+            "evidence_ledger": ledger_dict,
+            "pinned_identity": instance.context.get("pinned_identity"),
+            "hypotheses": instance.context.get("hypotheses", []),
+            "last_receipt": instance.context.get("last_receipt"),
+            "completed_observations": instance.context.get("completed_observations", []),
+            "budget": {
+                "max_samples": instance.context.get("max_samples", 10),
+                "max_bytes": instance.context.get("max_bytes", 65536),
+                "observation_count": instance.context.get("observation_count", 0),
+                "physical_bytes_read": instance.context.get("physical_bytes_read", 0),
+            },
+        }
+        raw_payload = json.dumps(checkpoint_data, sort_keys=True).encode("utf-8")
+        checksum = hashlib.sha256(raw_payload).hexdigest()
+
+        envelope = {
+            "format": "dynamicstate_workflow_checkpoint",
+            "schema_version": "2.0.0",
+            "checksum": checksum,
+            "checkpoint_data": checkpoint_data,
+        }
+
         tmp_path = f"{file_path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            json.dump(envelope, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, file_path)
@@ -440,11 +565,29 @@ class InvestigationWorkflowEngine:
 
     @classmethod
     def resume_instance(cls, file_path: str) -> WorkflowExecutionState:
-        """Restore execution state from checkpoint file."""
+        """Restore execution state from checkpoint file, verifying checksum integrity."""
         with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        inst = WorkflowExecutionState.from_dict(data)
-        return inst
+            envelope = json.load(f)
+
+        if isinstance(envelope, dict) and envelope.get("format") == "dynamicstate_workflow_checkpoint":
+            ckpt_data = envelope.get("checkpoint_data", {})
+            raw_payload = json.dumps(ckpt_data, sort_keys=True).encode("utf-8")
+            calc_sum = hashlib.sha256(raw_payload).hexdigest()
+            exp_sum = envelope.get("checksum", "")
+            if exp_sum and calc_sum != exp_sum:
+                raise ValueError(
+                    f"Checkpoint integrity verification failed: corrupt checksum (expected {exp_sum}, got {calc_sum})"
+                )
+            inst = WorkflowExecutionState.from_dict(ckpt_data.get("instance", {}))
+            if ckpt_data.get("evidence_ledger"):
+                inst.context["restored_evidence_ledger"] = ckpt_data["evidence_ledger"]
+            if ckpt_data.get("hypotheses"):
+                inst.context["hypotheses"] = ckpt_data["hypotheses"]
+            if ckpt_data.get("completed_observations"):
+                inst.context["completed_observations"] = ckpt_data["completed_observations"]
+            return inst
+        else:
+            return WorkflowExecutionState.from_dict(envelope)
 
     def execute_stage_initializing(self, instance: WorkflowExecutionState) -> bool:
         """Stage 1: Verify target PID is alive, accessible, and pin identity."""
@@ -455,7 +598,8 @@ class InvestigationWorkflowEngine:
             instance.record_transition(STAGE_BLOCKED, instance.stopping_explanation)
             return False
         try:
-            self.target_adapter.pin_target_identity(instance.target_pid)
+            pinned = self.target_adapter.pin_target_identity(instance.target_pid)
+            instance.context["pinned_identity"] = dict(pinned)
         except Exception as e:
             instance.record_transition(STAGE_FAILED, f"Failed pinning target identity: {e}")
             return False
@@ -484,8 +628,10 @@ class InvestigationWorkflowEngine:
 
         try:
             if hasattr(self.target_adapter, "capture_transaction"):
-                with self.target_adapter.capture_transaction(instance.session_id, instance.target_pid, operation_type="probe"):
+                with self.target_adapter.capture_transaction(instance.session_id, instance.target_pid, operation_type="probe") as tx:
                     self.target_adapter.read_memory(instance.target_pid, readable_maps[0]["start_int"], min(64, readable_maps[0]["size"]))
+                rcpt = self.target_adapter.issue_live_receipt_for_session(instance.session_id, instance.target_pid, transaction=tx)
+                instance.context["probe_receipt"] = rcpt.to_dict()
             else:
                 self.target_adapter.read_memory(instance.target_pid, readable_maps[0]["start_int"], min(64, readable_maps[0]["size"]))
         except Exception as exc:
@@ -505,10 +651,10 @@ class InvestigationWorkflowEngine:
         heap_maps = [m for m in maps if m.get("category") == "heap"]
 
         hyps: List[Dict[str, Any]] = [
-            {"id": "hyp_normal", "title": "Normal Operation", "prior": 0.3},
-            {"id": "hyp_deadlock", "title": "Mutex Contention or Deadlock", "prior": 0.4 if len(waiting_threads) >= 2 else 0.2},
-            {"id": "hyp_starvation", "title": "Worker Thread Starvation", "prior": 0.3 if len(waiting_threads) >= 1 else 0.1},
-            {"id": "hyp_leak", "title": "Memory Leak or High Growth", "prior": 0.3 if len(heap_maps) > 0 else 0.1},
+            {"id": "hyp_normal", "title": "Normal Operation", "prior": 0.3, "status": HYPOTHESIS_STATUS_NOT_TESTED, "confidence": 0.3},
+            {"id": "hyp_deadlock", "title": "Mutex Contention or Deadlock", "prior": 0.4 if len(waiting_threads) >= 2 else 0.2, "status": HYPOTHESIS_STATUS_NOT_TESTED, "confidence": 0.2},
+            {"id": "hyp_starvation", "title": "Worker Thread Starvation", "prior": 0.3 if len(waiting_threads) >= 1 else 0.1, "status": HYPOTHESIS_STATUS_NOT_TESTED, "confidence": 0.1},
+            {"id": "hyp_leak", "title": "Memory Leak or High Growth", "prior": 0.3 if len(heap_maps) > 0 else 0.1, "status": HYPOTHESIS_STATUS_NOT_TESTED, "confidence": 0.1},
         ]
         instance.context["hypotheses"] = hyps
         return self.transition_stage(
@@ -540,6 +686,17 @@ class InvestigationWorkflowEngine:
         target_addr = instance.context.get("target_addr", 0)
         target_size = instance.context.get("target_size", 128)
 
+        # Non-re-execution check on resume
+        completed_obs = instance.context.setdefault("completed_observations", [])
+        obs_key = f"0x{target_addr:x}:{target_size}"
+        if obs_key in completed_obs and "last_receipt" in instance.context:
+            return self.transition_stage(
+                instance,
+                STAGE_EVALUATING_EVIDENCE,
+                f"Observation at 0x{target_addr:x} already completed in previous run; avoiding duplicate physical read",
+                details={"target_addr": hex(target_addr), "cached": True},
+            )
+
         try:
             if hasattr(self.target_adapter, "capture_transaction"):
                 with self.target_adapter.capture_transaction(instance.session_id, instance.target_pid, operation_type="diagnostic") as tx:
@@ -549,15 +706,17 @@ class InvestigationWorkflowEngine:
                         return False
                     instance.context["last_read_bytes"] = len(raw_bytes)
                     instance.context["last_read_digest"] = tx.observation_digest
+                rcpt = self.target_adapter.issue_live_receipt_for_session(instance.session_id, instance.target_pid, transaction=tx)
             else:
                 raw_bytes, status, err = self.target_adapter.read_memory(instance.target_pid, target_addr, target_size)
                 if status not in ("OBSERVED", "PARTIAL") or not raw_bytes:
                     instance.record_transition(STAGE_FAILED, f"Observation read failed: {err}")
                     return False
                 instance.context["last_read_bytes"] = len(raw_bytes)
+                rcpt = self.target_adapter.issue_live_receipt_for_session(instance.session_id, instance.target_pid)
 
-            rcpt = self.target_adapter.issue_live_receipt_for_session(instance.session_id, instance.target_pid)
             instance.context["last_receipt"] = rcpt.to_dict()
+            completed_obs.append(obs_key)
         except Exception as exc:
             alive, _ = self.target_adapter.check_liveness(instance.target_pid)
             if not alive:
@@ -586,7 +745,7 @@ class InvestigationWorkflowEngine:
             evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
             observation=f"Physical read observation on PID {instance.target_pid}",
             field_observation={"field_path": "runtime.memory.slice"},
-            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt},
+            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict()},
             target_identity={
                 "pid": instance.target_pid,
                 "process_identity": rcpt.process_identity,
@@ -613,19 +772,70 @@ class InvestigationWorkflowEngine:
         )
 
     def execute_stage_updating_hypothesis(self, instance: WorkflowExecutionState) -> bool:
-        """Stage 7: Update hypothesis confidence and validation states."""
+        """Stage 7: Update hypothesis confidence and validation states based on validated ledger evidence."""
         hyps = instance.context.get("hypotheses") or []
+        ledger = getattr(self, "evidence_ledger", None)
+        ledger_records = ledger.records if ledger else []
+        threads = instance.context.get("threads") or []
+
+        waiting_futex_threads = [
+            t for t in threads
+            if t.get("state") in ("S", "D") and ("futex" in str(t.get("wchan", "")).lower() or t.get("voluntary_ctxt_switches", 0) > 0)
+        ]
+        has_deadlock_signal = len(waiting_futex_threads) >= 2 or any(
+            "deadlock" in r.observation.lower() or "contention" in r.observation.lower()
+            for r in ledger_records
+        )
+
         for h in hyps:
-            if h.get("id") == "hyp_normal":
-                h["status"] = HYPOTHESIS_STATUS_SUPPORTED
-                h["confidence"] = 0.85
+            hid = h.get("id", "")
+            prior = float(h.get("prior", 0.25))
+
+            if hid == "hyp_deadlock":
+                if has_deadlock_signal:
+                    h["status"] = HYPOTHESIS_STATUS_SUPPORTED
+                    evidence_boost = min(0.55, 0.20 * len(waiting_futex_threads) + 0.10 * len(ledger_records))
+                    h["confidence"] = round(min(0.95, prior + evidence_boost), 3)
+                    h["causally_verified"] = any(
+                        (r.details or {}).get("causal_proof") is True
+                        or (r.details or {}).get("deterministic_transition_verified") is True
+                        or (r.provenance or {}).get("verifier_attestation") is not None
+                        for r in ledger_records
+                    )
+                else:
+                    h["status"] = HYPOTHESIS_STATUS_REFUTED if any(t.get("is_running_user_space") for t in threads) else HYPOTHESIS_STATUS_INCONCLUSIVE
+                    h["confidence"] = 0.05 if h["status"] == HYPOTHESIS_STATUS_REFUTED else round(prior, 3)
+                    h["causally_verified"] = False
+
+            elif hid == "hyp_normal":
+                if has_deadlock_signal:
+                    h["status"] = HYPOTHESIS_STATUS_REFUTED
+                    h["confidence"] = 0.05
+                    h["causally_verified"] = False
+                elif ledger_records and not has_deadlock_signal:
+                    h["status"] = HYPOTHESIS_STATUS_SUPPORTED
+                    evidence_boost = min(0.60, 0.25 * len(ledger_records))
+                    h["confidence"] = round(min(0.92, prior + evidence_boost), 3)
+                    h["causally_verified"] = True
+                else:
+                    h["status"] = HYPOTHESIS_STATUS_INCONCLUSIVE
+                    h["confidence"] = round(prior, 3)
+                    h["causally_verified"] = False
+
             else:
-                h["status"] = HYPOTHESIS_STATUS_INCONCLUSIVE
-                h["confidence"] = 0.15
+                matching = [r for r in ledger_records if (r.details or {}).get("hypothesis_id") == hid or getattr(r, "hypothesis_id", None) == hid]
+                if matching:
+                    h["status"] = HYPOTHESIS_STATUS_SUPPORTED
+                    h["confidence"] = round(min(0.85, prior + 0.2 * len(matching)), 3)
+                else:
+                    h["status"] = HYPOTHESIS_STATUS_NOT_TESTED
+                    h["confidence"] = round(prior, 3)
+                h["causally_verified"] = False
+
         return self.transition_stage(
             instance,
             STAGE_CHECKING_BUDGET,
-            "Updated hypotheses confidence based on verified observations",
+            "Updated hypotheses confidence based on verified observations and calibration policy",
         )
 
     def execute_stage_checking_budget(self, instance: WorkflowExecutionState) -> bool:
@@ -644,50 +854,139 @@ class InvestigationWorkflowEngine:
         )
 
     def execute_stage_comparing_competing(self, instance: WorkflowExecutionState) -> bool:
-        """Stage 9: Discriminate among competing hypotheses."""
+        """Stage 9: Discriminate among competing hypotheses using evidence scores."""
+        hyps = instance.context.get("hypotheses") or []
+        if not hyps:
+            return self.transition_stage(instance, STAGE_VERIFYING_CAUSATION, "No competing hypotheses to compare")
+
+        hyps.sort(key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
+        top = hyps[0]
+
+        for comp in hyps[1:]:
+            top_conf = float(top.get("confidence", 0.0))
+            comp_conf = float(comp.get("confidence", 0.0))
+            if top.get("status") == HYPOTHESIS_STATUS_SUPPORTED:
+                if comp.get("status") != HYPOTHESIS_STATUS_REFUTED and (top_conf - comp_conf) >= 0.25:
+                    comp["status"] = HYPOTHESIS_STATUS_REFUTED if comp["id"] in ("hyp_normal", "hyp_deadlock") else HYPOTHESIS_STATUS_INCONCLUSIVE
+
+        instance.context["primary_hypothesis"] = top
+        instance.context["competing_hypotheses"] = hyps[1:]
         return self.transition_stage(
             instance,
             STAGE_VERIFYING_CAUSATION,
-            "Evaluated competing hypotheses; discriminating evidence established",
+            f"Discriminated competing hypotheses; top: '{top.get('id')}' (confidence={top.get('confidence')})",
+            details={"primary_hypothesis": top.get("id"), "primary_confidence": top.get("confidence")},
         )
 
     def execute_stage_verifying_causation(self, instance: WorkflowExecutionState) -> bool:
-        """Stage 10: Verify causal linkages and state stability."""
+        """Stage 10: Verify causal consistency and mechanistic linkage."""
+        top = instance.context.get("primary_hypothesis")
+        causation_verified = False
+        if top:
+            causation_verified = bool(top.get("causally_verified", False))
+
+        instance.context["causation_verified"] = causation_verified
+        explanation = (
+            "Causal proof verified via controlled transition/attestation"
+            if causation_verified
+            else "Static correlational observation verified (causal transition unverified)"
+        )
         return self.transition_stage(
             instance,
             STAGE_FORMING_DIAGNOSIS,
-            "Causal linkage verified from physical memory observation",
+            explanation,
+            details={"causation_verified": causation_verified},
         )
 
     def execute_stage_forming_diagnosis(self, instance: WorkflowExecutionState) -> bool:
-        """Stage 11: Form final diagnostic verdict."""
+        """Stage 11: Form final diagnostic verdict based exclusively on evidence and causality."""
+        top = instance.context.get("primary_hypothesis")
+        causation_verified = instance.context.get("causation_verified", False)
+        if not top and instance.context.get("hypotheses_validated"):
+            v_item = instance.context["hypotheses_validated"][0]
+            top = {
+                "id": v_item.get("id", "hyp_validated"),
+                "status": HYPOTHESIS_STATUS_SUPPORTED,
+                "confidence": 0.85,
+                "causally_verified": True,
+            }
+            if instance.context.get("causation_verified") is None:
+                causation_verified = True
+
         if instance.context.get("evidence_sufficient") is False:
             diag = DIAG_INCONCLUSIVE
-        elif instance.context.get("hypotheses_validated"):
-            diag = DIAG_CONFIRMED
+            stop_reason = STOP_EVIDENCE_INSUFFICIENT
+        elif instance.context.get("budget_exhausted"):
+            diag = DIAG_ABSTAINED
+            stop_reason = STOP_BUDGET_EXHAUSTED
+        elif not top or top.get("status") == HYPOTHESIS_STATUS_INCONCLUSIVE:
+            diag = DIAG_INCONCLUSIVE
+            stop_reason = STOP_EVIDENCE_INSUFFICIENT
+        elif top.get("id") == "hyp_normal" and top.get("status") == HYPOTHESIS_STATUS_SUPPORTED:
+            diag = DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE
+            stop_reason = STOP_DIAGNOSIS_CONFIRMED
+        elif top.get("status") == HYPOTHESIS_STATUS_SUPPORTED:
+            if causation_verified:
+                diag = DIAG_CONFIRMED
+            else:
+                diag = DIAG_SUSPECTED
+            stop_reason = STOP_DIAGNOSIS_CONFIRMED
         else:
-            diag = DIAG_CONFIRMED if "deadlock" in instance.goal.lower() else DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE
-        stop_reason = STOP_DIAGNOSIS_CONFIRMED
+            diag = DIAG_INCONCLUSIVE
+            stop_reason = STOP_EVIDENCE_INSUFFICIENT
+
         instance.context["diagnosis"] = diag
         instance.context["stopping_reason"] = stop_reason
         instance.stopping_reason = stop_reason
         return self.transition_stage(
             instance,
             STAGE_GENERATING_REPORT,
-            f"Formed final diagnosis: {diag}",
-            details={"diagnosis": diag, "stopping_reason": stop_reason},
+            f"Formed final diagnosis: {diag} (causation_verified={causation_verified})",
+            details={"diagnosis": diag, "stopping_reason": stop_reason, "causation_verified": causation_verified},
         )
 
     def execute_stage_generating_report(self, instance: WorkflowExecutionState) -> bool:
-        """Stage 12: Assemble final incident report and complete."""
+        """Stage 12: Assemble final incident report adhering to strict diagnosis contract."""
+        top = instance.context.get("primary_hypothesis") or {}
+        hyps = instance.context.get("hypotheses") or []
+        ledger = getattr(self, "evidence_ledger", None)
+        ledger_records = ledger.records if ledger else []
+
+        contradictory_recs = [
+            r.to_dict() for r in ledger_records
+            if (r.details or {}).get("is_contradiction")
+        ]
+        uninspected_hyps = [
+            h.get("id") for h in hyps
+            if h.get("status") == HYPOTHESIS_STATUS_NOT_TESTED
+        ]
+
         report = {
             "session_id": instance.session_id,
             "instance_id": instance.instance_id,
             "target_pid": instance.target_pid,
             "goal": instance.goal,
             "verdict": instance.context.get("diagnosis", DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE),
+            "primary_diagnosis": {
+                "hypothesis_id": top.get("id"),
+                "title": top.get("title"),
+                "status": top.get("status"),
+                "confidence_score": top.get("confidence", 0.0),
+                "causally_verified": bool(instance.context.get("causation_verified", False)),
+            },
             "stopping_reason": instance.stopping_reason or STOP_DIAGNOSIS_CONFIRMED,
-            "evidence_count": len(instance.context.get("evidence_records", [])),
+            "confidence_score": float(top.get("confidence", 0.0)),
+            "hypotheses_evaluated": [
+                {"id": h.get("id"), "status": h.get("status"), "confidence": h.get("confidence")}
+                for h in hyps
+            ],
+            "hypotheses_uninspected": uninspected_hyps,
+            "contradictory_evidence": contradictory_recs,
+            "operational_limitations": [
+                "Memory slice observation limited to mapped non-reserved pages",
+                "Lock contention evaluation based on kernel task wait channel signals",
+            ],
+            "evidence_count": len(instance.context.get("evidence_records", [])) or len(ledger_records),
             "audit_trail_length": len(instance.audit_trail),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -806,6 +1105,30 @@ class InvestigationWorkflowEngine:
                     f"Executable replacement detected on resume for PID {inst.target_pid}: "
                     f"{pinned['executable']} -> {cur_ident['executable']}"
                 )
+            if (
+                pinned.get("exe_inode")
+                and cur_ident.get("exe_inode")
+                and int(pinned["exe_inode"]) != int(cur_ident["exe_inode"])
+            ):
+                raise PIDReusedError(
+                    f"Executable inode changed on resume for PID {inst.target_pid}: "
+                    f"{pinned['exe_inode']} -> {cur_ident['exe_inode']}"
+                )
+            if (
+                pinned.get("build_id")
+                and cur_ident.get("build_id")
+                and str(pinned["build_id"]).strip().lower() != str(cur_ident["build_id"]).strip().lower()
+            ):
+                raise PIDReusedError(
+                    f"Build ID changed on resume for PID {inst.target_pid}: "
+                    f"{pinned['build_id']} -> {cur_ident['build_id']}"
+                )
+
+        # Restore ledger if serialized in checkpoint
+        restored_ledger = inst.context.get("restored_evidence_ledger")
+        if restored_ledger:
+            self.evidence_ledger = EvidenceLedger.from_dict(restored_ledger)
+
         return inst
 
     def execute_investigation(

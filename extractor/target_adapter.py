@@ -16,9 +16,11 @@ Enforces:
 from abc import ABC, abstractmethod
 import base64
 import contextlib
+import contextvars
 from dataclasses import dataclass, field
 import errno
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -78,6 +80,10 @@ class PIDReusedError(TargetIdentityChangedError):
     """Raised when target PID reuse is detected during or after capture operations."""
 
 
+_current_capture_tx: contextvars.ContextVar[Optional["CaptureTransaction"]] = contextvars.ContextVar("_current_capture_tx", default=None)
+_tx_stack: contextvars.ContextVar[List["CaptureTransaction"]] = contextvars.ContextVar("_tx_stack", default=None)
+
+
 @dataclass
 class CaptureTransaction:
     """Explicit capture transaction scoping physical reads, binding receipts, and verifying target identity invariants."""
@@ -85,6 +91,7 @@ class CaptureTransaction:
     session_id: str
     pid: int
     operation_type: str = "diagnostic"  # "diagnostic" or "probe"
+    target_host: str = "localhost"
     snapshot_binding: str = ""
     start_time_ns: int = 0
     end_time_ns: int = 0
@@ -93,6 +100,7 @@ class CaptureTransaction:
     physical_reads_count: int = 0
     physical_bytes_read: int = 0
     read_payloads: List[bytes] = field(default_factory=list)
+    read_operations: List[Dict[str, Any]] = field(default_factory=list)
     committed: bool = False
     aborted: bool = False
     abort_reason: Optional[str] = None
@@ -100,12 +108,45 @@ class CaptureTransaction:
 
     @property
     def observation_digest(self) -> str:
-        if not self.read_payloads:
+        if not self.read_operations and not self.read_payloads:
             return ""
-        hasher = hashlib.sha256()
-        for p in self.read_payloads:
-            hasher.update(p)
-        return hasher.hexdigest()
+        target_ident = {
+            "pid": int(self.pid),
+            "process_identity": str(self.pre_identity.get("process_identity", "")),
+            "executable_identity": str(self.pre_identity.get("executable_identity") or self.pre_identity.get("executable", "")),
+            "build_id": str(self.pre_identity.get("build_id", "")),
+            "target_host": str(self.target_host),
+        }
+        if self.read_operations:
+            read_seq = [
+                {
+                    "address": int(op.get("address", 0)),
+                    "requested_size": int(op.get("requested_size", 0)),
+                    "actual_bytes_read": int(op.get("actual_bytes_read", len(op.get("data", b"")))),
+                    "status": str(op.get("status", "OBSERVED")),
+                    "payload_sha256": hashlib.sha256(op.get("data", b"")).hexdigest(),
+                }
+                for op in self.read_operations
+            ]
+        else:
+            read_seq = [
+                {
+                    "address": 0,
+                    "requested_size": len(p),
+                    "actual_bytes_read": len(p),
+                    "status": "OBSERVED",
+                    "payload_sha256": hashlib.sha256(p).hexdigest(),
+                }
+                for p in self.read_payloads
+            ]
+        canonical_obj = {
+            "target_identity": target_ident,
+            "operation_id": str(self.transaction_id),
+            "operation_type": str(self.operation_type),
+            "read_sequence": read_seq,
+        }
+        raw_json = json.dumps(canonical_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(raw_json).hexdigest()
 
 
 class TargetExecutionAdapter(ABC):
@@ -116,6 +157,10 @@ class TargetExecutionAdapter(ABC):
             self._physical_reads_count: int = 0
         if not hasattr(self, "_physical_bytes_read"):
             self._physical_bytes_read: int = 0
+        if not hasattr(self, "_unscoped_physical_reads_count"):
+            self._unscoped_physical_reads_count: int = 0
+        if not hasattr(self, "_unscoped_physical_bytes_read"):
+            self._unscoped_physical_bytes_read: int = 0
         if not hasattr(self, "_capture_epoch"):
             self._capture_epoch: int = 0
         if not hasattr(self, "_pinned_identities"):
@@ -124,14 +169,40 @@ class TargetExecutionAdapter(ABC):
             self._observation_dedup_cache: Dict[Tuple[int, str, int, int, int], Tuple[Optional[bytes], str, Optional[str]]] = {}
         if not hasattr(self, "_issued_live_receipts"):
             self._issued_live_receipts: List[Any] = []
-        if not hasattr(self, "_active_transaction"):
-            self._active_transaction: Optional[CaptureTransaction] = None
         if not hasattr(self, "_last_committed_transaction"):
             self._last_committed_transaction: Optional[CaptureTransaction] = None
         if not hasattr(self, "_active_transactions"):
-            self._active_transactions: Dict[Tuple[str, int], CaptureTransaction] = {}
+            self._active_transactions: Dict[str, CaptureTransaction] = {}
+        if not hasattr(self, "_committed_transactions"):
+            self._committed_transactions: Dict[str, CaptureTransaction] = {}
+        if not hasattr(self, "_active_by_scope"):
+            self._active_by_scope: Dict[Tuple[str, str, int], CaptureTransaction] = {}
         if not hasattr(self, "_auto_transaction"):
             self._auto_transaction: Optional[CaptureTransaction] = None
+
+    @property
+    def _active_transaction(self) -> Optional[CaptureTransaction]:
+        self._ensure_tracking_state()
+        ctx_tx = _current_capture_tx.get(None)
+        if ctx_tx is not None and not ctx_tx.committed and not ctx_tx.aborted:
+            return ctx_tx
+        if len(self._active_transactions) == 1:
+            tx = next(iter(self._active_transactions.values()))
+            if not tx.committed and not tx.aborted:
+                return tx
+        return None
+
+    @_active_transaction.setter
+    def _active_transaction(self, val: Optional[CaptureTransaction]) -> None:
+        self._ensure_tracking_state()
+        if val is not None:
+            self._active_transactions[val.transaction_id] = val
+            _current_capture_tx.set(val)
+        else:
+            ctx_tx = _current_capture_tx.get(None)
+            if ctx_tx is not None:
+                self._active_transactions.pop(ctx_tx.transaction_id, None)
+                _current_capture_tx.set(None)
 
     @property
     def physical_reads_count(self) -> int:
@@ -142,6 +213,16 @@ class TargetExecutionAdapter(ABC):
     def cumulative_physical_bytes_read(self) -> int:
         self._ensure_tracking_state()
         return self._physical_bytes_read
+
+    @property
+    def unscoped_physical_reads_count(self) -> int:
+        self._ensure_tracking_state()
+        return self._unscoped_physical_reads_count
+
+    @property
+    def unscoped_physical_bytes_read(self) -> int:
+        self._ensure_tracking_state()
+        return self._unscoped_physical_bytes_read
 
     @property
     def capture_epoch(self) -> int:
@@ -157,12 +238,17 @@ class TargetExecutionAdapter(ABC):
         self._ensure_tracking_state()
         self._physical_reads_count = 0
         self._physical_bytes_read = 0
+        self._unscoped_physical_reads_count = 0
+        self._unscoped_physical_bytes_read = 0
         self._observation_dedup_cache.clear()
         self._issued_live_receipts.clear()
-        self._active_transaction = None
         self._last_committed_transaction = None
         self._active_transactions.clear()
+        self._committed_transactions.clear()
+        self._active_by_scope.clear()
         self._auto_transaction = None
+        _current_capture_tx.set(None)
+        _tx_stack.set([])
 
     def _record_physical_read(
         self,
@@ -170,6 +256,10 @@ class TargetExecutionAdapter(ABC):
         num_reads: int = 1,
         data: Optional[bytes] = None,
         pid: Optional[int] = None,
+        address: int = 0,
+        requested_size: Optional[int] = None,
+        status: str = "OBSERVED",
+        transaction: Optional[CaptureTransaction] = None,
     ) -> None:
         self._ensure_tracking_state()
         if num_reads > 0:
@@ -177,39 +267,77 @@ class TargetExecutionAdapter(ABC):
         if num_bytes > 0:
             self._physical_bytes_read += int(num_bytes)
 
-        eff_tx = self._active_transaction
-        if pid is not None:
-            if eff_tx is not None and int(eff_tx.pid) != int(pid):
-                eff_tx = None
-            if eff_tx is None:
-                for (s_id, p_id), tx in self._active_transactions.items():
-                    if p_id == int(pid) and not tx.committed and not tx.aborted:
-                        eff_tx = tx
-                        break
-
-        if eff_tx is not None and not eff_tx.committed and not eff_tx.aborted:
-            if pid is None or int(eff_tx.pid) == int(pid):
-                if num_reads > 0:
-                    eff_tx.physical_reads_count += int(num_reads)
-                if num_bytes > 0:
-                    eff_tx.physical_bytes_read += int(num_bytes)
-                if data:
-                    eff_tx.read_payloads.append(data)
+        eff_tx: Optional[CaptureTransaction] = None
+        if transaction is not None and not transaction.committed and not transaction.aborted:
+            eff_tx = transaction
         else:
-            if self._auto_transaction is None or self._auto_transaction.receipt_issued or self._auto_transaction.committed:
-                self._auto_transaction = CaptureTransaction(
-                    transaction_id=f"ctx_auto_{uuid.uuid4().hex[:12]}",
-                    session_id="auto_session",
-                    pid=int(pid or 0),
-                    operation_type="diagnostic",
-                    start_time_ns=time.time_ns(),
-                )
+            ctx_tx = _current_capture_tx.get(None)
+            if ctx_tx is not None and not ctx_tx.committed and not ctx_tx.aborted:
+                if pid is not None and int(ctx_tx.pid) != int(pid):
+                    eff_tx = None
+                else:
+                    eff_tx = ctx_tx
+            if eff_tx is None:
+                matching = [
+                    t for t in self._active_transactions.values()
+                    if not t.committed and not t.aborted and (pid is None or int(t.pid) == int(pid))
+                ]
+                if len(matching) == 1:
+                    eff_tx = matching[0]
+                elif len(matching) > 1:
+                    eff_tx = None
+
+        if eff_tx is not None:
             if num_reads > 0:
-                self._auto_transaction.physical_reads_count += int(num_reads)
+                eff_tx.physical_reads_count += int(num_reads)
             if num_bytes > 0:
-                self._auto_transaction.physical_bytes_read += int(num_bytes)
-            if data:
-                self._auto_transaction.read_payloads.append(data)
+                eff_tx.physical_bytes_read += int(num_bytes)
+            if data is not None:
+                eff_tx.read_payloads.append(data)
+                eff_tx.read_operations.append({
+                    "address": int(address),
+                    "requested_size": int(requested_size if requested_size is not None else num_bytes),
+                    "actual_bytes_read": len(data),
+                    "status": str(status),
+                    "data": data,
+                })
+        else:
+            # Pinned single target fallback for legacy operations
+            if (
+                pid is not None
+                and int(pid) in self._pinned_identities
+                and len(self._active_transactions) == 0
+            ):
+                if self._auto_transaction is None or self._auto_transaction.receipt_issued or self._auto_transaction.committed or int(self._auto_transaction.pid) != int(pid):
+                    ident = self._pinned_identities[int(pid)]
+                    th = self.target_host() if hasattr(self, "target_host") else "localhost"
+                    self._auto_transaction = CaptureTransaction(
+                        transaction_id=f"ctx_auto_{uuid.uuid4().hex[:12]}",
+                        session_id="auto_session",
+                        pid=int(pid),
+                        operation_type="diagnostic",
+                        target_host=str(th),
+                        start_time_ns=time.time_ns(),
+                        pre_identity=dict(ident),
+                    )
+                if num_reads > 0:
+                    self._auto_transaction.physical_reads_count += int(num_reads)
+                if num_bytes > 0:
+                    self._auto_transaction.physical_bytes_read += int(num_bytes)
+                if data is not None:
+                    self._auto_transaction.read_payloads.append(data)
+                    self._auto_transaction.read_operations.append({
+                        "address": int(address),
+                        "requested_size": int(requested_size if requested_size is not None else num_bytes),
+                        "actual_bytes_read": len(data),
+                        "status": str(status),
+                        "data": data,
+                    })
+            else:
+                if num_reads > 0:
+                    self._unscoped_physical_reads_count += int(num_reads)
+                if num_bytes > 0:
+                    self._unscoped_physical_bytes_read += int(num_bytes)
 
     def begin_capture_transaction(
         self,
@@ -234,17 +362,24 @@ class TargetExecutionAdapter(ABC):
         else:
             ident = self.pin_target_identity(int(pid))
 
+        th = self.target_host() if hasattr(self, "target_host") else "localhost"
         tx = CaptureTransaction(
             transaction_id=f"ctx_{uuid.uuid4().hex[:12]}",
             session_id=str(session_id),
             pid=int(pid),
             operation_type=str(operation_type),
+            target_host=str(th),
             snapshot_binding=snapshot_binding or f"live_reads:{pid}:epoch_{self._capture_epoch}",
             start_time_ns=time.time_ns(),
             pre_identity=dict(ident),
         )
-        self._active_transaction = tx
-        self._active_transactions[(str(session_id), int(pid))] = tx
+        self._active_transactions[tx.transaction_id] = tx
+        self._active_by_scope[(str(th), str(session_id), int(pid))] = tx
+
+        cur_stack = _tx_stack.get(None) or []
+        new_stack = list(cur_stack) + [tx]
+        _tx_stack.set(new_stack)
+        _current_capture_tx.set(tx)
         return tx
 
     def commit_capture_transaction(
@@ -253,11 +388,23 @@ class TargetExecutionAdapter(ABC):
     ) -> CaptureTransaction:
         """Commit an active capture transaction, verifying target identity post-capture."""
         self._ensure_tracking_state()
-        target_tx = tx or self._active_transaction
+        target_tx = tx or _current_capture_tx.get(None)
+        if not target_tx and len(self._active_transactions) == 1:
+            target_tx = next(iter(self._active_transactions.values()))
         if not target_tx or target_tx.aborted:
             raise ValueError("No active or valid capture transaction to commit")
         if target_tx.committed:
             return target_tx
+
+        cur_stack = _tx_stack.get(None) or []
+        if cur_stack and target_tx in cur_stack:
+            idx = cur_stack.index(target_tx)
+            for inner_tx in cur_stack[idx + 1:]:
+                if inner_tx.pid == target_tx.pid and inner_tx.session_id == target_tx.session_id:
+                    if not inner_tx.committed and not inner_tx.aborted:
+                        raise ValueError(
+                            f"Cannot commit outer transaction '{target_tx.transaction_id}' while nested inner transaction '{inner_tx.transaction_id}' is active"
+                        )
 
         cur_ident = self.get_process_identity(target_tx.pid)
         alive, live_err = self.check_liveness(target_tx.pid)
@@ -265,37 +412,38 @@ class TargetExecutionAdapter(ABC):
             self.rollback_capture_transaction(target_tx, f"Target process exited during capture: {live_err}")
             raise ProcessLookupError(f"Target process {target_tx.pid} terminated during capture: {live_err}")
 
-        if (
-            target_tx.pre_identity.get("start_time")
-            and cur_ident.get("start_time")
-            and str(target_tx.pre_identity["start_time"]) != str(cur_ident["start_time"])
-        ):
-            self.rollback_capture_transaction(target_tx, "PID reuse detected during capture transaction")
+        ok_pin, pin_err = self.verify_pinned_identity(target_tx.pid)
+        if not ok_pin:
+            self.rollback_capture_transaction(target_tx, f"Pinned identity changed: {pin_err}")
+            raise PIDReusedError(f"Pinned identity changed during capture transaction on PID {target_tx.pid}: {pin_err}")
+
+        for field_name, err_name in [
+            ("start_time", "start_time changed"),
+            ("boot_id", "boot_id changed"),
+            ("executable", "Executable replaced"),
+            ("exe_inode", "Executable inode changed"),
+        ]:
+            pre_val = target_tx.pre_identity.get(field_name)
+            cur_val = cur_ident.get(field_name)
+            if pre_val and cur_val and str(pre_val) != str(cur_val):
+                self.rollback_capture_transaction(target_tx, f"{err_name} during capture transaction")
+                raise PIDReusedError(
+                    f"{err_name} on PID {target_tx.pid}: {pre_val} -> {cur_val}"
+                )
+
+        pre_bid = target_tx.pre_identity.get("build_id")
+        cur_bid = cur_ident.get("build_id")
+        if pre_bid and cur_bid and str(pre_bid).strip().lower() != str(cur_bid).strip().lower():
+            self.rollback_capture_transaction(target_tx, "Build ID changed during capture transaction")
             raise PIDReusedError(
-                f"PID reuse detected during capture transaction on PID {target_tx.pid}: "
-                f"start_time changed from {target_tx.pre_identity['start_time']} to {cur_ident['start_time']}"
+                f"Build ID changed on PID {target_tx.pid}: {pre_bid} -> {cur_bid}"
             )
 
-        if (
-            target_tx.pre_identity.get("executable")
-            and cur_ident.get("executable")
-            and str(target_tx.pre_identity["executable"]) != str(cur_ident["executable"])
-        ):
-            self.rollback_capture_transaction(target_tx, "Executable replacement detected during capture transaction")
+        th = self.target_host() if hasattr(self, "target_host") else "localhost"
+        if str(target_tx.target_host) != str(th):
+            self.rollback_capture_transaction(target_tx, "Target host changed during capture transaction")
             raise PIDReusedError(
-                f"Executable replaced during capture transaction on PID {target_tx.pid}: "
-                f"{target_tx.pre_identity['executable']} -> {cur_ident['executable']}"
-            )
-
-        if (
-            target_tx.pre_identity.get("exe_inode")
-            and cur_ident.get("exe_inode")
-            and int(target_tx.pre_identity["exe_inode"]) != int(cur_ident["exe_inode"])
-        ):
-            self.rollback_capture_transaction(target_tx, "Executable inode changed during capture transaction")
-            raise PIDReusedError(
-                f"Executable inode changed during capture transaction on PID {target_tx.pid}: "
-                f"{target_tx.pre_identity['exe_inode']} -> {cur_ident['exe_inode']}"
+                f"Target host changed during capture transaction: {target_tx.target_host} -> {th}"
             )
 
         if target_tx.physical_bytes_read <= 0:
@@ -307,10 +455,17 @@ class TargetExecutionAdapter(ABC):
         target_tx.post_identity = dict(cur_ident)
         target_tx.end_time_ns = time.time_ns()
         target_tx.committed = True
+
+        self._committed_transactions[target_tx.transaction_id] = target_tx
         self._last_committed_transaction = target_tx
-        if self._active_transaction is target_tx:
-            self._active_transaction = None
-        self._active_transactions.pop((target_tx.session_id, target_tx.pid), None)
+        self._active_transactions.pop(target_tx.transaction_id, None)
+        self._active_by_scope.pop((str(target_tx.target_host), str(target_tx.session_id), int(target_tx.pid)), None)
+
+        if cur_stack and target_tx in cur_stack:
+            new_stack = [t for t in cur_stack if t.transaction_id != target_tx.transaction_id]
+            _tx_stack.set(new_stack)
+            _current_capture_tx.set(new_stack[-1] if new_stack else None)
+
         return target_tx
 
     def rollback_capture_transaction(
@@ -320,13 +475,19 @@ class TargetExecutionAdapter(ABC):
     ) -> None:
         """Roll back an in-flight capture transaction."""
         self._ensure_tracking_state()
-        target_tx = tx or self._active_transaction
+        target_tx = tx or _current_capture_tx.get(None)
+        if not target_tx and len(self._active_transactions) == 1:
+            target_tx = next(iter(self._active_transactions.values()))
         if target_tx:
             target_tx.aborted = True
             target_tx.abort_reason = reason or "Capture transaction rolled back"
-            self._active_transactions.pop((target_tx.session_id, target_tx.pid), None)
-        if self._active_transaction is target_tx:
-            self._active_transaction = None
+            self._active_transactions.pop(target_tx.transaction_id, None)
+            self._active_by_scope.pop((str(target_tx.target_host), str(target_tx.session_id), int(target_tx.pid)), None)
+            cur_stack = _tx_stack.get(None) or []
+            if cur_stack and target_tx in cur_stack:
+                new_stack = [t for t in cur_stack if t.transaction_id != target_tx.transaction_id]
+                _tx_stack.set(new_stack)
+                _current_capture_tx.set(new_stack[-1] if new_stack else None)
 
     @contextlib.contextmanager
     def capture_transaction(
@@ -391,20 +552,59 @@ class TargetExecutionAdapter(ABC):
 
         tx = transaction
         if tx is None:
-            if self._active_transaction is not None and self._active_transaction.physical_bytes_read > 0:
-                tx = self.commit_capture_transaction(self._active_transaction)
-            elif (
-                self._auto_transaction is not None
-                and self._auto_transaction.physical_bytes_read > 0
-                and not self._auto_transaction.receipt_issued
+            # Check last committed transaction first if it matches and is unissued
+            if (
+                self._last_committed_transaction is not None
+                and str(self._last_committed_transaction.session_id) == str(session_id)
+                and int(self._last_committed_transaction.pid) == int(pid)
+                and not self._last_committed_transaction.receipt_issued
+                and not self._last_committed_transaction.aborted
             ):
-                tx = self._auto_transaction
-                tx.session_id = str(session_id)
-                tx.pid = int(pid)
-                tx.committed = True
-                self._last_committed_transaction = tx
-            elif self._last_committed_transaction is not None:
                 tx = self._last_committed_transaction
+            else:
+                candidates = [
+                    t for t in self._committed_transactions.values()
+                    if str(t.session_id) == str(session_id) and int(t.pid) == int(pid) and not t.receipt_issued and not t.aborted
+                ]
+                if len(candidates) == 1:
+                    tx = candidates[0]
+                elif len(candidates) > 1:
+                    # Multiple unissued committed transactions: check if they are for different operation_types or order by end_time
+                    candidates.sort(key=lambda t: t.end_time_ns, reverse=True)
+                    tx = candidates[0]
+                else:
+                    # Check active transaction in current context or adapter matching session & PID
+                    ctx_tx = _current_capture_tx.get(None)
+                if (
+                    ctx_tx is not None
+                    and str(ctx_tx.session_id) == str(session_id)
+                    and int(ctx_tx.pid) == int(pid)
+                    and not ctx_tx.committed
+                    and not ctx_tx.aborted
+                    and ctx_tx.physical_bytes_read > 0
+                ):
+                    tx = self.commit_capture_transaction(ctx_tx)
+                elif len(self._active_transactions) == 1:
+                    act = next(iter(self._active_transactions.values()))
+                    if (
+                        str(act.session_id) == str(session_id)
+                        and int(act.pid) == int(pid)
+                        and not act.committed
+                        and not act.aborted
+                        and act.physical_bytes_read > 0
+                    ):
+                        tx = self.commit_capture_transaction(act)
+                elif (
+                    self._auto_transaction is not None
+                    and self._auto_transaction.physical_bytes_read > 0
+                    and not self._auto_transaction.receipt_issued
+                    and int(self._auto_transaction.pid) == int(pid)
+                ):
+                    self._auto_transaction.session_id = str(session_id)
+                    tx = self.commit_capture_transaction(self._auto_transaction)
+                    self._auto_transaction = None
+                elif self._last_committed_transaction is not None:
+                    tx = self._last_committed_transaction
 
         if tx is None or tx.physical_bytes_read <= 0:
             raise ValueError(
@@ -414,6 +614,11 @@ class TargetExecutionAdapter(ABC):
         if tx.receipt_issued:
             raise ValueError(
                 f"Cannot reuse capture transaction '{tx.transaction_id}': receipt already issued. New physical reads required."
+            )
+
+        if not tx.committed or tx.aborted:
+            raise ValueError(
+                f"Cannot issue live receipt: capture transaction '{tx.transaction_id}' is not committed or was aborted"
             )
 
         if tx.pid != 0 and int(tx.pid) != int(pid):
@@ -484,10 +689,25 @@ class TargetExecutionAdapter(ABC):
             capture_authority_token=token,
         )
         tx.receipt_issued = True
-        if self._auto_transaction is tx:
-            self._auto_transaction = None
         self._issued_live_receipts.append(rcpt)
         return rcpt
+
+    def read_unscoped(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
+        """Perform an explicitly unscoped physical read that cannot attest to production diagnostic evidence."""
+        # Save active transaction context if any
+        token = _current_capture_tx.set(None)
+        try:
+            self._ensure_tracking_state()
+            if hasattr(self, "read_memory"):
+                data, st, err = self.read_memory(pid, address, size)
+            else:
+                data, st, err = None, "UNAVAILABLE", "Adapter has no read_memory"
+            if data is not None and len(data) > 0:
+                self._unscoped_physical_reads_count += 1
+                self._unscoped_physical_bytes_read += len(data)
+            return data, st, err
+        finally:
+            _current_capture_tx.reset(token)
 
     @abstractmethod
     def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
@@ -986,12 +1206,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         if self._memory_reader:
             data, st, err = self._memory_reader(pid, address, size)
             if data is not None and len(data) > 0:
-                self._record_physical_read(len(data), 1, data=data, pid=pid)
+                self._record_physical_read(len(data), 1, data=data, pid=pid, address=address, requested_size=size, status=st)
             return data, st, err
         from .watch_session import read_process_memory_slice
         data, st, err = read_process_memory_slice(pid, address, size)
         if data is not None and len(data) > 0:
-            self._record_physical_read(len(data), 1, data=data, pid=pid)
+            self._record_physical_read(len(data), 1, data=data, pid=pid, address=address, requested_size=size, status=st)
         return data, st, err
 
     def find_processes(
@@ -1489,10 +1709,10 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         try:
             raw_bytes = base64.b64decode(encoded)
             if len(raw_bytes) == size:
-                self._record_physical_read(len(raw_bytes), 1, data=raw_bytes, pid=pid)
+                self._record_physical_read(len(raw_bytes), 1, data=raw_bytes, pid=pid, address=address, requested_size=size, status="OBSERVED")
                 return raw_bytes, "OBSERVED", None
             elif len(raw_bytes) > 0:
-                self._record_physical_read(len(raw_bytes), 1, data=raw_bytes, pid=pid)
+                self._record_physical_read(len(raw_bytes), 1, data=raw_bytes, pid=pid, address=address, requested_size=size, status="PARTIAL")
                 return raw_bytes, "PARTIAL", f"Partial read: {len(raw_bytes)}/{size} bytes"
             else:
                 return None, "UNAVAILABLE", f"Zero bytes returned at 0x{address:x}"
