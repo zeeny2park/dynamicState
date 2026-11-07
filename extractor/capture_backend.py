@@ -9,10 +9,12 @@ Enforces:
 """
 
 from abc import ABC, abstractmethod
+import contextlib
 import ctypes
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import errno
+import fcntl
 import hashlib
 import hmac
 import json
@@ -150,6 +152,16 @@ class CaptureKeyStore:
         with self._lock:
             return key_id in self._revoked_keys
 
+    def resolve_key(self, key_id: str) -> str:
+        """Resolve a secret by key_id. Raises ValueError if revoked, KeyError if not found."""
+        with self._lock:
+            kid = str(key_id)
+            if kid in self._revoked_keys:
+                raise ValueError(f"Key '{kid}' has been revoked")
+            if kid in self._keys:
+                return self._keys[kid]
+            raise KeyError(f"Key '{kid}' not found in key store")
+
     def get_active_signing_key(self) -> Tuple[str, str]:
         """Return (key_id, secret) for signing new receipts."""
         with self._lock:
@@ -183,10 +195,13 @@ class CaptureKeyStore:
             rcpt_kid = getattr(receipt, "key_id", "default") or "default"
             if rcpt_kid in self._revoked_keys:
                 return False, f"KEY_REVOKED: Key ID '{rcpt_kid}' has been revoked", None
+            dts = get_default_trust_store()
+            if dts and dts.is_revoked(rcpt_kid):
+                return False, f"KEY_REVOKED: Key ID '{rcpt_kid}' has been revoked in durable trust store", None
 
             # In cross-process mode: if the current key store was not explicitly configured (only ephemeral random),
-            # and the receipt specifies a key_id that is NOT our ephemeral key, fail closed with KEY_UNAVAILABLE!
-            if not self._is_explicitly_configured:
+            # and the receipt specifies a key_id that is NOT our ephemeral key or present in durable trust store, fail closed with KEY_UNAVAILABLE!
+            if not self._is_explicitly_configured and not (dts and rcpt_kid in dts.keys):
                 if rcpt_kid != "ephemeral" or not receipt.matches_secret(self._keys.get("ephemeral", "")):
                     return (
                         False,
@@ -199,6 +214,9 @@ class CaptureKeyStore:
             # 1. Try receipt's specific key_id first
             if rcpt_kid in self._keys and rcpt_kid not in self._revoked_keys:
                 if receipt.matches_secret(self._keys[rcpt_kid]):
+                    return True, "VERIFIED", rcpt_kid
+            if dts and rcpt_kid in dts.keys and not dts.is_revoked(rcpt_kid):
+                if receipt.matches_secret(dts.keys[rcpt_kid]):
                     return True, "VERIFIED", rcpt_kid
 
             # 2. Try default / other non-revoked keys in keyring
@@ -791,6 +809,7 @@ class DurableTrustStore:
 
     Atomic updates write to a temporary file in the same directory, fsync, and atomic rename.
     Corrupted or malformed store files trigger fail-closed RuntimeError.
+    Cross-process concurrency is guarded via fcntl.flock on a dedicated lock file.
     """
 
     def __init__(self, store_path: Optional[str] = None):
@@ -804,19 +823,62 @@ class DurableTrustStore:
         if self.store_path:
             self.load()
 
+    @contextlib.contextmanager
+    def _file_lock(self):
+        """Cross-process and cross-thread mutual exclusion context."""
+        if not self.store_path:
+            with self._lock:
+                yield
+            return
+
+        lock_path = self.store_path + ".lock"
+        dir_name = os.path.dirname(os.path.abspath(lock_path))
+        os.makedirs(dir_name, mode=0o700, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(lock_path, flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with self._lock:
+                yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
     def load(self) -> None:
         """Load state from persistent trust store file. Fails closed if corrupted."""
         with self._lock:
             if not self.store_path or not os.path.exists(self.store_path):
                 return
+            if os.path.islink(self.store_path):
+                raise RuntimeError(f"Refusing to load trust store from symlink: '{self.store_path}'")
             try:
-                with open(self.store_path, "r", encoding="utf-8") as f:
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(self.store_path, flags)
+                with os.fdopen(fd, "r", encoding="utf-8") as f:
                     content = f.read().strip()
                 if not content:
                     return
                 data = json.loads(content)
                 if not isinstance(data, dict):
                     raise ValueError("Trust store payload must be a JSON dictionary")
+
+                # Strict schema and type validation
+                if "keys" in data and not isinstance(data["keys"], dict):
+                    raise ValueError("Trust store 'keys' field must be a dictionary")
+                if "revoked_keys" in data and not isinstance(data["revoked_keys"], dict):
+                    raise ValueError("Trust store 'revoked_keys' field must be a dictionary")
+                if "used_attestation_ids" in data and not isinstance(data["used_attestation_ids"], (list, set)):
+                    raise ValueError("Trust store 'used_attestation_ids' must be a list or set")
+                if "used_operation_ids" in data and not isinstance(data["used_operation_ids"], dict):
+                    raise ValueError("Trust store 'used_operation_ids' must be a dictionary")
+
                 self.keys = {str(k): str(v) for k, v in data.get("keys", {}).items()}
                 self.active_key_id = str(data.get("active_key_id", "default"))
                 self.revoked_keys = dict(data.get("revoked_keys", {}))
@@ -830,6 +892,8 @@ class DurableTrustStore:
         with self._lock:
             if not self.store_path:
                 return
+            if os.path.islink(self.store_path):
+                raise RuntimeError(f"Refusing to save trust store to symlink: '{self.store_path}'")
             payload = {
                 "schema_version": "1.0.0",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -840,14 +904,43 @@ class DurableTrustStore:
                 "used_operation_ids": self.used_operation_ids,
             }
             dir_name = os.path.dirname(os.path.abspath(self.store_path))
-            os.makedirs(dir_name, exist_ok=True)
-            tmp_path = f"{self.store_path}.tmp.{uuid.uuid4().hex[:8]}"
+            os.makedirs(dir_name, mode=0o700, exist_ok=True)
+            tmp_path = os.path.join(dir_name, f".trust_tmp_{uuid.uuid4().hex[:12]}")
             try:
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(tmp_path, flags, 0o600)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                except BaseException:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
+
                 os.replace(tmp_path, self.store_path)
+                try:
+                    os.chmod(self.store_path, 0o600)
+                except OSError:
+                    pass
+
+                # Parent directory fsync
+                try:
+                    dir_flags = os.O_RDONLY
+                    if hasattr(os, "O_DIRECTORY"):
+                        dir_flags |= os.O_DIRECTORY
+                    dir_fd = os.open(dir_name, dir_flags)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
             except Exception as e:
                 if os.path.exists(tmp_path):
                     try:
@@ -857,28 +950,42 @@ class DurableTrustStore:
                 raise RuntimeError(f"Failed to persist durable trust store to '{self.store_path}': {e}") from e
 
     def register_key(self, key_id: str, secret: str, is_active: bool = False) -> None:
-        with self._lock:
-            if not key_id or not secret:
+        with self._file_lock():
+            self.load()
+            kid = str(key_id)
+            if not kid or not secret:
                 raise ValueError("key_id and secret must be non-empty strings")
-            self.keys[str(key_id)] = str(secret)
+            if kid in self.revoked_keys:
+                raise ValueError(f"Cannot register key '{kid}': key is permanently revoked")
+            self.keys[kid] = str(secret)
             if is_active or len(self.keys) == 1:
-                self.active_key_id = str(key_id)
+                self.active_key_id = kid
             self.save()
 
+    def rotate_key(self, new_key_id: str, new_secret: str) -> None:
+        self.register_key(new_key_id, new_secret, is_active=True)
+
     def revoke_key(self, key_id: str, reason: str = "revoked") -> None:
-        with self._lock:
-            self.revoked_keys[str(key_id)] = {
+        with self._file_lock():
+            self.load()
+            kid = str(key_id)
+            self.revoked_keys[kid] = {
                 "revoked_at": datetime.now(timezone.utc).isoformat(),
                 "reason": str(reason),
             }
+            if self.active_key_id == kid:
+                available = [k for k in self.keys.keys() if k not in self.revoked_keys]
+                self.active_key_id = available[0] if available else ""
             self.save()
 
     def is_revoked(self, key_id: str) -> bool:
-        with self._lock:
+        with self._file_lock():
+            self.load()
             return str(key_id) in self.revoked_keys
 
     def record_used_attestation(self, attestation_id: str) -> None:
-        with self._lock:
+        with self._file_lock():
+            self.load()
             att_id = str(attestation_id)
             if att_id in self.used_attestation_ids:
                 raise ValueError(f"Replay of causal attestation ID '{att_id}' rejected")
@@ -886,8 +993,68 @@ class DurableTrustStore:
             self.save()
 
     def is_attestation_used(self, attestation_id: str) -> bool:
-        with self._lock:
+        with self._file_lock():
+            self.load()
             return str(attestation_id) in self.used_attestation_ids
+
+    def record_used_operation(
+        self,
+        op_id: str,
+        session_id: str,
+        pid: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        with self._file_lock():
+            self.load()
+            oid = str(op_id)
+            if oid in self.used_operation_ids:
+                prev = self.used_operation_ids[oid]
+                if prev.get("session_id") != str(session_id):
+                    raise ValueError(f"Receipt replay across sessions rejected for operation '{oid}'")
+                if prev.get("pid") is not None and int(prev["pid"]) != int(pid):
+                    raise ValueError(f"Receipt replay across PIDs rejected for operation '{oid}'")
+                raise ValueError(f"Operation ID '{oid}' is already committed and single-use")
+            rec = {
+                "session_id": str(session_id),
+                "pid": int(pid),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if metadata:
+                rec.update(metadata)
+            self.used_operation_ids[oid] = rec
+            self.save()
+
+    def is_operation_used(self, op_id: str) -> bool:
+        with self._file_lock():
+            self.load()
+            return str(op_id) in self.used_operation_ids
+
+    def resolve_key(self, key_id: str) -> str:
+        with self._file_lock():
+            self.load()
+            kid = str(key_id)
+            if kid in self.revoked_keys:
+                raise ValueError(f"Key '{kid}' is revoked")
+            if kid in self.keys:
+                return self.keys[kid]
+            raise KeyError(f"Key '{kid}' not found in trust store")
+
+
+_DEFAULT_TRUST_STORE: Optional[DurableTrustStore] = None
+
+
+def get_default_trust_store() -> Optional[DurableTrustStore]:
+    global _DEFAULT_TRUST_STORE
+    if _DEFAULT_TRUST_STORE is None:
+        ts_env = os.environ.get("DYNAMICSTATE_TRUST_STORE_PATH")
+        if ts_env:
+            _DEFAULT_TRUST_STORE = DurableTrustStore(ts_env)
+    return _DEFAULT_TRUST_STORE
+
+
+def set_default_trust_store(ts: Optional[DurableTrustStore]) -> None:
+    global _DEFAULT_TRUST_STORE
+    _DEFAULT_TRUST_STORE = ts
 
 
 class CausalVerifierAuthority:
@@ -996,6 +1163,11 @@ class CausalVerifierAuthority:
             raise ValueError(f"CausalAttestation target_identity requires valid PID, got {pid}")
         if not target_identity.get("executable_identity") and not target_identity.get("executable"):
             raise ValueError("CausalAttestation target_identity requires verified executable identity")
+        if authority_level == "PRODUCTION":
+            if not target_identity.get("process_identity"):
+                raise ValueError("CausalAttestation target_identity requires verified process_identity for PRODUCTION authority")
+            if not target_identity.get("build_id"):
+                raise ValueError("CausalAttestation target_identity requires verified build_id for PRODUCTION authority")
         if not precondition_evidence_id or not str(precondition_evidence_id).strip():
             raise ValueError("CausalAttestation requires non-empty precondition_evidence_id")
         if not postcondition_evidence_id or not str(postcondition_evidence_id).strip():
@@ -1007,7 +1179,14 @@ class CausalVerifierAuthority:
         use_kid = key_id or active_kid
         if self.is_key_revoked(use_kid):
             raise ValueError(f"Cannot sign CausalAttestation: key '{use_kid}' is revoked")
-        use_sec = secret or (active_sec if use_kid == active_kid else self.key_store.resolve_key(use_kid))
+        if secret:
+            use_sec = secret
+        elif use_kid == active_kid:
+            use_sec = active_sec
+        elif self.trust_store and use_kid in self.trust_store.keys:
+            use_sec = self.trust_store.resolve_key(use_kid)
+        else:
+            use_sec = self.key_store.resolve_key(use_kid)
 
         if intervention_details is None:
             eff_intervention = {"action": "verified_transition", "verified_intervention": True}
@@ -1075,6 +1254,30 @@ class CausalAttestation:
                 "process_identity": str(self.target_identity.get("process_identity", "")),
                 "executable_identity": str(self.target_identity.get("executable_identity") or self.target_identity.get("executable", "")),
                 "build_id": str(self.target_identity.get("build_id", "")),
+                "target_host": str(self.target_identity.get("target_host", "")),
+            },
+            "operation_id": str(self.operation_id),
+            "precondition_evidence_id": str(self.precondition_evidence_id),
+            "postcondition_evidence_id": str(self.postcondition_evidence_id),
+            "claimed_transition": dict(self.claimed_transition or {}),
+            "intervention_details": dict(self.intervention_details or {}),
+            "issued_at_ns": int(self.issued_at_ns),
+            "expires_at_ns": int(self.expires_at_ns),
+            "verifier_identity": str(self.verifier_identity),
+            "key_id": str(self.key_id),
+            "authority_level": str(self.authority_level),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    def canonical_bytes_legacy(self) -> bytes:
+        payload = {
+            "attestation_id": str(self.attestation_id),
+            "session_id": str(self.session_id),
+            "target_identity": {
+                "pid": int(self.target_identity.get("pid", 0)),
+                "process_identity": str(self.target_identity.get("process_identity", "")),
+                "executable_identity": str(self.target_identity.get("executable_identity") or self.target_identity.get("executable", "")),
+                "build_id": str(self.target_identity.get("build_id", "")),
             },
             "operation_id": str(self.operation_id),
             "precondition_evidence_id": str(self.precondition_evidence_id),
@@ -1115,34 +1318,81 @@ class CausalAttestation:
         now = current_time_ns if current_time_ns is not None else time.time_ns()
         if self.expires_at_ns > 0 and now > self.expires_at_ns:
             return False, "EXPIRED_ATTESTATION: Attestation expired"
-        if expected_session_id and str(self.session_id) != str(expected_session_id):
-            return False, f"CROSS_SESSION_ATTESTATION: Expected session '{expected_session_id}', got '{self.session_id}'"
-        if expected_operation_id and str(self.operation_id) != str(expected_operation_id):
-            return False, f"OPERATION_ID_MISMATCH: Expected operation '{expected_operation_id}', got '{self.operation_id}'"
-        if expected_pid is not None and self.target_identity.get("pid") is not None:
-            if int(self.target_identity["pid"]) != int(expected_pid):
-                return False, f"TARGET_PID_MISMATCH: Target PID mismatch: Expected PID {expected_pid}, got {self.target_identity.get('pid')}"
-        if expected_process_identity and self.target_identity.get("process_identity"):
-            if str(self.target_identity["process_identity"]) != str(expected_process_identity):
-                return False, f"PROCESS_IDENTITY_MISMATCH: Expected '{expected_process_identity}', got '{self.target_identity.get('process_identity')}'"
-        if expected_executable_identity:
-            exe = str(self.target_identity.get("executable_identity") or self.target_identity.get("executable", ""))
-            if exe != str(expected_executable_identity):
-                return False, f"EXECUTABLE_IDENTITY_MISMATCH: Expected '{expected_executable_identity}', got '{exe}'"
-        if expected_build_id and self.target_identity.get("build_id"):
-            if str(self.target_identity["build_id"]).strip().lower() != str(expected_build_id).strip().lower():
-                return False, f"BUILD_ID_MISMATCH: Expected '{expected_build_id}', got '{self.target_identity.get('build_id')}'"
 
+        # Mandatory identity field validation for PRODUCTION authority
+        if self.authority_level == "PRODUCTION":
+            if not self.session_id or not str(self.session_id).strip():
+                return False, "MISSING_SESSION_ID: Attestation missing session_id"
+            if not self.operation_id or not str(self.operation_id).strip():
+                return False, "MISSING_OPERATION_ID: Attestation missing operation_id"
+            if not self.target_identity or not isinstance(self.target_identity, dict):
+                return False, "MALFORMED_ATTESTATION: Missing or invalid target_identity"
+            pid_val = self.target_identity.get("pid")
+            if pid_val is None or isinstance(pid_val, bool) or int(pid_val) <= 1:
+                return False, f"INVALID_TARGET_PID: Invalid PID '{pid_val}'"
+            if not self.target_identity.get("process_identity") or not str(self.target_identity["process_identity"]).strip():
+                return False, "MISSING_PROCESS_IDENTITY: Attestation missing process_identity"
+            exe_val = self.target_identity.get("executable_identity") or self.target_identity.get("executable")
+            if not exe_val or not str(exe_val).strip():
+                return False, "MISSING_EXECUTABLE_IDENTITY: Attestation missing executable_identity"
+            if not self.target_identity.get("build_id") or not str(self.target_identity["build_id"]).strip():
+                return False, "MISSING_BUILD_ID: Attestation missing build_id"
+
+        # Expected checks: never silently skip when attestation field is absent!
+        if expected_session_id is not None:
+            if not self.session_id or str(self.session_id) != str(expected_session_id):
+                return False, f"CROSS_SESSION_ATTESTATION: Expected session '{expected_session_id}', got '{self.session_id}'"
+
+        if expected_operation_id is not None:
+            if not self.operation_id or str(self.operation_id) != str(expected_operation_id):
+                return False, f"OPERATION_ID_MISMATCH: Expected operation '{expected_operation_id}', got '{self.operation_id}'"
+
+        if expected_pid is not None:
+            act_pid = self.target_identity.get("pid")
+            if act_pid is None or isinstance(act_pid, bool):
+                return False, f"TARGET_PID_MISMATCH: Attestation missing PID (expected PID {expected_pid})"
+            if int(act_pid) != int(expected_pid):
+                return False, f"TARGET_PID_MISMATCH: Target PID mismatch: Expected PID {expected_pid}, got {act_pid}"
+
+        if expected_process_identity is not None:
+            act_proc = str(self.target_identity.get("process_identity", "")).strip()
+            if not act_proc:
+                return False, f"PROCESS_IDENTITY_MISMATCH: Attestation missing process_identity (expected '{expected_process_identity}')"
+            if act_proc != str(expected_process_identity).strip():
+                return False, f"PROCESS_IDENTITY_MISMATCH: Expected '{expected_process_identity}', got '{act_proc}'"
+
+        if expected_executable_identity is not None:
+            act_exe = str(self.target_identity.get("executable_identity") or self.target_identity.get("executable", "")).strip()
+            if not act_exe:
+                return False, f"EXECUTABLE_IDENTITY_MISMATCH: Attestation missing executable_identity (expected '{expected_executable_identity}')"
+            if act_exe != str(expected_executable_identity).strip():
+                return False, f"EXECUTABLE_IDENTITY_MISMATCH: Expected '{expected_executable_identity}', got '{act_exe}'"
+
+        if expected_build_id is not None:
+            act_bid = str(self.target_identity.get("build_id", "")).strip()
+            if not act_bid:
+                return False, f"BUILD_ID_MISMATCH: Attestation missing build_id (expected '{expected_build_id}')"
+            if act_bid.lower() != str(expected_build_id).strip().lower():
+                return False, f"BUILD_ID_MISMATCH: Expected '{expected_build_id}', got '{act_bid}'"
+
+        if expected_target_host is not None:
+            act_host = str(self.target_identity.get("target_host", "")).strip()
+            if not act_host:
+                return False, f"TARGET_HOST_MISMATCH: Attestation missing target_host (expected '{expected_target_host}')"
+            if act_host != str(expected_target_host).strip():
+                return False, f"TARGET_HOST_MISMATCH: Expected target host '{expected_target_host}', got '{act_host}'"
+
+        eff_ts = trust_store or get_default_trust_store()
         use_sec = secret
         if not use_sec:
-            if trust_store and (self.key_id in trust_store.revoked_keys or trust_store.is_revoked(self.key_id)):
+            if eff_ts and (self.key_id in eff_ts.revoked_keys or eff_ts.is_revoked(self.key_id)):
                 return False, f"KEY_REVOKED: Attestation signing key '{self.key_id}' is revoked in durable trust store"
             ks = key_store or get_default_key_store()
             if hasattr(ks, "is_revoked") and ks.is_revoked(self.key_id):
                 return False, f"KEY_REVOKED: Attestation signing key '{self.key_id}' is revoked"
             try:
-                if trust_store and self.key_id in trust_store.keys:
-                    use_sec = trust_store.keys[self.key_id]
+                if eff_ts and self.key_id in eff_ts.keys:
+                    use_sec = eff_ts.keys[self.key_id]
                 elif hasattr(ks, "_keys") and self.key_id in ks._keys:
                     use_sec = ks._keys[self.key_id]
                 elif hasattr(ks, "resolve_key"):
@@ -1161,6 +1411,13 @@ class CausalAttestation:
                 return False, f"KEY_RESOLUTION_FAILED: {e}"
 
         expected_sig = hmac.new(use_sec.encode("utf-8"), self.canonical_bytes(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(self.signature, expected_sig):
+            # Check legacy format without target_host for backward compatibility if target_host is not set
+            expected_legacy_sig = hmac.new(use_sec.encode("utf-8"), self.canonical_bytes_legacy(), hashlib.sha256).hexdigest()
+            if hmac.compare_digest(self.signature, expected_legacy_sig) and not expected_target_host:
+                return True, "VERIFIED"
+            return False, "CORRUPT_ATTESTATION: HMAC signature verification failed"
+        return True, "VERIFIED"
         if not hmac.compare_digest(self.signature, expected_sig):
             return False, "CORRUPT_ATTESTATION: HMAC signature verification failed"
         return True, "VERIFIED"

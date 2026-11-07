@@ -249,6 +249,30 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase2_0_a_3_15_accounting_and_sla_integrity.py
 
+      - name: Run Phase 2.0-A.3.16 Strict Target Identity Verification Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_strict_identity_verification.py
+
+      - name: Run Phase 2.0-A.3.16 Durable Trust Store Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_durable_trust_store_integration.py
+
+      - name: Run Phase 2.0-A.3.16 Durable Anti-Replay Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_durable_anti_replay.py
+
+      - name: Run Phase 2.0-A.3.16 Evidence Ledger Transactional Validation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_ledger_transactional_validation.py
+
+      - name: Run Phase 2.0-A.3.16 Filesystem Hardening Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_filesystem_hardening.py
+
+      - name: Run Phase 2.0-A.3.16 Multiprocess Verification Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_multiprocess_verification.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

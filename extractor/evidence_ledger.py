@@ -703,6 +703,7 @@ class EvidenceLedger:
         schema_version: str = EVIDENCE_SCHEMA_VERSION,
         session_secret: Optional[str] = None,
         capability_key: Optional[str] = None,
+        trust_store: Optional[Any] = None,
     ):
         self.session_id: str = session_id or f"inv_sess_{uuid.uuid4().hex[:8]}"
         self.schema_version: str = schema_version
@@ -713,6 +714,19 @@ class EvidenceLedger:
         self._by_id: Dict[str, EvidenceRecord] = {}
         self._by_type: Dict[str, List[EvidenceRecord]] = {}
         self._by_finding: Dict[str, List[EvidenceRecord]] = {}
+        if trust_store is not None:
+            self.trust_store = trust_store
+        else:
+            try:
+                from .capture_backend import get_default_trust_store
+                self.trust_store = get_default_trust_store()
+            except ImportError:
+                self.trust_store = None
+        self._used_causal_attestation_ids: Set[str] = set()
+        self._causal_attestation_to_evidence_id: Dict[str, str] = {}
+        self._used_operation_ids: Dict[str, Dict[str, Any]] = {}
+        self._operation_to_evidence_ids: Dict[str, List[str]] = {}
+        self._operation_to_receipt_id: Dict[str, str] = {}
 
     @property
     def capability_key(self) -> str:
@@ -953,17 +967,42 @@ class EvidenceLedger:
         if not record.session_id:
             record.session_id = self.session_id
 
-        # Schema validation
-        self.validate_record(record)
+        _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
+        _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
+        _orig_used_op = {k: dict(v) for k, v in getattr(self, "_used_operation_ids", {}).items()}
+        _orig_op_to_ev = {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()}
+        _orig_op_to_rcpt = dict(getattr(self, "_operation_to_receipt_id", {}))
 
-        if record.evidence_id in self._by_id:
-            raise ValueError(f"Duplicate evidence_id '{record.evidence_id}': record with this ID already exists in ledger.")
+        try:
+            # Schema validation
+            self.validate_record(record)
 
-        self._records.append(record)
-        self._by_id[record.evidence_id] = record
-        self._by_type.setdefault(record.evidence_type, []).append(record)
-        if record.finding_id:
-            self._by_finding.setdefault(record.finding_id, []).append(record)
+            if record.evidence_id in self._by_id:
+                raise ValueError(f"Duplicate evidence_id '{record.evidence_id}': record with this ID already exists in ledger.")
+
+            # Atomically update durable trust store if configured
+            if getattr(self, "trust_store", None):
+                p_prov = record.provenance or {}
+                p_details = record.details or {}
+                raw_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
+                if raw_causal:
+                    c_id = getattr(raw_causal, "attestation_id", None) or (raw_causal.get("attestation_id") if isinstance(raw_causal, dict) else None)
+                    if c_id:
+                        self.trust_store.record_used_attestation(c_id)
+
+            self._records.append(record)
+            self._by_id[record.evidence_id] = record
+            self._by_type.setdefault(record.evidence_type, []).append(record)
+            if record.finding_id:
+                self._by_finding.setdefault(record.finding_id, []).append(record)
+        except Exception:
+            self._used_causal_attestation_ids = _orig_causal
+            self._causal_attestation_to_evidence_id = _orig_causal_to_eid
+            self._used_operation_ids = _orig_used_op
+            self._operation_to_evidence_ids = _orig_op_to_ev
+            self._operation_to_receipt_id = _orig_op_to_rcpt
+            raise
+
         return record
 
     def record(
@@ -1007,6 +1046,23 @@ class EvidenceLedger:
         return rec
 
     def validate_record(self, record: EvidenceRecord) -> None:
+        """Validate record structure, types, and consistency transactionally."""
+        _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
+        _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
+        _orig_used_op = {k: dict(v) for k, v in getattr(self, "_used_operation_ids", {}).items()}
+        _orig_op_to_ev = {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()}
+        _orig_op_to_rcpt = dict(getattr(self, "_operation_to_receipt_id", {}))
+        try:
+            self._do_validate_record(record)
+        except Exception:
+            self._used_causal_attestation_ids = _orig_causal
+            self._causal_attestation_to_evidence_id = _orig_causal_to_eid
+            self._used_operation_ids = _orig_used_op
+            self._operation_to_evidence_ids = _orig_op_to_ev
+            self._operation_to_receipt_id = _orig_op_to_rcpt
+            raise
+
+    def _do_validate_record(self, record: EvidenceRecord) -> None:
         """Validate record structure, types, and consistency."""
         if not record.evidence_id or not isinstance(record.evidence_id, str) or not record.evidence_id.strip():
             raise ValueError("EvidenceRecord must have a valid non-empty string evidence_id")
@@ -1227,18 +1283,17 @@ class EvidenceLedger:
                             )
                     if not record.parent_evidence_ids and derived_list:
                         record.parent_evidence_ids = list(derived_list)
-                    else:
-                        for d_src in derived_list:
-                            if d_src not in record.parent_evidence_ids:
-                                raise ValueError(
-                                    f"Derived record '{record.evidence_id}' missing source '{d_src}' in parent_evidence_ids"
-                                )
+                    for d_src in derived_list:
+                        if d_src not in record.parent_evidence_ids:
+                            raise ValueError(
+                                f"Derived record '{record.evidence_id}' missing source '{d_src}' in parent_evidence_ids"
+                            )
                         src_rec = self._by_id[d_src]
                         src_op = (src_rec.details or {}).get("operation_id")
                         if not src_op and (src_rec.provenance or {}).get("live_capture_receipt"):
                             slcr = src_rec.provenance["live_capture_receipt"]
                             src_op = slcr.get("operation_id") if isinstance(slcr, dict) else getattr(slcr, "operation_id", None)
-                        if src_op and str(src_op) != str(op_id):
+                        if record.evidence_type != EVIDENCE_TYPE_COMPARISON and src_op and str(src_op) != str(op_id):
                             raise ValueError(
                                 f"Derivation operation mismatch: source '{d_src}' belongs to operation '{src_op}', "
                                 f"derived record '{record.evidence_id}' claims operation '{op_id}'"
@@ -1326,6 +1381,8 @@ class EvidenceLedger:
                 expected_process_identity=r_proc,
                 expected_executable_identity=r_exe,
                 expected_build_id=r_bid,
+                expected_target_host=r_ident.get("target_host"),
+                trust_store=getattr(self, "trust_store", None),
             )
             if not ok_att:
                 raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': {err_att}")
@@ -1333,11 +1390,23 @@ class EvidenceLedger:
             if c_pid is not None and r_pid is not None and int(c_pid) != int(r_pid):
                 raise ValueError(f"CausalAttestation target PID mismatch for record '{record.evidence_id}': attestation has {c_pid}, record has {r_pid}")
 
+            if getattr(self, "trust_store", None) and self.trust_store.is_attestation_used(c_att.attestation_id):
+                bound_eid = getattr(self, "_causal_attestation_to_evidence_id", {}).get(c_att.attestation_id)
+                if bound_eid != record.evidence_id:
+                    raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected by durable trust store on record '{record.evidence_id}'")
+
             if not hasattr(self, "_used_causal_attestation_ids"):
                 self._used_causal_attestation_ids: Set[str] = set()
-            if c_att.attestation_id in self._used_causal_attestation_ids:
-                raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}'")
-            self._used_causal_attestation_ids.add(c_att.attestation_id)
+            if not hasattr(self, "_causal_attestation_to_evidence_id"):
+                self._causal_attestation_to_evidence_id: Dict[str, str] = {}
+
+            if c_att.attestation_id in self._causal_attestation_to_evidence_id:
+                bound_eid = self._causal_attestation_to_evidence_id[c_att.attestation_id]
+                if bound_eid != record.evidence_id:
+                    raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}'")
+            else:
+                self._causal_attestation_to_evidence_id[c_att.attestation_id] = record.evidence_id
+                self._used_causal_attestation_ids.add(c_att.attestation_id)
 
             # Precondition evidence verification
             if not c_att.precondition_evidence_id or c_att.precondition_evidence_id not in self._by_id:
@@ -1579,6 +1648,7 @@ class EvidenceLedger:
             "created_at": self.created_at,
             "record_count": len(self._records),
             "used_causal_attestation_ids": list(getattr(self, "_used_causal_attestation_ids", set())),
+            "causal_attestation_to_evidence_id": dict(getattr(self, "_causal_attestation_to_evidence_id", {})),
             "operation_to_evidence_ids": {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()},
             "operation_to_receipt_id": dict(getattr(self, "_operation_to_receipt_id", {})),
             "used_operation_ids": getattr(self, "_used_operation_ids", {}),
@@ -1590,14 +1660,16 @@ class EvidenceLedger:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "EvidenceLedger":
+    def from_dict(cls, data: Dict[str, Any], trust_store: Optional[Any] = None) -> "EvidenceLedger":
         """Reconstruct EvidenceLedger from serialized dictionary."""
         ledger = cls(
             session_id=data.get("session_id"),
             schema_version=data.get("schema_version", EVIDENCE_SCHEMA_VERSION),
+            trust_store=trust_store,
         )
         ledger.created_at = data.get("created_at", ledger.created_at)
         ledger._used_causal_attestation_ids = set()
+        ledger._causal_attestation_to_evidence_id = {}
         ledger._used_operation_ids = {}
         ledger._operation_to_evidence_ids = {}
         ledger._operation_to_receipt_id = {}
@@ -1609,6 +1681,7 @@ class EvidenceLedger:
             seen_ids.add(rec.evidence_id)
             ledger.add_record(rec)
         ledger._used_causal_attestation_ids.update(data.get("used_causal_attestation_ids", []))
+        ledger._causal_attestation_to_evidence_id.update(data.get("causal_attestation_to_evidence_id", {}))
         ledger._used_operation_ids.update(data.get("used_operation_ids", {}))
         for op_id, ev_ids in data.get("operation_to_evidence_ids", {}).items():
             existing = ledger._operation_to_evidence_ids.setdefault(op_id, [])
