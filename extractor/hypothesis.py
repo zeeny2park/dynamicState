@@ -1908,11 +1908,42 @@ def classify_evidence_relationship(
     return "independent"
 
 
+CLASSIFICATION_VERIFIED = "VERIFIED"
+CLASSIFICATION_UNVERIFIED = "UNVERIFIED"
+CLASSIFICATION_MISSING = "MISSING"
+CLASSIFICATION_DUPLICATE = "DUPLICATE"
+CLASSIFICATION_DERIVED = "DERIVED"
+CLASSIFICATION_CORRELATED = "CORRELATED"
+CLASSIFICATION_CONTRADICTORY = "CONTRADICTORY"
+CLASSIFICATION_INVALIDATED = "INVALIDATED"
+
+REQUIRED_EVIDENCE_RELATIONSHIP_CLASSIFICATIONS = {
+    CLASSIFICATION_VERIFIED,
+    CLASSIFICATION_UNVERIFIED,
+    CLASSIFICATION_MISSING,
+    CLASSIFICATION_DUPLICATE,
+    CLASSIFICATION_DERIVED,
+    CLASSIFICATION_CORRELATED,
+    CLASSIFICATION_CONTRADICTORY,
+    CLASSIFICATION_INVALIDATED,
+}
+
+
 def cluster_independent_supporting_evidence(
     evidence_ids: List[str],
     ledger: Optional[EvidenceLedger] = None,
 ) -> Tuple[List[str], List[str], Dict[str, str]]:
     """Filter duplicate evidence and group derived/correlated records into independent clusters.
+
+    Required classifications:
+    - VERIFIED: Authenticated live runtime or reproduction proof
+    - UNVERIFIED: Imported or synthetic evidence without verified execution proof
+    - MISSING: Supporting evidence ID not found in the EvidenceLedger
+    - DUPLICATE: Duplicate of an already processed evidence record
+    - DERIVED: Derives from another record via parent hierarchy
+    - CORRELATED: From the same snapshot, batch, or observation
+    - CONTRADICTORY: Direct or partial opposing outcome
+    - INVALIDATED: Invalidated by lifetime, process mismatch, or unresolvable parent
 
     Returns:
         (deduped_non_duplicate_ids, independent_cluster_representative_ids, relationship_map)
@@ -1924,38 +1955,90 @@ def cluster_independent_supporting_evidence(
     independent_records: List[EvidenceRecord] = []
 
     for eid in evidence_ids:
-        if eid in deduped_ids:
-            rel_map[eid] = "duplicate"
+        if eid in deduped_ids or eid in rel_map:
+            rel_map[eid] = CLASSIFICATION_DUPLICATE
             continue
+
         rec = ledger.get_record(eid) if ledger else None
         if rec is None:
-            deduped_ids.append(eid)
-            independent_rep_ids.append(eid)
-            rel_map[eid] = "independent"
+            # 3.1: A supporting_evidence_id not found in EvidenceLedger must never count as independent
+            rel_map[eid] = CLASSIFICATION_MISSING
+            continue
+
+        d = rec.details or {}
+        cq = rec.capture_quality or {}
+        p = rec.provenance or {}
+
+        # 3.4: Invalidation and stale object lifetime
+        if (
+            d.get("is_invalidated") is True
+            or d.get("invalidated") is True
+            or cq.get("status") == "INVALIDATED"
+            or d.get("lifetime_expired") is True
+            or d.get("object_freed") is True
+        ):
+            rel_map[eid] = CLASSIFICATION_INVALIDATED
+            continue
+
+        # 3.3: Missing parent references are rejected or marked unresolved
+        if rec.parent_evidence_ids and ledger:
+            if any(ledger.get_record(pid) is None for pid in rec.parent_evidence_ids):
+                rel_map[eid] = CLASSIFICATION_INVALIDATED
+                continue
+
+        if d.get("outcome") == "CONTRADICTED":
+            rel_map[eid] = CLASSIFICATION_CONTRADICTORY
             continue
 
         is_dup = False
         is_derived_or_corr = False
-        rel_type = "independent"
+        rel_type = None
+
         for prev_rec in accepted_records:
             rel = classify_evidence_relationship(prev_rec, rec, ledger=ledger)
             if rel == "duplicate":
                 is_dup = True
-                rel_type = "duplicate"
+                rel_type = CLASSIFICATION_DUPLICATE
                 break
-            elif rel in ("derived", "correlated"):
+            elif rel == "derived":
                 is_derived_or_corr = True
-                rel_type = rel
+                rel_type = CLASSIFICATION_DERIVED
+                break
+            elif rel == "correlated":
+                is_derived_or_corr = True
+                rel_type = CLASSIFICATION_CORRELATED
+                break
+            elif rel == "contradictory":
+                is_derived_or_corr = True
+                rel_type = CLASSIFICATION_CONTRADICTORY
+                break
 
-        rel_map[eid] = rel_type
         if is_dup:
+            rel_map[eid] = CLASSIFICATION_DUPLICATE
             continue
 
+        if is_derived_or_corr and rel_type:
+            rel_map[eid] = rel_type
+            deduped_ids.append(eid)
+            accepted_records.append(rec)
+            continue
+
+        # Independent record: evaluate verification status
+        is_verified = (
+            rec.provenance_class in TRUSTED_PROVENANCE_CLASSES
+            and not d.get("caller_submitted")
+            and not d.get("unverified_caller_claim")
+            and (
+                rec.provenance_class != PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+                or (p.get("live_capture_receipt") or d.get("live_capture_receipt"))
+            )
+        )
+        final_rel = CLASSIFICATION_VERIFIED if is_verified else CLASSIFICATION_UNVERIFIED
+        rel_map[eid] = final_rel
         deduped_ids.append(eid)
         accepted_records.append(rec)
-        if not is_derived_or_corr:
-            independent_rep_ids.append(eid)
-            independent_records.append(rec)
+        independent_rep_ids.append(eid)
+        independent_records.append(rec)
 
     return deduped_ids, independent_rep_ids, rel_map
 
@@ -2923,9 +3006,13 @@ class HypothesisValidator:
                     continue
                 rec = ledger.get_record(eid)
                 if not rec:
-                    unique_ids.append(eid)
+                    # 3.1: A supporting_evidence_id not found in EvidenceLedger must never count as independent evidence
                     continue
                 d = rec.details or {}
+                # 3.4: Invalidated records must not be counted in effective support
+                cq = rec.capture_quality or {}
+                if d.get("is_invalidated") or d.get("invalidated") or cq.get("status") == "INVALIDATED":
+                    continue
                 sem_key = d.get("semantic_digest") or d.get("observation_id") or (rec.source, rec.observation)
                 if sem_key in seen_keys:
                     continue
@@ -2933,11 +3020,14 @@ class HypothesisValidator:
                 unique_ids.append(eid)
             return unique_ids
 
-        hypothesis.supporting_evidence_ids = _dedup_independent_ids(hypothesis.supporting_evidence_ids)
+        raw_supp_ids = list(hypothesis.supporting_evidence_ids)
+        deduped_supp_ids, indep_supp_ids, supp_rel_map = cluster_independent_supporting_evidence(raw_supp_ids, ledger)
+        hypothesis.supporting_evidence_ids = deduped_supp_ids
         hypothesis.contradicting_evidence_ids = _dedup_independent_ids(hypothesis.contradicting_evidence_ids)
 
         supp_count = len(hypothesis.supporting_evidence_ids)
         contra_count = len(hypothesis.contradicting_evidence_ids)
+        indep_supp_count = len(indep_supp_ids)
 
         new_status = old_status
         new_conf = old_conf
@@ -3087,8 +3177,6 @@ class HypothesisValidator:
 
         # Phase 2.0-A.3.7: Multi-dimensional evidence quality & correlation-aware confidence calibration
         old_conf_score = float(getattr(hypothesis, "confidence_score", 0.40) or 0.40)
-        _, indep_supp_ids, supp_rel_map = cluster_independent_supporting_evidence(hypothesis.supporting_evidence_ids, ledger)
-        indep_supp_count = len(indep_supp_ids)
 
         # Evaluate partial vs direct counterevidence
         all_contra_partial = False

@@ -35,6 +35,7 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
     PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    PROVENANCE_CLASS_SYNTHETIC,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     TRUSTED_PROVENANCE_CLASSES,
     VALID_EVIDENCE_TYPES,
@@ -133,7 +134,7 @@ def compute_semantic_evidence_digest(
 class EvidenceAdapter:
     """Non-intrusive adapter for transforming tool output dicts into EvidenceRecords."""
 
-    def __init__(self, default_provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE):
+    def __init__(self, default_provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED):
         self.default_provenance_class = default_provenance_class
 
     def _resolve_provenance_class(
@@ -141,28 +142,86 @@ class EvidenceAdapter:
         payload: Optional[Dict[str, Any]] = None,
         target_identity: Optional[Dict[str, Any]] = None,
         override_provenance: Optional[str] = None,
+        session_id: Optional[str] = None,
+        live_receipt: Optional[Any] = None,
     ) -> str:
-        """Resolves provenance class while preventing untrusted/imported data from upgrading to live capture."""
-        candidates = []
-        if override_provenance:
-            candidates.append(override_provenance)
-        if isinstance(payload, dict):
-            if payload.get("provenance_class"):
-                candidates.append(payload["provenance_class"])
-            prov_dict = payload.get("provenance")
-            if isinstance(prov_dict, dict) and prov_dict.get("provenance_class"):
-                candidates.append(prov_dict["provenance_class"])
-        if isinstance(target_identity, dict) and target_identity.get("provenance_class"):
-            candidates.append(target_identity["provenance_class"])
-        candidates.append(self.default_provenance_class)
+        """Resolves provenance class with fail-closed trust boundaries.
 
-        # Invariant: If any source marks the data as IMPORTED_UNVERIFIED or SYNTHETIC_FIXTURE,
-        # it can never be upgraded to LIVE_RUNTIME_CAPTURE.
-        if PROVENANCE_CLASS_IMPORTED_UNVERIFIED in candidates:
-            return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-        if PROVENANCE_CLASS_SYNTHETIC_FIXTURE in candidates:
+        Rules:
+        - Default to untrusted/imported provenance (IMPORTED_UNVERIFIED).
+        - Never accept caller-provided provenance_class or target_identity flags as authority.
+        - Never upgrade based only on payload metadata.
+        - Live evidence requires independently verified capture receipt with production authority.
+        - Controlled reproduction requires independently verified execution proof.
+        - Synthetic and imported provenance ceilings are strictly preserved.
+        """
+        p_dict = payload if isinstance(payload, dict) else {}
+        prov_dict = p_dict.get("provenance") if isinstance(p_dict.get("provenance"), dict) else {}
+        t_ident = target_identity if isinstance(target_identity, dict) else {}
+
+        # 1. Synthetic ceiling: If any source indicates synthetic/simulated, clamp to SYNTHETIC_FIXTURE
+        is_synthetic = bool(
+            p_dict.get("is_synthetic")
+            or prov_dict.get("is_synthetic")
+            or t_ident.get("is_synthetic")
+            or p_dict.get("provenance_class") in (PROVENANCE_CLASS_SYNTHETIC, PROVENANCE_CLASS_SYNTHETIC_FIXTURE)
+            or prov_dict.get("provenance_class") in (PROVENANCE_CLASS_SYNTHETIC, PROVENANCE_CLASS_SYNTHETIC_FIXTURE)
+            or t_ident.get("provenance_class") in (PROVENANCE_CLASS_SYNTHETIC, PROVENANCE_CLASS_SYNTHETIC_FIXTURE)
+            or override_provenance in (PROVENANCE_CLASS_SYNTHETIC, PROVENANCE_CLASS_SYNTHETIC_FIXTURE)
+            or any(p_dict.get(k) is not None for k in ("force_failed", "force_error", "force_contradiction", "simulated_outcome"))
+            or any(prov_dict.get(k) is not None for k in ("force_failed", "force_error", "force_contradiction", "simulated_outcome"))
+        )
+        if is_synthetic:
             return PROVENANCE_CLASS_SYNTHETIC_FIXTURE
-        return candidates[0] if candidates else self.default_provenance_class
+
+        # 2. Caller-submitted or imported ceiling
+        if (
+            p_dict.get("caller_submitted")
+            or p_dict.get("unverified_caller_claim")
+            or prov_dict.get("submission_channel") == "external_caller"
+            or t_ident.get("caller_submitted")
+            or p_dict.get("provenance_class") == PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            or prov_dict.get("provenance_class") == PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            or t_ident.get("provenance_class") == PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            or override_provenance == PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        ):
+            return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+        # 3. Controlled runtime reproduction requires authentic verifier attestation or execution proof
+        if (
+            override_provenance == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+            or p_dict.get("provenance_class") == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+            or prov_dict.get("provenance_class") == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+        ):
+            att = prov_dict.get("verifier_attestation") or p_dict.get("verifier_attestation")
+            if att and isinstance(att, dict) and att.get("token_sig") and not att.get("attestation_rejected"):
+                return PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+            return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+        # 4. Genuine LIVE_RUNTIME_CAPTURE requires an authentic, verified LiveCaptureReceipt
+        rcpt = live_receipt or prov_dict.get("live_capture_receipt") or p_dict.get("live_capture_receipt")
+        if rcpt is not None and t_ident.get("pid"):
+            from .capture_backend import LiveCaptureReceipt
+            try:
+                rcpt_obj = rcpt if isinstance(rcpt, LiveCaptureReceipt) else LiveCaptureReceipt.from_dict(rcpt)
+                exp_pid = t_ident.get("pid")
+                exp_bid = t_ident.get("build_id") or t_ident.get("target_build_id")
+                exp_proc = t_ident.get("process_identity")
+                exp_exe = t_ident.get("executable_identity") or t_ident.get("executable")
+                ok, _ = rcpt_obj.verify(
+                    expected_session_id=session_id or p_dict.get("session_id"),
+                    expected_pid=exp_pid,
+                    expected_process_identity=exp_proc,
+                    expected_executable_identity=exp_exe,
+                    expected_build_id=exp_bid,
+                    require_production_authority=True,
+                )
+                if ok:
+                    return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+            except Exception:
+                pass
+
+        return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
     def adapt_raw_observation(
         self,
@@ -212,7 +271,8 @@ class EvidenceAdapter:
             "pid": eval_result.get("pid"),
             "companion_elf": eval_result.get("companion_elf"),
         }
-        prov_cls = self._resolve_provenance_class(eval_result, eff_target)
+        rcpt = eval_result.get("live_capture_receipt") or (eval_result.get("provenance") or {}).get("live_capture_receipt")
+        prov_cls = self._resolve_provenance_class(eval_result, eff_target, session_id=session_id, live_receipt=rcpt)
         timestamp = datetime.now(timezone.utc).isoformat()
         results = eval_result.get("results", [])
 
@@ -282,6 +342,7 @@ class EvidenceAdapter:
                         if eval_result.get("stop_duration_ms", 0.0) == 0.0
                         else CONSISTENCY_ZERO_STOP_ATOMIC
                     ),
+                    **({"live_capture_receipt": rcpt if isinstance(rcpt, dict) else rcpt.to_dict()} if rcpt is not None else {}),
                 },
                 capture_quality={
                     "completeness": "COMPLETE" if status == "OBSERVED" else "FAILED",
@@ -317,7 +378,8 @@ class EvidenceAdapter:
             "pid": verify_result.get("pid"),
             "companion_elf": verify_result.get("companion_elf"),
         }
-        prov_cls = self._resolve_provenance_class(verify_result, eff_target)
+        rcpt = verify_result.get("live_capture_receipt") or (verify_result.get("provenance") or {}).get("live_capture_receipt")
+        prov_cls = self._resolve_provenance_class(verify_result, eff_target, session_id=session_id, live_receipt=rcpt)
         timestamp = datetime.now(timezone.utc).isoformat()
         assertion_results = verify_result.get("assertion_results", [])
 
@@ -412,6 +474,7 @@ class EvidenceAdapter:
                 "tool": "runtime_verify_hypothesis",
                 "stop_duration_ms": verify_result.get("stop_duration_ms", 0.0),
                 "verification_latency_us": verify_result.get("verification_latency_us", 0.0),
+                **({"live_capture_receipt": rcpt if isinstance(rcpt, dict) else rcpt.to_dict()} if rcpt is not None else {}),
             },
             details={
                 "hypothesis_text": hyp_text,
@@ -536,7 +599,8 @@ class EvidenceAdapter:
             "pid": tool_result.get("pid"),
             "companion_elf": tool_result.get("companion_elf") or tool_result.get("companion_elf_path"),
         }
-        prov_cls = self._resolve_provenance_class(tool_result, eff_target)
+        rcpt = tool_result.get("live_capture_receipt") or (tool_result.get("provenance") or {}).get("live_capture_receipt")
+        prov_cls = self._resolve_provenance_class(tool_result, eff_target, session_id=session_id, live_receipt=rcpt)
         timestamp = datetime.now(timezone.utc).isoformat()
         digest, size_bytes = compute_payload_digest(tool_result)
         res_cat, coll_status, sem_digest = self.classify_tool_result_category(
@@ -580,6 +644,18 @@ class EvidenceAdapter:
                     if len(val) <= 16:
                         compact_details[k] = val
 
+        # Disarm caller-supplied confidence and authority upgrades on unverified inputs
+        if (
+            tool_result.get("caller_submitted")
+            or tool_result.get("unverified_caller_claim")
+            or prov_cls == PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            or tool_name.startswith("unverified_")
+        ):
+            compact_details["caller_submitted"] = True
+            compact_details.pop("confidence_score", None)
+            compact_details.pop("confidence", None)
+            compact_details.pop("verdict", None)
+
         final_ev_type = evidence_type if evidence_type in VALID_EVIDENCE_TYPES else EVIDENCE_TYPE_DIAGNOSTIC
         cq_completeness = (
             "COMPLETE"
@@ -608,6 +684,7 @@ class EvidenceAdapter:
                 "provenance_class": prov_cls,
                 "tool": tool_name,
                 "stop_duration_ms": tool_result.get("stop_duration_ms", 0.0),
+                **({"live_capture_receipt": rcpt if isinstance(rcpt, dict) else rcpt.to_dict()} if rcpt is not None else {}),
             },
             capture_quality={
                 "completeness": cq_completeness,

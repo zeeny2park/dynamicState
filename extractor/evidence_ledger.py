@@ -550,7 +550,7 @@ class EvidenceRecord:
             return str(self.provenance["provenance_class"])
         if isinstance(self.details, dict) and self.details.get("provenance_class"):
             return str(self.details["provenance_class"])
-        return PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
     @property
     def attribution_level(self) -> str:
@@ -713,7 +713,7 @@ class EvidenceLedger:
         self,
         module_id: str,
         domain: str = "GENERIC",
-        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+        provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
         attribution_basis: Optional[str] = None,
         evidence_payload: Optional[Dict[str, Any]] = None,
         nature: str = NATURE_OBSERVATION,
@@ -966,6 +966,10 @@ class EvidenceLedger:
         parent_evidence_ids: Optional[List[str]] = None,
         session_id: Optional[str] = None,
         provenance: Optional[Dict[str, Any]] = None,
+        target_identity: Optional[Dict[str, Any]] = None,
+        snapshot_ref: Optional[Dict[str, Any]] = None,
+        field_observation: Optional[Dict[str, Any]] = None,
+        object_observation: Optional[Dict[str, Any]] = None,
     ) -> EvidenceRecord:
         """Convenience method to construct, validate, and add an evidence record to the ledger."""
         obs_text = observation or summary or ""
@@ -981,6 +985,10 @@ class EvidenceLedger:
             capture_quality=capture_quality or {"completeness": "COMPLETE", "consistency_level": "STOPPED"},
             parent_evidence_ids=parent_evidence_ids or [],
             provenance=provenance or {},
+            target_identity=target_identity or {},
+            snapshot_ref=snapshot_ref or {},
+            field_observation=field_observation or {},
+            object_observation=object_observation or {},
         )
         self.add_record(rec)
         return rec
@@ -1089,26 +1097,54 @@ class EvidenceLedger:
                         f"Prohibited synthetic-to-live escalation: record '{record.evidence_id}' derives from synthetic parent '{par_id}' ({par_rec.provenance_class})"
                     )
 
-        # Validate attached LiveCaptureReceipt when present on LIVE_RUNTIME_CAPTURE records
-        raw_live_rcpt = p_prov.get("live_capture_receipt") or p_details.get("live_capture_receipt")
-        if raw_live_rcpt is not None:
-            from .capture_backend import LiveCaptureReceipt
-            rcpt_obj = raw_live_rcpt if isinstance(raw_live_rcpt, LiveCaptureReceipt) else LiveCaptureReceipt.from_dict(raw_live_rcpt)
-            t_ident = record.target_identity or {}
+        # Validate attached LiveCaptureReceipt on LIVE_RUNTIME_CAPTURE records
+        if prov_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+            raw_live_rcpt = p_prov.get("live_capture_receipt") or p_details.get("live_capture_receipt")
+            if raw_live_rcpt is None:
+                raise ValueError(f"LIVE_RUNTIME_CAPTURE record '{record.evidence_id}' requires an authentic LiveCaptureReceipt")
+            if not record.target_identity or not isinstance(record.target_identity, dict):
+                raise ValueError(f"LIVE_RUNTIME_CAPTURE record '{record.evidence_id}' missing required target identity")
+            t_ident = record.target_identity
             exp_pid = t_ident.get("pid")
-            exp_bid = t_ident.get("build_id") or t_ident.get("target_build_id")
             exp_proc_id = t_ident.get("process_identity")
             exp_exe_id = t_ident.get("executable_identity") or t_ident.get("executable")
+            if exp_pid is None or not exp_proc_id or not exp_exe_id:
+                raise ValueError(f"LIVE_RUNTIME_CAPTURE record '{record.evidence_id}' missing required process/executable identity fields in target_identity")
+
+            from .capture_backend import LiveCaptureReceipt
+            try:
+                rcpt_obj = raw_live_rcpt if isinstance(raw_live_rcpt, LiveCaptureReceipt) else LiveCaptureReceipt.from_dict(raw_live_rcpt)
+            except Exception as rcpt_err:
+                raise ValueError(f"LiveCaptureReceipt malformed for record '{record.evidence_id}': {rcpt_err}")
+
+            exp_bid = t_ident.get("build_id") or t_ident.get("target_build_id")
+            exp_snap = (record.snapshot_ref or {}).get("snapshot_id") if isinstance(record.snapshot_ref, dict) else None
             ok_rcpt, reason_rcpt = rcpt_obj.verify(
                 expected_session_id=record.session_id or self.session_id,
                 expected_pid=exp_pid,
                 expected_process_identity=exp_proc_id,
                 expected_executable_identity=exp_exe_id,
                 expected_build_id=exp_bid,
-                require_production_authority=(prov_cls in TRUSTED_PROVENANCE_CLASSES),
+                expected_snapshot_binding=exp_snap,
+                require_production_authority=True,
             )
-            if not ok_rcpt and prov_cls in TRUSTED_PROVENANCE_CLASSES:
+            if not ok_rcpt:
                 raise ValueError(f"LiveCaptureReceipt rejected for record '{record.evidence_id}': {reason_rcpt}")
+
+            exp_epoch = p_details.get("epoch", p_details.get("capture_epoch", (record.snapshot_ref or {}).get("epoch") if isinstance(record.snapshot_ref, dict) else None))
+            if exp_epoch is not None and not isinstance(exp_epoch, bool):
+                try:
+                    exp_ep_int = int(exp_epoch)
+                    rcpt_ep_int = int(rcpt_obj.capture_epoch)
+                except (ValueError, TypeError):
+                    exp_ep_int = None
+                    rcpt_ep_int = None
+                if exp_ep_int is not None and rcpt_ep_int is not None and exp_ep_int != rcpt_ep_int:
+                    raise ValueError(f"LiveCaptureReceipt capture_epoch mismatch for record '{record.evidence_id}': expected {exp_epoch}, got {rcpt_obj.capture_epoch}")
+        elif prov_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
+            att = p_prov.get("verifier_attestation") or p_details.get("verifier_attestation")
+            if not att or not isinstance(att, dict) or att.get("attestation_rejected") or not att.get("token_sig"):
+                raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION record '{record.evidence_id}' requires a valid cryptographically authenticated verifier attestation")
 
 
     def transition_provenance(

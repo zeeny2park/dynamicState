@@ -162,12 +162,51 @@ class TargetExecutionAdapter(ABC):
         """Issue an authenticated LiveCaptureReceipt for verified reads performed by this adapter."""
         self._ensure_tracking_state()
         from .capture_backend import issue_live_capture_receipt
-        ident = self._pinned_identities.get(int(pid)) or self.get_process_identity(int(pid))
-        proc_id = ident.get("process_identity") or f"{pid}:{ident.get('start_time', '0')}:{ident.get('boot_id', 'local')}"
-        exe_id = ident.get("executable_identity") or ident.get("executable") or f"/proc/{pid}/exe"
+
+        # 1. Require successful physical reads
+        if self._physical_bytes_read <= 0:
+            raise ValueError(f"Cannot issue live capture receipt for PID {pid}: no physical reads performed (physical_bytes_read={self._physical_bytes_read})")
+
+        # 2. Require verified process identity (reject PID reuse and executable replacement)
+        if int(pid) in self._pinned_identities:
+            ok_pin, pin_err = self.verify_pinned_identity(int(pid))
+            if not ok_pin:
+                raise ValueError(f"Cannot issue live receipt: pinned identity verification failed: {pin_err}")
+            ident = self._pinned_identities[int(pid)]
+        else:
+            ident = self.get_process_identity(int(pid))
+            alive, live_err = self.check_liveness(int(pid))
+            if not alive:
+                raise ValueError(f"Cannot issue live receipt: process {pid} is not alive or accessible: {live_err}")
+            self.pin_target_identity(int(pid))
+
+        proc_id = ident.get("process_identity")
+        start_time = ident.get("start_time")
+        if not proc_id or not start_time:
+            raise ValueError(f"Cannot issue live receipt: missing start_time / verified process identity for PID {pid}")
+        if not proc_id or proc_id.startswith(f"{pid}::"):
+            proc_id = f"{pid}:{start_time}:{ident.get('boot_id', 'local')}"
+
+        exe_id = ident.get("executable_identity") or ident.get("executable")
+        if not exe_id:
+            raise ValueError(f"Cannot issue live receipt: missing verified executable identity for PID {pid}")
+
         bid = ident.get("build_id") or companion_build_id or ""
+
+        # 3. Custom memory reader check: Must strictly use TEST authority and NEVER be promoted
         is_custom = bool(getattr(self, "_memory_reader", None) is not None)
-        auth_lvl = "TEST" if is_custom and getattr(self, "_force_test_authority", False) else "PRODUCTION"
+        if is_custom:
+            auth_lvl = "TEST"
+            if getattr(self, "_force_production_authority", False):
+                raise ValueError("Prohibited authority escalation: custom memory reader cannot obtain PRODUCTION authority")
+        else:
+            auth_lvl = "TEST" if getattr(self, "_force_test_authority", False) else "PRODUCTION"
+
+        target_constraints: Dict[str, Any] = {}
+        if self.is_remote():
+            target_constraints["target_host"] = self.target_host()
+            target_constraints["is_remote"] = True
+
         bind_str = snapshot_binding or f"live_reads:{pid}:epoch_{self._capture_epoch}:bytes_{self._physical_bytes_read}"
         rcpt = issue_live_capture_receipt(
             session_id=session_id,
@@ -179,6 +218,7 @@ class TargetExecutionAdapter(ABC):
             capture_epoch=self._capture_epoch,
             authority_level=auth_lvl,
             provenance_class="LIVE_RUNTIME_CAPTURE",
+            target_constraints=target_constraints,
         )
         self._issued_live_receipts.append(rcpt)
         return rcpt

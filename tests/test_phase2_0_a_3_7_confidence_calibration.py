@@ -25,6 +25,7 @@ Validates:
 
 import unittest
 
+from extractor.capture_backend import issue_live_capture_receipt
 from extractor.evidence_ledger import (
     EVIDENCE_TYPE_COMPARISON,
     EVIDENCE_TYPE_FIELD_OBSERVATION,
@@ -39,12 +40,21 @@ from extractor.evidence_ledger import (
     PROVENANCE_CLASS_SYNTHETIC,
 )
 from extractor.hypothesis import (
+    CLASSIFICATION_CONTRADICTORY,
+    CLASSIFICATION_CORRELATED,
+    CLASSIFICATION_DERIVED,
+    CLASSIFICATION_DUPLICATE,
+    CLASSIFICATION_INVALIDATED,
+    CLASSIFICATION_MISSING,
+    CLASSIFICATION_UNVERIFIED,
+    CLASSIFICATION_VERIFIED,
     EVIDENCE_QUALITY_DIMENSION_DOCS,
     HYPOTHESIS_STATUS_CONTRADICTED,
     HYPOTHESIS_STATUS_INCONCLUSIVE,
     HYPOTHESIS_STATUS_PROPOSED,
     HYPOTHESIS_STATUS_SUPPORTED,
     HYPOTHESIS_STATUS_VALIDATED,
+    REQUIRED_EVIDENCE_RELATIONSHIP_CLASSIFICATIONS,
     HypothesisValidator,
     InvestigationHypothesis,
     classify_evidence_relationship,
@@ -86,11 +96,27 @@ class TestPhase20A37ConfidenceCalibration(unittest.TestCase):
             self.assertTrue(meta.get("meaning"), f"Missing meaning for {dim_name}")
             self.assertTrue(meta.get("impact"), f"Missing impact for {dim_name}")
 
+        rcpt = issue_live_capture_receipt(
+            session_id=self.ledger.session_id,
+            pid=1234,
+            process_identity="1234:100:boot",
+            executable_identity="/bin/app:123",
+            build_id="build1",
+            snapshot_binding="snap_5",
+            capture_epoch=5,
+        )
         rec = self.ledger.record(
             evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
             observation="Direct live field read",
-            details={"epoch": 5},
-            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": None},
+            target_identity={
+                "pid": 1234,
+                "process_identity": "1234:100:boot",
+                "executable_identity": "/bin/app:123",
+                "build_id": "build1",
+            },
+            snapshot_ref={"snapshot_id": "snap_5", "epoch": 5},
+            details={"epoch": 5, "capture_epoch": 5},
+            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt},
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         q_vec = evaluate_record_quality_dimensions(rec, reference_epoch=5)
@@ -199,12 +225,28 @@ class TestPhase20A37ConfidenceCalibration(unittest.TestCase):
         HypothesisValidator.evaluate(hypo_weak, self.ledger, new_evidence=rec_weak)
 
         hypo_strong = self._new_hypo("h_03_s")
+        rcpt_s = issue_live_capture_receipt(
+            session_id=self.ledger.session_id,
+            pid=2001,
+            process_identity="2001:100:boot",
+            executable_identity="/bin/app:2001",
+            build_id="build_strong",
+            snapshot_binding="snap_strong_1",
+            capture_epoch=1,
+        )
         rec_strong = self.ledger.record(
             evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
             source="runtime_collector",
             observation="Direct live runtime field observation",
-            details={"outcome": "SUPPORTED", "snapshot_id": "snap_strong_1", "epoch": 1},
-            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE},
+            target_identity={
+                "pid": 2001,
+                "process_identity": "2001:100:boot",
+                "executable_identity": "/bin/app:2001",
+                "build_id": "build_strong",
+            },
+            snapshot_ref={"snapshot_id": "snap_strong_1", "epoch": 1},
+            details={"outcome": "SUPPORTED", "snapshot_id": "snap_strong_1", "epoch": 1, "capture_epoch": 1},
+            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt_s},
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         HypothesisValidator.evaluate(hypo_strong, self.ledger, new_evidence=rec_strong)
@@ -246,29 +288,83 @@ class TestPhase20A37ConfidenceCalibration(unittest.TestCase):
     def test_case_05_multiple_independent_observations_increase_confidence(self):
         """5. Multiple genuinely independent observations (distinct snapshots & epochs) increase confidence."""
         hypo = self._new_hypo("h_05")
+        rcpt1 = issue_live_capture_receipt(
+            session_id=self.ledger.session_id,
+            pid=3001,
+            process_identity="3001:100:boot",
+            executable_identity="/bin/app:3001",
+            build_id="build_indep",
+            snapshot_binding="snap_ind_1",
+            capture_epoch=1,
+        )
         rec1 = self.ledger.record(
             evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
             source="tool_1",
             observation="Independent observation 1 at epoch 1",
-            details={"outcome": "SUPPORTED", "observation_id": "obs_ind_1", "snapshot_id": "snap_ind_1", "epoch": 1},
+            target_identity={
+                "pid": 3001,
+                "process_identity": "3001:100:boot",
+                "executable_identity": "/bin/app:3001",
+                "build_id": "build_indep",
+            },
+            snapshot_ref={"snapshot_id": "snap_ind_1", "epoch": 1},
+            details={"outcome": "SUPPORTED", "observation_id": "obs_ind_1", "snapshot_id": "snap_ind_1", "epoch": 1, "capture_epoch": 1},
+            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt1},
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         HypothesisValidator.evaluate(hypo, self.ledger, new_evidence=rec1)
         score_1 = hypo.confidence_score
 
+        rcpt2 = issue_live_capture_receipt(
+            session_id=self.ledger.session_id,
+            pid=3001,
+            process_identity="3001:100:boot",
+            executable_identity="/bin/app:3001",
+            build_id="build_indep",
+            snapshot_binding="snap_ind_2",
+            capture_epoch=2,
+        )
         rec2 = self.ledger.record(
             evidence_type=EVIDENCE_TYPE_COMPARISON,
             source="tool_2",
             observation="Independent observation 2 at epoch 2",
-            details={"outcome": "SUPPORTED", "observation_id": "obs_ind_2", "snapshot_id": "snap_ind_2", "epoch": 2},
+            target_identity={
+                "pid": 3001,
+                "process_identity": "3001:100:boot",
+                "executable_identity": "/bin/app:3001",
+                "build_id": "build_indep",
+            },
+            snapshot_ref={"snapshot_id": "snap_ind_2", "epoch": 2},
+            details={"outcome": "SUPPORTED", "observation_id": "obs_ind_2", "snapshot_id": "snap_ind_2", "epoch": 2, "capture_epoch": 2},
+            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt2},
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         HypothesisValidator.evaluate(hypo, self.ledger, new_evidence=rec2)
         score_2 = hypo.confidence_score
 
+        rcpt3 = issue_live_capture_receipt(
+            session_id=self.ledger.session_id,
+            pid=3001,
+            process_identity="3001:100:boot",
+            executable_identity="/bin/app:3001",
+            build_id="build_indep",
+            snapshot_binding="snap_ind_3",
+            capture_epoch=3,
+        )
         rec3 = self.ledger.record(
             evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
             source="tool_3",
             observation="Independent observation 3 at epoch 3",
-            details={"outcome": "SUPPORTED", "observation_id": "obs_ind_3", "snapshot_id": "snap_ind_3", "epoch": 3},
+            target_identity={
+                "pid": 3001,
+                "process_identity": "3001:100:boot",
+                "executable_identity": "/bin/app:3001",
+                "build_id": "build_indep",
+            },
+            snapshot_ref={"snapshot_id": "snap_ind_3", "epoch": 3},
+            details={"outcome": "SUPPORTED", "observation_id": "obs_ind_3", "snapshot_id": "snap_ind_3", "epoch": 3, "capture_epoch": 3},
+            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt3},
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         HypothesisValidator.evaluate(hypo, self.ledger, new_evidence=rec3)
         score_3 = hypo.confidence_score
@@ -418,6 +514,118 @@ class TestPhase20A37ConfidenceCalibration(unittest.TestCase):
         self.assertEqual(hypo.validation_status, HYPOTHESIS_STATUS_CONTRADICTED)
         self.assertLessEqual(hypo.confidence_score, 0.20)
         self.assertGreaterEqual(len(hypo.confidence_history), 2)
+
+    def test_section_3_1_missing_evidence_ids_never_count_as_independent_or_increase_confidence(self):
+        """A supporting_evidence_id not found in EvidenceLedger must never count as independent or increase confidence."""
+        hypo = self._new_hypo("h_missing_ids")
+        init_score = hypo.confidence_score
+        hypo.supporting_evidence_ids = ["non_existent_ev_1", "non_existent_ev_2", "non_existent_ev_3"]
+
+        HypothesisValidator.evaluate(hypo, self.ledger)
+        self.assertEqual(hypo.quality_breakdown["independent_supporting_clusters"], 0)
+        self.assertEqual(hypo.quality_breakdown["total_supporting_records"], 0)
+        self.assertLessEqual(hypo.confidence_score, init_score)
+        self.assertEqual(hypo.quality_breakdown["relationships"]["non_existent_ev_1"], CLASSIFICATION_MISSING)
+        self.assertEqual(hypo.quality_breakdown["relationships"]["non_existent_ev_2"], CLASSIFICATION_MISSING)
+
+    def test_section_3_1_all_required_relationship_classifications(self):
+        """All 8 required classifications are supported and correctly assigned."""
+        expected_classes = {
+            "VERIFIED", "UNVERIFIED", "MISSING", "DUPLICATE",
+            "DERIVED", "CORRELATED", "CONTRADICTORY", "INVALIDATED"
+        }
+        self.assertEqual(REQUIRED_EVIDENCE_RELATIONSHIP_CLASSIFICATIONS, expected_classes)
+
+        # 1. VERIFIED
+        rcpt = issue_live_capture_receipt(
+            session_id=self.ledger.session_id,
+            pid=777,
+            process_identity="777:1:boot",
+            executable_identity="/bin/app:777",
+            build_id="b777",
+            snapshot_binding="snap_777",
+            capture_epoch=1,
+        )
+        r_ver = self.ledger.record(
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
+            observation="Verified live observation",
+            target_identity={"pid": 777, "process_identity": "777:1:boot", "executable_identity": "/bin/app:777", "build_id": "b777"},
+            snapshot_ref={"snapshot_id": "snap_777", "epoch": 1},
+            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt},
+            details={"epoch": 1, "capture_epoch": 1, "outcome": "SUPPORTED"},
+        )
+
+        # 2. UNVERIFIED
+        r_unver = self.ledger.record(
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
+            observation="Unverified imported",
+            provenance={"provenance_class": PROVENANCE_CLASS_IMPORTED_UNVERIFIED},
+            details={"outcome": "SUPPORTED", "epoch": 2, "snapshot_id": "snap_unver"},
+        )
+
+        # 3. CORRELATED
+        r_corr = self.ledger.record(
+            evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+            observation="Correlated same snap",
+            snapshot_ref={"snapshot_id": "snap_777", "epoch": 1},
+            details={"outcome": "SUPPORTED", "snapshot_id": "snap_777", "epoch": 1},
+        )
+
+        # 4. DERIVED
+        r_der = self.ledger.record(
+            evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+            observation="Derived from verified",
+            parent_evidence_ids=[r_ver.evidence_id],
+            details={"outcome": "SUPPORTED", "epoch": 3, "snapshot_id": "snap_der"},
+        )
+
+        # 5. CONTRADICTORY
+        r_contra = self.ledger.record(
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
+            observation="Opposing outcome",
+            details={"outcome": "CONTRADICTED"},
+        )
+
+        # 6. INVALIDATED
+        r_inv = self.ledger.record(
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
+            observation="Invalidated observation",
+            details={"outcome": "SUPPORTED", "is_invalidated": True},
+        )
+
+        # 7. DUPLICATE
+        r_dup = self.ledger.record(
+            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
+            observation="Verified live observation",
+            details={"semantic_digest": (r_ver.details or {}).get("semantic_digest", "digest_ver_1")},
+        )
+        if not (r_ver.details or {}).get("semantic_digest"):
+            r_ver.details["semantic_digest"] = "digest_ver_1"
+
+        test_eids = [
+            r_ver.evidence_id,
+            r_unver.evidence_id,
+            r_corr.evidence_id,
+            r_der.evidence_id,
+            r_contra.evidence_id,
+            r_inv.evidence_id,
+            r_dup.evidence_id,
+            "missing_eid_xyz",
+        ]
+
+        deduped, indep, rel_map = cluster_independent_supporting_evidence(test_eids, self.ledger)
+        self.assertEqual(rel_map[r_ver.evidence_id], CLASSIFICATION_VERIFIED)
+        self.assertEqual(rel_map[r_unver.evidence_id], CLASSIFICATION_UNVERIFIED)
+        self.assertEqual(rel_map[r_corr.evidence_id], CLASSIFICATION_CORRELATED)
+        self.assertEqual(rel_map[r_der.evidence_id], CLASSIFICATION_DERIVED)
+        self.assertEqual(rel_map[r_contra.evidence_id], CLASSIFICATION_CONTRADICTORY)
+        self.assertEqual(rel_map[r_inv.evidence_id], CLASSIFICATION_INVALIDATED)
+        self.assertEqual(rel_map[r_dup.evidence_id], CLASSIFICATION_DUPLICATE)
+        self.assertEqual(rel_map["missing_eid_xyz"], CLASSIFICATION_MISSING)
+        self.assertNotIn("missing_eid_xyz", indep)
+        self.assertNotIn(r_inv.evidence_id, indep)
+        self.assertNotIn(r_contra.evidence_id, indep)
+        self.assertNotIn(r_dup.evidence_id, indep)
 
 
 if __name__ == "__main__":

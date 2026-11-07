@@ -3127,7 +3127,7 @@ class InvestigationManager:
         ev_id = f"ev_obs_{uuid.uuid4().hex[:8]}"
         outcome = "ABSTAIN"
         source = "investigation_observer"
-        prov_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
         authority_lvl = "PRODUCTION"
         is_simulated_ctrl = False
 
@@ -3237,7 +3237,7 @@ class InvestigationManager:
             outcome = eval_out["outcome"]
             obs_text = eval_out["observation_text"]
             details = eval_out["details"]
-            prov_class = eval_out.get("provenance_class", PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE)
+            prov_class = eval_out.get("provenance_class", PROVENANCE_CLASS_IMPORTED_UNVERIFIED)
 
         details["observation_id"] = observation_id
         details["hypothesis_id"] = target_hypo.hypothesis_id

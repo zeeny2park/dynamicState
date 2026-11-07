@@ -1050,6 +1050,15 @@ class AdaptiveInvestigationEngine:
                 proc_ident = adapter.get_process_identity(pid) or {}
             except Exception:
                 proc_ident = {}
+            if hasattr(adapter, "get_proc_maps"):
+                try:
+                    p_maps = adapter.get_proc_maps(pid)
+                    if p_maps:
+                        r_vmas = [m for m in p_maps if m.get("is_readable")]
+                        if r_vmas:
+                            adapter.read_memory(pid, r_vmas[0]["start_int"], 64)
+                except Exception:
+                    pass
             if adapter.is_remote():
                 try:
                     rem_maps = adapter.get_proc_maps(pid)
@@ -1123,6 +1132,7 @@ class AdaptiveInvestigationEngine:
             "pid": pid,
             "companion_elf": companion_elf_path,
             "alive": alive,
+            **proc_ident,
             **elf_info,
         }
         capture_quality = {
@@ -1204,6 +1214,23 @@ class AdaptiveInvestigationEngine:
         )
         target_identity["provenance_class"] = eff_prov
 
+        live_rcpt_obj = None
+        if eff_adapter._physical_bytes_read > 0 and capabilities.get("process_alive") and not fixture_data:
+            try:
+                live_rcpt_obj = eff_adapter.issue_live_receipt_for_session(
+                    session_id=sess_id,
+                    pid=pid,
+                    companion_build_id=target_identity.get("build_id"),
+                )
+            except Exception:
+                live_rcpt_obj = None
+
+        id_prov = {"provenance_class": eff_prov, "stage": STATE_TARGET_VALIDATION}
+        cq_prov = {"provenance_class": eff_prov, "stage": STATE_TARGET_VALIDATION}
+        if live_rcpt_obj:
+            id_prov["live_capture_receipt"] = live_rcpt_obj.to_dict()
+            cq_prov["live_capture_receipt"] = live_rcpt_obj.to_dict()
+
         # Record target identity & capture quality in ledger
         id_rec = EvidenceRecord(
             evidence_id=f"evi_id_{hashlib.sha256(f'{sess_id}:{pid}:{companion_elf_path}'.encode()).hexdigest()[:10]}",
@@ -1213,7 +1240,7 @@ class AdaptiveInvestigationEngine:
             session_id=sess_id,
             observation=f"Target validation for PID {pid} (alive={capabilities.get('process_alive')}, provenance={eff_prov})",
             target_identity=target_identity,
-            provenance={"provenance_class": eff_prov, "stage": STATE_TARGET_VALIDATION},
+            provenance=id_prov,
             details={
                 "collection_status": COLLECTION_STATUS_COLLECTED if capabilities.get("process_alive") else COLLECTION_STATUS_FAILED,
                 "capabilities": capabilities,
@@ -1231,7 +1258,7 @@ class AdaptiveInvestigationEngine:
             observation=f"Capture quality assessment: completeness={capture_quality.get('completeness')}, provenance={eff_prov}",
             target_identity=target_identity,
             capture_quality=capture_quality,
-            provenance={"provenance_class": eff_prov, "stage": STATE_TARGET_VALIDATION},
+            provenance=cq_prov,
             details={
                 "collection_status": COLLECTION_STATUS_COLLECTED,
                 "capture_quality": capture_quality,
@@ -1448,6 +1475,9 @@ class AdaptiveInvestigationEngine:
                         "reason": res.get("error"),
                     })
                     break
+
+                if live_rcpt_obj:
+                    res["live_capture_receipt"] = live_rcpt_obj.to_dict()
 
                 ev_rec = self.adapter.adapt_generic_tool_output(
                     tool_name=f"inspection_{current_id}",
@@ -1679,6 +1709,9 @@ class AdaptiveInvestigationEngine:
                 if raw_obs_res.get("success", True):
                     temporal_samples_count += 1
                     self.cache.advance_epoch()
+
+            if live_rcpt_obj:
+                raw_obs_res["live_capture_receipt"] = live_rcpt_obj.to_dict()
 
             ev_rec = self.adapter.adapt_generic_tool_output(
                 tool_name=selected_obs.profile_id or selected_obs.observation_id,

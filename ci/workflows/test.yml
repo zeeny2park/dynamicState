@@ -121,6 +121,34 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase26_real_execution_quality.py
 
+      - name: Run Phase 2.0-A.3.6 Fail-Closed Evidence and Live Closure Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_6_fail_closed_evidence_and_live_closure.py
+
+      - name: Run Phase 2.0-A.3.7 Confidence Calibration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_7_confidence_calibration.py
+
+      - name: Run Phase 2.0-A.3.8 Adaptive Quality Validation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_8_adaptive_quality_validation.py
+
+      - name: Run Phase 2.0-A.3.9 Production Readiness Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_9_production_readiness.py
+
+      - name: Run Phase 2.0-A.3.10 Adversarial Provenance Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_10_adversarial_provenance.py
+
+      - name: Run Phase 2.0-A.3.10 Investigation Workflow Engine Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_10_workflow.py
+
+      - name: Run Phase 2.0-A.3.10 Real C++ Live Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_10_real_cpp_e2e.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests
