@@ -225,6 +225,30 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase2_0_a_3_14_target_identity_and_measurement.py
 
+      - name: Run Phase 2.0-A.3.15 Causal Authority Bypass Hardening Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_causal_authority_bypass.py
+
+      - name: Run Phase 2.0-A.3.15 Causal Evidence Chain Closure Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_causal_chain_closure.py
+
+      - name: Run Phase 2.0-A.3.15 Operation Provenance and Ledger Serialization Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_operation_provenance.py
+
+      - name: Run Phase 2.0-A.3.15 Durable Trust Store and Restart Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_durable_trust_restart.py
+
+      - name: Run Phase 2.0-A.3.15 Crash Safe Workflow Recovery Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_crash_safe_recovery.py
+
+      - name: Run Phase 2.0-A.3.15 Transaction Accounting and SLA Measurement Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_accounting_and_sla_integrity.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

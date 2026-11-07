@@ -1186,24 +1186,84 @@ class EvidenceLedger:
                         f"receipt={rcpt_obj.observation_digest}, record={rec_obs_dig}"
                     )
 
-            # A.3.11: Receipt replay protection
+            # A.3.11/A.3.15: Receipt and operation replay protection & derivation
             if not hasattr(self, "_used_operation_ids"):
                 self._used_operation_ids: Dict[str, Dict[str, Any]] = {}
+            if not hasattr(self, "_operation_to_evidence_ids"):
+                self._operation_to_evidence_ids: Dict[str, List[str]] = {}
+            if not hasattr(self, "_operation_to_receipt_id"):
+                self._operation_to_receipt_id: Dict[str, str] = {}
+
             op_id = getattr(rcpt_obj, "operation_id", None)
+            rcpt_id = getattr(rcpt_obj, "receipt_id", None)
             eff_field = (record.field_observation or {}).get("field_path") or record.details.get("field_path") or ""
+
             if op_id:
+                # 1. Bind receipt to operation (one receipt per operation)
+                if rcpt_id:
+                    if op_id in self._operation_to_receipt_id:
+                        bound_rcpt = self._operation_to_receipt_id[op_id]
+                        if bound_rcpt != rcpt_id:
+                            raise ValueError(
+                                f"Receipt-to-operation conflict: operation '{op_id}' is already bound to receipt '{bound_rcpt}', "
+                                f"cannot bind to different receipt '{rcpt_id}'"
+                            )
+                    else:
+                        self._operation_to_receipt_id[op_id] = rcpt_id
+
+                # Validate derived_from if present
+                derived_from = record.details.get("derived_from")
+                if derived_from:
+                    if isinstance(derived_from, str):
+                        derived_list = [derived_from]
+                    elif isinstance(derived_from, (list, tuple)):
+                        derived_list = list(derived_from)
+                    else:
+                        derived_list = []
+                    for d_src in derived_list:
+                        if d_src not in self._by_id:
+                            raise ValueError(
+                                f"Derived record '{record.evidence_id}' references nonexistent source observation '{d_src}'"
+                            )
+                    if not record.parent_evidence_ids and derived_list:
+                        record.parent_evidence_ids = list(derived_list)
+                    else:
+                        for d_src in derived_list:
+                            if d_src not in record.parent_evidence_ids:
+                                raise ValueError(
+                                    f"Derived record '{record.evidence_id}' missing source '{d_src}' in parent_evidence_ids"
+                                )
+                        src_rec = self._by_id[d_src]
+                        src_op = (src_rec.details or {}).get("operation_id")
+                        if not src_op and (src_rec.provenance or {}).get("live_capture_receipt"):
+                            slcr = src_rec.provenance["live_capture_receipt"]
+                            src_op = slcr.get("operation_id") if isinstance(slcr, dict) else getattr(slcr, "operation_id", None)
+                        if src_op and str(src_op) != str(op_id):
+                            raise ValueError(
+                                f"Derivation operation mismatch: source '{d_src}' belongs to operation '{src_op}', "
+                                f"derived record '{record.evidence_id}' claims operation '{op_id}'"
+                            )
+
+                # 2. Check source observation vs. derived evidence
+                if op_id in self._operation_to_evidence_ids:
+                    if not derived_from:
+                        if record.evidence_id not in self._operation_to_evidence_ids[op_id]:
+                            raise ValueError(
+                                f"Receipt replay detected for operation '{op_id}' across different evidence records: "
+                                f"operation is already bound to primary observation '{self._operation_to_evidence_ids[op_id][0]}'. "
+                                f"Multiple records from one operation must explicitly derive from the primary observation via 'derived_from' and 'parent_evidence_ids'."
+                            )
+                    if record.evidence_id not in self._operation_to_evidence_ids[op_id]:
+                        self._operation_to_evidence_ids[op_id].append(record.evidence_id)
+                else:
+                    self._operation_to_evidence_ids[op_id] = [record.evidence_id]
+
                 if op_id in self._used_operation_ids:
                     prev = self._used_operation_ids[op_id]
                     if prev.get("session_id") != (record.session_id or self.session_id):
                         raise ValueError(f"Receipt replay across sessions rejected for operation '{op_id}'")
                     if exp_pid is not None and prev.get("pid") is not None and prev["pid"] != exp_pid:
                         raise ValueError(f"Receipt replay across PIDs rejected for operation '{op_id}'")
-                    if prev.get("evidence_id") != record.evidence_id and not record.details.get("derived_from"):
-                        if prev.get("observation") != record.observation or prev.get("field") != eff_field:
-                            raise ValueError(
-                                f"Receipt replay detected for operation '{op_id}' across different evidence records: "
-                                f"prev='{prev.get('evidence_id')}', new='{record.evidence_id}'"
-                            )
                 self._used_operation_ids[op_id] = {
                     "session_id": record.session_id or self.session_id,
                     "pid": exp_pid,
@@ -1242,15 +1302,36 @@ class EvidenceLedger:
             else:
                 raise ValueError(f"Invalid causal_attestation on record '{record.evidence_id}'")
 
-            ok_att, err_att = c_att.verify(expected_session_id=record.session_id or self.session_id)
+            # Validate target identity mandatory fields on attestation
+            c_ident = c_att.target_identity or {}
+            c_pid = c_ident.get("pid")
+            c_proc = c_ident.get("process_identity")
+            c_exe = c_ident.get("executable_identity") or c_ident.get("executable")
+            if c_pid is None or int(c_pid) <= 1:
+                raise ValueError(f"CausalAttestation target identity missing valid PID on record '{record.evidence_id}'")
+            if not c_proc or not str(c_proc).strip():
+                raise ValueError(f"CausalAttestation target identity missing process_identity on record '{record.evidence_id}'")
+            if not c_exe or not str(c_exe).strip():
+                raise ValueError(f"CausalAttestation target identity missing executable_identity on record '{record.evidence_id}'")
+
+            r_ident = record.target_identity or {}
+            r_pid = r_ident.get("pid")
+            r_proc = r_ident.get("process_identity")
+            r_exe = r_ident.get("executable_identity") or r_ident.get("executable")
+            r_bid = r_ident.get("build_id")
+
+            ok_att, err_att = c_att.verify(
+                expected_session_id=record.session_id or self.session_id,
+                expected_pid=r_pid,
+                expected_process_identity=r_proc,
+                expected_executable_identity=r_exe,
+                expected_build_id=r_bid,
+            )
             if not ok_att:
                 raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': {err_att}")
 
-            if c_att.target_identity and record.target_identity:
-                c_pid = c_att.target_identity.get("pid")
-                r_pid = record.target_identity.get("pid")
-                if c_pid is not None and r_pid is not None and int(c_pid) != int(r_pid):
-                    raise ValueError(f"CausalAttestation target PID mismatch for record '{record.evidence_id}': attestation has {c_pid}, record has {r_pid}")
+            if c_pid is not None and r_pid is not None and int(c_pid) != int(r_pid):
+                raise ValueError(f"CausalAttestation target PID mismatch for record '{record.evidence_id}': attestation has {c_pid}, record has {r_pid}")
 
             if not hasattr(self, "_used_causal_attestation_ids"):
                 self._used_causal_attestation_ids: Set[str] = set()
@@ -1258,8 +1339,54 @@ class EvidenceLedger:
                 raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}'")
             self._used_causal_attestation_ids.add(c_att.attestation_id)
 
-            if c_att.precondition_evidence_id and c_att.precondition_evidence_id not in self._by_id:
+            # Precondition evidence verification
+            if not c_att.precondition_evidence_id or c_att.precondition_evidence_id not in self._by_id:
                 raise ValueError(f"CausalAttestation references nonexistent precondition evidence '{c_att.precondition_evidence_id}'")
+            pre_rec = self._by_id[c_att.precondition_evidence_id]
+
+            # Verify same session
+            if pre_rec.session_id and record.session_id and str(pre_rec.session_id) != str(record.session_id):
+                raise ValueError(
+                    f"CausalAttestation cross-session evidence binding rejected: "
+                    f"pre='{pre_rec.session_id}', post='{record.session_id}'"
+                )
+
+            # Verify same target PID
+            pre_pid = (pre_rec.target_identity or {}).get("pid")
+            if pre_pid is not None and r_pid is not None and int(pre_pid) != int(r_pid):
+                raise ValueError(
+                    f"CausalAttestation cross-target evidence binding rejected: "
+                    f"pre PID {pre_pid} != post PID {r_pid}"
+                )
+
+            # Verify postcondition evidence consistency if already in ledger
+            if c_att.postcondition_evidence_id in self._by_id:
+                post_rec = self._by_id[c_att.postcondition_evidence_id]
+                post_pid = (post_rec.target_identity or {}).get("pid")
+                if post_pid is not None and pre_pid is not None and int(post_pid) != int(pre_pid):
+                    raise ValueError(f"CausalAttestation cross-target evidence binding rejected: pre PID {pre_pid} != post PID {post_pid}")
+                if post_rec.session_id and pre_rec.session_id and str(post_rec.session_id) != str(pre_rec.session_id):
+                    raise ValueError(f"CausalAttestation cross-session evidence binding rejected: pre='{pre_rec.session_id}', post='{post_rec.session_id}'")
+
+            # Verify operation ID matching
+            rec_op = (record.details or {}).get("operation_id")
+            if rec_op and str(c_att.operation_id) != str(rec_op):
+                raise ValueError(f"CausalAttestation operation ID mismatch: attestation={c_att.operation_id}, record={rec_op}")
+
+            raw_rcpt = p_prov.get("live_capture_receipt") or p_details.get("live_capture_receipt")
+            if raw_rcpt:
+                rcpt_op = raw_rcpt.get("operation_id") if isinstance(raw_rcpt, dict) else getattr(raw_rcpt, "operation_id", None)
+                if rcpt_op and not str(rcpt_op).startswith("ctx_") and str(c_att.operation_id) != str(rcpt_op):
+                    raise ValueError(
+                        f"CausalAttestation operation ID '{c_att.operation_id}' does not match "
+                        f"live capture receipt operation ID '{rcpt_op}'"
+                    )
+
+            # Verify intervention details authorization
+            if not c_att.intervention_details or not isinstance(c_att.intervention_details, dict):
+                raise ValueError(f"CausalAttestation on record '{record.evidence_id}' missing verifiable intervention_details")
+            if not any(k in c_att.intervention_details for k in ("intervention_id", "verified_intervention", "authorized_by", "action", "transition_id")):
+                raise ValueError(f"CausalAttestation on record '{record.evidence_id}' lacks verifiable intervention authorization or identity")
 
         if (
             p_details.get("causal_proof") is True
@@ -1452,6 +1579,9 @@ class EvidenceLedger:
             "created_at": self.created_at,
             "record_count": len(self._records),
             "used_causal_attestation_ids": list(getattr(self, "_used_causal_attestation_ids", set())),
+            "operation_to_evidence_ids": {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()},
+            "operation_to_receipt_id": dict(getattr(self, "_operation_to_receipt_id", {})),
+            "used_operation_ids": getattr(self, "_used_operation_ids", {}),
             "records": [r.to_dict() for r in self._records],
         }
 
@@ -1468,6 +1598,9 @@ class EvidenceLedger:
         )
         ledger.created_at = data.get("created_at", ledger.created_at)
         ledger._used_causal_attestation_ids = set()
+        ledger._used_operation_ids = {}
+        ledger._operation_to_evidence_ids = {}
+        ledger._operation_to_receipt_id = {}
         seen_ids = set()
         for rec_data in data.get("records", []):
             rec = EvidenceRecord.from_dict(rec_data)
@@ -1476,6 +1609,14 @@ class EvidenceLedger:
             seen_ids.add(rec.evidence_id)
             ledger.add_record(rec)
         ledger._used_causal_attestation_ids.update(data.get("used_causal_attestation_ids", []))
+        ledger._used_operation_ids.update(data.get("used_operation_ids", {}))
+        for op_id, ev_ids in data.get("operation_to_evidence_ids", {}).items():
+            existing = ledger._operation_to_evidence_ids.setdefault(op_id, [])
+            for eid in ev_ids:
+                if eid not in existing:
+                    existing.append(eid)
+        for op_id, rcpt_id in data.get("operation_to_receipt_id", {}).items():
+            ledger._operation_to_receipt_id[op_id] = rcpt_id
         return ledger
 
     @classmethod

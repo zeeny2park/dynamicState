@@ -224,6 +224,11 @@ class TargetExecutionAdapter(ABC):
         return self._physical_bytes_read
 
     @property
+    def physical_bytes_read(self) -> int:
+        self._ensure_tracking_state()
+        return self._physical_bytes_read
+
+    @property
     def unscoped_physical_reads_count(self) -> int:
         self._ensure_tracking_state()
         return self._unscoped_physical_reads_count
@@ -245,6 +250,12 @@ class TargetExecutionAdapter(ABC):
 
     def reset_accounting(self) -> None:
         self._ensure_tracking_state()
+        if self._active_transactions:
+            active_ids = list(self._active_transactions.keys())
+            raise RuntimeError(
+                f"Cannot reset accounting while capture transactions are active ({len(active_ids)} active: {active_ids[:3]}). "
+                f"Transactions must be committed or rolled back prior to resetting accounting."
+            )
         self._physical_reads_count = 0
         self._physical_bytes_read = 0
         self._unscoped_physical_reads_count = 0
@@ -252,7 +263,6 @@ class TargetExecutionAdapter(ABC):
         self._observation_dedup_cache.clear()
         self._issued_live_receipts.clear()
         self._last_committed_transaction = None
-        self._active_transactions.clear()
         self._committed_transactions.clear()
         self._active_by_scope.clear()
         self._auto_transaction = None
@@ -271,10 +281,6 @@ class TargetExecutionAdapter(ABC):
         transaction: Optional[CaptureTransaction] = None,
     ) -> None:
         self._ensure_tracking_state()
-        if num_reads > 0:
-            self._physical_reads_count += int(num_reads)
-        if num_bytes > 0:
-            self._physical_bytes_read += int(num_bytes)
 
         eff_tx: Optional[CaptureTransaction] = None
         if transaction is not None:
@@ -283,8 +289,15 @@ class TargetExecutionAdapter(ABC):
                     f"Transaction ownership mismatch: transaction '{transaction.transaction_id}' "
                     f"belongs to adapter '{transaction.adapter_id}', not '{self.adapter_id}'"
                 )
-            if not transaction.committed and not transaction.aborted:
-                eff_tx = transaction
+            if transaction.aborted:
+                raise ValueError(
+                    f"Cannot record physical read on aborted capture transaction '{transaction.transaction_id}': {transaction.abort_reason}"
+                )
+            if transaction.committed:
+                raise ValueError(
+                    f"Cannot record physical read on committed capture transaction '{transaction.transaction_id}'"
+                )
+            eff_tx = transaction
         else:
             ctx_tx = _current_capture_tx.get(None)
             if ctx_tx is not None and not ctx_tx.committed and not ctx_tx.aborted:
@@ -299,6 +312,12 @@ class TargetExecutionAdapter(ABC):
                         if int(t.pid) == int(pid):
                             eff_tx = t
                             break
+
+        # Mutate accounting counters only AFTER transaction validation passes
+        if num_reads > 0:
+            self._physical_reads_count += int(num_reads)
+        if num_bytes > 0:
+            self._physical_bytes_read += int(num_bytes)
 
         if eff_tx is not None:
             if num_reads > 0:
@@ -499,8 +518,9 @@ class TargetExecutionAdapter(ABC):
             yield tx
             if not tx.aborted and not tx.committed:
                 self.commit_capture_transaction(tx)
-        except Exception as exc:
-            self.rollback_capture_transaction(tx, str(exc))
+        except BaseException as exc:
+            if not tx.aborted and not tx.committed:
+                self.rollback_capture_transaction(tx, str(exc))
             raise
 
     def measure_read_latency(
@@ -512,37 +532,62 @@ class TargetExecutionAdapter(ABC):
     ) -> Dict[str, Any]:
         """Measure exact physical memory read latency on target using monotonic clocks.
 
-        Distinguishes memory read latency from process suspension time.
-        When reading via zero-stop kernel mechanisms, suspension time is explicitly non-applicable.
+        Uses the documented nearest-rank percentile convention:
+            index = max(0, min(ceil(p * N) - 1, N - 1))
+        Distinguishes physical read latency, target suspension time, and collector overhead.
+        Reports successful and failed sample counts separately.
+        Flags mocked executions explicitly.
         """
+        import math
+
         latencies_ms: List[float] = []
-        for _ in range(max(1, samples)):
+        failed_reads: List[Dict[str, Any]] = []
+        is_mocked = getattr(self.read_memory, "_is_mock", False) or hasattr(self.read_memory, "mock_calls")
+
+        for s_idx in range(max(1, samples)):
             t0 = time.monotonic_ns()
             data, status, err = self.read_memory(pid, address, size)
             elapsed_ms = (time.monotonic_ns() - t0) / 1_000_000.0
             if status == "OBSERVED":
                 latencies_ms.append(elapsed_ms)
+            else:
+                failed_reads.append({"sample_index": s_idx, "status": status, "error": str(err), "elapsed_ms": elapsed_ms})
 
         if not latencies_ms:
             return {
                 "sample_count": 0,
+                "total_samples_attempted": max(1, samples),
+                "successful_sample_count": 0,
+                "failed_sample_count": len(failed_reads),
+                "failed_samples": failed_reads,
                 "read_latency_p50_ms": None,
                 "read_latency_p95_ms": None,
                 "read_latency_max_ms": None,
                 "target_suspension_applicable": False,
+                "target_suspension_status": "NOT_APPLICABLE",
                 "process_suspension_time_ms": None,
                 "measurement_method": "monotonic_ns_user_space",
+                "percentile_convention": "nearest_rank (ceil(p*N)-1)",
+                "is_mocked": is_mocked,
+                "hardware_sla_validated": False,
                 "notes": "No successful memory reads observed",
             }
 
         latencies_ms.sort()
         n = len(latencies_ms)
-        p50 = latencies_ms[int(n * 0.5)]
-        p95 = latencies_ms[min(int(n * 0.95), n - 1)]
+        p50_idx = max(0, min(math.ceil(0.50 * n) - 1, n - 1))
+        p95_idx = max(0, min(math.ceil(0.95 * n) - 1, n - 1))
+        p50 = latencies_ms[p50_idx]
+        p95 = latencies_ms[p95_idx]
         max_lat = latencies_ms[-1]
+
         return {
             "sample_count": n,
             "samples_collected": n,
+            "total_samples_attempted": max(1, samples),
+            "successful_sample_count": n,
+            "failed_sample_count": len(failed_reads),
+            "failed_samples": failed_reads,
             "read_latency_p50_ms": round(p50, 4),
             "read_latency_p95_ms": round(p95, 4),
             "read_latency_max_ms": round(max_lat, 4),
@@ -555,8 +600,11 @@ class TargetExecutionAdapter(ABC):
             "collector_overhead_ms": 0.0,
             "clock_source": "time.monotonic_ns",
             "measurement_type": "MEASURED",
+            "percentile_convention": "nearest_rank (ceil(p*N)-1)",
             "suspension_explanation": "Zero-stop concurrent read (process_vm_readv / procfs mem); target process was not suspended with SIGSTOP",
             "measurement_method": "monotonic_ns_user_space",
+            "is_mocked": is_mocked,
+            "hardware_sla_validated": bool(not is_mocked and max_lat < 4.5),
             "sla_4_5ms_satisfied": bool(max_lat < 4.5),
         }
 

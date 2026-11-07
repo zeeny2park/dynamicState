@@ -731,6 +731,7 @@ class InvestigationWorkflowEngine:
             op_lifecycle[obs_key] = "COMMITTED"
             op_records[op_id]["state"] = "COMMITTED"
             op_records[op_id]["receipt_id"] = rcpt.receipt_id
+            op_records[op_id]["receipt"] = rcpt.to_dict()
             completed_obs.append(obs_key)
         except Exception as exc:
             op_lifecycle[obs_key] = "ABORTED"
@@ -770,17 +771,19 @@ class InvestigationWorkflowEngine:
                 "build_id": rcpt.build_id,
             },
             snapshot_ref={"snapshot_id": rcpt.snapshot_binding, "epoch": rcpt.capture_epoch},
-            details={"payload_digest": rcpt.observation_digest, "bytes_read": rcpt.physical_bytes_read, "field_path": "runtime.memory.slice"},
+            details={"payload_digest": rcpt.observation_digest, "bytes_read": rcpt.physical_bytes_read, "field_path": "runtime.memory.slice", "operation_id": rcpt.operation_id},
             session_id=instance.session_id,
         )
         try:
-            self.evidence_ledger.add_record(rec)
+            if rec.evidence_id not in self.evidence_ledger._by_id:
+                self.evidence_ledger.add_record(rec)
         except Exception as exc:
             instance.record_transition(STAGE_FAILED, f"Evidence validation failed: {exc}")
             return False
 
         ev_list = instance.context.setdefault("evidence_records", [])
-        ev_list.append(rec.evidence_id)
+        if rec.evidence_id not in ev_list:
+            ev_list.append(rec.evidence_id)
         return self.transition_stage(
             instance,
             STAGE_UPDATING_HYPOTHESIS,
@@ -1222,25 +1225,66 @@ class InvestigationWorkflowEngine:
                     f"{pinned['build_id']} -> {cur_ident['build_id']}"
                 )
 
-        # Abort any in-flight uncommitted operations across recovery; validate COMMITTED operations
+        # Abort any in-flight uncommitted operations across recovery; validate COMMITTED operations cryptographically
         op_lifecycle = inst.context.get("operation_lifecycle", {})
         op_records = inst.context.get("operation_records", {})
+        from .capture_backend import LiveCaptureReceipt
+
         for op_id, op_state in list(op_lifecycle.items()):
             if op_state in ("RESERVED", "EXECUTING"):
                 op_lifecycle[op_id] = "ABORTED"
             elif op_state == "COMMITTED":
-                # Never treat a serialized COMMITTED flag as sufficient proof without validating receipt/evidence
-                has_rcpt = "last_receipt" in inst.context or any(bool(r.get("receipt_id")) for r in op_records.values())
-                if not has_rcpt:
+                # Verify authentic serialized receipt
+                rec_info = op_records.get(op_id, {})
+                rcpt_data = rec_info.get("receipt") or inst.context.get("last_receipt")
+                if not rcpt_data or not isinstance(rcpt_data, dict):
                     op_lifecycle[op_id] = "UNKNOWN"
+                    rec_info["state"] = "UNKNOWN"
+                    continue
+                if rcpt_data.get("signature"):
+                    try:
+                        reconstructed_rcpt = LiveCaptureReceipt.from_dict(rcpt_data)
+                        ok_v, err_v = reconstructed_rcpt.verify(
+                            expected_session_id=inst.session_id,
+                            expected_pid=inst.target_pid,
+                        )
+                        if not ok_v:
+                            op_lifecycle[op_id] = "UNKNOWN"
+                            rec_info["state"] = "UNKNOWN"
+                            rec_info["verification_error"] = err_v
+                    except Exception as exc:
+                        op_lifecycle[op_id] = "UNKNOWN"
+                        rec_info["state"] = "UNKNOWN"
+                        rec_info["verification_error"] = str(exc)
+                elif rcpt_data.get("authority_level") == "PRODUCTION":
+                    op_lifecycle[op_id] = "UNKNOWN"
+                    rec_info["state"] = "UNKNOWN"
+                    rec_info["verification_error"] = "Unsigned production receipt"
 
         for rec_id, rec_data in list(op_records.items()):
             rec_st = rec_data.get("state")
             if rec_st in ("RESERVED", "EXECUTING"):
                 rec_data["state"] = "ABORTED"
             elif rec_st == "COMMITTED":
-                if not rec_data.get("receipt_id") and "last_receipt" not in inst.context:
+                rcpt_data = rec_data.get("receipt") or inst.context.get("last_receipt")
+                if not rcpt_data or not isinstance(rcpt_data, dict):
                     rec_data["state"] = "UNKNOWN"
+                elif rcpt_data.get("signature"):
+                    try:
+                        reconstructed_rcpt = LiveCaptureReceipt.from_dict(rcpt_data)
+                        ok_v, err_v = reconstructed_rcpt.verify(
+                            expected_session_id=inst.session_id,
+                            expected_pid=inst.target_pid,
+                        )
+                        if not ok_v:
+                            rec_data["state"] = "UNKNOWN"
+                            rec_data["verification_error"] = err_v
+                    except Exception as exc:
+                        rec_data["state"] = "UNKNOWN"
+                        rec_data["verification_error"] = str(exc)
+                elif rcpt_data.get("authority_level") == "PRODUCTION":
+                    rec_data["state"] = "UNKNOWN"
+                    rec_data["verification_error"] = "Unsigned production receipt"
 
         # Restore ledger if serialized in checkpoint
         restored_ledger = inst.context.get("restored_evidence_ledger")
