@@ -3868,6 +3868,103 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": res.error.code if res.error else "EVAL_ERROR",
                                             "message": res.error.message if res.error else "Failed to evaluate hypothesis"}}
 
+    # -------------------------------------------------------------------------
+    # Phase 2.1 Adaptive Investigation & Expert Diagnostic API
+    # -------------------------------------------------------------------------
+
+    def start_expert_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        problem = params.get("problem_statement") or params.get("goal") or "General runtime diagnostic"
+        pid = params.get("pid")
+        companion_elf = params.get("companion_elf") or params.get("debug_image")
+        sess = self.runtime.expert_diagnostic_engine.start_investigation(
+            problem_statement=problem,
+            pid=pid,
+            companion_elf=companion_elf,
+        )
+        if params.get("auto_step", True):
+            sess.step()  # CLASSIFY
+            sess.step()  # ASSESS
+            sess.step()  # PLAN
+        return {
+            "success": True,
+            "investigation_id": sess.investigation_id,
+            "status": sess.get_status(),
+            "plan": sess.get_plan(),
+        }
+
+    def get_expert_investigation(self, investigation_id: str) -> Dict[str, Any]:
+        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not sess:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        return {
+            "success": True,
+            "investigation_id": investigation_id,
+            "status": sess.get_status(),
+            "active_hypotheses": [h.to_dict() for h in sess.active_hypotheses],
+            "rejected_hypotheses": [h.to_dict() for h in sess.rejected_hypotheses],
+            "plan": sess.get_plan(),
+            "timeline": sess.timeline,
+        }
+
+    def get_expert_investigation_plan(self, investigation_id: str) -> Dict[str, Any]:
+        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not sess:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        return {"success": True, "investigation_id": investigation_id, "plan": sess.get_plan()}
+
+    def execute_expert_investigation_step(self, investigation_id: str, step_id: Optional[str] = None) -> Dict[str, Any]:
+        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not sess:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        res = sess.execute_step(step_id=step_id)
+        return {
+            "success": True,
+            "investigation_id": investigation_id,
+            "step_execution": res,
+            "status": sess.get_status(),
+        }
+
+    def verify_expert_hypothesis(self, investigation_id: str, hypothesis_id: Optional[str] = None) -> Dict[str, Any]:
+        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not sess:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        target_hid = hypothesis_id or (sess.active_hypotheses[0].hypothesis_id if sess.active_hypotheses else "HYP_01")
+        res = sess.verify_hypothesis(target_hid)
+        return {"success": True, "investigation_id": investigation_id, **res}
+
+    def get_expert_investigation_conclusion(self, investigation_id: str) -> Dict[str, Any]:
+        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not sess:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        if not sess.conclusion:
+            sess.run_to_completion()
+        return {
+            "success": True,
+            "investigation_id": investigation_id,
+            "conclusion": asdict(sess.conclusion) if sess.conclusion else None,
+        }
+
+    def export_expert_investigation(self, investigation_id: str, format: str = "json") -> Dict[str, Any]:
+        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not sess:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        report = sess.export_report(format=format)
+        return {"success": True, "investigation_id": investigation_id, "format": format, "report": report}
+
+    def pause_expert_investigation(self, investigation_id: str) -> Dict[str, Any]:
+        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not sess:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        sess.pause()
+        return {"success": True, "investigation_id": investigation_id, "is_paused": True}
+
+    def resume_expert_investigation(self, investigation_id: str) -> Dict[str, Any]:
+        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not sess:
+            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        sess.resume()
+        return {"success": True, "investigation_id": investigation_id, "is_paused": False}
+
     def execute_observation(self, params: Dict[str, Any]) -> Dict[str, Any]:
         inv_id = params.get("investigation_id")
         obs_id = params.get("observation_id")
@@ -4355,6 +4452,30 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 ))
                 return
 
+            # GET /api/investigations/{id}/plan
+            m_exp_plan = re.match(r"^/api/investigations/([^/]+)/plan$", path)
+            if m_exp_plan:
+                self._send_json(adapter.get_expert_investigation_plan(m_exp_plan.group(1)))
+                return
+
+            # GET /api/investigations/{id}/conclusion
+            m_exp_concl = re.match(r"^/api/investigations/([^/]+)/conclusion$", path)
+            if m_exp_concl:
+                self._send_json(adapter.get_expert_investigation_conclusion(m_exp_concl.group(1)))
+                return
+
+            # GET /api/investigations/{id}/export
+            m_exp_exp = re.match(r"^/api/investigations/([^/]+)/export$", path)
+            if m_exp_exp:
+                self._send_json(adapter.export_expert_investigation(m_exp_exp.group(1), format=q_param("format", "json") or "json"))
+                return
+
+            # GET /api/investigations/{id}
+            m_exp_get = re.match(r"^/api/investigations/([^/]+)$", path)
+            if m_exp_get:
+                self._send_json(adapter.get_expert_investigation(m_exp_get.group(1)))
+                return
+
             # GET /api/investigations
             if path == "/api/investigations":
                 self._send_json(adapter.list_investigations())
@@ -4606,6 +4727,35 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
             if path in ("/api/investigation/chat/cancel", "/api/investigation/cancel-chat"):
                 self._send_json(adapter.cancel_investigation_chat(body))
+                return
+
+            # POST /api/investigations or /api/investigations/start
+            if path in ("/api/investigations", "/api/investigations/start"):
+                self._send_json(adapter.start_expert_investigation(body))
+                return
+
+            # POST /api/investigations/{id}/step
+            m_p_step = re.match(r"^/api/investigations/([^/]+)/step$", path)
+            if m_p_step:
+                self._send_json(adapter.execute_expert_investigation_step(m_p_step.group(1), step_id=body.get("step_id")))
+                return
+
+            # POST /api/investigations/{id}/verify
+            m_p_ver = re.match(r"^/api/investigations/([^/]+)/verify$", path)
+            if m_p_ver:
+                self._send_json(adapter.verify_expert_hypothesis(m_p_ver.group(1), hypothesis_id=body.get("hypothesis_id")))
+                return
+
+            # POST /api/investigations/{id}/pause
+            m_p_pause = re.match(r"^/api/investigations/([^/]+)/pause$", path)
+            if m_p_pause:
+                self._send_json(adapter.pause_expert_investigation(m_p_pause.group(1)))
+                return
+
+            # POST /api/investigations/{id}/resume
+            m_p_res = re.match(r"^/api/investigations/([^/]+)/resume$", path)
+            if m_p_res:
+                self._send_json(adapter.resume_expert_investigation(m_p_res.group(1)))
                 return
 
             # POST /api/watch/session/create

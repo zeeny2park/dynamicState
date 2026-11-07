@@ -333,6 +333,30 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase2_0_a_3_19_multiprocess_crash_repaired.py
 
+      - name: Run Phase 2.1 Problem Classification and Planning Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_classification_and_planning.py
+
+      - name: Run Phase 2.1 Deterministic Diagnostic Recipes Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_deterministic_recipes.py
+
+      - name: Run Phase 2.1 Evidence-to-Source Correlation Pipeline Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_evidence_source_correlation.py
+
+      - name: Run Phase 2.1 Adaptive Investigation Lifecycle Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_adaptive_investigation_lifecycle.py
+
+      - name: Run Phase 2.1 MCP Tools and Web UI Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_mcp_and_ui_integration.py
+
+      - name: Run Phase 2.1 Real C/C++ Target Diagnostic Scenarios Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_real_cpp_diagnostic_scenarios.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

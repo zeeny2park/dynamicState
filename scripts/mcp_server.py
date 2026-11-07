@@ -5,6 +5,7 @@ Model Context Protocol (MCP) server for dynamicState runtime state exploration,
 live memory capture, and C++ semantic investigation.
 """
 
+from dataclasses import asdict
 import json
 import os
 import sys
@@ -429,31 +430,37 @@ def runtime_inspect_field(
 
 @server.tool()
 def runtime_start_investigation(
-    goal: str,
+    goal: Optional[str] = None,
+    problem_statement: Optional[str] = None,
     pid: Optional[int] = None,
     debug_image: Optional[str] = None,
+    companion_elf: Optional[str] = None,
     memory_snapshot_path: Optional[str] = None,
     watch_session_id: Optional[str] = None,
     observation_window: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Launch an evidence-first investigation session against a live PID, offline snapshot, or persistent watch session.
+    """Launch an evidence-first adaptive investigation session against a live PID, offline snapshot, or persistent watch session.
     
     If target parameters are omitted, inherits from the active target bound via `runtime_target_connect`.
     
     Args:
         goal: Natural language investigation goal (e.g. 'Investigate worker counter mismatch' or Korean equivalent).
+        problem_statement: Alias for goal (natural language problem description in English or Korean).
         pid: Target process PID for live capture (if omitted, uses bound target session).
         debug_image: Path to external debug ELF binary with DWARF symbols (if omitted, uses bound session).
+        companion_elf: Alias for debug_image.
         memory_snapshot_path: Path to offline raw memory snapshot directory.
         watch_session_id: Optional persistent watch session ID (e.g. from runtime_watch_session_create).
         observation_window: Optional dict with start_seq, end_seq, duration_sec, guard_address, etc.
     """
     try:
-        if pid is None and debug_image is None and not memory_snapshot_path and not watch_session_id:
+        effective_goal = problem_statement or goal or "General runtime diagnostic"
+        effective_elf = companion_elf or debug_image
+        if pid is None and effective_elf is None and not memory_snapshot_path and not watch_session_id:
             try:
-                _c = _resolve_mcp_target(pid=pid, companion_elf=debug_image)
+                _c = _resolve_mcp_target(pid=pid, companion_elf=effective_elf)
                 pid = _c.get("pid")
-                debug_image = _c.get("companion_elf_path")
+                effective_elf = _c.get("companion_elf_path")
             except Exception:
                 pass
         valid_pid = _validate_mcp_pid(pid, allow_none=True)
@@ -464,17 +471,190 @@ def runtime_start_investigation(
                 "error_code": "NO_TARGET_SPECIFIED",
                 "recovery_hint": "Call runtime_target_connect(pid=..., companion_elf=...) or provide 'pid' to runtime_start_investigation."
             })
+
+        # Start expert adaptive investigation session
+        expert_sess = runtime.expert_diagnostic_engine.start_investigation(
+            problem_statement=effective_goal,
+            pid=valid_pid,
+            companion_elf=effective_elf,
+        )
+        expert_sess.step()  # CLASSIFY
+        expert_sess.step()  # ASSESS
+        expert_sess.step()  # PLAN
+
         res = runtime.dispatch_action({
             "action": "START_INVESTIGATION",
-            "goal": goal,
+            "goal": effective_goal,
             "pid": valid_pid,
-            "debug_image": debug_image,
+            "debug_image": effective_elf,
             "memory_snapshot_path": memory_snapshot_path,
             "watch_session_id": watch_session_id,
             "observation_window": observation_window,
             "authorize_target": True
         })
+        if hasattr(res, "data") and isinstance(res.data, dict):
+            legacy_id = res.data.get("investigation_id")
+            if legacy_id:
+                expert_sess.investigation_id = legacy_id
+                runtime.expert_diagnostic_engine.sessions[legacy_id] = expert_sess
+            res.data["plan"] = expert_sess.get_plan()
+            res.data["expert_status"] = expert_sess.get_status()
+            if expert_sess.classification_result:
+                res.data["classification"] = {
+                    "primary_category": expert_sess.classification_result.primary_category,
+                    "confidence": expert_sess.classification_result.confidence,
+                    "is_vague": expert_sess.classification_result.is_vague,
+                    "extracted_entities": expert_sess.classification_result.extracted_entities,
+                    "screening_strategy": expert_sess.classification_result.screening_strategy,
+                }
         return _format_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_inspect_investigation(investigation_id: str) -> str:
+    """Inspect current status, progress, active hypotheses, and next recommended action of an investigation session.
+    
+    Args:
+        investigation_id: Investigation session ID (e.g. 'inv_...').
+    """
+    try:
+        session = runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not session:
+            res = runtime.dispatch_action({
+                "action": "GET_INVESTIGATION_STATUS",
+                "investigation_id": investigation_id
+            })
+            return _format_result(res)
+        return _format_watch_result({"success": True, **session.get_status()})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_get_investigation_plan(investigation_id: str) -> str:
+    """Retrieve ordered investigation steps with rationale, cost, safety score, and priority.
+    
+    Args:
+        investigation_id: Investigation session ID (e.g. 'inv_...').
+    """
+    try:
+        session = runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not session:
+            return _format_watch_result({
+                "success": False,
+                "error": f"Investigation session '{investigation_id}' not found",
+                "error_code": "NOT_FOUND"
+            })
+        return _format_watch_result({"success": True, "investigation_id": investigation_id, "plan": session.get_plan()})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_execute_investigation_step(
+    investigation_id: str,
+    step_id: Optional[str] = None
+) -> str:
+    """Execute the next planned diagnostic step or a specific step manually.
+    
+    Args:
+        investigation_id: Investigation session ID (e.g. 'inv_...').
+        step_id: Optional specific step ID (e.g. 'STEP_01'). If omitted, runs next pending step.
+    """
+    try:
+        session = runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not session:
+            return _format_watch_result({
+                "success": False,
+                "error": f"Investigation session '{investigation_id}' not found",
+                "error_code": "NOT_FOUND"
+            })
+        res = session.execute_step(step_id=step_id)
+        return _format_watch_result({
+            "success": True,
+            "investigation_id": investigation_id,
+            "step_execution": res,
+            "status": session.get_status()
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_get_hypothesis_evidence(
+    investigation_id: str,
+    hypothesis_id: str
+) -> str:
+    """Get detailed supporting and contradicting evidence chain for a specific hypothesis.
+    
+    Args:
+        investigation_id: Investigation session ID (e.g. 'inv_...').
+        hypothesis_id: Hypothesis ID (e.g. 'HYP_01').
+    """
+    try:
+        session = runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not session:
+            return _format_watch_result({
+                "success": False,
+                "error": f"Investigation session '{investigation_id}' not found",
+                "error_code": "NOT_FOUND"
+            })
+        res = session.get_hypothesis_evidence(hypothesis_id)
+        return _format_watch_result({"success": "error" not in res, "investigation_id": investigation_id, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_compare_hypotheses(
+    investigation_id: str,
+    hypothesis_ids: List[str]
+) -> str:
+    """Compare two or more competing hypotheses side-by-side with discriminating evidence.
+    
+    Args:
+        investigation_id: Investigation session ID (e.g. 'inv_...').
+        hypothesis_ids: List of hypothesis IDs to compare (e.g. ['HYP_01', 'HYP_02']).
+    """
+    try:
+        session = runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not session:
+            return _format_watch_result({
+                "success": False,
+                "error": f"Investigation session '{investigation_id}' not found",
+                "error_code": "NOT_FOUND"
+            })
+        res = session.compare_hypotheses(hypothesis_ids)
+        return _format_watch_result({"success": True, **res})
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_get_investigation_conclusion(investigation_id: str) -> str:
+    """Get the final diagnostic report with root cause analysis, evidence chain, and recommendations.
+    
+    Args:
+        investigation_id: Investigation session ID (e.g. 'inv_...').
+    """
+    try:
+        session = runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if not session:
+            return _format_watch_result({
+                "success": False,
+                "error": f"Investigation session '{investigation_id}' not found",
+                "error_code": "NOT_FOUND"
+            })
+        if not session.conclusion:
+            session.run_to_completion()
+        conclusion_dict = asdict(session.conclusion) if session.conclusion else None
+        return _format_watch_result({
+            "success": True,
+            "investigation_id": investigation_id,
+            "conclusion": conclusion_dict
+        })
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -487,6 +667,13 @@ def runtime_get_investigation_report(investigation_id: str) -> str:
         investigation_id: Investigation session ID (e.g. 'inv_...').
     """
     try:
+        session = runtime.expert_diagnostic_engine.get_session(investigation_id)
+        if session and session.conclusion:
+            return _format_watch_result({
+                "success": True,
+                "investigation_id": investigation_id,
+                "report": session.export_report(format="json")
+            })
         res = runtime.dispatch_action({
             "action": "GET_INVESTIGATION_REPORT",
             "investigation_id": investigation_id
@@ -2408,8 +2595,10 @@ def runtime_batch_execute(
 
 @server.tool()
 def runtime_verify_hypothesis(
-    hypothesis: str,
-    assertions: List[str],
+    hypothesis: Optional[str] = None,
+    assertions: Optional[List[str]] = None,
+    investigation_id: Optional[str] = None,
+    hypothesis_id: Optional[str] = None,
     correlate_owners: bool = True,
     pid: Optional[int] = None,
     companion_elf: Optional[str] = None,
@@ -2421,14 +2610,22 @@ def runtime_verify_hypothesis(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Declarative Multi-Assertion Hypothesis Verifier (`0.00ms` stop time).
-    Evaluates a root-cause hypothesis and a list of forgiving C/C++ assertions (`==`, `!=`, `>=`, `<=`,
+    Can verify hypotheses within an active expert investigation (`investigation_id`, `hypothesis_id`),
+    or evaluate a root-cause hypothesis and a list of forgiving C/C++ assertions (`==`, `!=`, `>=`, `<=`,
     `>`, `<`, `IS_NULL`, `NOT_NULL`), returning `verdict` (`CONFIRMED`, `PARTIALLY_CONFIRMED`, `REFUTED`),
     `confidence_score`, per-assertion evidence, and automatic thread-owner lookup on referenced buffer slots.
     """
     try:
+        if investigation_id:
+            sess = runtime.expert_diagnostic_engine.get_session(investigation_id)
+            if sess:
+                target_hid = hypothesis_id or (sess.active_hypotheses[0].hypothesis_id if sess.active_hypotheses else "HYP_01")
+                res = sess.verify_hypothesis(target_hid)
+                return _format_watch_result({"success": True, "investigation_id": investigation_id, **res})
+
         res = runtime.watch_session_manager.verify_runtime_hypothesis(
-            hypothesis=hypothesis,
-            assertions=assertions,
+            hypothesis=hypothesis or "",
+            assertions=assertions or [],
             correlate_owners=correlate_owners,
             pid=pid,
             companion_elf_path=companion_elf,
@@ -2449,6 +2646,8 @@ def runtime_export_incident_report(
     title: str = "dynamicState Zero-Stop Runtime Incident Report",
     hypothesis: Optional[str] = None,
     assertions: Optional[List[str]] = None,
+    investigation_id: Optional[str] = None,
+    format: str = "markdown",
     output_path: Optional[str] = None,
     pid: Optional[int] = None,
     companion_elf: Optional[str] = None,
@@ -2460,10 +2659,30 @@ def runtime_export_incident_report(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """1-Call Comprehensive Incident Report & Remediation Exporter (`0.00ms` stop time).
-    Combines Target Identity, Auto-Triage Scorecard, Thread Callstacks & Locks, and Hypothesis
+    Exports either an active expert investigation (`investigation_id`) as Markdown/JSON, or
+    combines Target Identity, Auto-Triage Scorecard, Thread Callstacks & Locks, and Hypothesis
     Verification into a structured Markdown + JSON report (`report_markdown`, `remediation_checklist`).
     """
     try:
+        if investigation_id:
+            sess = runtime.expert_diagnostic_engine.get_session(investigation_id)
+            if sess:
+                report = sess.export_report(format=format)
+                if output_path:
+                    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+                    with open(output_path, "w", encoding="utf-8") as f:
+                        if isinstance(report, dict):
+                            json.dump(report, f, indent=2)
+                        else:
+                            f.write(report)
+                return _format_watch_result({
+                    "success": True,
+                    "investigation_id": investigation_id,
+                    "format": format,
+                    "output_path": output_path,
+                    "report": report
+                })
+
         res = runtime.watch_session_manager.export_incident_report(
             title=title,
             hypothesis=hypothesis,

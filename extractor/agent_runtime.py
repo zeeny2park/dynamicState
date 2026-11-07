@@ -45,6 +45,7 @@ from .state_replayer import StateReplayer
 from .investigation import InvestigationManager
 from .static_analyzer import StaticAnalysisProvider
 from .watch_session import WatchSessionManager
+from .expert_diagnostic_engine import ExpertDiagnosticEngine
 
 
 class AgentRuntime:
@@ -85,6 +86,9 @@ class AgentRuntime:
 
         # Phase 21 Persistent Watch Session Manager
         self.watch_session_manager: WatchSessionManager = WatchSessionManager(corpus_dir=self.corpus_dir)
+
+        # Phase 2.1 Adaptive Investigation & Expert Diagnostic Engine
+        self.expert_diagnostic_engine: ExpertDiagnosticEngine = ExpertDiagnosticEngine(corpus_dir=self.corpus_dir)
 
     # -------------------------------------------------------------------------
     # Protocol Action Dispatcher
