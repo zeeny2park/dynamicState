@@ -778,6 +778,185 @@ def issue_live_capture_receipt(
     return rcpt
 
 
+_TRUSTED_CAUSAL_VERIFIER_TOKEN = os.urandom(32).hex()
+
+
+def get_trusted_causal_authority_token() -> str:
+    """Internal token reserved strictly for authorized causal verification engines."""
+    return _TRUSTED_CAUSAL_VERIFIER_TOKEN
+
+
+@dataclass
+class CausalAttestation:
+    """Cryptographic attestation certifying a verified causal relationship or state transition."""
+    attestation_id: str
+    session_id: str
+    target_identity: Dict[str, Any]
+    operation_id: str
+    precondition_evidence_id: str
+    postcondition_evidence_id: str
+    claimed_transition: Dict[str, Any] = field(default_factory=dict)
+    intervention_details: Dict[str, Any] = field(default_factory=dict)
+    issued_at_ns: int = 0
+    expires_at_ns: int = 0
+    verifier_identity: str = "dynamicstate_causal_verifier_v1"
+    key_id: str = "default"
+    signature: str = ""
+    revoked: bool = False
+    authority_level: str = "PRODUCTION"
+
+    def canonical_bytes(self) -> bytes:
+        payload = {
+            "attestation_id": str(self.attestation_id),
+            "session_id": str(self.session_id),
+            "target_identity": {
+                "pid": int(self.target_identity.get("pid", 0)),
+                "process_identity": str(self.target_identity.get("process_identity", "")),
+                "executable_identity": str(self.target_identity.get("executable_identity") or self.target_identity.get("executable", "")),
+                "build_id": str(self.target_identity.get("build_id", "")),
+            },
+            "operation_id": str(self.operation_id),
+            "precondition_evidence_id": str(self.precondition_evidence_id),
+            "postcondition_evidence_id": str(self.postcondition_evidence_id),
+            "claimed_transition": dict(self.claimed_transition or {}),
+            "intervention_details": dict(self.intervention_details or {}),
+            "issued_at_ns": int(self.issued_at_ns),
+            "expires_at_ns": int(self.expires_at_ns),
+            "verifier_identity": str(self.verifier_identity),
+            "key_id": str(self.key_id),
+            "authority_level": str(self.authority_level),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    def sign(self, secret: str) -> None:
+        if not secret:
+            raise ValueError("Cannot sign CausalAttestation: missing secret")
+        self.signature = hmac.new(secret.encode("utf-8"), self.canonical_bytes(), hashlib.sha256).hexdigest()
+
+    def verify(
+        self,
+        secret: Optional[str] = None,
+        key_store: Optional[CaptureKeyStore] = None,
+        current_time_ns: Optional[int] = None,
+        expected_session_id: Optional[str] = None,
+        expected_pid: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        if not self.signature:
+            return False, "UNSIGNED_ATTESTATION: Missing HMAC signature"
+        if self.revoked:
+            return False, "REVOKED_ATTESTATION: Attestation has been revoked"
+        now = current_time_ns if current_time_ns is not None else time.time_ns()
+        if self.expires_at_ns > 0 and now > self.expires_at_ns:
+            return False, "EXPIRED_ATTESTATION: Attestation expired"
+        if expected_session_id and str(self.session_id) != str(expected_session_id):
+            return False, f"CROSS_SESSION_ATTESTATION: Expected session '{expected_session_id}', got '{self.session_id}'"
+        if expected_pid is not None and self.target_identity.get("pid") is not None:
+            if int(self.target_identity["pid"]) != int(expected_pid):
+                return False, f"TARGET_PID_MISMATCH: Expected PID {expected_pid}, got {self.target_identity.get('pid')}"
+
+        use_sec = secret
+        if not use_sec:
+            ks = key_store or get_default_key_store()
+            if hasattr(ks, "is_revoked") and ks.is_revoked(self.key_id):
+                return False, f"KEY_REVOKED: Attestation signing key '{self.key_id}' is revoked"
+            try:
+                if self.key_id in ("default", "ephemeral") or not ks._keys.get(self.key_id):
+                    _, use_sec = ks.get_active_signing_key()
+                else:
+                    use_sec = ks.resolve_key(self.key_id)
+            except Exception as e:
+                return False, f"KEY_RESOLUTION_FAILED: {e}"
+
+        expected_sig = hmac.new(use_sec.encode("utf-8"), self.canonical_bytes(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(self.signature, expected_sig):
+            return False, "CORRUPT_ATTESTATION: HMAC signature verification failed"
+        return True, "VERIFIED"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "attestation_id": self.attestation_id,
+            "session_id": self.session_id,
+            "target_identity": dict(self.target_identity),
+            "operation_id": self.operation_id,
+            "precondition_evidence_id": self.precondition_evidence_id,
+            "postcondition_evidence_id": self.postcondition_evidence_id,
+            "claimed_transition": dict(self.claimed_transition),
+            "intervention_details": dict(self.intervention_details),
+            "issued_at_ns": self.issued_at_ns,
+            "expires_at_ns": self.expires_at_ns,
+            "verifier_identity": self.verifier_identity,
+            "key_id": self.key_id,
+            "signature": self.signature,
+            "revoked": self.revoked,
+            "authority_level": self.authority_level,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CausalAttestation":
+        if not isinstance(data, dict):
+            raise TypeError("CausalAttestation.from_dict requires a dictionary")
+        return cls(
+            attestation_id=str(data.get("attestation_id", "")),
+            session_id=str(data.get("session_id", "")),
+            target_identity=dict(data.get("target_identity") or {}),
+            operation_id=str(data.get("operation_id", "")),
+            precondition_evidence_id=str(data.get("precondition_evidence_id", "")),
+            postcondition_evidence_id=str(data.get("postcondition_evidence_id", "")),
+            claimed_transition=dict(data.get("claimed_transition") or {}),
+            intervention_details=dict(data.get("intervention_details") or {}),
+            issued_at_ns=int(data.get("issued_at_ns", 0)),
+            expires_at_ns=int(data.get("expires_at_ns", 0)),
+            verifier_identity=str(data.get("verifier_identity", "dynamicstate_causal_verifier_v1")),
+            key_id=str(data.get("key_id", "default")),
+            signature=str(data.get("signature", "")),
+            revoked=bool(data.get("revoked", False)),
+            authority_level=str(data.get("authority_level", "PRODUCTION")),
+        )
+
+
+def issue_causal_attestation(
+    session_id: str,
+    target_identity: Dict[str, Any],
+    operation_id: str,
+    precondition_evidence_id: str,
+    postcondition_evidence_id: str,
+    claimed_transition: Dict[str, Any],
+    intervention_details: Optional[Dict[str, Any]] = None,
+    ttl_seconds: int = 3600,
+    authority_level: str = "PRODUCTION",
+    verifier_authority_token: Optional[str] = None,
+    secret: Optional[str] = None,
+    key_id: Optional[str] = None,
+) -> CausalAttestation:
+    if authority_level == "PRODUCTION":
+        if verifier_authority_token != _TRUSTED_CAUSAL_VERIFIER_TOKEN:
+            raise ValueError(
+                "Unauthorized causal attestation issuance: PRODUCTION authority can only be issued by trusted causal verification authority."
+            )
+    ks = get_default_key_store()
+    active_kid, active_sec = ks.get_active_signing_key()
+    use_kid = key_id or active_kid
+    use_sec = secret or active_sec
+    now = time.time_ns()
+    exp = now + int(ttl_seconds * 1_000_000_000)
+    att = CausalAttestation(
+        attestation_id=f"causal_att_{uuid.uuid4().hex[:12]}",
+        session_id=str(session_id),
+        target_identity=dict(target_identity or {}),
+        operation_id=str(operation_id or ""),
+        precondition_evidence_id=str(precondition_evidence_id or ""),
+        postcondition_evidence_id=str(postcondition_evidence_id or ""),
+        claimed_transition=dict(claimed_transition or {}),
+        intervention_details=dict(intervention_details or {}),
+        issued_at_ns=now,
+        expires_at_ns=exp,
+        key_id=use_kid,
+        authority_level=str(authority_level),
+    )
+    att.sign(secret=use_sec)
+    return att
+
+
 @dataclass
 class CaptureLatencyReport:
     """Exact latency measurements for each phase of runtime state capture.
@@ -790,6 +969,8 @@ class CaptureLatencyReport:
     memory_capture_latency_ms: Optional[float] = None
     resume_latency_ms: Optional[float] = None
     total_stop_time_ms: Optional[float] = None
+    process_suspension_time_ms: Optional[float] = None
+    target_suspended: bool = False
     target_capture_latency_ms: float = 10.0
     actual_capture_latency_ms: Optional[float] = None
 
@@ -799,6 +980,7 @@ class CaptureLatencyReport:
     memory_capture_latency_us: Optional[float] = None
     resume_latency_us: Optional[float] = None
     total_stop_time_us: Optional[float] = None
+    process_suspension_time_us: Optional[float] = None
     total_capture_latency_us: Optional[float] = None
     unavailable_reasons: Dict[str, str] = field(default_factory=dict)
 
@@ -817,6 +999,8 @@ class CaptureLatencyReport:
             "memory_capture_latency_ms": round(self.memory_capture_latency_ms, 3) if self.memory_capture_latency_ms is not None else None,
             "resume_latency_ms": round(self.resume_latency_ms, 3) if self.resume_latency_ms is not None else None,
             "total_stop_time_ms": round(self.total_stop_time_ms, 3) if self.total_stop_time_ms is not None else None,
+            "process_suspension_time_ms": round(self.process_suspension_time_ms, 3) if self.process_suspension_time_ms is not None else None,
+            "target_suspended": self.target_suspended,
             "target_capture_latency_ms": self.target_capture_latency_ms,
             "actual_capture_latency_ms": round(self.actual_capture_latency_ms, 3) if self.actual_capture_latency_ms is not None else None,
             "stop_latency_us": round(self.stop_latency_us, 1) if self.stop_latency_us is not None else None,
@@ -826,6 +1010,7 @@ class CaptureLatencyReport:
             "read_latency_us": round(self.memory_capture_latency_us, 1) if self.memory_capture_latency_us is not None else None,
             "resume_latency_us": round(self.resume_latency_us, 1) if self.resume_latency_us is not None else None,
             "total_stop_time_us": round(self.total_stop_time_us, 1) if self.total_stop_time_us is not None else None,
+            "process_suspension_time_us": round(self.process_suspension_time_us, 1) if self.process_suspension_time_us is not None else None,
             "total_capture_latency_us": round(self.total_capture_latency_us, 1) if self.total_capture_latency_us is not None else None,
             "unavailable_reasons": dict(self.unavailable_reasons),
         }
@@ -838,6 +1023,8 @@ class CaptureLatencyReport:
             memory_capture_latency_ms=data.get("memory_capture_latency_ms"),
             resume_latency_ms=data.get("resume_latency_ms"),
             total_stop_time_ms=data.get("total_stop_time_ms"),
+            process_suspension_time_ms=data.get("process_suspension_time_ms"),
+            target_suspended=bool(data.get("target_suspended", False)),
             target_capture_latency_ms=data.get("target_capture_latency_ms", 10.0),
             actual_capture_latency_ms=data.get("actual_capture_latency_ms"),
             stop_latency_us=data.get("stop_latency_us"),
@@ -845,6 +1032,7 @@ class CaptureLatencyReport:
             memory_capture_latency_us=data.get("memory_capture_latency_us"),
             resume_latency_us=data.get("resume_latency_us"),
             total_stop_time_us=data.get("total_stop_time_us"),
+            process_suspension_time_us=data.get("process_suspension_time_us"),
             total_capture_latency_us=data.get("total_capture_latency_us"),
             unavailable_reasons=data.get("unavailable_reasons", {}),
         )

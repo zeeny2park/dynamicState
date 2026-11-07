@@ -183,8 +183,9 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
             # Perform probe read from mapped memory and issue receipt
             maps = adapter.get_proc_maps(proc.pid)
             self.assertTrue(len(maps) > 0)
-            adapter.read_memory(proc.pid, maps[0]["start_int"], 32)
-            rcpt = adapter.issue_live_receipt_for_session("sess_blocked", proc.pid)
+            with adapter.capture_transaction("sess_blocked", proc.pid, operation_type="diagnostic") as tx:
+                adapter.read_memory(proc.pid, maps[0]["start_int"], 32)
+            rcpt = adapter.issue_live_receipt_for_session("sess_blocked", proc.pid, transaction=tx)
             self.assertEqual(rcpt.authority_level, "PRODUCTION")
         finally:
             proc.kill()
@@ -280,27 +281,28 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
             adapter.pin_target_identity(proc.pid)
 
             seq_addr = oracle["sequence"]
-            # Read initial value
-            data_1, st_1, err_1 = adapter.read_memory(proc.pid, seq_addr, 4)
-            self.assertEqual(st_1, "OBSERVED")
-            val_1 = int.from_bytes(data_1, "little")
-            self.assertEqual(val_1, 42)
+            with adapter.capture_transaction("sess_transition", proc.pid, operation_type="diagnostic") as tx:
+                # Read initial value
+                data_1, st_1, err_1 = adapter.read_memory(proc.pid, seq_addr, 4)
+                self.assertEqual(st_1, "OBSERVED")
+                val_1 = int.from_bytes(data_1, "little")
+                self.assertEqual(val_1, 42)
 
-            # Mutate via stdin
-            proc.stdin.write("SET sequence 9999\n")
-            proc.stdin.flush()
-            resp = proc.stdout.readline().strip()
-            self.assertEqual(resp, "OK sequence=9999")
+                # Mutate via stdin
+                proc.stdin.write("SET sequence 9999\n")
+                proc.stdin.flush()
+                resp = proc.stdout.readline().strip()
+                self.assertEqual(resp, "OK sequence=9999")
 
-            # Read mutated value
-            data_2, st_2, err_2 = adapter.read_memory(proc.pid, seq_addr, 4)
-            self.assertEqual(st_2, "OBSERVED")
-            val_2 = int.from_bytes(data_2, "little")
-            self.assertEqual(val_2, 9999)
+                # Read mutated value
+                data_2, st_2, err_2 = adapter.read_memory(proc.pid, seq_addr, 4)
+                self.assertEqual(st_2, "OBSERVED")
+                val_2 = int.from_bytes(data_2, "little")
+                self.assertEqual(val_2, 9999)
 
             # Ledger and causal validation
             ledger = EvidenceLedger(session_id="sess_transition")
-            rcpt = adapter.issue_live_receipt_for_session("sess_transition", proc.pid)
+            rcpt = adapter.issue_live_receipt_for_session("sess_transition", proc.pid, transaction=tx)
             epoch = rcpt.capture_epoch
             rec = ledger.record(
                 evidence_type=EVIDENCE_TYPE_COMPARISON,

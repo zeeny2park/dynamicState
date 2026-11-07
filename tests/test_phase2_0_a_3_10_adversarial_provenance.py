@@ -341,11 +341,12 @@ class TestPhase20A310AdversarialProvenance(unittest.TestCase):
         adapter = LocalTargetAdapter(memory_reader_fn=custom_reader)
         cur_pid = os.getpid()
         adapter.pin_target_identity(cur_pid)
-        adapter.read_memory(cur_pid, 0x1000, 32)
+        with adapter.capture_transaction("sess_custom_test", cur_pid, operation_type="diagnostic") as tx:
+            adapter.read_memory(cur_pid, 0x1000, 32)
         self.assertGreater(adapter.cumulative_physical_bytes_read, 0)
 
         # Issue receipt with custom reader: authority MUST be TEST
-        rcpt = adapter.issue_live_receipt_for_session("sess_custom_test", cur_pid)
+        rcpt = adapter.issue_live_receipt_for_session("sess_custom_test", cur_pid, transaction=tx)
         self.assertEqual(rcpt.authority_level, "TEST")
 
         # Production ledger must reject TEST authority receipt

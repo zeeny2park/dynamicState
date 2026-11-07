@@ -1023,6 +1023,22 @@ class EvidenceLedger:
         for pid in record.parent_evidence_ids:
             if not isinstance(pid, str) or not pid.strip():
                 raise ValueError(f"Invalid parent_evidence_id '{pid}' in parent_evidence_ids: must be a non-empty string")
+            if pid not in self._by_id:
+                raise ValueError(f"EvidenceRecord '{record.evidence_id}' references nonexistent parent record '{pid}'")
+            # Graph cycle detection
+            visited = set()
+            to_visit = [pid]
+            while to_visit:
+                curr = to_visit.pop()
+                if curr == record.evidence_id:
+                    raise ValueError(f"Cycle detected in evidence dependency graph for record '{record.evidence_id}': self is reachable from parent '{pid}'")
+                if curr in visited:
+                    continue
+                visited.add(curr)
+                parent_rec = self._by_id.get(curr)
+                if parent_rec and parent_rec.parent_evidence_ids:
+                    to_visit.extend(parent_rec.parent_evidence_ids)
+
         if record.evidence_id in record.parent_evidence_ids:
             raise ValueError(f"Self-reference detected: record cannot have its own evidence_id '{record.evidence_id}' as a parent")
         for field_name, val in [
@@ -1211,6 +1227,36 @@ class EvidenceLedger:
             expected_sig = compute_attestation_signature(self.session_secret, record.evidence_id, fp, self.session_id)
             if not hmac.compare_digest(str(att.get("token_sig", "")), str(expected_sig)):
                 raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION cryptographic signature verification failed for '{record.evidence_id}'")
+
+        # P0 Cryptographic Causal Attestation Verification
+        raw_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
+        if raw_causal is not None:
+            from .capture_backend import CausalAttestation
+            if isinstance(raw_causal, CausalAttestation):
+                c_att = raw_causal
+            elif isinstance(raw_causal, dict):
+                try:
+                    c_att = CausalAttestation.from_dict(raw_causal)
+                except Exception as e:
+                    raise ValueError(f"Malformed CausalAttestation on record '{record.evidence_id}': {e}")
+            else:
+                raise ValueError(f"Invalid causal_attestation on record '{record.evidence_id}'")
+
+            ok_att, err_att = c_att.verify(expected_session_id=record.session_id or self.session_id)
+            if not ok_att:
+                raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': {err_att}")
+
+            if not hasattr(self, "_used_causal_attestation_ids"):
+                self._used_causal_attestation_ids: Set[str] = set()
+            if c_att.attestation_id in self._used_causal_attestation_ids:
+                raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}'")
+            self._used_causal_attestation_ids.add(c_att.attestation_id)
+
+            if c_att.precondition_evidence_id and c_att.precondition_evidence_id not in self._by_id:
+                raise ValueError(f"CausalAttestation references nonexistent precondition evidence '{c_att.precondition_evidence_id}'")
+
+        if (p_details.get("causal_proof") is True or p_details.get("deterministic_transition_verified") is True) and not raw_causal and not p_prov.get("verifier_attestation"):
+            raise ValueError(f"Caller-supplied causal_proof=True on record '{record.evidence_id}' rejected: missing valid cryptographic CausalAttestation")
 
 
     def transition_provenance(

@@ -177,6 +177,30 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase2_0_a_3_12_real_cpp_e2e.py
 
+      - name: Run Phase 2.0-A.3.13 Transaction Context Security Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_transaction_context_security.py
+
+      - name: Run Phase 2.0-A.3.13 Causal Attestation Verification Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_causal_attestation.py
+
+      - name: Run Phase 2.0-A.3.13 Ledger Trust Closure Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_ledger_trust_closure.py
+
+      - name: Run Phase 2.0-A.3.13 Workflow Exactly-Once Execution Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_workflow_exactly_once.py
+
+      - name: Run Phase 2.0-A.3.13 Identity Fail-Closed Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_identity_fail_closed.py
+
+      - name: Run Phase 2.0-A.3.13 SLA Monotonic Latency Measurement Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_sla_measurement.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

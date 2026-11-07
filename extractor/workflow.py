@@ -686,22 +686,28 @@ class InvestigationWorkflowEngine:
         target_addr = instance.context.get("target_addr", 0)
         target_size = instance.context.get("target_size", 128)
 
-        # Non-re-execution check on resume
-        completed_obs = instance.context.setdefault("completed_observations", [])
+        # Durable operation lifecycle tracking: RESERVED -> EXECUTING -> COMMITTED / FAILED / ABORTED
         obs_key = f"0x{target_addr:x}:{target_size}"
-        if obs_key in completed_obs and "last_receipt" in instance.context:
+        op_lifecycle = instance.context.setdefault("operation_lifecycle", {})
+        completed_obs = instance.context.setdefault("completed_observations", [])
+
+        # Non-re-execution check on resume: only skip if observation was durably COMMITTED
+        if obs_key in completed_obs and op_lifecycle.get(obs_key, "COMMITTED") == "COMMITTED" and "last_receipt" in instance.context:
             return self.transition_stage(
                 instance,
                 STAGE_EVALUATING_EVIDENCE,
-                f"Observation at 0x{target_addr:x} already completed in previous run; avoiding duplicate physical read",
-                details={"target_addr": hex(target_addr), "cached": True},
+                f"Observation at 0x{target_addr:x} already committed in previous run; avoiding duplicate physical read",
+                details={"target_addr": hex(target_addr), "cached": True, "lifecycle_state": "COMMITTED"},
             )
 
+        op_lifecycle[obs_key] = "RESERVED"
         try:
+            op_lifecycle[obs_key] = "EXECUTING"
             if hasattr(self.target_adapter, "capture_transaction"):
                 with self.target_adapter.capture_transaction(instance.session_id, instance.target_pid, operation_type="diagnostic") as tx:
                     raw_bytes, status, err = self.target_adapter.read_memory(instance.target_pid, target_addr, target_size)
                     if status not in ("OBSERVED", "PARTIAL") or not raw_bytes:
+                        op_lifecycle[obs_key] = "FAILED"
                         instance.record_transition(STAGE_FAILED, f"Observation read failed: {err}")
                         return False
                     instance.context["last_read_bytes"] = len(raw_bytes)
@@ -710,14 +716,17 @@ class InvestigationWorkflowEngine:
             else:
                 raw_bytes, status, err = self.target_adapter.read_memory(instance.target_pid, target_addr, target_size)
                 if status not in ("OBSERVED", "PARTIAL") or not raw_bytes:
+                    op_lifecycle[obs_key] = "FAILED"
                     instance.record_transition(STAGE_FAILED, f"Observation read failed: {err}")
                     return False
                 instance.context["last_read_bytes"] = len(raw_bytes)
                 rcpt = self.target_adapter.issue_live_receipt_for_session(instance.session_id, instance.target_pid)
 
             instance.context["last_receipt"] = rcpt.to_dict()
+            op_lifecycle[obs_key] = "COMMITTED"
             completed_obs.append(obs_key)
         except Exception as exc:
+            op_lifecycle[obs_key] = "ABORTED"
             alive, _ = self.target_adapter.check_liveness(instance.target_pid)
             if not alive:
                 instance.stopping_reason = STOP_TARGET_TERMINATED
@@ -731,7 +740,7 @@ class InvestigationWorkflowEngine:
             instance,
             STAGE_EVALUATING_EVIDENCE,
             f"Executed diagnostic read ({len(raw_bytes)} bytes) with authenticated receipt",
-            details={"bytes_read": len(raw_bytes), "receipt_id": rcpt.receipt_id},
+            details={"bytes_read": len(raw_bytes), "receipt_id": rcpt.receipt_id, "lifecycle_state": "COMMITTED"},
         )
 
     def execute_stage_evaluating_evidence(self, instance: WorkflowExecutionState) -> bool:
@@ -782,10 +791,53 @@ class InvestigationWorkflowEngine:
             t for t in threads
             if t.get("state") in ("S", "D") and ("futex" in str(t.get("wchan", "")).lower() or t.get("voluntary_ctxt_switches", 0) > 0)
         ]
-        has_deadlock_signal = len(waiting_futex_threads) >= 2 or any(
-            "deadlock" in r.observation.lower() or "contention" in r.observation.lower()
+        running_user_threads = [
+            t for t in threads
+            if t.get("is_running_user_space") or t.get("state") == "R"
+        ]
+
+        has_deadlock_signal = (len(waiting_futex_threads) >= 2 and len(running_user_threads) == 0) or any(
+            "deadlock" in r.observation.lower()
             for r in ledger_records
         )
+        has_contention_signal = (len(waiting_futex_threads) >= 1 and len(running_user_threads) > 0) or any(
+            "contention" in r.observation.lower()
+            for r in ledger_records
+        )
+        if not has_deadlock_signal and any("deadlock" in r.observation.lower() for r in ledger_records):
+            has_deadlock_signal = True
+
+        # Check genuine cryptographic causal attestation on ledger records
+        has_verified_causal_attestation = False
+        for r in ledger_records:
+            ca = (r.provenance or {}).get("causal_attestation")
+            if ca:
+                if hasattr(ca, "verify"):
+                    ok_v, _ = ca.verify(expected_session_id=instance.session_id)
+                    if ok_v:
+                        has_verified_causal_attestation = True
+                        break
+                elif isinstance(ca, dict) and ca.get("signature"):
+                    from .capture_backend import CausalAttestation
+                    try:
+                        c_obj = CausalAttestation.from_dict(ca)
+                        ok_v, _ = c_obj.verify(expected_session_id=instance.session_id)
+                        if ok_v:
+                            has_verified_causal_attestation = True
+                            break
+                    except Exception:
+                        pass
+            va = (r.provenance or {}).get("verifier_attestation")
+            if va and isinstance(va, dict) and va.get("token_sig") and not va.get("attestation_rejected"):
+                has_verified_causal_attestation = True
+                break
+
+        # Deduplicate evidence count: avoid counting correlated/duplicate observations as independent
+        distinct_observations = {
+            f"{r.evidence_type}:{(r.details or {}).get('address', '')}:{(r.field_observation or {}).get('field_path', '')}"
+            for r in ledger_records
+        }
+        eff_evidence_count = len(distinct_observations)
 
         for h in hyps:
             hid = h.get("id", "")
@@ -794,27 +846,37 @@ class InvestigationWorkflowEngine:
             if hid == "hyp_deadlock":
                 if has_deadlock_signal:
                     h["status"] = HYPOTHESIS_STATUS_SUPPORTED
-                    evidence_boost = min(0.55, 0.20 * len(waiting_futex_threads) + 0.10 * len(ledger_records))
+                    evidence_boost = min(0.55, 0.20 * len(waiting_futex_threads) + 0.10 * eff_evidence_count)
                     h["confidence"] = round(min(0.95, prior + evidence_boost), 3)
-                    h["causally_verified"] = any(
-                        (r.details or {}).get("causal_proof") is True
-                        or (r.details or {}).get("deterministic_transition_verified") is True
-                        or (r.provenance or {}).get("verifier_attestation") is not None
-                        for r in ledger_records
-                    )
+                    h["causally_verified"] = has_verified_causal_attestation
+                elif has_contention_signal:
+                    h["status"] = HYPOTHESIS_STATUS_INCONCLUSIVE
+                    h["confidence"] = round(prior, 3)
+                    h["causally_verified"] = False
                 else:
-                    h["status"] = HYPOTHESIS_STATUS_REFUTED if any(t.get("is_running_user_space") for t in threads) else HYPOTHESIS_STATUS_INCONCLUSIVE
+                    h["status"] = HYPOTHESIS_STATUS_REFUTED if running_user_threads else HYPOTHESIS_STATUS_INCONCLUSIVE
+                    h["confidence"] = 0.05 if h["status"] == HYPOTHESIS_STATUS_REFUTED else round(prior, 3)
+                    h["causally_verified"] = False
+
+            elif hid == "hyp_contention":
+                if has_contention_signal:
+                    h["status"] = HYPOTHESIS_STATUS_SUPPORTED
+                    evidence_boost = min(0.50, 0.20 * len(waiting_futex_threads) + 0.10 * eff_evidence_count)
+                    h["confidence"] = round(min(0.90, prior + evidence_boost), 3)
+                    h["causally_verified"] = has_verified_causal_attestation
+                else:
+                    h["status"] = HYPOTHESIS_STATUS_REFUTED if len(waiting_futex_threads) == 0 and running_user_threads else HYPOTHESIS_STATUS_INCONCLUSIVE
                     h["confidence"] = 0.05 if h["status"] == HYPOTHESIS_STATUS_REFUTED else round(prior, 3)
                     h["causally_verified"] = False
 
             elif hid == "hyp_normal":
-                if has_deadlock_signal:
+                if has_deadlock_signal or (has_contention_signal and len(waiting_futex_threads) >= 2):
                     h["status"] = HYPOTHESIS_STATUS_REFUTED
                     h["confidence"] = 0.05
                     h["causally_verified"] = False
                 elif ledger_records and not has_deadlock_signal:
                     h["status"] = HYPOTHESIS_STATUS_SUPPORTED
-                    evidence_boost = min(0.60, 0.25 * len(ledger_records))
+                    evidence_boost = min(0.60, 0.25 * eff_evidence_count)
                     h["confidence"] = round(min(0.92, prior + evidence_boost), 3)
                     h["causally_verified"] = True
                 else:
@@ -823,14 +885,29 @@ class InvestigationWorkflowEngine:
                     h["causally_verified"] = False
 
             else:
-                matching = [r for r in ledger_records if (r.details or {}).get("hypothesis_id") == hid or getattr(r, "hypothesis_id", None) == hid]
+                matching = [
+                    r for r in ledger_records
+                    if (r.details or {}).get("hypothesis_id") == hid or getattr(r, "hypothesis_id", None) == hid
+                ]
                 if matching:
                     h["status"] = HYPOTHESIS_STATUS_SUPPORTED
                     h["confidence"] = round(min(0.85, prior + 0.2 * len(matching)), 3)
+                    h["causally_verified"] = has_verified_causal_attestation
                 else:
                     h["status"] = HYPOTHESIS_STATUS_NOT_TESTED
                     h["confidence"] = round(prior, 3)
-                h["causally_verified"] = False
+                    h["causally_verified"] = False
+
+            h["scoring_factors"] = {
+                "prior": prior,
+                "effective_evidence_count": eff_evidence_count,
+                "waiting_futex_threads": len(waiting_futex_threads),
+                "running_user_threads": len(running_user_threads),
+                "has_deadlock_signal": has_deadlock_signal,
+                "has_contention_signal": has_contention_signal,
+                "has_verified_causal_attestation": has_verified_causal_attestation,
+                "calibrated_confidence": h["confidence"],
+            }
 
         return self.transition_stage(
             instance,
@@ -1087,20 +1164,23 @@ class InvestigationWorkflowEngine:
         pinned = inst.context.get("pinned_identity")
         if pinned:
             cur_ident = eff_adapter.get_process_identity(inst.target_pid)
-            if (
-                pinned.get("start_time")
-                and cur_ident.get("start_time")
-                and str(pinned["start_time"]) != str(cur_ident["start_time"])
-            ):
+            # Fail closed if mandatory identity attributes are missing or empty
+            if not pinned.get("start_time") or not cur_ident.get("start_time"):
+                raise PIDReusedError(
+                    f"Target process identity missing mandatory start_time on resume: "
+                    f"pinned={pinned.get('start_time')}, cur={cur_ident.get('start_time')}"
+                )
+            if not pinned.get("executable") or not cur_ident.get("executable"):
+                raise PIDReusedError(
+                    f"Target process identity missing mandatory executable on resume: "
+                    f"pinned={pinned.get('executable')}, cur={cur_ident.get('executable')}"
+                )
+            if str(pinned["start_time"]) != str(cur_ident["start_time"]):
                 raise PIDReusedError(
                     f"PID reuse detected on resume for PID {inst.target_pid}: "
                     f"start_time changed from {pinned['start_time']} to {cur_ident['start_time']}"
                 )
-            if (
-                pinned.get("executable")
-                and cur_ident.get("executable")
-                and str(pinned["executable"]) != str(cur_ident["executable"])
-            ):
+            if str(pinned["executable"]) != str(cur_ident["executable"]):
                 raise PIDReusedError(
                     f"Executable replacement detected on resume for PID {inst.target_pid}: "
                     f"{pinned['executable']} -> {cur_ident['executable']}"
@@ -1123,6 +1203,12 @@ class InvestigationWorkflowEngine:
                     f"Build ID changed on resume for PID {inst.target_pid}: "
                     f"{pinned['build_id']} -> {cur_ident['build_id']}"
                 )
+
+        # Abort any in-flight uncommitted operations across recovery
+        op_lifecycle = inst.context.get("operation_lifecycle", {})
+        for op_id, op_state in op_lifecycle.items():
+            if op_state in ("RESERVED", "EXECUTING"):
+                op_lifecycle[op_id] = "ABORTED"
 
         # Restore ledger if serialized in checkpoint
         restored_ledger = inst.context.get("restored_evidence_ledger")

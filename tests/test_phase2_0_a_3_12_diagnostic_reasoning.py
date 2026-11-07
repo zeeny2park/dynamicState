@@ -37,6 +37,10 @@ from extractor.evidence_ledger import (
     EvidenceRecord,
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
 )
+from extractor.capture_backend import (
+    issue_causal_attestation,
+    get_trusted_causal_authority_token,
+)
 from extractor.target_adapter import LocalTargetAdapter
 
 
@@ -186,6 +190,20 @@ class TestPhase20A312DiagnosticReasoning(unittest.TestCase):
             adapter.read_memory(self.pid, 0x400000, 64)
         rcpt2 = adapter.issue_live_receipt_for_session("sess_causal", self.pid, transaction=tx2)
 
+        existing_records = engine2.evidence_ledger._records
+        pre_id = existing_records[0].evidence_id if existing_records else ""
+
+        causal_att = issue_causal_attestation(
+            session_id="sess_causal",
+            target_identity=inst_causal.context.get("pinned_identity"),
+            operation_id="op_causal_1",
+            precondition_evidence_id=pre_id,
+            postcondition_evidence_id="ev_causal_trans_1",
+            claimed_transition={"lock_state": "transitioned"},
+            authority_level="PRODUCTION",
+            verifier_authority_token=get_trusted_causal_authority_token(),
+        )
+
         # Inject verified deterministic transition record into ledger
         causal_rec = EvidenceRecord(
             evidence_id="ev_causal_trans_1",
@@ -194,7 +212,7 @@ class TestPhase20A312DiagnosticReasoning(unittest.TestCase):
             provenance={
                 "provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
                 "live_capture_receipt": rcpt2.to_dict(),
-                "verifier_attestation": {"token_sig": "valid"},
+                "causal_attestation": causal_att.to_dict(),
             },
             details={"causal_proof": True, "deterministic_transition_verified": True},
             target_identity=inst_causal.context.get("pinned_identity"),

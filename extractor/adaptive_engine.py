@@ -1009,6 +1009,7 @@ class AdaptiveInvestigationEngine:
         companion_elf_path: str,
         adapter: TargetExecutionAdapter,
         fixture_data: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """Establishes target identity, provenance, and available read-only observation capabilities."""
         if fixture_data:
@@ -1065,7 +1066,7 @@ class AdaptiveInvestigationEngine:
                         r_vmas = [m for m in p_maps if m.get("is_readable")]
                         if r_vmas:
                             if hasattr(adapter, "capture_transaction"):
-                                with adapter.capture_transaction(session_id="probe_cap", pid=pid, operation_type="probe"):
+                                with adapter.capture_transaction(session_id=session_id or "probe_cap", pid=pid, operation_type="diagnostic"):
                                     adapter.read_memory(pid, r_vmas[0]["start_int"], 64)
                             else:
                                 adapter.read_memory(pid, r_vmas[0]["start_int"], 64)
@@ -1223,6 +1224,7 @@ class AdaptiveInvestigationEngine:
             companion_elf_path=companion_elf_path,
             adapter=eff_adapter,
             fixture_data=fixture_data,
+            session_id=sess_id,
         )
         target_identity["provenance_class"] = eff_prov
 
@@ -1474,7 +1476,17 @@ class AdaptiveInvestigationEngine:
                     available_symbols=available_symbols,
                     capabilities=capabilities,
                 )
-                res = mod.run(ctx, self.watch_manager)
+                step_tx = None
+                if not fixture_data and hasattr(eff_adapter, "capture_transaction"):
+                    step_tx = eff_adapter.begin_capture_transaction(session_id=sess_id, pid=pid, operation_type="diagnostic")
+                try:
+                    res = mod.run(ctx, self.watch_manager)
+                finally:
+                    if step_tx is not None:
+                        try:
+                            eff_adapter.commit_capture_transaction(step_tx)
+                        except Exception:
+                            pass
                 executed_profiles.append(current_id)
                 inspection_outputs[current_id] = res
 
@@ -1489,14 +1501,25 @@ class AdaptiveInvestigationEngine:
                     break
 
                 step_rcpt = None
-                try:
-                    step_rcpt = eff_adapter.issue_live_receipt_for_session(
-                        session_id=sess_id,
-                        pid=pid,
-                        companion_build_id=target_identity.get("build_id"),
-                    )
-                except Exception:
-                    step_rcpt = None
+                if step_tx is not None and step_tx.physical_bytes_read > 0:
+                    try:
+                        step_rcpt = eff_adapter.issue_live_receipt_for_session(
+                            session_id=sess_id,
+                            pid=pid,
+                            companion_build_id=target_identity.get("build_id"),
+                            transaction=step_tx,
+                        )
+                    except Exception:
+                        step_rcpt = None
+                elif eff_adapter._physical_bytes_read > 0 and capabilities.get("process_alive") and not fixture_data:
+                    try:
+                        step_rcpt = eff_adapter.issue_live_receipt_for_session(
+                            session_id=sess_id,
+                            pid=pid,
+                            companion_build_id=target_identity.get("build_id"),
+                        )
+                    except Exception:
+                        step_rcpt = None
 
                 if step_rcpt:
                     res["live_capture_receipt"] = step_rcpt.to_dict()
@@ -1686,48 +1709,58 @@ class AdaptiveInvestigationEngine:
             executed_keys.add(epoch_key)
 
             t_obs_0 = time.monotonic_ns()
-            if follow_up_executor is not None:
-                raw_obs_res = follow_up_executor(selected_obs, self.cache.current_epoch)
-                lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
-                is_fail = (
-                    raw_obs_res.get("success") is False
-                    or raw_obs_res.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
-                )
-                meas_b = raw_obs_res.get("bytes_read") if isinstance(raw_obs_res.get("bytes_read"), int) else None
-                budget_tracker.record_read(
-                    bytes_read=meas_b,
-                    latency_us=lat_us,
-                    stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
-                    is_failure=is_fail,
-                    conservative_estimate_bytes=selected_obs.estimated_bytes,
-                    profile_id=selected_obs.profile_id or selected_obs.observation_id,
-                )
-                budget_tracker.record_sample(profile_id=selected_obs.profile_id or selected_obs.observation_id)
-            elif selected_obs.profile_id and self.registry.get(selected_obs.profile_id):
-                mod = self.registry.get(selected_obs.profile_id)
-                ctx = InspectionContext(
-                    pid=pid,
-                    companion_elf=companion_elf_path,
-                    adapter=eff_adapter,
-                    budget_tracker=budget_tracker,
-                    target_info=target_identity,
-                    parameters={
-                        **selected_obs.target_ref,
-                        "estimated_bytes": selected_obs.estimated_bytes,
-                        "estimated_latency_ms": selected_obs.estimated_latency_ms,
-                    },
-                    available_symbols=available_symbols,
-                    capabilities=capabilities,
-                )
-                raw_obs_res = mod.run(ctx, self.watch_manager)
-                executed_profiles.append(selected_obs.profile_id)
-            else:
-                raw_obs_res = {
-                    "success": False,
-                    "unavailable": True,
-                    "result_category": RESULT_OBSERVATION_UNAVAILABLE,
-                    "error": f"No execution handler available for observation '{selected_obs.observation_id}'",
-                }
+            step_tx = None
+            if not fixture_data and hasattr(eff_adapter, "capture_transaction"):
+                step_tx = eff_adapter.begin_capture_transaction(session_id=sess_id, pid=pid, operation_type="diagnostic")
+            try:
+                if follow_up_executor is not None:
+                    raw_obs_res = follow_up_executor(selected_obs, self.cache.current_epoch)
+                    lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
+                    is_fail = (
+                        raw_obs_res.get("success") is False
+                        or raw_obs_res.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
+                    )
+                    meas_b = raw_obs_res.get("bytes_read") if isinstance(raw_obs_res.get("bytes_read"), int) else None
+                    budget_tracker.record_read(
+                        bytes_read=meas_b,
+                        latency_us=lat_us,
+                        stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
+                        is_failure=is_fail,
+                        conservative_estimate_bytes=selected_obs.estimated_bytes,
+                        profile_id=selected_obs.profile_id or selected_obs.observation_id,
+                    )
+                    budget_tracker.record_sample(profile_id=selected_obs.profile_id or selected_obs.observation_id)
+                elif selected_obs.profile_id and self.registry.get(selected_obs.profile_id):
+                    mod = self.registry.get(selected_obs.profile_id)
+                    ctx = InspectionContext(
+                        pid=pid,
+                        companion_elf=companion_elf_path,
+                        adapter=eff_adapter,
+                        budget_tracker=budget_tracker,
+                        target_info=target_identity,
+                        parameters={
+                            **selected_obs.target_ref,
+                            "estimated_bytes": selected_obs.estimated_bytes,
+                            "estimated_latency_ms": selected_obs.estimated_latency_ms,
+                        },
+                        available_symbols=available_symbols,
+                        capabilities=capabilities,
+                    )
+                    raw_obs_res = mod.run(ctx, self.watch_manager)
+                    executed_profiles.append(selected_obs.profile_id)
+                else:
+                    raw_obs_res = {
+                        "success": False,
+                        "unavailable": True,
+                        "result_category": RESULT_OBSERVATION_UNAVAILABLE,
+                        "error": f"No execution handler available for observation '{selected_obs.observation_id}'",
+                    }
+            finally:
+                if step_tx is not None:
+                    try:
+                        eff_adapter.commit_capture_transaction(step_tx)
+                    except Exception:
+                        pass
 
             if selected_obs.target_kind == TARGET_KIND_COMPARISON or selected_obs.profile_id == "insp_temporal_diff" or raw_obs_res.get("is_temporal_sample"):
                 if raw_obs_res.get("success", True):
@@ -1735,14 +1768,25 @@ class AdaptiveInvestigationEngine:
                     self.cache.advance_epoch()
 
             step_rcpt = None
-            try:
-                step_rcpt = eff_adapter.issue_live_receipt_for_session(
-                    session_id=sess_id,
-                    pid=pid,
-                    companion_build_id=target_identity.get("build_id"),
-                )
-            except Exception:
-                step_rcpt = None
+            if step_tx is not None and step_tx.physical_bytes_read > 0:
+                try:
+                    step_rcpt = eff_adapter.issue_live_receipt_for_session(
+                        session_id=sess_id,
+                        pid=pid,
+                        companion_build_id=target_identity.get("build_id"),
+                        transaction=step_tx,
+                    )
+                except Exception:
+                    step_rcpt = None
+            elif eff_adapter._physical_bytes_read > 0 and capabilities.get("process_alive") and not fixture_data:
+                try:
+                    step_rcpt = eff_adapter.issue_live_receipt_for_session(
+                        session_id=sess_id,
+                        pid=pid,
+                        companion_build_id=target_identity.get("build_id"),
+                    )
+                except Exception:
+                    step_rcpt = None
 
             if step_rcpt:
                 raw_obs_res["live_capture_receipt"] = step_rcpt.to_dict()

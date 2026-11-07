@@ -473,15 +473,17 @@ class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
             self.assertTrue(pinned.get("build_id"))
             self.assertTrue(pinned.get("start_time"))
 
-            # Perform physical memory read
+            # Perform physical memory read within explicit capture transaction
+            tx = adapter.begin_capture_transaction("sess_live_25", proc.pid)
             data, status, err = adapter.read_memory(proc.pid, addr, 4)
+            adapter.commit_capture_transaction(tx)
             self.assertEqual(status, "OBSERVED", f"Read failed: {err}")
             self.assertEqual(int.from_bytes(data, "little"), 1337)
             self.assertEqual(adapter.physical_reads_count, 1)
             self.assertEqual(adapter.cumulative_physical_bytes_read, 4)
 
             # Issue LiveCaptureReceipt from adapter and verify
-            rcpt = adapter.issue_live_receipt_for_session("sess_live_25", proc.pid)
+            rcpt = adapter.issue_live_receipt_for_session("sess_live_25", proc.pid, transaction=tx)
             ok, reason = rcpt.verify(
                 expected_session_id="sess_live_25",
                 expected_pid=proc.pid,

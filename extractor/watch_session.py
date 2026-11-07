@@ -53,6 +53,19 @@ from .evidence_ledger import EvidenceLedger
 from .observation_budget import ObservationBudgetTracker, ObservationBudgetLimits
 
 
+ZERO_STOP_NON_ATOMIC_CONSISTENCY: Dict[str, Any] = {
+    "level": "NON_ATOMIC",
+    "is_consistent_snapshot": False,
+    "process_stopped": False,
+    "is_atomic_read": False,
+    "mechanism": "ZERO_STOP_CONCURRENT_READ",
+    "causal_guarantee": "NONE",
+    "has_causal_guarantee": False,
+    "data_completeness": "BEST_EFFORT_NON_ATOMIC",
+    "warning": "Read concurrently on live running threads without process suspension. Multi-variable observations may reflect distinct execution instants and cannot establish causal sequencing.",
+}
+
+
 # -----------------------------------------------------------------------------
 # Ctypes / Linux process_vm_readv binding
 # -----------------------------------------------------------------------------
@@ -2979,6 +2992,7 @@ class WatchSessionManager:
             "load_bias": f"0x{load_bias:x}",
             "stop_duration_ms": 0.0,
             "capture_latency_us": elapsed_us,
+            "consistency": dict(ZERO_STOP_NON_ATOMIC_CONSISTENCY),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "coercions_count": len(coercions_applied),
             "coercions": coercions_applied,
@@ -9913,6 +9927,23 @@ class WatchSessionManager:
         # Step 4: Persist resolved active context when pid is alive and eff_elf exists
         primary_resolved, _ = self._split_companion_elf_paths(eff_elf)
         if pid_alive and primary_resolved and os.path.isfile(primary_resolved):
+            try:
+                proc_ident = target_adapter.get_process_identity(eff_pid)
+                proc_bid = proc_ident.get("build_id")
+                elf_ident = inspect_elf(primary_resolved)
+                elf_bid = getattr(elf_ident, "build_id", None)
+                if proc_bid and elf_bid and str(proc_bid).strip().lower() != str(elf_bid).strip().lower():
+                    raise ValueError(
+                        f"Target process '{eff_pid}' running executable has build-id '{proc_bid}', "
+                        f"but companion image '{eff_elf}' has build-id '{elf_bid}'. Mismatched symbols rejected."
+                    )
+                if not known_build_id:
+                    known_build_id = elf_bid or proc_bid
+            except ValueError:
+                raise
+            except Exception:
+                pass
+
             if not eff_proc_name:
                 if not target_adapter.is_remote():
                     try:
