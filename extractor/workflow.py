@@ -1289,7 +1289,9 @@ class InvestigationWorkflowEngine:
         # Restore ledger if serialized in checkpoint
         restored_ledger = inst.context.get("restored_evidence_ledger")
         if restored_ledger:
-            self.evidence_ledger = EvidenceLedger.from_dict(restored_ledger)
+            from .capture_backend import get_default_trust_store
+            eff_ts = getattr(eff_adapter, "trust_store", None) or get_default_trust_store()
+            self.evidence_ledger = EvidenceLedger.from_dict(restored_ledger, trust_store=eff_ts)
 
         return inst
 

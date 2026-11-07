@@ -985,10 +985,37 @@ class EvidenceLedger:
                 p_prov = record.provenance or {}
                 p_details = record.details or {}
                 raw_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
-                if raw_causal:
+                if raw_causal and not hasattr(self.trust_store, "consume_attestation"):
                     c_id = getattr(raw_causal, "attestation_id", None) or (raw_causal.get("attestation_id") if isinstance(raw_causal, dict) else None)
                     if c_id:
                         self.trust_store.record_used_attestation(c_id)
+
+                # P0-2: Bind operation in trust store
+                op_id = (record.details or {}).get("operation_id")
+                if not op_id and record.provenance:
+                    lcr = record.provenance.get("live_capture_receipt")
+                    if lcr:
+                        op_id = lcr.get("operation_id") if isinstance(lcr, dict) else getattr(lcr, "operation_id", None)
+                    if not op_id and raw_causal:
+                        op_id = raw_causal.get("operation_id") if isinstance(raw_causal, dict) else getattr(raw_causal, "operation_id", None)
+                if op_id:
+                    t_ident = record.target_identity or {}
+                    pid_val = t_ident.get("pid")
+                    eff_pid = int(pid_val) if pid_val is not None and not isinstance(pid_val, bool) else 0
+                    self.trust_store.record_used_operation(
+                        op_id=str(op_id),
+                        session_id=record.session_id or self.session_id,
+                        pid=eff_pid,
+                        metadata={
+                            "evidence_id": record.evidence_id,
+                            "process_identity": str(t_ident.get("process_identity", "")),
+                            "executable_identity": str(t_ident.get("executable_identity") or t_ident.get("executable", "")),
+                            "build_id": str(t_ident.get("build_id", "")),
+                        },
+                        allow_idempotent=True,
+                    )
+                    if hasattr(self.trust_store, "bind_operation_evidence"):
+                        self.trust_store.bind_operation_evidence(str(op_id), record.evidence_id)
 
             self._records.append(record)
             self._by_id[record.evidence_id] = record
@@ -1375,25 +1402,43 @@ class EvidenceLedger:
             r_exe = r_ident.get("executable_identity") or r_ident.get("executable")
             r_bid = r_ident.get("build_id")
 
-            ok_att, err_att = c_att.verify(
-                expected_session_id=record.session_id or self.session_id,
-                expected_pid=r_pid,
-                expected_process_identity=r_proc,
-                expected_executable_identity=r_exe,
-                expected_build_id=r_bid,
-                expected_target_host=r_ident.get("target_host"),
-                trust_store=getattr(self, "trust_store", None),
-            )
-            if not ok_att:
-                raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': {err_att}")
+            eff_ts = getattr(self, "trust_store", None)
+            if eff_ts and hasattr(eff_ts, "consume_attestation"):
+                from .capture_backend import TrustConsumptionStatus
+                cons_res = eff_ts.consume_attestation(
+                    attestation=c_att,
+                    evidence_id=record.evidence_id,
+                    session_id=record.session_id or self.session_id,
+                    expected_pid=r_pid,
+                    expected_process_identity=r_proc,
+                    expected_executable_identity=r_exe,
+                    expected_build_id=r_bid,
+                    expected_target_host=r_ident.get("target_host"),
+                )
+                if not cons_res.is_accepted:
+                    if cons_res.status == TrustConsumptionStatus.PERSISTENCE_FAILURE:
+                        raise RuntimeError(cons_res.reason)
+                    raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': [{cons_res.status.value}] {cons_res.reason}")
+            else:
+                ok_att, err_att = c_att.verify(
+                    expected_session_id=record.session_id or self.session_id,
+                    expected_pid=r_pid,
+                    expected_process_identity=r_proc,
+                    expected_executable_identity=r_exe,
+                    expected_build_id=r_bid,
+                    expected_target_host=r_ident.get("target_host"),
+                    trust_store=eff_ts,
+                )
+                if not ok_att:
+                    raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': {err_att}")
+
+                if eff_ts and hasattr(eff_ts, "is_attestation_used") and eff_ts.is_attestation_used(c_att.attestation_id):
+                    bound_eid = getattr(self, "_causal_attestation_to_evidence_id", {}).get(c_att.attestation_id)
+                    if bound_eid != record.evidence_id:
+                        raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected by durable trust store on record '{record.evidence_id}'")
 
             if c_pid is not None and r_pid is not None and int(c_pid) != int(r_pid):
                 raise ValueError(f"CausalAttestation target PID mismatch for record '{record.evidence_id}': attestation has {c_pid}, record has {r_pid}")
-
-            if getattr(self, "trust_store", None) and self.trust_store.is_attestation_used(c_att.attestation_id):
-                bound_eid = getattr(self, "_causal_attestation_to_evidence_id", {}).get(c_att.attestation_id)
-                if bound_eid != record.evidence_id:
-                    raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected by durable trust store on record '{record.evidence_id}'")
 
             if not hasattr(self, "_used_causal_attestation_ids"):
                 self._used_causal_attestation_ids: Set[str] = set()
@@ -1661,10 +1706,21 @@ class EvidenceLedger:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], trust_store: Optional[Any] = None) -> "EvidenceLedger":
-        """Reconstruct EvidenceLedger from serialized dictionary."""
+        """Reconstruct EvidenceLedger from serialized dictionary.
+
+        Authoritative indexes are rebuilt strictly from validated records and compared
+        against serialized indexes rather than blindly merged. Rejects forged mappings,
+        invalid parent relationships, cardinality violations, and inconsistent identity.
+        Failed reconstruction admits no partial state.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("EvidenceLedger serialization data must be a dictionary")
+
+        schema_ver = data.get("schema_version", EVIDENCE_SCHEMA_VERSION)
+        session_id = data.get("session_id")
         ledger = cls(
-            session_id=data.get("session_id"),
-            schema_version=data.get("schema_version", EVIDENCE_SCHEMA_VERSION),
+            session_id=session_id,
+            schema_version=schema_ver,
             trust_store=trust_store,
         )
         ledger.created_at = data.get("created_at", ledger.created_at)
@@ -1673,23 +1729,88 @@ class EvidenceLedger:
         ledger._used_operation_ids = {}
         ledger._operation_to_evidence_ids = {}
         ledger._operation_to_receipt_id = {}
+
         seen_ids = set()
-        for rec_data in data.get("records", []):
+        raw_records = data.get("records", [])
+        if not isinstance(raw_records, list):
+            raise ValueError("Serialized ledger 'records' field must be a list")
+
+        # 1. Transactionally validate and add each record, rebuilding authoritative state
+        for rec_data in raw_records:
+            if not isinstance(rec_data, dict):
+                raise ValueError("Malformed evidence record in serialized ledger: must be a dictionary")
             rec = EvidenceRecord.from_dict(rec_data)
             if rec.evidence_id in seen_ids:
                 raise ValueError(f"Duplicate evidence_id '{rec.evidence_id}' during ledger reconstruction")
             seen_ids.add(rec.evidence_id)
             ledger.add_record(rec)
-        ledger._used_causal_attestation_ids.update(data.get("used_causal_attestation_ids", []))
-        ledger._causal_attestation_to_evidence_id.update(data.get("causal_attestation_to_evidence_id", {}))
-        ledger._used_operation_ids.update(data.get("used_operation_ids", {}))
-        for op_id, ev_ids in data.get("operation_to_evidence_ids", {}).items():
-            existing = ledger._operation_to_evidence_ids.setdefault(op_id, [])
-            for eid in ev_ids:
-                if eid not in existing:
-                    existing.append(eid)
-        for op_id, rcpt_id in data.get("operation_to_receipt_id", {}).items():
-            ledger._operation_to_receipt_id[op_id] = rcpt_id
+
+        # 2. Extract rebuilt authoritative indexes
+        rebuilt_causal_ids = set(ledger._used_causal_attestation_ids)
+        rebuilt_causal_to_eid = dict(ledger._causal_attestation_to_evidence_id)
+        rebuilt_used_ops = dict(ledger._used_operation_ids)
+        rebuilt_op_to_ev = {k: list(v) for k, v in ledger._operation_to_evidence_ids.items()}
+        rebuilt_op_to_rcpt = dict(ledger._operation_to_receipt_id)
+
+        # 3. Strictly compare serialized indexes against rebuilt authoritative indexes
+        if "used_causal_attestation_ids" in data:
+            ser_causal_ids = set(data.get("used_causal_attestation_ids", []))
+            if ser_causal_ids != rebuilt_causal_ids:
+                raise ValueError(
+                    f"Authoritative index mismatch during reconstruction: serialized used_causal_attestation_ids "
+                    f"differs from validated records index (serialized={ser_causal_ids}, rebuilt={rebuilt_causal_ids})"
+                )
+
+        if "causal_attestation_to_evidence_id" in data:
+            ser_causal_to_eid = dict(data.get("causal_attestation_to_evidence_id", {}))
+            if ser_causal_to_eid != rebuilt_causal_to_eid:
+                raise ValueError(
+                    f"Forged or conflicting index detected: serialized causal_attestation_to_evidence_id "
+                    f"does not match authoritative validated records mapping"
+                )
+
+        if "operation_to_receipt_id" in data:
+            ser_op_to_rcpt = dict(data.get("operation_to_receipt_id", {}))
+            if ser_op_to_rcpt != rebuilt_op_to_rcpt:
+                raise ValueError(
+                    f"Forged or conflicting index detected: serialized operation_to_receipt_id "
+                    f"does not match authoritative validated records mapping"
+                )
+
+        if "operation_to_evidence_ids" in data:
+            ser_op_to_ev = {k: list(v) for k, v in data.get("operation_to_evidence_ids", {}).items()}
+            if set(ser_op_to_ev.keys()) != set(rebuilt_op_to_ev.keys()):
+                raise ValueError(
+                    f"Operation mapping mismatch: serialized operation keys differ from validated records"
+                )
+            for op_k, ev_list in ser_op_to_ev.items():
+                if set(ev_list) != set(rebuilt_op_to_ev.get(op_k, [])):
+                    raise ValueError(
+                        f"Evidence mapping mismatch for operation '{op_k}': "
+                        f"serialized={ev_list}, rebuilt={rebuilt_op_to_ev.get(op_k)}"
+                    )
+
+        if "used_operation_ids" in data:
+            ser_used_ops = dict(data.get("used_operation_ids", {}))
+            for op_k, op_dict in ser_used_ops.items():
+                if op_k not in rebuilt_used_ops:
+                    raise ValueError(
+                        f"Forged operation mapping detected: operation '{op_k}' exists in serialized "
+                        f"used_operation_ids but has no validated record in ledger"
+                    )
+                rebuilt_rec = rebuilt_used_ops[op_k]
+                if op_dict.get("session_id") != rebuilt_rec.get("session_id"):
+                    raise ValueError(
+                        f"Session inconsistency for operation '{op_k}': serialized={op_dict.get('session_id')}, "
+                        f"rebuilt={rebuilt_rec.get('session_id')}"
+                    )
+                if op_dict.get("pid") is not None and rebuilt_rec.get("pid") is not None:
+                    if int(op_dict["pid"]) != int(rebuilt_rec["pid"]):
+                        raise ValueError(
+                            f"PID inconsistency for operation '{op_k}': serialized={op_dict.get('pid')}, "
+                            f"rebuilt={rebuilt_rec.get('pid')}"
+                        )
+
         return ledger
 
     @classmethod

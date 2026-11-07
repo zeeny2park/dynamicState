@@ -273,6 +273,30 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase2_0_a_3_16_multiprocess_verification.py
 
+      - name: Run Phase 2.0-A.3.17 Atomic Trust Consumption Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_atomic_trust_consumption.py
+
+      - name: Run Phase 2.0-A.3.17 Operation Lifecycle Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_operation_lifecycle_integration.py
+
+      - name: Run Phase 2.0-A.3.17 Idempotent Ledger Recovery Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_idempotent_ledger_recovery.py
+
+      - name: Run Phase 2.0-A.3.17 Authoritative Index Reconstruction Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_authoritative_index_reconstruction.py
+
+      - name: Run Phase 2.0-A.3.17 Trust Store Hardening Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_trust_store_hardening.py
+
+      - name: Run Phase 2.0-A.3.17 Multiprocess Crash Boundaries Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_multiprocess_crash_boundaries.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

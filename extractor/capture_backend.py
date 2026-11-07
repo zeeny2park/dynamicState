@@ -13,6 +13,7 @@ import contextlib
 import ctypes
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 import errno
 import fcntl
 import hashlib
@@ -804,50 +805,107 @@ def issue_live_capture_receipt(
 _TRUSTED_CAUSAL_VERIFIER_TOKEN = os.urandom(32).hex()
 
 
+class TrustConsumptionStatus(str, Enum):
+    """Explicit trust consumption outcomes distinguishing all verification and durability states."""
+    NEW_ACCEPTANCE = "NEW_ACCEPTANCE"
+    IDEMPOTENT_RECOVERY = "IDEMPOTENT_RECOVERY"
+    REPLAY_CONFLICT = "REPLAY_CONFLICT"
+    REVOKED = "REVOKED"
+    INVALID_SIGNATURE = "INVALID_SIGNATURE"
+    IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    EXPIRED = "EXPIRED"
+    PERSISTENCE_FAILURE = "PERSISTENCE_FAILURE"
+
+
+@dataclass
+class TrustConsumptionResult:
+    """Structured result of an atomic trust-consumption operation."""
+    status: TrustConsumptionStatus
+    reason: str
+    attestation_id: str
+    key_id: str = ""
+    evidence_id: str = ""
+    recorded_at: str = ""
+
+    @property
+    def is_accepted(self) -> bool:
+        """Returns True if the credential was legitimately accepted (new or idempotent same-evidence)."""
+        return self.status in (
+            TrustConsumptionStatus.NEW_ACCEPTANCE,
+            TrustConsumptionStatus.IDEMPOTENT_RECOVERY,
+        )
+
+
 class DurableTrustStore:
     """Persistent durable trust store for causal verifier keys, revocations, and anti-replay state.
 
-    Atomic updates write to a temporary file in the same directory, fsync, and atomic rename.
-    Corrupted or malformed store files trigger fail-closed RuntimeError.
-    Cross-process concurrency is guarded via fcntl.flock on a dedicated lock file.
+    POSIX / Linux Platform Assumptions:
+    1. Atomic File Replacement: Relies on POSIX rename(2) semantics via os.replace(), ensuring that
+       the temporary write file is atomically swapped into place without exposure of partial content.
+    2. Cross-Process Mutual Exclusion: Relies on fcntl.flock(LOCK_EX) on a dedicated '<store_path>.lock' file.
+       On Linux local filesystems (ext4, XFS, tmpfs, Btrfs), this provides rigorous kernel-managed
+       advisory file table locking across independent operating system processes.
+    3. Durability Guarantees: Calls os.fsync(fd) prior to rename to ensure file payload is committed to
+       underlying non-volatile block storage. Calls os.fsync(dir_fd) on the parent directory following rename
+       to ensure directory entry updates persist across sudden power loss or kernel panic.
+    4. Access Control & Permission Boundaries: Files are created with mode 0600 and directories with 0700,
+       restricting read and write authority strictly to the owning UID under Linux DAC (Discretionary Access Control).
+    5. Fail-Closed Invariant: Any corrupted store file, invalid schema, truncated JSON, or unpropagated
+       persistence error immediately raises RuntimeError and aborts trust acceptance.
     """
 
     def __init__(self, store_path: Optional[str] = None):
         self.store_path = store_path or os.environ.get("DYNAMICSTATE_TRUST_STORE_PATH")
         self._lock = threading.RLock()
+        self._lock_depth: int = 0
+        self._lock_fd: Optional[int] = None
         self.keys: Dict[str, str] = {}
         self.active_key_id: str = "default"
         self.revoked_keys: Dict[str, Dict[str, Any]] = {}
         self.used_attestation_ids: Set[str] = set()
+        self.used_attestations: Dict[str, Dict[str, Any]] = {}
         self.used_operation_ids: Dict[str, Dict[str, Any]] = {}
         if self.store_path:
             self.load()
 
     @contextlib.contextmanager
     def _file_lock(self):
-        """Cross-process and cross-thread mutual exclusion context."""
-        if not self.store_path:
-            with self._lock:
+        """Cross-process and cross-thread re-entrant mutual exclusion context."""
+        with self._lock:
+            if not self.store_path:
                 yield
-            return
+                return
 
-        lock_path = self.store_path + ".lock"
-        dir_name = os.path.dirname(os.path.abspath(lock_path))
-        os.makedirs(dir_name, mode=0o700, exist_ok=True)
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(lock_path, flags, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            with self._lock:
-                yield
-        finally:
+            lock_path = self.store_path + ".lock"
+            if self._lock_depth == 0:
+                dir_name = os.path.dirname(os.path.abspath(lock_path))
+                os.makedirs(dir_name, mode=0o700, exist_ok=True)
+                flags = os.O_RDWR | os.O_CREAT
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(lock_path, flags, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    self._lock_fd = fd
+                except BaseException:
+                    os.close(fd)
+                    raise
+            self._lock_depth += 1
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
+                yield
+            finally:
+                self._lock_depth -= 1
+                if self._lock_depth == 0 and self._lock_fd is not None:
+                    fd = self._lock_fd
+                    self._lock_fd = None
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def load(self) -> None:
         """Load state from persistent trust store file. Fails closed if corrupted."""
@@ -869,38 +927,77 @@ class DurableTrustStore:
                 if not isinstance(data, dict):
                     raise ValueError("Trust store payload must be a JSON dictionary")
 
-                # Strict schema and type validation
-                if "keys" in data and not isinstance(data["keys"], dict):
-                    raise ValueError("Trust store 'keys' field must be a dictionary")
-                if "revoked_keys" in data and not isinstance(data["revoked_keys"], dict):
-                    raise ValueError("Trust store 'revoked_keys' field must be a dictionary")
-                if "used_attestation_ids" in data and not isinstance(data["used_attestation_ids"], (list, set)):
-                    raise ValueError("Trust store 'used_attestation_ids' must be a list or set")
-                if "used_operation_ids" in data and not isinstance(data["used_operation_ids"], dict):
-                    raise ValueError("Trust store 'used_operation_ids' must be a dictionary")
+                # Strict schema and nested type validation
+                if "keys" in data:
+                    if not isinstance(data["keys"], dict):
+                        raise ValueError("Trust store 'keys' field must be a dictionary")
+                    for k, v in data["keys"].items():
+                        if not isinstance(k, str) or not isinstance(v, str) or not k:
+                            raise ValueError(f"Invalid key entry in trust store: {k!r}")
+
+                if "revoked_keys" in data:
+                    if not isinstance(data["revoked_keys"], dict):
+                        raise ValueError("Trust store 'revoked_keys' field must be a dictionary")
+                    for k, v in data["revoked_keys"].items():
+                        if not isinstance(k, str) or not isinstance(v, dict):
+                            raise ValueError(f"Invalid revoked_keys entry: {k!r}")
+                        if "revoked_at" not in v or not isinstance(v["revoked_at"], str):
+                            raise ValueError(f"revoked_keys entry '{k}' missing valid 'revoked_at'")
+
+                if "used_attestation_ids" in data:
+                    if not isinstance(data["used_attestation_ids"], (list, set)):
+                        raise ValueError("Trust store 'used_attestation_ids' must be a list or set")
+                    for aid in data["used_attestation_ids"]:
+                        if not isinstance(aid, str) or not aid:
+                            raise ValueError(f"Invalid used_attestation_id: {aid!r}")
+
+                if "used_attestations" in data:
+                    if not isinstance(data["used_attestations"], dict):
+                        raise ValueError("Trust store 'used_attestations' must be a dictionary")
+                    for aid, rec in data["used_attestations"].items():
+                        if not isinstance(aid, str) or not isinstance(rec, dict):
+                            raise ValueError(f"Invalid used_attestations entry: {aid!r}")
+                        if "evidence_id" not in rec or not isinstance(rec["evidence_id"], str):
+                            raise ValueError(f"used_attestations entry '{aid}' missing valid 'evidence_id'")
+
+                if "used_operation_ids" in data:
+                    if not isinstance(data["used_operation_ids"], dict):
+                        raise ValueError("Trust store 'used_operation_ids' must be a dictionary")
+                    for op_id, op_rec in data["used_operation_ids"].items():
+                        if not isinstance(op_id, str) or not isinstance(op_rec, dict):
+                            raise ValueError(f"Invalid used_operation_ids entry: {op_id!r}")
+                        if "session_id" not in op_rec or not isinstance(op_rec["session_id"], str):
+                            raise ValueError(f"used_operation_ids entry '{op_id}' missing valid 'session_id'")
+                        if "pid" not in op_rec or not isinstance(op_rec["pid"], int):
+                            raise ValueError(f"used_operation_ids entry '{op_id}' missing valid 'pid'")
 
                 self.keys = {str(k): str(v) for k, v in data.get("keys", {}).items()}
                 self.active_key_id = str(data.get("active_key_id", "default"))
                 self.revoked_keys = dict(data.get("revoked_keys", {}))
                 self.used_attestation_ids = set(data.get("used_attestation_ids", []))
+                self.used_attestations = dict(data.get("used_attestations", {}))
+                # Sync used_attestation_ids with used_attestations
+                for aid in self.used_attestations.keys():
+                    self.used_attestation_ids.add(aid)
                 self.used_operation_ids = dict(data.get("used_operation_ids", {}))
             except Exception as e:
                 raise RuntimeError(f"Durable trust store at '{self.store_path}' is corrupted or unreadable: {e}") from e
 
     def save(self) -> None:
         """Atomically persist trust store state to disk."""
-        with self._lock:
+        with self._file_lock():
             if not self.store_path:
                 return
             if os.path.islink(self.store_path):
                 raise RuntimeError(f"Refusing to save trust store to symlink: '{self.store_path}'")
             payload = {
-                "schema_version": "1.0.0",
+                "schema_version": "1.1.0",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "active_key_id": self.active_key_id,
                 "keys": self.keys,
                 "revoked_keys": self.revoked_keys,
                 "used_attestation_ids": sorted(list(self.used_attestation_ids)),
+                "used_attestations": getattr(self, "used_attestations", {}),
                 "used_operation_ids": self.used_operation_ids,
             }
             dir_name = os.path.dirname(os.path.abspath(self.store_path))
@@ -930,17 +1027,18 @@ class DurableTrustStore:
                     pass
 
                 # Parent directory fsync
+                dir_flags = os.O_RDONLY
+                if hasattr(os, "O_DIRECTORY"):
+                    dir_flags |= os.O_DIRECTORY
                 try:
-                    dir_flags = os.O_RDONLY
-                    if hasattr(os, "O_DIRECTORY"):
-                        dir_flags |= os.O_DIRECTORY
                     dir_fd = os.open(dir_name, dir_flags)
                     try:
                         os.fsync(dir_fd)
                     finally:
                         os.close(dir_fd)
-                except OSError:
-                    pass
+                except OSError as dir_err:
+                    if dir_err.errno not in (errno.EINVAL, errno.ENOTSUP):
+                        raise
             except Exception as e:
                 if os.path.exists(tmp_path):
                     try:
@@ -957,10 +1055,17 @@ class DurableTrustStore:
                 raise ValueError("key_id and secret must be non-empty strings")
             if kid in self.revoked_keys:
                 raise ValueError(f"Cannot register key '{kid}': key is permanently revoked")
+            orig_keys = dict(self.keys)
+            orig_active = self.active_key_id
             self.keys[kid] = str(secret)
             if is_active or len(self.keys) == 1:
                 self.active_key_id = kid
-            self.save()
+            try:
+                self.save()
+            except Exception:
+                self.keys = orig_keys
+                self.active_key_id = orig_active
+                raise
 
     def rotate_key(self, new_key_id: str, new_secret: str) -> None:
         self.register_key(new_key_id, new_secret, is_active=True)
@@ -969,6 +1074,8 @@ class DurableTrustStore:
         with self._file_lock():
             self.load()
             kid = str(key_id)
+            orig_rev = dict(self.revoked_keys)
+            orig_active = self.active_key_id
             self.revoked_keys[kid] = {
                 "revoked_at": datetime.now(timezone.utc).isoformat(),
                 "reason": str(reason),
@@ -976,7 +1083,12 @@ class DurableTrustStore:
             if self.active_key_id == kid:
                 available = [k for k in self.keys.keys() if k not in self.revoked_keys]
                 self.active_key_id = available[0] if available else ""
-            self.save()
+            try:
+                self.save()
+            except Exception:
+                self.revoked_keys = orig_rev
+                self.active_key_id = orig_active
+                raise
 
     def is_revoked(self, key_id: str) -> bool:
         with self._file_lock():
@@ -989,13 +1101,166 @@ class DurableTrustStore:
             att_id = str(attestation_id)
             if att_id in self.used_attestation_ids:
                 raise ValueError(f"Replay of causal attestation ID '{att_id}' rejected")
+            orig_set = set(self.used_attestation_ids)
             self.used_attestation_ids.add(att_id)
-            self.save()
+            try:
+                self.save()
+            except Exception:
+                self.used_attestation_ids = orig_set
+                raise
 
     def is_attestation_used(self, attestation_id: str) -> bool:
         with self._file_lock():
             self.load()
             return str(attestation_id) in self.used_attestation_ids
+
+    def consume_attestation(
+        self,
+        attestation: "CausalAttestation",
+        evidence_id: str,
+        session_id: Optional[str] = None,
+        expected_pid: Optional[int] = None,
+        expected_process_identity: Optional[str] = None,
+        expected_executable_identity: Optional[str] = None,
+        expected_build_id: Optional[str] = None,
+        expected_target_host: Optional[str] = None,
+        secret: Optional[str] = None,
+        key_store: Optional["CaptureKeyStore"] = None,
+        current_time_ns: Optional[int] = None,
+    ) -> TrustConsumptionResult:
+        """Atomic trust-consumption contract eliminating check-then-record race conditions."""
+        with self._file_lock():
+            self.load()
+            att_id = str(attestation.attestation_id)
+            kid = str(attestation.key_id)
+
+            # 1. Revocation check
+            if kid in self.revoked_keys or attestation.revoked:
+                return TrustConsumptionResult(
+                    status=TrustConsumptionStatus.REVOKED,
+                    reason=f"Attestation key '{kid}' or attestation itself is revoked",
+                    attestation_id=att_id,
+                    key_id=kid,
+                    evidence_id=str(evidence_id),
+                )
+
+            # 2. Signature verification & identity validation
+            ok_v, err_v = attestation.verify(
+                secret=secret,
+                key_store=key_store,
+                current_time_ns=current_time_ns,
+                expected_session_id=session_id,
+                expected_pid=expected_pid,
+                expected_process_identity=expected_process_identity,
+                expected_executable_identity=expected_executable_identity,
+                expected_build_id=expected_build_id,
+                expected_target_host=expected_target_host,
+                trust_store=self,
+            )
+            if not ok_v:
+                if "KEY_REVOKED" in err_v:
+                    return TrustConsumptionResult(
+                        status=TrustConsumptionStatus.REVOKED,
+                        reason=err_v,
+                        attestation_id=att_id,
+                        key_id=kid,
+                        evidence_id=str(evidence_id),
+                    )
+                if "EXPIRED_ATTESTATION" in err_v:
+                    return TrustConsumptionResult(
+                        status=TrustConsumptionStatus.EXPIRED,
+                        reason=err_v,
+                        attestation_id=att_id,
+                        key_id=kid,
+                        evidence_id=str(evidence_id),
+                    )
+                if any(m in err_v for m in ("MISMATCH", "MISSING_", "INVALID_TARGET_PID", "CROSS_SESSION")):
+                    return TrustConsumptionResult(
+                        status=TrustConsumptionStatus.IDENTITY_MISMATCH,
+                        reason=err_v,
+                        attestation_id=att_id,
+                        key_id=kid,
+                        evidence_id=str(evidence_id),
+                    )
+                return TrustConsumptionResult(
+                    status=TrustConsumptionStatus.INVALID_SIGNATURE,
+                    reason=err_v,
+                    attestation_id=att_id,
+                    key_id=kid,
+                    evidence_id=str(evidence_id),
+                )
+
+            # 3. Anti-replay reservation / idempotent check
+            if not hasattr(self, "used_attestations"):
+                self.used_attestations: Dict[str, Dict[str, Any]] = {}
+
+            if att_id in self.used_attestation_ids:
+                bound_info = self.used_attestations.get(att_id)
+                if bound_info:
+                    bound_eid = bound_info.get("evidence_id")
+                    bound_sess = bound_info.get("session_id")
+                    bound_pid = bound_info.get("pid")
+                    # Exact original committed evidence recovery
+                    if bound_eid == str(evidence_id) and (not session_id or bound_sess == str(session_id)) and (expected_pid is None or int(bound_pid) == int(expected_pid)):
+                        return TrustConsumptionResult(
+                            status=TrustConsumptionStatus.IDEMPOTENT_RECOVERY,
+                            reason="Idempotent re-verification of same evidence record",
+                            attestation_id=att_id,
+                            key_id=kid,
+                            evidence_id=str(evidence_id),
+                            recorded_at=bound_info.get("recorded_at", ""),
+                        )
+                    else:
+                        return TrustConsumptionResult(
+                            status=TrustConsumptionStatus.REPLAY_CONFLICT,
+                            reason=f"Attestation ID '{att_id}' already consumed by evidence '{bound_eid}' (session={bound_sess}, pid={bound_pid})",
+                            attestation_id=att_id,
+                            key_id=kid,
+                            evidence_id=str(evidence_id),
+                        )
+                else:
+                    return TrustConsumptionResult(
+                        status=TrustConsumptionStatus.REPLAY_CONFLICT,
+                        reason=f"Attestation ID '{att_id}' already recorded as used in trust store",
+                        attestation_id=att_id,
+                        key_id=kid,
+                        evidence_id=str(evidence_id),
+                    )
+
+            # 4. Atomic durable consumption
+            now_iso = datetime.now(timezone.utc).isoformat()
+            orig_used_set = set(self.used_attestation_ids)
+            orig_used_dict = dict(self.used_attestations)
+
+            self.used_attestation_ids.add(att_id)
+            self.used_attestations[att_id] = {
+                "evidence_id": str(evidence_id),
+                "session_id": str(session_id or attestation.session_id),
+                "pid": int(expected_pid or attestation.target_identity.get("pid", 0)),
+                "recorded_at": now_iso,
+            }
+
+            try:
+                self.save()
+            except Exception as e:
+                self.used_attestation_ids = orig_used_set
+                self.used_attestations = orig_used_dict
+                return TrustConsumptionResult(
+                    status=TrustConsumptionStatus.PERSISTENCE_FAILURE,
+                    reason=f"Persistence failure during atomic trust consumption: {e}",
+                    attestation_id=att_id,
+                    key_id=kid,
+                    evidence_id=str(evidence_id),
+                )
+
+            return TrustConsumptionResult(
+                status=TrustConsumptionStatus.NEW_ACCEPTANCE,
+                reason="Successfully verified and consumed attestation",
+                attestation_id=att_id,
+                key_id=kid,
+                evidence_id=str(evidence_id),
+                recorded_at=now_iso,
+            )
 
     def record_used_operation(
         self,
@@ -1003,6 +1268,7 @@ class DurableTrustStore:
         session_id: str,
         pid: int,
         metadata: Optional[Dict[str, Any]] = None,
+        allow_idempotent: bool = False,
     ) -> None:
         with self._file_lock():
             self.load()
@@ -1013,7 +1279,24 @@ class DurableTrustStore:
                     raise ValueError(f"Receipt replay across sessions rejected for operation '{oid}'")
                 if prev.get("pid") is not None and int(prev["pid"]) != int(pid):
                     raise ValueError(f"Receipt replay across PIDs rejected for operation '{oid}'")
+
+                if metadata:
+                    for id_field in ("process_identity", "executable_identity", "build_id", "target_host"):
+                        p_val = prev.get(id_field)
+                        m_val = metadata.get(id_field)
+                        if p_val and m_val and str(p_val) != str(m_val):
+                            raise ValueError(f"Conflicting target identity '{id_field}' for operation '{oid}': {p_val} vs {m_val}")
+
+                if allow_idempotent:
+                    if metadata:
+                        prev.update(metadata)
+                        try:
+                            self.save()
+                        except Exception:
+                            pass
+                    return
                 raise ValueError(f"Operation ID '{oid}' is already committed and single-use")
+
             rec = {
                 "session_id": str(session_id),
                 "pid": int(pid),
@@ -1021,8 +1304,52 @@ class DurableTrustStore:
             }
             if metadata:
                 rec.update(metadata)
+
+            orig_ops = dict(self.used_operation_ids)
             self.used_operation_ids[oid] = rec
-            self.save()
+            try:
+                self.save()
+            except Exception:
+                self.used_operation_ids = orig_ops
+                raise
+
+    def bind_operation_receipt(self, op_id: str, receipt_id: str) -> None:
+        """Atomically bind an issued receipt ID to a committed operation in trust store."""
+        with self._file_lock():
+            self.load()
+            oid = str(op_id)
+            rid = str(receipt_id)
+            if oid not in self.used_operation_ids:
+                raise ValueError(f"Operation '{oid}' not recorded in trust store")
+            rec = self.used_operation_ids[oid]
+            bound_rcpt = rec.get("receipt_id")
+            if bound_rcpt and bound_rcpt != rid:
+                raise ValueError(f"Operation '{oid}' is already bound to receipt '{bound_rcpt}', cannot bind to '{rid}'")
+            orig_rcpt = bound_rcpt
+            rec["receipt_id"] = rid
+            try:
+                self.save()
+            except Exception:
+                rec["receipt_id"] = orig_rcpt
+                raise
+
+    def bind_operation_evidence(self, op_id: str, evidence_id: str) -> None:
+        """Atomically bind an evidence ID to a committed operation in trust store."""
+        with self._file_lock():
+            self.load()
+            oid = str(op_id)
+            eid = str(evidence_id)
+            if oid not in self.used_operation_ids:
+                raise ValueError(f"Operation '{oid}' not recorded in trust store")
+            rec = self.used_operation_ids[oid]
+            eids = rec.setdefault("evidence_ids", [])
+            if eid not in eids:
+                eids.append(eid)
+                try:
+                    self.save()
+                except Exception:
+                    eids.remove(eid)
+                    raise
 
     def is_operation_used(self, op_id: str) -> bool:
         with self._file_lock():

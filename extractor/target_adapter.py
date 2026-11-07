@@ -467,6 +467,32 @@ class TargetExecutionAdapter(ABC):
                 f"Capture transaction '{target_tx.transaction_id}' committed with 0 physical bytes read"
             )
 
+        # P0-2: Integrate DurableTrustStore.record_used_operation() before committing transaction
+        from .capture_backend import get_default_trust_store
+        eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
+        if eff_ts:
+            op_meta = {
+                "process_identity": str(cur_ident.get("process_identity", "")),
+                "executable_identity": str(cur_ident.get("executable_identity") or cur_ident.get("executable", "")),
+                "build_id": str(cur_ident.get("build_id", "")),
+                "target_host": str(th),
+                "operation_type": str(target_tx.operation_type),
+                "physical_bytes_read": int(target_tx.physical_bytes_read),
+                "physical_reads_count": int(target_tx.physical_reads_count),
+                "adapter_id": str(self.adapter_id),
+            }
+            try:
+                eff_ts.record_used_operation(
+                    op_id=target_tx.transaction_id,
+                    session_id=target_tx.session_id,
+                    pid=target_tx.pid,
+                    metadata=op_meta,
+                    allow_idempotent=False,
+                )
+            except Exception as e:
+                self.rollback_capture_transaction(target_tx, f"Trust store persistence failed: {e}")
+                raise
+
         target_tx.post_identity = dict(cur_ident)
         target_tx.end_time_ns = time.time_ns()
         target_tx.committed = True
@@ -659,7 +685,7 @@ class TargetExecutionAdapter(ABC):
     ) -> Any:
         """Issue an authenticated LiveCaptureReceipt bound to verified physical reads performed in a transaction."""
         self._ensure_tracking_state()
-        from .capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
+        from .capture_backend import get_default_trust_store, get_trusted_capture_authority_token, issue_live_capture_receipt
 
         tx: Optional[CaptureTransaction] = None
         if transaction is None:
@@ -794,6 +820,12 @@ class TargetExecutionAdapter(ABC):
             operation_type=tx.operation_type,
             capture_authority_token=token,
         )
+        eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
+        if eff_ts:
+            try:
+                eff_ts.bind_operation_receipt(tx.transaction_id, rcpt.receipt_id)
+            except Exception as e:
+                raise RuntimeError(f"Failed to bind receipt to operation in durable trust store: {e}") from e
         tx.receipt_issued = True
         self._issued_live_receipts.append(rcpt)
         return rcpt
