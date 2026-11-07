@@ -24,7 +24,7 @@ import platform
 import signal
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .capture_plan import CaptureMode, CapturePlan
@@ -928,6 +928,20 @@ class DurableTrustStore:
                     raise ValueError("Trust store payload must be a JSON dictionary")
 
                 # Strict schema and nested type validation
+                if "schema_version" in data:
+                    schema_ver = data["schema_version"]
+                    if not isinstance(schema_ver, str) or schema_ver not in ("1.0.0", "1.1.0"):
+                        raise ValueError(f"Unsupported or invalid trust store schema_version: {schema_ver!r}")
+
+                if "updated_at" in data:
+                    up_at = data["updated_at"]
+                    if not isinstance(up_at, str):
+                        raise ValueError(f"Invalid updated_at in trust store: {up_at!r}")
+                    try:
+                        datetime.fromisoformat(up_at)
+                    except Exception as iso_err:
+                        raise ValueError(f"Invalid updated_at ISO 8601 timestamp in trust store: {up_at!r}") from iso_err
+
                 if "keys" in data:
                     if not isinstance(data["keys"], dict):
                         raise ValueError("Trust store 'keys' field must be a dictionary")
@@ -943,6 +957,10 @@ class DurableTrustStore:
                             raise ValueError(f"Invalid revoked_keys entry: {k!r}")
                         if "revoked_at" not in v or not isinstance(v["revoked_at"], str):
                             raise ValueError(f"revoked_keys entry '{k}' missing valid 'revoked_at'")
+                        try:
+                            datetime.fromisoformat(v["revoked_at"])
+                        except Exception as iso_err:
+                            raise ValueError(f"revoked_keys entry '{k}' has invalid revoked_at timestamp") from iso_err
 
                 if "used_attestation_ids" in data:
                     if not isinstance(data["used_attestation_ids"], (list, set)):
@@ -955,21 +973,55 @@ class DurableTrustStore:
                     if not isinstance(data["used_attestations"], dict):
                         raise ValueError("Trust store 'used_attestations' must be a dictionary")
                     for aid, rec in data["used_attestations"].items():
-                        if not isinstance(aid, str) or not isinstance(rec, dict):
+                        if not isinstance(aid, str) or not isinstance(rec, dict) or not aid:
                             raise ValueError(f"Invalid used_attestations entry: {aid!r}")
-                        if "evidence_id" not in rec or not isinstance(rec["evidence_id"], str):
+                        if "evidence_id" not in rec or not isinstance(rec["evidence_id"], str) or not rec["evidence_id"]:
                             raise ValueError(f"used_attestations entry '{aid}' missing valid 'evidence_id'")
+                        if "session_id" in rec and (not isinstance(rec["session_id"], str) or not rec["session_id"]):
+                            raise ValueError(f"used_attestations entry '{aid}' has invalid session_id")
+                        if "pid" in rec:
+                            p = rec["pid"]
+                            if isinstance(p, bool) or not isinstance(p, int) or p < 0:
+                                raise ValueError(f"used_attestations entry '{aid}' has invalid pid: {p!r}")
+                        if "recorded_at" in rec:
+                            r_at = rec["recorded_at"]
+                            if not isinstance(r_at, str):
+                                raise ValueError(f"used_attestations entry '{aid}' has non-string recorded_at")
+                            try:
+                                datetime.fromisoformat(r_at)
+                            except Exception as iso_err:
+                                raise ValueError(f"used_attestations entry '{aid}' invalid recorded_at timestamp: {r_at!r}") from iso_err
 
                 if "used_operation_ids" in data:
                     if not isinstance(data["used_operation_ids"], dict):
                         raise ValueError("Trust store 'used_operation_ids' must be a dictionary")
                     for op_id, op_rec in data["used_operation_ids"].items():
-                        if not isinstance(op_id, str) or not isinstance(op_rec, dict):
+                        if not isinstance(op_id, str) or not isinstance(op_rec, dict) or not op_id:
                             raise ValueError(f"Invalid used_operation_ids entry: {op_id!r}")
-                        if "session_id" not in op_rec or not isinstance(op_rec["session_id"], str):
+                        if "session_id" not in op_rec or not isinstance(op_rec["session_id"], str) or not op_rec["session_id"]:
                             raise ValueError(f"used_operation_ids entry '{op_id}' missing valid 'session_id'")
-                        if "pid" not in op_rec or not isinstance(op_rec["pid"], int):
+                        if "pid" not in op_rec or isinstance(op_rec["pid"], bool) or not isinstance(op_rec["pid"], int) or op_rec["pid"] < 0:
                             raise ValueError(f"used_operation_ids entry '{op_id}' missing valid 'pid'")
+                        if "recorded_at" in op_rec:
+                            r_at = op_rec["recorded_at"]
+                            if not isinstance(r_at, str):
+                                raise ValueError(f"used_operation_ids entry '{op_id}' has non-string recorded_at")
+                            try:
+                                datetime.fromisoformat(r_at)
+                            except Exception as iso_err:
+                                raise ValueError(f"used_operation_ids entry '{op_id}' invalid recorded_at timestamp: {r_at!r}") from iso_err
+                        if "evidence_ids" in op_rec:
+                            eids = op_rec["evidence_ids"]
+                            if not isinstance(eids, list):
+                                raise ValueError(f"used_operation_ids entry '{op_id}' evidence_ids must be a list")
+                            if len(eids) != len(set(eids)):
+                                raise ValueError(f"used_operation_ids entry '{op_id}' contains duplicate evidence_ids")
+                            for eid in eids:
+                                if not isinstance(eid, str) or not eid:
+                                    raise ValueError(f"used_operation_ids entry '{op_id}' contains invalid evidence_id: {eid!r}")
+                        for str_field in ("receipt_id", "process_identity", "executable_identity", "build_id", "target_host", "observation_digest", "operation_type"):
+                            if str_field in op_rec and not isinstance(op_rec[str_field], str):
+                                raise ValueError(f"used_operation_ids entry '{op_id}' has invalid non-string '{str_field}'")
 
                 self.keys = {str(k): str(v) for k, v in data.get("keys", {}).items()}
                 self.active_key_id = str(data.get("active_key_id", "default"))
@@ -1021,24 +1073,17 @@ class DurableTrustStore:
                     raise
 
                 os.replace(tmp_path, self.store_path)
-                try:
-                    os.chmod(self.store_path, 0o600)
-                except OSError:
-                    pass
+                os.chmod(self.store_path, 0o600)
 
                 # Parent directory fsync
                 dir_flags = os.O_RDONLY
                 if hasattr(os, "O_DIRECTORY"):
                     dir_flags |= os.O_DIRECTORY
+                dir_fd = os.open(dir_name, dir_flags)
                 try:
-                    dir_fd = os.open(dir_name, dir_flags)
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-                except OSError as dir_err:
-                    if dir_err.errno not in (errno.EINVAL, errno.ENOTSUP):
-                        raise
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
             except Exception as e:
                 if os.path.exists(tmp_path):
                     try:
@@ -1281,19 +1326,63 @@ class DurableTrustStore:
                     raise ValueError(f"Receipt replay across PIDs rejected for operation '{oid}'")
 
                 if metadata:
-                    for id_field in ("process_identity", "executable_identity", "build_id", "target_host"):
+                    for id_field in (
+                        "process_identity",
+                        "executable_identity",
+                        "build_id",
+                        "target_host",
+                        "receipt_id",
+                        "observation_digest",
+                        "operation_type",
+                    ):
                         p_val = prev.get(id_field)
                         m_val = metadata.get(id_field)
                         if p_val and m_val and str(p_val) != str(m_val):
-                            raise ValueError(f"Conflicting target identity '{id_field}' for operation '{oid}': {p_val} vs {m_val}")
+                            raise ValueError(
+                                f"Conflicting target identity or metadata '{id_field}' for operation '{oid}': {p_val} vs {m_val}"
+                            )
+
+                    # Multi-evidence operation derivation checks
+                    incoming_eid = metadata.get("evidence_id")
+                    bound_eid = prev.get("evidence_id")
+                    bound_eids = list(prev.get("evidence_ids", []))
+                    if bound_eid and bound_eid not in bound_eids:
+                        bound_eids.insert(0, bound_eid)
+
+                    if incoming_eid and bound_eid and incoming_eid != bound_eid:
+                        derived_from = metadata.get("derived_from")
+                        parent_eids = metadata.get("parent_evidence_ids")
+                        d_list = [derived_from] if isinstance(derived_from, str) else list(derived_from or [])
+                        p_list = [parent_eids] if isinstance(parent_eids, str) else list(parent_eids or [])
+                        has_derivation = any(d in bound_eids for d in d_list) or any(p in bound_eids for p in p_list)
+                        if not has_derivation:
+                            raise ValueError(
+                                f"Operation '{oid}' is already bound to primary evidence '{bound_eid}'. "
+                                f"Secondary evidence '{incoming_eid}' requires verifiable derivation from primary observation."
+                            )
 
                 if allow_idempotent:
                     if metadata:
-                        prev.update(metadata)
+                        orig_prev = dict(prev)
+                        orig_eids = list(prev.get("evidence_ids", []))
+                        for k, v in metadata.items():
+                            if k == "evidence_id" and "evidence_id" in prev and prev["evidence_id"] != v:
+                                continue
+                            prev[k] = v
+                        if metadata.get("evidence_id"):
+                            e_list = prev.setdefault("evidence_ids", [])
+                            if metadata["evidence_id"] not in e_list:
+                                e_list.append(metadata["evidence_id"])
                         try:
                             self.save()
                         except Exception:
-                            pass
+                            prev.clear()
+                            prev.update(orig_prev)
+                            if orig_eids:
+                                prev["evidence_ids"] = orig_eids
+                            else:
+                                prev.pop("evidence_ids", None)
+                            raise
                     return
                 raise ValueError(f"Operation ID '{oid}' is already committed and single-use")
 
@@ -1304,6 +1393,8 @@ class DurableTrustStore:
             }
             if metadata:
                 rec.update(metadata)
+            if metadata and metadata.get("evidence_id"):
+                rec["evidence_ids"] = [metadata["evidence_id"]]
 
             orig_ops = dict(self.used_operation_ids)
             self.used_operation_ids[oid] = rec
@@ -1330,10 +1421,19 @@ class DurableTrustStore:
             try:
                 self.save()
             except Exception:
-                rec["receipt_id"] = orig_rcpt
+                if orig_rcpt is None:
+                    rec.pop("receipt_id", None)
+                else:
+                    rec["receipt_id"] = orig_rcpt
                 raise
 
-    def bind_operation_evidence(self, op_id: str, evidence_id: str) -> None:
+    def bind_operation_evidence(
+        self,
+        op_id: str,
+        evidence_id: str,
+        derived_from: Optional[Union[str, List[str]]] = None,
+        parent_evidence_ids: Optional[List[str]] = None,
+    ) -> None:
         """Atomically bind an evidence ID to a committed operation in trust store."""
         with self._file_lock():
             self.load()
@@ -1343,12 +1443,24 @@ class DurableTrustStore:
                 raise ValueError(f"Operation '{oid}' not recorded in trust store")
             rec = self.used_operation_ids[oid]
             eids = rec.setdefault("evidence_ids", [])
+            if not eids and "evidence_id" in rec and rec["evidence_id"]:
+                eids.append(rec["evidence_id"])
             if eid not in eids:
+                if len(eids) > 0:
+                    d_list = [derived_from] if isinstance(derived_from, str) else list(derived_from or [])
+                    p_list = [parent_evidence_ids] if isinstance(parent_evidence_ids, str) else list(parent_evidence_ids or [])
+                    has_valid_derivation = any(d in eids for d in d_list) or any(p in eids for p in p_list)
+                    if not has_valid_derivation:
+                        raise ValueError(
+                            f"Multi-evidence operation '{oid}' rejected: secondary evidence '{eid}' lacks "
+                            f"verifiable derivation from primary observation '{eids[0]}'."
+                        )
+                orig_eids = list(eids)
                 eids.append(eid)
                 try:
                     self.save()
                 except Exception:
-                    eids.remove(eid)
+                    rec["evidence_ids"] = orig_eids
                     raise
 
     def is_operation_used(self, op_id: str) -> bool:

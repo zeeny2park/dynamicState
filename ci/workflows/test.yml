@@ -297,6 +297,26 @@ jobs:
         run: |
           python3 -m unittest tests/test_phase2_0_a_3_17_multiprocess_crash_boundaries.py
 
+      - name: Run Phase 2.0-A.3.18 Persistence Failure Closure Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_persistence_failure_closure.py
+
+      - name: Run Phase 2.0-A.3.18 Immutable Operation Bindings Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_immutable_operation_bindings.py
+
+      - name: Run Phase 2.0-A.3.18 Strict Index Equality Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_strict_index_equality.py
+
+      - name: Run Phase 2.0-A.3.18 Schema and Nested Validation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_schema_and_nested_validation.py
+
+      - name: Run Phase 2.0-A.3.18 Deterministic Multiprocess Barriers Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_deterministic_multiprocess_barriers.py
+
       - name: Run All Remaining Tests
         run: |
           python3 -m unittest discover tests

@@ -1002,20 +1002,35 @@ class EvidenceLedger:
                     t_ident = record.target_identity or {}
                     pid_val = t_ident.get("pid")
                     eff_pid = int(pid_val) if pid_val is not None and not isinstance(pid_val, bool) else 0
+                    op_meta = {
+                        "evidence_id": record.evidence_id,
+                        "process_identity": str(t_ident.get("process_identity", "")),
+                        "executable_identity": str(t_ident.get("executable_identity") or t_ident.get("executable", "")),
+                        "build_id": str(t_ident.get("build_id", "")),
+                    }
+                    if t_ident.get("target_host"):
+                        op_meta["target_host"] = str(t_ident["target_host"])
+                    if (record.details or {}).get("derived_from"):
+                        op_meta["derived_from"] = record.details["derived_from"]
+                    if record.parent_evidence_ids:
+                        op_meta["parent_evidence_ids"] = list(record.parent_evidence_ids)
+                    if (record.details or {}).get("observation_digest"):
+                        op_meta["observation_digest"] = str(record.details["observation_digest"])
+
                     self.trust_store.record_used_operation(
                         op_id=str(op_id),
                         session_id=record.session_id or self.session_id,
                         pid=eff_pid,
-                        metadata={
-                            "evidence_id": record.evidence_id,
-                            "process_identity": str(t_ident.get("process_identity", "")),
-                            "executable_identity": str(t_ident.get("executable_identity") or t_ident.get("executable", "")),
-                            "build_id": str(t_ident.get("build_id", "")),
-                        },
+                        metadata=op_meta,
                         allow_idempotent=True,
                     )
                     if hasattr(self.trust_store, "bind_operation_evidence"):
-                        self.trust_store.bind_operation_evidence(str(op_id), record.evidence_id)
+                        self.trust_store.bind_operation_evidence(
+                            str(op_id),
+                            record.evidence_id,
+                            derived_from=(record.details or {}).get("derived_from"),
+                            parent_evidence_ids=record.parent_evidence_ids,
+                        )
 
             self._records.append(record)
             self._by_id[record.evidence_id] = record
@@ -1346,13 +1361,25 @@ class EvidenceLedger:
                         raise ValueError(f"Receipt replay across sessions rejected for operation '{op_id}'")
                     if exp_pid is not None and prev.get("pid") is not None and prev["pid"] != exp_pid:
                         raise ValueError(f"Receipt replay across PIDs rejected for operation '{op_id}'")
-                self._used_operation_ids[op_id] = {
+                t_ident = record.target_identity or {}
+                rec_used_op = {
                     "session_id": record.session_id or self.session_id,
                     "pid": exp_pid,
                     "evidence_id": record.evidence_id,
                     "observation": record.observation,
                     "field": eff_field,
                 }
+                if rcpt_id:
+                    rec_used_op["receipt_id"] = str(rcpt_id)
+                if t_ident.get("process_identity"):
+                    rec_used_op["process_identity"] = str(t_ident["process_identity"])
+                if t_ident.get("executable_identity") or t_ident.get("executable"):
+                    rec_used_op["executable_identity"] = str(t_ident.get("executable_identity") or t_ident.get("executable"))
+                if t_ident.get("build_id"):
+                    rec_used_op["build_id"] = str(t_ident["build_id"])
+                if t_ident.get("target_host"):
+                    rec_used_op["target_host"] = str(t_ident["target_host"])
+                self._used_operation_ids[op_id] = rec_used_op
         elif prov_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
             att = p_prov.get("verifier_attestation") or p_details.get("verifier_attestation")
             if not att or not isinstance(att, dict) or att.get("attestation_rejected") or not att.get("token_sig"):
@@ -1784,20 +1811,27 @@ class EvidenceLedger:
                     f"Operation mapping mismatch: serialized operation keys differ from validated records"
                 )
             for op_k, ev_list in ser_op_to_ev.items():
-                if set(ev_list) != set(rebuilt_op_to_ev.get(op_k, [])):
+                if len(ev_list) != len(set(ev_list)):
+                    raise ValueError(
+                        f"Duplicate evidence ID detected in serialized operation_to_evidence_ids for operation '{op_k}': {ev_list}"
+                    )
+                rebuilt_list = rebuilt_op_to_ev.get(op_k, [])
+                if ev_list != rebuilt_list:
                     raise ValueError(
                         f"Evidence mapping mismatch for operation '{op_k}': "
-                        f"serialized={ev_list}, rebuilt={rebuilt_op_to_ev.get(op_k)}"
+                        f"serialized={ev_list}, rebuilt={rebuilt_list}"
                     )
 
         if "used_operation_ids" in data:
             ser_used_ops = dict(data.get("used_operation_ids", {}))
+            if set(ser_used_ops.keys()) != set(rebuilt_used_ops.keys()):
+                missing = set(rebuilt_used_ops.keys()) - set(ser_used_ops.keys())
+                extra = set(ser_used_ops.keys()) - set(rebuilt_used_ops.keys())
+                raise ValueError(
+                    f"Forged operation mapping detected: key-set mismatch between serialized and rebuilt "
+                    f"used_operation_ids: missing={sorted(list(missing))}, extra={sorted(list(extra))}"
+                )
             for op_k, op_dict in ser_used_ops.items():
-                if op_k not in rebuilt_used_ops:
-                    raise ValueError(
-                        f"Forged operation mapping detected: operation '{op_k}' exists in serialized "
-                        f"used_operation_ids but has no validated record in ledger"
-                    )
                 rebuilt_rec = rebuilt_used_ops[op_k]
                 if op_dict.get("session_id") != rebuilt_rec.get("session_id"):
                     raise ValueError(
@@ -1809,6 +1843,14 @@ class EvidenceLedger:
                         raise ValueError(
                             f"PID inconsistency for operation '{op_k}': serialized={op_dict.get('pid')}, "
                             f"rebuilt={rebuilt_rec.get('pid')}"
+                        )
+                for id_f in ("process_identity", "executable_identity", "build_id", "target_host", "receipt_id"):
+                    s_v = op_dict.get(id_f)
+                    r_v = rebuilt_rec.get(id_f)
+                    if s_v is not None and r_v is not None and str(s_v) != str(r_v):
+                        raise ValueError(
+                            f"Identity/receipt metadata mismatch for operation '{op_k}', field '{id_f}': "
+                            f"serialized={s_v}, rebuilt={r_v}"
                         )
 
         return ledger
