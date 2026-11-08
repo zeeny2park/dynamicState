@@ -24,6 +24,7 @@ from extractor.diagnostic_rule_model import (
     VERDICT_CONFIRMED,
     VERDICT_LIKELY,
     VERDICT_SUPPORTED,
+    VERDICT_OBSERVED,
     VERDICT_REFUTED,
     VERDICT_INCONCLUSIVE,
     VERDICT_NOT_APPLICABLE,
@@ -53,7 +54,7 @@ class CompetingHypothesis:
     category: str
     title: str = ""
     domain: str = "GENERAL"
-    status: str = VERDICT_INCONCLUSIVE  # CONFIRMED, LIKELY, SUPPORTED, REFUTED, INCONCLUSIVE, NOT_APPLICABLE
+    status: str = VERDICT_INCONCLUSIVE  # CONFIRMED, LIKELY, SUPPORTED, OBSERVED, REFUTED, INCONCLUSIVE, NOT_APPLICABLE
     confidence: float = 0.50
     confidence_basis: str = ""
     supporting_observations: List[str] = field(default_factory=list)
@@ -67,33 +68,106 @@ class CompetingHypothesis:
     supporting_evidence_ids: List[str] = field(default_factory=list)
     contradicting_evidence_ids: List[str] = field(default_factory=list)
     evidence_dependencies: Dict[str, List[str]] = field(default_factory=dict)
+    missing_evidence: List[str] = field(default_factory=list)
+    unverified_evidence_ids: List[str] = field(default_factory=list)
+    target_pid: Optional[int] = None
+    investigation_id: Optional[str] = None
+    target_identity: Optional[str] = None
+    allow_single_evidence_confirmation: bool = False
+    primary_evidence_rule: Optional[str] = None
     details: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_viable(self) -> bool:
         return self.status in (VERDICT_CONFIRMED, VERDICT_LIKELY, VERDICT_SUPPORTED, VERDICT_INCONCLUSIVE)
 
+    def get_independent_root_sources(self) -> Set[str]:
+        """Calculates the set of independent root evidence sources, resolving dependency trees.
+        
+        Ensures multiple observations or derived records sharing one root evidence source
+        do NOT count as independent evidence.
+        """
+        roots: Set[str] = set()
+        for ev_id in self.supporting_evidence_ids:
+            curr = ev_id
+            visited = set()
+            while curr in self.evidence_dependencies and self.evidence_dependencies[curr]:
+                visited.add(curr)
+                parents = [p for p in self.evidence_dependencies[curr] if p not in visited]
+                if not parents:
+                    break
+                curr = parents[0]
+            roots.add(curr)
+        return roots
+
     def add_supporting_observation(
         self,
         observation: str,
         evidence_id: Optional[str] = None,
         depends_on: Optional[List[str]] = None,
+        weight: float = 0.0,
+        evidence_record: Optional[Any] = None,
+        target_context: Optional[Dict[str, Any]] = None,
+        is_verified: bool = True,
     ) -> bool:
-        """Adds supporting observation with anti-double-counting and dependency tracking."""
-        if observation in self.supporting_observations:
+        """Adds supporting observation with strict validation, anti-double-counting, and dependency tracking.
+        
+        Rejects:
+        - Re-adding identical observation or evidence ID (idempotency, prevents confidence inflation).
+        - Evidence from another investigation or target context.
+        - Non-existent evidence ID when ledger context is provided.
+        """
+        ctx = target_context or {}
+        exp_inv = ctx.get("investigation_id") or self.investigation_id
+        exp_pid = ctx.get("target_pid") or ctx.get("pid") or self.target_pid
+        exp_target = ctx.get("target_identity") or self.target_identity
+
+        # Target context validation
+        if evidence_record:
+            rec_inv = getattr(evidence_record, "session_id", None) or getattr(evidence_record, "investigation_id", None)
+            rec_pid = getattr(evidence_record, "target_pid", None) or getattr(evidence_record, "pid", None)
+            rec_target = getattr(evidence_record, "target_identity", None)
+            if exp_inv and rec_inv and exp_inv != rec_inv:
+                return False
+            if exp_pid and rec_pid and exp_pid != rec_pid:
+                return False
+            if exp_target and rec_target and exp_target != rec_target:
+                return False
+
+        # Ledger resolution validation (non-existent Evidence ID rejection)
+        if evidence_id and "ledger" in ctx:
+            ledger = ctx["ledger"]
+            if hasattr(ledger, "has") and not ledger.has(evidence_id):
+                return False
+            elif hasattr(ledger, "records"):
+                existing_ids = {r.evidence_id for r in ledger.records}
+                if evidence_id not in existing_ids:
+                    return False
+
+        # Idempotency and anti-double-counting checks
+        if observation in self.supporting_observations and (not evidence_id or evidence_id in self.supporting_evidence_ids):
             return False
-        # If evidence_id is provided and already recorded as supporting evidence, avoid treating description as independent
-        if evidence_id and evidence_id in self.supporting_evidence_ids:
+        if evidence_id and evidence_id in self.supporting_evidence_ids and observation in self.supporting_observations:
             return False
 
-        self.supporting_observations.append(observation)
+        # If observation is not present, add it
+        if observation not in self.supporting_observations:
+            self.supporting_observations.append(observation)
+
+        # If evidence_id is provided
         if evidence_id:
+            if evidence_id in self.supporting_evidence_ids:
+                return False
             if evidence_id not in self.evidence_ids:
                 self.evidence_ids.append(evidence_id)
-            if evidence_id not in self.supporting_evidence_ids:
-                self.supporting_evidence_ids.append(evidence_id)
+            self.supporting_evidence_ids.append(evidence_id)
             if depends_on:
                 self.evidence_dependencies[evidence_id] = list(depends_on)
+            if not is_verified:
+                self.unverified_evidence_ids.append(evidence_id)
+
+        if weight > 0.0:
+            self.confidence = min(0.99, self.confidence + weight)
 
         self.evaluate_verdict()
         return True
@@ -103,14 +177,44 @@ class CompetingHypothesis:
         contradiction: str,
         evidence_id: Optional[str] = None,
         depends_on: Optional[List[str]] = None,
+        weight: float = 0.0,
+        evidence_record: Optional[Any] = None,
+        target_context: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Adds contradictory observation with anti-double-counting and authority tracking."""
-        if contradiction in self.contradicting_observations:
+        ctx = target_context or {}
+        exp_inv = ctx.get("investigation_id") or self.investigation_id
+        exp_pid = ctx.get("target_pid") or ctx.get("pid") or self.target_pid
+        exp_target = ctx.get("target_identity") or self.target_identity
+
+        if evidence_record:
+            rec_inv = getattr(evidence_record, "session_id", None) or getattr(evidence_record, "investigation_id", None)
+            rec_pid = getattr(evidence_record, "target_pid", None) or getattr(evidence_record, "pid", None)
+            rec_target = getattr(evidence_record, "target_identity", None)
+            if exp_inv and rec_inv and exp_inv != rec_inv:
+                return False
+            if exp_pid and rec_pid and exp_pid != rec_pid:
+                return False
+            if exp_target and rec_target and exp_target != rec_target:
+                return False
+
+        if evidence_id and "ledger" in ctx:
+            ledger = ctx["ledger"]
+            if hasattr(ledger, "has") and not ledger.has(evidence_id):
+                return False
+            elif hasattr(ledger, "records"):
+                existing_ids = {r.evidence_id for r in ledger.records}
+                if evidence_id not in existing_ids:
+                    return False
+
+        if contradiction in self.contradicting_observations and (not evidence_id or evidence_id in self.contradicting_evidence_ids):
             return False
-        if evidence_id and evidence_id in self.contradicting_evidence_ids:
+        if evidence_id and evidence_id in self.contradicting_evidence_ids and contradiction in self.contradicting_observations:
             return False
 
-        self.contradicting_observations.append(contradiction)
+        if contradiction not in self.contradicting_observations:
+            self.contradicting_observations.append(contradiction)
+
         if evidence_id:
             if evidence_id not in self.evidence_ids:
                 self.evidence_ids.append(evidence_id)
@@ -119,28 +223,64 @@ class CompetingHypothesis:
             if depends_on:
                 self.evidence_dependencies[evidence_id] = list(depends_on)
 
+        if weight > 0.0:
+            self.confidence = max(0.05, self.confidence - weight)
+
         self.evaluate_verdict()
         return True
 
     def evaluate_verdict(self) -> str:
-        """Updates hypothesis status following strict verdict semantics."""
-        # Contradicted: any authoritative counter-evidence refutes the hypothesis
+        """Updates hypothesis status following strict verdict semantics.
+        
+        Rules:
+        - Contradicted by authoritative evidence -> VERDICT_REFUTED.
+        - Missing evidence -> VERDICT_INCONCLUSIVE (never REFUTED or CONFIRMED).
+        - Descriptive observations alone without Evidence IDs CANNOT produce CONFIRMED.
+        - Unverified Evidence IDs CANNOT produce CONFIRMED.
+        - Two derived records sharing one root evidence source do NOT count as independent evidence.
+        - CONFIRMED requires >= 2 independent root evidence sources (or >= 1 if explicitly permitted
+          by primary evidence rule), zero contradictions, zero unverified evidence, and confidence >= 0.90.
+        """
+        # Contradicted: authoritative counter-evidence refutes the hypothesis
         if self.contradicting_observations or self.contradicting_evidence_ids:
             self.status = VERDICT_REFUTED
             self.confidence = min(self.confidence, 0.15)
             return self.status
 
-        # P0/P1: Confidence score alone CANNOT produce CONFIRMED!
-        # Requires at least one verified supporting observation with valid evidence ID,
-        # and zero unrefuted contradictions.
-        distinct_supp_count = len(self.supporting_evidence_ids) if self.supporting_evidence_ids else len(self.supporting_observations)
-        
-        # CONFIRMED requires high confidence AND distinct supporting evidence with verified IDs
-        if (len(self.supporting_evidence_ids) >= 1 or len(self.supporting_observations) >= 2) and self.confidence >= 0.90:
+        # Missing evidence: must remain INCONCLUSIVE
+        if self.missing_evidence:
+            self.status = VERDICT_INCONCLUSIVE
+            return self.status
+
+        # Rule A: Descriptive observations without Evidence IDs cannot produce CONFIRMED
+        if not self.supporting_evidence_ids:
+            if self.supporting_observations:
+                self.status = VERDICT_LIKELY if self.confidence >= 0.70 else VERDICT_SUPPORTED
+            else:
+                self.status = VERDICT_INCONCLUSIVE
+            return self.status
+
+        # Rule B: Unverified Evidence ID cannot produce CONFIRMED
+        if self.unverified_evidence_ids:
+            self.status = VERDICT_LIKELY if self.confidence >= 0.70 else VERDICT_SUPPORTED
+            return self.status
+
+        # Rule E: Evaluate independent root evidence sources
+        independent_roots = self.get_independent_root_sources()
+        num_independent = len(independent_roots)
+
+        if num_independent == 0:
+            self.status = VERDICT_INCONCLUSIVE
+            return self.status
+
+        # Single evidence confirmation check: requires explicit rule permission
+        can_single_confirm = self.allow_single_evidence_confirmation or bool(self.primary_evidence_rule)
+
+        if (num_independent >= 2 or (num_independent >= 1 and can_single_confirm)) and self.confidence >= 0.90:
             self.status = VERDICT_CONFIRMED
-        elif distinct_supp_count >= 1 and self.confidence >= 0.70:
+        elif num_independent >= 1 and self.confidence >= 0.70:
             self.status = VERDICT_LIKELY
-        elif distinct_supp_count >= 1:
+        elif num_independent >= 1:
             self.status = VERDICT_SUPPORTED
         else:
             self.status = VERDICT_INCONCLUSIVE
@@ -171,6 +311,68 @@ class HypothesisComparisonResult:
 
 class CompetingHypothesisManager:
     """Manages creation, evaluation, and true information-gain comparison of competing hypotheses."""
+
+    def __init__(self, target_context: Optional[Dict[str, Any]] = None):
+        self.hypotheses: Dict[str, CompetingHypothesis] = {}
+        self.target_context: Dict[str, Any] = target_context or {}
+
+    def register_hypothesis(self, hyp: CompetingHypothesis) -> None:
+        self.hypotheses[hyp.hypothesis_id] = hyp
+
+    def get_hypothesis(self, hyp_id: str) -> Optional[CompetingHypothesis]:
+        return self.hypotheses.get(hyp_id)
+
+    def add_supporting_observation(
+        self,
+        hypothesis_id: str,
+        observation: str,
+        weight: float = 0.0,
+        evidence_id: Optional[str] = None,
+        depends_on: Optional[List[str]] = None,
+        evidence_record: Optional[Any] = None,
+        target_context: Optional[Dict[str, Any]] = None,
+        is_verified: bool = True,
+    ) -> bool:
+        hyp = self.hypotheses.get(hypothesis_id)
+        if not hyp:
+            return False
+        ctx = target_context or self.target_context
+        return hyp.add_supporting_observation(
+            observation=observation,
+            evidence_id=evidence_id,
+            depends_on=depends_on,
+            weight=weight,
+            evidence_record=evidence_record,
+            target_context=ctx,
+            is_verified=is_verified,
+        )
+
+    def add_contradicting_observation(
+        self,
+        hypothesis_id: str,
+        contradiction: str,
+        weight: float = 0.0,
+        evidence_id: Optional[str] = None,
+        depends_on: Optional[List[str]] = None,
+        evidence_record: Optional[Any] = None,
+        target_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        hyp = self.hypotheses.get(hypothesis_id)
+        if not hyp:
+            return False
+        ctx = target_context or self.target_context
+        return hyp.add_contradicting_observation(
+            contradiction=contradiction,
+            evidence_id=evidence_id,
+            depends_on=depends_on,
+            weight=weight,
+            evidence_record=evidence_record,
+            target_context=ctx,
+        )
+
+    def update_verdicts(self) -> None:
+        for hyp in self.hypotheses.values():
+            hyp.evaluate_verdict()
 
     @staticmethod
     def generate_competing_hypotheses(

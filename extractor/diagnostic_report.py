@@ -65,6 +65,9 @@ class ExecutiveSummarySection:
     critical_risks: List[str] = field(default_factory=list)
     unresolved_questions: List[str] = field(default_factory=list)
     recommended_next_actions: List[str] = field(default_factory=list)
+    verdict_rationale: str = ""
+    contributing_factors: List[str] = field(default_factory=list)
+    limiting_factors: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -372,7 +375,9 @@ class DiagnosticReport:
                     md.append(f"- **Contradicting Evidence IDs**: `{', '.join(c.get('contradicting_evidence_ids'))}`")
                 if c.get("limitations"):
                     md.append(f"- **Limitations**: {'; '.join(c.get('limitations'))}")
-                md.append(f"- **Duration**: `{c.get('duration_seconds', 0.0):.4f}s` (Start: `{c.get('start_timestamp')}`)\n")
+                dur_val = c.get("duration_seconds")
+                dur_str = f"{dur_val:.4f}s" if (dur_val is not None and isinstance(dur_val, (int, float))) else "UNKNOWN"
+                md.append(f"- **Duration**: `{dur_str}` (Start: `{c.get('start_timestamp') or 'N/A'}`)\n")
 
         md.extend([
             "---",
@@ -649,11 +654,15 @@ class DiagnosticReport:
                 f"PASS: {badge(str(sec_d.checks_passed), 'PASS')} | "
                 f"FAIL: {badge(str(sec_d.checks_failed), 'FAIL')} | "
                 f"INCONCLUSIVE: {badge(str(sec_d.checks_inconclusive), 'INCONCLUSIVE')} | "
-                f"NOT_APPLICABLE: {badge(str(sec_d.checks_not_applicable), 'NOT_APPLICABLE')}</p>",
+                f"NOT_APPLICABLE: {badge(str(sec_d.checks_not_applicable), 'NOT_APPLICABLE')} | "
+                f"NOT_EXECUTED: {badge(str(sec_d.checks_not_executed), 'NOT_EXECUTED')} | "
+                f"ERROR: {badge(str(sec_d.checks_error), 'ERROR')}</p>",
                 "<table>",
-                "<tr><th>Status</th><th>Check ID</th><th>Recipe</th><th>Criteria</th><th>Observations</th><th>Interpretation</th></tr>",
+                "<tr><th>Status</th><th>Check ID</th><th>Recipe</th><th>Criteria</th><th>Observations</th><th>Interpretation</th><th>Duration</th></tr>",
             ])
             for c in sec_d.checks:
+                dur_val = c.get("duration_seconds")
+                dur_str = f"{dur_val:.4f}s" if (dur_val is not None and isinstance(dur_val, (int, float))) else "UNKNOWN"
                 html_out.append(
                     f"<tr>"
                     f"<td>{badge(c.get('status', 'UNKNOWN'), c.get('status'))}</td>"
@@ -662,6 +671,7 @@ class DiagnosticReport:
                     f"<td><small>{html.escape(str(c.get('decision_criteria', '')))}</small></td>"
                     f"<td><code>{html.escape(str(c.get('actual_observations', ''))[:120])}</code></td>"
                     f"<td>{html.escape(c.get('technical_interpretation', ''))}</td>"
+                    f"<td><small>{dur_str}</small></td>"
                     f"</tr>"
                 )
             html_out.append("</table>")

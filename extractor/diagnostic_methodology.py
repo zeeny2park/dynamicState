@@ -77,7 +77,7 @@ class DiagnosticCheck:
     missing_evidence: List[str] = field(default_factory=list)
     start_timestamp: Optional[str] = None
     completion_timestamp: Optional[str] = None
-    duration_seconds: float = 0.0
+    duration_seconds: Optional[float] = None
     monotonic_start: float = 0.0
     monotonic_end: float = 0.0
     inspected_entity: Optional[str] = None
@@ -98,7 +98,7 @@ class DiagnosticCheck:
 
     @property
     def duration_ms(self) -> Optional[float]:
-        return (self.duration_seconds * 1000.0) if self.duration_seconds > 0.0 else None
+        return (self.duration_seconds * 1000.0) if (self.duration_seconds is not None and self.duration_seconds > 0.0) else None
 
     def start(self) -> None:
         """Marks check start using monotonic clock and ISO-8601 wall clock."""
@@ -122,7 +122,7 @@ class DiagnosticCheck:
         if self.monotonic_start > 0.0 and self.monotonic_end >= self.monotonic_start:
             self.duration_seconds = self.monotonic_end - self.monotonic_start
         else:
-            self.duration_seconds = 0.0
+            self.duration_seconds = None
 
         if status not in CheckStatus.ALL_STATUSES:
             raise ValueError(f"Invalid status: {status!r}")

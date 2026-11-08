@@ -14,6 +14,7 @@ Orchestrates:
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 import hashlib
 import json
 import os
@@ -154,13 +155,36 @@ from .diagnostic_report import (
     LimitationsSection,
     TargetContextSection,
 )
+from .diagnostic_verdict_aggregator import (
+    DiagnosticVerdictAggregator,
+    AggregatedVerdict,
+    VERDICT_CONFIRMED_FAULT,
+    VERDICT_PROBABLE_FAULT,
+    VERDICT_HEALTHY,
+    VERDICT_INCONCLUSIVE,
+    VERDICT_ABORTED,
+)
 from .modules import ModuleAddressResolver
 from .debug_image import inspect_elf
 
 
+class DurableCommitOutcome(str, Enum):
+    NOT_COMMITTED = "NOT_COMMITTED"
+    COMMITTED = "COMMITTED"
+    COMMIT_UNKNOWN = "COMMIT_UNKNOWN"
+
+
 class InvestigationPersistenceError(RuntimeError):
     """Raised when investigation state persistence fails."""
-    pass
+    def __init__(
+        self,
+        message: str,
+        outcome: DurableCommitOutcome = DurableCommitOutcome.NOT_COMMITTED,
+        cause: Optional[Exception] = None,
+    ):
+        super().__init__(message)
+        self.outcome = outcome
+        self.cause = cause
 
 # -----------------------------------------------------------------------------
 # 1. State Machine States
@@ -1144,49 +1168,118 @@ class AdaptiveInvestigationSession:
         self._record_timeline_event("SESSION_CREATED", {"investigation_id": investigation_id, "pid": pid})
         self._save_to_disk()
 
-    def _save_to_disk(self) -> None:
-        """Persists authoritative investigation state atomically to disk."""
+    def _save_to_disk(self) -> DurableCommitOutcome:
+        """Persists authoritative investigation state atomically to disk.
+        
+        Durability and Trust Boundaries:
+        1. Atomic File Replacement: Relies on POSIX rename semantics via os.replace().
+        2. Pre-commit Durability: Writes to temporary file with mode 0600, explicit chmod verification,
+           and fsync() before replacement.
+        3. Durable Commit Point: os.replace(tmp_path, target_path) atomically replaces the target file.
+           Prior to replace, outcome is NOT_COMMITTED.
+        4. Post-replacement Durability: Calls os.fsync() on parent directory. If a failure occurs
+           following replacement during directory fsync, outcome is COMMIT_UNKNOWN.
+        5. Fail-Closed Boundaries: Rejects symlink directories and targets.
+        """
         target_path = os.path.join(self._investigations_dir, f"{self.investigation_id}.json")
         tmp_path = os.path.join(self._investigations_dir, f".tmp_{self.investigation_id}_{uuid.uuid4().hex[:8]}")
+        outcome = DurableCommitOutcome.NOT_COMMITTED
+
         try:
+            # 1. Symlink and trust-boundary check
+            if os.path.islink(self._investigations_dir):
+                raise InvestigationPersistenceError(
+                    f"Refusing to persist to symlink directory: {self._investigations_dir}",
+                    outcome=DurableCommitOutcome.NOT_COMMITTED,
+                )
+            if os.path.lexists(target_path) and os.path.islink(target_path):
+                raise InvestigationPersistenceError(
+                    f"Refusing to overwrite symlink target: {target_path}",
+                    outcome=DurableCommitOutcome.NOT_COMMITTED,
+                )
+
             os.makedirs(self._investigations_dir, mode=0o700, exist_ok=True)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
+
             fd = os.open(tmp_path, flags, 0o600)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(self.to_dict(), f, indent=2)
                     f.flush()
-                    try:
-                        os.chmod(tmp_path, 0o600)
-                    except OSError:
-                        pass
+                    # Apply and verify chmod 0600 - DO NOT SWALLOW
+                    os.chmod(tmp_path, 0o600)
+                    st = os.stat(tmp_path)
+                    if (st.st_mode & 0o777) != 0o600:
+                        raise InvestigationPersistenceError(
+                            f"Permissions verification failed on {tmp_path}: mode {oct(st.st_mode & 0o777)} != 0600",
+                            outcome=DurableCommitOutcome.NOT_COMMITTED,
+                        )
                     os.fsync(f.fileno())
-            except BaseException:
+            except BaseException as pre_commit_err:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-                raise
+                if isinstance(pre_commit_err, InvestigationPersistenceError):
+                    raise
+                raise InvestigationPersistenceError(
+                    f"Pre-commit operations failed for '{self.investigation_id}': {pre_commit_err}",
+                    outcome=DurableCommitOutcome.NOT_COMMITTED,
+                    cause=pre_commit_err,
+                ) from pre_commit_err
 
-            os.replace(tmp_path, target_path)
-
-            dir_flags = os.O_RDONLY
-            if hasattr(os, "O_DIRECTORY"):
-                dir_flags |= os.O_DIRECTORY
-            dir_fd = os.open(self._investigations_dir, dir_flags)
+            # 2. Durable Commit Point: Atomic rename
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+                os.replace(tmp_path, target_path)
+            except Exception as replace_err:
+                raise InvestigationPersistenceError(
+                    f"Atomic replacement failed for {target_path}: {replace_err}",
+                    outcome=DurableCommitOutcome.NOT_COMMITTED,
+                    cause=replace_err,
+                ) from replace_err
+
+            # Once replaced, the state is committed on disk
+            outcome = DurableCommitOutcome.COMMITTED
+
+            # 3. Post-replacement parent directory fsync
+            try:
+                dir_flags = os.O_RDONLY
+                if hasattr(os, "O_DIRECTORY"):
+                    dir_flags |= os.O_DIRECTORY
+                dir_fd = os.open(self._investigations_dir, dir_flags)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception as dir_err:
+                outcome = DurableCommitOutcome.COMMIT_UNKNOWN
+                raise InvestigationPersistenceError(
+                    f"Parent directory fsync failed after replacement: {dir_err}",
+                    outcome=DurableCommitOutcome.COMMIT_UNKNOWN,
+                    cause=dir_err,
+                ) from dir_err
+
+            return DurableCommitOutcome.COMMITTED
+        except InvestigationPersistenceError:
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
         except Exception as e:
             if "tmp_path" in locals() and os.path.exists(tmp_path):
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-            raise InvestigationPersistenceError(f"Authoritative persistence failure for investigation '{self.investigation_id}': {e}") from e
+            raise InvestigationPersistenceError(
+                f"Authoritative persistence failure for investigation '{self.investigation_id}': {e}",
+                outcome=outcome,
+                cause=e,
+            ) from e
 
     def _record_timeline_event(self, event_type: str, details: Dict[str, Any]) -> None:
         """Appends an event to the chronological timeline."""
@@ -2411,30 +2504,31 @@ class AdaptiveInvestigationSession:
         not_exec_chks = sum(1 for c in all_checks if c.status == CheckStatus.NOT_EXECUTED)
         err_chks = sum(1 for c in all_checks if c.status == CheckStatus.ERROR)
 
-        # Section A: Executive Summary
-        confirmed_probs = [h.problem_statement for h in self.active_hypotheses if h.status == "CONFIRMED"]
-        probable_probs = [h.problem_statement for h in self.active_hypotheses if h.status in ("LIKELY", "PROPOSED")]
-
-        overall_res = "INCONCLUSIVE"
-        if confirmed_probs:
-            overall_res = "CONFIRMED_FAULT"
-        elif probable_probs:
-            overall_res = "PROBABLE_FAULT"
-        elif self.conclusion and self.conclusion.stop_reason == "ALL_HYPOTHESES_REFUTED":
-            overall_res = "HEALTHY"
-        elif self.state == STATE_COMPLETED and not confirmed_probs and not probable_probs:
-            overall_res = "HEALTHY"
+        # Section A: Centralized Verdict Aggregation Policy
+        agg_verdict = DiagnosticVerdictAggregator.aggregate(
+            lifecycle_state=self.state,
+            stop_reason=self.conclusion.stop_reason if self.conclusion else None,
+            checks=all_checks,
+            active_hypotheses=self.active_hypotheses,
+            rejected_hypotheses=self.rejected_hypotheses,
+            limitations=[lim for lim in (self.target_assessment.limitations if self.target_assessment else [])],
+            target_assessment=self.target_assessment,
+            evidence_records=self.collected_evidence_records,
+        )
 
         sec_a = ExecutiveSummarySection(
             target_identity=f"PID {self.pid} ({self.companion_elf or 'live process'})",
             investigation_id=self.investigation_id,
-            overall_result=overall_res,
-            most_important_findings=confirmed_probs or probable_probs or ["No confirmed faults detected."],
-            confirmed_problems=confirmed_probs,
-            probable_problems=probable_probs,
-            critical_risks=[f"Critical risk: {p}" for p in confirmed_probs if any(k in p.upper() for k in ("CORRUPTION", "FREE", "DEADLOCK"))],
-            unresolved_questions=[h.problem_statement for h in self.active_hypotheses if h.status == "INCONCLUSIVE"],
-            recommended_next_actions=self.conclusion.recommended_remediations if self.conclusion else [],
+            overall_result=agg_verdict.overall_result,
+            most_important_findings=agg_verdict.confirmed_problems or agg_verdict.probable_problems or [agg_verdict.verdict_rationale],
+            confirmed_problems=agg_verdict.confirmed_problems,
+            probable_problems=agg_verdict.probable_problems,
+            critical_risks=agg_verdict.critical_risks,
+            unresolved_questions=agg_verdict.unresolved_questions,
+            recommended_next_actions=agg_verdict.recommended_next_actions,
+            verdict_rationale=agg_verdict.verdict_rationale,
+            contributing_factors=agg_verdict.contributing_factors,
+            limiting_factors=agg_verdict.limiting_factors,
         )
 
         # Section B: Target Context
@@ -2586,16 +2680,14 @@ class AdaptiveInvestigationSession:
 
         # Section I: Final Conclusions & Recommendations
         sec_i = FinalConclusionsSection(
-            overall_conclusion=self.conclusion.executive_summary if self.conclusion else "Investigation completed.",
-            confirmed_problems=confirmed_probs,
-            probable_problems=probable_probs,
+            overall_conclusion=agg_verdict.verdict_rationale,
+            confirmed_problems=agg_verdict.confirmed_problems,
+            probable_problems=agg_verdict.probable_problems,
             ruled_out_hypotheses=[{"hypothesis_id": rh.hypothesis_id, "rationale": rh.confidence_basis} for rh in self.rejected_hypotheses],
-            remaining_uncertainties=self.conclusion.missing_evidence_and_unknowns if self.conclusion else [],
-            recommended_next_diagnostic_steps=[
-                f"Verify {q}" for q in sec_a.unresolved_questions
-            ] or ["No further diagnostic steps required."],
-            expected_information_value=["Discriminates remaining suspected root causes."],
-            safe_remediation_suggestions=self.conclusion.recommended_remediations if self.conclusion else [],
+            remaining_uncertainties=agg_verdict.unresolved_questions or agg_verdict.limiting_factors,
+            recommended_next_diagnostic_steps=agg_verdict.recommended_next_actions,
+            expected_information_value=["Definitive verification of unresolved invariants" if agg_verdict.unresolved_questions else "Confirmation of clean execution"],
+            safe_remediation_suggestions=self.conclusion.recommended_remediations if (self.conclusion and self.conclusion.recommended_remediations) else agg_verdict.recommended_next_actions,
         )
 
         return DiagnosticReport(
@@ -2765,6 +2857,11 @@ class ExpertDiagnosticEngine:
             return self.sessions[investigation_id]
 
         disk_path = os.path.join(self._investigations_dir, f"{investigation_id}.json")
+        if os.path.islink(disk_path):
+            raise InvestigationPersistenceError(
+                f"Refusing to load from symlink: {disk_path}",
+                outcome=DurableCommitOutcome.NOT_COMMITTED,
+            )
         if os.path.exists(disk_path):
             try:
                 with open(disk_path, "r", encoding="utf-8") as f:
@@ -2772,9 +2869,13 @@ class ExpertDiagnosticEngine:
                 sess = AdaptiveInvestigationSession.from_dict(data)
                 self.sessions[investigation_id] = sess
                 return sess
+            except InvestigationPersistenceError:
+                raise
             except Exception as e:
                 raise InvestigationPersistenceError(
-                    f"Corrupted investigation session state on disk for '{investigation_id}': {e}"
+                    f"Corrupted investigation session state on disk for '{investigation_id}': {e}",
+                    outcome=DurableCommitOutcome.NOT_COMMITTED,
+                    cause=e,
                 ) from e
         return None
 
