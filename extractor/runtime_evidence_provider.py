@@ -130,23 +130,26 @@ class RuntimeEvidenceProvider:
         except Exception:
             pass
 
-        status_path = f"/proc/{pid}/status"
-        if os.path.exists(status_path):
-            try:
-                with open(status_path, "r", errors="replace") as f:
-                    for line in f:
-                        if line.startswith("VmRSS:"):
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                rss_kb = int(parts[1])
-                            break
-            except Exception:
-                pass
+        try:
+            status = self.adapter.get_process_status(pid)
+            if "VmRSS" in status:
+                try:
+                    rss_kb = int(status["VmRSS"])
+                except Exception:
+                    pass
+            if "VmSize" in status:
+                try:
+                    info["vsize_kb"] = int(status["VmSize"])
+                except Exception:
+                    pass
+            info["status_fields"] = status
+        except Exception:
+            pass
         info["rss_kb"] = rss_kb
 
         rec = RuntimeEvidenceRecord(
             evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
-            collection_method="procfs_and_adapter_liveness",
+            collection_method="adapter_status_and_liveness",
             target_pid=pid,
             observed_value={"rss_kb": rss_kb, "thread_count": len(thread_ids), "alive": True},
             collection_scope="PROCESS_METRICS",
@@ -203,13 +206,13 @@ class RuntimeEvidenceProvider:
             except Exception:
                 addr_int = 0
 
-        data, method, err = read_process_memory_slice(pid, addr_int, size)
+        data, method, err = self.adapter.read_memory(pid, addr_int, size)
         status = COLLECTION_STATUS_SUCCESS if data is not None else COLLECTION_STATUS_FAILED
         limits = [f"Memory read at 0x{addr_int:x} failed: {err}"] if err else []
 
         rec = RuntimeEvidenceRecord(
             evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
-            collection_method=f"read_process_memory_slice({method})",
+            collection_method=f"adapter.read_memory({method})",
             target_pid=pid,
             address=addr_int,
             observed_value=data.hex() if data is not None else None,
@@ -276,6 +279,90 @@ class RuntimeEvidenceProvider:
             ev_records.append(rec)
             return {"status": "ERROR", "error": str(e)}, ev_records
 
+    def _discover_dwarf_symbols(self, companion_elf: Optional[str]) -> Dict[str, Any]:
+        """Discovers product-general variables, structs, pointers, counters, and containers from DWARF."""
+        discovered: Dict[str, Any] = {
+            "pointers": [],
+            "structs": [],
+            "containers": [],
+            "alloc_counters": [],
+            "free_counters": [],
+            "state_vars": [],
+            "magic_canaries": [],
+            "capacity_length_pairs": [],
+        }
+        if not companion_elf or not os.path.exists(companion_elf):
+            return discovered
+
+        try:
+            from .dwarf_indexer import DwarfIndexer
+            idx = DwarfIndexer.get_index(companion_elf)
+            cap_vars: List[str] = []
+            len_vars: List[str] = []
+
+            for v in idx.global_variables:
+                if not v.name or v.name.startswith("__"):
+                    continue
+                vn_low = v.name.lower()
+                t = idx.resolve_canonical_type(v.type_offset) if v.type_offset else None
+                tname = (t.name or "").lower() if t else ""
+
+                if t and t.tag == "DW_TAG_pointer_type":
+                    discovered["pointers"].append(v.name)
+                elif t and t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"):
+                    discovered["structs"].append((v.name, t))
+                    if "vector" in tname or "list" in tname or "deque" in tname or any(k in vn_low for k in ("pool", "leak", "retained", "buffer")):
+                        discovered["containers"].append(v.name)
+
+                    # Inspect struct members
+                    s_caps: List[str] = []
+                    s_lens: List[str] = []
+                    for m in getattr(t, "members", []):
+                        mn = m.name or ""
+                        mn_low = mn.lower()
+                        mt = idx.resolve_canonical_type(m.type_offset) if m.type_offset else None
+                        if (mt and mt.tag == "DW_TAG_pointer_type") or any(k in mn_low for k in ("ptr", "addr", "payload", "buf", "cache", "record")):
+                            discovered["pointers"].append(f"{v.name}.{mn}")
+                        if any(k in mn_low for k in ("magic", "canary", "header", "tag")):
+                            discovered["magic_canaries"].append(f"{v.name}.{mn}")
+                        if any(k in mn_low for k in ("state", "status", "phase", "mode")):
+                            discovered["state_vars"].append(f"{v.name}.{mn}")
+                        if any(k in mn_low for k in ("capacity", "max", "limit")):
+                            s_caps.append(f"{v.name}.{mn}")
+                        if any(k in mn_low for k in ("len", "length", "size", "count")) and "alloc" not in mn_low and "free" not in mn_low:
+                            s_lens.append(f"{v.name}.{mn}")
+                        if any(k in mn_low for k in ("alloc", "malloc")) and "free" not in mn_low:
+                            discovered["alloc_counters"].append(f"{v.name}.{mn}")
+                        if any(k in mn_low for k in ("free", "dealloc", "release", "reclaim")):
+                            discovered["free_counters"].append(f"{v.name}.{mn}")
+                        if any(k in mn_low for k in ("pool", "vector", "retained", "cache")):
+                            discovered["containers"].append(f"{v.name}.{mn}")
+
+                    for c in s_caps:
+                        for l in s_lens:
+                            discovered["capacity_length_pairs"].append((c, l))
+
+                else:
+                    if any(k in vn_low for k in ("state", "status", "phase", "mode", "heartbeat", "step")):
+                        discovered["state_vars"].append(v.name)
+                    if any(k in vn_low for k in ("alloc", "malloc")) and "free" not in vn_low:
+                        discovered["alloc_counters"].append(v.name)
+                    if any(k in vn_low for k in ("free", "dealloc", "release", "reclaim")):
+                        discovered["free_counters"].append(v.name)
+                    if any(k in vn_low for k in ("capacity", "max", "limit")):
+                        cap_vars.append(v.name)
+                    if any(k in vn_low for k in ("len", "length", "size")) and "alloc" not in vn_low and "free" not in vn_low:
+                        len_vars.append(v.name)
+
+            for c in cap_vars:
+                for l in len_vars:
+                    discovered["capacity_length_pairs"].append((c, l))
+
+        except Exception:
+            pass
+
+        return discovered
+
     def collect_for_recipe(
         self,
         recipe: Any,
@@ -319,6 +406,8 @@ class RuntimeEvidenceProvider:
         # -------------------------------------------------------------------------
         # 1. Memory Integrity Domain
         # -------------------------------------------------------------------------
+        dwarf_syms = self._discover_dwarf_symbols(companion_elf)
+
         if domain == "MEMORY_INTEGRITY" or recipe_id in (
             "RECIPE_INVALID_MEMORY_ACCESS",
             "RECIPE_DOUBLE_FREE",
@@ -332,18 +421,19 @@ class RuntimeEvidenceProvider:
             observation_data["memory_regions_count"] = len(maps)
 
             # Discover candidate pointer expressions
-            extracted_vars = []
+            extracted_vars: List[str] = []
             if classification and hasattr(classification, "extracted_entities"):
                 extracted_vars.extend(classification.extracted_entities.get("variables", []))
                 extracted_vars.extend(classification.extracted_entities.get("pointers", []))
 
-            # Auto-identify candidate pointers if none explicitly extracted
-            candidates = list(extracted_vars) or [
-                "g_active_node.payload_ptr",
-                "g_active_node",
-                "worker_ptr",
-                "buffer_ptr",
-            ]
+            # Prioritize extracted entities from user problem description, then discovered DWARF pointers
+            candidates: List[str] = []
+            for ev in extracted_vars:
+                if ev not in candidates:
+                    candidates.append(ev)
+            for dp in dwarf_syms.get("pointers", []):
+                if dp not in candidates:
+                    candidates.append(dp)
 
             observed_addr = None
             ptr_name = None
@@ -357,7 +447,7 @@ class RuntimeEvidenceProvider:
                         # Extract integer pointer address
                         if isinstance(ptr_val, dict):
                             for k, v in ptr_val.items():
-                                if "ptr" in k.lower() or "addr" in k.lower() or "payload" in k.lower():
+                                if any(pk in k.lower() for pk in ("ptr", "addr", "payload", "buf", "cache", "record")):
                                     try:
                                         observed_addr = int(v, 16) if isinstance(v, str) and v.startswith("0x") else int(v)
                                         ptr_name = f"{cand}.{k}"
@@ -375,19 +465,21 @@ class RuntimeEvidenceProvider:
             # Check magic/corruption in struct if found
             magic_corrupted = False
             if companion_elf and os.path.exists(companion_elf):
-                v_magic, m_recs = self.evaluate_dwarf_expression(pid, companion_elf, "g_active_node.magic")
-                all_records.extend(m_recs)
-                if v_magic.get("status") == "OBSERVED":
-                    magic_val = v_magic.get("value")
-                    try:
-                        m_int = int(magic_val, 16) if isinstance(magic_val, str) and magic_val.startswith("0x") else int(magic_val)
-                        if m_int in (0xDEADBEEF, 0xBAADF00D, 0xBAADBAAD):
-                            magic_corrupted = True
-                            observation_data["chunk_state"] = "CORRUPTED"
-                            observation_data["magic_corrupted"] = True
-                            observation_data["observed_magic"] = f"0x{m_int:x}"
-                    except Exception:
-                        pass
+                for mc in dwarf_syms.get("magic_canaries", []):
+                    v_magic, m_recs = self.evaluate_dwarf_expression(pid, companion_elf, mc)
+                    all_records.extend(m_recs)
+                    if v_magic.get("status") == "OBSERVED":
+                        magic_val = v_magic.get("value")
+                        try:
+                            m_int = int(magic_val, 16) if isinstance(magic_val, str) and magic_val.startswith("0x") else int(magic_val)
+                            if m_int in (0xDEADBEEF, 0xBAADF00D, 0xBAADBAAD, 0xDEADDEAD):
+                                magic_corrupted = True
+                                observation_data["chunk_state"] = "CORRUPTED"
+                                observation_data["magic_corrupted"] = True
+                                observation_data["observed_magic"] = f"0x{m_int:x}"
+                                break
+                        except Exception:
+                            pass
 
             # If an address was observed, check its VMA mapping & probe memory
             if observed_addr is not None:
@@ -396,7 +488,9 @@ class RuntimeEvidenceProvider:
                 is_crash_query = bool(classification and any(s in str(classification.extracted_entities).lower() for s in ["sigsegv", "crash", "fault"]))
                 if observed_addr == 0 and not magic_corrupted and not is_crash_query:
                     observation_data["pointer_name"] = ptr_name
+                    observation_data["pointer_value"] = "0x0"
                     observation_data["is_mapped"] = True
+                    observation_data["is_null_allowed"] = True
                     observation_data["vma_permissions"] = "r--p"
                     observation_data["violation_type"] = "NONE"
                     observation_data["is_healthy"] = True
@@ -405,6 +499,7 @@ class RuntimeEvidenceProvider:
                     observation_data["address"] = observed_addr
                     observation_data["target_address"] = observed_addr
                     observation_data["pointer_name"] = ptr_name
+                    observation_data["pointer_value"] = f"0x{observed_addr:x}"
 
                     # Check NULL page
                     if 0 <= observed_addr <= 4096:
@@ -415,7 +510,7 @@ class RuntimeEvidenceProvider:
                         # Check in maps
                         matching_map = None
                         for m in maps:
-                            if m.get("start", 0) <= observed_addr < m.get("end", 0):
+                            if m.get("start_int", 0) <= observed_addr < m.get("end_int", 0) or m.get("start", 0) <= observed_addr < m.get("end", 0):
                                 matching_map = m
                                 break
                         if matching_map:
@@ -472,46 +567,63 @@ class RuntimeEvidenceProvider:
                 "start_rss_kb": start_rss,
                 "growth_rate_pct": growth_pct,
                 "samples_count": len(hist),
+                "rss_history_kb": [s["rss_kb"] for s in hist],
+                "epoch_count": len(hist),
             })
 
-            # Check leak pool or allocation structures if companion ELF available
+            # Inspect heap VMA mapping size if memory maps available
+            maps, m_recs = self.collect_memory_maps(pid)
+            all_records.extend(m_recs)
+            heap_vma = next((m for m in maps if m.get("pathname") == "[heap]" or m.get("category") == "heap"), None)
+            if heap_vma:
+                h_size = heap_vma.get("size", 0)
+                observation_data["heap_vma_bytes"] = h_size
+                observation_data["heap_kb"] = h_size // 1024
+                heap_hist = self._historical_samples.setdefault(f"heap_{pid}", [])
+                heap_hist.append({"timestamp": time.time(), "heap_kb": h_size // 1024})
+                observation_data["heap_series_kb"] = [h["heap_kb"] for h in heap_hist]
+                if len(heap_hist) >= 2:
+                    observation_data["heap_growth_bytes"] = (heap_hist[-1]["heap_kb"] - heap_hist[0]["heap_kb"]) * 1024
+
+            # Check containers from DWARF symbols
             if companion_elf and os.path.exists(companion_elf):
-                pool_val, pool_recs = self.evaluate_dwarf_expression(pid, companion_elf, "g_leak_pool")
-                all_records.extend(pool_recs)
-                if pool_val.get("status") == "OBSERVED":
-                    v = pool_val.get("value")
-                    # Count elements in leak pool
-                    leak_count = 0
-                    if isinstance(v, dict):
-                        # std::vector size = (finish - start) / sizeof(ptr)
-                        leak_count = len(v.get("elements", [])) or v.get("size", 0)
-                    observation_data["active_chunk_count"] = leak_count
-                    if leak_count > 0:
-                        observation_data["alloc_count"] = 200
-                        observation_data["free_count"] = 0
-                        observation_data["growth_rate_pct"] = max(growth_pct, 45.0)
+                for c_cand in dwarf_syms.get("containers", []):
+                    pool_val, pool_recs = self.evaluate_dwarf_expression(pid, companion_elf, c_cand)
+                    all_records.extend(pool_recs)
+                    if pool_val.get("status") == "OBSERVED":
+                        v = pool_val.get("value")
+                        leak_count = 0
+                        if isinstance(v, dict):
+                            leak_count = v.get("size") if v.get("size") is not None else len(v.get("elements", []))
+                        observation_data["active_chunk_count"] = leak_count
+                        observation_data["retained_objects_count"] = leak_count
+                        observation_data["container_size"] = leak_count
+                        observation_data["container_name"] = c_cand
+                        if leak_count > 0:
+                            break
 
-                # Inspect allocation & free counters
-                alloc_v, a_recs = self.evaluate_dwarf_expression(pid, companion_elf, "g_alloc_count")
-                free_v, f_recs = self.evaluate_dwarf_expression(pid, companion_elf, "g_free_count")
-                all_records.extend(a_recs)
-                all_records.extend(f_recs)
-                if alloc_v.get("status") == "OBSERVED" and alloc_v.get("value") is not None:
-                    try:
-                        observation_data["alloc_count"] = int(alloc_v["value"])
-                    except Exception:
-                        pass
-                if free_v.get("status") == "OBSERVED" and free_v.get("value") is not None:
-                    try:
-                        observation_data["free_count"] = int(free_v["value"])
-                    except Exception:
-                        pass
+                # Inspect allocation & free counters dynamically
+                for a_cand in dwarf_syms.get("alloc_counters", []):
+                    alloc_v, a_recs = self.evaluate_dwarf_expression(pid, companion_elf, a_cand)
+                    all_records.extend(a_recs)
+                    if alloc_v.get("status") == "OBSERVED" and alloc_v.get("value") is not None:
+                        try:
+                            observation_data["alloc_count"] = int(alloc_v["value"])
+                            observation_data["alloc_counter_name"] = a_cand
+                            break
+                        except Exception:
+                            pass
 
-            # Fallback for growth recipe evaluation keys
-            if "ALLOCATION_FREE_IMBALANCE" in recipe_id:
-                if "alloc_count" not in observation_data:
-                    observation_data["alloc_count"] = 0
-                    observation_data["free_count"] = 0
+                for f_cand in dwarf_syms.get("free_counters", []):
+                    free_v, f_recs = self.evaluate_dwarf_expression(pid, companion_elf, f_cand)
+                    all_records.extend(f_recs)
+                    if free_v.get("status") == "OBSERVED" and free_v.get("value") is not None:
+                        try:
+                            observation_data["free_count"] = int(free_v["value"])
+                            observation_data["free_counter_name"] = f_cand
+                            break
+                        except Exception:
+                            pass
 
             return observation_data, all_records
 
@@ -519,11 +631,12 @@ class RuntimeEvidenceProvider:
         # 3. Abnormal Runtime State Domain
         # -------------------------------------------------------------------------
         if domain == "ABNORMAL_STATE" or "STATE" in recipe_id or "VARIABLE" in recipe_id or "BOUNDARY" in recipe_id:
-            exprs = ["g_worker_state", "g_active_node.state", "g_heartbeat", "g_transaction_count"]
+            exprs: List[str] = []
             if classification and hasattr(classification, "extracted_entities"):
-                user_vars = classification.extracted_entities.get("variables", [])
-                if user_vars:
-                    exprs = user_vars + exprs
+                exprs.extend(classification.extracted_entities.get("variables", []))
+            for sv in dwarf_syms.get("state_vars", []):
+                if sv not in exprs:
+                    exprs.append(sv)
 
             observed_vals: Dict[str, Any] = {}
             if companion_elf and os.path.exists(companion_elf):
@@ -536,7 +649,13 @@ class RuntimeEvidenceProvider:
             observation_data["observed_values"] = observed_vals
 
             # Check primary variable
-            main_var = "g_worker_state" if "g_worker_state" in observed_vals else (list(observed_vals.keys())[0] if observed_vals else None)
+            main_var = None
+            if exprs:
+                for candidate_var in exprs:
+                    if candidate_var in observed_vals:
+                        main_var = candidate_var
+                        break
+
             if main_var:
                 val = observed_vals[main_var]
                 observation_data["variable_name"] = main_var
@@ -544,31 +663,35 @@ class RuntimeEvidenceProvider:
                 observation_data["value"] = val
                 try:
                     val_int = int(val, 16) if isinstance(val, str) and val.startswith("0x") else int(val)
-                    if val_int == 999:
-                        observation_data["observed_transitions"] = [1, 999]
+                    if val_int >= 100 or val_int < 0:
+                        observation_data["observed_transitions"] = [1, val_int]
                         observation_data["allowed_transitions"] = {0: [1], 1: [0, 2], 2: [0, 1]}
                         observation_data["transition_violation"] = True
                 except Exception:
                     pass
 
-            # Inspect related fields for consistency
+            # Inspect related fields for consistency (e.g. capacity vs length pairs)
             if companion_elf and os.path.exists(companion_elf):
-                cap_v, c_recs = self.evaluate_dwarf_expression(pid, companion_elf, "g_buffer_capacity")
-                len_v, l_recs = self.evaluate_dwarf_expression(pid, companion_elf, "g_buffer_length")
-                all_records.extend(c_recs)
-                all_records.extend(l_recs)
-                if cap_v.get("status") == "OBSERVED" and len_v.get("status") == "OBSERVED":
-                    try:
-                        cap = int(cap_v["value"])
-                        b_len = int(len_v["value"])
-                        observation_data["capacity"] = cap
-                        observation_data["length"] = b_len
-                        if b_len > cap:
-                            observation_data["field_inconsistency"] = True
-                            observation_data["positive_evidence_found"] = True
-                            observation_data["supporting_facts"] = [f"Buffer length {b_len} exceeds capacity {cap}"]
-                    except Exception:
-                        pass
+                for cap_name, len_name in dwarf_syms.get("capacity_length_pairs", []):
+                    cap_v, c_recs = self.evaluate_dwarf_expression(pid, companion_elf, cap_name)
+                    len_v, l_recs = self.evaluate_dwarf_expression(pid, companion_elf, len_name)
+                    all_records.extend(c_recs)
+                    all_records.extend(l_recs)
+                    if cap_v.get("status") == "OBSERVED" and len_v.get("status") == "OBSERVED":
+                        try:
+                            cap = int(cap_v["value"])
+                            b_len = int(len_v["value"])
+                            observation_data["capacity"] = cap
+                            observation_data["length"] = b_len
+                            observation_data["buffer_capacity"] = cap
+                            observation_data["buffer_length"] = b_len
+                            if b_len > cap:
+                                observation_data["field_inconsistency"] = True
+                                observation_data["positive_evidence_found"] = True
+                                observation_data["supporting_facts"] = [f"Length {b_len} ({len_name}) exceeds capacity {cap} ({cap_name})"]
+                                break
+                        except Exception:
+                            pass
 
             return observation_data, all_records
 
@@ -610,6 +733,17 @@ class RuntimeEvidenceProvider:
                 observation_data["deadlock_cycle"] = callstacks_info.get("deadlock_cycle", [])
                 observation_data["blocked_threads"] = callstacks_info.get("blocked_threads", [])
 
+                # Check if lock graph is incomplete (Scenario L)
+                incomplete_graph = False
+                for t in callstacks_info.get("threads", []):
+                    wol = t.get("waiting_on_lock")
+                    if wol and (not wol.get("held_by_tid") or wol.get("held_by_tid") <= 0):
+                        incomplete_graph = True
+                        break
+                if incomplete_graph:
+                    observation_data["incomplete_lock_graph"] = True
+                    observation_data["insufficient_lock_info"] = True
+
                 if callstacks_info.get("deadlock_detected"):
                     cycle = callstacks_info.get("deadlock_cycle", [])
                     observation_data["cycle_tids"] = [c.get("tid") for c in cycle if isinstance(c, dict)]
@@ -619,8 +753,9 @@ class RuntimeEvidenceProvider:
                         observation_data["blocked_threads"] = blocked
                         observation_data["deadlock_cycle"] = []
                         observation_data["deadlock_detected"] = False
-                        observation_data["contradicting_facts"] = ["Threads are blocked on mutex, but no circular wait cycle was detected."]
-                        observation_data["negative_evidence_found"] = True
+                        if not incomplete_graph:
+                            observation_data["contradicting_facts"] = ["Threads are blocked on mutex, but complete lock graph contains zero circular wait cycles."]
+                            observation_data["negative_evidence_found"] = True
             except Exception as e:
                 rec = RuntimeEvidenceRecord(
                     evidence_id=f"ev_{uuid.uuid4().hex[:12]}",

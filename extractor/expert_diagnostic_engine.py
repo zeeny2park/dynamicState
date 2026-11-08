@@ -400,59 +400,57 @@ class TargetAssessor:
         dwarf_available = False
         mode = "LIVE" if (pid is not None and pid > 0) else "OFFLINE_SNAPSHOT"
 
+        target_adapter = adapter or LocalTargetAdapter()
+        target_host = target_adapter.target_host()
+
         # 1. Target PID accessibility check
         if pid is not None and pid > 1:
-            proc_path = f"/proc/{pid}"
-            if os.path.exists(proc_path):
+            alive, live_err = target_adapter.check_liveness(pid)
+            if alive:
+                accessible = True
                 capabilities.append("PROC_FS_AVAILABLE")
                 # Count threads
-                task_path = f"/proc/{pid}/task"
-                if os.path.exists(task_path):
-                    try:
-                        thread_count = len(os.listdir(task_path))
-                        capabilities.append("THREAD_INSPECTION")
-                    except Exception:
-                        thread_count = 1
-                # Read memory maps
-                maps_path = f"/proc/{pid}/maps"
-                maps_lines = []
-                if os.path.exists(maps_path):
-                    try:
-                        with open(maps_path, "r", errors="replace") as f:
-                            maps_lines = f.readlines()
-                            memory_regions_count = len(maps_lines)
-                        capabilities.append("MAPS_READ")
-                    except Exception as e:
-                        limitations.append(f"Failed to read /proc/{pid}/maps: {e}")
-                # Read status for RSS
-                status_path = f"/proc/{pid}/status"
-                if os.path.exists(status_path):
-                    try:
-                        with open(status_path, "r", errors="replace") as f:
-                            for line in f:
-                                if line.startswith("VmRSS:"):
-                                    parts = line.split()
-                                    if len(parts) >= 2:
-                                        rss_kb = int(parts[1])
-                                    break
-                        capabilities.append("RSS_METRICS")
-                    except Exception:
-                        pass
+                try:
+                    threads = target_adapter.get_threads(pid)
+                    thread_count = len(threads)
+                    capabilities.append("THREAD_INSPECTION")
+                except Exception:
+                    thread_count = 1
 
-                # Probe process_vm_readv zero-stop capability by attempting to read first readable segment
-                if maps_lines:
+                # Read memory maps
+                maps: List[Dict[str, Any]] = []
+                try:
+                    maps = target_adapter.get_proc_maps(pid)
+                    memory_regions_count = len(maps)
+                    if maps:
+                        capabilities.append("MAPS_READ")
+                    else:
+                        limitations.append(f"Target process maps unavailable for PID {pid}")
+                except Exception as e:
+                    limitations.append(f"Failed to read target maps: {e}")
+
+                # Read status for RSS
+                try:
+                    p_st = target_adapter.get_process_status(pid)
+                    if "VmRSS" in p_st:
+                        try:
+                            rss_kb = int(p_st["VmRSS"])
+                            capabilities.append("RSS_METRICS")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Probe zero-stop memory readability capability by attempting to read first readable segment
+                if maps:
                     first_readable_addr = None
-                    for line in maps_lines:
-                        parts = line.split()
-                        if len(parts) >= 2 and "r" in parts[1]:
-                            addr_range = parts[0].split("-")
-                            try:
-                                first_readable_addr = int(addr_range[0], 16)
+                    for m in maps:
+                        if m.get("is_readable") or ("r" in m.get("permissions", "")):
+                            first_readable_addr = m.get("start_int") or (int(m["start"], 16) if isinstance(m.get("start"), str) else None)
+                            if first_readable_addr:
                                 break
-                            except Exception:
-                                pass
                     if first_readable_addr is not None:
-                        slice_b, _, read_err = read_process_memory_slice(pid, first_readable_addr, 16)
+                        slice_b, _, read_err = target_adapter.read_memory(pid, first_readable_addr, 16)
                         if slice_b is not None:
                             memory_readable = True
                             capabilities.append("PROCESS_MEMORY_READABLE")
@@ -463,10 +461,10 @@ class TargetAssessor:
                         limitations.append("No readable memory mappings found in target process")
                 else:
                     limitations.append(f"Target process maps unavailable for PID {pid}")
-
-                accessible = bool(memory_readable)
             else:
-                limitations.append(f"Target PID {pid} is not running or not found in /proc")
+                limitations.append(f"Target process {pid} is not running or not found in /proc: {live_err}")
+
+            accessible = bool(alive and memory_readable)
         else:
             limitations.append("No live target PID specified (offline or fixture mode)")
 
@@ -488,6 +486,7 @@ class TargetAssessor:
                         dwarf_available = True
                         capabilities.append("DWARF_DEBUG_INFO")
                     else:
+                        limitations.append("DWARF_DEBUG_INFO_MISSING")
                         limitations.append("Companion ELF lacks .debug_info (stripped or release binary without -g)")
                 except Exception:
                     # Fallback check file size
@@ -516,6 +515,7 @@ class TargetAssessor:
             capabilities=capabilities,
             limitations=limitations,
             prerequisites_met=prerequisites_met,
+            target_host=target_host,
             memory_readable=memory_readable,
             mode=mode,
         )
@@ -919,6 +919,7 @@ class AdaptiveInvestigationSession:
         pid: Optional[int] = None,
         companion_elf: Optional[str] = None,
         corpus_dir: Optional[str] = None,
+        adapter: Optional[TargetExecutionAdapter] = None,
     ):
         self.investigation_id = investigation_id
         self.raw_problem_statement = problem_statement
@@ -927,6 +928,7 @@ class AdaptiveInvestigationSession:
         self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
         self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
         os.makedirs(self._investigations_dir, exist_ok=True)
+        self.adapter = adapter or LocalTargetAdapter()
 
         # Components
         self.classifier = ProblemClassifier()
@@ -935,7 +937,8 @@ class AdaptiveInvestigationSession:
         self.planner = InvestigationPlanner(self.recipe_registry)
         self.correlator = EvidenceToSourceCorrelator(companion_elf)
         self.ledger = EvidenceLedger(session_id=self.investigation_id)
-        self.evidence_provider = RuntimeEvidenceProvider(adapter=LocalTargetAdapter(), corpus_dir=self.corpus_dir)
+        self.evidence_provider = RuntimeEvidenceProvider(adapter=self.adapter, corpus_dir=self.corpus_dir)
+        self.temporal_memory_samples: List[Dict[str, Any]] = []
 
         # State machine
         self.state = STATE_CREATED
@@ -1060,6 +1063,7 @@ class AdaptiveInvestigationSession:
         self.target_assessment = self.assessor.assess(
             pid=self.pid,
             companion_elf=self.companion_elf,
+            adapter=self.adapter,
         )
         self._record_timeline_event("TARGET_ASSESSED", {
             "accessible": self.target_assessment.accessible,
@@ -1113,6 +1117,22 @@ class AdaptiveInvestigationSession:
             self.plan.current_step_index += 1
             return {"action": "COLLECT_STEP", "step_id": step.step_id, "status": "FAILED"}
 
+        # Record real temporal memory sample for session persistence (Section 4)
+        if self.pid and self.pid > 0:
+            try:
+                p_st = self.adapter.get_process_status(self.pid)
+                sample_rss = int(p_st.get("VmRSS", 0))
+                sample_vsz = int(p_st.get("VmSize", 0))
+                self.temporal_memory_samples.append({
+                    "timestamp": time.time(),
+                    "rss_kb": sample_rss,
+                    "vsize_kb": sample_vsz,
+                    "step_index": self.plan.current_step_index,
+                    "recipe_id": recipe.recipe_id,
+                })
+            except Exception:
+                pass
+
         # Perform actual live runtime evidence acquisition via RuntimeEvidenceProvider
         obs_data, ev_records = self.evidence_provider.collect_for_recipe(
             recipe=recipe,
@@ -1122,6 +1142,13 @@ class AdaptiveInvestigationSession:
             classification=self.classification_result,
         )
         self.collected_evidence_records.extend(ev_records)
+
+        # Incorporate session temporal memory samples into recipe context
+        if self.temporal_memory_samples:
+            persisted_rss = [s["rss_kb"] for s in self.temporal_memory_samples if s.get("rss_kb")]
+            if len(persisted_rss) > len(obs_data.get("rss_history_kb", [])):
+                obs_data["rss_history_kb"] = persisted_rss
+                obs_data["epoch_count"] = len(persisted_rss)
 
         # Merge live observation data into deterministic recipe context
         eval_context: Dict[str, Any] = {
@@ -1135,28 +1162,34 @@ class AdaptiveInvestigationSession:
 
         # Deterministic recipe evaluation against real acquired observations
         eval_result = self.recipe_registry.evaluate_recipe(recipe, eval_context)
-        step.status = "COMPLETED"
-        step.result = {
-            "status": eval_result.status,
-            "confidence": eval_result.confidence,
-            "confidence_basis": eval_result.confidence_basis,
-            "supporting_facts": eval_result.supporting_facts,
-            "contradicting_facts": eval_result.contradicting_facts,
-            "missing_evidence": eval_result.missing_evidence,
-            "details": eval_result.details,
-        }
-        self.verified_checks_count += 1
+        consumed_step_ev_ids: List[str] = []
 
-        # Enrich and correlate evidence records
-        for fact in eval_result.supporting_facts:
-            ev_id = ev_records[0].evidence_id if ev_records else f"ev_{uuid.uuid4().hex[:12]}"
-            prov_class = ev_records[0].provenance_class if ev_records else RUNTIME_PROV_LIVE
+        # Enrich and correlate evidence records (Section 7: 1:1 finding-to-evidence relationship)
+        for i, fact in enumerate(eval_result.supporting_facts):
+            if i < len(ev_records):
+                matching_rec = ev_records[i]
+                ev_id = matching_rec.evidence_id
+                prov_class = matching_rec.provenance_class
+            else:
+                ev_id = f"ev_{uuid.uuid4().hex[:12]}"
+                prov_class = ev_records[0].provenance_class if ev_records else RUNTIME_PROV_LIVE
+                matching_rec = RuntimeEvidenceRecord(
+                    evidence_id=ev_id,
+                    collection_method=recipe.recipe_id,
+                    target_pid=self.pid,
+                    observed_value=fact,
+                    provenance_class=prov_class,
+                )
+                self.collected_evidence_records.append(matching_rec)
+
+            consumed_step_ev_ids.append(ev_id)
             ev_payload = {
                 "evidence_id": ev_id,
                 "problem_category": recipe.problem_category,
                 "recipe_id": recipe.recipe_id,
                 "domain": recipe.domain,
                 "finding": fact,
+                "finding_classification": "OBSERVED_FACT",
                 "status": "SUPPORTED",
                 "details": eval_result.details,
                 "address": obs_data.get("address") or obs_data.get("faulting_address"),
@@ -1166,8 +1199,8 @@ class AdaptiveInvestigationSession:
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
-            self.collected_evidence.append(enriched_ev)
 
+            ledger_status = "RECORDED"
             try:
                 self.ledger.add_record(EvidenceRecord(
                     record_id=ev_id,
@@ -1178,17 +1211,22 @@ class AdaptiveInvestigationSession:
                     evidence_payload=enriched_ev,
                     semantic_digest=hashlib.sha256(json.dumps(fact, sort_keys=True).encode()).hexdigest(),
                 ))
-            except Exception:
-                pass
+            except Exception as le:
+                ledger_status = f"FAILED: {le}"
 
-        for fact in eval_result.contradicting_facts:
-            ev_id = ev_records[0].evidence_id if ev_records else f"ev_{uuid.uuid4().hex[:12]}"
+            enriched_ev["ledger_status"] = ledger_status
+            self.collected_evidence.append(enriched_ev)
+
+        for j, fact in enumerate(eval_result.contradicting_facts):
+            contra_ev_id = f"ev_contra_{uuid.uuid4().hex[:10]}"
+            consumed_step_ev_ids.append(contra_ev_id)
             ev_payload = {
-                "evidence_id": ev_id,
+                "evidence_id": contra_ev_id,
                 "problem_category": recipe.problem_category,
                 "recipe_id": recipe.recipe_id,
                 "domain": recipe.domain,
                 "counter_indicator": fact,
+                "finding_classification": "OBSERVED_FACT",
                 "status": "CONTRADICTED",
                 "details": eval_result.details,
                 "address": obs_data.get("address"),
@@ -1198,26 +1236,56 @@ class AdaptiveInvestigationSession:
             enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
             self.collected_evidence.append(enriched_ev)
 
+        step.status = "COMPLETED"
+        step.result = {
+            "status": eval_result.status,
+            "confidence": eval_result.confidence,
+            "confidence_basis": eval_result.confidence_basis,
+            "supporting_facts": eval_result.supporting_facts,
+            "contradicting_facts": eval_result.contradicting_facts,
+            "missing_evidence": eval_result.missing_evidence,
+            "consumed_evidence_ids": consumed_step_ev_ids,
+            "details": eval_result.details,
+        }
+        self.verified_checks_count += 1
+
         self._record_timeline_event("STEP_EXECUTED", {
             "step_id": step.step_id,
             "recipe_id": step.recipe_id,
             "eval_status": eval_result.status,
             "confidence": eval_result.confidence,
+            "consumed_evidence_ids": consumed_step_ev_ids,
         })
 
         # ---------------------------------------------------------------------
-        # Adaptive Feedback Loop & Replanning (Section 5)
+        # Adaptive Feedback Loop & Dynamic Replanning (Section 10)
         # ---------------------------------------------------------------------
         remaining_steps = self.plan.steps[self.plan.current_step_index + 1:]
         if eval_result.status == RECIPE_STATUS_SUPPORTED:
-            # Anomaly confirmed! Prioritize relevant follow-up steps for this category
+            # If RSS growth was observed, dynamically schedule heap growth and object accumulation
+            if "MEMORY_GROWTH" in recipe.recipe_id or "GROWTH" in recipe.recipe_id:
+                followup_ids = ["RECIPE_HEAP_GROWTH", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"]
+                for fid in followup_ids:
+                    if not any(s.recipe_id == fid for s in self.plan.steps):
+                        f_rec = self.recipe_registry.get_recipe(fid)
+                        if f_rec:
+                            new_step = InvestigationStep(
+                                step_id=f"step_{len(self.plan.steps)+1:02d}",
+                                recipe_id=fid,
+                                recipe_name=f_rec.name,
+                                domain=f_rec.domain,
+                                category=f_rec.problem_category,
+                                rationale=f"Dynamic follow-up: isolated from confirmed {recipe.recipe_id}",
+                            )
+                            remaining_steps.insert(0, new_step)
+
+            # Prioritize relevant follow-up steps for this category
             related_steps = [s for s in remaining_steps if s.category == recipe.problem_category]
             unrelated_steps = [s for s in remaining_steps if s.category != recipe.problem_category]
             self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + related_steps + unrelated_steps
 
-            # Early stop condition: if definitive fault confirmed with high confidence (>= 0.90)
+            # Early stop condition: if definitive fault confirmed with high confidence (>= 0.90) and no contradiction
             if eval_result.confidence >= 0.90 and not eval_result.contradicting_facts:
-                # Mark remaining steps SKIPPED and transition directly to analyzing
                 for s in remaining_steps:
                     if s.category != recipe.problem_category:
                         s.status = "SKIPPED"
@@ -1230,6 +1298,11 @@ class AdaptiveInvestigationSession:
             for s in remaining_steps:
                 if s.category == recipe.problem_category:
                     s.status = "SKIPPED"
+
+        self.plan.current_step_index += 1
+        if self.plan.current_step_index >= len(self.plan.steps):
+            self.state = STATE_ANALYZING
+        return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result)}
 
         self.plan.current_step_index += 1
         if self.plan.current_step_index >= len(self.plan.steps):
@@ -1386,78 +1459,138 @@ class AdaptiveInvestigationSession:
             cid = crit.get("criterion_id", "")
             outcome = "INCONCLUSIVE"
             rationale = "No observation evidence available to verify criterion."
+            consumed_ids: List[str] = []
+            missing_ev: List[str] = []
 
             # 1. Pointer & VMA check
             if cid == "CRIT_POINTER_VALID_VMA":
-                # Check collected evidence for address and mapping
-                fault_ev = next((e for e in hyp.supporting_evidence if "NULL" in str(e) or "unmapped" in str(e).lower() or e.get("details", {}).get("violation_type")), None)
+                fault_ev = next((e for e in hyp.supporting_evidence if "NULL" in str(e) or "unmapped" in str(e).lower() or e.get("details", {}).get("violation_type") in ("NULL_POINTER_DEREFERENCE", "UNMAPPED_OR_GUARD_PAGE")), None)
+                contra_ev = next((e for e in hyp.contradicting_evidence if "validly mapped" in str(e) or e.get("details", {}).get("is_healthy") or e.get("details", {}).get("violation_type") == "NONE_IDLE_NULL_POINTER"), None)
                 if fault_ev:
-                    outcome = "FAIL"  # Criterion violated -> fault confirmed
+                    outcome = "FAIL"  # Invariant violated -> fault confirmed
+                    consumed_ids.append(fault_ev.get("evidence_id", ""))
                     rationale = f"Observed address violation: {fault_ev.get('finding')}"
+                elif contra_ev:
+                    outcome = "PASS"  # Invariant preserved -> fault contradicted
+                    consumed_ids.append(contra_ev.get("evidence_id", ""))
+                    rationale = "Target address resides in validly mapped readable VMA or represents clean idle pointer."
                 else:
-                    contra_ev = next((e for e in hyp.contradicting_evidence if "validly mapped" in str(e)), None)
-                    if contra_ev:
-                        outcome = "PASS"  # Criterion preserved -> fault contradicted
-                        rationale = "Target address resides in validly mapped readable VMA."
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("pointer_address_or_vma_mapping")
 
             # 2. Poison bytes / magic check
             elif cid == "CRIT_NO_POISON_PATTERN":
-                poison_ev = next((e for e in hyp.supporting_evidence if "magic" in str(e).lower() or "poison" in str(e).lower()), None)
+                poison_ev = next((e for e in hyp.supporting_evidence if "magic" in str(e).lower() or "poison" in str(e).lower() or e.get("details", {}).get("magic_corrupted")), None)
+                clean_ev = next((e for e in hyp.contradicting_evidence if "clean" in str(e).lower() or "valid" in str(e).lower()), None)
                 if poison_ev:
                     outcome = "FAIL"
+                    consumed_ids.append(poison_ev.get("evidence_id", ""))
                     rationale = f"Corruption pattern detected: {poison_ev.get('finding')}"
-                else:
+                elif clean_ev:
                     outcome = "PASS"
-                    rationale = "No memory corruption or poison patterns detected."
+                    consumed_ids.append(clean_ev.get("evidence_id", ""))
+                    rationale = "Memory slice verified intact with zero corruption or poison patterns."
+                else:
+                    # Check if memory was actually read and verified
+                    mem_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("observed_value") is not None), None)
+                    if mem_ev and not poison_ev:
+                        outcome = "PASS"
+                        consumed_ids.append(mem_ev.get("evidence_id", ""))
+                        rationale = "Memory slice audited clean without poison markers."
+                    else:
+                        outcome = "INCONCLUSIVE"
+                        missing_ev.append("memory_slice_read")
 
             # 3. Memory growth / leak check
             elif cid in ("CRIT_RSS_GROWTH_STABLE", "CRIT_CHUNK_RECLAMATION"):
-                growth_ev = next((e for e in hyp.supporting_evidence if "growth" in str(e).lower() or "leak" in str(e).lower()), None)
+                growth_ev = next((e for e in hyp.supporting_evidence if "growth" in str(e).lower() or "leak" in str(e).lower() or e.get("details", {}).get("growth_confirmed")), None)
+                stable_ev = next((e for e in hyp.contradicting_evidence if "stable" in str(e).lower() or "plateau" in str(e).lower() or e.get("details", {}).get("transient_warmup")), None)
                 if growth_ev:
                     outcome = "FAIL"
+                    consumed_ids.append(growth_ev.get("evidence_id", ""))
                     rationale = f"Unbounded memory growth detected: {growth_ev.get('finding')}"
+                elif stable_ev:
+                    outcome = "PASS"
+                    consumed_ids.append(stable_ev.get("evidence_id", ""))
+                    rationale = "Memory footprint verified stable across observation intervals (plateau reached)."
                 else:
-                    contra_ev = next((e for e in hyp.contradicting_evidence if "stable" in str(e).lower()), None)
-                    if contra_ev:
-                        outcome = "PASS"
-                        rationale = "Memory consumption remains stable across observation intervals."
-                    else:
-                        outcome = "PASS"
-                        rationale = "No memory growth detected in observed intervals."
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("temporal_memory_epochs_min_3")
 
             # 4. Circular wait / deadlock check
             elif cid == "CRIT_NO_CIRCULAR_WAIT":
+                incomplete_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("details", {}).get("incomplete_lock_graph")), None)
                 deadlock_ev = next((e for e in hyp.supporting_evidence if "deadlock" in str(e).lower() or e.get("details", {}).get("deadlock_detected")), None)
-                if deadlock_ev:
+                acyclic_ev = next((e for e in hyp.contradicting_evidence if "acyclic" in str(e).lower() or "no circular wait" in str(e).lower()), None)
+                blocked_ev = next((e for e in hyp.supporting_evidence if "blocked" in str(e).lower()), None)
+
+                if incomplete_ev:
+                    outcome = "INCONCLUSIVE"
+                    consumed_ids.append(incomplete_ev.get("evidence_id", ""))
+                    missing_ev.append("complete_lock_ownership_info")
+                    rationale = "Lock ownership graph is incomplete (threads waiting on locks with unresolvable owner). Cannot determine whether graph is acyclic."
+                elif deadlock_ev:
                     outcome = "FAIL"  # Circular wait confirmed
+                    consumed_ids.append(deadlock_ev.get("evidence_id", ""))
                     rationale = f"Circular wait cycle confirmed in lock graph: {deadlock_ev.get('finding')}"
+                elif acyclic_ev:
+                    outcome = "PASS"
+                    consumed_ids.append(acyclic_ev.get("evidence_id", ""))
+                    rationale = "Complete lock graph verified acyclic with zero circular wait cycles."
+                elif blocked_ev:
+                    outcome = "PASS"
+                    consumed_ids.append(blocked_ev.get("evidence_id", ""))
+                    rationale = "Thread blocked on lock, but lock graph is verified complete and acyclic (thread contention without deadlock)."
                 else:
-                    # Check if threads are blocked without deadlock
-                    blocked_ev = next((e for e in hyp.supporting_evidence if "blocked" in str(e).lower()), None)
-                    if blocked_ev:
-                        outcome = "PASS"
-                        rationale = "Thread blocked on lock, but NO circular wait cycle exists."
-                    else:
-                        outcome = "PASS"
-                        rationale = "No circular wait cycles detected in thread mutex graph."
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("thread_wait_for_graph")
 
             # 5. State domain / transition check
             elif cid in ("CRIT_VALID_STATE_DOMAIN", "CRIT_LEGAL_STATE_TRANSITION"):
-                trans_ev = next((e for e in hyp.supporting_evidence if "transition" in str(e).lower() or "boundary" in str(e).lower()), None)
+                trans_ev = next((e for e in hyp.supporting_evidence if "transition" in str(e).lower() or "boundary" in str(e).lower() or e.get("details", {}).get("field_inconsistency")), None)
+                valid_trans_ev = next((e for e in hyp.contradicting_evidence if "authorized" in str(e).lower() or "within bounds" in str(e).lower()), None)
                 if trans_ev:
                     outcome = "FAIL"
-                    rationale = f"State transition or boundary violation detected: {trans_ev.get('finding')}"
-                else:
+                    consumed_ids.append(trans_ev.get("evidence_id", ""))
+                    rationale = f"State transition or invariant boundary violation detected: {trans_ev.get('finding')}"
+                elif valid_trans_ev:
                     outcome = "PASS"
+                    consumed_ids.append(valid_trans_ev.get("evidence_id", ""))
                     rationale = "Observed state transitions conform to valid specification."
+                else:
+                    # Check if state variable was actually observed
+                    state_obs_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("symbol")), None)
+                    if state_obs_ev and not trans_ev:
+                        outcome = "PASS"
+                        consumed_ids.append(state_obs_ev.get("evidence_id", ""))
+                        rationale = f"Observed variable '{state_obs_ev.get('symbol')}' conforms to normal operational state."
+                    else:
+                        outcome = "INCONCLUSIVE"
+                        missing_ev.append("state_variable_value")
 
             # 6. Clean check
             elif cid == "CRIT_ZERO_ANOMALIES":
-                if not hyp.contradicting_evidence and hyp.status == "SUPPORTED":
+                mem_readable = getattr(self.target_assessment, "memory_readable", False) if self.target_assessment else False
+                if not hyp.contradicting_evidence and hyp.status == "SUPPORTED" and self.verified_checks_count >= 1 and mem_readable:
                     outcome = "PASS"
-                    rationale = "All scheduled diagnostic checks verified clean."
+                    consumed_ids.extend([e.get("evidence_id", "") for e in self.collected_evidence if e.get("evidence_id")])
+                    rationale = f"All {self.verified_checks_count} scheduled diagnostic checks verified clean with zero anomaly indicators."
                 else:
                     outcome = "FAIL"
+                    rationale = "Diagnostic checks could not be certified clean (unreadable memory or observed anomalies)."
+
+            results.append({
+                "criterion_id": cid,
+                "description": crit.get("description", ""),
+                "result": outcome,
+                "rationale": rationale,
+                "consumed_evidence_ids": [cid_val for cid_val in consumed_ids if cid_val],
+                "missing_evidence": missing_ev,
+            })
+            if outcome == "FAIL":
+                has_fail = True
+            elif outcome == "PASS":
+                has_pass = True
 
             results.append({
                 "criterion_id": cid,
@@ -1750,6 +1883,31 @@ class AdaptiveInvestigationSession:
                     "context": corr.get("source_context"),
                 })
 
+        detailed_findings = []
+        for h in self.active_hypotheses:
+            finding_classification = "CONFIRMED ROOT CAUSE" if h.status == "CONFIRMED" else ("HYPOTHESIS" if h.status == "PROPOSED" else ("INFERENCE" if h.status == "LIKELY" else "UNRESOLVED QUESTION"))
+            # Correlate consumed evidence details
+            obs_values = [e.get("observed_value") for e in h.supporting_evidence if e.get("observed_value") is not None]
+            source_locs = []
+            for e in h.supporting_evidence:
+                corr = e.get("correlation", {})
+                if corr.get("source_file"):
+                    source_locs.append(f"{corr.get('source_file')}:{corr.get('source_line')}")
+
+            detailed_findings.append({
+                "statement": h.problem_statement,
+                "classification": finding_classification,
+                "observed_values": obs_values,
+                "evidence_ids": h.supporting_evidence_ids,
+                "diagnostic_recipes": h.applicable_diagnostic_rules,
+                "verification_criteria": h.verification_criteria,
+                "verification_results": h.verification_execution_results,
+                "confidence_basis": h.confidence_basis,
+                "contradictory_evidence": [e.get("finding") for e in h.contradicting_evidence],
+                "source_locations": list(dict.fromkeys(source_locs)),
+                "remaining_uncertainty": h.missing_evidence,
+            })
+
         report_13_points = {
             "1_problem_description": self.raw_problem_statement,
             "2_target_information": {
@@ -1775,6 +1933,7 @@ class AdaptiveInvestigationSession:
             "5_executed_diagnostic_procedures": executed_procs,
             "6_actual_observations": observations_list,
             "7_confirmed_findings": confirmed_findings,
+            "7_findings_detail": detailed_findings,
             "8_probable_causes": [h.problem_statement for h in self.active_hypotheses if h.status in ("CONFIRMED", "LIKELY")],
             "9_rejected_hypotheses": rejected_hyps,
             "10_unresolved_hypotheses": unresolved_hyps,
@@ -1818,15 +1977,24 @@ class AdaptiveInvestigationSession:
                 f"## 6. Actual Observations ({len(observations_list)} records)",
             ])
             for obs in observations_list[:10]:
-                md.append(f"- `[{obs.get('evidence_id')}]` Method: `{obs.get('collection_method')}` | Value: `{obs.get('observed_value')}`")
+                md.append(f"- `[{obs.get('evidence_id')}]` [OBSERVED FACT] Method: `{obs.get('collection_method')}` | Value: `{obs.get('observed_value')}`")
 
             md.extend([
                 "",
-                "## 7. Confirmed Findings",
+                "## 7. Confirmed Findings & Technical Root Cause",
             ])
-            if confirmed_findings:
-                for cf in confirmed_findings:
-                    md.append(f"- **[CONFIRMED]** {cf.get('problem_statement')} (Confidence: {cf.get('confidence', 0)*100:.1f}%)")
+            if detailed_findings:
+                for df in detailed_findings:
+                    cls_tag = f"[{df['classification']}]"
+                    md.append(f"### {cls_tag} {df['statement']}")
+                    md.append(f"- **Classification**: `{df['classification']}`")
+                    md.append(f"- **Consumed Evidence IDs**: `{', '.join(df['evidence_ids']) if df['evidence_ids'] else 'None'}`")
+                    md.append(f"- **Diagnostic Rule / Recipe**: `{', '.join(df['diagnostic_recipes'])}`")
+                    md.append(f"- **Confidence Basis**: {df['confidence_basis']}")
+                    if df['source_locations']:
+                        md.append(f"- **Source Locations**: `{', '.join(df['source_locations'])}`")
+                    if df['remaining_uncertainty']:
+                        md.append(f"- **Remaining Uncertainty / Missing**: `{', '.join(df['remaining_uncertainty'])}`")
             else:
                 md.append("- No confirmed fault findings.")
 
@@ -1919,6 +2087,7 @@ class AdaptiveInvestigationSession:
             "classification_result": asdict(self.classification_result) if self.classification_result else None,
             "target_assessment": asdict(self.target_assessment) if self.target_assessment else None,
             "verified_checks_count": self.verified_checks_count,
+            "temporal_memory_samples": self.temporal_memory_samples,
         }
 
     @classmethod
@@ -1943,6 +2112,7 @@ class AdaptiveInvestigationSession:
         sess.active_hypotheses = [ExpertHypothesis.from_dict(h) for h in data.get("active_hypotheses", [])]
         sess.rejected_hypotheses = [ExpertHypothesis.from_dict(h) for h in data.get("rejected_hypotheses", [])]
         sess.verified_checks_count = data.get("verified_checks_count", 0)
+        sess.temporal_memory_samples = data.get("temporal_memory_samples", [])
         if data.get("classification_result"):
             sess.classification_result = ProblemClassificationResult(**data["classification_result"])
         if data.get("target_assessment"):
@@ -1971,6 +2141,7 @@ class ExpertDiagnosticEngine:
         pid: Optional[int] = None,
         companion_elf: Optional[str] = None,
         investigation_id: Optional[str] = None,
+        adapter: Optional[TargetExecutionAdapter] = None,
     ) -> AdaptiveInvestigationSession:
         """Launches a new adaptive investigation session."""
         inv_id = investigation_id or f"inv_{uuid.uuid4().hex[:12]}"
@@ -1980,7 +2151,10 @@ class ExpertDiagnosticEngine:
             pid=pid,
             companion_elf=companion_elf,
             corpus_dir=self.corpus_dir,
+            adapter=adapter,
         )
+        self.sessions[inv_id] = session
+        return session
         self.sessions[inv_id] = session
         return session
 

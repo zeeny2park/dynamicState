@@ -864,6 +864,11 @@ class TargetExecutionAdapter(ABC):
         """Reads /proc/<pid>/maps and returns structured memory mappings."""
         pass
 
+    @abstractmethod
+    def get_process_status(self, pid: int) -> Dict[str, Any]:
+        """Reads /proc/<pid>/status fields (e.g. VmRSS, VmSize, Threads) from target host."""
+        pass
+
     def get_memory_mappings(self, pid: int) -> List[Dict[str, Any]]:
         """Convenience alias for get_proc_maps."""
         return self.get_proc_maps(pid)
@@ -1075,6 +1080,31 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         return mappings
 
     get_memory_mappings = get_proc_maps
+
+    def get_process_status(self, pid: int) -> Dict[str, Any]:
+        status: Dict[str, Any] = {}
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return status
+        path = f"/proc/{pid}/status"
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        parts = line.split(":", 1)
+                        if len(parts) == 2:
+                            k = parts[0].strip()
+                            v = parts[1].strip()
+                            if k in ("VmRSS", "VmSize", "VmPeak", "VmData", "VmStk", "VmExe", "Threads"):
+                                val_parts = v.split()
+                                try:
+                                    status[k] = int(val_parts[0])
+                                except ValueError:
+                                    status[k] = v
+                            else:
+                                status[k] = v
+            except Exception:
+                pass
+        return status
 
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         import struct as _struct
@@ -1663,6 +1693,28 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     "is_executable": "x" in perms,
                 })
         return mappings
+
+    def get_process_status(self, pid: int) -> Dict[str, Any]:
+        status: Dict[str, Any] = {}
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return status
+        cmd = f"cat /proc/{int(pid)}/status 2>/dev/null"
+        rc, stdout, _ = self.run_ssh(cmd)
+        if rc == 0 and stdout:
+            for line in stdout.splitlines():
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    k = parts[0].strip()
+                    v = parts[1].strip()
+                    if k in ("VmRSS", "VmSize", "VmPeak", "VmData", "VmStk", "VmExe", "Threads"):
+                        val_parts = v.split()
+                        try:
+                            status[k] = int(val_parts[0])
+                        except ValueError:
+                            status[k] = v
+                    else:
+                        status[k] = v
+        return status
 
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         # Efficient remote script to list threads without spawning multiple remote processes

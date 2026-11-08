@@ -472,11 +472,28 @@ def runtime_start_investigation(
                 "recovery_hint": "Call runtime_target_connect(pid=..., companion_elf=...) or provide 'pid' to runtime_start_investigation."
             })
 
+        # Resolve target adapter if target session has remote host or custom adapter
+        target_adapter = None
+        try:
+            _c = runtime.watch_session_manager.get_active_target_context()
+            if _c and _c.get("remote_host"):
+                target_adapter = runtime.watch_session_manager._resolve_adapter(
+                    pid=valid_pid,
+                    remote_host=_c.get("remote_host"),
+                    ssh_user=_c.get("ssh_user"),
+                    ssh_port=_c.get("ssh_port", 22),
+                    ssh_key=_c.get("ssh_key"),
+                    ssh_proxy_jump=_c.get("ssh_proxy_jump"),
+                )
+        except Exception:
+            pass
+
         # Start expert adaptive investigation session
         expert_sess = runtime.expert_diagnostic_engine.start_investigation(
             problem_statement=effective_goal,
             pid=valid_pid,
             companion_elf=effective_elf,
+            adapter=target_adapter,
         )
         expert_sess.step()  # CLASSIFY
         expert_sess.step()  # ASSESS

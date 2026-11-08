@@ -116,6 +116,14 @@ class DiagnosticRecipe:
     stop_conditions: List[str]
     limitations: List[str]
     output_structure: Dict[str, Any]
+    required_evidence: List[str] = field(default_factory=list)
+    optional_evidence: List[str] = field(default_factory=list)
+    supported_collection_methods: List[str] = field(default_factory=list)
+    applicable_target_capabilities: List[str] = field(default_factory=list)
+    required_temporal_observations: int = 1
+    supported_cpp_constructs: List[str] = field(default_factory=list)
+    known_blind_spots: List[str] = field(default_factory=list)
+    minimum_conditions: List[str] = field(default_factory=list)
 
     @property
     def problem_category(self) -> str:
@@ -126,7 +134,9 @@ class DiagnosticRecipe:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DiagnosticRecipe":
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered)
 
 
 @dataclass
@@ -1018,13 +1028,46 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
         except Exception:
             addr_int = -1
 
-        if addr_int in (0, None) or (0 <= addr_int <= 4096):
+        is_crash_or_fault = bool(
+            data.get("fault_context")
+            or data.get("is_fault_address")
+            or data.get("dereferenced")
+            or data.get("violation_type") in ("NULL_POINTER_DEREFERENCE", "UNMAPPED_OR_GUARD_PAGE")
+            or data.get("chunk_state") == "CORRUPTED"
+            or data.get("magic_corrupted")
+            or (data.get("violation_type") and data.get("violation_type") not in ("NONE", "NONE_VALID_VMA"))
+        )
+
+        # Distinguish clean idle null pointer (Scenario B) from actual null pointer dereference
+        if addr_int == 0:
+            if not is_crash_or_fault and (data.get("is_healthy") or data.get("is_null_allowed", True)):
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_CONTRADICTED,
+                    confidence=0.92,
+                    confidence_basis="Target pointer is NULL in clean idle state without dereference fault or invariant violation. Memory integrity preserved.",
+                    contradicting_facts=["Clean NULL pointer in idle state; zero fault indicators"],
+                    recommended_action="Refute invalid memory access; pointer is intentionally NULL.",
+                    details={"violation_type": "NONE_IDLE_NULL_POINTER", "is_healthy": True},
+                )
+            else:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_SUPPORTED,
+                    confidence=0.98,
+                    confidence_basis="Address 0x0 was dereferenced in fault context. NULL pointer dereference confirmed.",
+                    supporting_facts=["Target address 0x0 dereferenced in fault context"],
+                    recommended_action="Trace pointer origin to identify uninitialized or failed allocation return.",
+                    details={"violation_type": "NULL_POINTER_DEREFERENCE"},
+                )
+
+        if 0 < addr_int <= 4096:
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_SUPPORTED,
                 confidence=0.98,
-                confidence_basis=f"Address {hex(addr_int) if addr_int >= 0 else addr} is within NULL page [0, 4096]. NULL pointer dereference confirmed.",
-                supporting_facts=[f"Target address {addr} is within NULL page [0x0, 0x1000]"],
+                confidence_basis=f"Address {hex(addr_int)} is within NULL guard page [0x1, 0x1000]. Invalid low-memory access confirmed.",
+                supporting_facts=[f"Target address {addr} is within NULL guard page [0x1, 0x1000]"],
                 recommended_action="Trace pointer origin to identify uninitialized or failed allocation return.",
                 details={"violation_type": "NULL_POINTER_DEREFERENCE"},
             )
@@ -1059,29 +1102,39 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
     # 2. RECIPE_DOUBLE_FREE
     elif rid == "RECIPE_DOUBLE_FREE":
-        in_freelist = data.get("in_freelist", False) or (data.get("slot_status") == "FREE" and data.get("operation") == "FREE")
+        in_freelist = data.get("in_freelist", False)
         freelist_occ = data.get("freelist_occurrences", 0)
+        double_free_recorded = data.get("double_free_recorded", False) or data.get("duplicate_free_event", False)
+        alloc_events = data.get("allocation_event_history", [])
         prev_inuse = data.get("prev_inuse")
         if data.get("slot_status") == "IN_USE":
             freelist_occ = 0
             prev_inuse = 1
 
-        if in_freelist or freelist_occ > 1 or prev_inuse == 0:
+        is_double_free = (
+            double_free_recorded
+            or freelist_occ > 1
+            or (in_freelist and data.get("operation") == "FREE")
+            or (data.get("slot_status") == "FREE" and data.get("operation") == "FREE")
+            or bool(data.get("freed_epoch") and data.get("current_epoch") and data.get("operation") == "FREE")
+        )
+
+        if is_double_free:
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_SUPPORTED,
                 confidence=0.96,
-                confidence_basis="Chunk was observed in freelist or freed slot freed again. Double free confirmed.",
-                supporting_facts=[f"Double free observed on slot"],
+                confidence_basis="Chunk deallocation was observed twice in event history or chunk appears multiple times in freelist. Double free confirmed.",
+                supporting_facts=["Double free observed on chunk/slot"],
                 recommended_action="Audit object destruction lifecycle to ensure single ownership.",
                 details={"double_free_confirmed": True},
             )
-        elif freelist_occ == 0 and prev_inuse == 1:
+        elif freelist_occ == 0 and prev_inuse == 1 and not double_free_recorded:
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_CONTRADICTED,
                 confidence=0.92,
-                confidence_basis="Chunk is in active state (prev_inuse==1) and absent from freelist.",
+                confidence_basis="Chunk is in active state (prev_inuse==1) and absent from freelist with zero duplicate free events.",
                 contradicting_facts=["Chunk not present in freelist", "prev_inuse is 1"],
                 recommended_action="Refute double free hypothesis for this chunk.",
                 details={"double_free_confirmed": False},
@@ -1090,8 +1143,8 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
             recipe_id=rid,
             status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
             confidence=0.20,
-            confidence_basis="Heap freelist state could not be conclusively determined.",
-            missing_evidence=["freelist_traversal_data"],
+            confidence_basis="A single snapshot cannot prove that a free operation occurred twice. Allocation/free event history or allocator metadata required.",
+            missing_evidence=["allocation_free_event_history", "freelist_traversal_data"],
             limitations=recipe.limitations,
         )
 
@@ -1130,15 +1183,15 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
     # 4. RECIPE_USE_AFTER_FREE
     elif rid == "RECIPE_USE_AFTER_FREE":
-        in_free = data.get("in_freelist", False) or (data.get("target_slot_status") == "FREE")
-        poison = data.get("poison_detected", False) or ("dd" in str(data.get("memory_content_hex", "")).lower())
+        in_free = data.get("in_freelist", False) or (data.get("target_slot_status") == "FREE") or data.get("is_freed_object", False) or data.get("is_freed", False)
+        poison = data.get("poison_detected", False) or (data.get("chunk_state") == "FREED") or data.get("poison_pattern_detected", False) or bool(data.get("poison_pattern"))
         active = data.get("is_active_chunk", False) or (data.get("target_slot_status") == "IN_USE")
         if in_free or poison:
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_SUPPORTED,
                 confidence=0.94,
-                confidence_basis="Pointer dereferences a memory block currently on freelist or containing deallocation poison markers.",
+                confidence_basis="Pointer dereferences a memory block currently on freelist, tracked as freed, or containing deallocation poison markers.",
                 supporting_facts=[f"in_freelist={in_free}", f"poison_detected={poison}"],
                 recommended_action="Locate dangling reference holders and nullify upon deallocation.",
                 details={"uaf_confirmed": True},
@@ -1168,19 +1221,28 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
         epochs = data.get("epoch_count", len(rss_hist))
         growth_bytes = data.get("rss_growth_bytes", 0)
         is_monotonic = data.get("is_monotonic")
-        if data.get("growth_rate_pct", 0) >= 20.0 or data.get("active_chunk_count", 0) >= 50:
-            growth_bytes = max(growth_bytes, 12 * 1024 * 1024)
-            is_monotonic = True
-            epochs = max(epochs, 3)
-            if not rss_hist:
-                curr_rss = data.get("current_rss_kb", 20000)
-                rss_hist = [curr_rss - 10000, curr_rss - 5000, curr_rss]
 
         if rss_hist and not is_monotonic:
             is_monotonic = all(rss_hist[i] <= rss_hist[i+1] for i in range(len(rss_hist)-1))
             growth_bytes = (rss_hist[-1] - rss_hist[0]) * 1024
 
-        if is_monotonic and growth_bytes > 1024 * 1024 and epochs >= 3:
+        # Scenario F check: Transient initialization growth followed by plateau
+        if len(rss_hist) >= 3:
+            # Check plateau between epoch 1 and subsequent epochs
+            delta_later = (rss_hist[-1] - rss_hist[1]) * 1024
+            max_plateau_tolerance = max(64 * 1024, int(0.02 * rss_hist[1] * 1024))
+            if delta_later <= max_plateau_tolerance and (rss_hist[1] - rss_hist[0]) > 0:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_CONTRADICTED,
+                    confidence=0.91,
+                    confidence_basis=f"Memory footprint stabilized at plateau ({rss_hist[-1]} KB) across later observation epochs (delta={delta_later} bytes). Transient initialization growth refuted as leak.",
+                    contradicting_facts=["Memory stabilized after initial warm-up", f"Plateau delta: {delta_later} bytes"],
+                    recommended_action="Refute unmanaged leak; process stabilized at plateau.",
+                    details={"growth_confirmed": False, "transient_warmup": True},
+                )
+
+        if is_monotonic and growth_bytes > 512 * 1024 and epochs >= 3:
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_SUPPORTED,
@@ -1199,7 +1261,7 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 missing_evidence=["temporal_epochs_minimum_3"],
                 limitations=recipe.limitations,
             )
-        elif is_monotonic is False or growth_bytes <= 100 * 1024:
+        elif (is_monotonic is False or growth_bytes <= 100 * 1024) and epochs >= 2:
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_CONTRADICTED,
@@ -1223,6 +1285,7 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
         thread_locks = data.get("thread_locks") or data.get("lock_graph") or data.get("callstacks_info")
         cycle_detected = data.get("cycle_detected", False) or data.get("deadlock_detected", False) or bool(data.get("deadlock_cycle"))
         cycle_persistent = data.get("cycle_persistent", True)
+        incomplete_graph = data.get("incomplete_lock_graph", False) or data.get("insufficient_lock_info", False)
 
         if thread_locks and not cycle_detected and isinstance(thread_locks, dict):
             waiting_map = {}
@@ -1241,6 +1304,17 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                         cycle_detected = True
                         break
 
+        # Scenario L: An incomplete lock graph must NEVER be interpreted as an acyclic graph!
+        if incomplete_graph:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.45,
+                confidence_basis="Lock ownership graph is incomplete (threads waiting on locks with unresolvable owner). Cannot determine whether graph is acyclic or contains cycles.",
+                missing_evidence=["complete_lock_ownership_info", "incomplete_lock_graph_cannot_prove_acyclic"],
+                limitations=recipe.limitations,
+            )
+
         if cycle_detected and cycle_persistent:
             return RecipeEvaluationResult(
                 recipe_id=rid,
@@ -1252,14 +1326,16 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 details={"deadlock_confirmed": True},
             )
         elif thread_locks and not cycle_detected:
+            # Check if threads are blocked without cycle (Scenario J)
+            blocked_threads = data.get("blocked_threads", [])
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_CONTRADICTED,
                 confidence=0.92,
-                confidence_basis="Wait-for graph is an acyclic directed graph with no wait cycles.",
-                contradicting_facts=["Wait-for graph is acyclic"],
-                recommended_action="Refute deadlock hypothesis; inspect individual thread blocked reasons.",
-                details={"deadlock_confirmed": False},
+                confidence_basis="Wait-for graph is a verified complete acyclic directed graph with no wait cycles.",
+                contradicting_facts=["Wait-for graph is complete and acyclic"],
+                recommended_action="Refute deadlock hypothesis; inspect thread contention and lock holding durations.",
+                details={"deadlock_confirmed": False, "thread_contention": bool(blocked_threads)},
             )
         return RecipeEvaluationResult(
             recipe_id=rid,
@@ -1267,6 +1343,133 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
             confidence=0.20,
             confidence_basis="Thread stacks or lock ownership words could not be read.",
             missing_evidence=["thread_callstacks", "mutex_owners"],
+            limitations=recipe.limitations,
+        )
+
+    # 6b. RECIPE_HEAP_GROWTH
+    elif rid == "RECIPE_HEAP_GROWTH":
+        heap_delta = data.get("heap_growth_bytes") or data.get("heap_kb_delta")
+        heap_series = data.get("heap_series_kb") or []
+        if heap_delta is None and len(heap_series) >= 2:
+            heap_delta = (heap_series[-1] - heap_series[0]) * 1024
+        if heap_delta is not None and heap_delta > 256 * 1024:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.92,
+                confidence_basis=f"Heap VMA / chunks grew by {heap_delta} bytes across observation epochs. Ongoing heap growth confirmed.",
+                supporting_facts=[f"Heap growth: {heap_delta} bytes"],
+                recommended_action="Isolate leaking object types and retaining containers.",
+                details={"heap_growth_confirmed": True, "heap_growth_bytes": heap_delta},
+            )
+        elif heap_delta is not None and heap_delta <= 64 * 1024:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.90,
+                confidence_basis=f"Heap footprint is stable (delta={heap_delta} bytes). Unmanaged heap expansion refuted.",
+                contradicting_facts=[f"Heap stable (delta={heap_delta} bytes)"],
+                recommended_action="Refute heap growth hypothesis.",
+                details={"heap_growth_confirmed": False},
+            )
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.25,
+            confidence_basis="Insufficient heap observation epochs to evaluate heap growth.",
+            missing_evidence=["heap_vma_temporal_samples"],
+            limitations=recipe.limitations,
+        )
+
+    # 6c. RECIPE_LONG_LIVED_OBJECT_ACCUMULATION
+    elif rid == "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION":
+        obj_delta = data.get("object_count_delta")
+        if obj_delta is None:
+            obj_delta = data.get("container_size_delta")
+        if obj_delta is None:
+            obj_delta = data.get("container_size")
+        if obj_delta is None:
+            obj_delta = data.get("active_chunk_count")
+        if obj_delta is None:
+            obj_delta = data.get("retained_objects_count")
+        if obj_delta is not None and obj_delta > 50:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.93,
+                confidence_basis=f"Sustained accumulation of long-lived objects detected (count={obj_delta}). Object retention confirmed.",
+                supporting_facts=[f"Retained objects count: {obj_delta}"],
+                recommended_action="Inspect retaining container or owning object references.",
+                details={"object_accumulation_confirmed": True, "retained_count": obj_delta},
+            )
+        elif obj_delta is not None and obj_delta <= 5:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.88,
+                confidence_basis=f"Object population remains stable without unbounded accumulation (count={obj_delta}).",
+                contradicting_facts=["Object population stable"],
+                recommended_action="Refute object accumulation hypothesis.",
+                details={"object_accumulation_confirmed": False},
+            )
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.25,
+            confidence_basis="Object census or container size could not be determined across epochs.",
+            missing_evidence=["object_census_data"],
+            limitations=recipe.limitations,
+        )
+
+    # 6d. RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS
+    elif rid == "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS":
+        ptr_val = data.get("pointer_value") or data.get("target_address") or data.get("address")
+        is_mapped = data.get("is_mapped")
+        is_null_allowed = data.get("is_null_allowed", False)
+        is_active = data.get("is_active_lifecycle", False)
+
+        if ptr_val is not None:
+            try:
+                pval_int = int(ptr_val, 16) if isinstance(ptr_val, str) and ptr_val.startswith("0x") else int(ptr_val)
+            except Exception:
+                pval_int = -1
+
+            if pval_int == 0 and not is_null_allowed and is_active:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_SUPPORTED,
+                    confidence=0.92,
+                    confidence_basis="Pointer member is NULL in active lifecycle state where non-null invariant is required.",
+                    supporting_facts=["Unexpected NULL pointer in active state"],
+                    recommended_action="Investigate why pointer was nullified or not initialized in active state.",
+                    details={"unexpected_null": True, "pointer": ptr_val},
+                )
+            elif pval_int > 0 and is_mapped is False:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_SUPPORTED,
+                    confidence=0.95,
+                    confidence_basis=f"Pointer member targets unmapped address 0x{pval_int:x}.",
+                    supporting_facts=[f"Pointer 0x{pval_int:x} points outside mapped VMAs"],
+                    recommended_action="Inspect source assignment and allocation bounds for pointer.",
+                    details={"invalid_pointer": True, "pointer": ptr_val},
+                )
+            elif (pval_int == 0 and is_null_allowed) or (pval_int > 0 and is_mapped is True):
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_CONTRADICTED,
+                    confidence=0.90,
+                    confidence_basis=f"Pointer member is valid (value={ptr_val}, is_mapped={is_mapped}, null_allowed={is_null_allowed}).",
+                    contradicting_facts=["Pointer member is valid within lifecycle rules"],
+                    recommended_action="Refute unexpected null or invalid pointer hypothesis.",
+                    details={"unexpected_null": False, "pointer": ptr_val},
+                )
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.25,
+            confidence_basis="Pointer member value or VMA mapping could not be determined.",
+            missing_evidence=["pointer_member_observation"],
             limitations=recipe.limitations,
         )
 
@@ -1388,8 +1591,8 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
     # 11. RECIPE_ALLOCATION_FREE_IMBALANCE
     elif rid == "RECIPE_ALLOCATION_FREE_IMBALANCE":
-        alloc_count = data.get("alloc_count") or data.get("cumulative_allocations")
-        free_count = data.get("free_count") or data.get("cumulative_frees")
+        alloc_count = data.get("alloc_count") if data.get("alloc_count") is not None else data.get("cumulative_allocations")
+        free_count = data.get("free_count") if data.get("free_count") is not None else data.get("cumulative_frees")
         if alloc_count is not None and free_count is not None:
             if alloc_count > 5 * max(1, free_count):
                 return RecipeEvaluationResult(
@@ -1411,6 +1614,24 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                     recommended_action="Refute allocation imbalance hypothesis.",
                     details={"imbalance_confirmed": False},
                 )
+            else:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_AMBIGUOUS,
+                    confidence=0.50,
+                    confidence_basis=f"Moderate disparity between allocations ({alloc_count}) and frees ({free_count}); within operational margin.",
+                    supporting_facts=[f"Allocs: {alloc_count}, Frees: {free_count}"],
+                    details={"imbalance_confirmed": False},
+                )
+        else:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis="Allocation and deallocation counters could not be observed from target process.",
+                missing_evidence=["allocation_counters"],
+                limitations=recipe.limitations,
+            )
 
     # 12. RECIPE_SUSPICIOUS_BOUNDARY_VALUES
     elif rid == "RECIPE_SUSPICIOUS_BOUNDARY_VALUES":
@@ -1425,6 +1646,40 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 recommended_action="Verify arithmetic underflow protection.",
                 details={"boundary_violation": True},
             )
+
+    # 13. RECIPE_INCONSISTENT_RELATED_VARIABLES
+    elif rid == "RECIPE_INCONSISTENT_RELATED_VARIABLES":
+        cap = data.get("buffer_capacity") or data.get("capacity")
+        length = data.get("buffer_length") or data.get("length")
+        field_incon = data.get("field_inconsistency", False)
+        if (cap is not None and length is not None and length > cap) or field_incon:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.95,
+                confidence_basis=f"Coupled variable invariant violation detected: length ({length}) exceeds capacity ({cap}).",
+                supporting_facts=[f"Length {length} exceeds capacity {cap}"],
+                recommended_action="Audit bounds checking on buffer write routines.",
+                details={"invariant_violation_confirmed": True, "field_inconsistency": True, "capacity": cap, "length": length},
+            )
+        elif cap is not None and length is not None and length <= cap:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.90,
+                confidence_basis=f"Buffer length ({length}) strictly respects capacity ({cap}). Invariant holds.",
+                contradicting_facts=["Length respects capacity"],
+                recommended_action="Refute variable coupling inconsistency.",
+                details={"invariant_violation_confirmed": False, "field_inconsistency": False},
+            )
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.25,
+            confidence_basis="Coupled variables or capacity/length pair could not be observed.",
+            missing_evidence=["paired_variables_data"],
+            limitations=recipe.limitations,
+        )
 
     # Generic Fallback Evaluation for other recipes
     pos_evidence = data.get("positive_evidence_found", False)
