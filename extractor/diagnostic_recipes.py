@@ -947,6 +947,10 @@ class DiagnosticRecipeRegistry:
         return list(_RECIPES.values())
 
     @classmethod
+    def list_recipe_ids(cls, domain: Optional[str] = None) -> List[str]:
+        return [r.recipe_id for r in cls.list_recipes(domain=domain)]
+
+    @classmethod
     def get_recipes_for_category(cls, category: str) -> List[DiagnosticRecipe]:
         return cls.find_recipes_for_categories([category])
 

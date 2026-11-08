@@ -556,7 +556,13 @@ def runtime_inspect_investigation(investigation_id: str) -> str:
                 "investigation_id": investigation_id
             })
             return _format_result(res)
-        return _format_watch_result({"success": True, **session.get_status()})
+        status_info = session.get_status()
+        return _format_watch_result({
+            "success": True,
+            **status_info,
+            "methodology": session.get_methodology(),
+            "checks": session.get_checks(),
+        })
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -689,19 +695,21 @@ def runtime_get_investigation_conclusion(investigation_id: str) -> str:
 
 
 @server.tool()
-def runtime_get_investigation_report(investigation_id: str) -> str:
+def runtime_get_investigation_report(investigation_id: str, format: str = "json") -> str:
     """Retrieve full synthesis report, verified evidence, and causal findings for an investigation.
     
     Args:
         investigation_id: Investigation session ID (e.g. 'inv_...').
+        format: Desired report format ('json', 'markdown', or 'html').
     """
     try:
         session = runtime.expert_diagnostic_engine.get_session(investigation_id)
-        if session and session.conclusion:
+        if session:
             return _format_watch_result({
                 "success": True,
                 "investigation_id": investigation_id,
-                "report": session.export_report(format="json")
+                "format": format,
+                "report": session.export_report(format=format)
             })
         res = runtime.dispatch_action({
             "action": "GET_INVESTIGATION_REPORT",

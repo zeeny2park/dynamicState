@@ -251,6 +251,28 @@ class ObservationWindow:
             current_limitations.append("Identical timestamps across valid samples; elapsed duration is zero")
             duration = 0.001
 
+        # Check for irregular observation intervals or missing samples
+        intervals = []
+        for i in range(len(valid_samples) - 1):
+            dt = valid_samples[i + 1].monotonic_timestamp - valid_samples[i].monotonic_timestamp
+            intervals.append(dt)
+        has_irregular_intervals = False
+        if len(intervals) >= 2:
+            avg_interval = sum(intervals) / len(intervals)
+            if avg_interval > 0:
+                for iv in intervals:
+                    if abs(iv - avg_interval) / avg_interval > 1.0 or iv <= 0:
+                        has_irregular_intervals = True
+                        break
+        if has_irregular_intervals:
+            current_limitations.append(
+                f"Irregular observation intervals detected across temporal samples: {[round(x, 4) for x in intervals]}s. Growth rates may have higher uncertainty."
+            )
+        if self.failed_samples_count > 0:
+            current_limitations.append(
+                f"Incomplete sample sequence: {self.failed_samples_count} samples missing/failed out of {self.requested_samples_count} requested."
+            )
+
         # 1. Process-level RSS metrics
         rss_start = valid_samples[0].rss_kb
         rss_end = valid_samples[-1].rss_kb

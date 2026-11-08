@@ -54,6 +54,25 @@ class RuntimeEvidenceRecord:
     limitations: List[str] = field(default_factory=list)
     provenance_class: str = PROVENANCE_LIVE_RUNTIME_CAPTURE
     raw_details: Dict[str, Any] = field(default_factory=dict)
+    raw_observation: Any = None
+    normalized_observation: Any = None
+
+    def __post_init__(self):
+        # Preserve raw and normalized observation while distinguishing falsey values (0, False, "")
+        if self.raw_observation is None:
+            if self.raw_details:
+                self.raw_observation = self.raw_details
+            elif self.observed_value is not None:
+                self.raw_observation = self.observed_value
+
+        if self.normalized_observation is None:
+            if self.observed_value is not None:
+                self.normalized_observation = self.observed_value
+            elif self.raw_observation is not None:
+                self.normalized_observation = self.raw_observation
+
+        if self.observed_value is None and self.normalized_observation is not None:
+            self.observed_value = self.normalized_observation
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -75,6 +94,8 @@ class RuntimeEvidenceRecord:
             limitations=list(data.get("limitations", [])),
             provenance_class=data.get("provenance_class", PROVENANCE_LIVE_RUNTIME_CAPTURE),
             raw_details=dict(data.get("raw_details", {})),
+            raw_observation=data.get("raw_observation"),
+            normalized_observation=data.get("normalized_observation"),
         )
 
 

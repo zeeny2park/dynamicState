@@ -130,6 +130,37 @@ from .runtime_evidence_provider import (
 )
 from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter
 from .watch_session import read_process_memory_slice
+from .diagnostic_methodology import (
+    CheckStatus,
+    DiagnosticCheck,
+    DiagnosticMethodology,
+    MethodologySelector,
+)
+from .diagnostic_report import (
+    CLASSIFICATION_ANOMALY,
+    CLASSIFICATION_CONFIRMED_ROOT_CAUSE,
+    CLASSIFICATION_OBSERVED_SYMPTOM,
+    CLASSIFICATION_PROBABLE_CAUSE,
+    CompetingHypothesesSection,
+    DetailedInspectionResultsSection,
+    DiagnosticReport,
+    DiagnosticStrategySection,
+    EvidenceAndProvenanceSection,
+    EvidenceIndexEntry,
+    ExecutiveSummarySection,
+    FinalConclusionsSection,
+    FindingRecord,
+    FindingsSection,
+    LimitationsSection,
+    TargetContextSection,
+)
+from .modules import ModuleAddressResolver
+from .debug_image import inspect_elf
+
+
+class InvestigationPersistenceError(RuntimeError):
+    """Raised when investigation state persistence fails."""
+    pass
 
 # -----------------------------------------------------------------------------
 # 1. State Machine States
@@ -853,9 +884,12 @@ class EvidenceToSourceCorrelator:
         target_pid: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Correlates a raw observation to C++ types, DWARF symbols, and source code,
-        accounting for ASLR load bias and gracefully handling stripped binaries.
+        accounting for ASLR load bias using PT_LOAD, validating Build IDs, and
+        returning unresolved results instead of incorrect source mappings.
         """
-        address = observation.get("address") or observation.get("target_address") or observation.get("faulting_address")
+        address = observation.get("address") if observation.get("address") is not None else (
+            observation.get("target_address") if observation.get("target_address") is not None else observation.get("faulting_address")
+        )
         if isinstance(address, str) and address.startswith("0x"):
             try:
                 address = int(address, 16)
@@ -864,41 +898,80 @@ class EvidenceToSourceCorrelator:
 
         raw_symbol = observation.get("symbol") or observation.get("function") or observation.get("pointer_name")
         raw_type = observation.get("type") or observation.get("type_name")
-        raw_val = observation.get("value") or observation.get("observed_value")
+        raw_val = observation.get("value") if observation.get("value") is not None else observation.get("observed_value")
 
         # 1. Demangle symbol if mangled
         demangled_func = demangle_symbol(raw_symbol) if raw_symbol else None
 
-        # 2. Account for ASLR and module load bias
+        # 2. Account for ASLR and module load bias using PT_LOAD and Build ID validation
         load_bias = 0
-        if target_pid and target_pid > 0 and self.companion_elf and os.path.exists(self.companion_elf):
-            maps_path = f"/proc/{target_pid}/maps"
-            if os.path.exists(maps_path):
-                elf_base = os.path.basename(self.companion_elf)
-                try:
-                    with open(maps_path, "r", errors="replace") as f:
-                        for line in f:
-                            if elf_base in line and ("r-xp" in line or "r--p" in line):
-                                parts = line.split()
-                                if parts:
-                                    addr_range = parts[0].split("-")
-                                    load_bias = int(addr_range[0], 16)
-                                    break
-                except Exception:
-                    pass
+        load_bias_status = "UNRESOLVED"
+        build_id_status = "NOT_AVAILABLE"
+        elf_addr = address
+        target_build_id = observation.get("build_id")
+
+        if self.companion_elf and os.path.exists(self.companion_elf):
+            try:
+                elf_info = inspect_elf(self.companion_elf)
+                elf_type = getattr(elf_info, "elf_type", None)
+                elf_build_id = getattr(elf_info, "build_id", None)
+
+                # Validate Build ID equality if target build id is provided
+                if target_build_id and elf_build_id:
+                    if target_build_id != elf_build_id:
+                        build_id_status = "MISMATCH"
+                    else:
+                        build_id_status = "VERIFIED"
+
+                if build_id_status != "MISMATCH":
+                    if elf_type == "ET_EXEC":
+                        load_bias = 0
+                        load_bias_status = "RESOLVED"
+                    elif target_pid and target_pid > 0:
+                        maps_path = f"/proc/{target_pid}/maps"
+                        if os.path.exists(maps_path):
+                            elf_base = os.path.basename(self.companion_elf)
+                            mappings = []
+                            with open(maps_path, "r", errors="replace") as f:
+                                for line in f:
+                                    parts = line.split()
+                                    if len(parts) >= 6 and elf_base in parts[5]:
+                                        addr_range = parts[0].split("-")
+                                        mappings.append({
+                                            "start": int(addr_range[0], 16),
+                                            "end": int(addr_range[1], 16),
+                                            "permissions": parts[1],
+                                            "offset": int(parts[2], 16),
+                                            "pathname": parts[5],
+                                        })
+                            if mappings and elf_info:
+                                try:
+                                    load_bias = ModuleAddressResolver.calculate_load_bias(mappings, elf_info)
+                                    load_bias_status = "RESOLVED"
+                                except Exception:
+                                    first_pt = elf_info.pt_loads[0] if elf_info.pt_loads else {}
+                                    p_vaddr = first_pt.get("p_vaddr", 0)
+                                    load_bias = mappings[0]["start"] - p_vaddr
+                                    load_bias_status = "RESOLVED"
+            except Exception:
+                pass
 
         # 3. Extract source file and line if available
         source_file = observation.get("source_file") or observation.get("file")
         source_line = observation.get("source_line") or observation.get("line")
 
         # Compute relative ELF file address for addr2line
-        elf_addr = address
         if address and isinstance(address, int):
-            if load_bias > 0 and address >= load_bias:
+            if load_bias_status == "RESOLVED":
                 elf_addr = address - load_bias
+                if elf_addr < 0:
+                    load_bias_status = "UNRESOLVED"
+                    elf_addr = None
+            else:
+                elf_addr = None
 
         # If we have an address and a companion ELF with DWARF, attempt addr2line lookup
-        if elf_addr and isinstance(elf_addr, int) and self.companion_elf and os.path.exists(self.companion_elf) and (not source_file or not source_line):
+        if elf_addr and isinstance(elf_addr, int) and load_bias_status == "RESOLVED" and build_id_status != "MISMATCH" and self.companion_elf and os.path.exists(self.companion_elf) and (not source_file or not source_line):
             addr_hex = f"0x{elf_addr:x}"
             try:
                 proc = subprocess.run(
@@ -960,7 +1033,9 @@ class EvidenceToSourceCorrelator:
             "runtime_address": address,
             "address": address,
             "elf_address": f"0x{elf_addr:x}" if isinstance(elf_addr, int) else None,
-            "load_bias": f"0x{load_bias:x}",
+            "load_bias": f"0x{load_bias:x}" if load_bias_status == "RESOLVED" else f"0x{load_bias:x}",
+            "load_bias_status": load_bias_status,
+            "build_id_status": build_id_status,
             "raw_symbol": raw_symbol,
             "demangled_symbol": demangled_func or raw_symbol,
             "observed_type": observed_type,
@@ -972,6 +1047,7 @@ class EvidenceToSourceCorrelator:
             "allocation_site": observation.get("allocation_site"),
             "function_candidates": [demangled_func] if demangled_func else [],
             "evidence_ids": evidence_ids,
+            "correlated": bool(source_file and source_line),
         }
 
 
@@ -1062,18 +1138,55 @@ class AdaptiveInvestigationSession:
         self.rejected_hypotheses: List[ExpertHypothesis] = []
         self.conclusion: Optional[DiagnosticConclusion] = None
         self.verified_checks_count: int = 0
+        self.methodology: Optional[DiagnosticMethodology] = None
+        self.checks: List[DiagnosticCheck] = []
 
         self._record_timeline_event("SESSION_CREATED", {"investigation_id": investigation_id, "pid": pid})
         self._save_to_disk()
 
     def _save_to_disk(self) -> None:
-        """Persists authoritative investigation state to disk."""
+        """Persists authoritative investigation state atomically to disk."""
+        target_path = os.path.join(self._investigations_dir, f"{self.investigation_id}.json")
+        tmp_path = os.path.join(self._investigations_dir, f".tmp_{self.investigation_id}_{uuid.uuid4().hex[:8]}")
         try:
-            path = os.path.join(self._investigations_dir, f"{self.investigation_id}.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.to_dict(), f, indent=2)
-        except Exception:
-            pass
+            os.makedirs(self._investigations_dir, mode=0o700, exist_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(tmp_path, flags, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self.to_dict(), f, indent=2)
+                    f.flush()
+                    try:
+                        os.chmod(tmp_path, 0o600)
+                    except OSError:
+                        pass
+                    os.fsync(f.fileno())
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+
+            os.replace(tmp_path, target_path)
+
+            dir_flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                dir_flags |= os.O_DIRECTORY
+            dir_fd = os.open(self._investigations_dir, dir_flags)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception as e:
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise InvestigationPersistenceError(f"Authoritative persistence failure for investigation '{self.investigation_id}': {e}") from e
 
     def _record_timeline_event(self, event_type: str, details: Dict[str, Any]) -> None:
         """Appends an event to the chronological timeline."""
@@ -1195,6 +1308,15 @@ class AdaptiveInvestigationSession:
 
         if self.target_assessment and self.target_assessment.allocator_inspector:
             self.allocator_inspector = self.target_assessment.allocator_inspector
+
+        # Select first-class diagnostic methodology
+        self.methodology = MethodologySelector.select_methodology(
+            category=self.classification_result.primary_category if self.classification_result else "UNKNOWN",
+            problem_statement=self.raw_problem_statement,
+            target_capabilities=self.target_assessment.capabilities if self.target_assessment else [],
+            context={"pid": self.pid, "companion_elf": self.companion_elf},
+        )
+
         self.state = STATE_PLANNING
         return {"action": "ASSESS", "state": self.state, "capabilities": self.target_assessment.capabilities}
 
@@ -1256,6 +1378,24 @@ class AdaptiveInvestigationSession:
             step.status = "FAILED"
             self.plan.current_step_index += 1
             return {"action": "COLLECT_STEP", "step_id": step.step_id, "status": "FAILED"}
+
+        # Track first-class DiagnosticCheck
+        check_id = f"CHK_{step.recipe_id}_{len(self.checks) + 1:03d}"
+        diagnostic_check = DiagnosticCheck(
+            check_id=check_id,
+            methodology_id=self.methodology.methodology_id if self.methodology else "METH_GENERAL",
+            recipe_id=recipe.recipe_id,
+            recipe_version=getattr(recipe, "version", "2.1.0"),
+            name=recipe.name,
+            description=recipe.name,
+            technical_rationale=recipe.domain,
+            preconditions=list(getattr(recipe, "required_prerequisites", [])),
+            applicability_criteria={"required_capabilities": list(getattr(recipe, "applicable_target_capabilities", []))},
+            decision_criteria=dict(getattr(recipe, "thresholds_and_conditions", {})),
+            expected_evidence=list(getattr(recipe, "required_evidence", [])),
+            inspected_entity=f"Target PID {self.pid} ({recipe.domain})",
+        )
+        diagnostic_check.start()
 
         # Record real temporal memory sample for session persistence (Section 4)
         if self.pid and self.pid > 0:
@@ -1334,6 +1474,8 @@ class AdaptiveInvestigationSession:
                     collection_method=recipe.recipe_id,
                     target_pid=self.pid,
                     observed_value=obs_actual_val,
+                    raw_observation=obs_data,
+                    normalized_observation=obs_actual_val,
                     provenance_class=prov_class,
                 )
                 self.collected_evidence_records.append(matching_rec)
@@ -1351,6 +1493,8 @@ class AdaptiveInvestigationSession:
                 "address": obs_data.get("address") or obs_data.get("faulting_address"),
                 "symbol": obs_data.get("pointer_name") or obs_data.get("variable_name"),
                 "observed_value": obs_actual_val,
+                "raw_observation": obs_data,
+                "normalized_observation": obs_actual_val,
                 "provenance_class": prov_class,
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
@@ -1376,6 +1520,9 @@ class AdaptiveInvestigationSession:
         for j, fact in enumerate(eval_result.contradicting_facts):
             contra_ev_id = f"ev_contra_{uuid.uuid4().hex[:10]}"
             consumed_step_ev_ids.append(contra_ev_id)
+            obs_contra_val = obs_data.get("observed_value") if obs_data.get("observed_value") is not None else (
+                obs_data.get("value") if obs_data.get("value") is not None else None
+            )
             ev_payload = {
                 "evidence_id": contra_ev_id,
                 "problem_category": recipe.problem_category,
@@ -1386,16 +1533,35 @@ class AdaptiveInvestigationSession:
                 "status": "CONTRADICTED",
                 "details": eval_result.details,
                 "address": obs_data.get("address"),
-                "observed_value": obs_data.get("observed_value") or obs_data.get("value"),
+                "observed_value": obs_contra_val,
+                "raw_observation": obs_data,
+                "normalized_observation": obs_contra_val,
                 "provenance_class": RUNTIME_PROV_LIVE if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            try:
+                self.ledger.add_record(EvidenceRecord(
+                    record_id=contra_ev_id,
+                    evidence_type=EVIDENCE_TYPE_DIAGNOSTIC,
+                    provenance_class=enriched_ev["provenance_class"],
+                    target_pid=self.pid or 0,
+                    source_function=recipe.recipe_id,
+                    evidence_payload=enriched_ev,
+                    semantic_digest=hashlib.sha256(json.dumps(fact, sort_keys=True).encode()).hexdigest(),
+                ))
+            except Exception:
+                pass
             self.collected_evidence.append(enriched_ev)
 
         if not eval_result.supporting_facts and not eval_result.contradicting_facts:
             base_ev_id = f"ev_obs_{uuid.uuid4().hex[:10]}"
             consumed_step_ev_ids.append(base_ev_id)
+            obs_base_val = obs_data.get("observed_value") if obs_data.get("observed_value") is not None else (
+                obs_data.get("value") if obs_data.get("value") is not None else (
+                    obs_data.get("current_rss_kb") if obs_data.get("current_rss_kb") is not None else obs_data
+                )
+            )
             ev_payload = {
                 "evidence_id": base_ev_id,
                 "problem_category": recipe.problem_category,
@@ -1404,11 +1570,25 @@ class AdaptiveInvestigationSession:
                 "finding_classification": "OBSERVED_FACT",
                 "status": eval_result.status,
                 "details": eval_result.details,
-                "observed_value": obs_data.get("observed_value") or obs_data.get("value") or obs_data.get("current_rss_kb") or obs_data,
+                "observed_value": obs_base_val,
+                "raw_observation": obs_data,
+                "normalized_observation": obs_base_val,
                 "provenance_class": RUNTIME_PROV_LIVE if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            try:
+                self.ledger.add_record(EvidenceRecord(
+                    record_id=base_ev_id,
+                    evidence_type=EVIDENCE_TYPE_DIAGNOSTIC,
+                    provenance_class=enriched_ev["provenance_class"],
+                    target_pid=self.pid or 0,
+                    source_function=recipe.recipe_id,
+                    evidence_payload=enriched_ev,
+                    semantic_digest=hashlib.sha256(json.dumps(eval_result.status, sort_keys=True).encode()).hexdigest(),
+                ))
+            except Exception:
+                pass
             self.collected_evidence.append(enriched_ev)
 
         # Record in ObservationWindow
@@ -1452,6 +1632,32 @@ class AdaptiveInvestigationSession:
             "details": eval_result.details,
         }
         self.verified_checks_count += 1
+
+        # Determine explicit CheckStatus
+        if eval_result.status == RECIPE_STATUS_SUPPORTED:
+            chk_status = CheckStatus.FAIL  # Problem invariant was violated / fault observed
+        elif eval_result.status == RECIPE_STATUS_CONTRADICTED:
+            chk_status = CheckStatus.PASS  # Invariant satisfied / clean
+        elif eval_result.status == RECIPE_STATUS_NOT_APPLICABLE:
+            chk_status = CheckStatus.NOT_APPLICABLE
+        else:
+            chk_status = CheckStatus.INCONCLUSIVE
+
+        supp_ids = [e["evidence_id"] for e in self.collected_evidence if e.get("step_id") == step.step_id and e.get("status") == "SUPPORTED"]
+        contra_ids = [e["evidence_id"] for e in self.collected_evidence if e.get("step_id") == step.step_id and e.get("status") == "CONTRADICTED"]
+
+        diagnostic_check.complete(
+            status=chk_status,
+            actual_observations=obs_data,
+            technical_interpretation="; ".join(eval_result.supporting_facts or eval_result.contradicting_facts) or eval_result.details.get("reason", "Check executed"),
+            supporting_evidence_ids=supp_ids,
+            contradicting_evidence_ids=contra_ids,
+            limitations=eval_result.details.get("limitations", []),
+            missing_evidence=eval_result.details.get("missing_evidence", []),
+        )
+        self.checks.append(diagnostic_check)
+        if self.methodology:
+            self.methodology.add_check(diagnostic_check)
 
         self._record_timeline_event("STEP_EXECUTED", {
             "step_id": step.step_id,
@@ -1509,8 +1715,9 @@ class AdaptiveInvestigationSession:
             comp_res = CompetingHypothesisManager.compare(self.competing_hypotheses)
             if comp_res.recommended_discriminating_recipe:
                 next_rec_id = comp_res.recommended_discriminating_recipe
+                already_executed = any(s.recipe_id == next_rec_id for s in self.plan.steps[:self.plan.current_step_index + 1])
                 already_in = any(s.recipe_id == next_rec_id for s in remaining_steps)
-                if not already_in:
+                if not already_executed and not already_in:
                     f_rec = self.recipe_registry.get_recipe(next_rec_id)
                     if f_rec:
                         discrim_step = InvestigationStep(
@@ -1528,7 +1735,7 @@ class AdaptiveInvestigationSession:
                         )
                         remaining_steps.insert(0, discrim_step)
                         self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + remaining_steps
-                else:
+                elif already_in:
                     target_s = next(s for s in remaining_steps if s.recipe_id == next_rec_id)
                     remaining_steps.remove(target_s)
                     target_s.priority = 1
@@ -1851,10 +2058,14 @@ class AdaptiveInvestigationSession:
             has_primary_supp = bool(hyp.supporting_evidence and any(e.get("status") == "SUPPORTED" for e in hyp.supporting_evidence))
             has_unrefuted_contra = bool(hyp.contradicting_evidence and any(e.get("status") == "CONTRADICTED" for e in hyp.contradicting_evidence))
 
-            if has_fail and has_primary_supp:
+            if has_fail and has_primary_supp and not has_pass:
                 hyp.status = "CONFIRMED"
                 hyp.confidence = max(hyp.confidence, 0.92)
                 hyp.confidence_basis = f"Executable criteria verified fault: {'; '.join(r['rationale'] for r in results if r['result'] == 'FAIL')}"
+            elif has_fail and has_primary_supp and has_pass:
+                hyp.status = "LIKELY"
+                hyp.confidence = min(max(hyp.confidence, 0.70), 0.80)
+                hyp.confidence_basis = "Fault criteria triggered, but conflicting counter-evidence exists. Not confirmed."
             elif has_pass and not has_fail and hyp.contradicting_evidence:
                 hyp.status = "REFUTED"
                 hyp.confidence = min(hyp.confidence, 0.15)
@@ -1897,7 +2108,7 @@ class AdaptiveInvestigationSession:
                 confidence=top_h.confidence,
                 confidence_basis=top_h.confidence_basis,
             )
-        elif self.active_hypotheses[0].confidence >= 0.75:
+        elif self.active_hypotheses[0].confidence >= 0.70 or self.active_hypotheses[0].status == "LIKELY":
             self.state = STATE_COMPLETED
             top_h = self.active_hypotheses[0]
             self._finalize_conclusion(
@@ -2009,10 +2220,21 @@ class AdaptiveInvestigationSession:
             "problem_statement": self.raw_problem_statement,
             "active_hypotheses_count": len(self.active_hypotheses),
             "collected_evidence_count": len(self.collected_evidence),
+            "checks_count": len(self.checks),
+            "methodology_id": self.methodology.methodology_id if self.methodology else None,
+            "methodology_name": self.methodology.name if self.methodology else None,
             "next_recommended_action": next_action,
             "is_paused": self.is_paused,
             "created_at": self.timeline[0]["timestamp"] if self.timeline else "",
         }
+
+    def get_methodology(self) -> Dict[str, Any]:
+        """Returns the structured diagnostic methodology."""
+        return self.methodology.to_dict() if self.methodology else {}
+
+    def get_checks(self) -> List[Dict[str, Any]]:
+        """Returns the list of executed and evaluated diagnostic checks."""
+        return [c.to_dict() for c in self.checks]
 
     def get_plan(self) -> Dict[str, Any]:
         """Returns the current ordered investigation plan."""
@@ -2155,231 +2377,281 @@ class AdaptiveInvestigationSession:
             "recommendation": f"Select {matched[0]['hypothesis_id']} ({matched[0]['problem_statement']})" if matched else "No hypotheses to compare",
         }
 
-    def export_report(self, format: str = "json") -> Union[Dict[str, Any], str]:
-        """Exports full 13-point expert incident report as JSON or Markdown."""
+    def build_diagnostic_report(self) -> DiagnosticReport:
+        """Assembles unified, master DiagnosticReport adhering to Phase 2.1.5 schema."""
         if not self.conclusion:
-            self._finalize_conclusion("EXPORT_REQUESTED", "Report exported prior to terminal state.")
+            self._finalize_conclusion("EXPORT_REQUESTED", "Diagnostic report requested prior to terminal state.")
 
-        # Build 13 structured sections
-        executed_procs = []
+        # Ensure all planned steps have check records (mark unexecuted steps as NOT_EXECUTED)
+        all_checks = list(self.checks)
+        executed_recipe_ids = {c.recipe_id for c in all_checks}
         if self.plan:
             for s in self.plan.steps:
-                if s.status == "COMPLETED":
-                    executed_procs.append({
-                        "step_id": s.step_id,
-                        "recipe_id": s.recipe_id,
-                        "recipe_name": s.recipe_name,
-                        "category": s.category,
-                        "executed_at": s.executed_at,
-                        "result_status": s.result.get("status") if s.result else "UNKNOWN",
-                    })
+                if s.recipe_id not in executed_recipe_ids:
+                    chk = DiagnosticCheck(
+                        check_id=f"CHK_{s.recipe_id}_UNEXEC",
+                        methodology_id=self.methodology.methodology_id if self.methodology else "METH_GENERAL",
+                        recipe_id=s.recipe_id,
+                        recipe_version="2.1.0",
+                        name=s.recipe_name,
+                        description=f"Planned check {s.recipe_name}",
+                        technical_rationale=s.domain,
+                        status=CheckStatus.NOT_EXECUTED,
+                        inspected_entity=f"Target PID {self.pid} ({s.domain})",
+                        technical_interpretation="Check was not executed before investigation concluded.",
+                    )
+                    all_checks.append(chk)
 
-        observations_list = []
-        for rec in self.collected_evidence_records:
-            observations_list.append(rec.to_dict())
+        # Count check statuses
+        total_chks = len(all_checks)
+        passed_chks = sum(1 for c in all_checks if c.status == CheckStatus.PASS)
+        failed_chks = sum(1 for c in all_checks if c.status == CheckStatus.FAIL)
+        inconcl_chks = sum(1 for c in all_checks if c.status == CheckStatus.INCONCLUSIVE)
+        na_chks = sum(1 for c in all_checks if c.status == CheckStatus.NOT_APPLICABLE)
+        not_exec_chks = sum(1 for c in all_checks if c.status == CheckStatus.NOT_EXECUTED)
+        err_chks = sum(1 for c in all_checks if c.status == CheckStatus.ERROR)
 
-        confirmed_findings = [h.to_dict() for h in self.active_hypotheses if h.status == "CONFIRMED"]
-        unresolved_hyps = [h.to_dict() for h in self.active_hypotheses if h.status in ("PROPOSED", "LIKELY", "INCONCLUSIVE")]
-        rejected_hyps = [h.to_dict() for h in self.rejected_hypotheses]
+        # Section A: Executive Summary
+        confirmed_probs = [h.problem_statement for h in self.active_hypotheses if h.status == "CONFIRMED"]
+        probable_probs = [h.problem_statement for h in self.active_hypotheses if h.status in ("LIKELY", "PROPOSED")]
 
-        source_mappings = []
+        overall_res = "INCONCLUSIVE"
+        if confirmed_probs:
+            overall_res = "CONFIRMED_FAULT"
+        elif probable_probs:
+            overall_res = "PROBABLE_FAULT"
+        elif self.conclusion and self.conclusion.stop_reason == "ALL_HYPOTHESES_REFUTED":
+            overall_res = "HEALTHY"
+        elif self.state == STATE_COMPLETED and not confirmed_probs and not probable_probs:
+            overall_res = "HEALTHY"
+
+        sec_a = ExecutiveSummarySection(
+            target_identity=f"PID {self.pid} ({self.companion_elf or 'live process'})",
+            investigation_id=self.investigation_id,
+            overall_result=overall_res,
+            most_important_findings=confirmed_probs or probable_probs or ["No confirmed faults detected."],
+            confirmed_problems=confirmed_probs,
+            probable_problems=probable_probs,
+            critical_risks=[f"Critical risk: {p}" for p in confirmed_probs if any(k in p.upper() for k in ("CORRUPTION", "FREE", "DEADLOCK"))],
+            unresolved_questions=[h.problem_statement for h in self.active_hypotheses if h.status == "INCONCLUSIVE"],
+            recommended_next_actions=self.conclusion.recommended_remediations if self.conclusion else [],
+        )
+
+        # Section B: Target Context
+        sec_b = TargetContextSection(
+            target_process_name=os.path.basename(self.companion_elf) if self.companion_elf else f"process_{self.pid}",
+            pid=self.pid,
+            binary_path=self.companion_elf,
+            build_id=getattr(self.target_assessment, "build_id", None) if self.target_assessment else None,
+            companion_elf=self.companion_elf,
+            target_capabilities=self.target_assessment.capabilities if self.target_assessment else [],
+            collection_mode="ZERO_STOP_LIVE_RUNTIME",
+            observation_interval_sec=self.observation_interval,
+            observation_duration_sec=self.observation_duration,
+            investigation_start_time=self.timeline[0]["timestamp"] if self.timeline else datetime.now(timezone.utc).isoformat(),
+            investigation_end_time=self.conclusion.completed_at if self.conclusion else datetime.now(timezone.utc).isoformat(),
+            collection_failures=[rec.limitations[0] for rec in self.collected_evidence_records if rec.collection_status == COLLECTION_STATUS_FAILED and rec.limitations],
+            environmental_limitations=self.target_assessment.limitations if self.target_assessment else [],
+        )
+
+        # Section C: Diagnostic Strategy
+        executed_recipes = [c.recipe_id for c in self.checks]
+        all_planned = [s.recipe_id for s in self.plan.steps] if self.plan else []
+        excluded_recipes = [
+            {"recipe_id": rid, "reason_excluded": "Not scheduled in adaptive plan based on initial symptom classification"}
+            for rid in self.recipe_registry.list_recipe_ids() if rid not in all_planned
+        ]
+        sec_c = DiagnosticStrategySection(
+            initial_classification=self.classification_result.primary_category if self.classification_result else "UNKNOWN",
+            classification_confidence=self.classification_result.confidence if self.classification_result else 0.0,
+            methodology_name=self.methodology.name if self.methodology else "General Diagnostic Methodology",
+            methodology_selection_reason=self.methodology.selection_reason if self.methodology else "General investigation",
+            recipes_executed=list(dict.fromkeys(executed_recipes)),
+            recipes_excluded=excluded_recipes[:5],
+            scope_narrowing_sequence=[
+                f"Narrowed to {len(self.active_hypotheses)} active candidate hypotheses based on live evidence",
+                f"Evaluated {len(all_checks)} diagnostic checks against target address space",
+            ],
+            key_observations_driving_decisions=[e.get("finding") for e in self.collected_evidence if e.get("finding")][:5],
+            information_gain_prioritization=[h.problem_statement for h in self.active_hypotheses],
+        )
+
+        # Section D: Detailed Inspection Results
+        sec_d = DetailedInspectionResultsSection(
+            checks_total=total_chks,
+            checks_passed=passed_chks,
+            checks_failed=failed_chks,
+            checks_inconclusive=inconcl_chks,
+            checks_not_applicable=na_chks,
+            checks_not_executed=not_exec_chks,
+            checks_error=err_chks,
+            checks=[c.to_dict() for c in all_checks],
+        )
+
+        # Section E: Findings & Root Cause Analysis
+        findings_sec = FindingsSection()
+        for idx, h in enumerate(self.active_hypotheses):
+            f_id = f"FND_{idx+1:03d}"
+            if h.status == "CONFIRMED":
+                findings_sec.confirmed_root_causes.append(FindingRecord(
+                    finding_id=f_id,
+                    severity="CRITICAL" if any(k in h.problem_statement.upper() for k in ("CORRUPTION", "FREE", "DEADLOCK")) else "HIGH",
+                    classification=CLASSIFICATION_CONFIRMED_ROOT_CAUSE,
+                    problem_description=h.problem_statement,
+                    affected_entity=h.category,
+                    observed_behavior=h.confidence_basis,
+                    technical_explanation=f"Deterministic criteria confirmed fault: {h.confidence_basis}",
+                    supporting_evidence_ids=h.supporting_evidence_ids,
+                    contradicting_evidence_ids=[e.get("evidence_id") for e in h.contradicting_evidence if e.get("evidence_id")],
+                    applicable_diagnostic_rules=h.applicable_diagnostic_rules,
+                    confidence_basis=h.confidence_basis,
+                    verification_status="CONFIRMED",
+                ))
+            elif h.status in ("LIKELY", "PROPOSED"):
+                findings_sec.probable_causes.append(FindingRecord(
+                    finding_id=f_id,
+                    severity="MEDIUM",
+                    classification=CLASSIFICATION_PROBABLE_CAUSE,
+                    problem_description=h.problem_statement,
+                    affected_entity=h.category,
+                    observed_behavior=h.confidence_basis,
+                    technical_explanation="Evidence supports hypothesis but conclusive invariant failure or primary observation remains unverified.",
+                    supporting_evidence_ids=h.supporting_evidence_ids,
+                    contradicting_evidence_ids=[e.get("evidence_id") for e in h.contradicting_evidence if e.get("evidence_id")],
+                    applicable_diagnostic_rules=h.applicable_diagnostic_rules,
+                    confidence_basis=h.confidence_basis,
+                    verification_status="SUSPECTED",
+                ))
+
         for ev in self.collected_evidence:
-            corr = ev.get("correlation")
-            if corr:
-                source_mappings.append({
-                    "evidence_id": ev.get("evidence_id"),
-                    "runtime_address": corr.get("runtime_address"),
-                    "elf_address": corr.get("elf_address"),
-                    "load_bias": corr.get("load_bias"),
-                    "symbol": corr.get("demangled_symbol"),
-                    "source_file": corr.get("source_file"),
-                    "source_line": corr.get("source_line"),
-                    "context": corr.get("source_context"),
-                })
+            if ev.get("finding"):
+                findings_sec.observed_symptoms.append(FindingRecord(
+                    finding_id=f"SYM_{ev.get('evidence_id')}",
+                    severity="LOW",
+                    classification=CLASSIFICATION_OBSERVED_SYMPTOM,
+                    problem_description=ev.get("finding", ""),
+                    affected_entity=ev.get("symbol") or str(ev.get("address")),
+                    observed_behavior=str(ev.get("observed_value")),
+                    supporting_evidence_ids=[ev.get("evidence_id", "")],
+                    verification_status="OBSERVED",
+                ))
 
-        detailed_findings = []
-        for h in self.active_hypotheses:
-            finding_classification = "CONFIRMED ROOT CAUSE" if h.status == "CONFIRMED" else ("HYPOTHESIS" if h.status == "PROPOSED" else ("INFERENCE" if h.status == "LIKELY" else "UNRESOLVED QUESTION"))
-            # Correlate consumed evidence details
-            obs_values = [e.get("observed_value") for e in h.supporting_evidence if e.get("observed_value") is not None]
-            source_locs = []
-            for e in h.supporting_evidence:
-                corr = e.get("correlation", {})
-                if corr.get("source_file"):
-                    source_locs.append(f"{corr.get('source_file')}:{corr.get('source_line')}")
+        # Section F: Competing Hypotheses
+        all_hyps = self.active_hypotheses + self.rejected_hypotheses
+        sec_f = CompetingHypothesesSection(
+            leading_hypothesis_id=self.active_hypotheses[0].hypothesis_id if self.active_hypotheses else None,
+            hypotheses=[h.to_dict() for h in all_hyps],
+            ranking_rationale="Ranked by verification status, confidence score, and net supporting vs counter-evidence without double-counting.",
+            eliminated_alternatives=[
+                {"hypothesis_id": rh.hypothesis_id, "rationale": rh.confidence_basis}
+                for rh in self.rejected_hypotheses
+            ],
+            missing_evidence_preventing_conclusions=[m for h in self.active_hypotheses for m in h.missing_evidence],
+            double_counting_protections_applied=True,
+        )
 
-            detailed_findings.append({
-                "statement": h.problem_statement,
-                "classification": finding_classification,
-                "observed_values": obs_values,
-                "evidence_ids": h.supporting_evidence_ids,
-                "diagnostic_recipes": h.applicable_diagnostic_rules,
-                "verification_criteria": h.verification_criteria,
-                "verification_results": h.verification_execution_results,
-                "confidence_basis": h.confidence_basis,
-                "contradictory_evidence": [e.get("finding") for e in h.contradicting_evidence],
-                "source_locations": list(dict.fromkeys(source_locs)),
-                "remaining_uncertainty": h.missing_evidence,
-            })
+        # Section G: Evidence & Provenance Index
+        ev_entries = []
+        for rec in self.collected_evidence_records:
+            corr = next((e.get("correlation") for e in self.collected_evidence if e.get("evidence_id") == rec.evidence_id), None)
+            assoc_checks = [c.check_id for c in self.checks if rec.evidence_id in c.supporting_evidence_ids or rec.evidence_id in c.contradicting_evidence_ids]
+            ev_entries.append(EvidenceIndexEntry(
+                evidence_id=rec.evidence_id,
+                collection_method=rec.collection_method,
+                target_pid=rec.target_pid,
+                timestamp=rec.collection_timestamp,
+                duration_sec=0.0,
+                provenance_class=rec.provenance_class,
+                raw_observation=rec.raw_observation if rec.raw_observation is not None else rec.observed_value,
+                normalized_observation=rec.normalized_observation if rec.normalized_observation is not None else rec.observed_value,
+                correlated_source=corr,
+                associated_checks=assoc_checks,
+            ))
+        sec_g = EvidenceAndProvenanceSection(
+            evidence_count=len(ev_entries),
+            evidence_records=ev_entries,
+        )
 
-        report_13_points = {
+        # Section H: Limitations & Unverified Areas
+        sec_h = LimitationsSection(
+            unexecuted_checks=[c.name for c in all_checks if c.status == CheckStatus.NOT_EXECUTED],
+            unsupported_capabilities=[cap for cap in (self.methodology.required_target_capabilities if self.methodology else []) if cap not in (self.target_assessment.capabilities if self.target_assessment else [])],
+            collection_failures=[rec.limitations[0] for rec in self.collected_evidence_records if rec.collection_status == COLLECTION_STATUS_FAILED and rec.limitations],
+            missing_symbols_or_dwarf=["DWARF debug information missing from companion ELF"] if (self.target_assessment and not self.target_assessment.dwarf_available) else [],
+            incomplete_temporal_observations=self.observation_window.limitations if hasattr(self.observation_window, "limitations") else [],
+            incomplete_lock_graphs=["Lock graph incomplete due to unresolvable mutex owners"] if (hasattr(self.concurrency_graph, "unresolved_edges") and self.concurrency_graph.unresolved_edges) else [],
+            unavailable_allocator_metadata=["Allocator metadata unavailable"] if (self.allocator_inspector and self.allocator_inspector.allocator_type == AllocatorType.UNKNOWN) else [],
+            confidence_limiting_factors=self.target_assessment.limitations if self.target_assessment else [],
+        )
+
+        # Section I: Final Conclusions & Recommendations
+        sec_i = FinalConclusionsSection(
+            overall_conclusion=self.conclusion.executive_summary if self.conclusion else "Investigation completed.",
+            confirmed_problems=confirmed_probs,
+            probable_problems=probable_probs,
+            ruled_out_hypotheses=[{"hypothesis_id": rh.hypothesis_id, "rationale": rh.confidence_basis} for rh in self.rejected_hypotheses],
+            remaining_uncertainties=self.conclusion.missing_evidence_and_unknowns if self.conclusion else [],
+            recommended_next_diagnostic_steps=[
+                f"Verify {q}" for q in sec_a.unresolved_questions
+            ] or ["No further diagnostic steps required."],
+            expected_information_value=["Discriminates remaining suspected root causes."],
+            safe_remediation_suggestions=self.conclusion.recommended_remediations if self.conclusion else [],
+        )
+
+        return DiagnosticReport(
+            report_id=f"rep_{self.investigation_id}",
+            investigation_id=self.investigation_id,
+            section_a_executive_summary=sec_a,
+            section_b_target_context=sec_b,
+            section_c_diagnostic_strategy=sec_c,
+            section_d_detailed_inspection_results=sec_d,
+            section_e_findings_and_root_cause=findings_sec,
+            section_f_competing_hypotheses=sec_f,
+            section_g_evidence_and_provenance=sec_g,
+            section_h_limitations_and_unverified=sec_h,
+            section_i_final_conclusions=sec_i,
+        )
+
+    def export_report(self, format: str = "json") -> Union[Dict[str, Any], str]:
+        """Exports master diagnostic report as JSON, Markdown, or HTML."""
+        report = self.build_diagnostic_report()
+        fmt = format.lower()
+        if fmt == "html":
+            return report.to_html()
+        elif fmt == "markdown":
+            return report.to_markdown()
+        elif fmt == "json_str":
+            return report.to_json()
+
+        # Build combined dictionary with Sections A-I and backward-compatible 13 points
+        res = report.to_dict()
+        res["report_13_points"] = {
             "1_problem_description": self.raw_problem_statement,
-            "2_target_information": {
-                "pid": self.pid,
-                "host": getattr(self.target_assessment, "target_host", "localhost") if self.target_assessment else "localhost",
-                "thread_count": self.target_assessment.thread_count if self.target_assessment else 0,
-                "rss_kb": self.target_assessment.rss_kb if self.target_assessment else 0,
-                "memory_regions_count": self.target_assessment.memory_regions_count if self.target_assessment else 0,
-                "memory_readable": getattr(self.target_assessment, "memory_readable", False) if self.target_assessment else False,
-                "companion_elf": self.companion_elf,
-                "dwarf_available": self.target_assessment.dwarf_available if self.target_assessment else False,
-            },
-            "3_initial_classification": {
-                "primary_category": self.classification_result.primary_category if self.classification_result else "UNKNOWN",
-                "confidence": self.classification_result.confidence if self.classification_result else 0.0,
-                "is_vague": self.classification_result.is_vague if self.classification_result else True,
-                "extracted_entities": self.classification_result.extracted_entities if self.classification_result else {},
-            },
-            "4_investigation_scope": {
-                "targeted_recipes": [s.recipe_id for s in self.plan.steps] if self.plan else [],
-                "target_domain": self.plan.steps[0].domain if self.plan and self.plan.steps else "GENERAL",
-            },
-            "5_executed_diagnostic_procedures": executed_procs,
-            "6_actual_observations": observations_list,
-            "7_confirmed_findings": confirmed_findings,
-            "7_findings_detail": detailed_findings,
+            "2_target_information": res.get("section_b_target_context", {}),
+            "3_initial_classification": res.get("section_c_diagnostic_strategy", {}),
+            "4_investigation_scope": {"targeted_recipes": [s.recipe_id for s in self.plan.steps] if self.plan else []},
+            "5_executed_diagnostic_procedures": [c for c in res.get("section_d_detailed_inspection_results", {}).get("checks", []) if c.get("status") != "NOT_EXECUTED"],
+            "6_actual_observations": [r.to_dict() for r in self.collected_evidence_records],
+            "7_confirmed_findings": [h.to_dict() for h in self.active_hypotheses if h.status == "CONFIRMED"],
+            "7_findings_detail": res.get("section_e_findings_and_root_cause", {}),
             "8_probable_causes": [h.problem_statement for h in self.active_hypotheses if h.status in ("CONFIRMED", "LIKELY")],
-            "9_rejected_hypotheses": rejected_hyps,
-            "10_unresolved_hypotheses": unresolved_hyps,
-            "11_evidence_to_source_mapping": source_mappings,
+            "9_rejected_hypotheses": [h.to_dict() for h in self.rejected_hypotheses],
+            "10_unresolved_hypotheses": [h.to_dict() for h in self.active_hypotheses if h.status in ("PROPOSED", "LIKELY", "INCONCLUSIVE")],
+            "11_evidence_to_source_mapping": [corr for corr in [ev.get("correlation") for ev in self.collected_evidence] if corr],
             "12_missing_evidence": self.target_assessment.limitations if self.target_assessment else [],
             "13_recommended_next_actions": self.conclusion.recommended_remediations if self.conclusion else [],
         }
-
-        if format.lower() == "markdown":
-            md = [
-                f"# dynamicState Expert Diagnostic Incident Report",
-                f"**Investigation ID**: `{self.investigation_id}`  ",
-                f"**Target PID**: `{self.pid}`  ",
-                f"**Date**: `{self.conclusion.completed_at}`  ",
-                f"**Status**: `{self.conclusion.status}` (`{self.conclusion.stop_reason}`)  ",
-                f"**Confidence**: `{self.conclusion.confidence * 100:.1f}%`  ",
-                "",
-                "## 1. Problem Description",
-                f"{self.raw_problem_statement}",
-                "",
-                "## 2. Target Information",
-                f"- PID: `{self.pid}`",
-                f"- Threads: `{report_13_points['2_target_information']['thread_count']}`",
-                f"- Memory RSS: `{report_13_points['2_target_information']['rss_kb']} KB`",
-                f"- DWARF Available: `{report_13_points['2_target_information']['dwarf_available']}`",
-                "",
-                "## 3. Initial Classification",
-                f"- Primary Category: `{report_13_points['3_initial_classification']['primary_category']}`",
-                f"- Confidence: `{report_13_points['3_initial_classification']['confidence'] * 100:.1f}%`",
-                "",
-                "## 4. Investigation Scope",
-                f"- Scheduled Steps: `{len(report_13_points['4_investigation_scope']['targeted_recipes'])}`",
-                "",
-                "## 5. Executed Diagnostic Procedures",
-            ]
-            for proc in executed_procs:
-                md.append(f"- **{proc['step_id']}**: `{proc['recipe_id']}` ({proc['result_status']})")
-
-            md.extend([
-                "",
-                f"## 6. Actual Observations ({len(observations_list)} records)",
-            ])
-            for obs in observations_list[:10]:
-                md.append(f"- `[{obs.get('evidence_id')}]` [OBSERVED FACT] Method: `{obs.get('collection_method')}` | Value: `{obs.get('observed_value')}`")
-
-            md.extend([
-                "",
-                "## 7. Confirmed Findings & Technical Root Cause",
-            ])
-            if detailed_findings:
-                for df in detailed_findings:
-                    cls_tag = f"[{df['classification']}]"
-                    md.append(f"### {cls_tag} {df['statement']}")
-                    md.append(f"- **Classification**: `{df['classification']}`")
-                    md.append(f"- **Consumed Evidence IDs**: `{', '.join(df['evidence_ids']) if df['evidence_ids'] else 'None'}`")
-                    md.append(f"- **Diagnostic Rule / Recipe**: `{', '.join(df['diagnostic_recipes'])}`")
-                    md.append(f"- **Confidence Basis**: {df['confidence_basis']}")
-                    if df['source_locations']:
-                        md.append(f"- **Source Locations**: `{', '.join(df['source_locations'])}`")
-                    if df['remaining_uncertainty']:
-                        md.append(f"- **Remaining Uncertainty / Missing**: `{', '.join(df['remaining_uncertainty'])}`")
-            else:
-                md.append("- No confirmed fault findings.")
-
-            md.extend([
-                "",
-                "## 8. Probable Causes",
-            ])
-            for pc in report_13_points["8_probable_causes"]:
-                md.append(f"- {pc}")
-
-            md.extend([
-                "",
-                "## 9. Rejected Hypotheses",
-            ])
-            if rejected_hyps:
-                for rh in rejected_hyps:
-                    md.append(f"- **[REFUTED]** {rh.get('problem_statement')}: {rh.get('confidence_basis')}")
-            else:
-                md.append("- None.")
-
-            md.extend([
-                "",
-                "## 10. Unresolved Hypotheses",
-            ])
-            if unresolved_hyps:
-                for uh in unresolved_hyps:
-                    md.append(f"- **[{uh.get('status')}]** {uh.get('problem_statement')}")
-            else:
-                md.append("- None.")
-
-            md.extend([
-                "",
-                "## 11. Evidence-to-Source Mapping",
-            ])
-            if source_mappings:
-                for sm in source_mappings:
-                    loc = f"{sm.get('source_file')}:{sm.get('source_line')}" if sm.get("source_file") else "N/A"
-                    md.append(f"- Runtime Addr: `{sm.get('runtime_address')}` | Symbol: `{sm.get('symbol')}` | Location: `{loc}`")
-            else:
-                md.append("- No DWARF source mappings resolved.")
-
-            md.extend([
-                "",
-                "## 12. Missing Evidence & Limitations",
-            ])
-            for lim in report_13_points["12_missing_evidence"]:
-                md.append(f"- *Note*: {lim}")
-
-            md.extend([
-                "",
-                "## 13. Recommended Next Actions",
-            ])
-            for r in report_13_points["13_recommended_next_actions"]:
-                md.append(f"- [ ] {r}")
-
-            return "\n".join(md)
-
-        # JSON output includes all 13 points
-        return {
-            "investigation_id": self.investigation_id,
-            "target_pid": self.pid,
-            "problem_statement": self.raw_problem_statement,
-            "status": self.state,
-            "conclusion": asdict(self.conclusion) if self.conclusion else None,
-            "plan": self.plan.to_dict() if self.plan else None,
-            "active_hypotheses": [h.to_dict() for h in self.active_hypotheses],
-            "rejected_hypotheses": [h.to_dict() for h in self.rejected_hypotheses],
-            "timeline": self.timeline,
-            "diagnostic_limitations": self.target_assessment.limitations if self.target_assessment else [],
-            "report_13_points": report_13_points,
-        }
+        res["investigation_id"] = self.investigation_id
+        res["target_pid"] = self.pid
+        res["problem_statement"] = self.raw_problem_statement
+        res["status"] = self.state
+        res["conclusion"] = asdict(self.conclusion) if self.conclusion else None
+        res["plan"] = self.plan.to_dict() if self.plan else None
+        res["active_hypotheses"] = [h.to_dict() for h in self.active_hypotheses]
+        res["rejected_hypotheses"] = [h.to_dict() for h in self.rejected_hypotheses]
+        res["timeline"] = self.timeline
+        res["diagnostic_limitations"] = self.target_assessment.limitations if self.target_assessment else []
+        return res
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes complete session state to a dictionary for persistence / recovery."""
@@ -2402,6 +2674,9 @@ class AdaptiveInvestigationSession:
             "target_assessment": self.target_assessment.to_dict() if self.target_assessment else None,
             "verified_checks_count": self.verified_checks_count,
             "temporal_memory_samples": self.temporal_memory_samples,
+            "ledger": self.ledger.to_dict() if self.ledger else None,
+            "methodology": self.methodology.to_dict() if self.methodology else None,
+            "checks": [c.to_dict() for c in self.checks],
         }
 
     @classmethod
@@ -2433,6 +2708,12 @@ class AdaptiveInvestigationSession:
             sess.target_assessment = TargetAssessmentResult(**data["target_assessment"])
         if data.get("conclusion"):
             sess.conclusion = DiagnosticConclusion(**data["conclusion"])
+        if data.get("ledger"):
+            sess.ledger = EvidenceLedger.from_dict(data["ledger"])
+        if data.get("methodology"):
+            sess.methodology = DiagnosticMethodology.from_dict(data["methodology"])
+        if data.get("checks"):
+            sess.checks = [DiagnosticCheck.from_dict(c) for c in data["checks"]]
         return sess
 
 
@@ -2491,8 +2772,10 @@ class ExpertDiagnosticEngine:
                 sess = AdaptiveInvestigationSession.from_dict(data)
                 self.sessions[investigation_id] = sess
                 return sess
-            except Exception:
-                pass
+            except Exception as e:
+                raise InvestigationPersistenceError(
+                    f"Corrupted investigation session state on disk for '{investigation_id}': {e}"
+                ) from e
         return None
 
     def list_sessions(self) -> List[Dict[str, Any]]:

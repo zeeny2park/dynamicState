@@ -64,47 +64,83 @@ class CompetingHypothesis:
     unresolved_assumptions: List[str] = field(default_factory=list)
     discriminating_actions: List[str] = field(default_factory=list)
     evidence_ids: List[str] = field(default_factory=list)
+    supporting_evidence_ids: List[str] = field(default_factory=list)
+    contradicting_evidence_ids: List[str] = field(default_factory=list)
+    evidence_dependencies: Dict[str, List[str]] = field(default_factory=dict)
     details: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_viable(self) -> bool:
         return self.status in (VERDICT_CONFIRMED, VERDICT_LIKELY, VERDICT_SUPPORTED, VERDICT_INCONCLUSIVE)
 
-    def add_supporting_observation(self, observation: str, evidence_id: Optional[str] = None) -> bool:
-        """Adds supporting observation preventing double-counting."""
+    def add_supporting_observation(
+        self,
+        observation: str,
+        evidence_id: Optional[str] = None,
+        depends_on: Optional[List[str]] = None,
+    ) -> bool:
+        """Adds supporting observation with anti-double-counting and dependency tracking."""
         if observation in self.supporting_observations:
             return False
+        # If evidence_id is provided and already recorded as supporting evidence, avoid treating description as independent
+        if evidence_id and evidence_id in self.supporting_evidence_ids:
+            return False
+
         self.supporting_observations.append(observation)
-        if evidence_id and evidence_id not in self.evidence_ids:
-            self.evidence_ids.append(evidence_id)
+        if evidence_id:
+            if evidence_id not in self.evidence_ids:
+                self.evidence_ids.append(evidence_id)
+            if evidence_id not in self.supporting_evidence_ids:
+                self.supporting_evidence_ids.append(evidence_id)
+            if depends_on:
+                self.evidence_dependencies[evidence_id] = list(depends_on)
+
         self.evaluate_verdict()
         return True
 
-    def add_contradicting_observation(self, contradiction: str, evidence_id: Optional[str] = None) -> bool:
-        """Adds contradictory observation preventing double-counting."""
+    def add_contradicting_observation(
+        self,
+        contradiction: str,
+        evidence_id: Optional[str] = None,
+        depends_on: Optional[List[str]] = None,
+    ) -> bool:
+        """Adds contradictory observation with anti-double-counting and authority tracking."""
         if contradiction in self.contradicting_observations:
             return False
+        if evidence_id and evidence_id in self.contradicting_evidence_ids:
+            return False
+
         self.contradicting_observations.append(contradiction)
-        if evidence_id and evidence_id not in self.evidence_ids:
-            self.evidence_ids.append(evidence_id)
+        if evidence_id:
+            if evidence_id not in self.evidence_ids:
+                self.evidence_ids.append(evidence_id)
+            if evidence_id not in self.contradicting_evidence_ids:
+                self.contradicting_evidence_ids.append(evidence_id)
+            if depends_on:
+                self.evidence_dependencies[evidence_id] = list(depends_on)
+
         self.evaluate_verdict()
         return True
 
     def evaluate_verdict(self) -> str:
         """Updates hypothesis status following strict verdict semantics."""
         # Contradicted: any authoritative counter-evidence refutes the hypothesis
-        if self.contradicting_observations:
+        if self.contradicting_observations or self.contradicting_evidence_ids:
             self.status = VERDICT_REFUTED
             self.confidence = min(self.confidence, 0.15)
             return self.status
 
-        # P1: Confidence score alone CANNOT produce CONFIRMED!
-        # Requires at least one verified supporting observation and zero contradictions
-        if len(self.supporting_observations) >= 2 and self.confidence >= 0.90:
+        # P0/P1: Confidence score alone CANNOT produce CONFIRMED!
+        # Requires at least one verified supporting observation with valid evidence ID,
+        # and zero unrefuted contradictions.
+        distinct_supp_count = len(self.supporting_evidence_ids) if self.supporting_evidence_ids else len(self.supporting_observations)
+        
+        # CONFIRMED requires high confidence AND distinct supporting evidence with verified IDs
+        if (len(self.supporting_evidence_ids) >= 1 or len(self.supporting_observations) >= 2) and self.confidence >= 0.90:
             self.status = VERDICT_CONFIRMED
-        elif len(self.supporting_observations) >= 1 and self.confidence >= 0.70:
+        elif distinct_supp_count >= 1 and self.confidence >= 0.70:
             self.status = VERDICT_LIKELY
-        elif len(self.supporting_observations) >= 1:
+        elif distinct_supp_count >= 1:
             self.status = VERDICT_SUPPORTED
         else:
             self.status = VERDICT_INCONCLUSIVE
