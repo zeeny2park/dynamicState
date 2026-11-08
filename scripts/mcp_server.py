@@ -438,6 +438,10 @@ def runtime_start_investigation(
     memory_snapshot_path: Optional[str] = None,
     watch_session_id: Optional[str] = None,
     observation_window: Optional[Dict[str, Any]] = None,
+    expert_overrides: Optional[List[Dict[str, Any]]] = None,
+    manual_invariants: Optional[List[Dict[str, Any]]] = None,
+    observation_interval: Optional[float] = None,
+    observation_duration: Optional[float] = None,
 ) -> str:
     """Launch an evidence-first adaptive investigation session against a live PID, offline snapshot, or persistent watch session.
     
@@ -494,6 +498,10 @@ def runtime_start_investigation(
             pid=valid_pid,
             companion_elf=effective_elf,
             adapter=target_adapter,
+            expert_overrides=expert_overrides,
+            manual_invariants=manual_invariants,
+            observation_interval=observation_interval,
+            observation_duration=observation_duration,
         )
         expert_sess.step()  # CLASSIFY
         expert_sess.step()  # ASSESS

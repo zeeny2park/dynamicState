@@ -48,9 +48,48 @@ from .diagnostic_recipes import (
     RECIPE_STATUS_CONTRADICTED,
     RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
     RECIPE_STATUS_SUPPORTED,
+    RECIPE_STATUS_NOT_APPLICABLE,
+    EVAL_STATUS_NOT_APPLICABLE,
     DiagnosticRecipe,
     DiagnosticRecipeRegistry,
     RecipeEvaluationResult,
+)
+from .diagnostic_rule_model import (
+    VERDICT_CONFIRMED,
+    VERDICT_LIKELY,
+    VERDICT_SUPPORTED,
+    VERDICT_REFUTED,
+    VERDICT_INCONCLUSIVE,
+    VERDICT_NOT_APPLICABLE,
+    DiagnosticRule,
+    RuleApplicabilityResult,
+)
+from .temporal_observation_window import (
+    ObservationWindow,
+    MemorySample,
+    MemoryBehavior,
+    MemoryAnalysisResult,
+)
+from .competing_hypotheses import (
+    CompetingHypothesis,
+    CompetingHypothesisManager,
+    HypothesisComparisonResult,
+)
+from .cpp_structural_discovery import (
+    CppStructuralDiscovery,
+    CppRelationshipCandidate,
+    ExpertOverrideConstraint,
+)
+from .invariant_framework import (
+    InvariantDefinition,
+    InvariantType,
+    InvariantSource,
+    InvariantEvaluator,
+    InvariantEvaluationResult,
+)
+from .concurrency_graph import (
+    WaitForGraph,
+    ConcurrencyState,
 )
 from .evidence_ledger import (
     ATTRIBUTION_BASIS_CALL_STACK,
@@ -920,6 +959,10 @@ class AdaptiveInvestigationSession:
         companion_elf: Optional[str] = None,
         corpus_dir: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
+        expert_overrides: Optional[List[Any]] = None,
+        manual_invariants: Optional[List[Any]] = None,
+        observation_interval: Optional[float] = None,
+        observation_duration: Optional[float] = None,
     ):
         self.investigation_id = investigation_id
         self.raw_problem_statement = problem_statement
@@ -929,6 +972,10 @@ class AdaptiveInvestigationSession:
         self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
         os.makedirs(self._investigations_dir, exist_ok=True)
         self.adapter = adapter or LocalTargetAdapter()
+        self.expert_overrides = expert_overrides or []
+        self.manual_invariants = manual_invariants or []
+        self.observation_interval = observation_interval or 0.05
+        self.observation_duration = observation_duration or 1.0
 
         # Components
         self.classifier = ProblemClassifier()
@@ -939,6 +986,13 @@ class AdaptiveInvestigationSession:
         self.ledger = EvidenceLedger(session_id=self.investigation_id)
         self.evidence_provider = RuntimeEvidenceProvider(adapter=self.adapter, corpus_dir=self.corpus_dir)
         self.temporal_memory_samples: List[Dict[str, Any]] = []
+        self.observation_window = ObservationWindow(
+            target_pid=pid or 0,
+            target_identity=str(self.adapter.target_host()),
+            default_interval=self.observation_interval,
+        )
+        self.competing_hypotheses: List[CompetingHypothesis] = []
+        self.invariant_evaluator = InvariantEvaluator()
 
         # State machine
         self.state = STATE_CREATED
@@ -1050,11 +1104,17 @@ class AdaptiveInvestigationSession:
     def _step_classify(self) -> Dict[str, Any]:
         self.state = STATE_CLASSIFYING
         self.classification_result = self.classifier.classify(self.raw_problem_statement)
+        # Generate initial competing hypotheses
+        self.competing_hypotheses = CompetingHypothesisManager.generate_competing_hypotheses_for_symptom(
+            self.classification_result.primary_category,
+            {"pid": self.pid, "entities": self.classification_result.extracted_entities},
+        )
         self._record_timeline_event("PROBLEM_CLASSIFIED", {
             "primary_category": self.classification_result.primary_category,
             "confidence": self.classification_result.confidence,
             "is_vague": self.classification_result.is_vague,
             "extracted_entities": self.classification_result.extracted_entities,
+            "competing_hypotheses_count": len(self.competing_hypotheses),
         })
         self.state = STATE_ASSESSING
         return {"action": "CLASSIFY", "state": self.state, "primary_category": self.classification_result.primary_category}
@@ -1092,9 +1152,34 @@ class AdaptiveInvestigationSession:
             classification=self.classification_result,
             target_assessment=self.target_assessment,
         )
+
+        # Incorporate Expert Overrides into plan (Case P)
+        if self.expert_overrides:
+            for ov in reversed(self.expert_overrides):
+                ov_vars = getattr(ov, "related_variables", []) or ([getattr(ov, "variable_expression")] if getattr(ov, "variable_expression", None) else [])
+                ov_recipe = "RECIPE_INCONSISTENT_RELATED_VARIABLES" if len(ov_vars) >= 2 else "RECIPE_UNEXPECTED_VARIABLE_CHANGES"
+                r_meta = self.recipe_registry.get_recipe(ov_recipe)
+                if r_meta:
+                    override_step = InvestigationStep(
+                        step_id=f"step_expert_{len(self.plan.steps)+1:02d}",
+                        recipe_id=ov_recipe,
+                        recipe_name=f"[Expert Override] {r_meta.name}",
+                        category=getattr(ov, "problem_category", None) or r_meta.problem_category,
+                        domain=r_meta.domain,
+                        rationale=f"Expert override prioritization: targeting {ov_vars}",
+                        priority=1,
+                        cost_score=0.95,
+                        safety_score=1.0,
+                        expected_info_gain=0.85,
+                        multi_factor_score=0.80,
+                    )
+                    self.plan.steps.insert(0, override_step)
+            self.plan.total_steps = len(self.plan.steps)
+
         self._record_timeline_event("PLAN_GENERATED", {
             "total_steps": self.plan.total_steps,
             "rationale": self.plan.plan_rationale,
+            "has_expert_overrides": bool(self.expert_overrides),
         })
         self.state = STATE_COLLECTING
         return {"action": "PLAN", "state": self.state, "plan": self.plan.to_dict()}
@@ -1166,6 +1251,14 @@ class AdaptiveInvestigationSession:
 
         # Enrich and correlate evidence records (Section 7: 1:1 finding-to-evidence relationship)
         for i, fact in enumerate(eval_result.supporting_facts):
+            obs_actual_val = obs_data.get("observed_value") if obs_data.get("observed_value") is not None else (
+                obs_data.get("value") if obs_data.get("value") is not None else (
+                    obs_data.get("current_rss_kb") if obs_data.get("current_rss_kb") is not None else (
+                        obs_data.get("pointer_value") if obs_data.get("pointer_value") is not None else obs_data
+                    )
+                )
+            )
+
             if i < len(ev_records):
                 matching_rec = ev_records[i]
                 ev_id = matching_rec.evidence_id
@@ -1177,7 +1270,7 @@ class AdaptiveInvestigationSession:
                     evidence_id=ev_id,
                     collection_method=recipe.recipe_id,
                     target_pid=self.pid,
-                    observed_value=fact,
+                    observed_value=obs_actual_val,
                     provenance_class=prov_class,
                 )
                 self.collected_evidence_records.append(matching_rec)
@@ -1194,7 +1287,7 @@ class AdaptiveInvestigationSession:
                 "details": eval_result.details,
                 "address": obs_data.get("address") or obs_data.get("faulting_address"),
                 "symbol": obs_data.get("pointer_name") or obs_data.get("variable_name"),
-                "observed_value": obs_data.get("observed_value") or obs_data.get("value"),
+                "observed_value": obs_actual_val,
                 "provenance_class": prov_class,
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
@@ -1230,11 +1323,44 @@ class AdaptiveInvestigationSession:
                 "status": "CONTRADICTED",
                 "details": eval_result.details,
                 "address": obs_data.get("address"),
-                "provenance_class": RUNTIME_PROV_LIVE if self.pid else PROVENANCE_SYNTHETIC_FIXTURE,
+                "observed_value": obs_data.get("observed_value") or obs_data.get("value"),
+                "provenance_class": RUNTIME_PROV_LIVE if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
             self.collected_evidence.append(enriched_ev)
+
+        if not eval_result.supporting_facts and not eval_result.contradicting_facts:
+            base_ev_id = f"ev_obs_{uuid.uuid4().hex[:10]}"
+            consumed_step_ev_ids.append(base_ev_id)
+            ev_payload = {
+                "evidence_id": base_ev_id,
+                "problem_category": recipe.problem_category,
+                "recipe_id": recipe.recipe_id,
+                "domain": recipe.domain,
+                "finding_classification": "OBSERVED_FACT",
+                "status": eval_result.status,
+                "details": eval_result.details,
+                "observed_value": obs_data.get("observed_value") or obs_data.get("value") or obs_data.get("current_rss_kb") or obs_data,
+                "provenance_class": RUNTIME_PROV_LIVE if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+            }
+            correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            self.collected_evidence.append(enriched_ev)
+
+        # Record in ObservationWindow
+        if self.pid and self.pid > 0:
+            sample = MemorySample(
+                epoch_id=self.observation_window.sample_count(),
+                timestamp=time.time(),
+                rss_kb=int(p_st.get("VmRSS", 0)) if "p_st" in locals() else obs_data.get("current_rss_kb", 0),
+                vsize_kb=int(p_st.get("VmSize", 0)) if "p_st" in locals() else 0,
+                heap_vma_kb=obs_data.get("heap_kb"),
+                container_sizes={obs_data.get("container_name"): obs_data.get("active_chunk_count")} if obs_data.get("container_name") else {},
+                alloc_counter=obs_data.get("alloc_count"),
+                free_counter=obs_data.get("free_count"),
+            )
+            self.observation_window.record_sample(sample)
 
         step.status = "COMPLETED"
         step.result = {
@@ -1258,7 +1384,7 @@ class AdaptiveInvestigationSession:
         })
 
         # ---------------------------------------------------------------------
-        # Adaptive Feedback Loop & Dynamic Replanning (Section 10)
+        # Adaptive Feedback Loop & Dynamic Replanning (Section 10 & Case O)
         # ---------------------------------------------------------------------
         remaining_steps = self.plan.steps[self.plan.current_step_index + 1:]
         if eval_result.status == RECIPE_STATUS_SUPPORTED:
@@ -1294,15 +1420,48 @@ class AdaptiveInvestigationSession:
                 return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result), "adaptive_action": "EARLY_ANOMALY_CONFIRMED"}
 
         elif eval_result.status == RECIPE_STATUS_CONTRADICTED:
-            # Category contradicted: down-weight or skip remaining steps for this category
-            for s in remaining_steps:
-                if s.category == recipe.problem_category:
-                    s.status = "SKIPPED"
+            # Case O: Contradictory evidence introduced: update competing hypotheses & discriminate remaining
+            for ch in self.competing_hypotheses:
+                if recipe.recipe_id in ch.applicable_diagnostic_rules:
+                    ch.contradicting_observations.append(f"{recipe.recipe_id}: contradicted by runtime observation")
+                    ch.status = VERDICT_REFUTED
+                    ch.confidence = min(ch.confidence, 0.15)
 
-        self.plan.current_step_index += 1
-        if self.plan.current_step_index >= len(self.plan.steps):
-            self.state = STATE_ANALYZING
-        return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result)}
+            # Re-rank competing hypotheses to find next discriminating recipe
+            comp_res = CompetingHypothesisManager.compare(self.competing_hypotheses)
+            if comp_res.recommended_discriminating_recipe:
+                next_rec_id = comp_res.recommended_discriminating_recipe
+                already_in = any(s.recipe_id == next_rec_id for s in remaining_steps)
+                if not already_in:
+                    f_rec = self.recipe_registry.get_recipe(next_rec_id)
+                    if f_rec:
+                        discrim_step = InvestigationStep(
+                            step_id=f"step_discrim_{len(self.plan.steps)+1:02d}",
+                            recipe_id=next_rec_id,
+                            recipe_name=f_rec.name,
+                            category=f_rec.problem_category,
+                            domain=f_rec.domain,
+                            rationale=f"Information-gain discriminating step: {comp_res.discrimination_rationale}",
+                            priority=1,
+                            cost_score=0.90,
+                            safety_score=1.0,
+                            expected_info_gain=0.80,
+                            multi_factor_score=0.75,
+                        )
+                        remaining_steps.insert(0, discrim_step)
+                        self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + remaining_steps
+                else:
+                    target_s = next(s for s in remaining_steps if s.recipe_id == next_rec_id)
+                    remaining_steps.remove(target_s)
+                    target_s.priority = 1
+                    target_s.step_id = f"step_discrim_{target_s.step_id}"
+                    target_s.rationale = f"Information-gain discriminating step prioritized: {comp_res.discrimination_rationale}"
+                    remaining_steps.insert(0, target_s)
+                    self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + remaining_steps
+            else:
+                for s in remaining_steps:
+                    if s.category == recipe.problem_category:
+                        s.status = "SKIPPED"
 
         self.plan.current_step_index += 1
         if self.plan.current_step_index >= len(self.plan.steps):
@@ -1592,17 +1751,6 @@ class AdaptiveInvestigationSession:
             elif outcome == "PASS":
                 has_pass = True
 
-            results.append({
-                "criterion_id": cid,
-                "description": crit.get("description", ""),
-                "result": outcome,
-                "rationale": rationale,
-            })
-            if outcome == "FAIL":
-                has_fail = True
-            elif outcome == "PASS":
-                has_pass = True
-
         hyp.verification_execution_results = results
 
         # Update hypothesis verdict based on criteria outcomes
@@ -1817,11 +1965,66 @@ class AdaptiveInvestigationSession:
                 return self._execute_verification_for_hypothesis(hyp)
         return {"error": f"Hypothesis '{hypothesis_id}' not found"}
 
-    def compare_hypotheses(self, hypothesis_ids: List[str]) -> Dict[str, Any]:
-        """Compares competing hypotheses side-by-side."""
+    def compare_hypotheses(self, hypothesis_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Compares competing hypotheses side-by-side with explicit discrimination metrics."""
+        all_hyps = {h.hypothesis_id: h for h in (self.active_hypotheses + self.rejected_hypotheses)}
+
+        # If specific active hypothesis IDs were requested and match
+        if hypothesis_ids and any(hid in all_hyps for hid in hypothesis_ids):
+            matched: List[Dict[str, Any]] = []
+            for hid in hypothesis_ids:
+                if hid in all_hyps:
+                    h = all_hyps[hid]
+                    matched.append({
+                        "hypothesis_id": h.hypothesis_id,
+                        "problem_statement": h.problem_statement,
+                        "category": h.category,
+                        "confidence": h.confidence,
+                        "status": h.status,
+                        "supporting_evidence_count": len(h.supporting_evidence),
+                        "contradicting_evidence_count": len(h.contradicting_evidence),
+                        "verification_results": h.verification_execution_results,
+                    })
+            matched.sort(
+                key=lambda x: (
+                    100 if x["status"] == "CONFIRMED" else (70 if x["status"] == "LIKELY" else (50 if x["status"] == "SUPPORTED" else 10)),
+                    x["confidence"],
+                    x["supporting_evidence_count"] - 2 * x["contradicting_evidence_count"],
+                ),
+                reverse=True,
+            )
+            return {
+                "investigation_id": self.investigation_id,
+                "compared_count": len(matched),
+                "hypotheses": matched,
+                "recommendation": f"Select {matched[0]['hypothesis_id']} (highest confidence)" if matched else "No hypotheses to compare",
+            }
+
+        # Otherwise if competing hypotheses are tracked in session
+        if self.competing_hypotheses:
+            target_set = self.competing_hypotheses
+            if hypothesis_ids:
+                filtered = [h for h in self.competing_hypotheses if h.hypothesis_id in hypothesis_ids]
+                if filtered:
+                    target_set = filtered
+            comp_res = CompetingHypothesisManager.compare(target_set)
+            return {
+                "investigation_id": self.investigation_id,
+                "compared_count": len(target_set),
+                "leading_hypothesis_id": comp_res.leading_hypothesis_id,
+                "hypotheses": comp_res.ranked_hypotheses,
+                "discrimination_rationale": comp_res.discrimination_rationale,
+                "eliminated_alternatives": comp_res.eliminated_alternatives,
+                "unresolved_uncertainties": comp_res.unresolved_uncertainties,
+                "recommended_discriminating_recipe": comp_res.recommended_discriminating_recipe,
+                "recommendation": f"Select {comp_res.leading_hypothesis_id} ({comp_res.ranked_hypotheses[0]['title']})" if comp_res.ranked_hypotheses else "No hypotheses to compare",
+            }
+
+        # Fallback to active/rejected hypotheses
         matched: List[Dict[str, Any]] = []
         all_hyps = {h.hypothesis_id: h for h in (self.active_hypotheses + self.rejected_hypotheses)}
-        for hid in hypothesis_ids:
+        ids_to_check = hypothesis_ids or list(all_hyps.keys())
+        for hid in ids_to_check:
             if hid in all_hyps:
                 h = all_hyps[hid]
                 matched.append({
@@ -1834,11 +2037,29 @@ class AdaptiveInvestigationSession:
                     "contradicting_evidence_count": len(h.contradicting_evidence),
                     "verification_results": h.verification_execution_results,
                 })
+
+        # Rank using explicit evidence quality
+        matched.sort(
+            key=lambda x: (
+                100 if x["status"] == "CONFIRMED" else (70 if x["status"] == "LIKELY" else (50 if x["status"] == "SUPPORTED" else 10)),
+                x["confidence"],
+                x["supporting_evidence_count"] - 2 * x["contradicting_evidence_count"],
+            ),
+            reverse=True,
+        )
+
+        rationale = (
+            f"Leading candidate '{matched[0]['hypothesis_id']}' (status={matched[0]['status']}, conf={matched[0]['confidence']}) "
+            f"has {matched[0]['supporting_evidence_count']} supporting facts vs {matched[0]['contradicting_evidence_count']} contradictions."
+            if matched else "No hypotheses to compare"
+        )
+
         return {
             "investigation_id": self.investigation_id,
             "compared_count": len(matched),
             "hypotheses": matched,
-            "recommendation": f"Select {matched[0]['hypothesis_id']} (highest confidence)" if matched else "No hypotheses to compare",
+            "discrimination_rationale": rationale,
+            "recommendation": f"Select {matched[0]['hypothesis_id']} ({matched[0]['problem_statement']})" if matched else "No hypotheses to compare",
         }
 
     def export_report(self, format: str = "json") -> Union[Dict[str, Any], str]:
@@ -2142,6 +2363,10 @@ class ExpertDiagnosticEngine:
         companion_elf: Optional[str] = None,
         investigation_id: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
+        expert_overrides: Optional[List[Any]] = None,
+        manual_invariants: Optional[List[Any]] = None,
+        observation_interval: Optional[float] = None,
+        observation_duration: Optional[float] = None,
     ) -> AdaptiveInvestigationSession:
         """Launches a new adaptive investigation session."""
         inv_id = investigation_id or f"inv_{uuid.uuid4().hex[:12]}"
@@ -2152,9 +2377,11 @@ class ExpertDiagnosticEngine:
             companion_elf=companion_elf,
             corpus_dir=self.corpus_dir,
             adapter=adapter,
+            expert_overrides=expert_overrides,
+            manual_invariants=manual_invariants,
+            observation_interval=observation_interval,
+            observation_duration=observation_duration,
         )
-        self.sessions[inv_id] = session
-        return session
         self.sessions[inv_id] = session
         return session
 
