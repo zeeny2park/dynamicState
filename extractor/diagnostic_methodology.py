@@ -22,8 +22,10 @@ class CheckStatus:
     NOT_APPLICABLE = "NOT_APPLICABLE"
     NOT_EXECUTED = "NOT_EXECUTED"
     ERROR = "ERROR"
+    UNSUPPORTED = "UNSUPPORTED"
+    SKIPPED = "SKIPPED"
 
-    ALL_STATUSES = {PASS, FAIL, INCONCLUSIVE, NOT_APPLICABLE, NOT_EXECUTED, ERROR}
+    ALL_STATUSES = {PASS, FAIL, INCONCLUSIVE, NOT_APPLICABLE, NOT_EXECUTED, ERROR, UNSUPPORTED, SKIPPED}
 
     @classmethod
     def is_unexecuted(cls, status: str) -> bool:
@@ -36,6 +38,14 @@ class CheckStatus:
     @classmethod
     def is_inconclusive(cls, status: str) -> bool:
         return status == cls.INCONCLUSIVE
+
+    @classmethod
+    def is_unsupported(cls, status: str) -> bool:
+        return status == cls.UNSUPPORTED
+
+    @classmethod
+    def is_skipped(cls, status: str) -> bool:
+        return status == cls.SKIPPED
 
     @classmethod
     def is_definitive(cls, status: str) -> bool:
@@ -85,6 +95,8 @@ class DiagnosticCheck:
     error_details: Optional[str] = None
     methodology_name: Optional[str] = None
     target_entity: Optional[str] = None
+    is_required: bool = True
+    applicability_rule: Optional[str] = None
 
     def __post_init__(self):
         if self.methodology_name and (self.methodology_id == "METH_GENERAL" or not self.methodology_id):
@@ -99,6 +111,20 @@ class DiagnosticCheck:
     @property
     def duration_ms(self) -> Optional[float]:
         return (self.duration_seconds * 1000.0) if (self.duration_seconds is not None and self.duration_seconds > 0.0) else None
+
+    @property
+    def required(self) -> bool:
+        return self.is_required
+
+    @required.setter
+    def required(self, val: bool) -> None:
+        self.is_required = bool(val)
+
+    def is_justified_not_applicable(self) -> bool:
+        """Determines if a NOT_APPLICABLE status is supported by an explicit rule or criteria."""
+        if self.status != CheckStatus.NOT_APPLICABLE:
+            return False
+        return bool(self.applicability_criteria or (self.applicability_rule and str(self.applicability_rule).strip()))
 
     def start(self) -> None:
         """Marks check start using monotonic clock and ISO-8601 wall clock."""

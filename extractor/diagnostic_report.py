@@ -119,6 +119,11 @@ class DetailedInspectionResultsSection:
     checks_not_applicable: int
     checks_not_executed: int
     checks_error: int
+    checks_skipped: int = 0
+    checks_unsupported: int = 0
+    required_checks_count: int = 0
+    required_checks_passed: int = 0
+    missing_coverage: List[str] = field(default_factory=list)
     checks: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -354,11 +359,16 @@ class DiagnosticReport:
             "## 5. Executed Diagnostic Procedures & Inspection Results (Section D)",
         ])
         if sec_d:
+            extra_counts = ""
+            if sec_d.checks_skipped > 0:
+                extra_counts += f" | SKIPPED: `{sec_d.checks_skipped}`"
+            if sec_d.checks_unsupported > 0:
+                extra_counts += f" | UNSUPPORTED: `{sec_d.checks_unsupported}`"
             md.append(
                 f"**Summary**: Total Checks: `{sec_d.checks_total}` | "
                 f"PASS: `{sec_d.checks_passed}` | FAIL: `{sec_d.checks_failed}` | "
                 f"INCONCLUSIVE: `{sec_d.checks_inconclusive}` | NOT_APPLICABLE: `{sec_d.checks_not_applicable}` | "
-                f"NOT_EXECUTED: `{sec_d.checks_not_executed}` | ERROR: `{sec_d.checks_error}`\n"
+                f"NOT_EXECUTED: `{sec_d.checks_not_executed}` | ERROR: `{sec_d.checks_error}`{extra_counts}\n"
             )
             for c in sec_d.checks:
                 status_badge = f"[{c.get('status')}]"
@@ -551,15 +561,21 @@ class DiagnosticReport:
         def badge(text: str, color_type: str) -> str:
             colors = {
                 "CONFIRMED": "#b91c1c; color: #fff",
+                "CONFIRMED_FAULT": "#b91c1c; color: #fff",
+                "FAULT": "#b91c1c; color: #fff",
                 "FAIL": "#b91c1c; color: #fff",
+                "DEGRADED": "#ea580c; color: #fff",
                 "LIKELY": "#d97706; color: #fff",
                 "PROBABLE": "#d97706; color: #fff",
+                "PROBABLE_FAULT": "#d97706; color: #fff",
                 "SUPPORTED": "#2563eb; color: #fff",
                 "PASS": "#15803d; color: #fff",
                 "HEALTHY": "#15803d; color: #fff",
                 "INCONCLUSIVE": "#6b7280; color: #fff",
                 "NOT_APPLICABLE": "#4b5563; color: #fff",
                 "NOT_EXECUTED": "#9ca3af; color: #111",
+                "SKIPPED": "#64748b; color: #fff",
+                "UNSUPPORTED": "#64748b; color: #fff",
                 "ERROR": "#dc2626; color: #fff",
                 "REFUTED": "#475569; color: #fff",
                 "CRITICAL": "#991b1b; color: #fff",
@@ -648,6 +664,11 @@ class DiagnosticReport:
 
         # Section D
         if sec_d:
+            extra_html = ""
+            if sec_d.checks_skipped > 0:
+                extra_html += f" | SKIPPED: {badge(str(sec_d.checks_skipped), 'SKIPPED')}"
+            if sec_d.checks_unsupported > 0:
+                extra_html += f" | UNSUPPORTED: {badge(str(sec_d.checks_unsupported), 'UNSUPPORTED')}"
             html_out.extend([
                 "<h2>D. Detailed Inspection Results</h2>",
                 f"<p>Total Checks: <strong>{sec_d.checks_total}</strong> | "
@@ -656,7 +677,7 @@ class DiagnosticReport:
                 f"INCONCLUSIVE: {badge(str(sec_d.checks_inconclusive), 'INCONCLUSIVE')} | "
                 f"NOT_APPLICABLE: {badge(str(sec_d.checks_not_applicable), 'NOT_APPLICABLE')} | "
                 f"NOT_EXECUTED: {badge(str(sec_d.checks_not_executed), 'NOT_EXECUTED')} | "
-                f"ERROR: {badge(str(sec_d.checks_error), 'ERROR')}</p>",
+                f"ERROR: {badge(str(sec_d.checks_error), 'ERROR')}{extra_html}</p>",
                 "<table>",
                 "<tr><th>Status</th><th>Check ID</th><th>Recipe</th><th>Criteria</th><th>Observations</th><th>Interpretation</th><th>Duration</th></tr>",
             ])

@@ -1736,6 +1736,13 @@ class EvidenceLedger:
         """Look up record by unique ID."""
         return self._by_id.get(evidence_id)
 
+    def has(self, evidence_id: str) -> bool:
+        """Checks if evidence record exists in ledger."""
+        return evidence_id in self._by_id
+
+    def __contains__(self, evidence_id: str) -> bool:
+        return evidence_id in self._by_id
+
     def query(
         self,
         evidence_type: Optional[str] = None,

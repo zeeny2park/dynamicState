@@ -15,7 +15,7 @@ Implements true Information-Gain-based competing hypothesis reasoning:
 - Explains why the selected discriminating action is superior to alternatives.
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from enum import Enum
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -29,6 +29,126 @@ from extractor.diagnostic_rule_model import (
     VERDICT_INCONCLUSIVE,
     VERDICT_NOT_APPLICABLE,
 )
+
+try:
+    from extractor.evidence_ledger import TRUSTED_PROVENANCE_CLASSES, PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+except ImportError:
+    TRUSTED_PROVENANCE_CLASSES = {"LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION"}
+    PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE = "LIVE_RUNTIME_CAPTURE"
+
+
+# =============================================================================
+# Primary Single-Evidence Confirmation Rules & Registry
+# =============================================================================
+
+@dataclass
+class PrimaryEvidenceRule:
+    """Explicit, registered rule authorizing single-evidence hypothesis confirmation."""
+    rule_id: str
+    description: str
+    applicable_categories: Set[str]
+    allowed_evidence_types: Set[str]
+    required_provenance_classes: Set[str]
+
+
+class PrimaryEvidenceRuleRegistry:
+    """Registry of validated single-evidence confirmation rules for C/C++ runtime diagnostics."""
+    _rules: Dict[str, PrimaryEvidenceRule] = {}
+
+    @classmethod
+    def register(cls, rule: PrimaryEvidenceRule) -> None:
+        cls._rules[rule.rule_id] = rule
+
+    @classmethod
+    def get(cls, rule_id: str) -> Optional[PrimaryEvidenceRule]:
+        return cls._rules.get(rule_id)
+
+    @classmethod
+    def list_rules(cls) -> List[str]:
+        return list(cls._rules.keys())
+
+
+# Pre-register authoritative rules
+PrimaryEvidenceRuleRegistry.register(
+    PrimaryEvidenceRule(
+        rule_id="RULE_MEM_CORRUPTION_CANARY",
+        description="Deterministic buffer overflow detected by canary overwrite or corrupt guard page magic bytes.",
+        applicable_categories={"HEAP_CORRUPTION", "MEMORY_CORRUPTION", "STACK_CORRUPTION"},
+        allowed_evidence_types={"DIAGNOSTIC", "OBJECT_STATE", "MEMORY_CHUNK"},
+        required_provenance_classes=TRUSTED_PROVENANCE_CLASSES,
+    )
+)
+PrimaryEvidenceRuleRegistry.register(
+    PrimaryEvidenceRule(
+        rule_id="RULE_PTMALLOC_DOUBLE_FREE",
+        description="Definitive free-list cycle or fastbin/tcache duplicate pointer detected in allocator metadata.",
+        applicable_categories={"INVALID_DOUBLE_FREE", "HEAP_CORRUPTION", "MEMORY_CORRUPTION"},
+        allowed_evidence_types={"DIAGNOSTIC", "OBJECT_STATE", "MEMORY_CHUNK"},
+        required_provenance_classes=TRUSTED_PROVENANCE_CLASSES,
+    )
+)
+PrimaryEvidenceRuleRegistry.register(
+    PrimaryEvidenceRule(
+        rule_id="RULE_SEGV_SIGNAL_CRASH",
+        description="Direct kernel signal delivery receipt (SIGSEGV/SIGBUS) with authoritative fault address.",
+        applicable_categories={"PROCESS_INSTABILITY", "MEMORY_CORRUPTION"},
+        allowed_evidence_types={"DIAGNOSTIC", "OBJECT_STATE"},
+        required_provenance_classes=TRUSTED_PROVENANCE_CLASSES,
+    )
+)
+PrimaryEvidenceRuleRegistry.register(
+    PrimaryEvidenceRule(
+        rule_id="RULE_DEADLOCK_CYCLE_DIRECT",
+        description="Authoritative directed circular wait-for graph cycle spanning 2 or more threads/locks.",
+        applicable_categories={"DEADLOCK_INDICATORS", "THREAD_DEADLOCK", "CONCURRENCY"},
+        allowed_evidence_types={"DIAGNOSTIC", "OBJECT_STATE"},
+        required_provenance_classes=TRUSTED_PROVENANCE_CLASSES,
+    )
+)
+PrimaryEvidenceRuleRegistry.register(
+    PrimaryEvidenceRule(
+        rule_id="RULE_KERNEL_OOM_KILL",
+        description="Direct kernel or cgroup OOM killer event targeting the exact process PID.",
+        applicable_categories={"RESOURCE_EXHAUSTION", "MEMORY_LEAK"},
+        allowed_evidence_types={"DIAGNOSTIC", "OBJECT_STATE"},
+        required_provenance_classes=TRUSTED_PROVENANCE_CLASSES,
+    )
+)
+PrimaryEvidenceRuleRegistry.register(
+    PrimaryEvidenceRule(
+        rule_id="RULE_EXPLICIT_CLEAN_REFUTATION",
+        description="Exhaustive positive check proving zero invariant violations and refuting candidate fault.",
+        applicable_categories={"HEALTHY_PROCESS"},
+        allowed_evidence_types={"DIAGNOSTIC", "OBJECT_STATE"},
+        required_provenance_classes=TRUSTED_PROVENANCE_CLASSES,
+    )
+)
+
+
+# =============================================================================
+# Structured Contradiction Record
+# =============================================================================
+
+@dataclass
+class ContradictionRecord:
+    """Structured record of contradictory evidence with explicit authority and decisiveness."""
+    contradiction: str
+    evidence_id: Optional[str] = None
+    is_decisive: bool = True
+    is_conflicting: bool = False
+    is_verified: bool = False
+    provenance_class: str = "IMPORTED_UNVERIFIED"
+    target_pid: Optional[int] = None
+    investigation_id: Optional[str] = None
+    is_relevant: bool = True
+    rejection_reason: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ContradictionRecord":
+        return cls(**data)
 
 
 @dataclass
@@ -70,35 +190,143 @@ class CompetingHypothesis:
     evidence_dependencies: Dict[str, List[str]] = field(default_factory=dict)
     missing_evidence: List[str] = field(default_factory=list)
     unverified_evidence_ids: List[str] = field(default_factory=list)
+    contradiction_records: List[ContradictionRecord] = field(default_factory=list)
     target_pid: Optional[int] = None
     investigation_id: Optional[str] = None
     target_identity: Optional[str] = None
     allow_single_evidence_confirmation: bool = False
     primary_evidence_rule: Optional[str] = None
+    satisfied_primary_rule: Optional[str] = None
+    primary_rule_rejection_reason: Optional[str] = None
+    integrity_limitations: List[str] = field(default_factory=list)
+    rejected_evidence_reasons: Dict[str, str] = field(default_factory=dict)
+    ledger: Optional[Any] = None
+    strict_ledger: bool = False
     details: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_viable(self) -> bool:
         return self.status in (VERDICT_CONFIRMED, VERDICT_LIKELY, VERDICT_SUPPORTED, VERDICT_INCONCLUSIVE)
 
-    def get_independent_root_sources(self) -> Set[str]:
-        """Calculates the set of independent root evidence sources, resolving dependency trees.
+    def validate_primary_evidence_rule(
+        self,
+        rule_id: str,
+        evidence_record: Optional[Any] = None,
+        ledger: Optional[Any] = None,
+    ) -> Tuple[bool, str]:
+        """Validates whether an explicit registered primary evidence rule authorizes confirmation."""
+        if not rule_id or not isinstance(rule_id, str) or not rule_id.strip():
+            return False, "Primary evidence rule identifier must be a non-empty string"
+
+        rule = PrimaryEvidenceRuleRegistry.get(rule_id)
+        if not rule:
+            return False, f"Rule '{rule_id}' is not a registered primary evidence rule"
+
+        if self.category not in rule.applicable_categories:
+            return False, f"Rule '{rule_id}' applicable categories {rule.applicable_categories} do not match hypothesis category '{self.category}'"
+
+        rec = evidence_record
+        eff_ledger = ledger or self.ledger
+        if rec is None and eff_ledger is not None and self.supporting_evidence_ids:
+            rec = eff_ledger.get_record(self.supporting_evidence_ids[0]) if hasattr(eff_ledger, "get_record") else None
+
+        if rec is not None:
+            # Validate provenance class
+            rec_prov = getattr(rec, "provenance_class", None)
+            if not rec_prov and hasattr(rec, "provenance") and isinstance(rec.provenance, dict):
+                rec_prov = rec.provenance.get("provenance_class")
+            if rec_prov not in rule.required_provenance_classes:
+                return False, f"Evidence provenance '{rec_prov}' does not satisfy rule '{rule_id}' required classes {rule.required_provenance_classes}"
+
+            # Validate evidence type
+            rec_type = getattr(rec, "evidence_type", None)
+            if rec_type and rec_type not in rule.allowed_evidence_types:
+                return False, f"Evidence type '{rec_type}' does not satisfy rule '{rule_id}' allowed types {rule.allowed_evidence_types}"
+
+        return True, f"Primary evidence rule '{rule_id}' criteria satisfied"
+
+    def get_independent_root_sources(self, ledger: Optional[Any] = None) -> Set[str]:
+        """Calculates the set of independent root evidence sources, traversing the complete
+        multi-parent dependency graph.
         
-        Ensures multiple observations or derived records sharing one root evidence source
-        do NOT count as independent evidence.
+        Guarantees:
+        - Traverses EVERY parent dependency, not only the first parent.
+        - Shared roots across multiple derived evidence items count as 1 independent source.
+        - Detects cycles, self-dependencies, missing parents, and unresolved dependencies.
+        - Invalid or cycle dependencies are excluded from increasing confidence.
+        - Deterministic traversal regardless of insertion order (sorts keys and parents).
+        - Prevents recursion or pathological graph structures with bounded traversal depth.
         """
-        roots: Set[str] = set()
-        for ev_id in self.supporting_evidence_ids:
-            curr = ev_id
-            visited = set()
-            while curr in self.evidence_dependencies and self.evidence_dependencies[curr]:
-                visited.add(curr)
-                parents = [p for p in self.evidence_dependencies[curr] if p not in visited]
-                if not parents:
+        eff_ledger = ledger or self.ledger
+        all_roots: Set[str] = set()
+        seen_roots_per_item: Dict[str, Set[str]] = {}
+
+        # Sort supporting evidence IDs alphabetically for determinism
+        sorted_ev_ids = sorted(set(self.supporting_evidence_ids))
+
+        for ev_id in sorted_ev_ids:
+            item_roots: Set[str] = set()
+            stack: List[Tuple[str, List[str]]] = [(ev_id, [ev_id])]
+            branch_invalid = False
+
+            while stack:
+                curr, path = stack.pop()
+                if len(path) > 200:
+                    self.integrity_limitations.append(f"Dependency graph depth exceeded 200 at {curr}")
+                    branch_invalid = True
                     break
-                curr = parents[0]
-            roots.add(curr)
-        return roots
+
+                if not isinstance(curr, str) or not curr.strip():
+                    self.integrity_limitations.append(f"Malformed dependency: {curr!r}")
+                    branch_invalid = True
+                    continue
+
+                parents = self.evidence_dependencies.get(curr, [])
+                if curr in parents:
+                    self.integrity_limitations.append(f"Self-dependency detected on {curr}")
+                    branch_invalid = True
+                    continue
+
+                # Deduplicate and sort parents for determinism
+                unique_parents = sorted(set(p for p in parents if isinstance(p, str) and p.strip()))
+
+                if not unique_parents:
+                    # Leaf / Root node reached
+                    if self.strict_ledger and eff_ledger is not None and hasattr(eff_ledger, "get_record"):
+                        rec = eff_ledger.get_record(curr)
+                        if rec is None:
+                            self.integrity_limitations.append(f"Missing root dependency {curr} in ledger")
+                            branch_invalid = True
+                            continue
+                        if getattr(rec, "provenance_class", None) not in TRUSTED_PROVENANCE_CLASSES:
+                            self.integrity_limitations.append(f"Root dependency {curr} has untrusted provenance")
+                            branch_invalid = True
+                            continue
+                    item_roots.add(curr)
+                else:
+                    for p in unique_parents:
+                        if p in path:
+                            # Cycle detected!
+                            cycle_str = " -> ".join(path[path.index(p):] + [p])
+                            self.integrity_limitations.append(f"Dependency cycle detected: {cycle_str}")
+                            branch_invalid = True
+                            continue
+                        if self.strict_ledger and eff_ledger is not None and hasattr(eff_ledger, "get_record"):
+                            if p not in self.evidence_dependencies and eff_ledger.get_record(p) is None:
+                                self.integrity_limitations.append(f"Missing parent dependency {p} in ledger")
+                                branch_invalid = True
+                                continue
+                        elif p not in self.evidence_dependencies and "missing" in p.lower():
+                            self.integrity_limitations.append(f"Missing parent dependency {p}")
+                            branch_invalid = True
+                            continue
+                        stack.append((p, path + [p]))
+
+            if not branch_invalid and item_roots:
+                seen_roots_per_item[ev_id] = item_roots
+                all_roots.update(item_roots)
+
+        return all_roots
 
     def add_supporting_observation(
         self,
@@ -108,15 +336,9 @@ class CompetingHypothesis:
         weight: float = 0.0,
         evidence_record: Optional[Any] = None,
         target_context: Optional[Dict[str, Any]] = None,
-        is_verified: bool = True,
+        is_verified: Optional[bool] = None,
     ) -> bool:
-        """Adds supporting observation with strict validation, anti-double-counting, and dependency tracking.
-        
-        Rejects:
-        - Re-adding identical observation or evidence ID (idempotency, prevents confidence inflation).
-        - Evidence from another investigation or target context.
-        - Non-existent evidence ID when ledger context is provided.
-        """
+        """Adds supporting observation with strict validation, anti-double-counting, and dependency tracking."""
         ctx = target_context or {}
         exp_inv = ctx.get("investigation_id") or self.investigation_id
         exp_pid = ctx.get("target_pid") or ctx.get("pid") or self.target_pid
@@ -128,21 +350,52 @@ class CompetingHypothesis:
             rec_pid = getattr(evidence_record, "target_pid", None) or getattr(evidence_record, "pid", None)
             rec_target = getattr(evidence_record, "target_identity", None)
             if exp_inv and rec_inv and exp_inv != rec_inv:
+                if evidence_id:
+                    self.rejected_evidence_reasons[evidence_id] = f"Investigation ID mismatch: expected {exp_inv}, record {rec_inv}"
                 return False
             if exp_pid and rec_pid and exp_pid != rec_pid:
+                if evidence_id:
+                    self.rejected_evidence_reasons[evidence_id] = f"Target PID mismatch: expected {exp_pid}, record {rec_pid}"
                 return False
             if exp_target and rec_target and exp_target != rec_target:
+                if evidence_id:
+                    self.rejected_evidence_reasons[evidence_id] = f"Target identity mismatch: expected {exp_target}, record {rec_target}"
                 return False
 
-        # Ledger resolution validation (non-existent Evidence ID rejection)
-        if evidence_id and "ledger" in ctx:
-            ledger = ctx["ledger"]
-            if hasattr(ledger, "has") and not ledger.has(evidence_id):
-                return False
-            elif hasattr(ledger, "records"):
-                existing_ids = {r.evidence_id for r in ledger.records}
-                if evidence_id not in existing_ids:
+        # Ledger resolution validation
+        eff_ledger = ctx.get("ledger") or self.ledger
+        rec_from_ledger = None
+        if evidence_id and eff_ledger is not None:
+            if hasattr(eff_ledger, "get_record"):
+                rec_from_ledger = eff_ledger.get_record(evidence_id)
+                if rec_from_ledger is None:
+                    self.rejected_evidence_reasons[evidence_id] = "Evidence ID not found in authoritative ledger"
                     return False
+            elif hasattr(eff_ledger, "has") and not eff_ledger.has(evidence_id):
+                self.rejected_evidence_reasons[evidence_id] = "Evidence ID not found in authoritative ledger"
+                return False
+            elif hasattr(eff_ledger, "records"):
+                existing_ids = {r.evidence_id for r in eff_ledger.records}
+                if evidence_id not in existing_ids:
+                    self.rejected_evidence_reasons[evidence_id] = "Evidence ID not found in authoritative ledger"
+                    return False
+
+        # Determine verification status
+        effective_rec = evidence_record or rec_from_ledger
+        effective_verified = is_verified
+        if effective_verified is None:
+            if effective_rec is not None:
+                prov = getattr(effective_rec, "provenance_class", None)
+                nature = getattr(effective_rec, "nature", None)
+                if prov in TRUSTED_PROVENANCE_CLASSES and nature != "hypothesis":
+                    effective_verified = True
+                else:
+                    effective_verified = False
+            elif eff_ledger is not None or self.strict_ledger:
+                effective_verified = False
+            else:
+                # Permissive fallback only when no ledger or strict mode is active
+                effective_verified = True
 
         # Idempotency and anti-double-counting checks
         if observation in self.supporting_observations and (not evidence_id or evidence_id in self.supporting_evidence_ids):
@@ -163,13 +416,13 @@ class CompetingHypothesis:
             self.supporting_evidence_ids.append(evidence_id)
             if depends_on:
                 self.evidence_dependencies[evidence_id] = list(depends_on)
-            if not is_verified:
+            if not effective_verified:
                 self.unverified_evidence_ids.append(evidence_id)
 
         if weight > 0.0:
             self.confidence = min(0.99, self.confidence + weight)
 
-        self.evaluate_verdict()
+        self.evaluate_verdict(ledger=eff_ledger)
         return True
 
     def add_contradicting_observation(
@@ -180,33 +433,63 @@ class CompetingHypothesis:
         weight: float = 0.0,
         evidence_record: Optional[Any] = None,
         target_context: Optional[Dict[str, Any]] = None,
+        is_decisive: bool = True,
+        is_conflicting: bool = False,
+        is_verified: Optional[bool] = None,
+        is_relevant: bool = True,
     ) -> bool:
-        """Adds contradictory observation with anti-double-counting and authority tracking."""
+        """Adds contradictory observation with anti-double-counting, authority tracking, and decisiveness."""
         ctx = target_context or {}
         exp_inv = ctx.get("investigation_id") or self.investigation_id
         exp_pid = ctx.get("target_pid") or ctx.get("pid") or self.target_pid
         exp_target = ctx.get("target_identity") or self.target_identity
+
+        rel = is_relevant
+        rej_reason = None
 
         if evidence_record:
             rec_inv = getattr(evidence_record, "session_id", None) or getattr(evidence_record, "investigation_id", None)
             rec_pid = getattr(evidence_record, "target_pid", None) or getattr(evidence_record, "pid", None)
             rec_target = getattr(evidence_record, "target_identity", None)
             if exp_inv and rec_inv and exp_inv != rec_inv:
-                return False
+                rel = False
+                rej_reason = f"Investigation ID mismatch: expected {exp_inv}, got {rec_inv}"
             if exp_pid and rec_pid and exp_pid != rec_pid:
-                return False
+                rel = False
+                rej_reason = f"Target PID mismatch: expected {exp_pid}, got {rec_pid}"
             if exp_target and rec_target and exp_target != rec_target:
-                return False
+                rel = False
+                rej_reason = f"Target identity mismatch: expected {exp_target}, got {rec_target}"
 
-        if evidence_id and "ledger" in ctx:
-            ledger = ctx["ledger"]
-            if hasattr(ledger, "has") and not ledger.has(evidence_id):
-                return False
-            elif hasattr(ledger, "records"):
-                existing_ids = {r.evidence_id for r in ledger.records}
+        eff_ledger = ctx.get("ledger") or self.ledger
+        rec_from_ledger = None
+        if evidence_id and eff_ledger is not None:
+            if hasattr(eff_ledger, "get_record"):
+                rec_from_ledger = eff_ledger.get_record(evidence_id)
+                if rec_from_ledger is None:
+                    rel = False
+                    rej_reason = "Evidence ID not found in authoritative ledger"
+            elif hasattr(eff_ledger, "has") and not eff_ledger.has(evidence_id):
+                rel = False
+                rej_reason = "Evidence ID not found in authoritative ledger"
+            elif hasattr(eff_ledger, "records"):
+                existing_ids = {r.evidence_id for r in eff_ledger.records}
                 if evidence_id not in existing_ids:
-                    return False
+                    rel = False
+                    rej_reason = "Evidence ID not found in authoritative ledger"
 
+        # Determine verification status
+        effective_rec = evidence_record or rec_from_ledger
+        effective_verified = is_verified
+        prov_class = "IMPORTED_UNVERIFIED"
+        if effective_rec is not None:
+            prov_class = getattr(effective_rec, "provenance_class", "IMPORTED_UNVERIFIED")
+            if effective_verified is None:
+                effective_verified = (prov_class in TRUSTED_PROVENANCE_CLASSES)
+        elif effective_verified is None:
+            effective_verified = True if (not eff_ledger and not self.strict_ledger) else False
+
+        # Idempotency and anti-double-counting checks
         if contradiction in self.contradicting_observations and (not evidence_id or evidence_id in self.contradicting_evidence_ids):
             return False
         if evidence_id and evidence_id in self.contradicting_evidence_ids and contradiction in self.contradicting_observations:
@@ -223,29 +506,108 @@ class CompetingHypothesis:
             if depends_on:
                 self.evidence_dependencies[evidence_id] = list(depends_on)
 
-        if weight > 0.0:
+        # Record structured contradiction
+        crec = ContradictionRecord(
+            contradiction=contradiction,
+            evidence_id=evidence_id,
+            is_decisive=is_decisive,
+            is_conflicting=is_conflicting,
+            is_verified=bool(effective_verified),
+            provenance_class=prov_class,
+            target_pid=exp_pid,
+            investigation_id=exp_inv,
+            is_relevant=rel,
+            rejection_reason=rej_reason,
+        )
+        self.contradiction_records.append(crec)
+
+        if rel and weight > 0.0:
             self.confidence = max(0.05, self.confidence - weight)
 
-        self.evaluate_verdict()
+        self.evaluate_verdict(ledger=eff_ledger)
         return True
 
-    def evaluate_verdict(self) -> str:
+    def evaluate_verdict(self, ledger: Optional[Any] = None) -> str:
         """Updates hypothesis status following strict verdict semantics.
         
         Rules:
-        - Contradicted by authoritative evidence -> VERDICT_REFUTED.
-        - Missing evidence -> VERDICT_INCONCLUSIVE (never REFUTED or CONFIRMED).
-        - Descriptive observations alone without Evidence IDs CANNOT produce CONFIRMED.
-        - Unverified Evidence IDs CANNOT produce CONFIRMED.
-        - Two derived records sharing one root evidence source do NOT count as independent evidence.
-        - CONFIRMED requires >= 2 independent root evidence sources (or >= 1 if explicitly permitted
-          by primary evidence rule), zero contradictions, zero unverified evidence, and confidence >= 0.90.
+        - Direct calls to evaluate_verdict validate evidence against ledger boundary.
+        - Untrusted contradictions cannot independently refute a hypothesis.
+        - Decisive trusted contradiction refutes hypothesis (VERDICT_REFUTED) when no trusted support exists.
+        - Conflicting trusted evidence (trusted support + trusted decisive contradiction) yields VERDICT_INCONCLUSIVE.
+        - Partial contradiction lowers confidence, preventing VERDICT_CONFIRMED.
+        - Single-evidence confirmation requires an explicit registered rule from PrimaryEvidenceRuleRegistry.
+          An arbitrary string or boolean flag alone cannot confirm.
+        - CONFIRMED requires >= 2 independent root evidence sources (or >= 1 with valid registered rule),
+          zero unverified evidence, zero contradictions, and confidence >= 0.90.
         """
-        # Contradicted: authoritative counter-evidence refutes the hypothesis
-        if self.contradicting_observations or self.contradicting_evidence_ids:
+        eff_ledger = ledger or self.ledger
+
+        # Validate evidence authority at the verdict boundary if ledger is present or required
+        if eff_ledger is not None and hasattr(eff_ledger, "get_record"):
+            for ev_id in list(self.supporting_evidence_ids):
+                rec = eff_ledger.get_record(ev_id)
+                if rec is None:
+                    if ev_id not in self.unverified_evidence_ids:
+                        self.unverified_evidence_ids.append(ev_id)
+                    self.rejected_evidence_reasons[ev_id] = "Evidence ID not found in authoritative ledger"
+                else:
+                    rec_prov = getattr(rec, "provenance_class", None)
+                    if rec_prov not in TRUSTED_PROVENANCE_CLASSES:
+                        if ev_id not in self.unverified_evidence_ids:
+                            self.unverified_evidence_ids.append(ev_id)
+                        self.rejected_evidence_reasons[ev_id] = f"Untrusted provenance class: {rec_prov}"
+                    exp_pid = self.target_pid
+                    rec_pid = getattr(rec, "target_pid", None) or (rec.details.get("target_pid") if hasattr(rec, "details") else None)
+                    if exp_pid and rec_pid and exp_pid != rec_pid:
+                        if ev_id not in self.unverified_evidence_ids:
+                            self.unverified_evidence_ids.append(ev_id)
+                        self.rejected_evidence_reasons[ev_id] = f"Target PID mismatch: expected {exp_pid}, got {rec_pid}"
+                    if getattr(rec, "nature", None) == "hypothesis":
+                        if ev_id not in self.unverified_evidence_ids:
+                            self.unverified_evidence_ids.append(ev_id)
+                        self.rejected_evidence_reasons[ev_id] = "Speculative hypothesis cannot serve as authoritative evidence"
+
+        # Separate decisive trusted contradictions, partial contradictions, and untrusted contradictions
+        trusted_conflicting = [
+            c for c in self.contradiction_records
+            if c.is_verified and c.is_conflicting and c.is_relevant
+        ]
+        trusted_decisive = [
+            c for c in self.contradiction_records
+            if c.is_verified and c.is_decisive and not c.is_conflicting and c.is_relevant
+        ]
+        trusted_partial = [
+            c for c in self.contradiction_records
+            if c.is_verified and not c.is_decisive and not c.is_conflicting and c.is_relevant
+        ]
+
+        # Legacy fallback if contradiction_records is empty but legacy fields are populated
+        if not self.contradiction_records and (self.contradicting_observations or self.contradicting_evidence_ids):
             self.status = VERDICT_REFUTED
             self.confidence = min(self.confidence, 0.15)
             return self.status
+
+        # Evaluate independent root evidence sources
+        independent_roots = self.get_independent_root_sources(ledger=eff_ledger)
+        num_independent = len(independent_roots)
+        has_trusted_support = (num_independent >= 1 and not self.unverified_evidence_ids)
+
+        # Handling contradictions
+        if trusted_conflicting:
+            self.status = VERDICT_INCONCLUSIVE
+            self.confidence = 0.45
+            self.confidence_basis = "Conflicting authoritative evidence: trusted observations support contradictory conclusions."
+            return self.status
+
+        if trusted_decisive:
+            self.status = VERDICT_REFUTED
+            self.confidence = min(self.confidence, 0.10)
+            return self.status
+
+        # Partial contradictions lower confidence and prevent CONFIRMED
+        if trusted_partial:
+            self.confidence = max(0.20, min(self.confidence, 0.65))
 
         # Missing evidence: must remain INCONCLUSIVE
         if self.missing_evidence:
@@ -260,23 +622,29 @@ class CompetingHypothesis:
                 self.status = VERDICT_INCONCLUSIVE
             return self.status
 
+        if num_independent == 0:
+            self.status = VERDICT_INCONCLUSIVE
+            return self.status
+
         # Rule B: Unverified Evidence ID cannot produce CONFIRMED
         if self.unverified_evidence_ids:
             self.status = VERDICT_LIKELY if self.confidence >= 0.70 else VERDICT_SUPPORTED
             return self.status
 
-        # Rule E: Evaluate independent root evidence sources
-        independent_roots = self.get_independent_root_sources()
-        num_independent = len(independent_roots)
+        # Single evidence confirmation check: requires an explicit validated registered rule!
+        can_single_confirm = False
+        if num_independent == 1 and self.primary_evidence_rule:
+            is_valid, reason = self.validate_primary_evidence_rule(
+                self.primary_evidence_rule, ledger=eff_ledger
+            )
+            if is_valid:
+                can_single_confirm = True
+                self.satisfied_primary_rule = self.primary_evidence_rule
+            else:
+                self.satisfied_primary_rule = None
+                self.primary_rule_rejection_reason = reason
 
-        if num_independent == 0:
-            self.status = VERDICT_INCONCLUSIVE
-            return self.status
-
-        # Single evidence confirmation check: requires explicit rule permission
-        can_single_confirm = self.allow_single_evidence_confirmation or bool(self.primary_evidence_rule)
-
-        if (num_independent >= 2 or (num_independent >= 1 and can_single_confirm)) and self.confidence >= 0.90:
+        if (num_independent >= 2 or (num_independent >= 1 and can_single_confirm)) and self.confidence >= 0.90 and not trusted_partial:
             self.status = VERDICT_CONFIRMED
         elif num_independent >= 1 and self.confidence >= 0.70:
             self.status = VERDICT_LIKELY
@@ -288,7 +656,22 @@ class CompetingHypothesis:
         return self.status
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("ledger", None)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CompetingHypothesis":
+        data_copy = dict(data)
+        data_copy.pop("ledger", None)
+        if "contradiction_records" in data_copy and isinstance(data_copy["contradiction_records"], list):
+            data_copy["contradiction_records"] = [
+                ContradictionRecord.from_dict(c) if isinstance(c, dict) else c
+                for c in data_copy["contradiction_records"]
+            ]
+        valid_fields = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data_copy.items() if k in valid_fields}
+        return cls(**filtered)
 
 
 @dataclass
@@ -331,7 +714,7 @@ class CompetingHypothesisManager:
         depends_on: Optional[List[str]] = None,
         evidence_record: Optional[Any] = None,
         target_context: Optional[Dict[str, Any]] = None,
-        is_verified: bool = True,
+        is_verified: Optional[bool] = None,
     ) -> bool:
         hyp = self.hypotheses.get(hypothesis_id)
         if not hyp:
@@ -356,6 +739,9 @@ class CompetingHypothesisManager:
         depends_on: Optional[List[str]] = None,
         evidence_record: Optional[Any] = None,
         target_context: Optional[Dict[str, Any]] = None,
+        is_decisive: bool = True,
+        is_verified: Optional[bool] = None,
+        is_relevant: bool = True,
     ) -> bool:
         hyp = self.hypotheses.get(hypothesis_id)
         if not hyp:
@@ -368,6 +754,9 @@ class CompetingHypothesisManager:
             weight=weight,
             evidence_record=evidence_record,
             target_context=ctx,
+            is_decisive=is_decisive,
+            is_verified=is_verified,
+            is_relevant=is_relevant,
         )
 
     def update_verdicts(self) -> None:

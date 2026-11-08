@@ -1096,6 +1096,7 @@ class DiagnosticConclusion:
     recommended_remediations: List[str]
     diagnostic_limitations: List[str]
     completed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    overall_verdict: Optional[str] = None
 
 
 class AdaptiveInvestigationSession:
@@ -2252,6 +2253,17 @@ class AdaptiveInvestigationSession:
         if self.target_assessment:
             limitations.extend(self.target_assessment.limitations)
 
+        agg = DiagnosticVerdictAggregator.aggregate(
+            lifecycle_state=self.state,
+            stop_reason=stop_reason,
+            checks=self.checks,
+            active_hypotheses=self.active_hypotheses,
+            rejected_hypotheses=self.rejected_hypotheses,
+            limitations=limitations,
+            target_assessment=self.target_assessment,
+            evidence_records=self.collected_evidence_records,
+        )
+
         self.conclusion = DiagnosticConclusion(
             investigation_id=self.investigation_id,
             target_pid=self.pid,
@@ -2266,6 +2278,7 @@ class AdaptiveInvestigationSession:
             missing_evidence_and_unknowns=list(limitations),
             recommended_remediations=remediations,
             diagnostic_limitations=limitations,
+            overall_verdict=agg.overall_result,
         )
         self._record_timeline_event("CONCLUSION_SEALED", {
             "status": self.state,
@@ -2561,7 +2574,7 @@ class AdaptiveInvestigationSession:
             methodology_name=self.methodology.name if self.methodology else "General Diagnostic Methodology",
             methodology_selection_reason=self.methodology.selection_reason if self.methodology else "General investigation",
             recipes_executed=list(dict.fromkeys(executed_recipes)),
-            recipes_excluded=excluded_recipes[:5],
+            recipes_excluded=excluded_recipes,
             scope_narrowing_sequence=[
                 f"Narrowed to {len(self.active_hypotheses)} active candidate hypotheses based on live evidence",
                 f"Evaluated {len(all_checks)} diagnostic checks against target address space",
@@ -2571,6 +2584,12 @@ class AdaptiveInvestigationSession:
         )
 
         # Section D: Detailed Inspection Results
+        skipped_chks = sum(1 for c in all_checks if c.status == getattr(CheckStatus, "SKIPPED", "SKIPPED"))
+        unsupp_chks = sum(1 for c in all_checks if c.status == getattr(CheckStatus, "UNSUPPORTED", "UNSUPPORTED"))
+        req_checks = [c for c in all_checks if getattr(c, "is_required", getattr(c, "required", True))]
+        req_passed = sum(1 for c in req_checks if c.status == CheckStatus.PASS)
+        missing_cov = [c.check_id for c in req_checks if c.status != CheckStatus.PASS]
+
         sec_d = DetailedInspectionResultsSection(
             checks_total=total_chks,
             checks_passed=passed_chks,
@@ -2579,6 +2598,11 @@ class AdaptiveInvestigationSession:
             checks_not_applicable=na_chks,
             checks_not_executed=not_exec_chks,
             checks_error=err_chks,
+            checks_skipped=skipped_chks,
+            checks_unsupported=unsupp_chks,
+            required_checks_count=len(req_checks),
+            required_checks_passed=req_passed,
+            missing_coverage=missing_cov,
             checks=[c.to_dict() for c in all_checks],
         )
 
@@ -2769,7 +2793,47 @@ class AdaptiveInvestigationSession:
             "ledger": self.ledger.to_dict() if self.ledger else None,
             "methodology": self.methodology.to_dict() if self.methodology else None,
             "checks": [c.to_dict() for c in self.checks],
+            "competing_hypotheses": [h.to_dict() for h in self.competing_hypotheses],
         }
+
+    def reconcile_durability(self) -> Dict[str, Any]:
+        """Reconciles durability state after an unknown commit outcome or crash."""
+        target_path = os.path.join(self._investigations_dir, f"{self.investigation_id}.json")
+        if not os.path.exists(target_path):
+            return {
+                "investigation_id": self.investigation_id,
+                "reconciled": False,
+                "outcome": DurableCommitOutcome.NOT_COMMITTED.value,
+                "details": f"Target file does not exist on disk: {target_path}",
+            }
+        try:
+            with open(target_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("investigation_id") != self.investigation_id:
+                return {
+                    "investigation_id": self.investigation_id,
+                    "reconciled": False,
+                    "outcome": DurableCommitOutcome.NOT_COMMITTED.value,
+                    "details": "Mismatched investigation_id in persisted file",
+                }
+            dir_fd = os.open(self._investigations_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            return {
+                "investigation_id": self.investigation_id,
+                "reconciled": True,
+                "outcome": DurableCommitOutcome.COMMITTED.value,
+                "details": "Persisted state verified and directory fsync completed",
+            }
+        except Exception as e:
+            return {
+                "investigation_id": self.investigation_id,
+                "reconciled": False,
+                "outcome": DurableCommitOutcome.COMMIT_UNKNOWN.value,
+                "details": f"Reconciliation failed: {e}",
+            }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AdaptiveInvestigationSession":
@@ -2806,6 +2870,13 @@ class AdaptiveInvestigationSession:
             sess.methodology = DiagnosticMethodology.from_dict(data["methodology"])
         if data.get("checks"):
             sess.checks = [DiagnosticCheck.from_dict(c) for c in data["checks"]]
+        if data.get("competing_hypotheses"):
+            sess.competing_hypotheses = [
+                CompetingHypothesis.from_dict(h) if hasattr(CompetingHypothesis, "from_dict") else CompetingHypothesis(**h)
+                for h in data["competing_hypotheses"]
+            ]
+            for h in sess.competing_hypotheses:
+                h.ledger = sess.ledger
         return sess
 
 
@@ -2878,6 +2949,13 @@ class ExpertDiagnosticEngine:
                     cause=e,
                 ) from e
         return None
+
+    def recover_session(self, investigation_id: str) -> Optional[AdaptiveInvestigationSession]:
+        """Recovers an investigation session from disk and reconciles durability state."""
+        sess = self.get_session(investigation_id)
+        if sess:
+            sess.reconcile_durability()
+        return sess
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         """Lists metadata for all active and completed sessions."""
