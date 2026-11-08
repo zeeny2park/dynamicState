@@ -103,6 +103,7 @@ from .allocator_inspector import (
     CustomAllocatorInspector,
     UnknownAllocatorInspector,
 )
+from .evidence_adapter import EvidenceAdapter
 from .evidence_ledger import (
     ATTRIBUTION_BASIS_CALL_STACK,
     EVIDENCE_TYPE_CAPTURE_QUALITY,
@@ -1141,6 +1142,7 @@ class AdaptiveInvestigationSession:
         self.planner = InvestigationPlanner(self.recipe_registry)
         self.correlator = EvidenceToSourceCorrelator(companion_elf)
         self.ledger = EvidenceLedger(session_id=self.investigation_id)
+        self.evidence_adapter = EvidenceAdapter()
         self.evidence_provider = RuntimeEvidenceProvider(adapter=self.adapter, corpus_dir=self.corpus_dir)
         self.temporal_memory_samples: List[Dict[str, Any]] = []
         self.observation_window = ObservationWindow(
@@ -1478,27 +1480,24 @@ class AdaptiveInvestigationSession:
         prov_class: str,
         enriched_ev: Dict[str, Any],
     ) -> str:
-        """Records an authoritative or unverified EvidenceRecord into self.ledger."""
+        """Records an authoritative or unverified EvidenceRecord into self.ledger via canonical EvidenceAdapter."""
         try:
-            eff_pid = int(self.pid) if (self.pid is not None and self.pid > 0) else 1234
-            t_ident = {
+            eff_pid = int(self.pid) if (self.pid is not None and self.pid > 0) else None
+            t_ident: Dict[str, Any] = {
                 "pid": eff_pid,
-                "process_identity": f"proc_{eff_pid}_{self.investigation_id}",
-                "executable_identity": self.companion_elf or f"/proc/{eff_pid}/exe",
+                "process_identity": f"proc_{eff_pid}_{self.investigation_id}" if eff_pid else "unspecified",
+                "executable_identity": self.companion_elf or (f"/proc/{eff_pid}/exe" if eff_pid else "unspecified"),
                 "build_id": getattr(self.target_assessment, "build_id", None) or "sha1:runtime_verified_build",
             }
-            prov_dict: Dict[str, Any] = {
-                "provenance_class": prov_class,
-                "module_id": recipe_id,
-            }
-            details_dict: Dict[str, Any] = {
-                "provenance_class": prov_class,
-                "target_pid": eff_pid,
-                "recipe_id": recipe_id,
-                "step_id": enriched_ev.get("step_id"),
-                "finding": observation_text,
-            }
-            if prov_class in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION"):
+            if not eff_pid:
+                t_ident.pop("pid", None)
+
+            # Strict trust boundary:
+            # Genuine LiveCaptureReceipt is ONLY issued if target is a live process (eff_pid > 0)
+            # and prov_class is live or controlled runtime reproduction.
+            # Never promote imported or synthetic evidence to live capture.
+            rcpt = None
+            if eff_pid and prov_class in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION"):
                 from .capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
                 token = get_trusted_capture_authority_token()
                 rcpt = issue_live_capture_receipt(
@@ -1510,25 +1509,37 @@ class AdaptiveInvestigationSession:
                     snapshot_binding=f"snap_{self.investigation_id}",
                     capture_authority_token=token,
                 )
-                prov_dict["live_capture_receipt"] = rcpt.to_dict()
-                details_dict["live_capture_receipt"] = rcpt.to_dict()
-                prov_dict["provenance_class"] = "LIVE_RUNTIME_CAPTURE"
-                details_dict["provenance_class"] = "LIVE_RUNTIME_CAPTURE"
 
-            rec_obj = EvidenceRecord(
-                evidence_id=ev_id,
-                session_id=self.ledger.session_id,
+            tool_result = dict(enriched_ev)
+            tool_result["evidence_id"] = ev_id
+            if "finding" not in tool_result or not tool_result["finding"]:
+                tool_result["finding"] = observation_text
+            tool_result["recipe_id"] = recipe_id
+            tool_result["provenance_class"] = prov_class
+            if rcpt is not None:
+                tool_result["live_capture_receipt"] = rcpt.to_dict()
+
+            # Canonical adaptation through EvidenceAdapter
+            rec_obj = self.evidence_adapter.adapt_generic_tool_output(
+                tool_name=recipe_id,
+                tool_result=tool_result,
                 evidence_type=EVIDENCE_TYPE_DIAGNOSTIC,
-                nature="observation",
-                source=recipe_id,
-                observation=str(observation_text or f"Observation from {recipe_id}"),
-                provenance=prov_dict,
-                details=details_dict,
+                nature=NATURE_OBSERVATION,
                 target_identity=t_ident,
+                session_id=self.ledger.session_id,
+                epoch=getattr(self.plan, "current_step_index", 0) if self.plan else 0,
+                evidence_id=ev_id,
+                observation=observation_text,
             )
-            self.ledger._by_id[ev_id] = rec_obj
-            if all(getattr(r, "evidence_id", None) != ev_id for r in self.ledger._records):
-                self.ledger._records.append(rec_obj)
+
+            # Canonical registration into EvidenceLedger via EvidenceAdapter (fail-closed, no private collection mutation)
+            added = self.evidence_adapter.record_into_ledger(rec_obj, self.ledger, raise_on_error=True)
+            if not added and not self.ledger.has(ev_id):
+                dup = next((ex for ex in self.ledger._records if (ex.details or {}).get("semantic_digest") == (rec_obj.details or {}).get("semantic_digest")), None)
+                if dup is not None:
+                    return f"DUPLICATE: {dup.evidence_id}"
+                return "FAILED: Record was not admitted by ledger"
+
             return "RECORDED"
         except Exception as le:
             return f"FAILED: {le}"

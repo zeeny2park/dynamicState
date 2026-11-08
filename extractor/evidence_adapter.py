@@ -588,6 +588,8 @@ class EvidenceAdapter:
         finding_id: Optional[str] = None,
         ledger: Optional[EvidenceLedger] = None,
         epoch: int = 0,
+        evidence_id: Optional[str] = None,
+        observation: Optional[str] = None,
     ) -> EvidenceRecord:
         """Adapts diagnostic or structural tool outputs, preserving semantic digest and result category."""
         # Rule: Never create an OBSERVED_FACT (NATURE_OBSERVATION) from an inference or hypothesis
@@ -625,8 +627,21 @@ class EvidenceAdapter:
             "charged_bytes": tool_result.get("charged_bytes"),
         }
 
-        if rcpt:
+        if eff_target.get("pid"):
+            compact_details["target_pid"] = eff_target["pid"]
+
+        # Preserve recipe, investigation, and source correlation metadata
+        for meta_k in (
+            "recipe_id", "step_id", "finding", "finding_classification",
+            "problem_category", "domain", "address", "symbol", "observed_value",
+            "raw_observation", "normalized_observation", "correlation",
+        ):
+            if meta_k in tool_result and tool_result[meta_k] is not None:
+                compact_details[meta_k] = tool_result[meta_k]
+
+        if rcpt and prov_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
             rcpt_dict = rcpt if isinstance(rcpt, dict) else (rcpt.to_dict() if hasattr(rcpt, "to_dict") else {})
+            compact_details["live_capture_receipt"] = rcpt_dict
             if rcpt_dict.get("observation_digest"):
                 compact_details["observation_digest"] = rcpt_dict["observation_digest"]
 
@@ -673,25 +688,35 @@ class EvidenceAdapter:
             or ("STOPPED" if tool_result.get("stop_duration_ms", 0.0) > 0 else "ZERO_STOP_ATOMIC")
         )
 
+        obs_text = (
+            observation
+            or tool_result.get("observation")
+            or tool_result.get("finding")
+            or f"Diagnostic result from '{tool_name}' (category: {res_cat}, status: {coll_status})"
+        )
+
+        eff_ev_id = evidence_id or tool_result.get("evidence_id") or f"evi_diag_{sem_digest[:10]}"
+
+        prov_dict: Dict[str, Any] = {
+            "provenance_class": prov_cls,
+            "tool": tool_name,
+            "module_id": tool_result.get("recipe_id") or tool_name,
+            "stop_duration_ms": tool_result.get("stop_duration_ms", 0.0),
+        }
+        if rcpt is not None and prov_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
+            prov_dict["live_capture_receipt"] = rcpt if isinstance(rcpt, dict) else rcpt.to_dict()
+
         rec = EvidenceRecord(
-            evidence_id=f"evi_diag_{sem_digest[:10]}",
+            evidence_id=eff_ev_id,
             evidence_type=final_ev_type,
             nature=nature,
             source=tool_name,
             timestamp=timestamp,
             session_id=session_id,
             finding_id=finding_id,
-            observation=(
-                tool_result.get("observation")
-                or f"Diagnostic result from '{tool_name}' (category: {res_cat}, status: {coll_status})"
-            ),
+            observation=str(obs_text),
             target_identity=eff_target,
-            provenance={
-                "provenance_class": prov_cls,
-                "tool": tool_name,
-                "stop_duration_ms": tool_result.get("stop_duration_ms", 0.0),
-                **({"live_capture_receipt": rcpt if isinstance(rcpt, dict) else rcpt.to_dict()} if rcpt is not None else {}),
-            },
+            provenance=prov_dict,
             capture_quality={
                 "completeness": cq_completeness,
                 "status": cq_completeness,
@@ -699,12 +724,15 @@ class EvidenceAdapter:
             },
             details=compact_details,
         )
+        if eff_target and eff_target.get("pid"):
+            rec.target_pid = eff_target["pid"]
         return rec
 
     def record_into_ledger(
         self,
         records: Union[EvidenceRecord, List[EvidenceRecord]],
         ledger: Optional[EvidenceLedger],
+        raise_on_error: bool = False,
     ) -> List[EvidenceRecord]:
         """Safely appends one or more non-duplicate records into an EvidenceLedger."""
         if not ledger:
@@ -724,6 +752,7 @@ class EvidenceAdapter:
             try:
                 ledger.add_record(r)
                 added.append(r)
-            except Exception:
-                pass
+            except Exception as e:
+                if raise_on_error:
+                    raise
         return added
