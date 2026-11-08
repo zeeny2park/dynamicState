@@ -15,6 +15,10 @@ from datetime import datetime, timezone
 import hashlib
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+from .allocator_inspector import FreeValidationOutcome, AllocatorType, FreeValidationResult
+from .temporal_observation_window import MemoryBehaviorClassification, TemporalAnalysisResult
+from .concurrency_graph import ConcurrencyState, DeadlockAnalysisResult
+
 
 # -----------------------------------------------------------------------------
 # Domain & Problem Category Constants
@@ -1213,6 +1217,42 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
     # 3. RECIPE_INVALID_FREE
     elif rid == "RECIPE_INVALID_FREE":
+        alloc_insp = data.get("allocator_inspector") or data.get("allocator")
+        ptr_addr = data.get("pointer_address") if "pointer_address" in data else (data.get("target_address") if "target_address" in data else data.get("address"))
+        maps = data.get("maps") or data.get("proc_maps") or []
+        if alloc_insp and ptr_addr is not None:
+            val_res = alloc_insp.validate_free_target(ptr_addr, maps=maps)
+            if not val_res.is_valid:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_SUPPORTED,
+                    confidence=0.98,
+                    confidence_basis=f"Invalid free target detected ({val_res.outcome.value}): {val_res.reason}",
+                    supporting_facts=[val_res.reason],
+                    recommended_action="Ensure free() is only called on dynamically allocated heap memory chunks.",
+                    details={"is_invalid_free": True, "outcome": val_res.outcome.value, "reason": val_res.reason},
+                )
+            elif val_res.outcome == FreeValidationOutcome.UNKNOWN_ALLOCATOR:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                    confidence=0.25,
+                    confidence_basis=f"Cannot validate free target: {val_res.reason}",
+                    missing_evidence=["allocator_specification"],
+                    limitations=recipe.limitations,
+                    details={"is_invalid_free": False, "outcome": val_res.outcome.value},
+                )
+            else:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_CONTRADICTED,
+                    confidence=0.92,
+                    confidence_basis=f"Target pointer is a valid free target: {val_res.reason}",
+                    contradicting_facts=["Pointer is a valid free target", val_res.reason],
+                    recommended_action="Refute invalid free; verify chunk lifetime and deallocation count.",
+                    details={"is_invalid_free": False, "outcome": val_res.outcome.value},
+                )
+
         aligned = data.get("alignment_valid")
         vma_name = data.get("vma_name") or data.get("mapped_region") or ""
         if aligned is False or any(seg in vma_name for seg in ("[stack]", ".data", ".rodata", ".bss")):
@@ -1313,6 +1353,40 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
     # 5. RECIPE_PROCESS_MEMORY_GROWTH
     elif rid == "RECIPE_PROCESS_MEMORY_GROWTH":
+        obs_win = data.get("observation_window") or data.get("window")
+        if obs_win and hasattr(obs_win, "analyze_memory_behavior") and getattr(obs_win, "sample_count", lambda: 0)() >= 2:
+            analysis = obs_win.analyze_memory_behavior()
+            if analysis.classification == MemoryBehaviorClassification.TEMPORAL_SEQUENCE_INVALID:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                    confidence=0.20,
+                    confidence_basis=f"Temporal sequence invalid: {analysis.summary}",
+                    missing_evidence=["valid_monotonic_temporal_sequence"],
+                    limitations=analysis.limitations or recipe.limitations,
+                    details={"classification": analysis.classification.value, "summary": analysis.summary},
+                )
+            elif analysis.classification in (MemoryBehaviorClassification.CONFIRMED_LEAK, MemoryBehaviorClassification.SUSTAINED_RSS_GROWTH, MemoryBehaviorClassification.PROBABLE_LEAK):
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_SUPPORTED,
+                    confidence=0.96 if analysis.classification == MemoryBehaviorClassification.CONFIRMED_LEAK else 0.88,
+                    confidence_basis=analysis.summary,
+                    supporting_facts=[analysis.summary, f"Rate: {analysis.growth_rate_kb_per_sec:.2f} KB/s"],
+                    recommended_action="Proceed to Heap Growth and Object Accumulation recipes to isolate leaking types.",
+                    details={"growth_confirmed": True, "classification": analysis.classification.value, "rate_kb_per_sec": analysis.growth_rate_kb_per_sec},
+                )
+            elif analysis.classification in (MemoryBehaviorClassification.STABLE_PLATEAU, MemoryBehaviorClassification.INITIALIZATION_WARMUP, MemoryBehaviorClassification.PERIODIC_RECLAMATION, MemoryBehaviorClassification.TRANSIENT_BURST):
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_CONTRADICTED,
+                    confidence=0.92,
+                    confidence_basis=analysis.summary,
+                    contradicting_facts=[analysis.summary],
+                    recommended_action="Refute unmanaged leak; memory behavior is bounded or reclaimed.",
+                    details={"growth_confirmed": False, "classification": analysis.classification.value},
+                )
+
         rss_hist = data.get("rss_history_kb") or data.get("rss_series_kb") or []
         epochs = data.get("epoch_count", len(rss_hist))
         growth_bytes = data.get("rss_growth_bytes", 0)
@@ -1378,6 +1452,50 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
     # 6. RECIPE_POTENTIAL_DEADLOCK_PATTERNS
     elif rid == "RECIPE_POTENTIAL_DEADLOCK_PATTERNS":
+        cg = data.get("concurrency_graph") or data.get("wait_for_graph")
+        if cg and hasattr(cg, "analyze") and (len(getattr(cg, "waiting_edges", [])) > 0 or len(getattr(cg, "ownership_edges", [])) > 0 or len(getattr(cg, "unresolved_edges", [])) > 0):
+            analysis = cg.analyze()
+            if analysis.concurrency_state == ConcurrencyState.INCONCLUSIVE_INCOMPLETE_GRAPH:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                    confidence=0.45,
+                    confidence_basis=f"Lock ownership graph is incomplete: {analysis.summary}. Cannot determine whether graph is acyclic or contains cycles.",
+                    missing_evidence=["complete_lock_ownership_info"],
+                    limitations=analysis.limitations or recipe.limitations,
+                    details={"incomplete_lock_graph": True, "concurrency_state": analysis.concurrency_state.value},
+                )
+            elif analysis.concurrency_state == ConcurrencyState.PERSISTENT_DEADLOCK:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_SUPPORTED,
+                    confidence=0.98,
+                    confidence_basis=f"Persistent deadlock confirmed: {analysis.summary}",
+                    supporting_facts=[f"Deadlock cycle: {c}" for c in analysis.cycles] or [analysis.summary],
+                    recommended_action="Enforce strict global lock acquisition hierarchy across participating functions.",
+                    details={"deadlock_confirmed": True, "state": "PERSISTENT_DEADLOCK", "cycles": analysis.cycles},
+                )
+            elif analysis.concurrency_state == ConcurrencyState.OBSERVED_CIRCULAR_WAIT:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                    confidence=0.75,
+                    confidence_basis=f"Circular wait observed in current snapshot ({analysis.summary}), but persistence across multiple validated epochs has not yet been demonstrated.",
+                    supporting_facts=[analysis.summary],
+                    recommended_action="Perform consecutive temporal sampling to confirm cycle persistence.",
+                    details={"deadlock_confirmed": False, "state": "OBSERVED_CIRCULAR_WAIT", "transient_cycle": True},
+                )
+            elif analysis.concurrency_state in (ConcurrencyState.NO_DEADLOCK_ACYCLIC, ConcurrencyState.LOCK_CONTENTION, ConcurrencyState.THREAD_BLOCKED):
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_CONTRADICTED,
+                    confidence=0.90,
+                    confidence_basis=f"Complete lock graph verified acyclic with zero circular wait cycles ({analysis.summary}).",
+                    contradicting_facts=["Complete lock graph verified acyclic (DAG)"],
+                    recommended_action="Refute deadlock; inspect thread worker contention or external I/O stall.",
+                    details={"deadlock_confirmed": False, "state": "NO_DEADLOCK_ACYCLIC"},
+                )
+
         thread_locks = data.get("thread_locks") or data.get("lock_graph") or data.get("callstacks_info")
         cycle_detected = data.get("cycle_detected", False) or data.get("deadlock_detected", False) or bool(data.get("deadlock_cycle"))
         cycle_persistent = data.get("cycle_persistent", True)

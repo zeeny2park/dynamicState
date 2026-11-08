@@ -91,6 +91,17 @@ from .concurrency_graph import (
     WaitForGraph,
     ConcurrencyState,
 )
+from .allocator_inspector import (
+    AllocatorType,
+    AllocatorInspector,
+    detect_allocator,
+    FreeValidationOutcome,
+    GlibcPtMallocInspector,
+    JemallocInspector,
+    TcmallocInspector,
+    CustomAllocatorInspector,
+    UnknownAllocatorInspector,
+)
 from .evidence_ledger import (
     ATTRIBUTION_BASIS_CALL_STACK,
     EVIDENCE_TYPE_CAPTURE_QUALITY,
@@ -417,6 +428,31 @@ class TargetAssessmentResult:
     target_host: str = "localhost"
     memory_readable: bool = False
     mode: str = "LIVE"
+    allocator_type: str = "UNKNOWN"
+    allocator_confidence: str = "UNKNOWN"
+    allocator_basis: str = ""
+    allocator_inspector: Optional[Any] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "accessible": self.accessible,
+            "thread_count": self.thread_count,
+            "memory_regions_count": self.memory_regions_count,
+            "rss_kb": self.rss_kb,
+            "companion_elf_path": self.companion_elf_path,
+            "companion_elf_valid": self.companion_elf_valid,
+            "dwarf_available": self.dwarf_available,
+            "capabilities": self.capabilities,
+            "limitations": self.limitations,
+            "prerequisites_met": self.prerequisites_met,
+            "target_host": self.target_host,
+            "memory_readable": self.memory_readable,
+            "mode": self.mode,
+            "allocator_type": self.allocator_type,
+            "allocator_confidence": self.allocator_confidence,
+            "allocator_basis": self.allocator_basis,
+        }
 
 
 class TargetAssessor:
@@ -438,6 +474,7 @@ class TargetAssessor:
         elf_valid = False
         dwarf_available = False
         mode = "LIVE" if (pid is not None and pid > 0) else "OFFLINE_SNAPSHOT"
+        maps: List[Dict[str, Any]] = []
 
         target_adapter = adapter or LocalTargetAdapter()
         target_host = target_adapter.target_host()
@@ -536,6 +573,15 @@ class TargetAssessor:
         else:
             limitations.append("No companion ELF provided: variable names and struct field offsets unavailable, relying on raw memory patterns and /proc info")
 
+        # 3. Allocator detection
+        allocator_det = detect_allocator(maps=maps, symbols=None)
+        if allocator_det and allocator_det.allocator_type != AllocatorType.UNKNOWN:
+            capabilities.append(f"ALLOCATOR_{allocator_det.allocator_type.value.upper()}")
+            capabilities.append(f"ALLOCATOR_CONFIDENCE_{allocator_det.confidence.upper()}")
+        else:
+            basis_str = allocator_det.basis if allocator_det else "not detected"
+            limitations.append(f"Allocator is UNKNOWN ({basis_str}); heap chunk inspection will be restricted")
+
         # Live PID must be accessible to satisfy prerequisites for live mode; offline mode only requires valid ELF/snapshot
         if pid is not None and pid > 0:
             prerequisites_met = accessible
@@ -557,6 +603,10 @@ class TargetAssessor:
             target_host=target_host,
             memory_readable=memory_readable,
             mode=mode,
+            allocator_type=allocator_det.allocator_type.value if allocator_det else "UNKNOWN",
+            allocator_confidence=allocator_det.confidence if allocator_det else "UNKNOWN",
+            allocator_basis=allocator_det.basis if allocator_det else "",
+            allocator_inspector=allocator_det.inspector if allocator_det else None,
         )
 
 
@@ -993,6 +1043,9 @@ class AdaptiveInvestigationSession:
         )
         self.competing_hypotheses: List[CompetingHypothesis] = []
         self.invariant_evaluator = InvariantEvaluator()
+        self.allocator_inspector: Optional[AllocatorInspector] = None
+        self.structural_discovery = CppStructuralDiscovery()
+        self.concurrency_graph = WaitForGraph()
 
         # State machine
         self.state = STATE_CREATED
@@ -1140,6 +1193,8 @@ class AdaptiveInvestigationSession:
             )
             return {"action": "ASSESS", "state": self.state, "status": "BLOCKED"}
 
+        if self.target_assessment and self.target_assessment.allocator_inspector:
+            self.allocator_inspector = self.target_assessment.allocator_inspector
         self.state = STATE_PLANNING
         return {"action": "ASSESS", "state": self.state, "capabilities": self.target_assessment.capabilities}
 
@@ -1242,6 +1297,14 @@ class AdaptiveInvestigationSession:
             "entities": self.classification_result.extracted_entities if self.classification_result else {},
             "capabilities": self.target_assessment.capabilities if self.target_assessment else [],
             "rss_kb": self.target_assessment.rss_kb if self.target_assessment else 0,
+            "allocator_inspector": self.allocator_inspector,
+            "allocator": self.allocator_inspector,
+            "structural_discovery": self.structural_discovery,
+            "invariant_evaluator": self.invariant_evaluator,
+            "concurrency_graph": self.concurrency_graph,
+            "wait_for_graph": self.concurrency_graph,
+            "observation_window": self.observation_window,
+            "window": self.observation_window,
             **obs_data,
         }
 
@@ -1350,17 +1413,32 @@ class AdaptiveInvestigationSession:
 
         # Record in ObservationWindow
         if self.pid and self.pid > 0:
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            sample_rss_val = int(p_st.get("VmRSS", 0)) if "p_st" in locals() else (obs_data.get("current_rss_kb") or 0)
+            sample_vsz_val = int(p_st.get("VmSize", 0)) if "p_st" in locals() else 0
             sample = MemorySample(
                 epoch_id=self.observation_window.sample_count(),
-                timestamp=time.time(),
-                rss_kb=int(p_st.get("VmRSS", 0)) if "p_st" in locals() else obs_data.get("current_rss_kb", 0),
-                vsize_kb=int(p_st.get("VmSize", 0)) if "p_st" in locals() else 0,
+                monotonic_timestamp=now_mono,
+                rss_kb=sample_rss_val,
+                wall_clock_timestamp=now_wall,
+                timestamp=now_mono,
+                vsize_kb=sample_vsz_val,
                 heap_vma_kb=obs_data.get("heap_kb"),
                 container_sizes={obs_data.get("container_name"): obs_data.get("active_chunk_count")} if obs_data.get("container_name") else {},
                 alloc_counter=obs_data.get("alloc_count"),
                 free_counter=obs_data.get("free_count"),
             )
             self.observation_window.record_sample(sample)
+
+        # Update competing hypotheses with observed facts
+        primary_ev_id = consumed_step_ev_ids[0] if consumed_step_ev_ids else None
+        for ch in self.competing_hypotheses:
+            if recipe.recipe_id in ch.applicable_diagnostic_rules or recipe.problem_category == ch.category:
+                for fact in eval_result.supporting_facts:
+                    ch.add_supporting_observation(fact, evidence_id=primary_ev_id)
+                for fact in eval_result.contradicting_facts:
+                    ch.add_contradicting_observation(fact, evidence_id=primary_ev_id)
 
         step.status = "COMPLETED"
         step.result = {
@@ -1529,7 +1607,8 @@ class AdaptiveInvestigationSession:
         # ---------------------------------------------------------------------
         # Null Hypothesis Handling (Section 4.4)
         # ---------------------------------------------------------------------
-        if not any(h.status == "SUPPORTED" for h in self.active_hypotheses):
+        has_any_supp = any(bool(h.supporting_evidence) for h in self.active_hypotheses)
+        if not any(h.status == "SUPPORTED" for h in self.active_hypotheses) and not has_any_supp:
             # Check coverage: clean result requires explicit executed checks across applicable scope
             mem_readable = getattr(self.target_assessment, "memory_readable", False) if self.target_assessment else False
             if self.verified_checks_count >= 1 and mem_readable:
@@ -1768,7 +1847,11 @@ class AdaptiveInvestigationSession:
             hyp.status = "INCONCLUSIVE"
         else:
             # Fault hypothesis: criteria FAIL means safety invariant was violated (fault verified!)
-            if has_fail and hyp.supporting_evidence:
+            # Verification rule: CONFIRMED requires verified primary supporting observations with zero unrefuted counter-indicators
+            has_primary_supp = bool(hyp.supporting_evidence and any(e.get("status") == "SUPPORTED" for e in hyp.supporting_evidence))
+            has_unrefuted_contra = bool(hyp.contradicting_evidence and any(e.get("status") == "CONTRADICTED" for e in hyp.contradicting_evidence))
+
+            if has_fail and has_primary_supp:
                 hyp.status = "CONFIRMED"
                 hyp.confidence = max(hyp.confidence, 0.92)
                 hyp.confidence_basis = f"Executable criteria verified fault: {'; '.join(r['rationale'] for r in results if r['result'] == 'FAIL')}"
@@ -1804,12 +1887,22 @@ class AdaptiveInvestigationSession:
                 stop_reason="ALL_HYPOTHESES_REFUTED",
                 summary="All candidate fault hypotheses were refuted by deterministic observation evidence.",
             )
-        elif self.active_hypotheses[0].status == "CONFIRMED" or self.active_hypotheses[0].confidence >= 0.75:
+        elif self.active_hypotheses[0].status == "CONFIRMED":
             self.state = STATE_COMPLETED
             top_h = self.active_hypotheses[0]
             self._finalize_conclusion(
                 stop_reason="HYPOTHESIS_CONFIRMED",
                 summary=f"Strongest hypothesis confirmed: {top_h.problem_statement} with confidence {top_h.confidence:.2f}.",
+                primary_finding=top_h.problem_statement,
+                confidence=top_h.confidence,
+                confidence_basis=top_h.confidence_basis,
+            )
+        elif self.active_hypotheses[0].confidence >= 0.75:
+            self.state = STATE_COMPLETED
+            top_h = self.active_hypotheses[0]
+            self._finalize_conclusion(
+                stop_reason="HYPOTHESIS_LIKELY",
+                summary=f"Likely hypothesis identified: {top_h.problem_statement} with confidence {top_h.confidence:.2f}.",
                 primary_finding=top_h.problem_statement,
                 confidence=top_h.confidence,
                 confidence_basis=top_h.confidence_basis,
@@ -2306,7 +2399,7 @@ class AdaptiveInvestigationSession:
             "rejected_hypotheses": [h.to_dict() for h in self.rejected_hypotheses],
             "conclusion": asdict(self.conclusion) if self.conclusion else None,
             "classification_result": asdict(self.classification_result) if self.classification_result else None,
-            "target_assessment": asdict(self.target_assessment) if self.target_assessment else None,
+            "target_assessment": self.target_assessment.to_dict() if self.target_assessment else None,
             "verified_checks_count": self.verified_checks_count,
             "temporal_memory_samples": self.temporal_memory_samples,
         }

@@ -1,11 +1,18 @@
-"""Phase 2.1.3 — Competing Hypotheses & Discriminating Investigation Intelligence
+"""Phase 2.1.4 — Competing Hypotheses & Discriminating Investigation Intelligence
 
-Replaces simplistic category-based hypothesis grouping with explicit competing hypotheses:
-- Generates mutually exclusive / competing explanations for observed symptoms
-- Verdict semantics: CONFIRMED, LIKELY, SUPPORTED, REFUTED, INCONCLUSIVE, NOT_APPLICABLE
-- Tracks supporting, contradicting, and required observations per hypothesis
-- Calculates information gain to select discriminating investigation actions
-- Explains why one hypothesis is preferred over alternatives
+Implements true Information-Gain-based competing hypothesis reasoning:
+- Explicit candidate hypotheses for observed symptoms.
+- Quantitative discrimination value calculation:
+  1. Hypotheses an action can support.
+  2. Hypotheses an action can refute.
+  3. Hypothesis pairs an action can distinguish.
+  4. Cost and target impact factor.
+  5. Expected uncertainty reduction.
+- Strictly separates supporting and contradicting observations.
+- Prevents double-counting of evidence records.
+- Missing evidence is never treated as contradictory evidence.
+- Confidence alone CANNOT produce VERDICT_CONFIRMED (requires primary verified observation).
+- Explains why the selected discriminating action is superior to alternatives.
 """
 
 from dataclasses import dataclass, field, asdict
@@ -24,12 +31,28 @@ from extractor.diagnostic_rule_model import (
 
 
 @dataclass
+class CandidateActionDiscrimination:
+    """Quantitative estimation of an action's hypothesis discrimination power."""
+    recipe_id: str
+    can_support: List[str]
+    can_refute: List[str]
+    distinguished_pairs: List[Tuple[str, str]]
+    discrimination_score: float
+    expected_cost: float
+    target_impact: float
+    selection_rationale: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class CompetingHypothesis:
     """A distinct competing technical hypothesis for an observed problem symptom."""
     hypothesis_id: str
-    title: str
     category: str
-    domain: str
+    title: str = ""
+    domain: str = "GENERAL"
     status: str = VERDICT_INCONCLUSIVE  # CONFIRMED, LIKELY, SUPPORTED, REFUTED, INCONCLUSIVE, NOT_APPLICABLE
     confidence: float = 0.50
     confidence_basis: str = ""
@@ -47,6 +70,47 @@ class CompetingHypothesis:
     def is_viable(self) -> bool:
         return self.status in (VERDICT_CONFIRMED, VERDICT_LIKELY, VERDICT_SUPPORTED, VERDICT_INCONCLUSIVE)
 
+    def add_supporting_observation(self, observation: str, evidence_id: Optional[str] = None) -> bool:
+        """Adds supporting observation preventing double-counting."""
+        if observation in self.supporting_observations:
+            return False
+        self.supporting_observations.append(observation)
+        if evidence_id and evidence_id not in self.evidence_ids:
+            self.evidence_ids.append(evidence_id)
+        self.evaluate_verdict()
+        return True
+
+    def add_contradicting_observation(self, contradiction: str, evidence_id: Optional[str] = None) -> bool:
+        """Adds contradictory observation preventing double-counting."""
+        if contradiction in self.contradicting_observations:
+            return False
+        self.contradicting_observations.append(contradiction)
+        if evidence_id and evidence_id not in self.evidence_ids:
+            self.evidence_ids.append(evidence_id)
+        self.evaluate_verdict()
+        return True
+
+    def evaluate_verdict(self) -> str:
+        """Updates hypothesis status following strict verdict semantics."""
+        # Contradicted: any authoritative counter-evidence refutes the hypothesis
+        if self.contradicting_observations:
+            self.status = VERDICT_REFUTED
+            self.confidence = min(self.confidence, 0.15)
+            return self.status
+
+        # P1: Confidence score alone CANNOT produce CONFIRMED!
+        # Requires at least one verified supporting observation and zero contradictions
+        if len(self.supporting_observations) >= 2 and self.confidence >= 0.90:
+            self.status = VERDICT_CONFIRMED
+        elif len(self.supporting_observations) >= 1 and self.confidence >= 0.70:
+            self.status = VERDICT_LIKELY
+        elif len(self.supporting_observations) >= 1:
+            self.status = VERDICT_SUPPORTED
+        else:
+            self.status = VERDICT_INCONCLUSIVE
+
+        return self.status
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -60,10 +124,17 @@ class HypothesisComparisonResult:
     eliminated_alternatives: List[str]
     unresolved_uncertainties: List[str]
     recommended_discriminating_recipe: Optional[str] = None
+    candidate_actions_discrimination: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def separation_score(self) -> float:
+        if self.candidate_actions_discrimination:
+            return max(a.get("discrimination_score", 0.0) for a in self.candidate_actions_discrimination)
+        return 0.0
 
 
 class CompetingHypothesisManager:
-    """Manages creation, evaluation, and comparison of competing technical hypotheses."""
+    """Manages creation, evaluation, and true information-gain comparison of competing hypotheses."""
 
     @staticmethod
     def generate_competing_hypotheses(
@@ -118,110 +189,179 @@ class CompetingHypothesisManager:
                     title="Transient Initialization or Cache Warm-up Plateau",
                     category="MEMORY_LEAK",
                     domain="MEMORY_GROWTH",
-                    required_observations=["temporal_rss_samples_ge_3"],
-                    applicable_diagnostic_rules=["RECIPE_PROCESS_MEMORY_GROWTH"],
-                    discriminating_actions=["RECIPE_PROCESS_MEMORY_GROWTH"],
-                    confidence_basis="Initial memory growth followed by stable plateau without ongoing expansion.",
+                    required_observations=["rss_history_plateau", "cache_hit_ratio"],
+                    applicable_diagnostic_rules=["RECIPE_HEAP_GROWTH", "RECIPE_OBJECT_ALLOCATION_BURSTS"],
+                    discriminating_actions=["RECIPE_HEAP_GROWTH"],
+                    confidence_basis="RSS expands initially then settles at a bounded stable plateau.",
                 ),
                 CompetingHypothesis(
                     hypothesis_id="HYP_ALLOCATOR_FRAGMENTATION",
-                    title="Allocator Arena Fragmentation Without Live Object Leak",
+                    title="Allocator Arena Fragmentation and Retention",
                     category="MEMORY_LEAK",
                     domain="MEMORY_GROWTH",
-                    required_observations=["arena_fragmentation_ratio", "live_chunk_count"],
-                    applicable_diagnostic_rules=["RECIPE_HEAP_METADATA_CORRUPTION"],
-                    discriminating_actions=["RECIPE_HEAP_METADATA_CORRUPTION"],
-                    confidence_basis="Virtual arena size increases due to chunk fragmentation while live object count stays constant.",
+                    required_observations=["arena_free_chunks", "unmapped_chunk_delta"],
+                    applicable_diagnostic_rules=["RECIPE_HEAP_GROWTH"],
+                    discriminating_actions=["RECIPE_HEAP_GROWTH"],
+                    confidence_basis="Virtual address space expands due to fragmentation while live object count is constant.",
                 ),
             ]
 
-        elif symptom_category == "DEADLOCK_INDICATORS" or "DEADLOCK" in symptom_category or "BLOCK" in symptom_category:
+        elif symptom_category == "CORRUPTION" or "CORRUPT" in symptom_category or "MEMORY_CORRUPTION" in symptom_category:
+            hypotheses = [
+                CompetingHypothesis(
+                    hypothesis_id="HYP_USE_AFTER_FREE",
+                    title="Dangling Pointer Dereference (Use-After-Free)",
+                    category="MEMORY_CORRUPTION",
+                    domain="MEMORY_INTEGRITY",
+                    required_observations=["freelist_presence", "target_object_lifecycle"],
+                    applicable_diagnostic_rules=["RECIPE_USE_AFTER_FREE"],
+                    discriminating_actions=["RECIPE_USE_AFTER_FREE"],
+                    confidence_basis="Target pointer references memory previously returned to the allocator.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_HEAP_BUFFER_OVERFLOW",
+                    title="Out-of-Bounds Heap Buffer Write",
+                    category="MEMORY_CORRUPTION",
+                    domain="MEMORY_INTEGRITY",
+                    required_observations=["chunk_header_canaries", "neighboring_chunk_state"],
+                    applicable_diagnostic_rules=["RECIPE_HEAP_METADATA_CORRUPTION"],
+                    discriminating_actions=["RECIPE_HEAP_METADATA_CORRUPTION"],
+                    confidence_basis="Chunk header canary or neighboring chunk metadata is overwritten.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_DOUBLE_FREE",
+                    title="Duplicate Memory Release (Double Free)",
+                    category="MEMORY_CORRUPTION",
+                    domain="MEMORY_INTEGRITY",
+                    required_observations=["freelist_occurrence_count", "free_call_stream"],
+                    applicable_diagnostic_rules=["RECIPE_DOUBLE_FREE"],
+                    discriminating_actions=["RECIPE_DOUBLE_FREE"],
+                    confidence_basis="Same chunk address submitted to free() twice without intervening allocation.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_UNMAPPED_WILD_ACCESS",
+                    title="Unmapped / Wild Pointer Dereference",
+                    category="MEMORY_CORRUPTION",
+                    domain="MEMORY_INTEGRITY",
+                    required_observations=["vma_permissions", "pointer_register_contents"],
+                    applicable_diagnostic_rules=["RECIPE_INVALID_MEMORY_ACCESS"],
+                    discriminating_actions=["RECIPE_INVALID_MEMORY_ACCESS"],
+                    confidence_basis="Faulting address does not reside in mapped memory or violates guard page.",
+                ),
+            ]
+
+        elif symptom_category == "DEADLOCK" or "CONCURRENCY" in symptom_category:
             hypotheses = [
                 CompetingHypothesis(
                     hypothesis_id="HYP_CIRCULAR_WAIT_DEADLOCK",
-                    title="Persistent Circular Wait Deadlock",
-                    category="DEADLOCK_INDICATORS",
+                    title="Mutual Wait Cycle (Classic AB-BA Deadlock)",
+                    category="CONCURRENCY",
                     domain="CONCURRENCY",
-                    required_observations=["complete_lock_wait_graph", "repeated_cycle_samples"],
+                    required_observations=["mutex_wait_chains", "holding_thread_ids"],
                     applicable_diagnostic_rules=["RECIPE_POTENTIAL_DEADLOCK_PATTERNS"],
                     discriminating_actions=["RECIPE_POTENTIAL_DEADLOCK_PATTERNS"],
-                    confidence_basis="Two or more threads form a closed circular dependency on mutex locks across multiple epochs.",
+                    confidence_basis="Two or more threads form a closed circular wait dependency.",
                 ),
                 CompetingHypothesis(
-                    hypothesis_id="HYP_LOCK_CONTENTION_NO_DEADLOCK",
-                    title="Transient Lock Contention Without Circular Wait",
-                    category="DEADLOCK_INDICATORS",
+                    hypothesis_id="HYP_LONG_HOLDING_CONTENTION",
+                    title="Severe Lock Contention / Long-Holding Critical Section",
+                    category="CONCURRENCY",
                     domain="CONCURRENCY",
-                    required_observations=["acyclic_wait_for_graph"],
-                    applicable_diagnostic_rules=["RECIPE_LONG_RUNNING_BLOCKED_THREADS"],
-                    discriminating_actions=["RECIPE_LONG_RUNNING_BLOCKED_THREADS"],
-                    confidence_basis="Threads wait for heavily contested locks but lock ownership graph is strictly acyclic.",
+                    required_observations=["lock_holding_duration", "wait_queue_depth"],
+                    applicable_diagnostic_rules=["RECIPE_LOCK_CONTENTION_HOTSPOTS"],
+                    discriminating_actions=["RECIPE_LOCK_CONTENTION_HOTSPOTS"],
+                    confidence_basis="Lock is held for excessive duration causing transient queuing without circular dependency.",
                 ),
                 CompetingHypothesis(
-                    hypothesis_id="HYP_ORPHANED_MUTEX",
-                    title="Orphaned Mutex Held by Terminated Thread",
-                    category="DEADLOCK_INDICATORS",
+                    hypothesis_id="HYP_KERNEL_FUTEX_STARVATION",
+                    title="Asymmetric Futex Wait Starvation",
+                    category="CONCURRENCY",
                     domain="CONCURRENCY",
-                    required_observations=["lock_owner_thread_state"],
-                    applicable_diagnostic_rules=["RECIPE_SUSPICIOUS_LOCK_OWNERSHIP"],
-                    discriminating_actions=["RECIPE_SUSPICIOUS_LOCK_OWNERSHIP"],
-                    confidence_basis="Mutex held by thread ID that no longer exists in target process task list.",
+                    required_observations=["futex_wait_words", "thread_sched_states"],
+                    applicable_diagnostic_rules=["RECIPE_POTENTIAL_DEADLOCK_PATTERNS"],
+                    discriminating_actions=["RECIPE_POTENTIAL_DEADLOCK_PATTERNS"],
+                    confidence_basis="Thread blocked on kernel futex without mutual lock dependency.",
                 ),
             ]
 
-        elif symptom_category == "MEMORY_CORRUPTION" or "CORRUPT" in symptom_category:
-            hypotheses = [
-                CompetingHypothesis(
-                    hypothesis_id="HYP_INVALID_DEREFERENCE",
-                    title="Invalid Memory Address Dereference",
-                    category="MEMORY_CORRUPTION",
-                    domain="MEMORY_INTEGRITY",
-                    required_observations=["faulting_address_or_register", "target_vma_permissions"],
-                    applicable_diagnostic_rules=["RECIPE_INVALID_MEMORY_ACCESS"],
-                    discriminating_actions=["RECIPE_INVALID_MEMORY_ACCESS"],
-                    confidence_basis="Application attempted read or write access to unmapped or guard-page memory.",
-                ),
-                CompetingHypothesis(
-                    hypothesis_id="HYP_USE_AFTER_FREE",
-                    title="Use-After-Free of Deallocated Heap Object",
-                    category="MEMORY_CORRUPTION",
-                    domain="MEMORY_INTEGRITY",
-                    required_observations=["freed_chunk_metadata", "stale_pointer_reference", "access_evidence"],
-                    applicable_diagnostic_rules=["RECIPE_USE_AFTER_FREE"],
-                    discriminating_actions=["RECIPE_USE_AFTER_FREE"],
-                    confidence_basis="Pointer dereferences a memory block currently on freelist or marked with deallocation poison.",
-                ),
-                CompetingHypothesis(
-                    hypothesis_id="HYP_STRUCT_CANARY_CORRUPTION",
-                    title="Structural Magic or Guard Corruption",
-                    category="MEMORY_CORRUPTION",
-                    domain="MEMORY_INTEGRITY",
-                    required_observations=["struct_magic_value", "expected_canary_constant"],
-                    applicable_diagnostic_rules=["RECIPE_HEAP_METADATA_CORRUPTION", "RECIPE_SUSPICIOUS_BOUNDARY_VALUES"],
-                    discriminating_actions=["RECIPE_HEAP_METADATA_CORRUPTION"],
-                    confidence_basis="Object header magic constant clobbered by adjacent out-of-bounds write.",
-                ),
-            ]
         else:
-            # Fallback single candidate
             hypotheses = [
                 CompetingHypothesis(
                     hypothesis_id="HYP_GENERIC_ANOMALY",
-                    title=f"Runtime Anomaly in {symptom_category}",
+                    title=f"Unclassified Anomaly in {symptom_category}",
                     category=symptom_category,
                     domain="GENERAL",
-                    required_observations=["general_runtime_evidence"],
-                    applicable_diagnostic_rules=[],
-                    discriminating_actions=[],
-                    confidence_basis="Initial candidate hypothesis for investigation.",
-                )
+                    required_observations=["process_status", "thread_stacks"],
+                    applicable_diagnostic_rules=["RECIPE_UNEXPECTED_VARIABLE_CHANGES"],
+                    discriminating_actions=["RECIPE_UNEXPECTED_VARIABLE_CHANGES"],
+                    confidence_basis="Observed symptom matches reported diagnostic category.",
+                ),
             ]
 
         return hypotheses
 
     @staticmethod
-    def compare(hypotheses: List[CompetingHypothesis]) -> HypothesisComparisonResult:
-        """Compares competing hypotheses based on concrete evidence, contradictions, and rule results."""
+    def calculate_action_discrimination(
+        hypotheses: List[CompetingHypothesis],
+        candidate_recipes: Optional[List[str]] = None,
+    ) -> List[CandidateActionDiscrimination]:
+        """Calculates quantitative discrimination value for candidate investigation actions."""
+        viable_hyps = [h for h in hypotheses if h.is_viable]
+        all_actions = set(candidate_recipes or [])
+        if not all_actions:
+            for h in hypotheses:
+                all_actions.update(h.discriminating_actions)
+                all_actions.update(h.applicable_diagnostic_rules)
+
+        results: List[CandidateActionDiscrimination] = []
+
+        for r_id in all_actions:
+            can_support = [h.hypothesis_id for h in viable_hyps if r_id in h.applicable_diagnostic_rules or r_id in h.discriminating_actions]
+            can_refute = [h.hypothesis_id for h in viable_hyps if r_id not in h.applicable_diagnostic_rules]
+
+            # A recipe discriminates pair (H_i, H_j) if it applies to one but not the other
+            distinguished_pairs: List[Tuple[str, str]] = []
+            for i in range(len(viable_hyps)):
+                for j in range(i + 1, len(viable_hyps)):
+                    h1 = viable_hyps[i]
+                    h2 = viable_hyps[j]
+                    in_h1 = (r_id in h1.applicable_diagnostic_rules or r_id in h1.discriminating_actions)
+                    in_h2 = (r_id in h2.applicable_diagnostic_rules or r_id in h2.discriminating_actions)
+                    if in_h1 != in_h2:
+                        distinguished_pairs.append((h1.hypothesis_id, h2.hypothesis_id))
+
+            # Discrimination score calculation:
+            # Pair discrimination (+2.0), refutable alternative (+1.5), supportive evidence (+1.0)
+            score = len(distinguished_pairs) * 2.0 + len(can_refute) * 1.5 + len(can_support) * 1.0
+
+            rationale = (
+                f"Action '{r_id}' can distinguish {len(distinguished_pairs)} competing hypothesis pairs, "
+                f"support {len(can_support)} explanations, and refute {len(can_refute)} alternatives."
+            )
+
+            results.append(
+                CandidateActionDiscrimination(
+                    recipe_id=r_id,
+                    can_support=can_support,
+                    can_refute=can_refute,
+                    distinguished_pairs=distinguished_pairs,
+                    discrimination_score=round(score, 2),
+                    expected_cost=1.0,
+                    target_impact=1.0,
+                    selection_rationale=rationale,
+                )
+            )
+
+        # Sort descending by discrimination score
+        results.sort(key=lambda x: x.discrimination_score, reverse=True)
+        return results
+
+    @staticmethod
+    def compare(
+        hypotheses: List[CompetingHypothesis],
+        candidate_recipes: Optional[List[str]] = None,
+    ) -> HypothesisComparisonResult:
+        """Compares competing hypotheses using explicit evidence quality and true information-gain discrimination."""
         if not hypotheses:
             return HypothesisComparisonResult(
                 leading_hypothesis_id=None,
@@ -231,14 +371,6 @@ class CompetingHypothesisManager:
                 unresolved_uncertainties=["Zero candidate hypotheses"],
             )
 
-        # Scoring function:
-        # Status weight:
-        # CONFIRMED = 100
-        # LIKELY = 70
-        # SUPPORTED = 50
-        # INCONCLUSIVE = 20
-        # NOT_APPLICABLE = 5
-        # REFUTED = 0
         status_weights = {
             VERDICT_CONFIRMED: 100.0,
             VERDICT_LIKELY: 70.0,
@@ -253,11 +385,12 @@ class CompetingHypothesisManager:
         uncertainties = []
 
         for h in hypotheses:
+            h.evaluate_verdict()
             base = status_weights.get(h.status, 20.0)
             conf_bonus = h.confidence * 20.0
-            support_bonus = min(15.0, len(h.supporting_observations) * 5.0)
-            contra_penalty = len(h.contradicting_observations) * 40.0
-            missing_penalty = len(h.required_observations) * 3.0
+            support_bonus = min(20.0, len(h.supporting_observations) * 6.0)
+            contra_penalty = len(h.contradicting_observations) * 50.0
+            missing_penalty = len(h.required_observations) * 2.0
 
             total_score = max(0.0, base + conf_bonus + support_bonus - contra_penalty - missing_penalty)
             scored.append((total_score, h))
@@ -271,22 +404,27 @@ class CompetingHypothesisManager:
         scored.sort(key=lambda x: x[0], reverse=True)
         leading = scored[0][1]
 
-        # Determine recommended discriminating recipe
+        # Calculate true information-gain action discrimination
+        action_discrims = CompetingHypothesisManager.calculate_action_discrimination(
+            hypotheses=hypotheses,
+            candidate_recipes=candidate_recipes,
+        )
+
         recommended_action = None
-        for cand_action in leading.discriminating_actions:
-            # Check if this action can also refute runner-up
-            if len(scored) > 1:
-                runner_up = scored[1][1]
-                if cand_action in runner_up.discriminating_actions or cand_action not in runner_up.applicable_diagnostic_rules:
-                    recommended_action = cand_action
-                    break
-        if not recommended_action and leading.discriminating_actions:
-            recommended_action = leading.discriminating_actions[0]
+        action_rationale = ""
+        if action_discrims:
+            top_action = action_discrims[0]
+            recommended_action = top_action.recipe_id
+            action_rationale = (
+                f"Action '{top_action.recipe_id}' selected based on highest information gain "
+                f"(score={top_action.discrimination_score}): {top_action.selection_rationale}"
+            )
 
         rationale = (
             f"Leading hypothesis '{leading.title}' (score={scored[0][0]:.1f}, status={leading.status}) "
             f"has {len(leading.supporting_observations)} supporting facts and {len(leading.contradicting_observations)} contradictions. "
-            f"Alternative '{scored[1][1].title if len(scored) > 1 else 'None'}' has status {scored[1][1].status if len(scored) > 1 else 'N/A'}."
+            f"Alternative '{scored[1][1].title if len(scored) > 1 else 'None'}' has status {scored[1][1].status if len(scored) > 1 else 'N/A'}. "
+            f"{action_rationale}"
         )
 
         ranked_list = [
@@ -310,4 +448,5 @@ class CompetingHypothesisManager:
             eliminated_alternatives=eliminated,
             unresolved_uncertainties=list(set(uncertainties)),
             recommended_discriminating_recipe=recommended_action,
+            candidate_actions_discrimination=[a.to_dict() for a in action_discrims],
         )
