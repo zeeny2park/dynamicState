@@ -44,6 +44,10 @@ from .diagnostic_recipes import (
     EVAL_STATUS_CONTRADICTED,
     EVAL_STATUS_INSUFFICIENT_EVIDENCE,
     EVAL_STATUS_SUPPORTED,
+    RECIPE_STATUS_AMBIGUOUS,
+    RECIPE_STATUS_CONTRADICTED,
+    RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+    RECIPE_STATUS_SUPPORTED,
     DiagnosticRecipe,
     DiagnosticRecipeRegistry,
     RecipeEvaluationResult,
@@ -63,7 +67,19 @@ from .evidence_ledger import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
 )
+from .runtime_evidence_provider import (
+    COLLECTION_STATUS_FAILED,
+    COLLECTION_STATUS_PARTIAL,
+    COLLECTION_STATUS_SUCCESS,
+    COLLECTION_STATUS_UNAVAILABLE,
+    PROVENANCE_HISTORICAL_RECORD,
+    PROVENANCE_INFERRED,
+    PROVENANCE_LIVE_RUNTIME_CAPTURE as RUNTIME_PROV_LIVE,
+    RuntimeEvidenceProvider,
+    RuntimeEvidenceRecord,
+)
 from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter
+from .watch_session import read_process_memory_slice
 
 # -----------------------------------------------------------------------------
 # 1. State Machine States
@@ -141,8 +157,8 @@ class ProblemClassifier:
             "ko": ["메모리 오염", "메모리 손상", "메모리 깨짐", "세그폴트", "크래시", "유효하지 않은 메모리", "잘못된 포인터", "오버플로우", "침범", "깨졌"],
         },
         CATEGORY_MEMORY_LEAK: {
-            "en": ["memory leak", "leak", "leaking", "rss growth", "heap growth", "unbounded growth", "oom", "out of memory", "allocations accumulating", "unfreed"],
-            "ko": ["메모리 누수", "누수", "메모리 증가", "새는", "힙 증가", "rss 증가", "메모리 고갈", "해제되지 않", "메모리가 계속 늘어"],
+            "en": ["memory leak", "leak", "leaking", "rss growth", "heap growth", "unbounded growth", "oom", "out of memory", "allocations accumulating", "unfreed", "allocation and free imbalance", "allocation imbalance", "alloc imbalance", "free imbalance"],
+            "ko": ["메모리 누수", "누수", "메모리 증가", "새는", "힙 증가", "rss 증가", "메모리 고갈", "해제되지 않", "메모리가 계속 늘어", "할당 해제 불균형", "할당 불균형", "해제 불균형"],
         },
         CATEGORY_INVALID_DOUBLE_FREE: {
             "en": ["double free", "free twice", "double deallocation", "free corrupted", "double-free"],
@@ -360,6 +376,8 @@ class TargetAssessmentResult:
     limitations: List[str]
     prerequisites_met: bool
     target_host: str = "localhost"
+    memory_readable: bool = False
+    mode: str = "LIVE"
 
 
 class TargetAssessor:
@@ -374,17 +392,18 @@ class TargetAssessor:
         capabilities: List[str] = []
         limitations: List[str] = []
         accessible = False
+        memory_readable = False
         thread_count = 0
         memory_regions_count = 0
         rss_kb = 0
         elf_valid = False
         dwarf_available = False
+        mode = "LIVE" if (pid is not None and pid > 0) else "OFFLINE_SNAPSHOT"
 
         # 1. Target PID accessibility check
         if pid is not None and pid > 1:
             proc_path = f"/proc/{pid}"
             if os.path.exists(proc_path):
-                accessible = True
                 capabilities.append("PROC_FS_AVAILABLE")
                 # Count threads
                 task_path = f"/proc/{pid}/task"
@@ -396,13 +415,15 @@ class TargetAssessor:
                         thread_count = 1
                 # Read memory maps
                 maps_path = f"/proc/{pid}/maps"
+                maps_lines = []
                 if os.path.exists(maps_path):
                     try:
                         with open(maps_path, "r", errors="replace") as f:
-                            memory_regions_count = sum(1 for _ in f)
+                            maps_lines = f.readlines()
+                            memory_regions_count = len(maps_lines)
                         capabilities.append("MAPS_READ")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        limitations.append(f"Failed to read /proc/{pid}/maps: {e}")
                 # Read status for RSS
                 status_path = f"/proc/{pid}/status"
                 if os.path.exists(status_path):
@@ -417,8 +438,33 @@ class TargetAssessor:
                         capabilities.append("RSS_METRICS")
                     except Exception:
                         pass
-                # Check process_vm_readv zero-stop capability
-                capabilities.append("PROCESS_VM_READV_ZERO_STOP")
+
+                # Probe process_vm_readv zero-stop capability by attempting to read first readable segment
+                if maps_lines:
+                    first_readable_addr = None
+                    for line in maps_lines:
+                        parts = line.split()
+                        if len(parts) >= 2 and "r" in parts[1]:
+                            addr_range = parts[0].split("-")
+                            try:
+                                first_readable_addr = int(addr_range[0], 16)
+                                break
+                            except Exception:
+                                pass
+                    if first_readable_addr is not None:
+                        slice_b, _, read_err = read_process_memory_slice(pid, first_readable_addr, 16)
+                        if slice_b is not None:
+                            memory_readable = True
+                            capabilities.append("PROCESS_MEMORY_READABLE")
+                            capabilities.append("PROCESS_VM_READV_ZERO_STOP")
+                        else:
+                            limitations.append(f"Target process memory unreadable (EPERM / ptrace_scope restricted): {read_err}")
+                    else:
+                        limitations.append("No readable memory mappings found in target process")
+                else:
+                    limitations.append(f"Target process maps unavailable for PID {pid}")
+
+                accessible = bool(memory_readable)
             else:
                 limitations.append(f"Target PID {pid} is not running or not found in /proc")
         else:
@@ -452,7 +498,11 @@ class TargetAssessor:
         else:
             limitations.append("No companion ELF provided: variable names and struct field offsets unavailable, relying on raw memory patterns and /proc info")
 
-        prerequisites_met = accessible or (companion_elf is not None and elf_valid)
+        # Live PID must be accessible to satisfy prerequisites for live mode; offline mode only requires valid ELF/snapshot
+        if pid is not None and pid > 0:
+            prerequisites_met = accessible
+        else:
+            prerequisites_met = bool(companion_elf is not None and elf_valid)
 
         return TargetAssessmentResult(
             pid=pid,
@@ -466,6 +516,8 @@ class TargetAssessor:
             capabilities=capabilities,
             limitations=limitations,
             prerequisites_met=prerequisites_met,
+            memory_readable=memory_readable,
+            mode=mode,
         )
 
 
@@ -650,19 +702,47 @@ class ExpertHypothesis:
     confidence_basis: str
     supporting_evidence: List[Dict[str, Any]] = field(default_factory=list)
     contradicting_evidence: List[Dict[str, Any]] = field(default_factory=list)
+    supporting_evidence_ids: List[str] = field(default_factory=list)
+    contradicting_evidence_ids: List[str] = field(default_factory=list)
     missing_evidence: List[str] = field(default_factory=list)
-    verification_criteria: Dict[str, Any] = field(default_factory=dict)
+    applicable_diagnostic_rules: List[str] = field(default_factory=list)
+    verification_criteria: Any = field(default_factory=list)
+    verification_execution_results: List[Dict[str, Any]] = field(default_factory=list)
     recommended_next_action: str = ""
     source_locations: List[Dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
+    @property
+    def problem_category(self) -> str:
+        return self.category
+
+    @property
+    def recommended_action(self) -> str:
+        return self.recommended_next_action
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["problem_category"] = self.category
+        d["recommended_action"] = self.recommended_next_action
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ExpertHypothesis":
-        return cls(**data)
+        clean = dict(data)
+        if "problem_category" in clean and "category" not in clean:
+            clean["category"] = clean.pop("problem_category")
+        elif "problem_category" in clean:
+            clean.pop("problem_category")
+        if "recommended_action" in clean and "recommended_next_action" not in clean:
+            clean["recommended_next_action"] = clean.pop("recommended_action")
+        elif "recommended_action" in clean:
+            clean.pop("recommended_action")
+        # Ensure optional list fields exist
+        for fld in ("supporting_evidence_ids", "contradicting_evidence_ids", "applicable_diagnostic_rules", "verification_execution_results"):
+            if fld not in clean:
+                clean[fld] = []
+        return cls(**clean)
 
 
 # -----------------------------------------------------------------------------
@@ -683,22 +763,54 @@ class EvidenceToSourceCorrelator:
         observation: Dict[str, Any],
         target_pid: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Correlates a raw observation to C++ types, DWARF symbols, and source code."""
-        address = observation.get("address")
-        raw_symbol = observation.get("symbol") or observation.get("function")
-        raw_type = observation.get("type")
-        raw_val = observation.get("value")
+        """Correlates a raw observation to C++ types, DWARF symbols, and source code,
+        accounting for ASLR load bias and gracefully handling stripped binaries.
+        """
+        address = observation.get("address") or observation.get("target_address") or observation.get("faulting_address")
+        if isinstance(address, str) and address.startswith("0x"):
+            try:
+                address = int(address, 16)
+            except Exception:
+                pass
+
+        raw_symbol = observation.get("symbol") or observation.get("function") or observation.get("pointer_name")
+        raw_type = observation.get("type") or observation.get("type_name")
+        raw_val = observation.get("value") or observation.get("observed_value")
 
         # 1. Demangle symbol if mangled
         demangled_func = demangle_symbol(raw_symbol) if raw_symbol else None
 
-        # 2. Extract source file and line if available
+        # 2. Account for ASLR and module load bias
+        load_bias = 0
+        if target_pid and target_pid > 0 and self.companion_elf and os.path.exists(self.companion_elf):
+            maps_path = f"/proc/{target_pid}/maps"
+            if os.path.exists(maps_path):
+                elf_base = os.path.basename(self.companion_elf)
+                try:
+                    with open(maps_path, "r", errors="replace") as f:
+                        for line in f:
+                            if elf_base in line and ("r-xp" in line or "r--p" in line):
+                                parts = line.split()
+                                if parts:
+                                    addr_range = parts[0].split("-")
+                                    load_bias = int(addr_range[0], 16)
+                                    break
+                except Exception:
+                    pass
+
+        # 3. Extract source file and line if available
         source_file = observation.get("source_file") or observation.get("file")
         source_line = observation.get("source_line") or observation.get("line")
 
+        # Compute relative ELF file address for addr2line
+        elf_addr = address
+        if address and isinstance(address, int):
+            if load_bias > 0 and address >= load_bias:
+                elf_addr = address - load_bias
+
         # If we have an address and a companion ELF with DWARF, attempt addr2line lookup
-        if address and self.companion_elf and os.path.exists(self.companion_elf) and (not source_file or not source_line):
-            addr_hex = hex(address) if isinstance(address, int) else str(address)
+        if elf_addr and isinstance(elf_addr, int) and self.companion_elf and os.path.exists(self.companion_elf) and (not source_file or not source_line):
+            addr_hex = f"0x{elf_addr:x}"
             try:
                 proc = subprocess.run(
                     ["addr2line", "-e", self.companion_elf, "-f", "-C", addr_hex],
@@ -710,9 +822,11 @@ class EvidenceToSourceCorrelator:
                 if proc.returncode == 0:
                     lines = [l.strip() for l in proc.stdout.strip().splitlines() if l.strip()]
                     if len(lines) >= 2:
-                        demangled_func = demangled_func or lines[0]
+                        func_line = lines[0]
                         file_line_part = lines[1].split(":")
-                        if len(file_line_part) >= 2 and "?" not in file_line_part[0]:
+                        if "??" not in func_line and func_line != "?":
+                            demangled_func = demangled_func or func_line
+                        if len(file_line_part) >= 2 and "??" not in file_line_part[0] and file_line_part[0] != "?":
                             source_file = file_line_part[0]
                             try:
                                 source_line = int(file_line_part[1].split()[0])
@@ -721,7 +835,14 @@ class EvidenceToSourceCorrelator:
             except Exception:
                 pass
 
-        # 3. Read context source lines if source_file exists
+        # Check if addr2line returned '??'
+        if demangled_func and ("??" in demangled_func or demangled_func == "?"):
+            demangled_func = raw_symbol or None
+        if source_file and ("??" in source_file or source_file == "?"):
+            source_file = None
+            source_line = None
+
+        # 4. Read context source lines if source_file exists
         source_context: List[str] = []
         if source_file and os.path.exists(source_file) and isinstance(source_line, int) and source_line > 0:
             try:
@@ -735,18 +856,33 @@ class EvidenceToSourceCorrelator:
             except Exception:
                 pass
 
-        # 4. Synthesize correlation output
+        # Extract evidence IDs
+        evidence_ids: List[str] = []
+        if observation.get("evidence_id"):
+            evidence_ids.append(observation["evidence_id"])
+        elif observation.get("evidence_ids"):
+            evidence_ids.extend(observation["evidence_ids"])
+
+        observed_type = observation.get("observed_type")
+        inferred_type = observation.get("inferred_type") or (raw_type if not observed_type else None)
+
+        # 5. Synthesize correlation output
         return {
+            "runtime_address": address,
             "address": address,
+            "elf_address": f"0x{elf_addr:x}" if isinstance(elf_addr, int) else None,
+            "load_bias": f"0x{load_bias:x}",
             "raw_symbol": raw_symbol,
             "demangled_symbol": demangled_func or raw_symbol,
-            "inferred_type": raw_type,
+            "observed_type": observed_type,
+            "inferred_type": inferred_type,
             "value": raw_val,
             "source_file": source_file,
             "source_line": source_line,
             "source_context": source_context,
             "allocation_site": observation.get("allocation_site"),
             "function_candidates": [demangled_func] if demangled_func else [],
+            "evidence_ids": evidence_ids,
         }
 
 
@@ -789,7 +925,8 @@ class AdaptiveInvestigationSession:
         self.pid = pid
         self.companion_elf = companion_elf
         self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
-        os.makedirs(self.corpus_dir, exist_ok=True)
+        self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
+        os.makedirs(self._investigations_dir, exist_ok=True)
 
         # Components
         self.classifier = ProblemClassifier()
@@ -798,6 +935,7 @@ class AdaptiveInvestigationSession:
         self.planner = InvestigationPlanner(self.recipe_registry)
         self.correlator = EvidenceToSourceCorrelator(companion_elf)
         self.ledger = EvidenceLedger(session_id=self.investigation_id)
+        self.evidence_provider = RuntimeEvidenceProvider(adapter=LocalTargetAdapter(), corpus_dir=self.corpus_dir)
 
         # State machine
         self.state = STATE_CREATED
@@ -809,11 +947,23 @@ class AdaptiveInvestigationSession:
         self.target_assessment: Optional[TargetAssessmentResult] = None
         self.plan: Optional[InvestigationPlan] = None
         self.collected_evidence: List[Dict[str, Any]] = []
+        self.collected_evidence_records: List[RuntimeEvidenceRecord] = []
         self.active_hypotheses: List[ExpertHypothesis] = []
         self.rejected_hypotheses: List[ExpertHypothesis] = []
         self.conclusion: Optional[DiagnosticConclusion] = None
+        self.verified_checks_count: int = 0
 
         self._record_timeline_event("SESSION_CREATED", {"investigation_id": investigation_id, "pid": pid})
+        self._save_to_disk()
+
+    def _save_to_disk(self) -> None:
+        """Persists authoritative investigation state to disk."""
+        try:
+            path = os.path.join(self._investigations_dir, f"{self.investigation_id}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, indent=2)
+        except Exception:
+            pass
 
     def _record_timeline_event(self, event_type: str, details: Dict[str, Any]) -> None:
         """Appends an event to the chronological timeline."""
@@ -828,11 +978,13 @@ class AdaptiveInvestigationSession:
         """Pauses the investigation session."""
         self.is_paused = True
         self._record_timeline_event("SESSION_PAUSED", {})
+        self._save_to_disk()
 
     def resume(self) -> None:
         """Resumes a paused investigation session."""
         self.is_paused = False
         self._record_timeline_event("SESSION_RESUMED", {})
+        self._save_to_disk()
 
     def step(self) -> Dict[str, Any]:
         """Advances the investigation session by exactly one state transition or collection step."""
@@ -848,22 +1000,26 @@ class AdaptiveInvestigationSession:
             }
 
         # Dispatch based on current state
+        res: Dict[str, Any] = {}
         if self.state == STATE_CREATED or self.state == STATE_CLASSIFYING:
-            return self._step_classify()
+            res = self._step_classify()
         elif self.state == STATE_ASSESSING:
-            return self._step_assess()
+            res = self._step_assess()
         elif self.state == STATE_PLANNING:
-            return self._step_plan()
+            res = self._step_plan()
         elif self.state == STATE_COLLECTING:
-            return self._step_collect_next()
+            res = self._step_collect_next()
         elif self.state == STATE_ANALYZING:
-            return self._step_analyze()
+            res = self._step_analyze()
         elif self.state == STATE_VERIFYING:
-            return self._step_verify()
+            res = self._step_verify()
         elif self.state == STATE_NARROWING:
-            return self._step_narrow()
+            res = self._step_narrow()
+        else:
+            res = {"status": "UNKNOWN_STATE", "state": self.state}
 
-        return {"status": "UNKNOWN_STATE", "state": self.state}
+        self._save_to_disk()
+        return res
 
     def run_to_completion(self, max_steps: int = 30) -> DiagnosticConclusion:
         """Runs the investigation state machine iteratively until a terminal state is reached."""
@@ -881,6 +1037,7 @@ class AdaptiveInvestigationSession:
                 summary="Investigation reached maximum iteration budget without fully separating hypotheses.",
             )
 
+        self._save_to_disk()
         return self.conclusion or self._finalize_conclusion("TERMINATED", "Session finished.")
 
     # -------------------------------------------------------------------------
@@ -908,13 +1065,14 @@ class AdaptiveInvestigationSession:
             "accessible": self.target_assessment.accessible,
             "thread_count": self.target_assessment.thread_count,
             "dwarf_available": self.target_assessment.dwarf_available,
+            "memory_readable": self.target_assessment.memory_readable,
             "limitations": self.target_assessment.limitations,
         })
         if not self.target_assessment.prerequisites_met and self.pid is not None:
             self.state = STATE_BLOCKED
             self._finalize_conclusion(
                 stop_reason="TARGET_INACCESSIBLE",
-                summary=f"Target PID {self.pid} is inaccessible and companion ELF is missing or invalid.",
+                summary=f"Target PID {self.pid} is inaccessible or memory is unreadable: {'; '.join(self.target_assessment.limitations)}",
             )
             return {"action": "ASSESS", "state": self.state, "status": "BLOCKED"}
 
@@ -949,57 +1107,129 @@ class AdaptiveInvestigationSession:
         step.status = "RUNNING"
         step.executed_at = datetime.now(timezone.utc).isoformat()
 
-        # Execute recipe evaluation
         recipe = self.recipe_registry.get_recipe(step.recipe_id)
         if not recipe:
             step.status = "FAILED"
             self.plan.current_step_index += 1
             return {"action": "COLLECT_STEP", "step_id": step.step_id, "status": "FAILED"}
 
-        # Build context for deterministic evaluation
+        # Perform actual live runtime evidence acquisition via RuntimeEvidenceProvider
+        obs_data, ev_records = self.evidence_provider.collect_for_recipe(
+            recipe=recipe,
+            pid=self.pid,
+            companion_elf=self.companion_elf,
+            target_assessment=self.target_assessment,
+            classification=self.classification_result,
+        )
+        self.collected_evidence_records.extend(ev_records)
+
+        # Merge live observation data into deterministic recipe context
         eval_context: Dict[str, Any] = {
             "pid": self.pid,
             "companion_elf": self.companion_elf,
             "entities": self.classification_result.extracted_entities if self.classification_result else {},
             "capabilities": self.target_assessment.capabilities if self.target_assessment else [],
             "rss_kb": self.target_assessment.rss_kb if self.target_assessment else 0,
+            **obs_data,
         }
 
+        # Deterministic recipe evaluation against real acquired observations
         eval_result = self.recipe_registry.evaluate_recipe(recipe, eval_context)
         step.status = "COMPLETED"
         step.result = {
             "status": eval_result.status,
-            "score": eval_result.score,
-            "rationale": eval_result.rationale,
-            "supporting_evidence": eval_result.supporting_evidence,
-            "contradicting_evidence": eval_result.contradicting_evidence,
+            "confidence": eval_result.confidence,
+            "confidence_basis": eval_result.confidence_basis,
+            "supporting_facts": eval_result.supporting_facts,
+            "contradicting_facts": eval_result.contradicting_facts,
+            "missing_evidence": eval_result.missing_evidence,
+            "details": eval_result.details,
         }
+        self.verified_checks_count += 1
 
-        # Store in collected evidence & correlate
-        for ev in eval_result.supporting_evidence:
-            correlated = self.correlator.correlate(ev, target_pid=self.pid)
-            enriched_ev = {**ev, "correlation": correlated, "step_id": step.step_id}
+        # Enrich and correlate evidence records
+        for fact in eval_result.supporting_facts:
+            ev_id = ev_records[0].evidence_id if ev_records else f"ev_{uuid.uuid4().hex[:12]}"
+            prov_class = ev_records[0].provenance_class if ev_records else RUNTIME_PROV_LIVE
+            ev_payload = {
+                "evidence_id": ev_id,
+                "problem_category": recipe.problem_category,
+                "recipe_id": recipe.recipe_id,
+                "domain": recipe.domain,
+                "finding": fact,
+                "status": "SUPPORTED",
+                "details": eval_result.details,
+                "address": obs_data.get("address") or obs_data.get("faulting_address"),
+                "symbol": obs_data.get("pointer_name") or obs_data.get("variable_name"),
+                "observed_value": obs_data.get("observed_value") or obs_data.get("value"),
+                "provenance_class": prov_class,
+            }
+            correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
             self.collected_evidence.append(enriched_ev)
-            # Record in EvidenceLedger
+
             try:
                 self.ledger.add_record(EvidenceRecord(
-                    record_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    record_id=ev_id,
                     evidence_type=EVIDENCE_TYPE_DIAGNOSTIC,
-                    provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+                    provenance_class=prov_class,
                     target_pid=self.pid or 0,
                     source_function=recipe.recipe_id,
                     evidence_payload=enriched_ev,
-                    semantic_digest=hashlib.sha256(json.dumps(ev, sort_keys=True).encode()).hexdigest(),
+                    semantic_digest=hashlib.sha256(json.dumps(fact, sort_keys=True).encode()).hexdigest(),
                 ))
             except Exception:
                 pass
+
+        for fact in eval_result.contradicting_facts:
+            ev_id = ev_records[0].evidence_id if ev_records else f"ev_{uuid.uuid4().hex[:12]}"
+            ev_payload = {
+                "evidence_id": ev_id,
+                "problem_category": recipe.problem_category,
+                "recipe_id": recipe.recipe_id,
+                "domain": recipe.domain,
+                "counter_indicator": fact,
+                "status": "CONTRADICTED",
+                "details": eval_result.details,
+                "address": obs_data.get("address"),
+                "provenance_class": RUNTIME_PROV_LIVE if self.pid else PROVENANCE_SYNTHETIC_FIXTURE,
+            }
+            correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            self.collected_evidence.append(enriched_ev)
 
         self._record_timeline_event("STEP_EXECUTED", {
             "step_id": step.step_id,
             "recipe_id": step.recipe_id,
             "eval_status": eval_result.status,
-            "eval_score": eval_result.score,
+            "confidence": eval_result.confidence,
         })
+
+        # ---------------------------------------------------------------------
+        # Adaptive Feedback Loop & Replanning (Section 5)
+        # ---------------------------------------------------------------------
+        remaining_steps = self.plan.steps[self.plan.current_step_index + 1:]
+        if eval_result.status == RECIPE_STATUS_SUPPORTED:
+            # Anomaly confirmed! Prioritize relevant follow-up steps for this category
+            related_steps = [s for s in remaining_steps if s.category == recipe.problem_category]
+            unrelated_steps = [s for s in remaining_steps if s.category != recipe.problem_category]
+            self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + related_steps + unrelated_steps
+
+            # Early stop condition: if definitive fault confirmed with high confidence (>= 0.90)
+            if eval_result.confidence >= 0.90 and not eval_result.contradicting_facts:
+                # Mark remaining steps SKIPPED and transition directly to analyzing
+                for s in remaining_steps:
+                    if s.category != recipe.problem_category:
+                        s.status = "SKIPPED"
+                self.state = STATE_ANALYZING
+                self.plan.current_step_index += 1
+                return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result), "adaptive_action": "EARLY_ANOMALY_CONFIRMED"}
+
+        elif eval_result.status == RECIPE_STATUS_CONTRADICTED:
+            # Category contradicted: down-weight or skip remaining steps for this category
+            for s in remaining_steps:
+                if s.category == recipe.problem_category:
+                    s.status = "SKIPPED"
 
         self.plan.current_step_index += 1
         if self.plan.current_step_index >= len(self.plan.steps):
@@ -1007,46 +1237,97 @@ class AdaptiveInvestigationSession:
         return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result)}
 
     def _step_analyze(self) -> Dict[str, Any]:
-        """Synthesizes falsifiable hypotheses from collected evidence."""
-        # Formulate initial hypotheses
+        """Synthesizes falsifiable hypotheses from collected observations and diagnostic rules."""
         self.active_hypotheses.clear()
 
-        # Group evidence by category
+        # Group collected evidence by category
         cat_evidence: Dict[str, List[Dict[str, Any]]] = {}
         for ev in self.collected_evidence:
-            cat = ev.get("problem_category") or self.classification_result.primary_category
+            cat = ev.get("problem_category") or (self.classification_result.primary_category if self.classification_result else "UNKNOWN")
             cat_evidence.setdefault(cat, []).append(ev)
 
         hyp_counter = 1
         for cat, ev_list in cat_evidence.items():
-            conf = min(0.95, 0.40 + 0.15 * len(ev_list))
+            supp_ev = [e for e in ev_list if e.get("status") == "SUPPORTED"]
+            contra_ev = [e for e in ev_list if e.get("status") == "CONTRADICTED"]
+
+            # Build executable verification criteria for this problem category
+            criteria = self._build_verification_criteria_for_category(cat)
+
+            # Determine applicable diagnostic rules
+            rules = list(dict.fromkeys(e.get("recipe_id") for e in ev_list if e.get("recipe_id")))
+
+            # Evidence-based confidence (derived from criteria and recipe outcome, NOT count)
+            if supp_ev and not contra_ev:
+                base_conf = max(e.get("details", {}).get("confidence", 0.85) for e in supp_ev)
+                hyp_status = "SUPPORTED"
+                conf_basis = f"Confirmed by deterministic recipe evaluation ({', '.join(rules)}) with zero contradiction."
+            elif supp_ev and contra_ev:
+                base_conf = 0.45
+                hyp_status = "PROPOSED"
+                conf_basis = f"Ambiguous: observed {len(supp_ev)} indicators alongside {len(contra_ev)} counter-indicators."
+            elif contra_ev and not supp_ev:
+                base_conf = 0.10
+                hyp_status = "CONTRADICTED"
+                conf_basis = f"Contradicted by counter-indicators observed during zero-stop evaluation."
+            else:
+                base_conf = 0.20
+                hyp_status = "INCONCLUSIVE"
+                conf_basis = "Insufficient evidence collected to evaluate hypothesis criteria."
+
             hyp = ExpertHypothesis(
                 hypothesis_id=f"HYP_{hyp_counter:02d}",
-                problem_statement=f"Runtime anomaly in {cat}: observed {len(ev_list)} corroborating evidence patterns.",
+                problem_statement=f"Runtime anomaly in {cat}: observed {len(supp_ev)} corroborating indicators.",
                 category=cat,
                 domain=ev_list[0].get("domain", DOMAIN_ABNORMAL_RUNTIME_STATE),
-                status="SUPPORTED" if conf >= 0.70 else "PROPOSED",
-                confidence=conf,
-                confidence_basis=f"Derived from {len(ev_list)} zero-stop observations matching diagnostic recipe criteria.",
-                supporting_evidence=ev_list,
-                verification_criteria={"minimum_supporting_evidence": 1, "confidence_threshold": 0.80},
-                recommended_next_action=f"Perform deterministic verification against {cat} invariants.",
+                status=hyp_status,
+                confidence=round(base_conf, 2),
+                confidence_basis=conf_basis,
+                supporting_evidence=supp_ev,
+                contradicting_evidence=contra_ev,
+                supporting_evidence_ids=[e.get("evidence_id") for e in supp_ev if e.get("evidence_id")],
+                contradicting_evidence_ids=[e.get("evidence_id") for e in contra_ev if e.get("evidence_id")],
+                applicable_diagnostic_rules=rules,
+                verification_criteria=criteria,
+                recommended_next_action=f"Execute deterministic multi-assertion verification against {cat} invariants.",
             )
             self.active_hypotheses.append(hyp)
             hyp_counter += 1
 
-        # If no evidence was found, create a null-hypothesis
-        if not self.active_hypotheses:
-            self.active_hypotheses.append(ExpertHypothesis(
-                hypothesis_id="HYP_01",
-                problem_statement="No abnormal runtime indicators observed within investigated scope.",
-                category=self.classification_result.primary_category if self.classification_result else "UNKNOWN",
-                domain=DOMAIN_ABNORMAL_RUNTIME_STATE,
-                status="SUPPORTED",
-                confidence=0.85,
-                confidence_basis="Zero-stop inspection completed with clean checks across all scheduled recipes.",
-                recommended_next_action="Conclude investigation or widen inspection scope.",
-            ))
+        # ---------------------------------------------------------------------
+        # Null Hypothesis Handling (Section 4.4)
+        # ---------------------------------------------------------------------
+        if not any(h.status == "SUPPORTED" for h in self.active_hypotheses):
+            # Check coverage: clean result requires explicit executed checks across applicable scope
+            mem_readable = getattr(self.target_assessment, "memory_readable", False) if self.target_assessment else False
+            if self.verified_checks_count >= 1 and mem_readable:
+                self.active_hypotheses.append(ExpertHypothesis(
+                    hypothesis_id=f"HYP_{hyp_counter:02d}",
+                    problem_statement="No abnormal runtime indicators observed within investigated scope.",
+                    category="HEALTHY",
+                    domain=DOMAIN_ABNORMAL_RUNTIME_STATE,
+                    status="SUPPORTED",
+                    confidence=0.85,
+                    confidence_basis=f"Zero-stop inspection completed with clean checks across {self.verified_checks_count} executed recipes and full memory access.",
+                    applicable_diagnostic_rules=["RECIPE_CLEAN_HEALTH_CHECK"],
+                    verification_criteria=[{"criterion_id": "CRIT_ZERO_ANOMALIES", "description": "All scheduled recipes completed without positive anomaly indicators", "expected": True}],
+                    recommended_next_action="Conclude investigation or widen inspection scope.",
+                ))
+            else:
+                # Coverage insufficient: return INCONCLUSIVE, not a healthy conclusion
+                limits = list(self.target_assessment.limitations if self.target_assessment else ["Insufficient diagnostic coverage"])
+                self.active_hypotheses.append(ExpertHypothesis(
+                    hypothesis_id=f"HYP_{hyp_counter:02d}",
+                    problem_statement="Diagnostic inspection inconclusive: insufficient evidence coverage or target access limitations.",
+                    category="UNKNOWN",
+                    domain=DOMAIN_ABNORMAL_RUNTIME_STATE,
+                    status="INCONCLUSIVE",
+                    confidence=0.20,
+                    confidence_basis=f"Diagnostic coverage was insufficient ({'; '.join(limits)}). Process cannot be certified healthy.",
+                    missing_evidence=limits,
+                    applicable_diagnostic_rules=[],
+                    recommended_next_action="Re-run investigation with elevated permissions or companion ELF DWARF symbols.",
+                ))
 
         self._record_timeline_event("HYPOTHESES_FORMED", {
             "active_hypotheses_count": len(self.active_hypotheses),
@@ -1054,18 +1335,38 @@ class AdaptiveInvestigationSession:
         self.state = STATE_VERIFYING
         return {"action": "ANALYZE", "state": self.state, "hypotheses_count": len(self.active_hypotheses)}
 
-    def _step_verify(self) -> Dict[str, Any]:
-        """Runs deterministic verification procedure for top hypothesis."""
-        for hyp in self.active_hypotheses:
-            if hyp.confidence >= 0.80 and hyp.supporting_evidence:
-                hyp.status = "CONFIRMED"
-            elif hyp.contradicting_evidence and not hyp.supporting_evidence:
-                hyp.status = "REFUTED"
-                self.rejected_hypotheses.append(hyp)
-            elif hyp.confidence < 0.50:
-                hyp.status = "INCONCLUSIVE"
+    def _build_verification_criteria_for_category(self, category: str) -> List[Dict[str, Any]]:
+        """Constructs executable verification criteria for a problem category."""
+        if "CORRUPTION" in category or "FREE" in category:
+            return [
+                {"criterion_id": "CRIT_POINTER_VALID_VMA", "description": "Target address resides in valid mapped VMA and outside NULL page [0, 4096]", "expected": True},
+                {"criterion_id": "CRIT_NO_POISON_PATTERN", "description": "Memory buffer does not contain allocator poison bytes (0xbaadbaad/0xdeadbeef)", "expected": True},
+            ]
+        elif "LEAK" in category or "GROWTH" in category:
+            return [
+                {"criterion_id": "CRIT_RSS_GROWTH_STABLE", "description": "Process RSS growth rate across observation window is bounded (< 20%)", "expected": True},
+                {"criterion_id": "CRIT_CHUNK_RECLAMATION", "description": "Allocated heap objects/chunks are reclaimed without sustained accumulation", "expected": True},
+            ]
+        elif "DEADLOCK" in category or "CONCURRENCY" in category:
+            return [
+                {"criterion_id": "CRIT_NO_CIRCULAR_WAIT", "description": "Thread mutex wait-for graph contains no circular wait cycles", "expected": True},
+                {"criterion_id": "CRIT_THREADS_PROGRESSING", "description": "Threads make execution progress without permanent futex lock stall", "expected": True},
+            ]
+        elif "STATE" in category or "VARIABLE" in category:
+            return [
+                {"criterion_id": "CRIT_VALID_STATE_DOMAIN", "description": "State variable values remain within defined enum/boundary domains", "expected": True},
+                {"criterion_id": "CRIT_LEGAL_STATE_TRANSITION", "description": "Observed state transitions conform to valid state machine edges", "expected": True},
+            ]
+        return [
+            {"criterion_id": "CRIT_INVARIANT_PRESERVED", "description": "Deterministic operational invariants are preserved", "expected": True}
+        ]
 
-        # Filter out rejected
+    def _step_verify(self) -> Dict[str, Any]:
+        """Runs executable verification criteria engine across all active hypotheses."""
+        for hyp in list(self.active_hypotheses):
+            self._execute_verification_for_hypothesis(hyp)
+
+        # Filter out refuted hypotheses
         self.active_hypotheses = [h for h in self.active_hypotheses if h.status != "REFUTED"]
         self._record_timeline_event("HYPOTHESES_VERIFIED", {
             "active_count": len(self.active_hypotheses),
@@ -1074,9 +1375,146 @@ class AdaptiveInvestigationSession:
         self.state = STATE_NARROWING
         return {"action": "VERIFY", "state": self.state}
 
+    def _execute_verification_for_hypothesis(self, hyp: ExpertHypothesis) -> Dict[str, Any]:
+        """Executes explicit verification criteria for a single hypothesis."""
+        results: List[Dict[str, Any]] = []
+        has_fail = False
+        has_pass = False
+
+        criteria_list = hyp.verification_criteria if isinstance(hyp.verification_criteria, list) else []
+        for crit in criteria_list:
+            cid = crit.get("criterion_id", "")
+            outcome = "INCONCLUSIVE"
+            rationale = "No observation evidence available to verify criterion."
+
+            # 1. Pointer & VMA check
+            if cid == "CRIT_POINTER_VALID_VMA":
+                # Check collected evidence for address and mapping
+                fault_ev = next((e for e in hyp.supporting_evidence if "NULL" in str(e) or "unmapped" in str(e).lower() or e.get("details", {}).get("violation_type")), None)
+                if fault_ev:
+                    outcome = "FAIL"  # Criterion violated -> fault confirmed
+                    rationale = f"Observed address violation: {fault_ev.get('finding')}"
+                else:
+                    contra_ev = next((e for e in hyp.contradicting_evidence if "validly mapped" in str(e)), None)
+                    if contra_ev:
+                        outcome = "PASS"  # Criterion preserved -> fault contradicted
+                        rationale = "Target address resides in validly mapped readable VMA."
+
+            # 2. Poison bytes / magic check
+            elif cid == "CRIT_NO_POISON_PATTERN":
+                poison_ev = next((e for e in hyp.supporting_evidence if "magic" in str(e).lower() or "poison" in str(e).lower()), None)
+                if poison_ev:
+                    outcome = "FAIL"
+                    rationale = f"Corruption pattern detected: {poison_ev.get('finding')}"
+                else:
+                    outcome = "PASS"
+                    rationale = "No memory corruption or poison patterns detected."
+
+            # 3. Memory growth / leak check
+            elif cid in ("CRIT_RSS_GROWTH_STABLE", "CRIT_CHUNK_RECLAMATION"):
+                growth_ev = next((e for e in hyp.supporting_evidence if "growth" in str(e).lower() or "leak" in str(e).lower()), None)
+                if growth_ev:
+                    outcome = "FAIL"
+                    rationale = f"Unbounded memory growth detected: {growth_ev.get('finding')}"
+                else:
+                    contra_ev = next((e for e in hyp.contradicting_evidence if "stable" in str(e).lower()), None)
+                    if contra_ev:
+                        outcome = "PASS"
+                        rationale = "Memory consumption remains stable across observation intervals."
+                    else:
+                        outcome = "PASS"
+                        rationale = "No memory growth detected in observed intervals."
+
+            # 4. Circular wait / deadlock check
+            elif cid == "CRIT_NO_CIRCULAR_WAIT":
+                deadlock_ev = next((e for e in hyp.supporting_evidence if "deadlock" in str(e).lower() or e.get("details", {}).get("deadlock_detected")), None)
+                if deadlock_ev:
+                    outcome = "FAIL"  # Circular wait confirmed
+                    rationale = f"Circular wait cycle confirmed in lock graph: {deadlock_ev.get('finding')}"
+                else:
+                    # Check if threads are blocked without deadlock
+                    blocked_ev = next((e for e in hyp.supporting_evidence if "blocked" in str(e).lower()), None)
+                    if blocked_ev:
+                        outcome = "PASS"
+                        rationale = "Thread blocked on lock, but NO circular wait cycle exists."
+                    else:
+                        outcome = "PASS"
+                        rationale = "No circular wait cycles detected in thread mutex graph."
+
+            # 5. State domain / transition check
+            elif cid in ("CRIT_VALID_STATE_DOMAIN", "CRIT_LEGAL_STATE_TRANSITION"):
+                trans_ev = next((e for e in hyp.supporting_evidence if "transition" in str(e).lower() or "boundary" in str(e).lower()), None)
+                if trans_ev:
+                    outcome = "FAIL"
+                    rationale = f"State transition or boundary violation detected: {trans_ev.get('finding')}"
+                else:
+                    outcome = "PASS"
+                    rationale = "Observed state transitions conform to valid specification."
+
+            # 6. Clean check
+            elif cid == "CRIT_ZERO_ANOMALIES":
+                if not hyp.contradicting_evidence and hyp.status == "SUPPORTED":
+                    outcome = "PASS"
+                    rationale = "All scheduled diagnostic checks verified clean."
+                else:
+                    outcome = "FAIL"
+
+            results.append({
+                "criterion_id": cid,
+                "description": crit.get("description", ""),
+                "result": outcome,
+                "rationale": rationale,
+            })
+            if outcome == "FAIL":
+                has_fail = True
+            elif outcome == "PASS":
+                has_pass = True
+
+        hyp.verification_execution_results = results
+
+        # Update hypothesis verdict based on criteria outcomes
+        is_clean_hyp = (
+            "No abnormal runtime indicators observed" in hyp.problem_statement or
+            any(c.get("criterion_id") == "CRIT_ZERO_ANOMALIES" for c in criteria_list)
+        )
+        if is_clean_hyp:
+            if has_pass and not has_fail:
+                hyp.status = "CONFIRMED"
+                hyp.confidence = 0.90
+            else:
+                hyp.status = "INCONCLUSIVE"
+        elif "inconclusive" in hyp.problem_statement.lower():
+            hyp.status = "INCONCLUSIVE"
+        else:
+            # Fault hypothesis: criteria FAIL means safety invariant was violated (fault verified!)
+            if has_fail and hyp.supporting_evidence:
+                hyp.status = "CONFIRMED"
+                hyp.confidence = max(hyp.confidence, 0.92)
+                hyp.confidence_basis = f"Executable criteria verified fault: {'; '.join(r['rationale'] for r in results if r['result'] == 'FAIL')}"
+            elif has_pass and not has_fail and hyp.contradicting_evidence:
+                hyp.status = "REFUTED"
+                hyp.confidence = min(hyp.confidence, 0.15)
+                hyp.confidence_basis = "Refuted by contradictory evidence and satisfied safety invariants."
+                self.rejected_hypotheses.append(hyp)
+            elif hyp.contradicting_evidence and not hyp.supporting_evidence:
+                hyp.status = "REFUTED"
+                hyp.confidence = 0.10
+                self.rejected_hypotheses.append(hyp)
+            elif hyp.supporting_evidence:
+                hyp.status = "LIKELY"
+            else:
+                hyp.status = "INCONCLUSIVE"
+
+        return {
+            "hypothesis_id": hyp.hypothesis_id,
+            "status": hyp.status,
+            "confidence": hyp.confidence,
+            "verdict": hyp.status,
+            "verification_results": results,
+        }
+
     def _step_narrow(self) -> Dict[str, Any]:
         """Adaptive narrowing: selects final conclusion or declares inconclusive."""
-        # Sort active hypotheses by confidence descending
         self.active_hypotheses.sort(key=lambda h: h.confidence, reverse=True)
 
         if not self.active_hypotheses:
@@ -1115,17 +1553,20 @@ class AdaptiveInvestigationSession:
         """Constructs and seals the final diagnostic conclusion."""
         remediations: List[str] = []
         if primary_finding:
-            if "MEMORY" in primary_finding.upper() or "CORRUPT" in primary_finding.upper():
-                remediations.append("Audit pointer dereference bounds and check for unaligned structure access.")
-                remediations.append("Enable AddressSanitizer (ASan) during testing builds: `-fsanitize=address`.")
-            elif "LEAK" in primary_finding.upper() or "GROWTH" in primary_finding.upper():
-                remediations.append("Profile heap allocations and verify balanced free/delete calls.")
-                remediations.append("Inspect long-lived container capacities and unbounded cache queues.")
-            elif "DEADLOCK" in primary_finding.upper() or "LOCK" in primary_finding.upper():
-                remediations.append("Enforce global lock acquisition ordering hierarchy.")
+            pf_up = primary_finding.upper()
+            if "MEMORY" in pf_up or "CORRUPT" in pf_up or "POINTER" in pf_up:
+                remediations.append("Audit pointer dereference bounds and verify memory mapping permissions before dereference.")
+                remediations.append("Enable AddressSanitizer (ASan) during build: `-fsanitize=address -g`.")
+            elif "LEAK" in pf_up or "GROWTH" in pf_up or "IMBALANCE" in pf_up:
+                remediations.append("Profile heap allocations and verify balanced free/delete calls across container lifecycles.")
+                remediations.append("Inspect long-lived container capacities and unbounded cache queue limits.")
+            elif "DEADLOCK" in pf_up or "LOCK" in pf_up:
+                remediations.append("Enforce strict global lock acquisition ordering hierarchy across all threads.")
                 remediations.append("Consider replacing nested mutexes with lock-free structures or fine-grained atomics.")
+            elif "HEALTHY" in pf_up or "CLEAN" in pf_up:
+                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
             else:
-                remediations.append("Review recent state transition logic and verify invariant assertion checks.")
+                remediations.append("Review state transition logic and enforce assertions for valid enum state transitions.")
         else:
             remediations.append("No active remediation required: runtime state appears healthy within investigated scope.")
 
@@ -1143,8 +1584,8 @@ class AdaptiveInvestigationSession:
             confidence=confidence,
             confidence_basis=confidence_basis or "Derived from multi-factor diagnostic recipe evaluations.",
             supporting_evidence_chain=self.collected_evidence,
-            rejected_alternatives=[asdict(h) for h in self.rejected_hypotheses],
-            missing_evidence_and_unknowns=[],
+            rejected_alternatives=[h.to_dict() for h in self.rejected_hypotheses],
+            missing_evidence_and_unknowns=list(limitations),
             recommended_remediations=remediations,
             diagnostic_limitations=limitations,
         )
@@ -1229,6 +1670,8 @@ class AdaptiveInvestigationSession:
                     "supporting_evidence": hyp.supporting_evidence,
                     "contradicting_evidence": hyp.contradicting_evidence,
                     "missing_evidence": hyp.missing_evidence,
+                    "verification_criteria": hyp.verification_criteria,
+                    "verification_results": hyp.verification_execution_results,
                 }
         return {"error": f"Hypothesis '{hypothesis_id}' not found in investigation {self.investigation_id}"}
 
@@ -1238,17 +1681,7 @@ class AdaptiveInvestigationSession:
             self._step_analyze()
         for hyp in self.active_hypotheses:
             if hyp.hypothesis_id == hypothesis_id:
-                if hyp.supporting_evidence:
-                    hyp.status = "CONFIRMED"
-                    hyp.confidence = max(hyp.confidence, 0.90)
-                else:
-                    hyp.status = "INCONCLUSIVE"
-                return {
-                    "hypothesis_id": hyp.hypothesis_id,
-                    "status": hyp.status,
-                    "confidence": hyp.confidence,
-                    "verdict": hyp.status,
-                }
+                return self._execute_verification_for_hypothesis(hyp)
         return {"error": f"Hypothesis '{hypothesis_id}' not found"}
 
     def compare_hypotheses(self, hypothesis_ids: List[str]) -> Dict[str, Any]:
@@ -1266,6 +1699,7 @@ class AdaptiveInvestigationSession:
                     "status": h.status,
                     "supporting_evidence_count": len(h.supporting_evidence),
                     "contradicting_evidence_count": len(h.contradicting_evidence),
+                    "verification_results": h.verification_execution_results,
                 })
         return {
             "investigation_id": self.investigation_id,
@@ -1275,9 +1709,79 @@ class AdaptiveInvestigationSession:
         }
 
     def export_report(self, format: str = "json") -> Union[Dict[str, Any], str]:
-        """Exports a full incident bundle as JSON or Markdown."""
+        """Exports full 13-point expert incident report as JSON or Markdown."""
         if not self.conclusion:
             self._finalize_conclusion("EXPORT_REQUESTED", "Report exported prior to terminal state.")
+
+        # Build 13 structured sections
+        executed_procs = []
+        if self.plan:
+            for s in self.plan.steps:
+                if s.status == "COMPLETED":
+                    executed_procs.append({
+                        "step_id": s.step_id,
+                        "recipe_id": s.recipe_id,
+                        "recipe_name": s.recipe_name,
+                        "category": s.category,
+                        "executed_at": s.executed_at,
+                        "result_status": s.result.get("status") if s.result else "UNKNOWN",
+                    })
+
+        observations_list = []
+        for rec in self.collected_evidence_records:
+            observations_list.append(rec.to_dict())
+
+        confirmed_findings = [h.to_dict() for h in self.active_hypotheses if h.status == "CONFIRMED"]
+        unresolved_hyps = [h.to_dict() for h in self.active_hypotheses if h.status in ("PROPOSED", "LIKELY", "INCONCLUSIVE")]
+        rejected_hyps = [h.to_dict() for h in self.rejected_hypotheses]
+
+        source_mappings = []
+        for ev in self.collected_evidence:
+            corr = ev.get("correlation")
+            if corr:
+                source_mappings.append({
+                    "evidence_id": ev.get("evidence_id"),
+                    "runtime_address": corr.get("runtime_address"),
+                    "elf_address": corr.get("elf_address"),
+                    "load_bias": corr.get("load_bias"),
+                    "symbol": corr.get("demangled_symbol"),
+                    "source_file": corr.get("source_file"),
+                    "source_line": corr.get("source_line"),
+                    "context": corr.get("source_context"),
+                })
+
+        report_13_points = {
+            "1_problem_description": self.raw_problem_statement,
+            "2_target_information": {
+                "pid": self.pid,
+                "host": getattr(self.target_assessment, "target_host", "localhost") if self.target_assessment else "localhost",
+                "thread_count": self.target_assessment.thread_count if self.target_assessment else 0,
+                "rss_kb": self.target_assessment.rss_kb if self.target_assessment else 0,
+                "memory_regions_count": self.target_assessment.memory_regions_count if self.target_assessment else 0,
+                "memory_readable": getattr(self.target_assessment, "memory_readable", False) if self.target_assessment else False,
+                "companion_elf": self.companion_elf,
+                "dwarf_available": self.target_assessment.dwarf_available if self.target_assessment else False,
+            },
+            "3_initial_classification": {
+                "primary_category": self.classification_result.primary_category if self.classification_result else "UNKNOWN",
+                "confidence": self.classification_result.confidence if self.classification_result else 0.0,
+                "is_vague": self.classification_result.is_vague if self.classification_result else True,
+                "extracted_entities": self.classification_result.extracted_entities if self.classification_result else {},
+            },
+            "4_investigation_scope": {
+                "targeted_recipes": [s.recipe_id for s in self.plan.steps] if self.plan else [],
+                "target_domain": self.plan.steps[0].domain if self.plan and self.plan.steps else "GENERAL",
+            },
+            "5_executed_diagnostic_procedures": executed_procs,
+            "6_actual_observations": observations_list,
+            "7_confirmed_findings": confirmed_findings,
+            "8_probable_causes": [h.problem_statement for h in self.active_hypotheses if h.status in ("CONFIRMED", "LIKELY")],
+            "9_rejected_hypotheses": rejected_hyps,
+            "10_unresolved_hypotheses": unresolved_hyps,
+            "11_evidence_to_source_mapping": source_mappings,
+            "12_missing_evidence": self.target_assessment.limitations if self.target_assessment else [],
+            "13_recommended_next_actions": self.conclusion.recommended_remediations if self.conclusion else [],
+        }
 
         if format.lower() == "markdown":
             md = [
@@ -1288,40 +1792,99 @@ class AdaptiveInvestigationSession:
                 f"**Status**: `{self.conclusion.status}` (`{self.conclusion.stop_reason}`)  ",
                 f"**Confidence**: `{self.conclusion.confidence * 100:.1f}%`  ",
                 "",
-                f"## 1. Executive Summary",
-                f"{self.conclusion.executive_summary}",
+                "## 1. Problem Description",
+                f"{self.raw_problem_statement}",
                 "",
-                f"## 2. Primary Finding",
-                f"> **{self.conclusion.primary_finding}**  ",
-                f"> *Confidence Basis*: {self.conclusion.confidence_basis}",
+                "## 2. Target Information",
+                f"- PID: `{self.pid}`",
+                f"- Threads: `{report_13_points['2_target_information']['thread_count']}`",
+                f"- Memory RSS: `{report_13_points['2_target_information']['rss_kb']} KB`",
+                f"- DWARF Available: `{report_13_points['2_target_information']['dwarf_available']}`",
                 "",
-                f"## 3. Supporting Evidence Chain ({len(self.conclusion.supporting_evidence_chain)} records)",
+                "## 3. Initial Classification",
+                f"- Primary Category: `{report_13_points['3_initial_classification']['primary_category']}`",
+                f"- Confidence: `{report_13_points['3_initial_classification']['confidence'] * 100:.1f}%`",
+                "",
+                "## 4. Investigation Scope",
+                f"- Scheduled Steps: `{len(report_13_points['4_investigation_scope']['targeted_recipes'])}`",
+                "",
+                "## 5. Executed Diagnostic Procedures",
             ]
-            for idx, ev in enumerate(self.conclusion.supporting_evidence_chain, 1):
-                corr = ev.get("correlation", {})
-                sym = corr.get("demangled_symbol") or ev.get("symbol") or "N/A"
-                loc = f"{corr.get('source_file')}:{corr.get('source_line')}" if corr.get("source_file") else "N/A"
-                md.append(f"- **[E{idx:02d}] {ev.get('problem_category', 'DIAGNOSTIC')}** | Symbol: `{sym}` | Location: `{loc}`")
-                if ev.get("finding"):
-                    md.append(f"  * Detail: {ev['finding']}")
+            for proc in executed_procs:
+                md.append(f"- **{proc['step_id']}**: `{proc['recipe_id']}` ({proc['result_status']})")
 
             md.extend([
                 "",
-                f"## 4. Recommended Remediations",
+                f"## 6. Actual Observations ({len(observations_list)} records)",
             ])
-            for r in self.conclusion.recommended_remediations:
-                md.append(f"- [ ] {r}")
+            for obs in observations_list[:10]:
+                md.append(f"- `[{obs.get('evidence_id')}]` Method: `{obs.get('collection_method')}` | Value: `{obs.get('observed_value')}`")
 
             md.extend([
                 "",
-                f"## 5. Diagnostic Limitations",
+                "## 7. Confirmed Findings",
             ])
-            for lim in self.conclusion.diagnostic_limitations:
+            if confirmed_findings:
+                for cf in confirmed_findings:
+                    md.append(f"- **[CONFIRMED]** {cf.get('problem_statement')} (Confidence: {cf.get('confidence', 0)*100:.1f}%)")
+            else:
+                md.append("- No confirmed fault findings.")
+
+            md.extend([
+                "",
+                "## 8. Probable Causes",
+            ])
+            for pc in report_13_points["8_probable_causes"]:
+                md.append(f"- {pc}")
+
+            md.extend([
+                "",
+                "## 9. Rejected Hypotheses",
+            ])
+            if rejected_hyps:
+                for rh in rejected_hyps:
+                    md.append(f"- **[REFUTED]** {rh.get('problem_statement')}: {rh.get('confidence_basis')}")
+            else:
+                md.append("- None.")
+
+            md.extend([
+                "",
+                "## 10. Unresolved Hypotheses",
+            ])
+            if unresolved_hyps:
+                for uh in unresolved_hyps:
+                    md.append(f"- **[{uh.get('status')}]** {uh.get('problem_statement')}")
+            else:
+                md.append("- None.")
+
+            md.extend([
+                "",
+                "## 11. Evidence-to-Source Mapping",
+            ])
+            if source_mappings:
+                for sm in source_mappings:
+                    loc = f"{sm.get('source_file')}:{sm.get('source_line')}" if sm.get("source_file") else "N/A"
+                    md.append(f"- Runtime Addr: `{sm.get('runtime_address')}` | Symbol: `{sm.get('symbol')}` | Location: `{loc}`")
+            else:
+                md.append("- No DWARF source mappings resolved.")
+
+            md.extend([
+                "",
+                "## 12. Missing Evidence & Limitations",
+            ])
+            for lim in report_13_points["12_missing_evidence"]:
                 md.append(f"- *Note*: {lim}")
+
+            md.extend([
+                "",
+                "## 13. Recommended Next Actions",
+            ])
+            for r in report_13_points["13_recommended_next_actions"]:
+                md.append(f"- [ ] {r}")
 
             return "\n".join(md)
 
-        # JSON output
+        # JSON output includes all 13 points
         return {
             "investigation_id": self.investigation_id,
             "target_pid": self.pid,
@@ -1333,6 +1896,7 @@ class AdaptiveInvestigationSession:
             "rejected_hypotheses": [h.to_dict() for h in self.rejected_hypotheses],
             "timeline": self.timeline,
             "diagnostic_limitations": self.target_assessment.limitations if self.target_assessment else [],
+            "report_13_points": report_13_points,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1348,9 +1912,13 @@ class AdaptiveInvestigationSession:
             "timeline": self.timeline,
             "plan": self.plan.to_dict() if self.plan else None,
             "collected_evidence": self.collected_evidence,
+            "collected_evidence_records": [r.to_dict() for r in self.collected_evidence_records],
             "active_hypotheses": [h.to_dict() for h in self.active_hypotheses],
             "rejected_hypotheses": [h.to_dict() for h in self.rejected_hypotheses],
             "conclusion": asdict(self.conclusion) if self.conclusion else None,
+            "classification_result": asdict(self.classification_result) if self.classification_result else None,
+            "target_assessment": asdict(self.target_assessment) if self.target_assessment else None,
+            "verified_checks_count": self.verified_checks_count,
         }
 
     @classmethod
@@ -1369,8 +1937,16 @@ class AdaptiveInvestigationSession:
         if data.get("plan"):
             sess.plan = InvestigationPlan.from_dict(data["plan"])
         sess.collected_evidence = data.get("collected_evidence", [])
+        sess.collected_evidence_records = [
+            RuntimeEvidenceRecord.from_dict(r) for r in data.get("collected_evidence_records", [])
+        ]
         sess.active_hypotheses = [ExpertHypothesis.from_dict(h) for h in data.get("active_hypotheses", [])]
         sess.rejected_hypotheses = [ExpertHypothesis.from_dict(h) for h in data.get("rejected_hypotheses", [])]
+        sess.verified_checks_count = data.get("verified_checks_count", 0)
+        if data.get("classification_result"):
+            sess.classification_result = ProblemClassificationResult(**data["classification_result"])
+        if data.get("target_assessment"):
+            sess.target_assessment = TargetAssessmentResult(**data["target_assessment"])
         if data.get("conclusion"):
             sess.conclusion = DiagnosticConclusion(**data["conclusion"])
         return sess
@@ -1385,6 +1961,8 @@ class ExpertDiagnosticEngine:
 
     def __init__(self, corpus_dir: Optional[str] = None):
         self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
+        self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
+        os.makedirs(self._investigations_dir, exist_ok=True)
         self.sessions: Dict[str, AdaptiveInvestigationSession] = {}
 
     def start_investigation(
@@ -1392,9 +1970,10 @@ class ExpertDiagnosticEngine:
         problem_statement: str,
         pid: Optional[int] = None,
         companion_elf: Optional[str] = None,
+        investigation_id: Optional[str] = None,
     ) -> AdaptiveInvestigationSession:
         """Launches a new adaptive investigation session."""
-        inv_id = f"inv_{uuid.uuid4().hex[:12]}"
+        inv_id = investigation_id or f"inv_{uuid.uuid4().hex[:12]}"
         session = AdaptiveInvestigationSession(
             investigation_id=inv_id,
             problem_statement=problem_statement,
@@ -1406,8 +1985,21 @@ class ExpertDiagnosticEngine:
         return session
 
     def get_session(self, investigation_id: str) -> Optional[AdaptiveInvestigationSession]:
-        """Retrieves an existing investigation session by ID."""
-        return self.sessions.get(investigation_id)
+        """Retrieves an existing investigation session by ID from memory or disk."""
+        if investigation_id in self.sessions:
+            return self.sessions[investigation_id]
+
+        disk_path = os.path.join(self._investigations_dir, f"{investigation_id}.json")
+        if os.path.exists(disk_path):
+            try:
+                with open(disk_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                sess = AdaptiveInvestigationSession.from_dict(data)
+                self.sessions[investigation_id] = sess
+                return sess
+            except Exception:
+                pass
+        return None
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         """Lists metadata for all active and completed sessions."""

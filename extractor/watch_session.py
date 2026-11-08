@@ -5512,10 +5512,10 @@ class WatchSessionManager:
                 except Exception:
                     pass
 
-            # Check if syscall_arg0 points into any known mutex!
+            # Check if syscall_arg0 points into any known mutex (pthread_mutex_t is 40 bytes)
             if syscall_arg0 is not None and syscall_arg0 > 0:
                 for l_addr, l_info in locks_by_addr.items():
-                    if l_addr <= syscall_arg0 < l_addr + 64:
+                    if l_addr <= syscall_arg0 < l_addr + 40:
                         waiting_on_lock = {
                             "lock_name": l_info["name"],
                             "lock_address": l_info["runtime_address"],

@@ -495,8 +495,12 @@ def runtime_start_investigation(
         if hasattr(res, "data") and isinstance(res.data, dict):
             legacy_id = res.data.get("investigation_id")
             if legacy_id:
+                old_id = expert_sess.investigation_id
+                if old_id != legacy_id and old_id in runtime.expert_diagnostic_engine.sessions:
+                    del runtime.expert_diagnostic_engine.sessions[old_id]
                 expert_sess.investigation_id = legacy_id
                 runtime.expert_diagnostic_engine.sessions[legacy_id] = expert_sess
+                expert_sess._save_to_disk()
             res.data["plan"] = expert_sess.get_plan()
             res.data["expert_status"] = expert_sess.get_status()
             if expert_sess.classification_result:
