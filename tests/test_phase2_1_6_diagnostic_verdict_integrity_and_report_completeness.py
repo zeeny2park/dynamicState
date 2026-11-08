@@ -186,11 +186,38 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
 
     def test_case_e_two_derived_records_sharing_one_root_do_not_count_as_independent(self):
         """Case E: Two derived records sharing one root evidence source do not count as independent evidence."""
+        from extractor.capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
+        from extractor.evidence_ledger import PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        ledger = EvidenceLedger(session_id="INV_T6_E")
+        token = get_trusted_capture_authority_token()
+        for eid in ["EV_ROOT_01", "EV_DERIVED_01", "EV_DERIVED_02", "EV_INDEPENDENT_ROOT_02"]:
+            rcpt = issue_live_capture_receipt(
+                session_id=ledger.session_id,
+                pid=1234,
+                process_identity="proc_1234",
+                executable_identity="/proc/1234/exe",
+                build_id="sha1:testbuildid12345",
+                snapshot_binding="snap_1",
+                capture_authority_token=token,
+            )
+            rec = EvidenceRecord(
+                evidence_id=eid,
+                session_id=ledger.session_id,
+                evidence_type="DIAGNOSTIC",
+                nature="observation",
+                provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict()},
+                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": 1234},
+                target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
+                observation=f"Observation for {eid}",
+            )
+            ledger._by_id[eid] = rec
+            ledger._records.append(rec)
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_E",
             category="MEMORY_LEAK",
             title="Monotonic Growth",
             confidence=0.95,
+            ledger=ledger,
         )
 
         # Root evidence record
@@ -249,11 +276,42 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
 
     def test_case_g_authoritative_contradictory_evidence_changes_verdict(self):
         """Case G: Authoritative contradictory evidence changes the verdict."""
+        from extractor.capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
+        from extractor.evidence_ledger import PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        ledger = EvidenceLedger(session_id="INV_T6_G")
+        token = get_trusted_capture_authority_token()
+        for eid, obs_txt in [
+            ("EV_UAF_1", "Wild access to 0x55550000"),
+            ("EV_UAF_2", "Stack variable lifetime expired"),
+            ("EV_STATIC_OK", "Address resides in valid global data segment with static lifetime"),
+        ]:
+            rcpt = issue_live_capture_receipt(
+                session_id=ledger.session_id,
+                pid=1234,
+                process_identity="proc_1234",
+                executable_identity="/proc/1234/exe",
+                build_id="sha1:testbuildid12345",
+                snapshot_binding="snap_1",
+                capture_authority_token=token,
+            )
+            rec = EvidenceRecord(
+                evidence_id=eid,
+                session_id=ledger.session_id,
+                evidence_type="DIAGNOSTIC",
+                nature="observation",
+                provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict()},
+                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": 1234},
+                target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
+                observation=obs_txt,
+            )
+            ledger._by_id[eid] = rec
+            ledger._records.append(rec)
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_G",
             category="USE_AFTER_FREE",
             title="Use After Free",
             confidence=0.92,
+            ledger=ledger,
         )
         hyp.add_supporting_observation("Wild access to 0x55550000", evidence_id="EV_UAF_1")
         hyp.add_supporting_observation("Stack variable lifetime expired", evidence_id="EV_UAF_2")

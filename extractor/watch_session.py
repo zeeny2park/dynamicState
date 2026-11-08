@@ -5623,6 +5623,49 @@ class WatchSessionManager:
                                         **sym,
                                     })
 
+                        # Fallback when /proc/<pid>/task/<tid>/syscall is unavailable:
+                        # Scan active stack frames (from innermost SP upward) for pointers into locked pthread_mutex_t objects
+                        if waiting_on_lock is None and locks_by_addr and t_state in ("S", "D"):
+                            matched_lock_info = None
+                            for w_i in range(num_words):
+                                cand_val = struct.unpack_from(ptr_fmt, raw_stack, w_i * ptr_size)[0]
+                                for l_addr, l_info in locks_by_addr.items():
+                                    if l_addr <= cand_val < l_addr + 40:
+                                        if l_info.get("is_locked") and l_info.get("owner_tid") and l_info.get("owner_tid") != t_tid:
+                                            matched_lock_info = l_info
+                                            break
+                                if matched_lock_info is not None:
+                                    break
+                            if matched_lock_info is None:
+                                for w_i in range(num_words):
+                                    cand_val = struct.unpack_from(ptr_fmt, raw_stack, w_i * ptr_size)[0]
+                                    for l_addr, l_info in locks_by_addr.items():
+                                        if l_addr <= cand_val < l_addr + 40:
+                                            if l_info.get("is_locked") and not l_info.get("owner_tid"):
+                                                matched_lock_info = l_info
+                                                break
+                                    if matched_lock_info is not None:
+                                        break
+                            if matched_lock_info is not None:
+                                waiting_on_lock = {
+                                    "lock_name": matched_lock_info["name"],
+                                    "lock_address": matched_lock_info["runtime_address"],
+                                    "held_by_tid": matched_lock_info["owner_tid"],
+                                    "held_by_thread_name": matched_lock_info["owner_thread_name"],
+                                    "resolved_via": "STACK_MUTEX_POINTER_SCAN",
+                                }
+                                if t_tid not in matched_lock_info["waiting_tids"]:
+                                    matched_lock_info["waiting_tids"].append(t_tid)
+                                if matched_lock_info["owner_tid"] and matched_lock_info["owner_tid"] != t_tid:
+                                    wait_for_edges.append({
+                                        "waiter_tid": t_tid,
+                                        "waiter_name": t_name,
+                                        "lock_name": matched_lock_info["name"],
+                                        "lock_address": matched_lock_info["runtime_address"],
+                                        "owner_tid": matched_lock_info["owner_tid"],
+                                        "owner_name": matched_lock_info["owner_thread_name"],
+                                    })
+
             thread_reports.append({
                 "tid": t_tid,
                 "name": t_name,
@@ -5677,6 +5720,8 @@ class WatchSessionManager:
             "wait_for_edges": wait_for_edges,
             "deadlock_detected": len(deadlock_cycles) > 0,
             "deadlock_cycles": deadlock_cycles,
+            "deadlock_cycle": deadlock_cycles[0] if deadlock_cycles else [],
+            "blocked_threads": [tr for tr in thread_reports if tr.get("waiting_on_lock") is not None],
             "llm_next_step_hint": (
                 f"CRITICAL DEADLOCK DETECTED: Circular mutex wait across {len(deadlock_cycles[0])} threads: "
                 + " -> ".join(f"TID {e['waiter_tid']} ({e['waiter_name']}) waits on {e['lock_name']} held by TID {e['owner_tid']}" for e in deadlock_cycles[0])

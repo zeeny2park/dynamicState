@@ -864,10 +864,9 @@ class TargetExecutionAdapter(ABC):
         """Reads /proc/<pid>/maps and returns structured memory mappings."""
         pass
 
-    @abstractmethod
     def get_process_status(self, pid: int) -> Dict[str, Any]:
         """Reads /proc/<pid>/status fields (e.g. VmRSS, VmSize, Threads) from target host."""
-        pass
+        return {}
 
     def get_memory_mappings(self, pid: int) -> List[Dict[str, Any]]:
         """Convenience alias for get_proc_maps."""

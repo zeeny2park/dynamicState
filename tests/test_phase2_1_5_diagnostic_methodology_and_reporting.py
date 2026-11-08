@@ -200,19 +200,53 @@ class TestHypothesisEvidenceIntegrity(unittest.TestCase):
         self.assertIn("EV_LEAK_101", hyp.supporting_evidence_ids)
 
     def test_contradictory_evidence_modifies_verdict_and_prevents_confirmed(self):
+        from extractor.evidence_ledger import EvidenceLedger, EvidenceRecord, PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        from extractor.capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
+        ledger = EvidenceLedger(session_id="INV_T5_UAF")
+        token = get_trusted_capture_authority_token()
+        for eid, obs_str in [
+            ("EV_UAF_01", "Dangling pointer detected"),
+            ("EV_ALLOC_ACTIVE", "Memory chunk is currently active in static lifetime global data segment"),
+        ]:
+            rcpt = issue_live_capture_receipt(
+                session_id=ledger.session_id,
+                pid=1234,
+                process_identity="proc_1234",
+                executable_identity="/proc/1234/exe",
+                build_id="sha1:testbuildid12345",
+                snapshot_binding="snap_1",
+                capture_authority_token=token,
+            )
+            rec = EvidenceRecord(
+                evidence_id=eid,
+                session_id=ledger.session_id,
+                evidence_type="DIAGNOSTIC",
+                nature="observation",
+                provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict()},
+                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": 1234},
+                target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
+                observation=obs_str,
+            )
+            ledger._by_id[eid] = rec
+            ledger._records.append(rec)
+
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_UAF_01",
             category="USE_AFTER_FREE",
             title="Use-After-Free",
             confidence=0.95,
+            ledger=ledger,
         )
 
         # Add support
         hyp.add_supporting_observation("Dangling pointer detected", evidence_id="EV_UAF_01")
-        # Add a contradiction
-        hyp.add_contradicting_observation("Memory chunk is currently active and allocated", evidence_id="EV_ALLOC_ACTIVE")
+        # Add an authoritative decisive contradiction with precedence
+        hyp.add_contradicting_observation(
+            "Memory chunk is currently active in static lifetime global data segment",
+            evidence_id="EV_ALLOC_ACTIVE",
+        )
 
-        # Must NOT be CONFIRMED because an unrefuted counter-indicator exists
+        # Must NOT be CONFIRMED because an authoritative counter-indicator exists
         self.assertNotEqual(hyp.status, VERDICT_CONFIRMED)
         self.assertEqual(hyp.status, VERDICT_REFUTED)
         self.assertIn("EV_ALLOC_ACTIVE", hyp.contradicting_evidence_ids)

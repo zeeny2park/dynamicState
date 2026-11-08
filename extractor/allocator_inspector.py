@@ -294,6 +294,20 @@ class GlibcPtMallocInspector(AllocatorInspector):
                 end = m.get("end_int") if m.get("end_int") is not None else m.get("end", 0)
                 if start <= target_address < end:
                     perms = m.get("permissions") or m.get("perms", "")
+                    pname = (m.get("pathname") or m.get("name") or "").strip()
+                    cat = (m.get("category") or "").strip().lower()
+                    if "[stack" in pname.lower() or cat == "stack":
+                        return FreeValidationResult(
+                            False,
+                            FreeValidationOutcome.FREE_TARGET_OUTSIDE_HEAP,
+                            f"Pointer {hex(target_address)} resides in thread stack ({pname or cat}), not heap memory",
+                        )
+                    if pname and not pname.startswith("[") and "heap" not in pname.lower() and "anon" not in pname.lower():
+                        return FreeValidationResult(
+                            False,
+                            FreeValidationOutcome.FREE_TARGET_OUTSIDE_HEAP,
+                            f"Pointer {hex(target_address)} resides in static/global binary segment ({pname}), not heap memory",
+                        )
                     if "r" in perms and "w" in perms:
                         in_heap = True
                         break

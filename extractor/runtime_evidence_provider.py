@@ -751,8 +751,13 @@ class RuntimeEvidenceProvider:
 
                 observation_data["callstacks_info"] = callstacks_info
                 observation_data["deadlock_detected"] = callstacks_info.get("deadlock_detected", False)
-                observation_data["deadlock_cycle"] = callstacks_info.get("deadlock_cycle", [])
-                observation_data["blocked_threads"] = callstacks_info.get("blocked_threads", [])
+                dl_cycles = callstacks_info.get("deadlock_cycles", [])
+                dl_first = callstacks_info.get("deadlock_cycle") or (dl_cycles[0] if dl_cycles else [])
+                observation_data["deadlock_cycles"] = dl_cycles
+                observation_data["deadlock_cycle"] = dl_first
+                observation_data["blocked_threads"] = callstacks_info.get("blocked_threads", [
+                    t for t in callstacks_info.get("threads", []) if t.get("waiting_on_lock")
+                ])
 
                 # Check if lock graph is incomplete (Scenario L)
                 incomplete_graph = False
@@ -766,8 +771,11 @@ class RuntimeEvidenceProvider:
                     observation_data["insufficient_lock_info"] = True
 
                 if callstacks_info.get("deadlock_detected"):
-                    cycle = callstacks_info.get("deadlock_cycle", [])
-                    observation_data["cycle_tids"] = [c.get("tid") for c in cycle if isinstance(c, dict)]
+                    cycle = observation_data["deadlock_cycle"]
+                    observation_data["cycle_tids"] = [
+                        c.get("tid") or c.get("waiter_tid")
+                        for c in cycle if isinstance(c, dict)
+                    ]
                 else:
                     blocked = callstacks_info.get("blocked_threads", [])
                     if blocked:

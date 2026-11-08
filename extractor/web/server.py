@@ -3780,6 +3780,11 @@ class WebApiAdapter:
     def get_investigation_status(self, investigation_id: Optional[str]) -> Dict[str, Any]:
         if not investigation_id:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        exp_eng = getattr(self.runtime, "expert_diagnostic_engine", None)
+        if exp_eng:
+            exp_sess = exp_eng.get_session(investigation_id)
+            if exp_sess:
+                return {"success": True, "data": _to_json_serializable(exp_sess.get_status())}
         res = self.runtime.get_investigation_status(investigation_id)
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
@@ -3825,9 +3830,32 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": res.error.code if res.error else "NOT_FOUND",
                                             "message": res.error.message if res.error else "Failed to get next steps"}}
 
-    def get_investigation_report(self, investigation_id: Optional[str]) -> Dict[str, Any]:
+    def get_investigation_report(self, investigation_id: Optional[str], format_type: Optional[str] = None) -> Dict[str, Any]:
         if not investigation_id:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        exp_eng = getattr(self.runtime, "expert_diagnostic_engine", None)
+        if exp_eng:
+            exp_sess = exp_eng.get_session(investigation_id)
+            if exp_sess:
+                fmt = (format_type or "json").lower()
+                if fmt in ("markdown", "md", "html"):
+                    rendered = exp_sess.export_report(format=fmt)
+                    json_rep = exp_sess.export_report(format="json")
+                    return {
+                        "success": True,
+                        "data": {
+                            "investigation_id": investigation_id,
+                            "format": fmt,
+                            "overall_verdict": json_rep["section_a_executive_summary"]["overall_result"],
+                            "rendered": rendered,
+                            "report": json_rep,
+                        },
+                    }
+                json_rep = dict(exp_sess.export_report(format="json"))
+                json_rep["overall_verdict"] = json_rep["section_a_executive_summary"]["overall_result"]
+                json_rep["report_markdown"] = exp_sess.export_report(format="markdown")
+                json_rep["report_html"] = exp_sess.export_report(format="html")
+                return {"success": True, "data": _to_json_serializable(json_rep)}
         res = self.runtime.get_investigation_report(investigation_id)
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
@@ -3837,11 +3865,24 @@ class WebApiAdapter:
     def list_investigations(self) -> Dict[str, Any]:
         sessions = getattr(self.runtime.investigation_manager, "sessions", {})
         summaries = [s.to_dict() for s in sessions.values()]
+        exp_eng = getattr(self.runtime, "expert_diagnostic_engine", None)
+        if exp_eng and hasattr(exp_eng, "list_investigations"):
+            summaries.extend(exp_eng.list_investigations())
         return {"success": True, "data": _to_json_serializable(summaries)}
 
     def get_hypotheses(self, investigation_id: Optional[str], status_filter: Optional[str] = None) -> Dict[str, Any]:
         if not investigation_id:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id is required"}}
+        exp_eng = getattr(self.runtime, "expert_diagnostic_engine", None)
+        if exp_eng:
+            exp_sess = exp_eng.get_session(investigation_id)
+            if exp_sess:
+                comp = exp_sess.compare_hypotheses()
+                hyps = comp.get("hypotheses", [])
+                if status_filter:
+                    hyps = [h for h in hyps if str(h.get("status", "")).upper() == status_filter.upper()]
+                comp["hypotheses"] = hyps
+                return {"success": True, "data": _to_json_serializable(comp)}
         res = self.runtime.get_hypotheses(investigation_id, status_filter=status_filter)
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
@@ -3853,6 +3894,14 @@ class WebApiAdapter:
         hypo_id = params.get("hypothesis_id")
         if not inv_id or not hypo_id:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "investigation_id and hypothesis_id are required"}}
+        exp_eng = getattr(self.runtime, "expert_diagnostic_engine", None)
+        if exp_eng:
+            exp_sess = exp_eng.get_session(inv_id)
+            if exp_sess:
+                v_res = exp_sess.verify_hypothesis(hypo_id)
+                if "error" in v_res:
+                    return {"success": False, "error": {"code": "NOT_FOUND", "message": v_res["error"]}}
+                return {"success": True, "data": _to_json_serializable(v_res)}
         new_ev = params.get("new_evidence")
         det_trans = bool(params.get("deterministic_transition_verified", False))
         proof_eid = params.get("proof_evidence_id")
@@ -4428,7 +4477,7 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
             # GET /api/investigation/report
             if path == "/api/investigation/report":
-                self._send_json(adapter.get_investigation_report(q_param("investigation_id")))
+                self._send_json(adapter.get_investigation_report(q_param("investigation_id"), format_type=q_param("format")))
                 return
 
             # GET /api/investigation/hypotheses

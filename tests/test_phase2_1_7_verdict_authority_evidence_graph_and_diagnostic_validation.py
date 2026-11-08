@@ -386,10 +386,14 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
 
     def test_case_e_multi_parent_graph_fully_traversed(self):
         """Case E: Multi-parent dependency DAG traverses EVERY parent dependency to find all roots."""
+        ledger = EvidenceLedger(session_id="INV_E_DAG")
+        for eid in ["EV_CHILD", "EV_PARENT_1", "EV_PARENT_2", "EV_ROOT_A", "EV_ROOT_B"]:
+            make_trusted_record(ledger, eid)
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_E",
             category="HEAP_CORRUPTION",
             confidence=0.95,
+            ledger=ledger,
         )
         # DAG structure:
         # EV_CHILD depends on [EV_PARENT_1, EV_PARENT_2]
@@ -416,10 +420,14 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
 
     def test_case_f_shared_roots_not_counted_as_independent(self):
         """Case F: Multiple derived evidence records sharing one root source count as only 1 independent source."""
+        ledger = EvidenceLedger(session_id="INV_F_SHARED")
+        for eid in ["EV_SHARED_ROOT", "EV_MID", "EV_DERIVED_1", "EV_DERIVED_2", "EV_DERIVED_3"]:
+            make_trusted_record(ledger, eid)
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_F",
             category="MEMORY_LEAK",
             confidence=0.95,
+            ledger=ledger,
         )
         # EV_DERIVED_1 -> EV_SHARED_ROOT
         # EV_DERIVED_2 -> EV_SHARED_ROOT
@@ -619,8 +627,11 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
 
     def test_case_k_results_stable_under_insertion_order_changes(self):
         """Case K: Re-evaluation and root independence calculations are identical regardless of insertion order."""
+        ledger = EvidenceLedger(session_id="INV_K_ORDER")
+        for eid in ["R_A", "R_B", "P1", "P2", "C"]:
+            make_trusted_record(ledger, eid)
         def build_hyp(order: list) -> CompetingHypothesis:
-            h = CompetingHypothesis(hypothesis_id="HYP_K", category="HEAP_CORRUPTION", confidence=0.95)
+            h = CompetingHypothesis(hypothesis_id="HYP_K", category="HEAP_CORRUPTION", confidence=0.95, ledger=ledger)
             h.evidence_dependencies = {
                 "C": ["P1", "P2"],
                 "P1": ["R_A"],

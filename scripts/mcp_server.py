@@ -2656,9 +2656,22 @@ def runtime_verify_hypothesis(
         if investigation_id:
             sess = runtime.expert_diagnostic_engine.get_session(investigation_id)
             if sess:
-                target_hid = hypothesis_id or (sess.active_hypotheses[0].hypothesis_id if sess.active_hypotheses else "HYP_01")
+                target_hid = hypothesis_id or (
+                    sess.active_hypotheses[0].hypothesis_id
+                    if sess.active_hypotheses
+                    else (sess.competing_hypotheses[0].hypothesis_id if sess.competing_hypotheses else "HYP_01")
+                )
                 res = sess.verify_hypothesis(target_hid)
-                return _format_watch_result({"success": True, "investigation_id": investigation_id, **res})
+                rep = sess.build_diagnostic_report()
+                overall_v = rep.section_a_executive_summary.overall_result if rep.section_a_executive_summary else "INCONCLUSIVE"
+                return _format_watch_result({
+                    "success": "error" not in res,
+                    "investigation_id": investigation_id,
+                    "overall_verdict": overall_v,
+                    "verdict": res.get("verdict") or res.get("status", "INCONCLUSIVE"),
+                    "confidence_score": res.get("confidence", 0.0),
+                    **res,
+                })
 
         res = runtime.watch_session_manager.verify_runtime_hypothesis(
             hypothesis=hypothesis or "",
@@ -2704,20 +2717,46 @@ def runtime_export_incident_report(
         if investigation_id:
             sess = runtime.expert_diagnostic_engine.get_session(investigation_id)
             if sess:
+                master_report_obj = sess.build_diagnostic_report()
+                master_dict = master_report_obj.to_dict()
                 report = sess.export_report(format=format)
+                safe_out_path = None
                 if output_path:
-                    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-                    with open(output_path, "w", encoding="utf-8") as f:
+                    from extractor.watch_session import sanitize_report_output_path
+                    safe_out_path, out_err = sanitize_report_output_path(output_path)
+                    if out_err or not safe_out_path:
+                        raise ValueError(out_err or f"Invalid report output_path: {output_path}")
+                    parent_dir = os.path.dirname(safe_out_path)
+                    if parent_dir:
+                        os.makedirs(parent_dir, mode=0o700, exist_ok=True)
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    fd = os.open(safe_out_path, flags, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
                         if isinstance(report, dict):
                             json.dump(report, f, indent=2)
                         else:
-                            f.write(report)
+                            f.write(str(report))
+                sec_a = master_dict.get("section_a_executive_summary", {})
+                sec_d = master_dict.get("section_d_detailed_inspection_results", {})
                 return _format_watch_result({
                     "success": True,
                     "investigation_id": investigation_id,
                     "format": format,
-                    "output_path": output_path,
-                    "report": report
+                    "output_path": safe_out_path or output_path,
+                    "overall_verdict": sec_a.get("overall_result", "INCONCLUSIVE"),
+                    "confirmed_problems": sec_a.get("confirmed_problems", []),
+                    "probable_problems": sec_a.get("probable_problems", []),
+                    "checks_summary": {
+                        "checks_total": sec_d.get("checks_total", 0),
+                        "checks_passed": sec_d.get("checks_passed", 0),
+                        "checks_failed": sec_d.get("checks_failed", 0),
+                        "checks_inconclusive": sec_d.get("checks_inconclusive", 0),
+                        "checks_not_executed": sec_d.get("checks_not_executed", 0),
+                        "checks_skipped": sec_d.get("checks_skipped", 0),
+                    },
+                    "report": report,
                 })
 
         res = runtime.watch_session_manager.export_incident_report(

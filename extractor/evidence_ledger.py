@@ -594,8 +594,6 @@ class EvidenceRecord:
         if "verifier_attestation" in prov_copy and isinstance(prov_copy["verifier_attestation"], dict):
             safe_att = dict(prov_copy["verifier_attestation"])
             safe_att.pop("token", None)
-            safe_att.pop("token_sig", None)
-            safe_att.pop("evidence_fingerprint", None)
             prov_copy["verifier_attestation"] = safe_att
         if "live_capture_receipt" in prov_copy and hasattr(prov_copy["live_capture_receipt"], "to_dict"):
             prov_copy["live_capture_receipt"] = prov_copy["live_capture_receipt"].to_dict()

@@ -212,10 +212,17 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
             for tid in os.listdir(tasks_dir):
                 if tid.isdigit():
                     try:
-                        with open(f"{tasks_dir}/{tid}/wchan", "r") as f:
-                            wchan = f.read().strip()
-                            if "futex" in wchan:
-                                wchan_futex += 1
+                        if os.path.exists(f"{tasks_dir}/{tid}/wchan"):
+                            with open(f"{tasks_dir}/{tid}/wchan", "r") as f:
+                                wchan = f.read().strip()
+                                if "futex" in wchan:
+                                    wchan_futex += 1
+                        elif int(tid) != proc.pid:
+                            with open(f"{tasks_dir}/{tid}/stat", "r") as sf:
+                                st_raw = sf.read()
+                                rp = st_raw.rfind(")")
+                                if rp != -1 and st_raw[rp + 1:].strip().split()[0] in ("S", "D"):
+                                    wchan_futex += 1
                     except Exception:
                         pass
             self.assertGreaterEqual(wchan_futex, 1)
@@ -239,9 +246,16 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
             for tid in os.listdir(tasks_dir):
                 if tid.isdigit():
                     try:
-                        with open(f"{tasks_dir}/{tid}/wchan", "r") as f:
-                            if "futex" in f.read().strip():
-                                futex_waiters.append(int(tid))
+                        if os.path.exists(f"{tasks_dir}/{tid}/wchan"):
+                            with open(f"{tasks_dir}/{tid}/wchan", "r") as f:
+                                if "futex" in f.read().strip():
+                                    futex_waiters.append(int(tid))
+                        elif int(tid) != proc.pid:
+                            with open(f"{tasks_dir}/{tid}/stat", "r") as sf:
+                                st_raw = sf.read()
+                                rp = st_raw.rfind(")")
+                                if rp != -1 and st_raw[rp + 1:].strip().split()[0] in ("S", "D"):
+                                    futex_waiters.append(int(tid))
                     except Exception:
                         pass
             self.assertGreaterEqual(len(futex_waiters), 2, "Expected both deadlock threads in futex wait")

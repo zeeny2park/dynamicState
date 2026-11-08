@@ -1236,7 +1236,7 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                     recommended_action="Ensure free() is only called on dynamically allocated heap memory chunks.",
                     details={"is_invalid_free": True, "outcome": val_res.outcome.value, "reason": val_res.reason},
                 )
-            elif val_res.outcome == FreeValidationOutcome.UNKNOWN_ALLOCATOR:
+            elif val_res.outcome == FreeValidationOutcome.FREE_TARGET_UNKNOWN_ALLOCATOR:
                 return RecipeEvaluationResult(
                     recipe_id=rid,
                     status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
@@ -1835,6 +1835,8 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
     # 9. RECIPE_HEAP_METADATA_CORRUPTION
     elif rid == "RECIPE_HEAP_METADATA_CORRUPTION":
         canary = data.get("canary_valid")
+        if canary is None and (data.get("canary_corrupted") is True or data.get("magic_corrupted") is True):
+            canary = False
         chunk_size = data.get("chunk_size") or data.get("chunk_size_bytes")
         if canary is False or (chunk_size is not None and chunk_size > 0x10000000000):
             return RecipeEvaluationResult(
@@ -1985,7 +1987,159 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
             limitations=recipe.limitations,
         )
 
+    # 17. RECIPE_LONG_RUNNING_BLOCKED_THREADS
+    elif rid == "RECIPE_LONG_RUNNING_BLOCKED_THREADS" and not ("positive_evidence_found" in data or "negative_evidence_found" in data):
+        blocked = data.get("blocked_threads") or []
+        stall_sec = data.get("blocked_duration_sec") or data.get("wait_duration_sec") or 0.0
+        deadlock_det = data.get("deadlock_detected", False)
+        if blocked and (stall_sec >= 1.0 or data.get("starvation_detected") or data.get("persistent_block")):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.88,
+                confidence_basis=f"Observed {len(blocked)} thread(s) blocked for {stall_sec}s without forward progress.",
+                supporting_facts=[f"Blocked threads: {len(blocked)}"],
+                recommended_action="Inspect lock holder critical section duration or futex wake signaling.",
+                details={"blocked_thread_count": len(blocked), "blocked_duration_sec": stall_sec, "deadlock_detected": deadlock_det},
+            )
+        elif "blocked_threads" in data and not blocked:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.90,
+                confidence_basis="Zero threads are blocked on locks or long-running waits.",
+                contradicting_facts=["Zero blocked threads observed"],
+                recommended_action="Refute long-running blocked thread stall.",
+                details={"blocked_thread_count": 0},
+            )
+
+    # 18. RECIPE_SUSPICIOUS_LOCK_OWNERSHIP
+    elif rid == "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP" and not ("positive_evidence_found" in data or "negative_evidence_found" in data):
+        deadlock_det = data.get("deadlock_detected", False)
+        orphan_lock = data.get("orphan_lock_owner", False) or data.get("invalid_owner_tid", False)
+        if deadlock_det or orphan_lock:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.92,
+                confidence_basis="Suspicious or circular mutex ownership verified in runtime lock table.",
+                supporting_facts=["Suspicious/circular mutex ownership detected"],
+                recommended_action="Audit mutex ownership lifecycle and lock acquisition ordering.",
+                details={"suspicious_lock_ownership": True},
+            )
+        elif data.get("callstacks_info") and not deadlock_det and not orphan_lock and not data.get("incomplete_lock_graph"):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.88,
+                confidence_basis="All inspected mutexes have valid active thread owners or are cleanly unlocked.",
+                contradicting_facts=["Lock ownership verified clean"],
+                recommended_action="Refute suspicious lock ownership.",
+                details={"suspicious_lock_ownership": False},
+            )
+
+    # 19. RECIPE_THREAD_STATE_ANOMALIES
+    elif rid == "RECIPE_THREAD_STATE_ANOMALIES" and not ("positive_evidence_found" in data or "negative_evidence_found" in data):
+        if data.get("zombie_threads") or data.get("runaway_threads") or data.get("thread_state_anomaly"):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.88,
+                confidence_basis="Abnormal thread scheduling/state distribution detected.",
+                supporting_facts=["Thread state anomaly observed"],
+                recommended_action="Inspect runaway or zombie thread creation sites.",
+                details={"thread_state_anomaly": True},
+            )
+        elif data.get("threads_healthy") is True:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.90,
+                confidence_basis="All worker threads are in expected operational states with forward progress.",
+                contradicting_facts=["All threads in normal state"],
+                recommended_action="Refute thread state anomaly.",
+                details={"thread_state_anomaly": False},
+            )
+
+    # 20. RECIPE_OBJECT_LIFETIME_ANOMALIES
+    elif rid == "RECIPE_OBJECT_LIFETIME_ANOMALIES" and not ("positive_evidence_found" in data or "negative_evidence_found" in data):
+        if data.get("lifetime_expired") is True or data.get("dangling_reference") is True:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.92,
+                confidence_basis="Active reference points to object whose lifetime has expired.",
+                supporting_facts=["Expired object lifetime reference detected"],
+                recommended_action="Audit smart pointer / ownership lifetime bindings.",
+                details={"lifetime_anomaly_confirmed": True},
+            )
+        elif data.get("lifetime_valid") is True:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.90,
+                confidence_basis="Object lifetime and epoch counter verified valid and active.",
+                contradicting_facts=["Object lifetime verified active"],
+                recommended_action="Refute object lifetime anomaly.",
+                details={"lifetime_anomaly_confirmed": False},
+            )
+
+    # 21. RECIPE_REPEATED_ALLOCATION_PATTERNS
+    elif rid == "RECIPE_REPEATED_ALLOCATION_PATTERNS" and not ("positive_evidence_found" in data or "negative_evidence_found" in data):
+        if data.get("unreclaimed_site_growth") is True or (data.get("alloc_delta", 0) > 100 and data.get("free_delta", 0) == 0):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.90,
+                confidence_basis="Repeated allocation site exhibits monotonic growth with zero reclamation.",
+                supporting_facts=["Repeated unreclaimed allocation pattern confirmed"],
+                recommended_action="Inspect allocation callsite for missing deallocation path.",
+                details={"repeated_leak_pattern": True},
+            )
+        elif data.get("alloc_reclaimed") is True:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.90,
+                confidence_basis="Repeated allocations are balanced by corresponding deallocations.",
+                contradicting_facts=["Repeated allocations properly reclaimed"],
+                recommended_action="Refute unreclaimed repeated allocation leak.",
+                details={"repeated_leak_pattern": False},
+            )
+
+    # 22. RECIPE_SHARED_STATE_INCONSISTENCIES
+    elif rid == "RECIPE_SHARED_STATE_INCONSISTENCIES" and not ("positive_evidence_found" in data or "negative_evidence_found" in data):
+        if data.get("shared_invariant_violated") is True or data.get("torn_shared_state") is True:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_SUPPORTED,
+                confidence=0.92,
+                confidence_basis="Shared state invariant across concurrent threads is violated.",
+                supporting_facts=["Shared state invariant violation observed"],
+                recommended_action="Protect shared multi-field state updates with a common mutex.",
+                details={"shared_state_inconsistency": True},
+            )
+        elif data.get("shared_invariant_intact") is True:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.90,
+                confidence_basis="Shared state invariant holds across consecutive atomic snapshots.",
+                contradicting_facts=["Shared state invariant intact"],
+                recommended_action="Refute shared state inconsistency.",
+                details={"shared_state_inconsistency": False},
+            )
+
     # Generic Fallback Evaluation for other recipes
+    _NON_JSON_KEYS = {
+        "allocator_inspector", "allocator", "structural_discovery",
+        "invariant_evaluator", "concurrency_graph", "wait_for_graph",
+        "observation_window", "window", "ledger", "adapter",
+    }
+    safe_data = {
+        k: v for k, v in data.items()
+        if k not in _NON_JSON_KEYS and isinstance(v, (str, int, float, bool, list, dict, type(None)))
+    }
     pos_evidence = data.get("positive_evidence_found", False)
     neg_evidence = data.get("negative_evidence_found", False)
     if pos_evidence and not neg_evidence:
@@ -1996,7 +2150,7 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
             confidence_basis=f"Deterministic criteria for recipe {recipe.name} satisfied.",
             supporting_facts=list(data.get("supporting_facts", ["Criteria verified by observation."])),
             recommended_action=f"Remediate {recipe.name} anomaly.",
-            details=data,
+            details=safe_data,
         )
     elif neg_evidence and not pos_evidence:
         return RecipeEvaluationResult(
@@ -2006,7 +2160,7 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
             confidence_basis=f"Counter-indicators observed for recipe {recipe.name}.",
             contradicting_facts=list(data.get("contradicting_facts", ["Counter-criteria verified."])),
             recommended_action=f"Refute {recipe.name} anomaly.",
-            details=data,
+            details=safe_data,
         )
     elif pos_evidence and neg_evidence:
         return RecipeEvaluationResult(
@@ -2016,7 +2170,7 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
             confidence_basis="Conflicting positive and counter-indicators observed.",
             supporting_facts=list(data.get("supporting_facts", [])),
             contradicting_facts=list(data.get("contradicting_facts", [])),
-            details=data,
+            details=safe_data,
         )
     return RecipeEvaluationResult(
         recipe_id=rid,
