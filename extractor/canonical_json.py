@@ -1,18 +1,26 @@
 """RFC 8785 (JSON Canonicalization Scheme - JCS) implementation for dynamicState.
 
-Compliant with RFC 8785 / ECMAScript 6 (ES6) 7.1.12.1 ToString(Number) specifications:
-- UTF-8 encoding without BOM.
+Compliant with RFC 8785 / ECMAScript 6 (ES6) specifications:
+- Character Encoding: Canonical JSON output is UTF-8 encoded without BOM.
 - Whitespace: No whitespace characters outside of string literals.
-- Object key sorting: Lexicographical order by UTF-8 bytes (RFC 8785 Section 3.2.3).
-- Number formatting:
+- Object Key Ordering: Lexicographical order by UTF-16 code units (RFC 8785 Section 3.2.3),
+  implemented via UTF-16 Big Endian code unit byte sequence (key.encode('utf-16-be')).
+- Number Formatting:
+  - Exact ECMAScript 6 (ES6) 7.1.12.1 ToString(Number) IEEE 754 double precision representation.
   - Non-finite numbers (NaN, +Infinity, -Infinity) are rejected with ValueError.
   - Negative zero (-0.0) is serialized as '0' (RFC 8785 Section 3.2.2).
-  - Floating-point numbers are serialized according to ES6 shortest representation.
+  - Exponential notation boundaries: 1e-6 -> 0.000001, 1e-7 -> 1e-7, 1e20 -> 100000000000000000000, 1e21 -> 1e+21.
+  - Exponents without leading zeros (1e+21, 1e-7).
+  - Floating-point integers serialized without decimal point (1.0 -> 1).
+  - Integer range validation: integers outside [-2^64+1, 2^64-1] rejected with ValueError.
 - Strings:
   - Standard JSON escaping for control characters (U+0000..U+001F), backslash, and double quote.
   - Literal UTF-8 characters for U+0020 and above.
-- Strict type checking:
-  - Rejects unsupported types (sets, functions, custom objects) with TypeError.
+  - Lone surrogate code points (U+D800..U+DFFF) rejected with ValueError.
+- Strict Type Enforcement:
+  - Object keys MUST be strings (TypeError on non-string keys).
+  - Array elements MUST be lists (TypeError on tuples, sets, custom objects; no silent conversion).
+  - Unsupported Python types reject fail-closed with TypeError.
 """
 
 import json
@@ -20,12 +28,83 @@ import math
 from typing import Any, List, Union
 
 
+def convert2Es6Format(value: Union[int, float]) -> str:
+    """Convert float/double or int to ECMAScript 6 ToString(Number) canonical format.
+
+    Implements exact ES6 IEEE 754 shortest round-trip representation per RFC 8785 Section 3.2.2.3.
+    """
+    fvalue = float(value)
+
+    # Negative zero (-0.0) and zero are serialized as '0'
+    if fvalue == 0:
+        return "0"
+
+    py_double = str(fvalue)
+
+    # Detect NaN, Infinity, -Infinity
+    if "n" in py_double:
+        raise ValueError(f"RFC 8785 rejects non-finite number: {py_double}")
+
+    py_sign = ""
+    if py_double[0] == "-":
+        py_sign = "-"
+        py_double = py_double[1:]
+
+    py_exp_str = ""
+    py_exp_val = 0
+    q = py_double.find("e")
+    if q > 0:
+        py_exp_str = py_double[q:]
+        # Suppress leading zero on exponents (e.g., e-07 -> e-7, e+05 -> e+5)
+        if py_exp_str[2:3] == "0":
+            py_exp_str = py_exp_str[:2] + py_exp_str[3:]
+        py_double = py_double[:q]
+        py_exp_val = int(py_exp_str[1:])
+
+    py_first = py_double
+    py_dot = ""
+    py_last = ""
+    q = py_double.find(".")
+    if q > 0:
+        py_dot = "."
+        py_first = py_double[:q]
+        py_last = py_double[q + 1:]
+
+    if py_last == "0":
+        # Remove trailing .0
+        py_dot = ""
+        py_last = ""
+
+    if 0 < py_exp_val < 21:
+        # Integers up to 21 digits shown without scientific notation
+        py_first += py_last
+        py_last = ""
+        py_dot = ""
+        py_exp_str = ""
+        pad = py_exp_val - len(py_first)
+        while pad >= 0:
+            pad -= 1
+            py_first += "0"
+    elif -7 < py_exp_val < 0:
+        # Small numbers down to 1e-6 shown in fixed decimal notation (0.etc)
+        py_last = py_first + py_last
+        py_first = "0"
+        py_dot = "."
+        py_exp_str = ""
+        pad = py_exp_val
+        while pad < -1:
+            pad += 1
+            py_last = "0" + py_last
+
+    return py_sign + py_first + py_dot + py_last + py_exp_str
+
+
 def rfc8785_canonical_json(obj: Any) -> bytes:
     """Serializes a Python data structure to canonical JSON bytes per RFC 8785 (JCS).
 
     Raises:
-        ValueError: If a non-finite float (NaN, inf, -inf) is encountered.
-        TypeError: If an object key is not a string, or an unsupported type is encountered.
+        ValueError: If a non-finite float (NaN, inf, -inf), out-of-range integer, or lone surrogate is encountered.
+        TypeError: If an object key is not a string, or an unsupported type (tuple, set, etc.) is encountered.
     """
     chunks: List[bytes] = []
 
@@ -33,30 +112,22 @@ def rfc8785_canonical_json(obj: Any) -> bytes:
         if v is None:
             chunks.append(b"null")
         elif isinstance(v, bool):
-            # Check bool before int, since in Python isinstance(True, int) is True
+            # Must check bool before int because bool subclasses int in Python
             chunks.append(b"true" if v else b"false")
         elif isinstance(v, int):
+            if abs(v) >= 2**64:
+                raise ValueError(f"RFC 8785 rejects integer outside 64-bit domain: {v}")
             chunks.append(str(v).encode("ascii"))
         elif isinstance(v, float):
             if math.isnan(v) or math.isinf(v):
                 raise ValueError(f"RFC 8785 rejects non-finite float: {v}")
-            if v == 0.0:
-                # RFC 8785 Section 3.2.2: Note that negative zero (-0) MUST be serialized as '0'
-                chunks.append(b"0")
-            elif v.is_integer() and abs(v) < 1e21:
-                chunks.append(str(int(v)).encode("ascii"))
-            else:
-                s = repr(v)
-                if "e" in s:
-                    parts = s.split("e")
-                    exp = int(parts[1])
-                    sign = "+" if exp >= 0 else "-"
-                    chunks.append(f"{parts[0]}e{sign}{abs(exp)}".encode("ascii"))
-                else:
-                    chunks.append(s.encode("ascii"))
+            chunks.append(convert2Es6Format(v).encode("ascii"))
         elif isinstance(v, str):
+            for ch in v:
+                if 0xD800 <= ord(ch) <= 0xDFFF:
+                    raise ValueError(f"RFC 8785 rejects invalid Unicode surrogate code point: U+{ord(ch):04X}")
             chunks.append(json.dumps(v, ensure_ascii=False).encode("utf-8"))
-        elif isinstance(v, (list, tuple)):
+        elif isinstance(v, list):
             chunks.append(b"[")
             for i, elem in enumerate(v):
                 if i > 0:
@@ -65,11 +136,16 @@ def rfc8785_canonical_json(obj: Any) -> bytes:
             chunks.append(b"]")
         elif isinstance(v, dict):
             chunks.append(b"{")
-            # RFC 8785 Section 3.2.3: Keys sorted in ascending order of their UTF-8 bytes
-            sorted_keys = sorted(v.keys(), key=lambda k: str(k).encode("utf-8"))
-            for i, k in enumerate(sorted_keys):
+            # All keys must be strings and checked for surrogates
+            for k in v.keys():
                 if not isinstance(k, str):
                     raise TypeError(f"RFC 8785 requires all object keys to be strings, got {type(k).__name__}")
+                for ch in k:
+                    if 0xD800 <= ord(ch) <= 0xDFFF:
+                        raise ValueError(f"RFC 8785 rejects invalid Unicode surrogate code point in key: U+{ord(ch):04X}")
+            # RFC 8785 Section 3.2.3: Keys MUST be sorted in ascending order of their UTF-16 code units
+            sorted_keys = sorted(v.keys(), key=lambda k: k.encode("utf-16-be"))
+            for i, k in enumerate(sorted_keys):
                 if i > 0:
                     chunks.append(b",")
                 chunks.append(json.dumps(k, ensure_ascii=False).encode("utf-8"))
@@ -77,7 +153,7 @@ def rfc8785_canonical_json(obj: Any) -> bytes:
                 _encode(v[k])
             chunks.append(b"}")
         else:
-            raise TypeError(f"RFC 8785 rejects unsupported type: {type(v).__name__}")
+            raise TypeError(f"RFC 8785 rejects unsupported type: {type(v).__name__} (no silent conversion)")
 
     _encode(obj)
     return b"".join(chunks)

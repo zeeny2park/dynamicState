@@ -109,6 +109,7 @@ class ControlledExecutionResult:
     verified_claims: Tuple[str, ...] = ()
     executed_at: str = ""
     receipt_signature: str = ""
+    signature_version: str = "v2_rfc8785"
 
     def __post_init__(self):
         if not isinstance(self.verified_claims, tuple):
@@ -127,22 +128,31 @@ class ControlledExecutionResult:
             or (self.execution_status in ("REPRODUCED", "SUCCESS", "CONFIRMED") and self.before_value is not None and self.after_value is not None)
         )
 
-    def verify_authenticity(self, session_secret: str) -> bool:
-        """Verify the cryptographic authenticity of this execution receipt against session secret."""
+    def verify_authenticity(self, session_secret: str, allow_legacy: bool = True) -> bool:
+        """Verify the cryptographic authenticity of this execution receipt against session secret.
+        
+        Enforces strict signature version compliance:
+        - 'v2_rfc8785': Verified strictly using RFC 8785 canonical JSON HMAC-SHA256. Fails closed without implicit downgrade.
+        - 'v1_legacy': Verified using legacy delimiter HMAC-SHA256 only when explicitly allowed.
+        - Any unrecognized version fails closed.
+        """
         if not self.receipt_signature:
             return False
-        try:
-            expected_v2 = compute_receipt_signature(session_secret, self)
-            if hmac.compare_digest(self.receipt_signature, expected_v2):
-                return True
-        except (ValueError, TypeError):
-            pass
-        try:
-            expected_v1 = compute_legacy_receipt_signature(session_secret, self)
-            if hmac.compare_digest(self.receipt_signature, expected_v1):
-                return True
-        except Exception:
-            pass
+        sig_ver = getattr(self, "signature_version", "v2_rfc8785") or "v2_rfc8785"
+        if sig_ver == "v2_rfc8785":
+            try:
+                expected_v2 = compute_receipt_signature(session_secret, self)
+                return hmac.compare_digest(self.receipt_signature, expected_v2)
+            except Exception:
+                return False
+        elif sig_ver == "v1_legacy":
+            if not allow_legacy:
+                return False
+            try:
+                expected_v1 = compute_legacy_receipt_signature(session_secret, self)
+                return hmac.compare_digest(self.receipt_signature, expected_v1)
+            except Exception:
+                return False
         return False
 
     def to_dict(self) -> Dict[str, Any]:
@@ -171,6 +181,7 @@ class ControlledExecutionResult:
             "verified_claims": list(self.verified_claims),
             "executed_at": self.executed_at,
             "receipt_signature": self.receipt_signature,
+            "signature_version": getattr(self, "signature_version", "v2_rfc8785"),
         }
 
     @classmethod
@@ -186,13 +197,11 @@ class ControlledExecutionResult:
 
 
 def canonicalize_receipt_value(val: Any) -> str:
-    """Canonicalize arbitrary values using RFC 8785 canonical JSON string."""
-    try:
-        return rfc8785_canonical_str(val)
-    except Exception:
-        if val is None:
-            return "None"
-        return str(val)
+    """Canonicalize values using RFC 8785 canonical JSON string.
+    
+    Fails closed: does not silently convert uncanonicalizable values or fallback to str().
+    """
+    return rfc8785_canonical_str(val)
 
 
 def compute_controlled_execution_payload(result: "ControlledExecutionResult", version: str = "v2_rfc8785") -> Dict[str, Any]:
@@ -759,14 +768,17 @@ class EvidenceRecord:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary without None values for optional fields."""
         prov_copy = dict(self.provenance) if self.provenance else {}
+        prov_copy.pop("session_secret", None)
         if "verifier_attestation" in prov_copy and isinstance(prov_copy["verifier_attestation"], dict):
             safe_att = dict(prov_copy["verifier_attestation"])
             safe_att.pop("token", None)
+            safe_att.pop("session_secret", None)
             prov_copy["verifier_attestation"] = safe_att
         if "live_capture_receipt" in prov_copy and hasattr(prov_copy["live_capture_receipt"], "to_dict"):
             prov_copy["live_capture_receipt"] = prov_copy["live_capture_receipt"].to_dict()
 
         details_copy = dict(self.details) if self.details else {}
+        details_copy.pop("session_secret", None)
         if "live_capture_receipt" in details_copy and hasattr(details_copy["live_capture_receipt"], "to_dict"):
             details_copy["live_capture_receipt"] = details_copy["live_capture_receipt"].to_dict()
 
@@ -980,7 +992,7 @@ class EvidenceLedger:
         evidence_id: str = "",
         target_function: str = "",
         field_path: str = "",
-        hypothesis_id: str = "",
+        hypothesis_id: Optional[str] = None,
         execution_result: Optional[ControlledExecutionResult] = None,
     ) -> CausalVerificationCapability:
         """Issue an internal unforgeable capability strictly after authentic execution receipt verification."""
@@ -1023,11 +1035,10 @@ class EvidenceLedger:
                 raise ValueError(f"Capability issuance rejected: execution receipt field_path '{rcpt_field}' does not match '{field_path}'")
 
             # Hypothesis ID scope binding:
-            eff_hypo = str(hypothesis_id or execution_result.hypothesis_id or "").strip()
+            eff_hypo = str(hypothesis_id if hypothesis_id is not None else (execution_result.hypothesis_id or "")).strip()
             rcpt_hypo = str(execution_result.hypothesis_id or "").strip()
-            if hypothesis_id is not None and str(hypothesis_id).strip() != "":
-                if str(hypothesis_id).strip() != rcpt_hypo:
-                    raise ValueError(f"Capability issuance rejected: execution receipt hypothesis '{rcpt_hypo}' does not match '{hypothesis_id}'")
+            if hypothesis_id is not None and str(hypothesis_id).strip() != rcpt_hypo:
+                raise ValueError(f"Capability issuance rejected: execution receipt hypothesis '{rcpt_hypo}' does not match '{hypothesis_id}'")
 
             # Target identity validation
             if getattr(self, "target_identity", None):

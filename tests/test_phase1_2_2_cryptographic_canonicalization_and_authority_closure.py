@@ -140,6 +140,7 @@ class TestPhase122CryptographicCanonicalizationAndAuthorityClosure(unittest.Test
             verified_claims=res_temp.verified_claims,
             executed_at=res_temp.executed_at,
             receipt_signature=sig,
+            signature_version="v1_legacy" if legacy_signature else "v2_rfc8785",
         )
 
     # =========================================================================
@@ -272,6 +273,7 @@ class TestPhase122CryptographicCanonicalizationAndAuthorityClosure(unittest.Test
             evidence_id=genuine_legacy.evidence_id,
             executed_at=genuine_legacy.executed_at,
             receipt_signature=genuine_legacy.receipt_signature,
+            signature_version=genuine_legacy.signature_version,
         )
         self.assertFalse(tampered_legacy.verify_authenticity(self.ledger.session_secret))
 
