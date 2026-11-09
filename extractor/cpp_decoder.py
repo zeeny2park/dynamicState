@@ -7,7 +7,8 @@ and partial memory capture reporting without relying on GDB or synthetic fallbac
 
 from dataclasses import dataclass, field
 import os
-from typing import Any, Dict, List, Optional, Set, Tuple
+import struct
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .debug_image import inspect_elf
 from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfType, DwarfVariable
@@ -39,6 +40,409 @@ class ResolutionResult:
     endianness: str = "little"
     build_id: Optional[str] = None
     debug_image_path: Optional[str] = None
+
+
+class CppContainerDecoder:
+    """Unified C++ STL Container Decoder supporting GNU libstdc++ and portable layouts.
+
+    Decodes:
+    1. std::string:
+       - Short String Optimization (SSO) vs heap allocation detection.
+       - Correct interpretation of size and capacity.
+       - Null termination and bounded memory reads.
+    2. std::vector<T>:
+       - Interpretation of start, finish, and end_of_storage pointers.
+       - Calculation of size and capacity.
+       - DWARF-guided element decoding.
+       - Handling of empty vectors and inconsistent pointer boundaries.
+    3. std::unique_ptr<T>:
+       - Null and non-null states.
+       - Exclusive ownership semantics separated from pointer validity.
+       - Pointee object decoding.
+    4. std::shared_ptr<T> & std::weak_ptr<T>:
+       - Pointee and control-block address resolution.
+       - Extraction of strong use_count and weak_count fields.
+       - Distinction between portable C++ semantics and implementation-specific structures.
+    """
+
+    @classmethod
+    def decode_container(
+        cls,
+        read_fn: Callable[[int, int], Tuple[Optional[bytes], str]],
+        address: int,
+        type_offset: Optional[int],
+        dwarf_index: Any,
+        depth: int = 0,
+        max_depth: int = 4,
+        max_elements: int = 64,
+        max_string_len: int = 1024,
+        decode_elem_fn: Optional[Callable[[int, Optional[int], int], Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Attempt to decode an STL container at the given memory address."""
+        if type_offset is None or dwarf_index is None or address == 0:
+            return None
+
+        stl_info = dwarf_index.classify_stl_type(type_offset)
+        if not stl_info:
+            return None
+
+        stl_kind = stl_info["stl_kind"]
+        ptr_size = dwarf_index.pointer_size or 8
+        endian = dwarf_index.endianness or "little"
+        ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
+
+        if stl_kind == "std::string":
+            return cls._decode_string(
+                read_fn=read_fn,
+                address=address,
+                ptr_size=ptr_size,
+                ptr_fmt=ptr_fmt,
+                max_string_len=max_string_len,
+            )
+        elif stl_kind == "std::vector":
+            return cls._decode_vector(
+                read_fn=read_fn,
+                address=address,
+                stl_info=stl_info,
+                ptr_size=ptr_size,
+                ptr_fmt=ptr_fmt,
+                depth=depth,
+                max_depth=max_depth,
+                max_elements=max_elements,
+                decode_elem_fn=decode_elem_fn,
+            )
+        elif stl_kind == "std::unique_ptr":
+            return cls._decode_unique_ptr(
+                read_fn=read_fn,
+                address=address,
+                stl_info=stl_info,
+                ptr_size=ptr_size,
+                ptr_fmt=ptr_fmt,
+                depth=depth,
+                max_depth=max_depth,
+                decode_elem_fn=decode_elem_fn,
+            )
+        elif stl_kind in ("std::shared_ptr", "std::weak_ptr"):
+            return cls._decode_shared_or_weak_ptr(
+                read_fn=read_fn,
+                address=address,
+                stl_info=stl_info,
+                ptr_size=ptr_size,
+                ptr_fmt=ptr_fmt,
+                endian=endian,
+                depth=depth,
+                max_depth=max_depth,
+                decode_elem_fn=decode_elem_fn,
+            )
+
+        return None
+
+    @classmethod
+    def _decode_string(
+        cls,
+        read_fn: Callable[[int, int], Tuple[Optional[bytes], str]],
+        address: int,
+        ptr_size: int,
+        ptr_fmt: str,
+        max_string_len: int = 1024,
+    ) -> Dict[str, Any]:
+        """Decode std::string with Short String Optimization (SSO) vs heap detection."""
+        header_len = 4 * ptr_size  # 32 bytes on 64-bit libstdc++
+        raw, st = read_fn(address, header_len)
+        if not raw or len(raw) < 2 * ptr_size:
+            return {
+                "container": "std::string",
+                "status": "MEMORY_NOT_CAPTURED",
+                "value": None,
+                "size": 0,
+                "length": 0,
+                "capacity": 0,
+                "storage": "unknown",
+                "data_ptr": "0x0",
+            }
+
+        data_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
+        str_len = struct.unpack(ptr_fmt, raw[ptr_size:2 * ptr_size])[0]
+
+        # In libstdc++ C++11 ABI, the local buffer is placed at offset 2 * ptr_size (address + 16 on 64-bit).
+        sso_buf_addr = address + 2 * ptr_size
+        sso_max_cap = 2 * ptr_size - 1  # 15 chars on 64-bit
+
+        is_sso = (data_ptr == sso_buf_addr)
+
+        if is_sso:
+            storage = "sso"
+            capacity = sso_max_cap
+            # Read local buffer directly from the object's inline memory
+            s_bytes = raw[2 * ptr_size: 2 * ptr_size + min(str_len, sso_max_cap)]
+            s_val = s_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            status = "COMPLETE"
+        else:
+            storage = "heap"
+            if len(raw) >= 3 * ptr_size:
+                capacity = struct.unpack(ptr_fmt, raw[2 * ptr_size:3 * ptr_size])[0]
+            else:
+                capacity = str_len
+
+            if data_ptr == 0 or str_len == 0:
+                s_val = ""
+                status = "COMPLETE"
+            elif str_len > 10_000_000 or data_ptr < 0x1000:
+                s_val = None
+                status = "CORRUPTED_POINTER"
+            else:
+                read_sz = int(min(str_len, max_string_len))
+                s_bytes, s_st = read_fn(data_ptr, read_sz)
+                if s_bytes is not None:
+                    s_val = s_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                    status = "COMPLETE"
+                else:
+                    s_val = None
+                    status = "MEMORY_NOT_CAPTURED"
+
+        return {
+            "container": "std::string",
+            "storage": storage,
+            "is_sso": is_sso,
+            "size": str_len,
+            "length": str_len,
+            "capacity": capacity,
+            "data_ptr": hex(data_ptr),
+            "value": s_val,
+            "status": status,
+        }
+
+    @classmethod
+    def _decode_vector(
+        cls,
+        read_fn: Callable[[int, int], Tuple[Optional[bytes], str]],
+        address: int,
+        stl_info: Dict[str, Any],
+        ptr_size: int,
+        ptr_fmt: str,
+        depth: int = 0,
+        max_depth: int = 4,
+        max_elements: int = 64,
+        decode_elem_fn: Optional[Callable[[int, Optional[int], int], Any]] = None,
+    ) -> Dict[str, Any]:
+        """Decode std::vector<T> with start, finish, and end_of_storage interpretation."""
+        header_len = 3 * ptr_size  # 24 bytes on 64-bit
+        raw, st = read_fn(address, header_len)
+        if not raw or len(raw) < 3 * ptr_size:
+            return {
+                "container": "std::vector",
+                "element_type": stl_info.get("element_type_name"),
+                "status": "MEMORY_NOT_CAPTURED",
+                "size": 0,
+                "capacity": 0,
+                "data_ptr": "0x0",
+                "elements": [],
+            }
+
+        start_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
+        finish_ptr = struct.unpack(ptr_fmt, raw[ptr_size:2 * ptr_size])[0]
+        end_of_storage = struct.unpack(ptr_fmt, raw[2 * ptr_size:3 * ptr_size])[0]
+
+        elem_sz = max(1, int(stl_info.get("element_size") or 4))
+        elem_type_off = stl_info.get("element_type_offset")
+
+        # 1. Clean empty vector
+        if start_ptr == 0 and finish_ptr == 0 and end_of_storage == 0:
+            return {
+                "container": "std::vector",
+                "element_type": stl_info.get("element_type_name"),
+                "size": 0,
+                "capacity": 0,
+                "data_ptr": "0x0",
+                "elements": [],
+                "status": "COMPLETE",
+            }
+
+        # 2. Inconsistent boundary detection
+        if finish_ptr < start_ptr or end_of_storage < finish_ptr or (start_ptr == 0 and finish_ptr != 0):
+            return {
+                "container": "std::vector",
+                "element_type": stl_info.get("element_type_name"),
+                "size": 0,
+                "capacity": 0,
+                "data_ptr": hex(start_ptr),
+                "elements": [],
+                "status": "CORRUPTED_BOUNDARIES",
+                "error": f"Invalid vector boundaries: start=0x{start_ptr:x}, finish=0x{finish_ptr:x}, end=0x{end_of_storage:x}",
+            }
+
+        byte_len = finish_ptr - start_ptr
+        byte_cap = end_of_storage - start_ptr
+        count = byte_len // elem_sz
+        cap = byte_cap // elem_sz
+
+        # Guard against absurd counts from uninitialized memory
+        if count > 1_000_000 or cap > 10_000_000:
+            return {
+                "container": "std::vector",
+                "element_type": stl_info.get("element_type_name"),
+                "size": count,
+                "capacity": cap,
+                "data_ptr": hex(start_ptr),
+                "elements": [],
+                "status": "SUSPICIOUS_CAPACITY",
+                "error": f"Vector size {count} or capacity {cap} exceeds sanity limit",
+            }
+
+        elements = []
+        elem_status = "COMPLETE"
+        if start_ptr > 0 and count > 0 and depth < max_depth and decode_elem_fn:
+            limit = min(count, max_elements)
+            for i in range(limit):
+                e_addr = start_ptr + i * elem_sz
+                ev = decode_elem_fn(e_addr, elem_type_off, depth + 1)
+                elements.append(ev)
+
+        return {
+            "container": "std::vector",
+            "element_type": stl_info.get("element_type_name"),
+            "size": count,
+            "capacity": cap,
+            "data_ptr": hex(start_ptr),
+            "elements": elements,
+            "elements_truncated": count > max_elements,
+            "status": elem_status,
+        }
+
+    @classmethod
+    def _decode_unique_ptr(
+        cls,
+        read_fn: Callable[[int, int], Tuple[Optional[bytes], str]],
+        address: int,
+        stl_info: Dict[str, Any],
+        ptr_size: int,
+        ptr_fmt: str,
+        depth: int = 0,
+        max_depth: int = 4,
+        decode_elem_fn: Optional[Callable[[int, Optional[int], int], Any]] = None,
+    ) -> Dict[str, Any]:
+        """Decode std::unique_ptr<T> with null vs non-null and exclusive ownership semantics."""
+        raw, st = read_fn(address, ptr_size)
+        if not raw or len(raw) < ptr_size:
+            return {
+                "container": "std::unique_ptr",
+                "smart_ptr": "std::unique_ptr",
+                "ownership": "EXCLUSIVE",
+                "element_type": stl_info.get("element_type_name"),
+                "status": "MEMORY_NOT_CAPTURED",
+                "is_null": True,
+                "ptr": "0x0",
+                "pointer": "0x0",
+                "target": None,
+            }
+
+        target_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
+        elem_type_off = stl_info.get("element_type_offset")
+        is_null = (target_ptr == 0)
+
+        target_val = None
+        status = "COMPLETE"
+        if not is_null:
+            if target_ptr < 0x1000:
+                status = "INVALID_POINTER"
+            elif depth < max_depth and decode_elem_fn and elem_type_off is not None:
+                target_val = decode_elem_fn(target_ptr, elem_type_off, depth + 1)
+
+        return {
+            "container": "std::unique_ptr",
+            "smart_ptr": "std::unique_ptr",
+            "ownership": "EXCLUSIVE",
+            "element_type": stl_info.get("element_type_name"),
+            "is_null": is_null,
+            "ptr": hex(target_ptr),
+            "pointer": hex(target_ptr),
+            "target": target_val,
+            "status": status,
+        }
+
+    @classmethod
+    def _decode_shared_or_weak_ptr(
+        cls,
+        read_fn: Callable[[int, int], Tuple[Optional[bytes], str]],
+        address: int,
+        stl_info: Dict[str, Any],
+        ptr_size: int,
+        ptr_fmt: str,
+        endian: str = "little",
+        depth: int = 0,
+        max_depth: int = 4,
+        decode_elem_fn: Optional[Callable[[int, Optional[int], int], Any]] = None,
+    ) -> Dict[str, Any]:
+        """Decode std::shared_ptr<T> or std::weak_ptr<T> with control-block refcounts."""
+        kind = stl_info["stl_kind"]
+        header_len = 2 * ptr_size  # 16 bytes on 64-bit
+        raw, st = read_fn(address, header_len)
+        if not raw or len(raw) < header_len:
+            return {
+                "container": kind,
+                "smart_ptr": kind,
+                "ownership": "SHARED",
+                "element_type": stl_info.get("element_type_name"),
+                "status": "MEMORY_NOT_CAPTURED",
+                "is_null": True,
+                "ptr": "0x0",
+                "pointer": "0x0",
+                "target": None,
+                "use_count": None,
+                "weak_count": None,
+            }
+
+        target_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
+        cb_ptr = struct.unpack(ptr_fmt, raw[ptr_size:2 * ptr_size])[0]
+        is_null = (target_ptr == 0)
+
+        use_count = None
+        weak_count = None
+        cb_status = "NULL_CONTROL_BLOCK" if cb_ptr == 0 else "COMPLETE"
+
+        # Control block inspection: in libstdc++, _Sp_counted_base has _vptr (8B), _M_use_count (4B), _M_weak_count (4B)
+        if cb_ptr != 0 and cb_ptr >= 0x1000:
+            cb_raw, _ = read_fn(cb_ptr, 16)
+            if cb_raw and len(cb_raw) >= 16:
+                int_fmt = "<i" if endian == "little" else ">i"
+                use_count = struct.unpack(int_fmt, cb_raw[8:12])[0]
+                weak_count = struct.unpack(int_fmt, cb_raw[12:16])[0]
+                cb_status = "OBSERVED"
+            else:
+                cb_status = "MEMORY_NOT_CAPTURED"
+
+        elem_type_off = stl_info.get("element_type_offset")
+        target_val = None
+        status = "COMPLETE"
+        if not is_null:
+            if target_ptr < 0x1000:
+                status = "INVALID_POINTER"
+            elif depth < max_depth and decode_elem_fn and elem_type_off is not None:
+                target_val = decode_elem_fn(target_ptr, elem_type_off, depth + 1)
+
+        is_expired = (use_count == 0) if (kind == "std::weak_ptr" and use_count is not None) else False
+
+        return {
+            "container": kind,
+            "smart_ptr": kind,
+            "ownership": "SHARED",
+            "element_type": stl_info.get("element_type_name"),
+            "is_null": is_null,
+            "ptr": hex(target_ptr),
+            "pointer": hex(target_ptr),
+            "control_block": hex(cb_ptr),
+            "use_count": use_count,
+            "weak_count": weak_count,
+            "is_expired": is_expired,
+            "target": target_val,
+            "status": status,
+            "implementation_details": {
+                "control_block_address": hex(cb_ptr),
+                "control_block_status": cb_status,
+                "strong_ref_count": use_count,
+                "weak_ref_count": weak_count,
+            },
+        }
 
 
 class CppObjectDecoder:
@@ -133,6 +537,50 @@ class CppObjectDecoder:
                 "recoverable": True,
             })
             return obj_id
+
+        # 1.5 C++ STL Container Pretty-Decoding
+        stl_info = self.index.classify_stl_type(type_offset) if type_offset is not None else None
+        if stl_info:
+            def _sub_reader(addr: int, sz: int) -> Tuple[Optional[bytes], str]:
+                if not self.reader.contains(addr, sz):
+                    return None, "MEMORY_NOT_CAPTURED"
+                return self.reader.read(addr, sz)
+
+            def _elem_decoder(e_addr: int, e_type_off: Optional[int], e_depth: int) -> Any:
+                e_obj_id = self.decode_object(
+                    address=e_addr,
+                    type_offset=e_type_off,
+                    path=f"{path}[elem]",
+                    storage="heap" if self.reader.is_heap(e_addr) else "global",
+                )
+                self.references.append({
+                    "from_id": obj_id,
+                    "to_id": e_obj_id,
+                    "field": "element",
+                    "type": "container_element",
+                })
+                return self.objects_by_id.get(e_obj_id)
+
+            container_data = CppContainerDecoder.decode_container(
+                read_fn=_sub_reader,
+                address=address,
+                type_offset=type_offset,
+                dwarf_index=self.index,
+                decode_elem_fn=_elem_decoder,
+            )
+            if container_data:
+                obj_dict["container_data"] = container_data
+                obj_dict["is_container"] = True
+                obj_dict["status"] = container_data.get("status", "COMPLETE")
+                for k, v in container_data.items():
+                    obj_dict["fields"].append({
+                        "name": k,
+                        "type": type(v).__name__,
+                        "value": v,
+                        "status": "RESOLVED",
+                        "address": hex(address),
+                    })
+                return obj_id
 
         # 2. Decode based on DWARF tag
         if canon_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type"):

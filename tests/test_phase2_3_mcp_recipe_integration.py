@@ -145,6 +145,27 @@ class TestPhase23McpRecipeIntegration(unittest.TestCase):
         self.assertEqual(res.get("recipe_id"), "RECIPE_POTENTIAL_DEADLOCK_PATTERNS")
         self.assertEqual(res.get("domain"), "CONCURRENCY")
 
+    def test_all_22_recipes_execute_meaningfully(self):
+        """All 22 DiagnosticRecipeRegistry recipes can be executed through MCP and return structured results."""
+        proc = self._start_target()
+        recipe_ids = DiagnosticRecipeRegistry.list_recipe_ids()
+        self.assertEqual(len(recipe_ids), 22, f"Expected 22 recipes, got {len(recipe_ids)}")
+
+        for rid in recipe_ids:
+            res_str = runtime_run_diagnostic_recipe(
+                pid=proc.pid,
+                companion_elf=self.debug_bin,
+                recipe=rid,
+            )
+            res = json.loads(res_str)
+            self.assertTrue(res.get("success"), f"Recipe {rid} failed: {res}")
+            self.assertEqual(res.get("recipe_id"), rid)
+            self.assertIn("domain", res)
+            self.assertIn("category", res)
+            self.assertIn("checks", res)
+            self.assertIn("conclusion", res)
+            self.assertIn(res.get("status"), ["PASS", "FAIL", "NOT_APPLICABLE", "INCONCLUSIVE", "COMPLETED", "BUDGET_EXHAUSTED"])
+
     def test_unknown_recipe_fails_descriptively(self):
         """Unknown recipe name produces a clear error."""
         proc = self._start_target()

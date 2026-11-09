@@ -3698,7 +3698,16 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     err = errno.ENOSYS
 
                 split_pages = None
-                PAGE_SIZE = 4096
+                try:
+                    import resource
+                    PAGE_SIZE = resource.getpagesize()
+                except Exception:
+                    try:
+                        PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
+                    except Exception:
+                        PAGE_SIZE = 4096
+                if not PAGE_SIZE or PAGE_SIZE <= 0:
+                    PAGE_SIZE = 4096
                 if is_same_mem and chunk_size > PAGE_SIZE and (nread < chunk_size or (nread <= 0 and err in (errno.EFAULT, errno.EIO))):
                     # Page-aware resilient splitting: retry sub-regions page-by-page without dropping the entire chunk
                     split_pages = []

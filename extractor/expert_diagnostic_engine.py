@@ -2054,7 +2054,7 @@ class AdaptiveInvestigationSession:
         diagnostic_check.complete(
             status=chk_status,
             actual_observations=obs_data,
-            technical_interpretation="; ".join(eval_result.supporting_facts or eval_result.contradicting_facts) or eval_result.details.get("reason", "Check executed"),
+            technical_interpretation="; ".join(str(f) for f in (eval_result.supporting_facts or eval_result.contradicting_facts or []) if f is not None) or eval_result.details.get("reason", "Check executed"),
             supporting_evidence_ids=supp_ids,
             contradicting_evidence_ids=contra_ids,
             limitations=eval_result.details.get("limitations", []),

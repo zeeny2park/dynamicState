@@ -300,11 +300,16 @@ class DwarfIndex:
         t_name = self.get_type_name(type_offset)
         c_name = (canon_t.name if canon_t and canon_t.name else t_name).strip()
 
+        norm_name = c_name
+        for pfx in ("std::__cxx11::", "std::__1::", "std::"):
+            norm_name = norm_name.replace(pfx, "")
+
         # 1. std::string / basic_string<char, ...>
         if (
             t_name in ("string", "std::string", "const string", "const std::string")
-            or c_name.startswith("basic_string<char")
-            or c_name in ("string", "std::string")
+            or norm_name.startswith("basic_string<char")
+            or norm_name in ("string", "const string")
+            or norm_name.startswith("string")
         ):
             return {
                 "stl_kind": "std::string",
@@ -314,7 +319,7 @@ class DwarfIndex:
             }
 
         # 2. std::vector<T, Alloc>
-        if c_name.startswith("vector<") or c_name.startswith("std::vector<"):
+        if norm_name.startswith("vector<"):
             elem_name = self._extract_first_template_arg(c_name) or "int"
             elem_t = self.resolve_type_by_name(elem_name)
             elem_sz = elem_t.byte_size if (elem_t and elem_t.byte_size > 0) else (self.pointer_size if elem_name.endswith("*") else 4)
@@ -328,13 +333,10 @@ class DwarfIndex:
         # 3. std::unique_ptr<T, Deleter>, std::shared_ptr<T>, std::weak_ptr<T>
         for prefix, kind in (
             ("unique_ptr<", "std::unique_ptr"),
-            ("std::unique_ptr<", "std::unique_ptr"),
             ("shared_ptr<", "std::shared_ptr"),
-            ("std::shared_ptr<", "std::shared_ptr"),
             ("weak_ptr<", "std::weak_ptr"),
-            ("std::weak_ptr<", "std::weak_ptr"),
         ):
-            if c_name.startswith(prefix):
+            if norm_name.startswith(prefix):
                 elem_name = self._extract_first_template_arg(c_name) or "void"
                 elem_t = self.resolve_type_by_name(elem_name)
                 elem_sz = elem_t.byte_size if (elem_t and elem_t.byte_size > 0) else 4

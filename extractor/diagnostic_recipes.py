@@ -1252,7 +1252,7 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                     status=RECIPE_STATUS_CONTRADICTED,
                     confidence=0.92,
                     confidence_basis=f"Target pointer is a valid free target: {val_res.reason}",
-                    contradicting_facts=["Pointer is a valid free target", val_res.reason],
+                    contradicting_facts=["Pointer is a valid free target"] + ([val_res.reason] if val_res.reason else []),
                     recommended_action="Refute invalid free; verify chunk lifetime and deallocation count.",
                     details={"is_invalid_free": False, "outcome": val_res.outcome.value},
                 )

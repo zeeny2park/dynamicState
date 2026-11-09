@@ -134,5 +134,43 @@ class TestPhase23BudgetEnforcement(unittest.TestCase):
         self.assertGreater(metrics.get("bytes_read", 0), 0)
 
 
+    def test_cumulative_budget_preservation_across_steps(self):
+        """Budget metrics strictly accumulate monotonically across investigation steps."""
+        engine = ExpertDiagnosticEngine(corpus_dir=self.tmpdir)
+        tracker = ObservationBudgetTracker(limits=ObservationBudgetLimits(
+            max_bytes_read=1024 * 1024,
+            max_samples=100,
+            max_wall_clock_ms=10000.0,
+        ))
+
+        session = engine.start_investigation(
+            problem_statement="Investigate unexpected memory growth and invalid memory access",
+            pid=self.proc.pid,
+            companion_elf=self.bin_path,
+            budget_tracker=tracker,
+        )
+
+        session.step()  # CLASSIFY
+        session.step()  # ASSESS
+        session.step()  # PLAN
+
+        initial_bytes = tracker.metrics.bytes_read
+        initial_samples = tracker.metrics.samples_collected
+
+        session.step()  # COLLECT step 1
+        bytes_after_1 = tracker.metrics.bytes_read
+        samples_after_1 = tracker.metrics.samples_collected
+
+        self.assertGreaterEqual(bytes_after_1, initial_bytes)
+        self.assertGreaterEqual(samples_after_1, initial_samples)
+
+        session.step()  # COLLECT step 2
+        bytes_after_2 = tracker.metrics.bytes_read
+        samples_after_2 = tracker.metrics.samples_collected
+
+        self.assertGreaterEqual(bytes_after_2, bytes_after_1)
+        self.assertGreaterEqual(samples_after_2, samples_after_1)
+
+
 if __name__ == "__main__":
     unittest.main()

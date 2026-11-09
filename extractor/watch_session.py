@@ -30,6 +30,8 @@ import ctypes
 
 from .debug_image import BinaryIdentity, inspect_elf
 from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
+from .cpp_decoder import CppContainerDecoder
+from .allocator_inspector import detect_allocator, classify_pointer_integrity, PointerClassification, AllocatorType
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
 from .verdict_engine import (
     VerdictEngine,
@@ -2464,73 +2466,32 @@ class WatchSessionManager:
                 return arr_vals, "OBSERVED", None, raw_hex
             return raw_hex, "OBSERVED", None, raw_hex
 
-        # 3.5 Phase 5: C++ STL Container Pretty-Decoding (std::string, std::vector, std::unique_ptr, std::shared_ptr)
+        # 3.5 Phase 5: C++ STL Container Pretty-Decoding via Unified CppContainerDecoder
         stl_info = idx.classify_stl_type(type_offset)
         if stl_info is not None:
-            stl_kind = stl_info["stl_kind"]
-            ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
+            def _live_read_fn(a: int, sz: int) -> Tuple[Optional[bytes], str]:
+                r_bytes, r_st, _ = adapter.read_memory(pid, a, sz)
+                return r_bytes, r_st
 
-            if stl_kind == "std::string":
-                if len(raw) >= 2 * ptr_size:
-                    data_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
-                    str_len = struct.unpack(ptr_fmt, raw[ptr_size:2 * ptr_size])[0]
-                    if data_ptr == 0 or str_len == 0:
-                        return "", "OBSERVED", None, raw_hex
-                    if 0 < str_len <= 4096:
-                        s_bytes, s_st, _ = adapter.read_memory(pid, data_ptr, int(min(str_len, 1024)))
-                        if s_st == "OBSERVED" and s_bytes is not None:
-                            return s_bytes.decode("utf-8", errors="replace"), "OBSERVED", None, raw_hex
+            def _live_elem_decoder(e_addr: int, e_type_off: Optional[int], e_depth: int) -> Any:
+                e_val, e_st, _, _ = self._decode_typed_memory(
+                    adapter, pid, idx, e_addr, e_type_off, depth=e_depth, max_struct_depth=max_struct_depth
+                )
+                return e_val
 
-            elif stl_kind == "std::vector":
-                if len(raw) >= 3 * ptr_size:
-                    start_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
-                    finish_ptr = struct.unpack(ptr_fmt, raw[ptr_size:2 * ptr_size])[0]
-                    cap_ptr = struct.unpack(ptr_fmt, raw[2 * ptr_size:3 * ptr_size])[0]
-                    elem_sz = max(1, int(stl_info.get("element_size") or 4))
-                    elem_type_off = stl_info.get("element_type_offset")
-                    count = int((finish_ptr - start_ptr) // elem_sz) if (finish_ptr >= start_ptr and start_ptr > 0) else 0
-                    cap = int((cap_ptr - start_ptr) // elem_sz) if (cap_ptr >= start_ptr and start_ptr > 0) else 0
-                    count = max(0, min(count, 100000))
-                    cap = max(0, min(cap, 100000))
-                    elements = []
-                    if start_ptr > 0 and count > 0 and depth < max_struct_depth:
-                        for i in range(min(count, 16)):
-                            ev_val, ev_st, _, _ = self._decode_typed_memory(
-                                adapter, pid, idx, start_ptr + i * elem_sz, elem_type_off, depth=depth + 1, max_struct_depth=max_struct_depth
-                            )
-                            if ev_st == "OBSERVED":
-                                elements.append(ev_val)
-                    return {
-                        "container": "std::vector",
-                        "element_type": stl_info.get("element_type_name"),
-                        "size": count,
-                        "capacity": cap,
-                        "data_ptr": f"0x{start_ptr:x}",
-                        "elements": elements,
-                    }, "OBSERVED", None, raw_hex
-
-            elif stl_kind in ("std::unique_ptr", "std::shared_ptr", "std::weak_ptr"):
-                if len(raw) >= ptr_size:
-                    target_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
-                    elem_type_off = stl_info.get("element_type_offset")
-                    if target_ptr == 0:
-                        return {
-                            "smart_ptr": stl_kind,
-                            "element_type": stl_info.get("element_type_name"),
-                            "ptr": "0x0",
-                            "target": None,
-                        }, "OBSERVED", None, raw_hex
-                    target_val = None
-                    if depth < max_struct_depth and elem_type_off is not None:
-                        target_val, _, _, _ = self._decode_typed_memory(
-                            adapter, pid, idx, target_ptr, elem_type_off, depth=depth + 1, max_struct_depth=max_struct_depth
-                        )
-                    return {
-                        "smart_ptr": stl_kind,
-                        "element_type": stl_info.get("element_type_name"),
-                        "ptr": f"0x{target_ptr:x}",
-                        "target": target_val,
-                    }, "OBSERVED", None, raw_hex
+            c_data = CppContainerDecoder.decode_container(
+                read_fn=_live_read_fn,
+                address=addr,
+                type_offset=type_offset,
+                dwarf_index=idx,
+                depth=depth,
+                max_depth=max_struct_depth,
+                decode_elem_fn=_live_elem_decoder,
+            )
+            if c_data:
+                if c_data.get("container") == "std::string":
+                    return c_data.get("value") or "", "OBSERVED", None, raw_hex
+                return c_data, "OBSERVED", None, raw_hex
 
         # 4. Structure / Class / Union type
         if canon_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type"):
@@ -5780,8 +5741,12 @@ class WatchSessionManager:
         endian = idx.endianness or "little"
         ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
 
+        mappings = map_data.get("mappings", [])
+        alloc_detection = detect_allocator(maps=mappings)
+        alloc_inspector = alloc_detection.inspector
+
         readable_vmas: List[Tuple[int, int]] = []
-        for m in map_data.get("mappings", []):
+        for m in mappings:
             perms = m.get("permissions", "")
             ms = int(m["start_int"]) if m.get("start_int") is not None else int(m.get("start", "0"), 16)
             me = int(m["end_int"]) if m.get("end_int") is not None else int(m.get("end", "0"), 16)
@@ -5838,16 +5803,39 @@ class WatchSessionManager:
                 # 1. Pointer validity check
                 if mc.tag == "DW_TAG_pointer_type" and len(m_slice) >= ptr_size:
                     pval = struct.unpack(ptr_fmt, m_slice[:ptr_size])[0]
-                    if pval != 0 and not _is_valid_ptr(pval):
-                        anomalies.append({
-                            "anomaly_kind": "DANGLING_OR_UNMAPPED_POINTER",
-                            "severity": "HIGH",
-                            "expression": m_expr,
-                            "runtime_address": f"0x{m_addr:x}",
-                            "observed_value": f"0x{pval:x}",
-                            "expected_constraint": "NULL (0x0) or address within mapped readable VMA",
-                            "detail": f"Pointer field '{m_expr}' holds unmapped/invalid address 0x{pval:x}",
-                        })
+                    if pval != 0:
+                        def _mem_reader(a: int, sz: int) -> Optional[bytes]:
+                            b, st, _ = target_adapter.read_memory(pid, a, sz)
+                            return b if st == "OBSERVED" else None
+
+                        p_res = classify_pointer_integrity(
+                            address=pval,
+                            maps=mappings,
+                            inspector=alloc_inspector,
+                            memory_reader=_mem_reader,
+                        )
+                        if p_res.classification == PointerClassification.OUT_OF_RANGE:
+                            anomalies.append({
+                                "anomaly_kind": "DANGLING_OR_UNMAPPED_POINTER",
+                                "severity": "HIGH",
+                                "expression": m_expr,
+                                "runtime_address": f"0x{m_addr:x}",
+                                "observed_value": f"0x{pval:x}",
+                                "expected_constraint": "NULL (0x0) or address within mapped readable VMA",
+                                "pointer_classification": p_res.classification.value,
+                                "detail": f"Pointer field '{m_expr}' holds unmapped/invalid address 0x{pval:x}: {p_res.reason}",
+                            })
+                        elif p_res.classification == PointerClassification.FREED_CHUNK:
+                            anomalies.append({
+                                "anomaly_kind": "USE_AFTER_FREE_POINTER",
+                                "severity": "HIGH",
+                                "expression": m_expr,
+                                "runtime_address": f"0x{m_addr:x}",
+                                "observed_value": f"0x{pval:x}",
+                                "expected_constraint": "Active allocated object (not freed chunk)",
+                                "pointer_classification": p_res.classification.value,
+                                "detail": f"Pointer field '{m_expr}' (0x{pval:x}) references freed heap chunk: {p_res.reason}",
+                            })
 
                 # 2. Corrupted bool check
                 elif mc.tag == "DW_TAG_base_type" and (mc.name or "").lower() in ("bool", "_bool") and len(m_slice) >= 1:
@@ -5980,6 +5968,8 @@ class WatchSessionManager:
             "stop_duration_ms": 0.0,
             "evaluation_latency_us": latency_us,
             "health_status": "ANOMALIES_DETECTED" if anomalies else "HEALTHY",
+            "allocator": alloc_detection.allocator_type.value,
+            "allocator_confidence": alloc_detection.confidence,
             "checked_symbols_count": checked_count,
             "anomalies_count": len(anomalies),
             "anomalies": anomalies,
