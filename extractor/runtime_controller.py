@@ -94,7 +94,7 @@ class RuntimeController:
         raise NotImplementedError
 
     def diff(self, before, after):
-        raise NotImplementedError
+        return StateDiffEngine().diff(before, after)
 
     def execute_transition(self, object_id=None, field_path=None, value=None, path=None,
                            timeout_ms=1000, transition_id=None, output=None):

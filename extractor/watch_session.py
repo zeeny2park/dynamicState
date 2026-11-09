@@ -2489,8 +2489,13 @@ class WatchSessionManager:
                 decode_elem_fn=_live_elem_decoder,
             )
             if c_data:
+                c_status = c_data.get("status", "COMPLETE")
+                c_err = c_data.get("error")
+                if c_status != "COMPLETE":
+                    return c_data.get("value"), c_status, c_err, raw_hex
+
                 if c_data.get("container") == "std::string":
-                    return c_data.get("value") or "", "OBSERVED", None, raw_hex
+                    return c_data.get("value"), "OBSERVED", None, raw_hex
                 return c_data, "OBSERVED", None, raw_hex
 
         # 4. Structure / Class / Union type
@@ -5906,16 +5911,39 @@ class WatchSessionManager:
             if canon_t.tag == "DW_TAG_pointer_type":
                 val_str = str(item.get("value") or "0x0")
                 pval = int(val_str, 16) if val_str.startswith("0x") else 0
-                if pval != 0 and not _is_valid_ptr(pval):
-                    anomalies.append({
-                        "anomaly_kind": "DANGLING_OR_UNMAPPED_POINTER",
-                        "severity": "HIGH",
-                        "expression": ex,
-                        "runtime_address": rt_addr_str,
-                        "observed_value": val_str,
-                        "expected_constraint": "NULL (0x0) or address within mapped readable VMA",
-                        "detail": f"Pointer '{ex}' points to unmapped address {val_str}",
-                    })
+                if pval != 0:
+                    def _mem_reader(a: int, sz: int) -> Optional[bytes]:
+                        b, st, _ = target_adapter.read_memory(pid, a, sz)
+                        return b if st == "OBSERVED" else None
+
+                    p_res = classify_pointer_integrity(
+                        address=pval,
+                        maps=mappings,
+                        inspector=alloc_inspector,
+                        memory_reader=_mem_reader,
+                    )
+                    if p_res.classification == PointerClassification.OUT_OF_RANGE:
+                        anomalies.append({
+                            "anomaly_kind": "DANGLING_OR_UNMAPPED_POINTER",
+                            "severity": "HIGH",
+                            "expression": ex,
+                            "runtime_address": rt_addr_str,
+                            "observed_value": val_str,
+                            "expected_constraint": "NULL (0x0) or address within mapped readable VMA",
+                            "pointer_classification": p_res.classification.value,
+                            "detail": f"Pointer '{ex}' points to unmapped/invalid address {val_str}: {p_res.reason}",
+                        })
+                    elif p_res.classification == PointerClassification.FREED_CHUNK:
+                        anomalies.append({
+                            "anomaly_kind": "USE_AFTER_FREE_POINTER",
+                            "severity": "HIGH",
+                            "expression": ex,
+                            "runtime_address": rt_addr_str,
+                            "observed_value": val_str,
+                            "expected_constraint": "Active allocated object (not freed chunk)",
+                            "pointer_classification": p_res.classification.value,
+                            "detail": f"Pointer '{ex}' ({val_str}) references freed heap chunk: {p_res.reason}",
+                        })
             elif canon_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type") and rt_addr > 0:
                 bsize = max(1, min(canon_t.byte_size or 64, 16384))
                 raw_s, sst, _ = target_adapter.read_memory(pid, rt_addr, bsize)

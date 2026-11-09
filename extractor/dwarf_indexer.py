@@ -316,6 +316,7 @@ class DwarfIndex:
                 "element_type_name": "char",
                 "element_type_offset": None,
                 "element_size": 1,
+                "byte_size": canon_t.byte_size if canon_t else None,
             }
 
         # 2. std::vector<T, Alloc>
@@ -328,6 +329,7 @@ class DwarfIndex:
                 "element_type_name": elem_name,
                 "element_type_offset": elem_t.die_offset if elem_t else None,
                 "element_size": elem_sz,
+                "byte_size": canon_t.byte_size if canon_t else None,
             }
 
         # 3. std::unique_ptr<T, Deleter>, std::shared_ptr<T>, std::weak_ptr<T>
@@ -345,6 +347,7 @@ class DwarfIndex:
                     "element_type_name": elem_name,
                     "element_type_offset": elem_t.die_offset if elem_t else None,
                     "element_size": elem_sz,
+                    "byte_size": canon_t.byte_size if canon_t else None,
                 }
 
         return None

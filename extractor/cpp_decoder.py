@@ -77,6 +77,7 @@ class CppContainerDecoder:
         max_elements: int = 64,
         max_string_len: int = 1024,
         decode_elem_fn: Optional[Callable[[int, Optional[int], int], Any]] = None,
+        visited_ptrs: Optional[Set[int]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Attempt to decode an STL container at the given memory address."""
         if type_offset is None or dwarf_index is None or address == 0:
@@ -91,6 +92,9 @@ class CppContainerDecoder:
         endian = dwarf_index.endianness or "little"
         ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
 
+        if visited_ptrs is None:
+            visited_ptrs = set()
+
         if stl_kind == "std::string":
             return cls._decode_string(
                 read_fn=read_fn,
@@ -98,6 +102,7 @@ class CppContainerDecoder:
                 ptr_size=ptr_size,
                 ptr_fmt=ptr_fmt,
                 max_string_len=max_string_len,
+                stl_info=stl_info,
             )
         elif stl_kind == "std::vector":
             return cls._decode_vector(
@@ -110,6 +115,7 @@ class CppContainerDecoder:
                 max_depth=max_depth,
                 max_elements=max_elements,
                 decode_elem_fn=decode_elem_fn,
+                visited_ptrs=visited_ptrs,
             )
         elif stl_kind == "std::unique_ptr":
             return cls._decode_unique_ptr(
@@ -121,6 +127,7 @@ class CppContainerDecoder:
                 depth=depth,
                 max_depth=max_depth,
                 decode_elem_fn=decode_elem_fn,
+                visited_ptrs=visited_ptrs,
             )
         elif stl_kind in ("std::shared_ptr", "std::weak_ptr"):
             return cls._decode_shared_or_weak_ptr(
@@ -133,6 +140,7 @@ class CppContainerDecoder:
                 depth=depth,
                 max_depth=max_depth,
                 decode_elem_fn=decode_elem_fn,
+                visited_ptrs=visited_ptrs,
             )
 
         return None
@@ -145,14 +153,46 @@ class CppContainerDecoder:
         ptr_size: int,
         ptr_fmt: str,
         max_string_len: int = 1024,
+        stl_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Decode std::string with Short String Optimization (SSO) vs heap detection."""
-        header_len = 4 * ptr_size  # 32 bytes on 64-bit libstdc++
+        """Decode std::string with Short String Optimization (SSO) vs heap detection and ABI validation."""
+        # 1. ABI Validation: libstdc++ C++11 SSO layout requires 4 * ptr_size (32 bytes on 64-bit)
+        expected_size = 4 * ptr_size
+        if stl_info and stl_info.get("byte_size") is not None and stl_info["byte_size"] > 0:
+            actual_size = stl_info["byte_size"]
+            if actual_size != expected_size:
+                return {
+                    "container": "std::string",
+                    "status": "UNSUPPORTED_ABI",
+                    "error": f"Unsupported std::string ABI layout: size {actual_size} != expected {expected_size}",
+                    "value": None,
+                    "size": 0,
+                    "length": 0,
+                    "capacity": 0,
+                    "storage": "unknown",
+                    "data_ptr": "0x0",
+                }
+
+        header_len = expected_size
         raw, st = read_fn(address, header_len)
         if not raw or len(raw) < 2 * ptr_size:
             return {
                 "container": "std::string",
-                "status": "MEMORY_NOT_CAPTURED",
+                "status": "MEMORY_NOT_CAPTURED" if not raw else "SHORT_READ",
+                "error": f"Failed to read std::string header ({len(raw) if raw else 0}/{header_len} bytes)",
+                "value": None,
+                "size": 0,
+                "length": 0,
+                "capacity": 0,
+                "storage": "unknown",
+                "data_ptr": "0x0",
+            }
+
+        if len(raw) < header_len:
+            return {
+                "container": "std::string",
+                "status": "SHORT_READ",
+                "error": f"Partial std::string header ({len(raw)}/{header_len} bytes)",
                 "value": None,
                 "size": 0,
                 "length": 0,
@@ -173,34 +213,57 @@ class CppContainerDecoder:
         if is_sso:
             storage = "sso"
             capacity = sso_max_cap
+            if str_len > sso_max_cap or str_len < 0:
+                return {
+                    "container": "std::string",
+                    "storage": "sso",
+                    "is_sso": True,
+                    "size": str_len,
+                    "length": str_len,
+                    "capacity": sso_max_cap,
+                    "data_ptr": hex(data_ptr),
+                    "value": None,
+                    "status": "CORRUPTED_BOUNDARIES",
+                    "error": f"SSO length {str_len} exceeds SSO capacity {sso_max_cap}",
+                }
             # Read local buffer directly from the object's inline memory
             s_bytes = raw[2 * ptr_size: 2 * ptr_size + min(str_len, sso_max_cap)]
             s_val = s_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
             status = "COMPLETE"
+            err = None
         else:
             storage = "heap"
-            if len(raw) >= 3 * ptr_size:
-                capacity = struct.unpack(ptr_fmt, raw[2 * ptr_size:3 * ptr_size])[0]
-            else:
-                capacity = str_len
+            capacity = struct.unpack(ptr_fmt, raw[2 * ptr_size:3 * ptr_size])[0]
 
-            if data_ptr == 0 or str_len == 0:
+            if data_ptr == 0 and str_len == 0:
                 s_val = ""
                 status = "COMPLETE"
-            elif str_len > 10_000_000 or data_ptr < 0x1000:
+                err = None
+            elif data_ptr < 0x1000:
                 s_val = None
-                status = "CORRUPTED_POINTER"
+                status = "INVALID_POINTER"
+                err = f"Invalid heap pointer 0x{data_ptr:x}"
+            elif str_len > capacity or str_len > 10_000_000 or capacity > 100_000_000 or str_len < 0:
+                s_val = None
+                status = "CORRUPTED_BOUNDARIES"
+                err = f"String length {str_len} exceeds capacity {capacity} or sanity limit"
             else:
                 read_sz = int(min(str_len, max_string_len))
                 s_bytes, s_st = read_fn(data_ptr, read_sz)
-                if s_bytes is not None:
-                    s_val = s_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-                    status = "COMPLETE"
-                else:
+                if s_bytes is None or len(s_bytes) == 0:
                     s_val = None
                     status = "MEMORY_NOT_CAPTURED"
+                    err = f"Heap payload at 0x{data_ptr:x} could not be read ({s_st})"
+                elif len(s_bytes) < read_sz:
+                    s_val = s_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                    status = "PARTIAL"
+                    err = f"Partial payload read ({len(s_bytes)}/{read_sz} bytes)"
+                else:
+                    s_val = s_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                    status = "COMPLETE"
+                    err = None
 
-        return {
+        res = {
             "container": "std::string",
             "storage": storage,
             "is_sso": is_sso,
@@ -211,6 +274,9 @@ class CppContainerDecoder:
             "value": s_val,
             "status": status,
         }
+        if err:
+            res["error"] = err
+        return res
 
     @classmethod
     def _decode_vector(
@@ -224,6 +290,7 @@ class CppContainerDecoder:
         max_depth: int = 4,
         max_elements: int = 64,
         decode_elem_fn: Optional[Callable[[int, Optional[int], int], Any]] = None,
+        visited_ptrs: Optional[Set[int]] = None,
     ) -> Dict[str, Any]:
         """Decode std::vector<T> with start, finish, and end_of_storage interpretation."""
         header_len = 3 * ptr_size  # 24 bytes on 64-bit
@@ -232,11 +299,13 @@ class CppContainerDecoder:
             return {
                 "container": "std::vector",
                 "element_type": stl_info.get("element_type_name"),
-                "status": "MEMORY_NOT_CAPTURED",
+                "status": "MEMORY_NOT_CAPTURED" if not raw else "SHORT_READ",
                 "size": 0,
                 "capacity": 0,
                 "data_ptr": "0x0",
                 "elements": [],
+                "elements_truncated": False,
+                "error": f"Failed to read std::vector header ({len(raw) if raw else 0}/{header_len} bytes)",
             }
 
         start_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
@@ -255,6 +324,7 @@ class CppContainerDecoder:
                 "capacity": 0,
                 "data_ptr": "0x0",
                 "elements": [],
+                "elements_truncated": False,
                 "status": "COMPLETE",
             }
 
@@ -267,17 +337,45 @@ class CppContainerDecoder:
                 "capacity": 0,
                 "data_ptr": hex(start_ptr),
                 "elements": [],
+                "elements_truncated": False,
                 "status": "CORRUPTED_BOUNDARIES",
                 "error": f"Invalid vector boundaries: start=0x{start_ptr:x}, finish=0x{finish_ptr:x}, end=0x{end_of_storage:x}",
             }
 
         byte_len = finish_ptr - start_ptr
         byte_cap = end_of_storage - start_ptr
+
+        # 3. Bounds check: byte length & capacity must be divisible by sizeof(element)
+        if byte_len % elem_sz != 0:
+            return {
+                "container": "std::vector",
+                "element_type": stl_info.get("element_type_name"),
+                "size": byte_len // elem_sz,
+                "capacity": byte_cap // elem_sz,
+                "data_ptr": hex(start_ptr),
+                "elements": [],
+                "elements_truncated": False,
+                "status": "NON_DIVISIBLE_BYTE_LENGTH",
+                "error": f"Vector byte length {byte_len} is not divisible by element size {elem_sz}",
+            }
+
+        if byte_cap % elem_sz != 0:
+            return {
+                "container": "std::vector",
+                "element_type": stl_info.get("element_type_name"),
+                "size": byte_len // elem_sz,
+                "capacity": byte_cap // elem_sz,
+                "data_ptr": hex(start_ptr),
+                "elements": [],
+                "elements_truncated": False,
+                "status": "CORRUPTED_BOUNDARIES",
+                "error": f"Vector capacity bytes {byte_cap} is not divisible by element size {elem_sz}",
+            }
+
         count = byte_len // elem_sz
         cap = byte_cap // elem_sz
 
-        # Guard against absurd counts from uninitialized memory
-        if count > 1_000_000 or cap > 10_000_000:
+        if start_ptr < 0x1000 and count > 0:
             return {
                 "container": "std::vector",
                 "element_type": stl_info.get("element_type_name"),
@@ -285,29 +383,61 @@ class CppContainerDecoder:
                 "capacity": cap,
                 "data_ptr": hex(start_ptr),
                 "elements": [],
+                "elements_truncated": False,
+                "status": "INVALID_POINTER",
+                "error": f"Invalid vector data pointer 0x{start_ptr:x}",
+            }
+
+        # Guard against absurd counts from uninitialized memory
+        if count > 1_000_000 or cap > 10_000_000 or count < 0 or cap < 0:
+            return {
+                "container": "std::vector",
+                "element_type": stl_info.get("element_type_name"),
+                "size": count,
+                "capacity": cap,
+                "data_ptr": hex(start_ptr),
+                "elements": [],
+                "elements_truncated": False,
                 "status": "SUSPICIOUS_CAPACITY",
                 "error": f"Vector size {count} or capacity {cap} exceeds sanity limit",
             }
 
         elements = []
         elem_status = "COMPLETE"
+        elem_err = None
+        failed_count = 0
+        limit = min(count, max_elements)
+        elements_truncated = (count > max_elements)
+
         if start_ptr > 0 and count > 0 and depth < max_depth and decode_elem_fn:
-            limit = min(count, max_elements)
             for i in range(limit):
                 e_addr = start_ptr + i * elem_sz
                 ev = decode_elem_fn(e_addr, elem_type_off, depth + 1)
+                if ev is None or (isinstance(ev, dict) and ev.get("status") in ("MEMORY_NOT_CAPTURED", "INVALID_POINTER", "DECODE_ERROR", "ERROR")):
+                    failed_count += 1
                 elements.append(ev)
 
-        return {
+            if failed_count > 0:
+                if failed_count == limit:
+                    elem_status = "ELEMENT_READ_FAILED"
+                    elem_err = f"Failed to read all {limit} decoded elements"
+                else:
+                    elem_status = "PARTIAL"
+                    elem_err = f"Failed to read {failed_count} of {limit} decoded elements"
+
+        res = {
             "container": "std::vector",
             "element_type": stl_info.get("element_type_name"),
             "size": count,
             "capacity": cap,
             "data_ptr": hex(start_ptr),
             "elements": elements,
-            "elements_truncated": count > max_elements,
+            "elements_truncated": elements_truncated,
             "status": elem_status,
         }
+        if elem_err:
+            res["error"] = elem_err
+        return res
 
     @classmethod
     def _decode_unique_ptr(
@@ -320,8 +450,40 @@ class CppContainerDecoder:
         depth: int = 0,
         max_depth: int = 4,
         decode_elem_fn: Optional[Callable[[int, Optional[int], int], Any]] = None,
+        visited_ptrs: Optional[Set[int]] = None,
     ) -> Dict[str, Any]:
         """Decode std::unique_ptr<T> with null vs non-null and exclusive ownership semantics."""
+        if visited_ptrs is not None and address in visited_ptrs:
+            return {
+                "container": "std::unique_ptr",
+                "smart_ptr": "std::unique_ptr",
+                "ownership": "EXCLUSIVE",
+                "element_type": stl_info.get("element_type_name"),
+                "status": "CYCLE_DETECTED",
+                "is_null": False,
+                "ptr": hex(address),
+                "pointer": hex(address),
+                "target": None,
+                "error": f"Cyclic pointer reference detected at 0x{address:x}",
+            }
+
+        if depth >= max_depth:
+            return {
+                "container": "std::unique_ptr",
+                "smart_ptr": "std::unique_ptr",
+                "ownership": "EXCLUSIVE",
+                "element_type": stl_info.get("element_type_name"),
+                "status": "RECURSION_LIMIT_REACHED",
+                "is_null": False,
+                "ptr": hex(address),
+                "pointer": hex(address),
+                "target": None,
+                "error": f"Recursion limit reached at depth {depth}",
+            }
+
+        cur_visited = set(visited_ptrs or ())
+        cur_visited.add(address)
+
         raw, st = read_fn(address, ptr_size)
         if not raw or len(raw) < ptr_size:
             return {
@@ -334,6 +496,7 @@ class CppContainerDecoder:
                 "ptr": "0x0",
                 "pointer": "0x0",
                 "target": None,
+                "error": f"Failed to read unique_ptr memory at 0x{address:x}: {st}",
             }
 
         target_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
@@ -342,13 +505,18 @@ class CppContainerDecoder:
 
         target_val = None
         status = "COMPLETE"
+        err = None
         if not is_null:
             if target_ptr < 0x1000:
                 status = "INVALID_POINTER"
+                err = f"Invalid target pointer 0x{target_ptr:x}"
             elif depth < max_depth and decode_elem_fn and elem_type_off is not None:
                 target_val = decode_elem_fn(target_ptr, elem_type_off, depth + 1)
+                if target_val is None:
+                    status = "ELEMENT_READ_FAILED"
+                    err = f"Failed to decode pointee at 0x{target_ptr:x}"
 
-        return {
+        res = {
             "container": "std::unique_ptr",
             "smart_ptr": "std::unique_ptr",
             "ownership": "EXCLUSIVE",
@@ -359,6 +527,9 @@ class CppContainerDecoder:
             "target": target_val,
             "status": status,
         }
+        if err:
+            res["error"] = err
+        return res
 
     @classmethod
     def _decode_shared_or_weak_ptr(
@@ -372,16 +543,50 @@ class CppContainerDecoder:
         depth: int = 0,
         max_depth: int = 4,
         decode_elem_fn: Optional[Callable[[int, Optional[int], int], Any]] = None,
+        visited_ptrs: Optional[Set[int]] = None,
     ) -> Dict[str, Any]:
-        """Decode std::shared_ptr<T> or std::weak_ptr<T> with control-block refcounts."""
+        """Decode std::shared_ptr<T> or std::weak_ptr<T> with control-block refcounts and cycle protection."""
         kind = stl_info["stl_kind"]
+        ownership = "SHARED" if kind == "std::shared_ptr" else "WEAK"
+
+        if visited_ptrs is not None and address in visited_ptrs:
+            return {
+                "container": kind,
+                "smart_ptr": kind,
+                "ownership": ownership,
+                "element_type": stl_info.get("element_type_name"),
+                "status": "CYCLE_DETECTED",
+                "is_null": False,
+                "ptr": hex(address),
+                "pointer": hex(address),
+                "target": None,
+                "error": f"Cyclic pointer reference detected at 0x{address:x}",
+            }
+
+        if depth >= max_depth:
+            return {
+                "container": kind,
+                "smart_ptr": kind,
+                "ownership": ownership,
+                "element_type": stl_info.get("element_type_name"),
+                "status": "RECURSION_LIMIT_REACHED",
+                "is_null": False,
+                "ptr": hex(address),
+                "pointer": hex(address),
+                "target": None,
+                "error": f"Recursion limit reached at depth {depth}",
+            }
+
+        cur_visited = set(visited_ptrs or ())
+        cur_visited.add(address)
+
         header_len = 2 * ptr_size  # 16 bytes on 64-bit
         raw, st = read_fn(address, header_len)
         if not raw or len(raw) < header_len:
             return {
                 "container": kind,
                 "smart_ptr": kind,
-                "ownership": "SHARED",
+                "ownership": ownership,
                 "element_type": stl_info.get("element_type_name"),
                 "status": "MEMORY_NOT_CAPTURED",
                 "is_null": True,
@@ -390,6 +595,7 @@ class CppContainerDecoder:
                 "target": None,
                 "use_count": None,
                 "weak_count": None,
+                "error": f"Failed to read {kind} header at 0x{address:x}: {st}",
             }
 
         target_ptr = struct.unpack(ptr_fmt, raw[:ptr_size])[0]
@@ -398,34 +604,56 @@ class CppContainerDecoder:
 
         use_count = None
         weak_count = None
-        cb_status = "NULL_CONTROL_BLOCK" if cb_ptr == 0 else "COMPLETE"
+        status = "COMPLETE"
+        err = None
 
         # Control block inspection: in libstdc++, _Sp_counted_base has _vptr (8B), _M_use_count (4B), _M_weak_count (4B)
-        if cb_ptr != 0 and cb_ptr >= 0x1000:
-            cb_raw, _ = read_fn(cb_ptr, 16)
+        if cb_ptr == 0:
+            if not is_null:
+                status = "CORRUPTED_BOUNDARIES"
+                cb_status = "NULL_CONTROL_BLOCK"
+                err = "Non-null smart pointer has null control block"
+            else:
+                cb_status = "NULL_CONTROL_BLOCK"
+        elif cb_ptr < 0x1000:
+            cb_status = "INVALID_POINTER"
+            status = "INVALID_POINTER"
+            err = f"Invalid control block pointer 0x{cb_ptr:x}"
+        else:
+            cb_raw, cb_st = read_fn(cb_ptr, 16)
             if cb_raw and len(cb_raw) >= 16:
                 int_fmt = "<i" if endian == "little" else ">i"
                 use_count = struct.unpack(int_fmt, cb_raw[8:12])[0]
                 weak_count = struct.unpack(int_fmt, cb_raw[12:16])[0]
-                cb_status = "OBSERVED"
+                if use_count < 0 or use_count > 10_000_000 or weak_count < 0 or weak_count > 10_000_000:
+                    cb_status = "CORRUPTED_CONTROL_BLOCK"
+                    status = "CORRUPTED_CONTROL_BLOCK"
+                    err = f"Corrupted control block refcounts: use={use_count}, weak={weak_count}"
+                else:
+                    cb_status = "OBSERVED"
             else:
-                cb_status = "MEMORY_NOT_CAPTURED"
+                cb_status = "UNKNOWN_CONTROL_BLOCK"
+                status = "UNKNOWN_CONTROL_BLOCK"
+                err = f"Failed to read control block at 0x{cb_ptr:x}: {cb_st}"
 
         elem_type_off = stl_info.get("element_type_offset")
         target_val = None
-        status = "COMPLETE"
-        if not is_null:
+        if not is_null and status == "COMPLETE":
             if target_ptr < 0x1000:
                 status = "INVALID_POINTER"
+                err = f"Invalid target pointer 0x{target_ptr:x}"
             elif depth < max_depth and decode_elem_fn and elem_type_off is not None:
                 target_val = decode_elem_fn(target_ptr, elem_type_off, depth + 1)
+                if target_val is None:
+                    status = "ELEMENT_READ_FAILED"
+                    err = f"Failed to decode pointee at 0x{target_ptr:x}"
 
         is_expired = (use_count == 0) if (kind == "std::weak_ptr" and use_count is not None) else False
 
-        return {
+        res = {
             "container": kind,
             "smart_ptr": kind,
-            "ownership": "SHARED",
+            "ownership": ownership,
             "element_type": stl_info.get("element_type_name"),
             "is_null": is_null,
             "ptr": hex(target_ptr),
@@ -443,6 +671,9 @@ class CppContainerDecoder:
                 "weak_ref_count": weak_count,
             },
         }
+        if err:
+            res["error"] = err
+        return res
 
 
 class CppObjectDecoder:

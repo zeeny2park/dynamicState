@@ -96,6 +96,12 @@ class ObservationMetrics:
     wall_clock_elapsed_ms: float = 0.0
     is_budget_exhausted: bool = False
     exhaustion_reason: Optional[str] = None
+    exhausted_dimension: Optional[str] = None
+    reserved_bytes: int = 0
+    reserved_samples: int = 0
+    reserved_wall_clock_ms: float = 0.0
+    reserved_stop_ms: float = 0.0
+    active_reservations: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     profile_usage: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
@@ -199,18 +205,26 @@ class ObservationBudgetTracker:
         ceil = profile_ceiling or {}
         if profile_id and ceil:
             p_usage = self._get_or_init_profile_usage(profile_id)
+            p_reserved_bytes = sum(
+                r["estimated_bytes"] for r in self.metrics.active_reservations.values()
+                if r.get("profile_id") == profile_id
+            )
+            p_reserved_samples = sum(
+                r["estimated_samples"] for r in self.metrics.active_reservations.values()
+                if r.get("profile_id") == profile_id
+            )
             p_max_bytes = ceil.get("max_bytes_read", ceil.get("max_bytes"))
-            if p_max_bytes is not None and (p_usage["bytes_read"] + eff_bytes) > int(p_max_bytes):
+            if p_max_bytes is not None and (p_usage["bytes_read"] + p_reserved_bytes + eff_bytes) > int(p_max_bytes):
                 return (
                     False,
-                    f"EXCEEDED_PROFILE_BYTES_CEILING: profile '{profile_id}' current {p_usage['bytes_read']}B + estimated {eff_bytes}B > ceiling {int(p_max_bytes)}B",
+                    f"EXCEEDED_PROFILE_BYTES_CEILING: profile '{profile_id}' current {p_usage['bytes_read']}B + reserved {p_reserved_bytes}B + estimated {eff_bytes}B > ceiling {int(p_max_bytes)}B",
                     eff_bytes,
                 )
             p_max_samples = ceil.get("max_samples")
-            if p_max_samples is not None and (p_usage["samples_collected"] + max(0, estimated_samples)) > int(p_max_samples):
+            if p_max_samples is not None and (p_usage["samples_collected"] + p_reserved_samples + max(0, estimated_samples)) > int(p_max_samples):
                 return (
                     False,
-                    f"EXCEEDED_PROFILE_SAMPLES_CEILING: profile '{profile_id}' current {p_usage['samples_collected']} + estimated {estimated_samples} > ceiling {int(p_max_samples)}",
+                    f"EXCEEDED_PROFILE_SAMPLES_CEILING: profile '{profile_id}' current {p_usage['samples_collected']} + reserved {p_reserved_samples} + estimated {estimated_samples} > ceiling {int(p_max_samples)}",
                     eff_bytes,
                 )
             p_max_ms = ceil.get("max_wall_clock_ms", ceil.get("timeout_ms"))
@@ -228,38 +242,138 @@ class ObservationBudgetTracker:
                     eff_bytes,
                 )
 
-        # 3. Global remaining budget pre-check (never start an operation whose estimated cost exceeds remaining budget)
-        if (self.metrics.bytes_read + eff_bytes) > self.limits.max_bytes_read:
+        # 3. Global remaining budget pre-check (accounting for committed + currently reserved resources)
+        total_bytes = self.metrics.bytes_read + self.metrics.reserved_bytes + eff_bytes
+        if total_bytes > self.limits.max_bytes_read:
             reason = (
                 f"PRECHECK_EXCEEDED_BYTES_READ: current {self.metrics.bytes_read}B + "
+                f"reserved {self.metrics.reserved_bytes}B + "
                 f"{'conservative ' if used_conservative else ''}estimated {eff_bytes}B > max {self.limits.max_bytes_read}B"
             )
             return False, reason, eff_bytes
 
         cur_elapsed = self.elapsed_ms
-        if (cur_elapsed + max(0.0, estimated_latency_ms)) > self.limits.max_wall_clock_ms:
+        total_wall_ms = cur_elapsed + self.metrics.reserved_wall_clock_ms + max(0.0, estimated_latency_ms)
+        if total_wall_ms > self.limits.max_wall_clock_ms:
             reason = (
                 f"PRECHECK_EXCEEDED_WALL_CLOCK: elapsed {cur_elapsed:.1f}ms + "
+                f"reserved {self.metrics.reserved_wall_clock_ms:.1f}ms + "
                 f"estimated {estimated_latency_ms:.1f}ms > max {self.limits.max_wall_clock_ms:.1f}ms"
             )
             return False, reason, eff_bytes
 
-        if (self.metrics.samples_collected + max(0, estimated_samples)) > self.limits.max_samples:
+        total_samples = self.metrics.samples_collected + self.metrics.reserved_samples + max(0, estimated_samples)
+        if total_samples > self.limits.max_samples:
             reason = (
                 f"PRECHECK_EXCEEDED_MAX_SAMPLES: current {self.metrics.samples_collected} + "
+                f"reserved {self.metrics.reserved_samples} + "
                 f"estimated {estimated_samples} > max {self.limits.max_samples}"
             )
             return False, reason, eff_bytes
 
         if self.limits.max_target_stop_ms is not None:
-            if (self.metrics.target_stop_duration_ms + max(0.0, estimated_stop_ms)) > self.limits.max_target_stop_ms:
+            total_stop = self.metrics.target_stop_duration_ms + self.metrics.reserved_stop_ms + max(0.0, estimated_stop_ms)
+            if total_stop > self.limits.max_target_stop_ms:
                 reason = (
                     f"PRECHECK_EXCEEDED_TARGET_STOP: current {self.metrics.target_stop_duration_ms:.2f}ms + "
+                    f"reserved {self.metrics.reserved_stop_ms:.2f}ms + "
                     f"estimated {estimated_stop_ms:.2f}ms > max {self.limits.max_target_stop_ms:.2f}ms"
                 )
                 return False, reason, eff_bytes
 
         return True, None, eff_bytes
+
+    def reserve(
+        self,
+        estimated_bytes: Optional[int] = None,
+        estimated_latency_ms: float = 0.0,
+        estimated_samples: int = 1,
+        estimated_stop_ms: float = 0.0,
+        profile_id: Optional[str] = None,
+        profile_ceiling: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Reserves budget before an expensive observation operation to prevent concurrent/replanned overspending.
+
+        Returns:
+            (allowed, rejection_reason, reservation_id)
+        """
+        ok, reason, eff_bytes = self.check_pre_execution(
+            estimated_bytes=estimated_bytes,
+            estimated_latency_ms=estimated_latency_ms,
+            estimated_samples=estimated_samples,
+            estimated_stop_ms=estimated_stop_ms,
+            profile_id=profile_id,
+            profile_ceiling=profile_ceiling,
+        )
+        if not ok:
+            self.record_rejection(profile_id, reason or "BUDGET_REJECTED")
+            return False, reason, None
+
+        import uuid
+        res_id = f"res_{uuid.uuid4().hex[:12]}"
+        reservation = {
+            "reservation_id": res_id,
+            "profile_id": profile_id,
+            "profile_ceiling": profile_ceiling,
+            "estimated_bytes": eff_bytes,
+            "estimated_latency_ms": max(0.0, estimated_latency_ms),
+            "estimated_samples": max(0, estimated_samples),
+            "estimated_stop_ms": max(0.0, estimated_stop_ms),
+            "created_at_ms": self.elapsed_ms,
+        }
+        self.metrics.active_reservations[res_id] = reservation
+        self.metrics.reserved_bytes += eff_bytes
+        self.metrics.reserved_samples += max(0, estimated_samples)
+        self.metrics.reserved_wall_clock_ms += max(0.0, estimated_latency_ms)
+        self.metrics.reserved_stop_ms += max(0.0, estimated_stop_ms)
+
+        return True, None, res_id
+
+    def release_reservation(self, reservation_id: str) -> bool:
+        """Releases an unused budget reservation without charging the budget."""
+        reservation = self.metrics.active_reservations.pop(reservation_id, None)
+        if not reservation:
+            return False
+
+        self.metrics.reserved_bytes = max(0, self.metrics.reserved_bytes - reservation["estimated_bytes"])
+        self.metrics.reserved_samples = max(0, self.metrics.reserved_samples - reservation["estimated_samples"])
+        self.metrics.reserved_wall_clock_ms = max(0.0, self.metrics.reserved_wall_clock_ms - reservation["estimated_latency_ms"])
+        self.metrics.reserved_stop_ms = max(0.0, self.metrics.reserved_stop_ms - reservation["estimated_stop_ms"])
+        return True
+
+    def reconcile_reservation(
+        self,
+        reservation_id: str,
+        actual_bytes_read: Optional[int] = None,
+        latency_us: float = 0.0,
+        stop_ms: float = 0.0,
+        is_failure: bool = False,
+        consistency_level: Optional[str] = None,
+        physical_reads: int = 0,
+    ) -> Dict[str, Any]:
+        """Reconciles reservation against actual measured consumption and releases unused reserved amounts."""
+        reservation = self.metrics.active_reservations.pop(reservation_id, None)
+        if reservation:
+            self.metrics.reserved_bytes = max(0, self.metrics.reserved_bytes - reservation["estimated_bytes"])
+            self.metrics.reserved_samples = max(0, self.metrics.reserved_samples - reservation["estimated_samples"])
+            self.metrics.reserved_wall_clock_ms = max(0.0, self.metrics.reserved_wall_clock_ms - reservation["estimated_latency_ms"])
+            self.metrics.reserved_stop_ms = max(0.0, self.metrics.reserved_stop_ms - reservation["estimated_stop_ms"])
+            profile_id = reservation.get("profile_id")
+            profile_ceiling = reservation.get("profile_ceiling")
+        else:
+            profile_id = None
+            profile_ceiling = None
+
+        return self.record_read(
+            bytes_read=actual_bytes_read,
+            latency_us=latency_us,
+            stop_ms=stop_ms,
+            is_failure=is_failure,
+            consistency_level=consistency_level,
+            profile_id=profile_id,
+            profile_ceiling=profile_ceiling,
+            physical_reads=physical_reads,
+        )
 
     def record_rejection(self, profile_id: Optional[str], reason: str) -> None:
         """Records a pre-execution budget rejection without fabricating a read or sample."""
@@ -425,6 +539,7 @@ class ObservationBudgetTracker:
 
         if cur_elapsed >= self.limits.max_wall_clock_ms:
             self.metrics.is_budget_exhausted = True
+            self.metrics.exhausted_dimension = "WALL_CLOCK"
             self.metrics.exhaustion_reason = (
                 f"EXCEEDED_WALL_CLOCK: elapsed {cur_elapsed:.1f}ms >= max {self.limits.max_wall_clock_ms:.1f}ms"
             )
@@ -432,6 +547,7 @@ class ObservationBudgetTracker:
 
         if self.metrics.bytes_read >= self.limits.max_bytes_read:
             self.metrics.is_budget_exhausted = True
+            self.metrics.exhausted_dimension = "BYTES_READ"
             self.metrics.exhaustion_reason = (
                 f"EXCEEDED_BYTES_READ: read {self.metrics.bytes_read} >= max {self.limits.max_bytes_read}"
             )
@@ -439,6 +555,7 @@ class ObservationBudgetTracker:
 
         if self.metrics.consecutive_read_failures >= self.limits.max_consecutive_read_failures:
             self.metrics.is_budget_exhausted = True
+            self.metrics.exhausted_dimension = "CONSECUTIVE_FAILURES"
             self.metrics.exhaustion_reason = (
                 f"EXCEEDED_CONSECUTIVE_FAILURES: consecutive {self.metrics.consecutive_read_failures} "
                 f">= max {self.limits.max_consecutive_read_failures}"
@@ -447,6 +564,7 @@ class ObservationBudgetTracker:
 
         if self.metrics.total_read_failures >= self.limits.max_total_read_failures:
             self.metrics.is_budget_exhausted = True
+            self.metrics.exhausted_dimension = "TOTAL_FAILURES"
             self.metrics.exhaustion_reason = (
                 f"EXCEEDED_TOTAL_FAILURES: total {self.metrics.total_read_failures} "
                 f">= max {self.limits.max_total_read_failures}"
@@ -455,6 +573,7 @@ class ObservationBudgetTracker:
 
         if self.metrics.samples_collected >= self.limits.max_samples:
             self.metrics.is_budget_exhausted = True
+            self.metrics.exhausted_dimension = "MAX_SAMPLES"
             self.metrics.exhaustion_reason = (
                 f"EXCEEDED_MAX_SAMPLES: samples {self.metrics.samples_collected} >= max {self.limits.max_samples}"
             )
@@ -462,6 +581,7 @@ class ObservationBudgetTracker:
 
         if self.limits.max_target_stop_ms is not None and self.metrics.target_stop_duration_ms > self.limits.max_target_stop_ms:
             self.metrics.is_budget_exhausted = True
+            self.metrics.exhausted_dimension = "TARGET_STOP"
             self.metrics.exhaustion_reason = (
                 f"EXCEEDED_TARGET_STOP_DURATION: stop {self.metrics.target_stop_duration_ms:.2f}ms "
                 f"> max {self.limits.max_target_stop_ms:.2f}ms"

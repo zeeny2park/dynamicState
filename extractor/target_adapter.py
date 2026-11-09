@@ -2093,3 +2093,70 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "collector_path": None,
             "reason": f"Failed deploying collector to {dest}: {err_up.strip() or out_up.strip()}",
         }
+
+
+# Backward-compatible aliases and models for test suites
+ReadOnlyTargetAdapter = LocalTargetAdapter
+RemoteTargetAdapter = RemoteSshTargetAdapter
+
+STATUS_OWNER_IDENTIFIED = "OWNER_IDENTIFIED"
+STATUS_OWNER_NOT_IDENTIFIED = "OWNER_NOT_IDENTIFIED"
+STATUS_MUTEX_LAYOUT_UNSUPPORTED = "MUTEX_LAYOUT_UNSUPPORTED"
+STATUS_MUTEX_STATE_INVALID = "MUTEX_STATE_INVALID"
+STATUS_MEMORY_READ_UNAVAILABLE = "MEMORY_READ_UNAVAILABLE"
+STATUS_PERMISSION_DENIED = "PERMISSION_DENIED"
+LAYOUT_GLIBC_LP64 = "GLIBC_LP64"
+
+# Libc / ABI Verification Statuses
+ABI_GLIBC_VERIFIED = "GLIBC_ABI_VERIFIED"
+ABI_MUSL_UNSUPPORTED = "MUSL_UNSUPPORTED"
+ABI_LIBC_UNKNOWN = "LIBC_UNKNOWN"
+ABI_STATIC_OR_UNIDENTIFIED = "STATIC_OR_UNIDENTIFIED_RUNTIME"
+ABI_ARCH_UNSUPPORTED = "ARCH_UNSUPPORTED"
+ABI_ELF_CLASS_UNSUPPORTED = "ELF_CLASS_UNSUPPORTED"
+ABI_ENDIANNESS_UNSUPPORTED = "ENDIANNESS_UNSUPPORTED"
+
+IDENTITY_VERIFIED = "IDENTITY_VERIFIED"
+IDENTITY_UNAVAILABLE = "IDENTITY_UNAVAILABLE"
+IDENTITY_INCONSISTENT = "IDENTITY_INCONSISTENT"
+IDENTITY_UNVERIFIED = "IDENTITY_UNVERIFIED"
+
+
+def normalize_futex_address(val: Any) -> Tuple[Optional[str], Optional[int], str, Any]:
+    raw_arg = val
+    if val is None:
+        return None, None, "UNAVAILABLE", None
+    if isinstance(val, bool):
+        return None, None, "INVALID_ADDRESS", raw_arg
+    if isinstance(val, int):
+        if val <= 0:
+            return None, None, "INVALID_ADDRESS", raw_arg
+        return f"0x{val:x}", val, "WAIT_ADDRESS_OBSERVED", raw_arg
+    if isinstance(val, str):
+        v = val.strip()
+        if not v or v in ("0", "0x0", "0x_lock", "0x_futex_lock") or "lock" in v.lower():
+            return None, None, "INVALID_ADDRESS", raw_arg
+        try:
+            if v.startswith("0x") or v.startswith("0X"):
+                i_val = int(v, 16)
+            elif v.startswith("-"):
+                return None, None, "INVALID_ADDRESS", raw_arg
+            else:
+                i_val = int(v, 10)
+            if i_val <= 0:
+                return None, None, "INVALID_ADDRESS", raw_arg
+            return f"0x{i_val:x}", i_val, "WAIT_ADDRESS_OBSERVED", raw_arg
+        except (ValueError, TypeError):
+            return None, None, "INVALID_ADDRESS", raw_arg
+    return None, None, "INVALID_ADDRESS", raw_arg
+
+
+@dataclass
+class MutexOwnerResolutionResult:
+    status: str = STATUS_OWNER_NOT_IDENTIFIED
+    owner_tid: Optional[int] = None
+    layout_id: Optional[str] = None
+    raw_bytes: Optional[bytes] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    owner_name: Optional[str] = None
+    error: Optional[str] = None

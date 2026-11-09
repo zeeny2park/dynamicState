@@ -83,7 +83,7 @@ class LifecycleAwareObjectMatcher(ObjectMatcher):
 
 class StateDiffEngine:
     def __init__(self, matcher: Optional[ObjectMatcher] = None):
-        self.matcher = matcher or AddressTypeObjectMatcher()
+        self.matcher = matcher or LifecycleAwareObjectMatcher()
 
     def diff(self, before: Any, after: Any) -> StateDiff:
         start = time.monotonic()
@@ -271,7 +271,7 @@ class StateDiffEngine:
             "total_changes": len(changes),
             "objects_created": sum(c["kind"] in ("object_created", "object_reallocated_at_same_address") for c in changes),
             "objects_removed": sum(c["kind"] in ("object_removed", "object_reallocated_at_same_address") for c in changes),
-            "address_reuses": sum(bool(c.get("address_reuse")) for c in changes),
+            "address_reuses": len({str(c.get("address")) for c in changes if c.get("address_reuse")}),
             "fields_added": sum(c["kind"] == "field_added" for c in changes),
             "fields_unavailable": sum(c["kind"] == "field_unavailable" for c in changes),
             "availability_changes": sum(c["kind"] == "availability_change" for c in changes),

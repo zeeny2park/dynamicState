@@ -138,7 +138,7 @@ class TestPhase22TemporalObjectIdentity(unittest.TestCase):
             ]
         }
         diff = self.engine.diff(snap_a, snap_b)
-        self.assertEqual(diff.summary["address_reuses"], 2)  # removed old + created new at reused address
+        self.assertEqual(diff.summary["address_reuses"], 1)  # Distinct address reuse count
         new_chg = next((c for c in diff.changes if c["kind"] == "object_created"), None)
         self.assertIsNotNone(new_chg)
         self.assertTrue(new_chg.get("address_reuse"))
