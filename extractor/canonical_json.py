@@ -12,7 +12,7 @@ Compliant with RFC 8785 / ECMAScript 6 (ES6) specifications:
   - Exponential notation boundaries: 1e-6 -> 0.000001, 1e-7 -> 1e-7, 1e20 -> 100000000000000000000, 1e21 -> 1e+21.
   - Exponents without leading zeros (1e+21, 1e-7).
   - Floating-point integers serialized without decimal point (1.0 -> 1).
-  - Integer range validation: integers outside [-2^64+1, 2^64-1] rejected with ValueError.
+  - Integer range validation: integers outside safe IEEE 754 range [-(2^53-1), 2^53-1] rejected with ValueError.
 - Strings:
   - Standard JSON escaping for control characters (U+0000..U+001F), backslash, and double quote.
   - Literal UTF-8 characters for U+0020 and above.
@@ -28,11 +28,23 @@ import math
 from typing import Any, List, Union
 
 
+IEEE754_MAX_SAFE_INTEGER: int = 9007199254740991  # 2**53 - 1
+IEEE754_MIN_SAFE_INTEGER: int = -9007199254740991  # -(2**53 - 1)
+
+
 def convert2Es6Format(value: Union[int, float]) -> str:
     """Convert float/double or int to ECMAScript 6 ToString(Number) canonical format.
 
     Implements exact ES6 IEEE 754 shortest round-trip representation per RFC 8785 Section 3.2.2.3.
+    Rejects integers outside the IEEE 754 double precision exact range [-(2^53-1), 2^53-1].
     """
+    if isinstance(value, int) and not isinstance(value, bool):
+        if not (IEEE754_MIN_SAFE_INTEGER <= value <= IEEE754_MAX_SAFE_INTEGER):
+            raise ValueError(
+                f"RFC 8785 rejects integer outside IEEE 754 safe integer range [-(2^53-1), 2^53-1]: {value}"
+            )
+        return str(value)
+
     fvalue = float(value)
 
     # Negative zero (-0.0) and zero are serialized as '0'
@@ -115,8 +127,10 @@ def rfc8785_canonical_json(obj: Any) -> bytes:
             # Must check bool before int because bool subclasses int in Python
             chunks.append(b"true" if v else b"false")
         elif isinstance(v, int):
-            if abs(v) >= 2**64:
-                raise ValueError(f"RFC 8785 rejects integer outside 64-bit domain: {v}")
+            if not (IEEE754_MIN_SAFE_INTEGER <= v <= IEEE754_MAX_SAFE_INTEGER):
+                raise ValueError(
+                    f"RFC 8785 rejects integer outside IEEE 754 safe integer range [-(2^53-1), 2^53-1]: {v}"
+                )
             chunks.append(str(v).encode("ascii"))
         elif isinstance(v, float):
             if math.isnan(v) or math.isinf(v):

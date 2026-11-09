@@ -43,6 +43,7 @@ from .evidence_ledger import (
     is_atomic_or_stopped_consistency,
     is_exact_semantic_path_match,
     find_matching_diff_changes,
+    strip_sensitive_session_secrets,
     ATTRIBUTION_BASIS_CALL_STACK,
     ATTRIBUTION_BASIS_EXECUTION_TRACE,
     ATTRIBUTION_BASIS_SINGLE_WRITER,
@@ -453,7 +454,7 @@ class InvestigationSession:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to JSON-serializable dictionary."""
-        return {
+        return strip_sensitive_session_secrets({
             "investigation_id": self.investigation_id,
             "goal": self.goal,
             "status": self.status,
@@ -482,7 +483,7 @@ class InvestigationSession:
             "state_transitions": self.state_machine.transitions,
             "executed_observation_keys": sorted(self.executed_observation_keys),
             "budget_usage": self.budget_tracker.to_dict(),
-        }
+        })
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], corpus: Optional[StateCorpus] = None) -> "InvestigationSession":
@@ -3515,7 +3516,7 @@ class InvestigationManager:
             ),
         }
 
-        return {
+        return strip_sensitive_session_secrets({
             "investigation_id": session.investigation_id,
             "goal": session.goal,
             "status": session.status,
@@ -3588,7 +3589,7 @@ class InvestigationManager:
                 title=f"dynamicState Investigation: {session.goal[:40]}",
                 remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
             ),
-        }
+        })
 
     def export_html_report(self, investigation_id: str, output_path: str) -> bool:
         """Exports the Zero-CDN standalone HTML investigation report to a validated disk path."""

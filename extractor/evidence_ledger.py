@@ -131,9 +131,9 @@ class ControlledExecutionResult:
     def verify_authenticity(self, session_secret: str, allow_legacy: bool = True) -> bool:
         """Verify the cryptographic authenticity of this execution receipt against session secret.
         
-        Enforces strict signature version compliance:
+        Enforces strict signature version compliance and legacy migration policy:
         - 'v2_rfc8785': Verified strictly using RFC 8785 canonical JSON HMAC-SHA256. Fails closed without implicit downgrade.
-        - 'v1_legacy': Verified using legacy delimiter HMAC-SHA256 only when explicitly allowed.
+        - 'v1_legacy', 'v1_legacy_unversioned': Verified using legacy delimiter HMAC-SHA256 only when explicitly allowed.
         - Any unrecognized version fails closed.
         """
         if not self.receipt_signature:
@@ -145,7 +145,7 @@ class ControlledExecutionResult:
                 return hmac.compare_digest(self.receipt_signature, expected_v2)
             except Exception:
                 return False
-        elif sig_ver == "v1_legacy":
+        elif sig_ver in ("v1_legacy", "v1_legacy_unversioned"):
             if not allow_legacy:
                 return False
             try:
@@ -186,14 +186,115 @@ class ControlledExecutionResult:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ControlledExecutionResult":
-        """Reconstruct ControlledExecutionResult from dictionary."""
+        """Reconstruct ControlledExecutionResult from dictionary.
+        
+        Legacy migration policy:
+        - If 'signature_version' is present, it is preserved ('v2_rfc8785', 'v1_legacy', etc.).
+        - If 'signature_version' is missing or empty (historical record), it is marked
+          as 'v1_legacy_unversioned' so that it can only be verified via explicit legacy policy
+          and cannot be confused with modern v2 receipts.
+        """
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict for ControlledExecutionResult, got {type(data).__name__}")
         allowed = cls.__dataclass_fields__.keys()
         filtered = {k: v for k, v in data.items() if k in allowed}
+        if "signature_version" not in filtered or not filtered["signature_version"]:
+            filtered["signature_version"] = "v1_legacy_unversioned"
         if "verified_claims" in filtered and filtered["verified_claims"] is not None:
             filtered["verified_claims"] = tuple(filtered["verified_claims"])
         return cls(**filtered)
+
+
+def migrate_legacy_execution_result(
+    result: "ControlledExecutionResult",
+    session_secret: str,
+) -> "ControlledExecutionResult":
+    """Migrate a legitimate historical legacy execution receipt to RFC 8785 v2 format.
+
+    Validates historical authenticity using legacy v1 verification. If authentic,
+    re-signs the structured payload using RFC 8785 JCS HMAC-SHA256 and sets
+    signature_version='v2_rfc8785'. If unauthentic or tampered, raises ValueError.
+    """
+    if not result.verify_authenticity(session_secret, allow_legacy=True):
+        raise ValueError(
+            f"Cannot migrate legacy execution receipt '{result.execution_id}': authenticity verification failed"
+        )
+    res_temp = ControlledExecutionResult(
+        execution_id=result.execution_id,
+        investigation_id=result.investigation_id,
+        target_function=result.target_function,
+        field_path=result.field_path,
+        before_value=result.before_value,
+        after_value=result.after_value,
+        execution_status=result.execution_status,
+        capture_quality=dict(result.capture_quality) if isinstance(result.capture_quality, dict) else {},
+        target_identity=dict(result.target_identity) if isinstance(result.target_identity, dict) else None,
+        hypothesis_id=result.hypothesis_id,
+        evidence_id=result.evidence_id,
+        before_snapshot_ref=result.before_snapshot_ref,
+        after_snapshot_ref=result.after_snapshot_ref,
+        before_snapshot_hash=result.before_snapshot_hash,
+        after_snapshot_hash=result.after_snapshot_hash,
+        backend_type=result.backend_type,
+        provenance_class=result.provenance_class,
+        function_attribution_verified=result.function_attribution_verified,
+        attribution_basis=result.attribution_basis,
+        attribution_limitation=result.attribution_limitation,
+        verified_claims=result.verified_claims,
+        executed_at=result.executed_at,
+        receipt_signature="",
+        signature_version="v2_rfc8785",
+    )
+    sig_v2 = compute_receipt_signature(session_secret, res_temp)
+    return ControlledExecutionResult(
+        execution_id=res_temp.execution_id,
+        investigation_id=res_temp.investigation_id,
+        target_function=res_temp.target_function,
+        field_path=res_temp.field_path,
+        before_value=res_temp.before_value,
+        after_value=res_temp.after_value,
+        execution_status=res_temp.execution_status,
+        capture_quality=res_temp.capture_quality,
+        target_identity=res_temp.target_identity,
+        hypothesis_id=res_temp.hypothesis_id,
+        evidence_id=res_temp.evidence_id,
+        before_snapshot_ref=res_temp.before_snapshot_ref,
+        after_snapshot_ref=res_temp.after_snapshot_ref,
+        before_snapshot_hash=res_temp.before_snapshot_hash,
+        after_snapshot_hash=res_temp.after_snapshot_hash,
+        backend_type=res_temp.backend_type,
+        provenance_class=res_temp.provenance_class,
+        function_attribution_verified=res_temp.function_attribution_verified,
+        attribution_basis=res_temp.attribution_basis,
+        attribution_limitation=res_temp.attribution_limitation,
+        verified_claims=res_temp.verified_claims,
+        executed_at=res_temp.executed_at,
+        receipt_signature=sig_v2,
+        signature_version="v2_rfc8785",
+    )
+
+
+def strip_sensitive_session_secrets(obj: Any) -> Any:
+    """Recursively strip raw session secrets and bearer tokens from data structures.
+
+    Targeted specifically to prevent leaking raw session secrets and raw bearer tokens
+    through nested dictionary or list structures, without removing legitimate fields.
+    """
+    if isinstance(obj, dict):
+        cleaned = {}
+        for k, v in obj.items():
+            if k in ("session_secret", "_session_secret", "raw_session_secret"):
+                continue
+            if k == "token" and isinstance(v, str) and len(v) in (32, 64):
+                # Raw token hex in verifier_attestation
+                continue
+            cleaned[k] = strip_sensitive_session_secrets(v)
+        return cleaned
+    elif isinstance(obj, list):
+        return [strip_sensitive_session_secrets(elem) for elem in obj]
+    elif isinstance(obj, tuple):
+        return tuple(strip_sensitive_session_secrets(elem) for elem in obj)
+    return obj
 
 
 def canonicalize_receipt_value(val: Any) -> str:
@@ -767,20 +868,19 @@ class EvidenceRecord:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary without None values for optional fields."""
-        prov_copy = dict(self.provenance) if self.provenance else {}
-        prov_copy.pop("session_secret", None)
+        prov_copy = strip_sensitive_session_secrets(dict(self.provenance)) if self.provenance else {}
         if "verifier_attestation" in prov_copy and isinstance(prov_copy["verifier_attestation"], dict):
             safe_att = dict(prov_copy["verifier_attestation"])
             safe_att.pop("token", None)
-            safe_att.pop("session_secret", None)
             prov_copy["verifier_attestation"] = safe_att
         if "live_capture_receipt" in prov_copy and hasattr(prov_copy["live_capture_receipt"], "to_dict"):
             prov_copy["live_capture_receipt"] = prov_copy["live_capture_receipt"].to_dict()
 
-        details_copy = dict(self.details) if self.details else {}
-        details_copy.pop("session_secret", None)
+        details_copy = strip_sensitive_session_secrets(dict(self.details)) if self.details else {}
         if "live_capture_receipt" in details_copy and hasattr(details_copy["live_capture_receipt"], "to_dict"):
             details_copy["live_capture_receipt"] = details_copy["live_capture_receipt"].to_dict()
+
+        obs_copy = strip_sensitive_session_secrets(self.observation) if isinstance(self.observation, (dict, list)) else self.observation
 
         data: Dict[str, Any] = {
             "evidence_id": self.evidence_id,
@@ -788,7 +888,7 @@ class EvidenceRecord:
             "nature": self.nature,
             "source": self.source,
             "timestamp": self.timestamp,
-            "observation": self.observation,
+            "observation": obs_copy,
             "parent_evidence_ids": list(self.parent_evidence_ids),
             "schema_version": self.schema_version,
             "provenance": prov_copy,
@@ -2122,9 +2222,27 @@ class EvidenceLedger:
 
         return []
 
+    def migrate_legacy_evidence(self, evidence_id: str) -> bool:
+        """Migrate a stored legacy execution record to v2 RFC 8785 format in-place."""
+        with self._lock:
+            rec = self.get_record(evidence_id)
+            if not rec or not rec.provenance:
+                return False
+            exec_dict = rec.provenance.get("controlled_execution_result")
+            if not exec_dict or not isinstance(exec_dict, dict):
+                return False
+            exec_res = ControlledExecutionResult.from_dict(exec_dict)
+            if getattr(exec_res, "signature_version", None) in ("v1_legacy", "v1_legacy_unversioned"):
+                migrated_res = migrate_legacy_execution_result(exec_res, self.session_secret)
+                rec.provenance["controlled_execution_result"] = migrated_res.to_dict()
+                if isinstance(rec.details, dict) and "controlled_execution_result" in rec.details:
+                    rec.details["controlled_execution_result"] = migrated_res.to_dict()
+                return True
+            return False
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize full ledger to dictionary."""
-        return {
+        return strip_sensitive_session_secrets({
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "created_at": self.created_at,
@@ -2135,7 +2253,7 @@ class EvidenceLedger:
             "operation_to_receipt_id": dict(getattr(self, "_operation_to_receipt_id", {})),
             "used_operation_ids": getattr(self, "_used_operation_ids", {}),
             "records": [r.to_dict() for r in self._records],
-        }
+        })
 
     def to_json(self, indent: Optional[int] = 2) -> str:
         """Serialize ledger to JSON string."""
