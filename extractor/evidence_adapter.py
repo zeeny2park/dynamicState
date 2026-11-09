@@ -137,6 +137,7 @@ class EvidenceAdapter:
 
     def __init__(self, default_provenance_class: str = PROVENANCE_CLASS_IMPORTED_UNVERIFIED):
         self.default_provenance_class = default_provenance_class
+        self._used_execution_ids: Set[str] = set()
 
     def _resolve_provenance_class(
         self,
@@ -148,6 +149,7 @@ class EvidenceAdapter:
         execution_result: Optional[Any] = None,
         session_secret: Optional[str] = None,
         ledger: Optional[Any] = None,
+        evidence_id: Optional[str] = None,
     ) -> str:
         """Resolves provenance class with fail-closed trust boundaries.
 
@@ -213,11 +215,14 @@ class EvidenceAdapter:
                 or p_dict.get("controlled_execution_result")
                 or prov_dict.get("controlled_execution_result")
             )
-            from .evidence_ledger import ControlledExecutionResult, is_atomic_or_stopped_consistency
+            from .evidence_ledger import (
+                ControlledExecutionResult,
+                is_atomic_or_stopped_consistency,
+                validate_controlled_execution_target_identity,
+            )
             if isinstance(cand_res, dict):
                 try:
-                    allowed = ControlledExecutionResult.__dataclass_fields__.keys()
-                    cand_res = ControlledExecutionResult(**{k: v for k, v in cand_res.items() if k in allowed})
+                    cand_res = ControlledExecutionResult.from_dict(cand_res)
                 except Exception:
                     cand_res = None
 
@@ -233,19 +238,26 @@ class EvidenceAdapter:
             if not cand_res.investigation_id or (eff_sess_id and str(cand_res.investigation_id) != str(eff_sess_id)):
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
-            res_tid = cand_res.target_identity or {}
-            if t_ident.get("pid") is not None and res_tid.get("pid") is not None:
-                if int(t_ident["pid"]) != int(res_tid["pid"]):
-                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-            if t_ident.get("build_id") and res_tid.get("build_id"):
-                if str(t_ident["build_id"]).strip().lower() != str(res_tid["build_id"]).strip().lower():
-                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-            if t_ident.get("process_identity") and res_tid.get("process_identity"):
-                if str(t_ident["process_identity"]).strip() != str(res_tid["process_identity"]).strip():
-                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-            if t_ident.get("executable_identity") and res_tid.get("executable_identity"):
-                if str(t_ident["executable_identity"]).strip() != str(res_tid["executable_identity"]).strip():
-                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            # Target identity validation (fail closed on missing fields, empty strings, or mismatches)
+            ok_tid, _ = validate_controlled_execution_target_identity(t_ident, cand_res.target_identity)
+            if not ok_tid:
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            # Scope binding: target_function and field_path must be non-empty strings
+            if not cand_res.target_function or not str(cand_res.target_function).strip():
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            if not cand_res.field_path or not str(cand_res.field_path).strip():
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            # Evidence ID binding
+            eff_eid = evidence_id or p_dict.get("evidence_id")
+            if cand_res.evidence_id and eff_eid and str(cand_res.evidence_id) != str(eff_eid):
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            # Hypothesis ID binding
+            eff_hypo = p_dict.get("hypothesis_id") or prov_dict.get("hypothesis_id")
+            if cand_res.hypothesis_id and eff_hypo and str(cand_res.hypothesis_id) != str(eff_hypo):
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
             if cand_res.execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
@@ -256,7 +268,11 @@ class EvidenceAdapter:
             if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
-            if not cand_res.target_function or not cand_res.field_path:
+            # Single-use execution receipt consumption check
+            if ledger is not None and hasattr(ledger, "_used_execution_ids"):
+                if cand_res.execution_id in ledger._used_execution_ids:
+                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            elif hasattr(self, "_used_execution_ids") and cand_res.execution_id in self._used_execution_ids:
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
             return PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
@@ -687,6 +703,7 @@ class EvidenceAdapter:
         eff_secret = session_secret or (getattr(ledger, "session_secret", None) if ledger is not None else None)
         eff_session_id = session_id or (getattr(ledger, "session_id", None) if ledger is not None else None)
 
+        cand_ev_id = evidence_id or tool_result.get("evidence_id")
         prov_cls = self._resolve_provenance_class(
             payload=tool_result,
             target_identity=eff_target,
@@ -695,6 +712,7 @@ class EvidenceAdapter:
             execution_result=cand_exec,
             session_secret=eff_secret,
             ledger=ledger,
+            evidence_id=cand_ev_id,
         )
         timestamp = datetime.now(timezone.utc).isoformat()
         digest, size_bytes = compute_payload_digest(tool_result)
@@ -839,12 +857,11 @@ class EvidenceAdapter:
             exec_obj = cand_exec
             if isinstance(exec_obj, dict):
                 try:
-                    allowed = ControlledExecutionResult.__dataclass_fields__.keys()
-                    exec_obj = ControlledExecutionResult(**{k: v for k, v in exec_obj.items() if k in allowed})
+                    exec_obj = ControlledExecutionResult.from_dict(exec_obj)
                 except Exception:
                     pass
             if isinstance(exec_obj, ControlledExecutionResult):
-                prov_dict["controlled_execution_result"] = asdict(exec_obj)
+                prov_dict["controlled_execution_result"] = exec_obj.to_dict()
                 compact_details["execution_provenance"] = {
                     "execution_id": exec_obj.execution_id,
                     "target_function": exec_obj.target_function,
@@ -853,7 +870,42 @@ class EvidenceAdapter:
                 }
                 compact_details["target_function"] = exec_obj.target_function
                 compact_details["field_path"] = exec_obj.field_path
-                if eff_secret and eff_session_id:
+
+                cap = None
+                if ledger is not None and hasattr(ledger, "issue_verification_capability"):
+                    try:
+                        cap = ledger.issue_verification_capability(
+                            evidence_id=eff_ev_id,
+                            target_function=exec_obj.target_function,
+                            field_path=exec_obj.field_path,
+                            hypothesis_id=exec_obj.hypothesis_id,
+                            execution_result=exec_obj,
+                        )
+                        cap.consume()
+                    except Exception as ce:
+                        prov_dict["attestation_rejected"] = f"Capability issuance failed: {ce}"
+                        prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                        prov_dict.pop("verifier_attestation", None)
+                        prov_dict.pop("controlled_execution_result", None)
+                        compact_details.pop("execution_provenance", None)
+                elif eff_secret and eff_session_id:
+                    if hasattr(self, "_used_execution_ids"):
+                        if exec_obj.execution_id in self._used_execution_ids:
+                            prov_dict["attestation_rejected"] = f"Execution receipt '{exec_obj.execution_id}' has already been consumed"
+                            prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                            prov_dict.pop("verifier_attestation", None)
+                            prov_dict.pop("controlled_execution_result", None)
+                            compact_details.pop("execution_provenance", None)
+                        else:
+                            self._used_execution_ids.add(exec_obj.execution_id)
+                else:
+                    prov_dict["attestation_rejected"] = "Missing ledger or session secret for execution verification"
+                    prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                    prov_dict.pop("verifier_attestation", None)
+                    prov_dict.pop("controlled_execution_result", None)
+                    compact_details.pop("execution_provenance", None)
+
+                if prov_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION and eff_secret and eff_session_id:
                     temp_rec = EvidenceRecord(
                         evidence_id=eff_ev_id,
                         evidence_type=final_ev_type,
@@ -903,7 +955,10 @@ class EvidenceAdapter:
                         "verification_type": "controlled_runtime_reproduction",
                         "attested_at": datetime.now(timezone.utc).isoformat(),
                     }
-        else:
+
+        if prov_cls != PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
+            prov_dict["provenance_class"] = prov_cls
+            compact_details["provenance_class"] = prov_cls
             prov_dict.pop("verifier_attestation", None)
             prov_dict.pop("controlled_execution_result", None)
             if (
@@ -911,7 +966,8 @@ class EvidenceAdapter:
                 or (tool_result.get("provenance") or {}).get("verifier_attestation")
                 or tool_result.get("provenance_class") == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
             ):
-                prov_dict["attestation_rejected"] = "Unverified, caller-supplied, or malformed attestation claim stripped"
+                if "attestation_rejected" not in prov_dict:
+                    prov_dict["attestation_rejected"] = "Unverified, caller-supplied, or malformed attestation claim stripped"
 
         rec = EvidenceRecord(
             evidence_id=eff_ev_id,

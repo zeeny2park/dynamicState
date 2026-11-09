@@ -1631,6 +1631,7 @@ class AdaptiveInvestigationSession:
                 nature=eff_nature,
                 target_identity=t_ident,
                 session_id=self.ledger.session_id,
+                ledger=self.ledger,
                 epoch=getattr(self.plan, "current_step_index", 0) if self.plan else 0,
                 evidence_id=ev_id,
                 observation=observation_text,

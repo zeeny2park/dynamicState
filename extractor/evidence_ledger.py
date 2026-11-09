@@ -130,11 +130,64 @@ class ControlledExecutionResult:
         expected = compute_receipt_signature(session_secret, self)
         return hmac.compare_digest(self.receipt_signature, expected)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize ControlledExecutionResult into JSON-serializable dictionary."""
+        return {
+            "execution_id": self.execution_id,
+            "investigation_id": self.investigation_id,
+            "target_function": self.target_function,
+            "field_path": self.field_path,
+            "before_value": self.before_value,
+            "after_value": self.after_value,
+            "execution_status": self.execution_status,
+            "capture_quality": dict(self.capture_quality) if isinstance(self.capture_quality, dict) else {},
+            "hypothesis_id": self.hypothesis_id,
+            "evidence_id": self.evidence_id,
+            "before_snapshot_ref": self.before_snapshot_ref,
+            "after_snapshot_ref": self.after_snapshot_ref,
+            "before_snapshot_hash": self.before_snapshot_hash,
+            "after_snapshot_hash": self.after_snapshot_hash,
+            "target_identity": dict(self.target_identity) if isinstance(self.target_identity, dict) else None,
+            "backend_type": self.backend_type,
+            "provenance_class": self.provenance_class,
+            "function_attribution_verified": self.function_attribution_verified,
+            "attribution_basis": self.attribution_basis,
+            "attribution_limitation": self.attribution_limitation,
+            "verified_claims": list(self.verified_claims),
+            "executed_at": self.executed_at,
+            "receipt_signature": self.receipt_signature,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ControlledExecutionResult":
+        """Reconstruct ControlledExecutionResult from dictionary."""
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected dict for ControlledExecutionResult, got {type(data).__name__}")
+        allowed = cls.__dataclass_fields__.keys()
+        filtered = {k: v for k, v in data.items() if k in allowed}
+        if "verified_claims" in filtered and filtered["verified_claims"] is not None:
+            filtered["verified_claims"] = tuple(filtered["verified_claims"])
+        return cls(**filtered)
+
+
+def canonicalize_receipt_value(val: Any) -> str:
+    """Canonicalize arbitrary values (nested dicts, lists, primitives, None) deterministically."""
+    if val is None:
+        return "None"
+    if isinstance(val, (dict, list, tuple)):
+        try:
+            return json.dumps(val, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        except Exception:
+            return str(val)
+    return str(val)
+
 
 def compute_receipt_signature(session_secret: str, result: "ControlledExecutionResult") -> str:
     """Compute HMAC-SHA256 signature binding the execution receipt to the session secret and complete execution scope."""
-    tid_str = json.dumps(result.target_identity or {}, sort_keys=True)
-    cq_str = json.dumps(result.capture_quality or {}, sort_keys=True)
+    tid_str = json.dumps(result.target_identity or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    cq_str = json.dumps(result.capture_quality or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    before_str = canonicalize_receipt_value(result.before_value)
+    after_str = canonicalize_receipt_value(result.after_value)
     prov_cls = getattr(result, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
     attr_ver = getattr(result, "is_function_attribution_verified", getattr(result, "function_attribution_verified", False))
     attr_basis = getattr(result, "attribution_basis", "")
@@ -142,13 +195,70 @@ def compute_receipt_signature(session_secret: str, result: "ControlledExecutionR
     raw = (
         f"{result.execution_id}|{result.investigation_id}|{result.hypothesis_id}|"
         f"{result.evidence_id}|{result.target_function}|{result.field_path}|"
-        f"{result.before_value}|{result.after_value}|{result.execution_status}|"
+        f"{before_str}|{after_str}|{result.execution_status}|"
         f"{result.backend_type}|{prov_cls}|{attr_ver}|{attr_basis}|{claims_str}|"
         f"{result.before_snapshot_ref}|{result.after_snapshot_ref}|"
         f"{result.before_snapshot_hash}|{result.after_snapshot_hash}|"
         f"{tid_str}|{cq_str}|{result.executed_at}"
     )
     return hmac.new(session_secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def validate_controlled_execution_target_identity(
+    expected_tid: Optional[Dict[str, Any]],
+    receipt_tid: Optional[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Validate target identity binding between expected identity and execution receipt.
+
+    Enforces required fields: pid, process_identity, executable_identity, and build_id.
+    Fails closed on missing fields, empty strings, or mismatches.
+    Explicit Build ID semantics:
+    - If neither expected nor receipt provides a build_id (both empty/None), target genuinely lacks ELF build_id (allowed).
+    - If one side has build_id but the other lacks it, or both have different non-empty values -> fail closed.
+    """
+    if not expected_tid or not isinstance(expected_tid, dict):
+        return False, "Target identity validation failed: missing or invalid expected target_identity"
+    if not receipt_tid or not isinstance(receipt_tid, dict):
+        return False, "Target identity validation failed: missing or invalid receipt target_identity"
+
+    # 1. PID
+    exp_pid = expected_tid.get("pid")
+    rcpt_pid = receipt_tid.get("pid")
+    if exp_pid is None or rcpt_pid is None or isinstance(exp_pid, bool) or isinstance(rcpt_pid, bool):
+        return False, f"Target identity validation failed: PID missing or boolean (expected={exp_pid}, receipt={rcpt_pid})"
+    try:
+        if int(exp_pid) != int(rcpt_pid) or int(exp_pid) <= 0:
+            return False, f"Target identity validation failed: PID mismatch or non-positive (expected={exp_pid}, receipt={rcpt_pid})"
+    except (ValueError, TypeError):
+        return False, f"Target identity validation failed: PID non-integer (expected={exp_pid}, receipt={rcpt_pid})"
+
+    # 2. Process identity
+    exp_proc = str(expected_tid.get("process_identity") or "").strip()
+    rcpt_proc = str(receipt_tid.get("process_identity") or "").strip()
+    if not exp_proc or not rcpt_proc:
+        return False, f"Target identity validation failed: process_identity missing (expected='{exp_proc}', receipt='{rcpt_proc}')"
+    if exp_proc != rcpt_proc:
+        return False, f"Target identity validation failed: process_identity mismatch (expected='{exp_proc}', receipt='{rcpt_proc}')"
+
+    # 3. Executable identity
+    exp_exe = str(expected_tid.get("executable_identity") or expected_tid.get("executable") or expected_tid.get("binary_path") or "").strip()
+    rcpt_exe = str(receipt_tid.get("executable_identity") or receipt_tid.get("executable") or receipt_tid.get("binary_path") or "").strip()
+    if not exp_exe or not rcpt_exe:
+        return False, f"Target identity validation failed: executable_identity missing (expected='{exp_exe}', receipt='{rcpt_exe}')"
+    if exp_exe != rcpt_exe:
+        return False, f"Target identity validation failed: executable_identity mismatch (expected='{exp_exe}', receipt='{rcpt_exe}')"
+
+    # 4. Build ID
+    exp_bid = str(expected_tid.get("build_id") or expected_tid.get("target_build_id") or "").strip().lower()
+    rcpt_bid = str(receipt_tid.get("build_id") or receipt_tid.get("target_build_id") or "").strip().lower()
+    if exp_bid and not rcpt_bid:
+        return False, f"Target identity validation failed: receipt missing build_id when expected='{exp_bid}'"
+    if rcpt_bid and not exp_bid:
+        return False, f"Target identity validation failed: expected identity missing build_id when receipt='{rcpt_bid}'"
+    if exp_bid and rcpt_bid and exp_bid != rcpt_bid:
+        return False, f"Target identity validation failed: build_id mismatch (expected='{exp_bid}', receipt='{rcpt_bid}')"
+
+    return True, "Target identity successfully verified"
 
 
 def is_atomic_or_stopped_consistency(cons: Any) -> bool:
@@ -738,6 +848,8 @@ class EvidenceLedger:
                 self.trust_store = None
         self._used_causal_attestation_ids: Set[str] = set()
         self._causal_attestation_to_evidence_id: Dict[str, str] = {}
+        self._used_execution_ids: Set[str] = set()
+        self._execution_to_evidence_id: Dict[str, str] = {}
         self._used_operation_ids: Dict[str, Dict[str, Any]] = {}
         self._operation_to_evidence_ids: Dict[str, List[str]] = {}
         self._operation_to_receipt_id: Dict[str, str] = {}
@@ -808,17 +920,41 @@ class EvidenceLedger:
         if execution_result.investigation_id != self.session_id:
             raise ValueError(f"Capability issuance rejected: execution receipt belongs to investigation '{execution_result.investigation_id}', not '{self.session_id}'")
 
+        # Single-use: reject replayed execution receipts
+        if execution_result.execution_id in self._used_execution_ids:
+            raise ValueError(f"Capability issuance rejected: execution receipt '{execution_result.execution_id}' has already been consumed")
+
+        # Evidence ID scope binding
+        eff_eid = evidence_id or execution_result.evidence_id
+        if not eff_eid:
+            raise ValueError("Capability issuance rejected: evidence_id is required")
         if execution_result.evidence_id and evidence_id and execution_result.evidence_id != evidence_id:
             raise ValueError(f"Capability issuance rejected: execution receipt evidence '{execution_result.evidence_id}' does not match '{evidence_id}'")
 
-        if execution_result.hypothesis_id and hypothesis_id and execution_result.hypothesis_id != hypothesis_id:
-            raise ValueError(f"Capability issuance rejected: execution receipt hypothesis '{execution_result.hypothesis_id}' does not match '{hypothesis_id}'")
-
+        # Target function scope binding
+        eff_fn = target_function or execution_result.target_function
+        if not eff_fn:
+            raise ValueError("Capability issuance rejected: target_function is required")
         if execution_result.target_function and target_function and execution_result.target_function != target_function:
             raise ValueError(f"Capability issuance rejected: execution receipt target_function '{execution_result.target_function}' does not match '{target_function}'")
 
+        # Field path scope binding
+        eff_field = field_path or execution_result.field_path
+        if not eff_field:
+            raise ValueError("Capability issuance rejected: field_path is required")
         if execution_result.field_path and field_path and execution_result.field_path != field_path:
             raise ValueError(f"Capability issuance rejected: execution receipt field_path '{execution_result.field_path}' does not match '{field_path}'")
+
+        # Hypothesis ID scope binding
+        eff_hypo = hypothesis_id or execution_result.hypothesis_id
+        if execution_result.hypothesis_id and hypothesis_id and execution_result.hypothesis_id != hypothesis_id:
+            raise ValueError(f"Capability issuance rejected: execution receipt hypothesis '{execution_result.hypothesis_id}' does not match '{hypothesis_id}'")
+
+        # Target identity validation
+        if getattr(self, "target_identity", None):
+            ok_tid, tid_reason = validate_controlled_execution_target_identity(self.target_identity, execution_result.target_identity)
+            if not ok_tid:
+                raise ValueError(f"Capability issuance rejected: {tid_reason}")
 
         if execution_result.execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
             raise ValueError(f"Capability issuance rejected: execution receipt status '{execution_result.execution_status}' does not prove reproduction")
@@ -829,10 +965,9 @@ class EvidenceLedger:
         if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
             raise ValueError(f"Capability issuance rejected: execution receipt capture quality ({comp}, {cons}) is not complete and atomic")
 
-        eff_eid = evidence_id or execution_result.evidence_id
-        eff_fn = target_function or execution_result.target_function
-        eff_field = field_path or execution_result.field_path
-        eff_hypo = hypothesis_id or execution_result.hypothesis_id
+        # Consume receipt single-use
+        self._used_execution_ids.add(execution_result.execution_id)
+        self._execution_to_evidence_id[execution_result.execution_id] = eff_eid
 
         return CausalVerificationCapability(
             investigation_id=self.session_id,
@@ -983,6 +1118,8 @@ class EvidenceLedger:
 
         _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
         _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
+        _orig_exec = set(getattr(self, "_used_execution_ids", set()))
+        _orig_exec_to_eid = dict(getattr(self, "_execution_to_evidence_id", {}))
         _orig_used_op = {k: dict(v) for k, v in getattr(self, "_used_operation_ids", {}).items()}
         _orig_op_to_ev = {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()}
         _orig_op_to_rcpt = dict(getattr(self, "_operation_to_receipt_id", {}))
@@ -1057,6 +1194,8 @@ class EvidenceLedger:
         except Exception:
             self._used_causal_attestation_ids = _orig_causal
             self._causal_attestation_to_evidence_id = _orig_causal_to_eid
+            self._used_execution_ids = _orig_exec
+            self._execution_to_evidence_id = _orig_exec_to_eid
             self._used_operation_ids = _orig_used_op
             self._operation_to_evidence_ids = _orig_op_to_ev
             self._operation_to_receipt_id = _orig_op_to_rcpt
@@ -1108,6 +1247,8 @@ class EvidenceLedger:
         """Validate record structure, types, and consistency transactionally."""
         _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
         _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
+        _orig_exec = set(getattr(self, "_used_execution_ids", set()))
+        _orig_exec_to_eid = dict(getattr(self, "_execution_to_evidence_id", {}))
         _orig_used_op = {k: dict(v) for k, v in getattr(self, "_used_operation_ids", {}).items()}
         _orig_op_to_ev = {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()}
         _orig_op_to_rcpt = dict(getattr(self, "_operation_to_receipt_id", {}))
@@ -1116,6 +1257,8 @@ class EvidenceLedger:
         except Exception:
             self._used_causal_attestation_ids = _orig_causal
             self._causal_attestation_to_evidence_id = _orig_causal_to_eid
+            self._used_execution_ids = _orig_exec
+            self._execution_to_evidence_id = _orig_exec_to_eid
             self._used_operation_ids = _orig_used_op
             self._operation_to_evidence_ids = _orig_op_to_ev
             self._operation_to_receipt_id = _orig_op_to_rcpt
@@ -1316,6 +1459,25 @@ class EvidenceLedger:
             expected_sig = compute_attestation_signature(self.session_secret, record.evidence_id, fp, self.session_id)
             if not hmac.compare_digest(str(att.get("token_sig", "")), str(expected_sig)):
                 raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION cryptographic signature verification failed for '{record.evidence_id}'")
+
+            # Target identity validation if ledger has target_identity
+            if getattr(self, "target_identity", None):
+                ok_tid, tid_reason = validate_controlled_execution_target_identity(self.target_identity, record.target_identity)
+                if not ok_tid:
+                    raise ValueError(f"CONTROLLED_RUNTIME_REPRODUCTION target identity mismatch for '{record.evidence_id}': {tid_reason}")
+
+            # Single-use execution receipt consumption
+            c_res = p_prov.get("controlled_execution_result") or p_details.get("controlled_execution_result")
+            if c_res and isinstance(c_res, dict):
+                eid = c_res.get("execution_id")
+                if eid:
+                    bound_ev = self._execution_to_evidence_id.get(eid)
+                    if bound_ev is not None and bound_ev != record.evidence_id:
+                        raise ValueError(f"Controlled execution receipt '{eid}' was issued for evidence '{bound_ev}', cannot be used for '{record.evidence_id}'")
+                    if bound_ev is None and eid in self._used_execution_ids:
+                        raise ValueError(f"Controlled execution receipt '{eid}' has already been consumed in this ledger")
+                    self._used_execution_ids.add(eid)
+                    self._execution_to_evidence_id[eid] = record.evidence_id
 
         # Derivation and Self-Reference validation (applicable across all provenance classes)
         if record.parent_evidence_ids and record.evidence_id in record.parent_evidence_ids:
