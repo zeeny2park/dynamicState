@@ -674,11 +674,20 @@ class TargetAssessor:
             except Exception:
                 pass
 
-        if not build_id and companion_elf and os.path.exists(companion_elf):
+        if companion_elf and os.path.exists(companion_elf):
             try:
                 from .target_adapter import inspect_elf
                 companion_info = inspect_elf(companion_elf)
-                build_id = companion_info.build_id
+                if companion_info.build_id:
+                    if build_id and str(build_id).strip().lower() != str(companion_info.build_id).strip().lower():
+                        limitations.append(
+                            f"Build ID mismatch: process ({build_id}) != companion ELF ({companion_info.build_id})"
+                        )
+                        dwarf_available = False
+                        capabilities = [c for c in capabilities if c != "DWARF_DEBUG_INFO"]
+                        build_id = None
+                    elif not build_id:
+                        build_id = companion_info.build_id
                 if not executable_identity:
                     executable_identity = companion_elf
             except Exception:
@@ -1629,18 +1638,18 @@ class AdaptiveInvestigationSession:
 
             # Canonical registration into EvidenceLedger via EvidenceAdapter (fail-closed, no private collection mutation)
             added = self.evidence_adapter.record_into_ledger(rec_obj, self.ledger, raise_on_error=True)
-            if not added and not self.ledger.has(ev_id):
+            if not added:
                 sem_dig = (rec_obj.details or {}).get("semantic_digest")
-                dup = self.ledger.find_by_semantic_digest(sem_dig)
+                dup = self.ledger.find_by_semantic_digest(sem_dig) if sem_dig else None
+                if dup is None and self.ledger.has(ev_id):
+                    dup = self.ledger.get_record(ev_id)
                 if dup is not None:
                     return f"DUPLICATE: {dup.evidence_id}"
                 return "FAILED: Record was not admitted by ledger"
 
             return "RECORDED"
         except Exception as le:
-            return f"FAILED: {le}"
-        except Exception as le:
-            return f"FAILED: {le}"
+            return f"FAILED: {type(le).__name__}: {le}"
 
     def _step_collect_next(self) -> Dict[str, Any]:
         if not self.plan:

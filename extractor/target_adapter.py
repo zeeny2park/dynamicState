@@ -782,7 +782,14 @@ class TargetExecutionAdapter(ABC):
         if not exe_id:
             raise ValueError(f"Cannot issue live receipt: missing verified executable identity for PID {pid}")
 
-        bid = ident.get("build_id") or companion_build_id or ""
+        bid = ident.get("build_id") or ""
+        if companion_build_id:
+            if bid and str(bid).strip().lower() != str(companion_build_id).strip().lower():
+                raise ValueError(
+                    f"Cannot issue live receipt: Build ID mismatch between process ({bid}) and companion ELF ({companion_build_id})"
+                )
+            if not bid:
+                bid = companion_build_id
 
         is_custom = bool(getattr(self, "_memory_reader", None) is not None)
         if is_custom:

@@ -23,6 +23,7 @@ Comprehensive test suite verifying:
    - Partial/failed observation statuses preserved.
 """
 
+from datetime import datetime, timezone
 import json
 import os
 import subprocess
@@ -289,8 +290,56 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
         self.assertEqual(ledger_rec.provenance_class, PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE)
 
     def test_08_controlled_reproduction_not_promoted_to_live(self):
-        """Controlled reproduction evidence is never converted to live capture merely because a live PID exists."""
+        """Controlled reproduction evidence requires genuine signed ControlledExecutionResult and is never escalated to live."""
+        from extractor.evidence_ledger import ControlledExecutionResult, compute_receipt_signature
+        now_ts = datetime.now(timezone.utc).isoformat()
+        temp_res = ControlledExecutionResult(
+            execution_id="exec_test_08",
+            investigation_id=self.session_id,
+            target_function="test_fn",
+            field_path="test_field",
+            before_value=1,
+            after_value=2,
+            execution_status="REPRODUCED",
+            capture_quality={"completeness": "COMPLETE", "consistency_level": "ZERO_STOP_ATOMIC"},
+            target_identity=self.target,
+            evidence_id="ev_controlled_01",
+            executed_at=now_ts,
+            receipt_signature="",
+        )
+        sig = compute_receipt_signature(self.ledger.session_secret, temp_res)
+        genuine_res = ControlledExecutionResult(
+            execution_id=temp_res.execution_id,
+            investigation_id=temp_res.investigation_id,
+            target_function=temp_res.target_function,
+            field_path=temp_res.field_path,
+            before_value=temp_res.before_value,
+            after_value=temp_res.after_value,
+            execution_status=temp_res.execution_status,
+            capture_quality=temp_res.capture_quality,
+            target_identity=temp_res.target_identity,
+            evidence_id=temp_res.evidence_id,
+            executed_at=temp_res.executed_at,
+            receipt_signature=sig,
+        )
+
         rec = self.adapter.adapt_generic_tool_output(
+            tool_name="gdb_replay",
+            tool_result={
+                "outcome": "reproduced",
+                "provenance_class": PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+                "execution_result": genuine_res,
+            },
+            target_identity=self.target,
+            session_id=self.session_id,
+            ledger=self.ledger,
+            evidence_id="ev_controlled_01",
+        )
+        self.assertEqual(rec.provenance_class, PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
+        self.assertNotEqual(rec.provenance_class, PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE)
+
+        # Conversely, arbitrary caller-supplied token_sig without genuine execution proof is rejected
+        rec_forged = self.adapter.adapt_generic_tool_output(
             tool_name="gdb_replay",
             tool_result={
                 "outcome": "reproduced",
@@ -299,10 +348,9 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
             },
             target_identity=self.target,
             session_id=self.session_id,
-            evidence_id="ev_controlled_01",
+            evidence_id="ev_controlled_forged",
         )
-        self.assertEqual(rec.provenance_class, PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
-        self.assertNotEqual(rec.provenance_class, PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE)
+        self.assertEqual(rec_forged.provenance_class, PROVENANCE_CLASS_IMPORTED_UNVERIFIED)
 
     # =========================================================================
     # Part 2: Encapsulation & Private Ledger Access Removal

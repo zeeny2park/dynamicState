@@ -10,6 +10,7 @@ observation tools into cryptographically-traceable EvidenceRecord instances whil
 - Preserving provenance ceilings (imported/unverified data is never upgraded to live capture)
 """
 
+from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -144,6 +145,9 @@ class EvidenceAdapter:
         override_provenance: Optional[str] = None,
         session_id: Optional[str] = None,
         live_receipt: Optional[Any] = None,
+        execution_result: Optional[Any] = None,
+        session_secret: Optional[str] = None,
+        ledger: Optional[Any] = None,
     ) -> str:
         """Resolves provenance class with fail-closed trust boundaries.
 
@@ -158,6 +162,9 @@ class EvidenceAdapter:
         p_dict = payload if isinstance(payload, dict) else {}
         prov_dict = p_dict.get("provenance") if isinstance(p_dict.get("provenance"), dict) else {}
         t_ident = target_identity if isinstance(target_identity, dict) else {}
+
+        eff_secret = session_secret or (getattr(ledger, "session_secret", None) if ledger is not None else None)
+        eff_sess_id = session_id or (getattr(ledger, "session_id", None) if ledger is not None else None) or p_dict.get("session_id")
 
         # 1. Synthetic ceiling: If any source indicates synthetic/simulated, clamp to SYNTHETIC_FIXTURE
         is_synthetic = bool(
@@ -187,16 +194,72 @@ class EvidenceAdapter:
         ):
             return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
-        # 3. Controlled runtime reproduction requires authentic verifier attestation or execution proof
-        if (
+        # 3. Controlled runtime reproduction requires authentic, cryptographically verified execution proof
+        wants_controlled = (
             override_provenance == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
             or p_dict.get("provenance_class") == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
             or prov_dict.get("provenance_class") == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
-        ):
-            att = prov_dict.get("verifier_attestation") or p_dict.get("verifier_attestation")
-            if att and isinstance(att, dict) and att.get("token_sig") and not att.get("attestation_rejected"):
-                return PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
-            return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            or execution_result is not None
+            or p_dict.get("execution_result") is not None
+            or prov_dict.get("execution_result") is not None
+            or p_dict.get("controlled_execution_result") is not None
+            or prov_dict.get("controlled_execution_result") is not None
+        )
+        if wants_controlled:
+            cand_res = (
+                execution_result
+                or p_dict.get("execution_result")
+                or prov_dict.get("execution_result")
+                or p_dict.get("controlled_execution_result")
+                or prov_dict.get("controlled_execution_result")
+            )
+            from .evidence_ledger import ControlledExecutionResult, is_atomic_or_stopped_consistency
+            if isinstance(cand_res, dict):
+                try:
+                    allowed = ControlledExecutionResult.__dataclass_fields__.keys()
+                    cand_res = ControlledExecutionResult(**{k: v for k, v in cand_res.items() if k in allowed})
+                except Exception:
+                    cand_res = None
+
+            if not isinstance(cand_res, ControlledExecutionResult):
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            if not eff_secret:
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            if not cand_res.verify_authenticity(eff_secret):
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            if not cand_res.investigation_id or (eff_sess_id and str(cand_res.investigation_id) != str(eff_sess_id)):
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            res_tid = cand_res.target_identity or {}
+            if t_ident.get("pid") is not None and res_tid.get("pid") is not None:
+                if int(t_ident["pid"]) != int(res_tid["pid"]):
+                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            if t_ident.get("build_id") and res_tid.get("build_id"):
+                if str(t_ident["build_id"]).strip().lower() != str(res_tid["build_id"]).strip().lower():
+                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            if t_ident.get("process_identity") and res_tid.get("process_identity"):
+                if str(t_ident["process_identity"]).strip() != str(res_tid["process_identity"]).strip():
+                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            if t_ident.get("executable_identity") and res_tid.get("executable_identity"):
+                if str(t_ident["executable_identity"]).strip() != str(res_tid["executable_identity"]).strip():
+                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            if cand_res.execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            cq = cand_res.capture_quality or {}
+            comp = cq.get("completeness") or cq.get("status")
+            cons = cq.get("consistency_level") or cq.get("consistency_classification")
+            if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            if not cand_res.target_function or not cand_res.field_path:
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
+            return PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
 
         # 4. Genuine LIVE_RUNTIME_CAPTURE requires an authentic, verified LiveCaptureReceipt
         rcpt = live_receipt or prov_dict.get("live_capture_receipt") or p_dict.get("live_capture_receipt")
@@ -208,15 +271,17 @@ class EvidenceAdapter:
                 exp_bid = t_ident.get("build_id") or t_ident.get("target_build_id")
                 exp_proc = t_ident.get("process_identity")
                 exp_exe = t_ident.get("executable_identity") or t_ident.get("executable")
+                exp_obs_dig = p_dict.get("observation_digest") or p_dict.get("payload_digest")
                 # Do not assign LIVE_RUNTIME_CAPTURE to incomplete target identity
                 if exp_pid is None or not exp_proc or not exp_exe:
                     return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
                 ok, _ = rcpt_obj.verify(
-                    expected_session_id=session_id or p_dict.get("session_id"),
+                    expected_session_id=eff_sess_id,
                     expected_pid=exp_pid,
                     expected_process_identity=exp_proc,
                     expected_executable_identity=exp_exe,
                     expected_build_id=exp_bid,
+                    expected_observation_digest=exp_obs_dig if getattr(rcpt_obj, "observation_digest", None) else None,
                     require_production_authority=True,
                 )
                 if ok:
@@ -597,6 +662,8 @@ class EvidenceAdapter:
         epoch: int = 0,
         evidence_id: Optional[str] = None,
         observation: Optional[str] = None,
+        execution_result: Optional[Any] = None,
+        session_secret: Optional[str] = None,
     ) -> EvidenceRecord:
         """Adapts diagnostic or structural tool outputs, preserving semantic digest and result category."""
         # Rule: Never create an OBSERVED_FACT (NATURE_OBSERVATION) from an inference or hypothesis
@@ -610,7 +677,25 @@ class EvidenceAdapter:
             "companion_elf": tool_result.get("companion_elf") or tool_result.get("companion_elf_path"),
         }
         rcpt = tool_result.get("live_capture_receipt") or (tool_result.get("provenance") or {}).get("live_capture_receipt")
-        prov_cls = self._resolve_provenance_class(tool_result, eff_target, session_id=session_id, live_receipt=rcpt)
+        cand_exec = (
+            execution_result
+            or tool_result.get("execution_result")
+            or (tool_result.get("provenance") or {}).get("execution_result")
+            or tool_result.get("controlled_execution_result")
+            or (tool_result.get("provenance") or {}).get("controlled_execution_result")
+        )
+        eff_secret = session_secret or (getattr(ledger, "session_secret", None) if ledger is not None else None)
+        eff_session_id = session_id or (getattr(ledger, "session_id", None) if ledger is not None else None)
+
+        prov_cls = self._resolve_provenance_class(
+            payload=tool_result,
+            target_identity=eff_target,
+            session_id=eff_session_id,
+            live_receipt=rcpt,
+            execution_result=cand_exec,
+            session_secret=eff_secret,
+            ledger=ledger,
+        )
         timestamp = datetime.now(timezone.utc).isoformat()
         digest, size_bytes = compute_payload_digest(tool_result)
         res_cat, coll_status, sem_digest = self.classify_tool_result_category(
@@ -745,13 +830,96 @@ class EvidenceAdapter:
         if isinstance(static_code_link, dict):
             compact_details["static_code_link"] = static_code_link
 
+        if prov_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
+            from .evidence_ledger import (
+                ControlledExecutionResult,
+                compute_evidence_fingerprint,
+                compute_attestation_signature,
+            )
+            exec_obj = cand_exec
+            if isinstance(exec_obj, dict):
+                try:
+                    allowed = ControlledExecutionResult.__dataclass_fields__.keys()
+                    exec_obj = ControlledExecutionResult(**{k: v for k, v in exec_obj.items() if k in allowed})
+                except Exception:
+                    pass
+            if isinstance(exec_obj, ControlledExecutionResult):
+                prov_dict["controlled_execution_result"] = asdict(exec_obj)
+                compact_details["execution_provenance"] = {
+                    "execution_id": exec_obj.execution_id,
+                    "target_function": exec_obj.target_function,
+                    "field_path": exec_obj.field_path,
+                    "provenance_class": PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+                }
+                compact_details["target_function"] = exec_obj.target_function
+                compact_details["field_path"] = exec_obj.field_path
+                if eff_secret and eff_session_id:
+                    temp_rec = EvidenceRecord(
+                        evidence_id=eff_ev_id,
+                        evidence_type=final_ev_type,
+                        nature=eff_nature,
+                        source=tool_name,
+                        timestamp=timestamp,
+                        session_id=eff_session_id,
+                        finding_id=finding_id,
+                        observation=str(obs_text),
+                        parent_evidence_ids=parent_ev_ids,
+                        target_identity=eff_target,
+                        provenance=dict(prov_dict),
+                        static_code_link=static_code_link if isinstance(static_code_link, dict) else None,
+                        capture_quality={
+                            "completeness": cq_completeness,
+                            "status": cq_completeness,
+                            "consistency_level": cq_consistency,
+                        },
+                        details=compact_details,
+                    )
+                    fp = compute_evidence_fingerprint(
+                        record=temp_rec,
+                        target_function=exec_obj.target_function,
+                        field_path=exec_obj.field_path,
+                        hypothesis_id=exec_obj.hypothesis_id,
+                        target_identity=eff_target,
+                        provenance_class=PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+                        function_attribution_verified=exec_obj.is_function_attribution_verified,
+                        attribution_basis=exec_obj.attribution_basis,
+                        verified_claims=exec_obj.verified_claims,
+                    )
+                    sig = compute_attestation_signature(eff_secret, eff_ev_id, fp, eff_session_id)
+                    prov_dict["verifier_attestation"] = {
+                        "token": eff_secret,
+                        "token_sig": sig,
+                        "evidence_fingerprint": fp,
+                        "investigation_id": eff_session_id,
+                        "hypothesis_id": exec_obj.hypothesis_id,
+                        "target_function": exec_obj.target_function,
+                        "field_path": exec_obj.field_path,
+                        "target_identity": eff_target,
+                        "provenance_class": PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+                        "function_attribution_verified": exec_obj.is_function_attribution_verified,
+                        "attribution_basis": exec_obj.attribution_basis,
+                        "attribution_limitation": getattr(exec_obj, "attribution_limitation", ""),
+                        "verified_claims": list(exec_obj.verified_claims),
+                        "verification_type": "controlled_runtime_reproduction",
+                        "attested_at": datetime.now(timezone.utc).isoformat(),
+                    }
+        else:
+            prov_dict.pop("verifier_attestation", None)
+            prov_dict.pop("controlled_execution_result", None)
+            if (
+                tool_result.get("verifier_attestation")
+                or (tool_result.get("provenance") or {}).get("verifier_attestation")
+                or tool_result.get("provenance_class") == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
+            ):
+                prov_dict["attestation_rejected"] = "Unverified, caller-supplied, or malformed attestation claim stripped"
+
         rec = EvidenceRecord(
             evidence_id=eff_ev_id,
             evidence_type=final_ev_type,
             nature=eff_nature,
             source=tool_name,
             timestamp=timestamp,
-            session_id=session_id,
+            session_id=eff_session_id or session_id,
             finding_id=finding_id,
             observation=str(obs_text),
             parent_evidence_ids=parent_ev_ids,
