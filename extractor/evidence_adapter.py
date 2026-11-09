@@ -229,6 +229,9 @@ class EvidenceAdapter:
             if not isinstance(cand_res, ControlledExecutionResult):
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
+            if ledger is None:
+                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
             if not eff_secret:
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
@@ -249,15 +252,17 @@ class EvidenceAdapter:
             if not cand_res.field_path or not str(cand_res.field_path).strip():
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
-            # Evidence ID binding
-            eff_eid = evidence_id or p_dict.get("evidence_id")
-            if cand_res.evidence_id and eff_eid and str(cand_res.evidence_id) != str(eff_eid):
+            # Evidence ID scope binding
+            eff_eid = str(evidence_id or p_dict.get("evidence_id") or cand_res.evidence_id or "").strip()
+            rcpt_eid = str(cand_res.evidence_id or "").strip()
+            if not eff_eid or not rcpt_eid or (evidence_id and eff_eid != rcpt_eid):
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
-            # Hypothesis ID binding
-            eff_hypo = p_dict.get("hypothesis_id") or prov_dict.get("hypothesis_id")
-            if cand_res.hypothesis_id and eff_hypo and str(cand_res.hypothesis_id) != str(eff_hypo):
-                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            # Hypothesis ID scope binding:
+            cand_hypo = p_dict.get("hypothesis_id") or prov_dict.get("hypothesis_id")
+            if cand_hypo is not None and str(cand_hypo).strip() != "":
+                if str(cand_hypo).strip() != str(cand_res.hypothesis_id or "").strip():
+                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
             if cand_res.execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
@@ -268,12 +273,10 @@ class EvidenceAdapter:
             if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
-            # Single-use execution receipt consumption check
-            if ledger is not None and hasattr(ledger, "_used_execution_ids"):
+            # Single-use execution receipt consumption check (canonical ledger check)
+            if hasattr(ledger, "_used_execution_ids"):
                 if cand_res.execution_id in ledger._used_execution_ids:
                     return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-            elif hasattr(self, "_used_execution_ids") and cand_res.execution_id in self._used_execution_ids:
-                return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
             return PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION
 
@@ -871,8 +874,57 @@ class EvidenceAdapter:
                 compact_details["target_function"] = exec_obj.target_function
                 compact_details["field_path"] = exec_obj.field_path
 
-                cap = None
-                if ledger is not None and hasattr(ledger, "issue_verification_capability"):
+                if ledger is None or not hasattr(ledger, "issue_verification_capability") or not hasattr(ledger, "attest_causal_proof"):
+                    prov_dict["attestation_rejected"] = "Missing ledger with causal verification capability"
+                    prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                    prov_dict.pop("verifier_attestation", None)
+                    prov_dict.pop("controlled_execution_result", None)
+                    compact_details.pop("execution_provenance", None)
+                else:
+                    cand_prov = dict(prov_dict)
+                    cand_prov["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                    cand_prov.pop("verifier_attestation", None)
+
+                    cand_details = dict(compact_details)
+                    cand_details["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                    cand_details.pop("execution_provenance", None)
+
+                    cand_rec = EvidenceRecord(
+                        evidence_id=eff_ev_id,
+                        evidence_type=final_ev_type,
+                        nature=eff_nature,
+                        source=tool_name,
+                        timestamp=timestamp,
+                        session_id=eff_session_id or getattr(ledger, "session_id", None) or session_id,
+                        finding_id=finding_id,
+                        observation=str(obs_text),
+                        parent_evidence_ids=parent_ev_ids,
+                        target_identity=eff_target,
+                        provenance=cand_prov,
+                        static_code_link=static_code_link if isinstance(static_code_link, dict) else None,
+                        capture_quality={
+                            "completeness": cq_completeness,
+                            "status": cq_completeness,
+                            "consistency_level": cq_consistency,
+                        },
+                        details=cand_details,
+                    )
+                    if eff_target and eff_target.get("pid"):
+                        cand_rec.target_pid = eff_target["pid"]
+
+                    # 1. Admit candidate record into ledger
+                    try:
+                        ledger.add_record(cand_rec)
+                    except Exception as ae:
+                        prov_dict["attestation_rejected"] = f"Ledger admission failed: {ae}"
+                        prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                        prov_dict.pop("verifier_attestation", None)
+                        prov_dict.pop("controlled_execution_result", None)
+                        compact_details.pop("execution_provenance", None)
+                        cand_rec.provenance["attestation_rejected"] = prov_dict["attestation_rejected"]
+                        return cand_rec
+
+                    # 2. Issue internal capability & 3. Attest through canonical authority
                     try:
                         cap = ledger.issue_verification_capability(
                             evidence_id=eff_ev_id,
@@ -881,80 +933,31 @@ class EvidenceAdapter:
                             hypothesis_id=exec_obj.hypothesis_id,
                             execution_result=exec_obj,
                         )
-                        cap.consume()
+                        ledger.attest_causal_proof(
+                            evidence_id=eff_ev_id,
+                            target_function=exec_obj.target_function,
+                            field_path=exec_obj.field_path,
+                            verification_type="controlled_runtime_reproduction",
+                            capability=cap,
+                            target_identity=eff_target,
+                            hypothesis_id=exec_obj.hypothesis_id,
+                        )
+                        attested_rec = ledger.get_record(eff_ev_id)
+                        if attested_rec is not None:
+                            return attested_rec
                     except Exception as ce:
-                        prov_dict["attestation_rejected"] = f"Capability issuance failed: {ce}"
+                        # Rollback on attestation failure so no partially trusted or inconsistent state remains
+                        if hasattr(ledger, "remove_record"):
+                            ledger.remove_record(eff_ev_id)
+                        prov_dict["attestation_rejected"] = f"Causal attestation failed: {ce}"
                         prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
                         prov_dict.pop("verifier_attestation", None)
                         prov_dict.pop("controlled_execution_result", None)
                         compact_details.pop("execution_provenance", None)
-                elif eff_secret and eff_session_id:
-                    if hasattr(self, "_used_execution_ids"):
-                        if exec_obj.execution_id in self._used_execution_ids:
-                            prov_dict["attestation_rejected"] = f"Execution receipt '{exec_obj.execution_id}' has already been consumed"
-                            prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-                            prov_dict.pop("verifier_attestation", None)
-                            prov_dict.pop("controlled_execution_result", None)
-                            compact_details.pop("execution_provenance", None)
-                        else:
-                            self._used_execution_ids.add(exec_obj.execution_id)
-                else:
-                    prov_dict["attestation_rejected"] = "Missing ledger or session secret for execution verification"
-                    prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
-                    prov_dict.pop("verifier_attestation", None)
-                    prov_dict.pop("controlled_execution_result", None)
-                    compact_details.pop("execution_provenance", None)
-
-                if prov_cls == PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION and eff_secret and eff_session_id:
-                    temp_rec = EvidenceRecord(
-                        evidence_id=eff_ev_id,
-                        evidence_type=final_ev_type,
-                        nature=eff_nature,
-                        source=tool_name,
-                        timestamp=timestamp,
-                        session_id=eff_session_id,
-                        finding_id=finding_id,
-                        observation=str(obs_text),
-                        parent_evidence_ids=parent_ev_ids,
-                        target_identity=eff_target,
-                        provenance=dict(prov_dict),
-                        static_code_link=static_code_link if isinstance(static_code_link, dict) else None,
-                        capture_quality={
-                            "completeness": cq_completeness,
-                            "status": cq_completeness,
-                            "consistency_level": cq_consistency,
-                        },
-                        details=compact_details,
-                    )
-                    fp = compute_evidence_fingerprint(
-                        record=temp_rec,
-                        target_function=exec_obj.target_function,
-                        field_path=exec_obj.field_path,
-                        hypothesis_id=exec_obj.hypothesis_id,
-                        target_identity=eff_target,
-                        provenance_class=PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
-                        function_attribution_verified=exec_obj.is_function_attribution_verified,
-                        attribution_basis=exec_obj.attribution_basis,
-                        verified_claims=exec_obj.verified_claims,
-                    )
-                    sig = compute_attestation_signature(eff_secret, eff_ev_id, fp, eff_session_id)
-                    prov_dict["verifier_attestation"] = {
-                        "token": eff_secret,
-                        "token_sig": sig,
-                        "evidence_fingerprint": fp,
-                        "investigation_id": eff_session_id,
-                        "hypothesis_id": exec_obj.hypothesis_id,
-                        "target_function": exec_obj.target_function,
-                        "field_path": exec_obj.field_path,
-                        "target_identity": eff_target,
-                        "provenance_class": PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
-                        "function_attribution_verified": exec_obj.is_function_attribution_verified,
-                        "attribution_basis": exec_obj.attribution_basis,
-                        "attribution_limitation": getattr(exec_obj, "attribution_limitation", ""),
-                        "verified_claims": list(exec_obj.verified_claims),
-                        "verification_type": "controlled_runtime_reproduction",
-                        "attested_at": datetime.now(timezone.utc).isoformat(),
-                    }
+                        cand_rec.provenance["attestation_rejected"] = prov_dict["attestation_rejected"]
+                        cand_rec.provenance["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                        cand_rec.details["provenance_class"] = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                        return cand_rec
 
         if prov_cls != PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION:
             prov_dict["provenance_class"] = prov_cls
@@ -1006,6 +1009,19 @@ class EvidenceAdapter:
         added: List[EvidenceRecord] = []
         rec_list = records if isinstance(records, list) else [records]
         for r in rec_list:
+            if hasattr(ledger, "get_record"):
+                existing = ledger.get_record(r.evidence_id)
+                if existing is not None:
+                    if existing is r:
+                        added.append(r)
+                        continue
+                    if (
+                        existing.observation == r.observation
+                        and (existing.details or {}).get("payload_digest") == (r.details or {}).get("payload_digest")
+                        and (existing.details or {}).get("semantic_digest") == (r.details or {}).get("semantic_digest")
+                    ):
+                        added.append(existing)
+                        continue
             sem_dig = (r.details or {}).get("semantic_digest")
             if sem_dig:
                 dup = ledger.find_by_semantic_digest(sem_dig) if hasattr(ledger, "find_by_semantic_digest") else next(

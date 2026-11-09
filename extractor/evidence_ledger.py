@@ -10,9 +10,13 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import math
 import re
+import threading
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+from .canonical_json import rfc8785_canonical_json, rfc8785_canonical_str
 
 
 PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE = "LIVE_RUNTIME_CAPTURE"
@@ -127,8 +131,19 @@ class ControlledExecutionResult:
         """Verify the cryptographic authenticity of this execution receipt against session secret."""
         if not self.receipt_signature:
             return False
-        expected = compute_receipt_signature(session_secret, self)
-        return hmac.compare_digest(self.receipt_signature, expected)
+        try:
+            expected_v2 = compute_receipt_signature(session_secret, self)
+            if hmac.compare_digest(self.receipt_signature, expected_v2):
+                return True
+        except (ValueError, TypeError):
+            pass
+        try:
+            expected_v1 = compute_legacy_receipt_signature(session_secret, self)
+            if hmac.compare_digest(self.receipt_signature, expected_v1):
+                return True
+        except Exception:
+            pass
+        return False
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize ControlledExecutionResult into JSON-serializable dictionary."""
@@ -171,19 +186,59 @@ class ControlledExecutionResult:
 
 
 def canonicalize_receipt_value(val: Any) -> str:
-    """Canonicalize arbitrary values (nested dicts, lists, primitives, None) deterministically."""
-    if val is None:
-        return "None"
-    if isinstance(val, (dict, list, tuple)):
-        try:
-            return json.dumps(val, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        except Exception:
-            return str(val)
-    return str(val)
+    """Canonicalize arbitrary values using RFC 8785 canonical JSON string."""
+    try:
+        return rfc8785_canonical_str(val)
+    except Exception:
+        if val is None:
+            return "None"
+        return str(val)
+
+
+def compute_controlled_execution_payload(result: "ControlledExecutionResult", version: str = "v2_rfc8785") -> Dict[str, Any]:
+    """Construct an unambiguous structured payload containing all security-relevant fields for signing."""
+    tid = dict(result.target_identity or {})
+    cq = dict(result.capture_quality or {})
+    prov_cls = getattr(result, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
+    attr_ver = getattr(result, "is_function_attribution_verified", getattr(result, "function_attribution_verified", False))
+    attr_basis = getattr(result, "attribution_basis", "")
+    claims = list(sorted(getattr(result, "verified_claims", ()) or ()))
+
+    return {
+        "version": version,
+        "execution_id": str(result.execution_id),
+        "investigation_id": str(result.investigation_id),
+        "hypothesis_id": str(result.hypothesis_id or ""),
+        "evidence_id": str(result.evidence_id or ""),
+        "target_function": str(result.target_function),
+        "field_path": str(result.field_path),
+        "before_value": result.before_value,
+        "after_value": result.after_value,
+        "execution_status": str(result.execution_status),
+        "backend_type": str(result.backend_type),
+        "provenance_class": str(prov_cls),
+        "function_attribution_verified": bool(attr_ver),
+        "attribution_basis": str(attr_basis),
+        "verified_claims": claims,
+        "before_snapshot_ref": result.before_snapshot_ref,
+        "after_snapshot_ref": result.after_snapshot_ref,
+        "before_snapshot_hash": result.before_snapshot_hash,
+        "after_snapshot_hash": result.after_snapshot_hash,
+        "target_identity": tid,
+        "capture_quality": cq,
+        "executed_at": str(result.executed_at),
+    }
 
 
 def compute_receipt_signature(session_secret: str, result: "ControlledExecutionResult") -> str:
-    """Compute HMAC-SHA256 signature binding the execution receipt to the session secret and complete execution scope."""
+    """Compute HMAC-SHA256 signature over RFC 8785 canonical JSON bytes of the structured payload."""
+    payload = compute_controlled_execution_payload(result, version="v2_rfc8785")
+    canonical_bytes = rfc8785_canonical_json(payload)
+    return hmac.new(session_secret.encode("utf-8"), canonical_bytes, hashlib.sha256).hexdigest()
+
+
+def compute_legacy_receipt_signature(session_secret: str, result: "ControlledExecutionResult") -> str:
+    """Legacy v1 delimiter-concatenation signature for backward-compatibility verification only."""
     tid_str = json.dumps(result.target_identity or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     cq_str = json.dumps(result.capture_quality or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     before_str = canonicalize_receipt_value(result.before_value)
@@ -319,14 +374,17 @@ class CausalVerificationCapability:
         key = getattr(ledger_or_session, "_capability_key", None)
         if not key or self._capability_key != key or inv_id != self._investigation_id:
             return False
-        if self._evidence_id and evidence_id != self._evidence_id:
+        if self._evidence_id and str(evidence_id or "").strip() != str(self._evidence_id).strip():
             return False
-        if target_function and self._target_function and target_function != self._target_function:
+        if target_function and self._target_function and str(target_function).strip() != str(self._target_function).strip():
             return False
-        if field_path and self._field_path and field_path != self._field_path:
+        if field_path and self._field_path and str(field_path).strip() != str(self._field_path).strip():
             return False
-        if hypothesis_id and self._hypothesis_id and hypothesis_id != self._hypothesis_id:
-            return False
+        if hypothesis_id is not None:
+            eff_h = str(hypothesis_id).strip()
+            cap_h = str(self._hypothesis_id or "").strip()
+            if eff_h != cap_h:
+                return False
         return True
 
     def consume(self) -> None:
@@ -853,6 +911,20 @@ class EvidenceLedger:
         self._used_operation_ids: Dict[str, Dict[str, Any]] = {}
         self._operation_to_evidence_ids: Dict[str, List[str]] = {}
         self._operation_to_receipt_id: Dict[str, str] = {}
+        self._lock: threading.RLock = threading.RLock()
+
+    def remove_record(self, evidence_id: str) -> Optional[EvidenceRecord]:
+        """Remove a record from the ledger (e.g. for rollback on attestation failure)."""
+        with self._lock:
+            rec = self._by_id.pop(evidence_id, None)
+            if rec:
+                if rec in self._records:
+                    self._records.remove(rec)
+                if rec.evidence_type in self._by_type and rec in self._by_type[rec.evidence_type]:
+                    self._by_type[rec.evidence_type].remove(rec)
+                if rec.finding_id and rec.finding_id in self._by_finding and rec in self._by_finding[rec.finding_id]:
+                    self._by_finding[rec.finding_id].remove(rec)
+            return rec
 
     @property
     def capability_key(self) -> str:
@@ -860,7 +932,8 @@ class EvidenceLedger:
 
     @property
     def records(self) -> List[EvidenceRecord]:
-        return list(self._records)
+        with self._lock:
+            return list(self._records)
 
     def record_evidence(
         self,
@@ -911,63 +984,69 @@ class EvidenceLedger:
         execution_result: Optional[ControlledExecutionResult] = None,
     ) -> CausalVerificationCapability:
         """Issue an internal unforgeable capability strictly after authentic execution receipt verification."""
-        if execution_result is None or not isinstance(execution_result, ControlledExecutionResult):
-            raise ValueError("Capability issuance requires an authentic ControlledExecutionResult verified against session secret")
+        with self._lock:
+            if execution_result is None or not isinstance(execution_result, ControlledExecutionResult):
+                raise ValueError("Capability issuance requires an authentic ControlledExecutionResult verified against session secret")
 
-        if not execution_result.verify_authenticity(self.session_secret):
-            raise ValueError("Capability issuance rejected: execution receipt signature verification failed")
+            if not execution_result.verify_authenticity(self.session_secret):
+                raise ValueError("Capability issuance rejected: execution receipt signature verification failed")
 
-        if execution_result.investigation_id != self.session_id:
-            raise ValueError(f"Capability issuance rejected: execution receipt belongs to investigation '{execution_result.investigation_id}', not '{self.session_id}'")
+            if execution_result.investigation_id != self.session_id:
+                raise ValueError(f"Capability issuance rejected: execution receipt belongs to investigation '{execution_result.investigation_id}', not '{self.session_id}'")
 
-        # Single-use: reject replayed execution receipts
-        if execution_result.execution_id in self._used_execution_ids:
-            raise ValueError(f"Capability issuance rejected: execution receipt '{execution_result.execution_id}' has already been consumed")
+            # Single-use: reject replayed execution receipts
+            if execution_result.execution_id in self._used_execution_ids:
+                raise ValueError(f"Capability issuance rejected: execution receipt '{execution_result.execution_id}' has already been consumed")
 
-        # Evidence ID scope binding
-        eff_eid = evidence_id or execution_result.evidence_id
-        if not eff_eid:
-            raise ValueError("Capability issuance rejected: evidence_id is required")
-        if execution_result.evidence_id and evidence_id and execution_result.evidence_id != evidence_id:
-            raise ValueError(f"Capability issuance rejected: execution receipt evidence '{execution_result.evidence_id}' does not match '{evidence_id}'")
+            # Evidence ID scope binding
+            eff_eid = str(evidence_id or execution_result.evidence_id or "").strip()
+            rcpt_eid = str(execution_result.evidence_id or "").strip()
+            if not eff_eid or not rcpt_eid:
+                raise ValueError("Capability issuance rejected: evidence_id is required and non-empty")
+            if evidence_id and eff_eid != rcpt_eid:
+                raise ValueError(f"Capability issuance rejected: execution receipt evidence '{rcpt_eid}' does not match '{evidence_id}'")
 
-        # Target function scope binding
-        eff_fn = target_function or execution_result.target_function
-        if not eff_fn:
-            raise ValueError("Capability issuance rejected: target_function is required")
-        if execution_result.target_function and target_function and execution_result.target_function != target_function:
-            raise ValueError(f"Capability issuance rejected: execution receipt target_function '{execution_result.target_function}' does not match '{target_function}'")
+            # Target function scope binding
+            eff_fn = str(target_function or execution_result.target_function or "").strip()
+            rcpt_fn = str(execution_result.target_function or "").strip()
+            if not eff_fn or not rcpt_fn:
+                raise ValueError("Capability issuance rejected: target_function is required and non-empty")
+            if target_function and eff_fn != rcpt_fn:
+                raise ValueError(f"Capability issuance rejected: execution receipt target_function '{rcpt_fn}' does not match '{target_function}'")
 
-        # Field path scope binding
-        eff_field = field_path or execution_result.field_path
-        if not eff_field:
-            raise ValueError("Capability issuance rejected: field_path is required")
-        if execution_result.field_path and field_path and execution_result.field_path != field_path:
-            raise ValueError(f"Capability issuance rejected: execution receipt field_path '{execution_result.field_path}' does not match '{field_path}'")
+            # Field path scope binding
+            eff_field = str(field_path or execution_result.field_path or "").strip()
+            rcpt_field = str(execution_result.field_path or "").strip()
+            if not eff_field or not rcpt_field:
+                raise ValueError("Capability issuance rejected: field_path is required and non-empty")
+            if field_path and eff_field != rcpt_field:
+                raise ValueError(f"Capability issuance rejected: execution receipt field_path '{rcpt_field}' does not match '{field_path}'")
 
-        # Hypothesis ID scope binding
-        eff_hypo = hypothesis_id or execution_result.hypothesis_id
-        if execution_result.hypothesis_id and hypothesis_id and execution_result.hypothesis_id != hypothesis_id:
-            raise ValueError(f"Capability issuance rejected: execution receipt hypothesis '{execution_result.hypothesis_id}' does not match '{hypothesis_id}'")
+            # Hypothesis ID scope binding:
+            eff_hypo = str(hypothesis_id or execution_result.hypothesis_id or "").strip()
+            rcpt_hypo = str(execution_result.hypothesis_id or "").strip()
+            if hypothesis_id is not None and str(hypothesis_id).strip() != "":
+                if str(hypothesis_id).strip() != rcpt_hypo:
+                    raise ValueError(f"Capability issuance rejected: execution receipt hypothesis '{rcpt_hypo}' does not match '{hypothesis_id}'")
 
-        # Target identity validation
-        if getattr(self, "target_identity", None):
-            ok_tid, tid_reason = validate_controlled_execution_target_identity(self.target_identity, execution_result.target_identity)
-            if not ok_tid:
-                raise ValueError(f"Capability issuance rejected: {tid_reason}")
+            # Target identity validation
+            if getattr(self, "target_identity", None):
+                ok_tid, tid_reason = validate_controlled_execution_target_identity(self.target_identity, execution_result.target_identity)
+                if not ok_tid:
+                    raise ValueError(f"Capability issuance rejected: {tid_reason}")
 
-        if execution_result.execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
-            raise ValueError(f"Capability issuance rejected: execution receipt status '{execution_result.execution_status}' does not prove reproduction")
+            if execution_result.execution_status not in ("REPRODUCED", "SUCCESS", "CONFIRMED"):
+                raise ValueError(f"Capability issuance rejected: execution receipt status '{execution_result.execution_status}' does not prove reproduction")
 
-        cq = execution_result.capture_quality or {}
-        comp = cq.get("completeness") or cq.get("status")
-        cons = cq.get("consistency_level") or cq.get("consistency_classification")
-        if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
-            raise ValueError(f"Capability issuance rejected: execution receipt capture quality ({comp}, {cons}) is not complete and atomic")
+            cq = execution_result.capture_quality or {}
+            comp = cq.get("completeness") or cq.get("status")
+            cons = cq.get("consistency_level") or cq.get("consistency_classification")
+            if comp != "COMPLETE" or not is_atomic_or_stopped_consistency(cons):
+                raise ValueError(f"Capability issuance rejected: execution receipt capture quality ({comp}, {cons}) is not complete and atomic")
 
-        # Consume receipt single-use
-        self._used_execution_ids.add(execution_result.execution_id)
-        self._execution_to_evidence_id[execution_result.execution_id] = eff_eid
+            # Consume receipt single-use atomically
+            self._used_execution_ids.add(execution_result.execution_id)
+            self._execution_to_evidence_id[execution_result.execution_id] = eff_eid
 
         return CausalVerificationCapability(
             investigation_id=self.session_id,
@@ -995,99 +1074,99 @@ class EvidenceLedger:
         target_identity: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Attest an authentic proof record in this ledger with the session secret and cryptographic binding."""
-        rec = self.get_record(evidence_id)
-        if not rec:
-            raise ValueError(f"Evidence record '{evidence_id}' does not exist in ledger")
+        with self._lock:
+            rec = self.get_record(evidence_id)
+            if not rec:
+                raise ValueError(f"Evidence record '{evidence_id}' does not exist in ledger")
 
-        p_details = rec.details or {}
-        p_prov = rec.provenance or {}
-        if (
-            p_details.get("caller_submitted") is True
-            or p_details.get("unverified_caller_claim") is True
-            or rec.source == "unverified_caller"
-            or p_prov.get("submission_channel") == "external_caller"
-        ):
-            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' originated from unverified external caller")
+            p_details = rec.details or {}
+            p_prov = rec.provenance or {}
+            if (
+                p_details.get("caller_submitted") is True
+                or p_details.get("unverified_caller_claim") is True
+                or rec.source == "unverified_caller"
+                or p_prov.get("submission_channel") == "external_caller"
+            ):
+                raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' originated from unverified external caller")
 
-        cq = rec.capture_quality
-        if not cq or not isinstance(cq, dict):
-            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' lacks capture quality metadata")
-        comp = cq.get("completeness") or cq.get("status")
-        if comp != "COMPLETE":
-            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' has non-complete capture quality '{comp}'")
-        cons = cq.get("consistency_level") or cq.get("consistency_classification") or p_details.get("consistency_classification")
-        if not is_atomic_or_stopped_consistency(cons) or p_details.get("is_non_atomic") is True:
-            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' lacks atomic/stopped consistency '{cons}'")
+            cq = rec.capture_quality
+            if not cq or not isinstance(cq, dict):
+                raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' lacks capture quality metadata")
+            comp = cq.get("completeness") or cq.get("status")
+            if comp != "COMPLETE":
+                raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' has non-complete capture quality '{comp}'")
+            cons = cq.get("consistency_level") or cq.get("consistency_classification") or p_details.get("consistency_classification")
+            if not is_atomic_or_stopped_consistency(cons) or p_details.get("is_non_atomic") is True:
+                raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' lacks atomic/stopped consistency '{cons}'")
 
-        if rec.session_id and rec.session_id != self.session_id:
-            raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' belongs to session '{rec.session_id}', not '{self.session_id}'")
+            if rec.session_id and rec.session_id != self.session_id:
+                raise ValueError(f"Cannot attest causal proof: record '{evidence_id}' belongs to session '{rec.session_id}', not '{self.session_id}'")
 
-        # Authority check: Strictly require genuine internal verification capability!
-        # Caller-supplied booleans, status strings, or raw execution_provenance dictionaries cannot authorize attestation.
-        if capability is None or not isinstance(capability, CausalVerificationCapability):
-            raise ValueError(
-                f"Cannot attest causal proof: record '{evidence_id}' lacks genuine execution provenance or internal verification capability. "
-                "Caller-supplied booleans, status strings, or execution_provenance dictionaries cannot authorize attestation."
+            # Authority check: Strictly require genuine internal verification capability!
+            # Caller-supplied booleans, status strings, or raw execution_provenance dictionaries cannot authorize attestation.
+            if capability is None or not isinstance(capability, CausalVerificationCapability):
+                raise ValueError(
+                    f"Cannot attest causal proof: record '{evidence_id}' lacks genuine execution provenance or internal verification capability. "
+                    "Caller-supplied booleans, status strings, or execution_provenance dictionaries cannot authorize attestation."
+                )
+
+            eff_fn = target_function or capability.target_function
+            eff_field = field_path or capability.field_path
+            eff_hypo = hypothesis_id or capability.hypothesis_id
+
+            if not capability.is_valid_for(
+                self,
+                evidence_id=evidence_id,
+                target_function=eff_fn,
+                field_path=eff_field,
+                hypothesis_id=eff_hypo,
+            ):
+                raise ValueError(
+                    f"Cannot attest causal proof: capability is invalid, expired, cross-session, scope-mismatched, or already consumed for record '{evidence_id}'."
+                )
+
+            # Single-use: Consume capability immediately
+            capability.consume()
+
+            eff_tid = dict(target_identity or rec.target_identity or {})
+            rec.target_identity = dict(eff_tid)
+            rec.details["target_identity"] = dict(eff_tid)
+            eff_prov_cls = getattr(capability, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
+            eff_attr_ver = getattr(capability, "function_attribution_verified", False)
+            eff_attr_basis = getattr(capability, "attribution_basis", "")
+            eff_claims = getattr(capability, "verified_claims", ())
+
+            # Compute tamper-evident fingerprint and HMAC signature
+            fingerprint = compute_evidence_fingerprint(
+                record=rec,
+                target_function=eff_fn,
+                field_path=eff_field,
+                hypothesis_id=eff_hypo,
+                target_identity=eff_tid,
+                provenance_class=eff_prov_cls,
+                function_attribution_verified=eff_attr_ver,
+                attribution_basis=eff_attr_basis,
+                verified_claims=eff_claims,
             )
+            token_sig = compute_attestation_signature(self.session_secret, rec.evidence_id, fingerprint, self.session_id)
 
-        eff_fn = target_function or capability.target_function
-        eff_field = field_path or capability.field_path
-        eff_hypo = hypothesis_id or capability.hypothesis_id
-
-        if not capability.is_valid_for(
-            self,
-            evidence_id=evidence_id,
-            target_function=eff_fn,
-            field_path=eff_field,
-            hypothesis_id=eff_hypo,
-        ):
-            raise ValueError(
-                f"Cannot attest causal proof: capability is invalid, expired, cross-session, scope-mismatched, or already consumed for record '{evidence_id}'."
-            )
-
-        # Single-use: Consume capability immediately
-        capability.consume()
-
-        eff_tid = dict(target_identity or rec.target_identity or {})
-        rec.target_identity = dict(eff_tid)
-        rec.details["target_identity"] = dict(eff_tid)
-        eff_prov_cls = getattr(capability, "provenance_class", PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION)
-        eff_attr_ver = getattr(capability, "function_attribution_verified", False)
-        eff_attr_basis = getattr(capability, "attribution_basis", "")
-        eff_claims = getattr(capability, "verified_claims", ())
-
-        # Compute tamper-evident fingerprint and HMAC signature
-        fingerprint = compute_evidence_fingerprint(
-            record=rec,
-            target_function=eff_fn,
-            field_path=eff_field,
-            hypothesis_id=eff_hypo,
-            target_identity=eff_tid,
-            provenance_class=eff_prov_cls,
-            function_attribution_verified=eff_attr_ver,
-            attribution_basis=eff_attr_basis,
-            verified_claims=eff_claims,
-        )
-        token_sig = compute_attestation_signature(self.session_secret, rec.evidence_id, fingerprint, self.session_id)
-
-        # Stamp authentic internal attestation
-        rec.provenance["verifier_attestation"] = {
-            "token": self.session_secret,
-            "token_sig": token_sig,
-            "evidence_fingerprint": fingerprint,
-            "investigation_id": self.session_id,
-            "hypothesis_id": eff_hypo,
-            "target_function": eff_fn,
-            "field_path": eff_field,
-            "target_identity": eff_tid,
-            "provenance_class": eff_prov_cls,
-            "function_attribution_verified": eff_attr_ver,
-            "attribution_basis": eff_attr_basis,
-            "attribution_limitation": getattr(capability, "attribution_limitation", ""),
-            "verified_claims": list(eff_claims),
-            "verification_type": verification_type,
-            "attested_at": datetime.now(timezone.utc).isoformat(),
-        }
+            # Stamp authentic internal attestation (without exposing raw session secret)
+            rec.provenance["verifier_attestation"] = {
+                "token_sig": token_sig,
+                "evidence_fingerprint": fingerprint,
+                "investigation_id": self.session_id,
+                "hypothesis_id": eff_hypo,
+                "target_function": eff_fn,
+                "field_path": eff_field,
+                "target_identity": eff_tid,
+                "provenance_class": eff_prov_cls,
+                "function_attribution_verified": eff_attr_ver,
+                "attribution_basis": eff_attr_basis,
+                "attribution_limitation": getattr(capability, "attribution_limitation", ""),
+                "verified_claims": list(eff_claims),
+                "verification_type": verification_type,
+                "attested_at": datetime.now(timezone.utc).isoformat(),
+            }
         rec.provenance["provenance_class"] = eff_prov_cls
         rec.details["provenance_class"] = eff_prov_cls
         rec.details["function_attribution_verified"] = eff_attr_ver
@@ -1111,97 +1190,98 @@ class EvidenceLedger:
 
     def add_record(self, record: Union[EvidenceRecord, Dict[str, Any]]) -> EvidenceRecord:
         """Add an evidence record to the ledger, rejecting duplicate IDs."""
-        if isinstance(record, dict):
-            record = EvidenceRecord.from_dict(record)
-        if not record.session_id:
-            record.session_id = self.session_id
+        with self._lock:
+            if isinstance(record, dict):
+                record = EvidenceRecord.from_dict(record)
+            if not record.session_id:
+                record.session_id = self.session_id
 
-        _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
-        _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
-        _orig_exec = set(getattr(self, "_used_execution_ids", set()))
-        _orig_exec_to_eid = dict(getattr(self, "_execution_to_evidence_id", {}))
-        _orig_used_op = {k: dict(v) for k, v in getattr(self, "_used_operation_ids", {}).items()}
-        _orig_op_to_ev = {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()}
-        _orig_op_to_rcpt = dict(getattr(self, "_operation_to_receipt_id", {}))
+            _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
+            _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
+            _orig_exec = set(getattr(self, "_used_execution_ids", set()))
+            _orig_exec_to_eid = dict(getattr(self, "_execution_to_evidence_id", {}))
+            _orig_used_op = {k: dict(v) for k, v in getattr(self, "_used_operation_ids", {}).items()}
+            _orig_op_to_ev = {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()}
+            _orig_op_to_rcpt = dict(getattr(self, "_operation_to_receipt_id", {}))
 
-        try:
-            # Schema validation
-            self.validate_record(record)
+            try:
+                # Schema validation
+                self.validate_record(record)
 
-            if record.evidence_id in self._by_id:
-                raise ValueError(f"Duplicate evidence_id '{record.evidence_id}': record with this ID already exists in ledger.")
+                if record.evidence_id in self._by_id:
+                    raise ValueError(f"Duplicate evidence_id '{record.evidence_id}': record with this ID already exists in ledger.")
 
-            # Atomically update durable trust store if configured
-            if getattr(self, "trust_store", None):
-                p_prov = record.provenance or {}
-                p_details = record.details or {}
-                raw_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
-                if raw_causal and not hasattr(self.trust_store, "consume_attestation"):
-                    c_id = getattr(raw_causal, "attestation_id", None) or (raw_causal.get("attestation_id") if isinstance(raw_causal, dict) else None)
-                    if c_id:
-                        self.trust_store.record_used_attestation(c_id)
+                # Atomically update durable trust store if configured
+                if getattr(self, "trust_store", None):
+                    p_prov = record.provenance or {}
+                    p_details = record.details or {}
+                    raw_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
+                    if raw_causal and not hasattr(self.trust_store, "consume_attestation"):
+                        c_id = getattr(raw_causal, "attestation_id", None) or (raw_causal.get("attestation_id") if isinstance(raw_causal, dict) else None)
+                        if c_id:
+                            self.trust_store.record_used_attestation(c_id)
 
-                # P0-2: Bind operation in trust store
-                op_id = (record.details or {}).get("operation_id")
-                if not op_id and record.provenance:
-                    lcr = record.provenance.get("live_capture_receipt")
-                    if lcr:
-                        op_id = lcr.get("operation_id") if isinstance(lcr, dict) else getattr(lcr, "operation_id", None)
-                    if not op_id and raw_causal:
-                        op_id = raw_causal.get("operation_id") if isinstance(raw_causal, dict) else getattr(raw_causal, "operation_id", None)
-                if op_id:
-                    t_ident = record.target_identity or {}
-                    pid_val = t_ident.get("pid")
-                    eff_pid = int(pid_val) if pid_val is not None and not isinstance(pid_val, bool) else 0
-                    op_meta = {
-                        "evidence_id": record.evidence_id,
-                        "process_identity": str(t_ident.get("process_identity", "")),
-                        "executable_identity": str(t_ident.get("executable_identity") or t_ident.get("executable", "")),
-                        "build_id": str(t_ident.get("build_id", "")),
-                    }
-                    if t_ident.get("target_host"):
-                        op_meta["target_host"] = str(t_ident["target_host"])
-                    if (record.details or {}).get("derived_from"):
-                        op_meta["derived_from"] = record.details["derived_from"]
-                    if record.parent_evidence_ids:
-                        op_meta["parent_evidence_ids"] = list(record.parent_evidence_ids)
-                    if (record.details or {}).get("observation_digest"):
-                        op_meta["observation_digest"] = str(record.details["observation_digest"])
-                    if (record.details or {}).get("parent_evidence_digest"):
-                        op_meta["parent_evidence_digest"] = str(record.details["parent_evidence_digest"])
+                    # P0-2: Bind operation in trust store
+                    op_id = (record.details or {}).get("operation_id")
+                    if not op_id and record.provenance:
+                        lcr = record.provenance.get("live_capture_receipt")
+                        if lcr:
+                            op_id = lcr.get("operation_id") if isinstance(lcr, dict) else getattr(lcr, "operation_id", None)
+                        if not op_id and raw_causal:
+                            op_id = raw_causal.get("operation_id") if isinstance(raw_causal, dict) else getattr(raw_causal, "operation_id", None)
+                    if op_id:
+                        t_ident = record.target_identity or {}
+                        pid_val = t_ident.get("pid")
+                        eff_pid = int(pid_val) if pid_val is not None and not isinstance(pid_val, bool) else 0
+                        op_meta = {
+                            "evidence_id": record.evidence_id,
+                            "process_identity": str(t_ident.get("process_identity", "")),
+                            "executable_identity": str(t_ident.get("executable_identity") or t_ident.get("executable", "")),
+                            "build_id": str(t_ident.get("build_id", "")),
+                        }
+                        if t_ident.get("target_host"):
+                            op_meta["target_host"] = str(t_ident["target_host"])
+                        if (record.details or {}).get("derived_from"):
+                            op_meta["derived_from"] = record.details["derived_from"]
+                        if record.parent_evidence_ids:
+                            op_meta["parent_evidence_ids"] = list(record.parent_evidence_ids)
+                        if (record.details or {}).get("observation_digest"):
+                            op_meta["observation_digest"] = str(record.details["observation_digest"])
+                        if (record.details or {}).get("parent_evidence_digest"):
+                            op_meta["parent_evidence_digest"] = str(record.details["parent_evidence_digest"])
 
-                    self.trust_store.record_used_operation(
-                        op_id=str(op_id),
-                        session_id=record.session_id or self.session_id,
-                        pid=eff_pid,
-                        metadata=op_meta,
-                        allow_idempotent=True,
-                    )
-                    if hasattr(self.trust_store, "bind_operation_evidence"):
-                        self.trust_store.bind_operation_evidence(
-                            str(op_id),
-                            record.evidence_id,
-                            derived_from=(record.details or {}).get("derived_from"),
-                            parent_evidence_ids=record.parent_evidence_ids,
-                            parent_evidence_digest=(record.details or {}).get("parent_evidence_digest"),
+                        self.trust_store.record_used_operation(
+                            op_id=str(op_id),
+                            session_id=record.session_id or self.session_id,
+                            pid=eff_pid,
+                            metadata=op_meta,
+                            allow_idempotent=True,
                         )
+                        if hasattr(self.trust_store, "bind_operation_evidence"):
+                            self.trust_store.bind_operation_evidence(
+                                str(op_id),
+                                record.evidence_id,
+                                derived_from=(record.details or {}).get("derived_from"),
+                                parent_evidence_ids=record.parent_evidence_ids,
+                                parent_evidence_digest=(record.details or {}).get("parent_evidence_digest"),
+                            )
 
-            self._records.append(record)
-            self._by_id[record.evidence_id] = record
-            self._by_type.setdefault(record.evidence_type, []).append(record)
-            if record.finding_id:
-                self._by_finding.setdefault(record.finding_id, []).append(record)
-        except Exception:
-            self._used_causal_attestation_ids = _orig_causal
-            self._causal_attestation_to_evidence_id = _orig_causal_to_eid
-            self._used_execution_ids = _orig_exec
-            self._execution_to_evidence_id = _orig_exec_to_eid
-            self._used_operation_ids = _orig_used_op
-            self._operation_to_evidence_ids = _orig_op_to_ev
-            self._operation_to_receipt_id = _orig_op_to_rcpt
-            raise
+                self._records.append(record)
+                self._by_id[record.evidence_id] = record
+                self._by_type.setdefault(record.evidence_type, []).append(record)
+                if record.finding_id:
+                    self._by_finding.setdefault(record.finding_id, []).append(record)
+            except Exception:
+                self._used_causal_attestation_ids = _orig_causal
+                self._causal_attestation_to_evidence_id = _orig_causal_to_eid
+                self._used_execution_ids = _orig_exec
+                self._execution_to_evidence_id = _orig_exec_to_eid
+                self._used_operation_ids = _orig_used_op
+                self._operation_to_evidence_ids = _orig_op_to_ev
+                self._operation_to_receipt_id = _orig_op_to_rcpt
+                raise
 
-        return record
+            return record
 
     def record(
         self,
@@ -1245,24 +1325,25 @@ class EvidenceLedger:
 
     def validate_record(self, record: EvidenceRecord) -> None:
         """Validate record structure, types, and consistency transactionally."""
-        _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
-        _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
-        _orig_exec = set(getattr(self, "_used_execution_ids", set()))
-        _orig_exec_to_eid = dict(getattr(self, "_execution_to_evidence_id", {}))
-        _orig_used_op = {k: dict(v) for k, v in getattr(self, "_used_operation_ids", {}).items()}
-        _orig_op_to_ev = {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()}
-        _orig_op_to_rcpt = dict(getattr(self, "_operation_to_receipt_id", {}))
-        try:
-            self._do_validate_record(record)
-        except Exception:
-            self._used_causal_attestation_ids = _orig_causal
-            self._causal_attestation_to_evidence_id = _orig_causal_to_eid
-            self._used_execution_ids = _orig_exec
-            self._execution_to_evidence_id = _orig_exec_to_eid
-            self._used_operation_ids = _orig_used_op
-            self._operation_to_evidence_ids = _orig_op_to_ev
-            self._operation_to_receipt_id = _orig_op_to_rcpt
-            raise
+        with self._lock:
+            _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
+            _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
+            _orig_exec = set(getattr(self, "_used_execution_ids", set()))
+            _orig_exec_to_eid = dict(getattr(self, "_execution_to_evidence_id", {}))
+            _orig_used_op = {k: dict(v) for k, v in getattr(self, "_used_operation_ids", {}).items()}
+            _orig_op_to_ev = {k: list(v) for k, v in getattr(self, "_operation_to_evidence_ids", {}).items()}
+            _orig_op_to_rcpt = dict(getattr(self, "_operation_to_receipt_id", {}))
+            try:
+                self._do_validate_record(record)
+            except Exception:
+                self._used_causal_attestation_ids = _orig_causal
+                self._causal_attestation_to_evidence_id = _orig_causal_to_eid
+                self._used_execution_ids = _orig_exec
+                self._execution_to_evidence_id = _orig_exec_to_eid
+                self._used_operation_ids = _orig_used_op
+                self._operation_to_evidence_ids = _orig_op_to_ev
+                self._operation_to_receipt_id = _orig_op_to_rcpt
+                raise
 
     def _do_validate_record(self, record: EvidenceRecord) -> None:
         """Validate record structure, types, and consistency."""
@@ -1319,7 +1400,7 @@ class EvidenceLedger:
             if not isinstance(att, dict):
                 record.provenance["verifier_attestation"] = None
                 record.provenance["attestation_rejected"] = "Malformed verifier attestation structure"
-            elif att.get("token") != self.session_secret or att.get("investigation_id") != self.session_id:
+            elif not att.get("token_sig") or att.get("investigation_id") != self.session_id:
                 record.provenance["verifier_attestation"] = None
                 record.provenance["attestation_rejected"] = "Invalid, unverified, or cross-session attestation token"
             else:
@@ -1334,7 +1415,7 @@ class EvidenceLedger:
                     attribution_basis=att.get("attribution_basis"),
                 )
                 expected_sig = compute_attestation_signature(self.session_secret, record.evidence_id, expected_fp, self.session_id)
-                if att.get("evidence_fingerprint") != expected_fp or att.get("token_sig") != expected_sig:
+                if att.get("evidence_fingerprint") != expected_fp or not hmac.compare_digest(str(att.get("token_sig", "")), str(expected_sig)):
                     record.provenance["verifier_attestation"] = None
                     record.provenance["attestation_rejected"] = "Attestation signature mismatch or post-issuance tampering detected"
 

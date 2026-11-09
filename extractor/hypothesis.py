@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 """Structured Hypothesis Model, Follow-up Observation Planning, and Validation Engine.
 
 Provides an evidence-grounded hypothesis framework for dynamicState investigations:
@@ -2650,16 +2651,16 @@ class HypothesisValidator:
                 f"Proof evidence '{proof_rec.evidence_id}' lacks authentic internal verifier attestation",
                 proof_rec,
             )
-        if attestation.get("token") != ledger.session_secret:
+        if not attestation.get("token_sig"):
             return (
                 False,
-                f"Proof evidence '{proof_rec.evidence_id}' has invalid or unverified attestation token",
+                f"Proof evidence '{proof_rec.evidence_id}' lacks authentic internal verifier attestation token / signature",
                 proof_rec,
             )
         if attestation.get("investigation_id") != hypothesis.investigation_id:
             return (
                 False,
-                f"Proof evidence '{proof_rec.evidence_id}' attestation belongs to investigation '{attestation.get('investigation_id')}', not '{hypothesis.investigation_id}'",
+                f"Proof evidence '{proof_rec.evidence_id}' attestation token belongs to investigation '{attestation.get('investigation_id')}', not '{hypothesis.investigation_id}'",
                 proof_rec,
             )
 
@@ -2689,7 +2690,7 @@ class HypothesisValidator:
             hypothesis.investigation_id,
         )
         stored_sig = attestation.get("token_sig")
-        if not stored_sig or stored_sig != expected_sig:
+        if not stored_sig or not hmac.compare_digest(str(stored_sig), str(expected_sig)):
             return (
                 False,
                 f"Proof evidence '{proof_rec.evidence_id}' has invalid or forged cryptographic attestation signature",

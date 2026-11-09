@@ -1867,7 +1867,12 @@ class CompetingHypothesis:
         return self.status
 
     def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
+        saved_ledger = self.ledger
+        try:
+            self.ledger = None
+            d = asdict(self)
+        finally:
+            self.ledger = saved_ledger
         d.pop("ledger", None)
         d["_base_confidence"] = getattr(self, "_base_confidence", self.confidence)
         d["_support_weights"] = dict(getattr(self, "_support_weights", {}))
