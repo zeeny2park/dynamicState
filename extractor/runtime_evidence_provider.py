@@ -107,9 +107,11 @@ class RuntimeEvidenceProvider:
         adapter: Optional[TargetExecutionAdapter] = None,
         watch_manager: Optional[WatchSessionManager] = None,
         corpus_dir: Optional[str] = None,
+        budget_tracker: Optional[Any] = None,
     ):
         self.adapter = adapter or LocalTargetAdapter()
         self.watch_manager = watch_manager or WatchSessionManager(corpus_dir=corpus_dir or "/tmp/dynamicstate_corpus")
+        self.budget_tracker = budget_tracker
         self._historical_samples: Dict[str, List[Dict[str, Any]]] = {}
 
     def collect_process_info(self, pid: int) -> Tuple[Dict[str, Any], List[RuntimeEvidenceRecord]]:
@@ -420,6 +422,22 @@ class RuntimeEvidenceProvider:
             observation_data["missing_prerequisites"] = ["LIVE_TARGET_PID"]
             return observation_data, all_records
 
+        # Guard: Check observation budget exhaustion
+        if self.budget_tracker and not self.budget_tracker.can_continue():
+            rec = RuntimeEvidenceRecord(
+                evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                collection_method="budget_guard",
+                target_pid=pid,
+                observed_value=None,
+                collection_status="BUDGET_EXHAUSTED",
+                limitations=[f"Budget exhausted before collecting {recipe_id}: {self.budget_tracker.exhaustion_reason}"],
+                provenance_class=PROVENANCE_HISTORICAL_RECORD if companion_elf else PROVENANCE_SYNTHETIC_FIXTURE,
+            )
+            all_records.append(rec)
+            observation_data["budget_exhausted"] = True
+            observation_data["exhaustion_reason"] = self.budget_tracker.exhaustion_reason
+            return observation_data, all_records
+
         # Check target capability
         caps = getattr(target_assessment, "capabilities", []) if target_assessment else []
         limits = getattr(target_assessment, "limitations", []) if target_assessment else []
@@ -531,7 +549,22 @@ class RuntimeEvidenceProvider:
                         # Check in maps
                         matching_map = None
                         for m in maps:
-                            if m.get("start_int", 0) <= observed_addr < m.get("end_int", 0) or m.get("start", 0) <= observed_addr < m.get("end", 0):
+                            def _parse_m_addr(v):
+                                if isinstance(v, int):
+                                    return v
+                                if isinstance(v, str):
+                                    try:
+                                        return int(v, 16) if v.startswith("0x") else int(v)
+                                    except Exception:
+                                        return 0
+                                return 0
+                            m_start = m.get("start_int")
+                            if m_start is None:
+                                m_start = _parse_m_addr(m.get("start", 0))
+                            m_end = m.get("end_int")
+                            if m_end is None:
+                                m_end = _parse_m_addr(m.get("end", 0))
+                            if m_start <= observed_addr < m_end:
                                 matching_map = m
                                 break
                         if matching_map:

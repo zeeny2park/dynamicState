@@ -3697,13 +3697,97 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                     nread = -1
                     err = errno.ENOSYS
 
+                split_pages = None
+                PAGE_SIZE = 4096
+                if is_same_mem and chunk_size > PAGE_SIZE and (nread < chunk_size or (nread <= 0 and err in (errno.EFAULT, errno.EIO))):
+                    # Page-aware resilient splitting: retry sub-regions page-by-page without dropping the entire chunk
+                    split_pages = []
+                    page_off = 0
+                    while page_off < chunk_size:
+                        page_len = min(PAGE_SIZE, chunk_size - page_off)
+                        page_start = reg_start + page_off
+
+                        # If already successfully read in initial call
+                        if nread > 0 and (page_off + page_len) <= nread:
+                            split_pages.append((page_off, page_len, page_len, 0))
+                            page_off += page_len
+                            continue
+
+                        p_nread = -1
+                        p_err = errno.EFAULT
+                        if mem_reader:
+                            try:
+                                p_data = mem_reader(pid, page_start, page_len)
+                                if p_data is not None:
+                                    p_nread = len(p_data)
+                                    ctypes.memmove(ctypes.byref(buf, page_off), p_data, p_nread)
+                                    p_err = 0
+                                else:
+                                    p_nread = -1
+                                    p_err = errno.EIO
+                            except Exception:
+                                p_nread = -1
+                                p_err = errno.EIO
+                        elif fn_vm_readv:
+                            p_l_iov = _struct_iovec(ctypes.cast(ctypes.byref(buf, page_off), ctypes.c_void_p), page_len)
+                            p_r_iov = _struct_iovec(ctypes.c_void_p(page_start), page_len)
+                            p_nread = fn_vm_readv(
+                                pid,
+                                ctypes.byref(p_l_iov),
+                                1,
+                                ctypes.byref(p_r_iov),
+                                1,
+                                0
+                            )
+                            p_err = ctypes.get_errno() if p_nread <= 0 else 0
+                            if p_nread <= 0 and p_err == errno.EINTR:
+                                p_nread = fn_vm_readv(
+                                    pid,
+                                    ctypes.byref(p_l_iov),
+                                    1,
+                                    ctypes.byref(p_r_iov),
+                                    1,
+                                    0
+                                )
+                                p_err = ctypes.get_errno() if p_nread <= 0 else 0
+                            if p_nread <= 0 and p_err in (errno.ENOSYS, errno.EPERM) and handle.mem_pinned and handle.mem_fd is not None:
+                                try:
+                                    p_bytes = handle.read_mem(page_start, page_len)
+                                    if p_bytes is not None:
+                                        p_nread = len(p_bytes)
+                                        ctypes.memmove(ctypes.byref(buf, page_off), p_bytes, p_nread)
+                                        p_err = 0
+                                except Exception:
+                                    pass
+                        elif handle.mem_pinned and handle.mem_fd is not None:
+                            try:
+                                p_bytes = handle.read_mem(page_start, page_len)
+                                if p_bytes is not None:
+                                    p_nread = len(p_bytes)
+                                    ctypes.memmove(ctypes.byref(buf, page_off), p_bytes, p_nread)
+                                    p_err = 0
+                                else:
+                                    p_nread = -1
+                                    p_err = errno.EIO
+                            except Exception:
+                                p_nread = -1
+                                p_err = errno.EIO
+
+                        split_pages.append((page_off, page_len, p_nread, p_err))
+                        page_off += page_len
+
+                    salvaged = sum(p[2] for p in split_pages if p[2] > 0)
+                    if salvaged > 0:
+                        nread = salvaged
+                        err = 0
+
                 if nread <= 0 and err == errno.ESRCH:
                     diagnostics.append({
                         "code": "TARGET_EXITED_DURING_CAPTURE",
                         "message": f"Process {pid} exited while reading range 0x{reg_start:x}-0x{reg_start+chunk_size:x} (ESRCH).",
                         "level": "ERROR"
                     })
-                read_results.append((item, nread, err))
+                read_results.append((item, nread, err, split_pages))
 
             memory_read_completed = True
             handle.record_checkpoint("POST_MEMORY_READ")
@@ -3822,13 +3906,15 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         processed_plan_indices = {r[0][0] for r in read_results}
         for item in read_plans:
             if item[0] not in processed_plan_indices:
-                read_results.append((item, -1, errno.EIO))
+                read_results.append((item, -1, errno.EIO, None))
 
         mapping_race_detected = False
         if getattr(policy, "simulate_mapping_race", False):
             mapping_race_detected = True
 
-        for item, nread, err in read_results:
+        for res_entry in read_results:
+            nread = res_entry[1]
+            err = res_entry[2]
             if nread <= 0 and err == errno.EFAULT and not explicit_ranges_used_without_maps:
                 mapping_race_detected = True
                 break
@@ -3864,9 +3950,71 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         bytes_failed = 0
         bytes_unread = 0
 
-        for item, nread, err in read_results:
+        for res_entry in read_results:
+            if len(res_entry) == 4:
+                item, nread, err, split_pages = res_entry
+            else:
+                item, nread, err = res_entry
+                split_pages = None
+
             idx, reg, reg_start, reg_size, chunk_size, tail_omitted, buf, _, _ = item
-            if nread == chunk_size:
+            if split_pages is not None and any(p[2] > 0 for p in split_pages):
+                # Page-aware split processing: salvage valid pages without dropping the chunk
+                salvaged_in_chunk = 0
+                failed_in_chunk = 0
+                unreadable_subranges = []
+                readable_subranges = []
+
+                curr_start = None
+                curr_len = 0
+                for p_off, p_len, p_read, p_err in split_pages:
+                    if p_read == p_len:
+                        salvaged_in_chunk += p_read
+                        if curr_start is None:
+                            curr_start = reg_start + p_off
+                            curr_len = p_read
+                        else:
+                            curr_len += p_read
+                    else:
+                        if curr_start is not None:
+                            sub_bytes = bytes(buf.raw[(curr_start - reg_start):(curr_start - reg_start + curr_len)])
+                            buffers[(curr_start, curr_start + curr_len)] = sub_bytes
+                            captured_ranges.append((curr_start, curr_start + curr_len))
+                            readable_subranges.append((curr_start, curr_start + curr_len))
+                            curr_start = None
+                            curr_len = 0
+                        failed_in_chunk += p_len
+                        unreadable_subranges.append((reg_start + p_off, reg_start + p_off + p_len))
+
+                if curr_start is not None:
+                    sub_bytes = bytes(buf.raw[(curr_start - reg_start):(curr_start - reg_start + curr_len)])
+                    buffers[(curr_start, curr_start + curr_len)] = sub_bytes
+                    captured_ranges.append((curr_start, curr_start + curr_len))
+                    readable_subranges.append((curr_start, curr_start + curr_len))
+                    curr_start = None
+                    curr_len = 0
+
+                bytes_read += salvaged_in_chunk
+                bytes_failed += failed_in_chunk
+                if tail_omitted > 0:
+                    bytes_unread += tail_omitted
+
+                status = "COMPLETE" if (failed_in_chunk == 0 and tail_omitted == 0) else "PARTIAL"
+                raw_regions.append({
+                    "region_id": f"R{idx:05d}",
+                    "start": "0x{:x}".format(reg_start),
+                    "end": "0x{:x}".format(reg_start + chunk_size),
+                    "size": reg_size,
+                    "permissions": reg["permissions"],
+                    "offset": reg.get("offset", 0),
+                    "category": reg["category"],
+                    "pathname": reg.get("pathname", ""),
+                    "captured_bytes": salvaged_in_chunk,
+                    "status": status,
+                    "error": None if status == "COMPLETE" else "PARTIAL_PAGE_FAULT",
+                    "unreadable_subranges": [["0x{:x}".format(s), "0x{:x}".format(e)] for s, e in unreadable_subranges] if unreadable_subranges else [],
+                })
+            elif nread == chunk_size:
                 read_bytes = bytes(buf.raw[:nread])
                 buffers[(reg_start, reg_start + nread)] = read_bytes
                 captured_ranges.append((reg_start, reg_start + nread))

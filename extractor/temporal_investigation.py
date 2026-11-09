@@ -56,6 +56,7 @@ from extractor.evidence_ledger import (
     NATURE_INFERENCE,
     NATURE_OBSERVATION,
     PROVENANCE_CLASS_CONTROLLED_RUNTIME_REPRODUCTION,
+    PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
 )
 from extractor.hypothesis import (
@@ -541,6 +542,49 @@ class TemporalInvestigationService:
                 ident_status = "MISMATCH"
                 ident_reason = f"Failed to inspect companion ELF: {e}"
 
+        # Resolve authentic capture provenance and target identity
+        raw_live_rcpt = (
+            getattr(watch_session, "live_capture_receipt", None)
+            or (watch_session.provenance or {}).get("live_capture_receipt")
+            or (watch_session.configuration or {}).get("live_capture_receipt")
+        )
+
+        target_ident = {
+            "pid": watch_session.pid,
+            "target_build_id": target_bid,
+            "debug_build_id": comp_bid,
+            "status": ident_status,
+            "is_remote": watch_session.provenance.get("is_remote", False),
+            "host": watch_session.provenance.get("host", "localhost"),
+        }
+        if isinstance(watch_session.target_identity, dict):
+            for k, v in watch_session.target_identity.items():
+                if k not in target_ident:
+                    target_ident[k] = v
+
+        if raw_live_rcpt is not None:
+            if hasattr(raw_live_rcpt, "process_identity") and "process_identity" not in target_ident:
+                target_ident["process_identity"] = raw_live_rcpt.process_identity
+            elif isinstance(raw_live_rcpt, dict) and "process_identity" in raw_live_rcpt and "process_identity" not in target_ident:
+                target_ident["process_identity"] = raw_live_rcpt["process_identity"]
+            if hasattr(raw_live_rcpt, "executable_path") and "executable_identity" not in target_ident:
+                target_ident["executable_identity"] = raw_live_rcpt.executable_path
+            elif isinstance(raw_live_rcpt, dict) and "executable_path" in raw_live_rcpt and "executable_identity" not in target_ident:
+                target_ident["executable_identity"] = raw_live_rcpt["executable_path"]
+
+            prov_cls = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+            base_prov = {
+                "watch_session_id": sid,
+                "provenance_class": prov_cls,
+                "live_capture_receipt": raw_live_rcpt,
+            }
+        else:
+            prov_cls = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+            base_prov = {
+                "watch_session_id": sid,
+                "provenance_class": prov_cls,
+            }
+
         # Record Target Identity in canonical EvidenceLedger
         ev_ident = investigation_session.ledger.add_record(EvidenceRecord(
             evidence_type=EVIDENCE_TYPE_RUNTIME_IDENTITY,
@@ -548,17 +592,10 @@ class TemporalInvestigationService:
             source="watch_session_adapter",
             session_id=investigation_session.investigation_id,
             observation=f"Target PID {watch_session.pid} identity verified: Build ID '{target_bid or 'UNKNOWN'}' ({ident_status}).",
-            target_identity={
-                "pid": watch_session.pid,
-                "target_build_id": target_bid,
-                "debug_build_id": comp_bid,
-                "status": ident_status,
-                "is_remote": watch_session.provenance.get("is_remote", False),
-                "host": watch_session.provenance.get("host", "localhost"),
-            },
+            target_identity=dict(target_ident),
             provenance={
                 "watch_session_id": sid,
-                "provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+                "provenance_class": PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
             },
             details={"identity_status": ident_status, "reason": ident_reason},
         ))
@@ -626,16 +663,14 @@ class TemporalInvestigationService:
                 f"Watch session '{sid}' capture quality evaluated: mode={watch_session.capture_mode}, "
                 f"consistency={cap_consistency}. {HONEST_CAPTURE_SEMANTICS_NOTICE}"
             ),
+            target_identity=dict(target_ident),
             capture_quality={
                 "completeness": cap_quality,
                 "consistency_level": cap_consistency,
                 "capture_mode": watch_session.capture_mode,
                 "backend": watch_session.configuration.get("backend", "process_vm_readv"),
             },
-            provenance={
-                "watch_session_id": sid,
-                "provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
-            },
+            provenance=dict(base_prov),
             details={
                 "limitations": [HONEST_CAPTURE_SEMANTICS_NOTICE] + [
                     f"Capture gap ({gap.reason}): missing samples between {gap.start_ns} and {gap.end_ns}"
@@ -867,6 +902,7 @@ class TemporalInvestigationService:
                     f"Watch item '{item.name}' temporal observation: initial={first_val}, "
                     f"final={last_val}, changed={changed}, samples={len(item_vals)}."
                 ),
+                target_identity=dict(target_ident),
                 comparison_observation={
                     "item_id": item.item_id,
                     "item_name": item.name,
@@ -880,9 +916,8 @@ class TemporalInvestigationService:
                     "end_seq": item_vals[-1][0],
                 },
                 provenance={
-                    "watch_session_id": sid,
+                    **base_prov,
                     "watch_item_id": item.item_id,
-                    "provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
                 },
                 details={
                     "type_name": item.type_name,
@@ -1079,6 +1114,7 @@ class TemporalInvestigationService:
                             f"address 0x{closest_ptr_val:x} is {closest_dist} bytes from guard 0x{guard_target:x} "
                             f"(threshold: {plan.guard_threshold}B, sequence: {closest_seq})."
                         ),
+                        target_identity=dict(target_ident),
                         field_observation={
                             "variable_name": item.name,
                             "pointer_value": f"0x{closest_ptr_val:x}",
@@ -1087,9 +1123,8 @@ class TemporalInvestigationService:
                             "sequence": closest_seq,
                         },
                         provenance={
-                            "watch_session_id": sid,
+                            **base_prov,
                             "watch_item_id": item.item_id,
-                            "provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
                         },
                         details={"limitations": [HONEST_CAPTURE_SEMANTICS_NOTICE]},
                     ))

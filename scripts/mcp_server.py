@@ -35,6 +35,8 @@ except ImportError:
         def run(self, transport: str = "stdio"):
             pass
 from extractor.agent_runtime import AgentRuntime
+from extractor.diagnostic_recipes import DiagnosticRecipeRegistry
+from extractor.observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
 
 server = MCPServer(
     name="dynamicstate",
@@ -1484,36 +1486,124 @@ def runtime_run_diagnostic_recipe(
     expressions: Optional[List[str]] = None,
     duration_ms: int = 1000,
     interval_ms: int = 200,
+    thresholds: Optional[Dict[str, Any]] = None,
+    max_bytes_read: Optional[int] = None,
+    max_samples: Optional[int] = None,
+    max_target_stop_ms: Optional[float] = None,
+    budget_limits: Optional[Dict[str, Any]] = None,
     remote_host: Optional[str] = None,
     ssh_user: Optional[str] = None,
     ssh_port: int = 22,
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Run a guided embedded diagnostic recipe in a single call:
-    - 'instant_xray': Decode top state globals and heap pointer targets immediately (Silent Hang triage).
-    - 'before_after_diff': Sample twice across `duration_ms` and report mutated vs unchanged fields.
-    - 'timeseries_watch': Sample periodically over `duration_ms` and classify active vs stuck variables.
+    """Run a diagnostic recipe in a single call.
+
+    Supports:
+    1. Legacy watch modes:
+       - 'instant_xray': Decode top state globals and heap pointer targets immediately (Silent Hang triage).
+       - 'before_after_diff': Sample twice across `duration_ms` and report mutated vs unchanged fields.
+       - 'timeseries_watch': Sample periodically over `duration_ms` and classify active vs stuck variables.
+    2. Phase 2.1 Deterministic Diagnostic Recipes (22 recipes from DiagnosticRecipeRegistry):
+       - Memory Integrity: RECIPE_INVALID_MEMORY_ACCESS, RECIPE_DOUBLE_FREE, RECIPE_INVALID_FREE,
+         RECIPE_USE_AFTER_FREE, RECIPE_HEAP_METADATA_CORRUPTION, RECIPE_SUSPICIOUS_ALLOCATION_PATTERNS.
+       - Memory Growth: RECIPE_PROCESS_MEMORY_GROWTH, RECIPE_HEAP_GROWTH, RECIPE_ALLOCATION_FREE_IMBALANCE,
+         RECIPE_OBJECT_LIFETIME_ANOMALIES, RECIPE_REPEATED_ALLOCATION_PATTERNS, RECIPE_LONG_LIVED_OBJECT_ACCUMULATION.
+       - Abnormal Runtime State: RECIPE_UNEXPECTED_VARIABLE_CHANGES, RECIPE_STATE_TRANSITION_VIOLATIONS,
+         RECIPE_INCONSISTENT_RELATED_VARIABLES, RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS, RECIPE_SUSPICIOUS_BOUNDARY_VALUES.
+       - Thread & Synchronization: RECIPE_THREAD_STATE_ANOMALIES, RECIPE_SUSPICIOUS_LOCK_OWNERSHIP,
+         RECIPE_POTENTIAL_DEADLOCK_PATTERNS, RECIPE_LONG_RUNNING_BLOCKED_THREADS, RECIPE_SHARED_STATE_INCONSISTENCIES.
     """
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
             _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
             pid = _ctx['pid']
             companion_elf = _ctx['companion_elf_path']
-        res = runtime.watch_session_manager.run_diagnostic_recipe(
-            recipe=recipe,
-            pid=pid,
-            companion_elf_path=companion_elf,
-            expressions=expressions,
-            duration_ms=duration_ms,
-            interval_ms=interval_ms,
-            remote_host=remote_host,
-            ssh_user=ssh_user,
-            ssh_port=ssh_port,
-            ssh_key=ssh_key,
-            ssh_proxy_jump=ssh_proxy_jump,
+
+        recipe_raw = (recipe or "").strip()
+        recipe_lower = recipe_raw.lower()
+        legacy_modes = {"instant_xray", "before_after_diff", "timeseries_watch", "xray", "snapshot"}
+
+        if recipe_lower in legacy_modes:
+            res = runtime.watch_session_manager.run_diagnostic_recipe(
+                recipe=recipe_lower,
+                pid=pid,
+                companion_elf_path=companion_elf,
+                expressions=expressions,
+                duration_ms=duration_ms,
+                interval_ms=interval_ms,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
+            )
+            return _format_watch_result({"success": True, **res})
+
+        # Check DiagnosticRecipeRegistry
+        matched_id = None
+        for r_id in DiagnosticRecipeRegistry.list_recipe_ids():
+            if r_id.lower() == recipe_lower or r_id.replace("RECIPE_", "").lower() == recipe_lower:
+                matched_id = r_id
+                break
+
+        if matched_id:
+            # Build budget tracker if requested
+            b_tracker = None
+            b_kwargs: Dict[str, Any] = {}
+            if budget_limits and isinstance(budget_limits, dict):
+                b_kwargs.update(budget_limits)
+            if max_bytes_read is not None:
+                b_kwargs["max_bytes_read"] = max_bytes_read
+            if max_samples is not None:
+                b_kwargs["max_samples"] = max_samples
+            if max_target_stop_ms is not None:
+                b_kwargs["max_target_stop_ms"] = max_target_stop_ms
+            if duration_ms and "max_wall_clock_ms" not in b_kwargs:
+                b_kwargs["max_wall_clock_ms"] = float(duration_ms)
+
+            if b_kwargs:
+                b_tracker = ObservationBudgetTracker(limits=ObservationBudgetLimits(**b_kwargs))
+
+            target_adapter = None
+            try:
+                if remote_host:
+                    target_adapter = runtime.watch_session_manager._resolve_adapter(
+                        pid=pid,
+                        remote_host=remote_host,
+                        ssh_user=ssh_user,
+                        ssh_port=ssh_port,
+                        ssh_key=ssh_key,
+                        ssh_proxy_jump=ssh_proxy_jump,
+                    )
+                else:
+                    _c = runtime.watch_session_manager.get_active_target_context()
+                    if _c and _c.get("remote_host"):
+                        target_adapter = runtime.watch_session_manager._resolve_adapter(
+                            pid=pid,
+                            remote_host=_c.get("remote_host"),
+                            ssh_user=_c.get("ssh_user"),
+                            ssh_port=_c.get("ssh_port", 22),
+                            ssh_key=_c.get("ssh_key"),
+                            ssh_proxy_jump=_c.get("ssh_proxy_jump"),
+                        )
+            except Exception:
+                pass
+            res = runtime.expert_diagnostic_engine.run_recipe(
+                recipe_id=matched_id,
+                pid=pid,
+                companion_elf=companion_elf,
+                expressions=expressions,
+                thresholds=thresholds,
+                adapter=target_adapter,
+                budget=b_tracker,
+            )
+            return _format_watch_result({"success": True, **res})
+
+        raise ValueError(
+            f"Unknown diagnostic recipe '{recipe}'. Expected one of legacy watch modes {sorted(list(legacy_modes))} "
+            f"or one of 22 DiagnosticRecipeRegistry recipes: {DiagnosticRecipeRegistry.list_recipe_ids()}"
         )
-        return _format_watch_result({"success": True, **res})
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 

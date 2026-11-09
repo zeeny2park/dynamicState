@@ -109,6 +109,10 @@ from .evidence_adapter import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
 )
+from .observation_budget import (
+    ObservationBudgetLimits,
+    ObservationBudgetTracker,
+)
 from .evidence_ledger import (
     ATTRIBUTION_BASIS_CALL_STACK,
     EVIDENCE_TYPE_CAPTURE_QUALITY,
@@ -208,8 +212,9 @@ STATE_COMPLETED = "COMPLETED"
 STATE_INCONCLUSIVE = "INCONCLUSIVE"
 STATE_BLOCKED = "BLOCKED"
 STATE_FAILED = "FAILED"
+STATE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 
-TERMINAL_STATES = {STATE_COMPLETED, STATE_INCONCLUSIVE, STATE_BLOCKED, STATE_FAILED}
+TERMINAL_STATES = {STATE_COMPLETED, STATE_INCONCLUSIVE, STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED}
 
 
 # -----------------------------------------------------------------------------
@@ -1167,6 +1172,11 @@ class AdaptiveInvestigationSession:
         manual_invariants: Optional[List[Any]] = None,
         observation_interval: Optional[float] = None,
         observation_duration: Optional[float] = None,
+        target_recipe: Optional[str] = None,
+        target_expressions: Optional[List[str]] = None,
+        recipe_thresholds: Optional[Dict[str, Any]] = None,
+        budget_tracker: Optional[ObservationBudgetTracker] = None,
+        budget_limits: Optional[ObservationBudgetLimits] = None,
     ):
         self.investigation_id = investigation_id
         self.raw_problem_statement = problem_statement
@@ -1180,6 +1190,17 @@ class AdaptiveInvestigationSession:
         self.manual_invariants = manual_invariants or []
         self.observation_interval = observation_interval or 0.05
         self.observation_duration = observation_duration or 1.0
+        self.target_recipe = target_recipe
+        self.target_expressions = list(target_expressions or [])
+        self.recipe_thresholds = dict(recipe_thresholds or {})
+
+        # Budget Tracker
+        if budget_tracker is not None:
+            self.budget_tracker = budget_tracker
+        elif budget_limits is not None:
+            self.budget_tracker = ObservationBudgetTracker(limits=budget_limits)
+        else:
+            self.budget_tracker = ObservationBudgetTracker(limits=ObservationBudgetLimits())
 
         # Components
         self.classifier = ProblemClassifier()
@@ -1189,7 +1210,11 @@ class AdaptiveInvestigationSession:
         self.correlator = EvidenceToSourceCorrelator(companion_elf)
         self.ledger = EvidenceLedger(session_id=self.investigation_id)
         self.evidence_adapter = EvidenceAdapter()
-        self.evidence_provider = RuntimeEvidenceProvider(adapter=self.adapter, corpus_dir=self.corpus_dir)
+        self.evidence_provider = RuntimeEvidenceProvider(
+            adapter=self.adapter,
+            corpus_dir=self.corpus_dir,
+            budget_tracker=self.budget_tracker,
+        )
         self.temporal_memory_samples: List[Dict[str, Any]] = []
         self.observation_window = ObservationWindow(
             target_pid=pid or 0,
@@ -1479,10 +1504,34 @@ class AdaptiveInvestigationSession:
             self.state = STATE_FAILED
             return {"action": "PLAN", "state": self.state, "error": "Missing prerequisites for planning"}
 
-        self.plan = self.planner.create_plan(
-            classification=self.classification_result,
-            target_assessment=self.target_assessment,
-        )
+        if self.target_recipe:
+            r_meta = self.recipe_registry.get_recipe(self.target_recipe)
+            if r_meta:
+                primary_step = InvestigationStep(
+                    step_id=f"step_{r_meta.recipe_id.lower()}_01",
+                    recipe_id=r_meta.recipe_id,
+                    recipe_name=r_meta.name,
+                    category=r_meta.problem_category,
+                    domain=r_meta.domain,
+                    rationale=f"Targeted execution of diagnostic recipe {r_meta.name}",
+                    priority=1,
+                    cost_score=0.9,
+                    safety_score=1.0,
+                    expected_info_gain=0.9,
+                    multi_factor_score=0.95,
+                )
+                self.plan = InvestigationPlan(
+                    steps=[primary_step],
+                    total_steps=1,
+                    current_step_index=0,
+                    plan_rationale=f"Targeted execution of diagnostic recipe {r_meta.recipe_id}",
+                )
+
+        if not self.plan:
+            self.plan = self.planner.create_plan(
+                classification=self.classification_result,
+                target_assessment=self.target_assessment,
+            )
 
         # Incorporate Expert Overrides into plan (Case P)
         if self.expert_overrides:
@@ -1653,6 +1702,15 @@ class AdaptiveInvestigationSession:
             return f"FAILED: {type(le).__name__}: {le}"
 
     def _step_collect_next(self) -> Dict[str, Any]:
+        if self.budget_tracker and not self.budget_tracker.can_continue():
+            self.state = STATE_BUDGET_EXHAUSTED
+            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
+            self._finalize_conclusion(
+                stop_reason="BUDGET_EXHAUSTED",
+                summary=f"Investigation halted: {reason}",
+            )
+            return {"action": "BUDGET_EXHAUSTED", "state": self.state, "reason": reason}
+
         if not self.plan:
             self.state = STATE_ANALYZING
             return {"action": "COLLECT_COMPLETE", "state": self.state}
@@ -1669,6 +1727,15 @@ class AdaptiveInvestigationSession:
                 self.plan.current_step_index += 1
                 continue
             break
+
+        if self.budget_tracker and not self.budget_tracker.can_continue():
+            self.state = STATE_BUDGET_EXHAUSTED
+            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
+            self._finalize_conclusion(
+                stop_reason="BUDGET_EXHAUSTED",
+                summary=f"Investigation halted: {reason}",
+            )
+            return {"action": "BUDGET_EXHAUSTED", "state": self.state}
 
         if self.plan.current_step_index >= len(self.plan.steps):
             self.state = STATE_ANALYZING
@@ -2088,7 +2155,35 @@ class AdaptiveInvestigationSession:
                     if s.category == recipe.problem_category:
                         s.status = "SKIPPED"
 
+        # Deduct actual consumed resources into budget_tracker
+        if self.budget_tracker:
+            bytes_in_step = sum(
+                len(_er.observed_value) if isinstance(_er.observed_value, (bytes, bytearray))
+                else (len(str(_er.observed_value)) if _er.observed_value is not None else 0)
+                for _er in ev_records
+            )
+            measured_bytes = int(obs_data.get("bytes_read") or obs_data.get("bytes_captured") or bytes_in_step)
+            t_stop = float(obs_data.get("target_stop_ms", 0.0))
+            self.budget_tracker.record_sample(profile_id=step.recipe_id)
+            self.budget_tracker.record_read(
+                bytes_read=measured_bytes,
+                latency_us=float(_collect_dur_sec * 1_000_000.0),
+                stop_ms=t_stop,
+                is_failure=False,
+                profile_id=step.recipe_id,
+            )
+
         self.plan.current_step_index += 1
+
+        if self.budget_tracker and not self.budget_tracker.can_continue():
+            self.state = STATE_BUDGET_EXHAUSTED
+            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
+            self._finalize_conclusion(
+                stop_reason="BUDGET_EXHAUSTED",
+                summary=f"Investigation halted: {reason}",
+            )
+            return {"action": "BUDGET_EXHAUSTED", "step_id": step.step_id, "state": self.state, "reason": reason}
+
         if self.plan.current_step_index >= len(self.plan.steps):
             self.state = STATE_ANALYZING
         return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result)}
@@ -2609,6 +2704,7 @@ class AdaptiveInvestigationSession:
             "is_paused": self.is_paused,
             "created_at": self.timeline[0]["timestamp"] if self.timeline else "",
             "overall_verdict": self.conclusion.overall_verdict if self.conclusion else None,
+            "budget": self.budget_tracker.to_dict() if self.budget_tracker else None,
         }
 
     def get_methodology(self) -> Dict[str, Any]:
@@ -3344,6 +3440,11 @@ class ExpertDiagnosticEngine:
         manual_invariants: Optional[List[Any]] = None,
         observation_interval: Optional[float] = None,
         observation_duration: Optional[float] = None,
+        target_recipe: Optional[str] = None,
+        target_expressions: Optional[List[str]] = None,
+        recipe_thresholds: Optional[Dict[str, Any]] = None,
+        budget_tracker: Optional[ObservationBudgetTracker] = None,
+        budget_limits: Optional[ObservationBudgetLimits] = None,
     ) -> AdaptiveInvestigationSession:
         """Launches a new adaptive investigation session."""
         inv_id = investigation_id or f"inv_{uuid.uuid4().hex[:12]}"
@@ -3358,7 +3459,81 @@ class ExpertDiagnosticEngine:
             manual_invariants=manual_invariants,
             observation_interval=observation_interval,
             observation_duration=observation_duration,
+            target_recipe=target_recipe,
+            target_expressions=target_expressions,
+            recipe_thresholds=recipe_thresholds,
+            budget_tracker=budget_tracker,
+            budget_limits=budget_limits,
         )
+        self.sessions[inv_id] = session
+        return session
+
+    def run_recipe(
+        self,
+        recipe_id: str,
+        pid: Optional[int] = None,
+        companion_elf: Optional[str] = None,
+        expressions: Optional[List[str]] = None,
+        thresholds: Optional[Dict[str, Any]] = None,
+        adapter: Optional[TargetExecutionAdapter] = None,
+        budget: Optional[ObservationBudgetTracker] = None,
+        budget_limits: Optional[ObservationBudgetLimits] = None,
+    ) -> Dict[str, Any]:
+        """Runs a targeted deterministic diagnostic recipe from the registry with budget enforcement."""
+        from .diagnostic_recipes import DiagnosticRecipeRegistry
+        recipe = DiagnosticRecipeRegistry.get_recipe(recipe_id)
+        if not recipe:
+            norm = recipe_id.strip().upper()
+            if not norm.startswith("RECIPE_"):
+                recipe = DiagnosticRecipeRegistry.get_recipe(f"RECIPE_{norm}")
+            if not recipe:
+                for rid in DiagnosticRecipeRegistry.list_recipe_ids():
+                    if rid.upper() == norm or rid.replace("RECIPE_", "").upper() == norm:
+                        recipe = DiagnosticRecipeRegistry.get_recipe(rid)
+                        break
+        if not recipe:
+            raise ValueError(f"Recipe '{recipe_id}' not found in DiagnosticRecipeRegistry")
+
+        session = self.start_investigation(
+            problem_statement=f"Targeted execution of diagnostic recipe {recipe.recipe_id}: {recipe.name}",
+            pid=pid,
+            companion_elf=companion_elf,
+            adapter=adapter,
+            target_recipe=recipe.recipe_id,
+            target_expressions=expressions,
+            recipe_thresholds=thresholds,
+            budget_tracker=budget,
+            budget_limits=budget_limits,
+        )
+
+        conclusion = session.run_to_completion(max_steps=20)
+        check = next((c for c in session.checks if c.recipe_id == recipe.recipe_id), None)
+        records = session.ledger.get_records()
+
+        res = {
+            "investigation_id": session.investigation_id,
+            "recipe_id": recipe.recipe_id,
+            "recipe_name": recipe.name,
+            "domain": recipe.domain,
+            "category": recipe.problem_category,
+            "status": session.state if session.state == STATE_BUDGET_EXHAUSTED else (getattr(check, "status", session.state)),
+            "outcome": getattr(check, "outcome", session.state),
+            "state": session.state,
+            "stop_reason": getattr(conclusion, "stop_reason", None) or (session.state if session.state == STATE_BUDGET_EXHAUSTED else None),
+            "confidence": conclusion.confidence if conclusion else "medium",
+            "findings": [
+                asdict(f) if hasattr(f, "__dataclass_fields__") else f
+                for f in (conclusion.findings if conclusion and hasattr(conclusion, "findings") else [])
+            ],
+            "checks": [c.to_dict() if hasattr(c, "to_dict") else asdict(c) for c in session.checks],
+            "evidence_records": [r.to_dict() for r in records],
+            "evidence_count": len(records),
+            "limitations": conclusion.diagnostic_limitations if conclusion and hasattr(conclusion, "diagnostic_limitations") else [],
+            "budget": session.budget_tracker.to_dict() if session.budget_tracker else None,
+            "budget_metrics": asdict(session.budget_tracker.metrics) if (session.budget_tracker and hasattr(session.budget_tracker, "metrics")) else None,
+            "conclusion": conclusion.to_dict() if hasattr(conclusion, "to_dict") else (asdict(conclusion) if conclusion else None),
+        }
+        return res
         self.sessions[inv_id] = session
         return session
 
