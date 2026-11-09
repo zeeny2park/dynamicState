@@ -114,6 +114,13 @@ class ControlledExecutionResult:
     def __post_init__(self):
         if not isinstance(self.verified_claims, tuple):
             object.__setattr__(self, "verified_claims", tuple(sorted(self.verified_claims or ())))
+        # Unified canonical signature_version normalization policy:
+        # None, empty string, or whitespace-only is explicitly normalized to "v1_legacy_unversioned"
+        raw_version = getattr(self, "signature_version", None)
+        if raw_version is None or (isinstance(raw_version, str) and not raw_version.strip()):
+            object.__setattr__(self, "signature_version", "v1_legacy_unversioned")
+        elif isinstance(raw_version, str):
+            object.__setattr__(self, "signature_version", raw_version.strip())
 
     @property
     def is_function_attribution_verified(self) -> bool:
@@ -138,7 +145,7 @@ class ControlledExecutionResult:
         """
         if not self.receipt_signature:
             return False
-        sig_ver = getattr(self, "signature_version", "v2_rfc8785") or "v2_rfc8785"
+        sig_ver = getattr(self, "signature_version", "v1_legacy_unversioned")
         if sig_ver == "v2_rfc8785":
             try:
                 expected_v2 = compute_receipt_signature(session_secret, self)
@@ -157,7 +164,7 @@ class ControlledExecutionResult:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize ControlledExecutionResult into JSON-serializable dictionary."""
-        return {
+        data = {
             "execution_id": self.execution_id,
             "investigation_id": self.investigation_id,
             "target_function": self.target_function,
@@ -181,8 +188,9 @@ class ControlledExecutionResult:
             "verified_claims": list(self.verified_claims),
             "executed_at": self.executed_at,
             "receipt_signature": self.receipt_signature,
-            "signature_version": getattr(self, "signature_version", "v2_rfc8785"),
+            "signature_version": getattr(self, "signature_version", "v1_legacy_unversioned"),
         }
+        return strip_sensitive_session_secrets(data)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ControlledExecutionResult":
@@ -190,8 +198,8 @@ class ControlledExecutionResult:
         
         Legacy migration policy:
         - If 'signature_version' is present, it is preserved ('v2_rfc8785', 'v1_legacy', etc.).
-        - If 'signature_version' is missing or empty (historical record), it is marked
-          as 'v1_legacy_unversioned' so that it can only be verified via explicit legacy policy
+        - If 'signature_version' is missing or empty (historical record), __post_init__ normalizes
+          it to 'v1_legacy_unversioned' so that it can only be verified via explicit legacy policy
           and cannot be confused with modern v2 receipts.
         """
         if not isinstance(data, dict):
@@ -214,7 +222,15 @@ def migrate_legacy_execution_result(
     Validates historical authenticity using legacy v1 verification. If authentic,
     re-signs the structured payload using RFC 8785 JCS HMAC-SHA256 and sets
     signature_version='v2_rfc8785'. If unauthentic or tampered, raises ValueError.
+    Repeated migration on an already authentic v2 receipt is safe and idempotent.
     """
+    if getattr(result, "signature_version", None) == "v2_rfc8785":
+        if not result.verify_authenticity(session_secret, allow_legacy=False):
+            raise ValueError(
+                f"Cannot migrate execution receipt '{result.execution_id}': v2 authenticity verification failed"
+            )
+        return result
+
     if not result.verify_authenticity(session_secret, allow_legacy=True):
         raise ValueError(
             f"Cannot migrate legacy execution receipt '{result.execution_id}': authenticity verification failed"
@@ -274,19 +290,33 @@ def migrate_legacy_execution_result(
     )
 
 
-def strip_sensitive_session_secrets(obj: Any) -> Any:
-    """Recursively strip raw session secrets and bearer tokens from data structures.
+SENSITIVE_SECRET_FIELD_NAMES = frozenset({
+    "session_secret",
+    "_session_secret",
+    "raw_session_secret",
+    "session_secret_key",
+    "secret_key",
+    "capability_key",
+    "_capability_key",
+    "raw_capability_key",
+    "bearer_token",
+    "auth_token",
+    "raw_token",
+    "token",
+})
 
-    Targeted specifically to prevent leaking raw session secrets and raw bearer tokens
-    through nested dictionary or list structures, without removing legitimate fields.
+
+def strip_sensitive_session_secrets(obj: Any) -> Any:
+    """Recursively strip raw session secrets, capability keys, and bearer tokens from data structures.
+
+    Targeted specifically to prevent leaking raw session secrets, capability keys, and bearer tokens
+    through nested dictionary or list structures, without removing legitimate fields
+    such as 'token_sig', 'receipt_signature', 'secret_sauce', or 'shared_secret_id'.
     """
     if isinstance(obj, dict):
         cleaned = {}
         for k, v in obj.items():
-            if k in ("session_secret", "_session_secret", "raw_session_secret"):
-                continue
-            if k == "token" and isinstance(v, str) and len(v) in (32, 64):
-                # Raw token hex in verifier_attestation
+            if isinstance(k, str) and k.strip().lower() in SENSITIVE_SECRET_FIELD_NAMES:
                 continue
             cleaned[k] = strip_sensitive_session_secrets(v)
         return cleaned
@@ -914,7 +944,7 @@ class EvidenceRecord:
             data["comparison_observation"] = self.comparison_observation
         if self.uncertainty is not None:
             data["uncertainty"] = self.uncertainty
-        return data
+        return strip_sensitive_session_secrets(data)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EvidenceRecord":
@@ -998,11 +1028,13 @@ class EvidenceLedger:
         session_secret: Optional[str] = None,
         capability_key: Optional[str] = None,
         trust_store: Optional[Any] = None,
+        allow_legacy_signatures: bool = True,
     ):
         self.session_id: str = session_id or f"inv_sess_{uuid.uuid4().hex[:8]}"
         self.schema_version: str = schema_version
         self.session_secret: str = session_secret or uuid.uuid4().hex
         self._capability_key: str = capability_key or uuid.uuid4().hex
+        self.allow_legacy_signatures: bool = allow_legacy_signatures
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self._records: List[EvidenceRecord] = []
         self._by_id: Dict[str, EvidenceRecord] = {}
@@ -1100,7 +1132,8 @@ class EvidenceLedger:
             if execution_result is None or not isinstance(execution_result, ControlledExecutionResult):
                 raise ValueError("Capability issuance requires an authentic ControlledExecutionResult verified against session secret")
 
-            if not execution_result.verify_authenticity(self.session_secret):
+            allow_legacy = getattr(self, "allow_legacy_signatures", True)
+            if not execution_result.verify_authenticity(self.session_secret, allow_legacy=allow_legacy):
                 raise ValueError("Capability issuance rejected: execution receipt signature verification failed")
 
             if execution_result.investigation_id != self.session_id:
@@ -2242,7 +2275,7 @@ class EvidenceLedger:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize full ledger to dictionary."""
-        return strip_sensitive_session_secrets({
+        data = {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "created_at": self.created_at,
@@ -2253,14 +2286,23 @@ class EvidenceLedger:
             "operation_to_receipt_id": dict(getattr(self, "_operation_to_receipt_id", {})),
             "used_operation_ids": getattr(self, "_used_operation_ids", {}),
             "records": [r.to_dict() for r in self._records],
-        })
+        }
+        if getattr(self, "target_identity", None) is not None:
+            data["target_identity"] = self.target_identity
+        return strip_sensitive_session_secrets(data)
 
     def to_json(self, indent: Optional[int] = 2) -> str:
         """Serialize ledger to JSON string."""
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any], trust_store: Optional[Any] = None) -> "EvidenceLedger":
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        trust_store: Optional[Any] = None,
+        session_secret: Optional[str] = None,
+        allow_legacy_signatures: Optional[bool] = None,
+    ) -> "EvidenceLedger":
         """Reconstruct EvidenceLedger from serialized dictionary.
 
         Authoritative indexes are rebuilt strictly from validated records and compared
@@ -2273,11 +2315,18 @@ class EvidenceLedger:
 
         schema_ver = data.get("schema_version", EVIDENCE_SCHEMA_VERSION)
         session_id = data.get("session_id")
-        ledger = cls(
-            session_id=session_id,
-            schema_version=schema_ver,
-            trust_store=trust_store,
-        )
+        kwargs: Dict[str, Any] = {
+            "session_id": session_id,
+            "schema_version": schema_ver,
+            "trust_store": trust_store,
+        }
+        if session_secret is not None:
+            kwargs["session_secret"] = session_secret
+        if allow_legacy_signatures is not None:
+            kwargs["allow_legacy_signatures"] = allow_legacy_signatures
+        ledger = cls(**kwargs)
+        if "target_identity" in data:
+            ledger.target_identity = data["target_identity"]
         ledger.created_at = data.get("created_at", ledger.created_at)
         ledger._used_causal_attestation_ids = set()
         ledger._causal_attestation_to_evidence_id = {}

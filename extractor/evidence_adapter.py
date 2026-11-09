@@ -235,7 +235,8 @@ class EvidenceAdapter:
             if not eff_secret:
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
-            if not cand_res.verify_authenticity(eff_secret):
+            allow_legacy = getattr(ledger, "allow_legacy_signatures", True) if ledger is not None else True
+            if not cand_res.verify_authenticity(eff_secret, allow_legacy=allow_legacy):
                 return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
             if not cand_res.investigation_id or (eff_sess_id and str(cand_res.investigation_id) != str(eff_sess_id)):

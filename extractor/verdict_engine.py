@@ -864,6 +864,8 @@ class ZeroCdnReporter:
         data = asdict(verdict) if hasattr(verdict, "__dataclass_fields__") else dict(verdict)
         if metadata:
             data["report_metadata"] = metadata
+        from .evidence_ledger import strip_sensitive_session_secrets
+        data = strip_sensitive_session_secrets(data)
         return json.dumps(data, indent=2, sort_keys=True)
 
     def generate_html_report(self, title: str, report_data: Dict[str, Any]) -> str:

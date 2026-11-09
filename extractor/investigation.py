@@ -1085,7 +1085,8 @@ class TrustedCausalVerifier:
             raise ValueError("Invalid execution result: must be an instance of ControlledExecutionResult")
 
         # 1. Verify receipt authenticity against session secret
-        if not execution_result.verify_authenticity(self._session._session_secret):
+        allow_legacy = getattr(self.ledger, "allow_legacy_signatures", True) if getattr(self, "ledger", None) is not None else True
+        if not execution_result.verify_authenticity(self._session._session_secret, allow_legacy=allow_legacy):
             raise ValueError("Execution receipt signature / authenticity verification failed: forged or tampered receipt")
 
         # 2. Verify investigation binding
