@@ -775,7 +775,7 @@ class InvestigationWorkflowEngine:
             session_id=instance.session_id,
         )
         try:
-            if rec.evidence_id not in self.evidence_ledger._by_id:
+            if not self.evidence_ledger.has(rec.evidence_id):
                 self.evidence_ledger.add_record(rec)
         except Exception as exc:
             instance.record_transition(STAGE_FAILED, f"Evidence validation failed: {exc}")

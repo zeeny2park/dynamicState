@@ -208,6 +208,9 @@ class EvidenceAdapter:
                 exp_bid = t_ident.get("build_id") or t_ident.get("target_build_id")
                 exp_proc = t_ident.get("process_identity")
                 exp_exe = t_ident.get("executable_identity") or t_ident.get("executable")
+                # Do not assign LIVE_RUNTIME_CAPTURE to incomplete target identity
+                if exp_pid is None or not exp_proc or not exp_exe:
+                    return PROVENANCE_CLASS_IMPORTED_UNVERIFIED
                 ok, _ = rcpt_obj.verify(
                     expected_session_id=session_id or p_dict.get("session_id"),
                     expected_pid=exp_pid,
@@ -529,10 +532,14 @@ class EvidenceAdapter:
 
         # Check for duplicate semantic digest in ledger
         if ledger is not None:
-            for existing in ledger._records:
-                ex_details = existing.details or {}
-                if ex_details.get("semantic_digest") == sem_digest:
+            if hasattr(ledger, "has_semantic_digest"):
+                if ledger.has_semantic_digest(sem_digest):
                     return RESULT_DUPLICATE_EVIDENCE, COLLECTION_STATUS_COLLECTED, sem_digest
+            else:
+                for existing in getattr(ledger, "records", []):
+                    ex_details = existing.details or {}
+                    if ex_details.get("semantic_digest") == sem_digest:
+                        return RESULT_DUPLICATE_EVIDENCE, COLLECTION_STATUS_COLLECTED, sem_digest
 
         # Check for partial observation
         if (
@@ -635,9 +642,16 @@ class EvidenceAdapter:
             "recipe_id", "step_id", "finding", "finding_classification",
             "problem_category", "domain", "address", "symbol", "observed_value",
             "raw_observation", "normalized_observation", "correlation",
+            "source_correlation", "limitations", "collection_status",
+            "parent_evidence_ids",
         ):
             if meta_k in tool_result and tool_result[meta_k] is not None:
                 compact_details[meta_k] = tool_result[meta_k]
+
+        if "source_correlation" in tool_result and "correlation" not in compact_details:
+            compact_details["correlation"] = tool_result["source_correlation"]
+        if "correlation" in tool_result and "source_correlation" not in compact_details:
+            compact_details["source_correlation"] = tool_result["correlation"]
 
         if rcpt and prov_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
             rcpt_dict = rcpt if isinstance(rcpt, dict) else (rcpt.to_dict() if hasattr(rcpt, "to_dict") else {})
@@ -706,17 +720,44 @@ class EvidenceAdapter:
         if rcpt is not None and prov_cls == PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE:
             prov_dict["live_capture_receipt"] = rcpt if isinstance(rcpt, dict) else rcpt.to_dict()
 
+        # Preserve parent causality IDs
+        parent_ev_ids: List[str] = []
+        if tool_result.get("parent_evidence_ids") and isinstance(tool_result["parent_evidence_ids"], (list, tuple)):
+            parent_ev_ids = [str(pid) for pid in tool_result["parent_evidence_ids"]]
+        elif tool_result.get("parent_evidence_id"):
+            parent_ev_ids = [str(tool_result["parent_evidence_id"])]
+        elif tool_result.get("causal_parents") and isinstance(tool_result["causal_parents"], (list, tuple)):
+            parent_ev_ids = [str(pid) for pid in tool_result["causal_parents"]]
+
+        # Disarm inferences/hypotheses being promoted to observation facts
+        eff_nature = tool_result.get("nature") or nature
+        fc = str(tool_result.get("finding_classification") or "").upper()
+        if fc in ("INFERENCE", "DERIVED") or tool_result.get("is_inference"):
+            eff_nature = NATURE_INFERENCE
+        elif fc in ("HYPOTHESIS", "SPECULATION") or tool_result.get("is_hypothesis"):
+            eff_nature = NATURE_HYPOTHESIS
+
+        static_code_link = (
+            tool_result.get("static_code_link")
+            or tool_result.get("source_correlation")
+            or tool_result.get("correlation")
+        )
+        if isinstance(static_code_link, dict):
+            compact_details["static_code_link"] = static_code_link
+
         rec = EvidenceRecord(
             evidence_id=eff_ev_id,
             evidence_type=final_ev_type,
-            nature=nature,
+            nature=eff_nature,
             source=tool_name,
             timestamp=timestamp,
             session_id=session_id,
             finding_id=finding_id,
             observation=str(obs_text),
+            parent_evidence_ids=parent_ev_ids,
             target_identity=eff_target,
             provenance=prov_dict,
+            static_code_link=static_code_link if isinstance(static_code_link, dict) else None,
             capture_quality={
                 "completeness": cq_completeness,
                 "status": cq_completeness,
@@ -735,7 +776,7 @@ class EvidenceAdapter:
         raise_on_error: bool = False,
     ) -> List[EvidenceRecord]:
         """Safely appends one or more non-duplicate records into an EvidenceLedger."""
-        if not ledger:
+        if ledger is None:
             return records if isinstance(records, list) else [records]
 
         added: List[EvidenceRecord] = []
@@ -743,8 +784,8 @@ class EvidenceAdapter:
         for r in rec_list:
             sem_dig = (r.details or {}).get("semantic_digest")
             if sem_dig:
-                dup = next(
-                    (ex for ex in ledger._records if (ex.details or {}).get("semantic_digest") == sem_dig),
+                dup = ledger.find_by_semantic_digest(sem_dig) if hasattr(ledger, "find_by_semantic_digest") else next(
+                    (ex for ex in getattr(ledger, "records", []) if (ex.details or {}).get("semantic_digest") == sem_dig),
                     None,
                 )
                 if dup is not None:

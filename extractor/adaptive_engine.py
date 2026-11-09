@@ -2133,7 +2133,7 @@ class AdaptiveInvestigationEngine:
             {"step": 7, "name": "hypothesis_prioritization", "status": "COMPLETED", "detail": f"active_hypotheses={len(hypotheses)}"},
             {"step": 8, "name": "discriminating_observation_planning", "status": "COMPLETED", "detail": f"decisions={len(planner_decisions)}"},
             {"step": 9, "name": "observation_execution_under_budget", "status": "COMPLETED" if succ_obs_cnt > 0 else "ABSTAINED", "detail": f"actual={actual_obs_cnt},succ={succ_obs_cnt}"},
-            {"step": 10, "name": "evidence_normalization_and_ledger_recording", "status": "COMPLETED", "detail": f"records={len(ledger._records)}"},
+            {"step": 10, "name": "evidence_normalization_and_ledger_recording", "status": "COMPLETED", "detail": f"records={len(ledger)}"},
             {"step": 11, "name": "hypothesis_re_evaluation", "status": "COMPLETED", "detail": f"states={[h.validation_status for h in hypotheses]}"},
             {"step": 12, "name": "iterative_refinement_or_stopping_decision", "status": "COMPLETED", "detail": f"stop_reason={verdict.stop_reason}"},
             {"step": 13, "name": "verdict_synthesis", "status": "COMPLETED", "detail": f"verdict={verdict.final_diagnosis}"},
@@ -2216,7 +2216,7 @@ class AdaptiveInvestigationEngine:
                 for a in verdict.assertion_evaluations
             ],
             "inspection_summary": {k: {"success": v.get("success", True)} for k, v in inspection_outputs.items()},
-            "evidence_ledger_count": len(ledger._records),
+            "evidence_ledger_count": len(ledger),
             "evidence_ledger": ledger.to_dict(),
             "report_html": report_html,
             "report_json": report_json,

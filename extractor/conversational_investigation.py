@@ -167,8 +167,8 @@ class ConversationalAnalysisService:
         # 6. Valid Ledger Evidence IDs
         ledger = getattr(session, "ledger", None)
         valid_evidence_ids: List[str] = []
-        if ledger and hasattr(ledger, "_by_id"):
-            valid_evidence_ids = list(ledger._by_id.keys())
+        if ledger and hasattr(ledger, "records"):
+            valid_evidence_ids = [r.evidence_id for r in ledger.records]
         elif ledger and hasattr(ledger, "get_all_records"):
             valid_evidence_ids = [r.evidence_id for r in ledger.get_all_records()]
 
@@ -496,7 +496,7 @@ class ConversationalAnalysisService:
         if ledger is None and session and hasattr(session, "ledger"):
             ledger = session.ledger
         if not valid_evidence_ids and ledger:
-            valid_evidence_ids = list(ledger._by_id.keys()) if hasattr(ledger, "_by_id") else [r.evidence_id for r in ledger.get_all_records()]
+            valid_evidence_ids = [r.evidence_id for r in ledger.records] if hasattr(ledger, "records") else [r.evidence_id for r in ledger.get_all_records()]
 
         # 1. Clean markdown JSON formatting if present
         text = raw_response.strip()

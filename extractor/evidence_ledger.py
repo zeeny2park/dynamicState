@@ -1741,6 +1741,27 @@ class EvidenceLedger:
     def __contains__(self, evidence_id: str) -> bool:
         return evidence_id in self._by_id
 
+    def __len__(self) -> int:
+        """Returns the total number of admitted evidence records."""
+        return len(self._records)
+
+    def get_records(self) -> List[EvidenceRecord]:
+        """Returns a snapshot copy of all admitted evidence records."""
+        return list(self._records)
+
+    def find_by_semantic_digest(self, semantic_digest: str) -> Optional[EvidenceRecord]:
+        """Look up existing record by semantic digest for deduplication."""
+        if not semantic_digest:
+            return None
+        for r in self._records:
+            if (r.details or {}).get("semantic_digest") == semantic_digest:
+                return r
+        return None
+
+    def has_semantic_digest(self, semantic_digest: str) -> bool:
+        """Checks if a record with the specified semantic digest already exists."""
+        return self.find_by_semantic_digest(semantic_digest) is not None
+
     def query(
         self,
         evidence_type: Optional[str] = None,

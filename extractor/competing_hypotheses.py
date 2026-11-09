@@ -480,8 +480,6 @@ class CompetingHypothesis:
             return None
         if hasattr(ledger, "get_record"):
             return ledger.get_record(evidence_id)
-        if hasattr(ledger, "_by_id") and isinstance(ledger._by_id, dict):
-            return ledger._by_id.get(evidence_id)
         if hasattr(ledger, "records"):
             for r in ledger.records:
                 if getattr(r, "evidence_id", None) == evidence_id:

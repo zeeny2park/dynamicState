@@ -103,7 +103,12 @@ from .allocator_inspector import (
     CustomAllocatorInspector,
     UnknownAllocatorInspector,
 )
-from .evidence_adapter import EvidenceAdapter
+from .evidence_adapter import (
+    EvidenceAdapter,
+    PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+    PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+    PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+)
 from .evidence_ledger import (
     ATTRIBUTION_BASIS_CALL_STACK,
     EVIDENCE_TYPE_CAPTURE_QUALITY,
@@ -488,6 +493,9 @@ class TargetAssessmentResult:
     allocator_confidence: str = "UNKNOWN"
     allocator_basis: str = ""
     allocator_inspector: Optional[Any] = None
+    build_id: Optional[str] = None
+    process_identity: Optional[str] = None
+    executable_identity: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -508,6 +516,9 @@ class TargetAssessmentResult:
             "allocator_type": self.allocator_type,
             "allocator_confidence": self.allocator_confidence,
             "allocator_basis": self.allocator_basis,
+            "build_id": self.build_id,
+            "process_identity": self.process_identity,
+            "executable_identity": self.executable_identity,
         }
 
 
@@ -650,6 +661,29 @@ class TargetAssessor:
         else:
             prerequisites_met = bool(companion_elf is not None and elf_valid)
 
+        # Extract verified target identity attributes without fabrication
+        proc_identity = None
+        executable_identity = None
+        build_id = None
+        if pid is not None and pid > 1 and accessible:
+            try:
+                proc_info = target_adapter.get_process_identity(pid)
+                proc_identity = proc_info.get("process_identity")
+                executable_identity = proc_info.get("executable_identity") or proc_info.get("executable")
+                build_id = proc_info.get("build_id")
+            except Exception:
+                pass
+
+        if not build_id and companion_elf and os.path.exists(companion_elf):
+            try:
+                from .target_adapter import inspect_elf
+                companion_info = inspect_elf(companion_elf)
+                build_id = companion_info.build_id
+                if not executable_identity:
+                    executable_identity = companion_elf
+            except Exception:
+                pass
+
         return TargetAssessmentResult(
             pid=pid,
             accessible=accessible,
@@ -669,6 +703,9 @@ class TargetAssessor:
             allocator_confidence=allocator_det.confidence if allocator_det else "UNKNOWN",
             allocator_basis=allocator_det.basis if allocator_det else "",
             allocator_inspector=allocator_det.inspector if allocator_det else None,
+            build_id=build_id,
+            process_identity=proc_identity,
+            executable_identity=executable_identity,
         )
 
 
@@ -1483,32 +1520,75 @@ class AdaptiveInvestigationSession:
         """Records an authoritative or unverified EvidenceRecord into self.ledger via canonical EvidenceAdapter."""
         try:
             eff_pid = int(self.pid) if (self.pid is not None and self.pid > 0) else None
-            t_ident: Dict[str, Any] = {
-                "pid": eff_pid,
-                "process_identity": f"proc_{eff_pid}_{self.investigation_id}" if eff_pid else "unspecified",
-                "executable_identity": self.companion_elf or (f"/proc/{eff_pid}/exe" if eff_pid else "unspecified"),
-                "build_id": getattr(self.target_assessment, "build_id", None) or "sha1:runtime_verified_build",
-            }
-            if not eff_pid:
-                t_ident.pop("pid", None)
+            t_ident: Dict[str, Any] = {}
+            if eff_pid:
+                t_ident["pid"] = eff_pid
+
+            # Preserve real process_identity without fabrication
+            proc_id = (
+                getattr(self.target_assessment, "process_identity", None)
+                or enriched_ev.get("process_identity")
+                or (enriched_ev.get("target_identity") or {}).get("process_identity")
+                or (self.adapter.get_process_identity(eff_pid).get("process_identity") if eff_pid else None)
+            )
+            if proc_id:
+                t_ident["process_identity"] = proc_id
+
+            # Preserve real executable_identity without fabrication
+            exe_id = (
+                getattr(self.target_assessment, "executable_identity", None)
+                or enriched_ev.get("executable_identity")
+                or (enriched_ev.get("target_identity") or {}).get("executable_identity")
+                or self.companion_elf
+                or (self.adapter.get_process_identity(eff_pid).get("executable_identity") if eff_pid else None)
+            )
+            if exe_id:
+                t_ident["executable_identity"] = exe_id
+
+            # Preserve real build_id without fabrication (never fabricate fallback)
+            bid = (
+                getattr(self.target_assessment, "build_id", None)
+                or enriched_ev.get("build_id")
+                or (enriched_ev.get("target_identity") or {}).get("build_id")
+                or (self.adapter.get_process_identity(eff_pid).get("build_id") if eff_pid else None)
+            )
+            if bid:
+                t_ident["build_id"] = bid
 
             # Strict trust boundary:
-            # Genuine LiveCaptureReceipt is ONLY issued if target is a live process (eff_pid > 0)
-            # and prov_class is live or controlled runtime reproduction.
-            # Never promote imported or synthetic evidence to live capture.
-            rcpt = None
-            if eff_pid and prov_class in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION"):
-                from .capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
-                token = get_trusted_capture_authority_token()
-                rcpt = issue_live_capture_receipt(
-                    session_id=self.ledger.session_id,
-                    pid=eff_pid,
-                    process_identity=t_ident["process_identity"],
-                    executable_identity=t_ident["executable_identity"],
-                    build_id=t_ident["build_id"],
-                    snapshot_binding=f"snap_{self.investigation_id}",
-                    capture_authority_token=token,
-                )
+            # LiveCaptureReceipt must originate authentically from trusted capture backend.
+            # Never manufacture receipts in this recording method.
+            rcpt_raw = (
+                enriched_ev.get("live_capture_receipt")
+                or (enriched_ev.get("provenance") or {}).get("live_capture_receipt")
+            )
+            if prov_class == "LIVE_RUNTIME_CAPTURE":
+                if rcpt_raw is None:
+                    # Missing receipt: fail-closed downgrade to untrusted
+                    prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                else:
+                    from .capture_backend import LiveCaptureReceipt
+                    try:
+                        rcpt_obj = rcpt_raw if isinstance(rcpt_raw, LiveCaptureReceipt) else LiveCaptureReceipt.from_dict(rcpt_raw)
+                        # Reject if target identity is incomplete
+                        if eff_pid is None or not t_ident.get("process_identity") or not t_ident.get("executable_identity"):
+                            prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                            rcpt_raw = None
+                        else:
+                            ok, reason = rcpt_obj.verify(
+                                expected_session_id=self.ledger.session_id,
+                                expected_pid=eff_pid,
+                                expected_process_identity=t_ident.get("process_identity"),
+                                expected_executable_identity=t_ident.get("executable_identity"),
+                                expected_build_id=t_ident.get("build_id"),
+                                require_production_authority=True,
+                            )
+                            if not ok:
+                                prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                                rcpt_raw = None
+                    except Exception:
+                        prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+                        rcpt_raw = None
 
             tool_result = dict(enriched_ev)
             tool_result["evidence_id"] = ev_id
@@ -1516,15 +1596,30 @@ class AdaptiveInvestigationSession:
                 tool_result["finding"] = observation_text
             tool_result["recipe_id"] = recipe_id
             tool_result["provenance_class"] = prov_class
-            if rcpt is not None:
-                tool_result["live_capture_receipt"] = rcpt.to_dict()
+            if rcpt_raw is not None and prov_class == "LIVE_RUNTIME_CAPTURE":
+                tool_result["live_capture_receipt"] = rcpt_raw.to_dict() if hasattr(rcpt_raw, "to_dict") else rcpt_raw
+            else:
+                tool_result.pop("live_capture_receipt", None)
+                if "provenance" in tool_result and isinstance(tool_result["provenance"], dict):
+                    tool_result["provenance"].pop("live_capture_receipt", None)
+
+            # Preserve nature: Never turn an inference or hypothesis into an observation fact
+            eff_nature = enriched_ev.get("nature")
+            if not eff_nature:
+                fc = str(enriched_ev.get("finding_classification") or "").upper()
+                if fc in ("INFERENCE", "DERIVED") or enriched_ev.get("is_inference"):
+                    eff_nature = NATURE_INFERENCE
+                elif fc in ("HYPOTHESIS", "SPECULATION") or enriched_ev.get("is_hypothesis"):
+                    eff_nature = NATURE_HYPOTHESIS
+                else:
+                    eff_nature = NATURE_OBSERVATION
 
             # Canonical adaptation through EvidenceAdapter
             rec_obj = self.evidence_adapter.adapt_generic_tool_output(
                 tool_name=recipe_id,
                 tool_result=tool_result,
                 evidence_type=EVIDENCE_TYPE_DIAGNOSTIC,
-                nature=NATURE_OBSERVATION,
+                nature=eff_nature,
                 target_identity=t_ident,
                 session_id=self.ledger.session_id,
                 epoch=getattr(self.plan, "current_step_index", 0) if self.plan else 0,
@@ -1535,12 +1630,15 @@ class AdaptiveInvestigationSession:
             # Canonical registration into EvidenceLedger via EvidenceAdapter (fail-closed, no private collection mutation)
             added = self.evidence_adapter.record_into_ledger(rec_obj, self.ledger, raise_on_error=True)
             if not added and not self.ledger.has(ev_id):
-                dup = next((ex for ex in self.ledger._records if (ex.details or {}).get("semantic_digest") == (rec_obj.details or {}).get("semantic_digest")), None)
+                sem_dig = (rec_obj.details or {}).get("semantic_digest")
+                dup = self.ledger.find_by_semantic_digest(sem_dig)
                 if dup is not None:
                     return f"DUPLICATE: {dup.evidence_id}"
                 return "FAILED: Record was not admitted by ledger"
 
             return "RECORDED"
+        except Exception as le:
+            return f"FAILED: {le}"
         except Exception as le:
             return f"FAILED: {le}"
 
@@ -1610,15 +1708,50 @@ class AdaptiveInvestigationSession:
             except Exception:
                 pass
 
+        # Open transaction on self.adapter for live process if supported
+        step_tx = None
+        if self.pid and self.pid > 0 and hasattr(self.adapter, "begin_capture_transaction"):
+            try:
+                step_tx = self.adapter.begin_capture_transaction(
+                    session_id=self.ledger.session_id,
+                    pid=int(self.pid),
+                    operation_type="diagnostic",
+                    snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
+                )
+            except Exception:
+                step_tx = None
+
         # Perform actual live runtime evidence acquisition via RuntimeEvidenceProvider
         _t0_collect = time.monotonic()
-        obs_data, ev_records = self.evidence_provider.collect_for_recipe(
-            recipe=recipe,
-            pid=self.pid,
-            companion_elf=self.companion_elf,
-            target_assessment=self.target_assessment,
-            classification=self.classification_result,
-        )
+        try:
+            obs_data, ev_records = self.evidence_provider.collect_for_recipe(
+                recipe=recipe,
+                pid=self.pid,
+                companion_elf=self.companion_elf,
+                target_assessment=self.target_assessment,
+                classification=self.classification_result,
+            )
+        finally:
+            step_rcpt = None
+            if step_tx is not None:
+                try:
+                    committed_tx = self.adapter.commit_capture_transaction(step_tx)
+                    if committed_tx.physical_bytes_read > 0:
+                        bid = getattr(self.target_assessment, "build_id", None)
+                        step_rcpt = self.adapter.issue_live_receipt_for_session(
+                            session_id=self.ledger.session_id,
+                            pid=int(self.pid),
+                            snapshot_binding=committed_tx.snapshot_binding,
+                            companion_build_id=bid,
+                            transaction=committed_tx,
+                        )
+                except Exception as tx_err:
+                    try:
+                        self.adapter.rollback_capture_transaction(step_tx, str(tx_err))
+                    except Exception:
+                        pass
+                    step_rcpt = None
+
         _collect_dur_sec = round(max(0.0001, time.monotonic() - _t0_collect), 6)
         for _er in ev_records:
             if isinstance(_er.raw_details, dict) and "duration_sec" not in _er.raw_details:
@@ -1654,6 +1787,11 @@ class AdaptiveInvestigationSession:
         eval_result = self.recipe_registry.evaluate_recipe(recipe, eval_context)
         consumed_step_ev_ids: List[str] = []
 
+        eff_step_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE if step_rcpt is not None else (
+            PROVENANCE_CLASS_IMPORTED_UNVERIFIED if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE
+        )
+        rcpt_dict_payload = step_rcpt.to_dict() if step_rcpt is not None else None
+
         # Enrich and correlate evidence records (Section 7: 1:1 finding-to-evidence relationship)
         for i, fact in enumerate(eval_result.supporting_facts):
             obs_actual_val = obs_data.get("observed_value") if obs_data.get("observed_value") is not None else (
@@ -1667,10 +1805,10 @@ class AdaptiveInvestigationSession:
             if i < len(ev_records):
                 matching_rec = ev_records[i]
                 ev_id = matching_rec.evidence_id
-                prov_class = matching_rec.provenance_class
+                prov_class = eff_step_prov
             else:
                 ev_id = f"ev_{uuid.uuid4().hex[:12]}"
-                prov_class = ev_records[0].provenance_class if ev_records else RUNTIME_PROV_LIVE
+                prov_class = eff_step_prov
                 matching_rec = RuntimeEvidenceRecord(
                     evidence_id=ev_id,
                     collection_method=recipe.recipe_id,
@@ -1698,6 +1836,7 @@ class AdaptiveInvestigationSession:
                 "raw_observation": obs_data,
                 "normalized_observation": obs_actual_val,
                 "provenance_class": prov_class,
+                **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
@@ -1731,7 +1870,8 @@ class AdaptiveInvestigationSession:
                 "observed_value": obs_contra_val,
                 "raw_observation": obs_data,
                 "normalized_observation": obs_contra_val,
-                "provenance_class": RUNTIME_PROV_LIVE if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+                "provenance_class": eff_step_prov,
+                **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
@@ -1763,7 +1903,8 @@ class AdaptiveInvestigationSession:
                 "observed_value": obs_base_val,
                 "raw_observation": obs_data,
                 "normalized_observation": obs_base_val,
-                "provenance_class": RUNTIME_PROV_LIVE if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
+                "provenance_class": eff_step_prov,
+                **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}

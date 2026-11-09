@@ -467,7 +467,7 @@ class InvestigationSession:
             "findings": [f.to_dict() for f in self.findings],
             "hypotheses_count": len(self.hypotheses),
             "hypotheses": [h.to_dict() for h in self.hypotheses],
-            "evidence_count": len(self.ledger._records),
+            "evidence_count": len(self.ledger),
             "next_steps": [s.to_dict() for s in self.next_steps],
             "recommended_next_steps": [s.to_dict() for s in self.next_steps],
             "comparison_results": self.comparison_results,
@@ -1528,7 +1528,7 @@ class InvestigationManager:
             "status": session.status,
             "stages": session.stages,
             "findings_count": len(session.findings),
-            "evidence_count": len(session.ledger._records),
+            "evidence_count": len(session.ledger),
             "safety": session.safety,
             "summary": session.summary,
         }
@@ -3729,7 +3729,7 @@ class InvestigationManager:
 
         # Attribution evidence in ledger
         attr_records = []
-        for ev in session.ledger._records:
+        for ev in session.ledger.records:
             ev_details = ev.details or {}
             ev_att = (ev.provenance or {}).get("verifier_attestation") or {}
             matches_field = (
@@ -3812,13 +3812,13 @@ class InvestigationManager:
                         "comparison": ev.comparison_observation,
                         "field_observation": ev.field_observation,
                     }
-                    for ev in session.ledger._records
+                    for ev in session.ledger.records
                     if ev.evidence_id in target_finding.evidence_ids and (ev.comparison_observation or ev.field_observation)
                 ),
                 {}
             ),
             "evidence_records": [
-                ev.to_dict() for ev in session.ledger._records
+                ev.to_dict() for ev in session.ledger.records
                 if ev.evidence_id in target_finding.evidence_ids
             ],
         }
@@ -5099,7 +5099,7 @@ class InvestigationManager:
             "unknowns_count": unknown_cnt,
             "total_findings": len(session.findings),
             "next_steps_count": len(steps),
-            "evidence_count": len(session.ledger._records),
+            "evidence_count": len(session.ledger),
             "scope": {
                 "objects_examined": objects_examined,
                 "roots_examined": roots_examined,
