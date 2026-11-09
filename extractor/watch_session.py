@@ -2474,9 +2474,15 @@ class WatchSessionManager:
                 return r_bytes, r_st
 
             def _live_elem_decoder(e_addr: int, e_type_off: Optional[int], e_depth: int) -> Any:
-                e_val, e_st, _, _ = self._decode_typed_memory(
+                e_val, e_st, e_err, _ = self._decode_typed_memory(
                     adapter, pid, idx, e_addr, e_type_off, depth=e_depth, max_struct_depth=max_struct_depth
                 )
+                if e_st not in ("OBSERVED", "COMPLETE"):
+                    return {
+                        "value": e_val,
+                        "status": e_st,
+                        "error": e_err,
+                    }
                 return e_val
 
             c_data = CppContainerDecoder.decode_container(
@@ -2503,6 +2509,8 @@ class WatchSessionManager:
             if depth >= max_struct_depth or not canon_t.members:
                 return f"<{t_name} @ 0x{addr:x}>", "OBSERVED", None, raw_hex
             fields_dict: Dict[str, Any] = {}
+            struct_status = "OBSERVED"
+            struct_err = None
             for mem in canon_t.members:
                 if not mem.name:
                     continue
@@ -2513,10 +2521,14 @@ class WatchSessionManager:
                 if m_off + m_size <= len(raw):
                     m_slice = raw[m_off:m_off + m_size]
                     if m_canon and (m_canon.tag in ("DW_TAG_structure_type", "DW_TAG_class_type") or idx.classify_stl_type(mem.type_offset) is not None) and depth + 1 < max_struct_depth:
-                        sub_val, _, _, _ = self._decode_typed_memory(
+                        sub_val, sub_st, sub_err, _ = self._decode_typed_memory(
                             adapter, pid, idx, addr + m_off, mem.type_offset, depth=depth + 1, max_struct_depth=max_struct_depth
                         )
                         fields_dict[mem.name] = sub_val
+                        if sub_st not in ("OBSERVED", "COMPLETE"):
+                            struct_status = "PARTIAL"
+                            if not struct_err:
+                                struct_err = f"Member '{mem.name}' decode status: {sub_st} ({sub_err})"
                     elif m_canon and m_canon.tag == "DW_TAG_enumeration_type":
                         int_t = "int32_t" if m_size == 4 else ("int16_t" if m_size == 2 else ("int8_t" if m_size == 1 else "int64_t"))
                         ev_int, _ = decode_value_from_bytes(m_slice, int_t, endian=endian)
@@ -2536,7 +2548,11 @@ class WatchSessionManager:
                     else:
                         v, _ = decode_value_from_bytes(m_slice, m_canon.name if m_canon and m_canon.name else m_tname, endian=endian)
                         fields_dict[mem.name] = v
-            return fields_dict, "OBSERVED", None, raw_hex
+                else:
+                    struct_status = "PARTIAL"
+                    if not struct_err:
+                        struct_err = f"Member '{mem.name}' memory truncated or not captured"
+            return fields_dict, struct_status, struct_err, raw_hex
 
         # 5. Base / primitive type
         val, dec_err = decode_value_from_bytes(raw, canon_t.name or t_name, endian=endian)

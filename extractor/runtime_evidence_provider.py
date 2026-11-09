@@ -121,73 +121,152 @@ class RuntimeEvidenceProvider:
         if not pid or pid <= 0:
             return info, ev_records
 
-        alive, live_err = self.adapter.check_liveness(pid)
-        info["alive"] = alive
-        if not alive:
+        res_id = None
+        t0 = time.monotonic_ns()
+        if self.budget_tracker:
+            est_b = max(1, min(1024, self.budget_tracker.limits.max_bytes_read))
+            allowed, reason, res_id = self.budget_tracker.reserve(
+                estimated_bytes=est_b,
+                estimated_latency_ms=5.0,
+                estimated_samples=1,
+                profile_id="collect_process_info",
+            )
+            if not allowed:
+                rec = RuntimeEvidenceRecord(
+                    evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    collection_method="budget_guard",
+                    target_pid=pid,
+                    observed_value=None,
+                    collection_status="BUDGET_EXHAUSTED",
+                    limitations=[f"Budget exhausted before collecting process info: {reason}"],
+                    provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                )
+                ev_records.append(rec)
+                return info, ev_records
+
+        try:
+            alive, live_err = self.adapter.check_liveness(pid)
+            info["alive"] = alive
+            if not alive:
+                rec = RuntimeEvidenceRecord(
+                    evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    collection_method="adapter.check_liveness",
+                    target_pid=pid,
+                    observed_value={"alive": False, "error": live_err},
+                    collection_status=COLLECTION_STATUS_FAILED,
+                    limitations=[f"Process {pid} is not running or not accessible: {live_err}"],
+                    provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                )
+                ev_records.append(rec)
+                if self.budget_tracker and res_id:
+                    self.budget_tracker.reconcile_reservation(
+                        res_id,
+                        actual_bytes_read=128,
+                        latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0),
+                        is_failure=True,
+                    )
+                    self.budget_tracker.record_sample(profile_id="collect_process_info")
+                    res_id = None
+                return info, ev_records
+
+            try:
+                ident = self.adapter.get_process_identity(pid)
+                info.update(ident)
+            except Exception as e:
+                info["identity_error"] = str(e)
+
+            # RSS & Threads
+            rss_kb = 0
+            thread_ids: List[int] = []
+            try:
+                threads = self.adapter.get_threads(pid)
+                thread_ids = [t.get("tid", pid) for t in threads if isinstance(t, dict)]
+                info["threads"] = threads
+                info["thread_count"] = len(thread_ids)
+            except Exception:
+                pass
+
+            try:
+                status = self.adapter.get_process_status(pid)
+                if "VmRSS" in status:
+                    try:
+                        rss_kb = int(status["VmRSS"])
+                    except Exception:
+                        pass
+                if "VmSize" in status:
+                    try:
+                        info["vsize_kb"] = int(status["VmSize"])
+                    except Exception:
+                        pass
+                info["status_fields"] = status
+            except Exception:
+                pass
+            info["rss_kb"] = rss_kb
+
+            if self.budget_tracker and res_id:
+                approx_bytes = max(256, len(str(info).encode("utf-8", errors="replace")))
+                self.budget_tracker.reconcile_reservation(
+                    res_id,
+                    actual_bytes_read=approx_bytes,
+                    latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0),
+                    is_failure=False,
+                )
+                self.budget_tracker.record_sample(profile_id="collect_process_info")
+                res_id = None
+
             rec = RuntimeEvidenceRecord(
                 evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
-                collection_method="adapter.check_liveness",
+                collection_method="adapter_status_and_liveness",
                 target_pid=pid,
-                observed_value={"alive": False, "error": live_err},
-                collection_status=COLLECTION_STATUS_FAILED,
-                limitations=[f"Process {pid} is not running or not accessible: {live_err}"],
+                observed_value={"rss_kb": rss_kb, "thread_count": len(thread_ids), "alive": True},
+                collection_scope="PROCESS_METRICS",
+                collection_status=COLLECTION_STATUS_SUCCESS,
                 provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                raw_details=info,
             )
             ev_records.append(rec)
             return info, ev_records
-
-        try:
-            ident = self.adapter.get_process_identity(pid)
-            info.update(ident)
-        except Exception as e:
-            info["identity_error"] = str(e)
-
-        # RSS & Threads
-        rss_kb = 0
-        thread_ids: List[int] = []
-        try:
-            threads = self.adapter.get_threads(pid)
-            thread_ids = [t.get("tid", pid) for t in threads if isinstance(t, dict)]
-            info["threads"] = threads
-            info["thread_count"] = len(thread_ids)
-        except Exception:
-            pass
-
-        try:
-            status = self.adapter.get_process_status(pid)
-            if "VmRSS" in status:
-                try:
-                    rss_kb = int(status["VmRSS"])
-                except Exception:
-                    pass
-            if "VmSize" in status:
-                try:
-                    info["vsize_kb"] = int(status["VmSize"])
-                except Exception:
-                    pass
-            info["status_fields"] = status
-        except Exception:
-            pass
-        info["rss_kb"] = rss_kb
-
-        rec = RuntimeEvidenceRecord(
-            evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
-            collection_method="adapter_status_and_liveness",
-            target_pid=pid,
-            observed_value={"rss_kb": rss_kb, "thread_count": len(thread_ids), "alive": True},
-            collection_scope="PROCESS_METRICS",
-            collection_status=COLLECTION_STATUS_SUCCESS,
-            provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
-            raw_details=info,
-        )
-        ev_records.append(rec)
-        return info, ev_records
+        finally:
+            if self.budget_tracker and res_id:
+                self.budget_tracker.release_reservation(res_id)
 
     def collect_memory_maps(self, pid: int) -> Tuple[List[Dict[str, Any]], List[RuntimeEvidenceRecord]]:
         """Collects memory mappings directly from target /proc/<pid>/maps."""
         ev_records: List[RuntimeEvidenceRecord] = []
+        res_id = None
+        t0 = time.monotonic_ns()
+        if self.budget_tracker:
+            est_b = max(1, min(4096, self.budget_tracker.limits.max_bytes_read))
+            allowed, reason, res_id = self.budget_tracker.reserve(
+                estimated_bytes=est_b,
+                estimated_latency_ms=10.0,
+                estimated_samples=1,
+                profile_id="collect_memory_maps",
+            )
+            if not allowed:
+                rec = RuntimeEvidenceRecord(
+                    evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    collection_method="budget_guard",
+                    target_pid=pid,
+                    observed_value=None,
+                    collection_status="BUDGET_EXHAUSTED",
+                    limitations=[f"Budget exhausted before collecting memory maps: {reason}"],
+                    provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                )
+                ev_records.append(rec)
+                return [], ev_records
         try:
             maps = self.adapter.get_proc_maps(pid)
+            approx_bytes = max(512, len(maps) * 64)
+            if self.budget_tracker and res_id:
+                self.budget_tracker.reconcile_reservation(
+                    res_id,
+                    actual_bytes_read=approx_bytes,
+                    latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0),
+                    is_failure=False,
+                )
+                self.budget_tracker.record_sample(profile_id="collect_memory_maps")
+                res_id = None
             rec = RuntimeEvidenceRecord(
                 evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
                 collection_method="adapter.get_proc_maps",
@@ -201,6 +280,9 @@ class RuntimeEvidenceProvider:
             ev_records.append(rec)
             return maps, ev_records
         except Exception as e:
+            if self.budget_tracker and res_id:
+                self.budget_tracker.release_reservation(res_id)
+                res_id = None
             rec = RuntimeEvidenceRecord(
                 evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
                 collection_method="adapter.get_proc_maps",
@@ -212,6 +294,9 @@ class RuntimeEvidenceProvider:
             )
             ev_records.append(rec)
             return [], ev_records
+        finally:
+            if self.budget_tracker and res_id:
+                self.budget_tracker.release_reservation(res_id)
 
     def read_memory_range(
         self,
@@ -229,7 +314,50 @@ class RuntimeEvidenceProvider:
             except Exception:
                 addr_int = 0
 
-        data, method, err = self.adapter.read_memory(pid, addr_int, size)
+        res_id = None
+        t0 = time.monotonic_ns()
+        if self.budget_tracker:
+            allowed, reason, res_id = self.budget_tracker.reserve(
+                estimated_bytes=max(1, size),
+                estimated_latency_ms=2.0,
+                estimated_samples=1,
+                profile_id="read_memory_range",
+            )
+            if not allowed:
+                rec = RuntimeEvidenceRecord(
+                    evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    collection_method="budget_guard",
+                    target_pid=pid,
+                    address=addr_int,
+                    observed_value=None,
+                    collection_status="BUDGET_EXHAUSTED",
+                    limitations=[f"Budget exhausted before reading memory: {reason}"],
+                    provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                )
+                ev_records.append(rec)
+                return None, "BUDGET_EXHAUSTED", reason, ev_records
+
+        try:
+            data, method, err = self.adapter.read_memory(pid, addr_int, size)
+            if self.budget_tracker and res_id:
+                actual_bytes = len(data) if data is not None else 0
+                self.budget_tracker.reconcile_reservation(
+                    res_id,
+                    actual_bytes_read=actual_bytes,
+                    latency_us=max(50.0, (time.monotonic_ns() - t0) / 1000.0),
+                    is_failure=(data is None),
+                )
+                self.budget_tracker.record_sample(profile_id="read_memory_range")
+                res_id = None
+        except Exception as e:
+            if self.budget_tracker and res_id:
+                self.budget_tracker.release_reservation(res_id)
+                res_id = None
+            data, method, err = None, "exception", str(e)
+        finally:
+            if self.budget_tracker and res_id:
+                self.budget_tracker.release_reservation(res_id)
+
         status = COLLECTION_STATUS_SUCCESS if data is not None else COLLECTION_STATUS_FAILED
         limits = [f"Memory read at 0x{addr_int:x} failed: {err}"] if err else []
 
@@ -256,6 +384,30 @@ class RuntimeEvidenceProvider:
     ) -> Tuple[Dict[str, Any], List[RuntimeEvidenceRecord]]:
         """Evaluates a DWARF variable or struct expression non-intrusively."""
         ev_records: List[RuntimeEvidenceRecord] = []
+        res_id = None
+        t0 = time.monotonic_ns()
+        if self.budget_tracker:
+            est_b = max(1, min(1024, self.budget_tracker.limits.max_bytes_read))
+            allowed, reason, res_id = self.budget_tracker.reserve(
+                estimated_bytes=est_b,
+                estimated_latency_ms=10.0,
+                estimated_samples=1,
+                profile_id="evaluate_dwarf_expression",
+            )
+            if not allowed:
+                rec = RuntimeEvidenceRecord(
+                    evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    collection_method="budget_guard",
+                    target_pid=pid,
+                    source_variable=expression,
+                    observed_value=None,
+                    collection_status="BUDGET_EXHAUSTED",
+                    limitations=[f"Budget exhausted before evaluating DWARF expression '{expression}': {reason}"],
+                    provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                )
+                ev_records.append(rec)
+                return {"status": "BUDGET_EXHAUSTED", "error": reason}, ev_records
+
         try:
             res = self.watch_manager.evaluate_symbol_paths(
                 pid=pid,
@@ -268,6 +420,17 @@ class RuntimeEvidenceProvider:
             status_str = val_item.get("status", "NOT_FOUND")
             obs_val = val_item.get("value")
             addr_int = val_item.get("address_int")
+
+            approx_bytes = max(128, len(str(obs_val).encode("utf-8", errors="replace"))) if obs_val is not None else 64
+            if self.budget_tracker and res_id:
+                self.budget_tracker.reconcile_reservation(
+                    res_id,
+                    actual_bytes_read=approx_bytes,
+                    latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0),
+                    is_failure=(status_str != "OBSERVED"),
+                )
+                self.budget_tracker.record_sample(profile_id="evaluate_dwarf_expression")
+                res_id = None
 
             limits = []
             if status_str != "OBSERVED":
@@ -289,6 +452,9 @@ class RuntimeEvidenceProvider:
             ev_records.append(rec)
             return val_item, ev_records
         except Exception as e:
+            if self.budget_tracker and res_id:
+                self.budget_tracker.release_reservation(res_id)
+                res_id = None
             rec = RuntimeEvidenceRecord(
                 evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
                 collection_method="watch_manager.evaluate_symbol_paths",
@@ -301,6 +467,9 @@ class RuntimeEvidenceProvider:
             )
             ev_records.append(rec)
             return {"status": "ERROR", "error": str(e)}, ev_records
+        finally:
+            if self.budget_tracker and res_id:
+                self.budget_tracker.release_reservation(res_id)
 
     def _discover_dwarf_symbols(self, companion_elf: Optional[str]) -> Dict[str, Any]:
         """Discovers product-general variables, structs, pointers, counters, and containers from DWARF."""

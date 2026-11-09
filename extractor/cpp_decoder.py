@@ -406,6 +406,7 @@ class CppContainerDecoder:
         elem_status = "COMPLETE"
         elem_err = None
         failed_count = 0
+        partial_count = 0
         limit = min(count, max_elements)
         elements_truncated = (count > max_elements)
 
@@ -413,17 +414,32 @@ class CppContainerDecoder:
             for i in range(limit):
                 e_addr = start_ptr + i * elem_sz
                 ev = decode_elem_fn(e_addr, elem_type_off, depth + 1)
-                if ev is None or (isinstance(ev, dict) and ev.get("status") in ("MEMORY_NOT_CAPTURED", "INVALID_POINTER", "DECODE_ERROR", "ERROR")):
+                is_fail = False
+                is_part = False
+                if ev is None:
+                    is_fail = True
+                elif isinstance(ev, dict):
+                    st = ev.get("status")
+                    if st in ("MEMORY_NOT_CAPTURED", "INVALID_POINTER", "DECODE_ERROR", "ERROR", "ELEMENT_READ_FAILED"):
+                        is_fail = True
+                    elif st in ("PARTIAL", "CYCLE_DETECTED", "RECURSION_LIMIT_REACHED", "UNKNOWN_CONTROL_BLOCK", "CORRUPTED_CONTROL_BLOCK", "SUSPICIOUS_CAPACITY"):
+                        is_part = True
+                if is_fail:
                     failed_count += 1
+                elif is_part:
+                    partial_count += 1
                 elements.append(ev)
 
-            if failed_count > 0:
+            if failed_count > 0 or partial_count > 0:
                 if failed_count == limit:
                     elem_status = "ELEMENT_READ_FAILED"
                     elem_err = f"Failed to read all {limit} decoded elements"
-                else:
+                elif partial_count == 0:
                     elem_status = "PARTIAL"
                     elem_err = f"Failed to read {failed_count} of {limit} decoded elements"
+                else:
+                    elem_status = "PARTIAL"
+                    elem_err = f"Failed or partial decode for {failed_count + partial_count} of {limit} elements"
 
         res = {
             "container": "std::vector",
@@ -515,6 +531,11 @@ class CppContainerDecoder:
                 if target_val is None:
                     status = "ELEMENT_READ_FAILED"
                     err = f"Failed to decode pointee at 0x{target_ptr:x}"
+                elif isinstance(target_val, dict):
+                    t_st = target_val.get("status")
+                    if t_st and t_st not in ("COMPLETE", "RESOLVED", "OBSERVED"):
+                        status = t_st
+                        err = target_val.get("error") or f"Pointee at 0x{target_ptr:x} reported status {t_st}"
 
         res = {
             "container": "std::unique_ptr",
@@ -647,6 +668,11 @@ class CppContainerDecoder:
                 if target_val is None:
                     status = "ELEMENT_READ_FAILED"
                     err = f"Failed to decode pointee at 0x{target_ptr:x}"
+                elif isinstance(target_val, dict):
+                    t_st = target_val.get("status")
+                    if t_st and t_st not in ("COMPLETE", "RESOLVED", "OBSERVED"):
+                        status = t_st
+                        err = target_val.get("error") or f"Pointee at 0x{target_ptr:x} reported status {t_st}"
 
         is_expired = (use_count == 0) if (kind == "std::weak_ptr" and use_count is not None) else False
 
@@ -802,13 +828,14 @@ class CppObjectDecoder:
             if container_data:
                 obj_dict["container_data"] = container_data
                 obj_dict["is_container"] = True
-                obj_dict["status"] = container_data.get("status", "COMPLETE")
+                c_st = container_data.get("status", "COMPLETE")
+                obj_dict["status"] = c_st
                 for k, v in container_data.items():
                     obj_dict["fields"].append({
                         "name": k,
                         "type": type(v).__name__,
                         "value": v,
-                        "status": "RESOLVED",
+                        "status": "RESOLVED" if c_st == "COMPLETE" else c_st,
                         "address": hex(address),
                     })
                 return obj_id
@@ -1103,17 +1130,23 @@ class CppObjectDecoder:
                             path=m_path,
                             storage=target_storage,
                         )
-                        f_prov["status"] = "RESOLVED"
+                        target_obj = self.objects_by_id.get(target_id)
+                        t_st = target_obj.get("status", "COMPLETE") if target_obj else "COMPLETE"
+                        field_st = "RESOLVED" if t_st == "COMPLETE" else t_st
+                        f_prov["status"] = field_st
                         field_entry = {
                             "name": member.name,
                             "type": clean_m_type,
                             "value": hex(ptr_val),
                             "reference": target_id,
                             "object_ref": target_id,
-                            "status": "RESOLVED",
+                            "status": field_st,
                             "address": hex(m_addr),
                             "provenance": f_prov
                         }
+                        if t_st != "COMPLETE":
+                            field_entry["target_status"] = t_st
+                            obj_dict["status"] = "PARTIAL"
                         obj_dict["fields"].append(field_entry)
                         self.references.append({
                             "from_id": obj_dict["object_id"],

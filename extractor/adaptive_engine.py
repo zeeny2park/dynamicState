@@ -1351,7 +1351,7 @@ class AdaptiveInvestigationEngine:
                 est_lat = float(step.get("estimated_latency_ms", 10.0))
                 prof_ceil = step.get("budget_ceiling")
 
-                can_run, b_reason, eff_est_b = budget_tracker.check_pre_execution(
+                can_run, b_reason, step_res_id = budget_tracker.reserve(
                     estimated_bytes=est_b,
                     estimated_latency_ms=est_lat,
                     estimated_samples=1,
@@ -1359,7 +1359,6 @@ class AdaptiveInvestigationEngine:
                     profile_ceiling=prof_ceil,
                 )
                 if not can_run:
-                    budget_tracker.record_rejection(step_id, b_reason or "BUDGET_REJECTED")
                     triage_budget_rejected = True
                     observation_log.append({
                         "step_id": step_id,
@@ -1369,21 +1368,35 @@ class AdaptiveInvestigationEngine:
                     })
                     break
 
-                raw_out = dict(step.get("output") or {})
-                is_fail = raw_out.get("success") is False or raw_out.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
-                meas_b = raw_out.get("bytes_read") if isinstance(raw_out.get("bytes_read"), int) else None
-                budget_tracker.record_read(
-                    bytes_read=meas_b,
-                    latency_us=est_lat * 1000.0,
-                    stop_ms=float(raw_out.get("stop_duration_ms", 0.0)),
-                    is_failure=is_fail,
-                    conservative_estimate_bytes=eff_est_b,
-                    profile_id=step_id,
-                    profile_ceiling=prof_ceil,
-                )
-                budget_tracker.record_sample(profile_id=step_id)
-                executed_profiles.append(step_id)
-                inspection_outputs[step_id] = raw_out
+                try:
+                    raw_out = dict(step.get("output") or {})
+                    is_fail = raw_out.get("success") is False or raw_out.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
+                    meas_b = raw_out.get("bytes_read") if isinstance(raw_out.get("bytes_read"), int) else None
+                    if step_res_id:
+                        budget_tracker.reconcile_reservation(
+                            step_res_id,
+                            actual_bytes_read=meas_b,
+                            latency_us=est_lat * 1000.0,
+                            stop_ms=float(raw_out.get("stop_duration_ms", 0.0)),
+                            is_failure=is_fail,
+                        )
+                        step_res_id = None
+                    else:
+                        budget_tracker.record_read(
+                            bytes_read=meas_b,
+                            latency_us=est_lat * 1000.0,
+                            stop_ms=float(raw_out.get("stop_duration_ms", 0.0)),
+                            is_failure=is_fail,
+                            conservative_estimate_bytes=eff_est_b,
+                            profile_id=step_id,
+                            profile_ceiling=prof_ceil,
+                        )
+                    budget_tracker.record_sample(profile_id=step_id)
+                    executed_profiles.append(step_id)
+                    inspection_outputs[step_id] = raw_out
+                finally:
+                    if step_res_id:
+                        budget_tracker.release_reservation(step_res_id)
 
                 ev_rec = self.adapter.adapt_generic_tool_output(
                     tool_name=step_id,
@@ -1702,6 +1715,24 @@ class AdaptiveInvestigationEngine:
             executed_keys.add(selected_obs.observation_id)
             executed_keys.add(epoch_key)
 
+            obs_res_ok, obs_res_reason, obs_res_id = budget_tracker.reserve(
+                estimated_bytes=selected_obs.estimated_bytes,
+                estimated_latency_ms=selected_obs.estimated_latency_ms,
+                estimated_samples=1,
+                profile_id=selected_obs.profile_id or selected_obs.observation_id,
+            )
+            if not obs_res_ok:
+                observation_log.append({
+                    "observation_id": selected_obs.observation_id,
+                    "profile_id": selected_obs.profile_id,
+                    "target_ref": selected_obs.target_ref,
+                    "result_category": RESULT_BUDGET_REJECTED,
+                    "error": obs_res_reason,
+                    "success": False,
+                })
+                stop_reason = STOP_BUDGET_EXHAUSTED
+                break
+
             t_obs_0 = time.monotonic_ns()
             step_tx = None
             if not fixture_data and hasattr(eff_adapter, "capture_transaction"):
@@ -1715,14 +1746,24 @@ class AdaptiveInvestigationEngine:
                         or raw_obs_res.get("status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "FAILED")
                     )
                     meas_b = raw_obs_res.get("bytes_read") if isinstance(raw_obs_res.get("bytes_read"), int) else None
-                    budget_tracker.record_read(
-                        bytes_read=meas_b,
-                        latency_us=lat_us,
-                        stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
-                        is_failure=is_fail,
-                        conservative_estimate_bytes=selected_obs.estimated_bytes,
-                        profile_id=selected_obs.profile_id or selected_obs.observation_id,
-                    )
+                    if obs_res_id:
+                        budget_tracker.reconcile_reservation(
+                            obs_res_id,
+                            actual_bytes_read=meas_b,
+                            latency_us=lat_us,
+                            stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
+                            is_failure=is_fail,
+                        )
+                        obs_res_id = None
+                    else:
+                        budget_tracker.record_read(
+                            bytes_read=meas_b,
+                            latency_us=lat_us,
+                            stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
+                            is_failure=is_fail,
+                            conservative_estimate_bytes=selected_obs.estimated_bytes,
+                            profile_id=selected_obs.profile_id or selected_obs.observation_id,
+                        )
                     budget_tracker.record_sample(profile_id=selected_obs.profile_id or selected_obs.observation_id)
                 elif selected_obs.profile_id and self.registry.get(selected_obs.profile_id):
                     mod = self.registry.get(selected_obs.profile_id)
@@ -1741,8 +1782,24 @@ class AdaptiveInvestigationEngine:
                         capabilities=capabilities,
                     )
                     raw_obs_res = mod.run(ctx, self.watch_manager)
+                    if obs_res_id:
+                        meas_b = raw_obs_res.get("bytes_read") if isinstance(raw_obs_res.get("bytes_read"), int) else None
+                        lat_us = (time.monotonic_ns() - t_obs_0) / 1000.0
+                        is_fail = raw_obs_res.get("success") is False
+                        budget_tracker.reconcile_reservation(
+                            obs_res_id,
+                            actual_bytes_read=meas_b,
+                            latency_us=lat_us,
+                            stop_ms=float(raw_obs_res.get("stop_duration_ms", 0.0)),
+                            is_failure=is_fail,
+                        )
+                        budget_tracker.record_sample(profile_id=selected_obs.profile_id or selected_obs.observation_id)
+                        obs_res_id = None
                     executed_profiles.append(selected_obs.profile_id)
                 else:
+                    if obs_res_id:
+                        budget_tracker.release_reservation(obs_res_id)
+                        obs_res_id = None
                     raw_obs_res = {
                         "success": False,
                         "unavailable": True,
@@ -1750,6 +1807,9 @@ class AdaptiveInvestigationEngine:
                         "error": f"No execution handler available for observation '{selected_obs.observation_id}'",
                     }
             finally:
+                if obs_res_id:
+                    budget_tracker.release_reservation(obs_res_id)
+                    obs_res_id = None
                 if step_tx is not None:
                     try:
                         eff_adapter.commit_capture_transaction(step_tx)
