@@ -161,9 +161,10 @@ class RuntimeEvidenceProvider:
                 if self.budget_tracker and res_id:
                     self.budget_tracker.reconcile_reservation(
                         res_id,
-                        actual_bytes_read=128,
+                        actual_bytes_read=0,
                         latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0),
                         is_failure=True,
+                        physical_reads=0,
                     )
                     self.budget_tracker.record_sample(profile_id="collect_process_info")
                     res_id = None
@@ -207,9 +208,11 @@ class RuntimeEvidenceProvider:
                 approx_bytes = max(256, len(str(info).encode("utf-8", errors="replace")))
                 self.budget_tracker.reconcile_reservation(
                     res_id,
-                    actual_bytes_read=approx_bytes,
+                    actual_bytes_read=None,
+                    conservative_estimate_bytes=approx_bytes,
                     latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0),
                     is_failure=False,
+                    physical_reads=0,
                 )
                 self.budget_tracker.record_sample(profile_id="collect_process_info")
                 res_id = None
@@ -261,9 +264,11 @@ class RuntimeEvidenceProvider:
             if self.budget_tracker and res_id:
                 self.budget_tracker.reconcile_reservation(
                     res_id,
-                    actual_bytes_read=approx_bytes,
+                    actual_bytes_read=None,
+                    conservative_estimate_bytes=approx_bytes,
                     latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0),
                     is_failure=False,
+                    physical_reads=0,
                 )
                 self.budget_tracker.record_sample(profile_id="collect_memory_maps")
                 res_id = None
@@ -425,9 +430,11 @@ class RuntimeEvidenceProvider:
             if self.budget_tracker and res_id:
                 self.budget_tracker.reconcile_reservation(
                     res_id,
-                    actual_bytes_read=approx_bytes,
+                    actual_bytes_read=None,
+                    conservative_estimate_bytes=approx_bytes,
                     latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0),
                     is_failure=(status_str != "OBSERVED"),
+                    physical_reads=0,
                 )
                 self.budget_tracker.record_sample(profile_id="evaluate_dwarf_expression")
                 res_id = None

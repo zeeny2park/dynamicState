@@ -1443,6 +1443,12 @@ class AdaptiveInvestigationSession:
     def _step_classify(self) -> Dict[str, Any]:
         self.state = STATE_CLASSIFYING
         self.classification_result = self.classifier.classify(self.raw_problem_statement)
+        if self.target_expressions:
+            for exp in self.target_expressions:
+                if exp not in self.classification_result.extracted_entities.setdefault("variables", []):
+                    self.classification_result.extracted_entities["variables"].append(exp)
+                if exp not in self.classification_result.extracted_entities.setdefault("pointers", []):
+                    self.classification_result.extracted_entities["pointers"].append(exp)
         # Generate initial competing hypotheses bound to session ledger and target identity
         self.competing_hypotheses = CompetingHypothesisManager.generate_competing_hypotheses_for_symptom(
             self.classification_result.primary_category,
@@ -1857,6 +1863,7 @@ class AdaptiveInvestigationSession:
             "wait_for_graph": self.concurrency_graph,
             "observation_window": self.observation_window,
             "window": self.observation_window,
+            **self.recipe_thresholds,
             **obs_data,
         }
 

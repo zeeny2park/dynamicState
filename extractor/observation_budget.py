@@ -363,47 +363,61 @@ class ObservationBudgetTracker:
         is_failure: bool = False,
         consistency_level: Optional[str] = None,
         physical_reads: int = 0,
+        conservative_estimate_bytes: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Reconciles reservation against actual measured consumption, records overruns, and releases unused reserved amounts."""
         with self._lock:
             reservation = self.metrics.active_reservations.pop(reservation_id, None)
-            if reservation:
-                self.metrics.reserved_bytes = max(0, self.metrics.reserved_bytes - reservation["estimated_bytes"])
-                self.metrics.reserved_samples = max(0, self.metrics.reserved_samples - reservation["estimated_samples"])
-                self.metrics.reserved_wall_clock_ms = max(0.0, self.metrics.reserved_wall_clock_ms - reservation["estimated_latency_ms"])
-                self.metrics.reserved_stop_ms = max(0.0, self.metrics.reserved_stop_ms - reservation["estimated_stop_ms"])
-                profile_id = reservation.get("profile_id")
-                profile_ceiling = reservation.get("profile_ceiling")
+            if not reservation:
+                # Idempotent: reservation already reconciled, released, or invalid.
+                # Strictly prevent double-counting or charging budget multiple times.
+                return {
+                    "measured_bytes_read": None,
+                    "charged_bytes": 0,
+                    "used_conservative_byte_estimate": False,
+                    "latency_us": 0.0,
+                    "stop_ms": 0.0,
+                    "is_failure": False,
+                    "already_reconciled": True,
+                }
 
-                # Detect and record overrun
-                if actual_bytes_read is not None and isinstance(actual_bytes_read, (int, float)):
-                    act_b = max(0, int(actual_bytes_read))
-                    est_b = reservation.get("estimated_bytes", 0)
-                    if act_b > est_b:
-                        overrun = act_b - est_b
-                        self.metrics.overrun_count += 1
-                        self.metrics.total_overrun_bytes += overrun
-                        self.metrics.last_overrun_details = {
-                            "reservation_id": reservation_id,
-                            "estimated_bytes": est_b,
-                            "actual_bytes": act_b,
-                            "overrun_bytes": overrun,
-                            "profile_id": profile_id,
-                        }
-                        if len(self._history) >= 1000:
-                            self._history.pop(0)
-                        self._history.append({
-                            "event": "OVERRUN",
-                            "reservation_id": reservation_id,
-                            "estimated_bytes": est_b,
-                            "actual_bytes": act_b,
-                            "overrun_bytes": overrun,
-                            "profile_id": profile_id,
-                            "elapsed_ms": round(self.elapsed_ms, 3),
-                        })
-            else:
-                profile_id = None
-                profile_ceiling = None
+            self.metrics.reserved_bytes = max(0, self.metrics.reserved_bytes - reservation["estimated_bytes"])
+            self.metrics.reserved_samples = max(0, self.metrics.reserved_samples - reservation["estimated_samples"])
+            self.metrics.reserved_wall_clock_ms = max(0.0, self.metrics.reserved_wall_clock_ms - reservation["estimated_latency_ms"])
+            self.metrics.reserved_stop_ms = max(0.0, self.metrics.reserved_stop_ms - reservation["estimated_stop_ms"])
+            profile_id = reservation.get("profile_id")
+            profile_ceiling = reservation.get("profile_ceiling")
+
+            # Detect and record overrun
+            est_b = reservation.get("estimated_bytes", 0)
+            charge_check = None
+            if actual_bytes_read is not None and isinstance(actual_bytes_read, (int, float)):
+                charge_check = max(0, int(actual_bytes_read))
+            elif conservative_estimate_bytes is not None and isinstance(conservative_estimate_bytes, (int, float)):
+                charge_check = max(0, int(conservative_estimate_bytes))
+
+            if charge_check is not None and charge_check > est_b:
+                overrun = charge_check - est_b
+                self.metrics.overrun_count += 1
+                self.metrics.total_overrun_bytes += overrun
+                self.metrics.last_overrun_details = {
+                    "reservation_id": reservation_id,
+                    "estimated_bytes": est_b,
+                    "actual_bytes": charge_check,
+                    "overrun_bytes": overrun,
+                    "profile_id": profile_id,
+                }
+                if len(self._history) >= 1000:
+                    self._history.pop(0)
+                self._history.append({
+                    "event": "OVERRUN",
+                    "reservation_id": reservation_id,
+                    "estimated_bytes": est_b,
+                    "actual_bytes": charge_check,
+                    "overrun_bytes": overrun,
+                    "profile_id": profile_id,
+                    "elapsed_ms": round(self.elapsed_ms, 3),
+                })
 
             return self.record_read(
                 bytes_read=actual_bytes_read,
@@ -411,6 +425,7 @@ class ObservationBudgetTracker:
                 stop_ms=stop_ms,
                 is_failure=is_failure,
                 consistency_level=consistency_level,
+                conservative_estimate_bytes=conservative_estimate_bytes,
                 profile_id=profile_id,
                 profile_ceiling=profile_ceiling,
                 physical_reads=physical_reads,

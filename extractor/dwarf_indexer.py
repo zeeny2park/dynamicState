@@ -243,8 +243,12 @@ class DwarfIndex:
             if clean.startswith(prefix):
                 clean = clean[len(prefix):].strip()
         candidates = list(self.types_by_name.get(clean, []))
-        if not candidates and clean.startswith("std::"):
-            candidates = list(self.types_by_name.get(clean[5:].strip(), []))
+        if not candidates:
+            for pfx in ("std::__cxx11::", "std::__1::", "std::"):
+                if clean.startswith(pfx):
+                    candidates = list(self.types_by_name.get(clean[len(pfx):].strip(), []))
+                    if candidates:
+                        break
         if not candidates:
             # Handle common C/C++ integer aliases
             alias_map = {
