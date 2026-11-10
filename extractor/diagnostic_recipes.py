@@ -1357,6 +1357,27 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
     # 5. RECIPE_PROCESS_MEMORY_GROWTH
     elif rid == "RECIPE_PROCESS_MEMORY_GROWTH":
+        if data.get("insufficient_temporal_separation"):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis="Insufficient temporal separation (<50ms) between observation epochs. Rapid caller increments cannot manufacture temporal validity.",
+                missing_evidence=["adequate_temporal_separation"],
+                limitations=recipe.limitations + ["Insufficient temporal separation (<50ms)"],
+                details={"insufficient_temporal_separation": True},
+            )
+        if data.get("out_of_order_epoch_detected"):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis="Observation epochs arrived out-of-order. Temporal sequence cannot establish trend.",
+                missing_evidence=["strictly_increasing_epoch_sequence"],
+                limitations=recipe.limitations + ["Out-of-order epoch sequence"],
+                details={"out_of_order_epoch_detected": True},
+            )
+
         obs_win = data.get("observation_window") or data.get("window")
         if obs_win and hasattr(obs_win, "analyze_memory_behavior") and getattr(obs_win, "sample_count", lambda: 0)() >= 2:
             analysis = obs_win.analyze_memory_behavior()
@@ -1369,6 +1390,16 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                     missing_evidence=["valid_monotonic_temporal_sequence"],
                     limitations=analysis.limitations or recipe.limitations,
                     details={"classification": analysis.classification.value, "summary": analysis.summary},
+                )
+            elif analysis.classification == MemoryBehaviorClassification.INSUFFICIENT_OBSERVATION:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                    confidence=0.20,
+                    confidence_basis=f"Insufficient observation: {analysis.summary}",
+                    missing_evidence=["adequate_temporal_separation_or_duration", "minimum_3_valid_epochs"],
+                    limitations=analysis.limitations or recipe.limitations,
+                    details={"classification": analysis.classification.value, "summary": analysis.summary, **(analysis.details or {})},
                 )
             elif analysis.classification in (MemoryBehaviorClassification.CONFIRMED_LEAK, MemoryBehaviorClassification.SUSTAINED_RSS_GROWTH, MemoryBehaviorClassification.PROBABLE_LEAK):
                 rate = getattr(analysis, "rss_growth_rate_kb_per_sec", getattr(analysis, "growth_rate_kb_per_sec", 0.0))
@@ -1585,6 +1616,27 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
     # 6b. RECIPE_HEAP_GROWTH
     elif rid == "RECIPE_HEAP_GROWTH":
+        if data.get("insufficient_temporal_separation"):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis="Insufficient temporal separation (<50ms) between observation epochs.",
+                missing_evidence=["adequate_temporal_separation"],
+                limitations=recipe.limitations + ["Insufficient temporal separation (<50ms)"],
+                details={"insufficient_temporal_separation": True},
+            )
+        if data.get("out_of_order_epoch_detected"):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis="Observation epochs arrived out-of-order.",
+                missing_evidence=["strictly_increasing_epoch_sequence"],
+                limitations=recipe.limitations + ["Out-of-order epoch sequence"],
+                details={"out_of_order_epoch_detected": True},
+            )
+
         # Case F: Heap VMA growth must be distinguished from live object growth!
         if data.get("heap_growth_type") == "VMA_RESERVATION_ONLY" or data.get("live_objects_growing") is False:
             return RecipeEvaluationResult(
@@ -1911,6 +1963,31 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 limitations=["Counter reset detected between observation epochs"],
                 details={"imbalance_confirmed": False, "counter_reset_detected": True},
             )
+
+        # Check temporal progression deltas if available across multiple epochs
+        alloc_delta = data.get("alloc_delta")
+        free_delta = data.get("free_delta")
+        if alloc_delta is not None and free_delta is not None:
+            if alloc_delta >= 5 * max(1, free_delta) and alloc_delta > 10:
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_SUPPORTED,
+                    confidence=0.94,
+                    confidence_basis=f"Severe temporal allocation/free delta imbalance: +{alloc_delta} allocations vs +{free_delta} frees across observation window.",
+                    supporting_facts=[f"Temporal delta: allocs=+{alloc_delta}, frees=+{free_delta}"],
+                    recommended_action="Audit dynamic allocation sites and ensure symmetric release.",
+                    details={"imbalance_confirmed": True, "alloc_delta": alloc_delta, "free_delta": free_delta},
+                )
+            elif abs(alloc_delta - free_delta) <= max(10, int(0.05 * max(1, alloc_delta))):
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_CONTRADICTED,
+                    confidence=0.92,
+                    confidence_basis=f"Temporal allocation and free progression are balanced (alloc delta=+{alloc_delta}, free delta=+{free_delta}).",
+                    contradicting_facts=["Balanced alloc/free progression delta"],
+                    recommended_action="Refute allocation imbalance hypothesis.",
+                    details={"imbalance_confirmed": False, "alloc_delta": alloc_delta, "free_delta": free_delta},
+                )
 
         alloc_count = data.get("alloc_count") if data.get("alloc_count") is not None else data.get("cumulative_allocations")
         free_count = data.get("free_count") if data.get("free_count") is not None else data.get("cumulative_frees")

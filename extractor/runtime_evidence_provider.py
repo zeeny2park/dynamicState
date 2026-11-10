@@ -137,7 +137,7 @@ class RuntimeEvidenceProvider:
         host = ident.get("host") or (self.adapter.target_host() if hasattr(self.adapter, "target_host") else "localhost")
         boot_id = ident.get("boot_id") or ""
         start_time = ident.get("start_time") or ""
-        exe = ident.get("executable") or ident.get("executable_identity") or ""
+        exe = ident.get("executable") or ident.get("executable_identity") or ident.get("exe_path") or ""
         build_id = ident.get("build_id") or ""
 
         missing_fields = []
@@ -713,6 +713,7 @@ class RuntimeEvidenceProvider:
             "RECIPE_USE_AFTER_FREE",
             "RECIPE_HEAP_METADATA_CORRUPTION",
             "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS",
+            "RECIPE_OBJECT_LIFETIME_ANOMALIES",
         ):
             maps, m_recs = self.collect_memory_maps(pid)
             all_records.extend(m_recs)
@@ -907,6 +908,8 @@ class RuntimeEvidenceProvider:
                     "last_epoch_id": 0,
                     "last_monotonic_ns": 0,
                     "has_temporal_regression": False,
+                    "has_out_of_order_epochs": False,
+                    "insufficient_temporal_separation": False,
                     "counter_reset_detected": False,
                 }
             hist_state = self._historical_samples[scoped_key]
@@ -914,6 +917,7 @@ class RuntimeEvidenceProvider:
             now_mono_ns = time.monotonic_ns()
             now_wall = time.time()
             last_mono_ns = hist_state["last_monotonic_ns"]
+            MIN_EPOCH_SEPARATION_NS = 50_000_000  # 50ms minimum temporal separation
 
             # Clock regression check
             if last_mono_ns > 0 and now_mono_ns < last_mono_ns:
@@ -922,10 +926,18 @@ class RuntimeEvidenceProvider:
             # Observation Epoch handling:
             if epoch_id is not None:
                 eff_epoch_id = int(epoch_id)
+                # Check for out-of-order epoch IDs
+                if hist_state["samples"] and eff_epoch_id < hist_state["last_epoch_id"]:
+                    hist_state["has_out_of_order_epochs"] = True
+                # Check for insufficient temporal separation if caller supplies advancing epoch_id
+                elif hist_state["samples"] and eff_epoch_id > hist_state["last_epoch_id"]:
+                    elapsed_ns = now_mono_ns - hist_state["last_monotonic_ns"]
+                    if elapsed_ns < MIN_EPOCH_SEPARATION_NS:
+                        hist_state["insufficient_temporal_separation"] = True
             else:
                 if not hist_state["samples"]:
                     eff_epoch_id = 1
-                elif now_mono_ns - last_mono_ns > 100_000_000:
+                elif now_mono_ns - last_mono_ns >= MIN_EPOCH_SEPARATION_NS:
                     eff_epoch_id = hist_state["last_epoch_id"] + 1
                 else:
                     eff_epoch_id = max(1, hist_state["last_epoch_id"])
@@ -943,11 +955,13 @@ class RuntimeEvidenceProvider:
                     "alloc_count": None,
                     "free_count": None,
                     "container_sizes": {},
+                    "insufficient_temporal_separation": hist_state.get("insufficient_temporal_separation", False),
                 }
                 hist_state["samples"].append(epoch_sample)
-                hist_state["last_epoch_id"] = eff_epoch_id
+                hist_state["last_epoch_id"] = max(eff_epoch_id, hist_state["last_epoch_id"])
                 hist_state["last_monotonic_ns"] = now_mono_ns
             else:
+                # Same-epoch deduplication: reuse observation point without advancing epoch or rewriting timestamps
                 if curr_rss is not None:
                     epoch_sample["rss_kb"] = curr_rss
 
@@ -1024,23 +1038,33 @@ class RuntimeEvidenceProvider:
             if hist_state["has_temporal_regression"]:
                 observation_data["has_temporal_regression"] = True
                 observation_data["clock_regression_detected"] = True
+            if hist_state.get("has_out_of_order_epochs"):
+                observation_data["out_of_order_epoch_detected"] = True
+            if hist_state.get("insufficient_temporal_separation"):
+                observation_data["insufficient_temporal_separation"] = True
 
             for s_item in hist_state["samples"]:
                 ms = MemorySample(
                     epoch_id=s_item["epoch_id"],
                     monotonic_timestamp=s_item["monotonic_ns"] / 1e9,
                     wall_clock_timestamp=s_item["wall_time"],
-                    rss_kb=s_item["rss_kb"] if s_item["rss_kb"] is not None else 0,
+                    rss_kb=s_item["rss_kb"],
                     heap_vma_kb=s_item["heap_kb"],
                     container_sizes=dict(s_item.get("container_sizes", {})),
                     alloc_counter=s_item.get("alloc_count"),
                     free_counter=s_item.get("free_count"),
+                    rss_metric_status="OBSERVED_VALUE" if s_item["rss_kb"] is not None else "UNAVAILABLE",
+                    insufficient_temporal_separation=s_item.get("insufficient_temporal_separation", False),
                     collection_status="SUCCESS" if s_item["rss_kb"] is not None else "PARTIAL",
                 )
                 obs_win.record_sample(ms)
 
             if hist_state["has_temporal_regression"]:
                 obs_win.limitations.append("Monotonic clock regression detected in observation history")
+            if hist_state.get("has_out_of_order_epochs"):
+                obs_win.limitations.append("Out-of-order epoch sequence detected in observation history")
+            if hist_state.get("insufficient_temporal_separation"):
+                obs_win.limitations.append("Insufficient temporal separation (<50ms) between observation epochs")
 
             rss_valid_series = [s["rss_kb"] for s in hist_state["samples"] if s.get("rss_kb") is not None]
             heap_valid_series = [s["heap_kb"] for s in hist_state["samples"] if s.get("heap_kb") is not None]
@@ -1049,6 +1073,19 @@ class RuntimeEvidenceProvider:
             growth_pct = 0.0
             if len(rss_valid_series) > 1 and start_rss and curr_rss is not None:
                 growth_pct = ((curr_rss - start_rss) / max(start_rss, 1)) * 100.0
+
+            # Compute alloc / free counter temporal deltas
+            alloc_valid_series = [s["alloc_count"] for s in hist_state["samples"] if s.get("alloc_count") is not None]
+            free_valid_series = [s["free_count"] for s in hist_state["samples"] if s.get("free_count") is not None]
+            if len(alloc_valid_series) >= 2 and len(free_valid_series) >= 2:
+                alloc_delta = alloc_valid_series[-1] - alloc_valid_series[0]
+                free_delta = free_valid_series[-1] - free_valid_series[0]
+                observation_data["alloc_delta"] = alloc_delta
+                observation_data["free_delta"] = free_delta
+                if free_delta > 0:
+                    observation_data["temporal_imbalance_ratio"] = alloc_delta / free_delta
+                elif alloc_delta > 0:
+                    observation_data["temporal_imbalance_ratio"] = float("inf")
 
             observation_data.update({
                 "target_identity_key": target_key,

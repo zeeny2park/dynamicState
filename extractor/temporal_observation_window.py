@@ -44,7 +44,7 @@ class MemorySample:
     """A point-in-time measurement of memory metrics from the target."""
     epoch_id: int
     monotonic_timestamp: float = 0.0  # Required for duration and rate calculations
-    rss_kb: int = 0
+    rss_kb: Optional[int] = None
     wall_clock_timestamp: float = field(default_factory=time.time)
     timestamp: float = 0.0  # Backwards compatibility alias for monotonic/wall time
     pss_kb: Optional[int] = None
@@ -58,6 +58,9 @@ class MemorySample:
     object_counts: Dict[str, int] = field(default_factory=dict)
     alloc_counter: Optional[int] = None
     free_counter: Optional[int] = None
+    rss_metric_status: str = "OBSERVED_VALUE"
+    rss_error: Optional[str] = None
+    insufficient_temporal_separation: bool = False
     collection_status: str = "SUCCESS"  # "SUCCESS", "FAILED", "PARTIAL"
     collection_overhead_ms: float = 0.0
     failure_reason: Optional[str] = None
@@ -67,6 +70,10 @@ class MemorySample:
             self.monotonic_timestamp = self.timestamp
         elif self.timestamp == 0.0 and self.monotonic_timestamp != 0.0:
             self.timestamp = self.monotonic_timestamp
+        if self.rss_kb is None and self.rss_metric_status == "OBSERVED_VALUE":
+            self.rss_metric_status = "UNAVAILABLE"
+            if self.collection_status == "SUCCESS":
+                self.collection_status = "PARTIAL"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -264,6 +271,31 @@ class ObservationWindow:
             current_limitations.append("Identical timestamps across valid samples; elapsed duration is zero")
             duration = 0.001
 
+        # Check temporal separation & minimum observation duration
+        has_insufficient_separation = any(
+            getattr(s, "insufficient_temporal_separation", False) for s in self.samples
+        )
+        if has_insufficient_separation or (len(valid_samples) >= 3 and duration < 0.05):
+            return MemoryAnalysisResult(
+                behavior=MemoryBehavior.INSUFFICIENT_OBSERVATION,
+                confidence=0.10,
+                rationale="Observation duration or sample separation is insufficient (<50ms) to infer memory growth reliably.",
+                rss_delta_kb=0,
+                rss_growth_rate_kb_per_sec=0.0,
+                heap_vma_delta_kb=0,
+                allocator_heap_delta_kb=0,
+                live_allocations_delta=0,
+                object_count_deltas={},
+                container_size_deltas={},
+                alloc_free_imbalance_ratio=None,
+                supporting_facts=[],
+                contradicting_facts=["Temporal separation between observation epochs is less than minimum 50ms requirement"],
+                retaining_containers=[],
+                next_recommended_action="Execute observations with at least 50ms temporal separation.",
+                limitations=current_limitations + ["Insufficient temporal separation between observation epochs"],
+                details={"insufficient_temporal_separation": True},
+            )
+
         # Check for irregular observation intervals or missing samples
         intervals = []
         for i in range(len(valid_samples) - 1):
@@ -287,12 +319,21 @@ class ObservationWindow:
             )
 
         # 1. Process-level RSS metrics
-        rss_start = valid_samples[0].rss_kb
-        rss_end = valid_samples[-1].rss_kb
-        rss_delta = rss_end - rss_start
-        rss_rate = rss_delta / duration if duration > 0 else 0.0
-        rss_series = [s.rss_kb for s in valid_samples]
-        is_rss_monotonic = all(rss_series[i] <= rss_series[i + 1] for i in range(len(rss_series) - 1))
+        rss_valid_samples = [s for s in valid_samples if s.rss_kb is not None]
+        if len(rss_valid_samples) < 2:
+            rss_delta = 0
+            rss_rate = 0.0
+            is_rss_monotonic = False
+            rss_series = [s.rss_kb for s in rss_valid_samples]
+            current_limitations.append("Insufficient valid RSS samples (< 2) to calculate process memory growth")
+        else:
+            rss_start = rss_valid_samples[0].rss_kb
+            rss_end = rss_valid_samples[-1].rss_kb
+            rss_duration = rss_valid_samples[-1].monotonic_timestamp - rss_valid_samples[0].monotonic_timestamp
+            rss_delta = rss_end - rss_start
+            rss_rate = rss_delta / rss_duration if rss_duration > 0 else 0.0
+            rss_series = [s.rss_kb for s in rss_valid_samples]
+            is_rss_monotonic = all(rss_series[i] <= rss_series[i + 1] for i in range(len(rss_series) - 1))
 
         # 2. Heap VMA metrics
         h_series = [s.heap_vma_kb for s in valid_samples if s.heap_vma_kb is not None]
@@ -358,28 +399,29 @@ class ObservationWindow:
 
         # Plateau Evaluation (Initialization or Cache Warmup)
         # Delta between later samples is negligible (< 64KB or < 2%) following earlier growth
-        later_delta = valid_samples[-1].rss_kb - valid_samples[1].rss_kb
-        initial_growth = valid_samples[1].rss_kb - valid_samples[0].rss_kb
-        if later_delta <= max(64, int(0.02 * valid_samples[1].rss_kb)) and initial_growth > 0:
-            return MemoryAnalysisResult(
-                behavior=MemoryBehavior.STABLE_PLATEAU,
-                confidence=0.92,
-                rationale=f"Memory footprint stabilized at plateau ({rss_end} KB) following initial warm-up (+{initial_growth} KB). Unmanaged leak refuted.",
-                rss_delta_kb=rss_delta,
-                rss_growth_rate_kb_per_sec=rss_rate,
-                heap_vma_delta_kb=heap_vma_delta,
-                allocator_heap_delta_kb=allocator_heap_delta,
-                live_allocations_delta=live_alloc_delta,
-                object_count_deltas={},
-                container_size_deltas=container_deltas,
-                alloc_free_imbalance_ratio=imbalance_ratio,
-                supporting_facts=["RSS reached stable plateau across later observation epochs", f"Plateau delta: {later_delta} KB"],
-                contradicting_facts=["Sustained growth refuted by plateau stabilization"],
-                retaining_containers=[],
-                next_recommended_action="Refute memory leak hypothesis; target process is operating in stable state.",
-                details={"plateau_kb": rss_end, "initial_growth_kb": initial_growth, "later_delta_kb": later_delta, "transient_warmup": True},
-                limitations=current_limitations,
-            )
+        if len(rss_valid_samples) >= 3:
+            later_delta = rss_valid_samples[-1].rss_kb - rss_valid_samples[1].rss_kb
+            initial_growth = rss_valid_samples[1].rss_kb - rss_valid_samples[0].rss_kb
+            if later_delta <= max(64, int(0.02 * rss_valid_samples[1].rss_kb)) and initial_growth > 0:
+                return MemoryAnalysisResult(
+                    behavior=MemoryBehavior.STABLE_PLATEAU,
+                    confidence=0.92,
+                    rationale=f"Memory footprint stabilized at plateau ({rss_valid_samples[-1].rss_kb} KB) following initial warm-up (+{initial_growth} KB). Unmanaged leak refuted.",
+                    rss_delta_kb=rss_delta,
+                    rss_growth_rate_kb_per_sec=rss_rate,
+                    heap_vma_delta_kb=heap_vma_delta,
+                    allocator_heap_delta_kb=allocator_heap_delta,
+                    live_allocations_delta=live_alloc_delta,
+                    object_count_deltas={},
+                    container_size_deltas=container_deltas,
+                    alloc_free_imbalance_ratio=imbalance_ratio,
+                    supporting_facts=["RSS reached stable plateau across later observation epochs", f"Plateau delta: {later_delta} KB"],
+                    contradicting_facts=["Sustained growth refuted by plateau stabilization"],
+                    retaining_containers=[],
+                    next_recommended_action="Refute memory leak hypothesis; target process is operating in stable state.",
+                    details={"plateau_kb": rss_valid_samples[-1].rss_kb, "initial_growth_kb": initial_growth, "later_delta_kb": later_delta, "transient_warmup": True},
+                    limitations=current_limitations,
+                )
 
         # Object Accumulation: Proven only when container delta > 0 across valid epochs
         if retaining_containers:
@@ -477,6 +519,28 @@ class ObservationWindow:
                     details={"growth_confirmed": True, "internal_heap_evidence_missing": True, "rss_series": rss_series},
                     limitations=current_limitations,
                 )
+
+        # If RSS samples were insufficient (< 2), we cannot determine stable memory from RSS
+        if len(rss_valid_samples) < 2:
+            return MemoryAnalysisResult(
+                behavior=MemoryBehavior.INSUFFICIENT_OBSERVATION,
+                confidence=0.10,
+                rationale="Insufficient valid RSS observations across temporal window to determine memory stability.",
+                rss_delta_kb=0,
+                rss_growth_rate_kb_per_sec=0.0,
+                heap_vma_delta_kb=heap_vma_delta,
+                allocator_heap_delta_kb=allocator_heap_delta,
+                live_allocations_delta=live_alloc_delta,
+                object_count_deltas={},
+                container_size_deltas=container_deltas,
+                alloc_free_imbalance_ratio=imbalance_ratio,
+                supporting_facts=[],
+                contradicting_facts=["Process RSS unavailable across observation epochs"],
+                retaining_containers=[],
+                next_recommended_action="Verify target process exposes VmRSS in /proc/[pid]/status.",
+                limitations=current_limitations,
+                details={"rss_unavailable": True},
+            )
 
         # Stable Memory
         if abs(rss_delta) <= 64:

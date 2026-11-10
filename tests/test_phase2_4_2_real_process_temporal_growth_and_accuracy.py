@@ -289,8 +289,12 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
             p_stable.terminate()
             p_stable.wait()
 
-    def test_04_systematic_accuracy_and_honest_confusion_matrix(self):
-        """Audits all 22 recipes with honest confusion matrix reporting abstentions separately with real denominators."""
+    def test_04_synthetic_rule_conformance_matrix_all_22_recipes(self):
+        """Measures SYNTHETIC_RULE_CONFORMANCE across all 22 recipes using manually constructed observation fixtures.
+        
+        NOTE: This test verifies deterministic rule-conformance and logic predicates in DiagnosticRecipeRegistry.
+        It does NOT measure real-process diagnostic accuracy, which requires compiled Linux binaries and adapter collection.
+        """
         all_recipe_ids = DiagnosticRecipeRegistry.list_recipe_ids()
         self.assertEqual(len(all_recipe_ids), 22)
 

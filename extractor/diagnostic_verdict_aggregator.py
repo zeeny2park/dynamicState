@@ -181,6 +181,10 @@ class AggregatedVerdict:
     decision_rule_id: str = ""
     decision_trace: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def verdict(self) -> str:
+        return self.overall_result
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "overall_result": self.overall_result,
