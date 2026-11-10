@@ -542,6 +542,8 @@ class RuntimeEvidenceProvider:
                             discovered["capacity_length_pairs"].append((c, l))
 
                 else:
+                    if any(k in vn_low for k in ("magic", "canary", "guard")):
+                        discovered["magic_canaries"].append(v.name)
                     if any(k in vn_low for k in ("state", "status", "phase", "mode", "heartbeat", "step")):
                         discovered["state_vars"].append(v.name)
                     if any(k in vn_low for k in ("alloc", "malloc")) and "free" not in vn_low:

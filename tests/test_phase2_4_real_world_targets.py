@@ -485,15 +485,18 @@ class TestPhase24RealWorldTargets(unittest.TestCase):
             text=True,
         )
         try:
+            pid2 = proc2.pid
+            # Pin the identity of proc2
+            adapter.pin_target_identity(pid2)
             # Inject a mismatch in adapter's pinned identity to simulate exact PID reuse
-            adapter._pinned_identities[pid]["start_time"] = "99999999"
+            adapter._pinned_identities[pid2]["start_time"] = "99999999"
 
-            ok_pin, pin_err = adapter.verify_pinned_identity(pid)
+            ok_pin, pin_err = adapter.verify_pinned_identity(pid2)
             self.assertFalse(ok_pin)
             self.assertIn("start_time", pin_err)
 
             # Calling read_memory on reused PID must fail-closed with PID_REUSED
-            mem_data, mem_status, mem_err = adapter.read_memory(pid, 0x1000, 16)
+            mem_data, mem_status, mem_err = adapter.read_memory(pid2, 0x1000, 16)
             self.assertIsNone(mem_data)
             self.assertEqual(mem_status, "PID_REUSED")
             self.assertIn("PID", mem_err)

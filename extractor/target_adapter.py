@@ -640,6 +640,10 @@ class TargetExecutionAdapter(ABC):
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             raise ValueError(f"Invalid target PID {pid} (must be integer > 1)")
         ident = self.get_process_identity(pid)
+        if not ident.get("boot_id") and ident.get("process_identity"):
+            parts = str(ident["process_identity"]).split(":")
+            if len(parts) >= 3 and parts[2]:
+                ident["boot_id"] = parts[2]
         for req_field in ("start_time", "executable", "boot_id"):
             if not ident.get(req_field):
                 raise PIDReusedError(
@@ -662,17 +666,21 @@ class TargetExecutionAdapter(ABC):
         if not pinned:
             return True, None
         cur = self.get_process_identity(int(pid))
+        if not cur.get("boot_id") and cur.get("process_identity"):
+            parts = str(cur["process_identity"]).split(":")
+            if len(parts) >= 3 and parts[2]:
+                cur["boot_id"] = parts[2]
         for req_field in ("start_time", "executable", "boot_id"):
             p_val = pinned.get(req_field)
             c_val = cur.get(req_field)
             if not p_val or not c_val:
-                return False, f"Missing mandatory identity field '{req_field}' on PID {pid} during verification (pinned={p_val!r}, cur={c_val!r})"
+                return False, f"IDENTITY_UNAVAILABLE: Missing mandatory identity field '{req_field}' on PID {pid} during verification (pinned={p_val!r}, cur={c_val!r})"
             if str(p_val) != str(c_val):
-                return False, f"PID reuse detected: target identity changed for '{req_field}' on PID {pid}: {p_val} -> {c_val}"
+                return False, f"PID_REUSED: Target identity changed for '{req_field}' on PID {pid}: {p_val} -> {c_val}"
         if pinned.get("exe_inode") and cur.get("exe_inode") and int(pinned["exe_inode"]) != int(cur["exe_inode"]):
-            return False, f"Executable inode changed on PID {pid}: {pinned['exe_inode']} -> {cur['exe_inode']}"
+            return False, f"PID_REUSED: Executable inode changed on PID {pid}: {pinned['exe_inode']} -> {cur['exe_inode']}"
         if pinned.get("build_id") and cur.get("build_id") and str(pinned["build_id"]).strip().lower() != str(cur["build_id"]).strip().lower():
-            return False, f"Build ID changed on PID {pid}: {pinned['build_id']} -> {cur['build_id']}"
+            return False, f"PID_REUSED: Build ID changed on PID {pid}: {pinned['build_id']} -> {cur['build_id']}"
         return True, None
 
     def issue_live_receipt_for_session(
@@ -990,12 +998,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         except Exception:
             pass
 
-        boot_id = "local"
+        boot_id = ""
         try:
             with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as bf:
                 boot_id = bf.read().strip()
         except Exception:
-            pass
+            boot_id = ""
 
         exe_inode = 0
         try:
@@ -1379,7 +1387,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             return None, "UNAVAILABLE", f"Invalid or reserved PID {pid}"
         ok_pin, pin_err = self.verify_pinned_identity(pid)
         if not ok_pin:
-            return None, "PID_REUSED", pin_err
+            st = "PID_REUSED" if (pin_err and "PID_REUSED" in pin_err) else "IDENTITY_UNAVAILABLE"
+            return None, st, pin_err
         if self._memory_reader:
             data, st, err = self._memory_reader(pid, address, size)
             if data is not None and len(data) > 0:
@@ -1647,7 +1656,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 if len(after_comm) >= 20:
                     start_time = after_comm[19]
 
-        boot_id = "remote"
+        boot_id = ""
         rc_boot, stdout_boot, _ = self.run_ssh("cat /proc/sys/kernel/random/boot_id 2>/dev/null")
         if rc_boot == 0 and stdout_boot.strip():
             boot_id = stdout_boot.strip()
@@ -1835,7 +1844,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return [(None, "UNAVAILABLE", f"Invalid PID {pid}") for _ in slices]
         ok_pin, pin_err = self.verify_pinned_identity(pid)
         if not ok_pin:
-            return [(None, "PID_REUSED", pin_err) for _ in slices]
+            st = "PID_REUSED" if (pin_err and "PID_REUSED" in pin_err) else "IDENTITY_UNAVAILABLE"
+            return [(None, st, pin_err) for _ in slices]
 
         if len(slices) == 1 and not self.collector_path:
             return [self.read_memory(pid, slices[0][0], slices[0][1])]
@@ -1908,7 +1918,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return None, "UNAVAILABLE", f"Invalid PID {pid}"
         ok_pin, pin_err = self.verify_pinned_identity(pid)
         if not ok_pin:
-            return None, "PID_REUSED", pin_err
+            st = "PID_REUSED" if (pin_err and "PID_REUSED" in pin_err) else "IDENTITY_UNAVAILABLE"
+            return None, st, pin_err
         if size <= 0:
             return b"", "OBSERVED", None
 
