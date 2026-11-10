@@ -640,7 +640,7 @@ class TargetExecutionAdapter(ABC):
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             raise ValueError(f"Invalid target PID {pid} (must be integer > 1)")
         ident = self.get_process_identity(pid)
-        for req_field in ("start_time", "executable"):
+        for req_field in ("start_time", "executable", "boot_id"):
             if not ident.get(req_field):
                 raise PIDReusedError(
                     f"Cannot pin target identity for PID {pid}: missing mandatory attribute '{req_field}'"
@@ -662,7 +662,7 @@ class TargetExecutionAdapter(ABC):
         if not pinned:
             return True, None
         cur = self.get_process_identity(int(pid))
-        for req_field in ("start_time", "executable"):
+        for req_field in ("start_time", "executable", "boot_id"):
             p_val = pinned.get(req_field)
             c_val = cur.get(req_field)
             if not p_val or not c_val:
@@ -1636,13 +1636,34 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             if rc == 0 and stdout_uname.strip():
                 arch = stdout_uname.strip()
 
+        # 3. Read remote start_time and boot_id to support pin_target_identity and PID reuse detection
+        start_time = ""
+        rc_stat, stdout_stat, _ = self.run_ssh(f"cat /proc/{int(pid)}/stat 2>/dev/null")
+        if rc_stat == 0 and stdout_stat.strip():
+            raw_stat = stdout_stat.strip()
+            rparen = raw_stat.rfind(")")
+            if rparen != -1:
+                after_comm = raw_stat[rparen + 1 :].strip().split()
+                if len(after_comm) >= 20:
+                    start_time = after_comm[19]
+
+        boot_id = "remote"
+        rc_boot, stdout_boot, _ = self.run_ssh("cat /proc/sys/kernel/random/boot_id 2>/dev/null")
+        if rc_boot == 0 and stdout_boot.strip():
+            boot_id = stdout_boot.strip()
+
         return {
             "pid": pid,
             "executable": remote_exe,
+            "executable_identity": f"{remote_exe}:remote",
+            "start_time": start_time,
+            "boot_id": boot_id,
+            "process_identity": f"{pid}:{start_time}:{boot_id}" if start_time else f"{pid}::{boot_id}",
             "architecture": arch,
             "elf_type": elf_type,
             "build_id": build_id,
             "pt_loads": pt_loads,
+            "page_size": 4096,
             "is_remote": True,
             "host": self.target_host(),
         }
@@ -1809,6 +1830,13 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         """Reads multiple memory slices in a single SSH roundtrip (via C99 collector or batched POSIX shell)."""
         if not slices:
             return []
+        self._ensure_tracking_state()
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return [(None, "UNAVAILABLE", f"Invalid PID {pid}") for _ in slices]
+        ok_pin, pin_err = self.verify_pinned_identity(pid)
+        if not ok_pin:
+            return [(None, "PID_REUSED", pin_err) for _ in slices]
+
         if len(slices) == 1 and not self.collector_path:
             return [self.read_memory(pid, slices[0][0], slices[0][1])]
 
@@ -1875,6 +1903,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         return results
 
     def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
+        self._ensure_tracking_state()
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return None, "UNAVAILABLE", f"Invalid PID {pid}"
+        ok_pin, pin_err = self.verify_pinned_identity(pid)
+        if not ok_pin:
+            return None, "PID_REUSED", pin_err
         if size <= 0:
             return b"", "OBSERVED", None
 
