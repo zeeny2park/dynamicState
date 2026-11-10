@@ -145,7 +145,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
             "RECIPE_HEAP_METADATA_CORRUPTION": {"magic_corrupted": True, "canary_corrupted": True},
             "RECIPE_SUSPICIOUS_ALLOCATION_PATTERNS": {"requested_bytes": 2147483648},
             "RECIPE_PROCESS_MEMORY_GROWTH": {"is_monotonic": True, "rss_growth_bytes": 1048576, "epoch_count": 4, "rss_history_kb": [1000, 1500, 2000, 2500]},
-            "RECIPE_HEAP_GROWTH": {"heap_growth_bytes": 524288, "heap_series_kb": [1024, 2048]},
+            "RECIPE_HEAP_GROWTH": {"heap_growth_bytes": 524288, "heap_series_kb": [1024, 1536, 2048], "epoch_count": 3},
             "RECIPE_ALLOCATION_FREE_IMBALANCE": {"alloc_count": 1000, "free_count": 50},
             "RECIPE_OBJECT_LIFETIME_ANOMALIES": {"lifetime_expired": True},
             "RECIPE_REPEATED_ALLOCATION_PATTERNS": {"unreclaimed_site_growth": True},

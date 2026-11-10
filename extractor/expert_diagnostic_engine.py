@@ -1285,8 +1285,15 @@ class AdaptiveInvestigationSession:
 
             fd = os.open(tmp_path, flags, 0o600)
             try:
+                def _serialize_fallback(o):
+                    if hasattr(o, "to_dict"):
+                        return o.to_dict()
+                    if hasattr(o, "value"):
+                        return o.value
+                    return str(o)
+
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(self.to_dict(), f, indent=2)
+                    json.dump(self.to_dict(), f, indent=2, default=_serialize_fallback)
                     f.flush()
                     # Apply and verify chmod 0600 - DO NOT SWALLOW
                     os.chmod(tmp_path, 0o600)
@@ -1779,15 +1786,19 @@ class AdaptiveInvestigationSession:
         if self.pid and self.pid > 0:
             try:
                 p_st = self.adapter.get_process_status(self.pid)
-                sample_rss = int(p_st.get("VmRSS", 0))
-                sample_vsz = int(p_st.get("VmSize", 0))
-                self.temporal_memory_samples.append({
-                    "timestamp": time.time(),
-                    "rss_kb": sample_rss,
-                    "vsize_kb": sample_vsz,
-                    "step_index": self.plan.current_step_index,
-                    "recipe_id": recipe.recipe_id,
-                })
+                sample_rss = int(p_st.get("VmRSS", 0)) if "VmRSS" in p_st else None
+                sample_vsz = int(p_st.get("VmSize", 0)) if "VmSize" in p_st else None
+                step_idx = self.plan.current_step_index if self.plan else 0
+                existing_step_sample = next((s for s in self.temporal_memory_samples if s.get("step_index") == step_idx), None)
+                if existing_step_sample is None:
+                    self.temporal_memory_samples.append({
+                        "monotonic_ns": time.monotonic_ns(),
+                        "timestamp": time.time(),
+                        "rss_kb": sample_rss,
+                        "vsize_kb": sample_vsz,
+                        "step_index": step_idx,
+                        "recipe_id": recipe.recipe_id,
+                    })
             except Exception:
                 pass
 
@@ -1807,12 +1818,15 @@ class AdaptiveInvestigationSession:
         # Perform actual live runtime evidence acquisition via RuntimeEvidenceProvider
         _t0_collect = time.monotonic()
         try:
+            cur_epoch = (self.plan.current_step_index + 1) if self.plan else 1
             obs_data, ev_records = self.evidence_provider.collect_for_recipe(
                 recipe=recipe,
                 pid=self.pid,
                 companion_elf=self.companion_elf,
                 target_assessment=self.target_assessment,
                 classification=self.classification_result,
+                session_id=self.investigation_id,
+                epoch_id=cur_epoch,
             )
         finally:
             step_rcpt = None

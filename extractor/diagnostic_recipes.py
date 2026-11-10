@@ -1371,14 +1371,15 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                     details={"classification": analysis.classification.value, "summary": analysis.summary},
                 )
             elif analysis.classification in (MemoryBehaviorClassification.CONFIRMED_LEAK, MemoryBehaviorClassification.SUSTAINED_RSS_GROWTH, MemoryBehaviorClassification.PROBABLE_LEAK):
+                rate = getattr(analysis, "rss_growth_rate_kb_per_sec", getattr(analysis, "growth_rate_kb_per_sec", 0.0))
                 return RecipeEvaluationResult(
                     recipe_id=rid,
                     status=RECIPE_STATUS_SUPPORTED,
                     confidence=0.96 if analysis.classification == MemoryBehaviorClassification.CONFIRMED_LEAK else 0.88,
                     confidence_basis=analysis.summary,
-                    supporting_facts=[analysis.summary, f"Rate: {analysis.growth_rate_kb_per_sec:.2f} KB/s"],
+                    supporting_facts=[analysis.summary, f"Rate: {rate:.2f} KB/s"],
                     recommended_action="Proceed to Heap Growth and Object Accumulation recipes to isolate leaking types.",
-                    details={"growth_confirmed": True, "classification": analysis.classification.value, "rate_kb_per_sec": analysis.growth_rate_kb_per_sec},
+                    details={"growth_confirmed": True, "classification": analysis.classification.value, "rate_kb_per_sec": rate},
                 )
             elif analysis.classification in (MemoryBehaviorClassification.STABLE_PLATEAU, MemoryBehaviorClassification.INITIALIZATION_WARMUP, MemoryBehaviorClassification.PERIODIC_RECLAMATION, MemoryBehaviorClassification.TRANSIENT_BURST):
                 return RecipeEvaluationResult(
@@ -1598,14 +1599,27 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
         heap_delta = data.get("heap_growth_bytes") or data.get("heap_kb_delta") or data.get("allocator_allocated_delta")
         heap_series = data.get("heap_series_kb") or []
+        epochs = data.get("epoch_count", len(heap_series))
         if heap_delta is None and len(heap_series) >= 2:
             heap_delta = (heap_series[-1] - heap_series[0]) * 1024
+
         if heap_delta is not None and heap_delta > 256 * 1024:
+            # Enforce >= 3 observation epochs to confirm sustained growth; 2 samples must not produce growth verdict
+            if len(heap_series) == 2 or (0 < epochs < 3):
+                return RecipeEvaluationResult(
+                    recipe_id=rid,
+                    status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                    confidence=0.40,
+                    confidence_basis=f"Initial heap expansion (+{heap_delta} bytes) observed across 2 samples, but at least 3 observation epochs are required to verify sustained growth versus transient arena reservation.",
+                    missing_evidence=["sustained_heap_growth_epochs >= 3"],
+                    limitations=recipe.limitations,
+                    details={"heap_growth_confirmed": False, "two_sample_delta_only": True},
+                )
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_SUPPORTED,
                 confidence=0.92,
-                confidence_basis=f"Heap VMA / chunks grew by {heap_delta} bytes across observation epochs. Ongoing heap growth confirmed.",
+                confidence_basis=f"Heap VMA / chunks grew by {heap_delta} bytes across {max(epochs, len(heap_series))} observation epochs. Ongoing heap growth confirmed.",
                 supporting_facts=[f"Heap growth: {heap_delta} bytes"],
                 recommended_action="Isolate leaking object types and retaining containers.",
                 details={"heap_growth_confirmed": True, "heap_growth_bytes": heap_delta, "live_leak_confirmed": True},
@@ -1886,6 +1900,18 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 details={"not_applicable": True},
             )
 
+        # Counter reset or discontinuity across observation epochs
+        if data.get("counter_reset_detected"):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.30,
+                confidence_basis="Allocation/free counter reset or discontinuity detected across observation epochs; counters cannot be reliably compared.",
+                missing_evidence=["continuous_monotonic_allocation_counters"],
+                limitations=["Counter reset detected between observation epochs"],
+                details={"imbalance_confirmed": False, "counter_reset_detected": True},
+            )
+
         alloc_count = data.get("alloc_count") if data.get("alloc_count") is not None else data.get("cumulative_allocations")
         free_count = data.get("free_count") if data.get("free_count") is not None else data.get("cumulative_frees")
         if alloc_count is not None and free_count is not None:
@@ -2081,6 +2107,16 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 confidence_basis="Object lifetime and epoch counter verified valid and active.",
                 contradicting_facts=["Object lifetime verified active"],
                 recommended_action="Refute object lifetime anomaly.",
+                details={"lifetime_anomaly_confirmed": False},
+            )
+        else:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis="Object lifetime history or allocator tracking could not be observed from target process.",
+                missing_evidence=["object_lifetime_event_history", "lifetime_epoch_tracker"],
+                limitations=recipe.limitations,
                 details={"lifetime_anomaly_confirmed": False},
             )
 

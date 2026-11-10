@@ -170,6 +170,19 @@ class ObservationWindow:
 
         self.samples.append(sample)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes observation window state to a dictionary."""
+        return {
+            "target_pid": self.target_pid,
+            "target_identity": self.target_identity,
+            "default_interval": self.default_interval,
+            "observation_duration_sec": self.observation_duration_sec,
+            "samples": [s.to_dict() for s in self.samples],
+            "requested_samples_count": self.requested_samples_count,
+            "failed_samples_count": self.failed_samples_count,
+            "limitations": list(self.limitations),
+        }
+
     def sample_count(self) -> int:
         return len(self.samples)
 

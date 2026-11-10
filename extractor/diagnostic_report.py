@@ -528,7 +528,13 @@ class DiagnosticReport:
         return cls.from_dict(json.loads(json_str))
 
     def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
+        def _fallback(o):
+            if hasattr(o, "to_dict"):
+                return o.to_dict()
+            if hasattr(o, "value"):
+                return o.value
+            return str(o)
+        return json.dumps(self.to_dict(), indent=indent, default=_fallback)
 
     def to_markdown(self) -> str:
         sec_a = self.section_a_executive_summary

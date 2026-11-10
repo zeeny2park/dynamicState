@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter
+from .temporal_observation_window import MemorySample, ObservationWindow, MemoryBehavior
 from .watch_session import WatchSessionManager, read_process_memory_slice
 
 
@@ -112,10 +113,59 @@ class RuntimeEvidenceProvider:
         self.adapter = adapter or LocalTargetAdapter()
         self.watch_manager = watch_manager or WatchSessionManager(corpus_dir=corpus_dir or "/tmp/dynamicstate_corpus")
         self.budget_tracker = budget_tracker
-        self._historical_samples: Dict[str, List[Dict[str, Any]]] = {}
+        self._historical_samples: Dict[str, Dict[str, Any]] = {}
+
+    def get_target_identity_key(self, pid: int) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+        """Discovers and verifies mandatory process identity fields.
+
+        Enforces:
+        - Target host, boot_id, pid, start_time, executable (and build_id).
+        - If any mandatory field cannot be verified, returns (None, ident, error_message).
+        - Prevents cross-process, cross-boot, and cross-session contamination.
+        """
+        if not pid or pid <= 0:
+            return None, None, "Invalid target PID (must be positive integer)"
+
+        try:
+            ident = self.adapter.get_process_identity(pid)
+        except Exception as e:
+            return None, None, f"IDENTITY_UNAVAILABLE: Failed to query process identity for PID {pid}: {e}"
+
+        if not ident or not isinstance(ident, dict):
+            return None, None, f"IDENTITY_UNAVAILABLE: Empty identity record returned for PID {pid}"
+
+        host = ident.get("host") or (self.adapter.target_host() if hasattr(self.adapter, "target_host") else "localhost")
+        boot_id = ident.get("boot_id") or ""
+        start_time = ident.get("start_time") or ""
+        exe = ident.get("executable") or ident.get("executable_identity") or ""
+        build_id = ident.get("build_id") or ""
+
+        missing_fields = []
+        if not host:
+            missing_fields.append("host")
+        if not boot_id:
+            missing_fields.append("boot_id")
+        if not start_time:
+            missing_fields.append("start_time")
+        if not exe:
+            missing_fields.append("executable")
+
+        if missing_fields:
+            return None, ident, f"IDENTITY_UNAVAILABLE: Mandatory identity fields missing for PID {pid}: {', '.join(missing_fields)}"
+
+        exe_tag = exe
+        if build_id:
+            exe_tag = f"{exe}:{build_id}"
+        target_key = f"{host}:{boot_id}:{pid}:{start_time}:{exe_tag}"
+        return target_key, ident, None
 
     def collect_process_info(self, pid: int) -> Tuple[Dict[str, Any], List[RuntimeEvidenceRecord]]:
-        """Collects live process status, thread count, RSS, and process identity."""
+        """Collects live process status, thread count, RSS, and process identity.
+
+        Enforces strict measurement semantics:
+        - Distinguishes OBSERVED_VALUE, OBSERVED_ZERO, UNAVAILABLE, and PARTIAL.
+        - Never substitutes 0 for missing VmRSS.
+        """
         ev_records: List[RuntimeEvidenceRecord] = []
         info: Dict[str, Any] = {"pid": pid, "alive": False}
         if not pid or pid <= 0:
@@ -177,32 +227,59 @@ class RuntimeEvidenceProvider:
                 info["identity_error"] = str(e)
 
             # RSS & Threads
-            rss_kb = 0
+            rss_kb: Optional[int] = None
+            rss_metric_status = "UNAVAILABLE"
+            rss_error = None
             thread_ids: List[int] = []
             try:
                 threads = self.adapter.get_threads(pid)
                 thread_ids = [t.get("tid", pid) for t in threads if isinstance(t, dict)]
                 info["threads"] = threads
                 info["thread_count"] = len(thread_ids)
-            except Exception:
-                pass
+            except Exception as te:
+                info["threads_error"] = str(te)
 
             try:
                 status = self.adapter.get_process_status(pid)
-                if "VmRSS" in status:
-                    try:
-                        rss_kb = int(status["VmRSS"])
-                    except Exception:
-                        pass
-                if "VmSize" in status:
-                    try:
-                        info["vsize_kb"] = int(status["VmSize"])
-                    except Exception:
-                        pass
-                info["status_fields"] = status
-            except Exception:
-                pass
+                if not status:
+                    rss_metric_status = "UNAVAILABLE"
+                    rss_error = "Process status dictionary is empty or unreadable"
+                else:
+                    info["status_fields"] = status
+                    if "VmRSS" in status:
+                        try:
+                            raw_rss = status["VmRSS"]
+                            if isinstance(raw_rss, str):
+                                raw_rss = raw_rss.strip().split()[0]
+                            val_rss = int(raw_rss)
+                            if val_rss > 0:
+                                rss_kb = val_rss
+                                rss_metric_status = "OBSERVED_VALUE"
+                            else:
+                                rss_kb = 0
+                                rss_metric_status = "OBSERVED_ZERO"
+                        except (ValueError, TypeError) as ve:
+                            rss_kb = None
+                            rss_metric_status = "UNAVAILABLE"
+                            rss_error = f"Malformed VmRSS value '{status.get('VmRSS')}': {ve}"
+                    else:
+                        rss_kb = None
+                        rss_metric_status = "UNAVAILABLE"
+                        rss_error = "VmRSS field absent in process status"
+
+                    if "VmSize" in status:
+                        try:
+                            info["vsize_kb"] = int(status["VmSize"])
+                        except Exception:
+                            pass
+            except Exception as pe:
+                rss_metric_status = "UNAVAILABLE"
+                rss_error = str(pe)
+
             info["rss_kb"] = rss_kb
+            info["rss_metric_status"] = rss_metric_status
+            if rss_error:
+                info["rss_error"] = rss_error
 
             if self.budget_tracker and res_id:
                 approx_bytes = max(256, len(str(info).encode("utf-8", errors="replace")))
@@ -217,13 +294,15 @@ class RuntimeEvidenceProvider:
                 self.budget_tracker.record_sample(profile_id="collect_process_info")
                 res_id = None
 
+            is_observed = rss_metric_status in ("OBSERVED_VALUE", "OBSERVED_ZERO")
             rec = RuntimeEvidenceRecord(
                 evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
                 collection_method="adapter_status_and_liveness",
                 target_pid=pid,
-                observed_value={"rss_kb": rss_kb, "thread_count": len(thread_ids), "alive": True},
+                observed_value={"rss_kb": rss_kb, "rss_metric_status": rss_metric_status, "thread_count": len(thread_ids), "alive": True},
                 collection_scope="PROCESS_METRICS",
-                collection_status=COLLECTION_STATUS_SUCCESS,
+                collection_status=COLLECTION_STATUS_SUCCESS if is_observed else COLLECTION_STATUS_PARTIAL,
+                limitations=[rss_error] if rss_error else [],
                 provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
                 raw_details=info,
             )
@@ -571,6 +650,8 @@ class RuntimeEvidenceProvider:
         companion_elf: Optional[str] = None,
         target_assessment: Optional[Any] = None,
         classification: Optional[Any] = None,
+        session_id: Optional[str] = None,
+        epoch_id: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], List[RuntimeEvidenceRecord]]:
         """Dispatches live runtime collection tailored to the recipe specification.
         Returns (normalized_observation_dict, collected_evidence_records).
@@ -766,13 +847,18 @@ class RuntimeEvidenceProvider:
 
             # In case no candidate pointer was found, record limitation
             if observed_addr is None and not observation_data.get("faulting_address"):
+                lims = ["No candidate pointer address identified from DWARF symbols or classification"]
+                if recipe_id in ("RECIPE_DOUBLE_FREE", "RECIPE_INVALID_FREE", "RECIPE_USE_AFTER_FREE", "RECIPE_OBJECT_LIFETIME_ANOMALIES"):
+                    lims.append("Target process lacks dynamic allocation event tracer / hook; lifecycle events unavailable at runtime")
+                    observation_data["lifecycle_tracing_unavailable"] = True
+                    observation_data["missing_capability"] = "DYNAMIC_EVENT_TRACING"
                 rec_lim = RuntimeEvidenceRecord(
                     evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
                     collection_method="dwarf_pointer_search",
                     target_pid=pid,
                     observed_value=None,
                     collection_status=COLLECTION_STATUS_PARTIAL,
-                    limitations=["No candidate pointer address identified from DWARF symbols or classification"],
+                    limitations=lims,
                     provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
                 )
                 all_records.append(rec_lim)
@@ -783,25 +869,87 @@ class RuntimeEvidenceProvider:
         # 2. Memory Growth and Leaks Domain
         # -------------------------------------------------------------------------
         if domain == "MEMORY_GROWTH" or "GROWTH" in recipe_id or "LEAK" in recipe_id or "IMBALANCE" in recipe_id:
+            # 1. Enforce verified target identity
+            target_key, ident, id_err = self.get_target_identity_key(pid)
+            if not target_key:
+                rec_id = RuntimeEvidenceRecord(
+                    evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    collection_method="identity_verification",
+                    target_pid=pid,
+                    observed_value=None,
+                    collection_status="IDENTITY_UNAVAILABLE",
+                    limitations=[id_err or "Mandatory identity fields unavailable"],
+                    provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                )
+                all_records.append(rec_id)
+                observation_data.update({
+                    "identity_status": "IDENTITY_UNAVAILABLE",
+                    "identity_error": id_err,
+                    "epoch_count": 0,
+                    "samples_count": 0,
+                    "rss_history_kb": [],
+                    "heap_series_kb": [],
+                })
+                return observation_data, all_records
+
             info, p_recs = self.collect_process_info(pid)
             all_records.extend(p_recs)
-            curr_rss = info.get("rss_kb", 0)
+            curr_rss = info.get("rss_kb")  # Can be None if UNAVAILABLE
 
-            # Check historical samples for temporal growth
-            hist = self._historical_samples.setdefault(f"rss_{pid}", [])
-            hist.append({"timestamp": time.time(), "rss_kb": curr_rss})
+            # Scoped history key prevents cross-process, cross-session, cross-boot contamination
+            scoped_key = f"{session_id or 'default'}::{target_key}"
+            if scoped_key not in self._historical_samples:
+                self._historical_samples[scoped_key] = {
+                    "session_id": session_id or "default",
+                    "target_key": target_key,
+                    "identity": ident,
+                    "samples": [],
+                    "last_epoch_id": 0,
+                    "last_monotonic_ns": 0,
+                    "has_temporal_regression": False,
+                    "counter_reset_detected": False,
+                }
+            hist_state = self._historical_samples[scoped_key]
 
-            start_rss = hist[0]["rss_kb"] if len(hist) > 1 else curr_rss
-            growth_pct = ((curr_rss - start_rss) / max(start_rss, 1)) * 100.0 if len(hist) > 1 else 0.0
+            now_mono_ns = time.monotonic_ns()
+            now_wall = time.time()
+            last_mono_ns = hist_state["last_monotonic_ns"]
 
-            observation_data.update({
-                "current_rss_kb": curr_rss,
-                "start_rss_kb": start_rss,
-                "growth_rate_pct": growth_pct,
-                "samples_count": len(hist),
-                "rss_history_kb": [s["rss_kb"] for s in hist],
-                "epoch_count": len(hist),
-            })
+            # Clock regression check
+            if last_mono_ns > 0 and now_mono_ns < last_mono_ns:
+                hist_state["has_temporal_regression"] = True
+
+            # Observation Epoch handling:
+            if epoch_id is not None:
+                eff_epoch_id = int(epoch_id)
+            else:
+                if not hist_state["samples"]:
+                    eff_epoch_id = 1
+                elif now_mono_ns - last_mono_ns > 100_000_000:
+                    eff_epoch_id = hist_state["last_epoch_id"] + 1
+                else:
+                    eff_epoch_id = max(1, hist_state["last_epoch_id"])
+
+            # Find or create sample for this epoch (same-epoch deduplication)
+            epoch_sample = next((s for s in hist_state["samples"] if s["epoch_id"] == eff_epoch_id), None)
+            if epoch_sample is None:
+                epoch_sample = {
+                    "epoch_id": eff_epoch_id,
+                    "monotonic_ns": now_mono_ns,
+                    "wall_time": now_wall,
+                    "rss_kb": curr_rss,
+                    "heap_kb": None,
+                    "heap_vma_bytes": None,
+                    "alloc_count": None,
+                    "free_count": None,
+                    "container_sizes": {},
+                }
+                hist_state["samples"].append(epoch_sample)
+                hist_state["last_epoch_id"] = eff_epoch_id
+                hist_state["last_monotonic_ns"] = now_mono_ns
+            else:
+                if curr_rss is not None:
+                    epoch_sample["rss_kb"] = curr_rss
 
             # Inspect heap VMA mapping size if memory maps available
             maps, m_recs = self.collect_memory_maps(pid)
@@ -809,13 +957,10 @@ class RuntimeEvidenceProvider:
             heap_vma = next((m for m in maps if m.get("pathname") == "[heap]" or m.get("category") == "heap"), None)
             if heap_vma:
                 h_size = heap_vma.get("size", 0)
+                epoch_sample["heap_vma_bytes"] = h_size
+                epoch_sample["heap_kb"] = h_size // 1024
                 observation_data["heap_vma_bytes"] = h_size
                 observation_data["heap_kb"] = h_size // 1024
-                heap_hist = self._historical_samples.setdefault(f"heap_{pid}", [])
-                heap_hist.append({"timestamp": time.time(), "heap_kb": h_size // 1024})
-                observation_data["heap_series_kb"] = [h["heap_kb"] for h in heap_hist]
-                if len(heap_hist) >= 2:
-                    observation_data["heap_growth_bytes"] = (heap_hist[-1]["heap_kb"] - heap_hist[0]["heap_kb"]) * 1024
 
             # Check containers from DWARF symbols
             if companion_elf and os.path.exists(companion_elf):
@@ -827,6 +972,7 @@ class RuntimeEvidenceProvider:
                         leak_count = 0
                         if isinstance(v, dict):
                             leak_count = v.get("size") if v.get("size") is not None else len(v.get("elements", []))
+                        epoch_sample["container_sizes"][c_cand] = leak_count
                         observation_data["active_chunk_count"] = leak_count
                         observation_data["retained_objects_count"] = leak_count
                         observation_data["container_size"] = leak_count
@@ -834,13 +980,21 @@ class RuntimeEvidenceProvider:
                         if leak_count > 0:
                             break
 
-                # Inspect allocation & free counters dynamically
+                # Inspect allocation & free counters dynamically + counter reset detection
                 for a_cand in dwarf_syms.get("alloc_counters", []):
                     alloc_v, a_recs = self.evaluate_dwarf_expression(pid, companion_elf, a_cand)
                     all_records.extend(a_recs)
                     if alloc_v.get("status") == "OBSERVED" and alloc_v.get("value") is not None:
                         try:
-                            observation_data["alloc_count"] = int(alloc_v["value"])
+                            a_val = int(alloc_v["value"])
+                            prev_allocs = [
+                                s["alloc_count"] for s in hist_state["samples"]
+                                if s["epoch_id"] < eff_epoch_id and s.get("alloc_count") is not None
+                            ]
+                            if prev_allocs and a_val < prev_allocs[-1]:
+                                hist_state["counter_reset_detected"] = True
+                            epoch_sample["alloc_count"] = a_val
+                            observation_data["alloc_count"] = a_val
                             observation_data["alloc_counter_name"] = a_cand
                             break
                         except Exception:
@@ -851,11 +1005,65 @@ class RuntimeEvidenceProvider:
                     all_records.extend(f_recs)
                     if free_v.get("status") == "OBSERVED" and free_v.get("value") is not None:
                         try:
-                            observation_data["free_count"] = int(free_v["value"])
+                            f_val = int(free_v["value"])
+                            prev_frees = [
+                                s["free_count"] for s in hist_state["samples"]
+                                if s["epoch_id"] < eff_epoch_id and s.get("free_count") is not None
+                            ]
+                            if prev_frees and f_val < prev_frees[-1]:
+                                hist_state["counter_reset_detected"] = True
+                            epoch_sample["free_count"] = f_val
+                            observation_data["free_count"] = f_val
                             observation_data["free_counter_name"] = f_cand
                             break
                         except Exception:
                             pass
+
+            # Build MemorySample and update ObservationWindow
+            obs_win = ObservationWindow(target_pid=pid, target_identity=target_key)
+            if hist_state["has_temporal_regression"]:
+                observation_data["has_temporal_regression"] = True
+                observation_data["clock_regression_detected"] = True
+
+            for s_item in hist_state["samples"]:
+                ms = MemorySample(
+                    epoch_id=s_item["epoch_id"],
+                    monotonic_timestamp=s_item["monotonic_ns"] / 1e9,
+                    wall_clock_timestamp=s_item["wall_time"],
+                    rss_kb=s_item["rss_kb"] if s_item["rss_kb"] is not None else 0,
+                    heap_vma_kb=s_item["heap_kb"],
+                    container_sizes=dict(s_item.get("container_sizes", {})),
+                    alloc_counter=s_item.get("alloc_count"),
+                    free_counter=s_item.get("free_count"),
+                    collection_status="SUCCESS" if s_item["rss_kb"] is not None else "PARTIAL",
+                )
+                obs_win.record_sample(ms)
+
+            if hist_state["has_temporal_regression"]:
+                obs_win.limitations.append("Monotonic clock regression detected in observation history")
+
+            rss_valid_series = [s["rss_kb"] for s in hist_state["samples"] if s.get("rss_kb") is not None]
+            heap_valid_series = [s["heap_kb"] for s in hist_state["samples"] if s.get("heap_kb") is not None]
+
+            start_rss = rss_valid_series[0] if rss_valid_series else curr_rss
+            growth_pct = 0.0
+            if len(rss_valid_series) > 1 and start_rss and curr_rss is not None:
+                growth_pct = ((curr_rss - start_rss) / max(start_rss, 1)) * 100.0
+
+            observation_data.update({
+                "target_identity_key": target_key,
+                "current_rss_kb": curr_rss,
+                "start_rss_kb": start_rss,
+                "growth_rate_pct": growth_pct,
+                "samples_count": len(hist_state["samples"]),
+                "epoch_count": len(hist_state["samples"]),
+                "rss_history_kb": rss_valid_series,
+                "heap_series_kb": heap_valid_series,
+                "observation_window": obs_win,
+                "counter_reset_detected": hist_state["counter_reset_detected"],
+            })
+            if len(heap_valid_series) >= 2:
+                observation_data["heap_growth_bytes"] = (heap_valid_series[-1] - heap_valid_series[0]) * 1024
 
             return observation_data, all_records
 
