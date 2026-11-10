@@ -1952,6 +1952,18 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 details={"not_applicable": True},
             )
 
+        # Counter source changed between epochs (different symbol used for alloc counter) or reset/discontinuity
+        if data.get("counter_source_changed"):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis="Counter source symbol changed between observation epochs; cross-epoch comparison is invalid.",
+                missing_evidence=["consistent_counter_source_across_epochs"],
+                limitations=["Counter source changed between epochs; alloc/free delta comparison rejected"],
+                details={"imbalance_confirmed": False, "counter_source_changed": True},
+            )
+
         # Counter reset or discontinuity across observation epochs
         if data.get("counter_reset_detected"):
             return RecipeEvaluationResult(

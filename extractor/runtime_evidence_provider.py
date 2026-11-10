@@ -911,6 +911,7 @@ class RuntimeEvidenceProvider:
                     "has_out_of_order_epochs": False,
                     "insufficient_temporal_separation": False,
                     "counter_reset_detected": False,
+                    "counter_source_changed": False,
                 }
             hist_state = self._historical_samples[scoped_key]
 
@@ -953,7 +954,9 @@ class RuntimeEvidenceProvider:
                     "heap_kb": None,
                     "heap_vma_bytes": None,
                     "alloc_count": None,
+                    "alloc_counter_symbol": None,  # tracks which symbol sourced alloc_count this epoch
                     "free_count": None,
+                    "free_counter_symbol": None,  # tracks which symbol sourced free_count this epoch
                     "container_sizes": {},
                     "insufficient_temporal_separation": hist_state.get("insufficient_temporal_separation", False),
                 }
@@ -1008,8 +1011,17 @@ class RuntimeEvidenceProvider:
                             if prev_allocs and a_val < prev_allocs[-1]:
                                 hist_state["counter_reset_detected"] = True
                             epoch_sample["alloc_count"] = a_val
+                            epoch_sample["alloc_counter_symbol"] = a_cand
                             observation_data["alloc_count"] = a_val
                             observation_data["alloc_counter_name"] = a_cand
+                            # Detect counter source change across epochs
+                            prev_alloc_syms = [
+                                s.get("alloc_counter_symbol") for s in hist_state["samples"]
+                                if s["epoch_id"] < eff_epoch_id and s.get("alloc_counter_symbol") is not None
+                            ]
+                            if prev_alloc_syms and prev_alloc_syms[-1] != a_cand:
+                                hist_state["counter_source_changed"] = True
+                                hist_state["counter_reset_detected"] = True
                             break
                         except Exception:
                             pass
@@ -1027,8 +1039,17 @@ class RuntimeEvidenceProvider:
                             if prev_frees and f_val < prev_frees[-1]:
                                 hist_state["counter_reset_detected"] = True
                             epoch_sample["free_count"] = f_val
+                            epoch_sample["free_counter_symbol"] = f_cand
                             observation_data["free_count"] = f_val
                             observation_data["free_counter_name"] = f_cand
+                            # Detect counter source change across epochs
+                            prev_free_syms = [
+                                s.get("free_counter_symbol") for s in hist_state["samples"]
+                                if s["epoch_id"] < eff_epoch_id and s.get("free_counter_symbol") is not None
+                            ]
+                            if prev_free_syms and prev_free_syms[-1] != f_cand:
+                                hist_state["counter_source_changed"] = True
+                                hist_state["counter_reset_detected"] = True
                             break
                         except Exception:
                             pass
@@ -1078,14 +1099,20 @@ class RuntimeEvidenceProvider:
             alloc_valid_series = [s["alloc_count"] for s in hist_state["samples"] if s.get("alloc_count") is not None]
             free_valid_series = [s["free_count"] for s in hist_state["samples"] if s.get("free_count") is not None]
             if len(alloc_valid_series) >= 2 and len(free_valid_series) >= 2:
-                alloc_delta = alloc_valid_series[-1] - alloc_valid_series[0]
-                free_delta = free_valid_series[-1] - free_valid_series[0]
-                observation_data["alloc_delta"] = alloc_delta
-                observation_data["free_delta"] = free_delta
-                if free_delta > 0:
-                    observation_data["temporal_imbalance_ratio"] = alloc_delta / free_delta
-                elif alloc_delta > 0:
-                    observation_data["temporal_imbalance_ratio"] = float("inf")
+                # Skip temporal delta when counter source changed across epochs (invalid comparison)
+                if hist_state.get("counter_source_changed", False):
+                    observation_data["alloc_delta"] = None
+                    observation_data["free_delta"] = None
+                    observation_data["counter_source_changed"] = True
+                else:
+                    alloc_delta = alloc_valid_series[-1] - alloc_valid_series[0]
+                    free_delta = free_valid_series[-1] - free_valid_series[0]
+                    observation_data["alloc_delta"] = alloc_delta
+                    observation_data["free_delta"] = free_delta
+                    if free_delta > 0:
+                        observation_data["temporal_imbalance_ratio"] = alloc_delta / free_delta
+                    elif alloc_delta > 0:
+                        observation_data["temporal_imbalance_ratio"] = float("inf")
 
             observation_data.update({
                 "target_identity_key": target_key,
@@ -1098,6 +1125,7 @@ class RuntimeEvidenceProvider:
                 "heap_series_kb": heap_valid_series,
                 "observation_window": obs_win,
                 "counter_reset_detected": hist_state["counter_reset_detected"],
+                "counter_source_changed": hist_state.get("counter_source_changed", False),
             })
             if len(heap_valid_series) >= 2:
                 observation_data["heap_growth_bytes"] = (heap_valid_series[-1] - heap_valid_series[0]) * 1024
