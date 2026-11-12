@@ -137,9 +137,9 @@ sequenceDiagram
 1. **Build the Collector for Target Architecture**:
    Cross-compile on host or build natively:
    ```bash
-   # Cross-compile for ARM:
+   # Cross-compile for ARM64 (aarch64):
    cd target/collector
-   CC=arm-linux-gnueabihf-gcc make
+   CC=aarch64-linux-gnu-gcc make
    ```
 
 2. **On Target Board**:

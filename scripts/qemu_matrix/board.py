@@ -1,7 +1,7 @@
 """Run the same checks against a REAL board over SSH (manual procedure: docs/EMBEDDED_BOARD_RUN.md).
 
     python3 -m scripts.qemu_matrix board --host 192.168.1.50 --user root --key ~/.ssh/id_board \
-        --arch arm --libc glibc --cc arm-linux-gnueabihf-gcc --out board_record
+        --arch aarch64 --cc aarch64-linux-gnu-gcc --out board_record
 
 Nothing is fabricated: the JSON written is exactly what the checks observed, plus the board facts the
 operator passes in (--board-name etc.).  Needs the cross compiler for the board, `make -C target/collector dist`,
@@ -19,28 +19,25 @@ from typing import Any, Dict, List, Optional
 from . import build_targets, checks, guest as guest_mod, results
 from .entries import _NS, _OK
 
-_ARCH = {"arm": (32, "little", "armv7l"), "aarch64": (64, "little", "aarch64")}
+_ARCH = {"aarch64": (64, "little", "aarch64"), "x86_64": (64, "little", "x86_64")}
+LIBC = "glibc"  # the only supported libc (musl / ARM32 targets are refused by extractor/target_abi.py)
 
 
-def expected_support_for(arch: str, libc: str) -> Dict[str, str]:
-    lp64_glibc = arch in ("aarch64", "x86_64") and libc == "glibc"
+def expected_support_for(arch: str) -> Dict[str, str]:
     return {
-        "mutex_owner": _OK if lp64_glibc else _NS,
-        "allocator_chunks": _OK if lp64_glibc else _NS,
-        "syscall_names": _OK,
-        "tcb_scan": _OK if (arch == "x86_64" and libc == "glibc") else _NS,
-        "frame_layout": _OK if arch in ("aarch64", "x86_64") else _NS,
-        "cfi_unwind": _OK if arch in ("aarch64", "x86_64") else _NS,
+        "mutex_owner": _OK, "allocator_chunks": _OK, "syscall_names": _OK,
+        "tcb_scan": _OK if arch == "x86_64" else _NS,
+        "frame_layout": _OK, "cfi_unwind": _OK,
     }
 
 
-def board_entry(arch: str, libc: str, cc: str, name: str, uname_m: Optional[str] = None) -> Dict[str, Any]:
+def board_entry(arch: str, cc: str, name: str, uname_m: Optional[str] = None) -> Dict[str, Any]:
     word, endian, um = _ARCH[arch]
     return {
-        "name": name, "title": f"real board {name} ({arch}, {libc})", "cc": cc, "libc": libc,
+        "name": name, "title": f"real board {name} ({arch}, {LIBC})", "cc": cc, "libc": LIBC,
         "uname_m": uname_m or um, "collector_arch": arch, "mem_mb": 0,
-        "expected_abi": {"architecture": arch, "word_size": word, "endianness": endian, "libc": libc},
-        "expected_support": expected_support_for(arch, libc),
+        "expected_abi": {"architecture": arch, "word_size": word, "endianness": endian, "libc": LIBC},
+        "expected_support": expected_support_for(arch),
     }
 
 
@@ -80,20 +77,14 @@ class BoardGuest(guest_mod.Guest):
 
 
 def run_board(args: argparse.Namespace) -> int:
-    from . import images
-    entry = board_entry(args.arch, args.libc, args.cc, args.board_name, args.uname_m)
+    entry = board_entry(args.arch, args.cc, args.board_name, args.uname_m)
     doc = results.new_result(entry)
     doc["guest"] = {"board_name": args.board_name, "notes": args.notes}
     t0 = time.monotonic()
     g = BoardGuest(args.host, args.port, args.user, os.path.expanduser(args.key), args.workdir)
     try:
-        if args.libc == "musl":
-            if not args.musl_sysroot:
-                raise SystemExit("--libc musl needs --musl-sysroot (see docs/EMBEDDED_BOARD_RUN.md)")
-            entry.update(musl_sysroot=os.path.abspath(args.musl_sysroot), musl_loader=args.musl_loader,
-                         musl_libc_so=args.musl_libc_so)
         outdir = os.path.join(args.out, "targets")
-        targets = build_targets.build_entry_targets(entry, outdir, images.cache_dir())
+        targets = build_targets.build_entry_targets(entry, outdir)
         g.start()
         rc, un, _ = g.ssh("uname -a; cat /proc/cpuinfo | head -20; free; busybox 2>&1 | head -1; ls -l /lib/ld-* /lib/*/ld-* 2>/dev/null")
         doc["guest"]["facts"] = un.strip().splitlines()
@@ -114,7 +105,6 @@ def run_board(args: argparse.Namespace) -> int:
             return checks.c4a_deadlock(ctx, holder["run"])
         out.append(checks.guarded("C4a_deadlock_diagnosis", "deadlock", _dl))
         if "run" in holder:
-            out.append(checks.guarded("C4d_recipe_verdict_on_unsupported", "verdict", lambda: checks.c4d_recipe_verdict(ctx, holder["run"])))
             out.append(checks.guarded("C4b_glibc_only_gating", "gating", lambda: checks.c4b_gating(ctx)))
             out.append(checks.guarded("C4c_futex_syscall_names", "syscall", lambda: checks.c4c_syscall_names(ctx)))
             out.append(checks.guarded("C5_collection_cost", "cost", lambda: checks.c5_cost(ctx, holder["run"])))

@@ -49,7 +49,7 @@ def host_info() -> Dict[str, Any]:
             return "unavailable"
     return {"machine": platform.machine(), "python": platform.python_version(),
             "kernel": platform.release(), "kvm_available": os.path.exists("/dev/kvm"),
-            "qemu_arm": ver(["qemu-system-arm", "--version"]), "qemu_aarch64": ver(["qemu-system-aarch64", "--version"]),
+            "qemu_aarch64": ver(["qemu-system-aarch64", "--version"]),
             "cross_cc": {e["cc"]: ver([e["cc"], "--version"]) for e in {v["cc"]: v for v in entries.ENTRIES.values()}.values()}}
 
 
@@ -85,7 +85,7 @@ def run_entry(name: str, out_dir: str, entry_timeout_s: float = 1500.0, host_ref
         miss = missing_prerequisites(name)
         if miss:
             raise RuntimeError("prerequisites missing: " + "; ".join(miss))
-        targets = build_targets.build_entry_targets(e, os.path.join(entries.entry_cache(name), "targets"), images.cache_dir())
+        targets = build_targets.build_entry_targets(e, os.path.join(entries.entry_cache(name), "targets"))
         g = guest_mod.Guest(name)
         work = g.work
         _ACTIVE.append(g)
@@ -116,10 +116,6 @@ def run_entry(name: str, out_dir: str, entry_timeout_s: float = 1500.0, host_ref
             holder["run"] = checks.collect_deadlock(ctx)
             return checks.c4a_deadlock(ctx, holder["run"])
         out.append(checks.guarded("C4a_deadlock_diagnosis", "deadlock", _dl))
-        if "run" in holder:
-            out.append(checks.guarded("C4d_recipe_verdict_on_unsupported", "verdict", lambda: checks.c4d_recipe_verdict(ctx, holder["run"])))
-        else:
-            out.append(results.check("C4d_recipe_verdict_on_unsupported", "verdict", results.SKIPPED, "deadlock collection failed (C4a)"))
         out.append(checks.guarded("C4b_glibc_only_gating", "gating", lambda: checks.c4b_gating(ctx)))
         out.append(checks.guarded("C4c_futex_syscall_names", "syscall", lambda: checks.c4c_syscall_names(ctx)))
         if "run" in holder:
@@ -163,10 +159,9 @@ _CHECK_NAMES = {
     "C2a_daemon_channel": "Daemon channel: N reads, one collector process",
     "C2b_no_collector_fallback": "No-collector fallback with the guest's BusyBox dd/tail/head, unaligned ranges",
     "C3_abi_detection": "ABI detection via remote adapter (arch / word size / endianness / libc)",
-    "C4a_deadlock_diagnosis": "Deadlock diagnosis vs. host result (or explicit unsupported)",
-    "C4b_glibc_only_gating": "glibc-only checks (heap walk, mutex owner) gated",
+    "C4a_deadlock_diagnosis": "Deadlock diagnosis vs. host result",
+    "C4b_glibc_only_gating": "Remote heap walk (glibc allocator)",
     "C4c_futex_syscall_names": "futex waiters carry the right syscall name",
-    "C4d_recipe_verdict_on_unsupported": "Recipe verdict on an unsupported target",
     "C5_collection_cost": "Collection cost (wall time, remote commands)",
     "C6_process_discovery_and_identity": "Process discovery / identity / maps via BusyBox shell tools",
 }
@@ -215,16 +210,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     b.add_argument("--port", type=int, default=22)
     b.add_argument("--user", default="root")
     b.add_argument("--key", required=True)
-    b.add_argument("--arch", choices=["arm", "aarch64"], required=True)
-    b.add_argument("--libc", choices=["glibc", "musl"], required=True)
-    b.add_argument("--cc", required=True, help="cross compiler for the board, e.g. arm-linux-gnueabihf-gcc")
+    b.add_argument("--arch", choices=["aarch64", "x86_64"], default="aarch64")
+    b.add_argument("--cc", required=True, help="cross compiler for the board, e.g. aarch64-linux-gnu-gcc")
     b.add_argument("--board-name", required=True)
     b.add_argument("--notes", default="")
-    b.add_argument("--uname-m", default=None, help="override expected `uname -m` (default armv7l / aarch64)")
+    b.add_argument("--uname-m", default=None, help="override expected `uname -m` (default aarch64 / x86_64)")
     b.add_argument("--workdir", default="/tmp", help="writable, exec-capable directory on the board")
-    b.add_argument("--musl-sysroot", default=None, help="musl sysroot (headers+crt+libc) for --libc musl")
-    b.add_argument("--musl-loader", default="/lib/ld-musl-armhf.so.1")
-    b.add_argument("--musl-libc-so", default="libc.musl-armv7.so.1")
     b.add_argument("--out", default="board_record")
     a = ap.parse_args(argv)
     if a.cmd == "board":

@@ -22,7 +22,6 @@ CHECK_IDS = (
     "C4a_deadlock_diagnosis",
     "C4b_glibc_only_gating",
     "C4c_futex_syscall_names",
-    "C4d_recipe_verdict_on_unsupported",
     "C5_collection_cost",
     "C6_process_discovery_and_identity",
 )

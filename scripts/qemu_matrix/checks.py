@@ -11,7 +11,7 @@ import traceback
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import build_targets
-from .results import BLOCKED, FAIL, PASS, SKIPPED, UNSUPPORTED, check
+from .results import BLOCKED, FAIL, PASS, SKIPPED, check
 
 KNOWN = b"DYNAMICSTATE-MATRIX-KNOWN-BUFFER-0123456789abcd\x00"
 EXPECTED_LOCKS = {"g_mutex_a", "g_mutex_b"}
@@ -352,7 +352,7 @@ def host_reference() -> Dict[str, Any]:
     proc = None
     try:
         out = os.path.join(tmp, "deadlock")
-        subprocess.run(build_targets.glibc_cc_cmd(cc, build_targets.TARGET_SRC["deadlock"], out), check=True,
+        subprocess.run(build_targets.cc_cmd(cc, build_targets.TARGET_SRC["deadlock"], out), check=True,
                        capture_output=True)
         proc = subprocess.Popen([out], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.5)
@@ -378,21 +378,6 @@ def host_reference() -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------------------- C4
-def _scan_owner_values(obj: Any, path: str = "") -> List[str]:
-    """Every non-null owner TID / lock name that appears anywhere in an observation."""
-    found: List[str] = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in ("owner_tid", "held_by_tid") and v not in (None, 0):
-                found.append(f"{path}/{k}={v}")
-            else:
-                found.extend(_scan_owner_values(v, f"{path}/{k}"))
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            found.extend(_scan_owner_values(v, f"{path}[{i}]"))
-    return found
-
-
 def collect_deadlock(ctx: Ctx, attempts: int = 3) -> Dict[str, Any]:
     """Run the production deadlock path against the guest; shared by C4a/C4d/C5."""
     from extractor.diagnostic_recipes import RECIPE_POTENTIAL_DEADLOCK_PATTERNS, DiagnosticRecipeRegistry
@@ -419,72 +404,41 @@ def collect_deadlock(ctx: Ctx, attempts: int = 3) -> Dict[str, Any]:
                 "recipe_details": dict(res.details), "wall_s": round(wall, 2), "ssh_commands": tr.snapshot()["commands"],
                 "collections": n, "callstacks_status": ci.get("status"), "lock_owner_status": ci.get("lock_owner_status"),
                 "lock_owner_reason": ci.get("lock_owner_status_reason"), "cfi_status": ci.get("cfi_unwind_status"),
-                "threads": obs.get("threads") or [], "owner_values": _scan_owner_values(obs)}
+                "threads": obs.get("threads") or []}
     finally:
         ad.close()
 
 
 def c4a_deadlock(ctx: Ctx, run: Dict[str, Any]) -> Dict[str, Any]:
     cid, name = "C4a_deadlock_diagnosis", "deadlock diagnosis of proc_thread_circular_deadlock (vs. host result)"
-    obs, e = run["obs"], ctx.entry
+    obs = run["obs"]
     ref = ctx.host_ref
     locks = sorted({c["lock_name"] for c in obs.get("deadlock_cycle", [])})
     d = {"host_reference": ref, "remote": {"deadlock_detected": bool(obs.get("deadlock_detected")), "locks": locks,
                                            "recipe_status": run["recipe_status"], "lock_owner_status": run["lock_owner_status"],
                                            "collections": run["collections"], "wall_s": run["wall_s"],
                                            "ssh_commands": run["ssh_commands"]}}
-    supported = e["expected_support"]["mutex_owner"] == "SUPPORTED"
-    if supported:
-        want_locks = ref.get("locks") if ref.get("available") else sorted(EXPECTED_LOCKS)
-        if obs.get("deadlock_detected") and locks == want_locks and run["recipe_status"] == ref.get("recipe_status", "SUPPORTED"):
-            limits = []
-            if all(t.get("syscall") is None and t.get("syscall_nr") is None for t in run["threads"]):
-                limits.append("remote get_threads carries no syscall fields; waiters were found via stack scan")
-            d["limitations"] = limits
-            return check(cid, name, PASS, f"verdict {run['recipe_status']} = host; cycle locks {locks} = host", d,
-                         duration_s=run["wall_s"], remote_commands=run["ssh_commands"])
-        if all(t.get("syscall") is None for t in run["threads"]):
-            return check(cid, name, BLOCKED, "deadlock not established remotely and remote get_threads returns no syscall/wait info "
-                                             "(thread-info collector command not available yet)", d,
-                         duration_s=run["wall_s"], remote_commands=run["ssh_commands"])
-        return check(cid, name, FAIL, f"remote deadlock_detected={obs.get('deadlock_detected')} locks={locks} "
-                                      f"recipe={run['recipe_status']} vs host {ref}", d,
+    want_locks = ref.get("locks") if ref.get("available") else sorted(EXPECTED_LOCKS)
+    if obs.get("deadlock_detected") and locks == want_locks and run["recipe_status"] == ref.get("recipe_status", "SUPPORTED"):
+        limits = []
+        if all(t.get("syscall") is None and t.get("syscall_nr") is None for t in run["threads"]):
+            limits.append("remote get_threads carries no syscall fields; waiters were found via stack scan")
+        d["limitations"] = limits
+        return check(cid, name, PASS, f"verdict {run['recipe_status']} = host; cycle locks {locks} = host", d,
                      duration_s=run["wall_s"], remote_commands=run["ssh_commands"])
-    # unsupported architecture/libc: the expected outcome is the explicit unsupported status, no owners
-    probs = []
-    if run["lock_owner_status"] != "NOT_SUPPORTED_ON_TARGET":
-        probs.append(f"lock_owner_status={run['lock_owner_status']!r} (want NOT_SUPPORTED_ON_TARGET)")
-    if run["owner_values"]:
-        probs.append(f"owner TIDs reported on an unsupported target: {run['owner_values'][:4]}")
-    if obs.get("deadlock_detected"):
-        probs.append("deadlock_detected on an unsupported target")
-    if probs:
-        return check(cid, name, FAIL, "; ".join(probs), d, duration_s=run["wall_s"], remote_commands=run["ssh_commands"])
-    return check(cid, name, UNSUPPORTED,
-                 f"mutex owner decoding explicitly NOT_SUPPORTED_ON_TARGET ({run['lock_owner_reason']}); no owner TID, no cycle reported",
-                 d, duration_s=run["wall_s"], remote_commands=run["ssh_commands"])
-
-
-def c4d_recipe_verdict(ctx: Ctx, run: Dict[str, Any]) -> Dict[str, Any]:
-    cid, name = "C4d_recipe_verdict_on_unsupported", "recipe verdict on a target whose lock-owner decoding is unsupported"
-    if ctx.entry["expected_support"]["mutex_owner"] == "SUPPORTED":
-        return check(cid, name, SKIPPED, "mutex owner decoding is supported on this target; see C4a", {})
-    st = run["recipe_status"]
-    d = {"recipe_status": st, "recipe_basis": run["recipe_basis"], "recipe_details": run["recipe_details"],
-         "lock_owner_status": run["lock_owner_status"]}
-    if st in ("CONTRADICTED", "SUPPORTED"):
-        return check(cid, name, FAIL,
-                     f"recipe reports {st} ('{run['recipe_basis']}') although the evidence layer says lock-owner "
-                     f"decoding is {run['lock_owner_status']}; a definite verdict (esp. 'no wait cycles') on an "
-                     f"unsupported target is a silent misdiagnosis - should be INSUFFICIENT_EVIDENCE/NOT_APPLICABLE",
-                     d, known_defect="DEF-ARM-1")
-    return check(cid, name, UNSUPPORTED, f"recipe verdict {st}: no definite deadlock verdict on an unsupported target", d)
+    if all(t.get("syscall") is None for t in run["threads"]):
+        return check(cid, name, BLOCKED, "deadlock not established remotely and remote get_threads returns no syscall/wait info "
+                                         "(thread-info collector command not available yet)", d,
+                     duration_s=run["wall_s"], remote_commands=run["ssh_commands"])
+    return check(cid, name, FAIL, f"remote deadlock_detected={obs.get('deadlock_detected')} locks={locks} "
+                                  f"recipe={run['recipe_status']} vs host {ref}", d,
+                 duration_s=run["wall_s"], remote_commands=run["ssh_commands"])
 
 
 def c4b_gating(ctx: Ctx) -> Dict[str, Any]:
-    cid, name = "C4b_glibc_only_gating", "glibc-only checks (heap walking, mutex owner decoding) gated by the support table"
-    from extractor.heap_walker import (STATUS_OK, STATUS_PARTIAL, STATUS_UNSUPPORTED_ALLOCATOR, HeapWalker)
-    g, e = ctx.guest, ctx.entry
+    cid, name = "C4b_glibc_only_gating", "remote heap walking (glibc allocator)"
+    from extractor.heap_walker import STATUS_OK, STATUS_PARTIAL, HeapWalker
+    g = ctx.guest
     ad, tr = g.make_adapter(collector_path=ctx.collector_info.get("collector_path"))
     try:
         t0 = time.monotonic()
@@ -493,23 +447,14 @@ def c4b_gating(ctx: Ctx) -> Dict[str, Any]:
         n_chunks = len(w.chunks)
         d = {"heap_walk_status": w.status, "heap_walk_message": w.message, "chunks": n_chunks,
              "arenas": len(w.arenas), "wall_s": round(wall, 2), "ssh_commands": tr.snapshot()["commands"]}
-        if e["expected_support"]["allocator_chunks"] == "SUPPORTED":
-            if w.status in (STATUS_OK, STATUS_PARTIAL):
-                return check(cid, name, PASS, f"heap walk {w.status}: {n_chunks} chunks in {len(w.arenas)} arena(s)", d)
-            if w.status == "INCONCLUSIVE_ABI_UNDETECTED" and "glibc version" in w.message:
-                return check(cid, name, BLOCKED,
-                             "heap walking is declared supported here but HeapWalker cannot identify the glibc version of a REMOTE target "
-                             "(version probe is local-only / banner read from target memory failed) and answers INCONCLUSIVE - honest, "
-                             "but the remote heap walk cannot run: " + w.message, d)
-            return check(cid, name, FAIL, f"heap walk on a supported target returned {w.status}: {w.message}", d)
-        probs = []
-        if w.status != STATUS_UNSUPPORTED_ALLOCATOR:
-            probs.append(f"heap walk status {w.status!r} (want {STATUS_UNSUPPORTED_ALLOCATOR})")
-        if n_chunks or w.arenas:
-            probs.append(f"heap walk returned {n_chunks} chunks / {len(w.arenas)} arenas on an unsupported target")
-        if probs:
-            return check(cid, name, FAIL, "; ".join(probs), d)
-        return check(cid, name, UNSUPPORTED, f"heap walking -> {w.status} ({w.message[:90]}); mutex owner decoding gated, see C4a", d)
+        if w.status in (STATUS_OK, STATUS_PARTIAL):
+            return check(cid, name, PASS, f"heap walk {w.status}: {n_chunks} chunks in {len(w.arenas)} arena(s)", d)
+        if w.status == "INCONCLUSIVE_ABI_UNDETECTED" and "glibc version" in w.message:
+            return check(cid, name, BLOCKED,
+                         "heap walking is declared supported here but HeapWalker cannot identify the glibc version of a REMOTE target "
+                         "(version probe is local-only / banner read from target memory failed) and answers INCONCLUSIVE - honest, "
+                         "but the remote heap walk cannot run: " + w.message, d)
+        return check(cid, name, FAIL, f"heap walk on a supported target returned {w.status}: {w.message}", d)
     finally:
         ad.close()
 

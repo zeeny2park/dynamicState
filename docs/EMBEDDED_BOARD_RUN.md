@@ -1,7 +1,8 @@
 # Running the matrix checks on one real board (manual procedure)
 
-The QEMU matrix (`docs/EMBEDDED_TARGET_MATRIX.md`) executes the collector and the diagnosis path on emulated
-ARM32 / aarch64 guests.  Emulation does not prove behaviour on real silicon (timing, kernel configuration,
+The QEMU matrix (`docs/EMBEDDED_TARGET_MATRIX.md`) executes the collector and the diagnosis path on an emulated
+ARM64 (aarch64, glibc) guest.  Supported scope: x86-64 and ARM64 with glibc; ARM32 and musl boards are out of scope
+(the tool refuses them explicitly, see `extractor/target_abi.py`), so this procedure is for an ARM64 glibc board.  Emulation does not prove behaviour on real silicon (timing, kernel configuration,
 vendor BusyBox builds, `ptrace_scope`, read-only root filesystems).  This page is the procedure to run
 the **same checks** against one physical board and to record the result.
 
@@ -16,11 +17,8 @@ Board: Linux, reachable over SSH as root (or as the user that owns the test proc
 execution (`/tmp` by default; check `mount | grep -E ' /tmp | / '` for `noexec`), `dd`, `head`, `tail`,
 `base64`, `readlink`, `cat` (BusyBox is fine), and an SSH server (dropbear or OpenSSH).
 
-Host: this repository, Python 3.10+, `ssh`, the cross toolchain for the board's architecture
-(`arm-linux-gnueabihf-gcc` for 32-bit ARM hard-float, `aarch64-linux-gnu-gcc` for aarch64) and the static
-collectors (`make -C target/collector dist`).  Musl boards additionally need a musl sysroot:
-`python3 -m scripts.qemu_matrix prepare arm32-musl` creates `~/.cache/dynamicstate-qemu/arm32-musl/musl-sysroot`
-(Alpine `musl` + `musl-dev`; for a different musl version unpack the matching `musl-dev` and `musl` apks yourself).
+Host: this repository, Python 3.10+, `ssh`, `aarch64-linux-gnu-gcc` (cross toolchain for an ARM64 board) and the
+static collectors (`make -C target/collector dist`).  The board's libc must be glibc.
 
 ## 1. Collect the board facts (paste back verbatim)
 
@@ -35,31 +33,20 @@ ssh root@BOARD 'uname -a; cat /proc/cpuinfo | head -25; cat /proc/meminfo | head
 make -C target/collector dist
 python3 -m unittest tests/test_imp014_qemu_matrix_logic.py        # harness sanity on the host
 
-# glibc 32-bit ARM board
+# ARM64 (aarch64) glibc board
 python3 -m scripts.qemu_matrix board --host BOARD_IP --user root --key ~/.ssh/id_board \
-    --arch arm --libc glibc --cc arm-linux-gnueabihf-gcc --board-name myboard-v1 \
-    --notes "Raspberry Pi Zero W, Raspbian 11" --out board_record
-
-# musl 32-bit ARM board (BusyBox userland)
-python3 -m scripts.qemu_matrix board --host BOARD_IP --user root --key ~/.ssh/id_board \
-    --arch arm --libc musl --cc arm-linux-gnueabihf-gcc --board-name myboard-v1 \
-    --musl-sysroot ~/.cache/dynamicstate-qemu/arm32-musl/musl-sysroot --out board_record
-
-# aarch64 board: --arch aarch64 --cc aarch64-linux-gnu-gcc --libc glibc|musl
+    --arch aarch64 --cc aarch64-linux-gnu-gcc --board-name myboard-v1 \
+    --notes "ARM64 SBC, Debian 12" --out board_record
 ```
 
-Options: `--port`, `--workdir DIR` (exec-capable directory on the board, default `/tmp`), `--uname-m` if the board
-reports e.g. `armv6l` (then also check that the `arm` collector is acceptable, see below).  The command uploads two
-test programs to the board, starts them, runs checks C1-C5 exactly as in the emulator matrix, kills the
-programs and removes the files.  Result: `board_record/<board-name>.json` (+ a PASS/FAIL line per check on stdout).
+Options: `--port`, `--workdir DIR` (exec-capable directory on the board, default `/tmp`), `--uname-m` to override the
+expected `uname -m`.  The command uploads two test programs to the board, starts them, runs checks C1-C6 exactly as
+in the emulator matrix, kills the programs and removes the files.  Result: `board_record/<board-name>.json`
+(+ a PASS/FAIL line per check on stdout).
 
-Things that are *expected* and not failures: on ARM32 the deadlock check must report
-`UNSUPPORTED-AS-EXPECTED` (mutex owner decoding is LP64-glibc only), and `BLOCKED` for the futex-syscall check while the
-remote adapter has no thread-info collector command.
-
-If the board's CPU is ARMv6 (e.g. Pi Zero / Pi 1) the stock `arm` collector (built with the distro
-`arm-linux-gnueabihf-gcc`, ARMv7-A hard-float) will not run: record that as a finding, and rebuild it with
-`make -C target/collector dist` after setting a suitable compiler/`-march` in your toolchain.
+Things that are *expected* and not failures: `BLOCKED` for the futex-syscall check while the remote adapter has no
+thread-info collector command, and `BLOCKED` for the heap walk (the heap walker cannot identify the glibc version of
+a remote target; see `docs/EMBEDDED_TARGET_MATRIX.md`).
 
 ## 3. What to paste back
 
@@ -80,7 +67,7 @@ If the board's CPU is ARMv6 (e.g. Pi Zero / Pi 1) the stock `arm` collector (bui
 | CPU arch / `uname -m` | |
 | kernel (`uname -r`) | |
 | RAM (MemTotal) / cores | |
-| libc (glibc/musl + version) | |
+| glibc version | |
 | userland (BusyBox version / coreutils) | |
 | sshd (dropbear/openssh) | |
 | `ptrace_scope` / running as | |
@@ -88,16 +75,15 @@ If the board's CPU is ARMv6 (e.g. Pi Zero / Pi 1) the stock `arm` collector (bui
 | repository commit | |
 | result JSON | `docs/test_baseline/board_<name>.json` |
 
-| check | status (PASS / FAIL / UNSUPPORTED-AS-EXPECTED / BLOCKED) | observed (copy `summary`) |
+| check | status (PASS / FAIL / BLOCKED / SKIPPED) | observed (copy `summary`) |
 |---|---|---|
 | C1 collector deploy + slice read | | |
 | C2a daemon channel | | |
 | C2b no-collector fallback (BusyBox dd/tail/head) | | |
 | C3 ABI detection | | |
-| C4a deadlock diagnosis / explicit unsupported | | |
-| C4b glibc-only gating | | |
+| C4a deadlock diagnosis | | |
+| C4b remote heap walk | | |
 | C4c futex syscall names | | |
-| C4d recipe verdict on unsupported | | |
 | C5 cost (deadlock s / cmds; 100 reads daemon / oneshot / dd) | | |
 
 Deviations from the emulator matrix and defects found (command, observed output, expected):

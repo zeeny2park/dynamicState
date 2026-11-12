@@ -62,7 +62,7 @@ Host tools used by the analysis (install the `binutils` package; `gcc`/`g++` onl
 | `ssh`, `scp` (OpenSSH client) | remote (embedded) targets | only for remote |
 | `gdb` | CONSISTENT (stop-and-checkpoint) mode only | optional |
 | `bpftrace` | function tracing (`trace-function`) | optional |
-| cross compilers (`arm-linux-gnueabihf-gcc`, `aarch64-linux-gnu-gcc`) | building the collector for ARM targets | only to build it |
+| cross compilers (`aarch64-linux-gnu-gcc`, `x86_64-linux-gnu-gcc`) | building the collector for ARM64 / x86-64 targets | only to build it |
 
 Reading another process's memory needs the same user and `kernel.yama.ptrace_scope` permitting it (or `CAP_SYS_PTRACE`).
 Debug info: the target binary must be built with `-g`, or you must pass the unstripped build of the same program as
@@ -91,7 +91,7 @@ The target needs no Python: a small static C collector captures memory on the bo
 make -C target/collector dist
 ```
 
-This builds `target/collector/dist/<arch>/dynamicstate-collector` for each installed cross compiler (arm, aarch64,
+This builds `target/collector/dist/<arch>/dynamicstate-collector` for each installed cross compiler (aarch64 and
 x86_64) and prints which architectures were skipped. Deploy and connect (needs SSH access to the target):
 
 <!-- check: skip (needs a remote target; checked with --help) -->

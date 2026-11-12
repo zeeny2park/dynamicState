@@ -5,17 +5,12 @@ Normal test runs only check existence (see ``matrix.images_ready``).
 
 Guest = kernel + one initramfs (no disk image, no root needed):
 
-* kernel: Debian trixie ``linux-image-*-armmp`` / ``-arm64`` (virtio-pci built in; virtio_net as module)
-* userland glibc: Debian trixie debs (busybox-static, dropbear-bin, libc6 closure), resolved through the
+* kernel: Debian trixie ``linux-image-*-arm64`` (virtio-pci built in; virtio_net as module)
+* userland (glibc): Debian trixie debs (busybox-static, dropbear-bin, libc6 closure), resolved through the
   ``Release`` -> ``Packages.xz`` -> per-deb SHA256 chain (HTTPS; the Release GPG signature is not checked)
-* userland musl:  Alpine v3.22 minirootfs (+ dropbear and its ``so:`` closure from the main repo, each apk
-  verified against the APKINDEX ``C:`` checksum); BusyBox is Alpine's musl-linked build
-* ``musl-dev`` (headers, crt, libc) is unpacked on the HOST only, to cross-compile musl test targets
-  with the glibc cross gcc (``-nostdinc -nostdlib`` against the musl sysroot)
 """
 from __future__ import annotations
 
-import base64
 import gzip
 import hashlib
 import json
@@ -25,16 +20,11 @@ import re
 import shutil
 import stat
 import subprocess
-import tarfile
 import urllib.request
-import zlib
 from typing import Dict, List, Optional, Tuple
 
 DEBIAN_MIRROR = "https://deb.debian.org/debian"
 DEBIAN_SUITE = "trixie"
-ALPINE_MIRROR = "https://dl-cdn.alpinelinux.org/alpine"
-ALPINE_BRANCH = "v3.22"
-ALPINE_MINIROOTFS = "3.22.8"
 
 MODULES = ["failover", "net_failover", "virtio_net"]
 
@@ -345,111 +335,3 @@ def build_debian_entry(deb_arch: str, kernel_pkg: str, outdir: str) -> Dict[str,
     with open(os.path.join(outdir, "packages.txt"), "w") as f:
         f.write("\n".join(used) + "\n")
     return {"kernel": kernel, "initrd": initrd}
-
-
-# ---------------------------------------------------------------- Alpine
-def _alpine_index(arch: str) -> Dict[str, dict]:
-    idx = download(f"{ALPINE_MIRROR}/{ALPINE_BRANCH}/main/{arch}/APKINDEX.tar.gz",
-                   name=f"alpine-{ALPINE_BRANCH}-main-{arch}-APKINDEX.tar.gz")
-    with tarfile.open(idx, "r:gz") as tf:
-        txt = tf.extractfile("APKINDEX").read().decode()
-    pk: Dict[str, dict] = {}
-    for stanza in txt.split("\n\n"):
-        d = {}
-        for line in stanza.splitlines():
-            if len(line) > 2 and line[1] == ":":
-                d[line[0]] = line[2:]
-        if "P" in d:
-            pk[d["P"]] = d
-    return pk
-
-
-def _apk_closure(idx: Dict[str, dict], roots: List[str]) -> List[dict]:
-    prov: Dict[str, str] = {}
-    for n, d in idx.items():
-        for p in d.get("p", "").split():
-            prov.setdefault(p.split("=")[0], n)
-    out: Dict[str, dict] = {}
-    todo = list(roots)
-    while todo:
-        n = todo.pop()
-        n = n if n in idx else prov.get(n)
-        if n is None or n in out:
-            continue
-        out[n] = idx[n]
-        for dep in idx[n].get("D", "").split():
-            if dep.startswith("!"):
-                continue
-            todo.append(re.split(r"[=<>~]", dep)[0])
-    return list(out.values())
-
-
-def _apk_verify(path: str, c_field: str) -> None:
-    """Alpine 'C:' = Q1 + base64(sha1(control segment)); control = 2nd gzip stream of the .apk."""
-    raw = open(path, "rb").read()
-    segs = []
-    while raw:
-        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        d.decompress(raw)
-        used = len(raw) - len(d.unused_data)
-        segs.append(raw[:used])
-        raw = d.unused_data
-    ctl = segs[1] if len(segs) >= 3 else segs[0]
-    got = "Q1" + base64.b64encode(hashlib.sha1(ctl).digest()).decode()
-    if got != c_field:
-        raise RuntimeError(f"apk checksum mismatch for {path}: {got} != {c_field}")
-
-
-def _apk_extract(path: str, root: str) -> None:
-    subprocess.run(["tar", "-xzf", path, "-C", root, "--no-same-owner", "--warning=no-unknown-keyword"],
-                   check=False, stderr=subprocess.DEVNULL)
-    for fn in os.listdir(root):
-        p = os.path.join(root, fn)
-        if fn.startswith(".") and os.path.isfile(p):
-            os.unlink(p)
-
-
-def _fetch_apks(arch: str, roots: List[str], dest_root: str) -> List[str]:
-    idx = _alpine_index(arch)
-    used = []
-    for d in _apk_closure(idx, roots):
-        url = f"{ALPINE_MIRROR}/{ALPINE_BRANCH}/main/{arch}/{d['P']}-{d['V']}.apk"
-        p = download(url, name=f"alpine-{ALPINE_BRANCH}-{arch}-{d['P']}-{d['V']}.apk")
-        _apk_verify(p, d["C"])
-        _apk_extract(p, dest_root)
-        used.append(f"{d['P']}={d['V']}")
-    return used
-
-
-def build_alpine_entry(alpine_arch: str, kernel_deb_arch: str, kernel_pkg: str, outdir: str) -> Dict[str, str]:
-    os.makedirs(outdir, exist_ok=True)
-    kernel, mods = _extract_kernel(kernel_deb_arch, kernel_pkg, outdir)
-    base = (f"{ALPINE_MIRROR}/{ALPINE_BRANCH}/releases/{alpine_arch}/"
-            f"alpine-minirootfs-{ALPINE_MINIROOTFS}-{alpine_arch}.tar.gz")
-    sha_file = download(base + ".sha256", name=f"alpine-minirootfs-{ALPINE_MINIROOTFS}-{alpine_arch}.tar.gz.sha256")
-    sha = open(sha_file).read().split()[0]
-    tgz = download(base, sha, name=f"alpine-minirootfs-{ALPINE_MINIROOTFS}-{alpine_arch}.tar.gz")
-    root = os.path.join(outdir, "rootfs")
-    shutil.rmtree(root, ignore_errors=True)
-    os.makedirs(root)
-    subprocess.run(["tar", "-xzf", tgz, "-C", root, "--no-same-owner", "--exclude=./dev/*"],
-                   check=True, stderr=subprocess.DEVNULL)
-    used = [f"kernel:{kernel_pkg}", f"alpine-minirootfs={ALPINE_MINIROOTFS}"] + \
-        _fetch_apks(alpine_arch, ["dropbear", "musl", "libgcc"], root)
-    initrd = os.path.join(outdir, "initramfs.cpio.gz")
-    _finish_initramfs(root, mods, initrd)
-    shutil.rmtree(root)
-    with open(os.path.join(outdir, "packages.txt"), "w") as f:
-        f.write("\n".join(used) + "\n")
-    return {"kernel": kernel, "initrd": initrd}
-
-
-def build_musl_sysroot(alpine_arch: str, outdir: str) -> str:
-    """Host-side musl sysroot (headers, crt*.o, libc.so/.a) from Alpine musl + musl-dev."""
-    root = os.path.join(outdir, "musl-sysroot")
-    shutil.rmtree(root, ignore_errors=True)
-    os.makedirs(root)
-    used = _fetch_apks(alpine_arch, ["musl", "musl-dev", "libgcc"], root)
-    with open(os.path.join(outdir, "musl-sysroot.txt"), "w") as f:
-        f.write("\n".join(used) + "\n")
-    return root

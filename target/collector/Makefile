@@ -22,7 +22,7 @@ $(TEST_CRYPTO): src/test_crypto.o src/sha256.o
 
 # ---- Static per-architecture builds: `make dist` -> dist/<arch>/dynamicstate-collector
 # arch:cross-compiler pairs; an arch is skipped (and reported) if its compiler is missing.
-DIST_ARCHES = arm:arm-linux-gnueabihf-gcc aarch64:aarch64-linux-gnu-gcc x86_64:x86_64-linux-gnu-gcc
+DIST_ARCHES = aarch64:aarch64-linux-gnu-gcc x86_64:x86_64-linux-gnu-gcc
 DIST_CFLAGS = -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude -DCOLLECTOR_VERSION=\"$(VERSION)\"
 
 dist:
@@ -40,7 +40,7 @@ dist:
 	[ -z "$$failed" ] || { echo "dist: FAILED:$$failed"; exit 1; }
 
 clean:
-	rm -f $(foreach a,arm aarch64 x86_64,dist/$(a)/$(TARGET))
+	rm -f $(foreach a,aarch64 x86_64,dist/$(a)/$(TARGET))
 	rm -f $(OBJS) src/test_crypto.o $(TARGET) $(TEST_CRYPTO)
 
 install: $(TARGET)

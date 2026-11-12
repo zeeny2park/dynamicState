@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       entries:
-        description: 'Space separated matrix entries (empty = all): arm32-glibc arm32-musl aarch64-glibc'
+        description: 'Space separated matrix entries (empty = all): aarch64-glibc'
         required: false
         default: ''
   schedule:
@@ -25,11 +25,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install system dependencies (QEMU, cross compilers, ssh client)
+      - name: Install system dependencies (QEMU for the ARM64 guest, cross compilers, ssh client)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-arm gcc gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu make binutils openssh-client dpkg-dev xz-utils
-          qemu-system-arm --version
+          sudo apt-get install -y --no-install-recommends qemu-system-arm gcc gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu make binutils openssh-client dpkg-dev xz-utils
           qemu-system-aarch64 --version
 
       - name: Install Python test dependencies
@@ -43,7 +42,7 @@ jobs:
           path: ~/.cache/dynamicstate-qemu
           key: qemu-matrix-images-${{ hashFiles('scripts/qemu_matrix/images.py', 'scripts/qemu_matrix/entries.py') }}
 
-      - name: Build static collectors for arm, aarch64 and x86_64
+      - name: Build static collectors for aarch64 and x86_64
         run: |
           make -C target/collector dist
 

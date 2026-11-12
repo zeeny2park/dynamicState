@@ -20,7 +20,6 @@ from extractor.target_adapter import RemoteSshTargetAdapter
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 COLLECTOR_SRC = os.path.join(REPO_ROOT, "target", "collector")
 CROSS = {
-    "arm": "arm-linux-gnueabihf-gcc",
     "aarch64": "aarch64-linux-gnu-gcc",
     "x86_64": "x86_64-linux-gnu-gcc",
 }
@@ -46,7 +45,7 @@ def copy_collector_tree(dst: str) -> str:
 class FakeTarget:
     """Fake remote executor recording commands; optionally reports an arch and keeps stdin."""
 
-    def __init__(self, uname="armv7l", present=None, noexec_prefixes=()):
+    def __init__(self, uname="aarch64", present=None, noexec_prefixes=()):
         self.uname = uname
         self.present = dict(present or {})  # path -> version
         self.noexec_prefixes = noexec_prefixes
@@ -76,7 +75,7 @@ class SelectionAndVersionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        for arch, (machine, cls) in {"arm": (40, 1), "aarch64": (183, 2), "x86_64": (62, 2)}.items():
+        for arch, (machine, cls) in {"aarch64": (183, 2), "x86_64": (62, 2)}.items():
             d = os.path.join(self.tmp, "dist", arch)
             os.makedirs(d)
             with open(os.path.join(d, "dynamicstate-collector"), "wb") as f:
@@ -88,17 +87,28 @@ class SelectionAndVersionTests(unittest.TestCase):
     def _adapter(self, target):
         return RemoteSshTargetAdapter(host="10.0.0.9", user="root", command_runner=target)
 
-    def test_arm_target_gets_arm_binary_regardless_of_host_arch(self):
-        for uname, expect in (("armv7l", "arm"), ("armv6l", "arm"), ("aarch64", "aarch64"), ("x86_64", "x86_64")):
+    def test_each_shipped_architecture_gets_its_own_binary_regardless_of_host_arch(self):
+        for uname, expect in (("aarch64", "aarch64"), ("arm64", "aarch64"), ("x86_64", "x86_64"), ("amd64", "x86_64")):
             t = FakeTarget(uname=uname)
             res = self._adapter(t).ensure_remote_collector()
             self.assertEqual(res["status"], "DEPLOYED_BINARY", uname)
             self.assertEqual(res["architecture"], expect)
             self.assertTrue(res["local_binary"].endswith(os.path.join("dist", expect, "dynamicstate-collector")))
-            self.assertEqual(t.uploads[0][1][18:20], struct.pack("<H", {"arm": 40, "aarch64": 183, "x86_64": 62}[expect]))
+            self.assertEqual(t.uploads[0][1][18:20], struct.pack("<H", {"aarch64": 183, "x86_64": 62}[expect]))
+
+    def test_target_without_a_shipped_binary_never_gets_a_wrong_architecture_binary(self):
+        # 32-bit ARM is out of scope: no dist/arm binary ships.  The deploy must not substitute another
+        # architecture's binary; it falls back to the shell path without uploading anything.
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "dist", "arm")))
+        for uname in ("armv7l", "armv6l", "mips", "riscv64"):
+            t = FakeTarget(uname=uname)
+            res = self._adapter(t).ensure_remote_collector()
+            self.assertEqual(res["status"], "FALLBACK_SHELL", uname)
+            self.assertEqual(t.uploads, [], uname)
+            self.assertIsNone(res.get("local_binary"), uname)
 
     def test_transfer_uses_stdin_not_argv(self):
-        t = FakeTarget(uname="armv7l")
+        t = FakeTarget(uname="aarch64")
         self._adapter(t).ensure_remote_collector()
         cmd, payload = t.uploads[0]
         self.assertIn("cat >", cmd)
@@ -107,27 +117,27 @@ class SelectionAndVersionTests(unittest.TestCase):
         self.assertTrue(payload.startswith(b"\x7fELF"))
 
     def test_explicit_wrong_arch_binary_falls_back_to_shell(self):
-        t = FakeTarget(uname="armv7l")
+        t = FakeTarget(uname="aarch64")
         x86 = os.path.join(self.tmp, "dist", "x86_64", "dynamicstate-collector")
         res = self._adapter(t).ensure_remote_collector(local_collector_bin=x86)
         self.assertEqual(res["status"], "FALLBACK_SHELL")
         self.assertEqual(t.uploads, [])
 
     def test_version_match_is_not_redeployed(self):
-        t = FakeTarget(uname="armv7l", present={"/tmp/dynamicstate-collector": "1.2.3"})
+        t = FakeTarget(uname="aarch64", present={"/tmp/dynamicstate-collector": "1.2.3"})
         res = self._adapter(t).ensure_remote_collector()
         self.assertEqual(res["status"], "ALREADY_PRESENT")
         self.assertEqual(t.uploads, [])
 
     def test_version_mismatch_triggers_redeploy(self):
-        t = FakeTarget(uname="armv7l", present={"/tmp/dynamicstate-collector": "0.9.0"})
+        t = FakeTarget(uname="aarch64", present={"/tmp/dynamicstate-collector": "0.9.0"})
         res = self._adapter(t).ensure_remote_collector()
         self.assertEqual(res["status"], "DEPLOYED_BINARY")
         self.assertEqual(res["collector_version"], "1.2.3")
         self.assertEqual(len(t.uploads), 1)
 
     def test_noexec_primary_location_uses_fallback(self):
-        t = FakeTarget(uname="armv7l", noexec_prefixes=("cat > '/tmp/", "cat > /tmp/"))
+        t = FakeTarget(uname="aarch64", noexec_prefixes=("cat > '/tmp/", "cat > /tmp/"))
         res = self._adapter(t).ensure_remote_collector()
         self.assertEqual(res["status"], "DEPLOYED_BINARY")
         self.assertEqual(res["collector_path"], "/var/tmp/dynamicstate-collector")
@@ -219,7 +229,7 @@ class MakeDistTests(unittest.TestCase):
         res = subprocess.run(["make", "-C", src, "dist"], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertIn("SKIPPED", res.stdout)
-        expected_machine = {"arm": "arm", "aarch64": "aarch64", "x86_64": "x86_64"}
+        expected_machine = {"aarch64": "aarch64", "x86_64": "x86_64"}
         for arch in available:
             path = os.path.join(src, "dist", arch, "dynamicstate-collector")
             self.assertTrue(os.path.isfile(path), f"missing {path}")
@@ -235,8 +245,8 @@ class MakeDistTests(unittest.TestCase):
         for arch in missing:
             self.assertFalse(os.path.exists(os.path.join(src, "dist", arch)))
             self.assertIn(missing[arch], res.stdout)
-        if len(available) < 3:
-            self.skipTest(f"only {available} cross compilers present; need all 3 for the 3-arch criterion")
+        if len(available) < 2:
+            self.skipTest(f"only {available} cross compilers present; need both in-scope architectures (aarch64, x86_64)")
 
 
 if __name__ == "__main__":

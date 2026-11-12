@@ -1,7 +1,7 @@
 """IMP-014: the real QEMU matrix as a test (skipped unless QEMU, the cross compilers, the collector
 binaries and the CACHED guest images are present).  Never downloads or builds images - run
 ``python3 -m scripts.qemu_matrix prepare`` first.  Each entry boots a TCG guest (minutes); restrict with
-DYNAMICSTATE_QEMU_ENTRIES="arm32-musl,aarch64-glibc".
+DYNAMICSTATE_QEMU_ENTRIES="aarch64-glibc".
 """
 import os
 import shutil
@@ -53,24 +53,6 @@ class TestQemuMatrix(unittest.TestCase):
             c = self._status(d, cid)
             self.assertEqual(c["status"], results.PASS, f"{cid}: {c['summary']}")
         return d
-
-    def _unsupported_entry(self, name):
-        d = self._common(name)
-        a = self._status(d, "C4a_deadlock_diagnosis")
-        self.assertEqual(a["status"], results.UNSUPPORTED, a["summary"])
-        b = self._status(d, "C4b_glibc_only_gating")
-        self.assertEqual(b["status"], results.UNSUPPORTED, b["summary"])
-        for c in d["checks"]:
-            if c["status"] == results.FAIL:
-                self.assertTrue(c.get("known_defect"), f"{c['id']}: {c['summary']}")
-
-    @unittest.skipUnless("arm32-glibc" in _WANTED, "entry not selected")
-    def test_arm32_glibc(self):
-        self._unsupported_entry("arm32-glibc")
-
-    @unittest.skipUnless("arm32-musl" in _WANTED, "entry not selected")
-    def test_arm32_musl(self):
-        self._unsupported_entry("arm32-musl")
 
     @unittest.skipUnless("aarch64-glibc" in _WANTED, "entry not selected")
     def test_aarch64_glibc(self):

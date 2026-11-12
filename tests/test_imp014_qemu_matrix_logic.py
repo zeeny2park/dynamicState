@@ -18,7 +18,7 @@ from scripts.qemu_matrix import checks, entries, guest, images, matrix, results,
 
 class TestQemuArgs(unittest.TestCase):
     def _args(self, **kw):
-        base = dict(qemu_bin="qemu-system-arm", machine="virt,highmem=off", cpu="cortex-a15", mem_mb=128,
+        base = dict(qemu_bin="qemu-system-aarch64", machine="virt", cpu="cortex-a72", mem_mb=128,
                     kernel="/k", initrd="/i", console_tty="ttyAMA0", ssh_port=2222, console_log="/c.log")
         base.update(kw)
         return vm.build_qemu_args(**base)
@@ -49,12 +49,12 @@ class TestQemuArgs(unittest.TestCase):
             self.assertTrue(vm.MIN_MEM_MB <= e["mem_mb"] <= vm.MAX_MEM_MB, name)
             self.assertEqual(set(e["expected_support"]), {"mutex_owner", "allocator_chunks", "syscall_names",
                                                           "tcb_scan", "frame_layout", "cfi_unwind"}, name)
-            self.assertIn(e["libc"], ("glibc", "musl"))
-        # the roadmap minimum matrix
-        self.assertEqual({(e["expected_abi"]["architecture"], e["libc"]) for e in entries.ENTRIES.values()},
-                         {("arm", "glibc"), ("arm", "musl"), ("aarch64", "glibc")})
+            self.assertEqual(e["libc"], "glibc", name)
+            self.assertIn(e["expected_abi"]["architecture"], ("aarch64", "x86_64"), name)
+        # the supported scope: x86-64 is verified by the regular CI job, so the QEMU matrix is ARM64 glibc only
+        self.assertEqual(entries.entry_names(), ["aarch64-glibc"])
 
-    def test_expected_support_matches_product_table_for_musl_and_arm(self):
+    def test_expected_support_matches_product_table(self):
         """The independent expectation and the product table agree on the glibc-only features."""
         from extractor.target_abi import TargetABI, check_support
         for name, e in entries.ENTRIES.items():
@@ -180,7 +180,7 @@ class TestVmLifecycle(unittest.TestCase):
 
 class TestResultSchema(unittest.TestCase):
     def _doc(self):
-        e = entries.ENTRIES["arm32-musl"]
+        e = entries.ENTRIES["aarch64-glibc"]
         d = results.new_result(e)
         d["checks"] = [results.check(cid, "n", results.PASS, "ok") for cid in results.CHECK_IDS]
         d["overall"] = results.overall(d["checks"])
@@ -263,24 +263,19 @@ class TestTransportAndHelpers(unittest.TestCase):
         self.assertEqual(p, {"pid": 173, "known": 0x4FD000, "known_len": 48, "region": 0xB6EBC000, "region_len": 12288})
         self.assertIsNone(checks.parse_memtarget_line("garbage"))
 
-    def test_owner_value_scan(self):
-        obs = {"locks": [{"name": "m", "owner_tid": None}], "t": [{"waiting_on_lock": {"held_by_tid": 12}}]}
-        self.assertEqual(len(checks._scan_owner_values(obs)), 1)
-        self.assertEqual(checks._scan_owner_values({"owner_tid": None, "x": [1, 2]}), [])
-
     def test_missing_prerequisites_reported_not_raised(self):
         with mock.patch("shutil.which", return_value=None):
-            miss = matrix.missing_prerequisites("arm32-musl")
-        self.assertTrue(any("qemu-system-arm" in m for m in miss))
-        self.assertTrue(any("cross" in m or "arm-linux-gnueabihf-gcc" in m for m in miss))
+            miss = matrix.missing_prerequisites("aarch64-glibc")
+        self.assertTrue(any("qemu-system-aarch64" in m for m in miss))
+        self.assertTrue(any("aarch64-linux-gnu-gcc" in m for m in miss))
 
     def test_run_entry_with_missing_prerequisites_writes_incomplete_result(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(matrix, "missing_prerequisites", return_value=["nope"]), \
                 mock.patch.object(vm, "leftover_qemu_processes", return_value=[]):
-            doc = matrix.run_entry("arm32-musl", td)
+            doc = matrix.run_entry("aarch64-glibc", td)
             self.assertEqual(doc["overall"], "INCOMPLETE")
             self.assertIn("nope", doc["infrastructure_error"])
-            on_disk = json.load(open(os.path.join(td, "arm32-musl.json")))
+            on_disk = json.load(open(os.path.join(td, "aarch64-glibc.json")))
             self.assertEqual(results.validate_result(on_disk), [])
 
     def test_run_entry_always_stops_guest_when_checks_blow_up(self):
@@ -303,7 +298,7 @@ class TestTransportAndHelpers(unittest.TestCase):
                 mock.patch.object(matrix.build_targets, "build_entry_targets", return_value={}), \
                 mock.patch.object(guest, "Guest", FakeGuest), \
                 mock.patch.object(vm, "leftover_qemu_processes", return_value=[]):
-            doc = matrix.run_entry("arm32-musl", td)
+            doc = matrix.run_entry("aarch64-glibc", td)
         self.assertGreaterEqual(len(stopped), 1)
         self.assertEqual(doc["overall"], "INCOMPLETE")
         self.assertEqual(matrix._ACTIVE, [])
@@ -319,16 +314,19 @@ class TestTransportAndHelpers(unittest.TestCase):
 class TestBoardRun(unittest.TestCase):
     def test_board_entry_expectations_follow_the_roadmap_rules(self):
         from scripts.qemu_matrix import board
-        for arch, libc, owner in (("arm", "glibc", "NOT_SUPPORTED_ON_TARGET"), ("arm", "musl", "NOT_SUPPORTED_ON_TARGET"),
-                                  ("aarch64", "glibc", "SUPPORTED"), ("aarch64", "musl", "NOT_SUPPORTED_ON_TARGET")):
-            e = board.board_entry(arch, libc, "cc", "b")
-            self.assertEqual(e["expected_support"]["mutex_owner"], owner, (arch, libc))
-            self.assertEqual(e["expected_support"]["allocator_chunks"], owner, (arch, libc))
+        for arch in ("aarch64", "x86_64"):
+            e = board.board_entry(arch, "cc", "b")
+            self.assertEqual(e["libc"], "glibc")
+            self.assertEqual(e["expected_abi"], {"architecture": arch, "word_size": 64, "endianness": "little", "libc": "glibc"})
+            self.assertEqual(e["expected_support"]["mutex_owner"], "SUPPORTED", arch)
+            self.assertEqual(e["expected_support"]["allocator_chunks"], "SUPPORTED", arch)
             self.assertEqual(e["expected_support"]["syscall_names"], "SUPPORTED")
-        self.assertEqual(board.board_entry("arm", "glibc", "cc", "b")["expected_abi"]["word_size"], 32)
+        self.assertEqual(board.board_entry("aarch64", "cc", "b")["uname_m"], "aarch64")
+        with self.assertRaises(KeyError):  # ARM32 is out of scope: no board entry can be built for it
+            board.board_entry("arm", "cc", "b")
         # the board table must agree with the QEMU entries it generalises
         for name, e in entries.ENTRIES.items():
-            b = board.board_entry(e["expected_abi"]["architecture"], e["libc"], "cc", name)
+            b = board.board_entry(e["expected_abi"]["architecture"], "cc", name)
             self.assertEqual(b["expected_support"], e["expected_support"], name)
 
     def test_board_guest_does_not_start_a_vm(self):
@@ -389,38 +387,19 @@ class TestInitramfsAndImages(unittest.TestCase):
             self.assertTrue(os.path.isfile(p))
             self.assertEqual(images.downloads_manifest()[0]["size"], 4)
 
-    def test_apk_checksum_verification(self):
-        import base64
-        import hashlib
-        import zlib
-
-        def gz(b):
-            c = zlib.compressobj(wbits=31)
-            return c.compress(b) + c.flush()
-        sig, ctl, data = gz(b"s"), gz(b"control"), gz(b"data")
-        with tempfile.NamedTemporaryFile(suffix=".apk") as f:
-            f.write(sig + ctl + data)
-            f.flush()
-            good = "Q1" + base64.b64encode(hashlib.sha1(ctl).digest()).decode()
-            images._apk_verify(f.name, good)
-            with self.assertRaises(RuntimeError):
-                images._apk_verify(f.name, "Q1AAAA")
-
     def test_images_ready_is_a_pure_check(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"DYNAMICSTATE_QEMU_CACHE": td}), \
                 mock.patch("urllib.request.urlopen", side_effect=AssertionError("network used")):
             for n in entries.entry_names():
                 self.assertFalse(entries.images_ready(n))
 
-    def test_musl_compile_commands_use_the_musl_sysroot_only(self):
+    def test_target_compile_command_is_the_glibc_cross_gcc(self):
         from scripts.qemu_matrix import build_targets
-        c1, c2 = build_targets.musl_cc_cmd("cc", "/sys", "a.c", "out", "/lib/ld-musl-armhf.so.1",
-                                           "libc.musl-armv7.so.1", "/lg.a", "/gccinc")
-        self.assertIn("-nostdinc", c1)
-        self.assertIn("/sys/usr/include", c1)
-        self.assertIn("-nostdlib", c2)
-        self.assertIn("-Wl,-dynamic-linker=/lib/ld-musl-armhf.so.1", c2)
-        self.assertIn("/sys/lib/libc.musl-armv7.so.1", c2)
+        c = build_targets.cc_cmd("aarch64-linux-gnu-gcc", "a.c", "out")
+        self.assertEqual(c[0], "aarch64-linux-gnu-gcc")
+        self.assertIn("-pthread", c)
+        self.assertIn("-Wl,--build-id=sha1", c)
+        self.assertNotIn("-nostdlib", c)
 
 
 if __name__ == "__main__":
