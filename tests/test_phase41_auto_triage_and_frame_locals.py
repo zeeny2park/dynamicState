@@ -22,11 +22,6 @@ from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
 
 
-# Production unwinder/TCB discovery assumes the x86_64 ABI; on other architectures the tests below are known-defect baselines.
-# (On x86_64 the decorator is a no-op so an unexpected pass there is not reported as an unexpected success.)
-_X86_64 = platform.machine() in ("x86_64", "AMD64")
-_x86_layout_defect = (lambda f: f) if _X86_64 else unittest.expectedFailure
-
 class TestPhase41AutoTriageAndFrameLocals(unittest.TestCase):
     """End-to-end verification of Phase 11 Auto-Triage and Stack Frame Local Variable Decoder."""
 
@@ -122,10 +117,8 @@ int main() {
                 cls.proc.kill()
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
-    # IMP-005 baseline: real defect — on aarch64 (non-x86_64) param_tag decodes as a garbage value that varies per run (e.g. 49979; inner_local_magic equals the same garbage) vs expected 4242:
-    # extractor/watch_session.py:6525 computes CFA as saved_fp + 2*ptr_size (x86_64 frame layout), wrong for aarch64 where DW_OP_fbreg CFA != fp+16;
-    # the 0xe8 x86 CALL opcode probe at extractor/watch_session.py:6506 is also x86-only.
-    @_x86_layout_defect
+    # IMP-011: the CFA now comes from the CFI unwinder on x86_64 and aarch64 (the IMP-005 aarch64 baseline
+    # failure - CFA = saved_fp + 2*ptr_size and the x86-only 0xe8 probe - is fixed; marker removed).
     def test_01_inspect_thread_locals_and_frame_vars(self) -> None:
         """`runtime_inspect_thread_locals_and_frame_vars` decodes live stack parameters and locals in 0.00ms stop mode."""
         raw_out = mcp_srv.runtime_inspect_thread_locals_and_frame_vars(

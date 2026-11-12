@@ -41,6 +41,7 @@ FEATURE_ALLOCATOR_CHUNKS = "allocator_chunks"
 FEATURE_SYSCALL_NAMES = "syscall_names"
 FEATURE_TCB_SCAN = "tcb_scan"
 FEATURE_FRAME_LAYOUT = "frame_layout"
+FEATURE_CFI_UNWIND = "cfi_unwind"
 
 _ANY = None  # wildcard in the support table
 
@@ -67,9 +68,19 @@ SUPPORT_TABLE: Dict[str, List[Tuple[Optional[str], Optional[str], Optional[int],
     FEATURE_TCB_SCAN: [
         ("x86_64", LIBC_GLIBC, 64, "little"),
     ],
-    # x86-64 `call rel32` (0xE8) decoding and rbp-chain / CFA = rbp+16 frame assumptions.
+    # IMP-011: frame parameter/local decoding.  The CFA of each frame comes from the CFI unwinder
+    # (extractor/cfi_unwinder.py: .eh_frame/.debug_frame CFA programs, per-architecture DWARF register
+    # numbering, call-site decoding) and DW_OP_fbreg is evaluated against DW_AT_frame_base
+    # (DW_OP_call_frame_cfa or a register).  Exercised on aarch64 (executed) and x86_64.
     FEATURE_FRAME_LAYOUT: [
         ("x86_64", _ANY, 64, "little"),
+        ("aarch64", _ANY, 64, "little"),
+    ],
+    # IMP-011: CFI call-stack unwinding from the kernel-reported SP/PC of a blocked thread.
+    # 32-bit arm (EHABI .ARM.exidx, r11/r7 frame pointers, Thumb bit) is not implemented.
+    FEATURE_CFI_UNWIND: [
+        ("x86_64", _ANY, 64, "little"),
+        ("aarch64", _ANY, 64, "little"),
     ],
 }
 

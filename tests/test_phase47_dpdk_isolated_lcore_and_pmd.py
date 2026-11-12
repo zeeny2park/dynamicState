@@ -211,9 +211,8 @@ class TestPhase47DpdkIsolatedLcoreAndPmd(unittest.TestCase):
                     pass
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
-    # IMP-005 baseline: real defect — on aarch64 (non-x86_64) lcore-worker-1 callstack is ['_fini', 'dpdk_eal_lcore_trampoline'] (expected frame #0 pmd_poll_rx_tx_burst):
-    # leaf-frame recovery for running user-space threads probes for the x86 CALL opcode 0xe8 at extractor/watch_session.py:5589 (callstacks) and :6506 (frame locals).
-    @_x86_layout_defect
+    # IMP-011: running lcores are unwound as a labelled two-read stack sample with per-architecture call-site
+    # decoding (x86_64 CALL / aarch64 BL) and CFI; the IMP-005 aarch64 baseline failure is fixed (marker removed).
     def test_01_pure_userspace_poll_loop_callstack_and_frame_locals(self):
         """Verifies that 100% user-space spinning DPDK lcores (syscall=='running', sp==0) unwind leaf functions and decode frame locals."""
         cs_res = self.watch_mgr.inspect_thread_callstacks_and_locks(
