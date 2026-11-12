@@ -202,7 +202,13 @@ class RemoteThreadInfoTests(unittest.TestCase):
                     self.assertEqual(lt["syscall"]["sp"], rt["syscall"]["sp"])
                     self.assertEqual(lt["syscall"]["pc"], rt["syscall"]["pc"])
                     self.assertEqual(lt["syscall"]["args"], rt["syscall"]["args"])
-                    self.assertEqual(lt["stack_info"], rt["stack_info"])
+                    # The remote adapter does not run the TCB self-pointer scan (known gap: remote TLS/TCB
+                    # discovery is not implemented), so `tcb_address*` is None remotely while the local
+                    # adapter fills it on targets where the scan is supported (x86_64/glibc). Everything
+                    # else in stack_info must match exactly.
+                    _no_tcb = lambda d: {k: v for k, v in (d or {}).items() if not k.startswith("tcb_address")}
+                    self.assertEqual(_no_tcb(lt["stack_info"]), _no_tcb(rt["stack_info"]))
+                    self.assertIsNone((rt["stack_info"] or {}).get("tcb_address"))
                     self.assertEqual(rt["stack_info"]["sp_int"], rt["syscall"]["sp"])
                     self.assertIsInstance(rt["schedstat"], (dict, type(None)))
                 spin, spin_l = by_name["spin_hang"], lby["spin_hang"]
