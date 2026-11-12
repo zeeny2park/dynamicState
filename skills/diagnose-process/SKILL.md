@@ -29,10 +29,10 @@ report the result honestly.
    available remotely.
 
 ## Workflow
-1. Call `runtime_diagnose_process(pid, debug_image, symptom)` once. CLI equivalent: `dynamic-state diagnose -p PID [-d ELF] [--symptom TEXT] --json`.
-2. Read `verdict`, `findings`, `not_covered`, `collection_impact` (see next section).
+1. Call `runtime_diagnose_process(pid, debug_image, symptom, language)` once; set `language` to `ko` when the user writes Korean, otherwise `en`. CLI equivalent: `dynamic-state diagnose -p PID [-d ELF] [--symptom TEXT] [--lang ko|en] --json`.
+2. Read `human_summary` first (a ready-made plain-language report in the requested language), then `verdict`, `findings`, `not_covered`, `collection_impact` (see next section).
 3. Follow up according to the verdict (see Follow-up). Do not re-run `diagnose` hoping for a different answer.
-4. Explain to the user in plain language, in the user's language: what was found, where, and what was not examined.
+4. Relay `human_summary` to the user as written (do not re-summarize away its names, source locations, what was not examined or the measured impact), then add only what a follow-up tool contributed. If you must explain in your own words, use the user's language.
 
 ## Reading the result
 - `verdict`: CONFIRMED_FAULT (a named problem, evidence in hand), PROBABLE_FAULT / FAULT (likely, not fully proven),
@@ -45,6 +45,7 @@ report the result honestly.
   exhausted budget. This is part of the answer, not a footnote.
 - `collection_impact`: `capture_mode`, `measured_stop_ms`, `zero_stop` (true means the process was never paused),
   `bytes_read`, `budget_exhausted`.
+- `human_summary`: Markdown report with six numbered sections (conclusion, what is wrong, why, certainty and what was not examined, next steps, impact) and a glossary; identifiers are untouched.
 - `report_path`: JSON report on disk; cite it so the user can open it.
 
 ## Follow-up by verdict

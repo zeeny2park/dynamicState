@@ -527,7 +527,9 @@ def main():
     dx_p.add_argument("--symptom", type=str, default=None, help="Optional natural-language symptom (default: general health check)")
     dx_p.add_argument("--time-limit", dest="time_limit_s", type=float, default=None, help="Wall-clock observation budget in seconds")
     dx_p.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (reports are written under <corpus>/reports)")
-    dx_p.add_argument("--json", action="store_true", default=False, help="Print the full result as JSON")
+    dx_p.add_argument("--json", action="store_true", default=False,
+                      help="Print the full result as JSON (the readable summary is under 'human_summary')")
+    dx_p.add_argument("--lang", choices=("en", "ko"), default="en", help="Language of the human-readable summary")
 
     args = parser.parse_args()
 
@@ -1721,17 +1723,17 @@ def main():
         sys.exit(0)
 
     elif args.command == "diagnose":
-        from .expert_diagnostic_engine import ExpertDiagnosticEngine, diagnose
-        result = diagnose(
+        from .expert_diagnostic_engine import ExpertDiagnosticEngine
+        from .human_report import diagnose_with_summary
+        result, summary = diagnose_with_summary(
             args.pid, debug_image=args.debug_image, symptom=args.symptom, time_limit_s=args.time_limit_s,
-            engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)),
+            engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)), lang=args.lang,
         )
         if args.json:
-            print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+            result["human_summary"] = summary
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         else:
-            print(result.summary)
-            if result.report_path:
-                print(f"Report: {result.report_path}")
+            print(summary)
         sys.exit(0)
 
 

@@ -156,7 +156,7 @@ class TestDiagnoseEntryPoint(unittest.TestCase):
         self.assertEqual(cli.returncode, 0, cli.stderr)
         cli_out = json.loads(cli.stdout)
         self.assertEqual(set(mcp_out) - {"success"}, set(cli_out))
-        self.assertEqual(set(cli_out), RESULT_KEYS)
+        self.assertEqual(set(cli_out), RESULT_KEYS | {"human_summary"})  # IMP-012 adds the readable summary
         self.assertEqual(mcp_out["verdict"], cli_out["verdict"])
         self.assertIn(mcp_out["verdict"], ("CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT"))
         plain = subprocess.run(
