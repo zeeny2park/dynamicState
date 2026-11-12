@@ -154,11 +154,8 @@ class RuntimeEvidenceProvider:
         cache_key = (pid, repr(cfg))
         try:
             if self.thread_series_cache is not None and cache_key in self.thread_series_cache:
-                # Same sample series as an earlier recipe of this run: reuse the verdict keys, but do not store the
-                # bulky per-thread summary a second time (every step re-persists the whole session).
-                derived = {k: v for k, v in self.thread_series_cache[cache_key].items()
-                           if k not in ("thread_summary", "thread_count_series")}
-                derived["thread_series_shared"] = True
+                # Same sample series as an earlier recipe of this run (thread recipes share one sampling window)
+                derived = self.thread_series_cache[cache_key]
             else:
                 sampler = ThreadSampler(self.adapter, self.watch_manager, self.budget_tracker)
                 series = sampler.collect(pid, companion_elf or "", cfg, inspect_fn=lambda: self._inspect_locks(pid, companion_elf))
